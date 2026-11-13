@@ -3,9 +3,11 @@
 """Native-state MP admission and PAGE-image lifetime contracts."""
 
 from types import SimpleNamespace
+from weakref import WeakKeyDictionary
 
 import pytest
 from conftest import MockConfig
+from test_lmcache_mp_async_lookup import _Adapter, _Client
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -31,8 +33,9 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
 )
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.sequence import Replay, Sequence, SequenceStatus, SequenceType
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +95,8 @@ def make_scheduler(
     adapter = Adapter()
     connections = []
 
-    def connect(config, *, checkpoint_spec=None):
+    def connect(config, *, checkpoint_spec=None, images=True):
+        assert images  # no bounded replay here, so saves carry their images
         connections.append(checkpoint_spec)
         return adapter
 
@@ -122,6 +126,14 @@ def make_scheduler(
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
+    )
+    manager._prompt_hash_chains = WeakKeyDictionary()
+    manager._prompt_hashes = lambda seq: BlockManager._prompt_hashes(manager, seq)
+    manager._adopt_shipped_chain = lambda seq: BlockManager._adopt_shipped_chain(
+        manager, seq
+    )
+    manager._block_hash = lambda seq, chain, i, prev: BlockManager._block_hash(
+        manager, seq, chain, i, prev
     )
     manager.prefix_hash_chain = lambda seq, hashes, blocks: BlockManager._chain_to(
         manager, seq, hashes, blocks
@@ -191,7 +203,7 @@ def test_save_uses_ready_native_hash_and_never_copies_active_slot(monkeypatch):
     assert request.native_state.boundary_tokens == 16
     assert request.native_state.unit_ids == image.unit_ids
     assert request.native_state.destination_slot is None
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert request.save_spec.skip_leading_tokens == 0
     assert checkpoints.take_checkpoint_ops() == ((), ())
     checkpoints.clear_index()
@@ -227,7 +239,7 @@ def test_save_frontier_selects_existing_checkpoint_below_computed_tokens(monkeyp
     checkpoint(scheduler, checkpoints, seq, 8)
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
-    assert len(request.token_ids) == 8
+    assert len(_shipped_tokens(request)) == 8
     assert request.native_state.boundary_tokens == 8
     assert scheduler._save_tracker["1"][1] == 8
 
@@ -392,6 +404,7 @@ def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    assert scheduler._scheduler_deadline_s == 40.0
     seq = sequence(computed=0 if kind == "load" else 16)
     if kind == "save":
         checkpoint(scheduler, checkpoints, seq, 16)
@@ -449,7 +462,7 @@ def test_load_queries_safe_chunk_boundary_before_reserving_state(monkeypatch, pr
     assert request.native_state.destination_slot == seq.state_slot
     assert request.load_spec.lmcache_cached_tokens == expected
     assert request.load_spec.transfer_end_tokens is None
-    assert request.token_ids == list(seq.token_ids[:expected])
+    assert _shipped_tokens(request) == list(seq.token_ids[:expected])
     assert (
         scheduler.load_finished(LoadOperationId(seq.id, operation.generation + 1))
         is False
@@ -473,7 +486,7 @@ def test_aligned_hbm_hit_uses_incremental_native_restore(monkeypatch):
     [request] = scheduler.build_connector_meta().requests
     assert request.load_spec.hbm_cached_tokens == 8
     assert request.load_spec.lmcache_cached_tokens == 16
-    assert request.token_ids == list(seq.token_ids[:16])
+    assert _shipped_tokens(request) == list(seq.token_ids[:16])
     assert seq.offload_load_start_tokens == 8
     assert checkpoints.store.pool.num_free == 27
 
@@ -661,8 +674,8 @@ def test_loads_are_not_limited_by_the_save_limit(monkeypatch):
     terminal(scheduler, request.save_operation)
 
 
-def engine_scheduler(monkeypatch):
-    adapter = Adapter()
+def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
+    adapter = adapter if adapter is not None else Adapter()
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "2")
@@ -682,6 +695,7 @@ def engine_scheduler(monkeypatch):
                 "lmcache.chunk_size": 8,
             },
         },
+        **overrides,
     )
     connector = LMCacheMPConnectorScheduler(config)
     monkeypatch.setattr(
@@ -749,6 +763,111 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     assert seq.state_slot == state_slot
     assert engine._num_parked_remote_kv == 0
     assert len(adapter.queries) == 1
+
+
+class _MissFromAdapter(Adapter):
+    """A server holding every prompt below token id `miss_from`, none above."""
+
+    def __init__(self, miss_from):
+        super().__init__()
+        self.miss_from = miss_from
+
+    def check_lookup_result(self, request_id):
+        tokens = self.queries[-1][1]
+        return 0 if tokens[0] >= self.miss_from else len(tokens)
+
+
+def test_engine_holds_back_a_restore_while_every_restore_slot_is_taken(monkeypatch):
+    """A load dispatched past the worker's two restore slots would wait there
+    with no worker clock running, while its deadline counts from dispatch."""
+    engine, connector, _adapter = engine_scheduler(
+        monkeypatch, adapter=_MissFromAdapter(400)
+    )
+    seqs = [
+        Sequence(list(range(100 * i, 100 * i + 24)), 4, has_per_req_cache=True)
+        for i in range(3)
+    ]
+    for seq in seqs:
+        engine.add(seq)
+    batch, _ = engine.schedule()
+    assert [seq.status for seq in seqs] == [
+        SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        SequenceStatus.WAITING,
+    ]
+    first = batch.connector_meta_output.requests[0]
+
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={first.load_operation})
+    )
+    engine.schedule()
+    assert seqs[2].status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    # Both slots are taken again; a request the tier misses still goes ahead.
+    impl = connector._require_impl()
+    fourth = Sequence(list(range(400, 424)), 4, has_per_req_cache=True)
+    assert connector.lookup_pending(fourth) is True
+    assert impl._lookup_client.lookup(fourth.token_ids, str(fourth.id)) == 0
+    assert connector.lookup_pending(fourth) is False
+
+
+class _AsyncAdapter(_Adapter):
+    lmcache_tokens_per_chunk = 8
+
+    def end_session(self, request_id):
+        pass
+
+
+@pytest.mark.parametrize("third, runs", [(0, True), (2, False)])
+def test_engine_gates_a_prefetched_answer_while_every_restore_slot_is_taken(
+    monkeypatch, third, runs
+):
+    # Prefetched lookups answer in order: two 2-chunk hits, then `third` chunks.
+    engine, _connector, _adapter = engine_scheduler(
+        monkeypatch, adapter=_AsyncAdapter(_Client(0, status=[2, 2, third]))
+    )
+    seqs = [
+        Sequence(list(range(100 * i, 100 * i + 24)), 4, has_per_req_cache=True)
+        for i in range(3)
+    ]
+    for seq in seqs:
+        engine.add(seq)
+    _, scheduled = engine.schedule()
+    assert [seq.status for seq in seqs] == [
+        SequenceStatus.WAITING_FOR_REMOTE_KVS
+    ] * 2 + [SequenceStatus.RUNNING if runs else SequenceStatus.WAITING]
+    assert scheduled == ({seqs[2].id: seqs[2]} if runs else {})
+
+
+def test_unaligned_hbm_handoffs_do_not_reserve_past_the_restore_slots(monkeypatch):
+    """A hand-off reserves its load after admission, so `lookup_pending` never
+    weighed it: three of them must not dispatch past the two restore slots."""
+    scheduler, _, _ = make_scheduler(monkeypatch)
+    seqs = [sequence(1 + i, computed=0, token_offset=100 * i) for i in range(3)]
+    for seq in seqs:
+        assert scheduler.get_num_new_matched_tokens(seq) == (16, True)
+        seq.num_cached_tokens = 4
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.should_park_for_load_after_alloc(seq) is False
+    assert scheduler._handoff_loads == {"1", "2", "3"}
+
+    for seq in seqs:
+        seq.num_cached_tokens = 8
+    assert [scheduler.should_park_partial_prefill_for_load(s) for s in seqs] == [
+        True,
+        True,
+        False,
+    ]
+    first, second = scheduler.build_connector_meta().requests
+    assert (first.req_id, second.req_id) == (1, 2)
+    assert scheduler._handoff_loads == {"3"}
+    assert scheduler.should_park_partial_prefill_for_load(seqs[2]) is False
+
+    assert scheduler.load_finished(first.load_operation)
+    assert scheduler.should_park_partial_prefill_for_load(seqs[2]) is True
+    [third] = scheduler.build_connector_meta().requests
+    assert third.req_id == 3 and third.load_spec.hbm_cached_tokens == 8
+    assert len(scheduler._native_loads) == 2
 
 
 @pytest.mark.parametrize("succeeded", [True, False])
@@ -857,3 +976,173 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()
+
+
+# --- Bounded replay over a KV-only load ------------------------------------
+
+
+class _ReachAdapter(Adapter):
+    """A stock server whose PAGE KV for the prompt reaches `reach` tokens."""
+
+    def __init__(self, reach):
+        super().__init__()
+        self.reach = reach
+
+    def check_lookup_result(self, request_id):
+        return self.reach
+
+
+_REPLAY = 7
+
+
+def replaying_engine(monkeypatch, *, reach=32, hbm=16, **overrides):
+    """A replaying engine whose HBM holds `hbm` prompt tokens with no checkpoint
+    and whose LMCache holds the PAGE KV to `reach`, and a waiting 40-token
+    prompt over both."""
+    adapter = _ReachAdapter(reach)
+    engine, connector, _ = engine_scheduler(
+        monkeypatch, adapter=adapter, state_replay_tokens=_REPLAY, **overrides
+    )
+    bm = engine.block_manager
+    if hbm:
+        first = Sequence(list(range(hbm)) + [900] * 4, 4, has_per_req_cache=True)
+        assert bm.allocate(first, bm.can_allocate(first))
+        bm.hash_blocks(first, first.num_tokens)
+        bm.deallocate(first)
+    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    engine.add(seq)
+    return engine, connector, adapter, seq
+
+
+def test_engine_kv_only_load_then_replays_below_the_reach(monkeypatch):
+    engine, _, _, seq = replaying_engine(monkeypatch)
+    batch, scheduled = engine.schedule()
+    assert scheduled == {}
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq.replays_hit and seq.replay_kv_load
+    assert seq.num_cached_tokens == 16  # the HBM hit; the load runs from there
+    [request] = batch.connector_meta_output.requests
+    assert request.native_state.kv_only and not request.native_state.unit_ids
+    assert request.native_state.boundary_tokens == 32
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    # The slot is fresh: the forward replays the field below the reach.
+    assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [32 - _REPLAY]
+    assert batch.replaying == {0: seq.replay}
+    # The replayed rows are recomputed, not a hit.
+    assert seq.prefix_cache_hit_tokens == 32 - _REPLAY
+
+
+def test_engine_failed_kv_only_load_replays_below_the_hbm_hit(monkeypatch):
+    engine, _, _, seq = replaying_engine(monkeypatch)
+    batch, _ = engine.schedule()
+    [request] = batch.connector_meta_output.requests
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(failed_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    # `num_cached_tokens` stayed at the HBM hit; the slot is fresh, so the
+    # resume replays below it.
+    assert seq.replay == Replay(16, True, (), 16 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [16 - _REPLAY]
+
+
+def test_engine_replay_wider_than_the_budget_resumes_after_its_load(monkeypatch):
+    """After the load the replay (7 rows) is wider than a 4-token budget: it
+    resumes anyway and continues in the next forwards."""
+    adapter = _ReachAdapter(32)
+    engine, _, _ = engine_scheduler(
+        monkeypatch,
+        adapter=adapter,
+        state_replay_tokens=_REPLAY,
+        max_num_batched_tokens=4,
+    )
+    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    [request] = batch.connector_meta_output.requests
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert list(batch.num_scheduled_tokens) == [4]
+    assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
+
+
+def _woken(engine, seq):
+    """Land `seq`'s KV-only load and wake it without admitting it: no room yet,
+    so it waits at the head of `waiting` holding its blocks."""
+    batch, _ = engine.schedule()
+    [request] = batch.connector_meta_output.requests
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    engine._resolve_offload_load(seq)
+    assert engine._is_offload_prefill_resume(seq)
+    assert seq.status == SequenceStatus.WAITING and seq.replays_hit
+    assert seq.num_cached_tokens == 32
+
+
+def test_engine_head_probe_keeps_a_woken_replay(monkeypatch):
+    """The delayer's head probe does not re-decide a woken request's hit: a
+    checkpoint cut just below the reach since would turn the replay off, and
+    the forward resume at the reach on a fresh state slot."""
+    engine, _, _, seq = replaying_engine(monkeypatch)
+    _woken(engine, seq)
+    monkeypatch.setattr(
+        engine.block_manager,
+        "_gated_hit",
+        lambda _seq, compressed_hit, _hashes, **_kw: compressed_hit,
+    )
+    assert engine._can_admit_head_prefill()
+    assert seq.replays_hit
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [32 - _REPLAY]
+
+
+def test_engine_estimates_a_woken_replay_from_its_forward_start(monkeypatch):
+    """The local prefill probe and the DP cost estimate (#2551) start a woken
+    replay below the reach, as admission does."""
+    engine, _, _, seq = replaying_engine(monkeypatch)
+    _woken(engine, seq)
+    assert engine._local_prefill_pending_work() == (True, 40 - (32 - _REPLAY))
+    starts = []
+    real_cost = engine._chunk_cost
+    monkeypatch.setattr(
+        engine,
+        "_chunk_cost",
+        lambda start, k: starts.append(start) or real_cost(start, k),
+    )
+    engine._estimate_prefill_chunk_cost()
+    assert starts == [32 - _REPLAY]
+
+
+def test_engine_kv_only_loads_count_against_parked_capacity(monkeypatch):
+    """A replay that loads its KV first parks, so it waits for a parked slot
+    like any remote load."""
+    engine, _, _, seq = replaying_engine(monkeypatch, max_num_seqs=1)
+    other = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    engine.add(other)
+    engine.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert other.status == SequenceStatus.WAITING
+    assert not other.block_table and engine._num_parked_remote_kv == 1
+
+
+def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
+    """An HBM hit off LMCache's chunk grid cannot start a KV-only load: the
+    request replays below the HBM hit at once."""
+    engine, _, _, seq = replaying_engine(monkeypatch, hbm=12)
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert not seq.replay_kv_load
+    assert seq.replay == Replay(12, True, (), 12 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [12 - _REPLAY]

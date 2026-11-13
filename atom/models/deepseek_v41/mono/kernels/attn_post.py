@@ -12,18 +12,24 @@ Task counts are TP4's (``Dims``: the rank's widths at the build's ``tp``):
     irq      (S x 16 a head tile, 32 columns of its heads a task): the attention's PV and
              split combine (``attention.py``), then the inverse RoPE of each
              head's tail, group-32 FP8 of the fp32 result (aiter
-             ``inverse_rope_group_quant``: amax floored at 1e-8, the ceil code,
+             ``inverse_rope_group_quant``: amax floored at AMAX_FLOOR, the ceil code,
              the hardware scaled convert) -> mailbox XO
     wo_a     (64, 32 rows: two tiles, K split 4 each): the grouped FP8 GEMV (8
              heads a group) -> bf16 -> ATOM ``quantize_fp8`` of the 32 (one
-             group: the ceil code, floor 1e-4) -> X8B, X8BS
+             group: the ceil code, floor AMAX_FLOOR) -> X8B, X8BS
     wo_b     (320, 16 rows): FP8 GEMV -> the rank's bf16 partial -> pushed to
              every rank's ATTN region (system scope)
     slice    (160): the TP partials of its 32 columns summed as the all-reduce
-             the original path runs sums them (fp32, this rank's first, then
-             rank + 1, + 2, ..; bf16) -- the attention output -- folded into the
-             residual; then the FFN seam as in K1
-    gate, norm: the FFN gates and ffn_norm -> ``normed`` (the MoE input)
+             the original path runs sums them (fp32, in rank order 0 .. TP - 1;
+             bf16) -- the attention output -- folded into the residual; then
+             the FFN seam as in K1
+    norm, gate: ffn_norm -> ``normed`` (the MoE input), then the FFN gates
+
+Token parallel (``tok_par``, S a multiple of TP): wo_b pushes a token's partial
+to its owner alone (rank r owns rows r S/TP ..: a reduce-scatter), and the
+slice, gate and norm run on this rank's tokens (``own_view``); the caller
+gathers the normed rows (``layer_post``). The sums are the all-reduce's, in
+the same order, so every output is the same to the bit.
 
 A selecting layer's indexer (``index_score.py``) runs first in this launch;
 before it stay the compressor and each token's window metadata
@@ -41,6 +47,8 @@ from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels.attention import (
     COLS,
     GROUPS,
+    SCORE_LDS_WORDS,
+    SCORE_Q_WORDS,
     only_live,
     pv_groups,
     score_tasks,
@@ -64,6 +72,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     lds_row,
     plus,
     poll_copy,
+    slice_prefetch,
     stage_gate,
     stage_norm,
     stage_slice,
@@ -84,15 +93,19 @@ from atom.models.deepseek_v41.mono.kernels.index_score import run_indexer
 from atom.models.deepseek_v41.mono.kernels.index_score import (
     scratch_pairs as index_pairs,
 )
+from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
+from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
     bf16_round,
     butterfly,
     fp8_pack4,
     kernel_symbol,
     lane_gather,
+    launcher,
     ld_i32,
     row_sum,
     traced,
@@ -117,14 +130,14 @@ WOA_SPLIT_K = WAVES * ROWS // WOA_ROWS
 _SEL = lds_words(SEL_PER_THREAD)
 SEL_KEYS, SEL_HIST, SEL_BUF = _SEL["keys"], _SEL["hist"], _SEL["buf"]
 WOB_TASKS = HIDDEN // ROWS  # 320
-IRQ_FLOOR = 1e-8
-QUANT_FLOOR = 1e-4
+# wo_b tasks a CTA holds the weights of at once past one token tile (TP 1)
+WOB_LIVE = 3
 
 SCORE0 = 0
 IRQ0 = 64  # past the score tasks (S x ``score_tasks`` = S x 8, S <= 8)
 WOA0 = 160  # past the pv tasks (S x 16, S <= 6): its weights load during them
-GATE0 = k1.GATE0
-NORM0 = k1.NORM0
+GATE0 = k1.SLICES
+NORM0 = GATE0 + 8
 _CURRENT_STREAM = fx.Stream(None)
 
 
@@ -137,12 +150,28 @@ class AttnPostBuild:
     # the index plane is FP4: its scorer is ``index_score_fp4`` (``iqs``,
     # ``pscale`` and the FULL layers' task plan ``iplan``)
     index_fp4: bool = False
+    # FP4 keys in OPUS 64-row groups; the query remains Mono's own layout.
+    index_mfma: bool = False
     # the TP size: every width a rank holds (``Dims``)
     tp: int = 4
     timeline: bool = field(default=False, metadata={"sym": "tl"})
     # ``ATOM_MONO_DEBUG``: bounded mailbox waits recording at this scratch
     # offset (``debug``); -1 is the normal build
     diag_off: int = -1
+    # token parallel: wo_b's partials go to each token's owner rank only (a
+    # reduce-scatter), and the slice, gate and norm run on this rank's tokens
+    # (``own_view``); the caller gathers the normed rows
+    tok_par: bool = False
+    # the pool's rows are MXFP8: QK on FP8 (q quantized by the original path's
+    # rule), PV on the rows dequantized (``attention``)
+    kv_fp8: bool = False
+
+
+# the per-token arguments the token-parallel stages read and write
+K2A_OWN = (
+    "res_in", "res_out", "pre_in", "post_in", "comb_in", "pre_out", "post_out",
+    "comb_out", "normed",
+)  # fmt: skip
 
 
 # ``timeline`` stamps: kernel start, then the end of each stage's task loop
@@ -153,8 +182,8 @@ TL_STAGES = (
     "wo_a",
     "wo_b",
     "slice",
-    "gate",
     "norm",
+    "gate",
 )
 TL_POINTS = 1 + len(TL_STAGES)
 
@@ -184,7 +213,9 @@ def scratch_layout(key: AttnPostBuild) -> dict[str, tuple[int, int]]:
         **attention_pairs(tokens, d),
         "x8b": tokens * d.yb_words,
         "x8bs": tokens * d.o_rows // 32,
-        **(index_pairs(tokens, index_bound_max) if index_bound_max else {}),
+        **(
+            index_pairs(tokens, index_bound_max, key.tok_par) if index_bound_max else {}
+        ),
     }
     out = {name: base[name] for name in ("lin", "pmix", "x8", "x8s")}
     start = max(o + n for o, n in base.values())
@@ -193,11 +224,6 @@ def scratch_layout(key: AttnPostBuild) -> dict[str, tuple[int, int]]:
 
 def scratch_bytes(key: AttnPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
-
-
-def peer_bytes(tokens: int, tp: int) -> int:
-    """ATTN: [source rank][token][hidden / 2] bf16 pairs."""
-    return tp * tokens * HIDDEN // 2 * 8
 
 
 def attn_region_pair(src, t, s, col):
@@ -262,8 +288,8 @@ def irq_group(c, t, tile, dc, out, rope):
     e1 = e * cs + o * sn
     o1 = o * cs - e * sn
     amax = butterfly(fx.max(abs(e1), abs(o1)), (1, 2, 4, 8), fx.max)
-    code = code_ceil(fx.max(amax, fx.Float32(IRQ_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
-    inv = pow2(254 - code)
+    code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
+    inv = rcp_pow2(code)
     # this thread's two bytes and its neighbour's make a word (4 dims)
     q0, q1 = clamp_fp8(e1 * inv), clamp_fp8(o1 * inv)
     n0, n1 = xshfl(q0, 1), xshfl(q1, 1)
@@ -317,7 +343,7 @@ def load_rows(
 @traced
 def stage_woa(c, task, ops, t0=0, n=None):
     """Rows 32 task .. of wo_a (two tiles, ``woa_loads``' operands) -> bf16 ->
-    ATOM ``quantize_fp8`` of the 32 (one group: amax floored 1e-4, the ceil
+    ATOM ``quantize_fp8`` of the 32 (one group: amax floored AMAX_FLOOR, the ceil
     code) -> X8B / X8BS, wo_b's input; the token tile from ``t0`` (its x in
     LDS)."""
     tid, red, d = c["tid"], c["red"], c["d"]
@@ -336,9 +362,9 @@ def stage_woa(c, task, ops, t0=0, n=None):
             fx.BFloat16
         )
     )
-    amax = fx.max(butterfly(abs(y), (1, 2, 4, 8, 16), fx.max), fx.Float32(QUANT_FLOOR))
+    amax = fx.max(butterfly(abs(y), (1, 2, 4, 8, 16), fx.max), fx.Float32(AMAX_FLOOR))
     code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-    q = clamp_fp8(y / pow2(code))
+    q = clamp_fp8(y * rcp_pow2(code))
     # rows row .. row + 3 (row a multiple of 4) make a word
     lane = c["lane"]
     w = fp8_pack4(
@@ -378,19 +404,52 @@ def woa_loads(c, task):
     )  # fmt: skip
 
 
-def wob_loads(c, task):
-    a = c["args"]
-    return gemv_fp8_loads(c, a["wob"], a["wob_s"], c["d"].o_rows, task)
+def wob_loads(c, task, part=0):
+    """wo_b task ``task``'s weight operands over K part ``part``
+    (``Dims.wob_parts``)."""
+    a, d = c["args"], c["d"]
+    if const_expr(d.wob_parts == 1):
+        return gemv_fp8_loads(c, a["wob"], a["wob_s"], d.o_rows, task)
+    return gemv_fp8_loads(
+        c, a["wob"], a["wob_s"], d.wob_k, task,
+        k_row=d.o_rows, st0=part * d.wob_k // 128,
+    )  # fmt: skip
+
+
+def load_wob_rows(c, part, t0, n):
+    """wo_b's input over K part ``part`` (X8B / X8BS) of tokens t0 .. t0 + n
+    into LDS ``xl`` / ``xsl``."""
+    d = c["d"]
+    load_rows(
+        c, c["x8b"], c["x8bs"], d.yb_words, part * d.wob_k // 4, d.wob_k // 4,
+        d.o_rows // 32, part * d.wob_k // 32, d.wob_k // 32, c["xl"], c["xsl"], t0, n,
+    )  # fmt: skip
+
+
+def stage_wob(c, task, ops, t0=0, n=None, part=0):
+    """Rows 16 task .. of wo_b over K part ``part`` (``wob_loads``' operands)
+    -> this rank's bf16 partial of the part, pushed to every rank (token
+    parallel: to the token's owner) as source ``rank parts + part``; the token
+    tile from ``t0`` (its x in LDS)."""
+    wob_mfma(c, ops, n)
+    wob_push(c, task, t0, n, part)
+
+
+def wob_mfma(c, ops, n=None):
+    """``stage_wob``'s GEMV into LDS ``red``: once it is issued, the registers
+    of ``ops`` are free for the next task's loads."""
+    n = c["S"] if n is None else n
+    gemv_fp8_mfmas(c, c["d"].wob_k, c["xl"], c["xsl"], c["red"], ops, rows=n)
+    gpu.barrier()
 
 
 @traced
-def stage_wob(c, task, ops, t0=0, n=None):
-    """Rows 16 task .. of wo_b (``wob_loads``' operands) -> this rank's bf16
-    partial, pushed to every rank; the token tile from ``t0`` (its x in LDS)."""
+def wob_push(c, task, t0=0, n=None, part=0):
+    """``stage_wob``'s row sums of ``red`` pushed as source ``rank parts +
+    part``."""
     s, tid, red, d = c["S"], c["tid"], c["red"], c["d"]
     n = s if n is None else n
-    gemv_fp8_mfmas(c, d.o_rows, c["xl"], c["xsl"], red, ops, rows=n)
-    gpu.barrier()
+    src = c["rank"] * d.wob_parts + part if d.wob_parts > 1 else c["rank"]
     if tid < ROWS * n // 2:
         rp = tid % (ROWS // 2)
         tl = tid // (ROWS // 2)
@@ -398,9 +457,19 @@ def stage_wob(c, task, ops, t0=0, n=None):
         col = task * ROWS + 2 * rp
         v0 = row_sum(red, 2 * rp, tl)
         v1 = row_sum(red, 2 * rp + 1, tl)
-        for p in range_constexpr(d.tp):
-            dst = preg(c["peer_addr"](p), 0, "attn")
-            c["put_bf"](dst, 2 * attn_region_pair(c["rank"], t, s, col), [v0, v1])
+        if const_expr(c["tok_par"]):
+            # to the token's owner only, at its own token index there
+            own_n = own_count(s, d.tp)
+            owner = t // own_n
+            for p in range_constexpr(d.tp):
+                if owner == p:
+                    dst = preg(c["peer_addr"](p), c["peer"]["attn"], "attn")
+                    pair = attn_region_pair(src, t - p * own_n, own_n, col)
+                    c["put_bf"](dst, 2 * pair, [v0, v1])
+        else:
+            for p in range_constexpr(d.tp):
+                dst = preg(c["peer_addr"](p), c["peer"]["attn"], "attn")
+                c["put_bf"](dst, 2 * attn_region_pair(src, t, s, col), [v0, v1])
     gpu.barrier()
 
 
@@ -423,12 +492,12 @@ def reduce_attn_pair(c, task, idx):
     if idx < s * k1.COLS // 2:
         t = idx // (k1.COLS // 2)
         col = c0 + 2 * (idx % (k1.COLS // 2))
-        own = preg(c["sym"], 0, "attn")
+        own = preg(c["sym"], c["peer"]["attn"], "attn")
         acc0, acc1 = sum_partials(
             c["poll"],
             own,
             lambda src: attn_region_pair(src, t, s, col),
-            c["d"].tp,
+            c["d"].attn_sources,
         )
         lds = c["pend_lds"] + (t * k1.COLS + col - c0)
         fx.ptr_store(bf16_round(acc0), lds)
@@ -458,16 +527,22 @@ def lds_union(name, members):
     )
 
 
-def attn_post_smem(s, timeline, bound_max, d) -> dict:
+def attn_post_smem(s, timeline, bound_max, d, kv_fp8=False) -> dict:
     """K2a's LDS, a struct a stage: the members of a union, so only one stage's
     buffers take space at a time (``run_attn_post`` fences each hand-over).
     Each opens with what every stage shares at the same offsets -- ``red`` and
-    the stamp record (``timeline``)."""
+    the stamp record (``timeline``). ``kv_fp8``: the score's MXFP8 q operands
+    (``attention._q_shared``)."""
     shared = {
         "red": fx.Array[fx.Float32, k1.WAVES * 2 * 64 * 4, 16],
         "tls": fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16],
     }
     stages = {
+        # the score's key rows, a wave's split at a time (``attention``)
+        "score": {
+            "sc_kv": fx.Array[fx.Int32, WAVES * SCORE_LDS_WORDS, 16],
+            "sc_q": fx.Array[fx.Int32, SCORE_Q_WORDS if kv_fp8 else 1, 16],
+        },
         "sel": {
             "sk": fx.Array[fx.Int32, SEL_KEYS if bound_max else 1, 16],
             "sh": fx.Array[fx.Int32, SEL_HIST, 16],
@@ -503,7 +578,9 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
     """K2a's stage context: LDS (``attn_post_smem``'s member views by name),
     mailbox, scratch regions, arguments."""
     tid = fx.thread_idx.x
-    sl, gm, at, se = (lds[f"k2a_{n}"] for n in ("slice", "gemv", "attn", "sel"))
+    sl, gm, at, se, sc = (
+        lds[f"k2a_{n}"] for n in ("slice", "gemv", "attn", "sel", "score")
+    )
     c = {
         "S": s, "tid": tid, "bid": fx.block_idx.x, "lane": tid % 64,
         "wave": tid // 64,
@@ -512,24 +589,30 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "att": {
             "tree": at.at_tree.ptr, "alpha": at.at_alpha.ptr,
             "stat": at.at_stat.ptr, "out": at.at_out.ptr, "kv": at.at_kv.ptr,
+            "score_kv": sc.sc_kv.ptr, "score_q": sc.sc_q.ptr,
         },
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
         "poll": mb.poll, "peer_addr": lambda p: bases[p], "rank": rank, "sym": sym,
+        "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
-        "index_fp4": key.index_fp4,
+        "index_fp4": key.index_fp4, "index_mfma": key.index_mfma,
+        "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "args": args, "d": Dims(key.tp),
     }  # fmt: skip
     for region, (off, _) in layout.items():
         c[region] = sreg(scratch, off, region)
+    if const_expr(key.tok_par and key.index_bound_max > 0):
+        c["irdy"] = preg(sym, c["peer"]["irdy"], "irdy")
     c["sel_lds"] = {"keys": se.sk.ptr, "hist": se.sh.ptr, "buf": se.sb.ptr}
     return c
 
 
 @traced
-def run_attn_post(c, key, bid, tls, tl0, after_norm=None):
+def run_attn_post(c, key, bid, tls, tl0, after_norm=None, gates=True):
     """K2a's stages, in order; ``timeline`` stamps from point ``tl0`` + 1.
     ``after_norm(t)``: once token t's ``normed`` row is written (a launch that
-    also reads it: ``layer_post``)."""
+    also reads it: ``layer_post``). ``gates``: the FFN gates last (else the
+    caller runs ``run_gates`` later and stamps it)."""
     s, timeline, tid, d = key.tokens, key.timeline, c["tid"], c["d"]
     bound_max = key.index_bound_max
     tiles = d.head_tiles.count
@@ -560,6 +643,14 @@ def run_attn_post(c, key, bid, tls, tl0, after_norm=None):
         if woa_task < d.woa_tasks:
             woa_ops = woa_loads(c, woa_task)
             woa_tile(c, woa_task, woa_ops, 0, s)
+    elif const_expr(d.woa_tasks == BLOCKS):
+        # TP 1 (DP attention): a task a CTA fills every CTA already, so a CTA
+        # runs its task's token tiles in series on its weights, loaded once
+        # (EP 24 / 48 rows -3.4 / -5.1 us)
+        woa_task = first_task(bid, WOA0)
+        woa_ops = woa_loads(c, woa_task)
+        for t0, n in tiles:
+            woa_tile(c, woa_task, woa_ops, t0, n)
     else:
         # a (task, token tile) a unit, a CTA each: a task's tiles in series on
         # one CTA left three quarters of the CTAs idle through wo_a (its weights
@@ -571,53 +662,108 @@ def run_attn_post(c, key, bid, tls, tl0, after_norm=None):
             woa_tile(c, woa_task, woa_ops, t0, fx.min(fx.Int32(TILE), s - t0))
     stamp(timeline, tls, tid, tl0 + 4)
     enter_stage("k2a.wo_b")
-    assert d.yb_words <= d.group_k // 4  # xl holds it
+    assert d.wob_k // 4 <= d.group_k // 4  # xl holds a part
     assert BLOCKS < WOB_TASKS <= 2 * BLOCKS
-    if const_expr(len(tiles) == 1):
+    if const_expr(len(tiles) == 1 and d.wob_parts == 2):
+        # TP 1 (DP attention): wo_a takes every CTA, so wo_b's weights wait for
+        # it; a CTA a K part of 2 or 3 tasks (half the CTAs a part), every
+        # task's weights in flight at once and the part's rows loaded once: one
+        # HBM round, not a part's after the other's
+        unit = first_task(bid, WOA0 + d.woa_tasks)
+        part, slot = unit % 2, unit // 2
+        per = BLOCKS // 2
+        tasks = [plus(slot, per * k) for k in range(-(-WOB_TASKS // per))]
+        ops = [wob_loads(c, fx.min(t, WOB_TASKS - 1), part) for t in tasks]
+        load_wob_rows(c, part, 0, s)
+        for k in range_constexpr(len(tasks)):
+            if tasks[k] < WOB_TASKS:
+                stage_wob(c, tasks[k], ops[k], 0, s, part)
+    elif const_expr(len(tiles) == 1):
         # every CTA has one or two wo_b tasks: both tasks' weights in flight
-        # before y's wait (a CTA with one loads its own again: L2 hits)
+        # before y's wait (a CTA with one loads its own again: L2 hits); a
+        # later K part's after the part before it
         wob_task = first_task(bid, WOA0 + d.woa_tasks)
         wob_second = wob_task + BLOCKS
         has_second = wob_second < WOB_TASKS
+        second = has_second.select(wob_second, wob_task)
         wob_ops = wob_loads(c, wob_task)
-        wob_ops2 = wob_loads(c, has_second.select(wob_second, wob_task))
-        load_rows(
-            c, c["x8b"], c["x8bs"], d.yb_words, 0, d.yb_words,
-            d.o_rows // 32, 0, d.o_rows // 32, c["xl"], c["xsl"], 0, s,
-        )  # fmt: skip
-        stage_wob(c, wob_task, wob_ops, 0, s)
-        if has_second:
-            stage_wob(c, wob_second, wob_ops2, 0, s)
+        wob_ops2 = wob_loads(c, second)
+        for part in range_constexpr(d.wob_parts):
+            if const_expr(part > 0):
+                wob_ops = wob_loads(c, wob_task, part)
+                wob_ops2 = wob_loads(c, second, part)
+            load_wob_rows(c, part, 0, s)
+            stage_wob(c, wob_task, wob_ops, 0, s, part)
+            if has_second:
+                stage_wob(c, wob_second, wob_ops2, 0, s, part)
+    elif const_expr(d.wob_parts == 2):
+        # TP 1 past one tile: a CTA a (tile, K part) and its tasks, as above
+        vt, wob_tasks = tile_tasks(
+            bid, WOA0 + d.woa_tasks * len(tiles), 2 * len(tiles), WOB_TASKS
+        )
+        part, tile = vt % 2, vt // 2
+        t0 = tile * TILE
+        n = fx.min(fx.Int32(TILE), s - t0)
+
+        def loads(k):
+            return wob_loads(c, fx.min(wob_tasks[k], WOB_TASKS - 1), part)
+
+        # WOB_LIVE tasks' weights in flight, the next issued as a GEMV frees
+        # its registers (all of a CTA's five at once spilled)
+        live = [loads(k) for k in range(min(WOB_LIVE, len(wob_tasks)))]
+        load_wob_rows(c, part, t0, n)
+        for k in range_constexpr(len(wob_tasks)):
+            ops = live[k % WOB_LIVE]
+            wob_mfma(c, ops, n)
+            if const_expr(k + WOB_LIVE < len(wob_tasks)):
+                live[k % WOB_LIVE] = loads(k + WOB_LIVE)
+            if wob_tasks[k] < WOB_TASKS:
+                wob_push(c, wob_tasks[k], t0, n, part)
     else:
         tile, wob_tasks = tile_tasks(
             bid, WOA0 + d.woa_tasks * len(tiles), len(tiles), WOB_TASKS
         )
-        wob_ops = [wob_loads(c, fx.min(t, WOB_TASKS - 1)) for t in wob_tasks]
         t0 = tile * TILE
         n = fx.min(fx.Int32(TILE), s - t0)
-        load_rows(
-            c, c["x8b"], c["x8bs"], d.yb_words, 0, d.yb_words,
-            d.o_rows // 32, 0, d.o_rows // 32, c["xl"], c["xsl"], t0, n,
-        )  # fmt: skip
-        for k in range_constexpr(len(wob_tasks)):
-            if wob_tasks[k] < WOB_TASKS:
-                stage_wob(c, wob_tasks[k], wob_ops[k], t0, n)
+        for part in range_constexpr(d.wob_parts):
+            wob_ops = [wob_loads(c, fx.min(t, WOB_TASKS - 1), part) for t in wob_tasks]
+            load_wob_rows(c, part, t0, n)
+            for k in range_constexpr(len(wob_tasks)):
+                if wob_tasks[k] < WOB_TASKS:
+                    stage_wob(c, wob_tasks[k], wob_ops[k], t0, n, part)
     stamp(timeline, tls, tid, tl0 + 5)
+    # token parallel: this rank's tokens from here on (``after_norm`` gets the
+    # token's index among them)
+    co = own_view(c, K2A_OWN) if const_expr(key.tok_par) else c
+    n = co["S"]
     enter_stage("k2a.slice")
     for task in range(first_task(bid, 0), k1.SLICES, BLOCKS):
-        stage_reduce(c, task)
-        stage_slice(c, task)
+        # the residual and gate loads in flight through the partials' wait
+        pre = slice_prefetch(co, task)
+        stage_reduce(co, task)
+        stage_slice(co, task, pre)
     stamp(timeline, tls, tid, tl0 + 6)
-    enter_stage("k2a.gate")
-    for t in range(first_task(bid, GATE0), s, BLOCKS):
-        stage_gate(c, t)
-    stamp(timeline, tls, tid, tl0 + 7)
+    # the norm before the gate: the MoE waits for it, the gate's outputs are
+    # the next layer's
     enter_stage("k2a.norm")
-    for t in range(first_task(bid, NORM0), s, BLOCKS):
-        stage_norm(c, t)
+    for t in range(first_task(bid, NORM0), n, BLOCKS):
+        stage_norm(co, t)
         if const_expr(after_norm is not None):
             after_norm(t)
-    stamp(timeline, tls, tid, tl0 + 8)
+    stamp(timeline, tls, tid, tl0 + 7)
+    if const_expr(gates):
+        run_gates(c, key, bid)
+        stamp(timeline, tls, tid, tl0 + 8)
+
+
+@traced
+def run_gates(c, key, bid):
+    """The FFN seam's gates (``stage_gate``) -> the next layer's post / comb /
+    pre: nothing in this launch waits on them."""
+    co = own_view(c, K2A_OWN) if const_expr(key.tok_par) else c
+    enter_stage("k2a.gate")
+    for t in range(first_task(bid, GATE0), co["S"], BLOCKS):
+        stage_gate(co, t)
 
 
 def build_attn_post(key: AttnPostBuild):
@@ -627,7 +773,7 @@ def build_attn_post(key: AttnPostBuild):
     bound_max = key.index_bound_max
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
-    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp))
+    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp), key.kv_fp8)
     Smem = lds_union("K2aLds", members)
 
     name = kernel_symbol(
@@ -636,6 +782,7 @@ def build_attn_post(key: AttnPostBuild):
         tl=int(timeline),
         ix=int(bound_max > 0),
         i4=int(key.index_fp4),
+        im=int(key.index_mfma),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -680,7 +827,7 @@ def build_attn_post(key: AttnPostBuild):
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         iact: Int32, iq: Int64, iw: Int64, plane: Int64, iqs: Int64,
         pscale: Int64, iplan: Int64, itab: Int64,

@@ -1,19 +1,30 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::Request,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
+use serde::de::DeserializeOwned;
 use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    core::{steps::TokenizerConfigRequest, Job, UNKNOWN_MODEL_ID},
+    core::{
+        prepare_pool::{JobContext, PrepareError},
+        steps::TokenizerConfigRequest,
+        Job, UNKNOWN_MODEL_ID,
+    },
     protocols::tokenize::{
         AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
         DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
         TokenizeRequest, TokenizeResponse, TokenizerInfo, TokensResult,
+    },
+    routers::{
+        comm::error::IngressError,
+        ingress::{read_body, InferenceEnvelope},
     },
     tokenizer::{registry::TokenizerEntry, traits::Tokenizer, TokenizerRegistry},
 };
@@ -31,10 +42,60 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         .into_response()
 }
 
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
-    if let Some(tokenizer) = registry.get(model) {
+fn ingress_error_response(error: IngressError) -> Response {
+    error_response(error.status, &error.message, error.code)
+}
+
+fn prepare_error_response(error: PrepareError) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    error_response(status, &error.to_string(), error.code())
+}
+
+/// Run CPU-bound tokenizer work and response serialization on the preparation
+/// pool, so Tokio workers stay free for I/O.
+async fn run_on_prepare_pool(
+    context: &AppContext,
+    work: impl FnOnce(&JobContext) -> Response + Send + 'static,
+) -> Response {
+    let pool = &context.prepare_pool;
+    let ticket = pool.submit(pool.prepare_deadline(), work).await;
+    match ticket {
+        Ok(ticket) => ticket.wait().await.unwrap_or_else(prepare_error_response),
+        Err(error) => prepare_error_response(error),
+    }
+}
+
+/// Check the headers and collect the body on Tokio, leaving JSON parsing to the
+/// preparation job so admission and its deadline bound that work too.
+async fn read_json_body(context: &AppContext, request: Request) -> Result<Bytes, IngressError> {
+    let (parts, body) = request.into_parts();
+    InferenceEnvelope::validate_headers(&parts.headers)?;
+    read_body(body, context.router_config.max_payload_size).await
+}
+
+fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, IngressError> {
+    serde_json::from_slice(body).map_err(|error| IngressError::invalid(error.to_string()))
+}
+
+fn tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, IngressError> {
+    get_tokenizer_entry(registry, model)
+        .map_err(|e| IngressError::new(StatusCode::BAD_REQUEST, "tokenizer_not_found", e))
+}
+
+fn get_tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, String> {
+    if let Some(entry) = registry
+        .get_by_name(model)
+        .or_else(|| registry.get_by_id(model))
+    {
         debug!("Found tokenizer for model: {}", model);
-        return Ok(tokenizer);
+        return Ok(entry);
     }
 
     if model == UNKNOWN_MODEL_ID || model.is_empty() {
@@ -44,7 +105,7 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
                 "Using first available tokenizer '{}' as default",
                 first.name
             );
-            return Ok(first.tokenizer.clone());
+            return Ok(first.clone());
         }
     }
 
@@ -61,16 +122,43 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
     }
 }
 
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
-    debug!("Tokenize request for model: {}", request.model);
-
-    let tokenizer = match get_tokenizer(registry, &request.model) {
-        Ok(t) => t,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
-        }
+pub async fn tokenize(context: &Arc<AppContext>, request: Request) -> Response {
+    let body = match read_json_body(context, request).await {
+        Ok(body) => body,
+        Err(error) => return ingress_error_response(error),
     };
+    let registry = context.tokenizer_registry.clone();
+    let max_tokenize_bytes = context.router_config.resolved_max_tokenize_bytes();
+    run_on_prepare_pool(context, move |_| {
+        tokenize_body(&registry, max_tokenize_bytes, &body).unwrap_or_else(ingress_error_response)
+    })
+    .await
+}
 
+fn tokenize_body(
+    registry: &TokenizerRegistry,
+    max_tokenize_bytes: usize,
+    body: &[u8],
+) -> Result<Response, IngressError> {
+    let request: TokenizeRequest = parse_body(body)?;
+    debug!("Tokenize request for model: {}", request.model);
+    let entry = tokenizer_entry(registry, &request.model)?;
+
+    // The whole batch encodes in one preparation job, so the limit covers its total.
+    let input_bytes = request
+        .prompt
+        .as_strings()
+        .iter()
+        .try_fold(0usize, |size, text| size.checked_add(text.len()));
+    if input_bytes.is_none_or(|size| size > max_tokenize_bytes) {
+        return Err(IngressError::tokenizer_input_too_large());
+    }
+
+    let encoder = crate::routers::prepare::thread_tokenizer::encoder(&entry);
+    Ok(encode_prompts(&*encoder, &request))
+}
+
+fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Response {
     let texts = request.prompt.as_strings();
     let is_batch = request.prompt.is_batch();
 
@@ -121,16 +209,26 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     .into_response()
 }
 
-pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
-    debug!("Detokenize request for model: {}", request.model);
-
-    let tokenizer = match get_tokenizer(registry, &request.model) {
-        Ok(t) => t,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
-        }
+pub async fn detokenize(context: &Arc<AppContext>, request: Request) -> Response {
+    let body = match read_json_body(context, request).await {
+        Ok(body) => body,
+        Err(error) => return ingress_error_response(error),
     };
+    let registry = context.tokenizer_registry.clone();
+    run_on_prepare_pool(context, move |_| {
+        detokenize_body(&registry, &body).unwrap_or_else(ingress_error_response)
+    })
+    .await
+}
 
+fn detokenize_body(registry: &TokenizerRegistry, body: &[u8]) -> Result<Response, IngressError> {
+    let request: DetokenizeRequest = parse_body(body)?;
+    debug!("Detokenize request for model: {}", request.model);
+    let entry = tokenizer_entry(registry, &request.model)?;
+    Ok(decode_sequences(&*entry.tokenizer, &request))
+}
+
+fn decode_sequences(tokenizer: &dyn Tokenizer, request: &DetokenizeRequest) -> Response {
     let sequences = request.tokens.sequences();
     let is_batch = request.tokens.is_batch();
 
@@ -262,6 +360,7 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
         .or_else(|| context.tokenizer_registry.remove(tokenizer_id));
 
     if let Some(entry) = removed {
+        crate::routers::prepare::thread_tokenizer::release_copies(&entry.id);
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,

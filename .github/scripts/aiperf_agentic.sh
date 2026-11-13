@@ -4,16 +4,17 @@
 # benchmarks/single_node/agentic recipe.
 #
 # Source it, then call `run_aiperf_agentic`. Everything it needs comes from the
-# AIPERF_* variables below, so a caller only overrides what it wants to differ.
+# AGENTX_* and AIPERF_* variables below, so a caller only overrides what it
+# wants to differ.
 #
-# Single-node workload defaults and installation policy come from run
-# 35834179304. PD keeps its own topology/dataset settings; both use the
-# shared aiperf_dashboard.py exporter. Sourcing leaves shell options intact.
+# Single-node workload defaults come from run 35834179304. PD keeps its own
+# topology/dataset settings; both use the shared aiperf_dashboard.py exporter.
+# Sourcing leaves shell options intact.
 
-AIPERF_DIR="${AIPERF_DIR:-/tmp/atom-aiperf}"
-AIPERF_VENV="${AIPERF_VENV:-/tmp/atom-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-754356e9a39acc6cc6afb242d123bb57c3fb6f75}"
-AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
+# The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
+AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.9}"
+AGENTX_VENV="${AGENTX_VENV:-/tmp/atom-agentx-venv}"
+AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126}"
 # Unset by default: the single-node recipe passes no --max-context-length.
 # `-` not `:-` so a caller can blank it back out explicitly.
@@ -27,8 +28,8 @@ AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
 # user-declared one, and its own help says the plain flag is only honoured
 # alongside `--warmup-duration` -- which an agentic run never sets. Passing
 # the plain one is therefore inert, and unset means the warmup barrier waits
-# INDEFINITELY for every primed trajectory to return (aiperf b7b16cf,
-# src/aiperf/config/flags/cli_config.py:2310-2330).
+# INDEFINITELY for every primed trajectory to return (agentx-harness 1.0.9,
+# aiperf/config/flags/cli_config.py:2305-2320).
 AIPERF_AGENTIC_WARMUP_GRACE_PERIOD="${AIPERF_AGENTIC_WARMUP_GRACE_PERIOD:-1800}"
 AIPERF_TRAJECTORY_START_MIN_RATIO="${AIPERF_TRAJECTORY_START_MIN_RATIO:-0.25}"
 AIPERF_TRAJECTORY_START_MAX_RATIO="${AIPERF_TRAJECTORY_START_MAX_RATIO:-0.75}"
@@ -36,69 +37,30 @@ AIPERF_FAILED_REQUEST_THRESHOLD="${AIPERF_FAILED_REQUEST_THRESHOLD:-0.10}"
 AIPERF_SLICE_DURATION="${AIPERF_SLICE_DURATION:-1.0}"
 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT:-300}"
 AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT:-900000}"
-AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES:-0}"
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 
-# Lowest aiperf the agentic flags require. `--warmup-requests-per-lane` and
-# `--agentic-warmup-grace-period` do not exist before this, and a run started
-# with them would die on an unknown-argument error rather than measure anything.
-AIPERF_MIN_VERSION="${AIPERF_MIN_VERSION:-0.12.0}"
-
-_aiperf_version_ge() {
-  # $1 >= $2, dotted-decimal. `sort -V` puts the lower one first, so $1 wins
-  # when the head of the sorted pair is $2 (or the two are equal).
-  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]
-}
-
-ensure_aiperf() {
-  # Prefer the aiperf the image already ships: the Dockerfile pins it to the
-  # same commit as AIPERF_COMMIT, so a matching image saves a clone plus an
-  # editable install per cell (~26s). Only the VERSION is checked, not the
-  # commit -- an image that is merely a few commits off still runs the same
-  # flags, while one that predates AIPERF_MIN_VERSION cannot.
-  #
-  # Note this is the server's own venv, so the client shares its site-packages;
-  # InferenceX isolates the two deliberately. That is a property of the image
-  # (it installs aiperf into /opt/venv at build time), not something reusing it
-  # introduces -- but it is why the fallback below builds a separate venv.
-  local img_bin img_ver
-  img_bin="$(command -v aiperf 2>/dev/null || true)"
-  if [[ -n "${img_bin}" ]]; then
-    img_ver="$("${img_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-    if [[ -n "${img_ver}" ]] && _aiperf_version_ge "${img_ver}" "${AIPERF_MIN_VERSION}"; then
-      AIPERF_VENV="$(dirname "$(dirname "${img_bin}")")"
-      echo "[aiperf] using the image's aiperf ${img_ver} (${img_bin})"
+ensure_agentx_harness() {
+  # The ATOM image ships this release in its own venv and links `agentx` onto
+  # PATH; reuse it, or an earlier install, on an exact match. Otherwise build
+  # the venv here, as InferenceX does for every job.
+  local bin
+  for bin in "$(command -v agentx 2>/dev/null)" "${AGENTX_VENV}/bin/agentx"; do
+    if [[ -x "${bin}" && "$("${bin}" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
+      AGENTX_VENV="$(dirname "$(dirname "$(readlink -f "${bin}")")")"
+      echo "[agentx] using agentx-harness ${AGENTX_HARNESS_VERSION} in ${AGENTX_VENV}"
       return
     fi
-    echo "[aiperf] image ships aiperf ${img_ver:-<unknown>}, below the required" \
-         "${AIPERF_MIN_VERSION}; building our own"
-  else
-    echo "[aiperf] no aiperf on PATH; building our own"
-  fi
+  done
 
-  local current_commit=""
-  if [[ -d "${AIPERF_DIR}/.git" ]]; then
-    current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
-  fi
-  if [[ -x "${AIPERF_VENV}/bin/aiperf" && "${current_commit}" == "${AIPERF_COMMIT}" ]]; then
-    return
-  fi
-
-  echo "[aiperf] preparing ${AIPERF_DIR} @ ${AIPERF_COMMIT}"
-  mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
-  if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
-    rm -rf "${AIPERF_DIR}"
-    git clone https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_DIR}"
-  fi
-  git -C "${AIPERF_DIR}" fetch https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_COMMIT}"
-  git -C "${AIPERF_DIR}" checkout --detach "${AIPERF_COMMIT}"
-  rm -rf "${AIPERF_VENV}"
-  python3 -m venv "${AIPERF_VENV}"
-  "${AIPERF_VENV}/bin/python" -m pip install --upgrade pip
-  "${AIPERF_VENV}/bin/python" -m pip install -e "${AIPERF_DIR}"
-  "${AIPERF_VENV}/bin/aiperf" --version
+  echo "[agentx] installing agentx-harness==${AGENTX_HARNESS_VERSION} into ${AGENTX_VENV}"
+  mkdir -p "$(dirname "${AGENTX_VENV}")"
+  rm -rf "${AGENTX_VENV}"
+  python3 -m venv "${AGENTX_VENV}"
+  "${AGENTX_VENV}/bin/python" -m pip install --upgrade pip
+  "${AGENTX_VENV}/bin/python" -m pip install "agentx-harness==${AGENTX_HARNESS_VERSION}"
+  "${AGENTX_VENV}/bin/agentx" --version
 }
 
 # The scenario locks its own invariants; a duration under its 900s floor is a
@@ -141,7 +103,7 @@ agentic_prepare() {
   fi
 
   AGENTIC_OUT_DIR="${AGENTIC_OUT_DIR:-./aiperf-artifacts-c${CONC}}"
-  ensure_aiperf
+  ensure_agentx_harness
   local metadata_key
   for metadata_key in ${!AIPERF_@}; do export "$metadata_key"; done
 
@@ -200,7 +162,7 @@ run_aiperf_agentic() {
     export AIPERF_DATASET_MMAP_CACHE_ENABLED=false
   fi
   local -a AIPERF_COMMAND
-  AIPERF_COMMAND=("${AIPERF_VENV}/bin/aiperf" profile \
+  AIPERF_COMMAND=("${AGENTX_VENV}/bin/agentx" profile \
     "${unsafe_args[@]}" \
     --scenario "${AIPERF_SCENARIO}" \
     --url "${url}" \

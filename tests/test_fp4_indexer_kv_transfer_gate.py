@@ -316,3 +316,31 @@ def test_fp4_gate_reads_the_shared_connector_predicate():
                 AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
         else:
             assert AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder) is None
+
+
+@pytest.mark.parametrize("connector", ["lmcache_mp"])
+def test_fp4_indexer_serves_whole_block_offload_and_multi(connector):
+    assert _passes_the_gate(_fp4_builder({"kv_connector": connector}))
+    assert _passes_the_gate(
+        _fp4_builder(
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": connector, "kv_role": "offload"},
+                ],
+            }
+        )
+    )
+    with pytest.raises(NotImplementedError, match="region map"):
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(
+            _fp4_builder(
+                {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {"kv_connector": connector, "kv_role": "offload"},
+                        {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    ],
+                }
+            )
+        )

@@ -44,7 +44,7 @@ Caller contract (`swa_write`):
                         the ring size `window_size + max_spec_steps` (e.g.
                         128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
 - `write_per_batch`     int — max tokens to write per seq this fwd
-                        (= `min(max_q_len, window.ring_slots)`). Sets grid Y;
+                        (at most `window.ring_slots`). Sets grid Y;
                         read from the launch grid inside the kernel.
 
 Grid = `(bs, write_per_batch)`; each program writes one (seq, row-in-seq)
@@ -79,7 +79,9 @@ def _swa_write_kernel(
     pool_rows,  # rows in that view; nothing may be written past it
     head_dim: tl.constexpr,
     ring_start,
+    cached_until_ptr,  # [bs] int: positions below it stay as they are
     BLOCK_D: tl.constexpr,
+    CACHED_UNTIL: tl.constexpr,
     RING_SLOTS: tl.constexpr,
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
@@ -123,6 +125,9 @@ def _swa_write_kernel(
     dst_row = window_row(
         slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
     )
+    if CACHED_UNTIL:
+        # a row its ring already holds stays as it is
+        dst_row = tl.where(pos < tl.load(cached_until_ptr + batch_idx), -1, dst_row)
 
     # `cu_seqlens_q` and `write_n` bound the reads; nothing bounded the write.
     # `slot` and `pos` are the row's only inputs and both come from per-forward
@@ -156,6 +161,7 @@ def swa_write(
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
     pool_rope: torch.Tensor | None = None,
+    cached_until: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """SWA ring in-place write, dispatching on the kv-cache layout.
@@ -195,15 +201,20 @@ def swa_write(
             the plane relative to this view's base.
         window: this layer's compress class's `WindowParams`
             (`UnifiedPoolGeometry.window_params`).
-        write_per_batch: `min(max_q_len, window.ring_slots)` — max tokens written
-            per seq this fwd (grid y dim).
+        write_per_batch: max tokens written per seq this fwd (grid y dim), at
+            most `window.ring_slots`; a seq shorter than it writes all its rows.
         k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
         k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
             2buff path only.
         pool_rope: [rows, rope_head_dim] bf16 RoPE plane view — presence selects
             the fp8 2buff path.
+        cached_until: [bs] int — bf16 path: per seq, the position below which
+            its ring already holds the rows and keeps them (a forward that
+            recomputes rows it has, V4.1 decoder bounded replay). None writes
+            every row.
     """
     if pool_rope is not None:
+        assert cached_until is None, "the fp8 2buff path writes every row"
         # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
         # planes. Flatten the [T, 1, *] quant-kernel views to [T, *]; the bf16
         # `kv` source is unused here.
@@ -256,7 +267,9 @@ def swa_write(
         pool.shape[0],
         head_dim,
         window.ring_start,
+        positions if cached_until is None else cached_until,
         BLOCK_D=BLOCK_D,
+        CACHED_UNTIL=cached_until is not None,
         **window_constexprs(window),
     )
 
@@ -516,7 +529,52 @@ def _update_compressor_states_kernel(
 
     Score write fuses ape lookup: `score + ape[position % RATIO]`.
     """
-    pid = tl.program_id(0)
+    write_compressor_state_row(
+        tl.program_id(0),
+        kv_ptr,
+        kv_row_stride,
+        score_ptr,
+        score_row_stride,
+        ape_ptr,
+        write_plan_ptr,
+        state_slot_mapping_ptr,
+        kv_state_ptr,
+        kv_state_slot_stride,
+        kv_state_pos_stride,
+        score_state_ptr,
+        score_state_slot_stride,
+        score_state_pos_stride,
+        dim,
+        STATE_SIZE,
+        RATIO,
+        BLOCK_D,
+    )
+
+
+@triton.jit
+def write_compressor_state_row(
+    pid,
+    kv_ptr,
+    kv_row_stride,
+    score_ptr,
+    score_row_stride,
+    ape_ptr,
+    write_plan_ptr,
+    state_slot_mapping_ptr,
+    kv_state_ptr,
+    kv_state_slot_stride,
+    kv_state_pos_stride,
+    score_state_ptr,
+    score_state_slot_stride,
+    score_state_pos_stride,
+    dim,
+    STATE_SIZE: tl.constexpr,
+    RATIO: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Write plan row ``pid`` into the ring (`_update_compressor_states_kernel`'s
+    one program; also run by `fused_compress_attn` when it takes the ring
+    update into its own launch)."""
     plan_base = write_plan_ptr + pid * 4
     ragged_id = tl.load(plan_base + 0)
     batch_id = tl.load(plan_base + 1)

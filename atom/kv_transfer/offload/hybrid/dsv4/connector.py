@@ -47,6 +47,7 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -56,6 +57,9 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     max_pending_saves,
     pp_aware_rank_and_world,
+    salt_kwargs,
+    tier_cache_salt,
+    tier_lookup_kwargs,
     tokens_to_tensor,
     validated_kv_role,
 )
@@ -78,6 +82,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
 )
+from atom.kv_transfer.offload.load_math import tier_load_tokens
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -1184,6 +1189,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             mask=mask,
             block_ids=req.block_ids,
             req_id=str(req.req_id),
+            **salt_kwargs(req.cache_salt),
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
@@ -1577,6 +1583,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     mask=mask,
                     block_ids=req.block_ids,
                     req_id=str(req.req_id),
+                    **salt_kwargs(req.cache_salt),
                 )
                 store_ms = (time.perf_counter() - t_store0) * 1000
                 transfer_stats = self._last_gpu_connector_transfer_stats()
@@ -1601,6 +1608,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     page_hit = self._engine.lookup(
                         req.token_ids[:boundary_tokens],
                         pin=False,
+                        **salt_kwargs(req.cache_salt),
                     )
                     return page_hit is not None and int(page_hit) >= boundary_tokens
 
@@ -1972,7 +1980,9 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            hit = self._lookup_client.lookup(
+                token_ids, lookup_id=sid, **tier_lookup_kwargs(seq)
+            )
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             self._remember_tier_hit(seq, sid, None)
@@ -2119,6 +2129,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         hashes = _chained_prefix_hashes(
             seq.token_ids,
             self.hash_block_size,
+            seed=seq.cache_seed,
         )
         records = [
             (boundary, hashes[boundary])
@@ -2237,7 +2248,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
         min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if need < min_load:
+        if not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
 
@@ -2308,11 +2319,19 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            # The HBM frontier a load that fails from here on reopens saves to.
+            self._load_save_floors[sid] = self._chunk_floor(hbm)
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
-            if not self._ensure_lookup_pin(seq, sid, ls):
+            pinned = self._ensure_lookup_pin(seq, sid, ls)
+            if not pinned:
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
+                if pinned is False:
+                    # The tier answered less: it no longer holds the prefix
+                    # this request recomputes. (None: the lookup did not answer,
+                    # and the tier most likely still does.)
+                    self._reopen_saves(sid)
                 self._clear_pending_load(sid)
                 continue
             slot_load_spec = None
@@ -2360,7 +2379,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 len(list(seq.block_table)),
             )
             loading_sids.add(sid)
-            self._load_save_floors[sid] = self._chunk_floor(hbm)
             load_operation = LoadOperationId(seq.id, self._load_nonce)
             self._load_nonce += 1
             seq.offload_loaded = False
@@ -2376,6 +2394,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     load_spec=ls,
                     slot_load_spec=slot_load_spec,
                     load_operation=load_operation,
+                    cache_salt=tier_cache_salt(seq),
                 )
             )
             self._pending_slot_loads.pop(sid, None)
@@ -2448,6 +2467,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     is_last_prefill=is_last_prefill,
                     slot_save_spec=slot_save_spec,
                     save_operation=save_operation,
+                    cache_salt=tier_cache_salt(seq),
                 )
             )
             if page_save_due:
@@ -2523,7 +2543,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
 
     @staticmethod
     def _watermark_sid(operation) -> str:
-        return str(getattr(operation, "req_id", operation))
+        return req_id_of(operation)
 
     def _forget_save_watermark(self, operation) -> int | None:
         """Drop one operation's contingency record, returning what it held."""
@@ -2709,13 +2729,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         active_slot = self._active_slot_loads.pop(sid, None)
         if active_slot is not None:
             self._committed_sidecar_hashes.discard(active_slot[1])
-        floor = self._load_save_floors.get(sid)
-        entry = self._save_tracker.get(sid)
-        if floor is not None and entry is not None:
-            # The LMCache hit was not actually loaded. Let the recomputed
-            # [HBM, LMC) chunks be saved again instead of permanently treating
-            # them as already persisted.
-            entry[1] = self._chunk_floor(floor)
+        # The LMCache hit was not actually loaded.
+        self._reopen_saves(sid)
         self._record_failed_load_attempt(sid)
         # See the dense scheduler's `load_failed`: the remembered hit must not
         # outlive the load spec it would imply.

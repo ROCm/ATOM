@@ -49,10 +49,13 @@ if not hasattr(_comm_stub, "set_custom_all_reduce"):
     _comm_stub.set_custom_all_reduce = lambda *a, **k: None
 sys.modules["aiter.ops.communication"] = _comm_stub
 
+from atom.config import Config
 from atom.distributed import pp_comm
 from atom.distributed.pp_transport import PPStageTransport
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.dynamic_chunking import ChunkSizePredictor
 from atom.model_engine.scheduler import (
+    ChunkKind,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -63,6 +66,7 @@ from atom.models.utils import (
     PPMissingLayer,
     get_pp_indices,
     make_layers,
+    pp_holds_embedding,
 )
 from tests.conftest import MockConfig
 
@@ -202,6 +206,36 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
     assert set(sent["tensors"].keys()) == {"hidden_states", "residual"}
     assert sent["dst"] == 1
     assert torch.equal(sent["tensors"]["hidden_states"], torch.ones(3, 4))
+
+
+@pytest.mark.parametrize(
+    "pp_rank,pp_size,arch,method,holds",
+    [
+        (0, 2, "KimiK3ForConditionalGeneration", None, True),
+        (1, 2, "KimiK3ForConditionalGeneration", None, False),
+        # A declared PP method's drafter shares the target's embedding.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", True),
+        (1, 4, "KimiK3ForConditionalGeneration", "dspark", False),
+        (3, 4, "KimiK3ForConditionalGeneration", "dspark", True),
+        # Undeclared: the drafter keeps its own, so build none for it.
+        (1, 2, "KimiK3ForConditionalGeneration", "eagle", False),
+        (1, 2, "MiniMaxM3SparseForCausalLM", "dspark", False),
+        (0, 1, "KimiK3ForConditionalGeneration", "dspark", True),
+    ],
+)
+def test_pp_holds_embedding(monkeypatch, pp_rank, pp_size, arch, method, holds):
+    grp = MagicMock(is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1)
+    fake_ps = MagicMock()
+    fake_ps.get_pp_group.return_value = grp
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", fake_ps)
+    spec = method and types.SimpleNamespace(
+        method=method, use_dspark=lambda: method == "dspark"
+    )
+    config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(architectures=[arch]),
+        speculative_config=spec,
+    )
+    assert pp_holds_embedding(config) is holds
 
 
 def test_send_tolerates_missing_residual(monkeypatch):
@@ -361,6 +395,24 @@ def test_async_send_full_tensor_when_not_divisible(monkeypatch):
     assert sent[2:] == [35]
 
 
+def test_async_send_hands_owned_tensors_over_uncloned(monkeypatch):
+    _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", False)
+    sent = []
+    monkeypatch.setattr(
+        pp_comm.torch.distributed,
+        "isend",
+        lambda buf, dst, group: sent.append(buf) or MagicMock(),
+    )
+    hidden, aux = torch.randn(4, 8), torch.randn(4, 16)
+    pp_comm.async_send_intermediate_tensors(
+        IntermediateTensors({"hidden_states": hidden, pp_comm.PP_AUX_KEY: aux}),
+        owned=(pp_comm.PP_AUX_KEY,),
+    )
+    assert sent[2] is not hidden and torch.equal(sent[2], hidden)
+    assert sent[3] is aux
+
+
 # ---------------------------------------------------------------------------
 # Inter-stage transport (PPStageTransport ZMQ)
 # ---------------------------------------------------------------------------
@@ -379,7 +431,7 @@ def _transport_addrs(tmpdir, pp_size):
     return meta, f"ipc://{os.path.join(tmpdir, 'token')}"
 
 
-def test_head_last_metadata_and_token_roundtrip():
+def test_head_last_metadata_and_completion_roundtrip():
     ctx = zmq.Context()
     with tempfile.TemporaryDirectory() as tmp:
         meta_addrs, token_addr = _transport_addrs(tmp, 2)
@@ -391,8 +443,10 @@ def test_head_last_metadata_and_token_roundtrip():
         assert last.recv_metadata(timeout_ms=2000) == batch
 
         tokens = {"req1": (42,), "req2": (7,)}
-        last.send_tokens(tokens)
-        assert head.recv_tokens(timeout_ms=2000) == tokens
+        last.send_completion(batch.req_ids)
+        assert head.recv_completion(timeout_ms=2000) == (batch.req_ids, None)
+        last.send_completion(batch.req_ids, tokens)
+        assert head.recv_completion(timeout_ms=2000) == (batch.req_ids, tokens)
 
         head.close()
         last.close()
@@ -425,7 +479,7 @@ def test_recv_timeout_returns_none():
         last = PPStageTransport(1, 2, meta_addrs, token_addr, ctx=ctx)
         head = PPStageTransport(0, 2, meta_addrs, token_addr, ctx=ctx)
         assert last.recv_metadata(timeout_ms=200) is None
-        assert head.recv_tokens(timeout_ms=200) is None
+        assert head.recv_completion(timeout_ms=200) is None
         head.close()
         last.close()
     ctx.term()
@@ -459,6 +513,94 @@ def test_cli_parses_pp_short_and_long():
     assert parser.parse_args([]).pipeline_parallel_size == 1
 
 
+def test_cli_parses_dynamic_chunking_options():
+    parser = argparse.ArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--enable-dynamic-chunking",
+            "--dynamic-chunking-smooth-factor",
+            "0.65",
+            "--dynamic-chunking-min-chunk-size",
+            "8192",
+        ]
+    )
+    assert args.enable_dynamic_chunking is True
+    assert args.dynamic_chunking_smooth_factor == pytest.approx(0.65)
+    assert args.dynamic_chunking_min_chunk_size == 8192
+
+
+def test_cli_does_not_read_the_smooth_factor_env(monkeypatch):
+    # A stale value in a shared launch script must not break argument parsing
+    # for a server that never asked for dynamic chunking.
+    monkeypatch.setenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "not-a-float")
+    parser = argparse.ArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    assert parser.parse_args([]).dynamic_chunking_smooth_factor is None
+
+
+def _resolved_dynamic_chunking(**overrides):
+    fields = {
+        "enable_dynamic_chunking": True,
+        "dynamic_chunking_smooth_factor": None,
+        "dynamic_chunking_min_chunk_size": 4096,
+        "pipeline_parallel_size": 4,
+        "enable_chunked_prefill": True,
+        "enable_rapidserve": False,
+        "kv_transfer_config": {},
+    }
+    fields.update(overrides)
+    config = types.SimpleNamespace(**fields)
+    Config._resolve_dynamic_chunking(config)
+    return config
+
+
+def test_smooth_factor_env_is_read_only_when_dynamic_chunking_is_on(monkeypatch):
+    monkeypatch.setenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "7")
+    off = _resolved_dynamic_chunking(enable_dynamic_chunking=False)
+    assert off.dynamic_chunking_smooth_factor is None
+    with pytest.raises(ValueError, match="got 7.0"):
+        _resolved_dynamic_chunking()
+
+    monkeypatch.setenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.8f")
+    with pytest.raises(ValueError, match="ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR"):
+        _resolved_dynamic_chunking()
+
+    monkeypatch.setenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.6")
+    assert _resolved_dynamic_chunking().dynamic_chunking_smooth_factor == 0.6
+    explicit = _resolved_dynamic_chunking(dynamic_chunking_smooth_factor=0.9)
+    assert explicit.dynamic_chunking_smooth_factor == 0.9
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pipeline_parallel_size": 1},
+        {"enable_chunked_prefill": False},
+        {"enable_rapidserve": True},
+        {"kv_transfer_config": {"kv_role": "kv_consumer"}},
+    ],
+)
+def test_dynamic_chunking_turns_off_where_it_cannot_size_a_chunk(overrides):
+    assert _resolved_dynamic_chunking(**overrides).enable_dynamic_chunking is False
+
+
+def test_dynamic_chunking_stays_on_for_a_pd_prefill_instance():
+    config = _resolved_dynamic_chunking(kv_transfer_config={"kv_role": "kv_producer"})
+    assert config.enable_dynamic_chunking is True
+
+
+def test_dynamic_chunking_passthrough_to_engine_kwargs():
+    kwargs = EngineArgs(
+        enable_dynamic_chunking=True,
+        dynamic_chunking_smooth_factor=0.8,
+        dynamic_chunking_min_chunk_size=8192,
+    )._get_engine_kwargs()
+    assert kwargs["enable_dynamic_chunking"] is True
+    assert kwargs["dynamic_chunking_smooth_factor"] == pytest.approx(0.8)
+    assert kwargs["dynamic_chunking_min_chunk_size"] == 8192
+
+
 def test_from_cli_args_roundtrip():
     parser = argparse.ArgumentParser()
     EngineArgs.add_cli_args(parser)
@@ -487,6 +629,40 @@ def _pp_config(**overrides):
 
 def _make_seq(prompt_len, block_size=16):
     return Sequence(token_ids=list(range(prompt_len)), block_size=block_size)
+
+
+def _dynamic_sched(coefficients=(1.0, 0.0, 0.0), **overrides):
+    """Scheduler with a calibrated latency model already installed.
+
+    Serving installs one only once the workers have fitted the attention terms
+    from real prefills, which is what these tests stand in for.
+    """
+    sched = Scheduler(
+        _pp_config(
+            enable_dynamic_chunking=True,
+            dynamic_chunking_smooth_factor=1.0,
+            dynamic_chunking_min_chunk_size=64,
+            **overrides,
+        )
+    )
+    assert sched.install_chunk_latency_model(
+        ChunkSizePredictor.from_coefficients(coefficients)
+    )
+    return _with_census(sched)
+
+
+def _with_census(sched, partial=0, waiting=0):
+    """Record one step's prefill census, as `_schedule` does before sizing."""
+    sched._partial_prefill_count = partial
+    sched.waiting.extend(_make_seq(64) for _ in range(waiting))
+    sched._record_prefill_supply()
+    return sched
+
+
+def _chunk(sched, num_new, budget, *, history_len=0, kind=ChunkKind.FIRST):
+    return sched._prefill_chunk_for_budget(
+        num_new, budget, 0, history_len=history_len, kind=kind
+    )
 
 
 def test_advance_on_schedule_enabled_for_pp_gt1():
@@ -591,14 +767,230 @@ def test_middle_chunk_output_discarded():
 )
 def test_prefill_chunk_page_alignment(num_new, budget, block_size, expected):
     sched = Scheduler(_pp_config(kv_cache_block_size=block_size))
-    assert sched._prefill_chunk_for_budget(num_new, budget, 0) == expected
+    assert _chunk(sched, num_new, budget) == expected
+
+
+def test_dynamic_prefill_chunk_uses_prefix_length():
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    assert _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 384
+
+
+def test_an_atomic_prefill_is_never_dynamically_limited():
+    # A prefill that must go whole would be requeued by any limit below its
+    # length, every tick, head-of-line blocking everything behind it.
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    assert _chunk(sched, 1000, 1024, history_len=1024, kind=ChunkKind.WHOLE) == 1000
+
+    calibrating = _with_census(_calibrating_sched(max_num_batched_tokens=1024))
+    for _ in range(2):
+        assert _chunk(calibrating, 1000, 1024, kind=ChunkKind.WHOLE) == 1000
+        calibrating._commit_calibration_arm()
+    # Neither whole prefill took an arm, so the next request starts the sweep.
+    assert _chunk(calibrating, 10000, 1024) == 256
+
+
+def _calibrating_sched(**kwargs):
+    """A scheduler before any model has been calibrated, so the sweep is running."""
+    return Scheduler(
+        _pp_config(
+            enable_dynamic_chunking=True,
+            dynamic_chunking_min_chunk_size=64,
+            **kwargs,
+        )
+    )
+
+
+def test_the_calibration_sweep_alternates_between_two_fixed_chunk_sizes():
+    # Startup profiling cannot supply a model - dummy forwards bypass attention -
+    # and traffic cannot condition one either, because a single chunk size leaves
+    # the terms unidentifiable. So requests alternate between the budget and a
+    # quarter of it until a fit lands, each carried across a whole prompt.
+    sched = _with_census(_calibrating_sched(max_num_batched_tokens=1024))
+
+    assert sched.dynamic_chunk_predictor is None
+    assert _chunk(sched, 10000, 1024) == 256
+    # A sizing query that is not admitted does not burn the other arm.
+    assert _chunk(sched, 10000, 1024) == 256
+    sched._commit_calibration_arm()
+    # Later chunks of the admitted request keep the size its first chunk used.
+    assert _chunk(sched, 10000, 1024, history_len=256, kind=ChunkKind.NEXT) == 256
+    assert _chunk(sched, 10000, 1024) == 1024
+    sched._commit_calibration_arm()
+    assert _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 1024
+    assert _chunk(sched, 10000, 1024) == 256
+
+
+def test_a_drawn_arm_that_is_never_admitted_does_not_pin_the_sweep():
+    # A request sized onto the small arm and then aborted, or never allocated,
+    # must not stop the next one from drawing. Only an admission moves the sweep.
+    sched = _with_census(_calibrating_sched(max_num_batched_tokens=1024))
+
+    assert _chunk(sched, 10000, 1024) == 256  # drawn, then abandoned
+    assert _chunk(sched, 10000, 1024) == 256  # the next request draws again
+    sched._commit_calibration_arm()
+    assert _chunk(sched, 10000, 1024) == 1024
+
+
+def test_the_fill_probe_sizes_a_waiting_request_as_admission_will():
+    # PrefillDelayer's probe has to see the arm the request is admitted on, or
+    # it misjudges forwardable work by the sweep ratio on every other request.
+    sched = _calibrating_sched(max_num_batched_tokens=1024)
+    sched.add(_make_seq(10000))
+    _with_census(sched)
+
+    assert sched._local_prefill_pending_work() == (True, 256)
+    assert not sched._dynamic_chunking_counts
+    batch, _ = sched.schedule()
+    assert batch.total_tokens_num == 256
+    assert sched._dynamic_chunking_counts == {"sweep": 1}
+
+
+def test_calibration_gives_up_when_the_sweep_arms_collapse():
+    # min_chunk_size at the batch budget leaves one aligned size, so the fit
+    # can never see two chunk sizes. Give up at init instead of sweeping.
+    sched = Scheduler(
+        _pp_config(
+            enable_dynamic_chunking=True,
+            dynamic_chunking_min_chunk_size=4096,
+            max_num_batched_tokens=4096,
+        )
+    )
+
+    assert sched._calibrating is False
+    assert _chunk(_with_census(sched), 10000, 4096) == 4096
+
+
+def test_the_calibration_sweep_ends_with_a_rejected_model():
+    # The workers stop timing prefills once they have answered with a fit, so a
+    # model that is not worth acting on still ends the sweep - otherwise chunk
+    # sizes would keep alternating for a fit that is never coming.
+    sched = _with_census(_calibrating_sched(max_num_batched_tokens=32768))
+
+    sched.install_chunk_latency_model(
+        ChunkSizePredictor(1.331e-10, 6.452e-03, 12.19, 2.345e-05)
+    )
+
+    assert sched.dynamic_chunk_predictor is None
+    assert not sched.dynamic_chunking_active
+    assert _chunk(sched, 10000, 32768, history_len=32768) == 10000
+
+
+def test_the_calibration_sweep_ends_when_calibration_gives_up():
+    # Calibration that never clears its quality gates must not sweep forever, or
+    # every other request stays at the sweep size for the life of the process.
+    sched = _with_census(_calibrating_sched(max_num_batched_tokens=32768))
+
+    sched.abandon_chunk_latency_calibration()
+
+    assert sched.dynamic_chunk_predictor is None
+    assert not sched.dynamic_chunking_active
+    assert _chunk(sched, 10000, 32768) == 10000
+
+
+def test_a_failing_prediction_falls_back_to_fixed_chunking():
+    # predict() validates its serving arguments; a ValueError on the per-step
+    # sizing path must drop the model, not take the engine down.
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    sched.dynamic_chunking_smooth_factor = 2.0
+
+    assert _chunk(sched, 10000, 1024, history_len=1024) == 1024
+    assert sched.dynamic_chunk_predictor is None
+    assert not sched.dynamic_chunking_active
+
+
+def test_a_prefix_flat_calibration_is_not_installed():
+    # What startup profiling used to produce: a model whose chunk cost barely
+    # grows with the prefix. Acting on it only splits requests into more chunks.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=32768,
+            enable_dynamic_chunking=True,
+            dynamic_chunking_min_chunk_size=64,
+        )
+    )
+
+    installed = sched.install_chunk_latency_model(
+        ChunkSizePredictor(1.331e-10, 6.452e-03, 12.19, 2.345e-05)
+    )
+
+    assert installed is False
+    assert sched.dynamic_chunk_predictor is None
+
+
+def test_dynamic_prefill_chunk_yields_to_a_second_prefill():
+    # One other request with prefill left to do is enough: it feeds the stages
+    # its own chunks, so the budget refills whatever this request is given and
+    # shrinking here only splits this request into more chunks.
+    sched = _with_census(
+        _dynamic_sched(max_num_batched_tokens=1024), partial=1, waiting=1
+    )
+
+    assert _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 1024
+    assert sched._dynamic_chunking_counts["multi_prefill"] == 1
+
+
+def test_dynamic_prefill_chunk_counts_a_request_once_wherever_it_waits():
+    # The census is taken before admission, so the request being sized is one
+    # source whether it is still waiting or already mid-prefill.
+    waiting = _with_census(_dynamic_sched(max_num_batched_tokens=1024), waiting=1)
+    assert _chunk(waiting, 10000, 1024, history_len=1024) == 384
+
+    resumed = _with_census(_dynamic_sched(max_num_batched_tokens=1024), partial=1)
+    assert _chunk(resumed, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 384
+
+
+def test_the_prefill_census_skips_waiting_requests_that_cannot_prefill():
+    # An aborted-but-unreaped request, or one parked on remote KV, is not a
+    # second prefill: counting it would close the gate beside a sole prefill.
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    aborted, parked = _make_seq(64), _make_seq(64)
+    aborted.status = SequenceStatus.ABORTED
+    parked.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    sched.waiting.extend([aborted, parked])
+    _with_census(sched, partial=1)
+
+    assert sched._recent_prefill_supply[-1] == 1
+    assert _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 384
+
+
+def test_dynamic_prefill_chunk_yields_after_a_recent_burst():
+    # The queue has just drained, but chunks sized now run alongside whatever is
+    # still prefilling behind them, so the lull alone does not reopen the solver.
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    sched._recent_prefill_supply.append(2)
+    _with_census(sched, partial=1)
+
+    assert _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT) == 1024
+
+
+def test_dynamic_chunking_reports_its_sizing_outcomes():
+    sched = _dynamic_sched(max_num_batched_tokens=1024)
+    _chunk(sched, 10000, 1024, history_len=1024)
+    _with_census(sched, partial=1, waiting=1)
+    _chunk(sched, 10000, 1024, history_len=1024, kind=ChunkKind.NEXT)
+
+    assert sched._dynamic_chunking_counts == {"solved": 1, "multi_prefill": 1}
+    sched._log_dynamic_chunking_counts()
+    assert not sched._dynamic_chunking_counts
+
+
+def test_dynamic_prefill_chunk_equalizes_against_the_batch_budget():
+    # The chunk the solver equalizes against is --max-num-batched-tokens, as in
+    # SGLang and vLLM-Ascend: raising the budget is how the operator gives the
+    # solver room to shrink into.
+    def limit(budget):
+        sched = _dynamic_sched(max_num_batched_tokens=budget)
+        return sched._dynamic_chunk_limit(1024, ChunkKind.NEXT)
+
+    assert limit(2048) == 1216
+    assert limit(4096) == 3136
 
 
 def test_prefill_chunk_not_aligned_when_chunked_prefill_disabled():
     # num_new (200) > budget (100): with chunked prefill enabled this would
     # align down to 64; disabled, the whole request is returned unaligned.
     sched = Scheduler(_pp_config(enable_chunked_prefill=False))
-    assert sched._prefill_chunk_for_budget(200, 100, 0) == 200
+    assert _chunk(sched, 200, 100) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +1175,169 @@ def test_parked_seq_prefix_is_discoverable_after_load():
         seq, start_token=boundary, end_token=loaded
     )
     assert promoted == loaded - boundary
-
     hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
     assert hit == prompt // bs - 1
+
+
+def test_dynamic_pp_prefill_registers_prefix_hashes():
+    bs = 16
+    sched = _dynamic_sched(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=256,
+        kv_cache_block_size=bs,
+        num_kvcache_blocks=4096,
+    )
+    prompt = 4096
+    seq = _drive_pp_prefill(sched, prompt, block_size=bs)
+    assert seq.num_cached_tokens == prompt
+    hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
+    assert hit == prompt // bs - 1
+
+
+# --- _checkpoint_holds: skipped while held, released when its batch files --
+
+
+def _held_after_first_chunk(prompt=400, bs=16):
+    """A PP seq with one middle chunk in flight, held as a rung would hold it."""
+    # Prefix caching on: the hold is only ever taken with it (`_partial_prefill_chunk`).
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=128,
+            kv_cache_block_size=bs,
+            enable_prefix_caching=True,
+        )
+    )
+    seq = _make_seq(prompt, block_size=bs)
+    sched.add(seq)
+    batch, seqs = sched.schedule()
+    assert seq.id in batch.req_ids and seq.is_partial_prefill
+    sched._checkpoint_holds[seq.id] = _chunk_end(batch, seq.id)
+    return sched, seq, batch, seqs
+
+
+def _chunk_end(batch, req_id):
+    i = list(batch.req_ids).index(req_id)
+    return int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
+
+
+def _prefill_ids(sched):
+    res = sched.schedule()
+    if res is None:
+        return set()
+    batch, _ = res
+    return set(batch.req_ids[: batch.total_seqs_num_prefill])
+
+
+def test_held_seq_is_skipped_by_both_prefill_scans():
+    sched, seq, _, _ = _held_after_first_chunk()
+    pending, _ = sched._local_prefill_pending_work()
+    assert not pending, "the probe counted a held chunk as pending work"
+    assert seq.id not in _prefill_ids(sched)
+    assert seq.id in sched._checkpoint_holds
+
+
+def test_hold_is_released_when_its_batch_files_its_hashes():
+    sched, seq, batch, seqs = _held_after_first_chunk()
+    assert sched.carries_held_checkpoint(batch)
+    sched.register_prefill_hashes(batch, seqs.values())
+    assert seq.id not in sched._checkpoint_holds
+    assert not sched.carries_held_checkpoint(batch)
+    assert seq.id in _prefill_ids(sched)
+
+
+def test_hold_is_released_only_by_the_chunk_that_holds_it():
+    # An earlier chunk of the same seq, in flight when the held one was
+    # scheduled, files first: the held chunk's checkpoint is not filed yet.
+    sched, seq, first, first_seqs = _held_after_first_chunk()
+    del sched._checkpoint_holds[seq.id]
+    held, held_seqs = sched.schedule()
+    assert seq.id in held.req_ids and seq.is_partial_prefill
+    sched._checkpoint_holds[seq.id] = _chunk_end(held, seq.id)
+    assert not sched.carries_held_checkpoint(first)
+    sched.register_prefill_hashes(first, first_seqs.values())
+    assert seq.id in sched._checkpoint_holds
+    assert seq.id not in _prefill_ids(sched)
+    assert sched.carries_held_checkpoint(held)
+    sched.register_prefill_hashes(held, held_seqs.values())
+    assert seq.id not in sched._checkpoint_holds
+
+
+def test_head_flushes_a_held_chunk_when_its_ack_arrives():
+    # Every middle chunk is acked: the ack must flush a hold, or the held seq
+    # never re-enters the prefill scan and stalls.
+    import queue
+
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    sched, seq, batch, seqs = _held_after_first_chunk()
+    batch.pp_completion_ack = True
+    sched.mark_pp_inflight(batch)
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.scheduler = sched
+    core.pp_size = 1  # the in-flight chunk fills the window: schedule nothing
+    core._in_flight = deque([(batch, seqs, False)])
+    core._pending_prefix_hash = deque()
+    core._defer_prefix_hash = True
+    core.output_queue = queue.Queue()
+    core._poll_kv_transfer_progress = lambda: None
+    core._poll_dynamic_chunking_calibration = lambda: None
+    core.runner_mgr = types.SimpleNamespace(call_func=lambda *a, **k: None)
+    completions = deque([(batch.req_ids, None)])
+    core.pp_transport = types.SimpleNamespace(
+        recv_completion=lambda **k: completions.popleft() if completions else None
+    )
+    core._pp_head_step()
+    assert not core._in_flight and not core._pending_prefix_hash
+    assert seq.id not in sched._checkpoint_holds
+    assert seq.id in _prefill_ids(sched)
+
+
+@pytest.mark.parametrize("filer", ["register_prefill_hashes", "postprocess"])
+def test_hold_is_released_even_if_the_seq_left_running(filer):
+    # Preempted, aborted or retired while its chunk was in flight: the batch
+    # still files, and the hold must go with it or the id is held forever.
+    import numpy as np
+
+    sched, seq, batch, _ = _held_after_first_chunk()
+    sched.running = deque(s for s in sched.running if s.id != seq.id)
+    if filer == "register_prefill_hashes":
+        sched.register_prefill_hashes(batch, [])
+    else:
+        n = len(batch.req_ids)
+        out = ScheduledBatchOutput(
+            req_ids=list(batch.req_ids),
+            token_ids=[(0,)] * n,
+            num_rejected=np.zeros(n, dtype=np.int32),
+            num_bonus=np.zeros(n, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=False,
+        )
+        sched.postprocess([], out, batch=batch)
+    assert seq.id not in sched._checkpoint_holds
+
+
+def test_hold_is_released_even_if_hashing_raises():
+    # The head loop logs a failed filing and carries on; the seqs after the
+    # one that raised must not stay out of the prefill scan forever.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=512,
+            kv_cache_block_size=16,
+            enable_prefix_caching=True,
+        )
+    )
+    seqs = [_make_seq(400), _make_seq(400)]
+    for seq in seqs:
+        sched.add(seq)
+    batch, by_id = sched.schedule()
+    assert all(seq.id in batch.req_ids for seq in seqs)
+    sched._checkpoint_holds.update(
+        {req_id: _chunk_end(batch, req_id) for req_id in batch.req_ids}
+    )
+    sched.block_manager.hash_blocks = MagicMock(side_effect=RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        sched.register_prefill_hashes(batch, by_id.values())
+    assert not sched._checkpoint_holds

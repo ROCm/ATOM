@@ -112,7 +112,6 @@ jobs:
           # to the job owner rather than decided here.
           atomesh_levels = {
               "DeepSeek-R1-0528": "main",
-              "DeepSeek-V4-Pro MTP": "nightly",
               "gpt-oss-120b": "nightly",
           }
           filtered = [m for m in models if atomesh_levels.get(m["model_name"], "skip") in allowed]
@@ -137,7 +136,10 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json) }}
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    # On a pull request an empty model list (every one today) must skip the
+    # job: a matrix without entries fails the run before any job starts. On
+    # push and nightly an empty list still fails the run.
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || needs.load-test-models.outputs.models_json != '[]') }}
     runs-on: ${{ matrix.runner }}
 
     env:

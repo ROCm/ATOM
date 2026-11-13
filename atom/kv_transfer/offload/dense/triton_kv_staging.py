@@ -652,6 +652,96 @@ def fused_pack_chunk_major(
     )
 
 
+@dataclass(frozen=True, eq=False)
+class PreparedSegmentGather:
+    """Device metadata for gathering one fixed geometry of raw segments.
+
+    Everything but the segment addresses follows from the sizes, so it is built
+    once per geometry and the addresses alone are uploaded per call, through a
+    pinned buffer the caller fences by synchronizing the stream it launched on.
+    """
+
+    device: torch.device
+    nbytes: int
+    num_segments: int
+    num_tiles: int
+    segment_block_bytes: torch.Tensor
+    segment_prefix_bytes: torch.Tensor
+    chunk_block_counts: torch.Tensor
+    chunk_block_offsets: torch.Tensor
+    chunk_output_bases: torch.Tensor
+    block_ids: torch.Tensor
+    tile_job: torch.Tensor
+    tile_pos: torch.Tensor
+    ptr_host: torch.Tensor
+    ptr_device: torch.Tensor
+
+
+def prepare_segment_gather(sizes, device: torch.device) -> PreparedSegmentGather:
+    """Build the size-derived metadata `fused_pack_segments` launches with."""
+    import numpy as np
+
+    sizes = np.ascontiguousarray(sizes, dtype=np.int64)
+    if sizes.ndim != 1 or not sizes.size or int(sizes.min()) <= 0:
+        raise ValueError("a segment gather needs one or more positive sizes")
+    device = torch.device(device)
+    tile_job, tile_pos = _tile_table([1], sizes.tolist(), device)
+    return PreparedSegmentGather(
+        device=device,
+        nbytes=int(sizes.sum()),
+        num_segments=int(sizes.size),
+        num_tiles=int(tile_job.numel()),
+        segment_block_bytes=torch.from_numpy(sizes).to(device),
+        segment_prefix_bytes=torch.from_numpy(np.cumsum(sizes) - sizes).to(device),
+        chunk_block_counts=_device_i64([1], device),
+        chunk_block_offsets=_device_i64([0], device),
+        chunk_output_bases=_device_i64([0], device),
+        block_ids=_device_i64([0], device),
+        tile_job=tile_job,
+        tile_pos=tile_pos,
+        ptr_host=torch.empty(int(sizes.size), dtype=torch.int64, pin_memory=True),
+        ptr_device=torch.empty(int(sizes.size), dtype=torch.int64, device=device),
+    )
+
+
+def fused_pack_segments(prepared: PreparedSegmentGather, ptrs, device_buf) -> None:
+    """Gather raw segments at `ptrs` into `device_buf` on the current stream.
+
+    The same kernel and output layout as `fused_pack_chunk_major` with one
+    chunk of one block, minus its per-segment Python validation and the two
+    `.item()` syncs: `ptrs` must name contiguous device memory of the sizes the
+    gather was prepared with.
+    """
+    if not device_buf.is_cuda or device_buf.device != prepared.device:
+        raise ValueError("device_buf must be on the gather's CUDA/HIP device")
+    if device_buf.dtype != torch.uint8 or not device_buf.is_contiguous():
+        raise TypeError("device_buf must be contiguous uint8")
+    if int(device_buf.numel()) < prepared.nbytes:
+        raise ValueError("device_buf is smaller than the gathered segments")
+    host = prepared.ptr_host.numpy()
+    if len(ptrs) != host.size:
+        raise ValueError(
+            f"gather prepared for {host.size} segments got {len(ptrs)} addresses"
+        )
+    host[:] = ptrs
+    prepared.ptr_device.copy_(prepared.ptr_host, non_blocking=True)
+    _pack_chunk_major_kernel[(prepared.num_tiles,)](
+        device_buf,
+        prepared.ptr_device,
+        prepared.segment_block_bytes,
+        prepared.segment_prefix_bytes,
+        prepared.chunk_block_counts,
+        prepared.chunk_block_offsets,
+        prepared.chunk_output_bases,
+        prepared.block_ids,
+        prepared.tile_job,
+        prepared.tile_pos,
+        NUM_SEGMENTS=prepared.num_segments,
+        BLOCK_BYTES=_BLOCK_BYTES,
+        num_warps=_NUM_WARPS,
+    )
+
+
 def fused_unpack_chunk_major(
     device_buf,
     segment_tensors,

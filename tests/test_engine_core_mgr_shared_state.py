@@ -19,10 +19,15 @@ thread reads off `self`, both managers must provide.
 
 import ast
 import pathlib
+import pickle
 import unittest
+import uuid
 from types import SimpleNamespace
 
+import zmq
+
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 MODULE_PATH = pathlib.Path(CoreManager.__module__.replace(".", "/") + ".py")
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / MODULE_PATH
@@ -67,7 +72,13 @@ def _bare_manager(cls, **kwargs):
     """A manager with its shared state set up and no engine processes spawned."""
     mgr = cls.__new__(cls)
     mgr._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            tp_world_size=1,
+            prefill_context_parallel_size=1,
+            keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
+            asyncio_mode=kwargs.get("asyncio_mode", False),
+        ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
     )
@@ -80,6 +91,77 @@ class OutputThreadStateTest(unittest.TestCase):
     def setUp(self):
         self.managers = [_bare_manager(CoreManager), _bare_manager(DisaggCoreManager)]
         self.addCleanup(self._terminate)
+
+    def test_health_detects_nested_failure_even_when_all_cores_are_alive(self):
+        for mgr in self.managers:
+            mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)] * 2
+            self.assertTrue(mgr.is_healthy())
+            mgr._engine_failed.set()
+            self.assertFalse(mgr.is_healthy())
+
+    def test_health_requires_every_local_core_and_open_manager(self):
+        for mgr in self.managers:
+            mgr.engine_core_processes = []
+            self.assertFalse(mgr.is_healthy())
+            mgr.engine_core_processes = [
+                SimpleNamespace(is_alive=lambda: True),
+                SimpleNamespace(is_alive=lambda: False),
+            ]
+            self.assertFalse(mgr.is_healthy())
+            mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)]
+            mgr._closed = True
+            self.assertFalse(mgr.is_healthy())
+
+    def test_shutdown_frame_marks_unhealthy_before_cleanup(self):
+        mgr = self.managers[0]
+        mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)]
+        url = f"inproc://failure-{uuid.uuid4().hex}"
+        receiver = mgr.ctx.socket(zmq.PULL)
+        receiver.bind(url)
+        sender = mgr.ctx.socket(zmq.PUSH)
+        sender.connect(url)
+        observed = []
+        mgr._shutdown_engine_core_rank = lambda rank: observed.append(mgr.is_healthy())
+        thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+        thread.start()
+        try:
+            sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(observed, [False])
+        finally:
+            sender.close(linger=0)
+
+    def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
+        # Off by default: online front ends take every output through the
+        # callbacks, and a queued Sequence would stay for the process's life.
+        # asyncio_mode reads the queue, so it keeps them too.
+        for keep, asyncio_mode in ((True, False), (False, True), (False, False)):
+            mgr = _bare_manager(
+                CoreManager, keep_finished_outputs=keep, asyncio_mode=asyncio_mode
+            )
+            self.addCleanup(mgr.ctx.term)
+            mgr._deliver_terminal_output = lambda seq: False
+            mgr._release_seq = lambda seq_id: None
+            mgr._shutdown_engine_core_rank = lambda rank: None
+            url = f"inproc://outputs-{uuid.uuid4().hex}"
+            receiver = mgr.ctx.socket(zmq.PULL)
+            receiver.bind(url)
+            sender = mgr.ctx.socket(zmq.PUSH)
+            sender.connect(url)
+            thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+            thread.start()
+            try:
+                seqs = [SimpleNamespace(id=7)]
+                sender.send(pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+                sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(
+                    mgr.outputs_queue.qsize(), 1 if keep or asyncio_mode else 0
+                )
+            finally:
+                sender.close(linger=0)
 
     def _terminate(self):
         for mgr in self.managers:

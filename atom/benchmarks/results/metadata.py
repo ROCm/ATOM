@@ -47,7 +47,6 @@ PERFORMANCE_KEYS = {
     "AIPERF_SLICE_DURATION",
     "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT",
     "AIPERF_HTTP_TCP_USER_TIMEOUT",
-    "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES",
     "AIPERF_DATASET_CONFIGURATION_TIMEOUT",
     "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT",
     "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID",
@@ -142,13 +141,23 @@ def installed_package(package):
             commit = git_sha(source)
             if commit:
                 result.update(sha=commit, sha_source="local_git")
-    if not commit and re.sub(r"[-_.]+", "-", package).lower() == "amd-aiter":
+    name = re.sub(r"[-_.]+", "-", package).lower()
+    if not commit and name == "amd-aiter":
         # AITER wheels embed a Git abbreviation, e.g. 0.1.1.dev1+ga75ba53de.
         # Retain it as an abbreviation; do not invent a full commit or use
         # an unrelated checkout. Dirty/unknown version suffixes stay unknown.
         match = re.search(r"\+g([0-9a-f]{7,40})$", distribution.version, re.IGNORECASE)
         if match:
             result.update(sha=match[1].lower(), sha_source="package_version")
+    if not commit and name == "agentx-harness":
+        # AgentX wheels record the commit they were built from in
+        # aiperf/_build_info.py; a source checkout has no such file.
+        build_info = Path(distribution.locate_file("aiperf/_build_info.py"))
+        match = build_info.is_file() and re.search(
+            r'^COMMIT_SHA = "([0-9a-f]{40})"$', build_info.read_text(), re.MULTILINE
+        )
+        if match:
+            result.update(sha=match[1], sha_source="wheel_build_info")
     if url.split("?", 1)[0].lower().endswith(".whl"):
         archive = direct.get("archive_info", {})
         digest = archive.get("hashes", {}).get("sha256")
@@ -289,7 +298,7 @@ def capture_config(model, server_argv, kind, concurrency, launch=None):
             None,
         )
     harness = (
-        installed_package("aiperf")
+        installed_package("agentx-harness")
         if kind == "agentic"
         else {"version": "atom", "sha": git_sha(Path.cwd())}
     )

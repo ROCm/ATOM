@@ -7,7 +7,9 @@ The native codec streams PAGE units in ordinal order, with regions inside
 each unit. Every ordinal gets its own engine block-id list while aliasing the
 original PAGE allocation. No Active SLOT or extra state allocation is exposed.
 LMCache imports stay behind ``engine_group_infos`` so layout validation and
-copy-plan tests run without a GPU or LMCache's native extension.
+copy-plan tests run without a GPU or LMCache's native extension. Every worker
+that registers this layout, and the scheduler naming its namespace, asks
+`stores_state_images` whether saves carry images.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ class NativeStateMPLayout:
     tensors: tuple[torch.Tensor, ...]
     kernel_groups: tuple[NativeStateMPKernelGroup, ...]
     checkpoint_spec: Any
+    # False: PAGE alone, no image group (`stores_state_images`).
+    images: bool = True
 
     def engine_group_infos(self) -> list[Any]:
         """Convert the neutral plan at the actual LMCache registration boundary."""
@@ -71,6 +75,18 @@ class NativeStateMPLayout:
             raise ValueError("native checkpoint unit IDs must be distinct")
         return ids
 
+    def transfer_block_ids(
+        self, pages: Sequence[int], unit_ids: Sequence[int], count: int
+    ) -> list[list[int]]:
+        """One block-id list per engine group for a transfer of `count` chunks.
+
+        PAGE engine group 0 names `pages`. Image ordinal ``j`` names its unit
+        at the final chunk and the server's null block (``-1``) before it:
+        earlier chunks have PAGE only, and a boundary image is indivisible, so
+        all its ordinal groups are present at exactly the same final chunk.
+        """
+        return [list(pages)] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
+
 
 def _positive_int(name: str, value: Any) -> int:
     if type(value) is not int or value <= 0:
@@ -84,6 +100,7 @@ def build_native_state_mp_layout(
     block_size: int,
     chunk_size: int,
     num_blocks: int | None = None,
+    images: bool = True,
 ) -> NativeStateMPLayout:
     """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
@@ -91,7 +108,8 @@ def build_native_state_mp_layout(
     logical chunk per block. The MP server's global null block ID must be
     configured as ``-1``. The final ordinal's final region ends exactly at
     ``image_bytes``; its dim-0 stride continues to address the original full
-    PAGE region.
+    PAGE region. ``images=False`` registers PAGE alone: with no image group,
+    LMCache's hit is the PAGE KV's own extent.
     """
     block_size = _positive_int("native PAGE block size", block_size)
     chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
@@ -146,7 +164,7 @@ def build_native_state_mp_layout(
     tensors = [view.view(torch.uint8) for view in page_views]
     engine_ids = [0] * len(tensors)
     image_offset = 0
-    for ordinal in range(units):
+    for ordinal in range(units if images else 0):
         for page_view, region in zip(
             page_views[:state_count], regions[:state_count], strict=True
         ):
@@ -167,7 +185,7 @@ def build_native_state_mp_layout(
             tensors.append(alias)
             engine_ids.append(1 + ordinal)
             image_offset += nbytes
-    if image_offset != image_bytes:
+    if images and image_offset != image_bytes:
         raise ValueError("PAGE aliases do not cover the native image")
 
     by_identity: dict[tuple, list[int]] = {}
@@ -198,11 +216,31 @@ def build_native_state_mp_layout(
         tensors=tuple(tensors),
         kernel_groups=groups,
         checkpoint_spec=spec,
+        images=images,
     )
+
+
+def stores_state_images(replay_tokens: int) -> bool:
+    """Whether native-state saves carry a state image: only without a bounded
+    replay (`replay_tokens`, 0 when off).
+
+    With one (DeepSeek-V4, ATOM_DSV4_STATE_REPLAY) the replay rebuilds the
+    state from the PAGE KV, so saves store that alone, the layout registers no
+    image group, and LMCache's own hit is the PAGE KV's extent. Without one a
+    save must carry its image: nothing could resume from PAGE alone, and for a
+    state with no bounded receptive field (Kimi-K3's KDA, GDN) no replay could
+    stand in for it. The scheduler and every worker ask with the one replay
+    length the engine runs, `Config.state_replay_tokens` (set once on the
+    engine's config, which a `multi` connector copies to its offload leg as
+    is), and register under the namespace their answer names
+    (`_model_namespace`).
+    """
+    return not replay_tokens
 
 
 __all__ = [
     "NativeStateMPKernelGroup",
     "NativeStateMPLayout",
     "build_native_state_mp_layout",
+    "stores_state_images",
 ]

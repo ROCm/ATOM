@@ -10,18 +10,18 @@ hand-written ATOM stand-ins.
 
 from __future__ import annotations
 
+import ast
 import importlib
-import importlib.abc
-import importlib.util
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
 
@@ -33,25 +33,17 @@ class _ShapeKey:
     experts: int
     topk: int
     tp_size: int
-
-
-class _ActivationType(Enum):
-    Silu = 0
-    Swiglu = 1
-    Situv2 = 2
-
-
-class _QuantType(Enum):
-    No = 0
-    per_Tensor = 1
-    per_Token = 2
-    per_1x128 = 3
-    per_1x32 = 4
-
-
-class _GateMode(Enum):
-    INTERLEAVE = "interleave"
-    SEPARATED = "separated"
+    cu_num: int | None = None
+    act_type: str = "ActivationType.Silu"
+    dtype: str = "torch.bfloat16"
+    q_dtype_a: str = "torch.float8_e4m3fn"
+    q_dtype_w: str = "torch.float4_e2m1fn_x2"
+    q_type: str = "QuantType.per_1x32"
+    use_g1u1: int = 1
+    doweight_stage1: int = 0
+    add_shared: bool | None = True
+    comm: str = "ar"
+    gpu_model: str | None = None
 
 
 class _CommFusedMoeRuntime:
@@ -61,6 +53,12 @@ class _CommFusedMoeRuntime:
     def supports(self, tokens: int) -> bool:
         return self.runners.supports(tokens)
 
+    def bucket_for(self, tokens: int) -> int:
+        return self.runners.bucket_for(tokens)
+
+    def supports_ragged_m(self, tokens: int) -> bool:
+        return self.runners.supports_ragged_m(tokens)
+
 
 class _State:
     def __init__(self) -> None:
@@ -69,6 +67,7 @@ class _State:
             enable_rapidserve=False,
             fake_eplb=False,
             enable_expert_parallel=False,
+            enable_dp_attention=False,
             parallel_config=SimpleNamespace(data_parallel_size=1),
             prefill_context_parallel_size=1,
             torch_dtype=torch.bfloat16,
@@ -78,128 +77,11 @@ class _State:
         self.missing_shape = False
 
 
-def _identity_decorator(*_args, **_kwargs):
-    return lambda function: function
-
-
-def _external_module_attributes(name: str) -> dict[str, object]:
-    dtypes = SimpleNamespace(
-        bf16=torch.bfloat16,
-        fp32=torch.float32,
-        fp4x2=torch.uint8,
-        fp8=torch.float8_e4m3fnuz,
-        fp8_e8m0=torch.uint8,
-        i4x2=torch.uint8,
-        i8=torch.int8,
-        d_dtypes={},
-    )
-    return {
-        "aiter": {
-            "ActivationType": _ActivationType,
-            "QuantType": _QuantType,
-            "dtypes": dtypes,
-        },
-        "aiter.jit.utils.torch_guard": {
-            "torch_compile_guard": _identity_decorator,
-        },
-        "aiter.ops.flydsl.moe_common": {"GateMode": _GateMode},
-        "triton": {
-            "jit": lambda function: function,
-            "heuristics": _identity_decorator,
-        },
-        "triton.language": {"constexpr": object},
-    }.get(name, {})
-
-
-class _ExternalModuleLoader(importlib.abc.Loader):
-    def create_module(self, spec):
-        return None
-
-    def exec_module(self, module) -> None:
-        module.__file__ = f"<test stub for {module.__name__}>"
-        module.__path__ = []
-        module.__dict__.update(_external_module_attributes(module.__name__))
-
-        def resolve(attribute: str):
-            value = MagicMock(name=f"{module.__name__}.{attribute}")
-            setattr(module, attribute, value)
-            return value
-
-        module.__getattr__ = resolve
-
-
-class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname in {"aiter", "triton"} or fullname.startswith(
-            ("aiter.", "triton.")
-        ):
-            return importlib.util.spec_from_loader(
-                fullname, _ExternalModuleLoader(), is_package=True
-            )
-        return None
-
-
-@contextmanager
-def _stubbed_external_kernel_modules():
-    # Torch imports its own optional Triton integration lazily. Resolve that
-    # first so this test's deliberately small Triton stub cannot affect it.
-    importlib.import_module("torch._dynamo.config")
-
-    prefixes = ("aiter", "triton")
-    saved = {
-        name: module
-        for name, module in sys.modules.items()
-        if name in prefixes or name.startswith(("aiter.", "triton."))
-    }
-    for name in saved:
-        sys.modules.pop(name, None)
-
-    finder = _ExternalModuleFinder()
-    sys.meta_path.insert(0, finder)
-    try:
-        yield
-    finally:
-        sys.meta_path.remove(finder)
-        for name in list(sys.modules):
-            if name in prefixes or name.startswith(("aiter.", "triton.")):
-                sys.modules.pop(name, None)
-        sys.modules.update(saved)
-
-
-@pytest.fixture(scope="module")
-def atom_modules():
-    existing_atom_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "atom" or name.startswith("atom.")
-    }
-    with _stubbed_external_kernel_modules():
-        moe = importlib.import_module("atom.model_ops.moe")
-        comm = importlib.import_module("atom.model_ops.fused_moe.comm_fused_moe")
-        deepseek_v4 = importlib.import_module("atom.models.deepseek_v4")
-        host = importlib.import_module("aiter.ops.flydsl.comm_fused_moe_host")
-        runtime = importlib.import_module("aiter.ops.comm_fused_moe_runtime")
-        try:
-            yield SimpleNamespace(
-                moe=moe,
-                comm=comm,
-                deepseek_v4=deepseek_v4,
-                host=host,
-                runtime=runtime,
-            )
-        finally:
-            for name in list(sys.modules):
-                if (name == "atom" or name.startswith("atom.")) and (
-                    name not in existing_atom_modules
-                ):
-                    sys.modules.pop(name, None)
-            sys.modules.update(existing_atom_modules)
-
-
 @pytest.fixture
 def comm_fused_env(monkeypatch, atom_modules):
     state = _State()
     tp_group = SimpleNamespace(world_size=8)
+    dp_group = SimpleNamespace(world_size=8)
     monkeypatch.setenv("ATOM_MOE_GU_ITLV", "1")
 
     def winners_for(shape):
@@ -210,12 +92,17 @@ def comm_fused_env(monkeypatch, atom_modules):
 
     def create_flydsl_comm_fused_runners(**kwargs):
         state.runner_calls.append(kwargs)
-        return SimpleNamespace(supports=lambda tokens: tokens == 32)
+        return SimpleNamespace(
+            supports=lambda tokens: tokens == 32,
+            bucket_for=lambda tokens: tokens,
+            supports_ragged_m=lambda tokens: False,
+        )
 
     monkeypatch.setattr(
         atom_modules.comm, "get_current_atom_config", lambda: state.config
     )
     monkeypatch.setattr(atom_modules.comm, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(atom_modules.comm, "get_dp_group", lambda: dp_group)
     monkeypatch.setattr(atom_modules.comm, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(atom_modules.host, "ShapeKey", _ShapeKey, raising=False)
     monkeypatch.setattr(atom_modules.host, "winners_for", winners_for, raising=False)
@@ -231,7 +118,7 @@ def comm_fused_env(monkeypatch, atom_modules):
         _CommFusedMoeRuntime,
         raising=False,
     )
-    return atom_modules, state, tp_group
+    return atom_modules, state, tp_group, dp_group
 
 
 def _create_backend(modules, state, **overrides):
@@ -257,145 +144,201 @@ def _new_fused_moe(modules):
     # FusedMoE is exposed through the repository's lazy plugin-mode decorator.
     layer = object.__new__(modules.moe.FusedMoE.__mro__[1])
     torch.nn.Module.__init__(layer)
+    layer.custom_routing_function = None
     return layer
 
 
-def test_registers_functional_custom_op(atom_modules):
+def _parallel(dp_size=1):
+    return SimpleNamespace(dp_size=dp_size, use_ep=False, tp_size=8)
 
-    schema = torch._C._dispatch_find_schema_or_throw(
-        "aiter::comm_fused_moe_forward", ""
-    ).schema()
-    assert all(argument.alias_info is None for argument in schema.arguments)
+
+def _create_dpa_backend(comm_fused_env):
+    modules, state, _, _ = comm_fused_env
+    state.config.enable_dp_attention = True
+    return (
+        modules,
+        state,
+        _create_backend(modules, state, parallel_config=_parallel(dp_size=8)),
+    )
+
+
+def _set_forward_context(monkeypatch, modules, *, metadata, tokens, unified=False):
+    forward_context = importlib.import_module("atom.utils.forward_context")
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=metadata,
+            context=SimpleNamespace(
+                running_tokens=tokens,
+                running_tokens_are_unified=unified,
+            ),
+        ),
+    )
+
+
+_RUNTIME_PASSTHROUGH = {
+    "w1": "w13_weight",
+    "w2": "w2_weight",
+    "expert_mask": "expert_mask",
+    "activation": "activation",
+    "w1_scale": "w13_weight_scale",
+    "w2_scale": "w2_weight_scale",
+    "a1_scale": "w13_input_scale",
+    "a2_scale": "w2_input_scale",
+    "bias1": "w13_bias",
+    "bias2": "w2_bias",
+}
+
+
+def _runtime_layer(modules, topk_weights, topk_ids, *, apply_router_weight=False):
+    layer = _new_fused_moe(modules)
+    method = SimpleNamespace(
+        select_experts=MagicMock(return_value=(topk_weights, topk_ids)),
+        place_experts=MagicMock(side_effect=lambda layer, w, ids, gathered: (w, ids)),
+        quant_type=object(),
+        hidden_pad=17,
+        intermediate_pad=19,
+        is_guinterleave=True,
+    )
+    values = {
+        "quant_method": method,
+        "use_grouped_topk": False,
+        "top_k": 2,
+        "renormalize": True,
+        "topk_group": None,
+        "num_expert_group": None,
+        "global_num_experts": 16,
+        "scoring_func": "sqrtsoftplus",
+        "shared_expert_scoring_func": None,
+        "apply_router_weight_on_input": apply_router_weight,
+        "swiglu_limit": 7.0,
+        # No prefilled shared columns to re-mark after the DPA gather.
+        "expert_layout": SimpleNamespace(mode=None),
+    }
+    for name, value in values.items():
+        setattr(layer, name, value)
+    for name in {
+        "custom_routing_function",
+        "e_score_correction_bias",
+        *_RUNTIME_PASSTHROUGH.values(),
+    }:
+        setattr(layer, name, object())
+    return layer, method
+
+
+def _new_v4_moe(modules):
+    moe = modules.deepseek_v4.MoE.__new__(modules.deepseek_v4.MoE)
+    torch.nn.Module.__init__(moe)
+    moe.prefix = "model.layers.3.mlp"
+    return moe
+
+
+def _mock_streams(monkeypatch, modules):
+    routed_stream = MagicMock(name="routed_stream")
+    alt_stream = MagicMock(name="alt_stream")
+    monkeypatch.setattr(
+        modules.deepseek_v4.torch.cuda,
+        "current_stream",
+        lambda _device: routed_stream,
+    )
+    monkeypatch.setattr(
+        modules.deepseek_v4.torch.cuda,
+        "stream",
+        lambda _stream: contextmanager(lambda: (yield))(),
+    )
+    return routed_stream, alt_stream
+
+
+def _initialize_backend(comm_fused_env, *, dpa=False):
+    modules, state, tp_group, dp_group = comm_fused_env
+    if dpa:
+        state.config.enable_dp_attention = True
+    backend = _create_backend(
+        modules,
+        state,
+        parallel_config=_parallel(dp_size=8) if dpa else _parallel(),
+    )
+    layer = _new_fused_moe(modules)
+    layer.quant_method = object.__new__(modules.moe.Mxfp4MoEMethod)
+    layer.quant_method.use_triton = True
+    layer.quant_method.use_triton_decode = True
+    layer.moe_parallel_config = _parallel(dp_size=8 if dpa else 1)
+    layer.hidden_size = 7168
+    layer.intermediate_size_per_partition = 384
+    layer.global_num_experts = 384
+    layer.top_k = 6
+    if dpa:
+        layer.w2_weight = torch.nn.Parameter(torch.empty(1))
+        layer.w2_weight_scale = torch.nn.Parameter(torch.empty(1))
+    backend.configure_quant_method(layer.quant_method)
+    backend.initialize(layer)
+    return backend, layer, state, dp_group if dpa else tp_group
 
 
 @pytest.mark.parametrize(
-    "attribute, value",
+    ("config_overrides", "backend_overrides"),
     [
-        ("moe_backend", "mega"),
-        ("online_quant", True),
-        ("quant_dtype", torch.bfloat16),
-        ("quant_type", _QuantType.per_Token),
-        ("torch_dtype", torch.float16),
-        ("activation", _ActivationType.Swiglu),
-        ("apply_router_weight_on_input", True),
-        ("enable_tbo", True),
-        ("enable_rapidserve", True),
-        ("fake_eplb", True),
-        ("enable_expert_parallel", True),
-        ("data_parallel_size", 2),
-        ("use_ep", True),
-        ("prefill_context_parallel_size", 2),
-        ("tp_size", 1),
+        ({"moe_backend": "mega"}, {}),
+        ({}, {"online_quant": True}),
+        (
+            {},
+            {
+                "layer_quant_config": SimpleNamespace(
+                    quant_dtype=torch.bfloat16,
+                    quant_type=QuantType.per_1x32,
+                )
+            },
+        ),
+        ({"torch_dtype": torch.float16}, {}),
+        ({}, {"activation": ActivationType.Swiglu}),
+        ({}, {"apply_router_weight_on_input": True}),
+        ({"enable_tbo": True}, {}),
+        ({"prefill_context_parallel_size": 2}, {}),
+        ({}, {"parallel_config": _parallel(dp_size=2)}),
+        ({}, {"parallel_config": SimpleNamespace(dp_size=1, use_ep=True, tp_size=8)}),
+        ({}, {"parallel_config": SimpleNamespace(dp_size=1, use_ep=False, tp_size=1)}),
     ],
 )
 def test_support_predicate_rejects_unsupported_configuration(
-    comm_fused_env, attribute, value
+    comm_fused_env, config_overrides, backend_overrides
 ):
-    modules, state, _ = comm_fused_env
-    overrides = {}
-    if attribute == "data_parallel_size":
-        overrides["parallel_config"] = SimpleNamespace(
-            dp_size=value, use_ep=False, tp_size=8
-        )
-    elif attribute == "use_ep":
-        overrides["parallel_config"] = SimpleNamespace(
-            dp_size=1, use_ep=value, tp_size=8
-        )
-    elif attribute == "tp_size":
-        overrides["parallel_config"] = SimpleNamespace(
-            dp_size=1, use_ep=False, tp_size=value
-        )
-    elif attribute == "online_quant":
-        overrides[attribute] = value
-    elif attribute == "quant_dtype":
-        overrides["layer_quant_config"] = SimpleNamespace(
-            quant_dtype=value,
-            quant_type=modules.comm.QuantType.per_1x32,
-        )
-    elif attribute == "quant_type":
-        overrides["layer_quant_config"] = SimpleNamespace(
-            quant_dtype=modules.comm.dtypes.fp4x2,
-            quant_type=value,
-        )
-    elif attribute in {"activation", "apply_router_weight_on_input"}:
-        overrides[attribute] = value
-    else:
-        setattr(state.config, attribute, value)
+    modules, state, _, _ = comm_fused_env
+    for name, value in config_overrides.items():
+        setattr(state.config, name, value)
 
-    assert _create_backend(modules, state, **overrides) is None
-    assert not state.shape_keys
-
-
-def test_support_predicate_honors_disable_flag(monkeypatch, comm_fused_env):
-    modules, state, _ = comm_fused_env
-    monkeypatch.setenv("AITER_DISABLE_COMM_FUSED_MOE", "1")
-
-    assert _create_backend(modules, state) is None
-    assert not state.shape_keys
-
-
-def test_support_predicate_requires_interleaved_gate_up(monkeypatch, comm_fused_env):
-    modules, state, _ = comm_fused_env
-    monkeypatch.setenv("ATOM_MOE_GU_ITLV", "0")
-
-    assert _create_backend(modules, state) is None
+    assert _create_backend(modules, state, **backend_overrides) is None
     assert not state.shape_keys
 
 
 @pytest.mark.parametrize(
-    "missing_module",
-    [
-        "aiter.ops.flydsl.comm_fused_moe_host",
-        "aiter.ops.comm_fused_moe_runtime",
-    ],
+    ("name", "value"),
+    [("AITER_DISABLE_COMM_FUSED_MOE", "1"), ("ATOM_MOE_GU_ITLV", "0")],
 )
-def test_support_predicate_falls_back_when_aiter_backend_is_missing(
-    monkeypatch, comm_fused_env, missing_module
+def test_support_predicate_honors_disable_flags(
+    monkeypatch, comm_fused_env, name, value
 ):
-    modules, state, _ = comm_fused_env
-    import_module = modules.comm.importlib.import_module
-
-    def import_without_comm_fused_backend(name):
-        if name == missing_module:
-            raise ModuleNotFoundError(name)
-        return import_module(name)
-
-    monkeypatch.setattr(
-        modules.comm.importlib, "import_module", import_without_comm_fused_backend
-    )
+    modules, state, _, _ = comm_fused_env
+    monkeypatch.setenv(name, value)
 
     assert _create_backend(modules, state) is None
     assert not state.shape_keys
 
 
 def test_support_predicate_uses_runtime_shape_and_fails_closed(comm_fused_env):
-    modules, state, _ = comm_fused_env
+    modules, state, _, _ = comm_fused_env
 
-    assert _create_backend(modules, state) is not None
+    backend = _create_backend(modules, state)
+    assert backend is not None
+    assert not backend.supports(32)
     assert state.shape_keys == [_ShapeKey("gfx950", 7168, 384, 384, 6, 8)]
 
     state.missing_shape = True
     assert _create_backend(modules, state) is None
 
 
-def test_runner_wiring_uses_real_moe_types(comm_fused_env):
-    modules, state, tp_group = comm_fused_env
-    backend = _create_backend(modules, state)
-    layer = _new_fused_moe(modules)
-    layer.quant_method = object.__new__(modules.moe.Mxfp4MoEMethod)
-    layer.quant_method.use_triton = True
-    layer.quant_method.use_triton_decode = True
-    layer.moe_parallel_config = SimpleNamespace(
-        dp_size=1,
-        use_ep=False,
-        tp_size=8,
-    )
-    layer.hidden_size = 7168
-    layer.intermediate_size_per_partition = 384
-    layer.global_num_experts = 384
-    layer.top_k = 6
-
-    backend.initialize(layer)
+def test_runner_wiring_pins_flydsl_weight_layout(comm_fused_env):
+    backend, layer, state, tp_group = _initialize_backend(comm_fused_env)
 
     assert not layer.quant_method.use_triton
     assert not layer.quant_method.use_triton_decode
@@ -406,58 +349,53 @@ def test_runner_wiring_uses_real_moe_types(comm_fused_env):
             "inter_dim": 384,
             "experts": 384,
             "topk": 6,
+            "comm": "ar",
+            "add_shared": True,
         }
     ]
     assert backend.supports(32)
     assert not backend.supports(31)
 
 
-def test_missing_runtime_falls_back(comm_fused_env):
-    modules, state, _ = comm_fused_env
-    backend = _create_backend(modules, state)
+def test_dpa_runner_uses_reduce_scatter_group(comm_fused_env):
+    backend, _, state, dp_group = _initialize_backend(comm_fused_env, dpa=True)
+    assert backend is not None
+    assert state.shape_keys == [
+        _ShapeKey(
+            "gfx950",
+            7168,
+            384,
+            384,
+            6,
+            8,
+            add_shared=True,
+            comm="rs",
+        )
+    ]
 
-    assert not backend.supports(32)
+    assert state.runner_calls == [
+        {
+            "tp_group": dp_group,
+            "model_dim": 7168,
+            "inter_dim": 384,
+            "experts": 384,
+            "topk": 6,
+            "comm": "rs",
+            "add_shared": True,
+        }
+    ]
 
 
 def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
-    modules, state, _ = comm_fused_env
+    modules, state, _, _ = comm_fused_env
     backend = _create_backend(modules, state)
-    layer = _new_fused_moe(modules)
-
     hidden_states, router_logits, topk_weights, topk_ids = (object() for _ in range(4))
     shared_partial, stage2_stream, output = (object() for _ in range(3))
-    before_stage2 = MagicMock(name="before_stage2")
-
-    method = SimpleNamespace(
-        select_experts_with_record=MagicMock(return_value=(topk_weights, topk_ids)),
-        quant_type=object(),
-        hidden_pad=17,
-        intermediate_pad=19,
-        is_guinterleave=True,
+    before_stage2_for_rows = MagicMock(name="before_stage2_for_rows")
+    layer, method = _runtime_layer(
+        modules, topk_weights, topk_ids, apply_router_weight=True
     )
     runtime = SimpleNamespace(run=MagicMock(return_value=output))
-    layer_state = {
-        "quant_method": method,
-        "use_grouped_topk": False,
-        "top_k": 2,
-        "renormalize": True,
-        "topk_group": None,
-        "num_expert_group": None,
-        "global_num_experts": 16,
-        "scoring_func": "sqrtsoftplus",
-        "shared_expert_scoring_func": None,
-        "apply_router_weight_on_input": True,
-        "swiglu_limit": 7.0,
-    }
-    for name, value in layer_state.items():
-        setattr(layer, name, value)
-    opaque_attributes = (
-        "custom_routing_function e_score_correction_bias w13_weight w2_weight "
-        "expert_mask activation w13_weight_scale w2_weight_scale "
-        "w13_input_scale w2_input_scale w13_bias w2_bias"
-    )
-    for name in opaque_attributes.split():
-        setattr(layer, name, object())
     backend.runtime = runtime
 
     result = backend.forward_impl(
@@ -465,48 +403,209 @@ def test_forward_impl_bridges_fused_moe_state_to_runtime(comm_fused_env):
         hidden_states,
         router_logits,
         shared_partial,
-        before_stage2=before_stage2,
+        before_stage2_for_rows=before_stage2_for_rows,
         stage2_stream=stage2_stream,
     )
 
     assert result is output
-    select_args = method.select_experts_with_record.call_args.kwargs
-    assert select_args["layer"] is layer
-    assert select_args["hidden_states"] is hidden_states
-    assert select_args["router_logits"] is router_logits
-    passthrough = {
-        "w1": "w13_weight",
-        "w2": "w2_weight",
-        "expert_mask": "expert_mask",
-        "activation": "activation",
-        "w1_scale": "w13_weight_scale",
-        "w2_scale": "w2_weight_scale",
-        "a1_scale": "w13_input_scale",
-        "a2_scale": "w2_input_scale",
-        "bias1": "w13_bias",
-        "bias2": "w2_bias",
-    }
-    expected_runtime_args = {
+    method.select_experts.assert_called_once_with(layer, hidden_states, router_logits)
+    runtime_args = runtime.run.call_args.kwargs
+    expected = {
         "hidden_states": hidden_states,
         "topk_weight": topk_weights,
         "topk_ids": topk_ids,
         "quant_type": method.quant_type,
-        "doweight_stage1": True,
-        "hidden_pad": 17,
-        "intermediate_pad": 19,
-        "swiglu_limit": 7.0,
-        "gate_mode": _GateMode.INTERLEAVE.value,
         "shared_partial": shared_partial,
-        "before_stage2": before_stage2,
+        "before_stage2_for_rows": before_stage2_for_rows,
         "stage2_stream": stage2_stream,
     }
-    expected_runtime_args.update(
-        {
-            argument: getattr(layer, attribute)
-            for argument, attribute in passthrough.items()
-        }
+    for name, value in expected.items():
+        assert runtime_args[name] is value
+    for name, attribute in _RUNTIME_PASSTHROUGH.items():
+        assert runtime_args[name] is getattr(layer, attribute)
+    assert runtime_args["gate_mode"] == GateMode.INTERLEAVE.value
+    assert runtime_args["reuse_is_synchronized"] is False
+    # Pad rows go to expert -1 as whole rows: no missing-route clear.
+    assert "routes_may_be_missing" not in runtime_args
+
+
+def test_dpa_forward_fuses_local_shared_into_owned_rs_rows(comm_fused_env):
+    modules, _, backend = _create_dpa_backend(comm_fused_env)
+
+    local_hidden = torch.randn(2, 8)
+    local_router = torch.randn(2, 16)
+    topk_weights = torch.randn(2, 2)
+    topk_ids = torch.zeros(2, 2, dtype=torch.int32)
+    gathered_hidden = torch.randn(16, 8)
+    gathered_weights = torch.randn(16, 2)
+    gathered_ids = torch.zeros(16, 2, dtype=torch.int32)
+    routed = torch.randn(2, 8)
+    reduce_scatter_sizes = [3, 1, 1, 2, 2, 3, 2, 2]
+    local_shared = torch.randn(2, 8)
+
+    layer, method = _runtime_layer(modules, topk_weights, topk_ids)
+
+    backend._gather_dpa_inputs = MagicMock(
+        return_value=(
+            (gathered_hidden, gathered_weights, gathered_ids),
+            2,
+            reduce_scatter_sizes,
+        )
     )
-    runtime.run.assert_called_once_with(**expected_runtime_args)
+    backend.runtime = SimpleNamespace(run=MagicMock(return_value=routed))
+
+    output = backend.forward_impl(
+        layer,
+        local_hidden,
+        local_router,
+        local_shared,
+    )
+
+    torch.testing.assert_close(output, routed)
+    # Routed on the local rows, then the routed rows gathered.
+    method.select_experts.assert_called_once_with(layer, local_hidden, local_router)
+    backend._gather_dpa_inputs.assert_called_once_with(
+        (local_hidden, topk_weights, topk_ids)
+    )
+    runtime_args = backend.runtime.run.call_args.kwargs
+    assert runtime_args["hidden_states"] is gathered_hidden
+    assert runtime_args["topk_weight"] is gathered_weights
+    assert runtime_args["topk_ids"] is gathered_ids
+    assert runtime_args["shared_partial"] is local_shared
+    assert runtime_args["before_stage2_for_rows"] is None
+    assert runtime_args["reduce_scatter_sizes"] is reduce_scatter_sizes
+    assert runtime_args["reuse_is_synchronized"] is True
+
+
+def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
+    monkeypatch, comm_fused_env
+):
+    modules, _, backend = _create_dpa_backend(comm_fused_env)
+
+    local_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    local_weights = torch.tensor([[5.0], [6.0]])
+    local_ids = torch.tensor([[7], [8]], dtype=torch.int32)
+
+    class FakeGroup:
+        world_size = 8
+
+        def __init__(self):
+            self.locals = []
+            self.sizes = []
+            self.device_communicator = SimpleNamespace(all_gatherv=self._all_gatherv)
+
+        def _all_gatherv(self, tensors, *, dim, sizes):
+            assert dim == 0
+            self.sizes.append(sizes)
+            self.locals.extend(t.clone() for t in tensors)
+            return [torch.cat([t] * self.world_size, dim=0) for t in tensors]
+
+    group = FakeGroup()
+    monkeypatch.setattr(modules.comm, "get_dp_group", lambda: group)
+    _set_forward_context(
+        monkeypatch,
+        modules,
+        metadata=SimpleNamespace(max_tokens_across_dp=3),
+        tokens=2,
+    )
+    backend.runtime = SimpleNamespace(
+        bucket_for=MagicMock(return_value=32),
+        supports_ragged_m=MagicMock(return_value=False),
+    )
+    (gathered_hidden, gathered_weights, gathered_ids), local_tokens, sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights, local_ids))
+    )
+
+    assert local_tokens == 2
+    assert sizes is None
+    # One grouped collective, every shard padded to the bucket's 4 rows.
+    assert group.sizes == [[4] * 8]
+    assert [tensor.shape for tensor in group.locals] == [(4, 2), (4, 1), (4, 1)]
+    hidden_sent, weights_sent, ids_sent = group.locals
+    torch.testing.assert_close(hidden_sent[:2], local_hidden)
+    torch.testing.assert_close(hidden_sent[2:], torch.zeros(2, 2))
+    torch.testing.assert_close(weights_sent[:2], local_weights)
+    torch.testing.assert_close(weights_sent[2:], torch.zeros(2, 1))
+    # The pad rows are routed nowhere (ids travel as their float carrier).
+    ids_sent = ids_sent.view(torch.int32)
+    assert torch.equal(ids_sent[:2], local_ids)
+    assert (ids_sent[2:] == -1).all()
+    assert gathered_hidden.shape == (32, 2)
+    assert gathered_weights.shape == (32, 1)
+    assert gathered_ids.dtype == torch.int32 and gathered_ids.shape == (32, 1)
+    backend.runtime.bucket_for.assert_called_once_with(24)
+
+
+def test_dpa_window_gathers_compact_inputs_with_one_grouped_all_gatherv(
+    monkeypatch, comm_fused_env
+):
+    modules, _, backend = _create_dpa_backend(comm_fused_env)
+
+    sizes = [3, 5, 1, 7, 2, 6, 4, 8]
+    local_hidden = torch.randn(sizes[1], 8)
+    local_weights = torch.randn(sizes[1], 2, dtype=torch.float32)
+    gathered_hidden = torch.randn(sum(sizes), 8)
+    gathered_weights = torch.randn(sum(sizes), 2, dtype=torch.float32)
+    communicator = SimpleNamespace(
+        all_gatherv=MagicMock(return_value=[gathered_hidden, gathered_weights])
+    )
+    group = SimpleNamespace(
+        world_size=8,
+        rank_in_group=1,
+        device_communicator=communicator,
+        all_gather=MagicMock(),
+    )
+    backend.runtime = SimpleNamespace(
+        bucket_for=MagicMock(return_value=64),
+        supports_ragged_m=MagicMock(return_value=True),
+    )
+    monkeypatch.setattr(modules.comm, "get_dp_group", lambda: group)
+    _set_forward_context(
+        monkeypatch,
+        modules,
+        metadata=SimpleNamespace(
+            max_tokens_across_dp=max(sizes),
+            get_sizes_across_dp=lambda: sizes,
+        ),
+        tokens=sizes[1],
+    )
+    (actual_hidden, actual_weights), local_tokens, actual_sizes = (
+        backend._gather_dpa_inputs((local_hidden, local_weights))
+    )
+
+    assert torch.equal(actual_hidden, gathered_hidden)
+    assert torch.equal(actual_weights, gathered_weights)
+    assert local_tokens == sizes[1]
+    assert actual_sizes == sizes
+    backend.runtime.bucket_for.assert_called_once_with(64)
+    backend.runtime.supports_ragged_m.assert_called_once_with(64)
+    communicator.all_gatherv.assert_called_once()
+    (sent,), kwargs = communicator.all_gatherv.call_args
+    assert kwargs == {"dim": 0, "sizes": sizes}
+    assert [torch.equal(s, t) for s, t in zip(sent, (local_hidden, local_weights))] == [
+        True,
+        True,
+    ]
+    group.all_gather.assert_not_called()
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_dpa_support_requires_rank_uniform_tokens(monkeypatch, comm_fused_env, unified):
+    modules, _, backend = _create_dpa_backend(comm_fused_env)
+    backend.runtime = SimpleNamespace(
+        supports=MagicMock(return_value=True),
+        bucket_for=MagicMock(return_value=32),
+    )
+    backend._logged_buckets.add(32)
+    _set_forward_context(monkeypatch, modules, metadata=None, tokens=4, unified=unified)
+
+    assert backend.supports(4) is unified
+    if unified:
+        backend.runtime.bucket_for.assert_called_once_with(32)
+        backend.runtime.supports.assert_called_once_with(32)
+    else:
+        backend.runtime.bucket_for.assert_not_called()
+        backend.runtime.supports.assert_not_called()
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -537,7 +636,8 @@ def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, suppor
             hidden_states,
             router_logits,
             shared_partial,
-            before_stage2=None,
+            before_stage2_for_rows=None,
+            before_shared_add=None,
             stage2_stream=None,
         )
         ordinary_forward.assert_not_called()
@@ -552,8 +652,7 @@ def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, suppor
 
 @pytest.mark.parametrize("supported", [True, False])
 def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported):
-    moe = atom_modules.deepseek_v4.MoE.__new__(atom_modules.deepseek_v4.MoE)
-    torch.nn.Module.__init__(moe)
+    moe = _new_v4_moe(atom_modules)
     hidden_states = torch.randn(4, 8)
     router_logits = torch.randn(4, 16)
     shared_partial = torch.randn_like(hidden_states)
@@ -561,10 +660,10 @@ def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported)
     routed_output = torch.randn_like(hidden_states)
     combined_output = torch.randn_like(hidden_states)
 
-    moe.prefix = "model.layers.3.mlp"
     moe.gate = MagicMock(return_value=router_logits)
     moe.shared_experts = MagicMock(return_value=shared_partial)
     moe.experts = MagicMock()
+    moe.experts._comm_fused_moe = SimpleNamespace()
     moe.experts.forward_maybe_comm_fused.return_value = (
         fused_output if supported else routed_output,
         supported,
@@ -587,72 +686,382 @@ def test_dsv4_single_stream_dispatches_by_token_support(atom_modules, supported)
         hidden_states,
         router_logits,
         shared_partial,
-        before_stage2=None,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
         stage2_stream=None,
+        shared_ready=None,
     )
 
 
-def test_dsv4_forward_keeps_comm_fused_dispatch_opaque_without_dual_stream(
-    monkeypatch, atom_modules
-):
-    moe = atom_modules.deepseek_v4.MoE.__new__(atom_modules.deepseek_v4.MoE)
-    torch.nn.Module.__init__(moe)
-    hidden_states = torch.randn(4, 8)
-    output = torch.randn_like(hidden_states)
-    dispatch = MagicMock(return_value=output)
-
-    moe.dim = hidden_states.shape[1]
-    moe.prefix = "model.layers.3.mlp"
-    moe._use_dual_stream = False
-    moe._use_comm_fused_dispatch = True
-    moe.single_stream_moe_forward = MagicMock()
-    monkeypatch.setattr(
-        atom_modules.deepseek_v4.torch.ops.aiter,
-        "maybe_dual_stream_forward",
-        dispatch,
+def test_dsv41_override_matches_stage2_callback_contract():
+    source = Path(__file__).parents[2] / "atom/models/deepseek_v41/moe.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if getattr(node, "name", None) == "routed_expert_forward"
     )
+    callbacks = [
+        "before_stage2_for_rows",
+        "before_shared_add",
+        "stage2_stream",
+        "shared_ready",
+    ]
+    assert [argument.arg for argument in method.args.args[-4:]] == callbacks
+    call = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "forward_maybe_comm_fused"
+    )
+    assert [keyword.arg for keyword in call.keywords] == callbacks
 
-    result = atom_modules.deepseek_v4.MoE.forward(moe, hidden_states)
 
-    assert result is output
-    dispatch.assert_called_once_with(hidden_states, moe.prefix)
-    moe.single_stream_moe_forward.assert_not_called()
-
-
-def test_dsv4_ordinary_dual_stream_fallback_waits_on_routed_stream(
-    monkeypatch, atom_modules
+@pytest.mark.parametrize("join_shared", [False, True])
+def test_dsv4_comm_fused_dual_stream_requires_shared_join(
+    monkeypatch, atom_modules, join_shared
 ):
-    moe = atom_modules.deepseek_v4.MoE.__new__(atom_modules.deepseek_v4.MoE)
-    torch.nn.Module.__init__(moe)
+    moe = _new_v4_moe(atom_modules)
     hidden_states = torch.randn(4, 8)
     routed = torch.randn_like(hidden_states)
-    shared = torch.randn_like(hidden_states)
-    output = torch.randn_like(hidden_states)
-    routed_stream = MagicMock(name="routed_stream")
-    alt_stream = MagicMock(name="alt_stream")
+    shared = MagicMock(name="shared")
+    routed_stream, alt_stream = _mock_streams(monkeypatch, atom_modules)
 
-    moe.prefix = "model.layers.3.mlp"
+    def run_fused(
+        _x, *, before_stage2_for_rows, before_shared_add, stage2_stream, **_kwargs
+    ):
+        assert stage2_stream is routed_stream
+        assert before_stage2_for_rows(shared.shape[0]) is shared
+        if join_shared:
+            before_shared_add()
+        return routed, True
+
     moe.alt_stream = alt_stream
     moe.shared_experts = MagicMock()
     moe.shared_experts.forward.return_value = shared
+    moe.routed_expert_forward = MagicMock(side_effect=run_fused)
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: False)
+    moe.combine_outputs = MagicMock()
+    if join_shared:
+        result = atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(
+            moe, hidden_states
+        )
+        assert result is routed
+        routed_stream.wait_stream.assert_called_once_with(alt_stream)
+        moe.combine_outputs.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="completed without joining"):
+            atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
+        routed_stream.wait_stream.assert_not_called()
+    assert alt_stream.wait_stream.call_args_list[0].args == (routed_stream,)
+
+
+def test_dsv4_dual_stream_hands_the_shared_output_to_the_combine(
+    monkeypatch, atom_modules
+):
+    """Where the routed combine adds the shared output, the dual-stream path
+    hands it down through `routed_expert_forward` with the event recorded on
+    the side stream, and neither joins the streams nor adds it again."""
+    moe = _new_v4_moe(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    routed = torch.randn_like(hidden_states)
+    shared = MagicMock(name="shared")
+    routed_stream, alt_stream = _mock_streams(monkeypatch, atom_modules)
+    ready = MagicMock(name="shared_ready")
+    monkeypatch.setattr(atom_modules.deepseek_v4.torch.cuda, "Event", lambda: ready)
+    moe.alt_stream = alt_stream
+    moe.experts = SimpleNamespace(combine_accepts_shared=lambda rows: rows == 4)
+    moe.shared_experts = MagicMock()
+    moe.shared_experts.forward.return_value = shared
     moe.routed_expert_forward = MagicMock(return_value=(routed, False))
-    moe.combine_outputs = MagicMock(return_value=output)
-    monkeypatch.setattr(
-        atom_modules.deepseek_v4.torch.cuda,
-        "current_stream",
-        lambda _device: routed_stream,
-    )
-    monkeypatch.setattr(
-        atom_modules.deepseek_v4.torch.cuda,
-        "stream",
-        lambda _stream: contextmanager(lambda: (yield))(),
-    )
+    combined = torch.randn_like(hidden_states)
+    moe.combine_outputs = MagicMock(return_value=combined)
 
     result = atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
 
-    assert result is output
-    assert alt_stream.wait_stream.call_args_list[0].args == (routed_stream,)
-    routed_stream.wait_stream.assert_called_once_with(alt_stream)
-    moe.combine_outputs.assert_called_once_with(
-        routed, shared, prefix="model.layers.3.mlp.combine_outputs"
+    assert result is combined
+    moe.routed_expert_forward.assert_called_once_with(
+        hidden_states, shared_partial=shared, shared_ready=ready
     )
+    ready.record.assert_called_once_with(alt_stream)
+    shared.record_stream.assert_called_once_with(routed_stream)
+    moe.combine_outputs.assert_called_once_with(
+        routed, None, prefix="model.layers.3.mlp.combine_outputs"
+    )
+    routed_stream.wait_stream.assert_not_called()
+
+
+def _fused_moe_for_shared_add(atom_modules, *, accepts):
+    layer = _new_fused_moe(atom_modules)
+    layer._comm_fused_moe = None
+    layer.balance_router_logits = None
+    layer.combine_accepts_shared = lambda rows: accepts
+    layer.forward_impl = MagicMock(name="forward_impl")
+    return layer
+
+
+def test_fused_moe_hands_the_shared_output_to_the_routed_combine(
+    monkeypatch, atom_modules
+):
+    layer = _fused_moe_for_shared_add(atom_modules, accepts=True)
+    ordinary_forward = MagicMock()
+    monkeypatch.setattr(type(layer), "forward", ordinary_forward)
+    hidden_states = torch.randn(4, 8)
+    router_logits = torch.randn(4, 16)
+    shared = torch.randn_like(hidden_states)
+    ready = MagicMock(name="shared_ready")
+
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared, shared_ready=ready
+    )
+
+    assert output is layer.forward_impl.return_value and is_complete is False
+    layer.forward_impl.assert_called_once_with(
+        hidden_states, router_logits, shared_add=shared, shared_ready=ready
+    )
+    ordinary_forward.assert_not_called()
+
+    # Without the event the shared output stays the caller's to add.
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared
+    )
+    assert output is ordinary_forward.return_value and is_complete is False
+    layer.forward_impl.assert_called_once()
+
+
+def test_fused_moe_refuses_a_shared_output_its_combine_cannot_add(atom_modules):
+    layer = _fused_moe_for_shared_add(atom_modules, accepts=False)
+    hidden_states = torch.randn(4, 8)
+    with pytest.raises(RuntimeError, match="combine_accepts_shared"):
+        layer.forward_maybe_comm_fused(
+            hidden_states,
+            torch.randn(4, 16),
+            torch.randn_like(hidden_states),
+            shared_ready=MagicMock(),
+        )
+    layer.forward_impl.assert_not_called()
+
+
+def test_fused_moe_combine_accepts_shared(monkeypatch, atom_modules):
+    class MoriV2ModularKernel:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_ops.fused_moe.mori_v2_prepare_finalize",
+        SimpleNamespace(MoriV2ModularKernel=MoriV2ModularKernel),
+    )
+    layer = _new_fused_moe(atom_modules)
+    layer._comm_fused_moe = None
+    layer.sp_mega_moe = None
+    layer.reduce_results = False
+    layer.moe_parallel_config = SimpleNamespace(pcp_merge=False, dp_logical_ratio=1)
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    method.fused_experts = MoriV2ModularKernel()
+    layer.quant_method = method
+    assert layer.combine_accepts_shared(4)
+
+    method.fused_experts = object()  # not the mori v2 kernel
+    assert not layer.combine_accepts_shared(4)
+    method.fused_experts = MoriV2ModularKernel()
+    layer.quant_method = SimpleNamespace(fused_experts=method.fused_experts)
+    assert not layer.combine_accepts_shared(4)  # not the MXFP4 method
+    layer.quant_method = method
+
+    refusals = [
+        ("_comm_fused_moe", SimpleNamespace(supports=lambda rows: rows <= 8)),
+        ("sp_mega_moe", SimpleNamespace(runs=lambda rows: True)),
+        ("reduce_results", True),
+        (
+            "moe_parallel_config",
+            SimpleNamespace(pcp_merge=True, dp_logical_ratio=1),
+        ),
+        (
+            "moe_parallel_config",
+            SimpleNamespace(pcp_merge=False, dp_logical_ratio=2),
+        ),
+    ]
+    for name, value in refusals:
+        kept = getattr(layer, name)
+        setattr(layer, name, value)
+        assert not layer.combine_accepts_shared(4), name
+        setattr(layer, name, kept)
+    assert layer.combine_accepts_shared(4)
+
+
+def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
+    """A FusedMoE whose real forward_impl / forward_impl_graph / _run_experts
+    run; only the quant method (which records what reaches ``apply``) and the
+    process groups are stand-ins."""
+    moe = atom_modules.moe
+    layer = _new_fused_moe(atom_modules)
+    routed = torch.randn(4, 8)
+    method = SimpleNamespace(
+        routed_rows_wire=None,
+        select_experts=MagicMock(
+            return_value=(torch.rand(4, 2), torch.zeros(4, 2, dtype=torch.int32))
+        ),
+        place_experts=MagicMock(side_effect=lambda layer, w, ids, gathered: (w, ids)),
+        apply=MagicMock(return_value=routed),
+    )
+    values = {
+        "quant_method": method,
+        "_comm_fused_moe": None,
+        "sp_mega_moe": None,
+        "balance_router_logits": None,
+        "reduce_results": False,
+        # EP all2all: forward_impl_graph does no DP gather/scatter of its own.
+        "moe_parallel_config": SimpleNamespace(
+            dp_size=dp_world,
+            pcp_merge=False,
+            dp_logical_ratio=1,
+            use_all2all_kernels=True,
+        ),
+        "global_num_experts": 16,
+        "expert_map": None,
+        "activation": None,
+        "apply_router_weight_on_input": False,
+        "prefix": "experts",
+    }
+    for name, value in values.items():
+        setattr(layer, name, value)
+    layer.combine_accepts_shared = lambda rows: True
+    context = SimpleNamespace(
+        is_dummy_run=False, pcp_split=False, scheduled_tokens_gpu=None
+    )
+    monkeypatch.setattr(
+        moe, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
+    monkeypatch.setattr(moe, "pass_scheduled_tokens_gpu", lambda rows: None)
+    monkeypatch.setattr(
+        moe, "get_dp_group", lambda: SimpleNamespace(world_size=dp_world)
+    )
+    graph = MagicMock(wraps=layer.forward_impl_graph)
+    monkeypatch.setattr(layer, "forward_impl_graph", graph)
+    return layer, method, routed, graph
+
+
+@pytest.mark.parametrize("dp_world", [1, 2], ids=["forward_impl", "graph"])
+def test_shared_output_reaches_the_quant_method_through_forward_impl(
+    monkeypatch, atom_modules, dp_world
+):
+    """Every hop from forward_maybe_comm_fused to quant_method.apply carries
+    the shared output and its event: forward_impl -> _run_experts on one DP
+    rank, forward_impl -> forward_impl_graph -> _run_experts on several."""
+    layer, method, routed, graph = _recording_fused_moe(
+        monkeypatch, atom_modules, dp_world=dp_world
+    )
+    hidden_states = torch.randn(4, 8)
+    router_logits = torch.randn(4, 16)
+    shared = torch.randn_like(hidden_states)
+    ready = MagicMock(name="shared_ready")
+
+    output, is_complete = layer.forward_maybe_comm_fused(
+        hidden_states, router_logits, shared, shared_ready=ready
+    )
+
+    assert output is routed and is_complete is False
+    assert graph.call_count == (1 if dp_world > 1 else 0)
+    method.apply.assert_called_once()
+    applied = method.apply.call_args.kwargs
+    assert applied["shared_add"] is shared
+    assert applied["shared_ready"] is ready
+    assert applied["x"] is hidden_states
+
+
+def test_routed_forward_without_a_shared_output_passes_none_down(
+    monkeypatch, atom_modules
+):
+    """The ordinary forward_impl call does not hand the quant method a shared
+    output, so the methods that do not take one are called as before."""
+    layer, method, _, _ = _recording_fused_moe(monkeypatch, atom_modules, dp_world=1)
+
+    layer.forward_impl(torch.randn(4, 8), torch.randn(4, 16))
+
+    applied = method.apply.call_args.kwargs
+    assert "shared_add" not in applied and "shared_ready" not in applied
+
+
+@pytest.mark.parametrize(
+    ("use_triton", "fused_experts"),
+    [(False, None), (True, object())],
+    ids=["no-modular-kernel", "triton-experts"],
+)
+def test_mxfp4_apply_refuses_a_shared_output_without_a_combine(
+    atom_modules, use_triton, fused_experts
+):
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    method.use_triton = use_triton
+    method.use_triton_decode = False
+    method.fused_experts = fused_experts
+    hidden_states = torch.randn(4, 8)
+    with pytest.raises(RuntimeError, match="without a combine"):
+        method.apply(
+            layer=SimpleNamespace(),
+            x=hidden_states,
+            topk_weights=torch.rand(4, 2),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            shared_add=torch.randn_like(hidden_states),
+            shared_ready=MagicMock(),
+        )
+
+
+def _mxfp4_method_with_recording_experts(atom_modules):
+    """An ``Mxfp4MoEMethod`` on the modular-kernel path (no Triton experts),
+    whose ``fused_experts`` records what ``apply`` hands it."""
+    method = object.__new__(atom_modules.moe.Mxfp4MoEMethod)
+    values = {
+        "use_triton": False,
+        "use_triton_decode": False,
+        "use_triton_ep": False,
+        "is_guinterleave": False,
+        "fp8_activations": False,
+        "quant_type": object(),
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "fused_experts": MagicMock(return_value=torch.randn(4, 8)),
+    }
+    for name, value in values.items():
+        setattr(method, name, value)
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(2, 16, 8),
+        w2_weight=torch.empty(2, 8, 8),
+        w13_weight_scale=None,
+        w2_weight_scale=None,
+        w13_bias=None,
+        w2_bias=None,
+        expert_mask=None,
+    )
+    return method, layer
+
+
+@pytest.mark.parametrize("with_shared", [True, False], ids=["shared", "plain"])
+def test_mxfp4_apply_hands_the_shared_output_to_fused_experts(
+    atom_modules, with_shared
+):
+    """The last hop: ``Mxfp4MoEMethod.apply`` passes the shared output and
+    its event on to the modular kernel (``fused_experts``), whose combine adds
+    it; without one, ``fused_experts`` is called without them."""
+    method, layer = _mxfp4_method_with_recording_experts(atom_modules)
+    hidden_states = torch.randn(4, 8)
+    shared = torch.randn_like(hidden_states) if with_shared else None
+    ready = MagicMock(name="shared_ready") if with_shared else None
+
+    output = method.apply(
+        layer=layer,
+        x=hidden_states,
+        topk_weights=torch.rand(4, 2),
+        topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+        shared_add=shared,
+        shared_ready=ready,
+    )
+
+    method.fused_experts.assert_called_once()
+    assert output is method.fused_experts.return_value
+    passed = method.fused_experts.call_args.kwargs
+    assert passed["hidden_states"] is hidden_states
+    if with_shared:
+        assert passed["shared_add"] is shared
+        assert passed["shared_ready"] is ready
+    else:
+        assert "shared_add" not in passed and "shared_ready" not in passed

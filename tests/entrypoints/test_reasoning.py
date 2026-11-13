@@ -8,46 +8,47 @@ from typing import ClassVar
 
 import pytest
 
+from atom.entrypoints.openai.protocol import ended_by_stop
 from atom.entrypoints.openai.reasoning import (
     ReasoningChannel,
     ReasoningFilter,
     prompt_starts_in_reasoning,
-    separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+from atom.entrypoints.openai.serving_chat import _build_chat_choice
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
 # ============================================================================
-# separate_reasoning() Tests
+# ReasoningChannel.split() Tests
 # ============================================================================
 
 
 class TestSeparateReasoning:
-    """Tests for the separate_reasoning() function."""
+    """Tests for `ReasoningChannel.split` on the default dialect."""
 
     def test_with_thinking_block(self):
         text = "<think>Let me think about this.</think>The answer is 42."
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning == "Let me think about this."
         assert content == "The answer is 42."
 
     def test_without_thinking(self):
         text = "The answer is 42."
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning is None
         assert content == "The answer is 42."
 
     def test_empty_thinking(self):
         text = "<think></think>Just the answer."
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning is None
         assert content == "Just the answer."
 
     def test_unclosed_thinking(self):
         """Truncated response where </think> was never generated."""
         text = "<think>I'm still thinking about this and the response got truncated"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning is not None
         assert "still thinking" in reasoning
         assert content == ""
@@ -56,15 +57,15 @@ class TestSeparateReasoning:
         text = (
             "<think>Step 1: analyze\nStep 2: compute\nStep 3: answer</think>Result: 42"
         )
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert "Step 1" in reasoning
         assert "Step 3" in reasoning
         assert content == "Result: 42"
 
     def test_tool_calls_preserved(self):
-        """Tool calls are NOT stripped by separate_reasoning (handled by tool_parser)."""
+        """Tool calls are NOT stripped by the split (handled by tool_parser)."""
         text = "Hello<|tool_calls_section_begin|>function call here<|tool_calls_section_end|>"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning is None
         # Tool call tokens remain — tool_parser.parse_tool_calls() handles them
         assert "Hello" in content
@@ -75,7 +76,7 @@ class TestSeparateReasoning:
             "<think>thinking</think>Answer"
             "<|tool_calls_section_begin|>call<|tool_calls_section_end|>"
         )
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning == "thinking"
         # Content includes tool call tokens (parsed separately by tool_parser)
         assert "Answer" in content
@@ -83,7 +84,7 @@ class TestSeparateReasoning:
     def test_only_thinking_no_answer(self):
         """Model generated only thinking content then stopped."""
         text = "<think>thinking only</think>"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning == "thinking only"
         assert content == ""
 
@@ -96,7 +97,7 @@ class TestSeparateReasoning:
         `.strip()` there cost a code-block answer its final newline.
         """
         text = "<think>thought</think>\n\nThe answer."
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert content == "\n\nThe answer."
         assert reasoning == "thought"
 
@@ -110,13 +111,17 @@ class TestSeparateReasoning:
         never come, so the two disagreed; the caller answers it once now.
         """
         text = "The user wants hello world...\n</think>\n\nprint('Hello')"
-        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(
+            text, stopped=True
+        )
         assert reasoning == "The user wants hello world...\n"
         assert content == "\n\nprint('Hello')"
 
     def test_no_think_start_tag_empty_content(self):
         text = "Reasoning only\n</think>"
-        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(
+            text, stopped=True
+        )
         assert reasoning == "Reasoning only\n"
         assert content == ""
 
@@ -129,7 +134,7 @@ class TestSeparateReasoning:
         that was never coming.
         """
         text = "The user wants hello world...\n</think>\n\nprint('Hello')"
-        reasoning, content = separate_reasoning(text)
+        reasoning, content = ReasoningChannel().split(text, stopped=True)
         assert reasoning is None
         assert content == text
 
@@ -142,10 +147,10 @@ class TestSeparateReasoning:
         the trace and a client reading `delta.content` saw nothing.
         """
         raw = "Let me consider whether the user wants a GLM parser. " * 4
-        reasoning, content = separate_reasoning(raw, starts_thinking=True)
+        reasoning, content = ReasoningChannel(starts_open=True).split(raw, stopped=True)
 
         rf = ReasoningFilter(starts_thinking=True)
-        segments = rf.process(raw) + rf.flush()
+        segments = rf.process(raw) + rf.flush(stopped=True)
         streamed_reasoning = "".join(s for f, s in segments if f == "reasoning_content")
         streamed_content = "".join(s for f, s in segments if f == "content")
 
@@ -167,7 +172,7 @@ class TestReasoningFilter:
         results = []
         for token in tokens:
             results.extend(rf.process(token))
-        results.extend(rf.flush())
+        results.extend(rf.flush(stopped=True))
         return results
 
     def test_simple_thinking_and_content(self):
@@ -238,7 +243,7 @@ class TestReasoningFilter:
         rf = ReasoningFilter()
         # Short text that doesn't trigger immediate emit (buffered for tag detection)
         results = rf.process("Hi")
-        results.extend(rf.flush())
+        results.extend(rf.flush(stopped=True))
         content = "".join(t for f, t in results if f == "content")
         assert "Hi" in content
 
@@ -271,13 +276,13 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
 
     def test_a_byte_between_the_markers_keeps_the_reasoning(self):
         text = f"my reasoning{self.THINK_END}\n{self.RESPONSE}the answer"
-        reasoning, content = self.K3.split(text)
+        reasoning, content = self.K3.split(text, stopped=True)
         assert reasoning == "my reasoning"
         assert "the answer" in content
 
     def test_opening_the_response_channel_ends_the_reasoning(self):
         text = f"my reasoning{self.RESPONSE}the answer"
-        reasoning, content = self.K3.split(text)
+        reasoning, content = self.K3.split(text, stopped=True)
         assert reasoning == "my reasoning"
         assert content == "the answer"
 
@@ -290,9 +295,9 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         once a channel is open."""
         marker = getattr(self, marker_attr)
         text = f"The K3 format uses {marker} to open the answer."
-        reasoning, content = self.K3_CLOSED.split(text)
+        reasoning, content = self.K3_CLOSED.split(text, stopped=True)
         assert reasoning is None
-        assert content == self.K3_CLOSED.dialect.strip_framing(text)
+        assert content == text.replace(self.RESPONSE, "")  # framing, removed
         assert "The K3 format uses" in content and "to open the answer." in content
 
     @pytest.mark.parametrize("chunk", [1, 3, 999])
@@ -305,9 +310,149 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         segs = []
         for i in range(0, len(text), chunk):
             segs += f.process(text[i : i + chunk])
-        segs += f.flush()
+        segs += f.flush(stopped=True)
         assert "".join(s for k, s in segs if k == "content") == "Hello world"
         assert "".join(s for k, s in segs if k == "reasoning_content") == ""
+
+    ANSWER_END = "<|close|>response<|sep|>"
+    MESSAGE_END = "<|close|>message<|sep|>"
+    REPLY = "To find it:\n\n1. **Convert** the coordinates.\n2. Apply the formula."
+    CALL = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
+        "<|close|>call<|close|>tools<|sep|>"
+    )
+
+    @pytest.mark.parametrize(
+        "ending, reply",
+        [
+            ("", REPLY),
+            (MESSAGE_END, REPLY),
+            ("\n" + MESSAGE_END, REPLY + "\n"),
+            (MESSAGE_END + "\n", REPLY + "\n"),
+            ("<|close|>mes", REPLY),
+        ],
+        ids=["cut-short", "whole", "space-between", "space-after", "cut-mid-marker"],
+    )
+    def test_a_channel_that_ends_on_the_answer_closer_was_the_reply(
+        self, ending, reply
+    ):
+        """Kimi-K3 sometimes skips its think channel (~1M-token prompts) and
+        writes the reply there. Streamed, it went out as reasoning before the
+        closer said otherwise, so every path returns it in both fields.
+        Whitespace after the closer, and a marker cut off by `max_tokens`, are
+        not words after it."""
+        text = self.REPLY + self.ANSWER_END + ending
+        reasoning = self.REPLY + ending.replace(self.MESSAGE_END, "")
+        assert self.K3.split(text, stopped=True) == (reasoning, reply)
+
+    @pytest.mark.parametrize("ending", ["", "\n"], ids=["closer", "closer-space"])
+    def test_a_closer_at_a_length_cut_is_not_the_reply(self, ending):
+        """Cut off at `max_tokens` right after a quoted closer looks like a
+        finished reply; only the finish reason tells them apart."""
+        text = f"I will end with {self.ANSWER_END}{ending}"
+        reasoning = "I will end with " + ending
+        assert self.K3.split(text, stopped=False) == (reasoning, "")
+        assert self.K3.split(text, stopped=True) == (reasoning, reasoning)
+        f = self.K3.stream()
+        segs = f.process(text) + f.flush(stopped=False)
+        assert [k for k, _ in segs] == ["reasoning_content"] * len(segs)
+
+    @pytest.mark.parametrize(
+        "reason, stopped",
+        [
+            ("eos", True),
+            ("stop", True),
+            ("stop_sequence", True),
+            ("stop_163586", True),
+            ("max_tokens", False),
+            ("aborted", False),
+            ("structured_output_error", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_the_engine_reasons_that_mean_the_model_stopped(self, reason, stopped):
+        assert ended_by_stop(reason) is stopped
+
+    @pytest.mark.parametrize(
+        "reason, replayed",
+        [("eos", True), ("stop_163586", True), ("max_tokens", False)],
+    )
+    def test_the_chat_response_reads_the_finish_reason(self, reason, replayed):
+        """Through the non-streaming chat builder, not the channel by hand."""
+        text = f"I will end with {self.ANSWER_END}"
+        message = _build_chat_choice(text, reason, reasoning=self.K3)["message"]
+        assert message["reasoning_content"] == "I will end with "
+        assert message["content"] == ("I will end with " if replayed else "")
+
+    def test_a_long_replay_is_sent_in_pieces(self):
+        """One event per piece, so the tool parser and the client never get
+        the whole reply as one frame."""
+        reply = "w" * 10_000
+        f = self.K3.stream()
+        segs = f.process(reply + self.ANSWER_END) + f.flush(stopped=True)
+        replayed = [t for k, t in segs if k == "content"]
+        assert "".join(replayed) == reply
+        assert max(len(t) for t in replayed) <= 4096
+
+    def test_an_answer_closer_the_channel_goes_on_past_is_not_the_end(self):
+        """Only the channel's last words count: a quoted closer leaves the
+        reasoning where it was."""
+        text = (
+            f"closes with {self.ANSWER_END} so{self.THINK_END}"
+            f"{self.RESPONSE}ok{self.ANSWER_END}"
+        )
+        assert self.K3.split(text, stopped=True) == ("closes with  so", "ok")
+
+    @pytest.mark.parametrize("exit_", ["THINK_END", "RESPONSE"])
+    def test_a_closer_then_the_exit_into_the_answer_is_not_the_reply(self, exit_):
+        """A draft that ends on the closer, followed by the think exit: the
+        model answered in its own channel, so the draft stays reasoning."""
+        text = (
+            f"draft{self.ANSWER_END}{getattr(self, exit_)}{self.RESPONSE}"
+            f"Final answer.{self.ANSWER_END}{self.MESSAGE_END}"
+        )
+        assert self.K3.split(text, stopped=True) == ("draft", "Final answer.")
+
+    def test_a_channel_the_model_opened_itself_reads_the_same(self):
+        text = f"Note. <|open|>think<|sep|>{self.REPLY}{self.ANSWER_END}"
+        assert self.K3_CLOSED.split(text, stopped=True) == (
+            self.REPLY,
+            "Note. " + self.REPLY,
+        )
+
+    def test_a_call_after_the_reply_reaches_the_tool_parser(self):
+        text = self.REPLY + self.ANSWER_END + self.CALL + self.MESSAGE_END
+        reasoning, content = self.K3.split(text, stopped=True)
+        answer, calls = parse_tool_calls(content, None, KimiK3Parser)
+        assert (reasoning, answer) == (self.REPLY, self.REPLY)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    @pytest.mark.parametrize("before", ["", "Sure. "], ids=["leading", "after-text"])
+    def test_with_thinking_off_reasoning_markers_in_an_argument_are_its_text(
+        self, before
+    ):
+        """Once the tools channel opens, no think channel follows it, so a
+        think marker inside the call is the argument's own text."""
+        value = "<|open|>think<|sep|>payload<|close|>think<|sep|>"
+        call = (
+            '<|open|>tools<|sep|><|open|>call tool="write_file"<|sep|>'
+            f'<|open|>argument key="text"<|sep|>{value}<|close|>argument'
+            "<|close|>call<|close|>tools<|sep|>"
+        )
+        reasoning, content = self.K3_CLOSED.split(before + call, stopped=True)
+        assert (reasoning, content) == (None, before + call)
+        answer, calls = parse_tool_calls(content, None, KimiK3Parser)
+        assert answer == before
+        assert [(c.function["name"], c.function["arguments"]) for c in calls] == [
+            ("write_file", '{"text": "' + value + '"}')
+        ]
+
+    def test_with_thinking_off_a_leading_call_keeps_its_opener(self):
+        """Only the think exit at offset 0 means "declined to think"; the
+        tools opener there is a channel switch, and the call stays whole."""
+        assert self.K3_CLOSED.split(self.CALL, stopped=True) == (None, self.CALL)
 
 
 class TestTheDialectIsReadFromWhicheverEvidenceExists:
@@ -351,7 +496,7 @@ class TestTheDialectIsReadFromWhicheverEvidenceExists:
 
     def test_a_k3_answer_is_split_by_the_dialect_it_resolved_to(self):
         """The consequence, end to end: the fallback returned `content: ''`."""
-        reasoning, content = self._channel().split(self.ANSWER)
+        reasoning, content = self._channel().split(self.ANSWER, stopped=True)
         assert reasoning == "The user wants the capital."
         assert "Paris." in content
 
@@ -366,7 +511,7 @@ class TestTheDialectIsReadFromWhicheverEvidenceExists:
         it, deleting anything after that token on one path alone.
         """
         channel = self._channel()
-        reasoning, rest = channel.split(self.ANSWER)
+        reasoning, rest = channel.split(self.ANSWER, stopped=True)
         content, _ = parse_tool_calls(rest, None, KimiK3Parser)
 
         filt, parser = channel.stream(), ToolCallStreamParser(parser_cls=KimiK3Parser)
@@ -374,7 +519,7 @@ class TestTheDialectIsReadFromWhicheverEvidenceExists:
         segments = []
         for i in range(0, len(self.ANSWER), chunk):
             segments += filt.process(self.ANSWER[i : i + chunk])
-        segments += filt.flush()
+        segments += filt.flush(stopped=True)
         for field, seg in segments:
             if field == "reasoning_content":
                 streamed_reasoning.append(seg)
@@ -425,14 +570,14 @@ class TestTheReasoningStageAgreesWithItselfWithoutHelp:
             segments = []
             for i in range(0, len(text), chunk):
                 segments += filt.process(text[i : i + chunk])
-            segments += filt.flush()
+            segments += filt.flush(stopped=True)
             streamed = (
                 "".join(x for k, x in segments if k == "reasoning_content") or None,
                 "".join(x for k, x in segments if k == "content"),
             )
-            assert streamed == channel.split(text), (
+            assert streamed == channel.split(text, stopped=True), (
                 f"{dialect.think_end_marker!r} starts_open={starts_open} "
-                f"chunk={chunk} text={text!r}: {streamed} != {channel.split(text)}"
+                f"chunk={chunk} text={text!r}: {streamed} != {channel.split(text, stopped=True)}"
             )
 
     @pytest.mark.parametrize("source", ["<think></think>", "<|open|>think<|sep|>"])
@@ -448,7 +593,7 @@ class TestTheReasoningStageAgreesWithItselfWithoutHelp:
             *dialect.content_framing,
         )
         for text in self.SHAPES:
-            reasoning, content = channel.split(text)
+            reasoning, content = channel.split(text, stopped=True)
             rebuilt = (reasoning or "") + content
             remainder = text
             for marker in declared:
@@ -473,7 +618,10 @@ class TestTheDialectsAsRegistered:
     def test_the_channel_dialect_declares_the_framing_it_wraps_answers_in(self):
         dialect, _ = resolve_dialect("<|open|>think<|sep|>")
         framed = "<|open|>response<|sep|>Hi there.<|close|>response<|sep|>"
-        assert ReasoningChannel(dialect=dialect).split(framed) == (None, "Hi there.")
+        assert ReasoningChannel(dialect=dialect).split(framed, stopped=True) == (
+            None,
+            "Hi there.",
+        )
 
     def test_minimax_m3_resolves_to_its_own_tags(self):
         """`<mm:think>`, not `<think>`.
@@ -492,7 +640,7 @@ class TestTheDialectsAsRegistered:
         dialect, stated = resolve_dialect(source)
         assert (dialect.think_end_marker, stated) == ("</mm:think>", True)
         channel = ReasoningChannel(dialect=dialect, starts_open=True)
-        assert channel.split("Reasoning.</mm:think>The answer.") == (
+        assert channel.split("Reasoning.</mm:think>The answer.", stopped=True) == (
             "Reasoning.",
             "The answer.",
         )

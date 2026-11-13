@@ -48,6 +48,10 @@ CLIENT_COMMAND="${MATRIX_CLIENT_COMMAND:-}"
 ENV_VARS="${MATRIX_ENV_VARS:-}"
 LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
+# Empty unless the cell speculates: an acceptance floor only means
+# something where there is a draft.
+MTP_ACCEPT_THRESHOLD="${MATRIX_MTP_ACCEPT_THRESHOLD:-}"
+MTP_PER_POS_THRESHOLD="${MATRIX_MTP_PER_POS_THRESHOLD:-}"
 
 if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
   echo "ERROR: MATRIX_MODEL_NAME and MATRIX_MODEL_PATH are required" >&2
@@ -60,14 +64,22 @@ source atom/plugin/vllm/vllm-version.env
 source .github/scripts/plugin_ci/cache_model.sh
 
 REBUILD_ATOM_BASE=false
+REBUILD_VLLM=false
 if [[ -n "${PR_BASE_SHA}" && -n "${PR_HEAD_SHA}" ]]; then
   git fetch --no-tags --depth=1 origin "${PR_BASE_SHA}" "${PR_HEAD_SHA}" || true
   set +e
   git diff --quiet "${PR_BASE_SHA}" "${PR_HEAD_SHA}" -- docker/atom_release.dockerfile
   diff_rc=$?
+  # The nightly vLLM image was built from main's recipe and patches; a PR
+  # that changes either is only tested if it builds its own image.
+  git diff --quiet "${PR_BASE_SHA}" "${PR_HEAD_SHA}" -- docker/vllm_release.dockerfile docker/patches
+  vllm_diff_rc=$?
   set -e
   if [[ "${diff_rc}" -eq 1 ]]; then
     REBUILD_ATOM_BASE=true
+  fi
+  if [[ "${vllm_diff_rc}" -eq 1 ]]; then
+    REBUILD_VLLM=true
   fi
 fi
 
@@ -117,7 +129,7 @@ docker rmi "atom_oot:ci" 2>/dev/null || true
 BUILD_MODE="full"
 if docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
   LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
-  if [[ -n "${LATEST_VLLM_COMMIT}" && "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" && "${REBUILD_ATOM_BASE}" != "true" ]]; then
+  if [[ -n "${LATEST_VLLM_COMMIT}" && "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" && "${REBUILD_ATOM_BASE}" != "true" && "${REBUILD_VLLM}" != "true" ]]; then
     BUILD_MODE="fast"
   fi
 fi
@@ -171,7 +183,9 @@ else
 fi
 
 MODEL_CACHE_MOUNT=""
-if [[ -d "/models" ]]; then
+if [[ -d "/share_nfs/models" ]]; then
+  MODEL_CACHE_MOUNT="-v /share_nfs/models:/models"
+elif [[ -d "/models" ]]; then
   MODEL_CACHE_MOUNT="-v /models:/models"
 elif [[ -d "/it-share/models" ]]; then
   MODEL_CACHE_MOUNT="-v /it-share/models:/models"
@@ -262,3 +276,12 @@ if [[ "${result}" -eq 1 ]]; then
 fi
 
 echo "Accuracy test passed for ${MODEL_NAME}"
+
+# The acceptance gate, shared with the nightly workflow. It was written twice
+# and the copies diverged: this one checked the overall rate only, so a
+# per-position collapse -- a draft still landing its first token and nothing
+# after it -- passed here while the nightly caught it.
+if [[ -n "${MTP_ACCEPT_THRESHOLD}" ]]; then
+  "${REPO_ROOT}/.github/scripts/check_mtp_acceptance.sh" \
+    "${result_file}" "${MTP_ACCEPT_THRESHOLD}" "${MTP_PER_POS_THRESHOLD}"
+fi

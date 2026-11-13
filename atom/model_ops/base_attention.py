@@ -4,20 +4,39 @@
 # from flash_attn import flash_attn_with_kvcache
 import functools
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    pa_decode_gluon_supports_arch,
+)
 from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
+from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
+from .sp_attention import gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
+
+
+def _warn_removed_flydsl_plan_env() -> None:
+    """Warn if the removed ATOM_PA_FLYDSL_PLAN is still set."""
+    if "ATOM_PA_FLYDSL_PLAN" in os.environ:
+        logger.warning(
+            "ATOM_PA_FLYDSL_PLAN is no longer used and is ignored; FlyDSL "
+            "paged decode always uses its work planner. Set ATOM_PA_FLYDSL=0 "
+            "to disable FlyDSL where another backend is available."
+        )
+
+
+_warn_removed_flydsl_plan_env()
 
 
 # frontend interface class for constructing attention
@@ -155,14 +174,32 @@ def run_pa_fwd_asm(
 
 
 # Copies of aiter's own limits, pinned against its source by a test. Mirroring
-# them is what lets an unsupported call fall back instead of raising inside
-# aiter; a copy that drifts either over-rejects or stops protecting.
+# them lets the gate decline an unsupported call before entering aiter; a copy
+# that drifts either over-rejects or stops protecting.
 _FLYDSL_PA_MAX_PARTITIONS = 256
 _FLYDSL_PA_TILE = 256
 _FLYDSL_PA_BLOCK_SIZES = (16, 64, 128)
-_FLYDSL_PA_ARCHS = ("gfx942", "gfx950")
+_FLYDSL_PA_ARCHS = ("gfx942", "gfx950", "gfx1250")
 _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
+
+
+def flydsl_plan_shape(head_dim) -> dict:
+    """plan_pa_decode shape kwargs for a head size: empty, i.e. aiter's
+    defaults, except at head_dim 256.
+
+    aiter's planned reducer for head_dim 256 has a fast per-lane shuffle path
+    only up to 64 partitions and a slow serial loop above it. At the default
+    ceiling (CU count, 256 on MI355X) a long request splits into up to 256
+    partials and the reduce costs up to 40 us per call, against about 4 us
+    capped at 64 with a 256-workgroup budget: 1.21x per layer (geo-mean over
+    19 Qwen3.5 TP4 MTP-3 shapes, same error against the reference). Remove
+    once aiter #5949, a parallel head-256 reducer above 64 partitions, is in
+    the image.
+    """
+    if head_dim == 256:
+        return {"max_partitions": 64, "workgroup_budget": 256}
+    return {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -194,11 +231,11 @@ def _flydsl_pa_decode_num_seqs(
     sliding_window: int,
     ps: bool,
 ) -> int | None:
-    """Sequence count to run aiter's FlyDSL paged decode with, or None for gluon.
+    """Sequence count to run aiter's FlyDSL paged decode with, or None to decline.
 
-    Mirrors the kernel's own validation, so an unsupported call falls back to
-    gluon instead of raising from inside aiter. Every clause below is a hard
-    reject there, not a preference.
+    Mirrors the kernel's own validation, so an unsupported call is rejected
+    before entering aiter. The caller uses gluon where available and raises
+    otherwise. Every clause below is a hard reject there, not a preference.
 
     Why a count rather than a bool: FlyDSL demands
     ``q.shape[0] == context_lens.shape[0] * query_length`` exactly, but ATOM
@@ -218,9 +255,16 @@ def _flydsl_pa_decode_num_seqs(
         return None
     if sliding_window > 0 or not ps:
         return None
-    if compute_type is not aiter.dtypes.fp8 or k_cache.dtype is not aiter.dtypes.fp8:
+    # Native BF16 KV uses 8-element vectors and no scales; FP8 uses 16.
+    is_bf16_kv = compute_type is torch.bfloat16 and k_cache.dtype is torch.bfloat16
+    is_fp8_kv = compute_type is aiter.dtypes.fp8 and k_cache.dtype is aiter.dtypes.fp8
+    if not (is_fp8_kv or is_bf16_kv):
         return None
-    if k_cache.dim() != 5 or k_cache.shape[-1] != 16:
+    # BF16 KV stays on gluon where gluon exists.
+    if is_bf16_kv and pa_decode_gluon_supports_arch():
+        return None
+    x = 8 if is_bf16_kv else 16
+    if k_cache.dim() != 5 or k_cache.shape[-1] != x:
         return None
     # block_size is dim -2 of the page-16 cache. --block-size 256/1024 reaches
     # this site whenever use_triton_attn is set, which the published recipe does.
@@ -235,9 +279,9 @@ def _flydsl_pa_decode_num_seqs(
     head_dim = q.shape[-1]
     if not (head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)):
         return None
-    # The cache encodes head_dim as num_hgroups * 16; aiter rejects a q whose
+    # The cache encodes head_dim as num_hgroups * x; aiter rejects a q whose
     # own head_dim disagrees, and nothing upstream forces the two to match.
-    if k_cache.shape[2] * 16 != head_dim:
+    if k_cache.shape[2] * x != head_dim:
         return None
     if q.dtype not in (torch.bfloat16, torch.float16):
         return None
@@ -276,7 +320,32 @@ def _flydsl_pa_decode_num_seqs(
 
 
 _FLYDSL_PLAN_MAX_BATCH = 4096
+# aiter's planner keeps one LDS int32 per sequence plus this much scan storage.
+_FLYDSL_PLAN_SCAN_LDS_BYTES = 512
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_plan_max_batch() -> int:
+    """Most sequences one FlyDSL plan takes on this GPU.
+
+    gfx1250 only, where sparse decode has no gluon to fall back to: past
+    _FLYDSL_PLAN_MAX_BATCH a plan sets max_batch_size (aiter #6462), bounded by
+    the planner's LDS: the 16-byte-rounded task_ends array plus scan storage
+    must fit one block (81792 sequences on gfx1250).
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return _FLYDSL_PLAN_MAX_BATCH
+    lds = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block
+    by_lds = (lds - _FLYDSL_PLAN_SCAN_LDS_BYTES) // 16 * 16 // 4
+    return max(_FLYDSL_PLAN_MAX_BATCH, by_lds)
+
+
+_FLYDSL_RUNTIME_PLANS: dict[tuple, object] = {}
 
 
 def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
@@ -284,7 +353,7 @@ def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
 
     The plan is built by the metadata builder for the batch it saw; a mismatch
     is aiter's `validate` raising, i.e. a dead worker. Checked here so the call
-    can fall back to the static path instead.
+    can rebuild a compatible explicit plan instead.
     """
     return int(plan.reduce_info.shape[0]) == int(num_seqs) and int(
         plan.num_kv_heads
@@ -292,7 +361,13 @@ def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
 
 
 def _flydsl_plan_scratch(
-    plan, query_length, query_group_size, head_dim, out_dtype, device
+    plan,
+    query_length,
+    query_group_size,
+    head_dim,
+    out_dtype,
+    device,
+    plan_cache_owner=None,
 ):
     """Partial-output buffers for a planned call, allocated once per shape.
 
@@ -305,6 +380,10 @@ def _flydsl_plan_scratch(
     ones raises a shape error. Keyed by capacity so a refresh that resized the
     plan gets its own buffers. Allocation stays here because the shapes come
     from the query tensor; only the per-step planner kernel moved out.
+
+    A cache-owned plan keeps its scratch on the same owner. Sparse prefill row
+    counts vary with every prompt; retaining those buffers in the process-wide
+    cache would keep one large allocation per distinct prompt length forever.
     """
     rows = query_length * query_group_size
     want = (int(plan.num_kv_heads), int(plan.capacity), rows)
@@ -313,7 +392,13 @@ def _flydsl_plan_scratch(
     # ubatch -- would otherwise share one triple of buffers and write it at the
     # same time. The plan is stored alongside so its id cannot be recycled.
     key = (id(plan), *want, head_dim, out_dtype, device.index)
-    hit = _FLYDSL_PLAN_SCRATCH.get(key)
+    scratch = _FLYDSL_PLAN_SCRATCH
+    if plan_cache_owner is not None:
+        scratch = getattr(plan_cache_owner, "_flydsl_plan_scratch", None)
+        if scratch is None:
+            scratch = {}
+            plan_cache_owner._flydsl_plan_scratch = scratch
+    hit = scratch.get(key)
     hit = hit[1] if hit is not None else None
     if hit is None:
         hit = (
@@ -321,8 +406,172 @@ def _flydsl_plan_scratch(
             torch.empty(want, dtype=torch.float32, device=device),
             torch.empty(*want, head_dim, dtype=out_dtype, device=device),
         )
-        _FLYDSL_PLAN_SCRATCH[key] = (plan, hit)
+        scratch[key] = (plan, hit)
     return hit
+
+
+def _flydsl_context_bound(max_context_length, block_tables, k_cache):
+    """Clamp the scheduling bound to the rows addressable by this block table."""
+    capacity = int(block_tables.shape[1]) * int(k_cache.shape[3])
+    if max_context_length is None:
+        return capacity
+    if isinstance(max_context_length, bool):
+        raise TypeError("max_context_length must be a host integer, not a bool")
+    try:
+        bound = int(max_context_length)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "max_context_length must be convertible to a nonnegative host integer"
+        ) from exc
+    if bound < 0:
+        raise ValueError("max_context_length must be a nonnegative host integer")
+    return min(bound, capacity)
+
+
+def _flydsl_step_refreshed(step_owner) -> set:
+    """Runtime-plan marks already refreshed in the step ``step_owner`` spans."""
+    refreshed = getattr(step_owner, "_flydsl_refreshed_plans", None)
+    if refreshed is None:
+        refreshed = set()
+        step_owner._flydsl_refreshed_plans = refreshed
+    return refreshed
+
+
+def _flydsl_prepare_explicit_plan(
+    *,
+    q,
+    k_cache,
+    context_lens,
+    num_seqs,
+    query_length,
+    plan_partition_cap,
+    context_bound,
+    existing_plan,
+    plan_step_owner=None,
+    plan_cache_owner=None,
+    plan_segment: int = 0,
+):
+    """Return the explicit plan aiter #5809 requires.
+
+    ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
+    defaults except at head_dim 256; a caller's cap is kept, with aiter's
+    default budget.
+    ``plan_step_owner``: a per-step object whose calls all share the same
+    lengths; the plan is then refreshed once per step instead of every call.
+    ``plan_segment``: which slice of one call's rows this is, for a caller that
+    runs more rows than one plan takes in segments of equal size, each with a plan
+    of its own.
+    ``plan_cache_owner``: the object that owns plan/scratch storage. Omit it
+    for process-lifetime storage (required by captured decode graphs); sparse
+    prefill passes its ephemeral metadata so variable row counts are released.
+    Plans are window-free: the gate rejects sliding windows.
+    """
+    from aiter.ops.flydsl.pa_decode import plan_pa_decode
+
+    device = q.device
+    num_kv_heads = int(k_cache.shape[1])
+    shape = {} if plan_partition_cap is not None else flydsl_plan_shape(q.shape[-1])
+    if existing_plan is not None:
+        max_partitions = int(existing_plan.max_partitions)
+    elif plan_partition_cap is not None:
+        max_partitions = int(plan_partition_cap)
+    else:
+        max_partitions = shape.get("max_partitions")
+    workgroup_budget = shape.get("workgroup_budget")
+
+    if existing_plan is not None and flydsl_plan_matches(
+        existing_plan, num_seqs, num_kv_heads
+    ):
+        return existing_plan
+
+    from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+    # Never keyed by tensor address. TBO ubatches share one compute stream, so
+    # the ubatch id keeps their plans (and lengths) apart. Step-scoped and
+    # per-call plans are kept apart so a per-call caller cannot leave the
+    # step's remaining calls on its lengths.
+    stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
+    plan_key = (
+        stream_id,
+        tbo_current_ubatch_id(),
+        num_seqs,
+        num_kv_heads,
+        query_length,
+        max_partitions,
+        workgroup_budget,
+        device.index,
+        plan_step_owner is not None,
+        plan_segment,
+    )
+    plans = _FLYDSL_RUNTIME_PLANS
+    if plan_cache_owner is not None:
+        plans = getattr(plan_cache_owner, "_flydsl_runtime_plans", None)
+        if plans is None:
+            plans = {}
+            plan_cache_owner._flydsl_runtime_plans = plans
+    plan = plans.get(plan_key)
+    lengths = context_lens[:num_seqs]
+    if plan_step_owner is not None:
+        # Warmup and capture share the metadata; keying on capture state makes
+        # the graph record its own refresh.
+        refreshed = _flydsl_step_refreshed(plan_step_owner)
+        mark = (plan_key, torch.cuda.is_current_stream_capturing())
+        if plan is not None and mark in refreshed:
+            return plan
+        refreshed.add(mark)
+    if plan is None:
+        budget = (
+            {} if workgroup_budget is None else {"workgroup_budget": workgroup_budget}
+        )
+        # A refresh keeps the plan's max_batch_size, so set it at creation.
+        if num_seqs > _FLYDSL_PLAN_MAX_BATCH:
+            budget["max_batch_size"] = num_seqs
+        plan = plan_pa_decode(
+            lengths,
+            num_kv_heads,
+            max_partitions=max_partitions,
+            query_length=query_length,
+            **budget,
+        )
+        plans[plan_key] = plan
+        if plan_cache_owner is None:
+            logger.info(
+                "flydsl plan: batch=%d ql=%d context_bound=%d "
+                "kv_heads=%d max_partitions=%d capacity=%d",
+                num_seqs,
+                query_length,
+                context_bound,
+                num_kv_heads,
+                int(plan.max_partitions),
+                int(plan.capacity),
+            )
+    else:
+        plan_pa_decode(
+            lengths,
+            num_kv_heads,
+            query_length=query_length,
+            plan=plan,
+        )
+    return plan
+
+
+def flydsl_decode_seqs(*, max_context_length=None, **kwargs):
+    """Sequence count FlyDSL's paged decode takes a run_pa_decode call with.
+
+    False when FlyDSL is off, None when the call is outside FlyDSL's domain.
+    """
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(**kwargs)
+    # aiter's planner rejects more sequences than one plan holds.
+    if flydsl_seqs and flydsl_seqs > _flydsl_plan_max_batch():
+        flydsl_seqs = None
+    # Only on the FlyDSL path; a bound below the query window declines the call.
+    if flydsl_seqs:
+        context_bound = _flydsl_context_bound(
+            max_context_length, kwargs["block_tables"], kwargs["k_cache"]
+        )
+        if context_bound < kwargs["max_seqlen_q"]:
+            flydsl_seqs = None
+    return flydsl_seqs
 
 
 def run_pa_decode(
@@ -341,14 +590,18 @@ def run_pa_decode(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     *,
-    exp_sums: torch.Tensor,
-    max_logits: torch.Tensor,
-    temporary_output: torch.Tensor,
+    exp_sums: torch.Tensor | None = None,
+    max_logits: torch.Tensor | None = None,
+    temporary_output: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
     ps: bool = True,
     work_plan=None,
+    max_context_length: int | None = None,
+    plan_step_owner=None,
+    plan_cache_owner=None,
+    plan_partition_cap: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -356,12 +609,16 @@ def run_pa_decode(
     it dispatched only gluon until ``ATOM_PA_FLYDSL`` arrived, and four call
     sites -- including the vLLM and SGLang bridges -- import it.
 
-    gluon unless ``ATOM_PA_FLYDSL=1``, and then only where FlyDSL's domain
-    covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's own
-    validation so an unsupported shape falls back here instead of raising
-    inside aiter.
+    gluon unless ``ATOM_PA_FLYDSL=1``, and then only where FlyDSL's
+    domain covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's
+    own validation. Unsupported shapes fall back on GPUs with gluon support;
+    a GPU without gluon raises an explicit error.
+
+    ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
+    Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
+    call, which uses its plan's cached scratch, allocates none.
     """
-    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
+    flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
         k_cache=k_cache,
@@ -377,19 +634,20 @@ def run_pa_decode(
         sinks=sinks,
         sliding_window=sliding_window,
         ps=ps,
+        max_context_length=max_context_length,
     )
     # Inside the guard, not before it: this runs 63 times per decode step and
-    # attention is a piecewise split op, so graph replay does not elide it. A
-    # deployment that never enables FlyDSL should pay nothing here.
+    # attention is an eager region of the token graphs, so replay does not
+    # elide it. A deployment that never enables FlyDSL should pay nothing here.
     #
     # Bounded on purpose: the row counts vary per step -- the sparse sites see a
     # new one on every prefill tail -- so keying on them leaks one entry and one
     # log line per distinct length for the life of the process.
     # `is not False` distinguishes the two falsy cases the `and` above produces:
-    # False means the env is off (log nothing -- a deployment that never enables
-    # this must not pay for it, and this runs 63x per step on a piecewise split
-    # op that graph replay does not elide), None means the env is on and the
-    # capability check rejected, which is exactly what the log exists to show.
+    # False means FlyDSL is off (log nothing -- such a deployment must not pay
+    # for it, and this runs 63x per step in an eager region that token-graph
+    # replay does not elide), None means it is on and the capability check
+    # rejected, which is exactly what the log exists to show.
     # The residual cost when off is one envs read; hoisting that to a module
     # constant would make the env unpatchable, which the tests rely on.
     if (
@@ -399,9 +657,16 @@ def run_pa_decode(
     ):
         _flydsl_pa_routed.add(route_sig)
         logger.info(
-            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
-            "head_dim=%d %s)",
-            f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
+            "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d head_dim=%d %s)",
+            (
+                f"flydsl[{flydsl_seqs} seqs]"
+                if flydsl_seqs
+                else (
+                    "gluon"
+                    if pa_decode_gluon_supports_arch()
+                    else "unsupported(no gluon)"
+                )
+            ),
             q.shape[0],
             max_seqlen_q,
             context_lens.shape[0],
@@ -413,18 +678,17 @@ def run_pa_decode(
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         n = flydsl_seqs
+        context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
         # Handed in by the caller off the ForwardContext it already holds, not
         # re-read from the thread-local one: under TBO a worker thread that
         # never installed its own context would read whatever the other ubatch
         # wrote last, and the shape guard below compares only batch and kv-head
-        # count -- two equal-sized ubatches pass. Which call sites pass a plan
-        # is the boundary: the sparse sites and the vLLM/SGLang bridges do not.
+        # count -- two equal-sized ubatches pass. Only the native dense sites
+        # pass a capture-owned plan; the others get a runtime plan below.
         if work_plan is not None and not flydsl_plan_matches(
             work_plan, flydsl_seqs, k_cache.shape[1]
         ):
-            # Static path: slower, not fatal. Logged because the planner
-            # keeps refreshing a plan nothing reads, which looks exactly
-            # like "the planner does not help" in an A/B.
+            # Not fatal: rebuild a compatible explicit plan below.
             # Keyed on the plan's batch alone, which is a capture-ladder
             # rung and therefore bounded. The op's own count is not: the
             # case this warning exists for is a non-unified DP step, where
@@ -433,24 +697,35 @@ def run_pa_decode(
             if plan_n not in _flydsl_plan_refused:
                 _flydsl_plan_refused.add(plan_n)
                 logger.warning(
-                    "flydsl work plan refused, falling back to the static "
-                    "path: op wants %d seqs, plan was built for %d",
+                    "flydsl work plan refused; rebuilding an explicit plan: "
+                    "op wants %d seqs, plan was built for %d",
                     flydsl_seqs,
                     plan_n,
                 )
             work_plan = None
-        if work_plan is None:
-            es, ml, tmp = exp_sums[:n], max_logits[:n], temporary_output[:n]
-        else:
-            nkv = k_cache.shape[1]
-            es, ml, tmp = _flydsl_plan_scratch(
-                work_plan,
-                max_seqlen_q,
-                q.shape[-2] // nkv,
-                q.shape[-1],
-                output.dtype,
-                context_lens.device,
-            )
+
+        # aiter #5809 needs an explicit plan on every call.
+        work_plan = _flydsl_prepare_explicit_plan(
+            q=q,
+            k_cache=k_cache,
+            context_lens=context_lens,
+            num_seqs=n,
+            query_length=max_seqlen_q,
+            plan_partition_cap=plan_partition_cap,
+            context_bound=context_bound,
+            existing_plan=work_plan,
+            plan_step_owner=plan_step_owner,
+            plan_cache_owner=plan_cache_owner,
+        )
+        es, ml, tmp = _flydsl_plan_scratch(
+            work_plan,
+            max_seqlen_q,
+            q.shape[-2] // k_cache.shape[1],
+            q.shape[-1],
+            output.dtype,
+            context_lens.device,
+            plan_cache_owner=plan_cache_owner,
+        )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
@@ -463,20 +738,11 @@ def run_pa_decode(
             block_tables[:n],
             softmax_scale,
             max_seqlen_q,
-            # A planned call is told the plan's own ceiling -- the only value
-            # `pa_decode` accepts, since it asserts the two are equal. The
-            # static one gets the count `get_recommended_splits` sized the
-            # scratch for.
-            (
-                max_context_partition_num
-                if work_plan is None
-                else int(work_plan.max_partitions)
-            ),
-            context_partition_size,
-            compute_type,
-            q_scale,
-            k_scale,
-            v_scale,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            query_scale=q_scale,
+            key_scale=k_scale,
+            value_scale=v_scale,
             exp_sums=es,
             max_logits=ml,
             temporary_output=tmp,
@@ -484,8 +750,16 @@ def run_pa_decode(
             sinks=sinks,
             sliding_window=0,
             work_plan=work_plan,
+            max_context_length=context_bound,
         )
 
+    if not pa_decode_gluon_supports_arch():
+        raise RuntimeError(
+            "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
+            if not envs.ATOM_PA_FLYDSL
+            else "FlyDSL paged decode does not take this call and this GPU "
+            f"has no gluon fallback (q {tuple(q.shape)}, {compute_type})"
+        )
     return torch.ops.aiter.pa_decode_gluon(
         output,
         q,
@@ -538,7 +812,8 @@ def cp_mha_gather_cache_kernel(
     CACHE_FORMAT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    # Packed KV output offsets can exceed int32 for long cached batches.
+    token_id = tl.program_id(0).to(tl.int64)
     head_id = tl.program_id(1)
     # BLOCK_SIZE is rounded up to next pow2 at the call site (tl.arange requires
     # pow2); col_mask guards stores/loads when head_size is non-pow2 (e.g. MiMo SWA=192).
@@ -730,6 +1005,7 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
+@eager_region()
 def unified_attention_with_output_base(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
@@ -750,6 +1026,11 @@ def unified_attention_with_output_base(
             positions=positions,
             q_scale=q_scale,
         )
+    elif getattr(self, "sp_columns", None) is not None:
+        # Ulysses: trade this rank's token chunk for its head slice around the
+        # unchanged impl. Inside the custom op, so the collectives stay opaque.
+        out, rows = ulysses_attention(self, q, k, v, positions, q_scale, qkv)
+        return gather_heads(out, rows, self.sp_head_exchange)
     else:
         return self.impl.forward(
             query=q,
@@ -776,6 +1057,7 @@ def linear_attention_with_output_base_fake(
     gen_fake=linear_attention_with_output_base_fake,
     mutates_args=[],
 )
+@eager_region()
 def linear_attention_with_output_base(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,

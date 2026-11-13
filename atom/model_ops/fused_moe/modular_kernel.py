@@ -76,7 +76,10 @@ class FusedMoEPrepareAndFinalize(ABC):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_type: QuantType = QuantType.No,
+        x_scale: torch.Tensor | None = None,
     ) -> PrepareResultType:
+        """`x_scale`: `a1` arrived already in the dispatch wire, with these
+        e8m0 rows; None: `a1` is as the model produced it."""
         raise NotImplementedError
 
     def supports_async(self) -> bool:
@@ -94,6 +97,7 @@ class FusedMoEPrepareAndFinalize(ABC):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        x_scale: torch.Tensor | None = None,
     ) -> tuple[Callable, ReceiverType] | ReceiverType:
         raise NotImplementedError
 
@@ -170,6 +174,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_type: QuantType = QuantType.No,
+        x_scale: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -199,6 +204,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 apply_router_weight_on_input,
                 self.quant_config,
                 quant_type,
+                x_scale=x_scale,
             )
         else:
             from atom.utils.tbo.ubatching import (
@@ -216,6 +222,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 global_num_experts,
                 expert_map,
                 apply_router_weight_on_input,
+                x_scale=x_scale,
             )
             if isinstance(result, tuple):
                 hook, receiver = result
@@ -376,7 +383,10 @@ class FusedMoEModularKernel(torch.nn.Module):
         hidden_pad: int | None = 0,
         intermediate_pad: int | None = 0,
         moe_extra_args: dict | None = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """`x_scale`: `hidden_states` arrived already in the dispatch wire (the
+        method's `routed_rows_wire`), with these e8m0 rows."""
 
         if inplace and self.shared_experts is None and not disable_inplace():
             output = hidden_states
@@ -400,6 +410,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_map,
             apply_router_weight_on_input,
             quant_type,
+            x_scale=x_scale,
         )
 
         # mori dispatch expands the receive buffer to
@@ -457,6 +468,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             # EP-specific argument: routing() never produces dead gates, but
             # routing_from_dispatched does.
             from atom.model_ops.fused_moe_triton import (
+                MXFP4_DTYPES,
                 routing_from_dispatched,
                 triton_kernel_fused_experts,
             )
@@ -515,13 +527,19 @@ class FusedMoEModularKernel(torch.nn.Module):
                 tokens_per_rank = _ctx.running_tokens
                 M_eff = min(M_full, tokens_per_rank * get_dp_group().world_size)
 
+            # A quantizing dispatch wire hands the experts its payload with the
+            # e8m0 rows alongside; they take both as they arrived.
+            a1_eff, scale_eff = dispatch_a1, dispatch_scale
+            ids_eff, wts_eff = dispatch_ids, dispatch_weights
             if M_eff < M_full:
                 # Views, not copies.
-                a1_eff = dispatch_a1[:M_eff]
-                ids_eff = dispatch_ids[:M_eff]
-                wts_eff = dispatch_weights[:M_eff]
-            else:
-                a1_eff, ids_eff, wts_eff = dispatch_a1, dispatch_ids, dispatch_weights
+                a1_eff, ids_eff, wts_eff = (
+                    a1_eff[:M_eff],
+                    ids_eff[:M_eff],
+                    wts_eff[:M_eff],
+                )
+                if scale_eff is not None:
+                    scale_eff = scale_eff[:M_eff]
 
             if ep_scatter_target is not None:
                 # Nothing is reduced here, so there is no per-token output to
@@ -539,13 +557,17 @@ class FusedMoEModularKernel(torch.nn.Module):
                 # rows are never read. Zeroing them would cost a ~147 MB memset
                 # per layer and buy nothing.
                 #
-                # GEMM2's output width is w2's N, which is the hidden size the
+                # GEMM2 writes bf16 rows of w2's N, the hidden size the
                 # activations came in with -- the experts are a K->N->K round
-                # trip -- so a1's trailing dim sizes this without reaching into
-                # the (pre-shuffled, hence misleading) weight shape.
+                # trip -- so a1 sizes this without reaching into the
+                # (pre-shuffled, hence misleading) weight shape: its trailing
+                # dim, twice that where a quantizing wire packs e2m1 pairs.
+                hidden = dispatch_a1.shape[-1] * (
+                    2 if dispatch_a1.dtype in MXFP4_DTYPES else 1
+                )
                 full_out = torch.empty(
-                    (M_full, dispatch_a1.shape[-1]),
-                    dtype=dispatch_a1.dtype,
+                    (M_full, hidden),
+                    dtype=torch.bfloat16,
                     device=dispatch_a1.device,
                 )
                 y_out = full_out[:M_eff]
@@ -602,6 +624,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 gate_valid=gate_valid,
                 y_out=y_out,
                 ep_scatter=ep_scatter,
+                x_scale=scale_eff,
             )
 
             if full_out is not None:

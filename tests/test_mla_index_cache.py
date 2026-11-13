@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from atom.models.utils import get_pp_indices
-from atom.utils.forward_context import get_published_dcp_local_context_lens
+from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
 
 try:
     import aiter  # noqa: F401
@@ -18,9 +18,39 @@ try:
     from atom.model_ops.attentions.aiter_mla import (
         AiterMLAMetadataBuilder,
         _pad_prefill_mla_draft_tail,
+        indexes_by_token_table,
     )
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_the_persistent_decode_is_any_mla_layers(persistent):
+    """The step's dense work plan is read on the persistent kernel when any
+    MLA layer decodes there (`MLAAttention.decode_is_persistent`); a ragged
+    step is refused then, its plan laying sequences `max_seqlen_q` apart."""
+
+    def impl(on_persistent):
+        cls = type(
+            "Impl",
+            (aiter_mla.MLAAttention,),
+            {"decode_is_persistent": lambda self: on_persistent},
+        )
+        return cls.__new__(cls)
+
+    sfc = {
+        "layers.0.attn": SimpleNamespace(impl=impl(False)),
+        "layers.1.attn": SimpleNamespace(impl=impl(persistent)),
+        "layers.1.mlp": SimpleNamespace(),
+    }
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            config=SimpleNamespace(
+                compilation_config=SimpleNamespace(static_forward_context=sfc)
+            )
+        )
+    )
+    assert AiterMLAMetadataBuilder._decode_runs_persistent(builder) is persistent
 
 
 def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
@@ -31,6 +61,43 @@ def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
 
 def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert aiter_mla._global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_dsa_layers_price_only_the_real_index_layers(monkeypatch):
+    from atom.config import flatten_dsa_config
+
+    # A hybrid stack: every fourth layer is full attention and owns an index
+    # plane; the layers between are linear attention.
+    full_layers = [4, 8, 12]
+    hf = SimpleNamespace(
+        num_hidden_layers=12,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        linear_attn_config={"full_attn_layers": full_layers},
+        dsa_config={
+            "dsa_layers": full_layers,
+            "index_topk": 2048,
+            "index_num_heads": 32,
+            "index_head_dim": 128,
+            "index_rope_dim": 0,
+            "index_topk_freq": 1,
+        },
+    )
+    flatten_dsa_config(hf)
+    builder, runner = _builder(None, total_local_layers=len(full_layers))
+    runner.config.hf_config = hf
+    runner.config.speculative_config = None
+    runner.config.kv_cache_dtype = "bf16"
+    runner.block_size = 128
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+    expected = tuple(layer - 1 for layer in full_layers)
+    assert builder._index_cache_layout() == (expected, expected)
+    # This exercises the actual pool declaration/pricing consumer, not just
+    # the config attribute. Index planes on the linear-attention layers would
+    # inflate this by 128 * 144 bytes each for every scheduler PAGE unit.
+    pool = builder._declare_kv_pool()
+    assert pool.entry_bytes == len(full_layers) * 128 * (576 * 2 + 144)
 
 
 def test_padded_prefill_mla_rows_have_empty_initialized_kv_ranges():
@@ -158,8 +225,10 @@ def _builder(
             hf_config=hf_config,
             kv_cache_dtype="fp8",
             speculative_config=SimpleNamespace(
+                # an MTP draft of a sparse target: the target's indexer fields
                 draft_model_hf_config=SimpleNamespace(
                     num_nextn_predict_layers=1,
+                    index_topk=2048,
                 ),
                 use_dspark_with_draft=lambda: False,
             ),
@@ -193,8 +262,9 @@ def test_pp_shared_indexer_uses_the_producer_buffer_width(monkeypatch):
             num_hidden_layers=4,
             indexer_types=("full", "shared", "shared", "full"),
             index_topk=2048,
-            index_topk_freq=1,
-            index_skip_topk_offset=1,
+            # As GLM-5.2 ships it: index_topk_freq > 1 turns the index cache on.
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
         )
     )
     runner.attn_metadata_builder = SimpleNamespace(index_topk_out=2176)
@@ -265,6 +335,26 @@ def test_a_hybrid_stage_still_finds_its_shared_draft(monkeypatch):
     # which is the difference the subtraction could not see.
     assert global_layer_ids == (1, 3, 5, 6)
     assert local_layer_ids == (3, 5, 6)
+
+
+def test_a_dense_dspark_draft_has_kv_rows_and_no_index_slices(monkeypatch):
+    """Kimi-K3-DSpark on K3.1: five dense MLA layers of its own (no indexer),
+    sharing the target's pool. Its rows are its `num_hidden_layers`, not an MTP
+    predict count, and it owns no index-key slice: the layout is the target's
+    alone. Counting one draft layer with a slice failed K3.1 + DSpark at
+    startup ("5 MLA modules ... declares 1 layers")."""
+    builder, runner = _builder(("full",) * 6, total_local_layers=11, draft_layers=5)
+    runner.config.speculative_config = SimpleNamespace(
+        draft_model_hf_config=SimpleNamespace(num_hidden_layers=5),
+        use_dspark_with_draft=lambda: True,
+    )
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    assert builder._local_draft_rows() == builder._global_num_draft_layers() == 5
+    assert builder._global_num_draft_index_layers() == 0
+    assert global_layer_ids == local_layer_ids == (0, 1, 2, 3, 4, 5)
 
 
 def test_a_draft_cannot_appear_on_a_stage_that_is_not_the_last(monkeypatch):
@@ -414,14 +504,14 @@ def _transfer_stack(num_layers):
     return [torch.zeros(8, dtype=torch.uint8) for _ in range(num_layers)]
 
 
-def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
+def _bind_builder(module, index_cache_layer_map, *, rows_before: int, cls=None):
     """A builder whose walk reaches `module` after `rows_before` MLA layers.
 
     The row is that position, deliberately not the module's `layer_num` -- the
     two agree only while every layer of the model is MLA, which is what the map
     exists to stop being assumed.
     """
-    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder = object.__new__(cls or AiterMLAMetadataBuilder)
     layers = [_MlaLayer() for _ in range(rows_before)] + [module]
     runner = SimpleNamespace(
         index_cache_layer_map=index_cache_layer_map,
@@ -499,6 +589,53 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
 
     assert module.kv_cache == (("kv", 1), (-1, 1, 576))
     assert cache_tensor.index_cache is None
+
+
+@pytest.mark.parametrize(
+    "builder_cls_name",
+    ("KimiAiterMLAGDNMetadataBuilder", "KimiTritonMLAGDNMetadataBuilder"),
+)
+@pytest.mark.parametrize("has_indexer", (False, True))
+def test_kimi_offload_includes_index_bytes(builder_cls_name, has_indexer):
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+    from atom.model_ops.attentions import kimi_mla_gdn_attn
+
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=(
+            SimpleNamespace(k_cache=SimpleNamespace(kv_cache=[None]))
+            if has_indexer
+            else None
+        ),
+    )
+    builder = _bind_builder(
+        module,
+        {3: 0, 5: 1},
+        rows_before=2,
+        cls=getattr(kimi_mla_gdn_attn, builder_cls_name),
+    )
+    builder.model_runner.has_mla_indexer = has_indexer
+    tensors = {
+        "kv": torch.zeros(3, 4, 16, 576, dtype=torch.uint8),
+        "index": torch.zeros(2, 4, 16, 144, dtype=torch.uint8),
+    }
+    builder.kv_pool = SimpleNamespace(
+        entry_dim=576, layer=lambda name, row: tensors[name][row]
+    )
+
+    cache = builder.build_kv_cache_tensor(module)
+    codec = DenseKVByteCodec({"layer5": cache}, num_blocks=4)
+
+    assert cache.k_cache.data_ptr() == tensors["kv"][2].data_ptr()
+    assert codec.bytes_per_block == 16 * (576 + (144 if has_indexer else 0))
+    if has_indexer:
+        assert cache.index_cache.data_ptr() == tensors["index"][1].data_ptr()
+        assert (
+            module.indexer.k_cache.kv_cache[0].data_ptr()
+            == cache.index_cache.data_ptr()
+        )
+    else:
+        assert cache.index_cache is None
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
@@ -589,56 +726,44 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
         var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
 
     builder = object.__new__(AiterMLAMetadataBuilder)
-    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=var,
+        block_size=1,
+        config=SimpleNamespace(max_model_len=1024),
+    )
     builder.block_size = 1
     builder.is_sparse = is_sparse
     builder.dcp_world_size = dcp_world_size
+    builder.index_kpool = 1
+    builder._indexer_fp4 = False
+    builder.index_logits_workspace = None
     builder._publishes_dcp_local_lens = is_sparse and dcp_world_size > 1
-    builder._tbo_full_running_bs = 0
+    builder.indexes_by_token_table = indexes_by_token_table(
+        is_sparse, dcp_world_size, builder.index_kpool
+    )
     builder.dtype_q = None
+    builder.index_topk_out = 2
+    builder._sparse_kv_indices_gpu = torch.zeros(bs * 2, dtype=torch.int32)
+    builder._dcp_sparse_kv_indptr_gpu = torch.zeros(bs + 1, dtype=torch.int32)
+    builder._dcp_owned_counts_gpu = torch.zeros(bs, dtype=torch.int32)
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
     return builder, var
 
 
-def test_cudagraph_capture_publishes_dcp_local_context_lens():
-    builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-
-    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
-
-    torch.testing.assert_close(
-        metadata.dcp_local_context_lens, torch.ones(4, dtype=torch.int32)
-    )
-    assert var["dcp_local_context_lens"].copy_sizes == [4]
-    assert (
-        get_published_dcp_local_context_lens(metadata, 4)
-        is metadata.dcp_local_context_lens
-    )
-
-
 @pytest.mark.parametrize(
-    ("dcp_world_size", "is_sparse"),
-    [(1, True), (4, False)],
+    ("running_bs", "expected"),
+    # ubatch 1 holds the step's last requests: 4 split [0, 2) / [2, 4), 3
+    # split [0, 1) / [1, 3).
+    [(4, [13, 14]), (3, [12, 13])],
 )
-def test_cudagraph_capture_keeps_non_sparse_dcp_paths_independent(
-    dcp_world_size, is_sparse
+def test_a_decode_micro_batch_reads_its_own_copy_of_the_per_token_rows(
+    running_bs, expected
 ):
-    builder, var = _capture_metadata_builder(
-        dcp_world_size=dcp_world_size, is_sparse=is_sparse
-    )
-    assert "dcp_local_context_lens" not in var
-
-    metadata, _ = builder.build_for_cudagraph_capture(bs=4)
-
-    assert metadata.dcp_local_context_lens is None
-
-
-def test_ubatch_metadata_views_full_dcp_local_context_buffer():
+    """A replayed micro-batch reads fixed addresses, so its per-token index
+    rows are its own buffer's, copied from its own tokens -- never a view of
+    the step's at an offset the recording fixed."""
     builder, var = _capture_metadata_builder(dcp_world_size=4, is_sparse=True)
-    builder._tbo_full_running_bs = 4
-    builder._set_ubatch_mla_buffers = lambda *args, **kwargs: None
-    var["dcp_local_context_lens"].gpu.copy_(
-        torch.tensor([11, 12, 13, 14], dtype=torch.int32)
-    )
+    var["dcp_local_context_lens"].np[:4] = [11, 12, 13, 14]
     p = "ub1_"
     for name, size in (
         ("slot_mapping", 2),
@@ -650,6 +775,7 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
         ("kv_last_page_lens", 2),
         ("sparse_kv_indptr", 3),
         ("g_kv_indptr", 3),
+        ("dcp_local_context_lens", 2),
     ):
         var[f"{p}{name}"] = _FakeMetadataBuffer(size)
     for name in (
@@ -662,10 +788,53 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
     ):
         var[f"{p}{name}"] = torch.empty(1)
 
-    metadata = builder.build_ubatch_metadata(ubatch_idx=1, running_bs=2)
+    ub = cut_decode_ubatches(running_bs, running_bs, np.ones(running_bs, np.int32))[1]
+    group = SimpleNamespace(set_counts=lambda counts: None)
+    lens = np.ones(ub.scheduled_bs(running_bs), np.int32)
+    metadata = builder._stage_decode_ubatch(1, ub, lens, None, 1, group)
 
-    torch.testing.assert_close(
-        metadata.dcp_local_context_lens,
-        torch.tensor([13, 14], dtype=torch.int32),
+    rows = var[f"{p}dcp_local_context_lens"]
+    assert rows.np.tolist() == expected
+    assert metadata.dcp_local_context_lens.data_ptr() == rows.gpu.data_ptr()
+    # Its selection starts at its own first token: a layer reusing an earlier
+    # layer's top-k never reads the other micro-batch's. Its compact indptr
+    # one entry later still, past the other's closing one.
+    first = ub.token_slice.start
+    selections = (
+        (metadata.sparse_kv_indices, builder._sparse_kv_indices_gpu, 2 * first),
+        (metadata.dcp_sparse_kv_indptr, builder._dcp_sparse_kv_indptr_gpu, first + 1),
+        (metadata.dcp_owned_counts, builder._dcp_owned_counts_gpu, first),
     )
-    assert "ub1_dcp_local_context_lens" not in var
+    for view, buffer, offset in selections:
+        assert view.data_ptr() == buffer[offset:].data_ptr()
+
+
+def test_pooled_prefill_spans_every_block_table_row():
+    """The gather gives each of the `running_bs` block-table rows a thread that
+    claims its pool span: a padding request's is empty, and the row runs start
+    past all of them."""
+    host = np.zeros(64, dtype=np.int32)
+    builder = SimpleNamespace(
+        index_kpool=4,
+        _pool_row_slices=AiterMLAMetadataBuilder._pool_row_slices,
+        model_runner=SimpleNamespace(
+            forward_vars={
+                "cu_seqlens_q": SimpleNamespace(np=np.array([0, 8, 12])),
+                "index_pool_rows": SimpleNamespace(np=host),
+            }
+        ),
+    )
+    row_ends = np.arange(1, 13, dtype=np.int32)
+    staged = AiterMLAMetadataBuilder._stage_prefill_pool_rows(
+        builder,
+        2,
+        4,
+        row_ends,
+        False,
+        SimpleNamespace(set_counts=lambda counts: None),
+        "",
+    )
+    assert staged.pools == 3
+    assert host[:5].tolist() == [0, 2, 3, 3, 3]
+    # Row starts follow the 4 + 1 prefix: request 0's 8 rows, then request 1's.
+    assert host[5:17].tolist() == [0] * 8 + [2] * 4

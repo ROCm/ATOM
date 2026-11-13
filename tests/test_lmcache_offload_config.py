@@ -59,6 +59,30 @@ def test_page_namespace_is_stable_for_equivalent_config():
     assert first.startswith("org/model::atom-page-v")
 
 
+def test_page_namespace_hashes_a_frontends_stable_speculative_form_even_empty():
+    """Supplied, it is what scheduler and workers agree on, empty or not: the
+    raw config it stands in for holds per-process fields."""
+    first, second = _config(), _config()
+    second.speculative_config.num_speculative_tokens = 5
+    for config in (first, second):
+        config.offload_speculative_config = {}
+    assert offcfg.build_page_namespace(
+        first, _lmcache_config(), 4
+    ) == offcfg.build_page_namespace(second, _lmcache_config(), 4)
+
+
+def test_page_namespace_stabilises_a_frontends_speculative_form():
+    """The frontend's form goes through the same canonical encoding: a dtype
+    hashes as its name, and a non-finite value is refused."""
+    torch = pytest.importorskip("torch")
+    config = _config()
+    config.offload_speculative_config = {"dtype": torch.bfloat16}
+    offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.offload_speculative_config = {"acceptance": float("nan")}
+    with pytest.raises(ValueError, match="finite"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
 def test_page_namespace_supports_torch_dtype_in_speculative_config():
     torch = pytest.importorskip("torch")
     config = _config()
@@ -118,6 +142,13 @@ def test_page_namespace_changes_for_meaningful_geometry(mutate):
     assert offcfg.build_page_namespace(config, cfg, 4) != original
 
 
+def test_page_namespace_tells_mxfp4_kv_pages_from_fp8_ones():
+    plain = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
+    config = _config()
+    config.kv_cache_dtype = "fp4"
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != plain
+
+
 def test_page_namespace_changes_when_code_layout_version_changes():
     current = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
     future = offcfg.build_page_namespace(
@@ -154,32 +185,65 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_linear_model_offload_is_refused(model_type):
-    # A GDN model must be turned away at config resolution, not fall through to
-    # `dense` and restore a KV prefix over its stale recurrent state. Clear
-    # `compress_ratios` so the hybrid branch does not claim it first.
+def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
+    # The PAGE-image tier already packs `page_unit_views`. Falling through to
+    # `dense` would restore KV over a stale slot. Clear `compress_ratios` so
+    # the hybrid branch does not claim the model first.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
 
-    with pytest.raises(ValueError, match="does not support GDN"):
-        offcfg.select_offload_layout(config)
+    assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def test_qwen_offload_classes_inherit_the_k3_tier():
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+        KimiK3OffloadConnector,
+        KimiK3OffloadScheduler,
+    )
+    from atom.kv_transfer.offload.hybrid.qwen.connector import (
+        QwenOffloadConnector,
+        QwenOffloadScheduler,
+    )
+
+    assert issubclass(QwenOffloadConnector, KimiK3OffloadConnector)
+    assert issubclass(QwenOffloadScheduler, KimiK3OffloadScheduler)
+    assert issubclass(QwenOffloadScheduler, StateOffloadFace)
 
 
 @pytest.mark.parametrize(
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_refusal_is_not_bypassed_by_offload_layout_override(model_type):
-    # The refusal must run *before* an explicit override is honoured. Otherwise
-    # `offload_layout: dense` on a GDN checkpoint returns `dense` early and
-    # restores a KV prefix over stale recurrent state (silent wrong output).
+def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
+    # lmcache_mp hashes the PAGE bytes through select_offload_layout. The
+    # family name is ``qwen``, which is not a page-mode key, so the pages stay
+    # the dense MHA mode. An illegal offload_layout override fails here too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+
+    namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    assert namespace.startswith("org/model::atom-page-v")
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
+)
+def test_gdn_state_tier_is_not_downgraded_to_dense(model_type):
+    # An explicit `dense` override must not strip the state tier. Otherwise a
+    # KV prefix is restored over a stale slot.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
     config.kv_transfer_config = {"offload_layout": "dense"}
 
-    with pytest.raises(ValueError, match="does not support GDN"):
+    with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
 
 
@@ -191,6 +255,21 @@ def test_offload_layout_override_cannot_downgrade_kimi_k3_to_dense():
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = "kimi_linear"
     config.kv_transfer_config = {"offload_layout": "dense"}
+
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "override"), [("kimi_linear", "qwen"), ("qwen3_next", "kimi_k3")]
+)
+def test_offload_layout_override_cannot_swap_the_two_state_tiers(model_type, override):
+    # `qwen` and `kimi_k3` both own a state tier, but each for its own family's
+    # state: neither restores the other's, so the swap is refused too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+    config.kv_transfer_config = {"offload_layout": override}
 
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
@@ -324,7 +403,7 @@ def test_unknown_lmcache_override_is_rejected():
         )
 
 
-def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+def _install_metadata_modules(monkeypatch):
     @dataclass
     class _Metadata:
         model_name: str
@@ -346,6 +425,11 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     monkeypatch.setitem(sys.modules, "lmcache", types.ModuleType("lmcache"))
     monkeypatch.setitem(sys.modules, "lmcache.v1", types.ModuleType("lmcache.v1"))
     monkeypatch.setitem(sys.modules, "lmcache.v1.metadata", metadata_module)
+    return _Metadata
+
+
+def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+    _install_metadata_modules(monkeypatch)
 
     scheduler = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 0)
     worker = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 3)
@@ -353,6 +437,78 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     assert scheduler.model_name == worker.model_name
     assert scheduler.worker_id == 0
     assert worker.worker_id == 3
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, [1]), (1, [0, 1]), (4, [4])],
+)
+def test_lmcache_metadata_rejects_lookup_scope_outside_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError) as exc_info:
+        offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+    expected = (
+        "lookup_server_worker_ids must be within the replica-local world "
+        f"[0, {world_size})"
+    )
+    assert expected in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, []), (1, [0]), (4, [0, 3])],
+)
+def test_lmcache_metadata_accepts_lookup_scope_within_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == world_size
+    assert metadata.worker_id == 0
+
+
+@pytest.mark.parametrize("worker_ids", [0, 3])
+def test_lmcache_metadata_rejects_scalar_lookup_scope(monkeypatch, worker_ids):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError, match="must be a list or tuple"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_rejects_duplicate_lookup_scope(monkeypatch):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = [0, 0]
+
+    with pytest.raises(ValueError, match="must not contain duplicate"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_accepts_tuple_lookup_scope(monkeypatch):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = (0, 3)
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == 4
 
 
 def test_page_namespace_survives_a_worker_normalising_hf_config():
@@ -382,3 +538,52 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type, compress_ratios", [("deepseek_v4", [4, 128, 0]), ("llama", None)]
+)
+def test_only_v41_runs_on_its_layout(model_type, compress_ratios):
+    """Another model would run the dense codec under V4.1's namespace."""
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = compress_ratios
+    config.kv_transfer_config = {"offload_layout": "dsv41"}
+    with pytest.raises(ValueError, match="DeepSeek-V4.1's layout"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
+def test_a_state_owning_model_keeps_its_own_layout(override):
+    """Another state-owning layout has no tier for this model's state either."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen3_next"
+    config.kv_transfer_config = {"offload_layout": override}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+    config.kv_transfer_config = {"offload_layout": "qwen"}
+    assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
+    """V4.1 resolved to `hybrid` before it had a layout of its own, and keeps
+    the namespace native ATOM's tiers were filled under. Its window and
+    candidate-block fields move no namespace here, V4.1's or another model's:
+    only the vLLM plugin, which never had such tiers, hashes them."""
+    assert offcfg.PAGE_LAYOUT_VERSION == 3
+
+    def namespace(model_type, **fields):
+        config = _config()
+        config.hf_config.model_type = model_type
+        for name, value in fields.items():
+            setattr(config.hf_config, name, value)
+        return offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+    v41 = namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+    assert v41 == namespace("deepseek_v41", sliding_window=256, candidate_block_size=8)
+    assert namespace("llama", compress_ratios=None) == namespace(
+        "llama", compress_ratios=None, sliding_window=4096, candidate_block_size=64
+    )
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
+    assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)

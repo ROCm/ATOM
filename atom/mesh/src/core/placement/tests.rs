@@ -1346,17 +1346,65 @@ mod f_atom_adapter {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     use super::super::backend::atom::{AtomAdapter, AtomPairCtx, AtomPrefillInfo};
     use super::super::backend::BackendAdapter;
     use super::super::test_support::*;
     use super::super::types::AdapterError;
 
+    #[test]
+    fn atom_chunked_injection_uses_discovery_and_shared_transfer_id() {
+        let mut info = AtomPrefillInfo::default();
+        info.tp_sizes.insert("http://p:8000".into(), 4);
+        info.chunked_transfer.insert(
+            "http://p:8000".into(),
+            json!({
+                "remote_host": "10.0.0.1", "remote_handshake_port": 6301,
+                "remote_pp_size": 3,
+            }),
+        );
+        let adapter = AtomAdapter::new(Arc::new(info));
+        let ctx: super::super::backend::PairCtx = Box::new(AtomPairCtx {
+            transfer_id: "chunked-id".into(),
+            prefill_url: "http://p:8000".into(),
+            prefill_dp_size: 2,
+            prefill_dp_rank: Some(1),
+            decode_dp_rank: None,
+        });
+        let mut p = json!({"prompt": [1, 2, 3], "stream": true, "max_tokens": 10});
+        let mut d = p.clone();
+        adapter.inject_prefill_fields(&mut p, &ctx).unwrap();
+        adapter.inject_decode_fields(&mut d, &ctx).unwrap();
+        assert_eq!(p["kv_transfer_params"]["transfer_id"], "chunked-id");
+        assert_eq!(d["kv_transfer_params"]["transfer_id"], "chunked-id");
+        assert_eq!(p["kv_transfer_params"]["chunked_transfer"], true);
+        assert_eq!(d["kv_transfer_params"]["chunked_transfer"], true);
+        assert_eq!(d["kv_transfer_params"]["do_remote_prefill"], true);
+        assert_eq!(d["kv_transfer_params"]["do_remote_decode"], false);
+        assert_eq!(d["kv_transfer_params"]["remote_pp_size"], 3);
+        assert_eq!(d["kv_transfer_params"]["remote_dp_rank"], 1);
+        assert_eq!(d["kv_transfer_params"]["remote_tp_size"], 4);
+        assert_eq!(d["max_tokens"], 10);
+        assert_eq!(p["max_tokens"], 1);
+        assert_eq!(p["stream"], false);
+        assert!(d["kv_transfer_params"].get("remote_block_ids").is_none());
+        for mut body in [json!({"n": 2}), json!({"prompt": ["a", "b"]})] {
+            let mut decode = body.clone();
+            adapter.inject_prefill_fields(&mut body, &ctx).unwrap();
+            adapter.inject_decode_fields(&mut decode, &ctx).unwrap();
+            assert!(body["kv_transfer_params"].get("chunked_transfer").is_none());
+            assert!(decode.get("kv_transfer_params").is_none());
+        }
+    }
+
     fn atom_info_with(prefill_url: &str, tp_size: usize) -> Arc<AtomPrefillInfo> {
         let mut tp_sizes = HashMap::new();
         tp_sizes.insert(prefill_url.to_string(), tp_size);
-        Arc::new(AtomPrefillInfo { tp_sizes })
+        Arc::new(AtomPrefillInfo {
+            tp_sizes,
+            ..Default::default()
+        })
     }
 
     fn atom_pair_for(
@@ -2116,6 +2164,188 @@ mod h_integration {
                 call.headers.as_ref().and_then(|h| h.get("x-trace")),
                 Some(&"abc".parse().unwrap())
             );
+        }
+    }
+}
+
+mod i_route_metrics {
+    use std::sync::Arc;
+
+    use super::super::planner::DefaultPlanner;
+    use super::super::policy_apply::apply_policy;
+    use super::super::test_support::*;
+    use super::super::traits::{PdPlanner, PolicySource, WorkerSource};
+    use super::super::types::PlacementError;
+    use crate::core::Worker;
+    use crate::policies::PolicyFactory;
+
+    const POLICIES: [&str; 6] = [
+        "random",
+        "round_robin",
+        "dp_sticky",
+        "power_of_two",
+        "cache_aware",
+        "prefix_hash",
+    ];
+
+    fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
+        worker.set_healthy(false);
+        worker
+    }
+
+    /// Sum of the samples of `metric` whose labels include every one of `labels`.
+    fn total(rendered: &str, metric: &str, labels: &[&str]) -> f64 {
+        rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with(metric) && labels.iter().all(|label| line.contains(label))
+            })
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn every_policy_records_one_decision_per_selection() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let candidates = [
+            make_regular_http("http://w1:8000", "m"),
+            make_regular_http("http://w2:8000", "m"),
+        ];
+        let tokens = [1, 2, 3];
+        let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
+
+        for name in POLICIES {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+                .await
+                .unwrap();
+        }
+
+        let rendered = handle.render();
+        for name in POLICIES {
+            let labels = [r#"pool="regular""#, &format!("policy=\"{name}\"")];
+            for metric in [
+                "mesh_route_branch_total{",
+                "mesh_route_selected_worker_active_requests_count{",
+            ] {
+                assert_eq!(
+                    total(&rendered, metric, &labels),
+                    1.0,
+                    "{name} {metric}\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_selection_without_healthy_candidates_counts_once_in_its_pool() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let candidates = [
+            unhealthy(make_prefill_http("http://p1:8000", "m", None)),
+            unhealthy(make_prefill_http("http://p2:8000", "m", None)),
+        ];
+        let tokens = [1, 2, 3];
+        let descriptor = make_descriptor(Some("m"), Some("hello"), Some(&tokens), None);
+
+        for name in POLICIES {
+            let policy = PolicyFactory::create_by_name(name).unwrap();
+            let err = apply_policy(&candidates, policy.as_ref(), &descriptor, None)
+                .await
+                .unwrap_err();
+            assert_eq!(err, PlacementError::PolicyReturnedNone, "{name}");
+        }
+
+        let rendered = handle.render();
+        for name in POLICIES {
+            let policy = format!("policy=\"{name}\"");
+            let failure = [
+                r#"pool="prefill""#,
+                policy.as_str(),
+                r#"branch="no_healthy_workers""#,
+            ];
+            let branches = "mesh_route_branch_total{";
+            assert_eq!(
+                total(&rendered, branches, &failure),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            assert_eq!(
+                total(&rendered, branches, &[&policy]),
+                1.0,
+                "{name}\n{rendered}"
+            );
+            let samples = "mesh_route_selected_worker_active_requests_count{";
+            assert_eq!(
+                total(&rendered, samples, &[&policy]),
+                0.0,
+                "{name}\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_candidates_counts_once_as_no_healthy_workers() {
+        let cases = [
+            (
+                "regular",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_regular_http("http://r1:8000", "m")))
+                    .add_worker(unhealthy(make_regular_http("http://r2:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new()
+                    .add_worker(unhealthy(make_prefill_http("http://p:8000", "m", None)))
+                    .add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new()
+                    .add_worker(make_prefill_http("http://p:8000", "m", None))
+                    .add_worker(unhealthy(make_decode_http("http://d:8000", "m"))),
+                PlacementError::NoAvailableWorkers,
+            ),
+            (
+                "prefill",
+                MockWorkerSource::new().add_worker(make_decode_http("http://d:8000", "m")),
+                PlacementError::NoPrefillWorkers,
+            ),
+            (
+                "decode",
+                MockWorkerSource::new().add_worker(make_prefill_http("http://p:8000", "m", None)),
+                PlacementError::NoDecodeWorkers,
+            ),
+        ];
+
+        for (pool, workers, expected) in cases {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let planner = DefaultPlanner::new(
+                Arc::new(workers) as Arc<dyn WorkerSource>,
+                Arc::new(MockPolicySource::new()) as Arc<dyn PolicySource>,
+            );
+
+            let err = planner
+                .plan(&make_descriptor(Some("m"), None, None, None))
+                .await
+                .unwrap_err();
+            assert_eq!(err, expected, "{pool}");
+            let rendered = handle.render();
+            let branches: Vec<_> = rendered
+                .lines()
+                .filter(|line| line.starts_with("mesh_route_branch_total{"))
+                .collect();
+            let line = format!(
+                r#"mesh_route_branch_total{{pool="{pool}",policy="round_robin",branch="no_healthy_workers"}} 1"#
+            );
+            assert_eq!(branches, [line.as_str()], "{expected:?}");
         }
     }
 }

@@ -31,6 +31,15 @@ def _spin(load_all, pending):
     return v
 
 
+@traced
+def sleep_ticks(ticks: int):
+    """Wait ``ticks`` of s_memrealtime (100 MHz): a harness's injected delay,
+    to hold a race's window open (never in a production build)."""
+    t0 = memrealtime()
+    while memrealtime() - t0 < ticks:
+        rocdl.s_sleep(1)
+
+
 # a debug build's mailbox wait gives up after this long (100 MHz ticks: 10 s)
 DIAG_TICKS = 10 * 100_000_000
 
@@ -160,9 +169,19 @@ class Mailbox:
             cache_modifier=_SCOPE_CM[a.space],
         )
 
+    def spin(self, a, index, load_all, pending):
+        """Re-issue ``load_all`` until ``pending`` clears: a wait in region
+        ``a`` (its word ``index``), bounded and named in a debug build's
+        report like every pair's (``poll``). A wait on plain words (counts
+        that say themselves when they are in) comes this way too."""
+        if const_expr(self.diag is None):
+            return _spin(load_all, pending)
+        rid = self.region_ids.get(a.region, -1)
+        return _spin_bounded(load_all, pending, self.diag, rid, index, self.tag)
+
     def poll(self, specs, batch=POLL_MAX):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
-        all of one space.
+        each loaded at its own space's scope.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
         one round trip after its last producer lands. Returns the value words."""
@@ -170,15 +189,13 @@ class Mailbox:
             return []
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
-        spaces = {a.space for a, _, _ in specs}
-        assert len(spaces) == 1, f"one poll batch spans {spaces}"
-        cm = _SCOPE_CM[spaces.pop()]
+        cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
         bases = [_noted(a, "poll") for a, _, _ in specs]
         tag = self.tag
 
         def load_all():
             words = []
-            for b, (_, i, n) in zip(bases, specs):
+            for b, cm, (_, i, n) in zip(bases, cms, specs):
                 w = fx.Vector(
                     bo.buffer_load(
                         rsrc(b),
@@ -199,11 +216,7 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        if const_expr(self.diag is None):
-            v = _spin(load_all, pending)
-        else:
-            rid = self.region_ids.get(specs[0][0].region, -1)
-            v = _spin_bounded(load_all, pending, self.diag, rid, specs[0][1], tag)
+        v = self.spin(specs[0][0], specs[0][1], load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

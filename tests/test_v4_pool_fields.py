@@ -22,6 +22,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import entry_bytes_for
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_DATA,
     CSA_INDEXER_SCALE,
+    FP4_GFX950_OPUS,
     FP4_GFX950_PRESHUFFLE,
     FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
@@ -113,9 +114,20 @@ class TestIndexerBlockRegions:
         assert scale.bytes_per_entry == 256
         assert data.dtype is scale.dtype is torch.uint8
 
-    def test_fp4_layout_is_architecture_specific(self):
-        assert fp4_indexer_layout_for_arch("gfx950") == FP4_GFX950_PRESHUFFLE
-        assert fp4_indexer_layout_for_arch("gfx1250") == FP4_GFX1250_NATURAL
+    def test_fp4_layout_is_architecture_and_backend_specific(self):
+        assert (
+            fp4_indexer_layout_for_arch("gfx950", backend="flydsl")
+            == FP4_GFX950_PRESHUFFLE
+        )
+        for backend in ("opus", "flydsl"):
+            assert (
+                fp4_indexer_layout_for_arch("gfx1250", backend=backend)
+                == FP4_GFX1250_NATURAL
+            )
+        assert fp4_indexer_layout_for_arch("gfx950", backend="opus") == FP4_GFX950_OPUS
+        data, scale = fp4_indexer_block_fields(64, 128, FP4_GFX950_OPUS)
+        assert data.shape == (4, 64, 16) and scale.shape == (2, 32, 4)
+        assert data.bytes_per_entry + scale.bytes_per_entry == 4352
 
     def test_regions_are_a_prefix_sum_with_nothing_between_them(self):
         fields = fp8_indexer_block_fields(64, 128, torch.uint8)

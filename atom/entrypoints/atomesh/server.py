@@ -92,12 +92,12 @@ def print_version(verbose: bool = False) -> None:
 
 def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
     from atom.model_engine.arg_utils import EngineArgs
-    from atom.model_engine.llm_engine import _load_tokenizer
+    from atom.model_engine.llm_engine import load_tokenizer
 
     global engine, tokenizer
 
     logger.info("Loading tokenizer from %s...", args.model)
-    tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
 
     logger.info("Initializing engine with model %s...", args.model)
     engine_args = EngineArgs.from_cli_args(args)

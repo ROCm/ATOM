@@ -333,7 +333,7 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
     method.hidden_pad = 0
     method.intermediate_pad = 0
     method.fused_experts = None
-    method.select_experts_with_record = lambda **_k: ("topk_weights", "topk_ids")
+    method.triton_identity_expert_map = "identity_map"
     method._triton_views_of_flydsl_weights = lambda _layer: (
         "w13_view",
         "w2_view",
@@ -384,6 +384,12 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
         swiglu_limit=0.0,
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
+        top_k=4,
+        use_grouped_topk=False,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=None,
+        custom_routing_function=None,
+        shared_expert_scoring_func=None,
     )
     captured["flydsl_calls"] = flydsl_calls
     return method, layer, captured
@@ -397,9 +403,8 @@ def test_prefill_falls_through_to_flydsl(monkeypatch):
     result = method.apply(
         layer=layer,
         x="x",
-        router_logits="router_logits",
-        top_k=4,
-        renormalize=False,
+        topk_weights="topk_weights",
+        topk_ids="topk_ids",
         global_num_experts=16,
         expert_map=None,
         activation="silu",
@@ -420,22 +425,27 @@ def test_decode_takes_triton_over_a_view_of_the_flydsl_weights(monkeypatch):
     method, layer, captured = _apply_dispatch_probe(
         monkeypatch, use_triton_decode=True, is_prefill=False
     )
-    # Reach the fused-experts call without standing up aiter's real routing().
-    import aiter.ops.triton.moe.moe_routing.routing as routing_mod
+    # Reach the fused-experts call without standing up aiter's real sort.
+    import atom.model_ops.fused_moe_triton as triton_mod
 
     monkeypatch.setattr(
-        routing_mod,
-        "routing",
-        lambda *a, **k: (SimpleNamespace(n_expts_act=4), "gather", "scatter"),
+        triton_mod,
+        "routing_from_dispatched",
+        lambda *a, **k: (
+            SimpleNamespace(n_expts_act=4),
+            "gather",
+            "scatter",
+            "gate_valid",
+            None,
+        ),
     )
     monkeypatch.setattr(torch, "empty_like", lambda _x: "out", raising=False)
 
     result = method.apply(
         layer=layer,
         x="x",
-        router_logits=SimpleNamespace(shape=(2, 16)),
-        top_k=4,
-        renormalize=False,
+        topk_weights=torch.zeros(2, 4),
+        topk_ids=torch.zeros(2, 4, dtype=torch.int32),
         global_num_experts=16,
         expert_map=None,
         activation=moe_mod.ActivationType.Silu,

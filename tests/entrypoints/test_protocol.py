@@ -314,6 +314,24 @@ class TestCompletionRequest:
         req = CompletionRequest.model_validate({"prompt": "Hi", "n": 3})
         assert req.n == 3
 
+    def test_prompt_as_token_array(self):
+        """OpenAI's `prompt` may be an array of token ids; it must take the
+        pre-tokenized path, exactly as `prompt_token_ids` does."""
+        req = CompletionRequest.model_validate({"prompt": [128000, 9906, 1917]})
+        assert req.prompt == [128000, 9906, 1917]
+        assert req.get_prompt_or_tokens() == [128000, 9906, 1917]
+
+    def test_prompt_token_array_takes_same_path_as_prompt_token_ids(self):
+        by_prompt = CompletionRequest.model_validate({"prompt": [1, 2, 3]})
+        by_ids = CompletionRequest.model_validate({"prompt_token_ids": [1, 2, 3]})
+        assert by_prompt.get_prompt_or_tokens() == by_ids.get_prompt_or_tokens()
+
+    def test_empty_prompt_token_array_rejected(self):
+        """An empty array would otherwise reach the engine as an empty prompt."""
+        req = CompletionRequest.model_validate({"prompt": []})
+        with pytest.raises(ValueError, match="token array but is empty"):
+            req.get_prompt_or_tokens()
+
 
 # ============================================================================
 # Response Model Tests

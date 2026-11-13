@@ -132,3 +132,34 @@ def test_migrate_and_commit_chunk_passes_same_stream(monkeypatch):
     )
     assert seen["migrate_stream"] is stream_obj
     assert seen["commit_stream"] is stream_obj
+
+
+class _FakeEpMoe(torch.nn.Module):
+    def __init__(self, layer_id, *, use_ep: bool = True):
+        super().__init__()
+        self.layer_id = layer_id
+        self.use_ep = use_ep
+        self.w13_weight = torch.zeros(1)
+        self.w2_weight = torch.zeros(1)
+
+
+class _FakeTarget(torch.nn.Module):
+    """DSR1-shaped: dense layers have no expert weights; MoE ids start at 3."""
+
+    def __init__(self, second_moe_id: int = 4):
+        super().__init__()
+        self.dense0 = torch.nn.Identity()
+        self.moe3 = _FakeEpMoe(3)
+        self.moe4 = _FakeEpMoe(second_moe_id)
+
+
+def test_dsr1_eplb_collects_gapped_layer_ids():
+    model = _FakeTarget()
+    layers = eplb.collect_ep_moe_layers(model)
+    assert sorted(layers) == [3, 4]
+    assert layers[3] is model.moe3
+
+
+def test_eplb_rejects_duplicate_layer_id():
+    with pytest.raises(RuntimeError, match="layer_id=3"):
+        eplb.collect_ep_moe_layers(_FakeTarget(second_moe_id=3))

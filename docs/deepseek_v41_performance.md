@@ -51,14 +51,21 @@ and buffer addresses remain fixed across steps. Padding tokens carry V4's
 
 ## Cache format and attention boundary
 
-The main pool accepts `kv_cache_dtype="bf16"` or `"fp4"`. The index plane is
-independent: `index_cache_dtype="fp8"` (default) or `"fp4"`.
+The main pool accepts `kv_cache_dtype="fp8"` (the deployed configuration),
+`"bf16"` or `"fp4"`. The index plane is independent: `index_cache_dtype="fp8"`
+(default) or `"fp4"`.
 
-| Region | BF16 main-pool configuration | FP4 main-pool configuration |
-|---|---|---|
-| Main KV, 512 dimensions | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
-| SWA, 512 dimensions | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
-| Index keys, 128 dimensions | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+| Region | FP8 main-pool configuration | BF16 main-pool configuration | FP4 main-pool configuration |
+|---|---|---|---|
+| Main KV, 512 dimensions | MXFP8: E4M3 with E8M0 scales, group 32 (528 B a row) | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
+| SWA, 512 dimensions | Same MXFP8 rows | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
+| Index keys, 128 dimensions | Per `index_cache_dtype` | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
+
+The FP8 pool holds 1.84x the rows of the BF16 one. Its rows are addressed like
+BF16 ones (int32 row indices), and attention reads them as they are stored:
+the query is quantized to the same MXFP8 format, and AITER's
+`mla_sparse_prefill_v41` (`fp8_attention.sparse_attn_v41_paged_2src`) attends
+over the pool and the window, prefill and decode alike.
 
 The index writer stores scales as FP32 in preshuffled tiles. Global owner
 regions share block IDs while keeping separate index planes. FP32 compressor
@@ -72,10 +79,20 @@ passes ordinary int32 row indices to V4 attention. Prefill keeps the current
 chunk in BF16; decode preserves V4's batch size and split-K dispatch. Neither
 path materializes the entire historical main KV pool.
 
-Packed PAGE writes reuse V4's sentinel-aware `swa_scatter_rows`. A zero-copy
-view preserves gaps between PAGE fields, and compression-plan offsets select
-the destination rows. Padding rows are skipped on the device, including during
-graph replay.
+On the BF16 pool (and on the FP8 pool through its MXFP8 twin above), decode
+attention reads two sources (`sparse_attn_v4_paged_2src`): the selection from
+the pool, and the window
+through the layer's own ring (`ring_view`), whose rows are one list shared by
+every layer. An index group's layers share one selection plane. The OPUS kernel
+splits each token's keys across blocks when the step has too few tokens to
+fill the GPU.
+
+A compressed main row is written by the compressor's own kernel
+(`fused_compress_attn`) in the pool's row format: BF16, or on the FP8 / FP4
+pools (`quant_mode` "packed_fp8" / "packed_fp4") the row rounded to BF16 and
+quantized by `quantize_fp8` / `quantize_fp4`'s rule, values then scales. The
+kernel resolves each plan row's PAGE through the block table; padding rows are
+skipped on the device, including during graph replay.
 
 ## Graph ownership
 
@@ -92,15 +109,20 @@ occurs during input preparation, since replay does not execute Python.
 
 Startup capture uses the serving allocation and block 0 for synthetic
 requests. The runtime validator checks that capture preserves live cache pages.
-`PIECEWISE` is also accepted by the runtime; development and validation use
+`TR_HYBRID` is also accepted by the runtime; development and validation use
 level 0, and broader compiler support remains outside the supported scope.
 
 ## Memory and numerical limits
 
-The paged scorer bands queries at the int32 addressing limit. A large band can
-require nearly 8 GiB of FP32 logits; quantized queries, tile tables and selection
-workspace occupy additional memory. Reserve scratch headroom when sizing
-long-context workloads. Visibility-sized scratch remains optimization work.
+The FP4 index plane packs the scorer's FP32 logits: each row as long as its own
+visibility, aligned, in one buffer sized from the PAGE pool the memory budget
+can hold rather than from the model length. A step whose rows overflow that
+buffer -- requests sharing a prefix the pool stores once -- runs eagerly,
+scored in bands, instead of from a decode graph. The FP8 plane
+keeps a plane band at the int32 addressing limit, which can require nearly
+8 GiB, plus its tile tables; reserve scratch headroom for it when sizing
+long-context workloads. Quantized queries and selection workspace occupy memory
+beside either.
 
 A Reindex layer scores `candidate_topk_blocks` blocks rather than the whole
 context: the index plane is paged at `candidate_block_size`, so the candidate

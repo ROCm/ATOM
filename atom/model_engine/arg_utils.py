@@ -16,7 +16,9 @@ from atom.config import (
     ParallelConfig,
     SpeculativeConfig,
 )
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -32,29 +34,21 @@ def parse_size_list(size_str: str) -> list[int]:
         raise ValueError(f"Error parsing size list: {size_str}") from e
 
 
-# Offload connector names and aliases (atom/kv_transfer/offload/__init__.py),
-# casefolded like KVConnectorFactory.canonical_name.
-_OFFLOAD_CONNECTORS = frozenset(
-    {
-        "lmcache_offload",
-        "lmcacheoffloadconnector",
-        "lmcacheconnectorv1",
-        "lmcache_mp",
-        "lmcachempconnector",
-    }
-)
-
-
 # ATOM_KV_OFFLOAD value -> the offload connector it selects.
-_KV_OFFLOAD_MODES = {"lmcache": "lmcache_offload", "lmcache_mp": "lmcache_mp"}
+_KV_OFFLOAD_MODES = {
+    "lmcache": "lmcache_offload",
+    "lmcache_mp": "lmcache_mp",
+    "mooncake_store": "mooncake_store",
+}
 
 
 def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
     """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
 
-    ``lmcache`` is the in-process backend and ``lmcache_mp`` the standalone
-    ``lmcache server`` one. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes
-    the connector's ``kv_connector_extra_config``, which both backends read.
+    ``lmcache`` is the in-process LMCache backend, ``lmcache_mp`` the standalone
+    ``lmcache server`` one, and ``mooncake_store`` a Mooncake Store reached
+    without LMCache. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes the
+    connector's ``kv_connector_extra_config``, which every backend reads.
     """
     mode = mode.strip().lower()
     if mode in ("", "0", "off", "none"):
@@ -89,7 +83,7 @@ def compose_kv_offload_config(kv_transfer_config: str, offload: dict | None) -> 
         return json.dumps(offload)
     is_multi = _connector_name(transfer) == "multi"
     subs = transfer.get("connectors", []) if is_multi else [transfer]
-    if any(_connector_name(sub) in _OFFLOAD_CONNECTORS for sub in subs):
+    if any(_is_offload_connector(sub) for sub in subs):
         raise ValueError(
             "ATOM_KV_OFFLOAD conflicts with an offload connector already set in "
             "--kv-transfer-config; use only one of them"
@@ -104,6 +98,21 @@ def _connector_name(cfg: object) -> str:
     return str(name).strip().casefold()
 
 
+def _is_offload_connector(cfg: object) -> bool:
+    """Whether a transfer config names a backend registered as an offload tier.
+
+    Resolved by name or alias, in any case, as the factory resolves it when it
+    builds the connector; a name it does not know is not an offload tier here
+    (building it fails later, with the factory's error).
+    """
+    name = cfg.get("kv_connector") if isinstance(cfg, dict) else None
+    try:
+        canonical = KVConnectorFactory.canonical_name(name)
+    except ValueError:
+        return False
+    return KVConnectorFactory.is_offload_backend(canonical)
+
+
 @dataclass
 class EngineArgs:
     """Arguments for configuring the LLM Engine."""
@@ -114,6 +123,7 @@ class EngineArgs:
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_size_local: int | None = None
     data_parallel_rank: int = 0
@@ -132,11 +142,22 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
+    enable_decoder_swa_bounded_replay: bool = True
+    enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
+    sampler_independent_noise: bool = False
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
+    # feature is on (see Config._resolve_dynamic_chunking).
+    dynamic_chunking_smooth_factor: float | None = None
+    dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
@@ -210,6 +231,17 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
+            "--sequence-parallel-size",
+            "-sp",
+            type=int,
+            default=1,
+            help="Ulysses sequence parallel size. Shards tokens across the "
+            "group and trades sequence for heads around attention via "
+            "all-to-all. Requires --tensor-parallel-size 1 and DP1/PP1; "
+            "refuses EP, TBO, speculative decoding, KV transfer and image "
+            "input. Attention heads must divide across the ranks.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -288,10 +320,12 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
+            "or DeepSeek-V4.1's own FP4 KV; other models refuse it. M3's conditions "
+            "are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
@@ -301,7 +335,8 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype.",
+            "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
+            "cache or another model's own FP4 layout; see the configuration guide.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -325,12 +360,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
+            choices=["NONE", "TR_HYBRID", "FULL", "FULL_AND_TR_HYBRID"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
-            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
-            "the attention core is also captured into its own cudagraph with "
-            "zero-copy buffers (DeepSeek-V4 DSpark).",
+            "(default, existing behavior). TR_HYBRID = a token graph per token "
+            "bucket, breaking only where a launch depends on host data, which "
+            "runs eagerly or as a request graph; recorded at any --level. "
+            "FULL_AND_TR_HYBRID is recorded as TR_HYBRID.",
         )
         parser.add_argument(
             "--load_dummy",
@@ -379,6 +414,11 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
@@ -408,7 +448,8 @@ class EngineArgs:
             default="standard",
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
-            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
+            "or AITER MegaMoeTP under --sequence-parallel-size.",
         )
         parser.add_argument(
             "--method",
@@ -505,6 +546,38 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--decoder-swa-bounded-replay",
+            "--enable-decoder-swa-bounded-replay",
+            dest="enable_decoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: in prefill, run the decoder (the last KV-source "
+                "layer and those after it) only on each request's last window "
+                "rows, their windows truncated there, and the last layer on its "
+                "last row (the V4.1 report's SWA Bounded Replay). Faster "
+                "prefill; not numerically equivalent to a full prefill. On by "
+                "default; --no-decoder-swa-bounded-replay turns it off. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-swa-bounded-replay",
+            "--enable-encoder-swa-bounded-replay",
+            dest="enable_encoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: a prefix hit resumes without a state checkpoint, "
+                "rebuilding the sliding-window state by recomputing the hash "
+                "block below the hit (no cached row is rewritten); no state "
+                "checkpoint is kept, so no prefill chunk is cut for one. Not "
+                "numerically equivalent to resuming a checkpoint. On by "
+                "default; --no-encoder-swa-bounded-replay keeps checkpoints. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
             "--state-checkpoint-demand",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -512,8 +585,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% of "
+                "the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )
@@ -523,6 +596,32 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-request-context-metrics",
+            action="store_true",
+            default=False,
+            help="Enable per-request prefill/decode context metrics (default: disabled). "
+            "Retains request-labelled series after completion; use only for short "
+            "diagnostic captures. Aggregate metrics are unaffected.",
+        )
+        parser.add_argument(
+            "--sampler-independent-noise",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Draw fresh per-row exponential noise for unfiltered "
+            "temperature sampling instead of broadcasting one row across the "
+            "batch, so ordinary n=1 stochastic requests are sampled "
+            "independently, not only fan-out siblings (n>1) and speculative "
+            "verification. Off by default; enabling it allocates a "
+            "(num_tokens, vocab_size) float32 noise tensor per sampler call "
+            "and changes the RNG stream, so identical seeds no longer "
+            "reproduce the default tokens. The top-k/top-p path already "
+            "draws per-row noise, so the option is inert there by design; "
+            "greedy rows never draw noise. Native ATOM "
+            "engine only (vLLM/SGLang plugin paths are unaffected). "
+            "Use --no-sampler-independent-noise to state the default "
+            "explicitly.",
         )
         parser.add_argument(
             "--enable-log-stats",
@@ -541,7 +640,24 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",
@@ -551,6 +667,37 @@ class EngineArgs:
             "line's prefix cache hit rate (default: 1000, matching vLLM). "
             "Must be > 0. Only the status line is windowed; /metrics and "
             "[Cache Stats] stay cumulative.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            help=(
+                "Equalize the runtime of a PP prefill request's chunks to shorten "
+                "pipeline fill/drain. Requires --pipeline-parallel-size > 1. Helps "
+                "single-stream long prefill and costs throughput once several "
+                "requests prefill at once, so it is meant for latency-bound "
+                "deployments; see docs/dynamic_chunking_guide.md."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-smooth-factor",
+            type=float,
+            default=None,
+            help=(
+                "Interpolation between the initial chunk size (0) and the "
+                "equal-latency prediction (1). Defaults to "
+                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75, read only when "
+                "--enable-dynamic-chunking is set."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-min-chunk-size",
+            type=int,
+            default=4096,
+            help=(
+                "Floor for solved chunk sizes. Every extra chunk rebuilds the "
+                "cached prefix again, so this bounds how much work shrinking adds."
+            ),
         )
         parser.add_argument(
             "--max-num-seqs",
@@ -578,6 +725,17 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--prefill-admit-policy",
+            choices=list(PREFILL_ADMIT_POLICIES),
+            default="interval",
+            help="When the prefill delayer admits new prefills. 'interval' "
+            "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
+            "'adaptive' fires once the held requests' accumulated cost reaches "
+            "the fixed prefill cost times the decode batch, fitted from measured "
+            "step times; on DP=1, PP=1 it enables the delayer as a positive "
+            "interval does.",
         )
         parser.add_argument(
             "--mark-trace",

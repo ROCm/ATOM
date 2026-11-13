@@ -143,7 +143,7 @@ def generate_matrix(report_path, models_path, top_n=3):
     matrix = []
     for (model_path, server_args, env_vars), group_configs in groups.items():
         # Find runner from models.json (first matching model)
-        runner = "atom-mi355-8gpu.predownload"
+        runner = "linux-atom-pitt-mi350x-8"
         for m in models:
             if m["path"] == model_path and m.get("args", "") == server_args:
                 runner = m.get("runner", runner)

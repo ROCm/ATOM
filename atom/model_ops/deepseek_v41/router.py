@@ -23,6 +23,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -31,6 +32,7 @@ from flydsl.expr.typing import Int64, T
 from atom.mono.device.ops import (
     bf16_pair,
     kernel_symbol,
+    launcher,
     mfma_bf16,
     row_sum,
     rsrc,
@@ -123,9 +125,9 @@ def _build(tokens: int):
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
 
-    @flyc.kernel(
-        name=kernel_symbol("v41_router", s=tokens), known_block_size=[THREADS, 1, 1]
-    )
+    name = kernel_symbol("v41_router", s=tokens)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def router(x: Int64, w: Int64, out: Int64):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -148,7 +150,7 @@ def _build(tokens: int):
                 (t * EXPERTS + bid * ROWS + 2 * rp) // 2,
             )
 
-    @flyc.jit
+    @launcher(name)
     def launch(x: Int64, w: Int64, out: Int64, stream: fx.Stream = _CURRENT_STREAM):
         router(x, w, out).launch(
             grid=(EXPERTS // ROWS,), block=(THREADS,), stream=stream
@@ -158,8 +160,11 @@ def _build(tokens: int):
 
 
 def router_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    # a gfx950 kernel (wave64, 16x16x32 bf16 MFMA), as is the mono MoE whose
+    # summation order it shares
     return (
-        x.dim() == 2
+        get_gfx() == "gfx950"
+        and x.dim() == 2
         and 1 <= x.shape[0] <= MAX_TOKENS
         and x.shape[1] == HIDDEN
         and x.dtype == torch.bfloat16

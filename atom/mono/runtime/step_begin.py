@@ -19,6 +19,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -27,6 +28,7 @@ from atom.mono.device.ops import (
     CM_SYS,
     ballot,
     kernel_symbol,
+    launcher,
     load_ptr64,
     memrealtime,
     rsrc,
@@ -149,10 +151,9 @@ def _build(key: StepBeginBuild):
     assert 1 <= tp <= FENCE_SLOTS
     keyed = key_tuple(key, source_digest("mono"))
 
-    @flyc.kernel(
-        name=kernel_symbol("mono_step_begin", tp=tp, debug=int(debug)),
-        known_block_size=[THREADS, 1, 1],
-    )
+    name = kernel_symbol("mono_step_begin", tp=tp, debug=int(debug))
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def step_begin(
         s0: Int64, n0: Int64, s1: Int64, n1: Int64,
         peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
@@ -180,7 +181,7 @@ def _build(key: StepBeginBuild):
         _zero(s0, n0, lane0, stride)
         _zero(s1, n1, lane0, stride)
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         s0: Int64, n0: Int64, s1: Int64, n1: Int64,
         peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
@@ -206,11 +207,12 @@ def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
     for b in scratch:
         args += [b.data_ptr(), b.nbytes]
     args += [0, 0] * (MAX_SCRATCH - len(scratch))
-    _build(StepBeginBuild(peers.addresses.numel(), debug))(
+    _run_compiled(
+        _build(StepBeginBuild(peers.addresses.numel(), debug)),
         *args,
         peers.addresses.data_ptr(),
         peers.bytes.nbytes,
         peers.rank,
         state.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )

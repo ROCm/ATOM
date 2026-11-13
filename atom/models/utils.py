@@ -13,6 +13,7 @@ from typing import (
 import torch
 from torch import nn
 from torch.nn.modules.module import register_module_module_registration_hook
+from transformers import PretrainedConfig
 from typing_extensions import overload
 
 from atom.model_loader.weight_utils import local_model_dir
@@ -133,6 +134,17 @@ def make_layers(
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )
     return start_layer, end_layer, modules
+
+
+def pp_holds_embedding(atom_config) -> bool:
+    """Whether this PP stage builds the token embedding: the first stage embeds
+    the prompt, and the last holds a copy for a drafter that shares it."""
+    from aiter.dist.parallel_state import get_pp_group
+
+    from atom.models.registry import serves_pp_speculation
+
+    pp = get_pp_group()
+    return pp.is_first_rank or (pp.is_last_rank and serves_pp_speculation(atom_config))
 
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
@@ -539,3 +551,20 @@ def common_prefix(items: Sequence[Sequence[T] | str]) -> Sequence[T] | str:
                 return shortest[: match_len - 1]
 
     return shortest
+
+
+def is_neox_rope_style(
+    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
+) -> bool:
+    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
+
+    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
+    an interleave flag of True means ``is_neox_style=False``. A missing or null
+    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
+    that predate the flag, which differs per rope instance (see call sites):
+    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
+    """
+    interleave = getattr(config, interleave_attr, None)
+    if interleave is None:
+        return default_is_neox
+    return not bool(interleave)

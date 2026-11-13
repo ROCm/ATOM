@@ -47,6 +47,17 @@ def _attribute_calls(method: ast.FunctionDef, attribute: str) -> list[ast.Call]:
     ]
 
 
+def _processor_flags(method: ast.FunctionDef) -> set[str]:
+    """Names this method reads off ``self.tokenID_processor``."""
+    return {
+        node.attr
+        for node in ast.walk(method)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "tokenID_processor"
+    }
+
+
 def _parent_map(root: ast.AST) -> dict[ast.AST, ast.AST]:
     return {
         child: parent
@@ -101,6 +112,18 @@ def test_dummy_forward_participates_in_staging_lifetime():
     )
 
 
+def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
+    """Only PP may be excluded from DP draft lockstep, and only by name.
+
+    `is_deferred_out` is off under PP, which once made it a usable stand-in,
+    but it is also off on a P/D producer -- a rank that keeps its drafter
+    loaded and still owes its DP peers the collectives `propose()` carries.
+    """
+    assert _processor_flags(_method("_dp_draft_lockstep_active")) == {
+        "is_pipeline_parallel"
+    }
+
+
 def test_prefill_ready_events_are_recorded_after_model_submission():
     method = _method("forward")
     helper = _method("_record_kv_cache_ready")
@@ -144,7 +167,7 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert len(_attribute_calls(prepare_model, "anchors_to_gpu")) == 1
     # Zero, not one: the per-request verify lengths used to be staged here into
     # their own pinned buffer, and now ride `cu_seqlens_q`, which
-    # the attention builder's `publish_cu_seqlens_q` uploads once per step.
+    # the attention builder's `prepare_query_metadata` stages once per step.
     #
     # This walks `prepare_model`'s own body, so it sees neither that upload nor
     # any other a callee makes -- it catches a copy written HERE, not a second

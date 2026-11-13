@@ -12,12 +12,12 @@ entry before scoring.
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.cache import indexer_k_quant_and_cache
+
+from atom.model_ops.indexer import IndexCache, IndexRows, score_topk
 
 from . import kpool
-from .geometry import (
-    get_query_request_indices,
-    speculative_pool_scratch_width,
-)
+from .geometry import get_query_request_indices
 
 
 @triton.jit
@@ -205,6 +205,7 @@ def map_token_indices_to_slots(
 
 def run_speculative_kpool_indexer(
     metadata,
+    rows: IndexRows,
     kv_cache: torch.Tensor,
     queries: torch.Tensor,
     keys: torch.Tensor,
@@ -224,12 +225,8 @@ def run_speculative_kpool_indexer(
     stable_topk: bool,
 ) -> None:
     """Run the pooled indexer for a speculative verification batch."""
-    from aiter.ops.cache import indexer_k_quant_and_cache
-    from aiter.ops.topk import top_k_per_row_decode
-    from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-
     cu_seqlens_q = metadata.cu_seqlens_q
-    num_query_tokens, num_heads, head_dim = queries.shape
+    num_query_tokens, _, head_dim = queries.shape
     pooled_keys, request_indices = build_speculative_pool_candidates(
         history,
         keys,
@@ -277,64 +274,30 @@ def run_speculative_kpool_indexer(
         source_slots,
         destination_slots,
     )
-    if metadata.max_seqlen_k <= topk_tokens:
-        return
-    # A per-token paged scoring path also handles ragged verification. Size its
-    # reusable scratch from this batch's live KV span, not the model limit.
-    selected = torch.full(
-        (num_query_tokens, output_width),
-        -1,
-        device=keys.device,
-        dtype=torch.int32,
+    # Always select, even below index_topk: MLA verification reads
+    # sparse_kv_indices whatever the length, so skipping the write leaves it the
+    # previous batch's selection. Pooled top-k then selects every pool, as in
+    # plain decode. Never branch on max_seqlen_k here either: CUDAGraph capture
+    # leaves it 0 and would record the skip for every replay. The `rows` --
+    # each off its own table row, to the pools its position closed, a draft
+    # row past the model length capped at the plane -- are the builder's.
+    selected_pools = score_topk(
+        queries,
+        weights,
+        IndexCache(pooled_kv_cache, None, pool_rows_per_block),
+        rows,
+        topk=topk_tokens // pool_size,
+        stable=stable_topk,
     )
-    max_pools = speculative_pool_scratch_width(metadata.max_seqlen_k, pool_size)
-    chunk_size = min(num_query_tokens, 128)
-    logits_scratch = torch.empty(
-        (chunk_size, max_pools),
-        device=keys.device,
-        dtype=torch.float32,
+    selected = kpool.expand_pools_and_append_tail(
+        selected_pools,
+        (positions + 1).to(torch.int32),
+        pool_size,
+        out=torch.empty(
+            (num_query_tokens, output_width), device=keys.device, dtype=torch.int32
+        ),
     )
-    selected_pools_scratch = torch.empty(
-        (chunk_size, topk_tokens // pool_size),
-        device=keys.device,
-        dtype=torch.int32,
-    )
-    query_block_tables = metadata.block_tables[request_indices].contiguous()
-    for begin in range(0, num_query_tokens, 128):
-        end = min(num_query_tokens, begin + 128)
-        count = end - begin
-        sequence_lengths = (positions[begin:end] + 1).to(torch.int32)
-        pool_lengths = (sequence_lengths // pool_size).contiguous()
-        logits = logits_scratch[:count]
-        selected_pools = selected_pools_scratch[:count]
-        deepgemm_fp8_paged_mqa_logits(
-            queries[begin:end].view(count, 1, num_heads, head_dim),
-            pooled_kv_cache.unsqueeze(-2),
-            weights[begin:end],
-            logits,
-            pool_lengths,
-            query_block_tables[begin:end],
-            max_pools,
-            KVBlockSize=pool_rows_per_block,
-            Preshuffle=True,
-        )
-        top_k_per_row_decode(
-            logits,
-            1,
-            pool_lengths,
-            selected_pools,
-            count,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk_tokens // pool_size,
-            stable=stable_topk,
-        )
-        kpool.expand_pools_and_append_tail(
-            selected_pools,
-            sequence_lengths,
-            pool_size,
-            out=selected[begin:end],
-        )
+
     map_token_indices_to_slots(
         selected,
         request_indices,

@@ -279,9 +279,9 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
 # rocm10-base flavor is excluded.
-ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
-ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
-ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
 RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
         echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
         pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
@@ -476,10 +476,19 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
-# Upstream Mooncake release tag with HIP dma-buf MR support.
-# Note: this tag does not include the Ionic QP atomic resource clamp.
+# Mooncake Store (WITH_STORE=ON) on top of the TransferEngine: the
+# `mooncake.store` client of the mooncake_store offload connector
+# (ATOM_KV_OFFLOAD=mooncake_store) and the `mooncake_master` /
+# `mooncake_client` processes the atomesh launcher starts (MOONCAKE_STORE=1).
+# On by default: nothing runs the Store unless one of those two asks for it, so
+# P->D KV through the TransferEngine moves as it does without the Store.
+# INSTALL_MOONCAKE_STORE=0 configures WITH_STORE=OFF, for a base on which a
+# Store dependency (cachelib) does not build.
+ARG INSTALL_MOONCAKE_STORE=1
+# Upstream Mooncake main after v0.3.14 (kvcache-ai/Mooncake#5151, THP-backed
+# RDMA Store segments); includes the RD-atomic QP depth clamp (#4312).
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+ARG MOONCAKE_COMMIT="206d6340a8b578f44519ccef90bdbfe8483d0231"
 ARG USE_HIP_DMABUF=ON
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
@@ -533,14 +542,17 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # both protocols and excludes HIP IPC for cross-host transfers.
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
-# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
-# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
-# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# ATOM consumes the TransferEngine (`mooncake.engine`) for P->D, and Mooncake
+# Store only with INSTALL_MOONCAKE_STORE=1. The Store's Rust bindings stay off:
+# nothing here loads them, and WITH_STORE_RUST=ON is a hard error without
+# WITH_STORE.
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON) =========="; \
+        MC_WITH_STORE=OFF; \
+        if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
         for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
                    /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
@@ -549,7 +561,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DENABLE_MULTI_PROTOCOL=ON \
-             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DWITH_TE=ON -DWITH_STORE=${MC_WITH_STORE} -DWITH_STORE_RUST=OFF \
              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
@@ -557,6 +569,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && cat /tmp/mooncake-cmake.log \
         && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && { grep -qx "WITH_STORE:BOOL=${MC_WITH_STORE}" CMakeCache.txt \
+             || { echo "ERROR: Mooncake was not configured WITH_STORE=${MC_WITH_STORE}"; exit 1; }; } \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
              grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
@@ -574,6 +588,12 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && ldconfig \
         && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
              || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
+        && if [ "${MC_WITH_STORE}" = "ON" ]; then \
+             { command -v mooncake_master && command -v mooncake_client \
+               || { echo "ERROR: Mooncake Store binaries mooncake_master / mooncake_client are missing"; exit 1; }; } \
+             && { "${VENV_PYTHON}" -c "from mooncake.store import MooncakeDistributedStore" \
+               || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; }; \
+           fi \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
@@ -736,41 +756,27 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
       print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
     fi
 
-# ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# The SemiAnalysis fork, which is what carries the SA agentic datasets
-# (semianalysis_cc_traces_weka_062126*).
+# ========== AgentX harness (agentic benchmark client) ==========
+# agentx-harness is the client InferenceX benchmarks with: every one of its
+# agentic jobs installs the release pinned in
+# inferencex-e2e/infx/bench/agentic/requirements.txt into a fresh venv. Pin
+# the same release here and follow it by hand.
 #
-# Pinned to the commit InferenceX's `utils/aiperf` submodule points at, so our
-# image ships the aiperf they measure with. Their pointer is a deliberate,
-# frequently-moved pin -- four bumps in the first half of August 2026, and a
-# same-day revert on 2026-07-28 -- with commit titles that read "pin AIPerf v1
-# timing watchdog", "pin additive AIPerf main warmup". Tracking aiperf's master
-# instead would take in exactly the upstream changes they evaluate and
-# sometimes reject.
-#
-# It therefore has to be followed by hand. To re-check:
-#   git ls-tree main utils/aiperf     # in a clone of SemiAnalysisAI/InferenceX
-#
-# `SA_AIPERF_REF` accepts any ref; empty means "whatever HEAD points at", which
-# is why the checkout below is conditional rather than naming a branch (an
-# upstream default-branch rename would otherwise break unrelated builds).
-ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_REF="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
-RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
-        echo "========== [ATOM] Install SemiAnalysis aiperf (ref=${SA_AIPERF_REF:-<default branch>}) =========="; \
-        rm -rf /opt/aiperf && \
-        git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
-        cd /opt/aiperf && \
-        { [ -z "${SA_AIPERF_REF}" ] || git checkout "${SA_AIPERF_REF}"; } && \
-        echo "[ATOM] aiperf resolved to $(git rev-parse HEAD)" && \
-        sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
-        ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
-        "${VENV_PYTHON}" -m pip install -e . && \
-        "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
-        "${VENV_PYTHON}" -m pip show aiperf || true && \
-        command -v aiperf && aiperf --help >/dev/null; \
+# Its own venv, as in InferenceX: the release pins prometheus-client~=0.23.1,
+# pyzmq~=26.4.0 and pandas~=2.3.3, which in /opt/venv would move the server's
+# packages. `agentx` and `aiperf` are linked onto PATH.
+ARG INSTALL_AGENTX_HARNESS=1
+ARG AGENTX_HARNESS_VERSION="1.0.9"
+RUN if [ "${INSTALL_AGENTX_HARNESS}" = "1" ]; then \
+        echo "========== [ATOM] Install agentx-harness==${AGENTX_HARNESS_VERSION} =========="; \
+        rm -rf /opt/agentx-venv && \
+        "${VENV_PYTHON}" -m venv /opt/agentx-venv && \
+        /opt/agentx-venv/bin/python -m pip install --no-cache-dir \
+            "agentx-harness==${AGENTX_HARNESS_VERSION}" && \
+        ln -sf /opt/agentx-venv/bin/agentx /opt/agentx-venv/bin/aiperf /usr/local/bin/ && \
+        test "$(agentx --version)" = "${AGENTX_HARNESS_VERSION}"; \
     else \
-        echo "========== Skipped SemiAnalysis aiperf (INSTALL_SA_AIPERF=0) =========="; \
+        echo "========== Skipped agentx-harness (INSTALL_AGENTX_HARNESS=0) =========="; \
     fi
 
 # ========== Final ROCm 10 stack validation ==========
@@ -783,26 +789,20 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
 # image, not a warning.
 RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         echo "========== [ATOM] Final ROCm 10 stack validation =========="; \
-        # aiperf's dependency resolution downgrades prometheus_client to
-        # 0.23.x (it even prints the incompatibility mid-install and pip
-        # continues); restore ATOM's pin before the check so the tripwire
-        # validates the stack we actually intend to ship.
-        python -m pip install "prometheus_client==0.25.0" && \
-        # pip check, minus the one known three-way conflict that cannot be
-        # satisfied by ANY version: atom wants prometheus_client>=0.25,
-        # aiperf 0.12.0 pins ~=0.23.1, lmcache 0.4.5 caps <=0.24.1. The
-        # ROCm 7 nightly image ships the same conflict silently (it has no
-        # pip check at all); both 0.23 and 0.25 work at runtime for all
-        # three. Filter exactly that line, fail on anything else.
+        # pip check, minus the one known conflict that cannot be satisfied
+        # by ANY version: atom wants prometheus_client>=0.25, lmcache 0.4.5
+        # caps <=0.24.1. The ROCm 7 nightly image ships the same conflict
+        # silently (it has no pip check at all); 0.25 works at runtime for
+        # both. Filter exactly that line, fail on anything else.
         if ! python -m pip check -q 2>/dev/null; then \
-            # pip check failed: allow only the known unsatisfiable three-way\
+            # pip check failed: allow only the known unsatisfiable\
             # prometheus_client pin, fail on anything else.\
             if python -m pip check 2>&1 | grep -v "prometheus.client" | grep -q "."; then \
                 echo "pip check reported unexpected conflicts:"; \
                 python -m pip check 2>&1 | grep -v "prometheus.client"; \
                 exit 1; \
             fi; \
-            echo "pip check: only the known prometheus_client three-way pin (atom>=0.25 / aiperf~=0.23.1 / lmcache<=0.24.1)"; \
+            echo "pip check: only the known prometheus_client pin (atom>=0.25 / lmcache<=0.24.1)"; \
         else \
             echo "pip check clean"; \
         fi; \
@@ -834,9 +834,9 @@ print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
 # rocm10-base flavor is excluded.
-ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
-ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
-ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
 RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
         cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
         if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \

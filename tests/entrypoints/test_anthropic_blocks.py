@@ -484,7 +484,7 @@ def stream_side(raw: str, channel, parser_cls, tools=None) -> list[dict]:
     """
     rf, tp = channel.stream(), ToolCallStreamParser(tools=tools, parser_cls=parser_cls)
     blocks, frames = AnthropicBlocks(), []
-    for field, text in rf.process(raw) + rf.flush():
+    for field, text in rf.process(raw) + rf.flush(stopped=True):
         if not text:
             continue
         if field == "reasoning_content":
@@ -498,7 +498,7 @@ def stream_side(raw: str, channel, parser_cls, tools=None) -> list[dict]:
 
 def nonstream_side(raw: str, channel, parser_cls, tools=None) -> list[dict]:
     """The same generation through `stream=false`, as `api_server` builds it."""
-    events = read_whole_blocks(channel, parser_cls, raw, tools)
+    events = read_whole_blocks(channel, parser_cls, raw, tools, stopped=True)
     return build_anthropic_response(
         request_id="r", model="m", events=events, stop_reason="end_turn"
     )["content"]

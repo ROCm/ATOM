@@ -22,8 +22,15 @@ import pytest
 import torch
 from torch import nn
 
+from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
-from atom.spec_decode.draft_kv import DRAFT_KV_ROWS, DraftKvBuilder
+from atom.spec_decode.draft_kv import (
+    DRAFT_KV_ROWS,
+    DraftKvBuilder,
+    DraftKvPoolSpec,
+    draft_kv_builder,
+    draft_owns_kv_pool,
+)
 
 
 class _PagedAttention(nn.Module):
@@ -33,6 +40,8 @@ class _PagedAttention(nn.Module):
         super().__init__()
         self.base_attention = True
         self.use_mla = False
+        self.impl = SimpleNamespace(kv_layout=None)
+        self.page_tokens = None
 
 
 class _Norm(nn.Module):
@@ -44,13 +53,28 @@ class _Norm(nn.Module):
 TARGET_BLOCK = 128
 
 
-def _runner(draft_layers: int, block_size: int = TARGET_BLOCK):
+def _runner(
+    draft_layers: int,
+    block_size: int = TARGET_BLOCK,
+    builder_block_size: int | None = None,
+):
+    """A stand-in runner.
+
+    `block_size` is the scheduler's; `builder_block_size` is the target
+    builder's, which defaults to the same number because a paged target pages at
+    the block it is scheduled in. They are separate arguments because an MLA
+    target's builder does NOT: it pages at ATOM_MLA_PAGE_SIZE, a kernel page
+    that is 1 by default.
+    """
     model = nn.Sequential(
         *[m for _ in range(draft_layers) for m in (_PagedAttention(), _Norm())]
     )
     return SimpleNamespace(
+        block_size=block_size,
         drafter=SimpleNamespace(model=model),
-        attn_metadata_builder=SimpleNamespace(block_size=block_size),
+        attn_metadata_builder=SimpleNamespace(
+            block_size=block_size if builder_block_size is None else builder_block_size
+        ),
     )
 
 
@@ -88,6 +112,35 @@ def test_the_pool_is_built_at_the_target_builders_block():
 
     assert builder.kv_pool is not None
     assert asked == [(2, 256)]
+
+
+def test_the_gqa_draft_pool_takes_the_schedulers_block():
+    """The DSpark GQA draft's pool sits beside an MLA target, whose builder pages at
+    ATOM_MLA_PAGE_SIZE -- 1 by default -- a kernel page, not a block id. Its
+    block tables count SCHEDULER blocks, so that is the number to size at; at
+    the builder's, MhaKvPool's SHUFFLE packing would not even construct.
+    """
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=128, builder_block_size=1),
+        make,
+        block_size=128,
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
+
+
+def test_other_pools_keep_the_target_builders_block():
+    """MiniMax-M3.1 DSpark and Eagle3 page at the builder's block, and
+    `allocate_kv_cache_tensors` refuses a scheduler block that differs."""
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=256, builder_block_size=128), make
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
 
 
 def test_siblings_are_not_rows():
@@ -175,6 +228,8 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     pool.allocate(2, "cpu")
     builder = DraftKvBuilder.__new__(DraftKvBuilder)
     builder._kv_pool = pool
+    layer = type("Layer", (), {"layer_num": 9, "page_tokens": None})()
+    builder._pool_rows = {DRAFT_KV_ROWS: {layer: 0}}
 
     transfer = builder.get_kv_transfer_tensors()
     transfer.set_block_count(2)
@@ -184,6 +239,11 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
         "draft.k.layer_0",
         "draft.v.layer_0",
     ]
+    # Named by its layer under its own namespace, split by head like a target.
+    assert [(p.unit_spec.namespace, p.unit_spec.layer) for p in transfer.pages] == [
+        ("draft", 9)
+    ] * 2
+    assert {p.head_major_runs for p in transfer.pages} == {(1, 4)}
     assert [tuple(view.shape[:2]) for view in transfer.block_tensor_views] == [
         (2, 1),
         (2, 1),
@@ -194,6 +254,97 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
             transfer.block_regions, transfer.block_tensor_views, strict=True
         )
     )
+
+
+def _paged(page):
+    """A binding's K, V and scale views of a pool row, in `page`-token pages."""
+
+    def views(pool, row):
+        (k, v), scales = pool.kv_views(row), pool.scale_views(row)
+        n, heads, x = k.shape[0] * pool.block_size // page, k.shape[1], k.shape[-1]
+        return (
+            k.view(n, heads, -1, page, x),
+            v.view(n, heads, page // x, -1, x),
+            *(s.view(n, heads, page) for s in scales),
+        )
+
+    return views
+
+
+def _cut_into_tp4(binding, views):
+    """Fill a TP1 draft per head through `views`, cut it for four TP4 ranks,
+    and return the values each rank reads back through `views`."""
+
+    def draft(heads):
+        pool = MhaKvPool(
+            layers=1,
+            block_size=128,
+            num_kv_heads=heads,
+            head_dim=128,
+            kv_dtype=torch.float8_e4m3fn,
+        )
+        pool.allocate(2, "cpu")
+        builder = DraftKvBuilder.__new__(DraftKvBuilder)
+        builder._kv_pool = pool
+        builder._pool_rows = {DRAFT_KV_ROWS: {binding: 0}}
+        return pool, builder.get_kv_transfer_tensors().pages
+
+    src, src_pages = draft(4)
+    for t in views(src, 0):
+        for head in range(4):
+            t[:, head] = torch.tensor(head + 1.0).to(t.dtype)
+    received = []
+    for rank in range(4):
+        dst, dst_pages = draft(1)
+        for s, d in zip(src_pages, dst_pages, strict=True):
+            cuts = consumer_head_slices(
+                s.region.unit_bytes,
+                d.region.unit_bytes,
+                s.head_major_runs,
+                d.head_major_runs,
+                rank,
+                4,
+                str(s.unit_spec),
+            )
+            for block in range(2):
+                for so, do, n in cuts.tolist():
+                    d.view[block].view(-1)[do : do + n] = s.view[block].view(-1)[
+                        so : so + n
+                    ]
+        received.append({v for t in views(dst, 0) for v in t.float().unique().tolist()})
+    return received
+
+
+@pytest.mark.parametrize("page", [128, 16])
+def test_each_tp4_rank_gets_its_head_in_the_pages_its_binding_views(page):
+    binding = type("Binding", (), {"layer_num": 60, "page_tokens": page})()
+    assert _cut_into_tp4(binding, _paged(page)) == [{1.0}, {2.0}, {3.0}, {4.0}]
+
+
+def test_the_m31_dspark_draft_is_cut_as_its_attention_views_it(monkeypatch):
+    dspark = pytest.importorskip("atom.models.minimax_m3.dspark", exc_type=ImportError)
+    from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
+    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "GemmaRMSNorm", "get_rope"):
+        monkeypatch.setattr(dspark, name, lambda *a, **k: nn.Identity())
+    config = SimpleNamespace(
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=6144,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=5e6,
+    )
+    atom_config = SimpleNamespace(kv_transfer_config={}, kv_cache_dtype="fp8")
+    attn = dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
+
+    def views(pool, row):
+        return to_page16_shuffle(*pool.kv_views(row), *pool.scale_views(row))
+
+    received = _cut_into_tp4(attn.kv, views)
+    assert received == [{1.0}, {2.0}, {3.0}, {4.0}]
 
 
 def test_rows_are_the_pool_layers_the_modules_index():
@@ -217,3 +368,242 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypatch):
+    """The vLLM offload adapter hands over vLLM's own SpeculativeConfig: `method`, no
+    `draft_model_hf_config`; and the selector has no backend for every draft flavor
+    there. Neither is consulted under a plugin."""
+    from atom.plugin import prepare
+    from atom.utils import selector
+
+    def refuse(*_a):
+        raise AssertionError("the selector was asked")
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    monkeypatch.setattr(selector, "attn_family", refuse)
+    vllm_spec = SimpleNamespace(method="eagle3", draft_model_config=object())
+    assert draft_owns_kv_pool(SimpleNamespace(speculative_config=vllm_spec)) is False
+
+
+@pytest.mark.parametrize(
+    "target, pool_dtype", [("fp4", "bf16"), ("fp8", "fp8")]  # fp4 has no draft layout
+)
+def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
+    target, pool_dtype
+):
+    """The draft's attention reads its dtype off the config it is built with and its
+    pool is built at `draft_kv_dtype`: one value; the target's config keeps its own."""
+    # eagle_proposer pulls aiter in through atom.distributed.pcp_utils
+    pytest.importorskip("aiter", reason="the proposer imports aiter at module load")
+    import atom.spec_decode.eagle_proposer as mod
+    from atom.config import CompilationConfig, resolve_draft_kv_dtype
+
+    spec = SimpleNamespace(method="eagle3", draft_model_hf_config=SimpleNamespace())
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True)
+    assert spec.draft_kv_dtype == pool_dtype
+    p = mod.EagleProposer.__new__(mod.EagleProposer)
+    p.speculative_config, p.runner = spec, SimpleNamespace()
+    p.config = SimpleNamespace(
+        kv_cache_dtype=target,
+        hf_config=SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+    seen = {}
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    orig, mod.draft_kv_builder = mod.draft_kv_builder, lambda runner, hf, model: None
+    try:
+        p._build_draft_model(model_class)
+    finally:
+        mod.draft_kv_builder = orig
+
+    assert seen == {"dtype": pool_dtype} and p.config.kv_cache_dtype == target
+
+
+def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
+    """The DSpark GQA draft's pool binds every layer the same one-element tensor
+    at the scale its spec declares, at bind time: both its write and its read
+    take the scale as a device pointer, and nothing may be built for it inside
+    a captured forward."""
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        flash_layout=True,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=2)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(
+        runner, lambda **_: pool, kv_scale=DraftKvPoolSpec().kv_scale
+    )
+    builder._kv_pool = pool
+
+    layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    for m in layers:
+        m.layer_num = 0
+        builder.build_kv_cache_tensor(m)
+
+    scale = layers[0].k_scale
+    assert torch.is_tensor(scale) and scale.numel() == 1 and float(scale) == 1.0
+    assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
+
+
+def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
+    """Bind one paged layer through the builder; return the module."""
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype=kv_cache_dtype)
+    builder = DraftKvBuilder(runner, lambda **_: pool, kv_scale=kv_scale)
+    builder._kv_pool = pool
+    module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
+    module.layer_num = 0
+    builder.build_kv_cache_tensor(module)
+    return module
+
+
+def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
+    """MiniMax-M3.1 DSpark and Eagle3: the pool's defaults bind what they
+    always did, `kv_views` and the per-token `scale_views`."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.float8_e4m3fnuz,
+    )
+    module = _bind_first_layer(pool, "fp8")
+
+    k, v = pool.kv_views(0)
+    k_scale, v_scale = pool.scale_views(0)
+    assert module.k_cache.shape == k.shape and module.v_cache.shape == v.shape
+    assert module.k_cache.data_ptr() == k.data_ptr()
+    assert module.k_scale.shape == k_scale.shape
+    assert module.k_scale.data_ptr() == k_scale.data_ptr()
+    assert module.v_scale.data_ptr() == v_scale.data_ptr()
+
+
+@pytest.mark.parametrize("blocks_per_entry", [1, 8])
+def test_a_flash_pool_binds_entry_wide_flash_views_and_the_declared_scale(
+    blocks_per_entry,
+):
+    """The FLASH order is the pool's own declaration, not inferred from the
+    entry width: at one block an entry it still binds `fa_views`. The scale is
+    the spec's, which the builder is handed, not one the layout implies."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.float8_e4m3fnuz,
+        blocks_per_entry=blocks_per_entry,
+        flash_layout=True,
+    )
+    module = _bind_first_layer(pool, "fp8", kv_scale=DraftKvPoolSpec().kv_scale)
+
+    assert module.k_cache.shape == (2, 128 * blocks_per_entry, 2, 64)
+    assert module.k_cache.shape[1] == pool.entry_tokens
+    assert module.v_cache.shape == pool.fa_views(0)[1].shape
+    assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_a_declared_entry_is_the_span_of_the_pool_the_spec_builds(dcp):
+    """`entry_tokens` is what a draft builds its reader for; it has to be the
+    width of the pool built from the same spec's block and kwargs."""
+    spec = DraftKvPoolSpec()
+    config = SimpleNamespace(kv_cache_block_size=128, decode_context_parallel_size=dcp)
+    pool = MhaKvPool(
+        layers=1,
+        block_size=spec.block_size(config),
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        **spec.pool_kwargs(dcp),
+    )
+    assert spec.entry_tokens(config) == pool.entry_tokens == 128 * dcp
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_a_pooled_draft_has_slots_of_its_own_only_under_dcp(dcp):
+    """At DCP 1 an entry is one target block, so the target's slots address
+    the draft's pool; under DCP they don't."""
+    config = SimpleNamespace(kv_cache_block_size=128, decode_context_parallel_size=dcp)
+    assert DraftKvPoolSpec().needs_own_ctx_slots(config) is (dcp > 1)
+
+
+def test_a_layer_refuses_a_cache_its_reader_was_not_built_for():
+    """A layer's `check_cache` sees the views before they are bound, and its
+    error stops the bind: the layer keeps no cache it would misread."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        blocks_per_entry=2,
+        flash_layout=True,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="bf16")
+    builder = DraftKvBuilder(runner, lambda **_: pool, kv_scale=1.0)
+    builder._kv_pool = pool
+    module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
+    module.layer_num = 0
+    seen = []
+
+    def check_cache(k_cache, v_cache):
+        seen.append((k_cache.shape, v_cache.shape))
+        if k_cache.shape[1] != 128:
+            raise ValueError("entry width")
+
+    module.check_cache = check_cache
+    with pytest.raises(ValueError, match="entry width"):
+        builder.build_kv_cache_tensor(module)
+    assert seen == [((2, 256, 2, 64), (2, 256, 2, 64))]
+    assert not hasattr(module, "k_cache")
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
+    monkeypatch, declared
+):
+    """A draft that declares a pool of its own on a backend that owns none is
+    refused here, not dropped: the target would still stage its slots and
+    fail later without a builder. A draft that declares none gets None."""
+    pytest.importorskip("aiter")
+    from atom.utils import selector
+
+    class _Backend:
+        pass
+
+    class _Draft:
+        kv_pool_spec = DraftKvPoolSpec() if declared else None
+
+    monkeypatch.setattr(selector, "get_attn_backend", lambda _family: _Backend)
+    monkeypatch.setattr(selector, "attn_family", lambda _cfg: selector.Family.MLA)
+    runner = SimpleNamespace(config=SimpleNamespace(kv_cache_dtype="bf16"))
+    if declared:
+        with pytest.raises(ValueError, match="cannot own a draft pool"):
+            draft_kv_builder(runner, None, _Draft())
+    else:
+        assert draft_kv_builder(runner, None, _Draft()) is None
+
+
+def test_a_declared_scale_other_than_unit_is_refused():
+    """The pool has no scale planes and nothing loads a scale into it, so a
+    spec declaring any other scale is refused when its builder is asked for,
+    before a backend is resolved, rather than bound as if it were 1.0."""
+
+    class _Draft:
+        kv_pool_spec = DraftKvPoolSpec(kv_scale=0.5)
+
+    with pytest.raises(ValueError, match="declares a KV scale of 0.5"):
+        draft_kv_builder(SimpleNamespace(), None, _Draft())

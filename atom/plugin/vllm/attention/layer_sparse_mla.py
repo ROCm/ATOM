@@ -138,6 +138,7 @@ def generate_sparse_seqlen_kernel(
     out_ptr,
     topk_token: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    INDEX_KPOOL: tl.constexpr = 1,
 ):
     seq_id = tl.program_id(0)
     query_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -152,9 +153,20 @@ def generate_sparse_seqlen_kernel(
         return
     context_start_point = seq_len - query_len
     sparse_seqlen = context_start_point + query_offset
-    sparse_seqlen_masked = tl.where(
-        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
-    )
+    if INDEX_KPOOL > 1:
+        # Pooled selection: top-k runs over COMPLETE pools and each selected
+        # pool expands back to its `INDEX_KPOOL` token positions, then the
+        # still-open tail is always appended. Counting `min(n, topk)` here
+        # would leave the compact rows the expansion writes misaligned against
+        # `paged_kv_indptr`.
+        n = sparse_seqlen + 1
+        pools = n // INDEX_KPOOL
+        selected = tl.minimum(pools, topk_token // INDEX_KPOOL)
+        sparse_seqlen_masked = selected * INDEX_KPOOL + (n % INDEX_KPOOL)
+    else:
+        sparse_seqlen_masked = tl.where(
+            sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
+        )
     tl.store(
         out_ptr + query_start + query_offset,
         sparse_seqlen_masked,
@@ -169,6 +181,7 @@ def generate_sparse_seqlen_triton(
     topk_token: int,
     num_tokens: int,
     max_query_len: int,
+    index_kpool: int = 1,
 ):
     num_seqs = query_lens.size(0)
     out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
@@ -181,6 +194,7 @@ def generate_sparse_seqlen_triton(
         out,
         topk_token,
         block_size,
+        INDEX_KPOOL=index_kpool,
     )
     return out
 
@@ -265,7 +279,7 @@ def sparse_attn_indexer_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
         -1,
@@ -289,12 +303,12 @@ def sparse_attn_indexer_plugin_mode(
     # During profile/dummy run the metadata dict may not contain
     # our layer or may be None.
     if attn_metadata_dict is None:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     if k_cache_prefix not in attn_metadata_dict:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     layer_meta = attn_metadata_dict[k_cache_prefix]
     if layer_meta is None:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
 
     # vLLM sparse indexer builders return AiterMlaSparseIndexerMetadataForVllm directly
     indexer_meta = layer_meta
@@ -518,56 +532,17 @@ def sparse_attn_indexer_plugin_mode(
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
 
-    return weights
-
-
-def sparse_attn_indexer_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_input: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
-    dcp_sparse_kv_indptr_buffer: torch.Tensor,
-    dcp_owned_counts_buffer: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor,
-    k_norm_eps: float,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    weights_scale: float,
-    is_neox_style: bool,
-    use_qk_rope_cache_fusion: bool,
-    stable_topk: bool,
-) -> torch.Tensor:
-    # profile run
-    # NOTE(Chen): create the max possible flattened_kv. So that
-    # profile_run can get correct memory usage.
-    _flattened_kv = torch.empty(
-        [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
-    )
-    _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
-    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
     mutates_args=[
+        "kv_cache",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
     ],
-    fake_impl=sparse_attn_indexer_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
 
 
@@ -597,6 +572,12 @@ def _deepseek_v32_indexer_get_kv_cache_spec(self, vllm_config):
         num_kv_heads=1,
         head_size=self.head_dim,
         dtype=self.dtype,
+        # 1 for every model but GLM-5.3-Flash's pooled indexer, which caches one
+        # row per `index_kpool` tokens. vLLM then budgets and views
+        # `block_size // tokens_per_state` rows per block, which is the
+        # addressing ATOM's native `pool_slot_mapping` does
+        # (atom/model_ops/glm5_next/kpool.py).
+        tokens_per_state=int(getattr(self, "tokens_per_state", 1) or 1),
     )
 
 
@@ -609,7 +590,10 @@ def _deepseek_v32_indexer_get_attn_backend(self):
 
 
 def _deepseek_v32_indexer_bind_kv_cache(self, kv_cache):
-    self.kv_cache = kv_cache
+    # vLLM 0.29 hands every layer a logical [B, H, N, C] page view. The indexer
+    # publishes a single head slot, so drop it to get the ATOM kernels'
+    # [num_blocks, block_size, head_dim].
+    self.kv_cache = kv_cache.squeeze(1)
 
 
 def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):

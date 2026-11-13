@@ -12,6 +12,7 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.compile import (
     _COMPILE_ONLY,
@@ -19,7 +20,6 @@ from atom.mono.runtime.compile import (
     kernel_resources,
     scratch_bytes,
 )
-from atom.mono.runtime.consensus import tp_agree
 
 FRAMEWORK = pathlib.Path(__file__).resolve().parents[1] / "atom" / "mono"
 
@@ -98,12 +98,12 @@ def test_compile_only_is_scoped(monkeypatch, before):
 
 
 def test_agree_alone():
-    assert tp_agree(True, None) and not tp_agree(False, None)
+    assert group_agree(True, None) and not group_agree(False, None)
 
 
 def _agree_worker(rank, world, init, refuser, out):
     dist.init_process_group("gloo", init_method=init, rank=rank, world_size=world)
-    out[rank] = tp_agree(rank != refuser, dist.group.WORLD)
+    out[rank] = group_agree(rank != refuser, dist.group.WORLD)
     dist.destroy_process_group()
 
 
@@ -158,6 +158,22 @@ def test_bind_agreed_reraises_this_ranks_refusal():
     bind_agreed(lambda: None, None)
 
 
+def test_bind_agreed_converts_other_failures_to_refusal():
+    """A non-refusal failure must still leave every rank on the same path.
+
+    Peers only ever see MonoUnsupported, so a rank whose bind raised something
+    else -- an OOM, typically -- has to refuse the same way instead of dying
+    alone with an exception LazyRunner does not catch."""
+
+    import torch
+
+    def oom():
+        raise torch.OutOfMemoryError("out of memory")
+
+    with pytest.raises(MonoUnsupported, match="OutOfMemoryError: out of memory"):
+        bind_agreed(oom, None)
+
+
 def _mlir_escaped(data: bytes) -> str:
     return "".join(
         chr(b) if 0x20 <= b < 0x7F and b not in b'\\"' else f"\\{b:02X}" for b in data
@@ -165,12 +181,20 @@ def _mlir_escaped(data: bytes) -> str:
 
 
 class _CompiledLauncher:
-    """A compiled ``@flyc.jit`` launcher as ``scratch_bytes`` reads it: one
-    artifact whose module text holds a code object's scratch size (``value``:
-    its msgpack encoding)."""
+    """A compiled ``@flyc.jit`` launcher as ``scratch_bytes`` / ``kernel_names``
+    read it: one artifact whose module text holds a code object's scratch size
+    (``value``: its msgpack encoding) and kernel ``name``."""
 
-    def __init__(self, value: bytes):
-        elf = b"\x7fELF\x02\x01" + b"\x9b.private_segment_fixed_size" + value + b"\x00"
+    def __init__(self, value: bytes, name: bytes = b"k_s6"):
+        elf = (
+            b"\x7fELF\x02\x01"
+            + b"\x9b.private_segment_fixed_size"
+            + value
+            + b"\xa7.symbol"
+            + bytes([0xA0 | len(name) + 3])
+            + name
+            + b".kd\x00"
+        )
         text = (
             f'gpu.binary @m [#gpu.object<#rocdl.target, bin = "{_mlir_escaped(elf)}">]'
         )
@@ -247,6 +271,31 @@ def test_a_width_is_built_and_compiled_once():
     assert built == [6] and compiled == ["k6"] and widths[6] == "k6"
 
 
+def test_each_rank_compiles_its_own_share_of_a_width_first(monkeypatch):
+    """Rank r of w compiles every w-th kernel from r first (the ranks side by
+    side, not queued on one cache lock), then loads all of them."""
+    from atom.mono.runtime import widths as widths_module
+
+    monkeypatch.setattr(widths_module.dist, "get_rank", lambda group: 1)
+    monkeypatch.setattr(widths_module.dist, "get_world_size", lambda group: 3)
+    widths = WidthBuilds(lambda key: key, lambda k: [], object(), "test")
+    assert widths._share(list(range(7))) == [1, 4]
+    assert WidthBuilds(lambda key: key, lambda k: [], None, "test")._share([0, 1]) == [
+        0,
+        1,
+    ]
+
+
+def test_a_built_width_logs_its_kernels_names(caplog):
+    launchers = [_CompiledLauncher(b"\x00", n) for n in (b"post_s6", b"pre_s6")]
+    widths = WidthBuilds(
+        lambda key: key, lambda k: [(x, _NoArgs) for x in launchers], None, "test"
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert widths.prepare(103)
+    assert "test kernels built: post_s6, pre_s6" in caplog.text
+
+
 def test_a_width_that_fails_to_build_is_not_kept():
     def build(rows):
         raise RuntimeError("trace error")
@@ -278,16 +327,101 @@ def test_a_kernel_with_scratch_refuses_its_width_with_a_warning(caplog):
 
     widths = WidthBuilds(
         build,
-        lambda k: [(NO_SCRATCH, _NoArgs), (_CompiledLauncher(b"\x34"), _NoArgs)],
+        lambda k: [
+            (NO_SCRATCH, _NoArgs),
+            (_CompiledLauncher(b"\x34", b"post_s48"), _NoArgs),
+        ],
         None,
         "test",
     )
     with caplog.at_level("WARNING", logger="atom"):
         assert not widths.prepare(48) and not widths.prepare(48)
     assert tries == [48]
-    assert "52 B of scratch" in caplog.text
+    assert "post_s48 needs 52 B of scratch" in caplog.text
     with pytest.raises(KeyError):
         widths[48]
+
+
+def test_a_spilled_kernel_is_rebuilt_lean_and_its_width_served(caplog):
+    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+    lean_calls = []
+
+    def lean(built, spilled):
+        lean_calls.append((built, spilled))
+        return "lean"
+
+    widths = WidthBuilds(
+        lambda key: "fat",
+        lambda k: [(NO_SCRATCH, _NoArgs)] + ([(spill, _NoArgs)] if k == "fat" else []),
+        None,
+        "test",
+        lean=lean,
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert widths.prepare(56)
+    assert lean_calls == [("fat", [spill])] and widths[56] == "lean"
+    assert "pre_s56 need scratch, rebuilt lean" in caplog.text
+
+
+def test_a_lean_rebuild_that_still_spills_refuses_its_width(caplog):
+    spill = _CompiledLauncher(b"\x18", b"pre_s56")
+    widths = WidthBuilds(
+        lambda key: "fat",
+        lambda k: [(spill, _NoArgs)],
+        None,
+        "test",
+        lean=lambda built, spilled: "lean",
+    )
+    with caplog.at_level("WARNING", logger="atom"):
+        assert not widths.prepare(56)
+    assert "pre_s56 needs 24 B of scratch" in caplog.text
+
+
+def test_a_spill_with_nothing_leaner_refuses_without_a_rebuild(caplog):
+    """``lean`` None (a K2 or indexer spill: no K1 build to restage) refuses
+    the width on the first build, not after compiling the same one again."""
+    spill = _CompiledLauncher(b"\x18", b"post_s56")
+    builds = []
+
+    def build(key):
+        builds.append(key)
+        return "fat"
+
+    widths = WidthBuilds(
+        build, lambda k: [(spill, _NoArgs)], None, "test", lean=lambda b, s: None
+    )
+    with caplog.at_level("INFO", logger="atom"):
+        assert not widths.prepare(56)
+    assert builds == [56]
+    assert "rebuilt lean" not in caplog.text
+    assert "post_s56 needs 24 B of scratch" in caplog.text
+
+
+def test_a_build_that_refuses_is_logged_by_its_reason(caplog):
+    """``build`` raising ``MonoUnsupported`` (a width that cannot fit) refuses
+    the width with that reason as a warning, not a traceback."""
+
+    def build(key):
+        raise MonoUnsupported("K1's KDA stage needs 200000 B of LDS")
+
+    widths = WidthBuilds(build, lambda k: [], None, "test")
+    with caplog.at_level("WARNING", logger="atom"):
+        assert not widths.prepare(64)
+    assert "width 64 refused: K1's KDA stage needs 200000 B of LDS" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_an_unreadable_binary_refuses_its_width_instead_of_raising(caplog):
+    """A launcher whose binary cannot be read (no compiled artifact) is a build
+    failure every rank agrees on, not an exception out of ``prepare``."""
+    unread = _CompiledLauncher(b"\x00")
+    unread._mem_cache = {}
+    widths = WidthBuilds(
+        lambda key: "built", lambda k: [(unread, _NoArgs)], None, "test"
+    )
+    with caplog.at_level("ERROR", logger="atom"):
+        assert not widths.prepare(8)
+    assert "loading the width-8 kernels failed" in caplog.text
 
 
 class _Runner:
@@ -309,14 +443,179 @@ def test_lazy_runner_waits_out_a_capture(monkeypatch):
     assert mono.ready(6) and mono.runner is not None
 
 
-@pytest.mark.parametrize("refusal", ["create", "prepare"])
-def test_lazy_runner_refusal_is_for_good(monkeypatch, refusal):
+def test_lazy_runner_create_refusal_is_for_good(monkeypatch):
+    """A `create()` refusal is a deployment verdict: mono cannot serve at all."""
     monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def create():
-        if refusal == "create":
-            raise MonoUnsupported("TP 8")
-        return _Runner(ok=False)
+        raise MonoUnsupported("TP 8")
 
     mono = route.LazyRunner(create, "test")
     assert not mono.ready(6) and not mono.enabled and not mono.ready(6)
+
+
+def test_lazy_runner_width_refusal_spares_other_widths(monkeypatch):
+    """A `prepare(width)` refusal is about that width and nothing else.
+
+    A step padded to an uncaptured width must not take mono away from the
+    widths that do build -- the runner stays enabled and a later good width
+    still runs.
+    """
+    monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class _ByWidth:
+        def prepare(self, rows):
+            return rows != 20
+
+    mono = route.LazyRunner(_ByWidth, "test")
+    assert not mono.ready(20)  # the padded width is declined
+    assert mono.enabled  # ...but mono is not switched off
+    assert mono.ready(6)  # ...and a width that builds still runs
+    assert not mono.ready(20)  # the refused width stays refused
+
+
+def test_aiter_stub_teardown_leaves_no_second_copy():
+    """Dropping a module must clear its parent's attribute too.
+
+    `sys.modules.pop` alone leaves the parent package bound to the same object,
+    so a later import builds a fresh module while attribute access still finds
+    the old one -- two copies of every class in it, and a dotted-path
+    monkeypatch can reach the copy the test is not holding.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import _drop
+
+    pkg = types.ModuleType("fake_pkg")
+    sub = types.ModuleType("fake_pkg.sub")
+    pkg.sub = sub
+    sys.modules["fake_pkg"] = pkg
+    sys.modules["fake_pkg.sub"] = sub
+    try:
+        _drop("fake_pkg.sub")
+        assert "fake_pkg.sub" not in sys.modules
+        assert not hasattr(pkg, "sub"), "parent still points at the dropped module"
+    finally:
+        sys.modules.pop("fake_pkg.sub", None)
+        sys.modules.pop("fake_pkg", None)
+
+
+def test_aiter_stub_teardown_spares_modules_that_took_nothing():
+    """The teardown must drop poisoned `atom` modules and only those.
+
+    Dropping every `atom` module imported under the stub is the two-copies
+    bug from the other end: a caller still holding a module that never
+    touched AITER gets a second copy of its classes on the next import.
+    `test_scheduler_metrics` hit exactly that -- `engine_core_protocol` has
+    no AITER dependency, and pickling an enum member out of it raised
+    `PicklingError` once the module had been dropped and re-imported.
+
+    Synthetic modules, so the assertion does not depend on which real module
+    some earlier test happened to import first.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import stubbed_aiter
+
+    # Force the stub path: with a real AITER present nothing is installed and
+    # the sweep under test never runs.
+    saved = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == "aiter" or name.startswith("aiter.")
+    }
+    clean = types.ModuleType("atom.took_nothing")
+    poisoned = types.ModuleType("atom.took_a_mock")
+    # Holds a class *from* the poisoned module and nothing from AITER itself,
+    # which is how `engine_core` relates to `async_proc`. Keeping it would
+    # leave the stale second copy `conftest.atom_modules_are_imported_once`
+    # fails on, so the taint has to reach it transitively.
+    importer = types.ModuleType("atom.imports_the_poisoned_one")
+
+    class Borrowed:
+        pass
+
+    Borrowed.__module__ = "atom.took_a_mock"
+    try:
+        with stubbed_aiter():
+            import aiter
+
+            poisoned.borrowed = aiter.some_symbol
+            poisoned.Borrowed = Borrowed
+            importer.Borrowed = Borrowed
+            sys.modules["atom.took_nothing"] = clean
+            sys.modules["atom.took_a_mock"] = poisoned
+            sys.modules["atom.imports_the_poisoned_one"] = importer
+
+        assert (
+            sys.modules.get("atom.took_nothing") is clean
+        ), "a module that never touched AITER was dropped"
+        assert "atom.took_a_mock" not in sys.modules, "a poisoned module survived"
+        assert "atom.imports_the_poisoned_one" not in sys.modules, (
+            "a module holding a class from a dropped module survived; that is "
+            "the stale second copy the conftest guard fails on"
+        )
+    finally:
+        for name in (
+            "atom.took_nothing",
+            "atom.took_a_mock",
+            "atom.imports_the_poisoned_one",
+        ):
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+
+def _aux_drafter(aux_extract):
+    from types import SimpleNamespace
+
+    import torch
+
+    config = SimpleNamespace(dspark_target_layer_ids=(1, 3))
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_hf_config=config),
+        _aux_buffers=[torch.zeros(4, 8, dtype=torch.bfloat16) for _ in range(2)],
+        aux_extract=aux_extract,
+    )
+
+
+def test_bind_aux_taps_carries_the_drafters_extract():
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+
+    def extract(output, layer):
+        return output[0]
+
+    taps = bind_aux_taps(_aux_drafter(aux_extract=extract), 8)
+    assert taps.layer_ids == (1, 3)
+    assert taps.extract is extract
+
+
+def test_bind_aux_taps_refuses_tapped_layers_without_an_extract():
+    """`extract` is required whenever a layer is tapped; only the drafterless
+    `AuxTaps((), ())` has none."""
+    from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
+
+    for kernel in (None, lambda out, layer: out):
+        with pytest.raises(MonoUnsupported, match="no aux extract"):
+            bind_aux_taps(_aux_drafter(aux_extract=None), 8, kernel)
+    assert AuxTaps((), ()).extract is None
+
+
+def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
+    """A runner that writes the taps from its kernels never calls ``extract``,
+    so a drafter armed with another one would draft from two features."""
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    def kernel(output, layer):
+        return output[0]
+
+    def other(output, layer):
+        return output[1]
+
+    with pytest.raises(MonoUnsupported, match="aux extract"):
+        bind_aux_taps(_aux_drafter(aux_extract=other), 8, kernel)
+    assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
+    # a runner that calls the extract itself takes any
+    assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other

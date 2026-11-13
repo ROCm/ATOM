@@ -1,4 +1,4 @@
-from typing import Optional, Union, Any
+from typing import Any, Optional, Union
 
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -6,6 +6,11 @@ from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_wo
 
 # from atom.model_ops.rotary_embedding import get_rope
 from aiter.rotary_embedding import get_rope
+from torch import nn
+
+# import torch.distributed as dist
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 
@@ -20,8 +25,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 
-from atom.utils.decorators import support_torch_compile
-
 # from atom.model_ops.rotary_embedding import get_rope
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import (
@@ -32,10 +35,8 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils import envs
-from torch import nn
-
-# import torch.distributed as dist
-from transformers import PretrainedConfig
+from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
@@ -363,6 +364,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@token_graph
 @support_torch_compile
 class Qwen3MoeModel(nn.Module):
     def __init__(

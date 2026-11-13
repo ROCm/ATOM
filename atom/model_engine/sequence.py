@@ -6,11 +6,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import UNCONSTRAINED, SamplingParams
 
 
 def new_token_ids(token_ids=()) -> array.array:
@@ -135,6 +135,24 @@ def new_block_table(block_ids=()) -> BlockTable:
     return BlockTable(block_ids)
 
 
+class Replay(NamedTuple):
+    """A prefill forward starting below the point its seq resumed at: that
+    point -- the cache holds every row below it --, whether the rows below are
+    the seq's state (a `replay` state transfer brought none; otherwise the
+    state is the one at `until`), the tokens just before the forward, for
+    state a backend derives from the preceding tokens (V4.1's Engram n-gram
+    history, `Config.replay_history_tokens` of them), and where the replay's
+    first forward started: a DeepSeek-V4 bounded replay may span forwards, and
+    no row below that start is in the state it rebuilds. `Scheduler.
+    _resume_prefill` always records it; 0 (no floor) is for a record built
+    elsewhere, which no V4 forward reads."""
+
+    until: int
+    rebuilds: bool
+    history_ids: tuple[int, ...]
+    start: int = 0
+
+
 class SequenceStatus(Enum):
     WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
@@ -160,6 +178,20 @@ def get_exit_sequence():
     return exit_seq
 
 
+def resumes_offload_prefill(seq) -> bool:
+    """True when an offload load already settled and `seq` keeps its blocks.
+
+    Such a request resumes its suffix prefill without matching the prefix
+    again. Shared by the scheduler's admission and the offload connector's
+    lookup prefetch, which must agree: a lookup sent for a request that skips
+    the match is never consumed and only holds read locks.
+    """
+    return (
+        getattr(seq, "offload_loaded", False)
+        or getattr(seq, "offload_load_failed", False)
+    ) and len(seq.block_table) > 0
+
+
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
@@ -180,10 +212,19 @@ class OffloadJointRecord:
     # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
     # is where the two legs agree on one boundary. 0 = no lookup.
     kv_prefix_tokens: int = 0
+    # The LMCache-resident KV prefix with no regard for window state, in
+    # tokens: how far the full-attention KV alone reaches, at or past
+    # `kv_prefix_tokens`. Asked only where a bounded replay could use it
+    # (`Sequence.replay_kv_load`). 0 = not asked or not answered.
+    kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
-    # covers. `num_cached_tokens` stays at the HBM prefix until both legs
-    # report, which keeps the forward honest if either fails.
+    # covers. An aligned hit leaves `num_cached_tokens` at the HBM prefix
+    # until both legs report. An unaligned hit lowers it to the chunk floor
+    # at allocate time and refills `[floor, hbm)` privately. A failed leg
+    # returns to that HBM hit (`hbm_hit_tokens`) when the hit's blocks and
+    # state are still recoverable, and disowns to token 0 only when they
+    # are not.
     boundary_tokens: int = 0
     # Content hash of that boundary's last block, for the state leg.
     boundary_hash: int = -1
@@ -191,20 +232,26 @@ class OffloadJointRecord:
     # the boundary above, which is at or past it. The request still only claims
     # the boundary -- see `_claim_after_load`.
     kv_tokens: int = 0
-    # How far `allocate` claimed straight out of the HBM prefix cache, in
-    # tokens. Above `num_cached_tokens`, not below it: the blocks in
-    # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
-    # the state gate cut the hit, the KV never went anywhere. Claiming them is
-    # what keeps the KV leg from paying LMCache to resend what the pool already
-    # has, and it is where that leg starts.
+    # How far `allocate` claimed out of the HBM prefix cache, in tokens, and
+    # where the KV leg starts. After allocate this is at or above
+    # `num_cached_tokens`. A compressed hit past the gated hit claims resident
+    # blocks above the HBM prefix. An unaligned hit lowers `num_cached_tokens`
+    # to this floor, so the partial chunk is private rather than shared. The
+    # blocks in `(hit, compressed_hit]` still hold this prompt's KV; claiming
+    # them is what keeps the KV leg from paying LMCache to resend what the
+    # pool already has.
     claim_tokens: int = 0
+    # The gated HBM hit, in tokens, when `allocate` lowered
+    # `num_cached_tokens` below it to refill a partial chunk. 0 when the hit
+    # was not lowered. A failed joint resumes here instead of at token 0.
+    hbm_hit_tokens: int = 0
 
     def reset_joint(self) -> None:
         """Drop the joint boundary and both of its transfer spans.
 
-        The four joint fields move together -- a boundary is meaningless
-        without the KV span aimed at it and the prefix claimed below it -- so
-        the sites that abandon a joint load in full clear them through here
+        The joint fields move together -- a boundary is meaningless without
+        the KV span aimed at it and the prefix claimed below it -- so the
+        sites that abandon a joint load in full clear them through here
         rather than by hand. Leaves `load_hash` and `kv_prefix_tokens`
         untouched: they are set on their own paths and are not part of the
         boundary this drops.
@@ -213,6 +260,7 @@ class OffloadJointRecord:
         self.boundary_hash = -1
         self.kv_tokens = 0
         self.claim_tokens = 0
+        self.hbm_hit_tokens = 0
 
 
 class Sequence:
@@ -244,10 +292,6 @@ class Sequence:
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
             sampling_params = SamplingParams()
-        if num_draft_tokens and sampling_params.logprobs:
-            raise ValueError(
-                "Token logprobs are not supported with speculative decoding"
-            )
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -286,6 +330,10 @@ class Sequence:
         self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # The prefill forward scheduled last, where it backed off below the
+        # point it resumed at (`BlockManager.replay_start`); None when it did
+        # not.
+        self.replay: Replay | None = None
         # Tokens whose blocks are registered in the prefix cache: through the
         # prompt as chunks finalize, then on through decode as generated blocks
         # fill (BlockManager.hash_decode_blocks). Distinct from
@@ -300,6 +348,15 @@ class Sequence:
         # the reuse a checkpoint would have delivered — what the EngineStats
         # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
+        # DeepSeek-V4 bounded replay: whether the hit `BlockManager.can_allocate`
+        # admitted last has no checkpoint behind its state, so its prefill
+        # starts `Config.state_replay_tokens` below it and rebuilds the state
+        # there (`BlockManager.replay_start`; the forward is a `Replay`).
+        self.replays_hit = False
+        # That replay ends past the HBM hit, at LMCache MP's KV-only reach
+        # (`OffloadJointRecord.kv_only_tokens`): the connector loads that KV
+        # alone first, and once it lands the forward replays below the reach.
+        self.replay_kv_load = False
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
         # checkpoint can be kept. 0 = nowhere. Both written by
@@ -336,6 +393,11 @@ class Sequence:
         # `BlockManager._extend_hash_chain` for why it cannot simply be the
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
+        # `prefix_hash.ShippedChain`, consumed by
+        # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
+        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
+        # inside a pickled seq (`__getstate__`).
+        self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`
@@ -343,11 +405,20 @@ class Sequence:
         # handed back by `cancel_midstep` if that forward never runs. Non-empty
         # only between those two points.
         self.midstep_reservations: list[tuple] = []
+        # `checkpoint_end_pos` as the forward holding these reservations files
+        # it: moved back onto that forward's snapshot grid. 0 when the forward
+        # does not reach the anchor. Read by `StateSlotPool._anchor_of`.
+        self.midstep_anchor_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
         # `BlockManager.checkpointers_at`, which measures spacing from here.
         self.last_checkpoint_pos = 0
+        # The furthest prompt position whose checkpoint was decided when its
+        # chunk was scheduled (`BlockManager.checkpoint_when_scheduled`) rather
+        # than when it retired. Retire files nothing at or before it: with
+        # forwards in flight the slot has moved on by then.
+        self.scheduled_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -356,6 +427,10 @@ class Sequence:
         # garbage sampled tokens from intermediate chunks and to skip the
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
+        # Set after the local prompt forward completes, or when P/D admission
+        # confirms the producer's completed prompt KV. The router uses this
+        # even for an abort with no sampled output.
+        self.prefill_completed = False
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
@@ -401,11 +476,26 @@ class Sequence:
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
+        # The channel `tool_choice="required"` must open, and how far the
+        # committed output has got towards it (see `RequiredChannel`). Advanced
+        # by the scheduler over each token it commits, so on a deferred step it
+        # trails the GPU's copy by one forward; the runner reads this one only
+        # for rows whose last tokens the host already has.
+        self.required_channel = sampling_params.required_channel
+        self.required_channel_state = (
+            UNCONSTRAINED if self.required_channel is None else 0
+        )
         # One entry per completion token, so the same reason `token_ids` is an
         # array applies: a list would box a PyFloat per token and hand the
         # collector a slot to walk for each one. `json.dumps` is the only
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
+        self.top_logprobs = sampling_params.top_logprobs
+        self.structured_cursor = 0
+        self.structured_started = False
+        self.json_schema = sampling_params.json_schema
+        self.structured_reasoning_end = sampling_params.structured_reasoning_end
+        self.structured_tool_format = sampling_params.structured_tool_format
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
@@ -467,6 +557,12 @@ class Sequence:
 
     def __getitem__(self, key):
         return self.token_ids[key]
+
+    @property
+    def replay_until(self) -> int:
+        """Where the prefill forward scheduled last resumed, 0 when it did not
+        back off below it."""
+        return 0 if self.replay is None else self.replay.until
 
     @property
     def num_tokens(self):
@@ -539,6 +635,12 @@ class Sequence:
         self.last_token = token_id
         self.output_tokens.append(token_id)
         self.num_tokens += 1
+
+    def __getstate__(self):
+        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        state = self.__dict__.copy()
+        state["prompt_hash_chain"] = None
+        return state
 
     # def __getstate__(self):
     #     return (

@@ -6,20 +6,20 @@ import torch
 
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
-    pack_rows,
     write_packed_window,
 )
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
     INDEX_FP8_SCALE_FMT,
-    MAIN_FP4,
 )
-from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
-from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+from atom.model_ops.deepseek_v41.index_plane import (
+    FP4_MFMA,
+    IndexUnits,
+)
 from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
@@ -28,30 +28,73 @@ from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import (
-    swa_scatter_rows,
-    swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, upload_numpy
 
-from .indices import build_indices, fill_step_indptrs
+from .indices import (
+    build_indices,
+    build_window_rows,
+    fill_step_indptrs,
+    splits_window,
+)
 from .metadata import prepare_batch_step
 from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0, workspace=None):
+    def _allocate_backing(self, size, device):
+        """This cache's whole pool, as one flat uint8 arena.
+
+        The one seam a caller that already owns the bytes overrides. PAGE and
+        STATE share a single address space here because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all, and an override returns the whole
+        arena rather than the paged part of it.
+
+        What an override has to return is what this returns: zeroed, flat
+        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
+        region below is a `view` of it with its own strides, which neither a
+        short arena nor a longer tail would divide, and the cursor reset plus
+        every cold read assume the zeros.
+        """
+        return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    def __init__(
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+    ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        index_layout = geometry.index_layout
+        if index_layout == FP4_MFMA and (
+            geometry.index_dim != 128
+            or any(geometry.rows_per_page(ratio) % 64 for _, ratio in geometry.owners)
+        ):
+            raise ValueError(
+                "gfx950 OPUS FP4 index cache requires dim=128 and complete "
+                "64-row groups in every PAGE (block_size multiple of 128 "
+                "for ratio-2 owners)"
+            )
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
         self.packed = geometry.packed
+        self.window_fp8 = geometry.window_fp8
+        # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
+        self.kv_fp8 = geometry.kv_dtype == "fp8"
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        self.backing = self._allocate_backing(size, device)
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,
@@ -80,7 +123,8 @@ class PagedAttentionCache:
                 *(
                     plane.view(-1, geometry.index_block_rows, plane.shape[-1])
                     for plane in planes
-                )
+                ),
+                layout=index_layout,
             )
             for owner, planes in self.index_planes.items()
         }
@@ -124,6 +168,14 @@ class PagedAttentionCache:
         self._reset_slots = CpuGpuBuffer(
             slots, dtype=torch.int64, device=device, pin_memory=pinned
         )
+        # The Engram history each of those starts at (`BatchStep.start_histories`).
+        self._reset_histories = CpuGpuBuffer(
+            slots,
+            self.cursor.shape[1] - 1,
+            dtype=self.cursor.dtype,
+            device=device,
+            pin_memory=pinned,
+        )
         # Where a caller that wants no history lands its cursor rows: the copy
         # is issued and judged a step later, so nothing waits for it. See
         # `prepare_state`.
@@ -136,11 +188,15 @@ class PagedAttentionCache:
         )
         self._probe_done = torch.cuda.Event() if pinned else None
         self._probe_claim = None
-        self.pool = (
-            self.backing.view(-1, 1)
-            if geometry.packed
-            else self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
-        )
+        # The requests of the last step whose state was prepared, in batch
+        # order: what a device-round step must continue.
+        self._prepared_requests = None
+        if geometry.packed:
+            self.pool = self.backing.view(-1, 1)
+        elif self.kv_fp8:
+            self.pool = self.backing.view(-1, geometry.row_bytes)
+        else:
+            self.pool = self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
         # Owner -> its row in the compressor rings, which hold the raw
         # projections a pool window reaching back before this forward needs.
         self.compress_indices = {
@@ -232,6 +288,7 @@ class PagedAttentionCache:
         *,
         block_tables,
         tentative=False,
+        is_prefill=False,
         buffers=None,
         running_bs=None,
         running_tokens=None,
@@ -240,9 +297,21 @@ class PagedAttentionCache:
         plans=None,
         publication_group=None,
         query_prefix_ready=False,
-        query_prefix_republish_reason=None,
         planners=(),
+        floors=None,
+        cached_until=None,
+        finals=None,
+        start_histories=None,
+        lean=False,
     ):
+        """`floors`, `cached_until`, `finals`, `start_histories`: per request,
+        on the host, `BatchStep`'s `request_*` and `start_histories`; None for
+        a forward recomputing nothing, ending every prompt.
+
+        `lean`: the step runs no layer that reads a compress plan or a step
+        planner's tables -- the model's decode round runs them all
+        (`AttentionMetaData.served_by_round` `LEAN` and above) -- so it gets
+        neither."""
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -278,6 +347,7 @@ class PagedAttentionCache:
             block_tables=block_tables,
             page_limit=self.num_pages,
             tentative=tentative,
+            is_prefill=is_prefill,
             buffers=buffers,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -286,20 +356,69 @@ class PagedAttentionCache:
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
-            query_prefix_republish_reason=query_prefix_republish_reason,
-            planners=planners,
+            planners=() if lean else planners,
         )
-        step.plans = (
-            self._private_plans(requests, tentative) if plans is None else plans
+        if lean:
+            step.plans = {}
+        else:
+            step.plans = (
+                self._private_plans(requests, tentative) if plans is None else plans
+            )
+        count = len(requests)
+        zeros = np.zeros(count, np.int32)
+        step.request_floors = zeros if floors is None else floors
+        step.request_cached_until = zeros if cached_until is None else cached_until
+        step.request_finals = (
+            np.ones(count, np.bool_) if finals is None else np.asarray(finals)
         )
+        step.start_histories = start_histories
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
-        self._reserve_indptrs(step.width)
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
+        self._reserve_indptrs(step.running_tokens)
+        # Before the indptrs, which count each row's window from its floor.
+        self.publish_replay_layout(step, count if running_bs is None else running_bs)
         return step
+
+    def publish_replay_layout(self, step, running_bs, floors=None):
+        """`step.swa_replay_start` and `swa_cached_until` from its host
+        `request_floors` and `request_cached_until`, indexed by the step's own
+        batch rows: the fixed zeros unless a request recomputes rows below
+        where it resumed. ``floors``: the floors already published at fixed
+        addresses, a bounded-replay tail's, whose rows no ring holds."""
+        zeros = self._replay_start_zeros(running_bs)
+        step.swa_replay_start = step.swa_cached_until = zeros
+        if floors is not None:
+            step.swa_replay_start = floors
+        elif step.request_floors.any() and not step.decode:
+            step.swa_replay_start, step.swa_cached_until = upload_numpy(
+                np.stack((step.request_floors, step.request_cached_until)),
+                step.positions.device,
+            )
+
+    def _replay_start_zeros(self, running_bs):
+        """Every request's window from position 0: what a step that is not a
+        bounded-replay tail reads as `swa_replay_start`, indexed by batch id up
+        to `running_bs - 1`. One fixed buffer, sized for every slot up front,
+        so the index kernels a capture records keep reading it on replay."""
+        rows = max(running_bs, self.num_slots, 1)
+        zeros = getattr(self, "_replay_zeros", None)
+        if zeros is None or zeros.numel() < rows:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("The replay-start buffer cannot grow under capture")
+            zeros = self._replay_zeros = torch.zeros(
+                rows, dtype=torch.int32, device=self.indptr_device
+            )
+        return zeros
 
     def _private_plans(self, requests, tentative):
         """Plans into freshly allocated buffers, for a caller without any.
@@ -335,17 +454,18 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-    def _report_stale_state(self, cursors, starts, requests):
+    def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
 
-        Fresh requests are excluded by their own position: the slot they are
-        about to reuse holds whatever the last tenant left, and the reset below
-        is what makes it theirs.
+        Fresh requests are excluded: the slot they are about to reuse holds
+        whatever the last tenant left, and the reset below is what makes it
+        theirs.
         """
-        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
             return
         first = int(wrong[0])
+
         raise ValueError(
             f"Request {requests[first]} needs state at {starts[first]}, "
             f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
@@ -361,9 +481,42 @@ class PagedAttentionCache:
             return
         if self._probe_done is not None and not self._probe_done.query():
             return
-        starts, requests = self._probe_claim
+        starts, requests, fresh = self._probe_claim
         self._probe_claim = None
-        self._report_stale_state(self._probe[: starts.size].numpy(), starts, requests)
+        self._report_stale_state(
+            self._probe[: starts.size].numpy(), starts, requests, fresh
+        )
+
+    def prepare_device_round_state(self, step, *, histories=True):
+        """`prepare_state` for a device-round step (`RoundService.DEVICE`: the
+        model's decode round advanced its positions on the device from the
+        previous verdict): a steady decode of the requests the previous step
+        served, so no slot restarts and no probe (its start is the device's),
+        only the tentative state its verdict commits.
+
+        What makes skipping them safe is checked on the host instead, as hard
+        as the probe: the step's requests are the previous step's, in the same
+        order, none of them starting over (fresh) or resuming. A recycled slot
+        raises here rather than reading its last tenant's state."""
+        if histories:
+            raise RuntimeError("A device-round step on the host Engram path")
+        self.require_committed()
+        self._judge_previous_probe()
+        count = step.scheduled_bs
+        ids = [span.request_id for span in step.requests]
+        resumes = step.request_cached_until[:count]
+        fresh = (step.request_positions[:count] == step.request_floors[:count]) & (
+            resumes == 0
+        )
+        if ids != self._prepared_requests or fresh.any() or resumes.any():
+            raise RuntimeError(
+                f"A device-round step of requests {ids} (fresh "
+                f"{np.flatnonzero(fresh).tolist()}, resuming "
+                f"{np.flatnonzero(resumes).tolist()}) does not continue the "
+                f"previous step's {self._prepared_requests}"
+            )
+        if step.tentative:
+            self.pending = TentativeState(self, step)
 
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.
@@ -386,38 +539,55 @@ class PagedAttentionCache:
         self._judge_previous_probe()
         count = step.scheduled_bs
         starts = step.request_positions[:count]
-        ids = [span.request_id for span in step.requests]
+        ids = self._prepared_requests = [span.request_id for span in step.requests]
+        # A slot starts over at its floor: 0, or where a request rebuilds its
+        # state below a prefix hit (`BatchStep.request_floors`). One
+        # recomputing rows below where its state is keeps the state, and its
+        # cursor steps back to the forward's start.
+        resumes = step.request_cached_until[:count]
+        fresh = (starts == step.request_floors[:count]) & (resumes == 0)
+        restarted = np.concatenate((np.flatnonzero(fresh), np.flatnonzero(resumes)))
+        # where each state has to be
+        wanted = np.where(resumes > 0, resumes, starts)
         if histories:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
+            self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as
-            # its old tenant left it -- which is why the judge skips position 0.
+            # its old tenant left it -- which is why the judge skips fresh ones.
             self._probe[:count].copy_(
                 torch.index_select(self.cursor, 0, step.slots[:count]),
                 non_blocking=True,
             )
             if self._probe_done is not None:
                 self._probe_done.record()
-            self._probe_claim = (starts.copy(), ids)
+            self._probe_claim = (wanted, ids, fresh.copy())
             cursors = None
-        fresh = starts == 0
-        if fresh.any():
-            # Both resets take the same index, so the slots cross once.
-            slots = self._reset_slots.np[: int(fresh.sum())]
-            slots[:] = [span.slot for span, new in zip(step.requests, fresh) if new]
+        if restarted.size:
+            # The resets take one index, fresh slots first, so the slots cross
+            # once.
+            slots = self._reset_slots.np[: restarted.size]
+            slots[:] = [step.requests[i].slot for i in restarted]
             index = self._reset_slots.copy_to_gpu(slots.size)
-            self.state_bytes.index_fill_(0, index, 0)
-            self.cursor[:, 1:].index_fill_(0, index, -1)
+            self.state_bytes.index_fill_(0, index[: int(fresh.sum())], 0)
+            if step.start_histories is None:
+                self.cursor[:, 1:].index_fill_(0, index, -1)
+                started = -1
+            else:
+                started = step.start_histories[:count][restarted]
+                self._reset_histories.np[: restarted.size] = started
+                self.cursor[:, 1:].index_copy_(
+                    0, index, self._reset_histories.copy_to_gpu(restarted.size)
+                )
             if cursors is not None:
-                cursors[fresh, 0] = 0
-                cursors[fresh, 1:] = -1
+                cursors[restarted, 0] = starts[restarted]
+                cursors[restarted, 1:] = started
         if cursors is None:
             if step.tentative:
                 self.pending = TentativeState(self, step)
             return None
-        self._report_stale_state(cursors, starts, ids)
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]
@@ -452,25 +622,20 @@ class PagedAttentionCache:
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
-        # The packed pool interleaves FP4 with its scales, which the kernel's
-        # BF16 scatter cannot write; take the rotated echo and pack it here.
-        scatter = (
-            None
-            if self.packed
-            else (self.pages.view(f"main_{owner}")[0], step.block_tables)
-        )
-        latent, rotated = compress_batch(
-            self, owner, compressor, values, scores, step, rope, scatter=scatter
-        )
-        if rotated is not None:
-            packed = quantize_fp4(rotated, **MAIN_FP4)
-            self._scatter_rows(
-                self.pages.view(f"main_{owner}")[0],
-                step,
-                packed,
-                compressor.ratio,
-            )
-        return latent
+        """The boundaries' rotated latents into this owner's main rows, in the
+        pool's own row format; returns the latent the index key projects from."""
+        return compress_batch(
+            self, owner, compressor, values, scores, step, rope,
+            pages=self.pages.view(f"main_{owner}")[0],
+            quant_mode=self.main_quant_mode,
+        )  # fmt: skip
+
+    @property
+    def main_quant_mode(self):
+        """How `fused_compress_attn` stores a main row in this pool."""
+        if self.packed:
+            return "packed_fp4"
+        return "packed_fp8" if self.kv_fp8 else "none"
 
     def write_index(self, owner, step, index, ratio):
         """One pass quantizes, preshuffles and scatters.
@@ -505,22 +670,44 @@ class PagedAttentionCache:
             rope=rope,
         )
 
+    def indptrs(self, step):
+        """`step`'s `{ratio: (prefix indptr, extend indptr, reserved top-k)}`
+        (`fill_step_indptrs`), into its fixed buffers: a TBO microbatch's own,
+        else the cache's. Memoized as `unit_tiles` is, so a forward that builds
+        no index (mono's) fills none."""
+        if not step.indptrs:
+            step.indptrs = fill_step_indptrs(
+                step, self.geometry, step.indptr_buffers or self.indptr_buffers
+            )
+        return step.indptrs
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
         Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: a table built outside the graph is one a
-        replay reads without rebuilding. With a `workspace` the table is its
+        with it: a table built outside the graph is one a replay reads without
+        rebuilding. With a `workspace` the table is its
         ratio's fixed rows, rewritten each step; without one, a fresh
         allocation.
         """
         table = step.tiles.get(ratio)
         if table is None:
+            block_tables = step.block_tables
+            if not step.decode and step.requests:
+                # Expand only pages visible to a nonempty prefill step,
+                # including the cached prefix of a chunk/TBO microbatch. The
+                # persistent table can hold a 1M context even for an 8k prompt.
+                # Decode/verify and empty steps retain the full table width.
+                end = max(request.end for request in step.requests)
+                columns = (
+                    end + self.geometry.block_size - 1
+                ) // self.geometry.block_size
+                block_tables = block_tables[:, :columns]
             table = step.tiles[ratio] = unit_table(
-                step.block_tables,
+                block_tables,
                 step.batch_ids,
                 self.geometry.index_blocks_per_page(ratio),
-                workspace=self.workspace,
+                workspace=step.tile_workspace or self.workspace,
                 ratio=ratio,
             )
         return table
@@ -541,27 +728,6 @@ class PagedAttentionCache:
             )
         return bound
 
-    def _scatter_rows(self, pages, step, value, ratio):
-        """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
-
-        PAGE fields have gaps between pages. Give the existing row scatter a
-        zero-copy view whose row stride is one element, so destination indices
-        are element offsets into this field's span. This retains the real page
-        stride without flattening/copying the field or compacting live rows on
-        the host during CUDA graph capture.
-        """
-        per_page = pages.shape[1]
-        plan = step.plans[ratio].compress_plan_gpu
-        batch = plan[:, 1].long()
-        rows = plan[:, 2].long() // ratio
-        page = step.block_tables[batch.clamp_min(0), (rows // per_page).clamp_min(0)]
-        offsets = page.long() * pages.stride(0) + (rows % per_page) * pages.stride(1)
-        last = (pages.shape[0] - 1) * pages.stride(0) + (per_page - 1) * pages.stride(1)
-        pool = pages.as_strided((last + 1, pages.shape[-1]), (1, 1))
-        rows_in = pack_rows(*value) if isinstance(value, tuple) else value
-        scatter = swa_scatter_rows if pages.is_cuda else swa_scatter_rows_reference
-        scatter(rows_in[0], offsets, batch, pool)
-
     def compress_state(self, owner):
         """This owner's `(kv_state, score_state)`, each `[slots, ring, dim]`.
 
@@ -580,48 +746,65 @@ class PagedAttentionCache:
     def read_window(self, layer, slots):
         """Materialize only these requests' bounded context for block drafting."""
         self.require_committed()
-        if not self.packed:
+        if not self.window_fp8:
             return self.state.view("window")[layer, slots.long()]
-        window = self.geometry.window(layer, self.num_pages)
-        addresses = (
-            window.ring_start
-            + slots.long()[:, None] * window.slot_rows
-            + torch.arange(window.ring_slots, device=slots.device) * window.run_rows
-        )
-        tagged = ((addresses << 1) | 1).flatten()
-        ptr = torch.tensor([0, tagged.numel()], dtype=torch.int32, device=slots.device)
-        output = torch.empty(
-            tagged.numel(),
-            self.geometry.head_dim,
-            dtype=torch.bfloat16,
-            device=slots.device,
-        )
-        gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
-        return output.view(slots.numel(), window.ring_slots, self.geometry.head_dim)
+        return self._decode_windows(layer, slots)
 
     def read_windows(self, layers, slots):
         """Every stage's window for these requests, in one gather.
 
         The draft's stages read the same rows of the same tensor and differ
         only in which layer they read, so indexing them one at a time spent a
-        gather and a `.long()` cast per stage on work that broadcasts. The
-        packed pool keeps the per-layer path: its rows are addressed through
-        the ring geometry rather than indexed, and each layer's `ring_start`
-        is its own.
+        gather and a `.long()` cast per stage on work that broadcasts.
 
         `layers` is a device tensor so it can be built once and kept; the
         result is `[len(layers), len(slots), ring_slots, head_dim]`.
         """
         self.require_committed()
-        if self.packed:
-            return torch.stack(
-                [self.read_window(int(layer), slots) for layer in layers]
-            )
+        if self.window_fp8:
+            return self._decode_windows(layers.long()[:, None, None], slots)
         # No `.long()`: the slot table is int32 and the kernel widens each
         # index itself, so casting the whole tensor first was a copy of it.
         return gather_window_rows(self.state.view("window"), layers, slots)
 
-    def rope_quant_window(self, layer, query, kv, rope, step):
+    def _decode_windows(self, layers, slots):
+        """FP8 windows decoded to BF16: `[slots, ring, dim]` for an int layer,
+        `[layers, slots, ring, dim]` for a `[layers, 1, 1]` device column.
+
+        A layer's ring starts `layer` rings past layer 0's, so the layers move
+        the addresses without a host read: a draft graph captures this.
+        """
+        first = self.geometry.window_bytes(0, self.num_pages)
+        addresses = (
+            first.ring_start
+            + layers * (first.ring_slots * first.run_rows)
+            + slots.long()[:, None] * first.slot_rows
+            + torch.arange(first.ring_slots, device=slots.device) * first.run_rows
+        )
+        tagged = ((addresses << 1) | 1).flatten()
+        # [0, rows] built on the device: no host copy inside a capture
+        ptr = torch.arange(2, dtype=torch.int32, device=slots.device) * tagged.numel()
+        dim = self.geometry.head_dim
+        output = torch.empty(
+            tagged.numel(), dim, dtype=torch.bfloat16, device=slots.device
+        )
+        gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
+        return output.view(*addresses.shape, dim)
+
+    def query_fp8(self, query):
+        """`(values, scales)` for `query`'s MXFP8 copy, which the FP8 pool's
+        attention reads (`rope_quant_window`'s `query_fp8`); None otherwise."""
+        if not self.kv_fp8:
+            return None
+        *rows, dim = query.shape
+        return (
+            torch.empty_like(query, dtype=FP8_DTYPE),
+            torch.empty(
+                (*rows, dim // 32), device=query.device, dtype=torch.float8_e8m0fnu
+            ),
+        )
+
+    def rope_quant_window(self, layer, query, kv, rope, step, query_fp8=None):
         """Rotate the query, quantize the KV row, and store it where it can be.
 
         A decode stores the row and produces nothing: no query of a decode
@@ -631,58 +814,103 @@ class PagedAttentionCache:
         attention, in `write_window`. The cache layout only decides the
         payload, so both halves of that read the same either way.
 
-        Returns the BF16 row an extend pass attends to and whatever the window
-        still owes, `None` for each the caller has no use for.
+        Returns the rows an extend pass attends to -- BF16, or on the FP8 pool
+        `[tokens, row_bytes]` MXFP8 rows at the pool's row stride -- and
+        whatever the window still owes, `None` for each the caller has no use
+        for. `query` None: the KV row alone, for a prefill whose queries are
+        not its rows (`rotate_query`). `query_fp8`: `query_fp8(query)`, the
+        rotated query's MXFP8 destination.
         """
-        dim, packed = self.geometry.head_dim, self.packed
-        if not step.width:
+        dim, window_fp8 = self.geometry.head_dim, self.window_fp8
+
+        if not step.running_tokens:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
-            query.view(step.width, -1, dim),
-            kv.view(step.width, dim),
+            (
+                kv.new_empty(step.running_tokens, 0, dim)
+                if query is None
+                else query.view(step.running_tokens, -1, dim)
+            ),
+            kv.view(step.running_tokens, dim),
             rope.cos_cache,
             rope.sin_cache,
             step.positions,
         )
         if step.decode:
+            # An FP8 window is stored as bytes, a BF16 one into the
+            # `[rows, head_dim]` pool, which is the whole difference.
+            ring = (
+                (self.backing, step, self.geometry.window_bytes(layer, self.num_pages))
+                if window_fp8
+                else (self.pool, step, self.geometry.window(layer, self.num_pages))
+            )
+            rope_quant_window(
+                *seam, rope_dim=rope.rope_dim, ring=ring, query_fp8=query_fp8
+            )
+            return None, None
+        if self.kv_fp8:
+            # Values then scales a row, the pool's own row: the attention's
+            # extend source has to share the prefix's strides.
+            rows = torch.empty(
+                (step.running_tokens, self.geometry.row_bytes),
+                device=kv.device,
+                dtype=torch.uint8,
+            )
+            values = rows[:, :dim].view(FP8_DTYPE)
+            scales = rows[:, dim:].view(torch.float8_e8m0fnu)
             rope_quant_window(
                 *seam,
                 rope_dim=rope.rope_dim,
-                # The packed pool is byte-addressed and the BF16 one is a
-                # `[rows, head_dim]` view, which is the whole difference.
-                ring=(
-                    self.backing if packed else self.pool,
-                    step,
-                    self.geometry.window(layer, self.num_pages),
-                    packed,
-                ),
+                values=values,
+                scales=scales,
+                query_fp8=query_fp8,
             )
-            return None, None
+            return rows, (values, scales)
         qat = torch.empty_like(kv)
-        values = torch.empty_like(kv, dtype=FP8_DTYPE) if packed else None
+        values = torch.empty_like(kv, dtype=FP8_DTYPE) if window_fp8 else None
         scales = (
             torch.empty(
                 (*kv.shape[:-1], dim // 32),
                 device=kv.device,
                 dtype=torch.float8_e8m0fnu,
             )
-            if packed
+            if window_fp8
             else None
         )
         rope_quant_window(
             *seam, rope_dim=rope.rope_dim, qat=qat, values=values, scales=scales
         )
-        return qat, (values, scales) if packed else qat
+        return qat, (values, scales) if window_fp8 else qat
+
+    def rotate_query(self, query, rope, positions, query_fp8=None):
+        """`rope_quant_window`'s query half alone, at `positions`."""
+        if positions.numel():
+            rope_quant_window(
+                query.view(positions.numel(), -1, self.geometry.head_dim),
+                None,
+                rope.cos_cache,
+                rope.sin_cache,
+                positions,
+                rope_dim=rope.rope_dim,
+                query_fp8=query_fp8,
+            )
 
     def write_window(self, layer, kv, step):
         # `None` is `rope_quant_window` reporting that it already stored the
-        # row, not an empty batch: those two differ in whether `step.width` is
+        # row, not an empty batch: those two differ in whether `step.running_tokens` is
         # zero, and only this one can reach here after a real forward.
-        if kv is not None and step.width:
+        if kv is not None and step.running_tokens:
             window = self.geometry.window(layer, self.num_pages)
-            if self.packed:
+            # rows below where a request's ring already holds them stay
+            cached = step.swa_cached_until if step.request_cached_until.any() else None
+            if self.window_fp8:
                 write_packed_window(
-                    *kv, self.backing, step, window, self.geometry.head_dim
+                    *kv,
+                    self.backing,
+                    step,
+                    self.geometry.window_bytes(layer, self.num_pages),
+                    self.geometry.head_dim,
+                    cached,
                 )
                 return
             swa_write(
@@ -697,29 +925,44 @@ class PagedAttentionCache:
                 # zero-length in `cu_seqlens_q`, which is what keeps it from
                 # writing anything at all.
                 min(step.max_q_len, window.ring_slots),
+                cached_until=cached,
             )
 
     def attention_indices(self, spec, step):
-        """This layer's prefix rows, built with its whole group's on a decode.
+        """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
+        rows into the attention's second source.
+
+        Prefill and decode alike build their index group's in one launch:
+        every layer's prefix, window included, or on a split decode
+        (`splits_window`) the selection alone, one plane the group shares. A
+        prefill's second source is its own KV (`extend`, one list for the
+        group); a decode's is the layer's ring (`ring_view`), and a split
+        decode's window rows one list for every layer.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
         Later layers find theirs written and launch nothing.
         """
-        first = spec.index_group_start
-        if not step.decode or spec.index_group_size == 1:
-            # A run of one, anchored on this layer's own ring, so a spec that
-            # declares no group never has to name a start. A prefill takes this
-            # too: it pays work rather than dispatch, and its `extend` plane is
-            # this layer's alone.
-            prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
-            return prefix[0], pptr, extend, eptr
+        # a spec that declares no group never names a start: its own
+        first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
+        split = splits_window(step, self.geometry)
         built = step.group_indices.get(first)
         if built is None:
-            built = self._index_group(spec, step, first, spec.index_group_size)
+            layers = 1 if split else spec.index_group_size
+            built = self._index_group(spec, step, first, layers)
             step.group_indices[first] = built
         prefix, pptr, extend, eptr = built
-        return prefix[spec.layer_id - first], pptr, extend, eptr
+        if not split:
+            return prefix[spec.layer_id - first], pptr, extend, eptr
+        if step.window_rows is None:
+            window = self.geometry.window(first, self.num_pages)
+            step.window_rows = build_window_rows(step, self.geometry, window, eptr)
+        return prefix[0], pptr, step.window_rows, eptr
+
+    def ring_view(self, layer):
+        """The row-addressed pool (BF16 or FP8 rows) from `layer`'s ring
+        start: a split decode's second source, which its window rows index."""
+        return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
     def _index_group(self, spec, step, first, layers):
         """One build covering `layers` consecutive layers from `first`.
@@ -736,6 +979,7 @@ class PagedAttentionCache:
         )
         return build_indices(
             step.selected[spec.topk_owner] if spec.ratio else None,
+            self.indptrs(step)[spec.ratio],
             step,
             self.geometry,
             window,

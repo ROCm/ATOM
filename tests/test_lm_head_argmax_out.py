@@ -83,3 +83,44 @@ def test_argmax_rejects_invalid_output_storage(monkeypatch, out):
     head = _tp1_head(torch.empty(2, 3), monkeypatch)
     with pytest.raises(AssertionError, match="argmax out"):
         head.compute_argmax_token(torch.empty(2, 4), out=out)
+
+
+@pytest.mark.parametrize(
+    "lengths,running_bs",
+    [
+        ((3, 2), 4),  # padding requests past the scheduled two
+        ((), 2),  # an idle DP rank: every request is padding
+    ],
+)
+def test_prefill_head_projects_the_scheduled_requests_last_tokens(
+    monkeypatch, lengths, running_bs
+):
+    """One row per scheduled request, its last token, out of the running
+    tokens the head gets: a padding request has no token to pick."""
+    from types import SimpleNamespace
+
+    from atom.distributed import ulysses_sp
+
+    monkeypatch.setattr(ulysses_sp, "sp_is_enabled", lambda: False)
+    monkeypatch.setattr(embed_head, "sp_is_enabled", lambda: False)
+    scheduled = sum(lengths)
+    running_tokens = scheduled + 2
+    cu = torch.zeros(running_bs + 1, dtype=torch.int32)
+    cu[1 : len(lengths) + 1] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
+    cu[len(lengths) + 1 :] = scheduled
+    context = SimpleNamespace(
+        is_prefill=True, is_draft=False, scheduled_bs=len(lengths)
+    )
+    fc = SimpleNamespace(
+        context=context, attn_metadata=SimpleNamespace(cu_seqlens_q=cu)
+    )
+    head = _tp1_head(torch.empty(0), monkeypatch)
+    monkeypatch.setattr(embed_head, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(embed_head, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(head, "_can_use_dp_sharded_head", lambda _ctx: False)
+    monkeypatch.setattr(embed_head.tgemm, "mm", lambda x, *_args: x)
+    hidden = torch.arange(running_tokens, dtype=torch.float32).unsqueeze(-1)
+
+    rows = head(hidden)
+
+    assert rows.squeeze(-1).tolist() == (torch.tensor(lengths).cumsum(0) - 1).tolist()

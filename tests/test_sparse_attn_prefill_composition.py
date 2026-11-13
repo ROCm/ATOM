@@ -3,7 +3,7 @@
 
 """A query token's prefill attention must not depend on its batch-mates.
 
-`sparse_attn_v4_paged_prefill` has no unit test at all, and it is the last
+`sparse_attn_v4_paged_2src` has no unit test at all, and it is the last
 consumer on the chunked-prefill path whose batch-composition behaviour is
 unmeasured. Swapping OPUS for Triton (`ATOM_FORCE_ATTN_TRITON=1`) changes the
 IMPLEMENTATION but not the contract, so it cannot settle this either.
@@ -33,7 +33,7 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_ops.v4_kernels.paged_prefill import sparse_attn_v4_paged_prefill
+from atom.model_ops.v4_kernels.paged_2src import sparse_attn_v4_paged_2src
 
 DEV = "cuda"
 H = 64  # DeepSeek-V4-Flash: 64 query heads, MQA
@@ -103,7 +103,7 @@ def _run(groups):
     e_idx = torch.tensor(
         [c for row in extend for c in row] or [0], dtype=torch.int32, device=DEV
     )
-    out = sparse_attn_v4_paged_prefill(
+    out = sparse_attn_v4_paged_2src(
         q,
         _pool(),
         p_idx,

@@ -123,6 +123,16 @@ class SinglePassHCState:
             self.pre_mix,
         )
 
+    def fields(self):
+        """The five tensors, in constructor order."""
+        return (
+            self.residual,
+            self.pre_mix,
+            self.pending,
+            self.post_mix,
+            self.combination,
+        )
+
     def collapse(self):
         """BF16 streams weighted by the FP32 pre-mix, settling an owed post.
 

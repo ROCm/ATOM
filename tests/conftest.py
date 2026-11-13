@@ -32,8 +32,35 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils.region_graph import ReqGraph
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
+
+
+def gpu_stack_import(name):
+    """Import an atom module that may need the aiter/triton GPU stack.
+
+    Tries the import first, so a module that imports fine without the stack
+    still runs on the CPU-only CI runner. A failure is turned into a skip only
+    when the stack is genuinely absent -- no aiter or triton, or no GPU for
+    aiter to probe the arch of at import. On a GPU host any import error FAILS.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        try:
+            importlib.import_module("aiter")
+            importlib.import_module("triton")
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception as e:  # noqa: BLE001 - any failure here means no stack
+            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
+        if not gpu:
+            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
+        raise
 
 
 class _MockHFConfig:
@@ -59,17 +86,24 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
+            "enable_dynamic_chunking": False,
+            "dynamic_chunking_smooth_factor": 0.75,
+            "dynamic_chunking_min_chunk_size": 4096,
             "max_num_seqs": 4,
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
             "decode_context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "kv_transfer_config": {},
             "max_model_len": 64,
             "bos_token_id": 1,
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "prefill_admit_policy": "interval",
             "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
@@ -252,3 +286,73 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+class ReqGraphRecordings:
+    """What a warmup's capture leaves in request graphs, held on the CPU: a
+    bucket of ``running_bs`` requests replays to ``out``."""
+
+    def __init__(self):
+        self.by_requests = {}
+
+    def add(self, running_bs, out, on_replay=None):
+        def replay():
+            if on_replay is not None:
+                on_replay()
+            return out
+
+        self.by_requests[running_bs] = replay
+
+
+@pytest.fixture
+def req_graph_recordings(monkeypatch):
+    """`ReqGraph`'s interface served from `ReqGraphRecordings`, for a draft
+    pass (`DraftGraph`, keyed by its request count) and a test without a GPU
+    to record it on."""
+    recordings = ReqGraphRecordings()
+    held = recordings.by_requests
+
+    def release_graphs(self):
+        dropped = len(held)
+        held.clear()
+        return dropped
+
+    monkeypatch.setattr(ReqGraph, "has", lambda self, key, phase=None: key in held)
+    monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
+    monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
+    return recordings
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
+
+
+@pytest.fixture(autouse=True)
+def mono_runs_on_gfx950(monkeypatch):
+    """Mono's deployment checks see gfx950, the only arch its kernels are built
+    for, so a refusal test asserts on its own condition on any runner (a CPU
+    one has no chip to ask). The arch check itself is tested by patching back.
+    """
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+
+
+@pytest.fixture
+def mxfp4_default_backends(monkeypatch):
+    """Pin the MXFP4 linear backend to the default preshuffled ASM path.
+
+    `mxfp4_k_pad_align` and the load-time K check read the backend live
+    (`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM`, the gfx1250 32x4 switch), so a
+    test of either must not depend on what the shell exported. Imported here
+    lazily: `atom.model_ops.linear` needs AITER.
+    """
+    from atom.model_ops import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)

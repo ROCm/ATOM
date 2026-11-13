@@ -968,6 +968,9 @@ jobs:
           j355 = json.dumps({"include": mi355_rows}, separators=sep)
           j308 = json.dumps({"include": mi308_rows}, separators=sep)
 
+          with open("sglang_benchmark_matrix.json", "w", encoding="utf-8") as fh:
+              json.dump({"include": mi355_rows + mi308_rows}, fh, separators=sep)
+
           gh_out = os.environ["GITHUB_OUTPUT"]
           with open(gh_out, "a", encoding="utf-8") as fh:
               fh.write(f"benchmark_matrix_mi355={j355}\n")
@@ -982,6 +985,15 @@ jobs:
               print(f"Benchmark cells: {len(include)}", file=sys.stderr)
               print(f"MI355 shard cells: {len(mi355_rows)}, MI308 shard cells: {len(mi308_rows)}", file=sys.stderr)
           PY
+
+      # The summary reads the matrix from this file: a full nightly matrix is
+      # larger than Linux's 128 KiB limit on a single env var or argument.
+      - name: Upload benchmark matrix payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-matrix-payload
+          path: sglang_benchmark_matrix.json
+          if-no-files-found: error
 
   build-sglang-image:
     name: Build custom SGLang benchmark image
@@ -1030,7 +1042,7 @@ jobs:
         run: |
           cat > Dockerfile.sglang-base <<EOF
           FROM ${SGLANG_BASE_IMAGE}
-          RUN pip install -U lm-eval[api]
+          RUN pip install -U "lm-eval[api]" "datasets==5.0.0"
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
           RUN pip show hf_transfer || true
@@ -1207,28 +1219,20 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Not under the result root: its *.json is scanned as benchmark results.
+      - name: Download benchmark matrix payload
+        uses: actions/download-artifact@v8
+        with:
+          name: sglang-matrix-payload
+          path: matrix-payload
+
       - name: Generate SGLang benchmark summary table
         env:
-          BENCHMARK_MATRIX_MI355: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi355 }}
-          BENCHMARK_MATRIX_MI308: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi308 }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          BENCHMARK_MATRIX="$(python3 - <<'PY'
-          import json
-          import os
-
-          include = []
-          for name in ("BENCHMARK_MATRIX_MI355", "BENCHMARK_MATRIX_MI308"):
-              raw = os.environ.get(name) or '{"include":[]}'
-              include.extend(json.loads(raw).get("include", []))
-
-          print(json.dumps({"include": include}, separators=(",", ":")))
-          PY
-          )"
-
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
-            --matrix-json "${BENCHMARK_MATRIX}" \
+            --matrix-json-file matrix-payload/sglang_benchmark_matrix.json \
             --run-url "${RUN_URL}" \
             --output-json sglang_benchmark_summary.json \
             --title "SGLang Benchmark Summary" \

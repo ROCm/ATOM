@@ -33,7 +33,7 @@ impl ExtProcService {
         Self {
             admission: Arc::new(Admission::new(&app)),
             streams: Arc::new(Semaphore::new(app.router_config.ext_proc.max_streams)),
-            parser: Arc::new(RequestParser::new(app.clone())),
+            parser: Arc::new(RequestParser::new(&app)),
             app,
             draining,
             force_stop,

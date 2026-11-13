@@ -44,7 +44,7 @@ from atom.models.minimax_m3.mono.layout import (
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.ops import block_max as block_max_of
-from atom.mono.device.ops import kernel_symbol, load_ptr64
+from atom.mono.device.ops import kernel_symbol, launcher, load_ptr64
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
@@ -253,7 +253,7 @@ def build_dense_post_kernel(
         stamp(8)
         stamp_flush(timeline, tls, tl, tid, bid, DENSE_TL_POINTS)
 
-    @flyc.jit
+    @launcher(kernel_name)
     def launch_dense_post(
         attn: Int64,
         h_in: Int64,

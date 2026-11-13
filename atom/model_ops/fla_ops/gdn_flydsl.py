@@ -215,8 +215,15 @@ def prefill(
     *,
     state_indices=None,
     has_initial_state=None,
+    snapshot_layout="kv",
 ):
-    """Return ATOM token-major output, FP32 final KV state and optional BF16 h."""
+    """Return token-major output, FP32 final KV state and optional BF16 h.
+
+    The default KV snapshot preserves the existing public contract. A caller
+    that writes native FlyDSL checkpoints may request its VK layout instead.
+    """
+    if snapshot_layout not in ("kv", "vk"):
+        raise ValueError(f"Unsupported GDN snapshot layout: {snapshot_layout}")
     if not prefill_supported(q, k, v, g, beta, metadata):
         raise ValueError("Unsupported AITER FlyDSL prefill shape/metadata")
     _log_dispatch("prefill K1-K5 (ATOM K6)")
@@ -253,7 +260,9 @@ def prefill(
     output = chunk_fwd_o(
         q, k, vn, h, gc, cu_seqlens=cu_seqlens, head_major_vk=True, chunk_indices=chunks
     )
-    snapshots = h.transpose(-1, -2).contiguous() if keep_intermediate_states else None
+    snapshots = None
+    if keep_intermediate_states:
+        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2).contiguous()
     return output, ht.transpose(-1, -2), snapshots
 
 
@@ -295,17 +304,29 @@ def decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
     )
 
 
-def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
-    """Fused gating/normalization/recurrence, zero-copy logical KV state view."""
+def decode(q, k, v, a, b, state, A_log, dt_bias, reads, writes, out=None):
+    """Fused gating/normalization/recurrence, zero-copy logical KV state view.
+
+    `out`, a contiguous `[batch, hv, 128]` buffer, receives the result
+    directly when the kernel writes every row itself.
+    """
     if not decode_supported(q, k, v, a, b, state, A_log, dt_bias, reads, writes):
         raise ValueError("Unsupported AITER FlyDSL decode inputs")
     _log_dispatch("decode (zero-copy VK state)")
     batch, hv = v.shape[1:3]
     fn = ops()[0]
-    allocate = (
-        torch.empty if getattr(fn, "zeroes_invalid_output", False) else torch.zeros
-    )
-    output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
+    writes_all_rows = getattr(fn, "zeroes_invalid_output", False)
+    if (
+        out is not None
+        and writes_all_rows
+        and out.is_contiguous()
+        and out.shape == (batch, hv, 128)
+        and out.dtype == q.dtype
+    ):
+        output = out.view(batch, 1, hv, 128)
+    else:
+        allocate = torch.empty if writes_all_rows else torch.zeros
+        output = allocate((batch, 1, hv, 128), device=q.device, dtype=q.dtype)
     fn(
         query=q.transpose(0, 1),
         key=k.transpose(0, 1),

@@ -177,3 +177,31 @@ def test_a_transfer_with_no_groups_still_yields_an_empty_table():
 
     assert spans == []
     assert table.dtype is torch.int32 and int(table.numel()) == 0
+
+
+def test_segment_gather_matches_the_view_gather_byte_for_byte():
+    """`fused_pack_segments` takes addresses where `fused_pack_chunk_major`
+    takes views. Same kernel, same layout: the two blobs must be identical,
+    including segments that end mid-tile, and a second call that reuses the
+    cached metadata and pinned address buffer with new sources."""
+    import pytest
+
+    if not (_REAL_TRITON and torch.cuda.is_available()):
+        pytest.skip("needs Triton and a GPU")
+    staging = importlib.import_module(_MODULE_NAME)
+    device = torch.device("cuda", 0)
+    sizes = [7, 1024, 1500, 3, 4096, 2049]
+    prepared = staging.prepare_segment_gather(sizes, device)
+    for seed in (1, 2):
+        gen = torch.Generator().manual_seed(seed)
+        segments = [
+            torch.randint(0, 256, (n,), dtype=torch.uint8, generator=gen).to(device)
+            for n in sizes
+        ]
+        want = torch.zeros(sum(sizes), dtype=torch.uint8, device=device)
+        got = torch.zeros_like(want)
+        staging.fused_pack_chunk_major(segments, sizes, [1], [0], want)
+        staging.fused_pack_segments(prepared, [s.data_ptr() for s in segments], got)
+        torch.cuda.synchronize(device)
+        assert torch.equal(got, want)
+        assert torch.equal(got, torch.cat(segments))

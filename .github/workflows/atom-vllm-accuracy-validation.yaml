@@ -974,7 +974,9 @@ jobs:
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
           MODEL_MOUNT_PATH="/models"
-          if [ -d "/mnt/dcgpuval" ]; then
+          if [ -d "/share_nfs/models" ]; then
+            MODEL_CACHE_ROOT="/share_nfs/models"
+          elif [ -d "/mnt/dcgpuval" ]; then
             MODEL_CACHE_ROOT="/mnt/dcgpuval"
           elif [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"
@@ -1074,7 +1076,11 @@ jobs:
               set -euo pipefail
               python3 - <<'"'"'PY'"'"'
           import os
+          import sys
           from pathlib import Path
+
+          sys.path.insert(0, "/workspace/.github/scripts")
+          from check_model_dir import incomplete_reason
 
           model_path = os.environ["MODEL_PATH"].strip().strip("/")
           normalized = model_path.rstrip("/")
@@ -1181,8 +1187,11 @@ jobs:
               seen.add(candidate)
               path = Path(candidate)
               if (path / "config.json").is_file():
-                  print(f"FOUND_LOCAL_MODEL={candidate}")
-                  raise SystemExit(0)
+                  reason = incomplete_reason(path)
+                  if reason is None:
+                      print(f"FOUND_LOCAL_MODEL={candidate}")
+                      raise SystemExit(0)
+                  print(f"Skipping incomplete local model {candidate}: {reason}")
 
           print("LOCAL_MODEL_NOT_FOUND")
           print("Checked candidates:")
@@ -1233,19 +1242,29 @@ jobs:
                   use_model_lock="false"
                 fi
 
+                model_dir_is_complete() {
+                  python3 /workspace/.github/scripts/check_model_dir.py "$MODEL_DIR"
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
-                    echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
+                    echo "Model directory exists without a complete download under ${MODEL_DIR}; resuming download"
                   else
                     echo "Model not found under ${MODEL_DIR}; downloading model"
                   fi
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  # Mark first so the check validates the downloaded shards rather
+                  # than the unmarked-directory heuristics; unmark if it fails.
                   touch "$completion_flag"
+                  if ! model_dir_is_complete; then
+                    rm -f "$completion_flag"
+                    exit 1
+                  fi
                 }
 
-                if [ -f "$completion_flag" ]; then
+                if [ -f "$completion_flag" ] && model_dir_is_complete; then
                   echo "Model already exists under ${MODEL_DIR}; skip download"
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
@@ -1261,7 +1280,7 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
                     download_model
@@ -1433,55 +1452,16 @@ jobs:
         run: |
           # MTP acceptance is recorded into the result JSON by atom_oot_test.sh
           # (scraped from the live vLLM /metrics endpoint during the gsm8k run).
-          # gsm8k accuracy alone CANNOT guard MTP: speculative decoding is loss-
-          # less w.r.t. the target model, so a broken draft head leaves accuracy
-          # unchanged and only craters acceptance/throughput. This step is the
-          # only gate that catches an MTP regression. Uses jq+awk (no python on
-          # the host runner), mirroring the gsm8k accuracy check above.
+          # The gate itself is shared with the PR path -- it was written twice
+          # and the copies diverged, the PR one having dropped the
+          # per-position check.
           result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
-          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+          if [ -z "$result_file" ]; then
             echo "ERROR: No results JSON file found for MTP acceptance check."
             exit 2
           fi
-          echo "RESULT_FILE: $result_file"
-
-          overall=$(jq -r '.atom_ci_metadata.mtp_acceptance_overall // empty' "$result_file")
-          if [ -z "$overall" ]; then
-            echo "ERROR: mtp_acceptance_overall missing — spec-decode /metrics were not captured during the run. Treating as a failure."
-            exit 1
-          fi
-
-          fail=0
-          echo "MTP overall acceptance: $overall (threshold ${MTP_ACCEPT_THRESHOLD})"
-          if awk -v v="$overall" -v t="${MTP_ACCEPT_THRESHOLD}" 'BEGIN {exit !(v < t)}'; then
-            echo "FAIL: overall acceptance $overall < threshold ${MTP_ACCEPT_THRESHOLD}"
-            fail=1
-          fi
-
-          if [ -n "${MTP_PER_POS_THRESHOLD}" ]; then
-            IFS=',' read -ra pos_thresholds <<< "${MTP_PER_POS_THRESHOLD}"
-            idx=0
-            for th in "${pos_thresholds[@]}"; do
-              p=$(jq -r ".atom_ci_metadata.mtp_per_pos_acceptance[$idx] // empty" "$result_file")
-              if [ -z "$p" ]; then
-                echo "FAIL: position $idx acceptance missing (expected >= $th)"
-                fail=1
-              else
-                echo "MTP position $idx acceptance: $p (threshold $th)"
-                if awk -v v="$p" -v t="$th" 'BEGIN {exit !(v < t)}'; then
-                  echo "FAIL: position $idx acceptance $p < threshold $th"
-                  fail=1
-                fi
-              fi
-              idx=$((idx + 1))
-            done
-          fi
-
-          if [ "$fail" -eq 1 ]; then
-            echo "MTP acceptance gate FAILED."
-            exit 1
-          fi
-          echo "MTP acceptance gate PASSED."
+          .github/scripts/check_mtp_acceptance.sh \
+            "$result_file" "${MTP_ACCEPT_THRESHOLD}" "${MTP_PER_POS_THRESHOLD}"
 
       - name: Collect summary
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}

@@ -11,13 +11,18 @@ from contextlib import ExitStack
 import torch
 import zmq
 
-from atom.config import Config, ParallelConfig
+from atom.config import Config
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dynamic_chunking import (
+    DYNAMIC_CHUNKING_POLL_STEPS,
+    ChunkSizePredictor,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -26,6 +31,8 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.observability import tracing
+from atom.structured_output import is_structured
 from atom.utils import (
     engine_process_name,
     envs,
@@ -49,6 +56,8 @@ logger = logging.getLogger("atom")
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
+# How long a busy loop that finds its engine held sleeps before it looks again.
+HELD_POLL_S = 0.01
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -64,6 +73,7 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -77,6 +87,12 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # Separate from memory residency: an update in progress, or one that
+        # failed after an in-place write, must not serve.
+        self._weight_sync_fenced = False
+        self._rl_weights_inconsistent = False
+        # pause_generation .. resume_generation: nothing new is scheduled.
+        self._generation_paused = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -120,9 +136,11 @@ class EngineCore:
             # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tp_world_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
+                on_worker_failure=self._send_engine_dead,
+                kv_progress_event=self._kv_progress_event,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -133,6 +151,7 @@ class EngineCore:
             # sliding-window pool each look up the class they declared, so
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
+            config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
@@ -141,12 +160,38 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            # Config has already turned the feature off wherever it cannot act,
+            # so every stage of a pipeline takes this branch or none does: the
+            # sweep's dummy forwards cross stages and must run in lockstep.
+            if config.enable_dynamic_chunking:
+                # Startup profiling only measures the chunk cost that carries no
+                # attention; the attention terms are calibrated from real
+                # prefills while serving, so no chunk is rebalanced until then.
+                profile = self.runner_mgr.call_func(
+                    "profile_dynamic_chunking", wait_out=True
+                )
+                if not profile or "linear_coeff" not in profile:
+                    config.enable_dynamic_chunking = False
+                    reason = (profile or {}).get("error", "")
+                    logger.warning(
+                        "%s: disabling dynamic chunking because startup profiling "
+                        "did not produce a chunk overhead baseline%s",
+                        self.label,
+                        f": {reason}" if reason else "",
+                    )
+                if (
+                    config.enable_dynamic_chunking
+                    and config.parallel_config.pipeline_parallel_rank != 0
+                ):
+                    # Downstream stages execute metadata from the PP head and
+                    # never make chunking decisions themselves.
+                    config.enable_dynamic_chunking = False
             if not config.enforce_eager and not config.disagg_is_decode:
-                cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
+                cap_cost, decode_sizes, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
                 )
                 logger.info(
-                    f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
+                    f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
             good = True
@@ -166,13 +211,22 @@ class EngineCore:
             self.scheduler = Scheduler(
                 config,
                 state_runtime=self.state_runtime,
+                prefill_token_graphs=self.runner_mgr.call_func(
+                    "prefill_token_graphs", wait_out=True
+                ),
             )
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                    or config.prefill_admit_policy == "adaptive"
+                )
             ):
                 self._init_prefill_delayer(config)
+
+        self._dynamic_chunking_enabled = config.enable_dynamic_chunking
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -189,6 +243,7 @@ class EngineCore:
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
+        tracing.initialize()
         self._freeze_after_startup()
 
         self._send_ready_signal()
@@ -216,6 +271,9 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                exchange_prefill_costs=self.scheduler.cost_balance,
+                cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
+                admit_policy=config.prefill_admit_policy,
             )
         )
 
@@ -362,16 +420,75 @@ class EngineCore:
             if engine is not None:
                 engine.exit()
 
-    def _is_idle_rl_weights_offloaded(self) -> bool:
-        """Check if weights are offloaded for RL training.
+    def _is_engine_held(self) -> bool:
+        """Whether this tick runs no forward: the weights are offloaded, a
+        weight sync is fenced, or generation is paused. A loop that finds it
+        held sleeps for ``HELD_POLL_S`` before it looks again."""
+        return (
+            self._is_rl_weights_offloaded
+            or self._weight_sync_fenced
+            or self._generation_paused
+        )
 
-        When offloaded, busy-wait with a short delay to avoid CPU spin.
-        Returns True if the caller should skip model execution this tick.
+    def _report_held_kv_work(self) -> None:
+        """Let transfers already in flight report back while no forward runs.
+
+        Starts none, and runs nothing while the weights (and so the KV pool)
+        may be released.
         """
-        if self._is_rl_weights_offloaded:
+        if not self._is_rl_weights_offloaded and self.has_pending_kv_work():
+            self._advance_idle_kv_transfer(dispatch_new=False)
+
+    def pause_generation(self, deadline: float) -> None:
+        """Schedule nothing until ``resume_generation``; what runs stays put."""
+        self._generation_paused = True
+
+    def resume_generation(self) -> None:
+        self._generation_paused = False
+
+    def prepare_weight_sync(self, deadline: float) -> None:
+        """Get ready for a weight sync's first update, or raise.
+
+        A single stage has nothing to wait for: its workers run the update
+        after any forward they were already sent.
+        """
+
+    def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
+        """Get the KV pool ready to be zeroed, freed or recomputed, or raise.
+
+        Waits until KV transfers in flight have reported back, then preempts
+        what is running so it recomputes on what follows. When the weights
+        change, the KV connector must also drop what it keeps for later
+        requests. Raises with the reason, changing nothing that was running.
+        """
+        if self.has_pending_kv_work():
+            logger.info(
+                f"{self.label}: waiting up to "
+                f"{max(0.0, deadline - time.monotonic()):.0f}s for KV transfers "
+                f"in flight before the KV pool changes"
+            )
+        while self.has_pending_kv_work():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("KV transfers are still in flight")
+            self._next_idle_kv_drain = 0.0
+            self._advance_idle_kv_transfer(dispatch_new=False)
             time.sleep(0.01)
-            return True
-        return False
+        scheduler = self.scheduler
+        if not scheduler.can_recompute_prompts and not scheduler.is_finished():
+            raise RuntimeError(
+                f"{type(scheduler).__name__} cannot recompute the requests it "
+                f"has in flight"
+            )
+        connector = getattr(scheduler, "kv_connector", None)
+        if weights and connector is not None and not connector.drop_cached_kv():
+            raise RuntimeError(
+                f"{type(connector).__name__} cannot drop KV computed with the "
+                f"old weights"
+            )
+        # One that cannot recompute is idle here, having been refused above;
+        # a prefill scheduler has no preempt_running.
+        if scheduler.can_recompute_prompts:
+            scheduler.preempt_running()
 
     def busy_loop(self):
         shutdown = False
@@ -388,22 +505,41 @@ class EngineCore:
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
+                    # An RL rollout parks the weights for minutes. No forward
+                    # can run meanwhile, so the window must not be charged.
+                    self.scheduler.engine_stats.note_idle(now)
+                    self._report_held_kv_work()
+                    time.sleep(HELD_POLL_S)
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                    # Keyed on the forward, not on having requests:
+                    # `is_finished()` stays False through a deferred offload
+                    # save and while decode spins for PrefillDone, and no
+                    # forward runs in either. `now` was read before the
+                    # forward, so the forward's own time stays in the window.
+                    if self._process_engine_step():
+                        self.scheduler.engine_stats.note_busy(now)
+                        self.scheduler.engine_stats.bump_step()
+                    else:
+                        self.scheduler.engine_stats.note_idle(now)
+                else:
+                    self.scheduler.engine_stats.note_idle(now)
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
         finally:
-            # Teardown runs even on exceptions so the sender thread/socket
-            # don't leak. Isolate the final publish so a publisher hiccup
-            # cannot skip shutdown_kv_events().
-            self._drain_kv_work_at_exit()
             try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during shutdown failed")
-            self.scheduler.shutdown_kv_events()
+                # Teardown runs even on exceptions so the sender thread/socket
+                # don't leak. Isolate the final publish so a publisher hiccup
+                # cannot skip shutdown_kv_events().
+                self._drain_kv_work_at_exit()
+                try:
+                    self.scheduler.publish_kv_events()
+                except Exception:
+                    logger.exception("KV event publish during shutdown failed")
+                self.scheduler.shutdown_kv_events()
+            finally:
+                tracing.shutdown()
 
     def _process_engine_step(self):
         try:
@@ -416,7 +552,10 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [seq.id for seq in sequences if is_structured(seq)]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -426,6 +565,10 @@ class EngineCore:
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
     def _process_engine_step_inner(self):
+        # Clear before scheduling/polling, never between checking progress and
+        # waiting. Arrivals during this step remain latched until the next step.
+        if self.kv_transfer_enabled:
+            self._kv_progress_event.clear()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -434,7 +577,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -448,9 +591,8 @@ class EngineCore:
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
-        if (
-            self.kv_transfer_enabled
-            and scheduled_batch.connector_meta_output is not None
+        if self.kv_transfer_enabled and connector_metadata_has_work(
+            scheduled_batch.connector_meta_output
         ):
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
@@ -460,6 +602,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
@@ -471,22 +614,35 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    scheduled_batch.total_tokens_num_prefill
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        self._poll_kv_transfer_progress()
+        kv_progress = self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            if self.kv_transfer_enabled and not kv_progress:
+                self._wait_for_kv_progress()
             return False
 
-        seqs = seqs.values()
+        self._postprocess(seqs.values(), fwd_out, scheduled_batch)
+        return True
+
+    def _wait_for_kv_progress(self) -> None:
+        # Work queued before the event was cleared must also prevent sleeping.
+        if not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
+
+    def _postprocess(self, seqs, fwd_out, batch):
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
             seqs,
             fwd_out,
             stream_output_queue=self.stream_output_queue,
-            batch=scheduled_batch,
+            batch=batch,
         )
 
         # Send stream outputs to main process via output_queue
@@ -499,10 +655,8 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
-
-        return True
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -579,9 +733,9 @@ class EngineCore:
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
 
-    def _poll_kv_transfer_progress(self) -> None:
+    def _poll_kv_transfer_progress(self) -> bool:
         if not self.kv_transfer_enabled:
-            return
+            return False
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
         # Reclaim any offload save whose completion report never came (LMCache
@@ -590,12 +744,62 @@ class EngineCore:
         reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
+        return kvoutput is not None and not kvoutput.is_empty()
+
+    def _poll_dynamic_chunking_calibration(self) -> None:
+        """Install a freshly calibrated chunk latency model, if one is ready.
+
+        The workers time their own prefills, so this is one RPC round trip every
+        `DYNAMIC_CHUNKING_POLL_STEPS` steps and nothing on the forward path.
+
+        Called from the PP head's step loop rather than from here: dynamic
+        chunking needs more than one stage, and every such deployment runs
+        `PPEngineCoreProc`, whose head loop replaces `_process_engine_step`.
+        Every other stage had the feature turned off during startup because it
+        makes no chunking decisions.
+        """
+        if not self._dynamic_chunking_enabled:
+            return
+        self._dynamic_chunking_poll_countdown -= 1
+        if self._dynamic_chunking_poll_countdown > 0:
+            return
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
+        fit = self.runner_mgr.call_func("take_dynamic_chunking_fit", wait_out=True)
+        coefficients = fit.get("coefficients") if fit else None
+        if coefficients is None:
+            if fit and fit.get("gave_up"):
+                # The workers have stopped timing, so end the sweep too rather
+                # than size every other request for a model that never lands.
+                self._dynamic_chunking_enabled = False
+                self.scheduler.abandon_chunk_latency_calibration()
+            return
+        # The workers stop timing prefills once they have answered with a fit, so
+        # there is never a second one to collect - whether the scheduler takes
+        # this model or rejects it as not worth acting on.
+        self._dynamic_chunking_enabled = False
+        try:
+            predictor = ChunkSizePredictor.from_coefficients(coefficients)
+        except (TypeError, ValueError):
+            logger.exception(
+                "%s: rejecting dynamic chunking coefficients %r",
+                self.label,
+                coefficients,
+            )
+            self.scheduler.abandon_chunk_latency_calibration()
+            return
+        self.scheduler.install_chunk_latency_model(predictor)
 
     def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None or not (
+            getattr(connector, "is_offload", False)
+            or (
+                getattr(connector, "is_producer", False)
+                and getattr(connector, "enable_chunked_transfer", False)
+            )
+        ):
             return
         # getattr for the same reason as `kv_connector` above: this path is
         # reached with scheduler doubles that implement only the connector
@@ -631,6 +835,23 @@ class EngineCore:
             self.scheduler.extend(recv_reqs)
         return False
 
+    def _offer_tier_lookups(self, reqs) -> None:
+        """Let an offload connector start tier lookups for arrived requests.
+
+        Runs on this IO thread, so a lookup is sent while the engine thread is
+        still inside a forward instead of when it next schedules. Only a
+        connector with a lookup thread defines `offer_lookups`.
+        """
+        connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
+        offer = getattr(connector, "offer_lookups", None)
+        if not callable(offer):
+            return
+        try:
+            offer(reqs)
+        except Exception:
+            # The scheduler's own prefetch still sends these lookups.
+            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
+
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
 
@@ -664,7 +885,8 @@ class EngineCore:
                     obj = sock.recv(copy=False)
                     received_at = time.perf_counter()
                     try:
-                        request_type, reqs = pickle.loads(obj)
+                        # ADD may carry the seqs' shipped prompt chains third.
+                        request_type, reqs, *chains = pickle.loads(obj)
                     except Exception:
                         # This thread is the only way requests reach the engine,
                         # so letting it die strands every later request: the
@@ -678,6 +900,8 @@ class EngineCore:
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
+                        attach_shipped_chains(reqs, *chains)
+                        tracing.enqueue_many(reqs, received_at=received_at)
                         for req in reqs:
                             SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
@@ -685,14 +909,18 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._kv_progress_event.set()
+                        self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
+                        self._kv_progress_event.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
+                        self._kv_progress_event.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
@@ -759,8 +987,6 @@ class DPEngineCoreProc(EngineCore):
         self.dp_rank = config.parallel_config.data_parallel_rank
         # self.dp_group = config.parallel_config.stateless_init_dp_group()
         super().__init__(config, input_address, output_address)
-        # Initialize to True so first iteration reaches all_reduce
-        self.engines_running = True
         self._shutting_down = False
 
         self._init_prefill_delayer(config, self.dp_group)
@@ -806,15 +1032,17 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = (
-                    not self.scheduler.is_finished()
-                    and not self._is_rl_weights_offloaded
+                local_held = (
+                    self._is_rl_weights_offloaded
+                    or self._weight_sync_fenced
+                    or self._generation_paused
                 )
+                local_unfinished = not self.scheduler.is_finished() and not local_held
 
-                global_has_unfinished, global_shutdown, global_offloaded = (
-                    self._sync_dp_state(
-                        local_unfinished, shutdown, self._is_rl_weights_offloaded
-                    )
+                # MAX-reduced: one held rank holds every rank of the group, so
+                # their forwards stay paired.
+                global_has_unfinished, global_shutdown, global_held = (
+                    self._sync_dp_state(local_unfinished, shutdown, local_held)
                 )
 
                 if global_shutdown and not global_has_unfinished:
@@ -823,12 +1051,19 @@ class DPEngineCoreProc(EngineCore):
                     )
                     break
 
-                if global_offloaded:
+                if global_held:
+                    # Already engine-wide, which is what `note_idle` wants.
+                    self.scheduler.engine_stats.note_idle(now)
+                    self._report_held_kv_work()
                     time.sleep(0.01)
                     continue
 
-                if not global_has_unfinished and not self.engines_running:
-                    self.engines_running = False
+                if not global_has_unfinished:
+                    # Global, not local: a locally idle rank reaching the pair
+                    # below is running a dummy for its peers, which is work.
+                    self.scheduler.engine_stats.note_idle(now)
+                    if self.scheduler.prefill_delayer is not None:
+                        self.scheduler.prefill_delayer.notify_idle()
                     if self.has_pending_kv_work():
                         # Local RPCs only. Anything that reaches schedule()
                         # would run the delayer's cross-DP all_reduce off
@@ -836,39 +1071,48 @@ class DPEngineCoreProc(EngineCore):
                         self._advance_idle_kv_transfer()
                     continue
 
+                self.scheduler.engine_stats.note_busy(now)
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
-
-                self.engines_running = global_has_unfinished
+                # After the pair, so the idle rank's dummy counts too: that is
+                # what keeps every rank's step number equal. See `bump_step`.
+                self.scheduler.engine_stats.bump_step()
         finally:
-            # Isolate the final publish so a publisher hiccup cannot skip
-            # shutdown_kv_events() (which closes the sender thread/socket).
-            self._drain_kv_work_at_exit()
             try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish during DP shutdown failed")
-            self.scheduler.shutdown_kv_events()
+                # Isolate the final publish so a publisher hiccup cannot skip
+                # shutdown_kv_events() (which closes the sender thread/socket).
+                self._drain_kv_work_at_exit()
+                try:
+                    self.scheduler.publish_kv_events()
+                except Exception:
+                    logger.exception("KV event publish during DP shutdown failed")
+                self.scheduler.shutdown_kv_events()
+            finally:
+                tracing.shutdown()
 
     def _execute_dummy_batch(self):
-        return self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        if self.scheduler.running:
+            # The tokens this rank's last real step sampled come back with this
+            # forward (deferred output), and land like any step's.
+            self._postprocess((), fwd_out, None)
 
     def _sync_dp_state(
         self,
         local_has_unfinished: bool,
         local_shutdown: bool = False,
-        local_offloaded: bool = False,
+        local_held: bool = False,
     ) -> tuple[bool, bool, bool]:
         if self._shutting_down:
-            return local_has_unfinished, True, local_offloaded
+            return local_has_unfinished, True, local_held
 
         try:
             state_tensor = torch.tensor(
                 [
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
-                    1 if local_offloaded else 0,
+                    1 if local_held else 0,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -878,40 +1122,12 @@ class DPEngineCoreProc(EngineCore):
             )
             global_has_unfinished = state_tensor[0].item() == 1
             global_shutdown = state_tensor[1].item() == 1
-            global_offloaded = state_tensor[2].item() == 1
-            return global_has_unfinished, global_shutdown, global_offloaded
+            global_held = state_tensor[2].item() == 1
+            return global_has_unfinished, global_shutdown, global_held
         except RuntimeError as e:
             logger.warning(f"{self.label}: _sync_dp_state failed: {e}")
             self._shutting_down = True
-            return local_has_unfinished, True, local_offloaded
-
-    def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
-        try:
-            tensor = torch.tensor(
-                [local_should_shutdown], dtype=torch.int32, device="cpu"
-            )
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
-            )
-            global_should_shutdown = bool(tensor.item())
-            return global_should_shutdown
-        except RuntimeError as e:
-            # If all_reduce fails, it means other ranks are shutting down
-            logger.warning(
-                f"{self.label}: Shutdown sync failed, assuming shutdown: {e}"
-            )
-            return True
-
-    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        if self._shutting_down:
-            logger.info(f"{self.label}: Skipping DP sync during shutdown")
-            return local_unfinished
-        try:
-            return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
-        except RuntimeError as e:
-            # Handle case where other ranks have already shut down
-            logger.warning(f"{self.label}: DP sync failed during shutdown: {e}")
-            return local_unfinished
+            return local_has_unfinished, True, local_held
 
 
 # ---------------------------------------------------------------------------
@@ -1219,11 +1435,12 @@ class DecodeEngineCore(EngineCore):
         config.num_kvcache_blocks = num_kvcache_blocks
 
         if not config.enforce_eager:
-            cap_cost, bs, _ = self.runner_mgr.call_func(
+            cap_cost, decode_sizes, _ = self.runner_mgr.call_func(
                 "capture_cudagraph", wait_out=True
             )
             logger.info(
-                f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
+                f"DecodeEngineCore: cudagraph capture{decode_sizes} cost: "
+                f"{cap_cost:.2f}s"
             )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---

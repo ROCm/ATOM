@@ -13,6 +13,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
+
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
 from atom.plugin import prepare as plugin_prepare
 
@@ -82,7 +84,9 @@ def runtime(monkeypatch):
             state.events.append(("build", self.rank, self.capacity))
             state.instances[self.rank, self.capacity] = self
 
-        def forward(self, x, weights, ids):
+        def forward(self, x, weights, ids, *, mask_invalid_slots):
+            # Pad rows are routed to -1, so combine must skip those slots.
+            assert mask_invalid_slots is True
             state.events.append(("forward", self.rank, self.capacity))
             return torch.full_like(x, self.capacity)
 

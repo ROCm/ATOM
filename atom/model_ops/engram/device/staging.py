@@ -9,6 +9,8 @@ fixed addresses (`EngramStep`): a replay reads its own step.
 
 import logging
 import os
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -33,7 +35,9 @@ class EngramStep:
     `live`: the live leading tokens, on the device (0: nothing is read or
     written). `dead`: a token's no-own-id flag. `candidates`: a verify step's
     every accepted prefix (`commit_tentative` picks one); None advances
-    `cursor` in place.
+    `cursor` in place. `served_by_round`: the forward's
+    `AttentionMetaData.served_by_round` (the model's decode round runs every
+    layer and looks the rows up itself): `start` only advances the cursor.
     """
 
     input_ids: torch.Tensor
@@ -45,6 +49,7 @@ class EngramStep:
     cursor: torch.Tensor
     history_index: torch.Tensor
     candidates: torch.Tensor | None
+    served_by_round: bool = False
 
 
 class EngramStaging:
@@ -63,6 +68,8 @@ class EngramStaging:
             host.max_num_tokens, dtype=torch.int32, device=host.device
         )
         self.step = None
+        # the step `start` left to the model (`EngramStep.served_by_round`)
+        self._served = False
         self.flat = {
             layer: torch.empty(
                 host.max_num_tokens,
@@ -76,6 +83,11 @@ class EngramStaging:
         self.collective = None
         self.gathered = {}
         self._init_collective()
+        self.fallback_done = (
+            {layer: torch.cuda.Event() for layer in host.layer_ids}
+            if host._tp_group is not None and self.collective is None
+            else {}
+        )
 
     def _init_collective(self):
         host = self.host
@@ -176,6 +188,12 @@ class EngramStaging:
             )
 
     def start(self, width):
+        # A step whose model looks the rows up itself: only the cursor advance
+        # (no snapshot, no side stream), and `join` waits on nothing.
+        self._served = self.step.served_by_round
+        if self._served:
+            self._advance_cursor(width)
+            return
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
@@ -230,6 +248,8 @@ class EngramStaging:
             host.buffers[layer].gpu[:width].copy_(out)
 
     def join(self):
+        if self._served:
+            return
         # Close the fork even if a partial forward did not consume every layer.
         torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
 
@@ -247,14 +267,67 @@ class EngramStagedRows(dict):
             for layer, buffer in staging.host.buffers.items()
         )
         self.staging, self.width = staging, width
+        self._fallback_ready = set()
 
-    def stage(self):
+    def stage(self, *, tbo=False):
+        self._fallback_ready.clear()
         self.staging.start(self.width)
+        # Only TBO must serialize shared-communicator gathers before workers
+        # start. Ordinary TP consumes each layer just before it is needed.
+        if tbo:
+            for layer in self.staging.fallback_done:
+                self.get(layer)
 
     def get(self, layer, default=None):
         if layer in self:
-            self.staging.consume(layer, self.width)
+            done = self.staging.fallback_done.get(layer)
+            if done is None or layer not in self._fallback_ready:
+                self.staging.consume(layer, self.width)
+                if done is not None:
+                    done.record()
+                    self._fallback_ready.add(layer)
+            elif done is not None:
+                torch.cuda.current_stream(self.staging.host.device).wait_event(done)
         return super().get(layer, default)
 
     def join(self):
         self.staging.join()
+
+    def slice(self, token_slice):
+        return EngramRowsView(self, token_slice)
+
+
+class EngramRowsView(Mapping):
+    """Read-only token slices; every value access waits for the parent lookup.
+
+    Mapping routes get/items/values/dict copies through __getitem__, so none
+    can expose a device row without establishing its consumer dependency.
+    """
+
+    def __init__(self, parent, token_slice):
+        self._rows = {layer: rows[:, token_slice] for layer, rows in parent.items()}
+        self.parent = parent
+
+    def __getitem__(self, layer):
+        rows = self._rows[layer]
+        self.parent.get(layer)
+        return rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)
+
+
+@contextmanager
+def engram_staging(rows: Mapping[int, torch.Tensor], *, tbo=False):
+    """Own the parent fork/join; token views never restart its lookup."""
+    if not isinstance(rows, EngramStagedRows):
+        yield
+        return
+    try:
+        rows.stage(tbo=tbo)
+        yield
+    finally:
+        rows.join()

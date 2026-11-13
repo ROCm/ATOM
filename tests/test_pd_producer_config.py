@@ -6,9 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.disaggregation.pd_producer import (
+    disaggregated_kv_role,
     index_staging_pool_size,
+    mla_staging_reserve_bytes,
+    mla_staging_slot_count,
     mooncake_pd_producer_configured,
     pd_producer_configured,
+    send_worker_count,
 )
 
 
@@ -95,7 +99,7 @@ def test_index_staging_pool_matches_mooncake_worker_count(kv_transfer_config, ex
     assert index_staging_pool_size(config) == expected
 
 
-@pytest.mark.parametrize("worker_count", [0, -1, True, "32"])
+@pytest.mark.parametrize("worker_count", [None, 0, -1, True, "32"])
 def test_index_staging_pool_rejects_invalid_worker_count(worker_count):
     config = SimpleNamespace(
         kv_transfer_config={
@@ -120,3 +124,160 @@ def test_index_staging_pool_rejects_two_mooncake_producers():
     )
     with pytest.raises(ValueError, match="multiple Mooncake"):
         index_staging_pool_size(config)
+
+
+def test_send_worker_count_defaults_to_sixteen():
+    assert send_worker_count({"kv_connector": "mooncake"}) == 16
+
+
+def test_mla_staging_slots_are_capped_by_pool_bytes():
+    slot = 8 << 20
+    assert mla_staging_slot_count(16, slot) == 16
+    assert mla_staging_slot_count(128, slot) == 32  # 256 MiB cap
+    # A slot wider than 8 MiB (one wide MLA block) gets fewer slots, or none,
+    # rather than outgrow the reserve: 4 x 12 MiB used to take 48 of 32 MiB.
+    assert mla_staging_slot_count(4, 12 << 20) == 2
+    assert mla_staging_slot_count(1, 12 << 20) == 0
+    assert mla_staging_slot_count(128, (256 << 20) + 64) == 0
+
+
+def _mla_producer_config(workers, **overrides):
+    config = {
+        "kv_transfer_config": {
+            "kv_connector": "mooncake",
+            "kv_role": "kv_producer",
+            "num_worker_threads": workers,
+        },
+        "hf_config": SimpleNamespace(kv_lora_rank=512),
+        "decode_context_parallel_size": 1,
+    }
+    config.update(overrides)
+    return SimpleNamespace(**config)
+
+
+def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
+    assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
+    # The connector rounds a slot down to whole pages, so the reserve bounds
+    # what it allocates for any worker count.
+    for page in (16 * 576, 12 << 20):
+        slot = max(page, (8 << 20) // page * page)
+        for workers in (1, 4, 16, 31, 32, 33, 128):
+            allocated = mla_staging_slot_count(workers, slot) * slot
+            reserved = mla_staging_reserve_bytes(_mla_producer_config(workers))
+            assert allocated <= reserved
+
+
+@pytest.mark.parametrize(
+    "overrides, env",
+    [
+        ({"hf_config": SimpleNamespace()}, {}),
+        # DeepSeek-V4 loads through the V3 schema, which defaults kv_lora_rank,
+        # and Kimi's MLA hybrid has slot regions: neither stages MLA rows.
+        (
+            {
+                "hf_config": SimpleNamespace(
+                    model_type="deepseek_v3",
+                    architectures=["DeepseekV4ForCausalLM"],
+                    kv_lora_rank=512,
+                )
+            },
+            {},
+        ),
+        (
+            {"hf_config": SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512)},
+            {},
+        ),
+        ({"decode_context_parallel_size": 4}, {}),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "mooncake",
+                    "kv_role": "kv_consumer",
+                }
+            },
+            {},
+        ),
+        ({}, {"ATOM_PD_MLA_STAGING": "0"}),
+    ],
+)
+def test_mla_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert mla_staging_reserve_bytes(_mla_producer_config(16, **overrides)) == 0
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config, expected",
+    [
+        # The connector name classifies, not the role. These three are cache
+        # tiers on an ordinary engine; `kv_producer` and `kv_consumer` are
+        # legal offload DIRECTIONS (save only / load only).
+        ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, None),
+        ({"kv_connector": "lmcache_offload", "kv_role": "kv_producer"}, None),
+        ({"kv_connector": "mooncake_store", "kv_role": "kv_consumer"}, None),
+        # Named transfer connectors, both directions, role defaulting.
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "kv_producer"),
+        ({"kv_connector": "moriio", "kv_role": "kv_consumer"}, "kv_consumer"),
+        ({"kv_connector": "mooncake"}, "kv_producer"),
+        ({"kv_connector": "MoonCake", "kv_role": "kv_consumer"}, "kv_consumer"),
+        # No name is not "no connector" -- `create_connector` builds moriio.
+        ({"kv_role": "kv_producer"}, "kv_producer"),
+        # multi carries the entry one level down, in either position.
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+            "kv_producer",
+        ),
+        # ...and a multi of pure cache tiers is not disaggregated.
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [{"kv_connector": "lmcache_offload"}],
+            },
+            None,
+        ),
+        (None, None),
+        ({}, None),
+    ],
+)
+def test_disaggregated_kv_role_keys_on_the_connector(kv_transfer_config, expected):
+    config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    assert disaggregated_kv_role(config) == expected
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        "not a dict",
+        {"kv_connector": "multi", "connectors": {"kv_connector": "mooncake"}},
+        {"kv_connector": "multi", "connectors": "mooncake"},
+        {"kv_connector": "multi", "connectors": [None, "mooncake"]},
+        {"kv_connector": 7, "kv_role": "kv_producer"},
+    ],
+)
+def test_disaggregated_kv_role_tolerates_any_shape(kv_transfer_config):
+    """The blob is user-supplied CLI JSON and a config-time caller must not die.
+
+    Shape validation belongs to the KV layer; this classifier only answers,
+    and a shape it cannot read reads as "not disaggregated".
+    """
+    config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    assert disaggregated_kv_role(config) is None
+
+
+def test_a_readable_entry_survives_an_unreadable_sibling():
+    """Skipping the junk entry, not the whole config -- the P/D node is real."""
+    config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector": "multi",
+            "connectors": [None, "junk", {"kv_connector": "moriio"}],
+        }
+    )
+    assert disaggregated_kv_role(config) == "kv_producer"

@@ -33,6 +33,7 @@ from aiter import QuantType, dtypes
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
     LinearBase,
+    use_mxfp4_preshuffle_triton_gemm,
     weight_is_stored_preshuffled,
 )
 from atom.rollout.weight_updater import WeightUpdaterMixin
@@ -110,6 +111,37 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
 
 
+def test_mxfp4_preshuffle_selects_a_compatible_backend(monkeypatch):
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    assert use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx1250")
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx950")
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp8, arch="gfx1250")
+
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: True)
+    monkeypatch.setattr(linear_mod, "gemm_afp4wfp4_preshuffle", object())
+    assert use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx950")
+
+
+def test_nonshuffle_fp4_override_keeps_its_existing_backend(monkeypatch):
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx1250")
+
+
+def test_forced_gfx1250_triton_uses_legacy_m_dependent_activation_layout(monkeypatch):
+    from atom.models import deepseek_v2
+
+    monkeypatch.setattr(deepseek_v2, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(
+        deepseek_v2,
+        "use_mxfp4_preshuffle_triton_gemm",
+        lambda dtype: dtype == dtypes.fp4x2,
+    )
+
+    assert deepseek_v2._mxfp4_activation_quant_layout(5) == (False, False)
+    assert deepseek_v2._mxfp4_activation_quant_layout(32) == (True, True)
+
+
 # ── the property: load and sync agree ─────────────────────────────────────
 
 
@@ -120,7 +152,9 @@ def _linear_double(quant_type, params_dtype, needs_preshuffled_weight, *, dim=2)
     quant config and a device allocation per row; the method under test is the
     real one.
     """
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     return SimpleNamespace(
         weight=nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False),
         weight_scale=nn.Parameter(torch.ones(32, 1), requires_grad=False),
@@ -168,7 +202,9 @@ def _sync_shuffles(monkeypatch, case, *, dim=2):
     calls = []
     monkeypatch.setattr(utils_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
     quant_type, params_dtype, needs_preshuffled_weight = case
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     param = nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False)
     module = SimpleNamespace(
         quant_type=quant_type,

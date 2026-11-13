@@ -65,7 +65,7 @@ Use existing files such as `llama.py`, `qwen3.py`, `qwen3_next.py`, `deepseek_v2
 
 ### 3) Register In ATOM Model Runner
 
-Update `support_model_arch_dict` in `atom/model_engine/model_runner.py`.
+Update `support_model_arch_dict` in `atom/models/registry.py`.
 
 Important: follow the **current local style** in that file (for example, string qualname mapping if that is what existing entries use). Do not introduce a different mapping format.
 

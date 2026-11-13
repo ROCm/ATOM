@@ -30,12 +30,13 @@ THINK = ("<think>", "</think>")
 def run(markers, chunks) -> tuple[str, tuple[str, ...]]:
     """Drive a scanner and return (everything released, the markers hit).
 
-    Deliberately not `Scan.rest`. That is how much text happened to be in hand
-    when the marker completed -- everything after it in the same chunk -- so it
-    is larger for coarse chunkings and empty for one-character ones. It is a
-    buffer handoff, not something a client can observe, and putting it in the
-    key would make chunk-invariance fail on a scanner that is behaving. What
-    must not vary is the text released and which markers fired.
+    Deliberately not what `take_rest` would hand back. That is how much text
+    happened to be in hand when the marker completed -- everything after it in
+    the same chunk -- so it is larger for coarse chunkings and empty for
+    one-character ones. It is a buffer handoff, not something a client can
+    observe, and putting it in the key would make chunk-invariance fail on a
+    scanner that is behaving. What must not vary is the text released and
+    which markers fired.
     """
     s = MarkerScanner(markers)
     out, hits = "", []
@@ -46,14 +47,14 @@ def run(markers, chunks) -> tuple[str, tuple[str, ...]]:
             out += scan.released
             if not scan.hit:
                 break
-            # `feed` stops at the first marker and hands the rest back: a hit
-            # is a state change, and where the text after it goes is the
-            # caller's call, not the scanner's. This caller keeps scanning, so
-            # it feeds the rest back -- without which a second marker in the
-            # same chunk is never seen, and the result depends on whether the
+            # `feed` stops at the first marker and keeps the rest: a hit is a
+            # state change, and where the text after it goes is the caller's
+            # call, not the scanner's. This caller keeps scanning, so it reads
+            # on with `feed("")` -- without which a second marker in the same
+            # chunk is never seen, and the result depends on whether the
             # chunking happened to put the two markers together.
             hits.append(scan.hit)
-            pending = scan.rest
+            pending = ""
     return out + s.flush(), tuple(hits)
 
 
@@ -143,15 +144,57 @@ class TestConservation:
         rebuilt = ""
         for i in range(0, len(text), 2):
             scan = s.feed(text[i : i + 2])
-            rebuilt += scan.released + (scan.hit or "") + scan.rest
+            rebuilt += scan.released + (scan.hit or "")
+            if scan.hit:
+                rebuilt += s.take_rest()
         assert rebuilt + s.flush() == text
 
 
+class TestOneLargeFeed:
+    """A whole output in one feed, as the non-streaming readers do it.
+
+    Each hit used to hand the text after it back to be fed again, and each
+    feed searched that text afresh for every marker, so one feed of N markers
+    did O(N) work per marker: 31.7 s for 32,768 of them in 819K characters.
+    """
+
+    def test_it_reads_what_one_character_feeds_read(self):
+        rng = random.Random(3)
+        parts = ["<tool_call>", "<function=", "<think>", "</think>", "<", "ab "]
+        text = "".join(rng.choice(parts) for _ in range(3000))
+        markers = TOOL + THINK
+        assert run(markers, [text]) == run(markers, list(text))
+
+    def test_the_text_is_neither_copied_nor_searched_twice(self):
+        """Over one feed, the searches together cover the text once, and
+        reading on after a hit keeps the same buffer."""
+        text = "<tool_call>x" * 2000 + "<function=" + "y" * 5000
+        s = MarkerScanner(TOOL)
+        real, covered, buffers = s._pattern, [], set()
+
+        class Recording:
+            def search(self, buf, pos):
+                buffers.add(id(buf))
+                found = real.search(buf, pos)
+                covered.append((found.end() if found else len(buf)) - pos)
+                return found
+
+        s._pattern = Recording()
+        s.feed(text)
+        while s.feed("").hit:
+            pass
+        assert len(buffers) == 1, f"the remainder was copied {len(buffers) - 1}x"
+        assert sum(covered) <= len(text) + len(covered), sum(covered)
+
+
 class TestMarkerPrecedence:
-    def test_the_rest_is_handed_back_not_kept(self):
-        """A hit is a state change, so what follows is the caller's to route."""
-        scan = MarkerScanner(TOOL).feed('Sure. <tool_call>{"a": 1}')
-        assert scan == Scan("Sure. ", "<tool_call>", '{"a": 1}')
+    def test_the_rest_is_the_callers_to_route(self):
+        """A hit is a state change, so what follows is the caller's to route:
+        read on with `feed("")`, or taken with `take_rest`."""
+        s = MarkerScanner(TOOL)
+        assert s.feed('Sure. <tool_call>{"a": 1}') == Scan("Sure. ", "<tool_call>")
+        assert s.take_rest() == '{"a": 1}'
+        assert s.feed("") == Scan("")
 
     def test_the_earliest_marker_wins(self):
         scan = MarkerScanner(TOOL).feed("a <function=x b <tool_call>")
@@ -159,8 +202,9 @@ class TestMarkerPrecedence:
 
     def test_at_one_position_the_longest_wins(self):
         """Otherwise a marker that prefixes another truncates it."""
-        scan = MarkerScanner(("<think>", "<thinking>")).feed("x<thinking>y")
-        assert scan.hit == "<thinking>" and scan.rest == "y"
+        s = MarkerScanner(("<think>", "<thinking>"))
+        scan = s.feed("x<thinking>y")
+        assert scan.hit == "<thinking>" and s.take_rest() == "y"
 
 
 class TestConstruction:
@@ -171,9 +215,9 @@ class TestConstruction:
             MarkerScanner(bad)
 
     def test_duplicates_do_not_change_the_answer(self):
-        a = MarkerScanner(TOOL).feed("x<tool_call>y")
-        b = MarkerScanner(TOOL + ("<tool_call>",)).feed("x<tool_call>y")
-        assert a == b == Scan("x", "<tool_call>", "y")
+        a, b = MarkerScanner(TOOL), MarkerScanner(TOOL + ("<tool_call>",))
+        assert a.feed("x<tool_call>y") == b.feed("x<tool_call>y")
+        assert a.feed("") == b.feed("") == Scan("y")
 
 
 class TestThePrecomputedPlanChangesNothing:

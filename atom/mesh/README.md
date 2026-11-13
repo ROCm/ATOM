@@ -22,12 +22,50 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /v1/chat/completions` | Chat completions with streaming and tool calls |
 | `POST /v1/completions` | Text completions |
 | `POST /generate` | SGLang generate API |
-| `POST /v1/responses` | Background responses with status tracking |
+| `POST /v1/messages` | HTTP-backend Messages proxy, JSON and SSE |
+| `POST /v1/responses` | HTTP-backend Responses proxy, JSON and SSE; existing background/query support |
 | `POST /v1/tokenize` / `/v1/detokenize` | Tokenization with batch support |
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
+| `GET /metrics` | Mesh self metrics, the same registry as the Prometheus exporter |
 | `GET /v1/models` | Model metadata |
+
+Responses resource operations (GET, DELETE, cancel and input_items) probe regular
+HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts supported
+APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
+omitting the label preserves the default of accepting all supported API routes.
+
+A Responses request that refers to stored state (`previous_response_id`,
+`conversation`, or an `item_reference` input item) must reach the backend that
+holds that state. When all candidate workers share one backend address, it is
+routed normally. When candidates span several addresses, every candidate must
+carry the `mesh.responses_state=shared` label, which declares that those backends
+read one shared state store; otherwise Mesh returns
+`501 stateful_routing_unsupported`. Unhealthy candidates count too, so failover
+cannot move a request to a different state store. Requests without these fields
+need no label.
+
+A configured worker API key replaces client credentials and is sent as
+`authorization: Bearer <key>`; Messages requests also carry it as `x-api-key`.
+Backends without a worker key receive the client's `authorization` and
+`x-api-key` headers. Resource operations use the same credential rules as
+inference.
+Workers sharing one backend address must have matching credential configuration.
+The first successful probe is returned immediately. If all probes fail, non-404
+client errors take precedence over server errors and unreachable backends
+(`502 backend_unreachable`), which outrank 404 because such a backend may own the
+resource. 405 and 501 from backends without these routes rank last. Errors with
+equal priority are selected by backend address order.
+
+DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
+the request body for Chat Completions, Completions and Generate, overriding any
+client value. Messages and Responses receive the rank only when the DP worker's
+`mesh.apis` label explicitly lists `/v1/messages` or `/v1/responses`; without the
+label they are forwarded unchanged, so the backend chooses the rank and DP
+placement is only a load-balancing estimate. The backend must consume the field
+to route to the selected rank. Verify support for each backend and API before
+listing it; accepting an unknown JSON field does not establish rank-routing support.
 
 ## Installation
 
@@ -163,6 +201,10 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
 
 Prefill entries may include an optional bootstrap port (e.g. for Mooncake KV cache transfer).
 
+Messages and Responses have no PD adapter: in PD mode `/v1/messages` and
+`/v1/responses` return `501 unsupported_api_topology`. Serve them from regular
+HTTP workers.
+
 ### gRPC routing
 
 ```bash
@@ -219,8 +261,33 @@ Supported tool parsers: `json`, `python`, `xml`.
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
+`prefix_hash` routes on exact request tokens. Messages and Responses have no
+registered token-routing template, so under `prefix_hash` they return
+`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
+`cache_aware` or `round_robin`, for models served through these APIs.
+
 ## Reliability
 
+- **Request preparation**: Parsing, template rendering and tokenization use a fixed
+  thread pool. By default, Mesh splits Rust's `available_parallelism()` count
+  between preparation and Tokio: 224 available CPUs give 112 preparation threads
+  and 112 Tokio workers. An odd spare CPU goes to Tokio; with one available CPU,
+  each pool still has one worker. `--prepare-workers` and `TOKIO_WORKER_THREADS`
+  independently override their respective defaults. The OS chooses CPU placement,
+  and auxiliary threads may also exist.
+  The waiting queue defaults to 10 jobs per resolved preparation thread: 1120 jobs
+  with 112 threads, or 20 with `--prepare-workers 2`.
+  `--prepare-queue-capacity` overrides that limit. Queued jobs still have a
+  `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
+  their slot immediately. All request parsing runs on this pool. Each request's
+  preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
+  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
+  When ext-proc is enabled, the legacy `--ext-proc-parser-concurrency` and
+  `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
+  `--prepare-*` option is unset; neither has a default of its own. On shutdown,
+  Mesh waits up to 5 seconds for preparation threads after transport draining.
+  Ext-proc's separate `--ext-proc-max-buffered-bytes` limit covers its request
+  buffers through rewriting and dispatch.
 - **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
 - **Circuit breakers**: Per-worker failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
 - **Rate limiting**: Token bucket via `--max-concurrent-requests`, optional queue (`--queue-size`, `--queue-timeout-secs`)
@@ -232,10 +299,14 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 
-Mesh self metrics are exposed by the Prometheus exporter above. Worker engine
-metrics remain available through the router's `/engine_metrics` endpoint, which
-scrapes backend workers, injects `worker_addr`, and aggregates their Prometheus
-text without changing worker metric names.
+Mesh self metrics are exposed by the Prometheus exporter above and by the
+router's own `/metrics` endpoint, which returns 503 when the exporter is not
+running. The router port serves the whole registry whatever `--prometheus-host`
+is set to, so binding the exporter to a private address does not hide these
+metrics from clients that can reach the router. Worker engine metrics remain
+available through the router's `/engine_metrics` endpoint, which scrapes backend
+workers, injects `worker_addr`, and aggregates their Prometheus text without
+changing worker metric names.
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
@@ -243,12 +314,23 @@ text without changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
+| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+
+[Routing metrics](docs/metrics.md) covers each routing metric's labels, the
+policies and branches that record it, how to read the values, and example
+queries.
 
 ### Logging
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
+
+`--route-log-sample-rate` (0 to 1, default 0 = off) logs the routing decisions of
+that fraction of inference requests at info level under target `mesh::route`.
+While it is above 0, a request carrying the `x-mesh-route-trace` header is always
+logged. HTTP routers only: gRPC workers and Envoy external processing do not
+emit these logs.
 
 ## Security
 

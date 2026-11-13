@@ -39,28 +39,49 @@ def k1_regions(key: k1.AttnPreBuild) -> list[RegionDecl]:
         RegionDecl("x8", S, "k1.norm"),
         RegionDecl("x8s", S, "k1.norm"),
         RegionDecl("qkv", S, "k1.wqkv_a"),
-        RegionDecl("qx8", S, "k1.qkv"),
-        RegionDecl("qx8s", S, "k1.qkv"),
     ]
-    if key.feeds_index:
+    if key.tok_par:
+        # every rank's q latent and window rows, gathered in the peer buffer
         regions += [
-            RegionDecl("nb", S, "k1.norm"),
-            RegionDecl("iq", S, "k1.wq_b"),
-            RegionDecl("iw", S, "k1.index_w"),
+            RegionDecl("qg", P, "k1.qkv"),
+            RegionDecl("qgs", P, "k1.qkv"),
+            RegionDecl("kg", P, "k1.qkv"),
         ]
+    else:
+        regions += [RegionDecl("qx8", S, "k1.qkv"), RegionDecl("qx8s", S, "k1.qkv")]
+    if key.feeds_index:
+        regions += [RegionDecl("nb", S, "k1.norm"), RegionDecl("iq", S, "k1.wq_b")]
+        if key.tok_par:
+            regions += [
+                RegionDecl("nbg", P, "k1.norm"),
+                RegionDecl("iwg", P, "k1.index_w"),
+            ]
+        else:
+            regions += [RegionDecl("iw", S, "k1.index_w")]
     return regions
 
 
-def indexer_regions(bound_max: int) -> list[RegionDecl]:
+def indexer_regions(bound_max: int, tok_par: bool) -> list[RegionDecl]:
     """The indexer's: the scores, then per kind (sel, blk) a stage a tree level,
     each level but the last putting its lists for the next. A token's selection
     is final at the level its bound reaches (``index_plan.final_level``), so any
-    sel level may put its ready flag."""
-    sel_levels = range(ip.top_level("sel", bound_max) + 1)
-    regions = [
-        RegionDecl("isf", S, "k2a.iscore"),
-        RegionDecl("irdy", S, tuple(f"k2a.isel{lv}" for lv in sel_levels)),
-    ]
+    sel level may put its ready flag. In a token-parallel launch a row's owner
+    puts its flags on every rank, the candidate blocks' too (ICRDY, awaited by
+    ``k2a.icwait``)."""
+
+    def finals(kind):
+        return tuple(
+            f"k2a.i{kind}{lv}" for lv in range(ip.top_level(kind, bound_max) + 1)
+        )
+
+    regions = [RegionDecl("isf", S, "k2a.iscore")]
+    if tok_par:
+        regions += [
+            RegionDecl("irdy", P, finals("sel")),
+            RegionDecl("icrdy", P, finals("blk")),
+        ]
+    else:
+        regions += [RegionDecl("irdy", S, finals("sel"))]
     for kind in ip.KINDS:
         regions += [
             RegionDecl(f"i{kind}{lv}", S, f"k2a.i{kind}{lv}")
@@ -72,7 +93,9 @@ def indexer_regions(bound_max: int) -> list[RegionDecl]:
 def k2a_regions(key: k2a.AttnPostBuild) -> list[RegionDecl]:
     """K2a's: (a selecting layer) the indexer, then attn_score, irq, wo_a,
     wo_b (pushing the all-reduce's partials), slice, gate, norm."""
-    regions = indexer_regions(key.index_bound_max) if key.index_bound_max else []
+    regions = (
+        indexer_regions(key.index_bound_max, key.tok_par) if key.index_bound_max else []
+    )
     return regions + [
         RegionDecl("am", S, "k2a.attn_score"),
         RegionDecl("al", S, "k2a.attn_score"),
@@ -107,11 +130,16 @@ def k2b_regions(key: MoeBuild) -> list[RegionDecl]:
 def k2_regions(key: k2.LayerPostBuild) -> list[RegionDecl]:
     """K2a's and K2b's in one launch, and K2b's wait for a token's normed row."""
     key_a, key_b = key.halves()
-    return [
-        *k2a_regions(key_a),
-        *k2b_regions(key_b),
-        RegionDecl("xrdy", S, "k2a.norm"),
-    ]
+    if key.tok_par:
+        # a token's flag here from its owner's norm or the row's gather;
+        # the owner pushes its row to every other rank's XG
+        gathered = [
+            RegionDecl("xrdy", S, ("k2a.norm", "k2b.gather")),
+            RegionDecl("xg", P, "k2a.norm"),
+        ]
+    else:
+        gathered = [RegionDecl("xrdy", S, "k2a.norm")]
+    return [*k2a_regions(key_a), *k2b_regions(key_b), *gathered]
 
 
 def check_k1(key: k1.AttnPreBuild) -> None:
@@ -128,6 +156,28 @@ if __name__ == "__main__":
     for s in sizes:
         for feeds_index, fp4 in ((False, False), (True, False), (True, True)):
             check_k1(k1.AttnPreBuild(tokens=s, feeds_index=feeds_index, index_fp4=fp4))
-        for bound, fp4 in ((0, False), (65536, False), (65536, True)):
-            check_k2(k2.LayerPostBuild(tokens=s, index_bound_max=bound, index_fp4=fp4))
+        for bound, fp4, mfma in (
+            (0, False, False),
+            (65536, False, False),
+            (65536, True, False),
+            (65536, True, True),
+        ):
+            check_k2(k2.LayerPostBuild(
+                tokens=s, index_bound_max=bound, index_fp4=fp4, index_mfma=mfma
+            ))  # fmt: skip
+        # an FP8 pool: the window row's bytes, the attention's dequant
+        check_k1(k1.AttnPreBuild(tokens=s, kv_fp8=True))
+        check_k2(k2.LayerPostBuild(
+            tokens=s, index_bound_max=65536, index_fp4=True, kv_fp8=True
+        ))  # fmt: skip
+        if s % 4 == 0 and s >= 12:
+            for feeds_index in (False, True):
+                check_k1(k1.AttnPreBuild(
+                    tokens=s, feeds_index=feeds_index, index_fp4=feeds_index,
+                    tok_par=True,
+                ))  # fmt: skip
+            check_k1(k1.AttnPreBuild(tokens=s, tok_par=True, kv_fp8=True))
+            check_k2(k2.LayerPostBuild(
+                tokens=s, index_bound_max=65536, index_fp4=True, tok_par=True
+            ))  # fmt: skip
         print(f"S={s}: contract holds")

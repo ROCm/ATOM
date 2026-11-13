@@ -94,43 +94,43 @@ def test_rebalance_experts_global_invariants():
     "kwargs,err",
     [
         (
-            dict(
-                num_physical=8,
-                num_groups=3,
-                num_nodes=1,
-                num_gpus=4,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 8,
+                "num_groups": 3,
+                "num_nodes": 2,
+                "num_gpus": 4,
+                "enable_hierarchical": True,
+            },
             "num_logical must be divisible by num_groups",
         ),
         (
-            dict(
-                num_physical=8,
-                num_groups=4,
-                num_nodes=3,
-                num_gpus=6,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 12,
+                "num_groups": 4,
+                "num_nodes": 3,
+                "num_gpus": 6,
+                "enable_hierarchical": True,
+            },
             "num_groups must be divisible by num_nodes",
         ),
         (
-            dict(
-                num_physical=8,
-                num_groups=4,
-                num_nodes=2,
-                num_gpus=3,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 12,
+                "num_groups": 4,
+                "num_nodes": 2,
+                "num_gpus": 3,
+                "enable_hierarchical": True,
+            },
             "num_gpus must be divisible by num_nodes",
         ),
         (
-            dict(
-                num_physical=10,
-                num_groups=4,
-                num_nodes=2,
-                num_gpus=4,
-                enable_hierarchical=True,
-            ),
+            {
+                "num_physical": 10,
+                "num_groups": 4,
+                "num_nodes": 2,
+                "num_gpus": 4,
+                "enable_hierarchical": True,
+            },
             "num_physical must be divisible by num_gpus",
         ),
     ],
@@ -139,6 +139,25 @@ def test_rebalance_experts_constraints(kwargs, err):
     weight = torch.ones((1, 8), dtype=torch.int32)
     with pytest.raises(AssertionError, match=err):
         rebalance_experts(weight, **kwargs)
+
+
+def test_rebalance_experts_flat_accepts_dsr1_shared_expert_tail():
+    # DSR1 has 256 routed experts in 8 router groups. EPLB also routes its
+    # fused shared expert, yielding 257 logical experts. Router-group
+    # divisibility is irrelevant to flat single-node placement.
+    weight = torch.ones((1, 257), dtype=torch.int32)
+    p2l, l2p, logcnt = rebalance_experts(
+        weight,
+        num_physical=328,
+        num_groups=8,
+        num_nodes=1,
+        num_gpus=8,
+        enable_hierarchical=False,
+    )
+    assert p2l.shape == (1, 328)
+    assert l2p.shape[:2] == (1, 257)
+    assert logcnt.shape == (1, 257)
+    assert int(logcnt.sum().item()) == 328
 
 
 def test_rebalance_experts_hierarchical_invariants():

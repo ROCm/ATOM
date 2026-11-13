@@ -49,10 +49,11 @@ class StagedTransfer:
     * KV -- `connector.py` records the fence commit 7427e05e added to fix KV
       corruption on reload on the RPC thread and `synchronize()`s it through
       `save_ready_event` before handing the blocks over.
-    * State -- `state_tier.submit_store` needs no event: the PAGE units are
-      reserved out of the KV pool and engine-pinned for the whole transfer, so
-      nothing on the compute stream is writing them and the gather reads them
-      where they sit.
+    * State -- the PAGE units are reserved out of the KV pool and
+      engine-pinned for the whole transfer, so nothing writes them after the
+      copy that filled them; `connector._start_state_stores` records an event
+      behind that copy and `state_tier._do_store` synchronizes it before the
+      gather.
 
     Do not delete the KV `save_ready_event` believing this class covers it:
     without it the gather reads the staging entry's previous occupant, which is
@@ -150,8 +151,8 @@ class StagedTransfer:
         nothing about the *producer* side -- this gather runs on a private
         stream and does not wait for the forward that wrote the entry. Keeping
         the source quiescent is the caller's job (KV via `save_ready_event`,
-        state via reserved-and-pinned units in `state_tier.submit_store`); see
-        the class docstring.
+        state via pinned units and the `ready_event` `state_tier._do_store`
+        waits on); see the class docstring.
         """
         from atom.kv_transfer.offload.dense.triton_kv_staging import (
             fused_pack_chunk_major,
@@ -159,7 +160,43 @@ class StagedTransfer:
 
         segments = list(segments)
         seg_bytes = self._segment_block_bytes(segments)
-        nbytes = sum(seg_bytes)
+        self._gather(
+            sum(seg_bytes),
+            dst,
+            lambda buf: fused_pack_chunk_major(segments, seg_bytes, [1], [0], buf),
+        )
+
+    def pack_segments(self, ptrs, sizes, dst: Any) -> None:
+        """`pack` for segments given as raw device addresses and byte sizes.
+
+        For a store whose image is thousands of small segments: the metadata
+        that depends only on `sizes` is built once per geometry and cached per
+        thread, so a store spends a few vector ops rather than a Python loop
+        per segment, under the GIL the scheduler thread also needs.
+        """
+        from atom.kv_transfer.offload.dense.triton_kv_staging import (
+            fused_pack_segments,
+            prepare_segment_gather,
+        )
+
+        gathers = getattr(self._tls, "segment_gathers", None)
+        if gathers is None:
+            gathers = self._tls.segment_gathers = {}
+        key = sizes.tobytes()
+        prepared = gathers.get(key)
+        if prepared is None:
+            if len(gathers) >= 4:
+                gathers.pop(next(iter(gathers)))
+            with self._device_ctx():
+                prepared = gathers[key] = prepare_segment_gather(sizes, self.device)
+        self._gather(
+            prepared.nbytes,
+            dst,
+            lambda buf: fused_pack_segments(prepared, ptrs, buf),
+        )
+
+    def _gather(self, nbytes: int, dst: Any, launch) -> None:
+        """Run `launch(device_buf)` on `pack_stream` and land the bytes in `dst`."""
         dst_tensor = memory_object_as_uint8(dst, nbytes)
         with self._device_ctx():
             state = self.thread_state()
@@ -172,9 +209,7 @@ class StagedTransfer:
                 # about to read them (same hazard as the general path's except).
                 try:
                     with state.stream_ctx(state.pack_stream):
-                        fused_pack_chunk_major(
-                            segments, seg_bytes, [1], [0], dst_tensor
-                        )
+                        launch(dst_tensor)
                     if state.pack_stream is not None:
                         state.pack_stream.synchronize()
                 except Exception:
@@ -192,7 +227,7 @@ class StagedTransfer:
                     # KV bytes under a valid prefix hash. Mirrors the hazard note
                     # on `atom_lmcache_staging.py`'s `ensure_buffer` call.
                     device_buf = self.ensure_buffer(staging_buffer, nbytes)
-                    fused_pack_chunk_major(segments, seg_bytes, [1], [0], device_buf)
+                    launch(device_buf)
                 self._handoff(state, state.pack_stream, state.copy_stream)
                 with state.stream_ctx(state.copy_stream):
                     dst_tensor.copy_(

@@ -10,8 +10,8 @@ including OPUS prefill rounding. This module owns cache-format adaptation.
 import torch
 
 from atom.model_ops.v4_kernels import (
+    sparse_attn_v4_paged_2src,
     sparse_attn_v4_paged_decode,
-    sparse_attn_v4_paged_prefill,
 )
 
 from .packed_rows import gather_prefix_rows
@@ -50,7 +50,7 @@ def packed_prefill(
         end = min(begin + query_tile, tokens)
         gather_prefix_rows(pool, indices, indptr, scratch, begin, end)
         local_ptr = indptr[begin : end + 1] - indptr[begin]
-        result = sparse_attn_v4_paged_prefill(
+        result = sparse_attn_v4_paged_2src(
             q[begin:end],
             scratch,
             local_indices,

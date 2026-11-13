@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 import sys
+import textwrap
 import types
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
+import numpy as np
 import pytest
 import torch
 
@@ -126,24 +131,28 @@ def _stub_v4_runtime_imports():
     aiter_jit_utils.__path__ = []
     chip_info = types.ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = lambda: "gfx950"
+    chip_info.get_gfx_runtime = lambda: "gfx950"
     # Replaced, not reused: other test modules leave their own, narrower
     # parallel_state stub in sys.modules.
     aiter_dist = types.ModuleType("aiter.dist")
     aiter_dist.__path__ = []
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state.get_tp_group = lambda: None
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
+        "get_pcp_rank",
         "get_pcp_world_size",
         "pcp_is_enabled",
+        "pcp_owned_rows_by_request",
         "pcp_pad_dense",
         "pcp_pad_indptr",
         "pcp_pad_len",
         "pcp_reindex_ragged",
-        "pcp_round_robin_query_indices",
     ):
         setattr(pcp_utils, name, lambda *args, **kwargs: None)
+    pcp_utils.PcpBalGroup = tuple
 
     backends = types.ModuleType("atom.model_ops.attentions.backends")
     for name in (
@@ -154,12 +163,11 @@ def _stub_v4_runtime_imports():
         setattr(backends, name, type(name, (), {}))
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
-    kernels.FP4_MQA_BLOCK_K = 128
-    kernels.FP4_MQA_PARALLEL_UNIT_NUM = 1
     for name in (
         "build_v4_paged_decode_indptr",
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
+        "make_compress_plans",
         "plan_context_lens",
         "v4_decode_split_plan",
         "v4_uniform_split_table",
@@ -173,6 +181,18 @@ def _stub_v4_runtime_imports():
         prepare=lambda *args, **kwargs: None,
     )
 
+    # The indexer's scorer needs aiter's kernels; the builder only names them.
+    indexer = types.ModuleType("atom.model_ops.indexer")
+    indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
+    indexer.MFMA = "mfma"
+    for name in ("ConcatKeys", "RowSplit", "IndexRows"):
+        setattr(indexer, name, type(name, (), {}))
+    for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
+        setattr(indexer, name, lambda *args, **kwargs: None)
+    # Its sequences are aiter's FP4 MQA plan; the builder only names the type.
+    ragged = types.ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
+    ragged.Fp4MqaRaggedMetadata = type("Fp4MqaRaggedMetadata", (), {})
+
     replacements = {
         "aiter": aiter,
         "aiter.jit": aiter_jit,
@@ -182,6 +202,8 @@ def _stub_v4_runtime_imports():
         "aiter.dist.parallel_state": parallel_state,
         "atom.distributed.pcp_utils": pcp_utils,
         "atom.model_ops.attentions.backends": backends,
+        "atom.model_ops.fp4_mqa_ragged_metadata": ragged,
+        "atom.model_ops.indexer": indexer,
         "atom.model_ops.v4_kernels": kernels,
     }
     previous = {name: sys.modules.get(name, _MISSING) for name in replacements}
@@ -613,6 +635,48 @@ def test_fp4_indexer_without_transfer_keeps_single_node_behavior(v4_builder_cls)
 
 
 @pytest.mark.parametrize(
+    "layout,expected",
+    [
+        ("fp4-gfx950-preshuffle", "fp4_gfx950_flydsl"),
+        ("fp4-gfx950-opus", "fp4_gfx950_opus"),
+        ("fp4-gfx1250-natural", "fp4"),
+        ("fp8", "per_row_fp8"),
+    ],
+)
+def test_cache_binding_preserves_indexer_writer_layout(
+    v4_builder_cls, monkeypatch, layout, expected
+):
+    model = types.ModuleType("atom.models.deepseek_v4")
+    for name in ("Compressor", "DeepseekV4Attention", "Indexer"):
+        setattr(model, name, type(name, (), {}))
+    monkeypatch.setitem(sys.modules, model.__name__, model)
+    builder, *_ = _transfer_builder(
+        v4_builder_cls, kv_dtype="fp8", indexer_fp4=layout != "fp8"
+    )
+    builder.indexer_layout = layout
+    builder.layer_id_to_csa_pos = {0: 0, 2: 1}
+    runner = builder.model_runner
+    runner.v4_csa_idx_kv_state = [object(), object()]
+    runner.v4_csa_idx_score_state = [object(), object()]
+    if builder._indexer_fp4:
+        data, scale = fp4_indexer_block_fields(64, 128, layout)
+        runner.v4_csa_idx_kv = torch.empty(2, 3, *data.shape, dtype=data.dtype)
+        runner.v4_csa_idx_kv_scale = torch.empty(2, 3, *scale.shape, dtype=scale.dtype)
+    module = model.Compressor()
+    module.prefix = "layers.2.attn.indexer.compressor"
+    module.compress_ratio = 4
+    module.quant_mode = "none"
+
+    builder.build_kv_cache_tensor(module)
+
+    assert module.quant_mode == expected
+    assert module.kv_cache.data_ptr() == runner.v4_csa_idx_kv[1].data_ptr()
+    if builder._indexer_fp4:
+        assert module.cache_scale.data_ptr() == runner.v4_csa_idx_kv_scale[1].data_ptr()
+    assert module.kv_cache_rope is None
+
+
+@pytest.mark.parametrize(
     ("transfer_config", "expected"),
     [
         (None, False),
@@ -718,6 +782,7 @@ def mooncake_page_writer():
     import ast
     import logging
     import time
+    from dataclasses import dataclass
 
     from atom.kv_transfer.disaggregation.port_offset import consumer_region_indices
 
@@ -725,14 +790,22 @@ def mooncake_page_writer():
         "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py"
     )
     tree = ast.parse(path.read_text())
-    names = {"_execute_block_slot_transfer", "_consumer_region_map"}
+    names = {
+        "_execute_block_slot_transfer",
+        "_consumer_region_map",
+        "_block_plan",
+        "_RdmaBatch",
+        "_UnitPlan",
+    }
     methods = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
     ]
     namespace = {
         "KVTransferRegion": KVTransferRegion,
+        "dataclass": dataclass,
+        "np": np,
         "consumer_region_indices": consumer_region_indices,
         "logger": logging.getLogger(__name__),
         "time": time,
@@ -766,6 +839,10 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
             for r in src.block_regions
         ),
         _block_region_consumer_indices=None,
+        _block_unit_specs=None,  # MLA: matched by position and role
+        _block_head_major_runs=(),
+        _per_block_bytes_list=[r.unit_bytes for r in src.block_regions],
+        _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
@@ -776,7 +853,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         pp_size=1,
         tp_rank=0,
     )
-    for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
+    for name in ("_execute_block_slot_transfer", "_consumer_region_map", "_block_plan"):
         setattr(conn, name, types.MethodType(writer[name], conn))
     req = {
         # FP4 consumers advertise under the FP4-only key (version fence).
@@ -825,14 +902,24 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
 
     selected_engine = object()
 
-    def write(target, sources, destinations, sizes, request_id, kind, *, engine=None):
+    def write(
+        target,
+        sources,
+        destinations,
+        sizes,
+        request_id,
+        kind,
+        *,
+        engine=None,
+        deadline=None,
+    ):
         assert engine is selected_engine
         calls.append(kind)
         for s, d, size in zip(sources, destinations, sizes, strict=True):
             ctypes.memmove(d, s, size)
         return True
 
-    conn._rdma_write_with_retry = write
+    conn._rdma_write = write
     assert conn._execute_block_slot_transfer(
         req,
         "test",
@@ -894,7 +981,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
             conn._block_region_roles = [r.semantic_role for r in regions]
 
     calls = []
-    conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
+    conn._rdma_write = lambda *args: calls.append(args) or True
     with pytest.raises(
         RuntimeError,
         match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|one-to-one",
@@ -923,3 +1010,542 @@ def test_v4_sidecar_offload_rejects_pipeline_parallelism_before_registration(
         ),
     ):
         builder.get_kv_transfer_tensors()
+
+
+# ---- The prefill indexer's row split across TP, as the builder wires it -------
+
+
+class _RecordingSplit:
+    """Stands in for `RowSplit`: records how the builder asks for its split
+    and deals the rows round-robin, as `RowSplit.striped` does."""
+
+    calls: ClassVar[list] = []
+
+    @classmethod
+    def striped(cls, rows, rank, world, *, group):
+        cls.calls.append(((rows, rank, world), {"group": group}))
+        return SimpleNamespace(
+            rank=rank, world=world, end=len(range(rank, rows, world))
+        )
+
+
+def _rows_by_request(cu, first, stride, owned):
+    """`pcp_owned_rows_by_request`, by counting: the rows `first`,
+    `first + stride`, ... below each request's start, then `owned`."""
+    below = [len(range(first, start, stride)) for start in cu[:-1]]
+    return np.array([*below, owned], dtype=np.int32)
+
+
+def _split_builder(v4_builder_cls, monkeypatch, *, world, rank=3, fp4, bound=None):
+    """A builder as TP rank `rank` of `world`, splitting from `bound` index
+    logits (the default's, by default)."""
+    # The fixture loads the builder module off `sys.modules`; its globals are
+    # reachable through any of its functions.
+    module = v4_builder_cls._prefill_row_split.__globals__
+    _RecordingSplit.calls = []
+    monkeypatch.setitem(module, "RowSplit", _RecordingSplit)
+    monkeypatch.setitem(
+        module, "get_tp_group", lambda: SimpleNamespace(rank_in_group=rank)
+    )
+    monkeypatch.setitem(module, "visible_csa", lambda positions: positions)
+    if bound is None:
+        monkeypatch.delenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", raising=False)
+        bound = module["envs"].ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world = world
+    builder._indexer_qsplit_min_logits = bound
+    builder._indexer_fp4 = fp4
+    return builder, module
+
+
+def _prefill_step(builder, module, monkeypatch, positions, rows, n_committed):
+    """What `builder` hands on for a prefill step of `rows` new rows per
+    request: FP4's `_index_rows` arguments, or FP8's `concat_rows`'."""
+    handed = {}
+
+    def index_rows(metadata, row_ends, width, **kwargs):
+        handed.update(kwargs, row_ends=row_ends, width=width)
+
+    def concat(row_ends, keys, split):
+        handed.update(row_ends=row_ends, keys=keys, split=split)
+
+    staged = {}
+
+    def stage(name, values, publication_group=None):
+        staged[name] = SimpleNamespace(
+            np=np.asarray(values), gpu=torch.as_tensor(values)
+        )
+
+    builder._index_rows = index_rows
+    builder._stage = stage
+    builder.csa_layers = [0]
+    builder.model_runner = SimpleNamespace(forward_vars=staged)
+    monkeypatch.setitem(module, "concat_rows", concat)
+    monkeypatch.setitem(module, "ConcatKeys", lambda **kwargs: kwargs)
+    monkeypatch.setitem(module, "pcp_owned_rows_by_request", _rows_by_request)
+    # No padding request: every running one is scheduled.
+    running_bs = len(n_committed)
+    running_tokens = int(rows.sum())
+    split = builder._prefill_row_split(running_tokens, rows, n_committed)
+    metadata = SimpleNamespace(
+        n_committed_csa_per_seq_cpu=n_committed,
+        index_row_split=split,
+        batch_id_per_q_token=_batch_ids(rows),
+        block_tables=torch.zeros((running_bs, 1), dtype=torch.int32),
+    )
+    builder._stage_prefill_index_keys(n_committed, running_bs, split, rows)
+    builder._attach_v4_index_rows(
+        metadata,
+        running_bs,
+        running_tokens,
+        positions,
+        "the step's starts",
+    )
+    return handed
+
+
+def _batch_ids(rows):
+    return torch.repeat_interleave(torch.arange(rows.shape[0]), torch.from_numpy(rows))
+
+
+@pytest.mark.parametrize("state", ["DECODE", "PREFILL_NATIVE", "PREFILL_PREFIX"])
+@pytest.mark.parametrize("layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural"])
+def test_opus_index_rows_keep_request_starts_and_split(
+    v4_builder_cls, monkeypatch, layout, state
+):
+    rows = pytest.importorskip("atom.model_ops.indexer.rows", exc_type=ImportError)
+    module = v4_builder_cls._index_rows.__globals__
+    monkeypatch.setitem(module, "fp4_rows", rows.fp4_rows)
+    monkeypatch.setitem(module, "Fp4MqaRaggedMetadata", rows.Fp4MqaRaggedMetadata)
+
+    class Config:
+        block_table_width = 2
+
+        def schedule_buffers(self):
+            return object()
+
+    cfg, schedule = Config(), object()
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.opus.pa_mqa_logits_mxfp4",
+        SimpleNamespace(
+            mqa_logits_mxfp4_config=lambda *a, **kw: cfg,
+            mqa_logits_mxfp4_schedule=lambda *a, **kw: schedule,
+        ),
+    )
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_fp4 = True
+    builder.indexer_layout = layout
+    builder.index_logits_workspace = None
+    builder.index_n_heads = 64
+    builder.csa_rows_per_block = 64
+    builder._fp4_launches = rows.Fp4LaunchStorages("cpu", 3, 2)
+    metadata = SimpleNamespace(
+        max_seqlen_q=9,
+        block_tables=torch.tensor([[2], [5]], dtype=torch.int32),
+        state=module["AttnState"][state],
+    )
+    starts = torch.tensor([0, 1, 3], dtype=torch.int32)
+    ends = torch.tensor([65, 7, 8], dtype=torch.int32)
+    split = rows.RowSplit.striped(13, 2, 4)
+
+    result = builder._index_rows(
+        metadata,
+        ends,
+        128,
+        query_start_loc=starts,
+        max_qlen=2,
+        split=split,
+        recorded_as="" if state == "DECODE" else None,
+    )
+
+    assert result.split is split
+    assert result.bands == ((0, 3),)
+    [launch] = result.fp4_bands
+    assert launch["cfg"] is cfg
+    assert launch["schedule"] is (schedule if state == "DECODE" else None)
+    assert launch["query_start_loc"].tolist() == starts.tolist()
+    assert launch["row_ends"].tolist() == ends.tolist()
+    assert launch["block_tables"].tolist() == [[2, 0], [5, 0]]
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_split_prefill_rows_are_every_world_th_row(v4_builder_cls, monkeypatch, fp4):
+    """Split across TP, the prefill rows a rank publishes are every `world`-th
+    of the step's from its rank, each with its own bound and request: FP4
+    grouped by request (a rank may hold none of one), at most the most any
+    request has; FP8 each at its request's run of the gathered keys."""
+    world = 4
+    rows = np.array([5, 1, 9, 3], dtype=np.int32)
+    starts = np.array([100, 0, 37, 2000], dtype=np.int32)
+    n_committed = (starts + rows) // 4
+    cu = np.concatenate(([0], np.cumsum(rows)))
+    cu_committed = np.concatenate(([0], np.cumsum(n_committed)))
+    total = int(cu[-1])
+    positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, rows)])
+    for rank in range(world):
+        builder, module = _split_builder(
+            v4_builder_cls, monkeypatch, world=world, rank=rank, fp4=fp4, bound=0
+        )
+        handed = _prefill_step(
+            builder, module, monkeypatch, positions, rows, n_committed
+        )
+        mine = slice(rank, total, world)
+        assert _RecordingSplit.calls == [((total, rank, world), {"group": "tp"})]
+        assert handed["row_ends"].tolist() == positions[mine].tolist()
+        batch_ids = _batch_ids(rows)[mine]
+        if fp4:
+            owned = [
+                len([i for i in range(cu[b], cu[b + 1]) if i % world == rank])
+                for b in range(rows.shape[0])
+            ]
+            assert handed["query_start_loc"].tolist() == [0, *np.cumsum(owned)]
+            assert handed["max_qlen"] == max(max(owned), 1)
+        else:
+            row_starts = cu_committed[batch_ids.numpy()]
+            assert handed["keys"]["row_starts"].tolist() == row_starts.tolist()
+            assert handed["keys"]["total"] == cu_committed[-1]
+        assert handed["split"].rank == rank
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_split_ranks_share_a_cold_chunk_s_scoring_evenly(
+    v4_builder_cls, monkeypatch, fp4
+):
+    """A prefill row scores the keys its position sees, so a cold chunk's last
+    rows cost the most: contiguous shares would leave the last of 8 ranks
+    1.9 times the mean. Every 8th row each, the ranks' keys are within 1%."""
+    world, total = 8, 1 << 13
+    rows = np.array([total], dtype=np.int32)
+    keys = []
+    for rank in range(world):
+        builder, module = _split_builder(
+            v4_builder_cls, monkeypatch, world=world, rank=rank, fp4=fp4, bound=0
+        )
+        handed = _prefill_step(
+            builder, module, monkeypatch, torch.arange(total), rows, rows // 4
+        )
+        keys.append(int(handed["row_ends"].sum()))
+    assert max(keys) / (sum(keys) / world) < 1.01
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_unsplit_prefill_rows_are_the_whole_step(v4_builder_cls, monkeypatch, fp4):
+    """Below the bound every rank publishes every row, as without a split:
+    FP4 grouped by the caller's starts at the step's longest request."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=fp4)
+    rows = np.array([3, 4], dtype=np.int32)
+    positions = torch.tensor([5, 6, 7, 0, 1, 2, 3])
+    handed = _prefill_step(
+        builder, module, monkeypatch, positions, rows, np.array([2, 1], np.int32)
+    )
+    assert _RecordingSplit.calls == []
+    assert handed["split"] is None
+    assert handed["row_ends"].tolist() == positions.tolist()
+    if fp4:
+        assert handed["query_start_loc"] == "the step's starts"
+        assert handed["max_qlen"] is None
+    else:
+        assert handed["keys"]["row_starts"].tolist() == [0, 0, 0, 2, 2, 2, 2]
+
+
+class _Metadata(SimpleNamespace):
+    """Stands in for the metadata `prepare_prefill` takes from its base and
+    promotes to V4's: a class of its own, so `__class__` can be reassigned."""
+
+
+def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
+    v4_builder_cls, monkeypatch
+):
+    """A prefill hands the split each scheduled request's new rows, not its
+    context: lost on the way, no prefill would ever split."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    starts, rows = [8, 16, 0], [3, 5, 3]
+    cu = np.cumsum([0, *rows], dtype=np.int32)
+    context = np.add(starts, rows, dtype=np.int32)
+    positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, rows)])
+    metadata = _Metadata(
+        block_tables=torch.zeros(3, 4, dtype=torch.int32),
+        cu_seqlens_q=torch.from_numpy(cu),
+        replay_start_cpu=None,
+        replay_end_cpu=None,
+        n_committed_csa_per_seq_cpu=context // 4,
+        batch_id_per_q_token=torch.zeros(11, dtype=torch.long),
+    )
+    monkeypatch.setitem(module, "AttentionMetaData_DSV4", _Metadata)
+    # `_stub_v4_runtime_imports` leaves the base builder an empty class: its
+    # staging hands back the common metadata, its finish does nothing.
+    base = v4_builder_cls.__mro__[1]
+    monkeypatch.setattr(
+        base,
+        "stage_prefill",
+        lambda self, batch, running_bs, running_tokens, group: (metadata, positions),
+        raising=False,
+    )
+    monkeypatch.setattr(base, "finish_prefill", lambda *args: None, raising=False)
+    monkeypatch.setattr(
+        base, "_check_metadata_writable", lambda *args: None, raising=False
+    )
+    builder.model_runner = SimpleNamespace(
+        forward_vars={
+            "positions": SimpleNamespace(np=positions.numpy(), gpu=positions),
+            "cu_seqlens_q": SimpleNamespace(np=cu),
+            "context_lens": SimpleNamespace(np=context),
+            "batch_id_per_q_token": SimpleNamespace(
+                gpu=torch.zeros(11, dtype=torch.int32)
+            ),
+            **{
+                name: SimpleNamespace(
+                    np=np.arange(3, dtype=np.int32),
+                    gpu=torch.arange(3, dtype=torch.int32),
+                )
+                for name in ("v4_meta_state_slot_out", "v4_meta_state_slot_in")
+            },
+        },
+        # No state pool yet: no paged-prefill inputs to stage.
+        pool_plan=SimpleNamespace(entries={}),
+    )
+    builder.csa_layers = [0]
+    builder._populate_state_slot_mappings = lambda *args, **kwargs: (
+        None,
+        np.arange(3, dtype=np.int32),
+    )
+    for name in (
+        "_populate_state_slot_in",
+        "_build_compress_plans",
+        "_attach_v4_per_fwd_meta",
+        "_build_paged_prefill_meta",
+        "_index_rows",
+    ):
+        setattr(builder, name, lambda *args, **kwargs: None)
+    asked = []
+    builder._prefill_row_split = lambda *args: asked.append(args)
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=3, total_tokens_num_prefill=11, is_dummy_run=False
+    )
+
+    staged, _ = builder.stage_prefill(batch, 3, 11, None)
+    builder.finish_prefill(batch, staged, 3, 11)
+
+    # Decided once where the keys are staged; the rows read it back.
+    [(tokens, new_rows, n_committed)] = asked
+    assert tokens == 11
+    assert new_rows.tolist() == rows
+    assert n_committed.tolist() == (context // 4).tolist()
+
+
+@pytest.mark.parametrize("world, given", [(1, True), (8, False)])
+def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch, world, given):
+    """No split without a split world, or for a caller with no per-request rows
+    (PCP, TBO), however big the step."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=world, fp4=True)
+    big = np.array([1 << 14], dtype=np.int32)
+    split = builder._prefill_row_split(1 << 14, big if given else None, big)
+    assert split is None and _RecordingSplit.calls == []
+
+
+@pytest.mark.parametrize("over", [0, 1], ids=["at_bound", "under"])
+@pytest.mark.parametrize(
+    "rows, n_committed, logits",
+    [
+        (8, 126, 1000),
+        (1 << 14, 1 << 12, 1 << 25),
+        (1 << 10, (1 << 16) + (1 << 8), (1 << 26) + (1 << 17)),
+    ],
+    ids=["8_rows", "cold_16k_chunk", "prefix_hit"],
+)
+def test_a_step_splits_from_the_keys_its_rows_see(
+    v4_builder_cls, monkeypatch, rows, n_committed, logits, over
+):
+    """A step's logits are the keys its rows see: up to the committed keys,
+    one fewer every 4 rows back. 8 rows at 126 keys are 1000 logits, not
+    1008; a cold 16K chunk's rows see 2K keys on average, 2^25 logits, half
+    of rows times keys; 1K new rows past a 256K-token prefix hit see 2^26 +
+    2^17. A step splits from exactly its bound."""
+    builder, _ = _split_builder(
+        v4_builder_cls, monkeypatch, world=8, fp4=True, bound=logits + over
+    )
+    split = builder._prefill_row_split(
+        rows,
+        np.array([rows], dtype=np.int32),
+        np.array([n_committed], dtype=np.int32),
+    )
+    assert (split is not None) == (over == 0)
+
+
+def test_split_pairs_each_request_s_rows_with_its_own_keys(v4_builder_cls, monkeypatch):
+    """A step's logits count each request's rows at its own committed keys,
+    the scoring those rows do, not at the plane's width (the longest
+    request's): one row of a long request beside three of a fresh one is one
+    row's scoring."""
+    builder, _ = _split_builder(
+        v4_builder_cls, monkeypatch, world=8, fp4=True, bound=1000
+    )
+    rows = np.array([1, 3], dtype=np.int32)
+    n_committed = np.array([999, 0], dtype=np.int32)
+    assert builder._prefill_row_split(4, rows, n_committed) is None
+
+
+def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
+    """16K rows of a 1M-token request are 2^32 logits, past int32 (the host
+    metadata's dtype): wrapped, the biggest steps would stay whole."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    rows = np.array([1 << 14], dtype=np.int32)
+    n_committed = np.array([1 << 18], dtype=np.int32)
+    assert builder._prefill_row_split(1 << 14, rows, n_committed) is not None
+
+
+_MOONCAKE = {"kv_connector": "mooncake"}
+_OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+_LOAD_ONLY = {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}
+
+
+def _multi(*connectors):
+    return {"kv_connector": "multi", "connectors": list(connectors)}
+
+
+@pytest.mark.parametrize(
+    "enabled, tbo, kv, world",
+    [
+        ("1", False, {}, 8),
+        ("true", False, {}, 8),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_producer"}, 8),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_producer"}, _OFFLOAD), 8),
+        ("1", False, _LOAD_ONLY, 8),
+        ("1", False, _multi(_LOAD_ONLY), 8),
+        ("1", False, {**_multi(_MOONCAKE, _OFFLOAD), "kv_role": "kv_consumer"}, 8),
+        ("1", True, {}, 1),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_consumer"}, 1),
+        ("1", False, {"kv_connector": "moriio", "kv_role": "kv_consumer"}, 1),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_consumer"}, _OFFLOAD), 1),
+        ("1", False, _multi(_OFFLOAD, {**_MOONCAKE, "kv_role": "kv_consumer"}), 1),
+        ("0", False, {}, 1),
+    ],
+    ids=[
+        "splits",
+        "flag_true",
+        "pd_prefill",
+        "multi_pd_prefill",
+        "offload_load_only",
+        "multi_offload_load_only",
+        "multi_top_level_role_only",
+        "prefill_tbo",
+        "pd_decode",
+        "moriio_pd_decode",
+        "multi_pd_decode",
+        "multi_pd_decode_offload_first",
+        "flag_off",
+    ],
+)
+def test_the_split_world_follows_the_run(
+    v4_builder_cls, monkeypatch, enabled, tbo, kv, world
+):
+    """With the flag on ("1" or "true"), plain TP8 splits, a P/D prefill
+    instance and a load-only offload node included; the flag off keeps the
+    rows whole, and so, for now, does prefill TBO, whose ubatches' rows do
+    not take the split yet, and so does a P/D decode instance, which only
+    recomputes prefills: under `multi` too, whose P/D sub-connector holds the
+    role, wherever it is listed (a role on `multi` alone reaches no
+    sub-connector, which runs as a producer). Reading the world is no collective: the
+    startup gather is the builder's `__init__`'s (`_warm_split_gather`)."""
+    module = v4_builder_cls._indexer_qsplit_world_size.__globals__
+    monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setitem(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
+    )
+    monkeypatch.setitem(module, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
+    gathers = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda out, mine, group: gathers.append((out, mine, group)),
+    )
+    monkeypatch.setenv("ATOM_V4_INDEXER_QSPLIT", enabled)
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.indexer_layout = "fp8"
+    builder.device = "cpu"
+    config = SimpleNamespace(
+        enable_dp_attention=False,
+        enable_tbo=tbo,
+        enable_tbo_decode=False,
+        decode_context_parallel_size=1,
+        kv_transfer_config=kv,
+    )
+    assert builder._indexer_qsplit_world_size(config) == world
+    assert gathers == []
+
+
+@pytest.mark.parametrize("world, gathers", [(8, [8]), (1, [])])
+def test_a_run_that_splits_gathers_at_startup(v4_builder_cls, world, gathers):
+    """A run that splits gathers once at startup, before the memory profile;
+    one that does not never gathers."""
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world_size = lambda config: world
+    warmed = []
+    builder._warm_split_gather = warmed.append
+    builder._init_indexer_qsplit(SimpleNamespace())
+    assert builder._indexer_qsplit_world == world
+    assert warmed == gathers
+
+
+def test_the_builder_inits_the_split(v4_builder_cls):
+    """`__init__` calls `_init_indexer_qsplit`: the builder is too heavy to
+    construct here, so its source is read. Without the call the startup
+    gather is gone and the split's state unset until a prefill reads it."""
+    init = ast.parse(textwrap.dedent(inspect.getsource(v4_builder_cls.__init__)))
+    calls = [
+        node.func.attr
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert calls.count("_init_indexer_qsplit") == 1
+
+
+def test_the_startup_gather_is_the_split_s(v4_builder_cls, monkeypatch):
+    """The startup gather runs on the TP group and from this rank's own slot,
+    as the split does, so what RCCL allocates on its first all-gather is
+    inside the memory profile."""
+    module = v4_builder_cls._warm_split_gather.__globals__
+    monkeypatch.setitem(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
+    )
+    gathers = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda out, mine, group: gathers.append((out, mine, group)),
+    )
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.device = "cpu"
+    builder._warm_split_gather(8)
+    [(out, mine, group)] = gathers
+    assert group == "tp" and out.numel() == 8
+    assert mine.numel() == 1 and mine.data_ptr() == out[3:].data_ptr()
+
+
+@pytest.mark.parametrize(
+    "n_committed, running_bs, expected",
+    [([5, 3], 4, [0, 5, 8, 8, 8]), ([], 1, [0, 1])],
+    ids=["padded", "idle"],
+)
+def test_fp8_committed_keys_span_every_block_table_row(
+    v4_builder_cls, monkeypatch, n_committed, running_bs, expected
+):
+    """The gather gives each of the `running_bs` block-table rows a thread that
+    claims its `cu_committed` span: a padding request's is empty, and with no
+    committed key the dummy row is the last span's."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=1, fp4=False)
+    staged = {}
+    builder._stage = lambda name, values, publication_group=None: staged.update(
+        {name: np.asarray(values)}
+    )
+    builder.csa_layers = [0]
+    builder._stage_prefill_index_keys(
+        np.asarray(n_committed, dtype=np.int32), running_bs
+    )
+    assert staged["v4_indexer_cu_committed"].tolist() == expected

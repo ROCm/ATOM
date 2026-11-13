@@ -88,7 +88,7 @@ Observed in the API process, plus one live-read gauge.
 | --- | --- | --- |
 | `atom:time_to_first_token_seconds` | Histogram, s | Local API request arrival to first output. `streaming="true"` observes the first generated SSE payload; `streaming="false"` observes the first internal token delivery. One sample per request. Label: `streaming`. |
 | `atom:inter_token_latency_seconds` | Histogram, s | Frontend-observed output interval divided by new token count, weighted by that count. Excludes the first output batch. |
-| `atom:stream_longest_silence_seconds` | Gauge, s | Seconds the most starved in-flight SSE stream has gone without a chunk; 0 when none is waiting. Read live at scrape time from the event loop serving the stream, not from the snapshot. |
+| `atom:stream_longest_silence_seconds` | Gauge, s | Seconds the most starved in-flight SSE stream has gone without a chunk; 0 when none is waiting. Read live at scrape time from the event loop serving the stream, not from the snapshot. With `--api-server-count` > 1, the max over all processes: each worker publishes when its oldest waiting stream started waiting, and the hub turns that into a silence at scrape time. |
 
 ### Scheduler
 
@@ -116,7 +116,16 @@ percentiles. Prefill and decode request contexts are exact gauges.
 KV block partition counts are maintained as blocks change state; snapshot
 collection does not scan the free block pool.
 
-Both request context gauges replace the former histograms of the same names;
+Both request context gauges are **disabled by default**. For a short diagnostic
+capture, pass `--enable-request-context-metrics` when starting the server.
+For PD deployments, pass it separately to each P/D service to be diagnosed.
+The option is disabled by default for both roles and standalone serving.
+Python callers can set `enable_request_context_metrics=True` on `LLM(...)`.
+When disabled, these gauges are not registered and no per-request samples are
+written. Aggregate context histograms, queue and batch
+metrics, cache counters and the independent GPU timing option are unaffected.
+
+These gauges replace the former histograms of the same names;
 their `_bucket`, `_count`, and `_sum` series are no longer emitted. Reports show
 exact request points, a table, and CSV rows instead of P50/P99 curves. The
 `started_at` label records the first dispatch time for that phase, not scrape time.
@@ -128,11 +137,13 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics: series count grows with requests.
+When enabled, these are per-request metrics: series count grows with requests.
 Samples remain after request completion so even short requests can be scraped.
 Native multiprocess files retain them until the service's metrics directory is
-cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
-directory between long benchmark runs when this accumulated cardinality matters.
+cleaned; there is no automatic per-request expiry. Keep this option disabled
+for sustained serving and throughput benchmarks. Disabling it does not remove
+old samples from an existing metrics directory: restart the service with a fresh
+metrics directory, without deleting storage used by live workers.
 
 ### GPU forward timing
 
@@ -204,7 +215,12 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_affinity_owner_hit` | Counter | Requests routed to an existing session cache owner. |
 | `atom:dp_affinity_spill` | Counter | Existing sessions moved off their cache owner; strict affinity keeps this at 0. |
 | `atom:dp_affinity_parent_ignored` | Counter | New child sessions placed independently instead of inheriting a parent owner. |
-| `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / by the load balancer. |
+| `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / sessionless requests placed by `round_robin`, `least_requests` or `least_tokens`. The offline backpressure pool (`ATOM_DP_DISPATCH_DEPTH`) does not count placements here. Under `prefix_spread`, explicit hints still increment `atom:dp_route_explicit`; automatic placements increment `atom:dp_prefix_route`, so `atom:dp_route_load_balanced` stays 0. |
+| `atom:dp_prefix_route` | Counter | `prefix_spread` only. Automatic placements by `decision`: `owner` (kept on the rank holding the prefix), `moved` (to an idle rank, reusing local KV and loading eligible tier KV, or recomputing when the load is below the minimum) or `cold` (no known prefix, placed by `least_tokens`). |
+| `atom:dp_prefix_moved_tokens` | Counter, tokens | `prefix_spread` only. Tier tokens credited at placement, including an explicit target that can load another rank's prefix: an estimate that excludes an unaligned head and loads under the minimum, not a count of completed restores. |
+| `atom:dp_prefix_index_events` | Counter | `prefix_spread` only. Prefix-index budget events by `event`: `tail_trim` (an old, finished history shortened from its tail to get back under the budget), `leaf_evict` (an old history dropped whole), `over_budget` (budget checks that found the index over budget), `blocked` (budget checks that ended still over budget because eviction ran out of evictable history: what is left is still-prefilling history and the finished ancestors of it, which cannot be shed while they have children). Cumulative per process; read with `rate()`/`increase()`. `tail_trim` and `leaf_evict` both 0 means the eviction path never ran. See "Index budget trade-off and how to see it" under "DP request load balancing" in the distributed guide. |
+| `atom:dp_prefix_index_evicted_tokens` | Counter, tokens | `prefix_spread` only. Prompt tokens of history shed by the budget, by `kind` (`tail_trim` or `leaf_evict`). Divide by the hash block size for blocks. |
+| `atom:dp_prefix_index_tokens` | Gauge, tokens | `prefix_spread` only. Tokens currently indexed (unique intervals). The budget is `PrefixSpreadRouter.CAP` tokens; eviction only runs when this exceeds it. |
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |
 | `atom:dp_inflight_requests` | Gauge, requests | In-flight requests charged to each rank. Label: `rank`. |
 | `atom:dp_queued_prefill_tokens` | Gauge, tokens | Estimated uncached prefill-token debt per rank; sticky follow-up turns charge only positive prompt growth. Label: `rank`. |
@@ -222,12 +238,15 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 ### Process and exporter health
 
 `gc_*` describe the API process's own collector, not the engine's — each
-interpreter keeps its own counters.
+interpreter keeps its own counters. With `--api-server-count` > 1 every series
+also carries a `process` label: `hub` for the process that owns the engine and
+`worker0`, `worker1`, ... for the front-end workers (published by each worker
+on the `ATOM_METRICS_UPDATE_INTERVAL_S` cadence).
 
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
-| `atom:gc_collections` / `atom:gc_collected` / `atom:gc_uncollectable` | Counter | Per-generation collections run, objects reclaimed, objects found unreclaimable. Label: `generation`. `gc_collected` flat after startup means raising `ATOM_GC_THRESHOLD` costs nothing; growth means it would defer real work. |
-| `atom:gc_threshold` | Gauge | Collection threshold in effect. Label: `generation`. |
+| `atom:gc_collections` / `atom:gc_collected` / `atom:gc_uncollectable` | Counter | Per-generation collections run, objects reclaimed, objects found unreclaimable. Labels: `generation`, plus `process` with `--api-server-count` > 1. `gc_collected` flat after startup means raising `ATOM_GC_THRESHOLD` costs nothing; growth means it would defer real work. |
+| `atom:gc_threshold` | Gauge | Collection threshold in effect. Labels: `generation`, plus `process` with `--api-server-count` > 1. |
 | `atom:metrics_snapshot_available` | Gauge, 0/1 | Whether a runtime snapshot has been collected successfully. |
 | `atom:metrics_refresh_errors` | Counter | Failed refreshes. Refresh failure, not scrape failure. |
 | `atom:metrics_last_refresh_timestamp_seconds` | Gauge, unix s | Timestamp of the last successful refresh. Stale value with a live scrape means the engine stopped answering. |

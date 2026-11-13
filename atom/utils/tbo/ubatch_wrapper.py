@@ -3,21 +3,22 @@
 
 import logging
 import threading
-import traceback
-from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import TypeAlias
 
+import numpy as np
 import torch
 from torch import nn
 
 from atom.utils.forward_context import (
     Context,
+    DPMetadata,
     ForwardContext,
     _forward_context_local,
     get_forward_context,
 )
 
-from .ubatch_splitting import UBatchSlice
+from .ubatch_splitting import NUM_TBO_UBATCHES, UBatchSlice
 from .ubatching import make_tbo_contexts
 
 logger = logging.getLogger("atom")
@@ -25,13 +26,20 @@ logger = logging.getLogger("atom")
 UBatchModelOutput: TypeAlias = torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]
 
 
-@dataclass
-class TBOGraphData:
-    """Stores a captured CUDAGraph alongside objects that must stay alive."""
-
-    graph: torch.cuda.CUDAGraph
-    tbo_ctxs: list  # keep torch.Event objects alive for replay
-    output: UBatchModelOutput | None = None  # output reference from capture
+def _packed_tokens(
+    tensors: list[torch.Tensor], token_order: torch.Tensor | None
+) -> torch.Tensor:
+    """The micro-batches' tokens end to end, each put back at its packed token
+    (``token_order``, a permutation) when one is given."""
+    if token_order is None:
+        return torch.cat(tensors)
+    first = tensors[0]
+    out = first.new_empty((sum(t.shape[0] for t in tensors), *first.shape[1:]))
+    start = 0
+    for tensor in tensors:
+        out.index_copy_(0, token_order[start : start + tensor.shape[0]], tensor)
+        start += tensor.shape[0]
+    return out
 
 
 class UBatchWrapper(nn.Module):
@@ -49,13 +57,10 @@ class UBatchWrapper(nn.Module):
         self.dp_gather_scatter = dp_gather_scatter
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
-        self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
-        # TBO CUDAGraph storage: keyed by (running_bs, max_q_len)
-        self.tbo_graphs: dict[tuple, TBOGraphData] = {}
+        self.ready_barrier = threading.Barrier(NUM_TBO_UBATCHES + 1)
 
-        # Persistent ubatch worker pool. Previously every forward spawned + joined
-        # 2 threads.
-        self._num_workers = 2
+        # Persistent ubatch worker pool, one thread a micro-batch.
+        self._num_workers = NUM_TBO_UBATCHES
         self._workers: list[threading.Thread] = []
         self._worker_jobs: list[callable | None] = [None] * self._num_workers
         self._worker_job_ready = [threading.Event() for _ in range(self._num_workers)]
@@ -76,6 +81,9 @@ class UBatchWrapper(nn.Module):
                 if job is not None:
                     job()
             finally:
+                # Drop the closure's tensors before the worker waits for its
+                # next job, including when subsequent steps do not use TBO.
+                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):
@@ -91,7 +99,10 @@ class UBatchWrapper(nn.Module):
 
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
-            self.comm_stream = torch.cuda.Stream()
+            priority = getattr(
+                self.attn_metadata_builder, "tbo_comm_stream_priority", 0
+            )
+            self.comm_stream = torch.cuda.Stream(priority=priority)
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -115,42 +126,30 @@ class UBatchWrapper(nn.Module):
 
         ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
 
-        full_running_bs = ctx.context.running_bs
         forward_contexts = []
         ub_inputs = []
 
-        # When using DP gather/scatter (no EP/all2all), compute the
-        # DP-synchronized per-ubatch row count so MoE's pad_for_all_gather can
-        # just read context.running_tokens.  MORI path doesn't need this.
-        dp_size = self._get_dp_size() if self.dp_gather_scatter else 1
-        ub_running_tokens_list = self._compute_ub_running_tokens(
-            ctx,
-            N,
-            full_running_bs,
-            dp_size,
-            input_ids.device,
-        )
+        # A split decode's micro-batches run their tokens in this order; a
+        # prefill's run them in place.
+        token_order = ctx.attn_metadata.ubatch_token_order
+        if token_order is not None:
+            input_ids = input_ids[token_order]
+            positions = positions[..., token_order]
 
         for i, ub_slice in enumerate(ctx.ubatch_slices):
-            ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
-            if ctx.context.is_prefill:
-                ub_running_bs = ub_num_reqs
-            else:
-                ub_running_bs = self._decode_ub_running_bs(ctx, i, N, full_running_bs)
             ub_ctx = self._make_ubatch_context(
                 original_ctx,
                 ub_slice,
-                ub_running_bs,
                 i,
-                ub_num_reqs,
-                ub_running_tokens=ub_running_tokens_list[i],
+                positions,
+                token_order,
                 dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
                 running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
             )
             forward_contexts.append(ub_ctx)
             ub_token_slice = (
                 input_ids[ub_slice.token_slice],
-                positions[ub_slice.token_slice],
+                positions[..., ub_slice.token_slice],
             )
             # Empty ubatch would return immediately, leaving the partner
             # wedged at its next yield (see TBOContext.__exit__ comment).
@@ -160,7 +159,8 @@ class UBatchWrapper(nn.Module):
             assert ub_token_slice[0].numel() > 0, (
                 f"ubatch {i} produced an empty token slice "
                 f"(ts={ub_slice.token_slice}, rs={ub_slice.request_slice}); "
-                "check local_tbo_precompute / maybe_create_ubatch_slices."
+                "check prefill_tbo_vote / cut_prefill_ubatches / "
+                "cut_decode_ubatches."
             )
             ub_inputs.append(ub_token_slice)
 
@@ -194,8 +194,12 @@ class UBatchWrapper(nn.Module):
                     # thread is unblocked via TBOContext.partner.done (set in
                     # __exit__) so the main thread's done-wait returns promptly
                     # and re-raises errors[idx].
-                    logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
+                    logger.exception("[TBO] ubatch %d crashed", idx)
                     errors[idx] = e
+                finally:
+                    # The worker thread outlives the forward; do not let its
+                    # thread-local context keep this microbatch's step alive.
+                    _forward_context_local.ctx = None
 
             return _job
 
@@ -204,20 +208,42 @@ class UBatchWrapper(nn.Module):
         _forward_context_local.ctx = None
 
         try:
-            # Hand each ubatch job to its persistent worker and wake it.
-            for i in range(N):
-                self._worker_job_done[i].clear()
-                self._worker_jobs[i] = _make_job(i)
-                self._worker_job_ready[i].set()
+            # The backend owns resources shared by both microbatches.
+            parent_forward = (
+                self.attn_metadata_builder.ubatch_forward(ctx.attn_metadata)
+                if self.attn_metadata_builder is not None
+                else nullcontext()
+            )
+            with parent_forward:
+                # Hand each ubatch job to its persistent worker and wake it.
+                for i in range(N):
+                    self._worker_job_done[i].clear()
+                    self._worker_jobs[i] = _make_job(i)
+                    self._worker_job_ready[i].set()
 
-            # Same handshake as before: all reach the barrier, then wake thread 0.
-            self.ready_barrier.wait()
-            tbo_ctxs[0].cpu_wait_event.set()
+                # Same handshake as before: all reach the barrier, then wake thread 0.
+                self.ready_barrier.wait()
+                tbo_ctxs[0].cpu_wait_event.set()
 
-            # Wait for this step's jobs to finish (replaces Thread.join()).
-            for i in range(N):
-                self._worker_job_done[i].wait()
+                # Wait for this step's jobs to finish (replaces Thread.join()).
+                for i in range(N):
+                    self._worker_job_done[i].wait()
         finally:
+            # The contexts point at each other (`partner`), a cycle that
+            # outlives the forward until Python's cycle collector runs, and
+            # each holds its microbatch's ForwardContext -- the attention
+            # metadata and every GPU tensor the step memoized. The collector
+            # runs on object counts and never sees that memory, so those
+            # steps piled up until the GPU ran out. Break the cycle here, with
+            # every worker done.
+            for tbo_ctx in tbo_ctxs:
+                tbo_ctx.partner = None
+                tbo_ctx.forward_context = None
+            # Order everything the workers left on the comm stream before any
+            # later work on the compute stream. A comm section normally rejoins
+            # (`switch_to_compute_sync`), but one that raised did not, and the
+            # next forward republishes the microbatch buffers on this stream.
+            compute_stream.wait_stream(self.comm_stream)
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
 
@@ -227,175 +253,33 @@ class UBatchWrapper(nn.Module):
                 raise e
 
         sorted_results = [value for _, value in sorted(results)]
-        return self._concat_ubatch_outputs(sorted_results)
-
-    def capture_tbo_graph(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        graph_pool,
-        capture_stream: torch.cuda.Stream,
-        output_buffer: torch.Tensor | None = None,
-    ) -> tuple[torch.cuda.CUDAGraph, UBatchModelOutput]:
-        """Capture a CUDAGraph for TBO ubatch execution.
-
-        Threads are started and cuBLAS is initialized BEFORE graph capture
-        begins (following vLLM's _capture_ubatches pattern). Only the model
-        forward execution happens during capture.
-
-        If output_buffer is provided, the concatenated output is copied into
-        it inside the graph capture so replay writes to the same buffer.
-
-        Returns (graph, output_tensor).
-        """
-        self._ensure_comm_stream()
-        ctx = get_forward_context()
-        N = len(ctx.ubatch_slices)
-        compute_stream = capture_stream
-
-        # Build per-ubatch ForwardContexts from pre-allocated forward_vars.
-        full_running_bs = ctx.context.running_bs
-        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
-        ub_dp_metadata = self._make_ubatch_dp_metadata(ctx, N)
-        forward_contexts = []
-        ub_inputs = []
-        for i, ub_slice in enumerate(ctx.ubatch_slices):
-            if i < N - 1:
-                ub_running_bs = full_running_bs // N
-            else:
-                ub_running_bs = full_running_bs - (full_running_bs // N) * (N - 1)
-            ub_ctx = self._make_ubatch_context(
-                ctx,
-                ub_slice,
-                ub_running_bs,
-                i,
-                ub_running_tokens=ub_running_bs * max_q,
-                dp_metadata=ub_dp_metadata[i] if ub_dp_metadata is not None else None,
-                running_tokens_across_dp=self._ub_tokens_across_dp(ctx, N, i),
-            )
-            forward_contexts.append(ub_ctx)
-            ub_inputs.append(
-                (
-                    input_ids[ub_slice.token_slice],
-                    positions[ub_slice.token_slice],
-                )
-            )
-
-        tbo_ctxs = make_tbo_contexts(
-            num_micro_batches=N,
-            compute_stream=compute_stream,
-            comm_stream=self.comm_stream,
-            forward_contexts=forward_contexts,
-            ready_barrier=self.ready_barrier,
-        )
-
-        results: list[tuple[int, UBatchModelOutput]] = []
-        errors: list[Exception | None] = [None] * N
-        device = input_ids.device
-
-        @torch.inference_mode()
-        def _capture_thread(idx):
-            try:
-                torch.cuda.set_device(device)
-                # Initialize cuBLAS on both streams BEFORE barrier.
-                # This prevents workspace allocation during graph capture.
-                with torch.cuda.stream(tbo_ctxs[idx].compute_stream):
-                    _ = torch.cuda.current_blas_handle()
-                with torch.cuda.stream(tbo_ctxs[idx].comm_stream):
-                    _ = torch.cuda.current_blas_handle()
-
-                ub_input_ids, ub_positions = ub_inputs[idx]
-                with tbo_ctxs[idx]:
-                    model_output = self.model(ub_input_ids, ub_positions)
-                results.append((idx, self._validate_ubatch_output(model_output)))
-            except Exception as e:
-                traceback.print_exc()
-                errors[idx] = e
-
-        saved_ctx = getattr(_forward_context_local, "ctx", None)
-        _forward_context_local.ctx = None
-
-        try:
-            # Start threads — cuBLAS init happens before barrier
-            threads = []
-            for i in range(N):
-                t = threading.Thread(target=_capture_thread, args=(i,))
-                threads.append(t)
-                t.start()
-
-            # Wait for all threads to be ready (past cuBLAS init, at barrier)
-            self.ready_barrier.wait()
-
-            # Capture the CUDAGraph
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=graph_pool, stream=capture_stream):
-                # Wake thread 0 — all GPU work from threads is captured
-                tbo_ctxs[0].cpu_wait_event.set()
-                for t in threads:
-                    t.join()
-                # Concatenate results (this op is captured too)
-                sorted_results = [v for _, v in sorted(results)]
-                output = self._concat_ubatch_outputs(sorted_results)
-                # capture_tbo_graph bypasses nn.Module.__call__, so registered
-                # forward hooks don't fire. Run them here (inside the graph) so
-                # drafter aux capture (EAGLE3 tuple-strip) writes its buffers as
-                # captured ops; a hook returning a value replaces the output,
-                # mirroring __call__ semantics.
-                for hook in self._forward_hooks.values():
-                    hooked = hook(self, (input_ids, positions), output)
-                    if hooked is not None:
-                        output = hooked
-                # Copy into caller's buffer so replay writes to the right place
-                if output_buffer is not None:
-                    output_buffer.copy_(self._primary_output(output))
-        finally:
-            _forward_context_local.ctx = saved_ctx
-
-        for e in errors:
-            if e is not None:
-                raise e
-
-        # Store TBOContext objects to keep torch.Event alive during replay
-        graph_key = (ctx.context.running_bs, ctx.attn_metadata.max_seqlen_q)
-        self.tbo_graphs[graph_key] = TBOGraphData(
-            graph=graph,
-            tbo_ctxs=tbo_ctxs,
-            output=output,
-        )
-        logger.info(f"[TBO] Captured CUDAGraph for {graph_key}")
-
-        return graph, output
+        return self._merge_ubatch_outputs(sorted_results, token_order)
 
     @staticmethod
-    def _concat_ubatch_outputs(
-        outputs: list[UBatchModelOutput],
+    def _merge_ubatch_outputs(
+        outputs: list[UBatchModelOutput], token_order: torch.Tensor | None = None
     ) -> UBatchModelOutput:
-        """Concatenate Tensor or Eagle3 aux outputs from per-ubatch forwards."""
+        """The micro-batches' Tensor or Eagle3 aux outputs, end to end, put
+        back in the step's packed token order (``token_order``) when they ran
+        in another."""
         first = outputs[0]
         if isinstance(first, torch.Tensor):
             if not all(isinstance(output, torch.Tensor) for output in outputs):
                 raise TypeError("TBO ubatch outputs must have matching structures")
-            return torch.cat(outputs, dim=0)
+            return _packed_tokens(outputs, token_order)
 
         if not all(isinstance(output, tuple) for output in outputs):
             raise TypeError("TBO ubatch outputs must have matching structures")
 
-        hidden_states = torch.cat([output[0] for output in outputs], dim=0)
+        hidden_states = _packed_tokens([output[0] for output in outputs], token_order)
         num_aux = len(first[1])
         if not all(len(output[1]) == num_aux for output in outputs):
             raise ValueError("TBO ubatch aux output counts must match")
         aux_hidden_states = [
-            torch.cat([output[1][idx] for output in outputs], dim=0)
+            _packed_tokens([output[1][idx] for output in outputs], token_order)
             for idx in range(num_aux)
         ]
         return hidden_states, aux_hidden_states
-
-    @staticmethod
-    def _primary_output(output: UBatchModelOutput) -> torch.Tensor:
-        """Return the tensor backed by ModelRunner's preallocated output buffer."""
-        if isinstance(output, tuple):
-            return output[0]
-        return output
 
     @staticmethod
     def _validate_ubatch_output(output: object) -> UBatchModelOutput:
@@ -416,16 +300,6 @@ class UBatchWrapper(nn.Module):
             f"{type(output).__name__}"
         )
 
-    @staticmethod
-    def _get_dp_size() -> int:
-        """Return DP world size (1 if DP is not active)."""
-        try:
-            from aiter.dist.parallel_state import get_dp_group
-
-            return get_dp_group().world_size
-        except Exception:
-            return 1
-
     def _make_ubatch_dp_metadata(self, ctx: ForwardContext, N: int):
         """Build per-ubatch :class:`DPMetadata` so the MoE DP collective uses
         each ubatch's own per-rank token counts.
@@ -434,154 +308,107 @@ class UBatchWrapper(nn.Module):
         context (the shared metadata is then reused, which is correct for the
         single-rank case). Otherwise returns a list of length ``N``.
 
-        Each ubatch's per-rank token count is obtained with the same CPU
-        all_reduce that :meth:`DPMetadata.num_tokens_across_dp` uses, one per
-        ubatch. This is a CPU collective (cheap) and keeps every rank's
-        all_gatherv / reduce_scatterv consistently sized.
+        Each ubatch's per-rank tokens are known without a collective of its
+        own (`_ub_tokens_across_dp`).
         """
         if ctx.dp_metadata is None:
             return None
-        from atom.config import get_current_atom_config
-        from atom.utils.forward_context import DPMetadata
-
-        parallel_config = get_current_atom_config().parallel_config
-        metas = []
-        for ub_slice in ctx.ubatch_slices:
-            ub_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-            metas.append(DPMetadata.make(parallel_config, int(ub_tokens), None))
-        return metas
+        return [
+            DPMetadata(np.asarray(self._ub_tokens_across_dp(ctx, N, i), np.int32))
+            for i in range(N)
+        ]
 
     @staticmethod
     def _ub_tokens_across_dp(ctx: ForwardContext, N: int, i: int):
         """Ubatch ``i``'s per-rank token counts, or None if none were reduced.
+        A decode's every rank cuts the same bucket, so each runs the ubatch's
+        `running_tokens`, as does a group of one; a prefill's peers' are the
+        step's sync's (`ub_tokens_across_dp`, sized by `prefill_tbo_vote` as
+        the slices are cut).
 
         Passed down because inside a ubatch only this rank's split is in reach.
         """
+        running_tokens = ctx.ubatch_slices[i].running_tokens
+        if not ctx.context.is_prefill:
+            step_rows = ctx.context.running_tokens_across_dp
+            if step_rows is None:
+                return None
+            return (running_tokens,) * len(step_rows)
         rows = ctx.ub_tokens_across_dp
-        return None if rows is None or len(rows) != N else rows[i]
+        if rows is None or len(rows) != N:
+            return None
+        return (running_tokens,) if len(rows[i]) == 1 else rows[i]
 
     @staticmethod
-    def _decode_ub_running_bs(
-        ctx: ForwardContext, i: int, N: int, full_running_bs: int
-    ) -> int:
-        """Per-ubatch padded request count for a decode micro-batch.
-
-        Must be IDENTICAL across DP ranks: the MoE all_gather/reduce_scatter
-        pads each ubatch to this size, so a per-rank-local split (which differs
-        when ranks carry different decode batch sizes, e.g. during drain)
-        desyncs the collective and faults. Derive it from the DP-unified
-        ``ub_max_tokens_across_dp`` (MAX-reduced in ``ForwardMode.decide``),
-        converting the per-ubatch token max back to a request count via
-        ``max_seqlen_q``. Falls back to the local split only when DP is off or
-        the precomputed value is unavailable.
-        """
-        ub_max = ctx.ub_max_tokens_across_dp
-        if ub_max is not None and len(ub_max) == N:
-            max_q = getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
-            return max(1, ub_max[i] // max_q)
-        # Fallback: local split (single-rank / value not precomputed).
-        if i < N - 1:
-            return full_running_bs // N
-        return full_running_bs - (full_running_bs // N) * (N - 1)
-
-    @staticmethod
-    def _compute_ub_running_tokens(
-        ctx: ForwardContext,
-        N: int,
-        full_running_bs: int,
-        dp_size: int,
-        device: torch.device,
-    ) -> list[int]:
-        """Per-ubatch ``running_tokens`` -- what each micro-batch's MoE pads to.
-
-        In TOKENS on both branches, which is why neither multiplies by
-        ``dp_size``: pad_for_all_gather gathers across ranks itself.
-
-        For prefill (eager only): the cross-DP per-ubatch token MAX that
-            ``ForwardMode.decide`` already packed into the single DP
-            all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
-            local sizes when DP is off / value not precomputed.
-        For decode: the per-ubatch padded request count times ``max_seqlen_q``.
-        """
-        if ctx.context.is_prefill:
-            if (
-                dp_size > 1
-                and ctx.ub_max_tokens_across_dp is not None
-                and len(ctx.ub_max_tokens_across_dp) == N
-            ):
-                # Precomputed via the packed DP reduce — no extra all_reduce.
-                return list(ctx.ub_max_tokens_across_dp)
-            ub_sizes = []
-            for ub_slice in ctx.ubatch_slices:
-                ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-                ub_sizes.append(ub_num_tokens)
-            return ub_sizes
-        max_q = int(getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1)
-        return [
-            UBatchWrapper._decode_ub_running_bs(ctx, i, N, full_running_bs) * max_q
-            for i in range(N)
-        ]
+    def _ubatch_scheduled_tokens_gpu(
+        step_scheduled_tokens_gpu: torch.Tensor | None,
+        token_start: int,
+        token_stop: int,
+    ) -> torch.Tensor | None:
+        """A micro-batch's scheduled token count on the device: the step's
+        within its own tokens, ``[token_start, token_stop)``. A step's tokens
+        past its scheduled ones trail it, so that is the micro-batch's own.
+        Clamped here, not by the consumer: aiter's sorter reads the count as
+        the row count."""
+        if step_scheduled_tokens_gpu is None:
+            return None
+        return (step_scheduled_tokens_gpu - token_start).clamp_(
+            0, token_stop - token_start
+        )
 
     def _make_ubatch_context(
         self,
         ctx: ForwardContext,
         ub_slice: UBatchSlice,
-        ub_running_bs: int,
-        ubatch_idx: int = 0,
-        actual_num_reqs: int | None = None,
-        ub_running_tokens: int | None = None,
+        ubatch_idx: int,
+        positions: torch.Tensor,
+        token_order: torch.Tensor | None,
         dp_metadata=None,
         running_tokens_across_dp: tuple[int, ...] | None = None,
     ) -> ForwardContext:
-        """Build a ForwardContext for a single micro-batch."""
-        ub_num_reqs = ub_slice.request_slice.stop - ub_slice.request_slice.start
+        """Build a ForwardContext for a single micro-batch, over the metadata
+        the step built for it (`AttentionMetaData.ubatches`). ``positions`` are
+        the step's in its micro-batches' order, ``token_order`` that order."""
+        ub_attn = ctx.attn_metadata.ubatches[ubatch_idx]
 
-        if ctx.context.is_prefill:
-            ub_attn = self.attn_metadata_builder.build_ubatch_prefill_metadata(
-                ctx.attn_metadata,
-                ub_slice,
-                ub_running_bs,
-                ubatch_idx=ubatch_idx,
-            )
-        else:
-            attn_bs = actual_num_reqs if actual_num_reqs is not None else ub_running_bs
-            ub_attn = self.attn_metadata_builder.build_ubatch_metadata(
-                ubatch_idx,
-                attn_bs,
-            )
-
-        # Split Context
-        ub_num_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-        if ub_running_tokens is not None:
-            running_tokens = ub_running_tokens
-        elif ctx.context.is_prefill:
-            running_tokens = ub_num_tokens
-        else:
-            running_tokens = ub_running_bs * int(
-                getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
+        # Split Context. Its tokens past its own requests' are padding.
+        ts = ub_slice.token_slice
+        ub_scheduled_bs = ub_slice.scheduled_bs(ctx.context.scheduled_bs)
+        ub_token_order = None if token_order is None else token_order[ts]
+        scheduled_tokens_gpu = ub_attn.scheduled_tokens_gpu
+        if scheduled_tokens_gpu is None:
+            scheduled_tokens_gpu = self._ubatch_scheduled_tokens_gpu(
+                ctx.context.scheduled_tokens_gpu,
+                ts.start,
+                ub_slice.scheduled_token_slice.stop,
             )
         ub_context = Context(
-            positions=ctx.context.positions[ub_slice.token_slice],
+            positions=positions[..., ts],
             is_prefill=ctx.context.is_prefill,
             is_dummy_run=ctx.context.is_dummy_run,
-            scheduled_bs=ub_num_reqs,
-            scheduled_tokens=ub_num_tokens,
-            running_bs=ub_running_bs,
-            running_tokens=running_tokens,
+            scheduled_bs=ub_scheduled_bs,
+            scheduled_tokens=ub_slice.scheduled_tokens,
+            running_bs=ub_slice.running_bs,
+            running_tokens=ub_slice.running_tokens,
+            # Each rank runs its own micro-batch tokens exactly when it runs
+            # the step's own: a prefill's are gathered by every rank's count.
+            running_tokens_are_unified=ctx.context.running_tokens_are_unified,
             running_tokens_across_dp=running_tokens_across_dp,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).
-            # run_model stores local (1/pcp) ids; each ubatch takes its token_slice.
-            # ForCausalLM.forward then allgathers the slice to get ids matching the
-            # MoE's per-ubatch allgathered hidden states (padded_total//2 tokens).
+            # run_model stores local (1/pcp) ids; each ubatch takes its token_slice,
+            # and the MoE hash-routes its local rows by them before any gather.
             input_ids=(
-                ctx.context.input_ids[ub_slice.token_slice]
-                if ctx.context.input_ids is not None
-                else None
+                None
+                if ctx.context.input_ids is None
+                else ctx.context.input_ids[
+                    ts if ub_token_order is None else ub_token_order
+                ]
             ),
-            # Where this ubatch's rows start on the full forward's token axis;
-            # drafter aux capture writes at this offset.
-            ubatch_token_offset=ub_slice.token_slice.start,
+            ubatch_token_offset=ts.start,
+            ubatch_token_order=ub_token_order,
+            scheduled_tokens_gpu=scheduled_tokens_gpu,
+            pcp_split=ctx.context.pcp_split,
         )
 
         return ForwardContext(

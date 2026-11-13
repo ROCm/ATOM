@@ -409,12 +409,15 @@ def main():
         runner.allocate_kv_cache(1024)
         if args.graph:
             runner.capture_cudagraph()
-            report["target_graph_shapes"] = sorted(runner.graphs)
+            report["target_graph_shapes"] = sorted(set(runner.req_graph.keys()))
             assert report["target_graph_shapes"]
             from atom.utils import envs
 
             expected = runner.capture_sizes if envs.ATOM_DRAFT_CUDAGRAPH else []
-            assert sorted(runner.drafter.block._cuda_graphs) == expected
+            block = runner.drafter.block
+            assert [bs for bs in runner.capture_sizes if block.is_captured(bs)] == (
+                expected
+            )
         tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
         if args.ragged_probe:
             calls = 0

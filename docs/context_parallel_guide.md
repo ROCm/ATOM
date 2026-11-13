@@ -90,7 +90,7 @@ ATOM_PCP_MOE_MERGE=0            # run MoE per-rank on its 1/pcp shard, no extra 
 
 | Value | MoE behaviour | When to use |
 |---|---|---|
-| `1` (default, recommended) | PCP is folded into the MoE tensor/expert sharding, so MoE weights are also sharded across PCP ranks. Lowers per-GPU MoE weight memory, at the cost of one hidden gather/scatter per MoE layer (which TBO overlaps). | Most deployments |
+| `1` (default, recommended) | PCP is folded into the MoE tensor/expert sharding, so MoE weights are also sharded across PCP ranks. Lowers per-GPU MoE weight memory, at the cost of one routed-rows gather (hidden states with their top-k weights and ids) and one reduce-scatter per MoE layer (which TBO overlaps). | Most deployments |
 | `0` | Each GPU runs MoE independently on its `1/pcp` shard with no extra MoE communication; MoE weights are replicated across PCP ranks. | Avoid extra MoE comm and have memory headroom for replicated MoE weights |
 
 ## Launching server
@@ -128,9 +128,7 @@ Tips:
   long-sequence / high-concurrency workloads (not yet supported). Give all GPUs to
   PCP instead, e.g. `-tp 1 -pcp 8`.
 - Under PCP, TBO uses a **request-boundary split** (each micro-batch is a whole
-  subset of requests) — the non-default TBO split mode — instead of the
-  token-midpoint split used without PCP. `ATOM_TBO_PREFILL_TOKEN_SPLIT`
-  therefore has no effect when PCP is enabled.
+  subset of requests) instead of the token-midpoint split used without PCP.
 - `--torch-profiler-dir ./log` can be added to collect traces for performance
   analysis.
 
@@ -171,7 +169,7 @@ Compare `-tp 4 -pcp 2` against the `-tp 8` baseline and watch **Mean TTFT** and
 output throughput; the gap widens as `--random-input-len` grows.
 
 > PCP was introduced in [ROCm/ATOM#1220](https://github.com/ROCm/ATOM/pull/1220),
-> which reported, on 8×MI308 for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
+> which reported, on 8×MI300X/MI300A/MI325X (gfx942) for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
 > reduction and up to **~49%** higher throughput on long prefill. Actual gains
 > depend on model, sequence length, and hardware.
 
@@ -179,10 +177,10 @@ output throughput; the gap widens as `--random-input-len` grows.
 
 TBO's benefit is **hardware-dependent**:
 
-- **MI308**: current testing shows PCP + TBO gives **almost no gain** over PCP
+- **MI300X/MI300A/MI325X** (gfx942): current testing shows PCP + TBO gives **almost no gain** over PCP
   alone — the overlap does not meaningfully hide the MoE communication on this
   hardware. Prefer plain PCP (`-tp 4 -pcp 2`) here.
-- **MI355**: PCP + TBO **does** deliver a speedup. Enable it with
+- **MI355X/MI350X** (gfx950): PCP + TBO **does** deliver a speedup. Enable it with
   `ATOM_PCP_MOE_MERGE=1 -tp 1 -pcp 8 --enable-tbo`.
 
 Because TBO requires `-tp 1`, compare TBO configs against the matching `-tp 1`
@@ -198,6 +196,7 @@ PCP baseline (not the `-tp 4 -pcp 2` numbers above).
 | PCP + TBO decode (`--enable-tbo all`) | Not supported (raises at startup); use `--enable-tbo` prefill-only |
 | `ATOM_PCP_MOE_MERGE=0` + `--enable-tbo` | TBO auto-disabled (warning logged) |
 | PCP + TBO with `tp > 1` | **Not supported.** May hang under long-sequence / high-concurrency workloads. TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
+| PCP + Ulysses SP (`-sp`) | `-sp N` runs on the PCP rank dimension, so it does not combine with `-pcp` (refused at startup). Its MoE is TP-sharded across the SP ranks, and `ATOM_PCP_MOE_MERGE` is ignored. See `docs/distributed_guide.md` |
 
 PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 `-tp 1`**. Decode is unchanged by PCP in all configurations.
@@ -210,8 +209,12 @@ PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 2. Each rank runs attention / indexer / compressor on its `1/pcp` token shard.
    The full KV is kept on every rank (all-gathered as needed), so the attention
    kernels are unchanged.
-3. MoE either runs on the local `1/pcp` shard (`ATOM_PCP_MOE_MERGE=0`) or gathers
-   to the full sequence and scatters back (`=1`, default).
+3. MoE either runs on the local `1/pcp` shard (`ATOM_PCP_MOE_MERGE=0`) or
+   (`=1`, default) routes the local shard, gathers the routed rows -- hidden
+   states with their top-k weights and ids, in the format the experts take
+   (MXFP8 where they take it) -- to the full sequence inside `FusedMoE`, and
+   reduce-scatters the routed experts' output back. The shared expert runs on
+   the local shard only.
 4. After the final layer, the `1/pcp` hidden states are all-gathered back to the
    full sequence, the original token order is restored, and the LM head runs.
 5. Decode is untouched: every rank keeps the full KV and runs normally, so PCP
@@ -364,6 +367,17 @@ sparse, dcp8, MTP=3 (gsm8k, QREP on/off agree within stderr) covers the sparse
 indexer's verify path; Kimi-K3 + DSpark, dcp8 (gsm8k 0.98/200, nshot=5) covers
 dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
 the removed `speculative_config` gate used to block.
+
+**Sparse (DSA) prefill** can use QREP too, opt-in via `ATOM_DCP_PREFILL_QREP=1`.
+Past `index_topk` context (2048 for GLM-5.2) prefill runs the absorbed MLA
+kernel and, like decode, AllGathers Q over the DCP group; through pynccl that
+gather lands rank-major, so `all_gather(dim=1)` also copies the whole gathered q
+back to token-major. With the env set, each rank projects the group's heads
+itself and both disappear, at the cost of a group-wide q GEMM + `W_K` bmm per
+prefill token. Dense prefill (context ≤ `index_topk`) never gathers q and is
+unaffected. Numerics: prefill then uses `W_K_qrep`, which is quantized with one
+scale across the group's heads rather than per rank -- the same weight decode
+already uses.
 
 A layer falls back to AllGather automatically, instead of enabling QREP
 incorrectly, for either of two reasons: `q_proj` was never built with the QREP
@@ -674,7 +688,7 @@ pass instead of `k` serial passes. Two properties decide how it meets DCP:
 
 | | Supported |
 |---|---|
-| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark`) |
+| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark` or `RadixArk/Kimi-K3-DSpark`) |
 | GPU arch | gfx950 |
 | DCP size | dcp8 validated (`tp8`) |
 | KV cache dtype | fp8 (per-tensor scale) |
@@ -685,6 +699,13 @@ an **87.1% acceptance rate** (1.74 of 2 draft tokens accepted per step). The
 per-step accepted-count distribution is `{0: 6.1%, 1: 13.7%, 2: 80.3%}` — 80% of
 steps take the whole draft and only 6% take none, so the draft is genuinely
 contributing under DCP rather than collapsing back to single-token decode.
+
+**The RadixArk DSpark GQA draft** (`--draft-model RadixArk/Kimi-K3-DSpark`, a
+SpecForge DFlash checkpoint) is the exception to the first point. It owns its
+pool and stays out of the DCP group, as SGLang runs it, so every rank caches the
+draft KV of every token in entries of `block_size × dcp` tokens. At `tp8 -dcp 8` with fp8 KV the draft
+entry is 43% of each paged block, draft included (74% on top of the target's
+MLA rows; see the [recipe](../recipes/DSpark.md)).
 
 ## Constraints & Compatibility
 
@@ -698,7 +719,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
 | gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
-| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
+| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DSpark GQA draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |

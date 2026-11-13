@@ -18,9 +18,7 @@ from aiter import (
     get_hip_quant,
     get_mla_metadata_v1,
 )
-from aiter import (
-    indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache,
-)
+from aiter import indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache
 
 # The segmented (page_size>1) MLA cache kernels only exist in newer aiter
 # builds. Import them lazily so that the default page_size=1 path keeps working
@@ -35,9 +33,7 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.ops.triton.attention.mla import (
-    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
-)
+from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
 )
@@ -49,8 +45,10 @@ from atom.config import (
     get_current_atom_config,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
+    qrep_for_step,
 )
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
@@ -58,12 +56,20 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_is_enabled,
 )
+from atom.model_ops.attentions.sparse_mla_head_groups import (
+    PERSISTENT_WORK_BUFFERS,
+)
+from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
@@ -200,12 +206,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
-# Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
-# ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
-# concat_and_cache / fused_qk_rope_concat_and_cache_mla but store the cache in
-# the shuffled layout the shuffled decode kernel reads back.
-triton_shuffle_mla_decode_fwd = mark_trace(
-    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+# Paged Triton decode supports both interleaved and shuffled KV caches.
+triton_mla_decode_fwd = mark_trace(
+    triton_mla_decode_fwd, prefix="mla_decode_triton", torch_compile=False
 )
 triton_cat_and_cache_mla = mark_trace(
     triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
@@ -221,6 +224,33 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+
+def check_kv_shuffled_supported(
+    atom_config,
+    *,
+    use_triton_mla: bool,
+    is_sparse_mla: bool,
+    dcp_world_size: int,
+    mla_page_size: int,
+) -> None:
+    unsupported = []
+    if not use_triton_mla and atom_config.speculative_config:
+        unsupported.append("speculative decoding without ATOM_USE_TRITON_MLA")
+    if is_sparse_mla:
+        unsupported.append("sparse MLA")
+    if dcp_world_size > 1:
+        unsupported.append("DCP>1")
+    if mla_page_size > 1:
+        unsupported.append("ATOM_MLA_PAGE_SIZE>1")
+    if atom_config.enable_tbo and (
+        atom_config.enable_prefix_caching or atom_config.enable_chunked_prefill
+    ):
+        unsupported.append("TBO with prefix caching or chunked prefill")
+    if unsupported:
+        raise ValueError(
+            "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
+        )
 
 
 def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
@@ -589,7 +619,11 @@ class MLAAttention(nn.Module):
         self.dtype = dtype
 
         self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        self.padded_num_heads = max(num_heads, self.min_query_heads)
+        # aiter MLA only serves multiples of 16 heads; round up so a per-rank
+        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
+        self.padded_num_heads = mla_kernel_num_heads(
+            max(num_heads, self.min_query_heads)
+        )
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
         # repeats of the real heads because zeros are what a producer can write
@@ -614,6 +648,9 @@ class MLAAttention(nn.Module):
         self.q_proj = mla_modules.q_proj
         self.o_proj = mla_modules.o_proj
         self.kv_b_proj = mla_modules.kv_b_proj
+        # The cached-prefix gather and the Triton split-cat read kv_b_proj's scale
+        # directly, so the loader keeps it e8m0-shuffled.
+        self.kv_b_proj.needs_e8m0_shuffled_scale = True
         self.kv_cache = torch.tensor([])
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
@@ -640,18 +677,35 @@ class MLAAttention(nn.Module):
         # (`mla_modules.is_sparse` defaults False, so non-sparse models and the
         # `indexer is not None` fallback keep their previous behavior.)
         self.is_sparse_mla = mla_modules.is_sparse or (mla_modules.indexer is not None)
-        # A full IndexShare layer owns an indexer and therefore produces a new
-        # layer-local DCP compact indptr. Shared layers reuse both its indices
-        # and the persistent work plan rebuilt from that indptr.
-        self.owns_sparse_indexer = mla_modules.indexer is not None
+        # A layer that runs its own top-k produces a new layer-local DCP compact
+        # indptr. A layer that skips it (IndexShare "shared", or a DeepSeek
+        # index_topk_freq skip, which still holds its indexer module) reuses
+        # both the prior layer's indices and the work plan rebuilt from them.
+        self.owns_sparse_indexer = mla_modules.indexer is not None and not (
+            skips_index_topk(atom_config.hf_config, layer_num)
+        )
+        # Bound by the metadata builder when owners may split a small BF16
+        # sparse prefill into head groups; see SparsePrefillHeadGroups.
+        self.sparse_prefill_head_groups = None
         self.topk_tokens = (
             mla_modules.indexer.topk_tokens
             if mla_modules.indexer is not None
             else mla_modules.topk_tokens
         )
-        # Shared layers have no indexer buffer at construction; the metadata
-        # builder rebinds it to the shared `_sparse_kv_indices_gpu` at runtime,
-        # so the layer reads the prior full layer's selected indices.
+        # One work unit covers every candidate in a BF16 sparse-prefill row.
+        # Pooled indexers publish their wider physical row capacity, including
+        # the incomplete pool tail; ordinary indexers are bounded by top-k.
+        self._sparse_prefill_kv_granularity = (
+            triton.next_power_of_2(
+                getattr(mla_modules.indexer, "topk_out_width", self.topk_tokens)
+            )
+            if self.topk_tokens is not None
+            else 16
+        )
+        # Not read by this layer (its forward reads `sparse_kv_indices`): the
+        # metadata builder rebinds it to the shared `_sparse_kv_indices_gpu`,
+        # where a mono layer writes its selection
+        # (`glm52.mono.contract.shared_sparse_buffer`).
         self.sparse_kv_indices_buffer = (
             mla_modules.indexer.sparse_kv_indices_buffer
             if mla_modules.indexer is not None
@@ -663,11 +717,14 @@ class MLAAttention(nn.Module):
         # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
         # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
         self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        self.kv_cache_block_size = atom_config.kv_cache_block_size
         # On the non-triton (aiter) path, ATOM_MLA_PAGE_SIZE selects the KV cache
         # layout: >1 uses the segmented (paged) seg kernels + padded q_out, while
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        # Shuffled KV cache; the decode kernel follows use_triton_mla.
+        self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
@@ -708,7 +765,7 @@ class MLAAttention(nn.Module):
         self._ctx_kv_fusion_enabled = (
             envs.ATOM_DSPARK_FUSED_CTX_KV
             and not self.use_seg_mla
-            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and not self.kv_shuffled
             and rope is not None
             and getattr(rope, "rotary_dim", None) == self.qk_rope_head_dim
             and getattr(rope, "mrope_section", None) is None
@@ -720,6 +777,14 @@ class MLAAttention(nn.Module):
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
         self.dcp_world_size = get_dcp_world_size()
+        if self.kv_shuffled:
+            check_kv_shuffled_supported(
+                atom_config,
+                use_triton_mla=self.use_triton_mla,
+                is_sparse_mla=self.is_sparse_mla,
+                dcp_world_size=self.dcp_world_size,
+                mla_page_size=envs.ATOM_MLA_PAGE_SIZE,
+            )
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import CPTritonContext
 
@@ -830,11 +895,6 @@ class MLAAttention(nn.Module):
             self.is_sparse_mla and self.dcp_world_size > 1
         )
 
-        # Compacted per-layer sparse offsets for DCP decode; rebound by the
-        # metadata builder to the shared buffer (see aiter_mla.py).
-        self.dcp_sparse_kv_indptr_buffer = None
-        self.dcp_owned_counts_buffer = None
-
         self._configure_dcp_decode_head_padding(self.dcp_world_size)
         # Read from the same predicate the width/rebuild decision came from,
         # not a hand-rolled restatement of it -- see mla_dcp_decode_is_persistent.
@@ -862,7 +922,7 @@ class MLAAttention(nn.Module):
             self.head_pad > 0
             and self.dcp_world_size <= 1
             and not self.use_seg_mla
-            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and not self.kv_shuffled
         )
 
     def _configure_dcp_decode_head_padding(self, dcp_world_size: int) -> None:
@@ -903,6 +963,7 @@ class MLAAttention(nn.Module):
         # can't silently borrow decode's answer if the two ever diverge.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
+        self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
@@ -918,6 +979,21 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
+            )
+            self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
+                dcp_world_size,
+                self.num_heads * dcp_world_size,
+                self.kv_cache_dtype.startswith("fp8"),
+                self.dcp_persistent_supported,
+                get_current_atom_config().max_num_batched_tokens,
+            )
+            (
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
+            ) = mla_dcp_sparse_prefill_mode(
+                self.dcp_sparse_prefill_nonps,
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
             )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -1145,15 +1221,14 @@ class MLAAttention(nn.Module):
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
     ) -> torch.Tensor:
-        """Drop the dead pad lanes off an MLA output or per-head LSE.
+        """Drop the dead pad lanes off an MLA output or per-head LSE, whichever
+        width the kernel was run at (the layer's pad, or a prefill kernel's).
 
         Returns a view, not a copy: the only consumer is the v-up bmm, which
         takes its operand strides at runtime and reads the real heads in place.
         Materialising them instead costs a full-output copy per layer.
         """
-        if self.head_pad > 0:
-            return output[:, : (num_heads or self.num_heads), ...]
-        return output
+        return output[:, : (num_heads or self.num_heads), ...]
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -1246,9 +1321,10 @@ class MLAAttention(nn.Module):
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
 
-        Prefill needs only its own heads, and slicing the OUTPUT still pays for
-        the whole group's GEMM -- so it projects through a zero-copy row view of
-        the weight. Decode keeps the full q_proj; that is what lets it skip the
+        Dense prefill (and sparse prefill without ATOM_DCP_PREFILL_QREP) needs
+        only its own heads, and slicing the OUTPUT still pays for the whole
+        group's GEMM -- so it projects through a zero-copy row view of the
+        weight. Decode keeps the full q_proj; that is what lets it skip the
         AllGather Q. See ``ColumnParallelLinear.make_row_view``.
         """
         w = self.q_proj.weight.data
@@ -1345,23 +1421,35 @@ class MLAAttention(nn.Module):
         return self._v_up_proj_and_o_proj(o)
 
     @mark_trace(prefix="dcp_sparse_prefill", torch_compile=False)
-    def _dcp_sparse_prefill(self, q_out, kv_cache, attn_metadata):
+    def _dcp_sparse_prefill(self, q_out, kv_cache, attn_metadata, use_qrep=False):
         """Sparse prefill under DCP: each rank holds a disjoint slice of the
         global top-k, so its partial output must be merged like decode's.
 
         Merge dtype is platform-dependent -- on gfx942 the bf16 ReduceScatter
         sum costs ~3.5pp, on gfx950 it is free even at ctx~32k with fp8 KV.
         See ``dcp_prefill_merge_bf16_ok``.
+
+        QREP skips the gather, as in ``_dcp_decode``: q_out already carries the
+        group's heads, in the same order the gather concatenates them. Without
+        it the prefill gather fuses rank-to-token reordering with head
+        padding, so attention receives its dispatch width directly.
         """
-        q_out = self.dcp_group.all_gather(q_out, dim=1)
+        if not use_qrep:
+            q_out = dcp_all_gather_prefill_query_heads(
+                self.dcp_group, q_out, self.dcp_sparse_prefill_num_heads
+            )
         o, lse = self._forward_prefill_mla(
-            q_out, kv_cache, attn_metadata, return_lse=True
+            q_out,
+            kv_cache,
+            attn_metadata,
+            return_lse=True,
+            q_prepadded=not use_qrep,
         )
         return self._dcp_project_merge_out(
             o,
             lse,
             merge_in_fp32=not self.dcp_prefill_merge_bf16_ok,
-            owned_counts=self.dcp_owned_counts_buffer[: q_out.shape[0]],
+            owned_counts=attn_metadata.dcp_owned_counts[: q_out.shape[0]],
         )
 
     @mark_trace(prefix="dcp_decode", torch_compile=False)
@@ -1379,8 +1467,8 @@ class MLAAttention(nn.Module):
             q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
         o, lse = self._forward_decode(q_out, kv_cache, attn_metadata, return_lse=True)
         owned_counts = (
-            self.dcp_owned_counts_buffer[: q_out.shape[0]]
-            if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
+            attn_metadata.dcp_owned_counts[: q_out.shape[0]]
+            if self.is_sparse_mla and attn_metadata.dcp_owned_counts is not None
             else None
         )
         return self._dcp_project_merge_out(
@@ -1642,7 +1730,7 @@ class MLAAttention(nn.Module):
         kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         weight = self.kv_b_proj.weight
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if self.kv_shuffled:
             # Shuffled KV: read the block_size-shuffled cache with block-granular
             # CSR indices built by the metadata builder. cu_seqlens_k stays the
             # token-granular context cumsum (output token positions).
@@ -1804,24 +1892,6 @@ class MLAAttention(nn.Module):
         from atom.model_ops.attentions.triton_merge_attn_states import merge_attn_states
 
         self._check_flydsl_fp8_mha(prefill_q)
-
-        # Trigger counter: log first hit + every 500th to confirm the chunked
-        # path is actually exercised (not silently bypassed when
-        # has_cached=True but cached prefix < CHUNK_TOKENS for every seq).
-        # Counter is class-level so all layers/instances share a single count.
-        n = MLAAttention._chunked_prefill_calls = (
-            getattr(MLAAttention, "_chunked_prefill_calls", 0) + 1
-        )
-        if n == 1 or n % 500 == 0:
-            logger.info(
-                "MLA chunked-prefill #%d: layer=%d num_chunks=%d "
-                "total_kv=%s cu_seqlens_q[-1]=%d",
-                n,
-                self.layer_num,
-                chunk_meta.num_chunks,
-                attn_metadata.total_kv,
-                int(attn_metadata.cu_seqlens_q[-1].item()),
-            )
 
         # Step 1: new-tokens self-attn via kv_b_proj on the latent.
         if k_rope_new.dim() == 2:
@@ -2223,9 +2293,11 @@ class MLAAttention(nn.Module):
         # the per-rank count.
         dcp_sparse = self.is_sparse_mla and self.dcp_world_size > 1
         if q_prepadded:
-            # The fused q write already produced the padded width, so q.shape[1]
-            # is the kernel width and the real head count is this rank's own.
-            num_heads_q = self.num_heads
+            # Fused Q writing pads local heads; DCP gather pads the whole group.
+            # Restore all real group heads before the cross-rank merge.
+            num_heads_q = (
+                self.num_heads * self.dcp_world_size if dcp_sparse else self.num_heads
+            )
         else:
             num_heads_q = q.shape[1]
             q = (
@@ -2233,6 +2305,18 @@ class MLAAttention(nn.Module):
                 if dcp_sparse
                 else self._pad_query_heads(q)
             )
+
+        # BF16 ASM prefill accepts 16 or 128 query heads, unlike decode's
+        # power-of-two widths, so a width between them is padded to 128.
+        asm_head_padding = (
+            not dcp_sparse
+            and not return_lse
+            and q.dtype == torch.bfloat16
+            and not self.kv_cache_dtype.startswith("fp8")
+            and 16 < q.shape[1] < 128
+        )
+        if asm_head_padding:
+            q = torch.nn.functional.pad(q, (0, 0, 0, 128 - q.shape[1]))
 
         # In the seg path q arrives with a padded per-head row stride
         # (_MLA_Q_OUT_PADDED_DIM); slice back to the logical
@@ -2269,7 +2353,7 @@ class MLAAttention(nn.Module):
         if self.is_sparse_mla:
             paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
             paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = self.sparse_kv_indices_buffer
+            paged_kv_indices = attn_metadata.sparse_kv_indices
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
@@ -2278,7 +2362,7 @@ class MLAAttention(nn.Module):
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
                 # Same substitution the decode path makes.
-                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[
                     : paged_cu_seqlens_q.shape[0]
                 ]
             max_q_len = 1
@@ -2300,10 +2384,13 @@ class MLAAttention(nn.Module):
                 # -- rebuild it here, or run non-persistent.
                 #
                 # Read from the same predicate the gathered pad width came from
-                # rather than re-deriving the gate: gqa=64 is correct only in
-                # persistent mode, so running one way while the width was chosen
-                # for the other silently miscomputes. The assert keeps the two
-                # spellings honest if either side gains a condition.
+                # rather than re-deriving the gate: on the persistent kernel set
+                # gqa=64 is correct only in persistent mode, so running one way
+                # while the width was chosen for the other silently miscomputes.
+                # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
+                # the exception, and runs at 64 non-persistent by design. The
+                # assert keeps the two spellings honest if either side gains a
+                # condition.
                 sparse_dcp_persistent = (
                     dcp_sparse and self.dcp_sparse_prefill_persistent
                 )
@@ -2312,12 +2399,41 @@ class MLAAttention(nn.Module):
                     and self.sparse_dcp_metadata_rebuild
                     and self.dcp_persistent_supported
                     and page_size <= 1
+                    and not self.dcp_sparse_prefill_nonps
                 ), (
                     "DCP sparse prefill would run in a different mode than the "
                     "one its gathered query width was padded for; update "
                     "mla_dcp_sparse_prefill_is_persistent alongside this gate."
                 )
-                if sparse_dcp_persistent and self.owns_sparse_indexer:
+                nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
+                assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
+                    f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
+                    f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
+                    "max_num_batched_tokens gate should have kept it persistent."
+                )
+                head_groups = self.sparse_prefill_head_groups
+                group_heads = (
+                    head_groups is not None
+                    and sparse_dcp_persistent
+                    and self.owns_sparse_indexer
+                    and head_groups.applies(
+                        q,
+                        o,
+                        kv_c_and_k_pe_cache,
+                        self._sparse_prefill_kv_granularity,
+                    )
+                )
+                kernel_q, kernel_o = q, o
+                if group_heads:
+                    (
+                        kernel_q,
+                        kernel_o,
+                        paged_cu_seqlens_q,
+                        paged_kv_indptr,
+                        paged_kv_indices,
+                        kv_last_page_lens,
+                    ) = head_groups.prepare(q, o, paged_kv_indptr, paged_kv_indices)
+                elif sparse_dcp_persistent and self.owns_sparse_indexer:
                     self._rebuild_sparse_dcp_persistent_metadata(
                         attn_metadata,
                         q,
@@ -2335,54 +2451,36 @@ class MLAAttention(nn.Module):
                 # or return_lse, and return_lse is never true when DCP is off
                 # -- kept only so both arms read the same condition.
                 use_work_meta = self.dcp_world_size <= 1 or sparse_dcp_persistent
+                if group_heads:
+                    work = head_groups.work
+                elif use_work_meta:
+                    work = {
+                        name: getattr(attn_metadata, f"sparse_prefill_{name}", None)
+                        for name in PERSISTENT_WORK_BUFFERS
+                    }
+                else:
+                    work = {}
                 _, final_lse = mla_decode_fwd(
-                    q,
+                    kernel_q,
                     kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
-                    o,
+                    kernel_o,
                     paged_cu_seqlens_q,
                     paged_kv_indptr,
                     paged_kv_indices,
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
+                    num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
+                        nonps, self.dcp_world_size
+                    ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
                     kv_scale=self._k_scale if is_fp8 else None,
-                    work_meta_data=(
-                        getattr(attn_metadata, "sparse_prefill_work_meta_data", None)
-                        if use_work_meta
-                        else None
-                    ),
-                    work_indptr=(
-                        getattr(attn_metadata, "sparse_prefill_work_indptr", None)
-                        if use_work_meta
-                        else None
-                    ),
-                    work_info_set=(
-                        getattr(attn_metadata, "sparse_prefill_work_info_set", None)
-                        if use_work_meta
-                        else None
-                    ),
-                    reduce_indptr=(
-                        getattr(attn_metadata, "sparse_prefill_reduce_indptr", None)
-                        if use_work_meta
-                        else None
-                    ),
-                    reduce_final_map=(
-                        getattr(attn_metadata, "sparse_prefill_reduce_final_map", None)
-                        if use_work_meta
-                        else None
-                    ),
-                    reduce_partial_map=(
-                        getattr(
-                            attn_metadata, "sparse_prefill_reduce_partial_map", None
-                        )
-                        if use_work_meta
-                        else None
-                    ),
                     return_lse=return_lse,
+                    **work,
                 )
+                if group_heads and final_lse is not None:
+                    final_lse = final_lse.view(B, q.shape[1])
             else:
                 mla_prefill_fwd(
                     q,
@@ -2439,8 +2537,8 @@ class MLAAttention(nn.Module):
 
     def _shuffled_kv_view(self, kv_cache: torch.Tensor):
         """View the flat ``[num_token_slots, 1, d]`` MLA cache as the
-        ``[num_blocks, num_kv_heads=1, block_size, d]`` shuffled layout the
-        block_size=64 Triton/Gluon MLA kernels read and write.
+        ``[num_blocks, num_kv_heads=1, block_size, d]`` shuffled (16x16-tiled)
+        layout, read by both the Triton/Gluon and the aiter MLA decode.
 
         This is a pure view: ``num_token_slots == num_blocks * block_size`` by
         construction (block_ratio == kv_cache_block_size), and the per-block
@@ -2481,7 +2579,7 @@ class MLAAttention(nn.Module):
     ) -> None:
         """Rebuild persistent work/reduce metadata from this layer's DCP top-k.
 
-        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr_buffer``
+        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr``
         after selecting and compacting the rank-owned top-k. Persistent work
         descriptors embed those region boundaries, so they must be rebuilt
         after that mutation rather than once per decode step from the global
@@ -2522,11 +2620,30 @@ class MLAAttention(nn.Module):
             page_size=1,
             dtype_q=q.dtype,
             dtype_kv=kv_buffer.dtype,
-            kv_granularity=16,
+            # Keep each BF16 prefill row whole: splitting its candidates
+            # according to batch occupancy changes the attention reduction
+            # order and can perturb downstream expert selection.
+            kv_granularity=(
+                self._sparse_prefill_kv_granularity
+                if work_prefix == "sparse_prefill_"
+                and q.dtype == kv_buffer.dtype == torch.bfloat16
+                else 16
+            ),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
             max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+        )
+
+    def decode_is_persistent(self) -> bool:
+        """Whether this layer's aiter decode runs the persistent kernel over the
+        step's work plan (`should_use_persistent_mode`)."""
+        return should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            dpa_persistent_supported=self._dpa_persistent_supported,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=self.dcp_world_size,
+            dcp_persistent_supported=self.dcp_persistent_supported,
         )
 
     def _forward_decode(
@@ -2571,55 +2688,52 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
-            # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
-            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
-            triton_shuffle_mla_decode_fwd(
-                q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
-                kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
+        if self.use_triton_mla:
+            if self.kv_shuffled:
+                kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            else:
+                # block_tables contains scheduler block IDs, while the plain
+                # cache is stored as token rows. Group rows into those blocks;
+                # the Triton kernel widens block offsets to int64 internally.
+                kv_buffer = kv_c_and_k_pe_cache.view(
+                    -1, self.kv_cache_block_size, 1, q.shape[-1]
+                )
+            triton_mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
                 attn_metadata.cu_seqlens_q,
-                attn_metadata.context_lens,  # seqused_k
-                int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
-                attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
+                attn_metadata.context_lens,
+                int(attn_metadata.max_seqlen_k),
+                attn_metadata.block_tables,
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
-                True,  # causal
-                # q is bf16 (the shuffled fused write does not quantize q), so
-                # no q de-scale; kv carries its own per-tensor scale.
-                None,  # q_descale
-                self._k_scale,  # kv_descale
-                shuffled_kv_cache=True,
+                causal,
+                self._q_scale if q.element_size() == 1 else None,
+                self._k_scale,
+                shuffled_kv_cache=self.kv_shuffled,
             )
-        elif hasattr(attn_metadata, "triton_block_table"):
-            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
-
-            k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-            v_buffer = k_buffer[..., : self.kv_lora_rank]
-            page_size = k_buffer.shape[1]
-
-            q_for_triton = (
-                q.to(torch.bfloat16)
-                if q.dtype.is_floating_point and q.element_size() == 1
-                else q
-            )
-
-            # Use pre-built dense block_table from prepare_decode()
-            decode_attention_fwd(
-                q_for_triton,
-                k_buffer,
-                v_buffer,
+        elif self.kv_shuffled:
+            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            _, final_lse = mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
-                attn_metadata.triton_lse,
-                attn_metadata.triton_block_table,
-                attn_metadata.context_lens,
-                attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
-                self.scale,
-                page_size,
-                k_scale=self._k_scale,
-                v_scale=self._k_scale,
+                attn_metadata.cu_seqlens_q,
+                None,  # kv_shuffled takes seq_lens/page_table, not CSR
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                page_size=kv_buffer.shape[2],
+                kv_layout="kv_shuffled",
+                seq_lens=attn_metadata.context_lens[:B],
+                page_table=attn_metadata.block_tables[:B],
+                sm_scale=self.scale,
+                causal=causal,
+                q_scale=self._q_scale if q.element_size() == 1 else None,
+                kv_scale=self._k_scale,
+                return_lse=return_lse,
             )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -2632,11 +2746,29 @@ class MLAAttention(nn.Module):
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
-                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
+                    # Cut to q's rows: the drafter's step 0 runs fewer than the
+                    # padded running_tokens these are published for, and the
+                    # DCP rebuild below plans from them.
+                    paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
-                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     max_q_len = 1
+                    # The persistent kernel reads q and writes o for every work
+                    # item, so a plan over more rows than q holds runs past both.
+                    # The MTP drafter's step 0 reuses this plan with the
+                    # target's unpadded stream (#287), hence the check on q's
+                    # own rows. Host ints only: no sync, safe under capture.
+                    # DCP rebuilds the sparse_mtp_ plan per layer below.
+                    planned_tokens = getattr(
+                        attn_metadata, "sparse_mtp_num_tokens", None
+                    )
+                    if self.dcp_world_size == 1 and planned_tokens is not None:
+                        assert planned_tokens <= B, (
+                            f"sparse MTP plan covers {planned_tokens} query "
+                            f"rows but q holds {B}: the decode would read q "
+                            f"and write o past their ends"
+                        )
                 else:
                     # Non-MTP sparse decode: KV is packed per token at
                     # page_size=1, so last_page_len is 1 for every seq. Use the
@@ -2645,22 +2777,15 @@ class MLAAttention(nn.Module):
                     # past the written sparse-index region -> illegal access).
                     paged_cu_seqlens_q = attn_metadata.cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr[: B + 1]
-                    paged_kv_indices = self.sparse_kv_indices_buffer
+                    paged_kv_indices = attn_metadata.sparse_kv_indices
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
                 if self.dcp_world_size > 1:
                     # The indexer compacted this layer's owned top-k, so the
                     # real lengths are here, not in sparse_kv_indptr; `B` is a
                     # token count on both branches.
-                    paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[: B + 1]
+                    paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[: B + 1]
 
-            dp_size = get_dp_group().world_size
-            use_persistent_mode = should_use_persistent_mode(
-                dp_size=dp_size,
-                dpa_persistent_supported=self._dpa_persistent_supported,
-                page_size=envs.ATOM_MLA_PAGE_SIZE,
-                dcp_world_size=self.dcp_world_size,
-                dcp_persistent_supported=self.dcp_persistent_supported,
-            )
+            use_persistent_mode = self.decode_is_persistent()
             # Sparse DCP persistent decode rebuilds the work plan below from
             # the layer-local compact indptr; MTP verify is per-token q_len=1
             # rows and rebuilds into the sparse_mtp_ buffers.
@@ -2789,7 +2914,7 @@ class MLAAttention(nn.Module):
         branch so the physical cache layout matches exactly. `k_rope` must
         already be rotary-embedded.
         """
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if self.kv_shuffled:
             shuffled_cache = self._shuffled_kv_view(kv_cache)
             triton_cat_and_cache_mla(
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -2926,9 +3051,7 @@ class MLAAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         context = forward_context.context
-        use_prefill_mla = (
-            self.is_sparse_mla and attn_metadata.max_seqlen_k > self.topk_tokens
-        )
+        use_prefill_mla = self.is_sparse_mla and attn_metadata.run_sparse
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
@@ -2942,9 +3065,9 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            # QREP: q_proj emits the whole DCP-group head set, but prefill needs
-            # only this rank's heads (QREP optimizes decode's AllGather Q, not
-            # prefill).
+            # QREP: q_proj emits the whole DCP-group head set, but dense prefill
+            # needs only this rank's heads: its MHA path never gathers q, so there
+            # is no AllGather Q for QREP to remove here.
             proj = self._local_q_proj() if self.qrep_enabled else self.q_proj
             prefill_q = proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
@@ -2953,7 +3076,7 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -2991,9 +3114,9 @@ class MLAAttention(nn.Module):
                     )
 
             if attn_metadata.has_cached:
-                # Shuffled KV: the builder nulls mla_chunk_meta, so cached-prefix
-                # prefill always takes the single-pass gather (which is shuffle
-                # aware). The chunked path stays on the plain layout.
+                # Shuffled KV takes either path too: the builder gives the chunked
+                # path block-granular per-chunk CSR, and the single-pass path a
+                # full-context one.
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
@@ -3012,9 +3135,12 @@ class MLAAttention(nn.Module):
             # query locally so it can skip the AllGather Q below. Correctness holds
             # even when use_qrep is False (group=False slices back to per-rank heads
             # and the AG path runs as before); use_qrep only toggles the optimization.
-            # Excludes prefill and the seg path (seg alloc is per-rank sized).
-            use_qrep = (
-                self.qrep_enabled and not context.is_prefill and not self.use_seg_mla
+            # Sparse prefill joins under ATOM_DCP_PREFILL_QREP (see qrep_for_step).
+            use_qrep = qrep_for_step(
+                self.qrep_enabled,
+                self.use_seg_mla,
+                context.is_prefill,
+                envs.ATOM_DCP_PREFILL_QREP,
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
                 q,
@@ -3101,11 +3227,7 @@ class MLAAttention(nn.Module):
                 q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
             )
             if kv_cache.numel() > 0:
-                if (
-                    envs.ATOM_USE_TRITON_MLA
-                    and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
-                    and self.dcp_world_size <= 1
-                ):
+                if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(
                         q_nope,
@@ -3187,7 +3309,9 @@ class MLAAttention(nn.Module):
 
             if context.is_prefill:
                 if self.is_sparse_mla and self.dcp_world_size > 1:
-                    output = self._dcp_sparse_prefill(q_out, kv_cache, attn_metadata)
+                    output = self._dcp_sparse_prefill(
+                        q_out, kv_cache, attn_metadata, use_qrep
+                    )
                 else:
                     output = self._forward_prefill_mla(
                         q_out,
@@ -3340,10 +3464,9 @@ def triton_convert_req_index_to_global_index(
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
-        f"BLOCK_N ({BLOCK_N})"
-    )
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
 
     # DP attention can expose transient local/global metadata length skew.
     # Launch only rows represented by every indptr; otherwise the kernel reads
@@ -3405,7 +3528,8 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q,  # int32 [num_tokens + 1]
+    cu_seqlens_k,  # int32 [num_req + 1]
+    row_starts,  # optional int32 [num_tokens], gathered-key base of each row
     out_kv_indices,  # int32
     # Fixed top-k/tile geometry; runtime bounds retain all safety masks.
     NUM_TOPK_TOKENS: tl.constexpr,
@@ -3414,14 +3538,12 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
-    # The FP8 indexer scores one concatenated KV plane, so a request's own
-    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
-    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
     bt_stride0: tl.int64,  # block_table stride 0
     bt_stride1: tl.constexpr,  # block_table stride 1
+    rs_stride: tl.int64,
 ):
     token_id = tl.program_id(0)
     tile_id = tl.program_id(1)
@@ -3439,11 +3561,16 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
-    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
-    req_kv_len = req_kv_end - pre_seqlens_q
+    req_kv_start = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_k + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - req_kv_start
 
-    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
+    # A direct FP8 prefill consumer receives gathered-key column IDs. Fold
+    # the request-base subtraction into this mapping rather than rewriting
+    # the entire top-k tensor first. Existing consumers supply local IDs.
+    seq_token_idx = indice
+    if row_starts is not None:
+        seq_token_idx -= tl.load(row_starts + token_id * rs_stride)
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3487,20 +3614,22 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
+    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
-    seq_local: bool = False,
+    row_starts: torch.Tensor | None = None,
 ):
-
+    """Map request-local top-k IDs to packed physical slots. If `row_starts`
+    is supplied, input IDs instead address gathered keys and each row's base
+    is subtracted in the same kernel. Negative IDs remain invalid.
+    """
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
-        f"BLOCK_N ({BLOCK_N})"
-    )
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
 
     num_tokens = min(
         dsa_qo_indptr.shape[0] - 1,
@@ -3512,6 +3641,13 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
     batch_id_per_q_token = batch_id_per_q_token[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
+    if row_starts is not None and (
+        row_starts.ndim != 1
+        or row_starts.shape[0] < num_tokens
+        or row_starts.dtype != torch.int32
+        or row_starts.device != topk_indices.device
+    ):
+        raise ValueError("row_starts must be int32 [num_tokens] on the index device")
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
@@ -3521,7 +3657,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         device=topk_indices.device,
         name="triton_convert_req_index_to_global_index_dsa_prefill",
     )
-    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    num_req = min(block_table.shape[0], cu_seqlens_k.shape[0] - 1)
     max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
@@ -3536,7 +3672,8 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         batch_id_per_q_token,
         topk_indices,
         block_table,
-        cu_seqlens_q,
+        cu_seqlens_k,
+        row_starts,
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
@@ -3545,12 +3682,12 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
-        seq_local,
         # strides
         ti_stride0,
         ti_stride1,
         bt_stride0,
         bt_stride1,
+        row_starts.stride(0) if row_starts is not None else 0,
     )
     return new_kv_indices
 

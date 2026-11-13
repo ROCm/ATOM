@@ -32,6 +32,7 @@ export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
 #   LM_EVAL_NUM_FEWSHOT
 #   LM_EVAL_NUM_CONCURRENT
 #   LM_EVAL_EXTRA_MODEL_ARGS
+#   LM_EVAL_REQUEST_TIMEOUT
 #   LM_EVAL_USE_CHAT_COMPLETIONS
 #   LM_EVAL_BATCH_SIZE
 #   LM_EVAL_GEN_KWARGS
@@ -57,6 +58,7 @@ LM_EVAL_TASK=${LM_EVAL_TASK:-gsm8k}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
 LM_EVAL_NUM_CONCURRENT=${LM_EVAL_NUM_CONCURRENT:-65}
 LM_EVAL_EXTRA_MODEL_ARGS=${LM_EVAL_EXTRA_MODEL_ARGS:-}
+LM_EVAL_REQUEST_TIMEOUT=${LM_EVAL_REQUEST_TIMEOUT:-1800}
 LM_EVAL_USE_CHAT_COMPLETIONS=${LM_EVAL_USE_CHAT_COMPLETIONS:-0}
 LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE:-65}
 LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS:-}
@@ -181,9 +183,15 @@ served_models = {
 sys.exit(0 if expected_model in served_models else 1)
 PY
       then
-        emit_new_sglang_logs
-        echo "SGLang server is ready for ${MODEL_NAME}."
-        return 0
+        # /v1/models answers before the warmup request finishes; /health stays
+        # 503 until then, and the warmup can spend minutes in JIT kernel builds
+        # that would otherwise eat the eval client's request timeout.
+        if curl -fsS -o /dev/null --max-time 60 "http://127.0.0.1:${SGLANG_PORT}/health" 2>/dev/null; then
+          emit_new_sglang_logs
+          echo "SGLang server is ready for ${MODEL_NAME}."
+          return 0
+        fi
+        echo "SGLang server lists ${MODEL_NAME} but is still warming up."
       fi
     fi
 
@@ -280,6 +288,37 @@ PY
   fi
 }
 
+pin_lm_eval_datasets() {
+  # datasets>=5.1 imports HfFileSystemResolvedBucketPath, added in
+  # huggingface-hub>=1.31. SGLang images pin huggingface-hub==1.5.0 for
+  # transformers 5.16.1, so keep datasets on 5.0.x. Serving itself does not
+  # import datasets; only lm_eval does.
+  python3 - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
+
+def pkg_version(name):
+    try:
+        return Version(version(name))
+    except PackageNotFoundError:
+        return None
+
+hub = pkg_version("huggingface-hub")
+datasets = pkg_version("datasets")
+if hub is not None and hub < Version("1.31.0") and (datasets is None or datasets >= Version("5.1.0")):
+    raise SystemExit(2)
+raise SystemExit(0)
+PY
+  local rc=$?
+  if [[ "${rc}" -eq 2 ]]; then
+    echo "========== Pinning datasets==5.0.0 for huggingface-hub<1.31 =========="
+    pip install 'datasets==5.0.0'
+  elif [[ "${rc}" -ne 0 ]]; then
+    echo "ERROR: failed to check datasets/huggingface-hub versions" >&2
+    return "${rc}"
+  fi
+}
+
 run_accuracy() {
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${MODEL_PATH}")
@@ -288,8 +327,9 @@ run_accuracy() {
 
   if ! command -v lm_eval >/dev/null 2>&1; then
     echo "========== Installing lm-eval =========="
-    pip install 'lm-eval[api]'
+    pip install 'lm-eval[api]' 'datasets==5.0.0'
   fi
+  pin_lm_eval_datasets
 
   mkdir -p "${RESULT_DIR}"
   : > "${ACCURACY_LOG_FILE}"
@@ -316,6 +356,10 @@ run_accuracy() {
   else
     lm_eval_model_args="model=${resolved_model_path},base_url=http://127.0.0.1:${SGLANG_PORT}${lm_eval_endpoint_path},num_concurrent=${LM_EVAL_NUM_CONCURRENT},max_retries=1,tokenized_requests=False,trust_remote_code=True"
   fi
+  # lm_eval's 300s default is shorter than a single aiter JIT build on an image
+  # without prebuilt kernels (e.g. module_moe_asm ~210s, stacked behind others).
+  # Later keys win, so LM_EVAL_EXTRA_MODEL_ARGS can still override this.
+  lm_eval_model_args="${lm_eval_model_args},timeout=${LM_EVAL_REQUEST_TIMEOUT}"
   if [[ -n "${LM_EVAL_EXTRA_MODEL_ARGS}" ]]; then
     lm_eval_model_args="${lm_eval_model_args},${LM_EVAL_EXTRA_MODEL_ARGS#,}"
   fi

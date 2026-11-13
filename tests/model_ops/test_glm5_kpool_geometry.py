@@ -9,9 +9,9 @@ import torch
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     get_query_request_indices,
+    pool_plane_width,
     pooled_path_enabled,
     speculative_kpool_history_size,
-    speculative_pool_scratch_width,
     speculative_verify_enabled,
     topk_output_width,
 )
@@ -105,6 +105,6 @@ def test_speculative_verify_dispatch(
     )
 
 
-def test_speculative_scratch_uses_live_batch_length():
-    assert speculative_pool_scratch_width(2051, 4) == 513
-    assert speculative_pool_scratch_width(128 * 1024, 4) == 32 * 1024
+def test_speculative_scratch_covers_the_model_limit():
+    assert pool_plane_width(2051, 4) == 513
+    assert pool_plane_width(128 * 1024, 4) == 32 * 1024

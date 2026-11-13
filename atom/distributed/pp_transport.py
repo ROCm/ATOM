@@ -6,9 +6,13 @@
 # (see pp_comm.py), never here.
 #
 #   metadata   (head -> every downstream stage): the scheduled batch to run.
-#   tokens     (last stage -> head):             sampled ScheduledBatchOutput,
-#                                                fed back so the head owns the
-#                                                request lifecycle / next step.
+#   completion (last stage -> head):             (req_ids, ScheduledBatchOutput
+#                                                or None) once a batch has run
+#                                                every stage, so the head owns
+#                                                the request lifecycle / next
+#                                                step. Sent for every batch that
+#                                                produces output or carries
+#                                                `pp_completion_ack`.
 #   kv_status  (every downstream stage -> head): KV offload load/save completion
 #                                                status, so the head can
 #                                                aggregate across all PP stages.
@@ -39,8 +43,8 @@ class PPStageTransport:
             s RECEIVES metadata from the head (index 0 is unused). The head
             connects a PUSH socket to each downstream endpoint; each downstream
             stage binds a PULL socket to its own endpoint.
-        token_addr: endpoint on which the head RECEIVES tokens from the last
-            stage. The head binds a PULL socket; the last stage connects PUSH.
+        token_addr: endpoint on which the head RECEIVES completions from the
+            last stage. The head binds a PULL socket; the last stage connects PUSH.
         kv_status_addr: endpoint on which the head RECEIVES KV offload status
             from ALL downstream stages. The head binds a PULL socket; every
             downstream stage connects a PUSH socket. Empty string = disabled.
@@ -104,10 +108,11 @@ class PPStageTransport:
         for sock in self._meta_send:
             sock.send(payload, copy=False)
 
-    def recv_tokens(self, timeout_ms: int | None = None) -> Any:
-        """Head: block for the last stage's sampled ScheduledBatchOutput.
+    def recv_completion(self, timeout_ms: int | None = None) -> Any:
+        """Head: block for the last stage's ``(req_ids, output)`` completion.
 
-        Returns None on timeout.
+        ``output`` is the sampled ScheduledBatchOutput, or None for a batch that
+        produces none. Returns None on timeout.
         """
         if timeout_ms is not None and not self._token_recv.poll(timeout_ms):
             return None
@@ -135,16 +140,16 @@ class PPStageTransport:
             return None
         return pickle.loads(self._meta_recv.recv())
 
-    def send_tokens(self, out: Any) -> None:
-        """Last stage: feed the sampled output back to the head."""
-        assert self._token_send is not None, "send_tokens only valid on last stage"
-        self._token_send.send(pickle.dumps(out), copy=False)
-
     def send_kv_status(self, output: Any) -> None:
         """Downstream: send KV offload completion status to the head."""
         if self._kv_status_send is None:
             return
         self._kv_status_send.send(pickle.dumps((self.pp_rank, output)), copy=False)
+
+    def send_completion(self, req_ids: Any, out: Any = None) -> None:
+        """Last stage: report a finished batch, with its sampled output if any."""
+        assert self._token_send is not None, "send_completion only valid on last stage"
+        self._token_send.send(pickle.dumps((tuple(req_ids), out)), copy=False)
 
     def close(self) -> None:
         for sock in self._meta_send:

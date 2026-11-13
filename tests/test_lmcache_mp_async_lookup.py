@@ -220,3 +220,53 @@ def test_adapter_without_async_internals_stays_synchronous(monkeypatch):
     client.pump()
     assert client.lookup(list(range(8)), "req") == CHUNK
     assert adapter.submitted == [_rid(client, "req")]
+
+
+def test_discard_after_status_cleanup_still_releases_locks():
+    # `request_finished` clears the lookup status before it discards; that
+    # cleanup empties the adapter's result cache for this request ID.
+    fake = _Client(chunks=2)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+    client.pump()
+
+    client.clear_lookup_status("req")
+    assert _rid(client, "req") not in adapter._lookup_results
+    client.discard("req")
+
+    assert [(c["start"], c["end"]) for c in adapter.freed] == [(0, 2 * CHUNK)]
+
+
+def test_answered_lookup_survives_status_cleanup(monkeypatch):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    fake = _Client(chunks=2)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+    client.pump()
+    client.clear_lookup_status("req")
+
+    assert not client.submit(list(range(8)), "req")
+    assert client.lookup(list(range(8)), "req") == 2 * CHUNK
+    assert len(fake.lookups) == 1
+    assert adapter.freed == []
+
+
+class _RaisingFuture(_Future):
+    def result(self, timeout=None):
+        raise RuntimeError("status query failed")
+
+
+def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
+    fake = _Client(chunks=2)
+    fake.query_prefetch_status = lambda _rid: _RaisingFuture()
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+
+    with caplog.at_level("WARNING", logger=mp_lookup.logger.name):
+        client.pump()
+
+    assert not client.is_pending("req")
+    assert "read TTL" in caplog.text and "phase status" in caplog.text

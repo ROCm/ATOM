@@ -16,6 +16,7 @@
 # Note: `mi35x` is the family-style label used by accuracy-validation runners
 # (`linux-atom-mi35x-1` / `-4` / `-8`). The MI35 series in ATOM CI currently
 # only contains MI355X, so we map both `mi355` and `mi35x` to MI355X.
+# `linux-atom-pitt-mi350x-8` is also an MI355X pool despite its label.
 #
 # Usage:
 #   collect_gpu_info.sh                                          # local host
@@ -76,7 +77,7 @@ if { [ -z "${GPU_NAME:-}" ] || echo "$GPU_NAME" | grep -qi "Radeon Graphics"; } 
     && [ -n "${RUNNER_HINT:-}" ]; then
     hint_lc=$(echo "$RUNNER_HINT" | tr '[:upper:]' '[:lower:]')
     case "$hint_lc" in
-        *mi355*|*mi35x*) GPU_NAME="AMD Instinct MI355X" ;;
+        *mi355*|*mi35x*|*pitt-mi350x*) GPU_NAME="AMD Instinct MI355X" ;;
         *mi325*) GPU_NAME="AMD Instinct MI325X" ;;
         *mi308*) GPU_NAME="AMD Instinct MI308X" ;;
         *mi300x*|*mi300*) GPU_NAME="AMD Instinct MI300X" ;;

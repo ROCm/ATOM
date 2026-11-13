@@ -12,6 +12,8 @@ both). DCP compute / communication primitives live in ``atom.model_ops.dcp_ops``
 this module is only the distributed-access layer.
 """
 
+import functools
+
 from atom.config import get_current_atom_config
 from atom.utils import envs
 
@@ -31,11 +33,20 @@ def dcp_is_enabled() -> bool:
     return get_dcp_world_size() > 1
 
 
+@functools.cache
 def get_dcp_group():
-    """The DCP process group (aiter parallel state). Only valid when DCP is enabled."""
+    """The DCP group coordinator (aiter parallel state). Only valid when DCP is
+    enabled. When the DCP group is the TP group's ranks in the same order (DCP
+    = TP, e.g. DCP8 at TP8) it is the TP group's coordinator itself,
+    so every DCP collective runs on the TP communicator rather than a second
+    one over the same GPUs. The order matters: a collective splits by rank in
+    group, so the same set ordered differently is not the same group. Cached:
+    the groups are fixed once built (a call before then raises, uncached)."""
     from aiter.dist.parallel_state import get_dcp_group as _get_dcp_group
+    from aiter.dist.parallel_state import get_tp_group
 
-    return _get_dcp_group()
+    dcp, tp = _get_dcp_group(), get_tp_group()
+    return tp if list(tp.ranks) == list(dcp.ranks) else dcp
 
 
 def get_dcp_rank() -> int:
@@ -102,6 +113,57 @@ def mla_dcp_sparse_prefill_is_persistent(
         dcp_persistent_supported,
         sparse_metadata_rebuild=sparse_metadata_rebuild,
     )
+
+
+# Most q rows one non-persistent gqa64 sparse prefill call takes. aiter checks
+# total_q * splits <= 32768 only for multi-split calls (the fp32 partials are
+# addressed with 32-bit offsets); one-split calls past it are untested.
+NONPS_MAX_Q_ROWS = 32768
+
+
+def mla_dcp_sparse_prefill_uses_nonps(
+    dcp_world_size: int,
+    gathered_heads: int,
+    fp8_qkv: bool,
+    is_gfx950: bool,
+    max_num_batched_tokens: int,
+) -> bool:
+    """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
+
+    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
+    no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
+    Every prefill token of a step is one q row, so a step budget above
+    NONPS_MAX_Q_ROWS stays on the persistent path.
+    """
+    return (
+        envs.ATOM_DCP_SPARSE_PREFILL_NONPS
+        and dcp_world_size > 1
+        and gathered_heads == 64
+        and fp8_qkv
+        and is_gfx950
+        and envs.ATOM_MLA_PAGE_SIZE <= 1
+        and max_num_batched_tokens <= NONPS_MAX_Q_ROWS
+    )
+
+
+def mla_dcp_sparse_prefill_mode(
+    uses_nonps: bool, persistent: bool, num_heads: int
+) -> tuple[bool, int]:
+    """(persistent, gathered width) for DCP sparse prefill.
+
+    The non-persistent gqa64 kernel overrides both: non-persistent, width 64.
+    """
+    return (False, 64) if uses_nonps else (persistent, num_heads)
+
+
+def mla_dcp_sparse_prefill_kv_splits(uses_nonps: bool, dcp_world_size: int) -> int:
+    """KV splits for DCP sparse prefill.
+
+    The non-persistent gqa64 kernel runs at one split: it writes O and LSE
+    directly, and its multi-split calls need total_q * splits <= 32768, which
+    a 16K-token step at the default splits exceeds.
+    """
+    return 1 if uses_nonps else max(2, 16 // max(1, dcp_world_size))
 
 
 def dcp_prefill_merge_bf16_ok() -> bool:

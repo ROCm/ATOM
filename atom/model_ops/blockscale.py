@@ -161,9 +161,11 @@ def native_quant_linear(
     """FP8 32x32/1x32 or W4A8 1x32 GEMM; inputs and weights stay native.
 
     Weight scales remain compact. FP8 prefers AITER's configured GEMM interface
-    and falls back to local kernels on older AITER builds. A
-    ``weight_preshuffled`` (16, 16) FP8 weight is read by AITER's preshuffled
-    group32 GEMM alone, which picks its own split and emits BF16. W4A8 unpacks to
+    and falls back to local kernels on older AITER builds. An opt-in native
+    MXFP8 1x32 preshuffle weight is sent through AITER's configured preshuffled
+    group32 GEMM, whose mxscale table selects the gfx950 MXFP8 backend.
+    Otherwise a ``weight_preshuffled`` (16, 16) FP8 weight is read by AITER's
+    preshuffled group32 GEMM. W4A8 unpacks to
     BF16 for a plain MFMA; both accumulate in FP32 before the
     requested output conversion. A8 QAT and native
     weight storage are retained without materializing a dequantized weight.
@@ -188,6 +190,11 @@ def native_quant_linear(
         raise ValueError("split_k must be a positive integer")
     if weight_scale.shape != (-(-n // weight_group_rows), k // 32):
         raise ValueError("Weight scale shape does not match the declared source blocks")
+    if weight_preshuffled and weight_group_rows == 1 and (k % 128 or n % 16):
+        raise ValueError(
+            "MXFP8 preshuffle requires a shuffled FP8 1x32 weight, "
+            "BF16 output, no split-K, K divisible by 128 and N divisible by 16"
+        )
     if weight_preshuffled and (
         fp4 or _aiter_fp8_gemm is None or split_k is not None or dtype != torch.bfloat16
     ):

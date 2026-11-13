@@ -39,6 +39,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     ht,
     cu_seqlens,
     ssm_state_indices,
+    ssm_state_indices_in,
     num_accepted_tokens,
     scale,
     N: tl.int64,  # num of sequences
@@ -112,10 +113,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for PAD_SLOT_ID (-1)
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            # Load the read-side state index and check for PAD_SLOT_ID (-1)
+            state_idx = tl.load(
+                ssm_state_indices_in + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
             # Skip if state index is invalid (PAD_SLOT_ID = -1)
             if state_idx < 0:
                 return
@@ -212,6 +213,7 @@ def fused_sigmoid_gating_delta_rule_update(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    ssm_state_indices_in: torch.Tensor | None = None,
     lower_bound: float | None = None,
 ):
     """
@@ -269,6 +271,17 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+    # The initial state is read at `ssm_state_indices_in` (a state fork's
+    # source) and written at `ssm_state_indices`; one set of strides serves
+    # both, so the read side must be laid out exactly like the write side.
+    if ssm_state_indices_in is None:
+        ssm_state_indices_in = ssm_state_indices
+    else:
+        assert (
+            ssm_state_indices is not None
+            and ssm_state_indices_in.shape == ssm_state_indices.shape
+            and ssm_state_indices_in.stride() == ssm_state_indices.stride()
+        ), "ssm_state_indices_in must match ssm_state_indices in shape and stride"
 
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
@@ -287,6 +300,7 @@ def fused_sigmoid_gating_delta_rule_update(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
+        ssm_state_indices_in=ssm_state_indices_in,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
         N=N,

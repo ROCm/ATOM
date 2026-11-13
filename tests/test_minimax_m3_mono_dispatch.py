@@ -10,7 +10,9 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
+from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS
 from atom.mono.runtime import deployment
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
 
 
@@ -18,7 +20,7 @@ class _Mode:
     def __init__(self, piecewise):
         self.piecewise = piecewise
 
-    def requires_piecewise_compilation(self):
+    def uses_tr_hybrid(self):
         return self.piecewise
 
 
@@ -28,6 +30,7 @@ def _atom_config(**overrides):
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
         "enable_expert_parallel": False,
+        "enable_dp_attention": False,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "kv_cache_dtype": "fp8",
@@ -36,6 +39,7 @@ def _atom_config(**overrides):
         "max_model_len": 32768,
         "enable_tbo": False,
         "enable_tbo_decode": False,
+        "dspark": SimpleNamespace(confidence_schedule=False, ragged=False),
         "speculative_config": None,
         "compilation_config": SimpleNamespace(cudagraph_mode=_Mode(False)),
     }
@@ -61,21 +65,60 @@ def test_supported_deployment_has_no_refusal(native):
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"enable_expert_parallel": True}, "expert parallel"),
+        # M3's `Dims` has no DP-attention form: refused, never built.
+        (
+            {
+                "tensor_parallel_size": 1,
+                "parallel_config": SimpleNamespace(data_parallel_size=4),
+                "enable_dp_attention": True,
+                "enable_expert_parallel": True,
+            },
+            "DP attention 4",
+        ),
         ({"decode_context_parallel_size": 2}, "decode CP"),
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
+        ({"sequence_parallel_size": 4}, "Ulysses SP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
+        ({"kv_cache_dtype": "fp4"}, "kv cache fp4"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
         ({"max_model_len": (1 << 20) + 1}, "max_model_len"),
         ({"enable_tbo_decode": True}, "TBO"),
         (
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
-            "piecewise",
+            "TR_HYBRID",
+        ),
+        # `model_runner` wraps the model and the drafter in
+        # `torch.compile(fullgraph=True)` at this level only, and mono calls
+        # `Tensor.data_ptr()`, which graph-breaks -- a break under `fullgraph`
+        # raises instead of falling back, so this has to refuse rather than
+        # crash a qualified deployment mid-request.
+        (
+            {
+                "compilation_config": SimpleNamespace(
+                    level=1, cudagraph_mode=_Mode(False)
+                )
+            },
+            "DYNAMO_AS_IS",
         ),
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):
     assert reason in dispatch._config_refusal(_atom_config(**overrides))
+
+
+@pytest.mark.parametrize("level", [0, 2, 3])
+def test_other_compilation_levels_are_not_refused(native, level):
+    """Only level 1 wraps in `fullgraph`; 2 and 3 go through the decorator.
+
+    Pinning the complement matters more than the refusal: copying copilot's
+    boundary without checking it would have refused every non-zero level and
+    turned mono off for the served `--level 3` launch.
+    """
+    cfg = _atom_config(
+        compilation_config=SimpleNamespace(level=level, cudagraph_mode=_Mode(False))
+    )
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_the_model_s_full_context_is_served(native):
@@ -150,12 +193,21 @@ def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
 
 
-def test_a_kernel_no_rank_could_build_turns_mono_off(monkeypatch):
-    """``prepare`` is the TP-wide verdict: false on every rank, so every rank falls
-    back, now and for the steps after."""
+def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
+    """``prepare`` is the TP-wide verdict: false on every rank, so every rank
+    falls back.
+
+    Asserted as behaviour rather than on ``_mono.enabled``. A width refusal
+    stopped latching the flag in `3b50fa529` -- it is memoized per width
+    instead -- and the flag is still the right assertion for a *create*
+    refusal, which is why the sibling check in `test_native_monokernel`
+    keeps it. What a caller can observe here is that no width is served,
+    this step and the ones after, because this runner builds nothing.
+    """
     mono = _mono(monkeypatch, _forward_context(_decode_md(rows=16)), builds=False)
     assert not mono.supports(*_step(4), None, None)
-    assert not mono._mono.enabled
+    assert not mono.supports(*_step(4), None, None)  # the memoized refusal
+    assert not mono.supports(*_step(8), None, None)  # and any other width
 
 
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
@@ -222,7 +274,22 @@ def test_speculative_decoding_is_not_refused(native):
     assert dispatch._config_refusal(cfg) is None
 
 
-@pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1)])
+def test_fixed_dspark_is_not_refused(native):
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    cfg = _atom_config(speculative_config=spec)
+    assert dispatch._config_refusal(cfg) is None
+
+
+@pytest.mark.parametrize("mode", ["confidence_schedule", "ragged"])
+def test_ragged_dspark_is_refused(native, mode):
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    dspark = SimpleNamespace(confidence_schedule=False, ragged=False)
+    setattr(dspark, mode, True)
+    cfg = _atom_config(speculative_config=spec, dspark=dspark)
+    assert dispatch._config_refusal(cfg) == "DSpark confidence schedule / ragged"
+
+
+@pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1), (8, 1), (8, 2)])
 def test_speculative_verify_steps_are_taken(monkeypatch, q, reqs):
     slots = torch.zeros(q * reqs, dtype=torch.int64)
     md = _forward_context(_decode_md(rows=reqs, slots=slots, max_query_len=q))
@@ -265,3 +332,178 @@ def test_disabled_mono_never_takes_a_step(monkeypatch):
     mono = _mono(monkeypatch, _forward_context())
     mono._mono.enabled = False
     assert not mono.supports(*_step(1), None, None)
+
+
+# --- rollout weight sync -----------------------------------------------------
+# A weight sync rewrites parameter buffers in place, so nothing moves address
+# and no shape or dtype check fires; the mono binds that cache a requantized or
+# dequantized copy go on serving the pre-sync weights. Until `weight_updater`
+# invalidates those copies, a runner that can take a sync must not get mono.
+
+
+class _UpdatingRunner:
+    def update_weights(self, named_tensors, clear_kv_cache=True):
+        raise NotImplementedError
+
+
+class _PlainRunner:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("resolved", "refused"),
+    [(_PlainRunner, False), (_UpdatingRunner, True)],
+)
+def test_a_runner_that_takes_weight_updates_is_refused(
+    native, monkeypatch, resolved, refused
+):
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", lambda _: resolved)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="a.runner.Class"))
+    assert (why is not None and "rollout weight updates" in why) is refused
+
+
+def test_an_unresolvable_runner_is_refused(native, monkeypatch):
+    """Guessing wrong costs correctness; refusing only costs speed."""
+
+    def _boom(_):
+        raise ImportError("no such module")
+
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", _boom)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="gone.Runner"))
+    assert "rollout weight updates" in why
+
+
+def test_a_config_without_a_runner_qualname_is_unaffected(native):
+    """SGLang builds its own `atom_config` and sets no runner."""
+    assert dispatch._config_refusal(_atom_config()) is None
+
+
+# ------------------------------------------------------------------ the prefix layers
+
+
+def _layers(count, sparse_prefix=False, moe_prefix=False):
+    """A layer stack shaped like M3's: a dense-MLP prefix, MoE sparse-attention
+    layers after it. ``sparse_prefix`` makes the prefix M3.1's."""
+    return [
+        SimpleNamespace(
+            is_moe_layer=moe_prefix if i < runner.N_DENSE else True,
+            self_attn=SimpleNamespace(
+                is_indexed_sparse_attention=(
+                    sparse_prefix if i < runner.N_DENSE else True
+                )
+            ),
+        )
+        for i in range(count)
+    ]
+
+
+def test_a_dense_attention_prefix_runs_on_the_mono_kernels():
+    assert runner.dense_prefix_mono(_layers(8))
+
+
+def test_a_sparse_attention_prefix_runs_on_the_original_modules():
+    assert not runner.dense_prefix_mono(_layers(8, sparse_prefix=True))
+
+
+@pytest.mark.parametrize(
+    "layers",
+    [_layers(8, moe_prefix=True), _layers(runner.N_DENSE)],
+    ids=["moe_prefix", "nothing_left_for_mono"],
+)
+def test_a_prefix_mono_cannot_hand_over_from_is_refused(layers):
+    with pytest.raises(MonoUnsupported, match="dense-MLP"):
+        runner.dense_prefix_mono(layers)
+
+
+def _dense_runner(n):
+    """A runner holding only what ``run_dense`` touches: ``ars`` and a model
+    whose prefix layers add one to the hidden and stamp the residual."""
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    stub.ars = [torch.zeros(MAX_TOKENS, HIDDEN) for _ in range(2)]
+
+    def layer(i):
+        def call(positions, hidden, residual, capture_aux=False):
+            out = (hidden + 1, torch.full((n, HIDDEN), float(i)))
+            return (*out, torch.full((n, HIDDEN), 10.0 + i)) if capture_aux else out
+
+        return call
+
+    stub.model = SimpleNamespace(
+        get_input_embeddings=lambda ids: torch.zeros(n, HIDDEN),
+        layers=[layer(i) for i in range(runner.N_DENSE)],
+    )
+    return stub
+
+
+def test_run_dense_hands_the_first_mono_layer_its_ar_and_residual(monkeypatch):
+    monkeypatch.setattr(runner, "tensor_model_parallel_all_reduce", lambda t: t)
+    stub = _dense_runner(2)
+    res = runner.MonoDecodeRunner.run_dense(stub, *_step(2), (), [])
+    assert float(res[0, 0]) == runner.N_DENSE - 1  # the last prefix layer's residual
+    assert float(stub.ars[0][0, 0]) == runner.N_DENSE  # its reduced hidden
+
+
+def test_run_dense_collects_the_aux_hidden_states_eagle3_asked_for(monkeypatch):
+    """The prefix is the only place these layers run on M3.1, so the aux list it
+    fills is the draft model's whole view of them."""
+    monkeypatch.setattr(runner, "tensor_model_parallel_all_reduce", lambda t: t)
+    aux = []
+    runner.MonoDecodeRunner.run_dense(_dense_runner(2), *_step(2), (0, 2), aux)
+    assert [float(a[0, 0]) for a in aux] == [10.0, 12.0]
+
+
+def test_mono_writes_dspark_aux_from_next_layer_and_final_residual():
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    buffers = (torch.zeros(2, HIDDEN), torch.zeros(2, HIDDEN))
+    stub.aux = SimpleNamespace(layer_ids=(3, 59), buffers=buffers)
+    layer3 = torch.full((2, HIDDEN), 3.0)
+    stub._write_aux(3, layer3)
+    assert torch.equal(buffers[0], layer3)
+
+    stub.sparse = [SimpleNamespace(layer_id=59)]
+    stub.ars = [torch.zeros(2, HIDDEN), torch.full((2, HIDDEN), 4.0)]
+    stub.model = SimpleNamespace(norm=lambda ar, res: (ar, ar + res))
+    stub.debug = False
+    runner.MonoDecodeRunner.finish_step(stub, torch.full((2, HIDDEN), 5.0))
+    assert torch.equal(buffers[1], torch.full((2, HIDDEN), 9.0))
+
+
+def test_dspark_drafter_binds_before_the_lazy_runner_starts():
+    mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
+    mono._uses_dspark = True
+    mono._drafter = None
+    mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
+    drafter = object()
+    mono.bind_drafter(drafter)
+    assert mono._drafter is drafter
+    mono._mono.runner = object()
+    with pytest.raises(RuntimeError, match="after Mono starts"):
+        mono.bind_drafter(object())
+
+
+def test_forward_taps_the_residual_entering_the_next_layer(monkeypatch):
+    monkeypatch.setattr(runner, "get_forward_context", lambda: _forward_context())
+    monkeypatch.setattr(
+        runner,
+        "token_rows",
+        lambda fwd, n: (torch.empty(0), torch.empty(0)),
+    )
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    stub.model = SimpleNamespace(aux_hidden_state_layers=())
+    stub.mailboxes = SimpleNamespace(begin_step=lambda: None)
+    stub.dense_mono = False
+    stub.sparse = [SimpleNamespace(layer_id=3), SimpleNamespace(layer_id=4)]
+    stub.timeline = None
+    stub.h = torch.empty(1, HIDDEN)
+    stub.run_dense = lambda *args: torch.zeros(1, HIDDEN)
+    tapped = []
+
+    def sparse(i, *args):
+        stub.h.fill_(i + 1)
+        return torch.zeros(1, HIDDEN)
+
+    stub.run_sparse_layer = sparse
+    stub._write_aux = lambda layer, value: tapped.append((layer, float(value[0, 0])))
+    stub.finish_step = lambda res: res
+    runner.MonoDecodeRunner.forward(stub, *_step(1))
+    assert tapped == [(2, 1.0), (3, 2.0)]

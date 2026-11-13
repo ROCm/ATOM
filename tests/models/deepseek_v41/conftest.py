@@ -86,7 +86,8 @@ def unallocated_moe(monkeypatch):
     def capture_v4(self, layer_id, args, prefix="", alt_stream=None):
         nn.Module.__init__(self)
         self.gate = nn.Module()
-        self.experts = SimpleNamespace(custom_routing_function=None)
+        self.experts = nn.Module()
+        self.experts.custom_routing_function = None
         self.quant_config = args.quant_config
         self.prefix = prefix
         self.alt_stream = alt_stream
@@ -210,8 +211,8 @@ def attention_contract(monkeypatch, reference):
             return call
 
         with pytest.MonkeyPatch.context() as patch:
-            for name in ("sparse_attn_v4_paged_decode", "sparse_attn_v4_paged_prefill"):
-                patch.setattr(attention, name, checked(getattr(attention, name)))
+            name = "sparse_attn_v4_paged_2src"
+            patch.setattr(attention, name, checked(getattr(attention, name)))
             yield
         assert next(remaining, None) is None
 

@@ -265,7 +265,11 @@ class StateSlotPool:
         resume point should do. Whether to demote at all is the caller's
         separate question; see `publish_midstep` for `seq=None`.
         """
-        pos = getattr(seq, "checkpoint_end_pos", 0) if seq is not None else 0
+        pos = 0
+        if seq is not None:
+            pos = getattr(seq, "midstep_anchor_pos", 0) or getattr(
+                seq, "checkpoint_end_pos", 0
+            )
         return pos or None
 
     def promote(self, slot: int) -> None:
@@ -453,6 +457,10 @@ class StateSlotPool:
         made dense, leaving only what a checkpoint could not have fixed.
         """
         if not self.applies(seq):
+            return hit
+        if self.transfer.replays:
+            # Nothing is kept: the forward resuming at any boundary rebuilds the
+            # state from the hash block below it (`StateTransfer.replay`).
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):

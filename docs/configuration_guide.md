@@ -12,7 +12,7 @@ controls ATOM's runtime behaviour.
 | `Config` | Master dataclass — model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
 | `CompilationConfig` | Compilation level (0-3), CUDA graph capture sizes, piecewise splitting ops, inductor settings |
 | `CompilationLevel` | Integer constants for the four compilation levels |
-| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
+| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (`NONE` / `TR_HYBRID` token graphs / `FULL` / `FULL_AND_TR_HYBRID`) |
 | `QuantizationConfig` | Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping |
 | `LayerQuantConfig` | Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method |
 | `ParallelConfig` | Data-parallel size, rank, master IP/port |
@@ -37,16 +37,26 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `tensor_parallel_size` | `int` | `1` | Number of tensor-parallel GPUs (1 — 8) |
 | `enforce_eager` | `bool` | `False` | Disable compilation and CUDA graphs; run in eager mode |
 | `parallel_config` | `ParallelConfig` | `ParallelConfig()` | Data-parallel configuration (see Section 4) |
-| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The FP4 sparse indexer requires exactly 64 |
+| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The DeepSeek-V4 FP4 sparse indexer requires exactly 64; MiniMax-M3's MXFP4 KV and index caches require exactly 128 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
-| `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`; its runtime also takes `"fp4"` (the official E2M1 + E8M0 arithmetic in the row-group scorer's page-8 layout, values and scales in two planes, which needs `candidate_block_size` 8) and refuses any other format before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
+| `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"`, `"fp8"` or `"fp4"`). `"fp4"` is DeepSeek-V4.1's own FP4 KV, or MiniMax-M3.1's MXFP4 K/V (e2m1 + e8m0 per 32) on every attention layer -- which must all be indexed sparse ones: a `sparse_attention_freq` of exactly `1` per `num_hidden_layers`, so M3's original dense-attention checkpoints are refused. On M3 it also needs gfx950, `--block-size 128` and a bf16 model, and is refused at startup with KV offload (`ATOM_KV_OFFLOAD`) or `--kv-transfer-config`, under decode or prefill context parallelism (`--decode-context-parallel-size` / `--prefill-context-parallel-size` > 1), under sequence parallelism (`--sequence-parallel-size` > 1), under the vLLM/SGLang bridges, and with a draft left with FP4 KV (an MTP draft shares the target's pool; a DSpark or EAGLE3 draft with its own pool is bf16, see `draft_kv_dtype`). Every other model refuses it. |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`; its runtime also takes `"fp4"` (the official E2M1 + E8M0 arithmetic in the row-group scorer's page-8 layout, values and scales in two planes, which needs `candidate_block_size` 8) and refuses any other format before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. On MiniMax-M3 `"fp4"` is the MXFP4 index cache (gfx950, `--block-size 128`, indexer head dim 128); anything else, and `--decode-context-parallel-size` or `--prefill-context-parallel-size` > 1, is refused at startup, with no FP8 fallback. The indexer query is then FP8. M3's `kv_cache_dtype="fp4"` needs `"fp4"` here: omitted, it follows the KV dtype (fp4); an explicit other value is refused at startup. On the DeepSeek-V4 family `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. **Minimum aiter (MiniMax-M3)**: a build that includes ROCm/aiter#7014 (the per-row selector `aiter.ops.flydsl.topk.topk_per_row_small_k`, which every M3 index cache takes once a row reaches 131072 tokens, so `bf16` and `fp8` need it there too), and for `"fp4"` also #7057 (the fused writer into MXFP4 pages), #7060 and #7061 (the MXFP4 index scorers), plus #7056 (MXFP4 K/V in `pa_decode`) for `kv_cache_dtype="fp4"`. There is no fallback: an older aiter fails at the first use. Upgrade ATOM and aiter together. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
+| `sampler_independent_noise` | `bool` | `False` | Draw a fresh exponential noise row per stochastic row of an unfiltered temperature batch instead of broadcasting one row across the batch, so ordinary `n=1` requests are sampled independently, not only fan-out siblings and speculative verification. Costs a `(num_tokens, vocab_size)` float32 noise allocation per sampler call and changes the RNG stream. The top-k/top-p path already draws per-row noise, so the option is inert there by design (not a gap to close later), and greedy rows never draw noise. Native ATOM engine only; the vLLM/SGLang plugin paths are unaffected |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `throughput_log_interval_steps` | `int` | `0` | Forwards between engine-status lines, replacing the clock above when > 0. For offline / MLPerf runs comparing one DP rank's lines against another's: the clock lands on a different step number on each rank, a forward count lands on the same one (an idle DP rank counts its dummy). The line reports a cumulative forward count, which is the quantity two ranks share; an all-dummy window still emits its line, since a missing line is what a comparison cannot recover from. Because the window closes on a count rather than a deadline it can span any amount of wall clock, so stretches where no forward ran — idle, stalled on a deferred save or PrefillDone, weights parked by an RL rollout — are subtracted from the `tokens/s` divisor. The first line can be warmup: a DP rank's window one opens before its first `_sync_dp_state`, so when that pass already has work, the barrier waiting for the slowest rank lands in that divisor (an engine-wide idle pass is subtracted like any other). Base and DP engines only — pipeline parallel replaces the busy loop that counts, and RapidServe and P/D are not covered yet; all three fall back to the clock with a warning. A decode step is milliseconds, so an interval below ~20 will dominate the log |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill, and does not apply to RapidServe or a P/D decode instance (`kv_role: kv_consumer`); otherwise the flag is turned off with a warning and chunking stays fixed |
+| `dynamic_chunking_smooth_factor` | `float \| None` | `None` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). `None` takes `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, read only when the feature is on. Must be in `[0, 1]` when the feature is on |
+| `dynamic_chunking_min_chunk_size` | `int` | `4096` | Floor for a solved chunk. Must be positive when the feature is on |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
+| `enable_decoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: prefill runs the decoder (layers 20..39) only on the rows the next forward reads, its windows truncated there (the V4.1 report's SWA Bounded Replay). Faster prefill, not numerically equivalent to a full prefill. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
+| `enable_encoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: a prefix hit resumes without a state checkpoint, rebuilding the sliding-window state from the hash block below the hit; no state checkpoint is kept. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
+| `min_final_prefill_rows` | `int` | `0` | Set by the model, not a flag: the fewest rows the forward finishing a prompt runs; one resuming closer to the end starts earlier, on the hash-block grid (`BlockManager.replay_start`). DeepSeek-V4.1 with decoder bounded replay: `sliding_window` |
+| `replay_history_tokens` | `int` | `0` | Set by the model, not a flag: the tokens before a forward that starts below where its prefill resumed which the backend reads (`Replay.history_ids`). DeepSeek-V4.1: its Engram n-gram lookback, `engram_max_ngram_size - 1` |
+| `state_replay_tokens` | `int` | `0` | Set by the model, not a flag: how far below a prefix hit with no state checkpoint behind it a prefill starts to rebuild that state exactly (`BlockManager.replay_start`); 0 takes no such hit. DeepSeek-V4 under `ATOM_DSV4_STATE_REPLAY`: the window receptive field `W + (L-1)(W-1)`, 7,748 on V4-Pro and 7,875 with MTP or DSpark |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -57,7 +67,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
 | `capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
-| `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`). Only effective when >1 DP rank. See distributed guide §2 |
+| `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`), or `"prefix_spread"` (keep a request on the rank holding its prompt's prefix unless that rank has a prefill backlog and another is about to idle; needs prefix caching and `ATOM_FRONTEND_PREFIX_HASH=1`). Only effective when >1 DP rank. See distributed guide §2 |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
 | `speculative_config` | `Optional[SpeculativeConfig]` | `None` | Speculative decoding configuration (see Section 5) |
 | `bos_token_id` | `int` | `-1` | Beginning-of-sequence token ID (`-1` = use model default) |
@@ -84,7 +94,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `NO_COMPILATION` | `0` | No compilation — pure eager execution |
 | `DYNAMO_AS_IS` | `1` | Use torch.compile / TorchDynamo as-is |
 | `DYNAMO_ONCE` | `2` | TorchDynamo with a single compilation pass |
-| `PIECEWISE` | `3` | Piecewise compilation with CUDA graph capture (recommended for production) |
+| `PIECEWISE` | `3` | Piecewise compilation: the graph is split at `splitting_ops` and each piece compiled by Inductor (recommended for production; CUDA graphs are chosen separately by `CUDAGraphMode`) |
 
 ### `CompilationConfig` fields
 
@@ -97,9 +107,9 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `TR_HYBRID` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
-| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
+| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; effective at level 3 whenever `cudagraph_mode` is not `NONE` |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
 | `inductor_compile_config` | `dict` | `{}` | Additional configuration passed to the inductor backend |
 
@@ -108,16 +118,16 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | Mode | Value | Description |
 |---|---|---|
 | `NONE` | `0` | No CUDA graph capture |
-| `PIECEWISE` | `1` | Piecewise CUDA graphs — attention ops stay outside the graph for flexibility (default at level 3) |
+| `TR_HYBRID` | `1` | Token graphs and request graphs mixed: a token graph per token bucket, breaking only where a launch depends on host data (default at level 3) |
 | `FULL` | `2` | Full CUDA graph capture for all batches; best for small models / short prompts |
 | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full CUDA graphs for decode batches only; mixed prefill-decode runs without graphs (useful in P/D setups) |
-| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed — most performant mode for most models |
+| `FULL_AND_TR_HYBRID` | `(FULL, TR_HYBRID)` | Recorded as `TR_HYBRID` by the native runner: decode replays token graphs too, no full decode graph |
 
 Helper methods on `CUDAGraphMode`:
 
 - `decode_mode()` — returns the mode used for pure decode batches.
 - `mixed_mode()` — returns the mode used for mixed prefill-decode batches.
-- `requires_piecewise_compilation()` — whether the mode needs piecewise compilation.
+- `uses_tr_hybrid()` — whether the mode records token graphs.
 - `has_full_cudagraphs()` — whether the mode includes full CUDA graph capture.
 - `separate_routine()` — whether decode and mixed batches use different routines.
 
@@ -282,6 +292,7 @@ method with `num_speculative_tokens=1` is supported.
 | `model` | `Optional[str]` | `None` | Draft model name or path (typically the same as the target model for MTP) |
 | `num_speculative_tokens` | `Optional[int]` | `None` | Number of speculative tokens per iteration; **must be `1`** |
 | `draft_model_hf_config` | `Optional[PretrainedConfig]` | `None` | HuggingFace config for the draft model; auto-loaded from `model` when `None` |
+| `draft_kv_dtype` | `Optional[str]` | `None` | KV dtype of the draft's pages (not an `__init__` argument). `None` until `Config` settles it at startup: the target's dtype, except `"bf16"` for a draft with a KV pool of its own (an MHA draft: MiniMax-M3.1's standalone DSpark, an MHA EAGLE3 draft) under an `fp4` target, which has no FP4 draft layout. A draft in the target's pool (MTP, an MLA draft) has the target's dtype; under an M3 `kv_cache_dtype="fp4"` target that is `"fp4"` (MTP) and is refused. Not a command-line setting. |
 
 ### Table-driven MTP config
 
@@ -357,29 +368,36 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--trust-remote-code` | | flag | `False` | Trust remote code when loading model |
 | `--tensor-parallel-size` | `-tp` | `int` | `1` | Tensor parallel size |
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
+| `--sequence-parallel-size` | `-sp` | `int` | `1` | Ulysses sequence parallel size; requires `-tp 1`, `-pp 1`, DP1, an MHA model whose heads divide across the ranks, and no expert parallelism, TBO, speculative decoding, KV transfer, RapidServe or image input; validated only on MiniMax-M3 MXFP4 at SP4, and fewer KV heads than SP ranks (KV replication, e.g. MiniMax-M3 at SP8) has not run end to end |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
 | `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
+| `--throughput-log-interval-steps` | | `int` | `0` | Forwards between engine-status lines instead of seconds; base and DP engines only |
+| `--sampler-independent-noise` / `--no-sampler-independent-noise` | | flag | `False` | Draw fresh per-row exponential noise for unfiltered temperature sampling instead of broadcasting one noise row over the batch. Off by default, which keeps the shared-row behaviour. Enabling it samples ordinary `n=1` stochastic requests independently, costs a `(num_tokens, vocab_size)` float32 noise allocation per sampler call, and changes the RNG stream. The top-k/top-p path already draws per-row noise, so the option is inert there by design; greedy rows never draw noise. Native ATOM engine only |
 | `--port` | | `int` | `8006` | Engine internal port |
-| `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
-| `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
-| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the FP4 sparse indexer requires exactly 64 |
+| `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8`, `fp4` (MiniMax-M3.1 MXFP4 K/V or DeepSeek-V4.1's own FP4 KV; see `kv_cache_dtype` above) |
+| `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4` (MiniMax-M3's MXFP4 index cache or another model's own FP4 layout; see `index_cache_dtype` above). When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
+| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the DeepSeek-V4 FP4 sparse indexer requires exactly 64, MiniMax-M3's MXFP4 KV and index caches exactly 128 |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
 | `--cudagraph-capture-sizes` | | `str` | `"[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"` (every batch of 1..8: a padded one runs the next size's step) | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
+| `--moe-backend` | | `str` | `"standard"` | MoE implementation; choices: `standard`, `mega`. `mega` runs FlyDSL MegaMoE and requires `--enable-expert-parallel`; with `-sp N` it instead runs the Ulysses SP MXFP4 MoE through AITER `MegaMoeTP` on gfx950, on every step whose native MoE quantizes activations to FP4 (prefill, and decode from 256 global rows), and needs MORI built with `BUILD_CCO_SDMA=ON`. Startup fails when a layer or setting is outside what it serves. Each launch covers at most `min(ceil(max_num_batched_tokens / N), 8192)` local rows |
 | `--torch-profiler-dir` | | `str` | `None` | Directory for torch profiler traces |
 | `--enable-dp-attention` | | flag | `False` | Enable DP attention |
-| `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
+| `--method` | | `str` | `None` | Speculative method; choices: `mtp`, `eagle3`, `dspark` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
 | `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
 | `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |
+| `--decoder-swa-bounded-replay` / `--no-decoder-swa-bounded-replay` | `--enable-decoder-swa-bounded-replay` | `bool` | on | DeepSeek-V4.1 only: the forward finishing a prompt runs the decoder (layers 20..39) on its last 128 rows only, their windows truncated at the first of them, and layer 39's query on the last row; one that does not finish runs none of it past layer 20's compression (the V4.1 report's SWA Bounded Replay). Not numerically equivalent to a full prefill. No effect on other models |
+| `--encoder-swa-bounded-replay` / `--no-encoder-swa-bounded-replay` | `--enable-encoder-swa-bounded-replay` | `bool` | on | DeepSeek-V4.1 only: a prefix hit resumes without a state checkpoint, recomputing the hash block below the hit to rebuild the sliding-window state (no cached row is rewritten); no state checkpoint is kept, so none cuts a prefill chunk. Not numerically equivalent to resuming a checkpoint. No effect on other models |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
+| `--prefill-admit-policy` | | `str` | `interval` | When the prefill delayer admits new prefills. `interval` (default) keeps `ATOM_PREFILL_DECODE_INTERVAL` and the coalescer. `adaptive` replaces both, after the must-fire bounds (no decode, KV, `MAX_QUEUE_MS`, `TTFT_MAX_TICKS`): it fits the decode step as `T0 + c*b` and the prefill step as `A + k*n` from measured step times, and fires once the held requests' accumulated cost (sum over held ticks of admittable requests × `T0`) reaches the fixed prefill cost × decode batch (`A × B`), i.e. the EOQ / rent-or-buy point. `T0` is taken as 0.75 × the mean decode step and `A` is clamped to 0.3–1.5 × the mean prefill step; a FIRE comes on the 4th decision after the previous one at the earliest (3 held ticks), and at the latest once about 600 ms of decode steps have passed (cold start: 24 decisions; at most 200). These are fixed constants in `prefill_delayer.py`. Fits and counts ride the delayer's existing all_reduce, so DP ranks decide in lockstep. Like a positive interval, it enables local coalescing on DP=1, PP=1, i.e. on plain TP runs too; the measurements so far are DEP4 only, so TP-only gains are unverified. Counterpart of vLLM's `--prefill-schedule-interval` (off by default there too). |
 | `--online_quant_config` | | JSON string | `None` | Load-time online quantization override; see Section 3.7 |
 
 **Example:**
@@ -409,6 +427,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
+| `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR` | `float` | `0.75` | Default for `dynamic_chunking_smooth_factor`: `0` keeps the initial chunk, `1` uses the equal-latency chunk |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
@@ -416,6 +435,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` | `bool` | `True` | Enable fused input RMSNorm + quantization for DeepSeek models |
 | `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` | `bool` | `True` | Enable fused QK-norm + quantization for DeepSeek models |
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
+| `ATOM_ENABLE_GLUON_FUSED_AR` | `bool` | `True` | Use aiter's Gluon fused all-reduce + RMSNorm for decode at TP4 (sets `AITER_GLUON_FUSED_AR=1`; aiter uses it on gfx1250 only) |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
 
@@ -444,14 +464,14 @@ Do you need torch.compile but no graph splitting?
   v
 Production inference on ROCm/HIP GPU?
   |-- Yes --> Level 3 (PIECEWISE) [default in EngineArgs]
-              - Auto-sets CUDAGraphMode.PIECEWISE
+              - Auto-sets CUDAGraphMode.TR_HYBRID
               - Auto-populates splitting_ops for attention ops
               - Pair with --cudagraph-capture-sizes for your batch profile
   |
   v
 Need maximum decode throughput?
-  |-- Yes --> Level 3 + set cudagraph_mode to FULL_AND_PIECEWISE
-              (full graphs for decode, piecewise for prefill)
+  |-- Yes --> set cudagraph_mode to FULL
+              (a whole-forward request graph per decode bucket)
 ```
 
 **Rules of thumb:**

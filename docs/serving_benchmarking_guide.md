@@ -152,6 +152,10 @@ its end marker — not a stall: it is reasoning, and it is delivered as
 region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
+One case is sent twice instead of held: a dialect that declares
+`answer_end_markers` replays a think channel the model used as its reply as
+`content` once that is known (see `ReasoningFilter._close_channel`).
+
 ##### What is held, and for how long
 
 The rule is that a byte is buffered only while its **destination field** is
@@ -344,6 +348,10 @@ chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
 agree on all of them, and the property that says so is byte-exact rather than
 word-level.
 
+There is one reader: the non-streaming split is the streaming filter run over
+the whole output, once, and the filter is chunk-invariant, so the two delivery
+modes cannot disagree.
+
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the
 same answer kept those bytes at one chunk size and lost them at another —
@@ -393,6 +401,19 @@ suppressed. `/v1/messages` reads the field too, in Anthropic's
 `{"type": "none"}` spelling; it previously parsed it off the request and used
 it nowhere, so a client that forbade tool calls got `tool_use` blocks and
 `stop_reason: tool_use` anyway.
+
+**`tool_choice: "required"` on Kimi-K3 opens the tools channel.** The chat
+template only tells the model it MUST call a tool, and at T=1 it still closed
+the message after its response on a share of requests, writing the arguments
+as `content`. On a chat request with `tool_choice: "required"` and a non-empty
+`tools`, both chat endpoints now hold K3's output to its tools channel on the
+GPU: it may not end before the channel opens, and once the response channel
+closes (`<|close|>response<|sep|>`) the next tokens are forced to
+`<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
+model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
+has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
+`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+A required request's own `stop` strings can still end it before a call.
 
 Forwarding it to the chat template is a separate step, and one that used to be
 a 500. The handler passes template controls it cannot know the model reads —
@@ -506,6 +527,7 @@ Server-specific CLI arguments:
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
 | `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
 | `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
+| `--api-server-count` | `1` | Front-end processes on the HTTP port. Each reads, parses, templates, tokenizes and streams its own requests; the process that owns the engine keeps DP routing, session affinity and metrics and answers the management endpoints, which the workers relay to it. Raise it when one process's event loop cannot keep up with the request rate: requests then wait unread in the socket while the engine runs short of work (long agentic conversations at high concurrency; 4 kept DSV4.1-Flash DEP4 c512 flat over 40 min where one process fell from ~12k to ~5k tok/s/GPU in 1 h) |
 | `--tool-call-parser` | `auto` | Tool-call wire format. `auto` reads it from the model's chat template at startup (Jinja, or a model-side `encoding/encoding_*.py`); a name — `dsml`, `glm`, `kimi`, `kimi_k3`, `minimax`, `qwen` — overrides. When neither resolves, tool calls are delivered as plain text and the startup log says so; the format is never guessed from output. On the OpenAI server an unknown name is refused at startup, before the weights load, rather than silently disabling tool parsing. The atomesh entrypoint deliberately does not refuse: it shares the flag with the mesh router, which declares its own vocabulary for it, so a name ATOM does not recognise is logged at INFO, forwarded to the router, and ATOM falls back to reading the chat template. Check the log for `is not one of ATOM's formats` if a format you specified is not taking effect |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
@@ -886,10 +908,14 @@ Eagle-style speculative decoding framework.
 - **EagleProposer** (`atom/spec_decode/eagle.py`): Loads and runs the draft
   (MTP) model to propose speculative tokens.  Supports the `DeepSeekMTPModel`
   architecture via `DeepSeekMTP`.
-- **RejectionSampler** (`atom/model_ops/rejection_sampler.py`): Implements
-  greedy rejection sampling with a Triton kernel.  Compares draft token IDs
-  against target model argmax and accepts matching prefixes; appends a bonus
-  token if all drafts are accepted.
+- **RejectionSampler** (`atom/model_ops/rejection_sampler.py`): Verifies the
+  drafts with Triton kernels and accepts each request's prefix up to the first
+  rejection; appends a bonus token if all drafts are accepted. By default a
+  draft is accepted iff it equals the target's own token: its argmax for a
+  greedy request, its temperature/top-k/top-p draw otherwise. With
+  `ATOM_SPEC_LOSSLESS_SAMPLING=1`, sampled DSpark drafts are verified by the
+  probability ratio instead (`u * q(x) < p(x)`). See `RejectionSampler` in
+  [`model_ops_guide.md`](model_ops_guide.md) for every rule.
 
 ### Configuration
 
@@ -945,6 +971,9 @@ MTP Statistics:
      subsequent draft tokens are discarded.
    - If all draft tokens match, a bonus token from the target model is
      appended.
+
+That is the greedy case; sampled requests and the probability-ratio rule are
+covered under [Architecture](#architecture).
 
 ### Forced acceptance length
 

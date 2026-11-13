@@ -14,9 +14,16 @@ from atom.distributed.dcp_layout import dcp_global_pos
 
 
 def coalesce_contiguous(
-    src: np.ndarray, dst: np.ndarray, length: np.ndarray
+    src: np.ndarray,
+    dst: np.ndarray,
+    length: np.ndarray,
+    split_before: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Merge adjacent runs that are contiguous on both sides."""
+    """Merge adjacent runs that are contiguous on both sides.
+
+    A run whose ``split_before`` entry is True always starts a new merged run,
+    e.g. where the destination crosses into another registered memory region.
+    """
 
     if src.size == 0:
         empty = np.empty(0, dtype=np.int64)
@@ -24,6 +31,8 @@ def coalesce_contiguous(
     contiguous = (src[1:] == src[:-1] + length[:-1]) & (
         dst[1:] == dst[:-1] + length[:-1]
     )
+    if split_before is not None:
+        contiguous &= ~split_before[1:]
     starts = np.concatenate(([True], ~contiguous))
     start_indices = np.flatnonzero(starts)
     merged_length = np.add.reduceat(length, start_indices)
@@ -95,6 +104,131 @@ class DCPShardPlan:
         dst = dst_ids[self.dst_page[keep]] * self.block_size + self.dst_token[keep]
         return src, dst, self.run_length[keep]
 
+    def landing_row_count(self) -> int:
+        """Rows a landing slot sequence carries, unpadded.
+
+        Rows are the valid destination tokens in destination order. They are
+        a prefix (see ``staged_page_runs``), so they are the leading rows of
+        ``source_token_per_dst_token`` and row ``j`` lands at token
+        ``j % block_size`` of destination page ``j // block_size``. The
+        decode side relies on exactly that mapping to scatter the rows
+        (``landing_scatter.landing_segments``).
+        """
+
+        if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
+            raise ValueError("DCP shard plan valid tokens are not a prefix")
+        return int(self.valid.sum()) * self.interleave_size
+
+    def source_token_per_dst_token(self) -> np.ndarray:
+        """Source token index for every destination token, page-major.
+
+        Row ``p * block_size + t`` names the producer token (``block_id *
+        block_size + token``) that lands at token ``t`` of destination page
+        ``p``. Tokens past the source end read token 0; ``staged_page_runs``
+        never sends them.
+        """
+
+        run_start = self.src_block_id_per_run * self.block_size + self.src_token
+        run_start = np.where(self.valid, run_start, 0)
+        offsets = np.arange(self.interleave_size, dtype=np.int64)
+        valid_offsets = np.where(self.valid[:, None], offsets, 0)
+        return (run_start[:, None] + valid_offsets).reshape(-1)
+
+    def staged_page_runs(
+        self,
+        dst_block_ids: Sequence[int],
+        staging_addr: int,
+        dst_base: int,
+        token_bytes: int,
+        dst_pages_per_mr: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Byte descriptors for pages staged page-major at ``staging_addr``.
+
+        The staging buffer holds ``dst_pages`` pages in destination token order
+        (see ``source_token_per_dst_token``). Each page sends only its valid
+        tokens, which the plan keeps as a page prefix because a rank's global
+        positions grow with its local ones, so the bytes written are exactly
+        those of ``token_runs``. Runs adjacent on both ends are merged, except
+        across a destination page that is a multiple of ``dst_pages_per_mr``:
+        the consumer registers its region as memory regions of that many
+        pages, and one RDMA op must stay inside one of them.
+        """
+
+        dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+        if dst_ids.size != self.dst_pages:
+            raise ValueError(
+                f"DCP shard plan has {self.dst_pages} destination pages, got "
+                f"{dst_ids.size} block ids"
+            )
+        if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
+            raise ValueError("DCP shard plan valid tokens are not a prefix")
+        runs_per_page = self.block_size // self.interleave_size
+        valid_tokens = (
+            self.valid.reshape(self.dst_pages, runs_per_page).sum(axis=1)
+            * self.interleave_size
+        )
+        page_bytes = self.block_size * token_bytes
+        keep = valid_tokens > 0
+        src = staging_addr + np.flatnonzero(keep).astype(np.int64) * page_bytes
+        dst = dst_base + dst_ids[keep] * page_bytes
+        return coalesce_contiguous(
+            src,
+            dst,
+            valid_tokens[keep] * token_bytes,
+            dst_ids[keep] % dst_pages_per_mr == 0,
+        )
+
+
+def pack_slots(
+    unit_bytes: Sequence[int],
+    num_units: int,
+    slot_bytes: int,
+    align: int,
+    first_units: Sequence[int] | None = None,
+) -> list[list[tuple[int, int, int, int]]]:
+    """Pack every region's ``num_units`` units into fixed-size slots.
+
+    Regions are packed in order, each split into unit ranges that fill the
+    current slot before a new one opens. Returns one list per slot of
+    ``(region_pos, unit_start, unit_stop, slot_offset)`` items, where
+    ``region_pos`` indexes ``unit_bytes`` and the units occupy
+    ``[slot_offset, slot_offset + (unit_stop - unit_start) * width)``. Every
+    item but a region's last spans a multiple of ``align`` units.
+    ``first_units`` optionally starts each region at a later unit (its
+    earlier units were already sent).
+
+    The staged MLA path packs destination pages (``align`` 1). Landing packs
+    the ``DCPShardPlan.landing_row_count`` unpadded rows with ``align`` the
+    block size, so the rows a sender has not landed yet always start on
+    a destination page and can go out as whole pages.
+    """
+
+    slots: list[list[tuple[int, int, int, int]]] = []
+    current: list[tuple[int, int, int, int]] = []
+    used = 0
+    for region_pos, width in enumerate(unit_bytes):
+        if width * align > slot_bytes:
+            raise ValueError(
+                f"Slot of {slot_bytes} bytes cannot hold {align} x "
+                f"{width}-byte units"
+            )
+        unit = 0 if first_units is None else first_units[region_pos]
+        while unit < num_units:
+            capacity = (slot_bytes - used) // width
+            if unit + capacity < num_units:
+                capacity -= capacity % align
+            if capacity == 0:
+                slots.append(current)
+                current, used = [], 0
+                continue
+            stop = min(num_units, unit + capacity)
+            current.append((region_pos, unit, stop, used))
+            used += (stop - unit) * width
+            unit = stop
+    if current:
+        slots.append(current)
+    return slots
+
 
 def build_dcp_shard_plan(
     src_block_ids: Sequence[int],
@@ -155,4 +289,60 @@ def build_dcp_shard_plan(
         dst_token=dst_token,
         run_length=np.full(local_token.size, interleave_size, dtype=np.int64),
         valid=valid,
+    )
+
+
+def kv_heads_of_rank(rank: int, tp: int, total_heads: int) -> tuple[int, int]:
+    """`(first, count)` of the KV heads TP rank `rank` holds, as
+    `QKVParallelLinear` shards them (one replicated head per rank past the count)."""
+    if not 0 <= rank < tp or total_heads <= 0:
+        raise ValueError(f"no KV heads for rank {rank} of TP {tp} ({total_heads})")
+    if total_heads % tp == 0:
+        count = total_heads // tp
+        return rank * count, count
+    if tp % total_heads == 0:
+        return rank // (tp // total_heads), 1
+    raise ValueError(f"{total_heads} KV heads do not shard over TP {tp}")
+
+
+def consumer_head_slices(
+    src_bytes: int,
+    dst_bytes: int,
+    src_runs: tuple[int, int] | None,
+    dst_runs: tuple[int, int] | None,
+    rank: int,
+    tp: int,
+    label: str,
+) -> np.ndarray:
+    """`[src offset, dst offset, bytes]` rows moving consumer `rank`'s heads of
+    a TP1 unit; runs None on both ends is a unit not per head, moved whole."""
+    if src_runs is None or dst_runs is None:
+        if src_runs != dst_runs or src_bytes != dst_bytes:
+            raise ValueError(
+                f"{label}: {src_runs} runs of {src_bytes} B here, "
+                f"{dst_runs} of {dst_bytes} B on consumer rank {rank}/{tp}"
+            )
+        return np.array([[0, 0, src_bytes]], dtype=np.int64)
+    (runs, heads), (dst_run_count, dst_heads) = src_runs, dst_runs
+    first, count = kv_heads_of_rank(rank, tp, heads)
+    width = src_bytes // (runs * heads) if runs > 0 else 0
+    if (
+        width <= 0
+        or (runs, count) != (dst_run_count, dst_heads)
+        or src_bytes != runs * heads * width
+        or dst_bytes != runs * count * width
+    ):
+        raise ValueError(
+            f"{label}: {runs}x{heads} heads in {src_bytes} B here do not cut "
+            f"into {dst_run_count}x{dst_heads} in {dst_bytes} B on consumer "
+            f"rank {rank}/{tp}"
+        )
+    run = np.arange(runs, dtype=np.int64)
+    return np.stack(
+        [
+            run * heads * width + first * width,
+            run * count * width,
+            np.full(runs, count * width, dtype=np.int64),
+        ],
+        axis=1,
     )

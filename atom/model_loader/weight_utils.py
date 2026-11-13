@@ -4,10 +4,12 @@
 # This code is adapted from https://github.com/ROCm/vllm/blob/main/vllm/model_executor/model_loader/weight_utils.py
 
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
 import os
+import struct
 import tempfile
 import time
 from pathlib import Path
@@ -89,6 +91,48 @@ def local_model_dir(model: str) -> str:
         return snapshot_download(model, local_files_only=True, allow_patterns=[])
     except Exception:  # noqa: BLE001 -- any failure to resolve means "not local"
         return model
+
+
+# safetensors dtype tags of unquantized storage.
+_PLAIN_FLOAT_TAGS = frozenset({"F32", "BF16", "F16"})
+
+
+def checkpoint_layer_key(name: str) -> str:
+    """A tensor's or module's name from `layers.` on (whole outside the layer
+    stack), so checkpoint and model prefixes need not agree."""
+    at = name.find("layers.")
+    return name if at < 0 else name[at:]
+
+
+@functools.lru_cache(maxsize=4)
+def unquantized_layer_keys(model: str) -> frozenset[str]:
+    """`checkpoint_layer_key`s of the layers the local checkpoint `model`
+    stores unquantized: every `weight*` tensor of the layer is a plain float.
+    Read from the shard headers, without loading a tensor. Empty when `model`
+    is not a local directory (a hub id not downloaded yet)."""
+    model_dir = local_model_dir(model)
+    if not model_dir or not os.path.isdir(model_dir):
+        return frozenset()
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+    else:
+        shards = sorted(n for n in os.listdir(model_dir) if n.endswith(".safetensors"))
+    plain, quantized = set(), set()
+    for shard in shards:
+        with open(os.path.join(model_dir, shard), "rb") as f:
+            (header_size,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_size))
+        for name, info in header.items():
+            stem, _, leaf = name.rpartition(".")
+            if not leaf.startswith("weight"):
+                continue
+            stored_plain = info["dtype"] in _PLAIN_FLOAT_TAGS
+            (plain if stored_plain else quantized).add(checkpoint_layer_key(stem))
+    # A key some checkpoint layer stores quantized stays quantized: prefixes
+    # cut away (e.g. an MTP or vision stack) can make two layers share one.
+    return frozenset(plain - quantized)
 
 
 def download_weights_from_hf(

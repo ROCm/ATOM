@@ -9,8 +9,11 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.mono import config as mono_config
 from atom.models.deepseek_v41.mono import dispatch
+from atom.models.deepseek_v41.mono import weights as mono_weights
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime import deployment
 
 
@@ -18,7 +21,7 @@ class _Mode:
     def __init__(self, piecewise):
         self.piecewise = piecewise
 
-    def requires_piecewise_compilation(self):
+    def uses_tr_hybrid(self):
         return self.piecewise
 
 
@@ -32,10 +35,21 @@ _HF = {
 }
 
 
+# DP attention over 2 ranks with expert parallel, as a worker sees it once
+# CoreManager has folded TP into DP
+_DPA = {
+    "tensor_parallel_size": 1,
+    "enable_dp_attention": True,
+    "enable_expert_parallel": True,
+    "parallel_config": SimpleNamespace(data_parallel_size=2),
+}
+
+
 def _atom_config(**overrides):
     fields = {
         "tensor_parallel_size": 4,
         "enable_expert_parallel": False,
+        "enable_dp_attention": False,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
@@ -69,6 +83,26 @@ def test_supported_deployment_has_no_refusal(native, tp):
     assert mono_config.config_refusal(_atom_config(tensor_parallel_size=tp)) is None
 
 
+def test_no_speculative_decoding_is_served(native):
+    config = _atom_config(speculative_config=None)
+    assert mono_config.config_refusal(config) is None
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 47])
+def test_any_verify_within_a_step_is_served(native, tokens):
+    spec = SimpleNamespace(method="dspark", num_speculative_tokens=tokens)
+    assert mono_config.config_refusal(_atom_config(speculative_config=spec)) is None
+
+
+@pytest.mark.parametrize(
+    "schedule, ragged", [(True, False), (True, True), (False, True)]
+)
+def test_per_request_verify_lengths_are_served(native, schedule, ragged):
+    # the target is routed by its rows, however they split into requests
+    dspark = SimpleNamespace(confidence_schedule=schedule, ragged=ragged)
+    assert mono_config.config_refusal(_atom_config(dspark=dspark)) is None
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -77,6 +111,10 @@ def test_supported_deployment_has_no_refusal(native, tp):
         ({"tensor_parallel_size": 16}, "wo_a groups 8 is not divisible by TP 16"),
         ({"enable_expert_parallel": True}, "expert parallel"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
+        (
+            {**_DPA, "parallel_config": SimpleNamespace(data_parallel_size=4)},
+            "DP attention 4 not in",
+        ),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"decode_context_parallel_size": 2}, "decode CP"),
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
@@ -88,32 +126,26 @@ def test_supported_deployment_has_no_refusal(native, tp):
                     level=0, cudagraph_mode=_Mode(True)
                 )
             },
-            "piecewise",
+            "TR_HYBRID",
         ),
         ({"kv_cache_dtype": "fp4"}, "kv cache"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
-        ({"speculative_config": None}, "not DSpark"),
         (
             {
                 "speculative_config": SimpleNamespace(
                     method="mtp", num_speculative_tokens=5
                 )
             },
-            "not DSpark",
+            "speculative method mtp",
         ),
         (
             {
                 "speculative_config": SimpleNamespace(
-                    method="dspark", num_speculative_tokens=3
+                    method="dspark", num_speculative_tokens=48
                 )
             },
-            "speculative tokens",
+            "a verify of more than 48 rows",
         ),
-        (
-            {"dspark": SimpleNamespace(confidence_schedule=True, ragged=False)},
-            "confidence",
-        ),
-        ({"dspark": SimpleNamespace(confidence_schedule=False, ragged=True)}, "ragged"),
         (
             {"hf_config": SimpleNamespace(**{**_HF, "index_topk": 1024})},
             "attention keys",
@@ -132,12 +164,54 @@ def test_unsupported_deployment_is_refused(native, overrides, reason):
     assert reason in mono_config.config_refusal(_atom_config(**overrides))
 
 
+def test_dp_attention_with_expert_parallel_is_served(native):
+    assert mono_config.config_refusal(_atom_config(**_DPA)) is None
+
+
+def test_dp_attention_with_moe_tp_is_served(native):
+    # the MoE TP over the DP ranks (no expert parallel)
+    overrides = {**_DPA, "enable_expert_parallel": False}
+    assert mono_config.config_refusal(_atom_config(**overrides)) is None
+
+
+def test_moe_tp_weight_table_is_every_expert_at_a_share():
+    table = mono_weights.expected(_v41_config(), AttentionMode.FULL, Dims(1), moe_tp=2)
+    # every routed expert at half its width, the shared expert whole
+    assert table["ffn.experts.w13_weight"][0] == (384, 2 * 1152, 2560)
+    assert table["ffn.experts.w2_weight"][0] == (384, 5120, 576)
+    assert table["ffn.shared_experts.gate_up_proj.weight"][0] == (2 * 2304, 5120)
+
+
+def test_expert_parallel_weight_table_is_a_ranks_experts_whole():
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(1, 2))
+    # half the routed experts, each at its whole (padded) width
+    assert table["ffn.experts.w13_weight"][0] == (192, 2 * 2304, 2560)
+    assert table["ffn.experts.w2_weight"][0] == (192, 5120, 1152)
+    # the router scores every expert on every rank
+    assert table["ffn.gate.weight"][0] == (384, 5120)
+    assert table["ffn.gate.e_score_correction_bias"][0] == (384,)
+    # attention whole on the rank: every head, every wo_a group
+    assert table["attn.wq_b.weight"][0] == (64 * 512, 1280)
+    assert table["attn.wo_b.weight"][0] == (5120, 8 * 1024)
+    # the shared expert replicated at its whole width
+    assert table["ffn.shared_experts.gate_up_proj.weight"][0] == (2 * 2304, 5120)
+
+
 def test_switches_refuse(native, monkeypatch):
     monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
     assert mono_config.config_refusal(_atom_config()) == "switched off"
     monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
     monkeypatch.setenv("ATOM_DSV41_SIDE_STREAMS", "1")
     assert mono_config.config_refusal(_atom_config()) == "ATOM_DSV41_SIDE_STREAMS"
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx1250"])
+def test_other_archs_are_refused(native, monkeypatch, arch):
+    monkeypatch.setattr(deployment, "_gfx", lambda: arch)
+    assert mono_config.config_refusal(_atom_config()) == f"arch {arch}"
 
 
 def test_plugin_mode_is_refused(native, monkeypatch):
@@ -151,7 +225,7 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
             "decode": True,
             "tentative": True,
             "requests": [object()],
-            "width": 6,
+            "running_tokens": 6,
             **step_fields,
         }
     )
@@ -169,6 +243,18 @@ def test_verify_step_is_routed(monkeypatch):
     assert dispatch.step_supported(torch.zeros(6, dtype=torch.int64), None)
 
 
+def test_plain_decode_step_is_routed(monkeypatch):
+    # no drafter: a token a request, not a tentative verify
+    _context(monkeypatch, tentative=False, requests=[object()] * 3, running_tokens=3)
+    assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
+
+
+def test_ragged_verify_step_is_routed(monkeypatch):
+    # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
+    _context(monkeypatch, requests=[object()] * 3, running_tokens=12)
+    assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
+
+
 @pytest.mark.parametrize(
     "tokens, kwargs",
     [
@@ -177,8 +263,7 @@ def test_verify_step_is_routed(monkeypatch):
         (6, {"prefill": True}),
         (6, {"ubatch": object()}),
         (6, {"decode": False}),
-        (6, {"tentative": False}),
-        (6, {"width": 12}),
+        (6, {"running_tokens": 12}),
     ],
 )
 def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
@@ -193,7 +278,7 @@ def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
     monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
-    _context(monkeypatch, width=tokens, requests=[object()])
+    _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
     assert dispatch.step_supported(ids, None) is routed
 
@@ -242,30 +327,13 @@ def test_embeddings_or_images_keep_the_original_model(monkeypatch):
 def test_refused_deployment_is_not_wrapped(native, monkeypatch):
     model = torch.nn.Linear(2, 2)
     assert (
-        dispatch.install_mono_decode(
-            model, _atom_config(tensor_parallel_size=16), None, None
-        )
+        dispatch.install_mono_decode(model, _atom_config(tensor_parallel_size=16), None)
         is model
     )
-    wrapped = dispatch.install_mono_decode(model, _atom_config(), None, None)
+    wrapped = dispatch.install_mono_decode(model, _atom_config(), None)
     assert isinstance(wrapped, dispatch.MonoDecodeModel)
     # attributes the runner never overrides pass through to the wrapped model
     assert wrapped.in_features == 2
-
-
-def test_fp4_index_plane_plans_its_walk_with_each_step(native, monkeypatch):
-    planners = []
-    builder = SimpleNamespace(
-        geometry=SimpleNamespace(compress_ratios=((2, 4), (8, 1))),
-        add_step_planner=planners.append,
-    )
-    model = torch.nn.Linear(2, 2)
-    dispatch.install_mono_decode(
-        model, _atom_config(index_cache_dtype="fp4"), None, builder
-    )
-    assert [p.ratios for p in planners] == [(2, 8)]
-    dispatch.install_mono_decode(model, _atom_config(), None, builder)
-    assert len(planners) == 1
 
 
 def _v41_config():
@@ -296,7 +364,7 @@ def test_weight_table_is_the_loaded_tp4_shard():
     from atom.models.deepseek_v41.config import AttentionMode
     from atom.models.deepseek_v41.mono import weights
 
-    table = weights.expected(_v41_config(), AttentionMode.FULL, 4)
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
     # as a TP4 server loads them (the p1 weight manifest)
     assert table["attn.wqkv_a.weight"] == ((1792, 5120), torch.float8_e4m3fn)
     assert table["attn.wo_a.weight_scale"] == ((64, 128), torch.float8_e8m0fnu)
@@ -310,7 +378,7 @@ def test_weight_table_is_the_loaded_tp4_shard():
         torch.float8_e8m0fnu,
     )
     assert table["attn.indexer.wq_b.weight"] == ((4096, 1280), torch.float8_e4m3fn)
-    window = weights.expected(_v41_config(), AttentionMode.WINDOW, 4)
+    window = weights.expected(_v41_config(), AttentionMode.WINDOW, Dims(4))
     assert "attn.indexer.wq_b.weight" not in window
 
 
@@ -331,7 +399,9 @@ def test_weight_table_follows_the_tp_size(tp, name, shape):
     from atom.models.deepseek_v41.config import AttentionMode
     from atom.models.deepseek_v41.mono import weights
 
-    assert weights.expected(_v41_config(), AttentionMode.FULL, tp)[name][0] == shape
+    assert (
+        weights.expected(_v41_config(), AttentionMode.FULL, Dims(tp))[name][0] == shape
+    )
 
 
 def test_a_weight_off_the_table_is_refused():
@@ -339,18 +409,18 @@ def test_a_weight_off_the_table_is_refused():
     from atom.models.deepseek_v41.mono import weights
     from atom.mono.runtime.consensus import MonoUnsupported
 
-    table = weights.expected(_v41_config(), AttentionMode.FULL, 4)
-    weights.bind_layer(_Block(table, AttentionMode.FULL), _v41_config(), 4)
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
+    weights.bind_layer(_Block(table, AttentionMode.FULL), _v41_config(), Dims(4))
     for name, change in (
         ("attn.wq_b.weight", ((8192, 1024), torch.float8_e4m3fn)),
         ("attn.attn_sink", ((16,), torch.bfloat16)),
     ):
         bad = dict(table, **{name: change})
         with pytest.raises(MonoUnsupported, match=name):
-            weights.bind_layer(_Block(bad, AttentionMode.FULL), _v41_config(), 4)
+            weights.bind_layer(_Block(bad, AttentionMode.FULL), _v41_config(), Dims(4))
     missing = {k: v for k, v in table.items() if k != "ffn_norm.weight"}
     with pytest.raises(MonoUnsupported, match="no ffn_norm.weight"):
-        weights.bind_layer(_Block(missing, AttentionMode.FULL), _v41_config(), 4)
+        weights.bind_layer(_Block(missing, AttentionMode.FULL), _v41_config(), Dims(4))
 
 
 @pytest.mark.parametrize(
@@ -361,7 +431,7 @@ def test_routed_experts_off_a8w4_are_refused(interleaved, fp8_activations):
     from atom.models.deepseek_v41.mono import weights
     from atom.mono.runtime.consensus import MonoUnsupported
 
-    table = weights.expected(_v41_config(), AttentionMode.FULL, 4)
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
     block = _Block(
         table,
         AttentionMode.FULL,
@@ -369,4 +439,4 @@ def test_routed_experts_off_a8w4_are_refused(interleaved, fp8_activations):
         fp8_activations=fp8_activations,
     )
     with pytest.raises(MonoUnsupported, match="not A8W4"):
-        weights.bind_layer(block, _v41_config(), 4)
+        weights.bind_layer(block, _v41_config(), Dims(4))

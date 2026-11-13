@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     NonNegativeInt,
@@ -79,6 +80,22 @@ def resolve_prompt_token_ids(
     return ids
 
 
+# The leave reasons that mean the model ended the output itself: its EOS, one
+# of the request's stop sequences, or one of the model's stop tokens
+# (`stop_<token_id>`), and `stop`, the same fact in OpenAI's words. Every other
+# reason -- `max_tokens`, `aborted`, `unschedulable: ...` -- cut it off.
+MODEL_STOP_REASONS = ("eos", "stop", "stop_sequence")
+STOP_TOKEN_REASON_PREFIX = "stop_"
+
+
+def ended_by_stop(finish_reason: str | None) -> bool:
+    """Did the model end its output itself, rather than being cut off?"""
+    return finish_reason is not None and (
+        finish_reason in MODEL_STOP_REASONS
+        or finish_reason.startswith(STOP_TOKEN_REASON_PREFIX)
+    )
+
+
 def openai_stop_reason(finish_reason: str | None) -> str | None:
     """The engine's leave reason as OpenAI spells it.
 
@@ -94,7 +111,9 @@ def openai_stop_reason(finish_reason: str | None) -> str | None:
     """
     if finish_reason is None:
         return None
-    if finish_reason in ("stop", "length", "tool_calls"):
+    if ended_by_stop(finish_reason):
+        return "stop"
+    if finish_reason in ("length", "tool_calls"):
         return finish_reason
     if finish_reason in ("max_tokens", "max_new_tokens"):
         return "length"
@@ -205,11 +224,18 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self, *, preserve_content: bool = False) -> dict[str, Any]:
+    def to_template_dict(
+        self,
+        *,
+        preserve_content: bool = False,
+        preserve_tool_call_arguments: bool = False,
+    ) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
+        ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
+        as sent, for templates that render them verbatim (Kimi-K3).
         """
         d: dict[str, Any] = {
             "role": self.role,
@@ -223,7 +249,7 @@ class ChatMessage(BaseModel):
             if key in extras:
                 d[key] = (
                     _normalize_tool_call_arguments(extras[key])
-                    if key == "tool_calls"
+                    if key == "tool_calls" and not preserve_tool_call_arguments
                     else extras[key]
                 )
         return d
@@ -245,6 +271,9 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
+    logprobs: Annotated[bool, Field(strict=True)] | None = False
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
@@ -301,8 +330,11 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    # Required when no prompt_token_ids are supplied.
-    prompt: str | None = None
+    # Required when no prompt_token_ids are supplied. Per the OpenAI spec this
+    # may also be an array of token ids; that form is accepted and routed to the
+    # pre-tokenized path (see get_prompt_or_tokens). The nested
+    # array-of-token-arrays (batch) form is not supported.
+    prompt: str | list[int] | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -331,6 +363,12 @@ class CompletionRequest(BaseModel):
             return ids
         if self.prompt is None:
             raise ValueError("either 'prompt' or 'prompt_token_ids' is required")
+        if isinstance(self.prompt, list):
+            # OpenAI-spec `prompt` as an array of token ids: same meaning as
+            # prompt_token_ids, so take the pre-tokenized path.
+            if not self.prompt:
+                raise ValueError("'prompt' was given as a token array but is empty")
+            return self.prompt
         return self.prompt
 
     def get_max_tokens(self) -> int:
@@ -340,6 +378,55 @@ class CompletionRequest(BaseModel):
         if self.max_tokens is not None:
             return validate_max_tokens(self.max_tokens)
         return DEFAULT_MAX_TOKENS
+
+
+def _one_or_many(value: Any) -> Any:
+    """A single stop string as a list of one."""
+    return [value] if isinstance(value, str) else value
+
+
+# DeepSeek's API takes one stop string or a list of them.
+OneOrManyStops = Annotated[list[str] | None, BeforeValidator(_one_or_many)]
+
+
+class BetaChatCompletionRequest(ChatCompletionRequest):
+    """``/beta/chat/completions``: Chat with DeepSeek's beta contract.
+
+    A final assistant message may carry ``prefix: true`` to be continued
+    (see ``prefix_completion``), and ``stop`` may be a single string.
+    """
+
+    stop: OneOrManyStops = None
+
+
+class BetaCompletionRequest(CompletionRequest):
+    """``/beta/completions``: completions with DeepSeek's FIM parameters.
+
+    ``/v1/completions`` does not declare these, so it ignores them, as it
+    always has.
+    """
+
+    stop: OneOrManyStops = None
+    # Text after the gap that fill-in-the-middle asks the model to fill.
+    suffix: str | None = None
+    # Only with `stream`: `include_usage` puts `usage` on every chunk.
+    stream_options: dict[str, Any] | None = None
+    # Return the prompt ahead of the completion; not with `suffix`.
+    echo: bool | None = False
+    # DeepSeek's range. Completions return no token probabilities yet, so
+    # a value is refused rather than dropped.
+    logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
+
+    def get_max_tokens(self) -> int:
+        """As for /v1, except that 0 is allowed: DeepSeek's completions take
+        ``max_tokens >= 0``, and 0 generates nothing (the ``echo`` alone).
+        """
+        limit = (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+        return 0 if limit == 0 else super().get_max_tokens()
 
 
 # ============================================================================
@@ -385,6 +472,12 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
+    name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    effort: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

@@ -5,7 +5,6 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from typing import Optional
 
 import numpy as np
 import torch
@@ -15,6 +14,7 @@ from aiter.dist.utils import get_distributed_init_method
 
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.forward_context import get_forward_context
@@ -22,7 +22,9 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
+class RLHFModelRunner(
+    ModelRunner, WeightUpdaterMixin, MemoryManagerMixin, CapabilityProviderMixin
+):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
     Used when ATOM is driven by an external RLHF framework (veRL or TorchSpec).
@@ -43,6 +45,8 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def __init__(self, rank: int, config):
+        if config.sequence_parallel_size > 1:
+            raise ValueError("RLHF rollout does not support Ulysses SP (-sp).")
         # 0 -- the default -- means "this checkpoint's vocabulary is not
         # padded", which is the right answer for almost every model and costs
         # one comparison per step.
@@ -180,9 +184,9 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         )
 
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
-        # within ModelRunner. Override so downstream code (get_dp_padding,
-        # ForwardMode.decide/sync_dp_metadata) sees dp_size=1 and skips cross-DP
-        # collectives that would fail on the isolated process group.
+        # within ModelRunner. Override so downstream code (ForwardMode.decide /
+        # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
+        # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
 
         # aiter's init_dist_env creates a signal tensor on device=rankID
@@ -232,6 +236,19 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             if module is not None:
                 logger.info(f"{self.label}: using {name} for hidden states hooks")
                 return module
+        return None
+
+    def _find_model_attr(self, name):
+        """`name` on the model or a module it wraps (`.model`), or None."""
+        module = self.model
+        for _ in range(8):
+            found = getattr(type(module), name, None)
+            if found is not None:
+                return getattr(module, name)
+            inner = getattr(module, "model", None)
+            if inner is None or inner is module:
+                return None
+            module = inner
         return None
 
     def _register_hidden_state_hooks(self) -> bool:
@@ -293,6 +310,14 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             mooncake_config: Dict with Mooncake connection parameters
                 (``local_hostname``, ``metadata_server``, ``protocol``, etc.).
         """
+        # DeepSeek-V4.1's decoder SWA bounded replay computes only each
+        # request's tail rows, and is fixed at launch.
+        replaying = self._find_model_attr("decoder_replay_active")
+        if replaying is not None and replaying():
+            raise ValueError(
+                f"{self.label}: hidden-state export reads every prefill row; "
+                "launch with --no-decoder-swa-bounded-replay"
+            )
         from torchspec.config.mooncake_config import MooncakeConfig
         from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
@@ -300,8 +325,8 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         mc_cfg = MooncakeConfig(**mooncake_config)
         self._mooncake_store = EagleMooncakeStore(mc_cfg)
         self._extract_mode = True
-        self._captured_hidden_states: Optional[dict[int, torch.Tensor]] = None
-        self._captured_last_hidden_states: Optional[torch.Tensor] = None
+        self._captured_hidden_states: dict[int, torch.Tensor] | None = None
+        self._captured_last_hidden_states: torch.Tensor | None = None
         self._hook_capture_enabled = False
         self._hook_captured_hidden_states: dict[int, torch.Tensor] = {}
         self._use_hook_capture = self._register_hidden_state_hooks()
@@ -315,7 +340,7 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     def run_model(
         self,
         input_ids: torch.Tensor,
-        batch: Optional[ScheduledBatch] = None,
+        batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._extract_mode:
             return super().run_model(input_ids, batch)

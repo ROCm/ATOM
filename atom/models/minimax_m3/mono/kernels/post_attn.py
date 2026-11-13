@@ -114,7 +114,7 @@ from atom.models.minimax_m3.mono.layout import (
     wide_moe,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, load_ptr64
+from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64
 from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
@@ -555,7 +555,7 @@ def build_post_attn_kernel(
         (stage_moe_wide if WIDE else stage_moe)()
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
-    @flyc.jit
+    @launcher(kernel_name)
     def launch_post_attn(
         h_in: Int64,
         q: Int64,

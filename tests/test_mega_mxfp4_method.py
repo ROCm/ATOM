@@ -17,18 +17,25 @@ def test_mega_method_is_mxfp4_specialization():
     assert issubclass(moe_mod.MegaMxfp4MoEMethod, moe_mod.Mxfp4MoEMethod)
 
 
+@pytest.mark.parametrize("sp", [False, True])
 @pytest.mark.parametrize("backend_name", ["standard", "mega"])
-def test_mxfp4_method_selection(monkeypatch, backend_name):
+def test_mxfp4_method_selection(monkeypatch, backend_name, sp):
     standard_method = object()
     mega_method = object()
     config = SimpleNamespace(moe_backend=backend_name)
     monkeypatch.setattr(moe_mod, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(moe_mod, "sp_is_enabled", lambda: sp)
     monkeypatch.setattr(moe_mod, "Mxfp4MoEMethod", lambda *_args: standard_method)
     monkeypatch.setattr(moe_mod, "MegaMxfp4MoEMethod", lambda *_args: mega_method)
 
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
-    assert selected is (mega_method if backend_name == "mega" else standard_method)
+    # Under SP, `mega` is SP MegaMoE over the standard method's weights.
+    use_mega = backend_name == "mega" and not sp
+    assert selected is (mega_method if use_mega else standard_method)
+    if sp:
+        # Nor does it hold the layer to the EP backend's requirements.
+        moe_mod.FusedMoE._validate_moe_backend(SimpleNamespace(quant_method=selected))
 
 
 @pytest.mark.parametrize("fp8_activations", [False, True])
@@ -46,13 +53,20 @@ def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activa
         quant_type=object(), quant_dtype=object(), quant_method=None, is_dynamic=True
     )
     moe_config = SimpleNamespace(
-        a_quant_dtype=None, mxfp4_fp8_activations=fp8_activations, use_ep=False
+        a_quant_dtype=None,
+        mxfp4_fp8_activations=fp8_activations,
+        use_ep=False,
+        in_dtype=torch.bfloat16,
+        hidden_dim=256,
     )
 
     method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
     assert method.fp8_activations is fp8_activations
     assert method.is_guinterleave is fp8_activations
+    # Routed rows that move between ranks travel in the MXFP8 the experts take.
+    wire = method.routed_rows_wire
+    assert (wire is not None and wire.dtype == moe_mod.dtypes.fp8) is fp8_activations
 
 
 @pytest.mark.parametrize(
@@ -104,17 +118,13 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
     method.fp8_activations = fp8_activations
     method.hidden_pad = 0
     method.intermediate_pad = 0
-    # Skip both pre-routing early returns so apply() reaches the post-routing
-    # block. use_triton_decode=False also short-circuits get_forward_context().
+    # Skip the Triton block so apply() reaches the FlyDSL tail.
+    # use_triton_decode=False also short-circuits get_forward_context().
     # `use_triton_ep` is the EP half of the same pair and is read further down;
-    # False keeps this on the TP path the post-routing block belongs to.
+    # False keeps this on the TP path the FlyDSL tail belongs to.
     method.use_triton = False
     method.use_triton_decode = False
     method.use_triton_ep = False
-    method.select_experts_with_record = lambda **_kwargs: (
-        "topk_weights",
-        "topk_ids",
-    )
     layer = SimpleNamespace(
         w13_weight="w1",
         w2_weight="w2",
@@ -131,9 +141,8 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
     result = method.apply(
         layer=layer,
         x="x",
-        router_logits="router_logits",
-        top_k=4,
-        renormalize=False,
+        topk_weights="topk_weights",
+        topk_ids="topk_ids",
         global_num_experts=16,
         expert_map="expert_map",
         activation="silu",
@@ -159,6 +168,8 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
         "doweight_stage1": False,
         "bias1": "b1",
         "bias2": "b2",
+        # No count: these rows were not marked as this rank's own.
+        "num_local_tokens": None,
         "gate_mode": moe_mod.GateMode.INTERLEAVE.value,
         "swiglu_limit": 7.0,
     }
@@ -230,6 +241,9 @@ def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
 
 
 def test_mega_backend_uses_global_dispatch_width(monkeypatch):
+    pytest.importorskip(
+        "triton", reason="MegaMoE imports its Triton row-zeroing kernel"
+    )
     from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
 
     captured = {}

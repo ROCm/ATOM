@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from functools import wraps
 
 import torch
 
@@ -28,6 +29,32 @@ _FUSED_EXPERT_LEAVES = {
 }
 
 _EXPERTS_PREFIX_SUFFIX = ".experts"
+
+
+def _discard_sync_state_on_error(method):
+    """A failed bucket may leave no scratch for the next sync to inherit."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self._discard_failed_weight_sync()
+            raise
+
+    return guarded
+
+
+def _one_update(method):
+    """Each call is one update, with its own wait for the readers of the
+    weights modules write themselves (`_synced_by_module`)."""
+
+    @wraps(method)
+    def update(self, *args, **kwargs):
+        self._module_readers_awaited = False
+        return method(self, *args, **kwargs)
+
+    return update
 
 
 def _unwrap_once(module) -> torch.nn.Module | None:
@@ -109,6 +136,28 @@ class WeightUpdaterMixin:
                 f"sender's names against the model's own "
                 f"(`model.named_parameters()`)."
             )
+
+    def _discard_failed_weight_sync(self) -> None:
+        """Drop reusable transport scratch after a failed update.
+
+        The generic RPC path reports an exception without killing the worker,
+        so this state now outlives a failed call unless it is explicitly
+        cleared. Expert-relayout bookkeeping is recovery state rather than
+        scratch and deliberately survives. Parameters already written cannot
+        be rolled back; EngineCore fences serving until a complete sync.
+        """
+        if hasattr(self, "_ipc_buffer"):
+            self._ipc_buffer = None
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        # Do not clear _expert_relayout_pending. A weight already written
+        # row-major still needs the later complete sync's finalizer to restore
+        # the layout its kernel reads, even if that sync does not touch it.
+
+    def discard_failed_weight_sync(self) -> bool:
+        """Worker RPC used to clear every peer after any one rank failed."""
+        self._discard_failed_weight_sync()
+        return True
 
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
@@ -205,6 +254,8 @@ class WeightUpdaterMixin:
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
+        if self._synced_by_module(module, param_name, tensor, shard_id):
+            return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
             return "skipped"
@@ -250,6 +301,30 @@ class WeightUpdaterMixin:
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
         return "updated"
+
+    def _synced_by_module(
+        self,
+        module: torch.nn.Module,
+        param_name: str,
+        tensor: torch.Tensor,
+        shard_id=None,
+    ) -> bool:
+        """Whether the module wrote this weight itself (``sync_weight``), for
+        a parameter that is only a placeholder for where the values live; it
+        is asked before the FP8 branches, which would leave such a weight
+        unchanged and count it as updated.
+
+        The module may write from the host, which no stream orders after the
+        last step's reads, so the device is waited for once per update.
+        """
+        sync = getattr(module, "sync_weight", None)
+        if not callable(sync):
+            return False
+        if not self._module_readers_awaited:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self._module_readers_awaited = True
+        return sync(param_name, tensor, shard_id)
 
     def _apply_unmatched_weight(
         self,
@@ -731,6 +806,30 @@ class WeightUpdaterMixin:
             and getattr(module, "weight_scale", None) is not None
         )
 
+    @staticmethod
+    def _logical_weight_shape(
+        module: torch.nn.Module, param: torch.nn.Parameter
+    ) -> tuple:
+        """Parameter shape without the E8M0 per_1x128 output-row pad.
+
+        Other layouts, including per-token FP8 padding, keep ``param.shape``:
+        their scale rows are padded too, and zero-filling before quantize would
+        not reproduce that scale.
+        """
+        from aiter import dtypes
+
+        shape = tuple(param.shape)
+        if (
+            module.weight_scale.dtype != dtypes.fp8_e8m0
+            or not getattr(module, "is_output_padded", False)
+            or len(shape) != 2
+        ):
+            return shape
+        logical_n = getattr(module, "_output_size_before_padding", None)
+        if not isinstance(logical_n, int) or not 0 < logical_n < shape[0]:
+            return shape
+        return (logical_n, shape[1])
+
     def _requantize_fp8_weight(
         self,
         module: torch.nn.Module,
@@ -750,15 +849,23 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
 
+        # E8M0 per_1x128 stores N padded up to a multiple of 128. The
+        # training weight is the logical, unpadded shape, so shard and compare
+        # against that and restore the pad rows before the shape check below.
+        logical_shape = self._logical_weight_shape(module, param)
         tp_size = self.world_size
         if tp_size > 1 and tensor_gpu.shape != param.shape:
             for dim in range(len(param.shape)):
-                if tensor_gpu.shape[dim] == param.shape[dim] * tp_size:
-                    shard_size = param.shape[dim]
+                if tensor_gpu.shape[dim] == logical_shape[dim] * tp_size:
+                    shard_size = logical_shape[dim]
                     tensor_gpu = tensor_gpu.narrow(
                         dim, self.rank * shard_size, shard_size
                     )
                     break
+        if tensor_gpu.shape == logical_shape and logical_shape != tuple(param.shape):
+            tensor_gpu = torch.nn.functional.pad(
+                tensor_gpu, (0, 0, 0, param.shape[0] - tensor_gpu.shape[0])
+            )
 
         if tensor_gpu.shape != param.shape:
             logger.warning(
@@ -777,12 +884,23 @@ class WeightUpdaterMixin:
             # produced a 1x128-along-K scale (N, K//128) and sliced it into the
             # (N//128, K//128) buffer, which is inconsistent with the blockscale
             # GEMM and collapses generation after the first weight update.
+            # ``scale_dtype`` has to be decided here too. Casting an FP32 scale
+            # to E8M0 afterwards does not round it up to a power of two, and
+            # the weight would have been quantized against the unrounded scale.
             from atom.quantization.quark.utils import (
                 quantize_weight_to_fp8_128x128_blockscale,
             )
 
             q_weight, scale = quantize_weight_to_fp8_128x128_blockscale(
-                tensor_gpu, fp8_dtype
+                tensor_gpu,
+                fp8_dtype,
+                # Online quant rebuilds its own (maybe E8M0) scale; a
+                # checkpoint's scale keeps main's FP32 requantize.
+                scale_dtype=(
+                    module.weight_scale.dtype
+                    if getattr(module.quant_config, "online_quant", False)
+                    else torch.float32
+                ),
             )
             # The scale writes ride on the weight's fence: `_await_readers_of`
             # synchronizes the device, so the reader that held the weight held
@@ -890,6 +1008,8 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_one_update
+    @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:
@@ -936,6 +1056,8 @@ class WeightUpdaterMixin:
 
             if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)
@@ -989,6 +1111,8 @@ class WeightUpdaterMixin:
         self._warn_if_nothing_matched(updated, skipped)
         return updated
 
+    @_one_update
+    @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
         shm_name: str,
@@ -1064,6 +1188,8 @@ class WeightUpdaterMixin:
                         name, param_name, module, param, tensor
                     )
                     updated += 1
+                elif self._synced_by_module(module, param_name, tensor):
+                    updated += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                     self._requantize_fp8_weight(module, param_name, param, tensor)
                     updated += 1
@@ -1120,6 +1246,8 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_one_update
+    @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,
         ipc_handle,
@@ -1225,6 +1353,8 @@ class WeightUpdaterMixin:
 
             if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)

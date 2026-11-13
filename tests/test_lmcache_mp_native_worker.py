@@ -3,6 +3,8 @@
 
 """Worker contracts for reusable native-state LMCache MP transfers."""
 
+import copy
+import json
 import sys
 import types
 from dataclasses import dataclass, replace
@@ -30,16 +32,22 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.mp.deployment import (
     _model_namespace,
     _tp_replication_factor,
+    require_native_state_server,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
-    require_native_state_server,
+)
+from atom.model_engine.arg_utils import (
+    compose_kv_offload_config,
+    kv_offload_connector_config,
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
 
 
 @dataclass
@@ -48,6 +56,7 @@ class _TransferSpec:
     block_ids: list[list[int]]
     start: int = 0
     end: int = 0
+    request_configs: dict | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +94,7 @@ def config(**extra):
         kv_cache_block_size=4,
         tensor_parallel_size=2,
         hf_config=SimpleNamespace(model_type="reusable_test_model", kv_lora_rank=512),
+        speculative_config=None,
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": "offload",
@@ -93,8 +103,7 @@ def config(**extra):
     )
 
 
-@pytest.fixture
-def worker():
+def _make_worker(*, images=True):
     instance = NativeStateLMCacheMPConnector(config())
     page = torch.zeros((32, 1, 32), dtype=torch.uint8)
     spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
@@ -112,7 +121,7 @@ def worker():
     )
     tensors.set_block_count(32)
     instance._native_layout = build_native_state_mp_layout(
-        tensors, block_size=4, chunk_size=8
+        tensors, block_size=4, chunk_size=8, images=images
     )
     instance.chunk_size = 8
     instance.submitted = []
@@ -128,6 +137,17 @@ def worker():
         submit_store_request=submit, submit_retrieve_request=submit
     )
     return instance
+
+
+@pytest.fixture
+def worker():
+    return _make_worker()
+
+
+@pytest.fixture
+def page_worker():
+    """A worker whose layout registered PAGE alone (`stores_state_images` False)."""
+    return _make_worker(images=False)
 
 
 def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
@@ -209,8 +229,9 @@ def test_invalid_native_source_fails_before_transport(worker, units):
 
 
 @pytest.mark.parametrize("loading", [False, True])
+@pytest.mark.parametrize("submit_raises", [False, True])
 def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine(
-    worker, monkeypatch, loading
+    worker, monkeypatch, loading, submit_raises
 ):
     """No clock releases a lease the server may still be using: the operation
     stays pending, and past the transfer deadline the worker fails stop."""
@@ -222,8 +243,9 @@ def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine
     def unprovable(*_):
         raise ConnectionError("server may have received request")
 
-    worker._adapter.submit_store_request = unprovable
-    worker._adapter.submit_retrieve_request = unprovable
+    if submit_raises:
+        worker._adapter.submit_store_request = unprovable
+        worker._adapter.submit_retrieve_request = unprovable
     pending = worker._native_loads if loading else worker._native_saves
     if loading:
         worker._submit_load(request(loading=True), object())
@@ -253,6 +275,133 @@ def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch)
     assert not finished.finished_loading
 
 
+def _kv_only_load(hbm=8):
+    return replace(
+        request(loading=True, hbm=hbm),
+        native_state=NativeStateTransfer((), 16, 998, None, kv_only=True),
+    )
+
+
+def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
+    req = replace(_kv_only_load(), cache_salt="11")
+    page_worker._submit_load(req, object())
+    # The lookup that reported the reach also locked it, under this session.
+    assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
+    [spec] = page_worker.submitted
+    # PAGE for [8, 16) and nothing else: the layout has no image group.
+    assert spec.block_ids == [[3, 4]]
+    assert spec.cache_salt == "11"
+
+
+def test_page_only_save_stores_page_alone(page_worker):
+    req = replace(
+        request(), native_state=NativeStateTransfer((), 16, 998, None, kv_only=True)
+    )
+    page_worker._submit_save(req, object())
+    [spec] = page_worker.submitted
+    assert spec.block_ids == [[1, 2, 3, 4]]
+    assert spec.cache_salt == ""
+    page_worker.future.ready = True
+    terminals = [
+        completion
+        for completion in page_worker.get_finished().connector_completions
+        if completion.channel == NATIVE_STATE_MP_STORE_CHANNEL
+    ]
+    assert terminals == [
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+    ]
+
+
+def test_kv_only_load_restores_nothing(page_worker, monkeypatch):
+    monkeypatch.setattr(
+        page_worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
+    )
+    req = _kv_only_load()
+    page_worker._submit_load(req, object())
+    page_worker.future.ready = True
+    finished = page_worker.get_finished()
+    assert finished.finished_loading == {req.load_operation}
+
+
+def test_a_page_only_layout_registers_no_image_group(page_worker, worker):
+    assert not page_worker._native_layout.images
+    assert {g.engine_group_id for g in page_worker._native_layout.kernel_groups} == {0}
+    assert not any(g.recurrent_state for g in page_worker._native_layout.kernel_groups)
+    assert any(g.recurrent_state for g in worker._native_layout.kernel_groups)
+
+
+def test_page_alone_on_an_images_layout_fails_before_transport(worker):
+    # The scheduler and this worker disagree about images: nothing is sent.
+    worker._submit_load(_kv_only_load(), object())
+    assert worker.submitted == []
+
+
+def test_an_image_on_a_page_only_layout_fails_before_transport(page_worker):
+    page_worker._submit_save(request(), object())
+    assert page_worker.submitted == []
+
+
+@pytest.mark.parametrize("replay, images", [(7875, False), (0, True)])
+def test_images_follow_the_replay(replay, images):
+    assert stores_state_images(replay) is images
+
+
+def _engine_config(kv_transfer_config, architectures=("DeepseekV4ForCausalLM",)):
+    hf = SimpleNamespace(
+        architectures=list(architectures),
+        sliding_window=128,
+        num_hidden_layers=61,
+        compress_ratios=[4, 128, 0],
+        num_nextn_predict_layers=1,
+    )
+    config = SimpleNamespace(
+        hf_config=hf,
+        speculative_config=None,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        enable_prefix_caching=True,
+        kv_transfer_config=kv_transfer_config,
+    )
+    config.state_replay_tokens = state_replay_tokens(config)  # Config.__post_init__
+    return config
+
+
+def test_the_scheduler_and_its_workers_read_one_replay_length(monkeypatch):
+    """Both decide images from `Config.state_replay_tokens`, set once on the
+    engine's config. A `multi` connector hands its offload leg a copy, so P/D
+    plus LMCache MP offload (whose P/D loads know nothing of a replay) runs no
+    replay and keeps images on both sides."""
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    pd = json.dumps({"kv_role": "kv_producer", "kv_connector": "mooncake"})
+    composed = json.loads(
+        compose_kv_offload_config(pd, kv_offload_connector_config("lmcache_mp", ""))
+    )
+    assert composed["kv_connector"] == "multi"
+    engine = _engine_config(composed)
+    assert engine.state_replay_tokens == 0
+    leg = copy.copy(engine)  # as `MultiConnector` builds its offload leg
+    leg.kv_transfer_config = composed["connectors"][1]
+    assert stores_state_images(leg.state_replay_tokens)
+    assert stores_state_images(engine.state_replay_tokens)
+    # LMCache MP offload alone replays, and neither side stores images.
+    alone = _engine_config({"kv_connector": "lmcache_mp", "kv_role": "offload"})
+    assert alone.state_replay_tokens == 128 + 60 * 127
+    assert not stores_state_images(alone.state_replay_tokens)
+
+
+def test_a_model_the_replay_does_not_cover_keeps_its_images(monkeypatch):
+    """Kimi-K3's KDA state has no bounded receptive field: only an image
+    restores it. The replay switch is DeepSeek-V4's, so it changes nothing
+    there, even turned on."""
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    k3 = _engine_config(
+        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+        architectures=("KimiK3ForConditionalGeneration",),
+    )
+    assert k3.state_replay_tokens == 0
+    assert stores_state_images(k3.state_replay_tokens)
+
+
 def test_load_completion_waits_for_native_restore(worker, monkeypatch):
     restore_event = Future(ready=False)
     restored = []
@@ -276,12 +425,15 @@ def test_load_completion_waits_for_native_restore(worker, monkeypatch):
 
 
 def test_query_exception_never_releases_dma_source(worker):
+    from atom.kv_transfer.offload.mp.transfer import LMCacheTransferUnprovable
+
     def broken():
         raise RuntimeError("IPC event unavailable")
 
     worker.future.query = broken
     worker._submit_save(request(), object())
-    assert not worker.get_finished().connector_completions
+    with pytest.raises(LMCacheTransferUnprovable, match="IPC event unavailable"):
+        worker.get_finished()
     assert worker._native_saves
 
 
@@ -480,6 +632,40 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     assert worker._native_loads == {}
 
 
+def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
+    worker, cuda, monkeypatch
+):
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
+    from atom.kv_transfer.offload.mp import transfer
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: None
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    now[0] += worker._transfer_deadline_s + 5
+    worker.future.value, worker.future.ready = True, True
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert len(worker._native_loads) == 1
+
+    now[0] += worker._transfer_deadline_s - 1
+    assert not worker.get_finished().finished_loading
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    assert worker.get_finished().finished_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
+
+
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     """Pinned staging allocation synchronizes; the restore slots are reserved
     while registering, not on the connector thread mid-serving."""
@@ -487,6 +673,7 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     import types
 
     from atom.kv_transfer.offload.mp import native_state_layout, native_state_worker
+    from atom.kv_transfer.offload.mp import worker as mp_worker
 
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
@@ -496,12 +683,9 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
         register_kv_caches=lambda tensors, engine_group_infos: None,
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(
-        native_state_worker, "_make_worker_adapter", lambda *_a, **_k: adapter
-    )
-    monkeypatch.setattr(
-        native_state_worker, "require_native_state_server", lambda *_a: None
-    )
+    # The registration both MP workers share lives on the base worker.
+    monkeypatch.setattr(mp_worker, "_make_worker_adapter", lambda *_a, **_k: adapter)
+    monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
     monkeypatch.setattr(
         native_state_layout.NativeStateMPLayout, "engine_group_infos", lambda _s: []
     )
@@ -570,10 +754,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import native_state_worker
+    from atom.kv_transfer.offload.mp import deployment
 
     monkeypatch.setattr(
-        native_state_worker.offcfg,
+        deployment.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )
@@ -595,3 +779,66 @@ def test_native_namespace_changes_with_image_codec(monkeypatch):
     assert _model_namespace(config(), checkpoint_spec=first) != _model_namespace(
         config(), checkpoint_spec=second
     )
+
+
+def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
+    # Scheduler and workers that disagree about images find nothing, never
+    # each other's objects.
+    from atom.kv_transfer.offload.mp import deployment
+
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _: object())
+    monkeypatch.setattr(deployment.offcfg, "lmcache_replica_world_size", lambda _: 2)
+    monkeypatch.setattr(
+        deployment.offcfg, "build_page_namespace", lambda *_: "page-config"
+    )
+    spec = PagedStateCheckpointSpec(32, 128, "native-test-v1", 80)
+    with_images = _model_namespace(config(), checkpoint_spec=spec)
+    page_alone = _model_namespace(config(), checkpoint_spec=spec, images=False)
+    assert with_images != page_alone
+    assert "::native-state-v1-" in with_images
+    assert "::native-page-v1-" in page_alone
+
+
+def test_a_save_that_landed_during_the_forward_is_reported_that_step(worker):
+    """The scheduler admits at most `max_pending_saves` native saves (two by
+    default), so one reported a step late keeps the next out: the report
+    polls every save, on the step thread."""
+    req = request()
+    worker._submit_save(req, object())
+    worker.future.ready = True
+    completions = worker.get_finished().connector_completions
+    assert (
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+        in completions
+    )
+
+
+def test_native_transfers_are_submitted_and_polled_on_the_step_thread():
+    """As native ATOM always has: a submit before the forward and a poll at
+    the report, the timing its save admission is sized to. No transfer
+    thread starts."""
+    import threading
+
+    instance = _make_worker()
+    submit, query = [], []
+    future = instance.future
+    real_query = future.query
+
+    def recording_query():
+        query.append(threading.current_thread() is threading.main_thread())
+        return real_query()
+
+    future.query = recording_query
+
+    def recording_submit(request_id, op, event):
+        submit.append(threading.current_thread() is threading.main_thread())
+        return future
+
+    instance._adapter.submit_store_request = recording_submit
+    threads = threading.active_count()
+    instance._submit_save(request(), object())
+    future.ready = True
+    assert submit == [True]
+    instance.get_finished()
+    assert query and all(query)
+    assert threading.active_count() == threads

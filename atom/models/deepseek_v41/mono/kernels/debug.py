@@ -7,12 +7,13 @@ region, pair index, tags and CTA in the scratch words at the build's
 
 import flydsl.expr as fx
 
+from atom.models.deepseek_v41.mono.kernels.peer_layout import PEER_REGIONS
 from atom.mono.device.sync import Mailbox
 from atom.mono.runtime.debug import region_ids, region_namer
 
 # the peer regions and the merged K2's readiness flags, besides the scratch
 # layouts' regions
-OTHER_REGIONS = ("attn", "ffn", "xrdy")
+OTHER_REGIONS = (*PEER_REGIONS, "xrdy")
 
 
 def mailbox(layer, scratch, diag_off, regions) -> Mailbox:

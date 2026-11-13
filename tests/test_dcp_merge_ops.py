@@ -36,9 +36,10 @@ runner, and those are the only ones that gate actually runs.
 """
 
 import ast
+import collections
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -51,11 +52,15 @@ from atom.config import (
     q_proj_has_row_sliceable_scale,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
+    qrep_for_step,
     qrep_unsupported_reason,
 )
 from atom.distributed.dcp_utils import (
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 
 try:
@@ -931,6 +936,122 @@ def test_gate_takes_no_interleave_input():
     )
 
 
+@pytest.mark.parametrize(
+    "qrep, seg, prefill, prefill_qrep, expected",
+    [
+        (True, False, False, False, True),  # decode: always, when the layer has QREP
+        (True, False, False, True, True),
+        (True, False, True, False, False),  # sparse prefill: gathers by default
+        (True, False, True, True, True),  # ... and replicates under the env
+        (True, True, False, False, False),  # seg: q_out is per-rank sized
+        (True, True, True, True, False),
+        (False, False, False, False, False),  # no QREP on the layer: never
+        (False, False, True, True, False),
+    ],
+)
+def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
+    assert qrep_for_step(qrep, seg, prefill, prefill_qrep) is expected
+
+
+@pytest.mark.parametrize(
+    "env, dcp, heads, fp8, gfx950, page, mbt, expected",
+    [
+        ("1", 4, 64, True, True, "1", 16384, True),  # tp4/dcp4: the one shape it serves
+        ("1", 8, 64, True, True, "1", 16384, True),  # tp8/dcp8, 8 heads a rank
+        ("1", 4, 64, True, True, "1", 32768, True),  # largest step budget it takes
+        ("1", 4, 64, True, True, "1", 65536, False),  # more q rows than it takes
+        ("0", 4, 64, True, True, "1", 16384, False),  # opt-in only
+        ("1", 1, 64, True, True, "1", 16384, False),  # no DCP group
+        ("1", 2, 32, True, True, "1", 16384, False),  # kernel is gqa64 only
+        ("1", 4, 128, True, True, "1", 16384, False),
+        ("1", 4, 64, False, True, "1", 16384, False),  # bf16 q/KV
+        ("1", 4, 64, True, False, "1", 16384, False),  # not gfx950
+        ("1", 4, 64, True, True, "16", 16384, False),  # paged MLA
+    ],
+)
+def test_sparse_prefill_nonps_gate(
+    monkeypatch, env, dcp, heads, fp8, gfx950, page, mbt, expected
+):
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
+
+
+def test_sparse_prefill_nonps_is_on_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_DCP_SPARSE_PREFILL_NONPS", raising=False)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, True, 16384)
+
+
+@pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
+def test_sparse_prefill_nonps_overrides_mode_and_width(persistent, width):
+    """The non-persistent gqa64 kernel runs non-persistent at exactly 64, whatever
+    the persistent table and the non-persistent pad table would pick; off, both
+    pass through untouched."""
+    assert mla_dcp_sparse_prefill_mode(True, persistent, width) == (False, 64)
+    assert mla_dcp_sparse_prefill_mode(False, persistent, width) == (persistent, width)
+
+
+@pytest.mark.parametrize("dcp", [2, 4, 8])
+def test_sparse_prefill_nonps_runs_one_split(dcp):
+    """One split for the non-persistent kernel, whose multi-split calls need
+    total_q * splits <= 32768 -- a full 16K step at the default splits would
+    exceed it."""
+    assert mla_dcp_sparse_prefill_kv_splits(True, dcp) == 1
+    assert 16384 * mla_dcp_sparse_prefill_kv_splits(True, dcp) <= 32768
+    assert mla_dcp_sparse_prefill_kv_splits(False, dcp) == max(2, 16 // dcp)
+    assert 16384 * mla_dcp_sparse_prefill_kv_splits(False, 4) > 32768
+
+
+@pytest.mark.parametrize("nonps, plans", [(True, 0), (False, 1)])
+def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
+    """Under PCP the owned-query reindex rebuilds the sparse-prefill work plan;
+    the non-persistent kernel reads none, so it must not be built or attached."""
+    try:
+        from atom.distributed import pcp_utils
+        from atom.model_ops.attentions import aiter_mla
+    except ImportError as e:  # aiter/triton absent
+        pytest.skip(f"requires full atom import env: {e}")
+    built = []
+    monkeypatch.setattr(
+        aiter_mla, "get_mla_metadata_v1", lambda *a, **k: built.append(a)
+    )
+    monkeypatch.setattr(aiter_mla, "get_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(pcp_utils, "get_pcp_rank", lambda: 0)
+    builder = SimpleNamespace(
+        device="cpu",
+        index_topk=2048,
+        dcp_sparse_prefill_nonps=nonps,
+        padded_num_attention_heads=64,
+        block_size=1,
+        dtype_q=None,
+        dtype_kv=None,
+        model_runner=SimpleNamespace(forward_vars=collections.defaultdict(object)),
+    )
+    forward_vars = builder.model_runner.forward_vars
+    forward_vars["sparse_cu_seqlens_q"] = SimpleNamespace(
+        gpu=torch.arange(5, dtype=torch.int32)
+    )
+    forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
+        gpu=torch.ones(4, dtype=torch.int32)
+    )
+    builder._sparse_prefill_work_plan = MethodType(
+        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
+    )
+    md = SimpleNamespace(
+        cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
+        cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
+        slot_mapping=torch.arange(4),
+        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
+    )
+    aiter_mla.AiterMLAMetadataBuilder._apply_pcp_reindex(
+        builder, md, 4, np.array([1, 2, 3, 4]), ""
+    )
+    assert len(built) == plans
+    assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
+    assert md.sparse_cu_seqlens_q.tolist() == [0, 1, 2]  # rank 0 owns q0, q2
+
+
 def test_gate_reason_is_human_readable():
     """The reason string is logged verbatim; it should name the actual cause."""
     reason = qrep_unsupported_reason(1, False)
@@ -1130,6 +1251,132 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
 
 
+@needs_gpu
+@pytest.mark.parametrize(
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+)
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_sparse_prefill_builder_allocates_for_its_consumer(
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+):
+    """12 heads per rank need distinct decode and prefill work buffers."""
+    from aiter import get_mla_metadata_info_v1
+
+    from atom.model_ops.attentions import aiter_mla, backends
+
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    monkeypatch.setenv("ATOM_MLA_KV_SHUFFLED", "0")
+    monkeypatch.setattr(backends, "attn_head_shard_size", lambda: 8)
+    for module in (backends, aiter_mla):
+        monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
+        monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
+    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda: True)
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_attention_heads=96,
+            index_topk=2048,
+            index_n_heads=32,
+            index_head_dim=128,
+        ),
+        max_model_len=16384,
+        max_num_batched_tokens=16,
+        kv_cache_dtype=cache_dtype,
+        index_cache_dtype="fp8",
+        attn_prefill_chunk_size=0,
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    runner = SimpleNamespace(
+        config=cfg,
+        block_size=128,
+        device=torch.device("cuda"),
+        max_num_batched_tokens=16,
+        max_bs=4,
+        num_spec_tokens=0,
+        has_mla_indexer=True,
+        forward_vars={},
+    )
+    builder = aiter_mla.AiterMLAMetadataBuilder(runner)
+    assert builder.persistent_num_heads == decode_heads
+    assert builder.sparse_prefill_num_heads == prefill_heads
+    names = (
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+    for prefix, rows, heads in (
+        ("", 4, decode_heads),
+        ("sparse_prefill_", 16, prefill_heads),
+    ):
+        info = get_mla_metadata_info_v1(
+            rows,
+            1,
+            heads,
+            builder.dtype_q,
+            builder.dtype_kv,
+            is_sparse=True,
+            fast_mode=True,
+        )
+        for name, (shape, dtype) in zip(names, info, strict=True):
+            tensor = runner.forward_vars[prefix + name]
+            expected_shape = (shape,) if isinstance(shape, int) else tuple(shape)
+            assert tuple(tensor.shape) == expected_shape
+            assert tensor.dtype == dtype
+
+
+@needs_gpu
+@pytest.mark.parametrize("lengths", [(45, 17), (1,), (13, 17, 3)])
+def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengths):
+    """The local cu-seqlens, not running_bs, bound the native gather's rows."""
+    from aiter import indexer_k_quant_and_cache
+
+    from atom.model_ops.indexer import indexer_forward
+
+    total = sum(lengths)
+    keys = torch.ones(total, 128, dtype=torch.bfloat16, device=DEV)
+    token = torch.arange(total, device=DEV)
+    for digit in range(2):
+        code = ((token >> (4 * digit)) & 15) - 8
+        keys[:, 2 * digit] = code
+        keys[:, 2 * digit + 1] = -code
+    # Distinct nonidentity pages for each real request; padding points at an
+    # unwritten page so reading it cannot reproduce the expected token tags.
+    table = torch.tensor([[3], [2], [1], [0]], dtype=torch.int32, device=DEV)
+    slots = torch.cat(
+        [
+            torch.arange(length, device=DEV) + (3 - request) * 128
+            for request, length in enumerate(lengths)
+        ]
+    )
+    cache = torch.full((4, 128, 132), 0xA5, dtype=torch.uint8, device=DEV)
+    indexer_k_quant_and_cache(keys, cache, slots, 128, "ue8m0", preshuffle=True)
+    # Put readable guards after the logical view. A gather that erroneously
+    # uses four table rows sees a bogus extra request overlapping valid rows.
+    cums = [0] + np.cumsum(lengths).tolist()
+    backing = torch.tensor(
+        cums + [0, total, total, total], dtype=torch.int32, device=DEV
+    )
+    md = SimpleNamespace(
+        dcp_indexer_local_total=total,
+        dcp_indexer_local_cu_seqlens=backing[: len(cums)],
+        dcp_indexer_gather_index=torch.arange(total, device=DEV),
+        block_tables=table,
+    )
+    monkeypatch.setattr(
+        indexer_forward,
+        "get_dcp_group",
+        lambda: SimpleNamespace(all_gather=lambda x, dim: x),
+    )
+    values, scales = indexer_forward._dcp_gather_indexer_k_prefill(
+        cache, md, 128, keys.device
+    )
+    torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
+
+
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
     """Pins gathered_num_heads at both call sites, not just the function.
 
@@ -1201,10 +1448,13 @@ def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
 
 _ATOM_MODELS = Path(__file__).resolve().parent.parent / "atom" / "models"
 
-# Query projections here must carry qrep_tp_override.
+# Query projections here must carry qrep_tp_override. Each entry is the path
+# relative to ``atom/models/``, not a bare file name: a model that is a package
+# names its module ``model.py``, so bare names collapse every such model onto
+# one ambiguous ``"model.py"`` key.
 _QREP_WIRED_MODELS = (
     "deepseek_v2.py",  # DeepSeek V2/V3/V3.2 and GLM-5.2 (GlmMoeDsaForCausalLM)
-    "kimi_k3.py",  # Kimi-K3 target
+    "kimi_k3/model.py",  # Kimi-K3 target
     "kimi_k3_dspark.py",  # DSpark draft for Kimi-K3
     "eagle3_deepseek_mla.py",  # eagle3 MLA draft
 )
@@ -1397,9 +1647,15 @@ def test_every_mla_model_has_an_explicit_qrep_decision():
     `rglob`, not `glob`: a non-recursive scan would miss an MLA model added
     under a subpackage (`atom/models/<family>/...`), the direction some of
     `atom/model_ops/` already organizes new code in.
+
+    Models are keyed by their path relative to `atom/models/`. `path.name`
+    would key every packaged model as `model.py`, so the first one to land
+    there would satisfy the census for all of them.
     """
     producers = {
-        path.name for path in _ATOM_MODELS.rglob("*.py") if _builds_mla_modules(path)
+        path.relative_to(_ATOM_MODELS).as_posix()
+        for path in _ATOM_MODELS.rglob("*.py")
+        if _builds_mla_modules(path)
     }
     undecided = producers - set(_QREP_WIRED_MODELS) - set(_QREP_UNWIRED_MODELS)
     assert not undecided, (
@@ -1780,4 +2036,7 @@ def test_sparse_prefill_persistent_table_would_allow_gqa64():
     ), "persistent sparse prefill should reach gqa=64, not pad past it"
     assert (
         mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=False) == 128
+    ), (
+        "the non-persistent pad table still pads 64 to 128; only the "
+        "non-persistent gqa64 kernel (mla_dcp_sparse_prefill_mode) runs at 64"
     )

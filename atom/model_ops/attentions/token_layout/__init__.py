@@ -22,8 +22,8 @@ goes wrong in silence, landing a write or a lookup on another request's row.
 Not everything per-token is here. A shape that only one caller has stays with
 that caller: V4's decode positions are ragged (a DSpark step verifies a
 different number of drafts per request), the one-token decode slot mapping is
-derived from `last_block_num_tokens` rather than from a position, and DCP's is
-a per-rank filter rather than an address. Pulling any of them in would put two
+one position per row computed inline by its builders, and DCP's is a per-rank
+filter rather than an address. Pulling any of them in would put two
 derivations behind one name.
 
 Nothing is re-exported.

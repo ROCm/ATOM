@@ -64,7 +64,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
         128,
         128,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         speculative_tokens=5,
         # The only class the window-only specs below ask for.
         layer_ratios=(0,),
@@ -263,10 +263,11 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("packed", [False, True])
-def test_block_context_read_decodes_only_the_selected_request_windows(packed):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp4", "fp8"])
+def test_block_context_read_decodes_only_the_selected_request_windows(kv_dtype):
     from atom.model_ops.blockscale import quantize_fp8
 
+    packed = kv_dtype != "bf16"  # an FP8 window
     geometry = V41PoolGeometry(
         2,
         ((0, 2),),
@@ -274,7 +275,7 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
         128,
         512,
         32,
-        packed=packed,
+        kv_dtype=kv_dtype,
         speculative_tokens=5,
         layer_ratios=(0,),
     )
@@ -292,12 +293,23 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
         1, quantize_fp8(values) if packed else expected_rows.unsqueeze(0), step
     )
     cache.advance_cursor(step, [[1, 2, 3], [4, 5, 6]])
-    actual = cache.read_window(1, torch.tensor([1, 3, 1], device="cuda"))
+    slots = torch.tensor([1, 3, 1], device="cuda")
+    actual = cache.read_window(1, slots)
     expected = torch.empty_like(actual)
     for i, span in enumerate((spans[1], spans[0], spans[1])):
         for p in range(span.end - geometry.ring_slots, span.end):
             expected[i, p % geometry.ring_slots] = expected_rows[span.offset + p]
     assert torch.equal(actual, expected)
+
+    # every stage in one read, as the draft graph captures it
+    layers = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    cache.read_windows(layers, slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        windows = cache.read_windows(layers, slots)
+    graph.replay()
+    assert torch.equal(windows[0], actual)
+    assert torch.equal(windows[1], cache.read_window(0, slots))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -306,7 +318,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
-    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
+    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     torch.manual_seed(863)
     geometry = V41PoolGeometry(
@@ -316,7 +328,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         4,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         speculative_tokens=5,
         layer_ratios=(0,),
     )
@@ -336,10 +348,18 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         step,
     )
     spec = LayerAttentionSpec(0, 0, AttentionMode.WINDOW)
-    indices, ptr, _, _ = cache.attention_indices(spec, step)
+    indices, ptr, window, wptr = cache.attention_indices(spec, step)
     query = torch.randn(6, 8, 512, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(8, device="cuda")
-    function = packed_decode if packed else sparse_attn_v4_paged_decode
+
+    def function(query, pool, indices, ptr, sink, scale):
+        if packed:
+            return packed_decode(query, pool, indices, ptr, sink, scale)
+        ring = cache.ring_view(0)
+        return sparse_attn_v4_paged_2src(
+            query, pool, indices, ptr, ring, window, wptr, sink, scale
+        )
+
     output = function(query, cache.pool, indices, ptr, sink, 512**-0.5)
     expected = []
     for t, position in enumerate(range(7, 13)):

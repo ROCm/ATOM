@@ -50,6 +50,10 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
   markov_head.markov_w{1,2}.weight              [163840, 256]
   confidence_head.proj.{weight,bias}            SKIPPED (training-only)
   embed_tokens.weight                           SKIPPED (target's is shared)
+
+Inferact/Kimi-K3.1-DSpark (67 tensors) is the same tree with 96 heads (q_b_proj
+[18432, 1536], kv_b_proj [24576, 512], o_proj [7168, 12288]), Markov rank 512
+and no embed_tokens; its ``rope_interleave: true`` is the same interleaved rope.
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -66,7 +70,6 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -74,96 +77,21 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
-from atom.models.dspark_draft import DSparkDraftModel
-from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
-from atom.utils import envs
+from atom.models.dspark_draft import (
+    DSparkDraftModel,
+    draft_rope_kwargs,
+    linear_out,
+)
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.models.utils import is_neox_rope_style
+from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
     from atom.config import Config
-
-
-def _linear_out(output):
-    """ATOM quantized linears may return (tensor, scale); take the tensor."""
-    return output[0] if isinstance(output, tuple) else output
-
-
-class DSparkMarkovHead(nn.Module):
-    """Low-rank first-order Markov transition bias over the draft logits.
-
-    The full ``V x V`` transition matrix is factorized as ``B = W1 @ W2^T`` with
-    ``W1, W2 in R^{V x r}``. Given the previously sampled token ``x_{k-1}``, the
-    bias added to position ``k``'s base logits is ``W1[x_{k-1}] @ W2^T in R^V``.
-
-    Because the bias is added INSIDE a per-position softmax (a local correction,
-    not a global renormalization), per-token probabilities stay exact, which is
-    what lets speculative verification remain lossless.
-
-    Both tables stay replicated across TP ranks: the bias is added to the
-    full-vocab logits the shared LM head produces, so a sharded ``W2`` would have
-    to be gathered anyway. Same choice ATOM's V4 DSpark makes.
-    """
-
-    def __init__(self, vocab_size: int, rank: int):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.rank = rank
-        self.markov_w1 = nn.Embedding(vocab_size, rank)
-        self.markov_w2 = nn.Embedding(vocab_size, rank)
-        # Read once here rather than per sampled position: envs re-reads the
-        # environment on every attribute access.
-        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
-
-    def forward(self, token_ids: torch.Tensor):
-        """Args:
-            token_ids: [*]  ids of the previously sampled token x_{k-1}.
-        Returns:
-            logits_bias:  [*, V]  bias to add to the next position's logits.
-            markov_embed: [*, r]  W1[x_{k-1}].
-        """
-        markov_embed = self.markov_w1(token_ids)
-        # fp32 matmul: the bias enters the softmax that gates acceptance.
-        logits_bias = torch.matmul(
-            markov_embed.float(), self.markov_w2.weight.float().t()
-        )
-        return logits_bias, markov_embed
-
-    def sample_next(
-        self, token_ids: torch.Tensor, base_logits: torch.Tensor, out: torch.Tensor
-    ) -> torch.Tensor:
-        """One greedy block position: the argmax of the biased logits into `out`.
-
-        The bias itself is never returned, which is what lets the fused path
-        skip materializing it: ``dspark_markov_argmax`` keeps ``W2`` bf16 and
-        reduces straight to ids, with the same fp32 accumulation the softmax
-        guarantee above asks for (see that module for the numerics argument).
-        ``markov_embed`` is the return because V4's confidence head consumes it;
-        the ids are not, so that `out` stays the only place to read them whether
-        or not the caller is compiled.
-
-        Args:
-            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
-            base_logits: [B, V]  this position's base logits.
-            out:         [B]     where the ids land; a strided view is fine,
-                                 which is how the caller's own block becomes
-                                 the destination instead of a copy's source.
-        Returns:
-            markov_embed: [B, r]  W1[x_{k-1}].
-        """
-        if self.fused_sample:
-            return dspark_markov_argmax(
-                base_logits,
-                token_ids,
-                self.markov_w1.weight,
-                self.markov_w2.weight,
-                out,
-            )
-        bias, markov_embed = self(token_ids)
-        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
-        # .float() would only materialize it twice for the same sum.
-        out.copy_((base_logits + bias).argmax(dim=-1))
-        return markov_embed
 
 
 def _dspark_block_width(draft_config, atom_config) -> int:
@@ -284,34 +212,21 @@ class K3DSparkMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # YaRN. Unlike the Kimi-K3 target (rope_theta 50000 with its own scaling)
-        # these are the DRAFT's own rope parameters and must be read from the
-        # draft config -- the draft was trained with them and the context rows it
-        # writes are rotated with them.
-        rope_params = dict(getattr(config, "rope_parameters", None) or {})
-        rope_theta = rope_params.get("rope_theta") or getattr(
-            config, "rope_theta", 10000.0
+        # DeepSeek's MLA YaRN and rope: interleaved when unspecified;
+        # rope_interleave=true is that same interleaved rope.
+        rope_kwargs = draft_rope_kwargs(
+            config,
+            rope_type="deepseek_yarn",
+            is_neox_style=is_neox_rope_style(
+                config, "rope_interleave", default_is_neox=False
+            ),
         )
-        use_yarn = rope_params.get("rope_type") in ("yarn", "deepseek_yarn") or (
-            rope_params.get("factor", 1.0) not in (1.0, None)
-        )
-        rope_scaling = None
-        if use_yarn:
-            rope_scaling = dict(rope_params)
-            rope_scaling["rope_type"] = "deepseek_yarn"
-            rope_scaling.setdefault(
-                "original_max_position_embeddings",
-                config.max_position_embeddings,
-            )
+        rope_scaling = rope_kwargs["rope_scaling"]
         self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            # DeepSeek-style MLA rope is interleaved unless told otherwise.
-            is_neox_style=bool(getattr(config, "rope_interleave", False)),
+            self.qk_rope_head_dim, rotary_dim=self.qk_rope_head_dim, **rope_kwargs
         )
+        # The softmax scale takes the YaRN mscale^2 correction, as the MLA
+        # target's does.
         if rope_scaling:
             mscale = yarn_get_mscale(
                 float(rope_scaling["factor"]),
@@ -365,7 +280,7 @@ class K3DSparkMLAAttention(nn.Module):
         # norms instead of feeding a GEMM the wrong layout.
         #
         # q side: q_b_proj consumes the normed query, inside the MLA impl.
-        qknorm_type, qknorm_dtype = _effective_layer_quant(
+        qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
@@ -377,7 +292,7 @@ class K3DSparkMLAAttention(nn.Module):
         # decoder's input_layernorm here (the draft has no g_proj gate), so one
         # scheme decides it. The layer reads these two back off the attention.
         self.fuse_input_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
@@ -402,9 +317,7 @@ class K3DSparkMLAAttention(nn.Module):
         (vLLM's reference computes the full projection here too, and offers a
         cross-layer fused fast path on top; that optimization is not ported.)
         """
-        kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
-            ..., self.q_lora_rank :
-        ]
+        kv_lora = linear_out(self.fused_qkv_a_proj(ctx_hidden))[..., self.q_lora_rank :]
         # norm + rope + concat + store live behind one call so every cache
         # layout stays in the attention impl: the normal store hardcodes
         # attn_metadata.slot_mapping, which is the draft block's, not these
@@ -429,9 +342,7 @@ class K3DSparkMLAAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
-        qkv_lora = _linear_out(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
-        )
+        qkv_lora = linear_out(self.fused_qkv_a_proj(hidden_states, hidden_states_scale))
         q_lora, kv_c, k_pe = qkv_lora.split(
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -454,7 +365,7 @@ class K3DSparkMLAAttention(nn.Module):
             from atom.model_ops.linear import use_triton_gemm
             from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
 
-            if not use_triton_gemm():
+            if not use_triton_gemm() or uses_mxfp4_n32k4_scale(self.q_b_proj):
                 q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
                     q_lora.shape[0]
                 )
@@ -488,12 +399,16 @@ class K3DSparkMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -501,6 +416,7 @@ class K3DSparkMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         self.act_fn = SiluAndMul()
 
@@ -510,8 +426,8 @@ class K3DSparkMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return _linear_out(
-            self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x, x_scale))))
+        return linear_out(
+            self.down_proj(self.act_fn(linear_out(self.gate_up_proj(x, x_scale))))
         )
 
 
@@ -551,7 +467,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=self.self_attn.input_quant_prefix,
         )
         self.fuse_ffn_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.post_attention_layernorm = RMSNorm(
@@ -562,7 +478,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp.gate_up_proj",
         )
 
-    def write_context_kv(self, ctx_hidden, positions) -> None:
+    def write_context_kv(self, ctx_hidden, positions, slot_mapping) -> None:
         """Populate this layer's context rows.
 
         The context source does NOT go through ``input_layernorm``: the reference
@@ -570,11 +486,6 @@ class K3DSparkDecoderLayer(nn.Module):
         straight into the KV projection, while ``input_layernorm`` applies only
         to the residual stream carrying the draft block.
         """
-        from atom.utils.forward_context import get_forward_context
-
-        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
-            : ctx_hidden.shape[0]
-        ]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(
@@ -600,6 +511,10 @@ class KimiK3DSpark(DSparkDraftModel):
     only the fused q/kv-A and gate/up projections are remapped, via
     ``packed_modules_mapping``.
     """
+
+    # The base `_sample_block` hands the binding to the head's `sample_block`,
+    # so `DSparkProposer` may arm lossless speculative sampling here.
+    supports_lossless_draft = True
 
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
@@ -630,9 +545,6 @@ class KimiK3DSpark(DSparkDraftModel):
         self.hf_config = config
 
         self.hidden_size = config.hidden_size
-        self.noise_token_id = int(config.dspark_noise_token_id)
-        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
-        self.markov_rank = int(config.dspark_markov_rank)
 
         # Aux fusion: [N, target_hidden * num_target_layers] -> [N, hidden].
         # Replicated, matching the reference and ATOM's other drafts: the aux
@@ -658,7 +570,7 @@ class KimiK3DSpark(DSparkDraftModel):
             ]
         )
         self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.markov_head = DSparkMarkovHead(config.vocab_size, self.markov_rank)
+        self.init_block_fields(config)
         # Markov-head vocab, exposed at the top level so the proposer can clamp
         # the anchor uniformly across DSpark flavors (V4 exposes it too).
         self.vocab_size = int(config.vocab_size)
@@ -670,25 +582,10 @@ class KimiK3DSpark(DSparkDraftModel):
         # This checkpoint deliberately skips the training-only head.
         self.confidence_head = None
 
-    # ---- weight-loading hooks ---------------------------------------------
-
-    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        """Bind embed/LM head to the target's already-loaded instances.
-
-        ``target_base`` is the Kimi-K3 ``KimiLinearForCausalLM`` (ModelRunner
-        unwraps the ``language_model`` multimodal wrapper before calling this).
-        The vocabularies must agree or the shared LM head would silently score
-        the wrong rows.
-        """
-        target_vocab = target_base.model.embed_tokens.num_embeddings
-        if target_vocab != self.hf_config.vocab_size:
-            raise ValueError(
-                f"DSpark draft vocab {self.hf_config.vocab_size} != target vocab "
-                f"{target_vocab}. The draft shares the target's embedding and LM "
-                "head, so the two must agree."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head
+    @property
+    def first_attention_layer_num(self) -> int:
+        """The MLA draft binds its pool on ``self_attn.mla_attn``."""
+        return self.layers[0].self_attn.mla_attn.layer_num
 
     # ---- drafting entry points (called by the proposer) --------------------
 
@@ -699,106 +596,4 @@ class KimiK3DSpark(DSparkDraftModel):
         the same projected tensor to all five, which each apply their own KV
         projection to it.
         """
-        return self.context_norm(_linear_out(self.context_proj(aux_concat)))
-
-    @property
-    def context_layers(self):
-        """Every draft layer holds context rows; `layers` is already in order.
-
-        The dummy-run guard and the project-once-share-everywhere loop live in
-        :meth:`DSparkDraftModel.write_context_kv`. The specific abort this draft
-        would hit without the guard is `kv_cache.size(2) == kv_lora_rank +
-        qk_rope_head_dim` in cache_kernels, on the still-empty init tensor.
-        """
-        return self.layers
-
-    def forward_spec(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ):
-        """One DSpark block: parallel backbone pass + sequential Markov sampling.
-
-        Returns ``(draft_token_ids [B, T], confidence)``. ``confidence`` is
-        always ``None`` here -- this checkpoint's confidence head is
-        training-only (see ``skip_weight_prefixes``). The proposer already
-        handles ``None`` by leaving the verify length fixed.
-
-        The two halves below are also callable separately, which is how the
-        proposer declares this block as a capturable pass: the backbone is the
-        recorded forward and the head is its epilogue. Kept as the composition
-        so the whole block still has one name, and so nothing that only wants a
-        block has to know it is made of two pieces.
-        """
-        return self.head_and_sample(
-            self.block_backbone(input_ids, positions, num_draft),
-            input_ids,
-            num_draft,
-        )
-
-    def block_backbone(
-        self,
-        input_ids: torch.Tensor,  # [B]   verified anchor token per request
-        positions: torch.Tensor,  # [B*T] block absolute positions
-        num_draft: int,
-    ) -> torch.Tensor:
-        """The parallel half: embed the block, run the layers, norm.
-
-        Returns the post-final-norm hidden states, ``[B*T, hidden]`` -- flat,
-        because that is what the LM head takes and what the layers produced.
-        """
-        bs = input_ids.shape[0]
-        T = num_draft
-
-        # Block input ids: [anchor, MASK, MASK, ...]. T positions in, T draft
-        # tokens out -- the same convention ATOM's V4 DSpark and vLLM/sglang all
-        # use. (dflash.py's standalone `spec_generate` demo slices
-        # `[:, -block_size+1:]` instead; that is NOT what any production
-        # implementation does. Do not "fix" the sampler to match it.)
-        draft_ids = input_ids.new_full((bs, T), self.noise_token_id)
-        draft_ids[:, 0] = input_ids
-        hidden = self.embed_tokens(draft_ids.view(-1))
-
-        residual = None
-        for layer in self.layers:
-            hidden, residual = layer(positions, hidden, residual)
-        hidden, _ = self.final_norm(hidden, residual)
-        return hidden
-
-    def head_and_sample(
-        self,
-        hidden: torch.Tensor,  # [B*T, hidden] post-final-norm
-        anchor_ids: torch.Tensor,  # [B]
-        num_draft: int,
-    ):
-        """The sequential half: LM head, then Markov sampling over the block.
-
-        Batch comes from ``anchor_ids`` rather than from ``hidden``, which is
-        flat over ``B*T`` and so cannot say which of the two axes it holds.
-        """
-        base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
-        return self._sample_block(base_logits, anchor_ids), None
-
-    def _sample_block(
-        self,
-        base_logits: torch.Tensor,  # [B, T, V]
-        anchor_ids: torch.Tensor,  # [B]
-    ) -> torch.Tensor:
-        """Markov-biased left-to-right sampling over the already-computed block.
-
-            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
-
-        Only this loop is sequential, and it is T tiny rank-256 matmuls rather
-        than T backbone passes -- which is the entire point of DSpark.
-        """
-        bs, T, _ = base_logits.shape
-        out_ids = anchor_ids.new_empty(bs, T + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(T):
-            # Greedy: temperature/sampling is applied by the target's verify.
-            # The column is the op's destination, so no id is written twice.
-            self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-            )
-        return out_ids[:, 1:]
+        return self.context_norm(linear_out(self.context_proj(aux_concat)))

@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -16,10 +17,14 @@ pytest.importorskip("aiter", reason="the V4.1 backend and cache reach AITER")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    StepPlan,
+    visible_buffer_name,
+)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
-from tests.attentions.deepseek_v41.helpers import metadata_buffers
+from atom.utils.forward_context import RoundService
+from tests.attentions.deepseek_v41.helpers import metadata_buffers, stage_query_layout
 
 
 def staged_step(cache, requests, *, buffers, running_bs, running_tokens):
@@ -62,20 +67,22 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
         # The step spans the forward's width, padding included: a captured
         # graph runs those rows whatever the batch, so they have to be
         # described rather than sliced off.
-        assert step.width == 8 and step.scheduled == sum(s.length for s in requests)
+        assert step.running_tokens == 8 and step.scheduled_tokens == sum(
+            s.length for s in requests
+        )
         expected_positions = [
             p for span in requests for p in range(span.position, span.end)
         ]
         expected_batches = [
             i for i, span in enumerate(requests) for _ in range(span.length)
         ]
-        pad_tokens, pad_requests = 8 - step.scheduled, 4 - len(requests)
+        pad_tokens, pad_requests = 8 - step.scheduled_tokens, 4 - len(requests)
         # `-1` for a padding token and a zero-length span for a padding
         # request: the two sentinels every consumer bails on.
         assert step.batch_ids.tolist() == expected_batches + [-1] * pad_tokens
         assert step.positions.tolist() == expected_positions + [0] * pad_tokens
         assert step.cu_seqlens_q.tolist() == [span.offset for span in requests] + [
-            step.scheduled
+            step.scheduled_tokens
         ] * (pad_requests + 1)
         assert (
             step.slots.tolist() == [span.slot for span in requests] + [0] * pad_requests
@@ -120,7 +127,11 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
         running_bs=2,
         running_tokens=6,
     )
-    assert step.scheduled == 3 and step.width == 6 and cache.pending is None
+    assert (
+        step.scheduled_tokens == 3
+        and step.running_tokens == 6
+        and cache.pending is None
+    )
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry, builder.device = geo, "cpu"
     builder.config = SimpleNamespace(
@@ -146,15 +157,22 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
         if engram
         else None
     )
-    metadata = SimpleNamespace(step=step, cache=cache, dummy=True, token_mask=None)
-    builder.prepare_model_inputs(
-        torch.zeros(step.scheduled, dtype=torch.int32), metadata
+    metadata = SimpleNamespace(
+        step=step,
+        cache=cache,
+        dummy=True,
+        token_mask=None,
+        ubatches=None,
+        served_by_round=RoundService.NONE,
     )
-    assert metadata.engram_embeddings[0].shape[:2] == (1, step.width)
+    builder.prepare_model_inputs(
+        torch.zeros(step.scheduled_tokens, dtype=torch.int32), metadata
+    )
+    assert metadata.engram_embeddings[0].shape[:2] == (1, step.running_tokens)
     if engram:
         assert staged == {
-            "tokens": step.scheduled,
-            "padded_rows": step.width,
+            "tokens": step.scheduled_tokens,
+            "padded_rows": step.running_tokens,
             "dummy": True,
             "token_mask": None,
             # A synthetic batch hashes on the host: the cursor the device path
@@ -256,7 +274,7 @@ def test_visible_rows_are_the_bound_every_indexer_layer_reads(ratio, positions_d
     step = staged_step(cache, requests, buffers=buffers, running_bs=4, running_tokens=8)
     # Armed: ragged, and padded past the batch, so the two layouts really do
     # disagree over these rows.
-    assert step.scheduled == 4 < step.width == 8
+    assert step.scheduled_tokens == 4 < step.running_tokens == 8
     assert len({span.length for span in requests}) > 1
     assert step.positions.dtype == positions_dtype
     assert step.visible[ratio].dtype == torch.int32
@@ -326,7 +344,7 @@ def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
         owners = staged["batch_id_per_q_token"].np[:rows]
         seen.append((visible.tolist(), owners.tolist()))
         staged["plan"].np[:] = (rows, visible.sum(), owners.max())
-        return {"plan": 3}
+        return StepPlan({"plan": 3})
 
     requests = (
         PagedRequest(17, 1, 0, 3, 3, (5, 1)),
@@ -340,3 +358,188 @@ def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
     assert seen == [([1, 1, 2, 2, 0, 0], [0, 0, 0, 1, -1, -1])]
     assert step.planned["plan"].tolist() == [6, 6, 1]
     assert begin_step(cache, requests, buffers=buffers).planned == {}
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_idle_dp_rank_refreshes_captured_pool_metadata(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = V41PoolGeometry(
+        1,
+        ((0, 2),),
+        32,
+        4,
+        512,
+        32,
+        speculative_tokens=5,
+        layer_ratios=(2,),
+        index_topk=4,
+    )
+    cache = PagedAttentionCache(geo, 4, 4, device, max_tokens=24)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry = geo
+    builder.device = device
+    builder.block_size = 32
+    builder.cache = cache
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(4, 24, 4, device, geo)
+    )
+    cache.backing.fill_(57)
+    before = cache.backing.clone()
+    for pair in cache.indptr_buffers.values():
+        for tensor in pair:
+            tensor.fill_(123)
+    # An idle DP rank schedules nothing; every row its forward runs is padding.
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
+        state_slots_committed=[],
+        req_ids=[],
+        num_scheduled_tokens=np.zeros(0, dtype=np.int32),
+        context_lens=np.zeros(0, dtype=np.int32),
+        total_seqs_num=0,
+        total_tokens_num=0,
+    )
+    stage_query_layout(builder, (), 4, 24)
+    metadata, _ = builder._prepare(batch, 4, 24, max_q_len=6, tentative=True)
+    step = metadata.step
+    assert metadata.cache is cache
+    assert step.requests == () and step.scheduled_tokens == 0 and step.decode
+    assert step.running_tokens == 24 and step.max_q_len == 6
+    assert torch.all(step.batch_ids == -1)
+    assert step.cu_seqlens_q.tolist() == [0, 0, 0, 0, 0]
+    if device == "cuda":
+        # Decode graph replay still executes the captured window writer. Its
+        # padding mask must suppress stores even with a valid dummy query.
+        query = torch.ones(24, 1, 512, dtype=torch.bfloat16, device=device)
+        kv = torch.ones(24, 512, dtype=torch.bfloat16, device=device)
+        rope = SimpleNamespace(
+            rope_dim=64,
+            cos_cache=torch.ones(32, 32, device=device),
+            sin_cache=torch.zeros(32, 32, device=device),
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            cache.rope_quant_window(0, query, kv, rope, step)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            cache.rope_quant_window(0, query, kv, rope, step)
+        graph.replay()
+        torch.cuda.synchronize()
+    assert cache.pending is None
+    for plan in step.plans.values():
+        assert plan.write_plan_gpu.shape[0] == 24
+        assert torch.all(plan.write_plan_gpu == -1)
+    if device == "cuda":
+        for ratio, (prefix, _, _) in cache.indptrs(step).items():
+            assert prefix.data_ptr() == cache.indptr_buffers[ratio][0].data_ptr()
+            assert torch.count_nonzero(prefix) == 0
+    torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
+
+
+def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
+    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, "cpu", 32
+    builder.cache = None
+    builder.score_workspace = None
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(1, 6, 1, "cpu", geo)
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=True,
+        is_final_chunk=None,
+        replaying={},
+        state_slots_committed=[],
+        req_ids=(-1,),
+        num_scheduled_tokens=(6,),
+        context_lens=(6,),
+        total_seqs_num=1,
+        total_tokens_num=6,
+    )
+    metadata, _ = builder._prepare(batch, 1, 6)
+    assert builder.cache is None
+    assert metadata.cache is not None
+    assert metadata.step.scheduled_tokens == 6
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "phase,position,length",
+    [
+        ("prefill", 0, 1),
+        ("prefill", 31, 1),
+        ("prefill", 32, 1),
+        ("decode", 31, 1),
+        ("verify", 31, 1),
+        ("verify", 31, 3),
+    ],
+)
+def test_parent_preparation_preserves_phase(device, phase, position, length):
+    """A one-token parent prefill needs prefill metadata even with DSpark on."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    from atom.utils.forward_context import AttnState
+
+    geo = V41PoolGeometry(
+        1,
+        ((0, 2),),
+        32,
+        4,
+        512,
+        32,
+        speculative_tokens=0 if phase == "decode" else 2,
+        layer_ratios=(0, 2),
+        index_topk=4,
+        index_block_rows=8,
+    )
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, device, 32
+    builder.cache = PagedAttentionCache(geo, 4, 1, device, max_tokens=8)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(1, 8, 4, device, geo),
+        tokenID_processor=SimpleNamespace(
+            num_rejected=None, verify_ctx_lens=lambda ctx: ctx
+        ),
+    )
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
+        state_slots_committed=[0],
+        req_ids=(17,),
+        num_scheduled_tokens=(length,),
+        context_lens=(position + length,),
+        block_tables=((0, 1, 2, 3),),
+        total_seqs_num=1,
+        total_tokens_num=length,
+        num_spec_step=length - 1,
+    )
+    stage_query_layout(builder, (length,), 1, length)
+    if phase == "prefill":
+        metadata, positions = builder.prepare_prefill(batch, 1, batch.total_tokens_num)
+    else:
+        metadata, positions = builder.prepare_decode(batch, 1, length, length)
+    step = metadata.step
+    assert step.is_prefill == (phase == "prefill")
+    assert step.decode == (phase != "prefill")
+    assert step.tentative == (phase == "verify")
+    assert metadata.state == (
+        AttnState.PREFILL_PREFIX if phase == "prefill" else AttnState.DECODE
+    )
+    assert positions.tolist() == list(range(position, position + length))
+    assert not hasattr(builder, "_tbo_storage")
+    if device == "cuda":
+        for prefix, extend, _ in metadata.cache.indptrs(step).values():
+            # BF16 decode also splits the ring-window source from paged KV.
+            assert prefix.data_ptr() != extend.data_ptr()
+            if phase == "prefill":
+                assert extend.tolist() == [0, 1]
+            else:
+                assert extend.tolist() == [4 * row for row in range(length + 1)]
+        tiles = builder.cache.unit_tiles(step, 2)
+        columns = (position + length + 31) // 32 if phase == "prefill" else 4
+        assert tiles.shape == (length, columns * (geo.rows_per_page(2) // 8))

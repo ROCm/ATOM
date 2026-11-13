@@ -13,19 +13,26 @@ from atom.model_ops.attentions.pool_layout.paged_state_copy import (
 
 class StateCopies:
     def __init__(self, cache, spec, max_batch):
+        """`spec` None: no checkpoint images (a `replay` state transfer), only
+        slot relocation."""
         self.cache, self.spec = cache, spec
+        if spec is None:
+            return
         if (spec.page_unit_bytes, spec.slot_bytes, spec.image_bytes) != (
             cache.geometry.paged_bytes,
             cache.geometry.state_bytes,
-            cache.geometry.state_bytes,
+            cache.geometry.checkpoint_image_bytes,
         ):
             raise ValueError("Checkpoint geometry differs from the allocated cache")
+        # The image is part of a slot, not all of it: the source stream is the
+        # slot's carried ranges.
+        self._ranges = cache.geometry.checkpoint_image_ranges
         # A PAGE unit is several regions, not one run: its main page and its
         # rows in each index plane. The destination stream repeats them per
         # unit, which is what `write_descriptor` wants one address per.
         self.regions = cache.unit_regions()
         self.plan = plan_segmented_copy(
-            [spec.slot_bytes],
+            [nbytes for _, nbytes in self._ranges],
             [
                 size
                 for _ in range(spec.units_per_checkpoint)
@@ -77,18 +84,7 @@ class StateCopies:
         if not self.cache.pool.is_cuda:
             for ops, storing in ((stores, True), (restores, False)):
                 for op in ops:
-                    slot = self.entry(op.src_slot if storing else op.dst_slot)
-                    at = 0
-                    for unit in op.unit_ids:
-                        for view in self.cache.unit_views(unit):
-                            take = min(view.numel(), slot.numel() - at)
-                            if take <= 0:
-                                break
-                            state, page = slot[at : at + take], view[:take]
-                            (page if storing else state).copy_(
-                                state if storing else page
-                            )
-                            at += take
+                    self._copy_on_host(op=op, storing=storing)
             return
         rows = self.staging.rows(descriptor_slot)
         total = (len(stores) + len(restores)) * self.plan.num_spans
@@ -101,7 +97,7 @@ class StateCopies:
             end = at + len(ops) * self.plan.num_spans
             slot_bases = np.asarray(
                 [
-                    [self.entry(op.src_slot if storing else op.dst_slot).data_ptr()]
+                    self._range_addresses(op.src_slot if storing else op.dst_slot)
                     for op in ops
                 ],
                 dtype=np.int64,
@@ -127,21 +123,33 @@ class StateCopies:
         launch_copy_descriptor(descriptor[:cut], self.plan)
         launch_copy_descriptor(descriptor[cut:], self.plan)
 
+    def _range_addresses(self, slot):
+        base = self.entry(slot).data_ptr()
+        return [base + offset for offset, _ in self._ranges]
+
+    def _copy_on_host(self, op, storing):
+        """One image, span by span, off the same plan the device copy reads."""
+        slot = self.entry(op.src_slot if storing else op.dst_slot)
+        views = [view for unit in op.unit_ids for view in self.cache.unit_views(unit)]
+        plan = self.plan
+        for src_seg, src_off, dst_seg, dst_off, length in zip(
+            plan.src_seg, plan.src_off, plan.dst_seg, plan.dst_off, plan.length
+        ):
+            at = self._ranges[src_seg][0] + src_off
+            state = slot[at : at + length]
+            page = views[dst_seg][dst_off : dst_off + length]
+            (page if storing else state).copy_(state if storing else page)
+
     def warmup(self):
-        if not self.cache.pool.is_cuda:
+        if self.spec is None or not self.cache.pool.is_cuda:
             return
-        slot = self.entry(0)
-        # Into the slot itself, one address per destination segment. Segments
-        # past the image get an address the plan never emits a span for.
-        offsets, at = [], 0
-        for _ in range(self.spec.units_per_checkpoint):
-            for _, size in self.regions:
-                offsets.append(at)
-                at += size
-        dst = np.asarray([[slot.data_ptr() + off for off in offsets]], dtype=np.int64)
-        self.plan.write_descriptor(
-            self.staging.rows(0)[: self.plan.num_spans],
-            np.asarray([[slot.data_ptr()]], dtype=np.int64),
-            dst,
+        src = np.asarray([self._range_addresses(0)], dtype=np.int64)
+        dst = np.zeros(
+            (1, len(self.regions) * self.spec.units_per_checkpoint), np.int64
         )
+        rows = self.staging.rows(0)[: self.plan.num_spans]
+        self.plan.write_descriptor(rows, src, dst)
+        # Every span onto itself: the image's ranges are not contiguous in the
+        # slot, so no one destination layout maps the slot back onto itself.
+        rows[:, 1] = rows[:, 0]
         launch_copy_descriptor(self.staging.upload(0, self.plan.num_spans), self.plan)

@@ -56,6 +56,18 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
         collector.scrape_config(["user:secret@host:8010"], ["host:8020"], "host:29100")
 
 
+def test_aggregated_server_is_scraped_once_and_needs_no_router(collector):
+    config = collector.scrape_config([], [], None, standalone=["10.0.0.1:8000"])
+    (api,) = config["scrape_configs"]
+    assert api["job_name"] == "atom"
+    assert api["static_configs"] == [
+        {
+            "targets": ["10.0.0.1:8000"],
+            "labels": {"observer": "api", "role": "standalone"},
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "interval,duration,timeout",
     [
@@ -107,6 +119,36 @@ def test_scrape_interval_cli(collector, monkeypatch, option, expected):
     collector.main()
     assert received[0].scrape_interval_seconds == expected
     assert received[0].command == ["benchmark"]
+
+
+@pytest.mark.parametrize(
+    "targets,error",
+    [
+        (["--standalone", "host:8000", "--decode", "host:8020"], "cannot be combined"),
+        (["--prefill", "host:8010"], "required without --standalone"),
+        ([], "required without --standalone"),
+    ],
+)
+def test_targets_are_either_a_pd_pair_or_one_aggregated_server(
+    collector, monkeypatch, capsys, targets, error
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect_metrics.py",
+            "--output",
+            "unused",
+            "--model",
+            "test",
+            *targets,
+            "--",
+            "benchmark",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        collector.main()
+    assert error in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -164,6 +206,7 @@ def test_collector_interval_waits_and_report_window(
         model="test",
         prefill=["host:8010"],
         decode=["host:8020"],
+        standalone=[],
         mesh="host:29100",
         command=["benchmark"],
         scrape_interval_seconds=interval,
@@ -177,6 +220,55 @@ def test_collector_interval_waits_and_report_window(
     data = json.loads((args.output / "report-data.json").read_text())
     assert data["meta"]["window"] == window
     assert any(f"preceding {window} seconds" in note for note in data["meta"]["notes"])
+
+
+def test_aggregated_run_waits_on_one_target_and_reports_standalone(
+    collector, monkeypatch, tmp_path
+):
+    """No router runs, so waiting for a mesh target would stall every run."""
+    monkeypatch.setattr(collector.time, "sleep", lambda _: None)
+    monkeypatch.setattr(collector.signal, "signal", lambda sig, fn: None)
+    monkeypatch.setattr(collector, "ensure_prometheus", lambda _: "prometheus")
+    process = Mock(returncode=0)
+    process.poll.return_value = 0
+    monkeypatch.setattr(collector.subprocess, "Popen", Mock(return_value=process))
+    ready = Mock(return_value="http://127.0.0.1:9090")
+    final = Mock(return_value=collector.time.time())
+    monkeypatch.setattr(collector, "wait_for_prometheus", ready)
+    monkeypatch.setattr(collector, "wait_for_final_scrape", final)
+    monkeypatch.setattr(collector, "get_json", lambda _: {"data": {"result": []}})
+    reports = []
+
+    def collect_report(_url, start, end, **kwargs):
+        reports.append(kwargs)
+        return collector.empty_report(
+            start, end, "test", [], window=kwargs["window"], deployment="standalone"
+        )
+
+    monkeypatch.setattr(collector.export_report, "collect_report", collect_report)
+    args = argparse.Namespace(
+        output=tmp_path / "report",
+        model="test",
+        prefill=[],
+        decode=[],
+        standalone=["host:8000"],
+        mesh=None,
+        command=["benchmark"],
+        scrape_interval_seconds=1.0,
+    )
+    assert collector.run(args) == 0
+    assert ready.call_args.args[2] == 1
+    assert final.call_args.args[4] == 1
+    assert reports[0]["deployment"] == "standalone"
+    assert (
+        json.loads((args.output / "prometheus.yml").read_text())["scrape_configs"][0][
+            "static_configs"
+        ][0]["labels"]["role"]
+        == "standalone"
+    )
+    data = json.loads((args.output / "report-data.json").read_text())
+    assert data["meta"]["title"] == "Agentic aggregated inference report"
+    assert {panel["role"] for panel in data["panels"]} == {"standalone"}
 
 
 def test_collector_startup_wait_is_interruptible(collector, tmp_path):
@@ -200,6 +292,7 @@ def test_collector_setup_failure_preserves_benchmark_exit_and_diagnostic_report(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         scrape_interval_seconds=1.0,
         command=[
@@ -271,6 +364,7 @@ def test_publication_failure_preserves_benchmark_exit(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         scrape_interval_seconds=1.0,
         command=[sys.executable, "-c", f"raise SystemExit({exit_code})"],
@@ -340,13 +434,15 @@ def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     stage = load_module("stage_reports")
     results, output = tmp_path / "results", tmp_path / "staged"
     make_report(results, "cell-a", 100)
-    make_report(results, "cell-a", 101)
+    folder = make_report(results, "cell-a", 101)
+    (folder / "router-metrics.prom").write_text("mesh_route_branch_total 1\n")
     make_report(results, "cell-b", 101)
     (results / "cell-a.slurm-job-id").write_text("101\n")
     manifest = stage.stage_reports(results, "cell-a", output)
     assert len(manifest["reports"]) == 1
     html = output / manifest["reports"][0]["html"]
     assert html.read_text() == "report for cell-a/101"
+    assert (html.parent / "router-metrics.prom").is_file()
     summary = tmp_path / "summary.md"
     stage.write_summary(
         manifest, "https://github.com/org/repo/actions/runs/123/artifacts/456", summary
@@ -354,6 +450,67 @@ def test_staging_selects_current_cell_and_job_and_links_the_artifact(tmp_path):
     assert "artifacts/456" in summary.read_text() and "101" in summary.read_text()
     with pytest.raises(FileExistsError):
         stage.stage_reports(results, "cell-a", output)
+
+
+def router_snapshot(scraped_at, affinity, relocate, low_ratio, ratio_sum):
+    decisions = affinity + relocate
+    return f"""# scraped_at {scraped_at}
+# HELP mesh_route_branch_total Routing decisions
+# TYPE mesh_route_branch_total counter
+mesh_route_branch_total{{branch="affinity"}} {affinity}
+mesh_route_branch_total{{branch="relocate"}} {relocate}
+# TYPE mesh_route_prefix_match_ratio histogram
+mesh_route_prefix_match_ratio_bucket{{le="0.3"}} {low_ratio}
+mesh_route_prefix_match_ratio_bucket{{le="+Inf"}} {decisions}
+mesh_route_prefix_match_ratio_sum {ratio_sum}
+mesh_route_prefix_match_ratio_count {decisions}
+# TYPE mesh_worker_pool_size gauge
+mesh_worker_pool_size 4
+"""
+
+
+def samples(text):
+    return {
+        series: float(value)
+        for series, value in (
+            line.rsplit(" ", 1)
+            for line in text.splitlines()
+            if line and not line.startswith("#")
+        )
+    }
+
+
+def test_router_metrics_delta_separates_consecutive_runs():
+    delta = load_module("router_metrics_delta").delta
+    start = router_snapshot("t0", 0, 0, 0, 0)
+    after_c2 = router_snapshot("t1", 90, 10, 10, 75.5)
+    after_c4 = router_snapshot("t2", 100, 100, 100, 85.5)
+
+    c2, reset = delta(start, after_c2)
+    assert not reset
+    assert samples(c2)['mesh_route_branch_total{branch="affinity"}'] == 90
+    c4, reset = delta(after_c2, after_c4)
+    assert not reset and "increase from t1 to t2" in c4
+    # c4's own affinity share is 10%, not the cumulative 100 / 200.
+    assert samples(c4) == {
+        'mesh_route_branch_total{branch="affinity"}': 10,
+        'mesh_route_branch_total{branch="relocate"}': 90,
+        'mesh_route_prefix_match_ratio_bucket{le="0.3"}': 90,
+        'mesh_route_prefix_match_ratio_bucket{le="+Inf"}': 100,
+        "mesh_route_prefix_match_ratio_sum": 10,
+        "mesh_route_prefix_match_ratio_count": 100,
+    }
+
+
+def test_router_metrics_delta_counts_from_a_router_restart():
+    delta = load_module("router_metrics_delta").delta
+    restarted, reset = delta(
+        router_snapshot("t2", 100, 100, 100, 85.5),
+        router_snapshot("t3", 5, 0, 0, 4.0),
+    )
+    assert reset and "counter reset: yes" in restarted
+    assert samples(restarted)['mesh_route_branch_total{branch="affinity"}'] == 5
+    assert samples(restarted)["mesh_route_prefix_match_ratio_count"] == 5
 
 
 def test_missing_job_never_publishes_historical_reports(tmp_path):
@@ -535,6 +692,24 @@ def test_mesh_setup_builds_once_and_passes_a_reusable_binary_path(tmp_path):
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == expected
     assert len(calls.read_text().splitlines()) == 1
+
+    log_root = tmp_path / "log root"
+    default_env = {
+        key: value for key, value in env.items() if key != "ATOMESH_MESH_TARGET_DIR"
+    }
+    command[3] = str(log_root / "cell-run" / "slurm_job-124")
+    command[-1] = "124"
+    result = subprocess.run(
+        command, env=default_env, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    host = subprocess.run(
+        ["hostname", "-s"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    cache = log_root / ".mesh-cache" / f"{host}-{os.getuid()}"
+    assert cache.is_dir()
+    recorded = json.loads(calls.read_text().splitlines()[-1])
+    assert f"{cache}:/mesh-cache" in recorded
 
 
 @pytest.mark.skipif(

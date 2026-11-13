@@ -16,7 +16,7 @@ from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import DecodeScheduler, Scheduler
+from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
 
 
@@ -39,6 +39,19 @@ def samples(exporter):
         for family in text_string_to_metric_families(exporter.render().decode())
         for sample in family.samples
     }
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [Scheduler, PrefillScheduler, DecodeScheduler]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_context_option_reaches_each_scheduler(scheduler_cls, enabled):
+    scheduler = scheduler_cls(MockConfig(enable_request_context_metrics=enabled))
+    assert (scheduler.metrics.prefill_request_context_tokens is not None) == enabled
+    assert (scheduler.metrics.decode_request_context_tokens is not None) == enabled
+    # Aggregate observations remain available under either setting.
+    scheduler.metrics.queue_time.observe(0.25)
+    assert histogram_values_by_name(scheduler.metrics)["queue_time"]["sum"] == 0.25
 
 
 @pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
@@ -64,7 +77,8 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
         utility_queue=None,
         kv_transfer_enabled=False,
         _is_rl_weights_offloaded=True,
-        _is_idle_rl_weights_offloaded=lambda: True,
+        _is_engine_held=lambda: True,
+        _report_held_kv_work=lambda: None,
         _drain_kv_work_at_exit=lambda: None,
         pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
         _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
@@ -74,6 +88,9 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
             is_finished=lambda: True,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            # Both loops park the window while the weights are offloaded,
+            # which is the state this test drives them through.
+            engine_stats=SimpleNamespace(note_idle=lambda _: None),
         ),
         utility_handler=SimpleNamespace(
             process_queue=lambda *args: now.__setitem__(0, next(ticks)),
@@ -143,6 +160,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         ),
     )
     engine = core.EngineCore.__new__(core.EngineCore)
+    engine._kv_progress_event = core.threading.Event()
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.process_input_sockets("input", "control")
@@ -204,7 +222,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     scheduler.add(seq)
     scheduler._count_inflight_load(seq)
-    scheduler._reject_aborted_waiting(seq)
+    scheduler._finish_rejected_waiting(seq)
     scheduler._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_recving={seq.id})
     )
@@ -419,11 +437,9 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     scheduler._count_inflight_load(seq)
     scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
-    assert scheduler.engine_stats.total_requests == 0
-    # At the failure/success branch, choose fallback without counting a PD hit.
-    # Local prefill admission is covered separately; block recovery is not part
-    # of this metrics change.
-    assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
+    # The request is aborted, not prefilled here, and counts no PD hit.
+    assert seq.leave_reason == "aborted"
+    assert scheduler.take_rejected() == [seq]
     assert scheduler.engine_stats.total_requests == 0
     assert scheduler.engine_stats.total_full_tokens == 0
     assert scheduler.engine_stats.total_cached_tokens == 0
@@ -458,9 +474,12 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         call_func=lambda name, *a, **k: dispatched.append(name)
     )
     proc.pp_transport = SimpleNamespace(
-        send_metadata=lambda _: None, recv_tokens=lambda **_: None
+        send_metadata=lambda _: None, recv_completion=lambda **_: None
     )
     proc._poll_kv_transfer_progress = lambda: None
+    # Dynamic chunking off, as it is for any pp_size == 1 deployment: the head
+    # step polls for a calibrated model, and this double answers that poll.
+    proc._dynamic_chunking_enabled = False
     proc._pp_head_step()
     proc._pp_head_step()  # full pipeline: collect only; no second submission
     assert dispatched == ["forward", "flush_pp_send"]
@@ -477,7 +496,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
 
     monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
     registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
+    metrics = SchedulerMetrics(registry=registry, request_context_enabled=True)
     decode = Sequence([1, 2], block_size=4)
     decode.type = SequenceType.DECODE
     first = Sequence(list(range(12)), block_size=4, request_id="first")
@@ -551,10 +570,12 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
         _partial_prefill_count=1,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, first)
     metrics.enqueue(first)
@@ -586,7 +607,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     from prometheus_client import CollectorRegistry, generate_latest
 
     registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
+    metrics = SchedulerMetrics(registry=registry, request_context_enabled=True)
     # Live sequence lengths deliberately differ from the dispatched context snapshot.
     seqs = {
         i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")
@@ -621,10 +642,12 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     owner = SimpleNamespace(
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, seqs[1])
     metrics.enqueue(seqs[1])

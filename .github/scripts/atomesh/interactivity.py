@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-request interactivity metrics for ATOMesh agentic (AIPerf) runs.
+"""Per-request interactivity and throughput metrics for ATOMesh agentic (AIPerf) runs.
 
 Mirrors ``compute_p90_e2e_normalized_interactivity.py`` from
 seungrokj/agentx_skills, extended to also produce the plain definition, so the
@@ -50,6 +50,7 @@ DEFAULT_PERCENTILE = 90.0
 TPOT_KEY = "inter_token_latency"
 TTFT_KEY = "time_to_first_token"
 OSL_KEY = "output_sequence_length"
+ISL_KEY = "input_sequence_length"
 
 PROFILING_PHASE = "profiling"
 
@@ -176,6 +177,58 @@ def agentic_interactivity(
         "n_requests": len(latencies),
         "percentile": percentile,
         "skipped_lines": skipped_lines,
+    }
+
+
+def agentic_throughput(jsonl_path: Path | str) -> dict[str, Any]:
+    """Token throughput as InferenceX computes it for one ``profile_export.jsonl``.
+
+    Mirrors ``compute_throughput_stats`` in InferenceX's
+    ``infx/results/agentic/request_metrics.py``: the summed ISL and OSL of the
+    successful profiling records (a record without a phase counts as profiling)
+    over the span from the first request start to the last request end. AIPerf's
+    own ``*_token_throughput`` attributes tokens to time slices inside the
+    benchmark window instead, which reads several percent lower on long
+    agentic turns, so the two cannot be compared with each other.
+
+    Raises ValueError when no record carries a usable start/end span.
+    """
+    path = Path(jsonl_path)
+    total_input = 0
+    total_output = 0
+    first_start_ns: int | None = None
+    last_end_ns: int | None = None
+    for record, _raw in iter_records(path):
+        if record is None or record.get("error"):
+            continue
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        phase = metadata.get("benchmark_phase")
+        if phase is not None and phase != PROFILING_PHASE:
+            continue
+        isl = _metric(record, ISL_KEY)
+        osl = _metric(record, OSL_KEY)
+        if isl is not None:
+            total_input += int(isl)
+        if osl is not None:
+            total_output += int(osl)
+        if metadata.get("request_start_ns"):
+            start_ns = int(metadata["request_start_ns"])
+            first_start_ns = (
+                start_ns if first_start_ns is None else min(first_start_ns, start_ns)
+            )
+        if metadata.get("request_end_ns"):
+            end_ns = int(metadata["request_end_ns"])
+            last_end_ns = end_ns if last_end_ns is None else max(last_end_ns, end_ns)
+    if first_start_ns is None or last_end_ns is None or last_end_ns <= first_start_ns:
+        raise ValueError(f"no profiling request span in {path}")
+    duration_s = (last_end_ns - first_start_ns) / 1e9
+    return {
+        "input_tput_tps": total_input / duration_s,
+        "output_tput_tps": total_output / duration_s,
+        "total_tput_tps": (total_input + total_output) / duration_s,
+        "duration_s": duration_s,
     }
 
 

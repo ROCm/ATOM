@@ -3,11 +3,14 @@
 """Qwen3.8-Flash-Next's shared-projection, multi-stream MTP drafter."""
 
 import copy
+import json
+import os
 
 import torch
 from torch import nn
 
 from atom.config import Config
+from atom.model_loader.weight_utils import local_model_dir
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.hyperconnection import (
@@ -18,7 +21,40 @@ from atom.models.qwen4_exp import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
+    _SequenceParallel,
 )
+from atom.quant_spec import LayerQuantConfig
+
+
+def _mtp_weights_quantized(model: str) -> bool:
+    """Whether any MTP weight in the checkpoint carries a quantization scale.
+
+    Quark exports list excluded modules one by one and can miss some: the
+    Qwen3.8-Flash-Next Quark MXFP4 checkpoint stores the whole MTP head in BF16
+    but leaves ``mtp.fc_embedding`` and ``mtp.layers.0.mlp.experts`` off its
+    exclude list. Without a readable index the configured policy is kept.
+    """
+    index = os.path.join(local_model_dir(model), "model.safetensors.index.json")
+    try:
+        with open(index) as f:
+            names = json.load(f)["weight_map"]
+    except (OSError, ValueError, KeyError):
+        return True
+    mtp = [n for n in names if n.startswith("mtp.")]
+    return not mtp or any("_scale" in n.rsplit(".", 1)[-1] for n in mtp)
+
+
+class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
+    """Resolves every MTP layer as excluded from quantization."""
+
+    def get_layer_quant_config(
+        self, layer_name, use_online_quant=False, *, check_children=False
+    ):
+        if layer_name.startswith("mtp."):
+            return LayerQuantConfig(quant_dtype=self.torch_dtype)
+        return super().get_layer_quant_config(
+            layer_name, use_online_quant, check_children=check_children
+        )
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
@@ -47,7 +83,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
-        quant_config = _Qwen4ExpQuantizationConfig(atom_config.quant_config)
+        quant_cls = (
+            _Qwen4ExpQuantizationConfig
+            if _mtp_weights_quantized(atom_config.model)
+            else _UnquantizedMTPQuantizationConfig
+        )
+        quant_config = quant_cls(atom_config.quant_config)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size
         )
@@ -98,14 +139,26 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Large (prefill) extends shard the per-token norms, fc projections
+        and hyper-connections across TP ranks like the target model does."""
         n = hidden_states.shape[0]
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        hidden_states = hidden_states.reshape(n, -1)
+        sp = _SequenceParallel.maybe(n)
+        if sp is not None:
+            inputs_embeds = sp.shard(inputs_embeds)
+            hidden_states = sp.shard(hidden_states)
+        rows = hidden_states.shape[0]
         embedding = self.fc_embedding(self.pre_fc_norm_embedding(inputs_embeds))
-        hidden = self.pre_fc_norm_hidden(hidden_states.reshape(n, -1))
+        hidden = self.pre_fc_norm_hidden(hidden_states)
         hidden = self.fc_hidden(hidden.reshape(-1, self.hidden_size))
-        hidden = hidden.view(n, self.hc_count, self.hidden_size) + embedding[:, None, :]
-        hidden = self.layers[0](positions, hidden.flatten(1), None)
+        hidden = hidden.view(rows, self.hc_count, self.hidden_size)
+        hidden = (hidden + embedding[:, None, :]).flatten(1)
+        if sp is None:
+            hidden = self.layers[0](positions, hidden, None)
+        else:
+            hidden = sp.gather(self.layers[0](positions, hidden, None, sp=sp))
         return hidden.view(n, self.hc_count, self.hidden_size)
 
 
@@ -113,7 +166,15 @@ class Qwen4ExpMTP(nn.Module):
     weights_mapping = Qwen4ExpForConditionalGeneration.weights_mapping
     packed_modules_mapping = Qwen4ExpForConditionalGeneration.packed_modules_mapping
     disable_fused_shared_loading = True
+    fused_shared_experts = 0
     get_expert_mapping = Qwen4ExpForConditionalGeneration.get_expert_mapping
+    draft_graph_supports_mrope = True
+    reuse_draft_graph_step_buffers = True
+
+    @staticmethod
+    def draft_graph_hidden_state_shape(draft_hf) -> tuple[int, ...]:
+        """The draft carries the whole hyper-connection bundle between steps."""
+        return (draft_hf.hc_count, draft_hf.hidden_size)
 
     def __init__(self, atom_config: Config):
         super().__init__()

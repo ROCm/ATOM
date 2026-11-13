@@ -130,6 +130,40 @@ class JobResultTest(unittest.TestCase):
         process = subprocess.run(args, capture_output=True, text=True, check=False)
         self.assertEqual(process.returncode, 1)
 
+    def test_cli_accepts_dash_prefixed_scheduler_exit_code(self):
+        # Spur reports cancelled and timed-out jobs as "-1:0".
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "resolve",
+                f"--run-dir={self.root}",
+                "--job-id=3619",
+                "--run-token=this-run",
+                "--num-ranks=2",
+                "--scheduler-state=TIMEOUT",
+                "--scheduler-exit-code=-1:0",
+                "--scheduler-rc=1",
+                "--spur=1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotIn("expected one argument", process.stderr)
+        self.assertEqual(process.returncode, 1, process.stderr)
+        saved = json.loads((self.root / "job-result.json").read_text())
+        self.assertEqual(
+            saved["scheduler"],
+            {"state": "TIMEOUT", "exit_code": "-1:0", "return_code": 1},
+        )
+
+    def test_submit_passes_scheduler_values_as_attached_options(self):
+        submit = (SCRIPT.parent / "pd_submit.sh").read_text()
+        for option in ("scheduler-state", "scheduler-exit-code", "scheduler-rc"):
+            self.assertIn(f"--{option}=", submit)
+            self.assertNotIn(f"--{option} ", submit)
+
 
 if __name__ == "__main__":
     unittest.main()

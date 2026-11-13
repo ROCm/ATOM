@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
 import threading
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -88,6 +90,60 @@ def _engine_scheduler(connector):
     scheduler.failed_recving_kv_req_ids = []
     scheduler.deferred_free_blocks = {}
     return scheduler
+
+
+def _stub_dcp_ops_without_triton(monkeypatch):
+    """BlockManager pulls get_dcp_local_seq_lens from dcp_ops, which imports Triton."""
+
+    def get_dcp_local_seq_lens(
+        seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    ):
+        full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
+        base = full_chunks * cp_kv_cache_interleave_size
+        remainder_total = seq_lens - base * dcp_size
+        remainder = np.clip(
+            remainder_total - dcp_rank * cp_kv_cache_interleave_size,
+            0,
+            cp_kv_cache_interleave_size,
+        )
+        return base + remainder
+
+    fake_dcp_ops = ModuleType("atom.model_ops.dcp_ops")
+    fake_dcp_ops.get_dcp_local_seq_lens = get_dcp_local_seq_lens
+    monkeypatch.setitem(sys.modules, "atom.model_ops.dcp_ops", fake_dcp_ops)
+
+
+@pytest.mark.parametrize("hbm", [0, 8])
+def test_loaded_prefix_can_publish_suffix_and_be_reused(
+    monkeypatch, mock_config, seq_factory, hbm
+):
+    _stub_dcp_ops_without_triton(monkeypatch)
+    mock_config.enable_prefix_caching = True
+    mock_config.decode_context_parallel_size = 2
+    mock_config.num_kvcache_blocks = 16
+    host = Scheduler(mock_config)
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    seq = seq_factory(list(range(25)))
+    host.block_manager.allocate(seq)
+    if hbm:
+        host.block_manager.hash_blocks(seq, hbm)
+        seq.num_cached_tokens = hbm
+    _arm_load(connector, seq, hbm=hbm, lmcache=16)
+
+    metadata = connector.build_connector_meta()
+    assert len(metadata.requests) == 1
+    # Model all ranks reporting successful load, then compute the next block.
+    host._mark_offload_load_ready(seq)
+    assert seq.num_cached_tokens == 16
+    assert seq.offload_promoted_tokens == 16 - hbm
+    host.block_manager.hash_blocks(seq, 8)
+    seq.num_cached_tokens = 24
+
+    following = seq_factory(list(range(25)))
+    matched = host.block_manager.can_allocate(following)
+    assert matched == 3
+    host.block_manager.allocate(following, matched)
+    assert following.num_cached_tokens == 24
 
 
 @pytest.mark.parametrize(
@@ -879,6 +935,79 @@ def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
     assert connector._tier_hit_memo == {}
 
 
+@pytest.mark.parametrize("settled", ["offload_loaded", "offload_load_failed"])
+def test_prefetch_skips_a_request_that_resumes_after_its_load(monkeypatch, settled):
+    """A resumed request skips the match, so its lookup would never be consumed."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    resumed = _load_seq(70, num_prompt_tokens=16)
+    setattr(resumed, settled, True)
+    preempted = _load_seq(71, num_prompt_tokens=16)
+    setattr(preempted, settled, True)
+    preempted.block_table = []
+
+    sched.prefetch_lookups([resumed, preempted])
+
+    assert submitted == ["71"]
+
+
+@pytest.mark.parametrize(
+    "flags, blocks",
+    [
+        ({}, [0]),
+        ({"offload_loaded": True}, [0]),
+        ({"offload_load_failed": True}, [0]),
+        ({"offload_loaded": True}, []),
+    ],
+)
+def test_prefetch_skips_exactly_what_admission_resumes(monkeypatch, flags, blocks):
+    """A lookup is prefetched iff admission will match the request again."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    seq = _load_seq(74, num_prompt_tokens=16)
+    seq.block_table = blocks
+    for name, value in flags.items():
+        setattr(seq, name, value)
+    admission = SimpleNamespace(_connector_flag=lambda name: name == "is_offload")
+
+    sched.prefetch_lookups([seq])
+
+    resumes = Scheduler._is_offload_prefill_resume(admission, seq)
+    assert (submitted == []) == resumes
+
+
+def test_prefetch_skips_a_finished_load_before_admission(monkeypatch):
+    """Promoted to the head after its load, `offload_loaded` is still unset."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    loaded = _load_seq(72, num_prompt_tokens=16)
+    loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    fresh = _load_seq(73, num_prompt_tokens=16)
+    fresh.status = SequenceStatus.WAITING
+
+    sched.prefetch_lookups([loaded, fresh])
+
+    assert submitted == ["73"]
+
+
 def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
     """The plugin's shape: the decline is what releases the lookup.
 
@@ -1314,3 +1443,81 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_prompt_carries_its_media_salt_to_lookup_save_and_load(
+    monkeypatch, cache_seed, salt
+):
+    """Image placeholder ids are the same for every picture, so each tier key
+    of a seeded prompt carries its `cache_seed`; a text prompt carries none."""
+    sched = _lookup_scheduler(monkeypatch, hit=16)
+    asked = []
+
+    def lookup(_token_ids, lookup_id, **kwargs):
+        asked.append(kwargs)
+        return 16
+
+    sched._lookup_client.lookup = lookup
+    loader, saver = _load_seq(950, num_prompt_tokens=24), _load_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 8
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("11", {"lmcache.tag.cache_salt": "11"}), ("", None)]
+)
+def test_dense_worker_loads_and_stores_under_the_prompts_salt(cache_salt, configs):
+    worker = DenseOffloadConnector(_config())
+    load = LMCacheReqMeta(
+        req_id=22,
+        token_ids=list(range(8)),
+        block_ids=[3],
+        load_spec=LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=8, can_load=True),
+        load_operation=LoadOperationId(req_id=22, generation=1),
+        cache_salt=cache_salt,
+    )
+    save = LMCacheReqMeta(
+        req_id=23,
+        token_ids=list(range(8)),
+        block_ids=[4],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        cache_salt=cache_salt,
+    )
+    worker.chunk_size = 8
+    received = []
+
+    class Engine:
+        gpu_connector = None
+
+        @staticmethod
+        def retrieve(_tokens, *, mask, **kwargs):
+            received.append(kwargs.get("request_configs"))
+            return mask.clone()
+
+        @staticmethod
+        def store(_tokens, **kwargs):
+            received.append(kwargs.get("request_configs"))
+
+        @staticmethod
+        def lookup_unpin(_lookup_id):
+            pass
+
+    try:
+        worker._engine = Engine()
+        worker._do_load_req(load)
+        worker._do_save_req(save)
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+    assert received == [configs, configs]

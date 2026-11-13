@@ -57,7 +57,7 @@ class _Step:
     """The fields the window write reads: one request and one padding row."""
 
     def __init__(self, tokens, slot, device):
-        self.width = tokens
+        self.running_tokens = tokens
         self.positions = torch.arange(tokens, device=device, dtype=torch.int32)
         self.batch_ids = torch.zeros(tokens, device=device, dtype=torch.int32)
         self.batch_ids[-1] = -1
@@ -145,7 +145,7 @@ def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
         rope.sin_cache,
         step.positions,
         rope_dim=rope_dim,
-        ring=(actual_pool, step, window, packed),
+        ring=(actual_pool, step, window),
     )
 
     assert torch.equal(actual_query, rope(query.clone(), step.positions))
@@ -192,6 +192,240 @@ def test_fused_seam_emits_the_rows_a_prefill_attends_to():
     assert torch.equal(actual_qat.view(tokens, dim), qat.view(tokens, dim))
     assert torch.equal(actual_values.view(torch.uint8), values.view(torch.uint8))
     assert torch.equal(actual_scales.view(torch.uint8), scales.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_fused_seam_writes_the_fp8_pools_query_and_rows():
+    """The FP8 pool's prefill: the rotated query quantized by the KV row's rule
+    (`query_fp8`), and the rows into a `[tokens, 528]` buffer through strided
+    views -- the bytes `quantize_fp8` gives, packed values then scales."""
+    from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+
+    torch.manual_seed(727)
+    device, tokens, heads, dim, rope_dim = "cuda", 13, 4, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    normed = torch.randn(1, tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
+
+    values, scales = quantize_fp8(rope(query.clone(), positions))
+    rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+    query_values = torch.empty_like(values).view(tokens, heads, dim)
+    query_scales = torch.empty_like(scales).view(tokens, heads, dim // 32)
+    rope_quant_window(
+        query.clone().view(tokens, heads, dim),
+        normed.view(tokens, dim),
+        rope.cos_cache,
+        rope.sin_cache,
+        positions,
+        rope_dim=rope_dim,
+        values=rows[:, :dim].view(values.dtype),
+        scales=rows[:, dim:].view(scales.dtype),
+        query_fp8=(query_values, query_scales),
+    )
+
+    expected_rows = pack_rows(*quantize_fp8(rope(normed.clone(), positions)))
+    assert torch.equal(rows, expected_rows.view(tokens, -1))
+    assert torch.equal(
+        query_values.view(torch.uint8), values.view(torch.uint8).view_as(query_values)
+    )
+    assert torch.equal(
+        query_scales.view(torch.uint8), scales.view(torch.uint8).view_as(query_scales)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("fp8_heads", [2, 4, 16, 64])
+def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
+    """Any power-of-two group of MXFP8 query heads a program gives a program a
+    head's query and KV bytes; the KV keeps the slot after the query ones."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(729)
+    device, tokens, heads, dim, rope_dim = "cuda", 64, 64, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
+
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
+    def run(n):
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
+        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
+        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
+        rope_window.rope_quant_window(
+            query.clone(),
+            normed,
+            rope.cos_cache,
+            rope.sin_cache,
+            positions,
+            rope_dim=rope_dim,
+            values=rows[:, :dim].view(fp8),
+            scales=rows[:, dim:].view(e8m0),
+            query_fp8=(qv, qs),
+        )
+        return rows, qv.view(torch.uint8), qs.view(torch.uint8)
+
+    for expected, actual in zip(run(1), run(fp8_heads)):
+        assert torch.equal(actual, expected)
+
+
+class _GridSpy:
+    """Wraps a Triton kernel to record each launch's grid, `HEAD_BLOCK` and
+    `FP8_HEADS`."""
+
+    def __init__(self, kernel):
+        self.kernel, self.launches = kernel, []
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            self.launches.append(
+                (tuple(grid), kwargs["HEAD_BLOCK"], kwargs["FP8_HEADS"])
+            )
+            return launch(*args, **kwargs)
+
+        return run
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("heads", [64, 4, 6])
+@pytest.mark.parametrize(
+    "sink", ["packed_ring", "bf16_ring", "prefill", "query", "query_fp8", "no_query"]
+)
+def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink):
+    """The head-blocked query grid against a program a head, byte for byte.
+
+    One program rotating a token's heads has to give the per-head programs'
+    query and leave the KV half -- now slot 1, not slot `heads` -- writing the
+    same rows. The launches are recorded, so a gate that never picks the
+    head-blocked grid fails here rather than comparing a grid to itself.
+    Six heads is no power of two, the MXFP8 query (`query_fp8`) is not the
+    in-place rotation, and a query-less KV launch (`no_query`, a prefill whose
+    queries rotate separately) has no heads: all three keep a program a head,
+    except that the MXFP8 query quantizes 8 heads a program where they divide.
+    """
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    if sink == "no_query" and heads != 64:
+        pytest.skip("no_query has no heads")
+    torch.manual_seed(728)
+    device, tokens, dim, rope_dim, ring, slot, start = "cuda", 37, 512, 64, 8, 3, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    step = _Step(tokens, slot, device)
+    query_heads = 0 if sink == "no_query" else heads
+    query = torch.randn(tokens, query_heads, dim, device=device, dtype=torch.bfloat16)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    packed = sink == "packed_ring"
+    run_rows = dim + dim // 32 if packed else 1
+    window = _window(packed, start, ring * run_rows, ring, run_rows)
+    rows = start + (slot + 1) * ring * run_rows
+    kv_half = sink != "query"
+    head_block = sink in ("packed_ring", "bf16_ring", "prefill", "query") and (
+        (heads & (heads - 1)) == 0
+    )
+    fp8_heads = 8 if sink == "query_fp8" and heads % 8 == 0 else 1
+    expected_grid = (
+        tokens * ((1 if head_block else query_heads // fp8_heads) + kv_half),
+    )
+
+    def run(flag):
+        monkeypatch.setattr(rope_window, "_HEAD_BLOCK", flag)
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", 8 if flag else 1)
+        monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+        spy = _GridSpy(rope_window._rope_window_kernel)
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+        out = {"query": query.clone()}
+        kwargs = {}
+        if sink == "packed_ring":
+            out["pool"] = torch.zeros(rows, device=device, dtype=torch.uint8)
+            kwargs["ring"] = (out["pool"], step, window)
+        elif sink == "bf16_ring":
+            out["pool"] = torch.zeros(rows, dim, device=device, dtype=torch.bfloat16)
+            kwargs["ring"] = (out["pool"], step, window)
+        elif sink in ("prefill", "query_fp8", "no_query"):
+            out["qat"] = torch.empty_like(normed)
+            # Buffers of the dtypes the seam writes; it overwrites them.
+            out["values"], out["scales"] = quantize_fp8(normed)
+            kwargs.update(qat=out["qat"], values=out["values"], scales=out["scales"])
+        if sink == "query_fp8":
+            # Zeroed as bytes: not every FP8 dtype implements a fill.
+            def zeros(width, like):
+                buffer = torch.zeros(
+                    tokens, heads, width, device=device, dtype=torch.uint8
+                )
+                return buffer.view(like.dtype)
+
+            out["query_values"] = zeros(dim, out["values"])
+            out["query_scales"] = zeros(dim // 32, out["scales"])
+            kwargs["query_fp8"] = (out["query_values"], out["query_scales"])
+        rope_window.rope_quant_window(
+            out["query"],
+            normed if kv_half else None,
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+            rope_dim=rope_dim,
+            **kwargs,
+        )
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy.kernel)
+        return out, spy.launches
+
+    (expected, default_launches), (actual, launches) = run(False), run(True)
+    assert default_launches == [((tokens * (query_heads + kv_half),), False, 1)]
+    assert launches == [(expected_grid, head_block, fp8_heads)]
+    if sink in ("packed_ring", "bf16_ring", "prefill", "query"):
+        assert not torch.equal(expected["query"], query)
+    for name, tensor in expected.items():
+        assert torch.equal(actual[name].view(torch.uint8), tensor.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize(
+    "cus, tokens, fp8_heads",
+    [(256, 1, 1), (256, 63, 1), (256, 64, 8), (80, 19, 1), (80, 20, 8)],
+)
+def test_fp8_query_groups_heads_from_two_programs_a_cu(
+    monkeypatch, cus, tokens, fp8_heads
+):
+    """64 heads quantize 8 a program from 2 grouped query programs a CU on
+    (64 tokens on 256 CUs, 20 on 80) and keep a program a head below."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: cus)
+    device, heads, dim, rope_dim = "cuda", 64, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.zeros(tokens, device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    values, scales = quantize_fp8(normed)
+    query_fp8 = (
+        torch.empty(tokens, heads, dim, device=device, dtype=values.dtype),
+        torch.empty(tokens, heads, dim // 32, device=device, dtype=scales.dtype),
+    )
+    spy = _GridSpy(rope_window._rope_window_kernel)
+    monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+    rope_window.rope_quant_window(
+        query,
+        normed,
+        rope.cos_cache,
+        rope.sin_cache,
+        positions,
+        rope_dim=rope_dim,
+        values=values,
+        scales=scales,
+        query_fp8=query_fp8,
+    )
+    assert spy.launches == [((tokens * (heads // fp8_heads + 1),), False, fp8_heads)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

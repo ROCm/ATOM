@@ -33,7 +33,7 @@ def _copy_checkpoints_kernel(
     h,  # [1, NT_total, H, K, V] per-chunk states, batch-concatenated
     ssm_dst,  # [num_slots, H, K, V] the state pool
     x,  # [total_tokens, D] the conv input, batch-concatenated
-    conv_dst,  # [num_slots, D, STATE_LEN] the conv state pool
+    conv_dst,  # [num_slots, D, >= STATE_LEN] the conv state pool
     rows,  # [T] batch row of each target
     slots,  # [T] absolute destination slot of each target
     offs,  # [T] token offset of the target within its slice of this step
@@ -91,7 +91,8 @@ def _copy_checkpoints_kernel(
         tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
     else:
         # ── conv window: the STATE_LEN tokens ending at the target, ────────
-        # transposed into the pool's [D, STATE_LEN] layout.
+        # oldest first into positions [0, STATE_LEN) of the pool's [D, W]
+        # layout -- where the prefill conv kernel reads a resumed state from.
         end = tl.load(cu_seqlens + row).to(tl.int64) + off
         d = (i_blk - NBLK_SSM) * BLOCK + tl.arange(0, BLOCK)
         dmask = d < D
@@ -119,6 +120,7 @@ def write_state_checkpoints(
     chunk_offsets: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_size: int,
+    conv_state_len: int,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -133,6 +135,14 @@ def write_state_checkpoints(
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
 
+    ``conv_state_len`` is ``conv_kernel - 1`` and is passed, not read off
+    ``conv_state``: the pool is ``conv_kernel - 1 + num_spec`` wide for the
+    decode path, while ``causal_conv1d_fn`` resumes a prefill from positions
+    ``[0, conv_kernel - 1)`` and nothing else. Filling the whole width put the
+    newest token at the last position and left the prefill kernel reading
+    tokens ``num_spec`` older than the checkpoint -- and read that many rows
+    before the target, into the previous sequence's tokens.
+
     Neither conv tensor may be assumed contiguous, so the conv half indexes by
     real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
     ``[slots, state_len, D]`` allocation, and ``x`` is a column slice of the
@@ -144,7 +154,8 @@ def write_state_checkpoints(
     if n == 0:
         return
     hkv = ssm_state.stride(0)
-    d, state_len = conv_state.shape[1], conv_state.shape[2]
+    d, state_len = conv_state.shape[1], conv_state_len
+    assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
     nblk_ssm = triton.cdiv(hkv, BLOCK)

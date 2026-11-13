@@ -3,8 +3,9 @@
 """Layer-by-layer comparison of the mono path against the original modules.
 
 Debug only (``ATOM_MONO_CHECK=1``, meant for ``--enforce-eager``). The dense
-layers run twice, mono then the original modules, compared where they hand the
-first sparse layer its (ar, res); the step goes on from mono's. Every sparse
+layers run twice where mono has kernels for them, mono then the original
+modules, compared where they hand the first sparse layer its (ar, res); the
+step goes on from mono's. Every sparse
 layer runs twice on the same (ar, res): first the mono layer kernel, then the
 original decoder layer, fed ``ar`` on rank 0 and zeros elsewhere so its fused
 all-reduce reproduces ``ar`` exactly. Both write the same cache bytes for the
@@ -36,23 +37,28 @@ def forward_checked(
     runner.mailboxes.begin_step()
     ars = runner.ars
     # the dense layers, mono first, then the original ones on the same step,
-    # compared where they hand the first sparse layer its (ar, res)
-    res = runner.run_dense_mono(input_ids, positions, fwd, (), []).clone()
-    n = res.shape[0]
-    ar = ars[0][:n].clone()
-    ref_res = runner.run_dense(input_ids, positions)
-    if runner.rank == 0:
-        for k in range(n):
-            logger.info(
-                "mono check dense layers token %d/%d pos %d: residual %s | "
-                "reduced out %s",
-                k,
-                n,
-                int(positions[k]),
-                compare(res[k], ref_res[k]),
-                compare(ar[k], ars[0][k]),
-            )
-    ars[0][:n].copy_(ar)
+    # compared where they hand the first sparse layer its (ar, res). A model
+    # with no kernels for its prefix (M3.1) has one arm and nothing to compare.
+    if not runner.dense_mono:
+        res = runner.run_dense(input_ids, positions, (), [])
+        n = res.shape[0]
+    else:
+        res = runner.run_dense_mono(input_ids, positions, fwd, (), []).clone()
+        n = res.shape[0]
+        ar = ars[0][:n].clone()
+        ref_res = runner.run_dense(input_ids, positions, (), [])
+        if runner.rank == 0:
+            for k in range(n):
+                logger.info(
+                    "mono check dense layers token %d/%d pos %d: residual %s | "
+                    "reduced out %s",
+                    k,
+                    n,
+                    int(positions[k]),
+                    compare(res[k], ref_res[k]),
+                    compare(ar[k], ars[0][k]),
+                )
+        ars[0][:n].copy_(ar)
     rows = token_rows(fwd, n)
     zeros = torch.zeros(n, HIDDEN, dtype=ars[0].dtype, device=ars[0].device)
     for i, lw in enumerate(runner.sparse):

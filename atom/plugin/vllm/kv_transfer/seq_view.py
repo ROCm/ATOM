@@ -22,7 +22,15 @@ class SeqView:
     __slots__ = (
         # Stamped by the shared offload scheduler when it refreshes a parked
         # deferred save; read back with ``getattr(seq, ..., None)``, so an
-        # unset slot reads as "not parked".
+        # unset slot reads as "not parked". Restarted on every newly
+        # dispatched deferred save (``_offload_common.
+        # _refresh_save_reclaim_clock`` and the park site in the scheduler).
+        # ATOM's ``Sequence`` has a ``__dict__`` and absorbs
+        # ``seq._deferred_save_at = ...``; a slotted view without this name
+        # raises ``AttributeError`` on that assignment, out of the save path,
+        # the first time a finished request is parked. A clock that is not
+        # restarted abandons the copy while the worker is still reading the
+        # blocks: a truncated snapshot under a valid prefix hash.
         "_deferred_save_at",
         "_load_operation",
         "_num_cached_tokens",
@@ -58,6 +66,7 @@ class SeqView:
         self.offload_loaded_tokens = 0
         self.offload_load_start_tokens = None
         self.offload_handoff_boundary_tokens = 0
+        self._deferred_save_at = None
         self.prefix_hashes_published = False
         self._load_operation = None
 
@@ -76,6 +85,13 @@ class SeqView:
     @property
     def num_prompt_tokens(self) -> int:
         return len(self._request.prompt_token_ids)
+
+    @property
+    def num_tokens(self) -> int:
+        # Prompt plus output, as on ATOM's Sequence. Read when deciding that a
+        # local hit leaves too little for any load (`_load_ruled_out`); missing
+        # here, that check raised AttributeError inside vLLM's schedule().
+        return int(self._request.num_tokens)
 
     @property
     def num_cached_tokens(self) -> int:
@@ -115,6 +131,7 @@ class SeqView:
         self.offload_loaded_tokens = 0
         self.offload_load_start_tokens = None
         self.offload_handoff_boundary_tokens = 0
+        self._deferred_save_at = None
         self.prefix_hashes_published = False
         self._load_operation = None
         # Frozen placement from a previous finish is placement too, and a

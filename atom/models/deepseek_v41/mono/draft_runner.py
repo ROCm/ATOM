@@ -58,7 +58,9 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         config = copy(draft.config)
         config.n_routed_experts = self.experts
         config.num_experts_per_tok = self.topk
-        self.layers = [bind_layer(block, config, self.tp) for block in draft.mtp]
+        self.layers = [
+            bind_layer(block, config, self.dims, self.moe_tp) for block in draft.mtp
+        ]
         for table in (draft.rope.cos_cache, draft.rope.sin_cache):
             if table.dtype != torch.bfloat16 or table.shape[-1] != k1.HALF:
                 raise MonoUnsupported(f"draft rope table {table.dtype} {table.shape}")
@@ -82,9 +84,14 @@ class DraftMonoRunner(V41MonoDecodeRunner):
                 tp=self.tp,
                 timeline=self.timeline,
                 diag_off=self.diag_off,
+                kv_fp8=self.kv_fp8,
             )
             for i in range(len(self.model.mtp))
         ]
+
+    def _tok_par(self, s: int) -> bool:
+        # the backbone gathers no rows: every K1 and K2 runs on all of them
+        return False
 
     def _rope_positions(self, cache, step) -> torch.Tensor:
         return self.positions

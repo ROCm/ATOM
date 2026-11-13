@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP4 scoring for a DSA sparse indexer: the predicate, the ABI, the schedule.
+"""FP4 scoring for a DSA sparse indexer: the predicate and the ABI.
 
 FP4 is a change of dtype, not a second cache: `indexer_qk_rope_quant_and_cache`
 writes packed E2M1 keys plus their e8m0 scales in place of the FP8 row, and
-`flydsl_pa_mqa_logits_fp4[_prefill]` score them straight out of the paged cache.
+`flydsl_pa_mqa_logits_fp4` scores them straight out of the paged cache.
 Every number here is one those kernels fix, so it drifts with them.
 """
 
@@ -18,28 +18,6 @@ import torch
 
 logger = logging.getLogger("atom")
 
-# Persistent-grid schedule params for `pa_mqa_logits_fp4_prefill`. A metadata
-# builder precomputes its cta_info with these and the scorer passes the
-# matching block_k, so layout and grid agree. DeepSeek-V4 drives the same kernel
-# and carries its own copy of this pair in `v4_kernels`; the two must be
-# changed together until something merges them, which is not this module's to
-# do. (Decode scores ragged rows through `Fp4MqaRaggedMetadata`, whose kernel
-# shares its work out by length itself.)
-#
-# The floor is a CTA-count target, not a kernel default: the consumer takes
-# `max(floor, rows)`, so it only adds split-K to grids too small to fill the
-# GPU and is an identity for the wide ones. Splits are numerically inert --
-# each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
-#
-# It cannot be fitted to the work. A CUDAGraph bakes the grid at capture,
-# while the work is `rows * ceil(ctx / block_k)` and the context term is only
-# known per replay; of what capture does know, the batch size measures flat, so
-# there is nothing to derive one from. It is therefore the smallest
-# worst-case regret over the served context range rather than any shape's
-# optimum -- re-tune against a real workload mix. At prefill rows=1024 and
-# W~32768, 4096 measured 206.2us a call against 512's 224.6us.
-FP4_MQA_PARALLEL_UNIT_NUM = 4096
-FP4_MQA_BLOCK_K = 256
 
 # The fused writer's FP4 group width, against 128 on the FP8 path.
 FP4_QUANT_BLOCK_SIZE = 32
@@ -101,7 +79,7 @@ def sparse_indexer_fp4_enabled(
 
 
 def assert_fp4_indexer_supported(
-    *, fused_writer: bool, prefill_context_parallel: bool, prefill_ubatching: bool
+    *, fused_writer: bool, prefill_context_parallel: bool
 ) -> None:
     """Reject the FP4 requests this build cannot serve.
 
@@ -124,14 +102,6 @@ def assert_fp4_indexer_supported(
             "The FP4 sparse indexer does not support PCP, whose candidate "
             "exchange is the one reader of the fp32 `weights` the FP4 writer "
             "does not produce. Pass --index-cache-dtype fp8."
-        )
-    if prefill_ubatching:
-        raise ValueError(
-            "The FP4 sparse indexer does not support prefill micro-batching. "
-            "`split_attn_metadata` rebuilds the metadata from its declared "
-            "fields, and the FP4 schedule rides on undeclared ones whose row "
-            "ids a ubatch rebases. Decode micro-batching (--enable-tbo-decode) "
-            "is supported. Pass --index-cache-dtype fp8."
         )
 
 
@@ -177,40 +147,3 @@ def fp4_index_block_shapes(rows: int, head_dim: int) -> tuple[tuple, tuple]:
         )
     k_tiles = head_dim // _K_TILE
     return (k_tiles, 4, rows, 16), (k_tiles, 4, rows)
-
-
-def fp4_prefill_schedule(
-    row_to_batch: torch.Tensor,
-    local_ends: torch.Tensor,
-    block_k: int,
-    parallel_floor: int,
-    max_seq_len: int,
-    local_starts: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, int, torch.Tensor]:
-    """Schedule one ragged-prefill forward, and the `local_starts` it scores from.
-
-    `local_ends` is each row's causal upper bound in the column space the paged
-    FP4 scorer emits -- DeepSeek-V4's `visible_end`, MLA's `cu_seqlen_ke -
-    cu_seqlen_ks`. Rows start at column 0 there, so `local_starts` defaults to
-    zeros; pass it when the columns are one concatenated plane instead, as they
-    are under DCP, where the scorer reads a gathered copy of every sequence.
-
-    `parallel_floor` is raised to the row count: prefill has one row per query
-    token and every (row, chunk-split) needs a slot. `max_seq_len` has to be the
-    width the scorer allocates its logits at, which the schedule bakes in.
-    """
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-        compute_prefill_schedule,
-    )
-
-    if local_starts is None:
-        local_starts = torch.zeros_like(local_ends)
-    _, cta_info, n_ctas = compute_prefill_schedule(
-        row_to_batch.to(torch.int32),
-        local_starts,
-        local_ends,
-        block_k,
-        max(parallel_floor, local_ends.shape[0]),
-        max_seq_len,
-    )
-    return cta_info, n_ctas, local_starts

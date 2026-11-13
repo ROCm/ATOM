@@ -28,7 +28,7 @@ heads, as the original does.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -137,8 +137,22 @@ def stage_iw(c, task, hidden, nbl, load_group):
             total = fx.Float32(live.select(total + (accx + accy), total))
         w = _wv_reduce(total, lane)
         if (lane == 0) & (wave < n):
-            c["put"](c["iw"], t * ip.HEADS + m, bf16_round(w))
+            if const_expr(c["tok_par"]):
+                # token parallel: to every rank, at the token's row of the step
+                for p in range_constexpr(c["d"].tp):
+                    dst = c["iw_dsts"][p]
+                    c["put"](dst, (c["t0"] + t) * ip.HEADS + m, bf16_round(w))
+            else:
+                c["put"](c["iw"], t * ip.HEADS + m, bf16_round(w))
         gpu.barrier()
+
+
+def poll_query(c, t, h, lane):
+    """Token t, head h: the lane's pair of the index query and the head's weight,
+    one poll batch (IW in the peer buffer in a token-parallel launch: IWG)."""
+    q = (c["iq"], (t * IDX_ROWS + h * ip.DIM) // 2 + lane, 1)
+    w = (c["iw"], t * ip.HEADS + h, 1)
+    return c["poll"]([q, w])
 
 
 @traced
@@ -149,12 +163,7 @@ def stage_iquant(c, task):
     t = task // ip.HEADS
     h = task % ip.HEADS
     if wave == 0:
-        got = c["poll"](
-            [
-                (c["iq"], (t * IDX_ROWS + h * ip.DIM) // 2 + lane, 1),
-                (c["iw"], t * ip.HEADS + h, 1),
-            ]
-        )
+        got = poll_query(c, t, h, lane)
         x0, x1 = bf2_f32(got[0][0])
         amax = butterfly(
             fx.max(fx.max(abs(x0), abs(x1)), fx.Float32(AMAX_SEED)),
@@ -212,12 +221,7 @@ def stage_iquant_fp4(c, task):
     t = task // ip.HEADS
     h = task % ip.HEADS
     if wave == 0:
-        got = c["poll"](
-            [
-                (c["iq"], (t * IDX_ROWS + h * ip.DIM) // 2 + lane, 1),
-                (c["iw"], t * ip.HEADS + h, 1),
-            ]
-        )
+        got = poll_query(c, t, h, lane)
         x0, x1 = bf2_f32(got[0][0])
         amax = butterfly(fx.max(abs(x0), abs(x1)), (1, 2, 4, 8), fx.max)
         bits = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1.0 / 6.0)).bitcast(
