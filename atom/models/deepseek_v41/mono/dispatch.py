@@ -164,7 +164,7 @@ def install_mono_decode(
             install_single_step,
         )
 
-        return install_single_step(model, atom_config, drafter)
+        return install_single_step(model, atom_config, drafter, metadata_builder)
     why = config_refusal(atom_config)
     if why is not None:
         if hi_gate.mode() == "1":

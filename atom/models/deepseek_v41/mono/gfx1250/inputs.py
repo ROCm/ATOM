@@ -11,6 +11,7 @@ import torch
 
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250.step_plans import fill_step_plans
 from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
 from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
 from atom.models.deepseek_v41.mono.step_meta import write_step_meta
@@ -43,11 +44,6 @@ class StepInputs:
                 why = f"index bound {end} > {ILW}"
             elif -(-end // geom.block_size) > BCOLS or bt.shape[0] > 8:
                 why = f"block table {bt.shape[0]} x {-(-end // geom.block_size)}"
-            elif self.tables.comp:
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    if plan.num_compress > T_MAX or plan.num_write > T_MAX:
-                        why = f"plan {r} rows"
         if why is None:
             self._precheck_why = None
         else:
@@ -122,16 +118,6 @@ class StepInputs:
                 )
             ]
             key += [bt.data_ptr(), tuple(bt.shape), bt.stride(0)]
-            if self.tables.comp:
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    for src, nl in (
-                        (plan.compress_plan_gpu, plan.num_compress),
-                        (plan.write_plan_gpu, plan.num_write),
-                    ):
-                        if nl > T_MAX:
-                            raise MonoUnsupported(f"plan {r}: {nl} rows > {T_MAX}")
-                        key += [src.data_ptr(), tuple(src.shape)]
         # the Engram layers' embedding rows (staged on Engram's side stream: ``get`` makes this stream wait for them)
         emb = getattr(md, "engram_embeddings", None)
         engs = {}
@@ -189,6 +175,7 @@ class StepInputs:
             (0, rows),
         )
         S["rpos"][:rows].copy_(step.positions[:rows])
+        self.first_positions[:req].copy_(step.positions[:rows:ROWS_PER_REQ])
         S["tids"][:rows].copy_(input_ids.view(-1))
         S["dids"][: req * 5].copy_(input_ids.view(req, 6)[:, 1:].reshape(-1))
         # each request's state slot (the draft context's rows): not its batch position once requests have finished
@@ -203,28 +190,28 @@ class StepInputs:
         )
         if self.tables.idx:
             S["ibat"][:rows].copy_(step.batch_ids[:rows])
-            for r in (1, 2):
-                S[f"ibound{r}"][:rows].copy_(step.visible[r][:rows])
+            if self.tables.comp:
+                # the visible counts and the compress / write plans from the step's positions, on the device (the
+                # host's arithmetic, ``step_plans``): they hold on a step whose positions the device advanced
+                fill_step_plans(
+                    step.positions[:rows],
+                    ROWS_PER_REQ,
+                    (1, 2),
+                    geom.speculative_tokens,
+                    {r: S[f"ibound{r}"] for r in (1, 2)},
+                    {r: S[f"cplan{r}"] for r in (1, 2)},
+                    {r: S[f"wplan{r}"] for r in (1, 2)},
+                    T_MAX,
+                )
+            else:
+                for r in (1, 2):
+                    S[f"ibound{r}"][:rows].copy_(step.visible[r][:rows])
             # the requests' page tables: a fixed BCOLS columns (past the step's reach: never read)
             bt = step.block_tables
             n = bt.shape[0]
             cc = min(bt.shape[1], BCOLS)
             S["btab"][: n * BCOLS].view(n, BCOLS)[:, :cc].copy_(bt[:, :cc])
-            if (
-                self.tables.comp
-            ):  # the compress / ring-write plans, -1 padded (pos < 0: skipped); the plan's rows past
-                # its live count are sentinels (its fixed-capacity layout) or absent (a tight one)
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    for name, src in (
-                        ("cplan", plan.compress_plan_gpu),
-                        ("wplan", plan.write_plan_gpu),
-                    ):
-                        dst = S[f"{name}{r}"]
-                        dst.fill_(-1)
-                        m = min(src.shape[0], T_MAX)
-                        if m:
-                            dst[: m * 4].copy_(src[:m].reshape(-1))
+            if self.tables.comp:
                 S["slots"][:n].copy_(step.slots[:n])
         for k, w in self.tables.engram.items():
             e = engs[k]

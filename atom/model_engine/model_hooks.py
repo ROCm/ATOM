@@ -22,6 +22,11 @@ class DecodeRound:
     """A model's decode round at its builder's points of a step. Every method
     defaults to "nothing taken over"."""
 
+    # On a served step, the model looks its Engram rows up itself (the staging
+    # only advances the cursor: ``EngramStep.served_by_round``); a model that
+    # reads the staged rows says False.
+    looks_up_engram_rows = True
+
     def consumes_device_verdict(self, batch, max_seqlen_q) -> bool:
         """Before the step's input ids, every forward: whether the step
         advances from the previous verdict on the device

@@ -94,7 +94,14 @@ class SingleStepModel(StepOverrideModel, nn.Module):
             if n == running_bs * ROWS_PER_REQ
             else None
         )
-        if runner is not None:
+        if runner is None:
+            md = getattr(get_forward_context(), "attn_metadata", None)
+            if md is not None and md.served_by_round:
+                # laid out for the launch alone (``round.SingleStepRound``): no plans for the production path
+                raise RuntimeError(
+                    "V4.1 single-launch step: a step the decode round gave the launch was not served"
+                )
+        else:
             runner.run_step(input_ids, running_bs, get_forward_context(), batch)
         self._served, self._decode_batch = runner, batch
         return runner
@@ -135,9 +142,18 @@ class SingleStepModel(StepOverrideModel, nn.Module):
             return getattr(self.model, name)
 
 
-def install_single_step(model: nn.Module, atom_config, drafter) -> nn.Module:
+def install_single_step(
+    model: nn.Module, atom_config, drafter, metadata_builder=None
+) -> nn.Module:
     why = refusal(atom_config)
     if why is not None:
         logger.info("V4.1 single-launch step off: %s", why)
         return model
-    return SingleStepModel(model, drafter, atom_config)
+    wrapped = SingleStepModel(model, drafter, atom_config)
+    if metadata_builder is not None and hasattr(metadata_builder, "use_decode_round"):
+        # (imported here: it imports Triton)
+        from atom.models.deepseek_v41.mono.gfx1250.round import SingleStepRound
+
+        # the builder's decode round on the launch's steps: lean host prep, the device-side round advance
+        metadata_builder.use_decode_round(SingleStepRound(wrapped, metadata_builder))
+    return wrapped

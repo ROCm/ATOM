@@ -46,10 +46,10 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
-
 # The TileRT-structured step (kernels/step.py: one row cluster a request, the mix partials' [8]-row layout) is the
 # c1 shape: one request (6 rows). Wider steps take the production path.
 MAX_STEP_ROWS = 6
+
 
 def _base_model(model):
     for m in model.modules():
@@ -172,6 +172,11 @@ class SingleStepRunner(StepInputs):
         # the stream the verdict's copies run on: ModelRunner's output D2H waits for it, not for the draft launch
         self.output_stream = self._verify_stream = torch.cuda.Stream()
         self._eng_rows = None
+        # each request's first position of the step (its preparation writes it): where the decode round's next step
+        # advances from (``round.SingleStepRound``)
+        self.first_positions = torch.zeros(
+            buffers.T_MAX // ROWS_PER_REQ, dtype=torch.int32, device="cuda"
+        )
         # every width built now (each a compile or a disk-cache load, then a TP barrier: ``prepare``), not on its first
         # step: a width first met mid-serve stalled every request for its JIT (~18 s cold)
         t0 = time.perf_counter()
@@ -234,7 +239,7 @@ class SingleStepRunner(StepInputs):
             float(self.base.layers[0].attn.softmax_scale),
             T_.fptab.data_ptr(),
             T_.tp.data_ptr(),
-            0,   # lo / hi: the target layer range of a split launch (one launch: every layer)
+            0,  # lo / hi: the target layer range of a split launch (one launch: every layer)
             len(self.base.layers),
         )
 
