@@ -9,17 +9,22 @@ as hex (`payload`), the batch and events decoded from them (byte hashes as
 vLLM and SGLang batches are encoded as their publishers encode them, with the
 engines' structs vendored below, trimmed to the fields the samples need. ATOM
 batches come from the block manager and publisher of the ATOM checkout at
-`--atom-root` (default: this one), read back from the publisher's replay socket.
+`--atom-root` (default: this one), read back from the publisher's replay socket;
+atom/main_* re-encode two of them with the kv_events.py of ATOM main before
+#3275, read from the checkout's git history.
 `--out` defaults to samples.jsonl next to this script. `--check` also decodes
 every vLLM and ATOM payload with vLLM's `KVEventBatch` and every SGLang payload
-with SGLang's; only sglang/eagle_bigram is rejected.
+with SGLang's; only sglang/eagle_bigram and the atom/main_* arrays are rejected.
 """
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -35,7 +40,7 @@ PINS = {
     "{sglang_emit}": "https://github.com/sgl-project/sglang/blob/72f72ccacb3a73fcd99d401e25ca986bda6144c8/",
     "{atom}": "https://github.com/ROCm/ATOM/blob/2b2fb2e6f83daa9a78202adf2c168ede5b600036/",
 }
-# The PR-1 commit whose serializer published the ATOM payloads in samples.jsonl.
+# The ROCm/ATOM#3275 commit whose serializer published the ATOM payloads in samples.jsonl.
 ATOM_PUBLISHED = "Published by ATOM at edd7abdd4744."
 
 # Every sample in samples.jsonl order: its engine/name and source permalink, then
@@ -59,7 +64,7 @@ vllm/salt_first_block {vllm}vllm/v1/core/kv_cache_utils.py#L655-L659
 vllm/lora_salt {vllm}vllm/v1/core/kv_cache_utils.py#L674-L700
     LoRA adapter 'my-lora' (adapter id 1) with cache_salt 'salt-abc': the LoRA name leads every block's extra_keys entry and the salt follows it on the first block only, so the entries are ('my-lora', 'salt-abc') and ('my-lora',).
 vllm/multimodal {vllm}vllm/v1/core/kv_cache_utils.py#L518-L583
-    Two images: A at token offset 1 (length 5), B at offset 7 (length 2), placeholder token 151655. Each block lists an (mm_identifier, offset) pair per image it overlaps, offset relative to the block start and so negative past an image's first block: ((A, 1),), ((A, -3), (B, 3)), ((B, -1),), then null for the text-only block. Identifiers are 64-hex-char stand-ins for vLLM's blake3 media hash.
+    Two images after a text-only block: A at token offset 5 (length 5), B at offset 11 (length 2), placeholder token 151655. Each block lists an (mm_identifier, offset) pair per image it overlaps, offset relative to the block start and so negative past an image's first block: null for the text-only block, then ((A, 1),), ((A, -3), (B, 3)), ((B, -1),). Identifiers are 64-hex-char stand-ins for vLLM's blake3 media hash.
 vllm/sliding_window_group {vllm}vllm/v1/core/kv_cache_manager.py#L721-L746
     Hybrid model: the same blocks published once per KV cache group with the same hashes, group 0 full_attention and group 1 sliding_window with kv_cache_spec_sliding_window 128.
 vllm/lookahead_token_ids {vllm}vllm/v1/core/block_pool.py#L296-L315
@@ -97,7 +102,7 @@ sglang/declared_disk_external {sglang}python/sglang/srt/disaggregation/kv_events
 sglang/dp_rank_1 {sglang}python/sglang/srt/disaggregation/kv_events.py#L463-L468
     Batch from attention-DP rank 1. SGLang names the third batch element attn_dp_rank; the publisher fills it (0 in every other SGLang sample).
 atom/startup_clear {atom}atom/distributed/kv_events.py#L523-L549
-    Seq 0 of every ATOM stream: make_publisher publishes a lone AllBlocksCleared before the engine's first batch (new in PR-1), kept for replay.
+    Seq 0 of every ATOM stream: make_publisher publishes a lone AllBlocksCleared before the engine's first batch (new in #3275), kept for replay.
 atom/stored_root {atom}atom/model_engine/block_manager.py#L2465-L2474
     Root store from the block manager: parent_block_hash null, two blocks of 4 with xxh64 chain hashes (u64, one >= 2**63), medium GPU, lora_id and lora_name null, and ATOM's own token_offset 0, which vLLM's decoder skips.
 atom/stored_child {atom}atom/model_engine/block_manager.py#L2465-L2474
@@ -105,11 +110,15 @@ atom/stored_child {atom}atom/model_engine/block_manager.py#L2465-L2474
 atom/removed {atom}atom/model_engine/block_manager.py#L615-L627
     Eviction of the three cached blocks for a new prompt: one BlockRemoved per hash, medium GPU, no group_idx.
 atom/remote_kv_gpu {atom}atom/model_engine/block_manager.py#L3726-L3750
-    KV received from a PD prefill producer (decode side): before PR-1 medium REMOTE, now GPU like any block in this engine's HBM. Two blocks after a locally cached one: parent_block_hash set, token_offset 4.
+    KV received from a PD prefill producer (decode side): before #3275 medium REMOTE, now GPU like any block in this engine's HBM. Two blocks after a locally cached one: parent_block_hash set, token_offset 4.
 atom/multimodal_extra_keys {atom}atom/model_engine/block_manager.py#L54-L86
-    Multimodal prompt: every block carries the media digest in extra_keys as ((mm_identifier, 0),) with mm_identifier '{seed}', the seq's cache_seed in 16 hex digits (new in PR-1). The seed also roots the hash chain, so this root event's parent_block_hash is the cache_seed itself, not a block hash.
+    Multimodal prompt: every block carries the media digest in extra_keys as ((mm_identifier, 0),) with mm_identifier '{seed}', the seq's cache_seed in 16 hex digits (new in #3275). The seed also roots the hash chain, so this root event's parent_block_hash is the cache_seed itself, not a block hash.
 atom/dp_rank_2 {atom}atom/distributed/kv_events.py#L312-L334
     Batch from data-parallel rank 2 (seq 1, after that publisher's startup clear); ATOM fills data_parallel_rank on every batch, 0 in the other ATOM samples.
+atom/main_stored_root {atom}atom/distributed/kv_events.py#L39-L67
+    stored_root as ATOM main encodes it before #3275: the same batch re-encoded with that commit's kv_events.py, whose events are array_like. The event is an array: the tag, then all twelve fields in declaration order, defaults included (omit_defaults does not apply to array_like structs); vLLM's decoder rejects it. events lists the fields by name, as that kv_events.py decodes them.
+atom/main_removed {atom}atom/distributed/kv_events.py#L70-L75
+    removed as ATOM main encodes it before #3275, re-encoded like main_stored_root: each event is [tag, block_hashes, medium, group_idx].
 """
 
 
@@ -273,8 +282,8 @@ def vllm_payloads(v: types.SimpleNamespace) -> dict[str, bytes]:
         "multimodal",
         gpu(
             vllm_hashes("mm/0", "mm/1", "mm/2", "mm/3"),
-            [100, *[pad] * 5, 101, pad, pad, *range(102, 109)],
-            extra_keys=[((a, 1),), ((a, -3), (b, 3)), ((b, -1),), None],
+            [*range(100, 105), *[pad] * 5, 105, pad, pad, *range(106, 109)],
+            extra_keys=[None, ((a, 1),), ((a, -3), (b, 3)), ((b, -1),)],
         ),
     )
     sliding = gpu(root, tokens, group_idx=1, kv_cache_spec_kind="sliding_window")
@@ -468,6 +477,31 @@ def atom_payloads(atom_root: Path) -> tuple[dict[str, bytes], str]:
     return payloads, format(mm.cache_seed & (2**64 - 1), "016x")
 
 
+def atom_main_samples(atom_root: Path, atom: dict[str, bytes]) -> dict[str, tuple]:
+    """stored_root and removed re-encoded by the kv_events.py of {atom}, ATOM main
+    before #3275, each with its events by field name as that module decodes them."""
+    rev = PINS["{atom}"].split("/")[-2]
+    show = ["git", "-C", str(atom_root), "show", f"{rev}:atom/distributed/kv_events.py"]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "kv_events.py")
+        path.write_bytes(subprocess.check_output(show))
+        spec = importlib.util.spec_from_file_location("atom_main_kv_events", path)
+        main = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = main
+        spec.loader.exec_module(main)
+    samples = {}
+    for name in ("stored_root", "removed"):
+        ts, events, rank = msgspec.msgpack.decode(atom[f"atom/{name}"])
+        events = [getattr(main, e.pop("type"))(**e) for e in events]
+        payload = msgspec.msgpack.Encoder().encode(main.EventBatch(ts, events, rank))
+        decoded = msgspec.msgpack.Decoder(main.EventBatch).decode(payload).events
+        by_name = [
+            {"type": type(e).__name__, **msgspec.structs.asdict(e)} for e in decoded
+        ]
+        samples[f"atom/main_{name}"] = (payload, by_name)
+    return samples
+
+
 def sample_table(seed: str) -> dict[str, tuple[str, str]]:
     """SAMPLES as {engine/name: (permalink, note)}."""
     text = SAMPLES.replace("{seed}", seed)
@@ -478,7 +512,7 @@ def sample_table(seed: str) -> dict[str, tuple[str, str]]:
         head, *lines = entry.split("\n")
         key, permalink = head.split()
         note = " ".join(line.strip() for line in lines)
-        if key.startswith("atom/"):
+        if key.startswith("atom/") and not key.startswith("atom/main_"):
             note = f"{note} {ATOM_PUBLISHED}"
         table[key] = (permalink, note)
     return table
@@ -494,9 +528,10 @@ def as_json(value: Any) -> Any:
     return value
 
 
-def record(key: str, permalink: str, note: str, payload: bytes) -> str:
+def record(key: str, permalink: str, note: str, payload: bytes, by_name=None) -> str:
     engine, name = key.split("/")
     ts, events, rank = msgspec.msgpack.decode(payload)
+    events = events if by_name is None else by_name
     line = {
         "engine": engine,
         "name": name,
@@ -535,14 +570,18 @@ def main() -> None:
 
     v, s = vllm_structs(), sglang_structs()
     atom, seed = atom_payloads(args.atom_root)
+    main_samples = atom_main_samples(args.atom_root, atom)
+    atom |= {key: payload for key, (payload, _) in main_samples.items()}
     payloads = {**vllm_payloads(v), **sglang_payloads(s), **atom}
     table = sample_table(seed)
     assert table.keys() == payloads.keys(), table.keys() ^ payloads.keys()
-    lines = [record(key, *table[key], payloads[key]) for key in table]
+    named = {key: by_name for key, (_, by_name) in main_samples.items()}
+    lines = [record(key, *table[key], payloads[key], named.get(key)) for key in table]
     args.out.write_bytes("".join(lines).encode())
     print(f"{len(lines)} samples written to {args.out}")
-    if args.check and rejected(payloads, v, s) != ["sglang/eagle_bigram"]:
-        sys.exit("--check: only sglang/eagle_bigram should fail to decode")
+    rejects = ["sglang/eagle_bigram", *main_samples]
+    if args.check and rejected(payloads, v, s) != rejects:
+        sys.exit(f"--check: only {' and '.join(rejects)} should fail to decode")
 
 
 if __name__ == "__main__":
