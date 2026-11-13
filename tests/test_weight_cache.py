@@ -11,6 +11,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -317,6 +318,14 @@ def test_change_out_of_the_walks_reach_is_reported(toy_packages):
     assert any("holders[0]::mode: changed during load" in u for u in exp["unshippable"])
 
 
+def test_submodule_replaced_by_another_class_is_reported(toy_packages):
+    def load(m):
+        m.child = nn.Identity()  # same path, another forward
+
+    _, exp = _export(Toy(), load)
+    assert any(u.startswith("child: replaced by a ") for u in exp["unshippable"])
+
+
 def test_process_state_loading_changes_travels_or_is_refused(monkeypatch):
     mod = types.ModuleType("atom._wc_test_state")
 
@@ -428,21 +437,6 @@ def test_attribute_written_then_read_keys_its_construction_value(layer_packages)
     reads = _record_load(Layer(), load)
     assert reads["attrs"]["\tinterleave"] == ("V", "true")
     assert ir.diff_reads(reads, ("attrs",), model=Layer()) == []
-
-
-def test_recorder_keeps_the_drafters_reads_apart(layer_packages):
-    target, draft = Layer(), Layer(interleave=False)
-    rec = ir.InputRecorder()
-    rec.enter_load(target)
-    target.process()
-    rec.enter_load(draft, kind="draft")
-    draft.process()
-    rec.finish_load(set())
-    reads = rec.key_reads()
-    assert reads["attrs"]["\tinterleave"] == ("V", "true")
-    assert reads["draft_attrs"]["\tinterleave"] == ("V", "false")
-    assert ir.diff_reads(reads, ("draft_attrs",), model=Layer(interleave=False)) == []
-    assert ir.diff_reads(reads, ("draft_attrs",), model=Layer())
 
 
 def test_recorder_keys_env_read_during_load_only(monkeypatch):
@@ -851,7 +845,9 @@ def loop(monkeypatch):
         "draft": {
             "structure": {},
             "export": {"plan": {}, "storages": {}},
+            "process": {"changes": [], "env": {}, "storages": {}},
             "reads": {},
+            "code": {},
             "loaded": ["mtp.0.w"],
         },
         "reads": {},
@@ -860,8 +856,9 @@ def loop(monkeypatch):
     def probe(path, label, started, config, rank, device):
         present, reasons = calls.probes.pop(0)
         if not present:
-            return None, None, [], False
-        return (None if reasons else _Conn()), payload, reasons, True
+            return None, None, [], client._NONE
+        status = client._UNUSABLE if reasons else client._USABLE
+        return (None if reasons else _Conn()), payload, reasons, status
 
     def spawn():
         calls.spawned += 1
@@ -872,6 +869,9 @@ def loop(monkeypatch):
 
     for name, fn in {
         "_probe": probe,
+        "_wait_together": lambda path, label, started, group: None,
+        "_pid_running": lambda pid: False,  # the fake pids must never be signalled
+        "verify_code": lambda code: [],
         "_spawn_daemon": spawn,
         "stop_daemon": stop,
         "socket_path": lambda device: "/nonexistent/gpu.sock",
@@ -944,6 +944,29 @@ def test_drafter_comes_from_the_daemon_the_model_came_from(loop, monkeypatch):
         client.load_drafter_from_cache(config, cpu, None, target, rank=0) == "from disk"
     )
     assert config.compilation_config.static_forward_context == {"other": 1}
+
+
+def test_a_server_whose_sources_changed_leaves_the_daemon_alone(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    stale = ["key.py changed after this server started; restart it"]
+    monkeypatch.setattr(client, "_probe", lambda *a: (None, None, stale, client._STALE))
+    with pytest.raises(RuntimeError, match="restart it"):
+        _from_daemon()
+    assert loop.stopped == loop.spawned == 0
+
+
+def test_socket_dir_must_be_private(monkeypatch):
+    d = tempfile.mkdtemp(dir="/tmp")
+    try:
+        os.chmod(d, 0o755)
+        monkeypatch.setenv("ATOM_WEIGHT_CACHE_DIR", d)
+        with pytest.raises(PermissionError):
+            transport.socket_dir()
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o755  # left as it was
+        os.chmod(d, 0o700)
+        assert transport.socket_dir() == d
+    finally:
+        os.rmdir(d)
 
 
 def test_preload_restarts_a_daemon_it_cannot_use_once(loop, monkeypatch):

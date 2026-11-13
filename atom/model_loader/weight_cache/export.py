@@ -41,6 +41,7 @@ def snapshot(model: nn.Module) -> dict:
     for path, obj, is_module in _walk_objects(model):
         entry = {"attrs": {k: _fp(v) for k, v in _attrs(obj, is_module).items()}}
         if is_module:
+            entry["type"] = f"{type(obj).__module__}.{type(obj).__qualname__}"
             # Parameters are always exported, so their identity is enough.
             entry["params"] = {
                 k: ("P", id(p), tuple(p.shape), str(p.dtype))
@@ -167,6 +168,9 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
             continue  # a new object: the attribute holding it decides below
         obj, is_module = objects[path]
         prev = before[path]
+        if prev.get("type") != entry.get("type"):
+            unshippable.append(f"{path or '<root>'}: replaced by a {entry['type']}")
+            continue
         item: dict[str, Any] = {"params": {}, "buffers": {}, "attrs": {}, "delete": []}
         if is_module:
             for k, p in obj._parameters.items():

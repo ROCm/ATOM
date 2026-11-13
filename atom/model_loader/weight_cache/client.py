@@ -6,7 +6,9 @@ restarting the daemon under ATOM_PRELOAD."""
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
+import signal
 import socket
 import threading
 import time
@@ -53,10 +55,13 @@ from atom.model_loader.weight_cache.transport import (
     daemon_state,
     socket_path,
 )
-from atom.model_loader.weight_cache.values import _TAG, _Miss, logger, rank_label
-from atom.utils import envs
+from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
+from atom.utils import envs, worker_process_name
 
 _STOP_HINT = "python -m atom.model_loader.weight_cache stop"
+# What a rank finds (the launch acts on the most severe): no daemon, one it
+# can use, one it cannot, or sources changed under this server.
+_NONE, _USABLE, _UNUSABLE, _STALE = range(4)
 # The drafter part of the payload this process took its model from, for the
 # drafter's loader (load_drafter_from_cache), which runs after the model's.
 _draft: dict | None = None
@@ -72,26 +77,22 @@ def _agree_group():
         return None
 
 
-def _wait_serving(path: str, label: str, started: dict | None) -> None:
-    """Wait until this GPU's daemon serves: first, for a daemon this launch
-    started, until it holds the GPU, then until it has loaded (raises _Miss)."""
+def _wait_together(path: str, label: str, started: dict | None, group) -> None:
+    """Wait until every GPU's daemon serves or will not: all ranks together,
+    so none sits in a collective while another waits out a load."""
     t0 = last = time.monotonic()
     seen = started is None  # a daemon that was there holds the GPU already
     while True:
         alive = daemon_alive(path)
-        if alive and os.path.exists(path):
-            return
+        seen = seen or alive
+        waiting = (alive and not os.path.exists(path)) or (
+            not seen and _pid_running(started["pid"])
+        )
         waited = time.monotonic() - t0
-        if alive:
-            seen = True
-        elif seen:
-            raise _Miss("the daemon exited while loading")
-        elif not _pid_running(started["pid"]):
-            raise _Miss(
-                f"the weight cache daemon (pid {started['pid']}) exited while starting; see {started['log']}"
-            )
-        if waited > envs.ATOM_WEIGHT_CACHE_WAIT_S:
-            raise _Miss(f"the daemon is still not serving after {waited:.0f}s")
+        if not group_max(
+            int(waiting and waited < envs.ATOM_WEIGHT_CACHE_WAIT_S), group
+        ):
+            return
         if time.monotonic() - last > 30:
             logger.info(
                 f"{_TAG} {label}: waiting for the daemon to finish loading ({waited:.0f}s)"
@@ -121,19 +122,14 @@ def _fetch(path: str, label: str) -> tuple[socket.socket, dict]:
 
 
 def _check_payload(payload: dict, config, rank: int, device) -> list[str]:
-    """Why this payload cannot be used here (empty: it can)."""
+    """Why this payload cannot be used here (empty: it can), as far as it
+    shows before this server builds its model; raises _SourceChanged."""
     if payload.get("protocol") != PROTOCOL_VERSION:
         return [f"protocol {payload.get('protocol')} != {PROTOCOL_VERSION}"]
     diffs = _diff_key(payload["key"], compute_key(config, rank, device))
     if diffs:
         return ["checkpoint, model, rank, GPU or library versions differ:"] + diffs
-    diffs = diff_reads(payload["reads"], STATIC_READS, config=config)
-    if diffs:
-        return ["settings the daemon's load read differ:"] + diffs
-    try:
-        changed = verify_code(payload["code"])
-    except _SourceChanged as e:
-        return [f"{e} changed after this server started; restart it"]
+    changed = verify_code(payload["code"])
     if changed:
         return [
             f"{len(changed)} function(s) or kernel(s) that ran while the daemon loaded have changed:"
@@ -171,30 +167,42 @@ def _fail(
 
 
 def _probe(path: str, label: str, started: dict | None, config, rank, device):
-    """This rank's daemon: (connection, payload, why it cannot be used, whether
-    there is one). Waits for a daemon that is starting or loading."""
-    sock, payload = None, None
+    """This rank's daemon, once _wait_together returned: (connection,
+    payload, why it cannot be used, status)."""
+    sock, payload, status = None, None, _USABLE
     try:
-        if started is None and not daemon_alive(path):
-            return None, None, [], False
-        _wait_serving(path, label, started)
+        if not daemon_alive(path):
+            if started is None:
+                return None, None, [], _NONE
+            raise _Miss(
+                f"the weight cache daemon (pid {started['pid']}) did not take this GPU; "
+                f"see {started['log']}"
+            )
+        if not os.path.exists(path):
+            raise _Miss(
+                f"the daemon is still not serving after {envs.ATOM_WEIGHT_CACHE_WAIT_S:.0f}s"
+            )
         sock, payload = _fetch(path, label)
         reasons = _check_payload(payload, config, rank, device)
+    except _SourceChanged as e:
+        reasons, status = [f"{e} changed after this server started; restart it"], _STALE
     except _Miss as e:
         reasons = [str(e)]
     except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
         reasons = [f"weight cache error: {e!r}"]
-    if reasons and sock is not None:
-        sock.close()
-        sock = None
-    return sock, payload, reasons, True
+    if reasons:
+        status = max(status, _UNUSABLE)
+        if sock is not None:
+            sock.close()
+            sock = None
+    return sock, payload, reasons, status
 
 
 def _stop_and_reclaim(path: str, device: torch.device) -> None:
     """Stop this GPU's daemon, then wait until its memory is free: the driver
     releases an exited process's device memory asynchronously, so a load
     that starts at once can still find the GPU full."""
-    held = (daemon_state(path) or {}).get("bytes") or 0
+    held = (daemon_state(path) or {}).get("bytes") or 0 if daemon_alive(path) else 0
     on_gpu = device.type == "cuda"
     free0 = torch.cuda.mem_get_info(device)[0] if on_gpu else 0
     stop_daemon(path)
@@ -223,14 +231,19 @@ def _forward_context(config) -> dict | None:
 
 def _give_up(label, path, reasons, started, group, config, device, layers) -> None:
     """The daemon this launch started cannot be used either: stop it so the
-    disk load has its memory, or fail if it won't stop."""
-    err = None
-    try:
-        _stop_and_reclaim(path, device)
-    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-        err = f"could not stop the daemon this launch started: {e}"
+    disk load has its memory, or fail if it won't stop or others use it."""
+    err = _in_use_by_others(path)
+    if err is None:
+        try:
+            _stop_and_reclaim(path, device)
+            if _pid_running(
+                started["pid"]
+            ):  # never took a GPU, so stop_daemon missed it
+                os.kill(started["pid"], signal.SIGTERM)
+        except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+            err = f"could not stop the daemon this launch started: {e}"
     if not group_agree(err is None, group):
-        raise _fail(label, [err] if err else [], preload=True)
+        raise _fail(label, ([err] if err else []) + reasons, preload=True)
     _drop_layers(config, layers)
     detail = "\n  ".join(reasons[:25]) if reasons else "another rank cannot use it"
     logger.warning(
@@ -249,6 +262,31 @@ def _drop_layers(config, layers) -> None:
             del ctx[name]
 
 
+def _map(modules, export: dict, device) -> tuple[int, str | None]:
+    """Point the meta-built ``modules[0]`` at the daemon's tensors: (bytes
+    mapped, why it failed). ``modules``: all that must end up off meta."""
+    try:
+        mapped = apply_export(modules[0], export, device)
+    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+        return 0, f"mapping the daemon's tensors failed: {e!r}"
+    left = [name for m in modules for name in _leftover_meta(m)]
+    if left:
+        return mapped, f"{len(left)} tensors still on meta after mapping: {left[:8]}"
+    return mapped, None
+
+
+def _apply_process(export: dict, device, label: str, group) -> int:
+    """Make the process changes the daemon's load made, on every rank."""
+    error, mapped = None, 0
+    try:
+        mapped = apply_process(export, device)
+    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+        error = f"applying what the daemon's load changed failed: {e!r}"
+    if not group_agree(error is None, group):
+        raise _fail(label, [error] if error else [])
+    return mapped
+
+
 def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module:
     """get_model's loader in client mode: the daemon's weights, else the
     checkpoint's (see _from_daemon)."""
@@ -257,50 +295,65 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module:
 
 
 def load_drafter_from_cache(config, device, runner, target, *, rank: int):
-    """get_drafter's loader in client mode: the drafter's own weights from
-    the daemon the model came from, else the checkpoint's. A drafter is
-    small, so a mismatch loads it from disk rather than failing."""
+    """The drafter loader in client mode: the drafter's own weights from the
+    daemon the model came from, else the checkpoint's. All ranks take the
+    same one; a drafter is small, so one the cache cannot give loads from
+    disk rather than failing."""
     global _draft
     draft, _draft = _draft, None
-    if draft is None:
-        return load_drafter_from_disk(config, device, runner, target)
     t0 = time.perf_counter()
-    label = rank_label(config, rank)
-    ctx = _forward_context(config)
-    layers = set(ctx) if ctx is not None else None
-    with params_on_meta():
-        drafter = construct_drafter(config, device, runner)
-    diffs = _diff_key(
-        draft["structure"],
-        exported_structure(structure(drafter.model), draft["export"]),
-    )
-    diffs += diff_reads(draft["reads"], ("draft_attrs",), model=drafter.model)
-    if diffs:
+    label = worker_process_name(config, rank)
+    group = _agree_group()
+    drafter, layers, reasons = None, None, []
+    if draft is None:
+        reasons = ["the daemon holds no drafter"]
+    else:
+        try:
+            reasons = verify_code(draft["code"])
+        except _SourceChanged as e:
+            reasons = [f"{e} changed after this server started"]
+        ctx = _forward_context(config)
+        layers = set(ctx) if ctx is not None else None
+        with params_on_meta():
+            drafter = construct_drafter(config, device, runner)
+        reasons += _diff_key(
+            draft["structure"],
+            exported_structure(structure(drafter.model), draft["export"]),
+        )
+        reasons += diff_reads(
+            draft["reads"],
+            STATIC_READS + ("attrs",),
+            config=config,
+            model=drafter.model,
+        )
+    if group_agree(not reasons, group):
+        modules = [m for m in vars(drafter).values() if isinstance(m, nn.Module)]
+        mapped, error = _map(
+            [drafter.model] + [m for m in modules if m is not drafter.model],
+            draft["export"],
+            device,
+        )
+        if group_agree(error is None, group):
+            mapped += _apply_process(draft["process"], device, label, group)
+            _run_prepare_finalize(drafter.model)
+            drafter.attach_to_target(target, set(draft["loaded"]))
+            logger.info(
+                f"{_TAG} {label}: drafter from the cache, mapped {mapped / (1 << 30):.2f} GiB "
+                f"in {time.perf_counter() - t0:.2f}s"
+            )
+            return drafter
+        reasons = [error] if error else []
+    if drafter is not None:
         _drop_layers(config, layers)
+        drafter = None
+        gc.collect()  # unmap what was mapped
+    if draft is not None:
         logger.warning(
-            f"{_TAG} {label}: the daemon's drafter was built differently, so this "
-            "server loads its drafter from disk:\n  " + "\n  ".join(diffs[:25])
+            f"{_TAG} {label}: this server loads its drafter from disk, the daemon's "
+            "cannot be used here:\n  "
+            + "\n  ".join(reasons[:25] or ["another rank cannot use it"])
         )
-        return load_drafter_from_disk(config, device, runner, target)
-    mapped = apply_export(drafter.model, draft["export"], device)
-    left = [
-        name
-        for m in vars(drafter).values()
-        if isinstance(m, nn.Module)
-        for name in _leftover_meta(m)
-    ]
-    if left:
-        raise RuntimeError(
-            f"{_TAG} {label}: {len(left)} drafter tensors still on meta after "
-            f"mapping: {left[:8]}"
-        )
-    _run_prepare_finalize(drafter.model)
-    drafter.attach_to_target(target, set(draft["loaded"]))
-    logger.info(
-        f"{_TAG} {label}: drafter from the cache, mapped {mapped / (1 << 30):.2f} GiB "
-        f"in {time.perf_counter() - t0:.2f}s"
-    )
-    return drafter
+    return load_drafter_from_disk(config, device, runner, target)
 
 
 def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
@@ -314,7 +367,7 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     it loads from disk. Every rank of the launch takes the same decisions."""
     global _draft
     t0 = time.perf_counter()
-    label = rank_label(config, rank)
+    label = worker_process_name(config, rank)
     group = _agree_group()
     auto = envs.ATOM_PRELOAD
     path = socket_path(device)
@@ -323,19 +376,25 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     settled = False
     model, t_meta, layers = None, 0.0, None
     while True:
-        sock, payload, reasons, present = _probe(
+        _wait_together(path, label, started, group)
+        sock, payload, reasons, status = _probe(
             path, label, started, config, rank, device
         )
-        status = 0 if not present else (2 if reasons else 1)
         lo, hi = group_min(status, group), group_max(status, group)
         summary = (payload or {}).get("summary", {})
         pid = summary.get("daemon_pid") or summary.get("pid")  # as `status` shows it
-        if hi == 0 and not auto:
+        if hi == _STALE:
+            # This server is the stale one: no daemon would fit its sources.
+            raise RuntimeError(
+                f"{_TAG} {label}: "
+                + "; ".join(reasons or ["sources changed after this server started"])
+            )
+        if hi == _NONE and not auto:
             logger.info(
                 f"{_TAG} {label}: no weight cache daemon on this launch's GPUs; loading from disk"
             )
             return None
-        if lo == 0 and hi > 0 and started is None and not settled:
+        if lo == _NONE and hi > _NONE and started is None and not settled:
             # A daemon takes its GPUs one rank at a time: give the others a moment.
             settled = True
             if sock is not None:
@@ -344,7 +403,7 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
             while not daemon_alive(path) and time.monotonic() < deadline:
                 time.sleep(0.5)
             continue
-        if lo == hi == 1:
+        if lo == hi == _USABLE:
             if model is None:  # built once: a model registers its layers globally
                 ctx = _forward_context(config)
                 layers = set(ctx) if ctx is not None else None
@@ -352,22 +411,35 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
                 with params_on_meta():
                     model = build_model(config, model_class, device)
                 t_meta = time.perf_counter() - t_build
+            # What loading read, compared after this server built its model as
+            # the daemon had: construction may set some of it.
             diffs = _diff_key(
                 payload["structure"],
                 exported_structure(structure(model), payload["export"]),
             )
-            diffs += diff_reads(payload["reads"], ("attrs",), model=model)
-            if group_agree(not diffs, group):
-                break
+            diffs += diff_reads(
+                payload["reads"], STATIC_READS + ("attrs",), config=config, model=model
+            )
             reasons = (
-                (["model construction differs where it matters to loading:"] + diffs)
+                ["model construction or settings differ where they matter to loading:"]
+                + diffs
                 if diffs
                 else []
             )
-        elif lo == 0 and hi > 0 and not reasons:
+            if group_agree(not diffs, group):
+                t_map = time.perf_counter()
+                mapped, error = _map([model], payload["export"], device)
+                if group_agree(error is None, group):
+                    break
+                reasons = [error] if error else []
+                # Unmapped before a restart, or the old daemon's memory stays in use.
+                _drop_layers(config, layers)
+                model = layers = None
+                gc.collect()
+        elif lo == _NONE and hi > _NONE and not reasons:
             reasons = (
                 ["a daemon serves only some of this launch's GPUs"]
-                if present
+                if status != _NONE
                 else [
                     "no daemon serves this GPU, but other GPUs of this launch have one"
                 ]
@@ -380,7 +452,7 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
         if started is not None:
             _give_up(label, path, reasons, started, group, config, device, layers)
             return None
-        if hi > 0:
+        if hi > _NONE:
             err = _in_use_by_others(path)
             if not group_agree(err is None, group):
                 why = (
@@ -427,19 +499,11 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
             "waiting for it to load"
         )
 
-    t_map = time.perf_counter()
-    error = None
     try:
-        mapped = apply_export(model, payload["export"], device)
-        mapped += apply_process(payload["process"], device)
-        left = _leftover_meta(model)
-        if left:
-            error = f"{len(left)} tensors still on meta after mapping: {left[:8]}"
-    except Exception as e:  # noqa: BLE001
-        error = f"mapping the daemon's tensors failed: {e!r}"
-    if not group_agree(error is None, group):
+        mapped += _apply_process(payload["process"], device, label, group)
+    except Exception:
         sock.close()
-        raise _fail(label, [error] if error else [], pid)
+        raise
     torch.cuda.reset_peak_memory_stats()
     # Collective on EP setups; a failure here must not be swallowed.
     n_moe = _run_prepare_finalize(model)

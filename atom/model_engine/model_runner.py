@@ -65,7 +65,6 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_setup import (
     ModelLoader,
     build_model,
-    get_drafter,
     get_model,
     init_model_env,
     load_drafter_from_disk,
@@ -932,16 +931,13 @@ class ModelRunner:
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
-            self.drafter = get_drafter(
-                self.config, self.device, self, self.model, self._drafter_loader()
-            )
-            torch.set_default_device(self.device)
+            load_drafter = self._drafter_loader()
+            self.drafter = load_drafter(self.config, self.device, self, self.model)
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
-            torch.set_default_device(None)
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -1065,7 +1061,7 @@ class ModelRunner:
             from atom.model_loader.weight_cache.client import load_from_cache
 
             return partial(load_from_cache, rank=self.rank)
-        return load_from_disk
+        return partial(load_from_disk, tag=self.rank_name)
 
     def _drafter_loader(self):
         """How this runner gets its drafter's weights (see _model_loader)."""

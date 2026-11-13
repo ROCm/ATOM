@@ -14,7 +14,6 @@ by C++) is invisible here.
 from __future__ import annotations
 
 import builtins
-import hashlib
 import importlib
 import io
 import os
@@ -23,7 +22,11 @@ import threading
 import types
 from typing import Any
 
-from atom.model_loader.weight_cache.key import _code_location, _package_roots
+from atom.model_loader.weight_cache.key import (
+    _code_location,
+    _package_roots,
+    file_identity,
+)
 from atom.model_loader.weight_cache.values import (
     _MODULE_INTERNALS,
     _attrs,
@@ -145,7 +148,8 @@ class InputRecorder:
         self.env_by_line: dict[str, set] = {}
         self.attrs: dict[tuple, dict] = {}  # (kind, path, name) -> info
         self.paths: dict[int, tuple[str, str]] = {}  # id(obj) -> (kind, path)
-        self.pre_load_fps: dict[tuple[str, str, str], Any] = {}  # (kind, path, name)
+        self.pre_load_fps: dict[tuple[str, str], Any] = {}
+        self.pre_load_globals: dict[str, dict] = {}  # module -> name -> fingerprint
         self.files: dict[str, set] = {}
         self.globals: dict[tuple, Any] = {}
         self.files_on = False
@@ -178,25 +182,24 @@ class InputRecorder:
         self.files_on = True
         self.attrs_on = True
 
-    def enter_load(self, model, kind: str = "model") -> None:
-        """Start the load of ``model``; ``kind``: "model" or "draft", whose
-        attribute reads key_reads reports apart."""
+    def enter_load(self, model) -> None:
         self.phase = "load"
         self.attrs_on = True
         # The construction-time values: what a client builds, and what loading
         # started from. (The first value loading reads may be one it wrote.)
+        self.pre_load_globals = _module_globals()
         values = {}
         for path, obj, is_module in _walk_objects(model):
-            self.paths[id(obj)] = (kind, path)
+            self.paths[id(obj)] = ("model", path)
             for name, v in _attrs(obj, is_module).items():
-                values[(kind, path, name)] = v
+                values[(path, name)] = v
             if is_module:
                 for name, b in obj._buffers.items():
                     if b is not None:
-                        values[(kind, path, f"[buffer]{name}")] = b
+                        values[(path, f"[buffer]{name}")] = b
             self._patch_class(type(obj))
         # Fingerprint now, before loading mutates anything in place.
-        self.pre_load_fps.update({k: _safe_key_fp(v) for k, v in values.items()})
+        self.pre_load_fps = {k: _safe_key_fp(v) for k, v in values.items()}
 
     def finish_load(self, codes) -> None:
         """Stop recording; ``codes``: the code objects that ran during load."""
@@ -368,6 +371,8 @@ class InputRecorder:
     # -- globals -------------------------------------------------------------
 
     def _collect_globals(self, codes) -> None:
+        """The globals the loading code referenced, as the load found them (one
+        it set itself travels with process_export)."""
         by_file = {}
         for mod in list(sys.modules.values()):
             f = getattr(mod, "__file__", None)
@@ -381,18 +386,14 @@ class InputRecorder:
             if mod is None:
                 continue
             g = vars(mod)
+            before = self.pre_load_globals.get(mod.__name__)
             for name in code.co_names:
-                if name not in g or name.startswith("__"):
+                if name not in g or name.startswith("__") or not _keyed(g[name]):
                     continue
-                v = g[name]
-                if isinstance(v, (types.ModuleType, type)):
-                    continue
-                if (
-                    _is_plain(v)
-                    or _ref_name(v)
-                    or isinstance(v, types.BuiltinFunctionType)
-                ):
-                    self.globals[(mod.__name__, name)] = key_fp(v)
+                if before is None:  # imported by the load: as importing builds it
+                    self.globals[(mod.__name__, name)] = key_fp(g[name])
+                elif name in before:
+                    self.globals[(mod.__name__, name)] = before[name]
 
     # -- results -------------------------------------------------------------
 
@@ -408,7 +409,7 @@ class InputRecorder:
             where = [w for w in info["load_where"] if w not in bulk]
             if any(w.startswith(KEY_ENV_PREFIXES) for w in where):
                 env[k] = info["load_value"]
-        config, attrs, classattrs, draft_attrs = {}, {}, {}, {}
+        config, attrs, classattrs = {}, {}, {}
         for (kind, path, name), info in self.attrs.items():
             if "load" not in info["phases"]:
                 continue
@@ -416,9 +417,8 @@ class InputRecorder:
                 config[f"{path}.{name}"] = info["fp"]
             elif kind == "class":
                 classattrs[f"{path}\t{name}"] = info["fp"]
-            elif (kind, path, name) in self.pre_load_fps:
-                out = draft_attrs if kind == "draft" else attrs
-                out[f"{path}\t{name}"] = self.pre_load_fps[(kind, path, name)]
+            elif (path, name) in self.pre_load_fps:
+                attrs[f"{path}\t{name}"] = self.pre_load_fps[(path, name)]
         ckpt = os.path.realpath(checkpoint_dir) + os.sep if checkpoint_dir else None
         files = {}
         for p, phases in self.files.items():
@@ -427,27 +427,37 @@ class InputRecorder:
                 and not (ckpt and p.startswith(ckpt))
                 and os.path.isfile(p)
             ):
-                files[p] = _file_digest(p)
+                files[p] = file_identity(p)
         return {
             "env": env,
             "config": config,
             "attrs": attrs,
-            "draft_attrs": draft_attrs,
             "classattrs": classattrs,
             "globals": {f"{m}\t{n}": fp for (m, n), fp in self.globals.items()},
             "files": files,
         }
 
 
-def _file_digest(path: str) -> str:
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError as e:
-        return f"<unreadable {type(e).__name__}>"
+def _keyed(v) -> bool:
+    """A global whose value enters the key."""
+    if isinstance(v, (types.ModuleType, type)):
+        return False
+    return (
+        _is_plain(v) or bool(_ref_name(v)) or isinstance(v, types.BuiltinFunctionType)
+    )
+
+
+def _module_globals() -> dict[str, dict]:
+    """The keyed globals of the ATOM/AITER modules there are, fingerprinted."""
+    out = {}
+    for name, mod in list(sys.modules.items()):
+        if mod is not None and name.split(".")[0] in ("atom", "aiter"):
+            out[name] = {
+                k: _safe_key_fp(v)
+                for k, v in list(vars(mod).items())
+                if not k.startswith("__") and _keyed(v)
+            }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +473,7 @@ def _now(kind: str, key: str, config, model):
     if kind == "env":
         return os.environ.get(key)
     if kind == "files":
-        return _file_digest(key)
+        return file_identity(key)
     if kind == "config":
         root, *rest = key.split(".")
         obj = config if root == "config" else getattr(config, "hf_config", None)
@@ -494,7 +504,6 @@ def _describe(kind: str, key: str, then, now) -> str:
             "classattrs": f"class attribute {a.split(':')[-1]}.{name}",
             "globals": f"global {a}.{name}",
             "attrs": f"{a or '<root>'}.{name}",
-            "draft_attrs": f"drafter {a or '<root>'}.{name}",
         }[kind]
     return f"{what}: daemon={str(then)[:80]} client={str(now)[:80]}"
 

@@ -815,29 +815,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
     # --- Shutdown ---
-    # Weight cache (atom/model_loader/weight_cache/). "daemon": this launch
-    # loads the weights, serves them over CUDA IPC and never serves requests.
-    # "client": map the weights from the daemon on the same GPUs instead of
-    # loading the checkpoint; without one, load from disk; a daemon that
-    # cannot be used fails the launch. "off": default.
-    "ATOM_WEIGHT_CACHE": lambda: _weight_cache_mode(),
-    # ATOM_PRELOAD=1: a normal server launch that keeps its weights in a
-    # weight cache daemon across restarts. It starts the daemon when there is
-    # none, reuses it when the cache key matches, and restarts it (once) when
-    # it does not, e.g. after an edit to weight loading. Implies client mode.
-    "ATOM_PRELOAD": lambda: _flag_env("ATOM_PRELOAD"),
-    # A daemon exits after this many seconds without a connected server
-    # (0: never). It holds a full copy of the weights on every GPU.
-    "ATOM_PRELOAD_IDLE_TIMEOUT_S": lambda: _nonnegative_int_env(
-        "ATOM_PRELOAD_IDLE_TIMEOUT_S", 3600
-    ),
-    # Directory for the daemons' sockets, locks and logs (default
-    # /tmp/atom_weight_cache_<uid>; daemon and clients must agree).
-    "ATOM_WEIGHT_CACHE_DIR": lambda: os.getenv("ATOM_WEIGHT_CACHE_DIR", ""),
-    # How long a client waits for a daemon that is still loading.
-    "ATOM_WEIGHT_CACHE_WAIT_S": lambda: _positive_float_env(
-        "ATOM_WEIGHT_CACHE_WAIT_S", "1800"
-    ),
     # How long a shutting-down process waits for its children (EngineCore,
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
@@ -908,6 +885,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GPU timestamps for both prefill and decode phases.
     "ATOM_RTL_TRACE_DIR": lambda: os.getenv("ATOM_RTL_TRACE_DIR", None),
     # --- Model Loading ---
+    # Weight cache (atom/model_loader/weight_cache/). "daemon": this launch
+    # loads the weights, serves them over CUDA IPC and never serves requests.
+    # "client": map the weights from the daemon on the same GPUs instead of
+    # loading the checkpoint; without one, load from disk; a daemon that
+    # cannot be used fails the launch. "off": default.
+    "ATOM_WEIGHT_CACHE": lambda: _weight_cache_mode(),
+    # ATOM_PRELOAD=1: a normal server launch that keeps its weights in a
+    # weight cache daemon across restarts. It starts the daemon when there is
+    # none, reuses it when the cache key matches, and restarts it (once) when
+    # it does not, e.g. after an edit to weight loading. Implies client mode.
+    "ATOM_PRELOAD": lambda: _flag_env("ATOM_PRELOAD"),
+    # A daemon exits after this many seconds without a connected server
+    # (0: never). It holds a full copy of the weights on every GPU.
+    "ATOM_PRELOAD_IDLE_TIMEOUT_S": lambda: _nonnegative_int_env(
+        "ATOM_PRELOAD_IDLE_TIMEOUT_S", 3600
+    ),
+    # Directory for the daemons' sockets, locks and logs (default
+    # /tmp/atom_weight_cache_<uid>; daemon and clients must agree).
+    "ATOM_WEIGHT_CACHE_DIR": lambda: os.getenv("ATOM_WEIGHT_CACHE_DIR", ""),
+    # How long a client waits for a daemon that is still loading.
+    "ATOM_WEIGHT_CACHE_WAIT_S": lambda: _positive_float_env(
+        "ATOM_WEIGHT_CACHE_WAIT_S", "1800"
+    ),
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),

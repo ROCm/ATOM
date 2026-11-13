@@ -42,6 +42,19 @@ class _SourceChanged(Exception):
 _SMALL_FILE = 1 << 20
 
 
+def file_identity(path: str) -> str:
+    """A file as the key sees it: a small one (a config) by content, a large
+    one (a weight shard) by size, mtime and inode, as rewriting it changes."""
+    try:
+        st = os.stat(path)
+        if st.st_size > _SMALL_FILE:
+            return f"{st.st_size}:{st.st_mtime_ns}:{st.st_ino}"
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError as e:
+        return f"<unreadable {type(e).__name__}>"
+
+
 def _checkpoint_digest(model_path: str) -> str:
     """Every file in the checkpoint directory by name, size, mtime and inode
     (a checkpoint rewritten in place changes them), with the content of small
@@ -129,11 +142,14 @@ def compute_key(config, rank: int, device: torch.device) -> dict:
         hf_dict = hf.to_dict()
     except Exception:  # noqa: BLE001
         hf_dict = vars(hf)
+    from atom.model_loader.weight_utils import local_model_dir
+
     props = torch.cuda.get_device_properties(device)
     pc = config.parallel_config
+    model_dir = local_model_dir(config.model)  # a hub id names a cache snapshot
     return {
-        "model": os.path.realpath(config.model),
-        "checkpoint": _checkpoint_digest(config.model),
+        "model": os.path.realpath(model_dir),
+        "checkpoint": _checkpoint_digest(model_dir),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
         "rank": rank,
         # The shard a rank holds depends on the whole layout (EP spans DP).
@@ -246,6 +262,7 @@ class _CodeTracer:
                 self._tool, self._mon.events.PY_START, self._on_start
             )
             self._mon.set_events(self._tool, self._mon.events.PY_START)
+            self._mon.restart_events()  # what an earlier trace disabled runs again
         else:
             logger.warning(
                 f"{_TAG} no free sys.monitoring tool id; tracing with sys.settrace"

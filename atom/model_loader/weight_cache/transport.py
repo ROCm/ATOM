@@ -39,11 +39,15 @@ def socket_dir() -> str:
     # Not /dev/shm: containers started with --ipc=host share it (and are all
     # root), and IPC handles do not cross containers anyway.
     d = envs.ATOM_WEIGHT_CACHE_DIR or f"/tmp/atom_weight_cache_{os.getuid()}"
+    # A socket path holds at most 107 bytes; the longest here adds 38.
+    if len(d.encode()) > 69:
+        raise ValueError(f"weight cache directory {d!r} is too long for a socket path")
     os.makedirs(d, mode=0o700, exist_ok=True)
     st = os.lstat(d)
-    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
-        raise PermissionError(f"{d} is a symlink or not owned by uid {os.getuid()}")
-    os.chmod(d, 0o700)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise PermissionError(
+            f"{d} must be a directory of uid {os.getuid()} that only it can access (mode 700)"
+        )
     return d
 
 

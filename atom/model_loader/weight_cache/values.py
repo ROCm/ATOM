@@ -62,14 +62,6 @@ _FUNCTION_TYPES = (
 )
 
 
-def rank_label(config, rank: int) -> str:
-    """How logs name a rank: with its DP rank when there is DP."""
-    pc = config.parallel_config
-    if pc.data_parallel_size > 1:
-        return f"dp {pc.data_parallel_rank} rank {rank}"
-    return f"rank {rank}"
-
-
 class _Miss(Exception):
     """The cache cannot be used; the message says why."""
 

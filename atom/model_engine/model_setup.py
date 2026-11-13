@@ -40,7 +40,8 @@ def init_model_env(
     loads). ``rank``: this worker's local index
     (0..tp*pcp-1) within its stage. ``device_communicators=False`` builds the
     groups without RCCL and the custom and quick all-reduce buffers (about
-    9 GiB per GPU), for a process that runs no device collectives."""
+    9 GiB per GPU), for a process that runs no device collectives; pipeline
+    parallel groups always get them."""
     set_current_atom_config(config)
     if sp_is_enabled():
         check_aiter_sp_api()
@@ -50,10 +51,6 @@ def init_model_env(
     if pp_size > 1:
         # Reject before any collective can wait for nonexistent ranks.
         reject_simulated_tp(config, "pipeline parallel")
-        if not device_communicators:
-            raise NotImplementedError(
-                "pipeline parallel groups always build device communicators"
-            )
     # tp_world_size: how many GPUs this stage actually occupies.
     stage_span = config.tp_world_size * config.pcp_group_size
     local_device_rank = local_device_index(config, rank)
@@ -165,12 +162,10 @@ def init_model_env(
     return device
 
 
-def get_model(
-    config: Config, device: torch.device, load: ModelLoader | None = None
-) -> nn.Module:
-    """This rank's model with its weights, after ``init_model_env``. ``load``
-    gets the weights; ``load_from_disk`` by default. Leaves the config's
-    dtype as the default dtype."""
+def get_model(config: Config, device: torch.device, load: ModelLoader) -> nn.Module:
+    """This rank's model with its weights, after ``init_model_env``: ``load``
+    builds it and gets the weights (``load_from_disk``, or a weight cache
+    client). Leaves the config's dtype as the default dtype."""
     torch.set_default_dtype(config.torch_dtype)
     model_class = resolve_obj_by_qualname(
         support_model_arch_dict[config.hf_config.architectures[0]]
@@ -184,7 +179,7 @@ def get_model(
             model_class, "quant_exclude_name_mapping", {}
         ),
     )
-    return (load or load_from_disk)(config, model_class, device)
+    return load(config, model_class, device)
 
 
 def build_model(config: Config, model_class: type, device: torch.device) -> nn.Module:
@@ -207,14 +202,6 @@ def load_weights(model: nn.Module, config: Config) -> None:
     )
 
 
-def get_drafter(config: Config, device: torch.device, runner, target, load=None):
-    """This rank's speculative drafter with its draft weights, after
-    ``get_model`` built ``target``. ``load`` builds and loads it:
-    (config, device, runner, target) -> drafter; ``load_drafter_from_disk``
-    by default."""
-    return (load or load_drafter_from_disk)(config, device, runner, target)
-
-
 def construct_drafter(config: Config, device: torch.device, runner):
     """Construct the drafter on ``device``, without its draft weights."""
     from atom.spec_decode.factory import build_drafter
@@ -229,6 +216,8 @@ def construct_drafter(config: Config, device: torch.device, runner):
 
 
 def load_drafter_from_disk(config: Config, device: torch.device, runner, target):
+    """A drafter loader, as ``load_from_disk`` is a model's: (config, device,
+    runner, the loaded target model) -> drafter with its weights."""
     drafter = construct_drafter(config, device, runner)
     logger.info("Loading drafter model...")
     drafter.load_model(target)
@@ -236,13 +225,14 @@ def load_drafter_from_disk(config: Config, device: torch.device, runner, target)
 
 
 def load_from_disk(
-    config: Config, model_class: type, device: torch.device
+    config: Config, model_class: type, device: torch.device, tag: str | None = None
 ) -> nn.Module:
+    """``tag``: how the log names this rank."""
     model = build_model(config, model_class, device)
     t0 = time.perf_counter()
     load_weights(model, config)
     logger.info(
-        f"[{rank_tag()}] Model load done: {config.model} "
+        f"[{tag or rank_tag()}] Model load done: {config.model} "
         f"(weights loaded in {time.perf_counter() - t0:.2f}s)"
     )
     return model

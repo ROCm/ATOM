@@ -79,9 +79,19 @@ def _remove(*paths: str) -> None:
             os.unlink(p)
 
 
+def _prune_logs(d: str, keep: int = 9) -> None:
+    """Keep the newest daemon logs only (one more is about to start)."""
+    logs = []
+    for p in glob.glob(os.path.join(d, "daemon_*.log")):
+        with contextlib.suppress(OSError):
+            logs.append((os.path.getmtime(p), p))
+    _remove(*[p for _, p in sorted(logs)[:-keep]])
+
+
 def record_launch() -> None:
-    """Called first thing by the API server (weight cache on). The time it
-    runs tells the processes that load which sources may have changed under
+    """Called by the API server before it starts any process (weight cache
+    on). The time it runs tells the processes that load which sources may
+    have changed under
     them. A daemon tells its processes its main process (stopping that stops
     the daemon). An ATOM_PRELOAD server saves its command line and
     environment, to start a daemon with them."""
@@ -182,6 +192,7 @@ def _spawn_daemon() -> dict:
             for k, v in launch["env"].items()
             if k not in ("ATOM_PRELOAD", _LAUNCH_ENV)
         }
+        _prune_logs(socket_dir())
         log = os.path.join(
             socket_dir(), f"daemon_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.log"
         )
