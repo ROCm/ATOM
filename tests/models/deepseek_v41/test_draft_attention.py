@@ -108,7 +108,6 @@ def test_draft_src_indices_follows_the_arch_gate(monkeypatch):
     assert draft_src_indices(anchors, 8, 4, 5, buffers) is None
     assert buffers.context is None  # nothing allocated off the gated arch
     monkeypatch.setattr(dspark, "two_source_draft", lambda: True)
-    assert draft_src_indices(anchors, 8, 4, 5, None) is None
     assert draft_src_indices(anchors, 8, 4, 5, buffers) is not None
 
 

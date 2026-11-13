@@ -25,10 +25,11 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
     """All draft rows attend to the whole draft block, plus valid target rows.
 
     With `step.src_indices` (`draft_src_indices`), the window and the block
-    are the two sources of the sparse MLA kernel the target's BF16 path uses:
-    no concatenated copy, and one workgroup per row for all heads instead of a
-    program per row and head tile that re-reads every key. Without it, joins
-    the two by concatenating. Neither touches `context_kv`.
+    are the two sources of `sparse_attn_v4_paged_2src`, the sparse kernel the
+    target's BF16 path uses: it reads both where they lie, so there is no
+    concatenated copy. It launches one program per row and 16-head tile, the
+    same grid as the concatenating path. Without `step.src_indices`, joins the
+    two by concatenating. Neither touches `context_kv`.
     """
     src = step.src_indices
     if src is None:
@@ -166,10 +167,15 @@ class DraftSrcBuffers:
 
     def claim(self, batch: int, width: int, ring: int, device) -> DraftSrcIndices:
         """This batch's slices, allocating the bundle on first use."""
-        if batch > self.max_batch or width > self.max_width:
+        if batch > self.max_batch:
             raise ValueError(
-                f"Draft source buffers hold {self.max_batch} x {self.max_width} "
-                f"rows, not {batch} x {width}; they are sized at max_num_seqs."
+                f"Draft source buffers hold {self.max_batch} requests, not {batch}; "
+                "they are sized at max_num_seqs."
+            )
+        if width > self.max_width:
+            raise ValueError(
+                f"Draft source buffers hold blocks {self.max_width} wide, not "
+                f"{width}; they are sized at the DSpark block width."
             )
         if self.context is None:
             rows = self.max_batch * self.max_width
@@ -189,16 +195,16 @@ class DraftSrcBuffers:
         )
 
 
-def draft_src_indices(positions, ring, window, width, buffers):
+def draft_src_indices(positions, ring, window, width, buffers: DraftSrcBuffers):
     """`draft_step_indices`' index list as `draft_attention`'s two sources,
     or None where the stages keep the concatenating path.
 
-    This is where the path is chosen: None without `buffers` or off
-    `two_source_draft()`. Otherwise fills `buffers` in one launch with no host
-    read; built once per step, every stage reads the same rows. With no rows
+    This is where the path is chosen, by `two_source_draft()` alone: None off
+    it, and nothing is allocated. Otherwise fills `buffers` in one launch with
+    no host read; built once per step, every stage reads the same rows. With no rows
     nothing is launched, and the attention has no query row to read an indptr.
     """
-    if buffers is None or not two_source_draft():
+    if not two_source_draft():
         return None
     batch = positions.shape[0]
     src = buffers.claim(batch, width, ring, positions.device)
