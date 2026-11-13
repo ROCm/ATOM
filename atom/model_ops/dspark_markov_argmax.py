@@ -17,6 +17,9 @@ This op keeps ``W2`` bf16, adds the base logits in the GEMM epilogue and
 reduces to ids in registers, so per block position the only large read is
 ``W2`` itself, exactly once.
 
+The sampled lossless draft shares the stage-1 GEMV and its launch
+(`dspark_markov_stage1`); it is `dspark_markov_sample.dspark_markov_sample`.
+
 Numerics. The reference does the GEMV as an fp32 matmul over an fp32 copy of
 bf16 data. Here ``tl.dot`` takes the bf16 operands directly into MFMA with an
 fp32 accumulator: a bf16 value is exactly representable in fp32 and the
@@ -53,22 +56,18 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-# Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
-# [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
-# stage stages [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB
-# LDS. Left as-is once these shapes measured 145us/step of savings at B=1 and
-# 235us at B=64 on Kimi-K3; a sweep is the obvious next thing if that matters.
-_BLOCK_V = 128
-_BLOCK_K = 64
-# MFMA needs M >= 16, so a batch smaller than that runs padded-and-masked
-# rather than falling off the kernel. Capped at 64 because the accumulator is
-# [BLOCK_ROW, BLOCK_V] fp32 and lives in registers: batches past the cap take
-# more row tiles rather than a wider accumulator, which would spill (native
-# ATOM defaults max_num_seqs to 512, so this is reachable, not theoretical).
-_MIN_BLOCK_ROW = 16
-_MAX_BLOCK_ROW = 64
-# Triton forms the offset expressions below in int32 before sign-extending
-# into the pointer, so a tensor whose largest element offset does not fit is
+from atom.model_ops.dspark_markov_stage1 import (
+    BLOCK_K,
+    BLOCK_V,
+    markov_launch_geometry,
+    markov_logits_tile,
+    publish_tile_argmax,
+)
+from atom.model_ops.tile_argmax import argmax_of_tiles
+
+# The GEMV addresses base, W1 and W2 in int64 (`markov_logits_tile`), but the
+# id and output offsets are still formed in int32 before sign-extending into
+# the pointer, so a tensor whose largest element offset does not fit is
 # handed to torch instead of silently wrapping.
 _MAX_INT32 = 2**31 - 1
 # An id block is one of these two; both ends of this op index with it.
@@ -76,7 +75,7 @@ _ID_DTYPES = (torch.int32, torch.int64)
 
 
 @triton.jit
-def _dspark_markov_argmax_stage1(
+def _markov_stage1(
     base_ptr,
     prev_ids_ptr,
     w1_ptr,
@@ -97,7 +96,8 @@ def _dspark_markov_argmax_stage1(
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """One (V tile, row tile): bias GEMV, add base logits, reduce to (max, id).
+    """One (V tile, row tile): bias GEMV, add base logits, publish the tile's
+    (max, lowest id) of the logits.
 
     ``base_ptr`` holds ``vocab_size`` columns starting at vocab id
     ``vocab_offset`` (a TP rank's shard of the LM head; 0 for the whole
@@ -108,62 +108,41 @@ def _dspark_markov_argmax_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
-    # assuming unit stride here reads another position's tokens.
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        # W1[x_{k-1}] rows, [BLOCK_ROW, BLOCK_K], gathered here rather than
-        # handed in: every tile program reads these same values anyway, so
-        # the gather rides along in L2 and costs no launch of its own.
-        embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        # One tile publishes the row for the confidence head; the rest hold
-        # the same values and would only write them again.
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
-        # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
-        w2 = tl.load(
-            w2_ptr
-            + (vocab_offset + offs_v[None, :]) * stride_w2_vocab
-            + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        # Zeros from the rank mask contribute exact 0.0 terms, so padding the
-        # K tile does not perturb the sum.
-        acc = tl.dot(embed, w2, acc)
-
-    base = tl.load(
-        base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
-        mask=row_mask[:, None] & v_mask[None, :],
-        other=0.0,
+    vals = markov_logits_tile(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        rank,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        vocab_offset,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
+        True,
     )
-    vals = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
-    tile_max = tl.max(vals, axis=1)
-    # `& v_mask` also covers the all--inf row: without it a padded lane, which
-    # is -inf too, could win the id.
-    cand = tl.where(
-        (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+    publish_tile_argmax(
+        vals,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        num_rows,
+        vocab_offset,
+        part_val_ptr,
+        part_idx_ptr,
     )
-    tile_idx = tl.min(cand, axis=1)
-    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
-    # recognizes before adding the offset back in.
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
-
-    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
-    tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
 
 
 @triton.jit
@@ -173,7 +152,6 @@ def _dspark_markov_argmax_stage2(
     out_ptr,
     num_rows,
     num_tiles,
-    vocab_size,
     stride_out,
     packed_ptr,
     BLOCK_TILE: tl.constexpr,
@@ -185,33 +163,18 @@ def _dspark_markov_argmax_stage2(
     the id to ``out_ptr``: the TP form, whose ranks then compare their bests.
     """
     row = tl.program_id(0)
-    offs_tile = tl.arange(0, BLOCK_TILE)
-    tile_mask = offs_tile < num_tiles
-    vals = tl.load(
-        part_val_ptr + offs_tile * num_rows + row,
-        mask=tile_mask,
-        other=float("-inf"),
+    # NaN never equals itself, so an all-NaN row answers id 0: what
+    # `torch.argmax` does, so a caller gathering `W1[x]` cannot read past the
+    # table. Packed, the NaN goes out with it, which `torch.argmax` across
+    # ranks then treats as the max, as it would the whole row's.
+    best, winner = argmax_of_tiles(
+        part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE
     )
-    idxs = tl.load(
-        part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
-    )
-    best = tl.max(vals, axis=0)
-    # Ids are global, so the sentinel is anything past every tile's id.
-    cand = tl.where((vals == best) & tile_mask, idxs, 2147483647)
-    winner = tl.min(cand, axis=0)
     if PACKED:
-        # An all-NaN row keeps the sentinel; publish id 0 with the NaN, which
-        # `torch.argmax` across ranks then treats as the max, as it would the
-        # whole row's.
-        winner = tl.where(winner == 2147483647, 0, winner)
         # ids < 2**24 are exact in fp32 (V4.1's vocab is 129280).
         tl.store(packed_ptr + row * 2, best)
         tl.store(packed_ptr + row * 2 + 1, winner.to(tl.float32))
         return
-    # NaN never equals itself, so no lane passes its `== max` test and every
-    # candidate keeps the out-of-range sentinel. Answer 0, as `torch.argmax`
-    # does, so a caller gathering `W1[x]` cannot read past the table.
-    winner = tl.where(winner == 2147483647, 0, winner)
     # Strided and in the destination's own dtype: the caller's `[B, T + 1]`
     # block is int32, and the copy this replaces was narrowing as well as
     # moving -- doing one and not the other would just relocate the cast.
@@ -311,6 +274,66 @@ def _torch_dspark_markov_argmax(
     return markov_embed
 
 
+def markov_weights_unsupported(
+    markov_w1: torch.Tensor, markov_w2: torch.Tensor
+) -> str | None:
+    """Why the fused Markov kernels cannot run these weights, or None. The one
+    check both ops, and lossless sampling's arming, ask."""
+    if not markov_w1.is_cuda:
+        return "the markov head is not on a GPU"
+    # tl.dot wants one dtype for both operands, and bf16/fp16 are the only ones
+    # whose products are exactly representable in the fp32 accumulator -- which
+    # is the whole numerics argument above.
+    if markov_w1.dtype is not markov_w2.dtype or markov_w1.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return f"markov weights are {markov_w1.dtype}/{markov_w2.dtype}"
+    # The kernels index the rank axis with stride 1; anything else would need
+    # a transposed load path.
+    if markov_w1.stride(1) != 1 or markov_w2.stride(1) != 1:
+        return "markov weights are not contiguous along the rank axis"
+    return None
+
+
+def check_markov_inputs(
+    op: str,
+    base_logits: torch.Tensor,
+    prev_ids: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Raise ``ValueError`` unless the inputs are a ``[B, V]`` logits block,
+    ``[B]`` previous and output ids, and ``[V, r]`` W1 / W2 tables over the
+    same V. Both ops index W2 by the logits' column, so a table of another
+    vocab would read the wrong rows or past the end."""
+    if base_logits.dim() != 2 or markov_w1.dim() != 2 or markov_w2.dim() != 2:
+        raise ValueError(f"{op} expects 2-D base_logits/w1/w2")
+    num_rows, vocab_size = base_logits.shape
+    rank = markov_w2.shape[1]
+    if prev_ids.shape != (num_rows,) or prev_ids.dtype not in _ID_DTYPES:
+        raise ValueError(
+            f"prev_ids {tuple(prev_ids.shape)} {prev_ids.dtype} is not the "
+            f"[{num_rows}] int32 or int64 an id block is made of"
+        )
+    if markov_w2.shape[0] != vocab_size:
+        raise ValueError(
+            f"markov_w2 covers {markov_w2.shape[0]} ids but base_logits has "
+            f"{vocab_size} columns"
+        )
+    if markov_w1.shape != (vocab_size, rank):
+        raise ValueError(
+            f"markov_w1 {tuple(markov_w1.shape)} does not match markov_w2's "
+            f"{tuple(markov_w2.shape)}"
+        )
+    if out.shape != (num_rows,) or out.dtype not in _ID_DTYPES:
+        raise ValueError(
+            f"out {tuple(out.shape)} {out.dtype} is not the [{num_rows}] int32 "
+            "or int64 an id block is made of"
+        )
+
+
 def _fused_is_supported(
     base_logits: torch.Tensor,
     prev_ids: torch.Tensor,
@@ -318,29 +341,15 @@ def _fused_is_supported(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
 ) -> bool:
-    num_rows, vocab_size = base_logits.shape
-    rank = markov_w2.shape[1]
-    if not base_logits.is_cuda:
+    num_rows = base_logits.shape[0]
+    if not base_logits.is_cuda or base_logits.stride(1) != 1:
         return False
-    # tl.dot wants one dtype for both operands, and bf16/fp16 are the only ones
-    # whose products are exactly representable in the fp32 accumulator -- which
-    # is the whole numerics argument above.
-    if markov_w1.dtype is not markov_w2.dtype:
+    if markov_weights_unsupported(markov_w1, markov_w2) is not None:
         return False
-    if markov_w1.dtype not in (torch.bfloat16, torch.float16):
-        return False
-    # The kernels index the vocab axis with stride 1 and the rank axis with
-    # stride 1; anything else would need a transposed load path.
-    if base_logits.stride(1) != 1 or markov_w1.stride(1) != 1:
-        return False
-    if markov_w2.stride(1) != 1:
-        return False
+    # base, W1 and W2 are addressed in int64; only these two are not.
     largest_offset = max(
-        (num_rows - 1) * base_logits.stride(0) + vocab_size,
         (num_rows - 1) * prev_ids.stride(0) + 1,
         (num_rows - 1) * out.stride(0) + 1,
-        (vocab_size - 1) * markov_w1.stride(0) + rank,
-        (vocab_size - 1) * markov_w2.stride(0) + rank,
     )
     return largest_offset <= _MAX_INT32
 
@@ -377,31 +386,10 @@ def dspark_markov_argmax(
         them in costs a launch that reads what the kernel is about to read
         anyway.
     """
-    if base_logits.dim() != 2 or markov_w1.dim() != 2 or markov_w2.dim() != 2:
-        raise ValueError("dspark_markov_argmax expects 2-D base_logits/w1/w2")
-    num_rows, vocab_size = base_logits.shape
-    rank = markov_w2.shape[1]
-    if prev_ids.shape != (num_rows,) or prev_ids.dtype not in _ID_DTYPES:
-        raise ValueError(
-            f"prev_ids {tuple(prev_ids.shape)} {prev_ids.dtype} is not the "
-            f"[{num_rows}] int32 or int64 an id block is made of"
-        )
-    if markov_w2.shape[0] != vocab_size:
-        raise ValueError(
-            f"markov_w2 covers {markov_w2.shape[0]} ids but base_logits has "
-            f"{vocab_size} columns"
-        )
-    if markov_w1.shape != (vocab_size, rank):
-        raise ValueError(
-            f"markov_w1 {tuple(markov_w1.shape)} does not match markov_w2's "
-            f"{tuple(markov_w2.shape)}"
-        )
-    if out.shape != (num_rows,) or out.dtype not in _ID_DTYPES:
-        raise ValueError(
-            f"out {tuple(out.shape)} {out.dtype} is not the [{num_rows}] int32 "
-            "or int64 an id block is made of"
-        )
-    if num_rows == 0 or not _fused_is_supported(
+    check_markov_inputs(
+        "dspark_markov_argmax", base_logits, prev_ids, markov_w1, markov_w2, out
+    )
+    if base_logits.shape[0] == 0 or not _fused_is_supported(
         base_logits, prev_ids, out, markov_w1, markov_w2
     ):
         return _torch_dspark_markov_argmax(
@@ -430,10 +418,8 @@ def _launch(
         if embed_out is None
         else embed_out
     )
-    num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    block_row = min(
-        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
-    )
+    geometry = markov_launch_geometry(num_rows, vocab_size)
+    num_tiles = geometry.v_tiles
     # Fresh per call rather than a persistent buffer: under CUDA-graph capture
     # these come from the graph's private pool and are freed back into it each
     # block position, so the pool holds one pair of them and replay reuses the
@@ -445,7 +431,7 @@ def _launch(
     part_idx = torch.empty(
         (num_tiles, num_rows), dtype=torch.int32, device=base_logits.device
     )
-    _dspark_markov_argmax_stage1[(num_tiles, triton.cdiv(num_rows, block_row))](
+    _markov_stage1[(num_tiles, geometry.row_tiles)](
         base_logits,
         prev_ids,
         markov_w1,
@@ -462,10 +448,10 @@ def _launch(
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
         vocab_offset=vocab_offset,
-        BLOCK_ROW=block_row,
-        BLOCK_V=_BLOCK_V,
-        BLOCK_K=_BLOCK_K,
-        num_warps=8 if block_row >= 32 else 4,
+        BLOCK_ROW=geometry.block_row,
+        BLOCK_V=BLOCK_V,
+        BLOCK_K=BLOCK_K,
+        num_warps=geometry.num_warps,
         num_stages=2,
     )
     _dspark_markov_argmax_stage2[(num_rows,)](
@@ -474,7 +460,6 @@ def _launch(
         out if packed is None else part_idx,
         num_rows,
         num_tiles,
-        vocab_size,
         out.stride(0) if packed is None else 0,
         part_val if packed is None else packed,
         BLOCK_TILE=triton.next_power_of_2(num_tiles),

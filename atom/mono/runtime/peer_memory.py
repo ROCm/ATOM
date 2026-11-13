@@ -18,6 +18,7 @@ from atom.mono.runtime.hip_ipc import (
 from atom.mono.runtime.uncached import (
     DeviceBytes,
     alloc_uncached,
+    fine_grained_bytes,
     ipc_heap,
     uncached_bytes,
 )
@@ -126,7 +127,14 @@ class SymmetricPeerBuffer:
     (``uncached``).
     """
 
-    def __init__(self, nbytes: int, rank: int = 0, npes: int = 1, group=None):
+    def __init__(
+        self,
+        nbytes: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        fine_grained: bool = False,
+    ):
         if nbytes <= 0:
             raise ValueError(f"nbytes must be positive, got {nbytes}")
         if not 0 <= rank < npes:
@@ -140,7 +148,9 @@ class SymmetricPeerBuffer:
 
         if npes == 1:
             device = torch.device("cuda", torch.cuda.current_device())
-            self.storage = uncached_bytes(nbytes, device)
+            self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                nbytes, device
+            )
             self.local_address = self.storage.data_ptr()
             addresses = [self.local_address]
         else:
@@ -150,7 +160,9 @@ class SymmetricPeerBuffer:
             mine = None
             try:
                 device = torch.device("cuda", torch.cuda.current_device())
-                self.storage = uncached_bytes(nbytes, device)
+                self.storage = (fine_grained_bytes if fine_grained else uncached_bytes)(
+                    nbytes, device
+                )
                 self.local_address = self.storage.data_ptr()
                 base = get_allocation_base(self.local_address)
                 mine = (get_ipc_handle(base), self.local_address - base)

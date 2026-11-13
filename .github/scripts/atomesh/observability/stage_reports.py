@@ -34,7 +34,7 @@ def stage_reports(results: Path, cell: str, output: Path) -> dict:
                 if (
                     source.is_file()
                     and not source.is_symlink()
-                    and source.suffix in {".html", ".json", ".log", ".yml"}
+                    and source.suffix in {".html", ".json", ".log", ".prom", ".yml"}
                 ):
                     shutil.copy2(source, destination / source.name)
             status_file = destination / "status.json"

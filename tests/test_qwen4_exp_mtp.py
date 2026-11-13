@@ -11,6 +11,7 @@ import torch
 pytest.importorskip("triton")
 pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 
+from atom.model_ops.attentions import qwen4_exp_attn
 from atom.model_ops.qwen4_exp.ops.ple import advance_ngram_state, dilated_causal_conv1d
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
@@ -378,6 +379,36 @@ def test_draft_qsa_view_drops_only_graph_padding():
         assert getattr(draft, name).data_ptr() == getattr(metadata, name).data_ptr()
     assert draft.block_tables is metadata.block_tables
     assert draft.seq_lens is metadata.seq_lens
+
+
+def test_qsa_prefill_pages_only_the_scheduled_requests(monkeypatch):
+    """A prefill of fewer requests than its `running_bs` uploads a block table
+    of `running_bs` rows for the drafter; QSA pages through the scheduled
+    requests' rows alone, one a sequence length (#3160)."""
+    monkeypatch.setattr(qwen4_exp_attn, "qsa_compressed_slots", lambda *args: None)
+    running_bs, num_reqs, num_tokens = 16, 14, 40
+    builder = object.__new__(qwen4_exp_attn.Qwen4ExpMetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(hf_config=SimpleNamespace(indexer_compress_ratio=4)),
+        forward_vars={
+            "qsa_token_to_req": SimpleNamespace(gpu=torch.zeros(64, dtype=torch.int32)),
+            "qsa_logical_positions": SimpleNamespace(
+                gpu=torch.zeros(64, dtype=torch.int64)
+            ),
+            "qsa_compressed_slots": torch.zeros(64, dtype=torch.int64),
+        },
+    )
+    attn_metadata = SimpleNamespace(
+        block_tables=torch.zeros(running_bs, 8, dtype=torch.int32),
+        slot_mapping=torch.zeros(64, dtype=torch.int64),
+        context_lens=torch.ones(running_bs, dtype=torch.int32),
+        max_seqlen_k=8,
+    )
+
+    qsa = builder._finish_qsa(attn_metadata, num_reqs, num_tokens)
+
+    assert qsa.block_tables.shape[0] == qsa.seq_lens.numel() == num_reqs
+    assert qsa.block_tables.data_ptr() == attn_metadata.block_tables.data_ptr()
 
 
 def test_draft_allocation_profile_does_not_require_qsa_pools():

@@ -120,6 +120,8 @@ def test_separate_stores_have_distinct_ports_and_keys(manager):
         manager._start_distributed_store(config)
     ports = [config.parallel_config.data_parallel_base_port for config in configs]
     assert ports[0] != ports[1]
+    ids = [config.parallel_config.server_instance_id for config in configs]
+    assert all(ids) and ids[0] != ids[1]
     clients = [dist.TCPStore("127.0.0.1", port, is_master=False) for port in ports]
     for i, client in enumerate(clients):
         client.set("same-key", str(i))

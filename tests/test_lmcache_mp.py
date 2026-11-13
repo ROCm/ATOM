@@ -47,8 +47,12 @@ from atom.kv_transfer.offload.mp import (
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.token_shipping import token_list
+from atom.model_engine.sequence import SequenceStatus
+from tests.lmcache_mp_support import bare_mp_scheduler as _bare_mp_scheduler
 from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
 from tests.lmcache_mp_support import settle as _settle
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 from tests.lmcache_mp_support import start_transfers as _start_transfers
 from tests.lmcache_mp_support import step_event as _step_event
 
@@ -359,6 +363,7 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
 ):
     @dataclass(frozen=True)
     class Key:
+        request_id: str = "req"
         num_kv_readers: int = 1
 
     class AtomMPParallelConfig:
@@ -386,6 +391,114 @@ def test_scheduler_reserves_locks_for_every_collapsed_tp_reader(
     key = adapter._create_key([], 0, 0, "req", None)
 
     assert key.num_kv_readers == expected_readers
+
+
+@dataclass(frozen=True)
+class _SaltKey:
+    request_id: str
+    num_kv_readers: int = 1
+    cache_salt: str = ""
+
+
+def _install_salt_adapters(monkeypatch, scheduler_base=None):
+    """LMCache's ATOM adapters as far as keys go: one per call, unsalted.
+    `scheduler_base` replaces the scheduler adapter's."""
+
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class AtomMPSchedulerAdapter(_LookupAdapter):
+        def __init__(self, **_kwargs):
+            super().__init__([8, 8])
+            self.keys = []
+
+        def _create_key(self, token_ids, start, end, request_id, worker_id):
+            return _SaltKey(request_id)
+
+        def maybe_submit_lookup_request(self, request_id, token_ids):
+            super().maybe_submit_lookup_request(request_id, token_ids)
+            self.keys.append(
+                self._create_key(
+                    token_ids,
+                    start=0,
+                    end=len(token_ids),
+                    request_id=request_id,
+                    worker_id=None,
+                )
+            )
+
+    class AtomMPWorkerAdapter:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def _create_key(self, request_id, spec):
+            return _SaltKey(request_id)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPTransferSpec = _FakeLoadStoreOp
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    adapter_module.AtomMPSchedulerAdapter = scheduler_base or AtomMPSchedulerAdapter
+    adapter_module.AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
+    """Image placeholder ids are the same for every picture, so each MP key of
+    a seeded prompt carries its `cache_seed`; a text prompt's carries none."""
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
+    _install_salt_adapters(monkeypatch)
+    adapter = mp_scheduler._make_scheduler_adapter(_config())
+    client = mp_lookup._MPLookupClient(
+        adapter, config=_config(), timeout=10.0, poll_interval=0.01
+    )
+    sched = _bare_mp_scheduler()
+    ChunkedOffloadSchedulerBase.__init__(
+        sched, _config(), chunk_size=8, lookup_client=client
+    )
+    seq = SimpleNamespace(
+        id=7,
+        num_prompt_tokens=16,
+        num_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[1, 2, 3, 4],
+        cache_seed=cache_seed,
+        status=SequenceStatus.WAITING,
+    )
+
+    sched.get_num_new_matched_tokens(seq)
+    assert [key.cache_salt for key in adapter.keys] == [salt]
+    adapter.end_session(mp_lookup._mp_session_id(_config(), "7"))
+    assert adapter.cache_salts == {}
+
+    sent = []
+    sched._lookup_client = SimpleNamespace(
+        driving=True,
+        offer=lambda _sid, _tokens, **kwargs: sent.append(kwargs),
+        submit=lambda _tokens, _sid, **kwargs: sent.append(kwargs) or True,
+        pump=lambda: None,
+        pending_ids=set,
+        supports_async=lambda: True,
+        discard=lambda _sid: None,
+    )
+    sched.offer_lookups([seq])
+    fresh = SimpleNamespace(**{**vars(seq), "id": 8})
+    sched.prefetch_lookups([fresh])
+    assert sched.detach_lookup(fresh, 0)
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert sent == [expected] * 3
+
+    worker_adapter = deployment._make_worker_adapter(_config(), rank=0)
+    spec = deployment.transfer_spec(
+        token_ids=list(range(8)), block_ids=[[1]], start=0, end=8, cache_salt=salt
+    )
+    assert isinstance(spec, _FakeLoadStoreOp)
+    assert worker_adapter._create_key("load:7", spec).cache_salt == salt
 
 
 def test_server_url_normalization_and_single_server_limit():
@@ -687,9 +800,7 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
             ),
         )
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    scheduler = _bare_mp_scheduler()
     scheduler._lookup_client = client
     monkeypatch.setattr(
         ChunkedOffloadSchedulerBase,
@@ -774,9 +885,7 @@ def _full_prompt_hit_scheduler(monkeypatch, chunk_size, hit=8):
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    scheduler = _bare_mp_scheduler()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -807,7 +916,7 @@ def test_full_prompt_hit_loads_to_the_chunk_boundary_below_the_last_token(monkey
 
     scheduler.update_state_after_alloc(seq)
     request = scheduler.build_connector_meta().requests[0]
-    assert request.token_ids == list(range(8))
+    assert _shipped_tokens(request) == list(range(8))
     assert request.load_spec.lmcache_cached_tokens == 4
     assert request.load_spec.transfer_end_tokens == 8
     assert seq.offload_loaded_tokens == 4
@@ -973,9 +1082,7 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
         timeout=1.0,
         poll_interval=0.01,
     )
-    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    scheduler = _bare_mp_scheduler()
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -1318,11 +1425,13 @@ def test_worker_uses_transfer_boundary_and_exact_completion(
             transfer_end_tokens=8,
         ),
         load_operation=operation,
+        cache_salt="11",
     )
 
     worker._submit_load(request, _step_event(worker))
     assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
+    assert submitted.cache_salt == "11"
     assert submitted.start == 0
     assert submitted.end == 8
     assert submitted.block_ids == [[10, 11]]
@@ -1728,11 +1837,13 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
         block_ids=[30, 31, 32, 33],
         save_spec=SaveSpec(skip_leading_tokens=8),
         save_operation=operation,
+        cache_salt="11",
     )
 
     worker._submit_save(request, _step_event(worker))
     assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
+    assert submitted.cache_salt == "11"
     assert submitted.start == 8
     assert submitted.end == 16
     assert submitted.block_ids == [[32, 33]]
@@ -2304,6 +2415,203 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert target.tp_replication_factor == 1
 
 
+# -- incremental token shipping (`token_shipping.py`) ------------------------
+
+
+def _shipping_pair():
+    """A scheduler, and the concrete MP worker every frontend reaches (the
+    shell, the native-state worker and the vLLM plugin's adapter all call its
+    `start_load_kv`). The worker has no adapter, so `start_load_kv` resolves the
+    shipped tokens and then stops at "not registered"; `_send` collects what it
+    resolved."""
+    from atom.kv_transfer.offload.mp.token_shipping import WorkerTokens
+
+    sched = _bare_mp_scheduler()
+    worker = mp_worker.LMCacheMPConnector.__new__(mp_worker.LMCacheMPConnector)
+    worker._tokens = WorkerTokens()
+    worker._adapter = None
+    worker.chunk_size = None
+    received = []
+    worker._received = received
+    return sched, worker, received
+
+
+def _start(worker, meta):
+    try:
+        worker.start_load_kv(meta)
+    except RuntimeError as exc:
+        if "not registered" not in str(exc):
+            raise
+
+
+def _send(worker, *reqs):
+    import pickle
+
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    meta.requests = list(reqs)
+    sent = pickle.loads(pickle.dumps(meta))
+    _start(worker, sent)
+    worker._received.extend(token_list(r.token_ids) for r in sent.requests)
+
+
+def test_incremental_tokens_round_trip_through_the_worker_shell():
+    """A load, growing saves, a shorter transfer after a longer one, and an id
+    reused after its drop: each transfer hands the worker exactly its prefix,
+    while only tokens past what the workers hold travel, as raw bytes."""
+    import array
+    import pickle
+
+    from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
+    sched, shell, received = _shipping_pair()
+    seq = SimpleNamespace(
+        id=7, token_ids=array.array("i", range(1000)), block_table=[0]
+    )
+    load = sched._build_load_request(seq, LoadSpec(0, 256, can_load=True), None, 256)
+    assert isinstance(load.token_ids, ShippedTokens)
+    assert isinstance(load.token_ids.tokens, array.array)
+    _send(shell, load)
+    sizes = []
+    for end in (512, 768, 512, 1000):
+        save = sched._build_save_request(seq, 0, end, None, [0], False)
+        sizes.append(len(save.token_ids.tokens))
+        _send(shell, save)
+    assert sizes == [256, 256, 0, 232]
+    assert [len(t) for t in received] == [256, 512, 768, 512, 1000]
+    assert all(t == list(range(len(t))) for t in received)
+    assert all(type(t) is list for t in received)
+    # Raw bytes on the wire, not a pickled list of ints.
+    assert len(pickle.dumps(save.token_ids)) < 232 * 4 + 200
+
+    # The session ends; a reused id starts its copy over at base 0.
+    sched._token_shipper.drop(7, seq)
+    other = SimpleNamespace(
+        id=7, token_ids=array.array("i", range(5000, 5600)), block_table=[0]
+    )
+    save = sched._build_save_request(other, 0, 600, None, [0], False)
+    assert save.token_ids.base == 0
+    _send(shell, save)
+    assert list(received[-1]) == list(range(5000, 5600))
+
+
+def test_a_reused_id_restarts_its_copy_and_a_late_drop_spares_it():
+    import array
+
+    sched, _shell, _ = _shipping_pair()
+    old = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    new = SimpleNamespace(id=7, token_ids=array.array("i", range(100, 164)))
+    shipper = sched._token_shipper
+    assert shipper.ship(old, 32).base == 0
+    shipped = shipper.ship(new, 32)  # reused id: old's copy goes first
+    assert shipped.base == 0 and shipper.take_drops() == (7,)
+    shipper.drop(7, old)  # old's session ends late: new's copy stays
+    assert shipper.ship(new, 64).base == 32
+
+
+def test_incremental_tokens_desync_raises():
+    from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens
+
+    _, shell, _ = _shipping_pair()
+    req = SimpleNamespace(req_id=7, token_ids=ShippedTokens(50, 52, [1, 2]))
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    meta.requests = [req]
+    with pytest.raises(RuntimeError, match="shipped from 50"):
+        shell.start_load_kv(meta)
+
+
+def test_the_session_end_drops_the_workers_copy(monkeypatch):
+    """`_end_finished_sessions` is where no save can follow: it drops the
+    request's shipped prefix, and only then."""
+    import array
+
+    sched = _bare_mp_scheduler()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    sched._token_shipper.ship(seq, 32)
+    sched._lookup_client = SimpleNamespace()
+    sched._save_tracker, sched._save_inflight = {}, {}
+    sched._mp_adapter = SimpleNamespace(end_session=lambda rid: None)
+    sched._config = SimpleNamespace()
+    monkeypatch.setattr(sched, "reconcile_detached_lookups", lambda: None)
+    monkeypatch.setattr(sched, "_pending_session_ends", lambda: {"7": seq})
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.mp.scheduler._mp_session_id", lambda c, i: str(i)
+    )
+    sched._save_inflight["7"] = object()  # a save is still in flight
+    sched._end_finished_sessions()
+    assert 7 in sched._token_shipper._shipped
+    del sched._save_inflight["7"]
+    sched._end_finished_sessions()
+    assert 7 not in sched._token_shipper._shipped
+    assert sched._token_shipper._drops == [7]
+
+
+def test_drops_reach_the_workers_without_a_transfer():
+    """A finished request's copy goes with the next metadata even when no
+    transfer is left to carry it."""
+    import array
+
+    sched, shell, _ = _shipping_pair()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    _send(
+        shell, SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 32))
+    )
+    assert 7 in shell._tokens._held
+    sched._token_shipper.drop(7, seq)
+    from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata
+
+    meta = MPOffloadMetadata()
+    meta.token_drops = sched._token_shipper.take_drops()
+    assert meta.has_work()
+    _start(shell, meta)
+    assert 7 not in shell._tokens._held
+
+
+@pytest.mark.parametrize(
+    "dp,tp,enable_dp_attention,requires_match",
+    [
+        (1, 1, False, False),
+        (1, 2, False, False),
+        (2, 1, False, True),
+        (1, 2, True, True),
+        (2, 1, True, True),
+    ],
+)
+def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
+    monkeypatch, dp, tp, enable_dp_attention, requires_match
+):
+    """Only `prefix_spread` reads the configured chunk (to predict loads), so
+    only an active prefix router is refused when the server runs on another
+    one. Ordinary DP=1 and other strategies use the server's chunk as before;
+    DP-attention's TP ranks are routable engines too."""
+    monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "256")
+    server_512 = SimpleNamespace(lmcache_tokens_per_chunk=512)
+    config = _config(dp=dp, tp=tp, enable_dp_attention=enable_dp_attention)
+    config.dp_load_balance = "least_requests"
+    deployment.require_chunk_matches_server(server_512, config)
+    config.dp_load_balance = "prefix_spread"
+    if requires_match:
+        with pytest.raises(ValueError, match="configured chunk to match the server"):
+            deployment.require_chunk_matches_server(server_512, config)
+    else:
+        deployment.require_chunk_matches_server(server_512, config)
+    deployment.require_chunk_matches_server(
+        SimpleNamespace(lmcache_tokens_per_chunk=256), config
+    )
+    monkeypatch.delenv("LMCACHE_CHUNK_SIZE")
+    config.kv_transfer_config = {
+        **config.kv_transfer_config,
+        "kv_connector_extra_config": {
+            **config.kv_transfer_config.get("kv_connector_extra_config", {}),
+            "lmcache.chunk_size": 512,
+        },
+    }
+    deployment.require_chunk_matches_server(server_512, config)
+
+
 def _checkpointed_transfer_tensors(*, num_blocks: int = 16) -> KVTransferTensors:
     """Two 16-byte PAGE planes whose units also hold a 40-byte checkpoint image
     (two units), declared the way a backend publishes native state."""
@@ -2730,3 +3038,57 @@ def test_get_finished_wakes_the_transfer_thread_while_transfers_are_pending(
     )
     worker.get_finished()
     assert looks == [mp_worker._LAST_LOOK_WAIT_S]
+
+
+def test_queued_token_drops_keep_the_connector_stepping(monkeypatch):
+    """The last request retiring queues the drop of its worker token copy; with
+    nothing else running, only `has_pending_work` makes the engine dispatch the
+    metadata that carries it."""
+    import array
+
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    sched, _worker, _ = _shipping_pair()
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase, "has_pending_work", lambda s: False
+    )
+    sched._lookup_client = SimpleNamespace()
+    monkeypatch.setattr(sched, "_pending_session_ends", dict)
+    assert not sched.has_pending_work()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
+    sched._token_shipper.ship(seq, 32)
+    sched._token_shipper.drop(7, seq)
+    assert sched.has_pending_work()
+    sched._token_shipper.take_drops()
+    assert not sched.has_pending_work()
+
+
+def test_the_vllm_plugin_path_resolves_shipped_tokens():
+    """The plugin builds the concrete worker without the shell; the worker's own
+    `start_load_kv` must resolve what the scheduler shipped."""
+    import array
+
+    sched, worker, received = _shipping_pair()
+    seq = SimpleNamespace(id=9, token_ids=array.array("i", range(300)))
+    save = sched._build_save_request(seq, 0, 256, None, [0], False)
+    _send(worker, save)
+    assert received == [list(range(256))]
+
+
+def test_resolve_does_not_copy_the_prefix():
+    """`resolve` only extends the worker copy; the list is built where a
+    transfer is submitted, and the prefix it names survives later shipments."""
+    import array
+
+    from atom.kv_transfer.offload.mp.token_shipping import TokenPrefix
+
+    sched, worker, _ = _shipping_pair()
+    seq = SimpleNamespace(id=7, token_ids=array.array("i", range(600)))
+    first = SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 256))
+    meta = SimpleNamespace(requests=[first])
+    worker._tokens.resolve(meta)
+    assert isinstance(first.token_ids, TokenPrefix) and len(first.token_ids) == 256
+    later = SimpleNamespace(req_id=7, token_ids=sched._token_shipper.ship(seq, 600))
+    worker._tokens.resolve(SimpleNamespace(requests=[later]))
+    assert token_list(first.token_ids) == list(range(256))
+    assert token_list(later.token_ids) == list(range(600))

@@ -148,7 +148,7 @@ def draft_kv_lookahead(
 ) -> int:
     """KV positions past `len(seq)` that one forward's draft round writes.
 
-    Serial MTP (`EagleProposer.propose`) runs the draft `k = num_speculative_tokens`
+    Serial MTP (`EagleProposer._propose`) runs the draft `k = num_speculative_tokens`
     times per forward. Step 0 writes the target's own slots; each of the `k - 1`
     mid-steps after it bumps `context_lens` and writes one token at
     `context_lens - 1`. So a forward whose target context ends at `C` writes

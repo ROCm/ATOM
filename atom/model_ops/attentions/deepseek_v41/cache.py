@@ -188,6 +188,9 @@ class PagedAttentionCache:
         )
         self._probe_done = torch.cuda.Event() if pinned else None
         self._probe_claim = None
+        # The requests of the last step whose state was prepared, in batch
+        # order: what a device-round step must continue.
+        self._prepared_requests = None
         if geometry.packed:
             self.pool = self.backing.view(-1, 1)
         elif self.kv_fp8:
@@ -299,10 +302,16 @@ class PagedAttentionCache:
         cached_until=None,
         finals=None,
         start_histories=None,
+        lean=False,
     ):
         """`floors`, `cached_until`, `finals`, `start_histories`: per request,
         on the host, `BatchStep`'s `request_*` and `start_histories`; None for
-        a forward recomputing nothing, ending every prompt."""
+        a forward recomputing nothing, ending every prompt.
+
+        `lean`: the step runs no layer that reads a compress plan or a step
+        planner's tables -- the model's decode round runs them all
+        (`AttentionMetaData.served_by_round` `LEAN` and above) -- so it gets
+        neither."""
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -347,11 +356,14 @@ class PagedAttentionCache:
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
-            planners=planners,
+            planners=() if lean else planners,
         )
-        step.plans = (
-            self._private_plans(requests, tentative) if plans is None else plans
-        )
+        if lean:
+            step.plans = {}
+        else:
+            step.plans = (
+                self._private_plans(requests, tentative) if plans is None else plans
+            )
         count = len(requests)
         zeros = np.zeros(count, np.int32)
         step.request_floors = zeros if floors is None else floors
@@ -475,6 +487,37 @@ class PagedAttentionCache:
             self._probe[: starts.size].numpy(), starts, requests, fresh
         )
 
+    def prepare_device_round_state(self, step, *, histories=True):
+        """`prepare_state` for a device-round step (`RoundService.DEVICE`: the
+        model's decode round advanced its positions on the device from the
+        previous verdict): a steady decode of the requests the previous step
+        served, so no slot restarts and no probe (its start is the device's),
+        only the tentative state its verdict commits.
+
+        What makes skipping them safe is checked on the host instead, as hard
+        as the probe: the step's requests are the previous step's, in the same
+        order, none of them starting over (fresh) or resuming. A recycled slot
+        raises here rather than reading its last tenant's state."""
+        if histories:
+            raise RuntimeError("A device-round step on the host Engram path")
+        self.require_committed()
+        self._judge_previous_probe()
+        count = step.scheduled_bs
+        ids = [span.request_id for span in step.requests]
+        resumes = step.request_cached_until[:count]
+        fresh = (step.request_positions[:count] == step.request_floors[:count]) & (
+            resumes == 0
+        )
+        if ids != self._prepared_requests or fresh.any() or resumes.any():
+            raise RuntimeError(
+                f"A device-round step of requests {ids} (fresh "
+                f"{np.flatnonzero(fresh).tolist()}, resuming "
+                f"{np.flatnonzero(resumes).tolist()}) does not continue the "
+                f"previous step's {self._prepared_requests}"
+            )
+        if step.tentative:
+            self.pending = TentativeState(self, step)
+
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.
 
@@ -496,7 +539,7 @@ class PagedAttentionCache:
         self._judge_previous_probe()
         count = step.scheduled_bs
         starts = step.request_positions[:count]
-        ids = [span.request_id for span in step.requests]
+        ids = self._prepared_requests = [span.request_id for span in step.requests]
         # A slot starts over at its floor: 0, or where a request rebuilds its
         # state below a prefix hit (`BatchStep.request_floors`). One
         # recomputing rows below where its state is keeps the state, and its

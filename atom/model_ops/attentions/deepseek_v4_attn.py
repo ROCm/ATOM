@@ -459,6 +459,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
 
+    # TBO's comm stream runs at high priority, as V4.1's does, so a ubatch's
+    # gather / reduce-scatter is scheduled while the other ubatch computes
+    # instead of waiting for the compute queue to drain.
+    tbo_comm_stream_priority = -1
+
     block_size = 256
 
     # Set by a subclass that rotates an index key at its compression group's
@@ -2357,7 +2362,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         """Per-draft-step V4 region metadata rebuild for 1-token-per-seq shape.
 
-        Called by EagleProposer.propose at mid-step iters. Eagle has already
+        Called by EagleProposer._propose at mid-step iters. Eagle has already
         updated GPU state before this call:
           - ``attn_metadata.context_lens`` (GPU view of
             ``var["context_lens"].gpu``): rolled-back by ``prepare_decode``
@@ -2398,7 +2403,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             AttentionMetaData_DSV4, get_forward_context().attn_metadata
         )
         # Pre-populated by the verify-forward `prepare_decode` and kept alive
-        # across eagle.propose; assert for the static checker.
+        # across EagleProposer._propose; assert for the static checker.
         assert attn_metadata.context_lens is not None
         assert attn_metadata.state_slot_out is not None
         win = self.window_size  # SWA prefix max per token

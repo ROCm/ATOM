@@ -2,7 +2,7 @@
 """Every KV position an MTP step writes is allocated before its forward.
 
 A forward writes the target's tokens and then the draft round's. With
-`k = num_speculative_tokens`, `EagleProposer.propose` runs `k - 1` draft
+`k = num_speculative_tokens`, `EagleProposer._propose` runs `k - 1` draft
 mid-steps after step 0, each bumping `context_lens` and writing one token at
 `context_lens - 1`; the builders' slot for it is
 `block_tables[row, pos // B] * B + pos % B`. So a forward whose target context

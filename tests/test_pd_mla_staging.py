@@ -222,6 +222,9 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
     conn._per_block_bytes_list = [PAGE_BYTES] * len(regions)
     conn._block_region_roles = [MLA_KV_ROLE] * len(regions)
     conn._block_region_consumer_indices = None
+    conn._block_unit_specs = None
+    conn._block_head_major_runs = ()
+    conn._unit_layout = None
     conn._consumer_region_map = lambda *_a, **_k: list(range(len(regions)))
     conn._prepare_sharded_index = None
     conn._gather_sharded_index = None

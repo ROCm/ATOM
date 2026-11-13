@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import time
 
+import torch
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
@@ -447,9 +449,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _start_state_stores(self, metadata) -> None:
         """Hand this step's ready checkpoints to the tier's executor.
 
-        No producer fence and no staging copy: the source is the checkpoint's
-        PAGE units, reserved out of the KV pool and pinned by the engine, so the
-        packer gathers straight from where they sit.
+        No staging copy: the source is the checkpoint's PAGE units, reserved out
+        of the KV pool and pinned by the engine, so the packer gathers straight
+        from where they sit. A checkpoint is READY once the batch carrying its
+        slot->PAGE copy was issued, not once the copy ran, so every store waits
+        on one event recorded on the current stream here, behind that copy.
 
         A store with no tier is reported failed rather than dropped -- the
         engine holds those units pinned against a report, and silence would
@@ -467,13 +471,27 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             for op, _units in stores:
                 self._store_failed_no_tier.add(op)
             return
+        try:
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream())
+        except Exception:
+            logger.exception(
+                "kimi_k3 offload: state store fence creation failed; failing "
+                "%d store(s).",
+                len(stores),
+            )
+            for op, _units in stores:
+                self._store_failed_no_tier.add(op)
+            return
         for op, unit_ids in stores:
             # Isolate each submit (finding #4): route a submit failure into the
             # same no-tier failure channel (get_finished drains it) so the engine
             # releases the store's pinned PAGE units now rather than on the
             # reconciler's full timeout, without escaping past super().
             try:
-                self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+                self._state_tier.submit_store(
+                    op, tuple(int(u) for u in unit_ids), ready_event
+                )
             except Exception:
                 logger.exception(
                     "kimi_k3 offload: submit_store failed for %s; failing it.",

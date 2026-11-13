@@ -571,6 +571,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 
@@ -584,7 +585,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         Every scheduled row is written on every step: the window must hold a row
         for every position it spans, and the read side gathers slots by absolute
         position regardless of whether they were ever written. See
-        :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
+        :meth:`DSparkProposer._propose` for why writing rejected rows is safe.
 
         The draft window KV lives in the draft layer's own plane
         (``self.attn.swa_plane``), addressed by ``self.attn.swa_window`` exactly
