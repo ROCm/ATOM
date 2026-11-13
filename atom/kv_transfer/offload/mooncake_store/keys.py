@@ -47,11 +47,6 @@ _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 _NAMESPACE_PREFIX = "atomkv1-"
 
 
-def codec_id(config: Any) -> str:
-    """The byte layout used by this configuration, preserving main namespaces."""
-    return mooncake_codec_id(config)
-
-
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
     """Each PP stage's ``[start, end)`` slice of the target model's layers.
 

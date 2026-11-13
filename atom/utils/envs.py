@@ -1382,7 +1382,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
-    # tier then uses its own default (`offload.config.resolve_min_load_tokens`).
+    # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
         _optional_int_env("OFFLOAD_MIN_LOAD_TOKENS")
     ),

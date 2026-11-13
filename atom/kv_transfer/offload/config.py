@@ -843,28 +843,3 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
 
 # The smallest tier hit worth loading unless the user or the tier says otherwise.
 DEFAULT_MIN_LOAD_TOKENS = 8192
-
-
-def resolve_min_load_tokens(config) -> int:
-    """`OFFLOAD_MIN_LOAD_TOKENS` for this configuration: the user's value, else
-    the configured offload tier's own default, else `DEFAULT_MIN_LOAD_TOKENS`.
-
-    Resolved per configuration (`Config.offload_min_load_tokens`), never written
-    into the process environment, so another engine in the process keeps its own.
-    """
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.utils import envs
-
-    override = envs.OFFLOAD_MIN_LOAD_TOKENS
-    if override is not None:
-        return override
-    tier = KVConnectorFactory.offload_min_load_tokens(config)
-    return DEFAULT_MIN_LOAD_TOKENS if tier is None else tier
-
-
-def min_load_tokens(config) -> int:
-    """Use the shared Config snapshot; support lightweight connector configs."""
-    value = getattr(config, "offload_min_load_tokens", None)
-    if value is not None:
-        return int(value)
-    return resolve_min_load_tokens(config)

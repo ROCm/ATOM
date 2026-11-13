@@ -23,7 +23,6 @@ from atom.kv_transfer.offload._offload_common import (
     tier_lookup_kwargs,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.config import min_load_tokens
 from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
@@ -162,7 +161,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
         # by the OFFLOAD_UNALIGNED_HANDOFF env var; now unconditional.)
-        self._min_load_tokens = min_load_tokens(config)
+        self._min_load_tokens = config.offload_min_load_tokens
 
     def bind_block_manager(self, block_manager) -> None:
         if self._block_manager is not None and self._block_manager is not block_manager:
@@ -466,8 +465,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     # unaligned HBM hit (`BlockManager.lower_hit_to_chunk`) instead of handing
     # off through a prefill to the next chunk boundary.
     lowers_hbm_hit_to_chunk = False
-    # It answers `lookup_ready`, so the scheduler may start its loads early.
-    supports_early_load = True
 
     def held_tier_hit(self, seq) -> int:
         """The tier hit armed for `seq`'s coming load, 0 when none.
@@ -915,7 +912,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     getattr(ls, "can_load", None),
                 )
                 continue
-            # â˜… Use the REAL HBM-cached count as the load floor.
+            # ★ Use the REAL HBM-cached count as the load floor.
             # get_num_new_matched_tokens runs BEFORE the prefix-cache match in
             # block_manager.allocate, so seq.num_cached_tokens was stale (often
             # 0) when the LoadSpec was recorded. By now (post-allocate) it is the

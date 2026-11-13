@@ -37,7 +37,6 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 
@@ -111,23 +110,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             close()
 
     # -- lifecycle --------------------------------------------------------
-    # The stream the forward runs on, as the model runner last reported it.
-    _forward_stream: Any = None
-
-    def set_forward_stream(self, stream: Any) -> None:
-        if stream is not None:
-            self._forward_stream = stream
-
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
-        # Called on the model runner's thread: its current stream is the one
-        # the forward runs on. Recorded here so a load that precedes the first
-        # save stages on it, where a connector stages on that stream.
-        if torch.cuda.is_available():
-            self.set_forward_stream(torch.cuda.current_stream())
         tp = get_tp_group()
         rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
@@ -241,7 +228,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     try:
                         candidate_event = torch.cuda.Event()
                         candidate_event.record(torch.cuda.current_stream())
-                        self.set_forward_stream(torch.cuda.current_stream())
                         save_ready_event = candidate_event
                         self._save_fence_failure_logged = False
                     except Exception:

@@ -646,8 +646,9 @@ class EngineCore:
         self._kv_progress_event.wait(KV_IDLE_DRAIN_INTERVAL_S)
 
     def _postprocess(self, seqs, fwd_out, batch):
-        # Ahead of this step's outputs, which complete or release placements.
-        flush_dp_reuse(self.scheduler, self.output_queue)
+        if self._report_backlog:
+            # Ahead of this step's outputs, which complete or release placements.
+            flush_dp_reuse(self.scheduler, self.output_queue)
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
             seqs,
@@ -1052,7 +1053,7 @@ class DPEngineCoreProc(EngineCore):
 
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
-        self._report_backlog = getattr(config, "dp_load_balance", None) == "share_cache"
+        self._report_backlog = config.dp_load_balance == "share_cache"
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank

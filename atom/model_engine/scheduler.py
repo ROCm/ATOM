@@ -34,7 +34,6 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
-from atom.kv_transfer.offload.config import min_load_tokens
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -1114,7 +1113,7 @@ class Scheduler:
                     seq.num_tokens - self._resume_start_after_tier_load(seq, boundary),
                 )
         elif estimate and not seq.block_table:
-            cached = max(cached, getattr(seq, "dp_est_cached_tokens", 0))
+            cached = max(cached, seq.dp_est_cached_tokens)
         return max(0, seq.num_tokens - cached)
 
     def _still_loading(self, seq: Sequence) -> bool:
@@ -3468,7 +3467,6 @@ class Scheduler:
             probe,
             int(conn.chunk_size),
             int(conn.held_tier_hit(seq)),
-            min_load_tokens(self.config),
         )
 
     def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
@@ -4047,7 +4045,7 @@ class Scheduler:
         routing placed it on an estimated prefix (`dp_est_cached_tokens`): the
         router drops index entries this rank did not find
         (`ShareCacheRouter.note_reuse`)."""
-        est = getattr(seq, "dp_est_cached_tokens", 0)
+        est = seq.dp_est_cached_tokens
         if est:
             seq.dp_est_cached_tokens = 0
             # `_resume_prefill` rewound `num_cached_tokens` to the replay start;
@@ -4300,7 +4298,7 @@ class Scheduler:
             state.skip(seq.id, "multimodal")
             state.settled.add(seq.id)
             return False
-        if seq.num_tokens < min_load_tokens(self.config):
+        if seq.num_tokens < self.config.offload_min_load_tokens:
             # No tier hit can be worth loading (`_load_ruled_out`).
             state.skip(seq.id, "below_min_load")
             state.settled.add(seq.id)
@@ -4336,8 +4334,9 @@ class Scheduler:
         batch (`build_connector_meta`) or the idle-dispatch path. Nothing else
         moves earlier:
           - the request stays where it is in `waiting`, and Phase 2 reaches it
-            in arrival order (`_promote_ready_remote_kv_requests` does not move
-            it up, a load in flight does not push it to the tail);
+            in arrival order (`_prioritize_ready_remote_kv_requests` moves a
+            finished load up only when the head is blocked, a load in flight
+            does not push it to the tail);
           - it is not prefillable while its load is in flight (`_still_loading`),
             and once loaded it prefills only when a FIRE admits it;
           - no collective runs and no step type changes, so DP lockstep holds.
@@ -4351,14 +4350,14 @@ class Scheduler:
         """
         state = self._early_load
         bm = self.block_manager
-        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
-        state.maybe_log(total_blocks)
         if (
             self.kv_connector is None
             or not self._connector_flag("is_offload")
             or not self._connector_flag("supports_early_load")
         ):
             return 0
+        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
+        state.maybe_log(total_blocks)
         state.tick += 1
         if state.entries:
             self._early_load_sweep(state)
@@ -4382,14 +4381,24 @@ class Scheduler:
                 # early loads behind it can never fill every slot first.
                 state.skip(seq.id, "seq_slots")
                 break
-            if self._lookup_detach_enabled(seq) and self._can_detach_tier_lookup(
-                seq, self._probe_hbm_prefix(seq)
-            ):
-                state.skip(seq.id, "detach_no_load")
-                state.settled.add(seq.id)
-                continue  # no load possible: it prefills when a FIRE admits it
+            hbm_probe = None
+            probed_tier_kv = (0, 0)
+            if self._lookup_detach_enabled(seq):
+                hbm_probe = self._probe_hbm_prefix(seq)
+                probed_tier_kv = self._tier_hit(seq)
+                if self._can_detach_tier_lookup(seq, hbm_probe):
+                    state.skip(seq.id, "detach_no_load")
+                    state.settled.add(seq.id)
+                    continue  # no load possible: it prefills when a FIRE admits it
             needs_remote_load = self._query_connector_prefill_match(seq, skip=False)
-            hbm_probe = self._probe_hbm_prefix(seq)
+            # As in Phase 2: the detach probe predates the connector's answer,
+            # which a replaying model's admission reads.
+            if hbm_probe is None or (
+                getattr(bm, "state_replay_tokens", 0)
+                and seq.has_per_req_cache
+                and self._tier_hit(seq) != probed_tier_kv
+            ):
+                hbm_probe = self._probe_hbm_prefix(seq)
             if hbm_probe.num_cached_blocks < 0:
                 state.skip(seq.id, "pool_full")
                 break  # the pool cannot take it now; neither could Phase 2
@@ -4405,6 +4414,16 @@ class Scheduler:
                 # Hand-off prefill runs first (`_maybe_start_unaligned_handoff`).
                 state.skip(seq.id, "unaligned_hbm")
                 state.settled.add(seq.id)
+                continue
+            if self._local_prefill_coalescing and self._wait_for_inflight_prefix(
+                seq,
+                max(
+                    hbm_probe.num_cached_blocks * hbs,
+                    seq.offload_joint.kv_prefix_tokens,
+                ),
+            ):
+                # Phase 2 waits for the same producer's checkpoint.
+                state.skip(seq.id, "inflight_prefix")
                 continue
             # KV pressure. Counted only for a request that would load: one that
             # would not never reached here.
@@ -5443,15 +5462,12 @@ class Scheduler:
 
     @staticmethod
     def _has_req_id(req_ids: list, seq_id) -> bool:
-        candidates = (seq_id, str(seq_id))
-        for candidate in candidates:
-            if candidate in req_ids:
-                return True
+        text = str(seq_id)
         try:
-            int_id = int(seq_id)
+            number = int(seq_id)
         except (TypeError, ValueError):
-            return False
-        return int_id in req_ids
+            number = seq_id
+        return any(r == seq_id or r == text or r == number for r in req_ids)
 
     @staticmethod
     def _pop_req_id(req_ids: list, seq_id) -> bool:

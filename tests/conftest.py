@@ -12,6 +12,7 @@
 # import here is a declared dependency, so a plain CPU runner has them.
 
 import dataclasses
+import os
 import sys
 from itertools import count
 from pathlib import Path
@@ -103,6 +104,10 @@ class MockConfig:
             "scheduler_delay_factor": 0.0,
             "prefill_admit_policy": "interval",
             "speculative_config": None,
+            # What `Config` resolves: the env override, else the global default.
+            "offload_min_load_tokens": int(
+                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192")
+            ),
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
             "hf_config": _MockHFConfig(),

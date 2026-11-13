@@ -22,7 +22,7 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.kv_transfer.offload.config import min_load_tokens
+from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -220,7 +220,7 @@ class BlockManager:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
-        self._min_load_tokens = min_load_tokens(config)
+        self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -1636,7 +1636,6 @@ class BlockManager:
         probe: AdmissionProbe,
         chunk: int,
         tier_hit: int,
-        min_load: int,
     ) -> bool:
         """Lower an unaligned HBM hit to the tier's chunk floor, so a load can
         start there.
@@ -1668,8 +1667,12 @@ class BlockManager:
         if chunk <= 0 or chunk % hbs:
             return False
         hit = hit_blocks * hbs
-        floor = hit // chunk * chunk
-        if floor == hit or tier_hit <= hit or tier_hit - floor < min_load:
+        floor = chunk_floor(hit, chunk)
+        if (
+            floor == hit
+            or tier_hit <= hit
+            or not tier_load_tokens(floor, tier_hit, chunk, self._min_load_tokens)
+        ):
             return False
         if seq.offload_joint.boundary_tokens:
             return False

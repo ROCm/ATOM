@@ -357,6 +357,20 @@ def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
     assert sched._early_load.skips["unaligned_hbm"] == 1
 
 
+def test_early_load_waits_for_the_inflight_prefix_producer_phase_2_waits_for(setup):
+    sched, _, seq = setup
+    sched._local_prefill_coalescing = True
+    waited = []
+    sched._wait_for_inflight_prefix = lambda s, cached: waited.append(s.id) or True
+
+    sched._early_load_tier_prefixes()
+
+    assert waited == [seq.id]
+    assert seq.status == SequenceStatus.WAITING
+    assert sched._early_load.skips["inflight_prefix"] == 1
+    assert seq.id not in sched._early_load.entries
+
+
 # -- pressure bounds ----------------------------------------------------------
 
 

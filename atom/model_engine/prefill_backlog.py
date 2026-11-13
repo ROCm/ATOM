@@ -19,7 +19,7 @@ def flush_dp_reuse(scheduler, output_queue) -> None:
     dp_reuse_reports`) for the CoreManager. Called before a step's outputs are
     queued: a request's report then reaches the router before its first or
     last output, which complete or release its placement."""
-    reports = getattr(scheduler, "dp_reuse_reports", None)
+    reports = scheduler.dp_reuse_reports
     if reports:
         scheduler.dp_reuse_reports = []
         output_queue.put_nowait(("DP_REUSE", reports))
@@ -47,6 +47,6 @@ def prefill_backlog(scheduler, scan: int = BACKLOG_SCAN) -> int:
     backlog += sum(
         scheduler.pending_prefill_tokens(seq, estimate=True)
         for seq in scheduler.running
-        if seq.num_completion_tokens == 0 or getattr(seq, "is_partial_prefill", False)
+        if seq.num_completion_tokens == 0 or seq.is_partial_prefill
     )
     return backlog

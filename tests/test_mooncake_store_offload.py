@@ -69,6 +69,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
 )
+from atom.kv_transfer.offload.mooncake_store.layouts import mooncake_codec_id
 from atom.kv_transfer.offload.mooncake_store.pool import (
     SlotPoolExhausted,
     TransferSlotPool,
@@ -3948,12 +3949,12 @@ def test_mixed_windows_report_the_same_chunks(
 def test_the_dense_codec_id_is_unchanged_and_v41_has_its_own():
     from types import SimpleNamespace
 
-    from atom.kv_transfer.offload.mooncake_store import keys
-
     dense = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
     v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
-    assert keys.codec_id(dense) == "dense-opaque-block-v1"  # stored entries stay valid
-    assert keys.codec_id(v41) == "v41-replay-page-v1"
+    assert (
+        mooncake_codec_id(dense) == "dense-opaque-block-v1"
+    )  # stored entries stay valid
+    assert mooncake_codec_id(v41) == "v41-replay-page-v1"
 
 
 def test_an_answer_taken_late_is_as_old_as_its_store_query(cluster):

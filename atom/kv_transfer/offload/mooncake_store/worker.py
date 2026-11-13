@@ -236,10 +236,19 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
 
     # -- lifecycle --------------------------------------------------------
+    # The stream the forward runs on: seeded at registration, then reported by
+    # the model runner before each forward (`ModelRunner.prefill_forward`).
+    _forward_stream: Any = None
+
+    def set_forward_stream(self, stream: Any) -> None:
+        if stream is not None:
+            self._forward_stream = stream
+
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
-        # The model runner's thread: its current stream is the forward's.
+        # The model runner's thread: its current stream is the forward's. The
+        # first load is dispatched before the first forward reports its stream.
         if torch.cuda.is_available():
             self.set_forward_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())

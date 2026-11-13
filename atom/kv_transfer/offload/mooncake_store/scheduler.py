@@ -499,11 +499,9 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     # The Store reads whole chunks into fresh blocks, so an HBM hit that ends
     # inside a chunk can be lowered to the chunk floor (see
     # `BlockManager.lower_hit_to_chunk`).
-    @property
-    def lowers_hbm_hit_to_chunk(self):
-        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-        return KVConnectorFactory.lowers_hbm_hit_to_chunk("mooncake_store")
+    lowers_hbm_hit_to_chunk = True
+    # It answers `lookup_ready`, so the scheduler may start its loads early.
+    supports_early_load = True
 
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.

@@ -21,9 +21,14 @@ HBS = 4  # hash block size of MockConfig
 CHUNK = 16  # four hash blocks
 
 
-def _manager(blocks=100):
+def _manager(blocks=100, min_load=8):
     return Scheduler(
-        MockConfig(max_num_seqs=8, max_num_batched_tokens=64, num_kvcache_blocks=blocks)
+        MockConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=blocks,
+            offload_min_load_tokens=min_load,
+        )
     ).block_manager
 
 
@@ -42,7 +47,7 @@ def test_lowers_an_unaligned_hit_to_the_chunk_floor(seq_factory):
     bm = _manager()
     seq = seq_factory(list(range(64)))
     probe = _probe(5)  # 20 tokens: 4 into the second 16-token chunk
-    assert bm.lower_hit_to_chunk(seq, probe, CHUNK, tier_hit=48, min_load=8)
+    assert bm.lower_hit_to_chunk(seq, probe, CHUNK, tier_hit=48)
     assert probe.num_cached_blocks == 4  # 16 tokens
     # The dropped block is cached-free (or gone): `num_new_blocks` already counts
     # it as one to allocate, so lowering adds no demand.
@@ -53,7 +58,7 @@ def test_a_dropped_block_a_request_still_holds_is_one_more_unit(seq_factory):
     bm = _manager()
     _held_by_a_request(bm, 104)  # the block at index 4, past the floor
     probe = _probe(5)
-    assert bm.lower_hit_to_chunk(seq_factory(list(range(64))), probe, CHUNK, 48, 8)
+    assert bm.lower_hit_to_chunk(seq_factory(list(range(64))), probe, CHUNK, 48)
     assert probe.num_new_blocks == 7
 
 
@@ -67,11 +72,11 @@ def test_a_dropped_block_a_request_still_holds_is_one_more_unit(seq_factory):
     ],
 )
 def test_leaves_the_probe_alone(seq_factory, hit_blocks, tier_hit, min_load, why):
-    bm = _manager()
+    bm = _manager(min_load=min_load)
     probe = _probe(hit_blocks)
     before = (probe.num_cached_blocks, probe.num_new_blocks)
     assert not bm.lower_hit_to_chunk(
-        seq_factory(list(range(64))), probe, CHUNK, tier_hit, min_load
+        seq_factory(list(range(64))), probe, CHUNK, tier_hit
     ), why
     assert (probe.num_cached_blocks, probe.num_new_blocks) == before
 
@@ -81,16 +86,16 @@ def test_refuses_when_the_state_cannot_be_rebuilt_below_the_hit(seq_factory):
     seq = seq_factory(list(range(64)))
     seq.has_per_req_cache = True
     bm.state = SimpleNamespace(transfer=SimpleNamespace(replays=False))
-    assert not bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48, 8)
+    assert not bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48)
     bm.state = SimpleNamespace(transfer=SimpleNamespace(replays=True))
-    assert bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48, 8)
+    assert bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48)
 
 
 def test_refuses_with_a_joint_boundary(seq_factory):
     bm = _manager()
     seq = seq_factory(list(range(64)))
     seq.offload_joint.boundary_tokens = 32
-    assert not bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48, 8)
+    assert not bm.lower_hit_to_chunk(seq, _probe(5), CHUNK, 48)
 
 
 def test_refuses_when_a_cache_class_rejects_the_lowered_boundary(seq_factory):
@@ -98,7 +103,7 @@ def test_refuses_when_a_cache_class_rejects_the_lowered_boundary(seq_factory):
     seq = seq_factory(list(range(64)))
     bm._gated_hit = lambda s, boundary, chain: boundary - 1  # window gone
     probe = _probe(5)
-    assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48, 8)
+    assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
     assert probe.num_cached_blocks == 5
 
 
@@ -107,7 +112,7 @@ def test_refuses_when_the_pool_cannot_give_the_extra_block(seq_factory):
     _held_by_a_request(bm, 104)
     seq = seq_factory(list(range(64)))
     probe = _probe(5, new=4)  # the pool has 4 free: one more does not fit
-    assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48, 8)
+    assert not bm.lower_hit_to_chunk(seq, probe, CHUNK, 48)
     assert probe.num_new_blocks == 4
 
 
@@ -173,6 +178,7 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
         _routable_engine_count=2,
     )
     cfg = SimpleNamespace(
+        offload_min_load_tokens=512,
         dp_load_balance="share_cache",
         enable_prefix_caching=True,
         kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
