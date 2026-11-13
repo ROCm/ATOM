@@ -870,6 +870,10 @@ def mask_empty_dcp_lse(
 # through its ``row_counts``; an aiter without that argument keeps a2a.
 
 _MAILBOX_WORKSPACES: dict = {}
+# Mailbox merges taken, per workspace. A merge can only take the mailbox inside
+# a graph capture, so after capture this is every launch a replay makes.
+_MAILBOX_LAUNCHES: dict = {}
+_MAILBOX_GROUPS: dict = {}
 # Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
 # system-scope stores beat pack -> RCCL -> combine while the merge is latency
 # bound and lose once it is bandwidth bound. On MI355X (token tiling,
@@ -931,6 +935,7 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         logger.warning("DCP mailbox peer memory: %s", error)
         return False
     _MAILBOX_WORKSPACES[key] = ws
+    _MAILBOX_GROUPS[key] = cp_group
     logger.info(
         "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
         "%.1f MiB of peer memory",
@@ -947,9 +952,8 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
     if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
         return None
     tokens, heads, dim = cp_attn_out.shape
-    ws = _MAILBOX_WORKSPACES.get(
-        _mailbox_key(cp_group, heads // cp_group.world_size, dim)
-    )
+    key = _mailbox_key(cp_group, heads // cp_group.world_size, dim)
+    ws = _MAILBOX_WORKSPACES.get(key)
     if (
         ws is None
         or tokens == 0
@@ -960,6 +964,7 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         return None
     from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
 
+    _MAILBOX_LAUNCHES[key] = _MAILBOX_LAUNCHES.get(key, 0) + 1
     # The combine takes exactly one int32 count per row, where the a2a path
     # accepts any buffer at least `tokens` long.
     out = dcp_lse_combine(
@@ -972,6 +977,26 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.
     return out if quant_dtype is None else (out, None)
+
+
+def check_dcp_mailbox_launches() -> None:
+    """Raise unless every rank of each mailbox group captured the same number
+    of mailbox merges. A launch pairs with the same launch on every peer, so a
+    rank that took one more would pair each later merge with the wrong call and
+    hang at the last one. Collective: call on every rank after graph capture."""
+    for key, group in _MAILBOX_GROUPS.items():
+        n = _MAILBOX_LAUNCHES.get(key, 0)
+        t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        lo, hi = t[0].item(), -t[1].item()
+        if lo != hi:
+            raise RuntimeError(
+                f"DCP mailbox: ranks captured between {lo} and {hi} mailbox "
+                f"merges (this rank {n}); replay would pair them wrongly. Set "
+                '--dcp-config \'{"comm_backend": "a2a"}\' and report this.'
+            )
 
 
 def dcp_lse_merge(

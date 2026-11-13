@@ -879,6 +879,7 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+        assert self.dcp_comm_backend != "auto", "Config resolves comm_backend"
         # Collective, once per (DCP group, heads, head dim): every DCP rank
         # builds the same MLA layers in the same order, as for the weights.
         if self.dcp_world_size > 1 and self.dcp_comm_backend == "mailbox":

@@ -827,9 +827,10 @@ def test_defaults():
     # is the way a default flip silently turns a comparison into a no-op.
     assert cfg.enable_query_replication is True
     assert cfg.enable_project_before_merge is True
-    # a2a: measured faster than ag_rs on the decode shapes here. Pinned because
-    # it also decides what an A/B control arm gets when it passes nothing.
-    assert cfg.comm_backend == "a2a"
+    # auto: Config resolves it to the mailbox where validated, else a2a. Pinned
+    # because it also decides what an A/B control arm gets when it passes
+    # nothing: a control arm must now pass "a2a" explicitly.
+    assert cfg.comm_backend == "auto"
 
 
 def test_from_dict_parses_both_keys():
@@ -855,7 +856,7 @@ def test_from_dict_empty_and_none_give_defaults():
             cfg.enable_query_replication,
             cfg.enable_project_before_merge,
             cfg.comm_backend,
-        ) == (1, True, True, "a2a")
+        ) == (1, True, True, "auto")
 
 
 def test_from_dict_coerces_types():
