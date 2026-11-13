@@ -233,9 +233,17 @@ class LogitsWorkspace:
         allocation, whichever is smaller, in whole groups of `group` rows."""
         return decode_band_rows(rows, width, group, self._logits.numel() // width)
 
-    def logits(self, rows: int, width: int) -> torch.Tensor:
-        """`[rows, width]` fp32, one band of the plane; fails past it."""
-        return flat_view(self._logits, rows, width)
+    def logits(self, rows: int, width: int, *, row_align: int = 1) -> torch.Tensor:
+        """A `[rows, width]` band, with an aligned row pitch when required.
+
+        Paged scorers use the logical width as the pitch. The FP8 concat
+        scorer needs 256-column alignment but must see only the key window's
+        columns. Both views are bounded by this workspace's storage.
+        """
+        if row_align == 1:
+            return flat_view(self._logits, rows, width)
+        pitch = max(row_align, -(-width // row_align) * row_align)
+        return flat_view(self._logits, rows, pitch)[:, :width]
 
 
 # aiter allocates a dense prefill plane with rows padded to this many columns;

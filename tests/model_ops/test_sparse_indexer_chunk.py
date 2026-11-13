@@ -203,6 +203,28 @@ def test_concat_plane_width_is_aiter_s_row_pitch():
     assert concat_plane_width(359_768) == 359_936
 
 
+@pytest.mark.parametrize("width", [1, 255, 256, 257, 610])
+def test_logits_workspace_reuses_storage_for_paged_and_concat_views(width):
+    """Both scorers use one allocation; concat's padding is not exposed as keys."""
+    pitch = concat_plane_width(width)
+    plane = LogitsWorkspace(3 * pitch, "cpu")
+    held = plane._logits.data_ptr()
+    plane._logits.fill_(-7)
+    concat = plane.logits(2, width, row_align=256)
+    assert concat.shape == (2, width)
+    assert concat.stride() == (pitch, 1)
+    assert concat.data_ptr() == held
+    concat.fill_(3)
+    storage = plane._logits.view(3, pitch)
+    assert storage[:2, :width].eq(3).all()
+    assert storage[:2, width:].eq(-7).all()
+    assert storage[2].eq(-7).all()
+    paged = plane.logits(3, width)
+    assert paged.data_ptr() == held and paged.stride() == (width, 1)
+    with pytest.raises(ValueError, match="exceeds"):
+        plane.logits(4, width, row_align=256)
+
+
 def _check_window_bands(first, end, row_cu, key_cu, plane, bands, windows):
     """The bands tile `[first, end)`; each fits the plane at its window's pitch,
     and its window holds every key its rows' requests have."""

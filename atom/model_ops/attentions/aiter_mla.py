@@ -78,9 +78,9 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
+from atom.model_ops.indexer.workspace import LogitsWorkspace
 from atom.model_ops.sparse_indexer_chunk import (
     ConcatKeyWorkspace,
-    LogitsWorkspace,
     concat_plane_width,
     logits_rows,
 )

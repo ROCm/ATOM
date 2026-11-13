@@ -52,24 +52,6 @@ class ConcatKeys(NamedTuple):
     workspace: Any = None
 
 
-def ubatch_concat_keys(keys: ConcatKeys, start: int, stop: int) -> ConcatKeys:
-    """`keys` as a TBO ubatch of the step's rows `[start, stop)` reads them:
-    its rows' starts, and the groups its rows fall in with those rows
-    rebased to the ubatch. A group keeps all its keys."""
-    row_starts = keys.row_starts[start:stop]
-    if keys.groups is None:
-        return keys._replace(row_starts=row_starts)
-    groups = tuple(
-        group._replace(
-            row_first=max(group.row_first, start) - start,
-            row_end=min(group.row_end, stop) - start,
-        )
-        for group in keys.groups
-        if group.row_first < stop and group.row_end > start
-    )
-    return keys._replace(row_starts=row_starts, groups=groups)
-
-
 def _check_split_group(group: str) -> None:
     if group not in ("dcp", "tp"):
         raise ValueError(f"RowSplit group must be 'dcp' or 'tp', got {group!r}")

@@ -33,12 +33,13 @@ from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logi
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
 from atom.distributed.dcp_utils import get_dcp_group
-from atom.model_ops.sparse_indexer_chunk import concat_plane_width
+from atom.model_ops.sparse_indexer_chunk import CONCAT_PLANE_ROW_ALIGN
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .layout import MFMA, NATURAL
 from .rows import IndexCache, IndexRows
+from .workspace import LogitsWorkspace
 
 # Whether aiter's dense FP8 scorer writes into a caller's plane (`logits=`).
 # Without it each prefill band's logits are allocated per call.
@@ -80,7 +81,8 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
+    its successors' candidate blocks) does it there. Concat columns are local
+    to the band's key window. `keys`: FP8 concat rows'
     `(values, scales)` already gathered end to end (DCP's all-gathered
     shards); gathered here from `cache` otherwise.
 
@@ -100,14 +102,19 @@ def score_topk(
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
     mine = out[split.slot : split.slot + split.stride] if split.stripe else out
-    if rows.concat is not None:
-        _score_concat(
-            query, weights, cache, rows, topk, stable, mine, keys, request_local
-        )
-    else:
-        _score_paged(
-            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
-        )
+    _score_bands(
+        query,
+        weights,
+        cache,
+        rows,
+        topk,
+        weight_scale,
+        stable,
+        on_band,
+        mine,
+        keys,
+        request_local,
+    )
     _gather_split(out, split)
     return out
 
@@ -148,73 +155,114 @@ def _gather_split(out, split):
     )
 
 
-def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_band, out):
-    """Paged rows, band by band into the plane, each band top-k'd at once."""
-    workspace = rows.workspace
-    # Without a workspace (rows cut to the logits budget alone), one band's
-    # plane for the call, a short band a prefix of it.
+def _score_bands(
+    query,
+    weights,
+    cache,
+    rows,
+    topk,
+    weight_scale,
+    stable,
+    on_band,
+    out,
+    gathered=None,
+    request_local=True,
+):
+    """Score and consume one workspace band at a time for every indexer.
 
-    plane = (
-        None
-        if workspace is not None or not rows.bands
-        else torch.empty(
-            max(end - first for first, end in rows.bands),
-            rows.width,
-            dtype=torch.float32,
-            device=weights.device,
+    V4.1's paged/packed rows and FP8 concat rows share the buffer lifetime,
+    candidate callback and top-k loop. Only key addressing, the kernel launch
+    and the mapping of selected columns differ.
+    """
+    concat = rows.concat
+    workspace = rows.workspace
+    if concat is not None:
+        k_fp8, k_scale = (
+            _gather_concat(query, cache, concat) if gathered is None else gathered
         )
-    )
+    elif workspace is None and rows.bands:
+        # Standalone paged calls have no builder-owned workspace. Hold one
+        # band's storage for the call and reuse it, including the short tail.
+        workspace = LogitsWorkspace(
+            max(end - first for first, end in rows.bands) * rows.width,
+            weights.device,
+        )
     group = rows.next_n
     for index, (first, end) in enumerate(rows.bands):
         count, span = end - first, slice(first, end)
-        # A band's bounds and tables: its rows', or its requests' when a
-        # request's rows share them.
         items = slice(first // group, end // group)
+        lo, width, alignment = 0, rows.width, 1
+        if concat is not None:
+            lo, hi = rows.key_windows[index] if rows.key_windows else (0, concat.total)
+            width, alignment = hi - lo, CONCAT_PLANE_ROW_ALIGN
         if rows.packed_offsets is not None:
             scores = workspace.packed_logits()
             offsets = rows.packed_offsets[span]
         else:
             scores = (
-                plane[:count]
-                if plane is not None
-                else workspace.logits(count, rows.width)
+                workspace.logits(count, width, row_align=alignment)
+                if workspace is not None
+                else None
             )
             offsets = None
-        if cache.fp4:
-            values, scales = query
-            _fp4_band_logits(
-                values[span],
-                scales[span],
-                weights[span],
+        if concat is not None:
+            starts = concat.row_starts[span]
+            if lo:
+                # PCP padding rows (start 0, length 0) stay empty.
+                starts = (starts - lo).clamp_min_(0)
+            stops = starts + rows.row_ends[span]
+            scores = fp8_mqa_logits(
+                Q=query[span],
+                KV=k_fp8[lo : lo + width],
+                kv_scales=k_scale[lo : lo + width],
+                weights=weights[span],
+                cu_starts=starts,
+                cu_ends=stops,
+                clean_logits=False,
+                **({"logits": scores} if scores is not None else {}),
+            )
+        else:
+            _paged_band_logits(
+                query,
+                weights,
                 cache,
+                rows,
+                index,
+                span,
+                items,
                 scores,
                 offsets,
                 weight_scale,
-                index,
-                rows,
-            )
-        else:
-            _fp8_paged_mqa_logits(
-                query[span].view(
-                    count // group, group, weights.shape[1], query.shape[-1]
-                ),
-                cache.values.unsqueeze(-2),
-                weights[span],
-                scores,
-                rows.row_ends[items],
-                rows.row_tables[items],
-                rows.width,
-                KVBlockSize=cache.rows_per_block,
-                Preshuffle=True,
             )
         if on_band is not None:
             on_band(scores, span)
-        if offsets is None:
+        picked = out[span]
+        if concat is not None:
+            top_k_per_row_prefill(
+                scores,
+                starts,
+                stops,
+                picked,
+                None,
+                count,
+                scores.stride(0),
+                scores.stride(1),
+                k=topk,
+                stable=stable,
+            )
+            # Window columns to request-local or whole-gather columns.
+            if request_local:
+                torch.where(
+                    picked < 0, picked, picked - starts.unsqueeze(1), out=picked
+                )
+            elif lo:
+                torch.where(picked < 0, picked, picked + lo, out=picked)
+        elif offsets is None:
             top_k_per_row_decode(
                 scores,
                 group,
                 rows.row_ends[items],
-                out[span],
+                picked,
                 count,
                 scores.stride(0),
                 scores.stride(1),
@@ -228,7 +276,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 scores,
                 1,
                 rows.row_ends[span],
-                out[span],
+                picked,
                 count,
                 0,
                 1,
@@ -237,6 +285,47 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 row_starts=offsets,
                 plane_width=rows.width,
             )
+
+
+def _paged_band_logits(
+    query,
+    weights,
+    cache,
+    rows,
+    index,
+    span,
+    items,
+    scores,
+    offsets,
+    weight_scale,
+):
+    """A paged band's kernel launch, into the shared loop's output view."""
+    if cache.fp4:
+        values, scales = query
+        _fp4_band_logits(
+            values[span],
+            scales[span],
+            weights[span],
+            cache,
+            scores,
+            offsets,
+            weight_scale,
+            index,
+            rows,
+        )
+    else:
+        count, group = span.stop - span.start, rows.next_n
+        _fp8_paged_mqa_logits(
+            query[span].view(count // group, group, weights.shape[1], query.shape[-1]),
+            cache.values.unsqueeze(-2),
+            weights[span],
+            scores,
+            rows.row_ends[items],
+            rows.row_tables[items],
+            rows.width,
+            KVBlockSize=cache.rows_per_block,
+            Preshuffle=True,
+        )
 
 
 def _gather_concat(query, cache, keys):
@@ -258,62 +347,6 @@ def _gather_concat(query, cache, keys):
         preshuffle=True,
     )
     return k_fp8, k_scale
-
-
-def _score_concat(
-    query, weights, cache, rows, topk, stable, out, gathered, request_local
-):
-    """FP8 prefill against the gathered keys, each band against its window of
-    them (`IndexRows.key_windows`). The top-k reports a key's place in the
-    gathered run; less its request's start it is the request's own."""
-    keys = rows.concat
-    k_fp8, k_scale = (
-        _gather_concat(query, cache, keys) if gathered is None else gathered
-    )
-    # The bands' plane: the workspace's, rows at `concat_plane_width` of their
-    # window apart; without one, each band allocated by the kernel.
-    plane = rows.workspace
-    windows = rows.key_windows or [(0, keys.total)] * len(rows.bands)
-    for (first, end), (lo, hi) in zip(rows.bands, windows):
-        span = slice(first, end)
-        starts = keys.row_starts[span]
-        if lo:
-            # PCP's padding rows (start 0, length 0) stay empty in the window.
-            starts = (starts - lo).clamp_min_(0)
-        stops = starts + rows.row_ends[span]
-        out_plane = {}
-        if plane is not None:
-            band = plane.logits(end - first, concat_plane_width(hi - lo))
-            out_plane["logits"] = band[:, : hi - lo]
-        scores = fp8_mqa_logits(
-            Q=query[span],
-            KV=k_fp8[lo:hi],
-            kv_scales=k_scale[lo:hi],
-            weights=weights[span],
-            cu_starts=starts,
-            cu_ends=stops,
-            clean_logits=False,
-            **out_plane,
-        )
-        picked = out[span]
-        top_k_per_row_prefill(
-            scores,
-            starts,
-            stops,
-            picked,
-            None,
-            end - first,
-            scores.stride(0),
-            scores.stride(1),
-            k=topk,
-            stable=stable,
-        )
-        # Window places: less the row's window start for its request's own,
-        # plus `lo` for the gathered run's.
-        if request_local:
-            torch.where(picked < 0, picked, picked - starts.unsqueeze(1), out=picked)
-        elif lo:
-            torch.where(picked < 0, picked, picked + lo, out=picked)
 
 
 def _live_rows():

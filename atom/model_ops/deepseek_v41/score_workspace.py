@@ -13,22 +13,31 @@ visibility, at a start of its own (`PackedRows`), so the buffer follows the
 batch's live context rather than its rows times the model length.
 """
 
-from typing import NamedTuple
-
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import (
+from atom.model_ops.indexer.workspace import (
+    ROW_ALIGN,
     LogitsWorkspace,
+    PackedRows,
+    aligned_spans,
+    band_offsets,
+)
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
+from atom.model_ops.sparse_indexer_chunk import (
     logits_rows,
     plane_rows,
 )
-from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
-# A packed row starts on a 256-byte boundary, which the row-group scorer's
-# stores need to run at speed, and on a whole candidate block, so its block
-# maxima start at its logits' start over the block.
-ROW_ALIGN = 64
+__all__ = [
+    "ROW_ALIGN",
+    "LogitsWorkspace",
+    "PackedRows",
+    "ScoreWorkspace",
+    "aligned_spans",
+    "band_offsets",
+    "packed_capacity",
+]
 
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
@@ -46,45 +55,6 @@ def packed_capacity(geometry, pages, max_tokens, plane_elements):
     rows_per_token = 1 + geometry.speculative_tokens
     live = pages * widest * rows_per_token + max_tokens * ROW_ALIGN
     return min(live, plane_elements)
-
-
-def aligned_spans(visible):
-    """Each row's packed length: its visibility rounded up to `ROW_ALIGN`."""
-    return (visible + ROW_ALIGN - 1) // ROW_ALIGN * ROW_ALIGN
-
-
-def band_offsets(visible, capacity, out):
-    """Pack rows `visible` [rows] into bands of at most `capacity` elements.
-
-    Writes each row's start, counted from its band's, into `out` and returns
-    the bands as `(first, end)` row ranges in order. A row longer than the
-    capacity is refused: no band could hold it.
-    """
-    spans = aligned_spans(visible.astype(np.int64))
-    if spans.size and int(spans.max()) > capacity:
-        raise ValueError(
-            f"a {int(spans.max())}-element row exceeds the {capacity}-element "
-            "packed logits buffer"
-        )
-    ends = np.cumsum(spans)
-    bands, first, base = [], 0, 0
-    while first < len(spans):
-        end = int(np.searchsorted(ends, base + capacity, side="right"))
-        out[first:end] = ends[first:end] - spans[first:end] - base
-        bands.append((first, end))
-        base, first = int(ends[end - 1]), end
-    return tuple(bands)
-
-
-class PackedRows(NamedTuple):
-    """A step's rows at one ratio laid out in the packed logits: each row's
-    visibility, where its logits and its block maxima start, counted from its
-    band's start, and the bands' rows (`band_offsets`)."""
-
-    visible: torch.Tensor
-    offsets: torch.Tensor
-    block_offsets: torch.Tensor
-    bands: tuple[tuple[int, int], ...]
 
 
 class ScoreWorkspace(LogitsWorkspace):

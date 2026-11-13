@@ -6,7 +6,7 @@ forward reads views of them and copies nothing of its own."""
 
 import torch
 
-from atom.model_ops.deepseek_v41.score_workspace import PackedRows
+from atom.model_ops.indexer.workspace import PackedRows
 from atom.utils import CpuGpuBuffer
 
 from .metadata import StepPlan, visible_buffer_name

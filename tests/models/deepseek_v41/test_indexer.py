@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 """The contract the paged index scorer rests on: one id per visible row."""
 
-import itertools
-
 import pytest
 import torch
 
@@ -708,35 +706,6 @@ def test_score_workspace_band_stops_at_the_int32_reach(monkeypatch):
     assert space.logits(2, 3 * 64).shape == (2, 3 * 64)
     with pytest.raises(ValueError):
         space.logits(3, 3 * 64)
-
-
-@pytest.mark.parametrize("seed", range(4))
-def test_packed_bands_hold_each_row_aligned_and_fill_before_cutting(seed):
-    """Bands partition the rows in order; a row starts on `ROW_ALIGN`, at its
-    band's running total; no band is past the capacity, and none could have
-    taken the next row."""
-    import numpy as np
-
-    from atom.model_ops.deepseek_v41 import score_workspace as ws
-
-    rng = np.random.default_rng(seed)
-    visible = rng.integers(0, 700, size=50).astype(np.int32)
-    visible[::7] = 0
-    capacity = 2048
-    offsets = np.full(50, -1, dtype=np.int32)
-    bands = ws.band_offsets(visible, capacity, offsets)
-    spans = ws.aligned_spans(visible.astype(np.int64))
-    assert bands[0][0] == 0 and bands[-1][1] == 50
-    assert all(a[1] == b[0] for a, b in itertools.pairwise(bands))
-    for first, end in bands:
-        within = spans[first:end]
-        assert np.array_equal(offsets[first:end], np.cumsum(within) - within)
-        assert int(within.sum()) <= capacity
-        if end < 50:
-            assert int(within.sum() + spans[end]) > capacity
-    assert not (offsets % ws.ROW_ALIGN).any()
-    with pytest.raises(ValueError, match="exceeds"):
-        ws.band_offsets(np.array([capacity + 1], np.int32), capacity, offsets)
 
 
 def _pool_geometry(index_fp4, speculative_tokens=5):
