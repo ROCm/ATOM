@@ -1191,12 +1191,9 @@ models:
         # eager, since a P/D producer never decodes. It also keeps the unsharded
         # KDA gate GEMM (f_b_proj, N 12288, K 128) in bf16: aiter has no tuned
         # FP8 config for that shape, and its untuned FP8 GEMM needs K above 192.
-        # Drop the exclusion once aiter's FP8 GEMM serves K 128.
-        #
-        # Each PP8 stage repacks its KV for the TP8xDCP8 decode into 128-page
-        # MLA staging slots, which are off unless set, on their own streams; at
-        # high priority a repack does not wait out the stage's next prefill
-        # forward.
+        # Drop the exclusion once aiter's FP8 GEMM serves K 128. Each stage
+        # repacks its MLA KV for the TP8xDCP8 decode in the producer's MLA
+        # staging pool (ATOM_PD_MLA_STAGING, on by default).
         - &kimi_k3_1p1d_pp8_dcp8
           <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
@@ -1215,19 +1212,11 @@ models:
             common_args:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 64
-          # An ATOM that does not define a setting ignores it, so the cell
-          # fails on one without the MLA staging settings its prefill sets
-          # instead of measuring without them.
-          requires_atom_env:
-            - ATOM_PD_MLA_STAGING_CHUNK_PAGES
-            - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
           env:
             common: *kimi_k3_pd_replay_env
             prefill: &kimi_k3_pp8_lmcache128_prefill_env
               <<: *kimi_k3_pd_lmcache128_prefill_env
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
-              ATOM_PD_MLA_STAGING_CHUNK_PAGES: "128"
-              ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
 
         - <<: *kimi_k3_1p1d_pp8_dcp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48
@@ -1294,10 +1283,10 @@ models:
             common_args:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 176
-          # Plus the in-flight cap.
+          # An ATOM that does not define a setting ignores it, so the cell
+          # fails on one without the in-flight cap instead of measuring
+          # without it.
           requires_atom_env:
-            - ATOM_PD_MLA_STAGING_CHUNK_PAGES
-            - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
             - ATOM_PP_MAX_INFLIGHT
           env:
             common: *kimi_k3_pp8_reuse_env

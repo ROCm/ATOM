@@ -188,8 +188,6 @@ class RequiredAtomEnvTest(unittest.TestCase):
             "ATOM_KV_POLL_FRESH_WAIT_MS",
             "ATOM_PD_PROMPT_IDS_B64",
             "ATOM_PD_EARLY_T0",
-            "ATOM_PD_MLA_STAGING_CHUNK_PAGES",
-            "ATOM_PD_MLA_STAGING_STREAM_PRIORITY",
             "ATOM_PP_MAX_INFLIGHT",
         }
         in_flight_cells = 0
