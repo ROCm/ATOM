@@ -49,9 +49,11 @@ BANDS = (6, 8)
 SLOTS = 7  # the ratio-2 sources' compressor state slots: ATOM's compress ring (2 + a verify's drafts), in place
 # launches merged into a neighbour's launch at a one-request width (each a launch fewer a step, its work on the
 # neighbour's idle CTAs): "ctx", the DSpark context write into the verify head's launch (``head_program(ctx=True)``,
-# its taps taken from the tapped layers' streams). On at the TP sizes of ``MERGE_TP``; env ATOM_DSV41_MONO_HI_MERGE
-# "0" turns every merge off, "1" every one on at any TP, or a comma list of them (e.g. "ctx") on at any TP
-MERGES = ("ctx",)
+# its taps taken from the tapped layers' streams); "engkv", the Engram token-only halves into the first hi layer's
+# launch (``recipe.merge_engram_kv``: their kv is read by the Engram layers' gates, later launches). On at the TP
+# sizes of ``MERGE_TP``; env ATOM_DSV41_MONO_HI_MERGE "0" turns every merge off, "1" every one on at any TP, or a
+# comma list of them (e.g. "ctx") on at any TP
+MERGES = ("ctx", "engkv")
 MERGE_TP = (8,)
 MERGE_ENV = "ATOM_DSV41_MONO_HI_MERGE"
 
@@ -182,6 +184,11 @@ class HiPrograms:
         # context write (set with the heads)
         self.merge = merges(tp)
         self.ctx_merged = set()
+        # ``eng_merged``: the widths whose first hi layer's launch runs the Engram token-only halves (one request,
+        # no band: the TP8 width); every Engram layer after it
+        self.eng_merged = set()
+        if "engkv" in self.merge and self.eng and min(self.eng.values()) > self.mf[0]:
+            self.eng_merged = {s for s, (b, _) in self.split.items() if b == 1 and s not in self.band_of}
         # ---- programs: one a (kind, width), shared by the layers of the kind
         # the verify head a width (before the layer programs: the last layer's chain role follows it): one request,
         # the head at its width; B requests, one wide head at Scenario(B, rows) where hi builds it, else B
@@ -230,7 +237,7 @@ class HiPrograms:
                 key = self._key(i, s)
                 if key not in self.programs:
                     self.programs[key] = self._program(
-                        p, s, *self.role(i, s), full_r_a=self.full_r_a(i, s)
+                        p, s, *self.role(i, s), full_r_a=self.full_r_a(i, s), engkv=self.engkv_in(i, s)
                     )
         # a width's programs read / write the cross-launch region at the same offset (a step runs one width)
         for s in self.widths:
@@ -250,6 +257,8 @@ class HiPrograms:
         self.eng_programs = {}
         if self.eng:
             for s in self.widths:
+                if s in self.eng_merged:  # (in the first hi layer's launch)
+                    continue
                 sc = Scenario(*self.split[s], self.tp)
                 self.eng_programs[s] = MonoKernel(
                     Program(f"atom_v41_engkv_r{s}", sc, L.engram_kv_stages(sc, self.eng, max_ctx + 16),
@@ -330,8 +339,14 @@ class HiPrograms:
 
     def _key(self, i: int, s: int) -> tuple:
         key = (self.plan[i].program_key, self.pwidth(s), *self.role(i, s))
-        # (a tap layer's own program)
-        return key + ("full_r_a",) if self.full_r_a(i, s) else key
+        # (a tap layer's own program; the first hi layer's with the Engram token-only halves)
+        key = key + ("full_r_a",) if self.full_r_a(i, s) else key
+        return key + ("engkv",) if self.engkv_in(i, s) else key
+
+    def engkv_in(self, i: int, s: int) -> bool:
+        """Whether hi layer i's launch at width s runs the Engram token-only halves (``eng_merged``: the first hi
+        layer's)."""
+        return s in getattr(self, "eng_merged", ()) and i == self.mf[0]
 
     def full_r_a(self, i: int, s: int) -> bool:
         """Whether layer i's program at width s writes its R_A whole for a DSpark aux tap: the hi runtime's sharded residual
@@ -365,6 +380,7 @@ class HiPrograms:
         push: bool = False,
         prev: bool = False,
         full_r_a: bool = False,
+        engkv: bool = False,
     ):
         from .hi.plan.program import Program, Scenario
         from .hi.runtime.kernel import MonoKernel
@@ -418,6 +434,12 @@ class HiPrograms:
             blocks = L.window_layer_blocks(first=False, tp=self.tp, source=self.sources[p.layer_id],
                                            engram=p.engram, **ch)  # fmt: skip
         stages = L.moe_route_early([st for b in blocks for st in b.stages(sc)])
+        if engkv:
+            # the Engram token-only halves (``MERGES``: "engkv"), their SGPR rule with the layer's
+            from .hi.v41 import recipe
+
+            stages = recipe.merge_engram_kv(stages, L.engram_kv_stages(sc, self.eng, self.max_ctx + 16))
+            spill = spill or L.engram_kv_spill_ok(self.tp)
         tag = "_".join(str(x) for x in p.program_key).replace(" ", "").replace("+", "")
         tag += (
             ("_push" if push else "")
@@ -428,6 +450,7 @@ class HiPrograms:
         kn = ch.get("knobs", {})
         tag += "_mfma" if "INDEX_KLAYOUT" in kn else ""
         tag += "_kv8" if "KV_FMT" in kn else ""
+        tag += "_engkv" if engkv else ""
         dk = {"dyn_rows": True} if dyn else {}
         return MonoKernel(Program(f"atom_v41_{tag}_r{s}", sc, stages, sgpr_spill_ok=spill,
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip

@@ -18,7 +18,9 @@ One served step:
    request's first position, its request words (batch id, slot, liveness:
    the in-place programs') and the indexer / candidate bounds, and the Engram history and cursor candidates;
    then the Engram token-only halves (one launch, ``engram_kv_stages``) looked
-   up from ATOM's page-locked host shards.
+   up from ATOM's page-locked host shards (at a width of ``eng_merged``, the
+   TP8 one-request width, inside layer 0's launch instead,
+   ``hi_compose.MERGES``).
 2. ``layer``: the 40 layer launches, chained (a layer pushes its MoE partials,
    the next one's seam A sums them), then the verify head (greedy, or one draw
    a sampled row; ``head.py``) on the last layer's pushed partials.
@@ -304,6 +306,10 @@ class HiLayers(HiDraft, HiPrograms):
         # ---- weights (the hi runtime's own packing, from ATOM's loaded tensors: ``hi_weights``) and the pointer tables
         self.tables, self._packed = {}, []
         nbytes = 0
+        # the Engram token-only halves' pointers (before the layers': a width of ``eng_merged`` runs them in the first
+        # hi layer's launch, its table holds them)
+        if self.eng:
+            nbytes += self._engram_args(model, dev)
         # the routed experts' weights, the plain bf16 / f32 tensors (``hi_weights.alias_plain``) read in place from ATOM's
         self.plain_aliased = 0
         inter = cfg.moe_intermediate_size
@@ -324,10 +330,12 @@ class HiLayers(HiDraft, HiPrograms):
             for s in self.widths:
                 key = self._key(i, s)
                 kern = self.programs[key]
+                # (with the Engram token-only halves: theirs, ``engkv_in``)
+                at = {**self._eng_args, **io} if self.engkv_in(i, s) else io
                 missing = (
                     set(kern.program.args)
                     - set(packed)
-                    - set(io)
+                    - set(at)
                     - {"_peers", "_rank", "_peer_top"}
                 )
                 if missing:
@@ -335,13 +343,13 @@ class HiLayers(HiDraft, HiPrograms):
                         f"layer {i} ({self.plan[i].kind}): no pointer for {sorted(missing)}"
                     )
                 self.tables[i, s] = kern.table(
-                    {**packed, **io}, device=dev, peers=self.peers
+                    {**packed, **at}, device=dev, peers=self.peers
                 )
                 self._late += [(self.tables[i, s], kern.program.args.index(n), n, own)
                                for n, own in self._late_args(i) if n in kern.program.args]  # fmt: skip
             self._packed.append(packed)
         if self.eng:
-            nbytes += self._engram_tables(model, dev)
+            self._engram_tables(dev)
         nbytes += self._head_tables(model, dev)
         # ---- the DSpark draft on the hi path: its context-KV write and the block draft (module docstring)
         self.cx_tables = {}
@@ -427,10 +435,10 @@ class HiLayers(HiDraft, HiPrograms):
         )
         return consts
 
-    def _engram_tables(self, model, dev) -> int:
-        """The token-only halves' pointer tables (one a width): each Engram layer's wkv column share (from ATOM's
-        ``engram.wkv``) and hash words, its table shard ATOM's page-locked host one (``use_host_tables``) + the step
-        inputs. -> bytes held.
+    def _engram_args(self, model, dev) -> int:
+        """The token-only halves' pointers: each Engram layer's wkv column share (from ATOM's ``engram.wkv``) and
+        hash words, its table shard ATOM's page-locked host one (``use_host_tables``) + the step inputs. -> bytes
+        held.
         """
         from .hi.v41 import engram_io
 
@@ -454,10 +462,21 @@ class HiLayers(HiDraft, HiPrograms):
             args[f"{n}.kv"] = self.eng_kv[i]
         self._packed.append(args)
         self._eng_args, self._eng_consts = args, consts
+        return sum(
+            t.numel() * t.element_size()
+            for k, t in args.items()
+            if k not in ("ids", "pos", "hist")
+        )
+
+    def _engram_tables(self, dev) -> None:
+        """The token-only halves' launch a width (not ``eng_merged``'s): its pointer table, peer group and
+        buffers."""
         from .hi.runtime.peer import PeerGroup
 
-        # a peer group of its own: its regions never overlap the chain's pinned moe.part (module docstring)
-        pb = max(k.program.peer_bytes for k in self.eng_programs.values())
+        args = self._eng_args
+        # a peer group of its own: its regions never overlap the chain's pinned moe.part (module docstring); none
+        # when every width runs them in the first hi layer's launch
+        pb = max([k.program.peer_bytes for k in self.eng_programs.values()], default=0)
         self.eng_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         for s, kern in self.eng_programs.items():
             missing = (
@@ -467,11 +486,6 @@ class HiLayers(HiDraft, HiPrograms):
                 raise KeyError(f"Engram kv launch: no pointer for {sorted(missing)}")
             self.tables[ENGKV, s] = kern.table(args, device=dev, peers=self.eng_peers)
         self.eng_bufs = _buffers(self.eng_programs, self.arena, dev, self.step)
-        return sum(
-            t.numel() * t.element_size()
-            for k, t in args.items()
-            if k not in ("ids", "pos", "hist")
-        )
 
     def use_host_tables(self, host, staging) -> None:
         """The Engram kv launch reads each layer's table shard from ATOM's page-locked host shard (``host``: its
@@ -499,6 +513,14 @@ class HiLayers(HiDraft, HiPrograms):
             ]
         dev = self.ids.device
         for s in self.widths:
+            if s in self.eng_merged:
+                # the first hi layer's table holds them: their two entries rewritten in place (a captured graph
+                # replays this table)
+                i, kern = self.mf[0], self.programs[self._key(self.mf[0], s)]
+                for n in self.eng:
+                    for a in (f"{n}.tq", f"{n}.ts"):
+                        self.tables[i, s][kern.program.args.index(a)] = int(self._eng_args[a])
+                continue
             self.tables[ENGKV, s] = self.eng_programs[s].table(
                 self._eng_args, device=dev, peers=self.eng_peers
             )
@@ -800,7 +822,7 @@ class HiLayers(HiDraft, HiPrograms):
         )  # fmt: skip
         if rows in self.band_of:
             self._band_step(rows)
-        if self.eng:
+        if self.eng and rows not in self.eng_merged:  # (else in the first hi layer's launch)
             self._engram_launch(rows)
         if rows in self.ctx_merged:
             # the verify head's tables with the context write's (it runs in the head's launch)

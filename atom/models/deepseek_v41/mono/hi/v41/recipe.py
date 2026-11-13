@@ -839,6 +839,81 @@ def engram_kv_stages(sc: Scenario, names: dict[str, int] | None = None, hist_len
                   key=lambda st: next(i for i, n in enumerate(steps) if st.name.split(".")[1] == n))  # fmt: skip
 
 
+def plan_bases(stages: list[Stage], cus: int = 256) -> list[int]:
+    """Each stage's first CTA where ``plan`` puts it (its ``base``, else right after the previous stage's tasks)."""
+    nxt, out = 0, []
+    for st in stages:
+        base = nxt % cus if st.base is None else st.base
+        nxt = base + st.tasks
+        out.append(base)
+    return out
+
+
+def free_window(stages: list[Stage], avoid: tuple[str, ...], cus: int = 256) -> tuple[int, int]:
+    """(first CTA, CTAs) of the widest cyclic run of CTAs that runs no task of the ``avoid`` stages of ``stages`` (at
+    ``plan``'s placement); every CTA when none is busy, (0, 0) when all are."""
+    busy = set()
+    for st, base in zip(stages, plan_bases(stages, cus), strict=True):
+        if st.name in avoid:
+            busy |= {(base + t) % cus for t in range(min(st.tasks, cus))}
+    if not busy:
+        return 0, cus
+    best = (0, 0)
+    for c in range(cus):
+        if c not in busy and (c - 1) % cus in busy:
+            n = 0
+            while n < cus and (c + n) % cus not in busy:
+                n += 1
+            best = max(best, (n, -c))
+    return -best[1], best[0]
+
+
+def place_in(stages: list[Stage], w0: int, n: int, cus: int = 256) -> None:
+    """``stages``' bases in the cyclic CTA window (``w0``, ``n`` CTAs): each on the least loaded run of its width
+    (the first of them; the load: the tasks of these stages placed so far); a stage wider than the window keeps its
+    base (None: ``plan``'s placement)."""
+    load = [0] * n
+    for st in stages:
+        if st.tasks > n:
+            continue
+        at = min(range(n - st.tasks + 1), key=lambda a: (sum(load[a : a + st.tasks]), a))
+        for t in range(st.tasks):
+            load[at + t] += 1
+        st.base = (w0 + at) % cus
+
+
+# ``merge_engram_kv``: where the Engram token-only halves go in the launch they merge into (the first hi layer's):
+# "tail" after its stages in program order (``plan``'s placement: they start as each CTA's last layer task ends), or
+# "look_front" their table lookups (the host-memory latency, no input but the begin-step's) first in program order on
+# the CTAs whose first layer task waits anyway (none of ``ENGKV_FRONT_AVOID``: the launch's first hand-offs), the rest
+# at the tail. Env ATOM_DSV41_MONO_HI_ENGKV_AT overrides it (a GPU A/B; every rank reads the same env)
+ENGKV_AT = "look_front"
+ENGKV_FRONT_AVOID = ("hca.slice", "attn_norm")
+
+
+def merge_engram_kv(stages: list[Stage], eng: list[Stage], at: str | None = None,
+                    cus: int = 256) -> list[Stage]:  # fmt: skip
+    """A layer program's ``stages`` with ``engram_kv_stages``' (``eng``: the token-only halves the later Engram
+    layers' gates read, plain ``<n>.kv``) merged into its launch (``ENGKV_AT``). The two share no region (the
+    Engram's peer regions are their own; ``pos`` a plain arg of both), so each keeps its hand-offs: every Engram poll
+    waits on an earlier Engram stage. The layer's stages keep their bases (``plan``'s, frozen first)."""
+    import os
+
+    at = at or os.environ.get("ATOM_DSV41_MONO_HI_ENGKV_AT", "") or ENGKV_AT
+    if at == "tail":
+        return stages + eng
+    if at != "look_front":
+        raise ValueError(f"merge_engram_kv: at {at!r}: 'tail' or 'look_front'")
+    for st, base in zip(stages, plan_bases(stages, cus), strict=True):
+        st.base = base  # (as plan puts them: the front stages do not move them)
+    front = [st for st in eng if st.name.split(".")[-1] == "look"]
+    rest = [st for st in eng if st not in front]
+    place_in(front, *free_window(stages, ENGKV_FRONT_AVOID, cus), cus)
+    if any(st.base is None for st in front):  # (no window: at the tail)
+        return stages + eng
+    return front + stages + rest
+
+
 def moe_route_early(stages: list[Stage], knobs: dict | None = None) -> list[Stage]:
     """``stages`` with MoEExperts' route moved up to right after the routing (router / replay stages). It depends only
     on the routing; placed after the shared expert's stages, its one CTA first runs a shared-expert task. Also every

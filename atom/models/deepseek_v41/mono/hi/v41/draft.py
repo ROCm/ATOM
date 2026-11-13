@@ -501,34 +501,11 @@ def place_after(stages: list[Stage], tail: list[Stage], avoid: tuple[str, ...],
     write in the verify head's launch), ``tail`` on the widest window of CTAs that runs none of ``avoid`` (the host
     program's long tasks: a tail stage queued behind one on its CTA starts when it ends). Every ``stages`` base stays
     where ``plan`` puts it; each tail stage on the least loaded run of the window's CTAs (a stage wider than the
-    window: where ``plan`` puts it). Program order is unchanged (``tail`` after ``stages``), so the hand-offs are the
-    two programs' own."""
-    nxt, busy = 0, set()
-    for st in stages:
-        base = nxt % cus if st.base is None else st.base
-        nxt = base + st.tasks
-        if any(st.name == n for n in avoid):
-            busy |= {(base + t) % cus for t in range(min(st.tasks, cus))}
-    free = [c not in busy for c in range(cus)]
-    best, w0 = (0, 0), None  # (length, start) of the widest free run (cyclic)
-    for c in range(cus):
-        if free[c] and not free[c - 1]:
-            n = 0
-            while n < cus and free[(c + n) % cus]:
-                n += 1
-            best = max(best, (n, -c))
-    n, w0 = best[0], -best[1]
-    if all(free):
-        n, w0 = cus, 0
-    load = [0] * n  # the tail's tasks a window CTA so far
-    for st in tail:
-        if st.tasks > n:
-            continue  # (no window wide enough: plan's placement)
-        # the least loaded run of the stage's width, the first of them
-        at = min(range(n - st.tasks + 1), key=lambda a: (sum(load[a : a + st.tasks]), a))
-        for t in range(st.tasks):
-            load[at + t] += 1
-        st.base = (w0 + at) % cus
+    window: where ``plan`` puts it, ``recipe.place_in``). Program order is unchanged (``tail`` after ``stages``), so
+    the hand-offs are the two programs' own."""
+    from .recipe import free_window, place_in
+
+    place_in(tail, *free_window(stages, avoid, cus), cus)
     return stages + tail
 
 
