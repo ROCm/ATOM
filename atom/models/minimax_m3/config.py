@@ -98,8 +98,12 @@ def validate_runtime_config(config):
         raise ValueError(
             f"--kv-cache-dtype {kv} needs --index-cache-dtype {kv}, got {index}"
         )
-    if index == "nvfp4" and kv not in ("nvfp4", "bf16", "fp8"):
-        raise ValueError(f"--index-cache-dtype nvfp4 does not pair with KV {kv}")
+    if index == "nvfp4" and kv != "nvfp4":
+        # the NVFP4 index feeds the NVFP4 sparse attention only: there is no emit of
+        # the page-16 table from it, and no run of it beside another KV is wired
+        raise ValueError(
+            f"--index-cache-dtype nvfp4 needs --kv-cache-dtype nvfp4, got {kv}"
+        )
     if kv in FP4_CACHE_DTYPES:
         why = _mxfp4_kv_refusal(config)
         if why is not None:
