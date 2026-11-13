@@ -565,6 +565,66 @@ def test_gdn_decode_publishes_slots_with_attention_metadata(
         assert actual.cpu().tolist() == expected
 
 
+def test_kimi_decode_publishes_draft_slots_with_attention_metadata(monkeypatch):
+    """A pooled draft's context slots go up in Kimi's decode metadata upload."""
+    from atom.model_ops.attentions.kimi_mla_gdn_attn import (
+        KimiAiterMLAGDNMetadataBuilder,
+    )
+
+    q = 4
+    runner, builder = make_runner(monkeypatch, q=q, tbo=False, bind=False)
+    builder.__class__ = KimiAiterMLAGDNMetadataBuilder
+    runner.drafter = SimpleNamespace(mtp_k=q - 1, runner=runner)
+    runner.tokenID_processor.num_bonus = None
+    runner.replayssm_write_pos = torch.full(
+        (64,), -1, dtype=torch.int32, device=runner.device
+    )
+    builder._init_gdn_state(runner)
+    # What `_KimiMLAGDNCommon.__init__` declares for a draft with a pool under
+    # DCP, whose entry spans `dcp` target blocks.
+    entry = runner.block_size * 8
+    runner.forward_vars["draft_ctx_slots"] = CpuGpuBuffer(
+        64, dtype=torch.int64, device=runner.device, publication_group="draft_ctx_slots"
+    )
+    runner.draft_kv_builder = SimpleNamespace(
+        kv_pool=SimpleNamespace(entry_tokens=entry)
+    )
+    runner._init_forward_vars_ring()
+    runner._init_h2d_publication()
+    assert "draft_ctx_slots" in {
+        b.name for b in runner.h2d_groups["decode_metadata"].members
+    }
+
+    direct = []
+    copy = BufferPublication._copy
+
+    def record_direct(binding, count):
+        direct.append(binding.name)
+        copy(binding, count)
+
+    monkeypatch.setattr(BufferPublication, "_copy", record_direct)
+    saved = []
+    for step, count in enumerate((3, 1)):
+        batch = decode_batch(count, q, step)
+        batch.state_slots = [[step + 3 * i + 1] * q for i in range(count)]
+        batch.state_fork_srcs = []
+        start_decode(runner, builder, batch, q)
+        direct.clear()
+        builder.prepare_decode(batch, 4, 4 * q, q)
+        assert direct == [], direct
+        var = runner.forward_vars
+        positions = var["positions"].np[: count * q].tolist()
+        expected = [
+            int(batch.block_tables[t // q][p // entry]) * entry + p % entry
+            for t, p in enumerate(positions)
+        ] + [-1] * ((4 - count) * q)
+        saved.append((var["draft_ctx_slots"].gpu[: 4 * q].clone(), expected))
+        finish(runner)
+    torch.cuda.synchronize()
+    for actual, expected in saved:
+        assert actual.cpu().tolist() == expected
+
+
 def make_qwen_runner(monkeypatch, pp=1, *, bind=True):
     from atom.model_ops.attentions.gdn_attn import (
         GDNAttentionMetadataBuilder,

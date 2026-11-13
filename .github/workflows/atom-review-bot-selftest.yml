@@ -1,0 +1,72 @@
+# The bot's own CI lane. Pure logic checks only -- no GPU, no self-hosted box --
+# so it can gate every change to the skill without competing with ATOM's main CI
+# for runners. The main CI gates merges on absolute accuracy across PRs; this one
+# only asserts that the bot's own machinery still holds together.
+name: atom-review-bot selftest
+
+on:
+  pull_request:
+    paths:
+      - '.claude/skills/review-pr/**'
+      - '.claude/skills/validate-atom-pr/**'
+      - '.github/workflows/atom-review-bot*.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.claude/skills/review-pr/**'
+      - '.claude/skills/validate-atom-pr/**'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0          # check_prompts.py resolves the repo root via git
+          persist-credentials: false
+
+      - name: Install test deps
+        run: python3 -m pip install --quiet pytest jsonschema
+
+      - name: Prompts have not drifted from SKILL.md
+        run: python3 .claude/skills/review-pr/check_prompts.py
+
+      - name: MAPPING.md matches the deriver
+        run: |
+          python3 .claude/skills/review-pr/triage.py mapping > /tmp/mapping.md
+          diff /tmp/mapping.md .claude/skills/review-pr/MAPPING.md
+
+      - name: Lint the skill for real errors
+        run: |
+          pip3 install --quiet ruff==0.16.0
+          # --isolated on purpose: pyproject exempts the vendored review-pr files from ALL
+          # rules so they stay byte-comparable with upstream aiter, and that exemption was
+          # hiding five genuine F-class defects in them (a dead import left by a refactor,
+          # four f-strings with no placeholders). Keeping vendored files unformatted is a
+          # reason not to restyle them, never a reason to stop looking for real errors.
+          # F and E9 only: actual mistakes, nothing about style.
+          ruff check --isolated --no-cache --select F,E9 .claude/skills/review-pr/ \
+            .claude/skills/validate-atom-pr/
+
+      - name: SKILL.md stays inside its 505-line budget
+        run: |
+          # 500 -> 505 once, for the Coverage line and the card format it belongs to.
+          # SKILL.md's own rule is that raising this is a decision to make the file less
+          # likely to be read in full, to be made in a commit that says why: the card had
+          # no way to say a diff is too large for one pass to cover, so five findings on a
+          # 16,000-line PR read exactly like five on a 400-line one. Two lines were
+          # compressed first; this is the remainder. The budget still binds -- it is not a
+          # number that moves whenever something new wants in.
+          n=$(wc -l < .claude/skills/review-pr/SKILL.md)
+          echo "SKILL.md is $n lines"
+          [ "$n" -le 505 ] || { echo "::error::SKILL.md is $n lines, budget is 505"; exit 1; }
+
+      - name: run_one.sh guards hold
+        run: bash .claude/skills/review-pr/selftest.sh
+
+      - name: Unit tests
+        run: python3 -m pytest .claude/skills/review-pr/*_test.py .claude/skills/validate-atom-pr/tests/ -v

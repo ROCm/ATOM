@@ -571,6 +571,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 
@@ -1057,6 +1058,7 @@ class DeepseekV4DSpark(DSparkDraftModel):
         aux_local: torch.Tensor,  # this PCP rank's round-robin stripe
         positions: torch.Tensor,  # [num_tokens] absolute positions
         num_tokens: int,
+        slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
     ) -> None:
         """The context and every stage's window KV are made row by row, so make
         this rank's rows and gather all stages' KV in one collective, already

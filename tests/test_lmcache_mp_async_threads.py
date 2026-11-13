@@ -20,11 +20,12 @@ from atom.kv_transfer.offload.metadata import (
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
-from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import transfer_thread
 from atom.kv_transfer.offload.mp import worker as mp_worker
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
 from atom.model_engine.sequence import SequenceStatus
+from tests.lmcache_mp_support import bare_mp_scheduler
+from tests.lmcache_mp_support import shipped_tokens as _shipped_tokens
 
 
 def _wait_until(predicate, timeout=5.0):
@@ -201,9 +202,7 @@ def test_offer_is_a_noop_without_a_driver():
 def test_scheduler_offers_only_waiting_requests_to_the_driver():
     adapter = _Adapter(_PerRequestClient(chunks=1))
     client = _driven_client(adapter)
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -564,9 +563,7 @@ def _same_step_scheduler():
     client = mp_lookup._MPLookupClient(
         adapter, config=_config(), timeout=1.0, poll_interval=0.01
     )
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
+    sched = bare_mp_scheduler()
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -597,7 +594,7 @@ def test_save_of_a_chunk_is_emitted_in_the_step_that_computes_it():
     # This step's forward computes tokens [0, 10) of the 16-token prompt.
     sched.note_scheduled_tokens({seq.id: seq}, [10])
     (save,) = _saves(sched.build_connector_meta())
-    assert len(save.token_ids) == 2 * CHUNK  # chunk floor of 10
+    assert len(_shipped_tokens(save)) == 2 * CHUNK  # chunk floor of 10
     assert save.after_forward
     assert not save.is_last_prefill
     # Nothing was computed before this step: the frontier came from the note.
@@ -612,7 +609,7 @@ def test_save_covering_only_earlier_steps_is_not_held_for_the_forward():
     # A decode-like step that computes nothing past the next chunk boundary.
     sched.note_scheduled_tokens({seq.id: seq}, [1])
     (save,) = _saves(sched.build_connector_meta())
-    assert len(save.token_ids) == 8
+    assert len(_shipped_tokens(save)) == 8
     assert not save.after_forward
 
 

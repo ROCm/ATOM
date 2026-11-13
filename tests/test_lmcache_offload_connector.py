@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 import types
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -3778,7 +3778,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert host._rejected == [seq]
     assert host.deferred_free_blocks[seq.id] is seq
@@ -3846,7 +3846,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         ("request_finished", seq.id),
@@ -3923,13 +3923,13 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
-    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    host._resolve_offload_load(seq)
     assert getattr(seq, consumed_flag) is True
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
 
     seq.status = SequenceStatus.ABORTED
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         (terminal_callback, seq.id),
@@ -3948,6 +3948,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     seq = SimpleNamespace(
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        block_table=[1],
         num_cached_tokens=4,
         offload_joint=OffloadJointRecord(),
     )

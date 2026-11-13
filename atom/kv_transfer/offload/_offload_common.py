@@ -32,6 +32,11 @@ from atom.kv_transfer.disaggregation.types import (
     raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.load_math import (
+    chunk_floor,
+    loadable_hit,
+    tier_load_tokens,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -677,31 +682,13 @@ class OffloadSchedulerMixin(ABC):
         return getattr(self, "_max_pending_saves", None)
 
     def _chunk_floor(self, tokens: int) -> int:
-        chunk = int(self.chunk_size or 256)
-        return (max(0, int(tokens)) // chunk) * chunk
+        return chunk_floor(tokens, int(self.chunk_size or 256))
 
     def _loadable_hit(self, hit: int, num_prompt: int) -> int:
-        """Turn a lookup hit into a length the external tier can actually serve.
-
-        Two steps, in this order:
-
-        * A hit covering the whole prompt leaves nothing to compute, so step
-          back one token.
-        * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
-          so a `hit` that is not a chunk multiple names tokens the tier does
-          not hold and the load's `ret_mask[hbm:lmc].all()` check can never
-          pass. The decrement above is exactly how that happens in practice:
-          a prompt whose length is a multiple of the chunk size lands on a
-          boundary and stepping back one token walks off it -- which is why the
-          floor must come second. Flooring costs at most one chunk of
-          re-prefill and makes the spec satisfiable; without it such a request
-          can never load, only fail.
-        """
-
-        hit = int(hit)
-        if hit == int(num_prompt):
-            hit -= 1
-        return self._chunk_floor(hit)
+        """Turn a lookup hit into a length the external tier can actually serve
+        (`load_math.loadable_hit`: step back from a whole-prompt hit, then floor
+        to a chunk, so the load's `ret_mask[hbm:lmc].all()` check can pass)."""
+        return loadable_hit(hit, num_prompt, int(self.chunk_size or 256))
 
     # -- the one expensive input: how much of this prompt the tier holds ---
     def _init_tier_hit_memo(self) -> None:
@@ -740,7 +727,7 @@ class OffloadSchedulerMixin(ABC):
         """A reference that does not keep an aborted request's prompt alive.
 
         A request can leave the waiting queue without ever reaching
-        `request_finished` -- `Scheduler._reject_aborted_waiting` is one such
+        `request_finished` -- `Scheduler._finish_rejected_waiting` is one such
         path -- and an entry holding the sequence strongly would pin its whole
         `token_ids` list for the life of the process.
         """
@@ -920,7 +907,7 @@ class OffloadSchedulerMixin(ABC):
         boundary = ((hbm + chunk - 1) // chunk) * chunk
         remaining_after_boundary = lmc - boundary
         min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if boundary <= hbm or remaining_after_boundary < min_load:
+        if boundary <= hbm or not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False
 
         sid = str(seq.id)

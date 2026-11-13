@@ -779,6 +779,7 @@ def mooncake_page_writer():
     import ast
     import logging
     import time
+    from dataclasses import dataclass
 
     from atom.kv_transfer.disaggregation.port_offset import consumer_region_indices
 
@@ -786,14 +787,22 @@ def mooncake_page_writer():
         "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py"
     )
     tree = ast.parse(path.read_text())
-    names = {"_execute_block_slot_transfer", "_consumer_region_map"}
+    names = {
+        "_execute_block_slot_transfer",
+        "_consumer_region_map",
+        "_block_plan",
+        "_RdmaBatch",
+        "_UnitPlan",
+    }
     methods = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names
     ]
     namespace = {
         "KVTransferRegion": KVTransferRegion,
+        "dataclass": dataclass,
+        "np": np,
         "consumer_region_indices": consumer_region_indices,
         "logger": logging.getLogger(__name__),
         "time": time,
@@ -827,6 +836,10 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
             for r in src.block_regions
         ),
         _block_region_consumer_indices=None,
+        _block_unit_specs=None,  # MLA: matched by position and role
+        _block_head_major_runs=(),
+        _per_block_bytes_list=[r.unit_bytes for r in src.block_regions],
+        _MAX_RDMA_ENTRIES_PER_BATCH=4096,
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
@@ -837,7 +850,7 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         pp_size=1,
         tp_rank=0,
     )
-    for name in ("_execute_block_slot_transfer", "_consumer_region_map"):
+    for name in ("_execute_block_slot_transfer", "_consumer_region_map", "_block_plan"):
         setattr(conn, name, types.MethodType(writer[name], conn))
     req = {
         # FP4 consumers advertise under the FP4-only key (version fence).

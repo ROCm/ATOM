@@ -213,6 +213,7 @@ def capture_fixture(monkeypatch):
     proposer.max_num_tokens, proposer.device, proposer.dtype = 9, "cpu", torch.float32
     target = nn.Module()
     target.layers = nn.ModuleList([ShiftBlock()])
+    proposer.runner = SimpleNamespace(model=target)
     context = SimpleNamespace(
         is_draft=False, ubatch_token_offset=2, ubatch_token_order=None
     )
@@ -432,3 +433,16 @@ def test_engram_rows_carry_live_tokens_and_dead_flags():
     # a capture's synthetic batch: no live token
     builder._prepare(batch, 2, 8, engram_live=False)
     assert rows.np[0] == 0
+
+
+def test_armed_capture_keeps_the_extract_its_hooks_run(monkeypatch):
+    """A mono step bypasses the hooks, so it needs the same function."""
+    proposer, target, _ = capture_fixture(monkeypatch)
+    proposer.aux_extract = None
+
+    def extract(output, block):
+        return output.residual.mean(-2).squeeze(0)
+
+    proposer._aux_capture_spec = lambda: AuxCaptureSpec((0,), 8, extract)
+    proposer.arm_aux_capture(target)
+    assert proposer.aux_extract is extract

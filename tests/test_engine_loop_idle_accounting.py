@@ -46,6 +46,7 @@ def _extract(class_name: str, method: str):
         "logger": SimpleNamespace(info=lambda *a, **k: None, exception=lambda *a: None),
         "tracing": SimpleNamespace(shutdown=lambda: None),
         "time": SimpleNamespace(monotonic=lambda: 0.0, sleep=lambda _: None),
+        "HELD_POLL_S": 0.0,
     }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module([func], []), str(ENGINE_CORE), "exec"), scope
@@ -94,6 +95,7 @@ class _Engine:
         self.label = "test"
         self._is_rl_weights_offloaded = False
         self._weight_sync_fenced = False
+        self._generation_paused = False
         self.forwards = 0
         self.dummies = 0
 
@@ -111,10 +113,13 @@ class _Engine:
     def pull_and_process_input_queue(self):
         return False
 
-    def _is_idle_rl_weights_offloaded(self):
-        # The real one sleeps 10ms and returns True; the base loop reads it as
-        # "skip this pass", which is all the schedule needs to express.
+    def _is_engine_held(self):
+        # The base loop reads True as "sleep a tick and skip this pass",
+        # which is all the schedule needs to express.
         return self._state is OFFLOAD
+
+    def _report_held_kv_work(self):
+        pass
 
     def _sync_dp_state(self, local_unfinished, shutdown, offloaded):
         # Mirrors the real `local_unfinished`: STALLED has requests, so
@@ -232,8 +237,8 @@ def test_requests_that_cannot_be_scheduled_are_not_work():
 
 @pytest.mark.parametrize(
     "class_name, origin",
-    # Base skips the pass via `_is_idle_rl_weights_offloaded`, DP via the
-    # `global_offloaded` branch; both leave the window open across it.
+    # Base skips the pass via `_is_engine_held`, DP via the
+    # `global_held` branch; both leave the window open across it.
     [("EngineCore", 600.0), ("DPEngineCoreProc", 600.0)],
 )
 def test_parked_weights_are_not_charged_to_the_window(class_name, origin):

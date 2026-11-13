@@ -581,9 +581,13 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     bufs = [torch.randn(16, 3), torch.randn(16, 2)]
     calls = []
     model = SimpleNamespace(
-        write_context_kv=lambda aux, pos, **kw: calls.append((aux, pos, kw))
+        kv_pool_spec=None,
+        write_context_kv=lambda aux, pos, slots, **kw: calls.append((aux, pos, kw)),
     )
-    ctx = SimpleNamespace(attn_metadata=None, context=SimpleNamespace(scheduled_bs=2))
+    ctx = SimpleNamespace(
+        attn_metadata=SimpleNamespace(served_by_round=False, slot_mapping=None),
+        context=SimpleNamespace(scheduled_bs=2),
+    )
     monkeypatch.setattr(dp, "get_forward_context", lambda: ctx)
     full = [b[:n] for b in bufs]
     drafter = SimpleNamespace(
@@ -599,6 +603,14 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     ((aux, pos, kw),) = calls
     assert torch.equal(aux, torch.cat([b[:n_local] for b in bufs], dim=-1))
     assert pos is positions and kw == {"pcp_num_tokens": n}
+
+    # TR_HYBRID: `positions` covers fewer rows than the target ran.
+    calls.clear()
+    dp.DSparkProposer.compute_draft_kv(
+        drafter, positions[: n - 2], torch.zeros(n, 7), None
+    )
+    ((_, _, kw),) = calls
+    assert kw == {"pcp_num_tokens": n - 2}
 
     calls.clear()
     monkeypatch.setattr(dp, "pcp_aux_rows", lambda rows: None)
@@ -696,7 +708,7 @@ def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
     model = SimpleNamespace(
         project_context=lambda a: a + 1,
         context_layers=[
-            SimpleNamespace(write_context_kv=lambda h, p: written.append((h, p)))
+            SimpleNamespace(write_context_kv=lambda h, p, s: written.append((h, p, s)))
         ],
     )
     model.write_context_kv = types.MethodType(DSparkDraftModel.write_context_kv, model)
@@ -710,9 +722,10 @@ def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
 
     monkeypatch.setattr(pu, "pcp_allgather_rerange_many", gather)
     positions = torch.arange(n)
-    model.write_context_kv(torch.ones(3, 5), positions, pcp_num_tokens=n)
-    ((h, p),) = written
-    assert gathers == [[3]] and h.shape == (n, 5) and p is positions
+    slots = torch.arange(n) + 100
+    model.write_context_kv(torch.ones(3, 5), positions, slots, pcp_num_tokens=n)
+    ((h, p, s),) = written
+    assert gathers == [[3]] and h.shape == (n, 5) and p is positions and s is slots
 
     written.clear()
     _split_ctx(monkeypatch, ws, dummy=True)

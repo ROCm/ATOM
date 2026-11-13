@@ -276,14 +276,22 @@ def _groups_have_v41_proxy(kv_cache_groups) -> bool:
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     try:
         from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-    except Exception:
+    except ImportError:
         return False
+    try:
+        from vllm.v1.kv_cache_interface import KpoolTailSpec
+    except ImportError:
+        KpoolTailSpec = ()
 
     has_mla = False
     has_non_mla_attn = False
     for spec in kv_cache_spec.values():
         if isinstance(spec, MLAAttentionSpec):
             has_mla = True
+        elif isinstance(spec, KpoolTailSpec):
+            # GLM-5.3-Flash's pooled-indexer tail ring: storage beside an MLA
+            # indexer layer, not an MHA draft. vLLM groups it with the indexer.
+            continue
         elif isinstance(spec, AttentionSpec):
             has_non_mla_attn = True
     return has_mla and has_non_mla_attn

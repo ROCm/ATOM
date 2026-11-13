@@ -150,7 +150,8 @@ class LMCacheReqMeta:
     req_id: ReqId
     # Token ids covering the prefix being moved (used to derive chunk-256 keys via
     # LMCache's ChunkedTokenDatabase). For load: prompt[:lmcache_cached_tokens];
-    # for save: computed token ids.
+    # for save: computed token ids. Transports with a different wire representation
+    # define their request metadata separately.
     token_ids: list[int]
     # The sequence's GPU block table (logical block ids). A chunk spanning token
     # range [start, end) maps to blocks block_ids[start // bs : ceil(end / bs)].
