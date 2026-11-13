@@ -84,10 +84,6 @@ class _ThreadTransferState:
                 self._copy_stream = torch.cuda.Stream()
         self.staging_buffer = _StagingBuffer(use_cuda)
 
-    @property
-    def follows_compute_stream(self) -> bool:
-        return self._pinned_stream is not None
-
     def begin_transfer(self) -> None:
         """Pin the stream this transfer stages on. A runner that picks a stream
         per forward (the disaggregated prefill pool) may move on while a transfer

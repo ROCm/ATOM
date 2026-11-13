@@ -174,6 +174,7 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
     }
     mgr = SimpleNamespace(
         _dp_session_affinity_enabled=False,
+        _dp_lb_strategy="share_cache",
         _dp_lb_req_equiv=512,
         _routable_engine_count=2,
     )
@@ -183,11 +184,11 @@ def test_share_cache_accepts_a_pd_multi_connector_with_a_shared_tier():
         enable_prefix_caching=True,
         kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
     )
-    assert CoreManager._build_share_cache_router(mgr, cfg) is not None
+    assert CoreManager._build_prefix_router(mgr, cfg) is not None
 
     cfg.kv_transfer_config = {"kv_connector": "multi", "connectors": [pd]}
     with pytest.raises(ValueError, match="shares"):
-        CoreManager._build_share_cache_router(mgr, cfg)
+        CoreManager._build_prefix_router(mgr, cfg)
 
 
 def test_a_store_transfer_keeps_the_stream_it_began_on():
@@ -200,7 +201,6 @@ def test_a_store_transfer_keeps_the_stream_it_began_on():
     state._provider = lambda: current[0]
     state._pinned_stream = "A"
     state._pack_stream = state._copy_stream = None
-    assert state.follows_compute_stream
     assert state.pack_stream == state.copy_stream == "A"
     current[0] = "B"  # a CU-masked prefill picked another stream
     assert state.pack_stream == state.copy_stream == "A"  # mid-transfer: unchanged
@@ -215,7 +215,6 @@ def test_every_other_connector_keeps_its_own_side_streams():
     state._provider = None
     state._pinned_stream = None
     state._pack_stream, state._copy_stream = "pack", "copy"
-    assert not state.follows_compute_stream
     state.begin_transfer()  # nothing to follow
     assert (state.pack_stream, state.copy_stream) == ("pack", "copy")
 
@@ -223,13 +222,7 @@ def test_every_other_connector_keeps_its_own_side_streams():
 def test_a_pack_always_waits_on_the_producer_device_side():
     from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 
-    # Also a state that follows the forward's stream: the stream may have
-    # changed between the producer's record and the job's pin.
-    for follows in (False, True):
-        waited = []
-        state = SimpleNamespace(
-            follows_compute_stream=follows,
-            pack_stream=SimpleNamespace(wait_event=waited.append),
-        )
-        BlockGPUConnector._wait_for_save_source(state, "event")
-        assert waited == ["event"]
+    waited = []
+    state = SimpleNamespace(pack_stream=SimpleNamespace(wait_event=waited.append))
+    BlockGPUConnector._wait_for_save_source(state, "event")
+    assert waited == ["event"]

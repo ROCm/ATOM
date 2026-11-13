@@ -13,9 +13,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 def _pair(stage):
     mgr = _make_mgr(2, strategy="share_cache")
-    mgr._share_cache_router = ShareCacheRouter(
-        OffloadTierProfile(True, 0, 256, True), 512
-    )
+    mgr._prefix_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 512)
     sent = []
     mgr._send_request = lambda rank, data: sent.append((rank, pickle.loads(data)))
     producer = _chain_seq(1, 100000)
@@ -75,7 +73,6 @@ def test_prefill_completion_retires_credit_state_but_keeps_request_charge():
     mgr._release_seq(1)
     mgr._mark_seq_prefill_complete(2)
     assert mgr._seq_load[2] == (0, 1, 0)
-    assert not mgr._backlog.prompt_tokens
     assert not mgr._backlog.ordinals
     assert not mgr._backlog.debts
     assert mgr._backlog.reported_credit_tokens == [0, 0]
@@ -96,7 +93,6 @@ def test_reset_clears_credit_identity_before_sequence_id_reuse():
     mgr._release_seq(1)
     mgr.reset_dp_router()
     assert not mgr._backlog.unsent
-    assert not mgr._backlog.prompt_tokens
     assert not mgr._backlog.credit_updates
     assert not mgr._backlog.credit_sent
     assert not mgr._backlog.debts
@@ -106,12 +102,12 @@ def test_reset_clears_credit_identity_before_sequence_id_reuse():
 
 
 def test_older_ack_clears_only_its_revision_and_unknown_ack_changes_nothing():
-    mgr, follower, _ = _pair("reported")
+    mgr, _, _ = _pair("reported")
     # Two successive losses before the latest revision has been acknowledged.
-    mgr._backlog.add_successor_debt(2, 0, 40000, 50032)
+    mgr._backlog.add_successor_debt(2, 0, 40000, 59968)
     mgr._flush_credit_updates()
-    older_credit = follower.num_prompt_tokens - 50032
-    mgr._backlog.add_successor_debt(2, 0, 59968, 110000)
+    older_credit = 59968
+    mgr._backlog.add_successor_debt(2, 0, 59968, 0)
     mgr._flush_credit_updates()
     assert mgr._backlog.reported_credit_tokens[0] == 99968
     mgr._backlog.ack(0, [(2, -1)])
@@ -144,3 +140,13 @@ def test_failed_credit_send_keeps_debt_and_retries_before_ack():
     assert sent[-1] == (0, (EngineCoreRequestType.DP_PREFIX_CREDIT, [(2, 0)]))
     mgr._backlog.ack(0, [(2, 0)])
     assert not mgr._backlog.debts
+
+
+def test_the_credit_sent_to_the_rank_is_what_the_router_retained():
+    mgr, _, sent = _pair("reported")
+    router = mgr._prefix_router
+    router._in_flight[2] = 60000  # a confirmed miss lowered the follower's credit
+    mgr._release_seq(1)
+    assert router._in_flight[2] == 0
+    credit = [u for _, (_, updates) in sent for u in updates]
+    assert credit[-1] == (2, router._in_flight[2])

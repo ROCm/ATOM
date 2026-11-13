@@ -206,7 +206,10 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     seq = SimpleNamespace(id=7, kv_transfer_params=None)
     if not s._lookup_detach_enabled(seq):
         return False, conn
-    return s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq)), conn
+    return (
+        s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq).num_cached_blocks),
+        conn,
+    )
 
 
 def test_scheduler_probe_is_pure_and_uses_the_hbm_frontier(monkeypatch):
@@ -565,7 +568,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     probe = s._probe_hbm_prefix(SimpleNamespace())
     assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
     assert walks == [False]
-    assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
+    assert s._can_detach_tier_lookup(SimpleNamespace(), probe.num_cached_blocks)
     assert walks == [False]  # the decision itself does not walk again
 
 

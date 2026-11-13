@@ -56,6 +56,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
     _supports_same_step_save = True
+    # Nesting of `build_connector_meta`: the shared builder advances lookups once
+    # per step, so the retirements inside it must not advance them again.
+    _metadata_build_depth = 0
 
     def __init__(
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
@@ -246,7 +249,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def build_connector_meta(self) -> MPOffloadMetadata:
         # Shared base advances lookups before it builds metadata. Retirements
         # inside that build must not pump the same client a second time.
-        depth = self.__dict__.get("_metadata_build_depth", 0)
+        depth = self._metadata_build_depth
         self._metadata_build_depth = depth + 1
         try:
             return self._build_mp_connector_meta()
@@ -436,7 +439,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # drives `prefetch_lookups`, is empty.
         # Metadata has already advanced this step; terminal-only calls still
         # need the shared reconciliation to free detached lookup locks.
-        if not self.__dict__.get("_metadata_build_depth", 0):
+        if not self._metadata_build_depth:
             self._reconcile_lookups_each_step()
         client = self._lookup_client
         pending = self._pending_session_ends()

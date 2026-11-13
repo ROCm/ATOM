@@ -39,7 +39,6 @@ class BacklogLedger:
         # Routing the next seq of the same batch has to see them.
         self.unsent: dict = {}
         self.unsent_tokens = [0] * n
-        self.prompt_tokens: dict = {}
         # seq id -> (rank, 1-based send ordinal on that rank).
         self.ordinals: dict = {}
         # Successor debt: sid -> [(credit, extra tokens)]; the corrected credit
@@ -59,9 +58,14 @@ class BacklogLedger:
 
     def note_charged(self, seq, rank: int, charge: int) -> None:
         """`seq` was charged to `rank` in a dispatch and is not sent yet."""
-        self.prompt_tokens[seq.id] = int(seq.num_prompt_tokens)
         self.unsent[seq.id] = (rank, charge, seq)
         self.unsent_tokens[rank] += charge
+
+    def release(self, seq_id) -> None:
+        """`seq_id` finished, was released or was rolled back: forget its
+        charge and its credit state. Idempotent."""
+        self.drop_unsent(seq_id)
+        self.forget(seq_id)
 
     def drop_unsent(self, seq_id) -> int:
         """Forget a charged-but-unsent seq (sent, rolled back or released);
@@ -141,10 +145,9 @@ class BacklogLedger:
 
     # -- successor debt -----------------------------------------------------------
 
-    def add_successor_debt(self, sid, rank: int, extra: int, charge: int) -> None:
-        """`sid`, on `rank`, loses `extra` tokens of credit: its charge is now
-        `charge`."""
-        credit = max(0, self.prompt_tokens[sid] - charge)
+    def add_successor_debt(self, sid, rank: int, extra: int, credit: int) -> None:
+        """`sid`, on `rank`, loses `extra` tokens of credit: the router keeps it
+        `credit` (what `PrefixSpreadRouter.release` reports as retained)."""
         self.credit_updates[sid] = (rank, credit)
         self.debts.setdefault(sid, []).append((credit, extra))
         if sid in self.unsent:
@@ -169,7 +172,6 @@ class BacklogLedger:
             self.reported_credit_tokens[sent[0]] -= sum(extra for _, extra in debts)
         self.credit_updates.pop(sid, None)
         self.credit_sent.pop(sid, None)
-        self.prompt_tokens.pop(sid, None)
 
     def take_credit_updates(self) -> list[tuple[int, list]]:
         """The corrected credits to send, per rank, for seqs already sent; they

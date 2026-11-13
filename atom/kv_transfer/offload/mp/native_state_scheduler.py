@@ -308,8 +308,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         worker running, while its deadline here counts from dispatch, so a few
         slow forwards (a cold restart) would stop the engine.
         """
-        if super().lookup_pending(seq):
-            return True
+        return super().lookup_pending(seq) or self._restore_slots_hold(seq)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return super().lookup_would_defer(seq) or self._restore_slots_hold(seq)
+
+    def _restore_slots_hold(self, seq: Any) -> bool:
         # With images every native load restores one (a KV-only load comes
         # only with a replay, which stores no images).
         if self._page_only or not seq.has_per_req_cache:
@@ -720,9 +724,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         super().cancel_pending_load(seq)
 
     def cancel_preadmission(self, seq: Any) -> None:
-        # A park this pass recorded must not reach dispatch: `build_connector_
-        # meta` would report the request's load as dropped and wake it as a
-        # failed load although it is back in `waiting`, unadmitted.
+        # A park `should_park_for_load_after_alloc` recorded must not reach
+        # dispatch: `build_connector_meta` would report the request's load as
+        # dropped and wake it as a failed load although it is back in
+        # `waiting`, unadmitted.
         parked = self._parked_loads.get(str(seq.id))
         if parked is seq:
             del self._parked_loads[str(seq.id)]

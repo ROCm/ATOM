@@ -231,27 +231,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             callback(scheduled_seqs, num_scheduled_tokens)
 
     def lookup_pending(self, seq) -> bool:
-        callback = getattr(self._impl, "lookup_pending", None)
-        return bool(callback(seq)) if callable(callback) else False
+        return self._impl.lookup_pending(seq)
 
-    @property
-    def chunk_size(self) -> int:
-        """The tier's transfer granule in tokens; 0 when the impl has none."""
-        return int(self._impl.chunk_size or 0)
-
-    @property
-    def supports_early_load(self) -> bool:
-        return self._impl.supports_early_load
-
-    def lookup_ready(self, seq) -> bool:
-        return self._impl.lookup_ready(seq)
-
-    @property
-    def lowers_hbm_hit_to_chunk(self) -> bool:
-        return self._impl.lowers_hbm_hit_to_chunk
-
-    def held_tier_hit(self, seq) -> int:
-        return int(self._impl.held_tier_hit(seq))
+    def lookup_would_defer(self, seq) -> bool:
+        return self._impl.lookup_would_defer(seq)
 
     def cancel_preadmission(self, seq) -> None:
         self._impl.cancel_preadmission(seq)

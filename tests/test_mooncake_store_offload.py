@@ -1347,13 +1347,41 @@ def _store_chunks(cluster, hashes, chunks, *, rank=0, world=1, master=MASTER):
         )
 
 
+def _wait_store_answer(lookup, sid):
+    """Wait outside admission so synchronous Store assertions consume a ready RPC."""
+    with lookup.lock:
+        future = lookup.pending.get(sid)
+    if future is not None:
+        # The scheduler never performs this wait. These tests inspect backend
+        # answers/backoff after the actual daemon has completed its fake RPC.
+        try:
+            future.result(timeout=5)
+        except Exception as error:  # noqa: BLE001
+            assert future.done(), f"Store test RPC did not finish: {error}"
+
+
+def _completed_lookup(lookup, seq, lookup_id=None):
+    sid = lookup_id or str(seq.id)
+    lookup.submit(seq, sid)
+    _wait_store_answer(lookup, sid)
+    return lookup.lookup(seq, lookup_id)
+
+
+def _completed_match(scheduler, seq):
+    if scheduler._lookup_len(seq) <= 0:
+        return scheduler.get_num_new_matched_tokens(seq)
+    scheduler.prefetch_lookups([seq])
+    _wait_store_answer(scheduler._lookup_client, str(seq.id))
+    return scheduler.get_num_new_matched_tokens(seq)
+
+
 def test_scheduler_opens_its_store_client_on_the_first_lookup(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     scheduler._min_load_tokens = 0
     assert cluster.stores == []  # every PP stage builds one; only the head asks
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
-    assert scheduler.get_num_new_matched_tokens(_seq(1, 41)) == (40, True)
+    assert _completed_match(scheduler, _seq(1, 41)) == (40, True)
     [store] = cluster.stores
     # Lookups are master RPCs: always tcp, no NIC.
     assert store.setup_args == ("10.0.0.2", METADATA, 0, 0, "tcp", "", MASTER)
@@ -1365,11 +1393,11 @@ def test_lookup_is_the_prefix_every_rank_holds(cluster):
     hashes = _hashes(48)
     _store_chunks(cluster, hashes, range(6), rank=0, world=2)
     _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
-    assert lookup.lookup(_seq(0, 48)) == 2 * CHUNK
+    assert _completed_lookup(lookup, _seq(0, 48)) == 2 * CHUNK
     _store_chunks(cluster, hashes, [2], rank=1, world=2)
-    assert lookup.lookup(_seq(0, 48)) == 6 * CHUNK
-    assert lookup.lookup(_seq(0, 52)) == 6 * CHUNK  # partial tail not asked
-    assert lookup.lookup(_seq(0, 7)) == 0  # shorter than a chunk
+    assert _completed_lookup(lookup, _seq(0, 48)) == 6 * CHUNK
+    assert _completed_lookup(lookup, _seq(0, 52)) == 6 * CHUNK  # partial tail not asked
+    assert _completed_lookup(lookup, _seq(0, 7)) == 0  # shorter than a chunk
     [store] = cluster.stores
     # One RPC per lookup: the taint marker, then every rank's chunks
     # rank-major, the partial chunk never asked about.
@@ -1386,7 +1414,7 @@ def test_lookup_counts_rank_objects_past_the_shared_prefix(
     hashes = _hashes(48)
     _store_chunks(cluster, hashes, range(6), rank=0, world=2)
     _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
-    assert lookup.lookup(_seq(0, 48)) == 2 * CHUNK
+    assert _completed_lookup(lookup, _seq(0, 48)) == 2 * CHUNK
     # Rank 0's chunks 2-5 are stranded: stored, unusable while rank 1 lacks 2.
     assert (
         lookup.backend.lookups,
@@ -1409,10 +1437,10 @@ def test_lookup_counts_rank_objects_past_the_shared_prefix(
         4,
     )
     with caplog.at_level(logging.INFO, logger="atom"):
-        lookup.lookup(_seq(0, 48))
+        _completed_lookup(lookup, _seq(0, 48))
         assert not any("LOOKUP-STATS" in r.getMessage() for r in caplog.records)
         scheduler_clock.now += scheduler_mod._LOOKUP_STATS_INTERVAL_S
-        lookup.lookup(_seq(0, 48))
+        _completed_lookup(lookup, _seq(0, 48))
     assert [
         r.getMessage() for r in caplog.records if "LOOKUP-STATS" in r.getMessage()
     ] == ["[OFFLOAD-LOOKUP-STATS] lookups=4 uneven_lookups=1 stranded_objects=4"]
@@ -1423,10 +1451,10 @@ def test_lookup_answers_nothing_on_any_store_error(cluster):
     hashes = _hashes(24)
     _store_chunks(cluster, hashes, range(3))
     lookup = scheduler._lookup_client
-    assert lookup.lookup(_seq(0, 24)) == 24
+    assert _completed_lookup(lookup, _seq(0, 24)) == 24
     [store] = cluster.stores
     store.exist_codes[next(iter(cluster.objects[MASTER]))] = store_client.RPC_FAIL
-    assert lookup.lookup(_seq(0, 24)) is None
+    assert _completed_lookup(lookup, _seq(0, 24)) is None
     store.exist_codes.clear()
     store.raise_on = "exists"
     lookup.backend._pools[0].paused_until = 0.0  # past the pause the failure started
@@ -1444,7 +1472,7 @@ def test_lookup_splits_large_prompts_into_batches(cluster, monkeypatch):
     hashes = _hashes(40)
     for rank in range(2):
         _store_chunks(cluster, hashes, range(5), rank=rank, world=2)
-    assert scheduler._lookup_client.lookup(_seq(0, 40)) == 40
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 40)) == 40
     [store] = cluster.stores
     # The taint marker and ten chunk keys.
     assert [len(c[1]) for c in store.calls if c[0] == "exists"] == [4, 4, 3]
@@ -1461,7 +1489,7 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
     # Each stage's NIC routes its chunks to its own pool.
     _store_chunks(cluster, hashes, range(4), rank=0, world=2, master="10.0.0.1:26051")
     _store_chunks(cluster, hashes, range(4), rank=1, world=2, master="10.0.0.1:26151")
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert sorted(s.setup_args[6] for s in cluster.stores) == [
         "10.0.0.1:26051",
         "10.0.0.1:26151",
@@ -1470,7 +1498,7 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
     cluster.store_of("10.0.0.1:26051").exist_codes = {
         key: store_client.RPC_FAIL for key in cluster.objects["10.0.0.1:26151"]
     }
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     # ... and is then not asked for a while: the other pool's answers stand,
     # so stage 0's chunks, which only the paused pool holds, are absent.
     cluster.objects["10.0.0.1:26151"].clear()
@@ -1494,7 +1522,7 @@ def test_a_failing_pool_leaves_the_others_answering(cluster, scheduler_clock, fa
     # Both stages read pool rdma0; rdma1 holds nothing of this prompt.
     for rank in range(2):
         _store_chunks(cluster, hashes, range(4), rank=rank, world=2)
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     down = cluster.store_of("10.0.0.1:26151")
     if failure == "raise":
         down.raise_on = "exists"  # its master is down
@@ -1502,11 +1530,11 @@ def test_a_failing_pool_leaves_the_others_answering(cluster, scheduler_clock, fa
         down.exist_codes = {
             key: store_client.RPC_FAIL for key in cluster.objects[MASTER]
         }
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     asked = len(down.calls)
     # Paused: not asked again for a while, and the hit stands meanwhile.
     scheduler_clock.now += 1.0
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert len(down.calls) == asked
 
 
@@ -1516,16 +1544,16 @@ def test_a_pool_that_cannot_connect_leaves_the_others_open(cluster, scheduler_cl
     for rank in range(2):
         _store_chunks(cluster, hashes, range(4), rank=rank, world=2)
     cluster.setup_rc_of["10.0.0.1:26151"] = store_client.RPC_FAIL
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     up = cluster.store_of("10.0.0.1:26051")
     assert not up.closed
     # The pool that failed is tried again only after its pause.
     scheduler_clock.now += scheduler_mod._RECONNECT_INTERVAL_S - 1.0
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert len(cluster.stores) == 2
     del cluster.setup_rc_of["10.0.0.1:26151"]
     scheduler_clock.now += 2.0
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert len(cluster.stores) == 3 and not up.closed
 
 
@@ -1535,17 +1563,17 @@ def test_lookups_count_nothing_a_marked_pool_holds(cluster, caplog):
     lookup = scheduler._lookup_client
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
-    assert lookup.lookup(_seq(0, 41)) == 40
+    assert _completed_lookup(lookup, _seq(0, 41)) == 40
     cluster.objects[MASTER][keys.STORE_TAINT_KEY] = b""
     with caplog.at_level(logging.ERROR, logger="atom"):
-        assert scheduler.get_num_new_matched_tokens(_seq(1, 41)) == (0, False)
+        assert _completed_match(scheduler, _seq(1, 41)) == (0, False)
     assert f"carries the taint marker {keys.STORE_TAINT_KEY}" in caplog.text
     [store] = cluster.stores
     asked = len(store.calls)
     # For good, and without asking it again: the marker goes only with the
     # Store, and the Store's memory does not come back with a removed key.
     del cluster.objects[MASTER][keys.STORE_TAINT_KEY]
-    assert lookup.lookup(_seq(2, 41)) == 0
+    assert _completed_lookup(lookup, _seq(2, 41)) == 0
     assert len(store.calls) == asked
 
 
@@ -1557,14 +1585,14 @@ def test_a_marked_pool_holds_nothing_beside_pools_that_are_not(cluster):
         _store_chunks(
             cluster, hashes, range(4), rank=rank, world=2, master="10.0.0.1:26151"
         )
-    assert lookup.lookup(_seq(0, 32)) == 32
+    assert _completed_lookup(lookup, _seq(0, 32)) == 32
     cluster.objects[MASTER][keys.STORE_TAINT_KEY] = b""
     # The other pool still holds the prefix.
     assert _completed_lookup(lookup, _seq(0, 32)) == 32
     assert [pool.tainted for pool in lookup.backend._pools] == [True, False]
     # What only the marked pool holds is absent.
     cluster.objects["10.0.0.1:26151"].clear()
-    assert lookup.lookup(_seq(0, 32)) == 0
+    assert _completed_lookup(lookup, _seq(0, 32)) == 0
 
 
 @pytest.mark.parametrize("code", [store_client.RPC_FAIL, "raise"])
@@ -1573,7 +1601,7 @@ def test_a_pool_that_cannot_say_whether_it_is_marked_answers_nothing(
 ):
     lookup = MooncakeStoreOffloadScheduler(_config())._lookup_client
     _store_chunks(cluster, _hashes(40), range(5))
-    assert lookup.lookup(_seq(0, 41)) == 40
+    assert _completed_lookup(lookup, _seq(0, 41)) == 40
     [store] = cluster.stores
     if code == "raise":
         store.raise_on = "exists"
@@ -1590,7 +1618,7 @@ def test_a_lookup_answers_what_unanswered_keys_cannot_change(cluster):
     hashes = _hashes(48)
     _store_chunks(cluster, hashes, range(6), rank=0, world=2)
     _store_chunks(cluster, hashes, [0, 1, 2, 4, 5], rank=1, world=2)  # 3 absent
-    assert lookup.lookup(_seq(0, 48)) == 3 * CHUNK
+    assert _completed_lookup(lookup, _seq(0, 48)) == 3 * CHUNK
     [store] = cluster.stores
     # An error past the hit cannot lengthen it: the hit stands.
     store.exist_codes = {
@@ -1616,7 +1644,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     lookup = scheduler._lookup_client
     prompt = _seq(0, 16)
-    assert lookup.lookup(prompt) == 0
+    assert _completed_lookup(lookup, prompt) == 0
     [store] = cluster.stores
 
     def asked():
@@ -1632,22 +1660,22 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
                     store_client.RPC_FAIL
                 )
             }
-        assert lookup.lookup(prompt) is None
+        assert _completed_lookup(lookup, prompt) is None
         store.raise_on, store.exist_codes = None, {}
         calls = asked()
         # A healthy Store again, but each call could block the scheduler
         # thread: inside the pause no lookup reaches it.
         scheduler_clock.now += scheduler_mod._LOOKUP_BACKOFF_S - 0.5
-        assert lookup.lookup(prompt) is None
+        assert _completed_lookup(lookup, prompt) is None
         assert asked() == calls
         scheduler_clock.now += 1.0
-        assert lookup.lookup(prompt) == 0
+        assert _completed_lookup(lookup, prompt) == 0
         assert asked() == calls + 1
 
 
 def test_a_lookup_that_blocked_pauses_ten_times_as_long(cluster, scheduler_clock):
     lookup = MooncakeStoreOffloadScheduler(_config())._lookup_client
-    assert lookup.lookup(_seq(0, 16)) == 0
+    assert _completed_lookup(lookup, _seq(0, 16)) == 0
     [store] = cluster.stores
 
     def dead_master(keys):
@@ -1665,8 +1693,8 @@ def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     lookup = scheduler._lookup_client
     cluster.setup_rc = store_client.RPC_FAIL
-    assert lookup.lookup(_seq(0, 16)) is None
-    assert lookup.lookup(_seq(0, 16)) is None
+    assert _completed_lookup(lookup, _seq(0, 16)) is None
+    assert _completed_lookup(lookup, _seq(0, 16)) is None
     assert len(cluster.stores) == 1  # no reconnect on every step
     cluster.setup_rc = 0
     lookup.backend._pools[0].paused_until = 0.0
@@ -1689,17 +1717,17 @@ def test_a_connect_that_blocked_pauses_ten_times_as_long(
         return store_client.RPC_TIMEOUT
 
     monkeypatch.setattr(FakeStore, "setup", unanswered_setup)
-    assert lookup.lookup(_seq(0, 16)) is None
+    assert _completed_lookup(lookup, _seq(0, 16)) is None
     # Paused from the failure, not from before the setup that blocked.
     assert lookup.backend._pools[0].paused_until == pytest.approx(
         scheduler_clock.now + 10 * blocked_s
     )
     scheduler_clock.now += 0.01  # the next request's lookup
-    assert lookup.lookup(_seq(0, 16)) is None
+    assert _completed_lookup(lookup, _seq(0, 16)) is None
     assert len(cluster.stores) == 1
     monkeypatch.setattr(FakeStore, "setup", setup)
     scheduler_clock.now += 10 * blocked_s
-    assert lookup.lookup(_seq(0, 16)) == 0
+    assert _completed_lookup(lookup, _seq(0, 16)) == 0
     assert len(cluster.stores) == 2
 
 
@@ -1712,7 +1740,7 @@ def test_a_prompt_too_short_to_load_is_not_looked_up(cluster):
     assert scheduler.get_num_new_matched_tokens(_seq(1, 32)) == (0, False)
     assert cluster.stores == []
     # One token more and 4 chunks could load: asked.
-    assert scheduler.get_num_new_matched_tokens(_seq(2, 33)) == (32, True)
+    assert _completed_match(scheduler, _seq(2, 33)) == (32, True)
     [store] = cluster.stores
     assert sum(1 for call in store.calls if call[0] == "exists") == 1
 
@@ -1722,7 +1750,7 @@ def test_lookup_hashes_a_sequence_prompt_once(cluster):
     seq = _seq(4, 20)
     seq.token_ids.extend([999] * 5)  # generated tokens are not prompt
     assert scheduler._lookup_token_ids(seq) is seq
-    assert scheduler._lookup_client.lookup(seq) == 0
+    assert _completed_lookup(scheduler._lookup_client, seq) == 0
     assert seq._mooncake_store_chunk_hashes == _hashes(16)
     seq._mooncake_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
     assert prompt_chunk_hashes(seq, CHUNK) == b"\x01" * 32
@@ -1801,7 +1829,7 @@ def test_a_hit_that_waited_for_blocks_is_looked_up_again_before_its_load(
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
     seq = _seq(50, 41)
-    assert scheduler.get_num_new_matched_tokens(seq) == (40, True)
+    assert _completed_match(scheduler, seq) == (40, True)
     [store] = cluster.stores
 
     def asked():
@@ -1810,7 +1838,7 @@ def test_a_hit_that_waited_for_blocks_is_looked_up_again_before_its_load(
     # No KV blocks for 100 steps: the hit is reused, the Store not asked again.
     for _ in range(100):
         scheduler_clock.now += 0.5
-        assert scheduler.get_num_new_matched_tokens(seq) == (40, True)
+        assert _completed_match(scheduler, seq) == (40, True)
         assert scheduler.build_connector_meta().requests == []
     assert asked() == 1
     # The lookup's lease ran out long ago, and the Store evicted a chunk.
@@ -1857,7 +1885,7 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
     seq = _seq(51, 41)
-    assert scheduler.get_num_new_matched_tokens(seq) == (40, True)
+    assert _completed_match(scheduler, seq) == (40, True)
     scheduler_clock.now += 0.5
     scheduler.update_state_after_alloc(seq)
     [request] = scheduler.build_connector_meta().requests
@@ -1866,7 +1894,7 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     assert sum(1 for call in store.calls if call[0] == "exists") == 1
     # A stale one that the Store still holds whole is loaded after one more ask.
     again = _seq(52, 41)
-    assert scheduler.get_num_new_matched_tokens(again) == (40, True)
+    assert _completed_match(scheduler, again) == (40, True)
     scheduler_clock.now += 5.0
     scheduler.update_state_after_alloc(again)
     [request] = scheduler.build_connector_meta().requests
@@ -1876,8 +1904,18 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     assert "52" not in scheduler._looked_up_at
 
 
+def _await_store_lookup(offload, seq):
+    """Establish an actual asynchronous answer before testing load/forward work."""
+    offload.offer_lookups([seq])
+    deadline = time.monotonic() + 5.0
+    while not offload.lookup_ready(seq) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert offload.lookup_ready(seq), "the real Store lookup did not answer"
+    assert offload._lookup_client.answered(str(seq.id))
+
+
 @pytest.fixture
-def store_engine(cluster, monkeypatch):
+def store_engine(cluster, monkeypatch, request):
     """The engine's scheduler, prefix caching on, offloading to the Store.
 
     ``withheld.on`` refuses every allocation, as a full KV cache does: a
@@ -1892,6 +1930,7 @@ def store_engine(cluster, monkeypatch):
         )
     )
     offload = MooncakeStoreOffloadScheduler(_config("offload"))
+    request.addfinalizer(offload.close)
     offload._min_load_tokens = 0
     offload.bind_block_manager(engine.block_manager)
     engine.kv_connector = offload
@@ -1917,6 +1956,7 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
     store_engine.withheld.on = True
+    _await_store_lookup(offload, seq)
     engine.schedule()  # lookup offered, but no KV blocks
     # Finish the asynchronous answer before simulating its lease expiry.
     assert offload.get_num_new_matched_tokens(seq) == (40, True)
@@ -1996,6 +2036,7 @@ def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
     _store_chunks(cluster, _hashes(40), range(5))
     seq = Sequence(list(range(49)), BLOCK, sampling_params=SamplingParams())
     engine.add(seq)
+    _await_store_lookup(offload, seq)
     batch, _ = engine.schedule()
     [request] = [r for r in batch.connector_meta_output.requests if r.load_spec]
     worker, _ = make_worker(namespace=offload._namespace)
@@ -2890,10 +2931,12 @@ def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
 
     # A later turn of the same conversation finds every stored chunk.
     turn = _seq(41, 60)
-    assert scheduler.get_num_new_matched_tokens(turn) == (40, True)
+    assert _completed_match(scheduler, turn) == (40, True)
 
 
-def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
+def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
+    cluster, request
+):
     """The PP save frontier runs ahead of the forwards; the fence still covers it.
 
     Under PP `schedule()` advances `num_cached_tokens` as it dispatches a
@@ -2917,6 +2960,8 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         )
     )
     offload = MooncakeStoreOffloadScheduler(_config("offload", pp=4, layers=8))
+    request.addfinalizer(offload.close)
+    offload._min_load_tokens = 0
     offload.bind_block_manager(engine.block_manager)
     engine.kv_connector = offload
     seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
@@ -2933,11 +2978,11 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
             elif name == "process_kvconnector_output":
                 rpcs.append(("fence", args[0]))  # `start_load_kv` records it
                 # Store each save at once, so that every step emits the next.
-                for request in args[0].requests if store_saves else []:
-                    assert request.save_spec is not None  # nothing to load
+                for pending_save in args[0].requests if store_saves else []:
+                    assert pending_save.save_spec is not None  # nothing to load
                     offload.connector_completion(
                         ConnectorCompletion(
-                            DENSE_PAGE_STORE_CHANNEL, request.save_operation, True
+                            DENSE_PAGE_STORE_CHANNEL, pending_save.save_operation, True
                         )
                     )
 
@@ -2970,6 +3015,10 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         ("_advance_idle_kv_transfer", EngineCore),
     ):
         setattr(head, name, getattr(owner, name).__get__(head))
+    # The Store lookup is asynchronous. Establish the answered cold-miss
+    # precondition so these steps exercise forward/save fencing rather than
+    # depending on whether the lookup thread happened to run between ticks.
+    _await_store_lookup(offload, seq)
     # The prompt's four chunks go out back to back. The next step has only
     # the last chunk's save to dispatch, while that chunk still runs.
     PPEngineCoreProc._pp_head_step(head)
@@ -3001,6 +3050,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
     PPEngineCoreProc._downstream_busy_loop(stage)
 
     for rpcs in (head_rpcs, stage_rpcs):
+        assert sum(kind == "forward" for kind, _ in rpcs) == 4
         enqueued, saves = 0, []
         for kind, item in rpcs:
             if kind == "forward":
@@ -3008,11 +3058,11 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
                 [tokens] = item.num_scheduled_tokens
                 enqueued = start + int(tokens)
                 continue
-            for request in item.requests:
-                end = len(request.chunk_hashes) // keys.DIGEST_BYTES * CHUNK
+            for saved_request in item.requests:
+                end = len(saved_request.chunk_hashes) // keys.DIGEST_BYTES * CHUNK
                 # The fence recorded here orders the save after these only.
                 assert end <= enqueued
-                saves.append((request.save_spec.skip_leading_tokens, end))
+                saves.append((saved_request.save_spec.skip_leading_tokens, end))
         # Each chunk is saved by the step after its own, before any stage
         # returned it, and the head and the stage see the same saves.
         assert saves == [(0, 16), (16, 32), (32, 48), (48, 64)]
@@ -3228,6 +3278,9 @@ def test_v41_registration_uses_pages_without_request_slots(
             state_transfer=lambda: SimpleNamespace(replays=True, copies=False)
         ),
     )
+    transfer.without_slots = lambda: SimpleNamespace(
+        **{**vars(transfer), "slot_regions": [], "num_slots": 0}
+    )
     selected = {}
 
     def page_codec(**kwargs):
@@ -3242,49 +3295,19 @@ def test_v41_registration_uses_pages_without_request_slots(
 
     monkeypatch.setattr(dsv4_codec, "DSV4PageSlotCodec", page_codec)
     worker = MooncakeStoreOffloadConnector(config)
+    original_slots = transfer.slot_regions
     try:
         worker.register_kv_caches({}, transfer_tensors=transfer, num_blocks=8)
         assert selected["page_regions"] is pages
         assert selected["slot_regions"] == ()
         assert selected["num_slots"] == 0
         assert selected["num_blocks"] == 8
+        assert transfer.slot_regions is original_slots
+        assert len(transfer.slot_regions) == 1
+        assert transfer.num_slots == 64
         assert worker._pool is not None
     finally:
         worker.close()
-
-
-@pytest.mark.parametrize("field", ["spec", "callback", "copies"])
-def test_replay_page_codec_refuses_native_state_contract(field):
-    from atom.kv_transfer.offload.page_codec import replay_page_codec
-
-    transfer = SimpleNamespace(
-        block_regions=[object()],
-        slot_regions=[object()],
-        state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(
-                replays=True, copies=field == "copies"
-            )
-        ),
-        paged_state_checkpoint_spec=object() if field == "spec" else None,
-        execute_paged_state_copies=(lambda: None) if field == "callback" else None,
-    )
-    with pytest.raises(ValueError, match="cannot carry native state checkpoints"):
-        replay_page_codec(transfer, 8)
-
-
-@pytest.mark.parametrize("replays", [None, False])
-def test_replay_page_codec_refuses_unconfirmed_replay(replays):
-    from atom.kv_transfer.offload.page_codec import replay_page_codec
-
-    transfer = SimpleNamespace(
-        block_regions=[object()],
-        slot_regions=[object()],
-        state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(replays=replays, copies=False)
-        ),
-    )
-    with pytest.raises(ValueError, match="requires the state replay contract"):
-        replay_page_codec(transfer, 8)
 
 
 def test_pure_page_codec_still_refuses_live_pd_slot():
@@ -3399,21 +3422,6 @@ def test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread(
             worker.register_kv_caches(_kv_caches(), num_blocks=8)
     finally:
         worker.close()
-
-
-def test_replay_page_metadata_budget_includes_every_copy_thread(monkeypatch):
-    from atom.kv_transfer.offload.metadata_lease import METADATA_GPU_RESERVE_BYTES
-
-    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "2")
-    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
-    config = _config(extra=_extra(save_pool_mib=3, load_pool_mib=5))
-    dense = KVConnectorFactory.kv_budget_reserve_bytes(config)
-    config.hf_config.model_type = "deepseek_v41"
-    assert (
-        KVConnectorFactory.kv_budget_reserve_bytes(config)
-        == dense + 5 * METADATA_GPU_RESERVE_BYTES
-    )
 
 
 def test_a_failed_probe_stops_startup_and_releases_the_pool(cluster, one_rank):
@@ -3917,23 +3925,9 @@ def test_mixed_windows_report_the_same_chunks(
         assert objects[_key(request.chunk_hashes, index)] == expected
 
 
-def test_v41_architecture_alias_and_codec_identity():
-    from atom.kv_transfer.offload.mooncake_store.layouts import (
-        REPLAY_PAGE_CODEC_ID,
-        mooncake_codec_id,
-    )
+def test_the_dense_codec_id_is_unchanged_and_v41_has_its_own():
+    from types import SimpleNamespace
 
-    config = _config()
-    dense = keys.store_namespace(config, CHUNK)
-    config.hf_config.model_type = "deepseek_v41"
-    config.enable_encoder_swa_bounded_replay = True
-    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
-    assert keys.store_namespace(config, CHUNK) != dense
-
-    dense = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
-    v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
-    assert keys.codec_id(dense) == "dense-opaque-block-v1"  # stored entries stay valid
-    assert keys.codec_id(v41) == "replay-page-block-v1"
     dense = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
     v41 = SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41"))
     assert (
@@ -3965,6 +3959,37 @@ def test_an_answer_taken_late_is_as_old_as_its_store_query(cluster):
     scheduler._ensure_lookup_pin(seq, sid, spec)
     assert renewed  # an old answer is confirmed again before the get
     scheduler.close()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
+def test_v41_architecture_alias_and_codec_identity():
+    from atom.kv_transfer.offload.mooncake_store.layouts import (
+        REPLAY_PAGE_CODEC_ID,
+        mooncake_codec_id,
+    )
+
+    config = _config()
+    dense = keys.store_namespace(config, CHUNK)
+    config.hf_config.model_type = "deepseek_v41"
+    config.enable_encoder_swa_bounded_replay = True
+    assert mooncake_codec_id(config) == REPLAY_PAGE_CODEC_ID
+    assert keys.store_namespace(config, CHUNK) != dense
+
 
 @pytest.mark.parametrize("blocks", [None, 0, -1])
 def test_pure_page_codec_rejects_missing_or_invalid_count(blocks):
@@ -4098,3 +4123,55 @@ def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout)
     assert keys.store_namespace(config, CHUNK) == namespace
     monkeypatch.setattr(*own, "own-codec-next-version")
     assert keys.store_namespace(config, CHUNK) != namespace
+
+
+def test_a_prompt_too_short_to_load_is_neither_asked_about_nor_waited_for(cluster):
+    """Such a lookup could not change what is loaded; submitted, it would park the
+    request for the defer window and hold the single query worker."""
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    assert scheduler._min_load_tokens == 512
+    seq = Sequence(list(range(100)), BLOCK, sampling_params=SamplingParams())
+    scheduler.offer_lookups([seq])
+    scheduler.prefetch_lookups([seq])
+    assert not scheduler._lookup_client.pending_ids()
+    assert not scheduler.lookup_pending(seq)
+    scheduler.close()
+
+
+def test_only_admission_starts_a_requests_lookup_defer_window(cluster, monkeypatch):
+    """The early-load scan and the prefillable-work probe run every tick; a
+    request that sat in their reach while its lookup queued behind the single
+    worker must still get its whole window when admission reaches it."""
+
+    class QueuedLookup:
+        def is_pending(self, sid):
+            return True
+
+        def poll(self, sid):
+            return False
+
+        def answered(self, sid):
+            return False
+
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    engine = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=40,
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            enable_prefix_caching=True,
+        )
+    )
+    offload = MooncakeStoreOffloadScheduler(_config("offload"))
+    offload._min_load_tokens = 0
+    offload._lookup_client = QueuedLookup()
+    offload.bind_block_manager(engine.block_manager)
+    engine.kv_connector = offload
+    seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    for _ in range(5):
+        engine._early_load_tier_prefixes()
+        engine._head_waits_on_tier_lookup(seq)
+    assert not offload._lookup_defer_since
+    assert offload.lookup_pending(seq)  # admission's call opens the window
+    assert str(seq.id) in offload._lookup_defer_since

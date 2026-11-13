@@ -50,6 +50,7 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
     BlockGPUConnector,
@@ -61,7 +62,6 @@ from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     check_engine_compatibility,
     parse_mooncake_store_config,
-    uses_replay_pages,
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
@@ -208,16 +208,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         cfg = parse_mooncake_store_config(kvc)
         threads = envs.OFFLOAD_COPY_WORKERS + envs.OFFLOAD_LOAD_WORKERS
-        metadata_bytes = 0
-        if uses_replay_pages(config):
-            from atom.kv_transfer.offload.metadata_lease import (
-                METADATA_GPU_RESERVE_BYTES,
-            )
-
-            metadata_bytes = METADATA_GPU_RESERVE_BYTES
-        return pool_allocation_bytes(
-            cfg.save_pool_bytes, cfg.load_pool_bytes
-        ) + threads * (_staging_buffer_bound() + metadata_bytes)
+        return (
+            pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
+            + threads * _staging_buffer_bound()
+        )
 
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""
@@ -242,8 +236,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
 
     # -- lifecycle --------------------------------------------------------
-    # The stream the forward runs on: seeded at registration, then reported by
-    # the model runner before each forward (`ModelRunner.prefill_forward`).
+    # The stream the forward runs on: seeded at registration, then reported
+    # before each forward by `RapidServeModelRunner`, the one runner that picks
+    # a stream per forward (`RapidServeModelRunner.prefill_forward`).
     _forward_stream: Any = None
 
     def set_forward_stream(self, stream: Any) -> None:
@@ -823,29 +818,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             run = pool.contiguous_view(slots) if self._in_place else None
-            chunk_stride_bytes = None
-            if (
-                run is None
-                and self._in_place
-                and callable(
-                    getattr(
-                        self._codec, "chunk_major_strided_buffer_to_gpu_prepared", None
-                    )
-                )
-            ):
-                run = pool.strided_view(slots)
-                if run is not None:
-                    chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
             try:
                 if run is not None:
-                    self._copy_in_place(
-                        run,
-                        window,
-                        req.block_ids,
-                        pack=False,
-                        chunk_stride_bytes=chunk_stride_bytes,
-                    )
+                    self._copy_in_place(run, window, req.block_ids, pack=False)
                     in_place_windows += 1
                 else:
                     gpu_connector.batched_to_gpu(
@@ -939,7 +915,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
-        chunk_stride_bytes: int | None = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
 
@@ -972,35 +947,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             if pack
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
-        finish_ids = getattr(codec, "finish_prepared_block_id_groups", None)
-        try:
-            if chunk_stride_bytes is not None:
-                assert not pack
-                codec.chunk_major_strided_buffer_to_gpu_prepared(
-                    run,
-                    owner,
-                    0,
-                    stream=stream,
-                    items_per_chunk=per_chunk,
-                    chunk_stride_bytes=chunk_stride_bytes,
-                )
-            else:
-                copy(run, owner, 0, stream=stream)
-            record_ids = getattr(codec, "record_prepared_block_id_completion", None)
-            if callable(record_ids):
-                record_ids(owner)
-            from atom.kv_transfer.offload.atom_lmcache_staging import (
-                fence_submitted_work,
-            )
-
-            fence_submitted_work(stream)
-        except BaseException:
-            if callable(finish_ids):
-                finish_ids(owner, safe=False)
-            raise
-        else:
-            if callable(finish_ids):
-                finish_ids(owner, safe=True)
+        copy(run, owner, 0, stream=stream)
+        atom_lmcache_staging.fence_submitted_work(stream)
 
         # -- slot settlement -----------------------------------------------
 

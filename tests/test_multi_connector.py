@@ -36,6 +36,12 @@ from atom.kv_transfer.disaggregation.types import (
 class FakeSchedSub:
     """Scheduler-side sub-connector mock."""
 
+    def lookup_pending(self, seq):
+        return False
+
+    def lookup_would_defer(self, seq):
+        return False
+
     def __init__(
         self,
         *,
@@ -48,6 +54,7 @@ class FakeSchedSub:
         self._match = match
         self.is_producer = is_producer
         self.is_offload = is_offload
+        self.supports_early_load = False
         self.alloc_calls = []
         self.finished_calls = []
         self.cancelled = []
@@ -1028,10 +1035,12 @@ def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_na
     assert built == []
 
 
+@pytest.mark.parametrize("role", ["kv_consumer", "kv_both"])
 @pytest.mark.parametrize("pd", ["mooncake", "moriio"])
-def test_a_pd_consumer_with_an_offload_tier_is_refused(monkeypatch, pd):
+def test_a_pd_consumer_with_an_offload_tier_is_refused(monkeypatch, pd, role):
     """The scheduler would resume a received prefill as a tier load and prefill
-    the prompt again on the decode instance, never reaching first decode."""
+    the prompt again on the decode instance, never reaching first decode. A P/D
+    leaf builds as a consumer whenever its role is not ``kv_producer``."""
     built = []
     import atom.kv_transfer.disaggregation.factory as factory_mod
 
@@ -1044,7 +1053,7 @@ def test_a_pd_consumer_with_an_offload_tier_is_refused(monkeypatch, pd):
         kv_transfer_config={
             "kv_connector": "multi",
             "connectors": [
-                {"kv_connector": pd, "kv_role": "kv_consumer"},
+                {"kv_connector": pd, "kv_role": role},
                 {"kv_connector": "mooncake_store"},
             ],
         }

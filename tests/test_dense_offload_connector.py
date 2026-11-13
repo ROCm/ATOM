@@ -71,6 +71,8 @@ def _load_seq(req_id, *, num_prompt_tokens=8):
         num_prompt_tokens=num_prompt_tokens,
         token_ids=list(range(num_prompt_tokens)),
         block_table=list(range(num_prompt_tokens // 8)),
+        offload_loaded=False,
+        offload_load_failed=False,
     )
 
 
@@ -573,9 +575,7 @@ def test_block_gpu_connector_waits_on_actual_pack_stream_without_host_sync():
     pack_stream = SimpleNamespace(
         wait_event=lambda event: trace.append(("wait", event))
     )
-    state = SimpleNamespace(
-        pack_stream=pack_stream, copy_stream=object(), follows_compute_stream=False
-    )
+    state = SimpleNamespace(pack_stream=pack_stream, copy_stream=object())
     connector = BlockGPUConnector.__new__(BlockGPUConnector)
     connector._capture_transfer_stats = lambda: nullcontext(stats)
     connector._prepare_transfer = lambda *_args, **_kwargs: (state, [object()])
@@ -1172,7 +1172,10 @@ def test_a_multi_connector_cancel_re_arms_honestly(monkeypatch):
         moriio_matched["yes"] = True
         return 16, True
 
-    moriio = SimpleNamespace(get_num_new_matched_tokens=moriio_match)
+    moriio = SimpleNamespace(
+        get_num_new_matched_tokens=moriio_match,
+        cancel_pending_load=lambda seq: None,
+    )
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [moriio, sched]
     multi._load_winner = {}
@@ -1524,6 +1527,8 @@ def _synthetic_stream_operation_completion(monkeypatch):
         return stream.synchronize()
 
     monkeypatch.setattr(staging, "fence_submitted_work", complete)
+
+
 @pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
 def test_a_prompt_carries_its_media_salt_to_lookup_save_and_load(
     monkeypatch, cache_seed, salt

@@ -217,20 +217,6 @@ class AsyncStoreLookup(LookupClient):
             f = self.pending.get(sid)
             return f is not None and f.done()
 
-    def has_answer(self, sid):
-        with self.lock:
-            f = self.pending.get(sid)
-            if f is None or not f.done() or f.cancelled():
-                return False
-            try:
-                return f.result() is not None
-            except Exception as exc:  # noqa: BLE001
-                self._warn_lookup_failure(exc)
-                return False
-
-    def __getattr__(self, name):
-        return getattr(self.backend, name)
-
     def lookup(self, seq, lookup_id=None):
         # Admission still reaches this after its defer window. A pending Store
         # query is a non-answer, not a reason to block the scheduler or a miss.
@@ -300,7 +286,7 @@ class AsyncStoreLookup(LookupClient):
             logger.warning(
                 "Mooncake Store lease renewal for seq=%s did not finish in %.1fs; "
                 "the load is dispatched without it",
-                getattr(seq, "id", None),
+                seq.id,
                 RENEW_TIMEOUT_S,
             )
             return 0

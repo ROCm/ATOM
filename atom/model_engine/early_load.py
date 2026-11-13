@@ -4,7 +4,7 @@
 """Bookkeeping of the scheduler's early tier loads.
 
 `Scheduler._early_load_tier_prefixes` allocates blocks for a waiting request and
-submits its LMCache load before the request's turn to prefill. This module keeps
+submits its tier load before the request's turn to prefill. This module keeps
 what it needs to bound that (the requests holding such blocks) and to report on
 it (one INFO line per interval).
 """
@@ -18,9 +18,9 @@ from typing import Any
 
 logger = logging.getLogger("atom")
 
-# Skips that are about KV pressure; every other skip is a condition the request
-# does not meet.
-LIMIT_REASONS = ("watermark", "max_frac")
+# Skips that are about pressure on blocks or slots; every other skip is a
+# condition the request does not meet.
+LIMIT_REASONS = ("watermark", "max_frac", "pool_full", "seq_slots")
 
 
 class EarlyLoadState:
@@ -44,7 +44,6 @@ class EarlyLoadState:
         self.skips: Counter = Counter()
         self.submitted = 0
         self.submitted_total = 0
-        self.takebacks = 0
         self.aborted = 0
         self.wait_sum_s = 0.0
         self.wait_n = 0
@@ -90,7 +89,7 @@ class EarlyLoadState:
         if now - self._last_log < self.LOG_INTERVAL_S:
             return
         self._last_log = now
-        if not (self.submitted or self.skips or self.entries or self.takebacks):
+        if not (self.submitted or self.skips or self.entries):
             return
         limit = {r: self.skips[r] for r in LIMIT_REASONS}
         cond = {r: n for r, n in sorted(self.skips.items()) if r not in LIMIT_REASONS}
@@ -99,7 +98,7 @@ class EarlyLoadState:
         wait_ms = 1e3 * self.wait_sum_s / self.wait_n if self.wait_n else 0.0
         logger.info(
             "[EARLY-LOAD] last %.0fs: submitted=%d (total %d) "
-            "skipped_by_limit=%s skipped_by_condition=%s taken_back=%d aborted=%d "
+            "skipped_by_limit=%s skipped_by_condition=%s aborted=%d "
             "| held_blocks=%d (%.1f%% of %d) held_requests=%d "
             "| to_prefill n=%d avg_wait=%.0fms",
             self.LOG_INTERVAL_S,
@@ -107,7 +106,6 @@ class EarlyLoadState:
             self.submitted_total,
             limit,
             cond,
-            self.takebacks,
             self.aborted,
             held,
             100.0 * frac,
@@ -118,7 +116,6 @@ class EarlyLoadState:
         )
         self.skips.clear()
         self.submitted = 0
-        self.takebacks = 0
         self.aborted = 0
         self.wait_sum_s = 0.0
         self.wait_n = 0
