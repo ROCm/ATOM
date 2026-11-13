@@ -33,6 +33,7 @@ class IndexScoreBuffers:
     scores: LogitsWorkspace
     work_map: torch.Tensor | None = None
     max_block: int = 0
+    nvfp4: bool = False  # the index cache is NVFP4 (else MXFP4)
     cp_world: int = 1
     cp_rank: int = 0
 
@@ -112,6 +113,7 @@ def allocate_index_scorers(
             scores=LogitsWorkspace(capacity, device),
             work_map=work_map(max_bs, max_qlen),
             max_block=decode_block,
+            nvfp4=config.index_cache_dtype == "nvfp4",
             cp_world=cp_world,
             cp_rank=cp_rank,
         )

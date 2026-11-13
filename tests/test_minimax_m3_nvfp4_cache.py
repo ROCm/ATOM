@@ -96,9 +96,14 @@ def test_only_the_128_page_of_head_dim_128_is_a_pool(kw):
 NV = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4"}
 
 
-@pytest.mark.parametrize("kv", ["nvfp4", "fp8", "bf16"])
-def test_nvfp4_index_pairs_with_nvfp4_bf16_and_fp8_kv(kv):
-    check(kv_cache_dtype=kv, index_cache_dtype="nvfp4")
+def test_nvfp4_kv_and_index_pass():
+    check(**NV)
+
+
+@pytest.mark.parametrize("kv", ["fp8", "bf16"])
+def test_nvfp4_index_needs_nvfp4_kv(kv):
+    with pytest.raises(ValueError, match="needs --kv-cache-dtype nvfp4"):
+        check(kv_cache_dtype=kv, index_cache_dtype="nvfp4")
 
 
 @pytest.mark.parametrize(
