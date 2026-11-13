@@ -31,7 +31,7 @@ use super::{
 };
 use crate::{
     core::Worker,
-    kv_index::{match_holders, Holder, HolderId, Partition, PrefixMatchProvider},
+    kv_index::{match_holders, Holder, Partition, PrefixMatchProvider},
 };
 
 /// The subscriptions by worker URL, and the index partitions by model, pool and block
@@ -62,8 +62,9 @@ impl Drop for KvEventMonitor {
 
 struct Subscription {
     status: Arc<Mutex<SourceStatus>>,
-    /// The rank's lane, when its partition had one left.
-    lane: Option<(Arc<Partition>, HolderId)>,
+    /// The rank's lane, when its partition had one left. The task holds it too, and the
+    /// lane is freed once both let go of it.
+    holder: Option<Arc<Holder>>,
     task: JoinHandle<()>,
 }
 
@@ -139,7 +140,7 @@ impl KvEventMonitor {
             .entry((model_id.into(), pool, source.block_size))
             .or_insert_with(|| Partition::start(source.block_size, &self.threads))
             .clone();
-        let holder = partition.hold(status.clone());
+        let holder = partition.hold(status.clone()).map(Arc::new);
         match &holder {
             Some(_) => status.lock().indexed_blocks = Some(0),
             None => warn!(
@@ -149,11 +150,14 @@ impl KvEventMonitor {
                 "Not indexing the rank's KV events: the 64 lanes of its model and pool are taken"
             ),
         }
-        let lane = holder.as_ref().map(Holder::lane);
         let task = self
             .threads
-            .spawn(follow(source, dp_rank, status.clone(), holder));
-        let subscription = Subscription { status, lane, task };
+            .spawn(follow(source, dp_rank, status.clone(), holder.clone()));
+        let subscription = Subscription {
+            status,
+            holder,
+            task,
+        };
         self.subscriptions.insert(worker.into(), subscription);
     }
 
@@ -178,8 +182,14 @@ impl PrefixMatchProvider for KvEventMonitor {
         let lanes: Vec<_> = workers
             .iter()
             .map(|worker| {
-                let subscription = self.subscriptions.get(worker.url());
-                subscription.and_then(|subscription| subscription.lane.clone())
+                let subscription = self.subscriptions.get(worker.url())?;
+                // A stream that could not start tells nothing of the rank's cache.
+                let followed = !subscription.task.is_finished();
+                subscription
+                    .holder
+                    .as_ref()
+                    .filter(|_| followed)
+                    .map(|h| h.lane())
             })
             .collect();
         match_holders(tokens, &lanes)
@@ -190,7 +200,7 @@ async fn follow(
     source: KvEventSource,
     dp_rank: u32,
     status: Arc<Mutex<SourceStatus>>,
-    holder: Option<Holder>,
+    holder: Option<Arc<Holder>>,
 ) {
     let mut options = SocketOptions::default();
     options.no_connect_timeout();
@@ -430,6 +440,34 @@ mod tests {
 
         monitor.detach(WORKER);
         assert!(monitor.sources().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_cannot_start_keeps_its_lane_and_matches_nothing() {
+        const OTHER: &str = "http://127.0.0.1:8001@1";
+        let monitor = KvEventMonitor::start(1).unwrap();
+        let source = |endpoint: &str| KvEventSource {
+            endpoint: endpoint.into(),
+            topic: "kv".into(),
+            block_size: 4,
+        };
+        monitor.attach(WORKER, "model", "regular", 1, source("not an endpoint"));
+        status_once(&monitor, |s| s.error.is_some()).await;
+        // Time for a lane given up too early to be freed by the writer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        monitor.attach(OTHER, "model", "regular", 1, source("tcp://127.0.0.1:1"));
+        let lane = |worker: &str| {
+            let subscription = monitor.subscriptions.get(worker).unwrap();
+            subscription.holder.as_ref().unwrap().lane().1
+        };
+        assert_ne!(lane(WORKER), lane(OTHER));
+        let workers: Vec<Arc<dyn Worker>> = [WORKER, OTHER]
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .into();
+        assert_eq!(
+            monitor.match_workers(&[1, 2, 3, 4], &workers),
+            [None, Some(0)]
+        );
     }
 
     #[test]
