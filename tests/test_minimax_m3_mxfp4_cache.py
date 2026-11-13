@@ -97,6 +97,7 @@ def check(*, hf=None, arch="gfx950", plugin_mode=False, **kw):
         "torch_dtype": torch.bfloat16,
         "kv_transfer_config": {},
         "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
         "sequence_parallel_size": 1,
         "speculative_config": None,
         "hf_config": text,
@@ -121,6 +122,8 @@ REFUSALS = [  # (config change, message): one row per refusal reason
         {"decode_context_parallel_size": 2, **INDEX_ONLY},
         "decode-context-parallel-size 2",
     ),
+    ({"prefill_context_parallel_size": 2}, "prefill-context-parallel-size 2"),
+    ({"prefill_context_parallel_size": 2, **INDEX_ONLY}, "prefill-context-parallel"),
     ({"plugin_mode": True, **INDEX_ONLY}, "bridges"),  # the index alone is held to it
     ({"arch": "gfx942", **INDEX_ONLY}, "gfx950, got gfx942"),
     ({"index_cache_dtype": "fp8"}, "needs --index-cache-dtype fp4, got fp8"),
@@ -144,7 +147,7 @@ def test_startup_refusals(kw, match):
         check(**kw)
 
 
-def test_what_still_passes_and_v41_keeps_its_fp4_kv():
+def test_fp4_kv_is_m3_and_v41_only():
     check()
     check(hf={}, torch_dtype=torch.float16, **INDEX_ONLY)  # index alone: no pa_decode
     _check_fp4_kv("fp4", is_m3=False, is_v41=True)

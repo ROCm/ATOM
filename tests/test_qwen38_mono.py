@@ -459,6 +459,50 @@ def test_fallback_draft_attention_runs_the_module_without_a_position_cache(
     ]
 
 
+# ------------------------------------------------------------------ a program's launches (GPU)
+
+
+def test_a_launch_does_not_trace_the_program_again(monkeypatch):
+    """After the first launch, ``MonoKernel.launch`` calls the compiled function: later launches trace nothing and
+    still pass their own ``layer``. The program's one task stores its launch's tag
+    (``step * LAYER_SLOTS + layer + 1``)."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    from atom.models.qwen38.mono.kernels.target import MI355X, device_arch
+
+    if device_arch() != MI355X.arch:
+        pytest.skip("an MI355X program")
+    from flydsl.compiler.kernel_function import KernelFunction
+
+    from atom.models.qwen38.mono.kernels.device import buffer_ops as bo
+    from atom.models.qwen38.mono.kernels.device.ops import rsrc
+    from atom.models.qwen38.mono.kernels.kernel import MonoKernel
+    from atom.models.qwen38.mono.kernels.program import Program, Scenario, Stage
+
+    def store_tag(k, t):
+        bo.buffer_store(k.tag, rsrc(k.args["out"]), 0)
+
+    stage = Stage("tag", 1, store_tag, args=("out",), base=0)
+    kernel = MonoKernel(Program("launch_tag", Scenario(1, 1), [stage]))
+    bufs, out = kernel.buffers(), torch.zeros(1, dtype=torch.int32, device="cuda")
+    table = kernel.table({"out": out})
+    kernel.launch(table, bufs)
+    torch.cuda.synchronize()
+    assert out.item() == 1
+    emitted = []
+    emit = KernelFunction._emit_kernel
+    monkeypatch.setattr(
+        KernelFunction,
+        "_emit_kernel",
+        lambda *a, **k: emitted.append(1) or emit(*a, **k),
+    )
+    for layer in (1, 2):
+        kernel.launch(table, bufs, layer=layer)
+        torch.cuda.synchronize()
+        assert out.item() == layer + 1
+    assert not emitted
+
+
 # ------------------------------------------------------------------ the step prep launches (GPU)
 
 

@@ -58,7 +58,7 @@ def validate_runtime_config(config):
     and nowhere else; nothing falls back to FP8:
 
     - both caches: native ATOM (not the vLLM/SGLang bridges), ``--block-size 128``,
-      gfx950, no decode context parallelism (the writer stores a rank's own tokens
+      gfx950, no decode or prefill context parallelism (the writer stores a rank's own tokens
       only and the sparse readers take global lengths: M3 has no DCP gather/merge);
     - ``--kv-cache-dtype fp4`` also: ``--index-cache-dtype fp4`` (the default when omitted, an explicit other value is refused),
       every attention layer an indexed sparse one (M3.1), a bf16 model, no sequence parallelism, no KV offload
@@ -78,6 +78,13 @@ def validate_runtime_config(config):
             "MXFP4 KV / index caches do not run with --decode-context-parallel-size "
             f"{config.decode_context_parallel_size} (> 1): M3's sparse readers have "
             "no DCP gather/merge over the rank-local keys"
+        )
+    if config.prefill_context_parallel_size > 1:
+        # a PCP rank's q rows are a shard of what the sparse metadata covers, which
+        # `_metadata_rows` asserts against (with or without TBO)
+        raise ValueError(
+            "MXFP4 KV / index caches do not run with --prefill-context-parallel-size "
+            f"{config.prefill_context_parallel_size} (> 1)"
         )
     if kv_fp4 and config.index_cache_dtype != "fp4":
         # The MXFP4 KV's attention reads exactly the rows the selection wrote, which

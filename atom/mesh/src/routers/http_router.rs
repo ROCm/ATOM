@@ -142,6 +142,12 @@ impl Router {
                 .body(request.body.clone()),
             Err(err) => return err.response(metadata.route),
         };
+        policy.on_dispatch(
+            metrics_labels::WORKER_REGULAR,
+            Some(&request.headers),
+            &worker,
+        );
+        crate::observability::route_trace::record_dispatch(metrics_labels::WORKER_REGULAR, &worker);
         events::RequestSentEvent { url: worker.url() }.emit();
         let upstream = builder.send().await;
         events::RequestReceivedEvent {}.emit();

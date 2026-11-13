@@ -8,14 +8,15 @@ metadata, and that half is per-runner: asking for a second pool by building a
 second builder would overwrite the first's `forward_vars`. So anything wanting
 a pool of MHA layers can have one -- the model's own, and a draft's.
 
-Two units, and the pool shapes by exactly one. `block_size` is the caller's
-block, the unit every view is taken at; an entry is `blocks_per_entry` of them
-laid end to end, and exists only because that is what `page_pool` charges per.
-Nothing reads at an entry.
+Two units. `block_size` is the caller's block; an entry is `blocks_per_entry`
+of them laid end to end, and is what `page_pool` charges per.
 
-A field says what an entry costs; `kv_views` says how those bytes read, and is
-the only place the element order may be written -- a second copy of it agrees
-on every byte while disagreeing on a shape, which no size check can see.
+A field says what an entry costs; the two views say how those bytes read, and
+a pool is written and read through exactly one of them (`flash_layout`).
+`kv_views` gives the SHUFFLE order at block granularity, `fa_views` the FLASH
+order at entry granularity. Both cover the same bytes, so a row written through
+one is not readable through the other, and no size check can see the mismatch;
+`kv_views` refuses a FLASH pool for that reason.
 """
 
 from __future__ import annotations
@@ -187,22 +188,23 @@ class MhaKvPool:
         head_dim: int,
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
+        flash_layout: bool = False,
         extra_fields: Sequence[EntryField] = (),
         layout: KvLayout | None = None,
     ):
-        # `block_size` is the caller's block, the only token count the pool
-        # shapes anything by. `blocks_per_entry` is how many of them the entry
-        # class holds -- a count, not a second block size, and the only reason
-        # the pool has it is that `entry_bytes` is what sizing charges. The
-        # blocks are contiguous, so the entry is bookkeeping and nothing reads
-        # at it.
         if blocks_per_entry < 1:
             raise ValueError(
                 f"an entry holds at least one block, not {blocks_per_entry}"
             )
         self.block_size = block_size
+        # Which order every writer and reader of this pool uses: FLASH
+        # (`fa_views`, at one per-tensor scale) or the layout's (`kv_views`).
+        # Explicit, not inferred from `blocks_per_entry`: at one block an entry
+        # the shapes match while the element orders still differ.
+        self.flash_layout = bool(flash_layout)
         self.layout = layout if layout is not None else ShuffleLayout(kv_dtype)
-        self.layout.check(block_size, head_dim, blocks_per_entry)
+        if not self.flash_layout:
+            self.layout.check(block_size, head_dim, blocks_per_entry)
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_dtype = kv_dtype
@@ -210,11 +212,22 @@ class MhaKvPool:
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
-        entry_tokens = self.entry_tokens = block_size * blocks_per_entry
+        #
+        # `entry_tokens` is the token span one entry id addresses, which
+        # `fa_views` shapes by and a draft riding another model's block ids
+        # has to agree with.
+        self.entry_tokens = entry_tokens = block_size * blocks_per_entry
         self.cache_fields = self.layout.cache_fields(
             layers, entry_tokens, num_kv_heads, head_dim
         )
-        self.scale_fields = self.layout.scale_fields(layers, entry_tokens, num_kv_heads)
+        # A FLASH pool is read at one scale for the whole cache
+        # (`reshape_and_cache_flash` and `unified_attention` each take one),
+        # so it has no per-token plane.
+        self.scale_fields = (
+            []
+            if self.flash_layout
+            else self.layout.scale_fields(layers, entry_tokens, num_kv_heads)
+        )
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
         # by both the price and the allocation, so a fourth group cannot be
@@ -236,6 +249,7 @@ class MhaKvPool:
         block_size: int,
         layers: int,
         blocks_per_entry: int = 1,
+        flash_layout: bool = False,
         kv_dtype: torch.dtype,
     ) -> MhaKvPool:
         """A pool at the geometry a model config declares, for `layers` of them.
@@ -267,6 +281,7 @@ class MhaKvPool:
             layers=layers,
             block_size=block_size,
             blocks_per_entry=blocks_per_entry,
+            flash_layout=flash_layout,
             num_kv_heads=per_rank,
             head_dim=hf_config.head_dim,
             kv_dtype=kv_dtype,
@@ -318,14 +333,39 @@ class MhaKvPool:
         return self._views[name][layer].view(dtype).view(shape)
 
     def kv_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """One layer's `(k, v)`, aliasing the pool, as its layout reads them."""
+        """One layer's `(k, v)`, aliasing the pool, as its layout reads them.
+
+        Raised on a FLASH pool, whose bytes this order would misread.
+        """
+        if self.flash_layout:
+            raise ValueError("a FLASH-layout pool is read through `fa_views`")
         return self.layout.kv_views(self, layer)
+
+    def fa_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's `(k, v)`, aliasing the pool, in FLASH layout.
+
+        `[entries, entry_tokens, kv_heads, head_dim]` -- the non-shuffled page
+        aiter's `unified_attention` reads at any page width. SHUFFLE needs a
+        power-of-two page there, and an entry is `block_size *
+        blocks_per_entry` tokens; its x-pack also splits `head_dim` across two
+        non-adjacent axes, so no permute of the 5-D view gives this one back.
+
+        The leading axis is the entry, not the block: a page table holds entry
+        ids, so a reader taking `block_tables` straight has to see
+        `entry_tokens` per id. At `blocks_per_entry == 1` the two coincide,
+        which is how a block-granular view would go unnoticed.
+        """
+        nh, hd, et = self.num_kv_heads, self.head_dim, self.entry_tokens
+        return (
+            self.field_view("k", layer, self.kv_dtype, (-1, et, nh, hd)),
+            self.field_view("v", layer, self.kv_dtype, (-1, et, nh, hd)),
+        )
 
     def scale_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k_scale, v_scale)`, one fp32 per (kv head, token).
 
-        An fp8 cache only, which is the only kind that declares them: a
-        `KeyError` here is a binder asking for a scale this dtype never needed.
+        A SHUFFLE fp8 cache only, the only kind that declares them: a
+        `KeyError` here is a binder asking for a scale this pool never needed.
         """
         shape = (-1, self.num_kv_heads, self.block_size)
         return (
