@@ -102,35 +102,26 @@ def _dcp_stage_indexer_fp4_prefill(
     page = prefill_metadata.dcp_indexer_fp4_read_page
     row = prefill_metadata.dcp_indexer_fp4_read_row
     if layout == "mfma":
-        # Scales cannot be indexed by the data plane's row axis. Gather
-        # each logical row's four bytes explicitly, then scatter the same
-        # OPUS permutation after the DCP all-gather.
-        g = torch.arange(4, device=kv_cache.device)
-        scale_at = (
-            g[None, :] % 2 * 128
-            + row[:, None] % 32 * 4
-            + g[None, :] // 2 * 2
-            + row[:, None] // 32
+        # Scales cannot be indexed by the data plane's row axis: each row's
+        # four bytes come from `scale_at`. Both planes are bytes, so one
+        # all-gather moves a row's 64 data and 4 scale bytes together.
+        rows = torch.cat(
+            (
+                kv_cache[page, :, row, :].flatten(1),
+                kv_cache_scale.view(-1)[prefill_metadata.dcp_indexer_fp4_read_scale_at],
+            ),
+            dim=1,
         )
-        data = kv_cache[page, :, row, :]
-        scale = kv_cache_scale.view(-1, 256)[page[:, None], scale_at]
-        group = get_dcp_group()
-        gather_index = prefill_metadata.dcp_indexer_gather_index
-        data = group.all_gather(data, dim=0).index_select(0, gather_index)
-        scale = group.all_gather(scale, dim=0).index_select(0, gather_index)
+        rows = get_dcp_group().all_gather(rows, dim=0)
+        rows = rows.index_select(0, prefill_metadata.dcp_indexer_gather_index)
         page = prefill_metadata.dcp_indexer_fp4_stage_page
         row = prefill_metadata.dcp_indexer_fp4_stage_row
         pages = prefill_metadata.dcp_indexer_fp4_stage_pages
         staged = kv_cache.new_zeros(pages, 4, 64, 16)
         staged_scale = kv_cache_scale.new_zeros(pages, 2, 32, 4)
-        staged[page, :, row, :] = data
-        scale_at = (
-            g[None, :] % 2 * 128
-            + row[:, None] % 32 * 4
-            + g[None, :] // 2 * 2
-            + row[:, None] // 32
-        )
-        staged_scale.view(-1, 256)[page[:, None], scale_at] = scale
+        staged[page, :, row, :] = rows[:, :64].unflatten(1, (4, 16))
+        scale_at = prefill_metadata.dcp_indexer_fp4_stage_scale_at
+        staged_scale.view(-1)[scale_at] = rows[:, 64:]
         return staged, staged_scale
     data = kv_cache[page, :, :, row, :]
     scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]

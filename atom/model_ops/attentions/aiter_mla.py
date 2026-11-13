@@ -82,6 +82,7 @@ from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
 )
+from atom.mono.dsa_indexer.plan import fp4_scale_byte
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
     decompose_slots_triton,
@@ -1963,10 +1964,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 g_cu,
                 g_lens,
                 var[f"{prefix}block_tables"].np[:bs],
+                self.model_runner.config.index_cache_layout,
             )
 
     def _build_dcp_indexer_fp4_prefill_meta(
-        self, attn_metadata, bs: int, lpad, cu_pad, g_cu, g_lens, block_tables
+        self,
+        attn_metadata,
+        bs: int,
+        lpad,
+        cu_pad,
+        g_cu,
+        g_lens,
+        block_tables,
+        layout="preshuffle",
     ):
         """Where FP4 staging reads this rank's shard and where it lays the
         gathered keys out: each request's from a page of its own, so a
@@ -2001,11 +2011,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Torch fallback (CPU / test builders); also the kernel's reference.
             page, row = slots // block, slots % block
             parts = (page, row, fp4_index_scale_rows(row, block))
+        names = ("page", "row", "scale_row")
+        if layout == "mfma":
+            # The OPUS e8m0 plane takes each row's four bytes from four
+            # places; index in int64 here, so no layer casts or rebuilds them.
+            chunk = torch.arange(4, device=slots.device)
+            parts = (
+                parts[0].long(),
+                parts[1].long(),
+                fp4_scale_byte(slots.long()[:, None], chunk),
+            )
+            names = ("page", "row", "scale_at")
         for side, cut in (
             ("read", slice(0, len(read))),
             ("stage", slice(len(read), None)),
         ):
-            for part, tensor in zip(("page", "row", "scale_row"), parts):
+            for part, tensor in zip(names, parts):
                 setattr(attn_metadata, f"dcp_indexer_fp4_{side}_{part}", tensor[cut])
         attn_metadata.dcp_indexer_fp4_stage_pages = int(first_page[bs])
 
