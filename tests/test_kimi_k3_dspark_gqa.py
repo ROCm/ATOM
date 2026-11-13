@@ -369,6 +369,8 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
             kv_cache_dtype=kv_cache_dtype,
             tensor_parallel_size=tp,
             decode_context_parallel_size=dcp,
+            # the draft's dtype, settled once by `Config` (the target's here)
+            speculative_config=types.SimpleNamespace(draft_kv_dtype=kv_cache_dtype),
         ),
     )
 
@@ -391,8 +393,6 @@ def _make_kv_pool_kwargs(runner, model=None):
     seen = {}
 
     class _Backend:
-        DRAFT_OWNS_KV_POOL = True
-
         @staticmethod
         def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
             seen.update(kw, world_size=world_size, kv_dtype=kv_dtype)
@@ -400,7 +400,7 @@ def _make_kv_pool_kwargs(runner, model=None):
 
     with (
         mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
-        mock.patch.object(selector, "attn_family", lambda _c: None),
+        mock.patch.object(selector, "attn_family", lambda _c: selector.Family.MHA),
     ):
         builder = dk.draft_kv_builder(
             runner,

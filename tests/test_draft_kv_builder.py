@@ -29,6 +29,7 @@ from atom.spec_decode.draft_kv import (
     DraftKvBuilder,
     DraftKvPoolSpec,
     draft_kv_builder,
+    draft_owns_kv_pool,
 )
 
 
@@ -39,6 +40,7 @@ class _PagedAttention(nn.Module):
         super().__init__()
         self.base_attention = True
         self.use_mla = False
+        self.impl = SimpleNamespace(kv_layout=None)
         self.page_tokens = None
 
 
@@ -368,6 +370,60 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert asked == [(draft_layers, TARGET_BLOCK)]
 
 
+def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypatch):
+    """The vLLM offload adapter hands over vLLM's own SpeculativeConfig: `method`, no
+    `draft_model_hf_config`; and the selector has no backend for every draft flavor
+    there. Neither is consulted under a plugin."""
+    from atom.plugin import prepare
+    from atom.utils import selector
+
+    def refuse(*_a):
+        raise AssertionError("the selector was asked")
+
+    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
+    monkeypatch.setattr(selector, "attn_family", refuse)
+    vllm_spec = SimpleNamespace(method="eagle3", draft_model_config=object())
+    assert draft_owns_kv_pool(SimpleNamespace(speculative_config=vllm_spec)) is False
+
+
+@pytest.mark.parametrize(
+    "target, pool_dtype", [("fp4", "bf16"), ("fp8", "fp8")]  # fp4 has no draft layout
+)
+def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
+    target, pool_dtype
+):
+    """The draft's attention reads its dtype off the config it is built with and its
+    pool is built at `draft_kv_dtype`: one value; the target's config keeps its own."""
+    # eagle_proposer pulls aiter in through atom.distributed.pcp_utils
+    pytest.importorskip("aiter", reason="the proposer imports aiter at module load")
+    import atom.spec_decode.eagle_proposer as mod
+    from atom.config import CompilationConfig, resolve_draft_kv_dtype
+
+    spec = SimpleNamespace(method="eagle3", draft_model_hf_config=SimpleNamespace())
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True)
+    assert spec.draft_kv_dtype == pool_dtype
+    p = mod.EagleProposer.__new__(mod.EagleProposer)
+    p.speculative_config, p.runner = spec, SimpleNamespace()
+    p.config = SimpleNamespace(
+        kv_cache_dtype=target,
+        hf_config=SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+    seen = {}
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    orig, mod.draft_kv_builder = mod.draft_kv_builder, lambda runner, hf, model: None
+    try:
+        p._build_draft_model(model_class)
+    finally:
+        mod.draft_kv_builder = orig
+
+    assert seen == {"dtype": pool_dtype} and p.config.kv_cache_dtype == target
+
+
 def test_gqa_draft_layers_share_one_bound_unit_scale_tensor():
     """The DSpark GQA draft's pool binds every layer the same one-element tensor
     at the scale its spec declares, at bind time: both its write and its read
@@ -526,13 +582,13 @@ def test_a_declared_pool_on_a_backend_that_cannot_own_one_is_refused(
     from atom.utils import selector
 
     class _Backend:
-        DRAFT_OWNS_KV_POOL = False
+        pass
 
     class _Draft:
         kv_pool_spec = DraftKvPoolSpec() if declared else None
 
     monkeypatch.setattr(selector, "get_attn_backend", lambda _family: _Backend)
-    monkeypatch.setattr(selector, "attn_family", lambda _cfg: None)
+    monkeypatch.setattr(selector, "attn_family", lambda _cfg: selector.Family.MLA)
     runner = SimpleNamespace(config=SimpleNamespace(kv_cache_dtype="bf16"))
     if declared:
         with pytest.raises(ValueError, match="cannot own a draft pool"):
