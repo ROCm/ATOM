@@ -27,7 +27,6 @@ def ffn_reduce_defs(k4ctx):
     own_task = k4ctx["own_task"]
     peer_addr = k4ctx["peer_addr"]
     push_rows = k4ctx["push_rows"]
-    rank = k4ctx["rank"]
     sym = k4ctx["sym"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]

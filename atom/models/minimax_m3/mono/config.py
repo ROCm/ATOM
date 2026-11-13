@@ -88,6 +88,9 @@ MAX_INDEX_BLOCKS = MAX_CONTEXT // SPARSE_BLOCK
 PAGE16 = 16
 
 MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
+# the most rows a front-half build serves: 16-row token groups (``pre_attn.TG``), the
+# lane-resident step plan (``index_score``: a lane a row) holds one wave of rows
+MAX_ROWS = 64
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
 # a request past this many index blocks is selected by the split stage's long
