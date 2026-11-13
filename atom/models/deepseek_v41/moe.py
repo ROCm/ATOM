@@ -46,7 +46,6 @@ from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 
 
@@ -163,10 +162,7 @@ class MoE(V4MoE):
         args.moe_fp8_activations = True
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
         # After `shared_experts` (see `_SharedExpertFold`).
-        if (
-            getattr(self, "shared_experts", None) is not None
-            and envs.ATOM_DSV41_FOLD_SHARED_EXPERT
-        ):
+        if getattr(self, "shared_experts", None) is not None:
             self.shared_fold = _SharedExpertFold(self)
         self.gate.bias_vl = atom_parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32)

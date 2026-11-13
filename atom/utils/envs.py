@@ -650,11 +650,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
-    # DeepSeek-V4.1 with ptpc_fp8 routed experts: fold the shared expert into
-    # their FP8 MoE. 0 keeps it a separate BF16 module.
-    "ATOM_DSV41_FOLD_SHARED_EXPERT": lambda: (
-        os.getenv("ATOM_DSV41_FOLD_SHARED_EXPERT", "1") == "1"
-    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
