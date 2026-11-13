@@ -221,11 +221,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 "[q | k | v]), which a decode at another TP needs"
             )
         if config.pipeline_parallel_size > 1:
-            # Without explicit indices, `consumer_region_indices` places a
-            # stage's regions group-major from its `start_layer`, in groups of
-            # the stage's layer count. The MLA rows and KDA slots are each
-            # numbered over their own kind only, so that placement would write
-            # one layer's KV or state over another's.
+            # Without explicit indices, `consumer_region_indices` puts a
+            # stage's region for layer l of group g at peer index
+            # g * (peer regions / groups) + start_layer + l. The MLA rows and
+            # KDA slots are each numbered over their own kind only, so that
+            # placement would write one layer's KV or state over another's.
             mla, slots = self._pp_consumer_region_indices(
                 len(tensors.block_regions), len(tensors.slot_regions)
             )
