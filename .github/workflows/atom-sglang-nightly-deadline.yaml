@@ -1,0 +1,64 @@
+name: ATOM SGLang Nightly Deadline
+
+# Stops the scheduled SGLang benchmark / accuracy runs that are still going at
+# 09:00 Beijing time, so a nightly that overruns does not hold the GPU runners
+# into the working day. Manually dispatched runs are left alone.
+on:
+  schedule:
+    - cron: '0 1 * * *'  # 09:00 Beijing time (01:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  stop-overrunning-nightly-runs:
+    name: Stop scheduled SGLang runs still in progress
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      WORKFLOWS: atom-sglang-benchmark.yaml atom-sglang-accuracy-validation.yaml
+      # A plain cancel still runs the GPU jobs' `if: always()` container
+      # cleanup; runs that have not finished after this grace period are
+      # force-cancelled, which skips it.
+      GRACE_SECONDS: 300
+    steps:
+      - name: Cancel, then force-cancel what is left
+        run: |
+          set -euo pipefail
+
+          unfinished_runs() {
+            for workflow in ${WORKFLOWS}; do
+              gh api "repos/${GH_REPO}/actions/workflows/${workflow}/runs?event=schedule&per_page=50" \
+                --jq '.workflow_runs[] | select(.status != "completed") | .id'
+            done
+          }
+
+          runs="$(unfinished_runs)"
+          if [ -z "${runs}" ]; then
+            echo "No scheduled SGLang run is still in progress."
+            exit 0
+          fi
+
+          for run in ${runs}; do
+            echo "Cancelling run ${run}: https://github.com/${GH_REPO}/actions/runs/${run}"
+            gh api -X POST "repos/${GH_REPO}/actions/runs/${run}/cancel" || true
+          done
+
+          deadline=$(( $(date +%s) + GRACE_SECONDS ))
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            runs="$(unfinished_runs)"
+            [ -z "${runs}" ] && break
+            sleep 30
+          done
+
+          runs="$(unfinished_runs)"
+          if [ -z "${runs}" ]; then
+            echo "All overrunning scheduled runs are cancelled."
+            exit 0
+          fi
+          for run in ${runs}; do
+            echo "Force-cancelling run ${run}: https://github.com/${GH_REPO}/actions/runs/${run}"
+            gh api -X POST "repos/${GH_REPO}/actions/runs/${run}/force-cancel" || true
+          done
