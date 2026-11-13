@@ -315,11 +315,13 @@ class KimiMLP(nn.Module):
             x, x_scale = x
         return self.act_and_down_proj(self.gate_up_proj(x, x_scale))
 
-    def act_and_down_proj(self, gate_up: torch.Tensor) -> torch.Tensor:
+    def act_and_down_proj(
+        self, gate_up: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # act_fn always returns (activation, scale): (fp8, scale) when it fused the
         # down_proj activation quant, else (bf16, None) so down_proj self-quantizes.
         act, act_scale = self.act_fn(gate_up)
-        return self.down_proj(act, x_scale=act_scale)
+        return self.down_proj(act, x_scale=act_scale, out=out)
 
 
 class MergedBF16Linears(nn.Module):
@@ -740,8 +742,13 @@ class KimiSparseMoeBlock(nn.Module):
         if self.front_proj is not None and self.front_proj.merged_weight is not None:
             gate_up, router_logits, routed_input = self.front_proj(hidden_states)
             # aiter's fused MoE takes its tuned kernels only on contiguous input.
+            routed_input = routed_input.contiguous()
+            if self.tp_size > 1 and self.shared_experts.down_proj.supports_out():
+                return self._one_reduce_split(
+                    hidden_states, gate_up, router_logits, routed_input
+                )
             routed_output = self.routed_expert_forward(
-                hidden_states, router_logits, routed_input.contiguous()
+                hidden_states, router_logits, routed_input
             )
             shared_output = self.shared_experts.act_and_down_proj(gate_up)
             if self.tp_size > 1:
@@ -775,6 +782,32 @@ class KimiSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output, None
+
+    def _one_reduce_split(
+        self,
+        hidden_states: torch.Tensor,
+        gate_up: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The latent and shared partial sums reduced by one all-reduce: the
+        experts and the shared down_proj write them into one buffer, the
+        latent block first, each block contiguous as its writer requires."""
+        latent_numel = routed_input.numel()
+        partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
+        self.experts(
+            routed_input,
+            router_logits,
+            out=partials[:latent_numel].view_as(routed_input),
+        )
+        self.shared_experts.act_and_down_proj(
+            gate_up, out=partials[latent_numel:].view_as(hidden_states)
+        )
+        reduced = tensor_model_parallel_all_reduce(partials)
+        routed_output = self._apply_routed_norm_and_up_proj(
+            reduced[:latent_numel].view_as(routed_input)
+        )
+        return routed_output, reduced[latent_numel:].view_as(hidden_states)
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Summed dual-stream dispatch target, for callers that cannot defer."""
