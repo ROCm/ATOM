@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 import time
+from concurrent.futures import Future
 from threading import Event
 from types import SimpleNamespace
 
@@ -14,6 +15,22 @@ from atom.kv_transfer.offload.mooncake_store.layouts import (
     REPLAY_PAGE_CODEC_ID,
     mooncake_codec_id,
 )
+
+
+def test_failed_lookup_warning_is_rate_limited_and_preserves_nonanswer(caplog):
+    client = AsyncStoreLookup(SimpleNamespace(lookup=lambda *args, **kwargs: None))
+    try:
+        future = Future()
+        future.set_exception(RuntimeError("Store unavailable"))
+        client.pending["failed"] = future
+        assert client.has_answer("failed") is False
+        assert client.has_answer("failed") is False
+        assert client.lookup(SimpleNamespace(id="failed")) is None
+        warnings = [r for r in caplog.records if "Store lookup failed" in r.message]
+        assert len(warnings) == 1
+        assert "Store unavailable" in warnings[0].message
+    finally:
+        client.close()
 
 
 def test_async_query_is_bounded_and_cancellable():

@@ -99,6 +99,7 @@ class KVConnectorSchedulerBase(ABC):
     for lifecycle events it does not own.
     """
 
+    is_offload = False
     is_producer: bool
 
     # Offload-tier hooks the scheduler reads from any connector; one without a
@@ -164,7 +165,7 @@ class KVConnectorSchedulerBase(ABC):
         can drop its store it answers False, and the engine refuses the weight
         change rather than serve old-weight KV from it.
         """
-        return not getattr(self, "is_offload", False)
+        return not self.is_offload
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

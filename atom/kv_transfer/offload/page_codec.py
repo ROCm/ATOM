@@ -40,8 +40,8 @@ def replay_page_codec(
     if not replays_state(transfer_tensors):
         raise ValueError("PAGE replay offload requires the state replay contract")
     if (
-        getattr(transfer_tensors, "paged_state_checkpoint_spec", None) is not None
-        or getattr(transfer_tensors, "execute_paged_state_copies", None) is not None
+        transfer_tensors.paged_state_checkpoint_spec is not None
+        or transfer_tensors.execute_paged_state_copies is not None
         or getattr(transfer_tensors.state_backend.state_transfer(), "copies", False)
     ):
         raise ValueError("PAGE replay offload cannot carry native state checkpoints")

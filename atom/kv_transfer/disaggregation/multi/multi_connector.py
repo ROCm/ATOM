@@ -425,9 +425,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # must not compete with a speculative Store read into the same blocks.
         if not self.is_producer:
             return None
-        return next(
-            (c for c in self._connectors if getattr(c, "is_offload", False)), None
-        )
+        return next((c for c in self._connectors if c.is_offload), None)
 
     @property
     def chunk_size(self):
@@ -537,7 +535,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
-        self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        self.is_offload = any(c.is_offload for c in self._connectors)
         self.enable_chunked_transfer = any(
             getattr(c, "enable_chunked_transfer", False) and c.is_producer
             for c in self._connectors
@@ -627,9 +625,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             self._load_winner[sid] = winner
             for c in self._connectors:
                 if c is not winner:
-                    fn = getattr(c, "cancel_pending_load", None)
-                    if callable(fn):
-                        fn(seq)
+                    c.cancel_pending_load(seq)
         else:
             self._load_winner.pop(sid, None)
         return result
@@ -647,9 +643,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """
         self._load_winner.pop(seq.id, None)
         for c in self._connectors:
-            fn = getattr(c, "cancel_pending_load", None)
-            if callable(fn):
-                fn(seq)
+            c.cancel_pending_load(seq)
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
         return MultiConnectorMetadata(

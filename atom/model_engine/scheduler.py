@@ -2399,8 +2399,7 @@ class Scheduler:
                 (
                     seq
                     for seq in self.waiting
-                    if seq.status == SequenceStatus.WAITING
-                    and not getattr(seq, "offload_loaded", False)
+                    if seq.status == SequenceStatus.WAITING and not seq.offload_loaded
                 ),
                 None,
             )
@@ -2432,14 +2431,12 @@ class Scheduler:
             if not priority_tick:
                 partial_order = sorted(
                     self.running,
-                    key=lambda seq: bool(
-                        seq.is_partial_prefill and getattr(seq, "offload_loaded", False)
-                    ),
+                    key=lambda seq: bool(seq.is_partial_prefill and seq.offload_loaded),
                 )
             for seq in partial_order:
                 if seq.id in scheduled_seqs:
                     continue
-                if force_waiting_cold and getattr(seq, "offload_loaded", False):
+                if force_waiting_cold and seq.offload_loaded:
                     continue
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -2856,16 +2853,15 @@ class Scheduler:
             cold_rows = sum(
                 width
                 for seq, width in zip(scheduled_seqs.values(), num_scheduled_tokens)
-                if not getattr(seq, "offload_loaded", False)
+                if not seq.offload_loaded
             )
             cold_waiting = any(
                 seq.is_partial_prefill
-                and not getattr(seq, "offload_loaded", False)
+                and not seq.offload_loaded
                 and seq.id not in self._checkpoint_holds
                 for seq in self.running
             ) or any(
-                seq.status == SequenceStatus.WAITING
-                and not getattr(seq, "offload_loaded", False)
+                seq.status == SequenceStatus.WAITING and not seq.offload_loaded
                 for seq in self.waiting
             )
             if cold_rows or not cold_waiting:
@@ -3315,10 +3311,7 @@ class Scheduler:
         terminal_queued = self._pop_req_id(
             self.finished_recving_kv_req_ids, seq.id
         ) or self._pop_req_id(self.failed_recving_kv_req_ids, seq.id)
-        terminal_consumed = bool(
-            getattr(seq, "offload_loaded", False)
-            or getattr(seq, "offload_load_failed", False)
-        )
+        terminal_consumed = bool(seq.offload_loaded or seq.offload_load_failed)
         if terminal_queued or terminal_consumed:
             self._cleanup_aborted_load(seq)
             return
@@ -3984,8 +3977,8 @@ class Scheduler:
                 getattr(seq, "_counted_as_inflight_load", False)
                 and len(seq.block_table) > 0
                 and self._still_loading(seq)
-                and not getattr(seq, "offload_loaded", False)
-                and not getattr(seq, "offload_load_failed", False)
+                and not seq.offload_loaded
+                and not seq.offload_load_failed
             ):
                 return cap
         return 0
@@ -3998,7 +3991,7 @@ class Scheduler:
             and seq.is_partial_prefill
             and start == resume
             and seq.replay_until <= resume
-            and not getattr(seq, "offload_loaded", False)
+            and not seq.offload_loaded
         )
 
     def _ready_short_demand(self, seq: Sequence, *, running: bool) -> int:
@@ -4006,15 +3999,15 @@ class Scheduler:
         if (
             not seq.block_table
             or seq.status == SequenceStatus.ABORTED
-            or getattr(seq, "offload_load_failed", False)
-            or getattr(seq, "state_fork_src", -1) >= 0
+            or seq.offload_load_failed
+            or seq.state_fork_src >= 0
             or self._requires_atomic_prefill(seq)
         ):
             return 0
         if running:
             if (
                 not seq.is_partial_prefill
-                or not getattr(seq, "offload_loaded", False)
+                or not seq.offload_loaded
                 or seq.id in self._checkpoint_holds
             ):
                 return 0
@@ -4025,9 +4018,7 @@ class Scheduler:
             if seq.status not in (
                 SequenceStatus.WAITING,
                 SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ) or not (
-                self._tier_load_succeeded(seq) or getattr(seq, "offload_loaded", False)
-            ):
+            ) or not (self._tier_load_succeeded(seq) or seq.offload_loaded):
                 return 0
             pair = self._tier_waiter_resume(seq)
             if pair is None:
@@ -4059,9 +4050,9 @@ class Scheduler:
             return num_seqs_prefill, num_batched_tokens
         if any(
             seq.is_partial_prefill
-            and not getattr(seq, "offload_loaded", False)
+            and not seq.offload_loaded
             and seq.id not in self._checkpoint_holds
-            and getattr(seq, "state_fork_src", -1) >= 0
+            and seq.state_fork_src >= 0
             for seq in self.running
         ):
             return num_seqs_prefill, num_batched_tokens

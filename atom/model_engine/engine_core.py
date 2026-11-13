@@ -849,6 +849,11 @@ class EngineCore:
             logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
             self.scheduler.extend(recv_reqs)
             self._ingested_seqs += len(recv_reqs)
+        self._apply_prefix_credit_updates(credit_updates)
+        return False
+
+    def _apply_prefix_credit_updates(self, credit_updates):
+        """Apply credits and publish the same authoritative backlog snapshot."""
         if credit_updates:
             self.scheduler.correct_prefix_estimates(credit_updates)
             report = (self._ingested_seqs, prefill_backlog(self.scheduler))
@@ -859,7 +864,6 @@ class EngineCore:
                 )
             )
             self._last_backlog_report = report
-        return False
 
     # How often the backlog is recomputed. Walking `waiting` costs about 0.25 us
     # a request (240 us at the 1024 the walk is capped at), on the engine
@@ -1650,18 +1654,7 @@ class DecodeEngineCore(EngineCore):
         if recv_reqs:
             self.scheduler.extend(recv_reqs)
             self._ingested_seqs += len(recv_reqs)
-        if credit_updates:
-            self.scheduler.correct_prefix_estimates(credit_updates)
-            self.output_queue.put_nowait(
-                (
-                    "PREFILL_BACKLOG",
-                    (
-                        self._ingested_seqs,
-                        prefill_backlog(self.scheduler),
-                        credit_updates,
-                    ),
-                )
-            )
+        self._apply_prefix_credit_updates(credit_updates)
         for seq in self.scheduler.allocate_waiting():
             self._send_block_assignment(seq)
         return False

@@ -114,9 +114,18 @@ class AsyncStoreLookup(LookupClient):
         self.discarded = set()
         self.discarded_hits = {}
         self.closed = False
+        self._next_failure_warning = 0.0
 
     def supports_async(self):
         return True
+
+    def _warn_lookup_failure(self, exc):
+        now = time.monotonic()
+        with self.lock:
+            if now < self._next_failure_warning:
+                return
+            self._next_failure_warning = now + 60.0
+        logger.warning("Mooncake Store lookup failed; answer unavailable: %s", exc)
 
     def _query(self, seq, sid):
         with self.backend_lock:
@@ -184,7 +193,8 @@ class AsyncStoreLookup(LookupClient):
                 return False
             try:
                 return f.result() is not None
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                self._warn_lookup_failure(exc)
                 return False
 
     def __getattr__(self, name):
@@ -201,7 +211,8 @@ class AsyncStoreLookup(LookupClient):
             return None
         try:
             result = f.result()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._warn_lookup_failure(exc)
             result = None
         with self.lock:
             if self.pending.get(sid) is f and f.done():
