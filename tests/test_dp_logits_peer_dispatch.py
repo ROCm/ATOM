@@ -69,14 +69,22 @@ def test_target_head_keeps_only_own_rows(modules, monkeypatch, rank, local_rows,
         mod, "get_forward_context", lambda: NS(context=NS(running_tokens=max_rows))
     )
     monkeypatch.setattr(mod.envs, "ATOM_USE_CUSTOM_ALL_GATHER", True)
-    monkeypatch.setattr(mod, "tgemm", NS(mm=lambda x, w, b: x @ w.t() + b))
+
+    def mm(x, w, b, out=None):
+        result = x @ w.t() + b
+        return result if out is None else out.copy_(result)
+
+    monkeypatch.setattr(mod, "tgemm", NS(mm=mm))
 
     class Peer:
         max_rows = 4 if path != "capacity_fallback" else 3
 
-        def __call__(self, logits, rows):
-            torch.testing.assert_close(logits, shards[rank], rtol=0, atol=0)
-            assert rows == local_rows
+        def produce(self, fill, rows, own_rows):
+            # The head's GEMM writes this rank's shard into the pool slot.
+            slot = torch.full((4 * rows, 64), float("nan"), dtype=torch.bfloat16)
+            fill(slot)
+            torch.testing.assert_close(slot, shards[rank], rtol=0, atol=0)
+            assert (rows, own_rows) == (max_rows, local_rows)
             calls.append("peer")
             return expected.clone()
 
@@ -163,9 +171,12 @@ def test_pool_prepares_all_row_buckets_before_capture(modules, monkeypatch):
             }
             self.max_rows = max_rows
 
-        def __call__(self, scratch, rows):
-            assert scratch.shape == (4 * rows, 64)
-            assert scratch.dtype == h.weight.dtype
+        def produce(self, fill, rows, own_rows):
+            assert own_rows == rows
+            slot = torch.zeros((4 * rows, 64), dtype=h.weight.dtype)
+            fill(slot)
+            # Warmup is transport only: nothing is written into the pool.
+            assert not slot.any()
             calls.append(rows)
 
     monkeypatch.setattr(modules.exchange, "PeerLogitsExchange", Peer)
