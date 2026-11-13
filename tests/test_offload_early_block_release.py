@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import (
@@ -35,11 +35,13 @@ from atom.model_engine.sequence import Sequence
 
 
 def _config(role="kv_producer", *, block_size=4):
-    return SimpleNamespace(
-        kv_transfer_config={"kv_role": role},
-        kv_cache_block_size=block_size,
-        decode_context_parallel_size=1,
-        tensor_parallel_size=1,
+    return with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": role},
+            kv_cache_block_size=block_size,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+        )
     )
 
 

@@ -30,7 +30,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
@@ -431,20 +431,24 @@ def _extra(**overrides):
 
 
 def _config(role="offload", *, pp=1, tp=1, layers=4, extra=None, **fields):
-    config = SimpleNamespace(
-        kv_transfer_config={
-            "kv_connector": "mooncake_store",
-            "kv_role": role,
-            "kv_connector_extra_config": _extra() if extra is None else extra,
-        },
-        kv_cache_block_size=BLOCK,
-        decode_context_parallel_size=1,
-        tensor_parallel_size=tp,
-        pipeline_parallel_size=pp,
-        hf_config=SimpleNamespace(num_hidden_layers=layers, model_type="glm_moe_dsa"),
-        model="test-model",
-        kv_cache_dtype="fp8",
-        speculative_config=None,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={
+                "kv_connector": "mooncake_store",
+                "kv_role": role,
+                "kv_connector_extra_config": _extra() if extra is None else extra,
+            },
+            kv_cache_block_size=BLOCK,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            hf_config=SimpleNamespace(
+                num_hidden_layers=layers, model_type="glm_moe_dsa"
+            ),
+            model="test-model",
+            kv_cache_dtype="fp8",
+            speculative_config=None,
+        )
     )
     for name, value in fields.items():
         setattr(config, name, value)
@@ -2037,11 +2041,13 @@ def test_dense_scheduler_load_request_is_unchanged(monkeypatch):
         lambda _config=None: SimpleNamespace(chunk_size=CHUNK),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_role": "kv_consumer"},
-        kv_cache_block_size=BLOCK,
-        decode_context_parallel_size=1,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "kv_consumer"},
+            kv_cache_block_size=BLOCK,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+        )
     )
     scheduler = DenseOffloadScheduler(config)
     seq = _seq(10, 40)
@@ -3184,7 +3190,7 @@ def test_v41_registration_requires_explicit_page_replay(cluster, one_rank, repla
     config.enable_encoder_swa_bounded_replay = True
     transfer = SimpleNamespace(
         state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(replays=replays)
+            state_transfer=lambda: SimpleNamespace(replays=replays, copies=False)
         )
     )
     worker = MooncakeStoreOffloadConnector(config)
@@ -3216,7 +3222,7 @@ def test_v41_registration_uses_pages_without_request_slots(
         block_tensor_views=[SimpleNamespace(device=torch.device("cpu"))],
         num_blocks=8,
         state_backend=SimpleNamespace(
-            state_transfer=lambda: SimpleNamespace(replays=True)
+            state_transfer=lambda: SimpleNamespace(replays=True, copies=False)
         ),
     )
     selected = {}
@@ -3242,6 +3248,49 @@ def test_v41_registration_uses_pages_without_request_slots(
         assert worker._pool is not None
     finally:
         worker.close()
+
+
+@pytest.mark.parametrize("field", ["spec", "callback", "copies"])
+def test_replay_page_codec_refuses_native_state_contract(field):
+    from atom.kv_transfer.offload.page_codec import replay_page_codec
+
+    transfer = SimpleNamespace(
+        block_regions=[object()],
+        slot_regions=[object()],
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(
+                replays=True, copies=field == "copies"
+            )
+        ),
+        paged_state_checkpoint_spec=object() if field == "spec" else None,
+        execute_paged_state_copies=(lambda: None) if field == "callback" else None,
+    )
+    with pytest.raises(ValueError, match="cannot carry native state checkpoints"):
+        replay_page_codec(transfer, 8)
+
+
+@pytest.mark.parametrize("replays", [None, False])
+def test_replay_page_codec_refuses_unconfirmed_replay(replays):
+    from atom.kv_transfer.offload.page_codec import replay_page_codec
+
+    transfer = SimpleNamespace(
+        block_regions=[object()],
+        slot_regions=[object()],
+        state_backend=SimpleNamespace(
+            state_transfer=lambda: SimpleNamespace(replays=replays, copies=False)
+        ),
+    )
+    with pytest.raises(ValueError, match="requires the state replay contract"):
+        replay_page_codec(transfer, 8)
+
+
+def test_pure_page_codec_still_refuses_live_pd_slot():
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+
+    with pytest.raises(ValueError, match="requires empty SLOT"):
+        pure_page_codec(
+            SimpleNamespace(block_regions=[object()], slot_regions=[object()]), 8
+        )
 
 
 def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):

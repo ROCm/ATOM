@@ -20,7 +20,7 @@ def test_credit_ack_snapshot_does_not_suppress_finished_backlog(monkeypatch):
     engine._ingested_seqs = 2
     engine._last_backlog_report = (2, 0)
     engine._next_backlog_report = 0
-    seq = SimpleNamespace(num_completion_tokens=0)
+    seq = SimpleNamespace(num_completion_tokens=0, is_partial_prefill=False)
     engine.scheduler = SimpleNamespace(
         waiting=[],
         running=[seq],
