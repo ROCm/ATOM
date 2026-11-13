@@ -9,17 +9,21 @@ use super::types::{PlacementError, PlacementPlan, Protocol, RequestDescriptor};
 use crate::core::{ConnectionMode, HashRing, Worker, WorkerType};
 use crate::kv_events::Namespace;
 use crate::kv_index::PrefixRequest;
-use crate::observability::metrics::{metrics_labels, MeshMetrics};
+use crate::observability::{
+    metrics::{metrics_labels, MeshMetrics},
+    route_trace,
+};
 use crate::policies::{LoadBalancingPolicy, NO_HEALTHY_WORKERS};
 
 fn health_filter(pool: Vec<Arc<dyn Worker>>) -> Vec<Arc<dyn Worker>> {
     pool.into_iter().filter(|w| w.is_available()).collect()
 }
 
-/// Counts a selection that has no candidate in `pool`. The policy never runs,
+/// Records a selection that has no candidate in `pool`. The policy never runs,
 /// so it cannot report the failure itself.
 fn report_no_candidates(pool: &'static str, policy: &dyn LoadBalancingPolicy) {
     MeshMetrics::record_route_branch(pool, policy.name(), NO_HEALTHY_WORKERS);
+    route_trace::record_selection(pool, policy.name(), None, NO_HEALTHY_WORKERS, None);
 }
 
 pub struct DefaultPlanner {
