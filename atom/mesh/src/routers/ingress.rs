@@ -1,5 +1,8 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 
 use axum::{
     extract::{FromRequestParts, Path, RawQuery, Request, State},
@@ -8,7 +11,9 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use dashmap::DashSet;
 use http::{HeaderMap, Uri};
+use tracing::warn;
 
 use crate::{
     app_context::AppContext,
@@ -36,6 +41,29 @@ enum Tokens {
     /// Used when the router can tokenize the request and it carries no media.
     Wanted,
     Needed,
+}
+
+/// Models whose requests could not be tokenized for the KV event index, each warned of
+/// once. A request names its own model, so no more than this many are kept.
+static UNTOKENIZED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+const MAX_UNTOKENIZED_MODELS: usize = 64;
+
+/// Counts a request that `cache_aware` places by its text, as the router cannot tokenize it.
+fn untokenized(model: Option<&str>, error: &IngressError) {
+    metrics::counter!("mesh_kv_events_untokenized_total", "reason" => error.code).increment(1);
+    let model = model.unwrap_or_default();
+    let models = &UNTOKENIZED_MODELS;
+    if models.len() < MAX_UNTOKENIZED_MODELS
+        && !models.contains(model)
+        && models.insert(model.to_string())
+    {
+        warn!(
+            model,
+            reason = error.code,
+            error = %error.message,
+            "Placing the model's requests by their text: the router cannot tokenize them for the KV event index"
+        );
+    }
 }
 
 const MAX_RESPONSE_ID_BYTES: usize = 256;
@@ -682,13 +710,15 @@ impl IngressRouting {
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
         let tokens = match tokens {
-            Tokens::Needed => Some(self.tokens(parsed, &metadata, ctx)?),
+            Tokens::Needed => Some(self.tokens(parsed, &metadata, ctx, false)?),
             Tokens::Wanted if parsed.carries_media() => None,
-            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx) {
+            // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
+            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
-                Err(_) => {
+                Err(error) => {
                     ctx.check()?;
+                    untokenized(metadata.model.as_deref(), &error);
                     None
                 }
             },
@@ -785,11 +815,14 @@ impl IngressRouting {
         Ok(())
     }
 
+    /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
+    /// when `add_special_tokens`.
     fn tokens(
         &self,
         parsed: &ParsedInference,
         metadata: &InferenceMetadata,
         ctx: &JobContext,
+        add_special_tokens: bool,
     ) -> Result<Vec<u32>, IngressError> {
         ctx.check()?;
         if let Some(ids) = parsed.input_tokens().map_err(IngressError::invalid)? {
@@ -838,7 +871,7 @@ impl IngressRouting {
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
         let tokens = encoder
-            .encode(&prompt, false)
+            .encode(&prompt, add_special_tokens)
             .map_err(|e| IngressError::invalid(e.to_string()))?
             .token_ids()
             .to_vec();

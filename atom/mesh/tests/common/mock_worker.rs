@@ -447,6 +447,7 @@ async fn chat_completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
         return (
@@ -502,7 +503,7 @@ async fn chat_completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        Json(json!({
+        let response = Json(json!({
             "id": format!("chatcmpl-{}", Uuid::new_v4()),
             "object": "chat.completion",
             "created": timestamp,
@@ -520,8 +521,8 @@ async fn chat_completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
-        }))
-        .into_response()
+        }));
+        ([("x-worker-id", worker_id)], response).into_response()
     }
 }
 
@@ -530,6 +531,7 @@ async fn completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
         return (
@@ -584,7 +586,7 @@ async fn completions_handler(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        Json(json!({
+        let response = Json(json!({
             "id": format!("cmpl-{}", Uuid::new_v4()),
             "object": "text_completion",
             "created": timestamp,
@@ -600,8 +602,8 @@ async fn completions_handler(
                 "completion_tokens": 5,
                 "total_tokens": 15
             }
-        }))
-        .into_response()
+        }));
+        ([("x-worker-id", worker_id)], response).into_response()
     }
 }
 

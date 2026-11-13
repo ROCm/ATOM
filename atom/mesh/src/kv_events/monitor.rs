@@ -445,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_cannot_start_keeps_its_lane_and_matches_nothing() {
         const OTHER: &str = "http://127.0.0.1:8001@1";
-        let monitor = KvEventMonitor::start(1).unwrap();
+        let monitor = KvEventMonitor::start().unwrap();
         let source = |endpoint: &str| KvEventSource {
             endpoint: endpoint.into(),
             topic: "kv".into(),

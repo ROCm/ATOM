@@ -58,9 +58,12 @@
     Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
 
-    With --kv-events, a request the router can tokenize is placed by the KV
-    event index instead of the tree: the match rate is the share of its tokens
-    a worker's device cache holds, compared with cache_threshold as above.
+    With --kv-events, a request the router can tokenize goes to the worker whose
+    device cache, as its KV events show, holds the largest share of its tokens,
+    if that share is above cache_threshold. The tree places all other requests:
+    those at or below the threshold, those with media, those under imbalanced
+    load, those whose candidates have no indexed events, and those on the
+    ext-proc path, which tokenizes only for policies that need tokens.
 */
 
 use std::sync::{Arc, OnceLock};
@@ -315,10 +318,10 @@ impl CacheAwarePolicy {
         Some(min_load_idx)
     }
 
-    /// The tree's affinity and relocate branches, with the match rate of the KV event
-    /// index: the share of the request's tokens a worker's device cache holds, the
-    /// highest first, then the lower load. None leaves the request to the tree: it has no
-    /// tokens, or no candidate's events are indexed.
+    /// The tree's affinity branch, with the match rate of the KV event index: the share of
+    /// the request's tokens a worker's device cache holds, the highest first, then the
+    /// lower load. None leaves the request to the tree: it has no tokens, or no candidate
+    /// holds more of them than `cache_threshold`.
     fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -328,20 +331,15 @@ impl CacheAwarePolicy {
     ) -> Option<(Option<usize>, RouteDecision)> {
         let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
         let hits = self.kv_events.get()?.match_workers(tokens, workers);
-        if healthy_indices.iter().all(|&idx| hits[idx].is_none()) {
-            return None;
-        }
-        let (best, cached) = healthy_indices
+        let (idx, cached) = healthy_indices
             .iter()
-            .map(|&idx| (idx, hits[idx].unwrap_or(0)))
+            .filter_map(|&idx| Some((idx, hits[idx]?)))
             .max_by_key(|&(idx, cached)| (cached, std::cmp::Reverse(workers[idx].load())))?;
         let match_rate = f64::from(cached) / tokens.len() as f64;
-        let affinity = match_rate > f64::from(self.config.cache_threshold);
-        let idx = if affinity {
-            best
-        } else {
-            least_loaded(workers, healthy_indices)?
-        };
+        // Below it, the tree, which learns every placement, may know where the prompt went.
+        if match_rate <= f64::from(self.config.cache_threshold) {
+            return None;
+        }
         // The tree keeps learning, for requests without tokens.
         let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
         if let (Some(text), Some(tree)) = (info.request_text, tree) {
@@ -349,11 +347,7 @@ impl CacheAwarePolicy {
         }
         workers[idx].increment_processed();
         let decision = RouteDecision {
-            branch: if affinity {
-                "kv_affinity"
-            } else {
-                "kv_relocate"
-            },
+            branch: "kv_affinity",
             match_ratio: Some(match_rate),
         };
         Some((Some(idx), decision))
@@ -812,10 +806,15 @@ mod tests {
             (0, "kv_affinity", Some(0.6))
         );
         workers[0].increment_load();
+        // At most cache_threshold of the prompt cached, the tree places it, then knows it.
         let cold = policy(Some(vec![("http://w1:8000", 30)]));
         assert_eq!(
             decide(&cold, &workers, &info).await,
-            (2, "kv_relocate", Some(0.3))
+            (2, "relocate", Some(0.0))
+        );
+        assert_eq!(
+            decide(&cold, &workers, &info).await,
+            (2, "affinity", Some(1.0))
         );
     }
 

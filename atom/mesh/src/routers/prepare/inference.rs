@@ -475,24 +475,23 @@ mod tests {
 
     #[test]
     fn media_is_told_from_text() {
+        let chat = |role: &str, part: &str| {
+            let body =
+                format!(r#"{{"model":"m","messages":[{{"role":"{role}","content":[{part}]}}]}}"#);
+            ("/v1/chat/completions", body)
+        };
+        let text = r#"{"type":"text","text":"hi"}"#;
         let image = r#"{"type":"image_url","image_url":{"url":"https://x/cat.png"}}"#;
-        for (route, body, media) in [
-            (
-                "/v1/chat/completions",
-                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#.to_string(),
-                false,
-            ),
-            (
-                "/v1/chat/completions",
-                format!(r#"{{"model":"m","messages":[{{"role":"user","content":[{image}]}}]}}"#),
-                true,
-            ),
-            ("/generate", r#"{"input_ids":[1,2]}"#.into(), false),
-            (
-                "/generate",
-                r#"{"input_ids":[1,2],"image_data":"https://x/cat.png"}"#.into(),
-                true,
-            ),
+        let generate = |media: &str| ("/generate", format!(r#"{{"input_ids":[1,2]{media}}}"#));
+        for ((route, body), media) in [
+            (chat("user", text), false),
+            (chat("user", image), true),
+            (chat("system", image), true),
+            (generate(""), false),
+            (generate(r#","image_data":"https://x/cat.png""#), true),
+            (generate(r#","video_data":"https://x/cat.mp4""#), true),
+            (generate(r#","audio_data":"https://x/cat.wav""#), true),
+            (generate(r#","input_embeds":[[0.1,0.2]]"#), true),
         ] {
             let parsed = ParsedInference::parse(route, body.as_bytes()).unwrap();
             assert_eq!(parsed.carries_media(), media, "{body}");

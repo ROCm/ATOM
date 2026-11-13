@@ -1,5 +1,5 @@
-//! A partition of the index: the ranks of one model and block size, each on a lane, and
-//! the writer task that alone applies their admitted batches, in order.
+//! A partition of the index: the ranks of one model, pool and block size, each on a lane,
+//! and the writer task that alone applies their admitted batches, in order.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -25,6 +25,8 @@ pub(crate) struct Partition {
     /// Lanes taken, by bit.
     lanes: Mutex<u64>,
     writes: mpsc::Sender<Write>,
+    /// Where the writer runs, and a release waits for room in `writes`.
+    runtime: Handle,
 }
 
 enum Write {
@@ -48,6 +50,7 @@ impl Partition {
             index: PrefixIndex::default(),
             lanes: Mutex::new(0),
             writes,
+            runtime: runtime.clone(),
         });
         runtime.spawn(write(partition.clone(), batches));
         partition
@@ -98,11 +101,15 @@ impl Holder {
 impl Drop for Holder {
     fn drop(&mut self) {
         let writes = &self.partition.writes;
-        if let Err(TrySendError::Full(release)) = writes.try_send(Write::Release(self.id)) {
-            let writes = writes.clone();
-            if let Ok(runtime) = Handle::try_current() {
-                runtime.spawn(async move { writes.send(release).await });
+        match writes.try_send(Write::Release(self.id)) {
+            Err(TrySendError::Full(release)) => {
+                let writes = writes.clone();
+                self.partition
+                    .runtime
+                    .spawn(async move { writes.send(release).await });
             }
+            // Closed only once the monitor's runtime, and the index with it, is gone.
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
         }
     }
 }
