@@ -66,7 +66,9 @@ fn select_with_rng(
         .iter()
         .map(|candidate| score(prompt_tokens, candidate));
     let best = scored.clone().map(|selection| selection.cost).min()?;
-    scored.filter(|selection| selection.cost == best).choose(rng)
+    scored
+        .filter(|selection| selection.cost == best)
+        .choose(rng)
 }
 
 #[cfg(test)]
@@ -112,7 +114,10 @@ mod tests {
     #[test]
     fn unknown_hits_stay_eligible_without_cache_credit() {
         let unknown = candidate(4, None, 0, 0);
-        assert_eq!(score(128, &unknown), score(128, &candidate(4, Some(0), 0, 0)));
+        assert_eq!(
+            score(128, &unknown),
+            score(128, &candidate(4, Some(0), 0, 0))
+        );
         let busy = candidate(9, Some(128), 1_000, 0);
         let selected = select_worker(128, &[unknown, busy]).unwrap();
         assert_eq!((selected.worker_index, selected.uncached_tokens), (4, 128));
