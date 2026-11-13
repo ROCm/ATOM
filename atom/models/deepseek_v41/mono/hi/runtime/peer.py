@@ -124,14 +124,23 @@ class PeerGroup:
                           "land on a slot the previous launch still polls on a slower rank (Program.peer_shared, "
                           "plan.program.share_peer_groups)", stacklevel=3)  # fmt: skip
 
-    def end_step(self) -> None:
+    def end_step(self, defer: bool = False) -> torch.Tensor | None:
         """A step's last launch on the group is issued (module docstring, "The step phase"): after an odd number of
         launches since the last call, the step phase flips (a device add on the current stream, graph-capturable), so
-        the next launch has the other parity. Only shared programs read the phase."""
+        the next launch has the other parity. Only shared programs read the phase.
+
+        ``defer``: the caller adds one to the returned phase word itself (int64 [1], the peer table's entry ``tp``) on
+        the same stream before the group's next launch (one kernel bumping several groups' words); None when no flip is
+        due. The host's phase flips here either way."""
+        due = None
         if self.since_step % 2:
-            self.addresses[self.tp :].add_(1)
+            due = self.addresses[self.tp :]
+            if not defer:
+                due.add_(1)
+                due = None
             self._phase ^= 1
         self.since_step = 0
+        return due
 
     def launched(self, layer: int, program_name: str) -> None:
         """Record a launch's tag parity; raise if it repeats the previous launch's (module docstring)."""

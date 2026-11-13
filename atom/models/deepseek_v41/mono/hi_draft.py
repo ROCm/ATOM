@@ -96,12 +96,16 @@ class _Streams:
     ffn_out: torch.Tensor  # bf16 [R, H]
 
 
-def _end_step(peers) -> None:
+def _end_step(peers, due: list | None = None) -> None:
     """A step's last launch on a peer group is issued: the hi runtime's step phase (``PeerGroup.end_step``: after an odd
     number of launches the next step's first launch takes the other parity, so it cannot land on this step's last
-    slots)."""
-    if peers is not None:
-        peers.end_step()
+    slots). ``due``: the phase word joins it instead of its own add (``HiLayers.phase_due``: one device bump of every
+    group's word at the end of the target forward, ``_flush_phases``)."""
+    if peers is None:
+        return
+    word = peers.end_step(defer=due is not None)
+    if word is not None:
+        due.append(word)
 
 
 class HiDraft:
@@ -243,8 +247,9 @@ class HiDraft:
         self.ctx_programs[rows].launch(
             table, bufs, layer=CTX_LAUNCH, stream=torch.cuda.current_stream()
         )
-        # (one launch a step: the step phase flips, the next CTX launch has the other parity)
-        _end_step(self.cx_peers)
+        # (one launch a step: the step phase flips, the next CTX launch has the other parity; bumped with the target
+        # forward's other groups' at its end, ``_flush_phases``)
+        _end_step(self.cx_peers, getattr(self, "phase_due", None))
 
     def _ctx_after_target(self, cache, step, rows: int) -> None:
         """A served step's end (``end_step``): ``CTX`` inside the target graph, after the end-step launch (the taps

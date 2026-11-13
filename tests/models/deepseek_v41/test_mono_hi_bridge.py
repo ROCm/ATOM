@@ -1708,10 +1708,13 @@ def check_post_verify_pad(pad_slot: int):
     target = torch.tensor([b * rq + j for b in range(nb) for j in range(s)])
     bonus = torch.tensor([b * rq + s for b in range(nb)])
     before = cursor.clone()
+    # two peer groups' step-phase words (the peer tables' entry tp) due a bump, a third word not
+    table = torch.tensor([11, 22, 7, 33, 5], dtype=torch.int64)
+    ph = [table[2:3], table[4:5]]
     pv._post_verify_kernel[(nb,)](
         out, verdict, cu, seg, target, bonus, head, out, torch.zeros(1, **i32), torch.zeros(1, dtype=torch.int64),
         cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1), starts, slots, live[hb.REQ_LIVE :],
-        s, 0, WIDTH=W, BLOCK=W, SP=8, SYNTHETIC=False, SHADOW=False,
+        s, 0, *pv._phase_args(ph)[:3], WIDTH=W, BLOCK=W, SP=8, SYNTHETIC=False, SHADOW=False, NPH=len(ph),
     )  # fmt: skip
     want = before.clone()
     for b in range(3):
@@ -1720,6 +1723,13 @@ def check_post_verify_pad(pad_slot: int):
     report(f"[pv] post-verify on a bs-4 graph with a padding request (its slot entry {pad_slot}): the live requests'"
            " cursors committed, no padding commit", torch.equal(cursor, want) and int(verdict[0, 0]) == 2,
            f"(rows {(cursor != want).any(1).nonzero().flatten().tolist()} differ; accepted {verdict[0].tolist()})")  # fmt: skip
+    report("[pv] the post-verify bumps the step-phase words due once (program 0 of 4), nothing else",
+           table.tolist() == [11, 22, 8, 33, 6], f"({table.tolist()})")  # fmt: skip
+    for n in (1, 2, 3, 4, 7):
+        words = torch.arange(n * 2, dtype=torch.int64)
+        pv.bump_phases([words[2 * i : 2 * i + 1] for i in range(n)])
+        report(f"[pv] bump_phases of {n} words: each + 1 once, the words between untouched",
+               words.tolist() == [v + (1 - v % 2) for v in range(n * 2)], f"({words.tolist()})")  # fmt: skip
 
 
 def check_glue_folds():

@@ -257,6 +257,9 @@ class HiLayers(HiDraft, HiPrograms):
         self._eng_mapping = engram_mapping  # ATOM's NgramHashMapping: the hash constants (``engram_consts``)
         # ``post_verify`` (set by ``install``); the runner and the step's input ids
         self.pv, self.runner, self.step_ids = None, None, None
+        # the step-phase words due a bump in this forward (``begin_step`` .. ``end_step``: ``_flush_phases``); None
+        # outside a forward (each group's own add then, ``PeerGroup.end_step``)
+        self.phase_due = None
         if self.eng:
             from .hi.blocks.gfx950.engram import NOUT
 
@@ -760,6 +763,8 @@ class HiLayers(HiDraft, HiPrograms):
         step; ``input_ids``: the step's tokens); then the Engram token-only halves. First the programs' pointers into
         ATOM's storage (``_bind_cache``)."""
         self._bind_cache(cache, step)
+        # the peer groups' step-phase bumps of this forward: one launch at its end (``_flush_phases``)
+        self.phase_due = []
         if self.pv is not None and input_ids is not None:
             # the post-verify's drafts (a fixed address under a capture)
             self.step_ids = input_ids.view(-1)
@@ -871,7 +876,8 @@ class HiLayers(HiDraft, HiPrograms):
             self.eng_peers.last_parity = None
         self.eng_programs[rows].launch(self.tables[ENGKV, rows], self.eng_bufs[rows], layer=ENGKV_LAUNCH,
                                        stream=torch.cuda.current_stream())  # fmt: skip
-        _end_step(self.eng_peers)  # (one launch a step: the step phase flips)
+        # (one launch a step: the step phase flips; bumped at the forward's end, ``_flush_phases``)
+        _end_step(self.eng_peers, self.phase_due)
 
     def layer(self, i: int, rows: int) -> None:
         """The hi runtime layer i (every layer runs on the hi path: layer i - 1's outputs are its inputs, in place); after the
@@ -890,8 +896,9 @@ class HiLayers(HiDraft, HiPrograms):
             for b, lid in enumerate(head_launch_ids(i, launches)):
                 self.head_programs[rows].launch(self.tables[HEAD, rows, b], self.head_bufs[rows], layer=lid,
                                                 stream=torch.cuda.current_stream())  # fmt: skip
-            # the step's last launch on the group: 41 (odd) flip the step phase
-            _end_step(self.peers)
+            # the step's last launch on the group: 41 (odd) flip the step phase (at the forward's end,
+            # ``_flush_phases``)
+            _end_step(self.peers, self.phase_due)
 
     def _taps(self) -> list:
         """(r_a, ATOM's aux buffer) of the hi layers ATOM's DSpark taps. (Bound here on the first served step,
@@ -909,10 +916,22 @@ class HiLayers(HiDraft, HiPrograms):
         """
         self._end_step(cache, step, rows)
         self._ctx_after_target(cache, step, rows)
+        due, self.phase_due = self.phase_due or [], None
         if self.pv is not None and step.max_q_len == self.split[rows][1]:
-            # the verdict and commit in the graph (``post_verify``): the forward's head output (``head_output``)
-            self.pv.launch(self, cache, step, rows)
+            # the verdict and commit in the graph (``post_verify``): the forward's head output (``head_output``); its
+            # first program also bumps the step phases due (``_flush_phases``)
+            self.pv.launch(self, cache, step, rows, phases=due)
             self.verified = rows
+        else:
+            _flush_phases(due)
+
+    # The step phases (``PeerGroup.end_step``) of the forward's peer groups: the main group's (41 launches at one
+    # request), the Engram kv launch's and CTX's (one each) flip every step. Each flip was a device add of its own
+    # after the group's last launch (3 graph nodes, ~4.6 us each); they are bumped together at the forward's end
+    # instead, by the post-verify's first program (or one ``bump_phases`` launch on a step without it). The same
+    # values: each word + 1 once a step where it flipped. The same order for every reader: a group's phase word is
+    # read only by its own programs, at their entry, and every group's next launch is the next forward's (the draft
+    # has a group of its own), after this one's end on the same stream.
 
     def _end_step(self, cache, step, rows: int) -> None:
         taps = self._taps()
@@ -941,6 +960,14 @@ class HiLayers(HiDraft, HiPrograms):
             WIN=WINDOW, DIM=HEAD_DIM, HIDDEN=hidden, BLOCK=1024, NHC=HC, NMIX=MIX, **ke, NTAPS=len(taps),
             PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax, KV8=int(self.kv_fp8),
         )  # fmt: skip
+
+
+def _flush_phases(due: list) -> None:
+    """The forward's step-phase bumps (``HiLayers.end_step``) without a post-verify: one launch for all of them."""
+    if due:
+        from atom.models.deepseek_v41.mono.round.post_verify import bump_phases
+
+        bump_phases(due)
 
 
 def head_launch_ids(last: int, requests: int) -> tuple[int, ...]:

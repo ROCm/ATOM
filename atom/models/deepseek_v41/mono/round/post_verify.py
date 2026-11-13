@@ -44,23 +44,65 @@ from atom.models.deepseek_v41.mono.hi_bridge import REQ_LIVE
 logger = logging.getLogger("atom")
 
 
+MAX_PHASES = 3  # the step-phase words one launch bumps (``_bump``)
+
+
+@triton.jit
+def _bump(ph0_ptr, ph1_ptr, ph2_ptr, NPH: tl.constexpr):
+    """Add one to the first ``NPH`` (<= ``MAX_PHASES``) int64 words (peer groups' step phases,
+    ``PeerGroup.end_step``)."""
+    if NPH > 0:
+        tl.store(ph0_ptr, tl.load(ph0_ptr) + 1)
+    if NPH > 1:
+        tl.store(ph1_ptr, tl.load(ph1_ptr) + 1)
+    if NPH > 2:
+        tl.store(ph2_ptr, tl.load(ph2_ptr) + 1)
+
+
+@triton.jit
+def _bump_phases_kernel(ph0_ptr, ph1_ptr, ph2_ptr, NPH: tl.constexpr):
+    _bump(ph0_ptr, ph1_ptr, ph2_ptr, NPH)
+
+
+def _phase_args(words: list) -> tuple:
+    """(ph0, ph1, ph2, NPH) of up to ``MAX_PHASES`` words (an unused pointer repeats the first)."""
+    if not 0 < len(words) <= MAX_PHASES:
+        raise ValueError(f"{len(words)} step-phase words, a launch bumps 1..{MAX_PHASES}")
+    for w in words:
+        if w.dtype != torch.int64 or w.numel() != 1:
+            raise ValueError(f"a step-phase word is int64 [1], not {w.dtype} {tuple(w.shape)}")
+    pad = list(words) + [words[0]] * (MAX_PHASES - len(words))
+    return (*pad, len(words))
+
+
+def bump_phases(words: list) -> None:
+    """Add one to each int64 [1] word of ``words`` (peer groups' step phases due, ``HiLayers.end_step``): one launch
+    per ``MAX_PHASES`` words, on the current stream (a capture records it)."""
+    for i in range(0, len(words), MAX_PHASES):
+        *ph, n = _phase_args(words[i : i + MAX_PHASES])
+        _bump_phases_kernel[(1,)](*ph, NPH=n, num_warps=1)
+
+
 @triton.jit(do_not_specialize=["num_spec_steps", "seed_base"])
 def _post_verify_kernel(
     out_ptr, verdict_ptr, cu_ptr, input_ids_ptr, target_idx_ptr, bonus_idx_ptr, head_ids_ptr, cond_rates_ptr,
     step_ptr, used_seed_ptr, cursor_ptr, cursor_stride, staging_ptr, staging_req_stride, staging_row_stride, starts_ptr,
-    slots_ptr, live_ptr, num_spec_steps, seed_base,
+    slots_ptr, live_ptr, num_spec_steps, seed_base, ph0_ptr, ph1_ptr, ph2_ptr,
     WIDTH: tl.constexpr, BLOCK: tl.constexpr, SP: tl.constexpr, SYNTHETIC: tl.constexpr, SHADOW: tl.constexpr,
+    NPH: tl.constexpr = 0,
 ):  # fmt: skip
     """Program b, request b: the verdict (ATOM's rejection kernels' arithmetic, its rows at once: the first rejected
     position is a min over the rows) and the commit (request b's accepted prefix's candidate cursor,
     ``staging[b, anchor - start]``, into ``cursor[slot]`` when ``live_ptr[b]`` (the hook's request word: not a padding
     request); ``SHADOW``: into ``cursor[b]``, the check's rows). The uniforms' seed is ``seed_base`` + the hook's
     launch-tag step (bumped by every forward's begin-step: the same on every TP rank), recorded in
-    ``used_seed_ptr``."""
+    ``used_seed_ptr``. Program 0 also adds one to the first ``NPH`` of the int64 step-phase words ``ph*_ptr``
+    (``bump_phases``'s, ``HiLayers.end_step``)."""
     b = tl.program_id(0)
     seed = seed_base + tl.load(step_ptr).to(tl.int64)
     if b == 0:
         tl.store(used_seed_ptr, seed)
+        _bump(ph0_ptr, ph1_ptr, ph2_ptr, NPH)
     if b == 0:
         start = 0
     else:
@@ -134,10 +176,12 @@ class PostVerify:
                 "bonus": torch.tensor([b * rq + s for b in range(nb)], dtype=torch.long, device=device),
             }  # fmt: skip
 
-    def launch(self, hook, cache, step, rows: int) -> None:
+    def launch(self, hook, cache, step, rows: int, phases: list = ()) -> None:
         """At the end of a served forward (``HiLayers.end_step``; a capture records it): the kernel on this
         width's fixed buffers. Every input is a fixed address of this width: the head's ids, the step's input ids,
-        query starts and slots, ATOM's cursor and tentative staging plane."""
+        query starts and slots, ATOM's cursor and tentative staging plane. ``phases``: the forward's step-phase words
+        due a bump (int64 [1] each, ``PeerGroup.end_step(defer=True)``), bumped by its program 0 (past
+        ``MAX_PHASES``: ``bump_phases``)."""
         from atom.model_ops.rejection_sampler import _get_synthetic_cond_rates
 
         nb, rq = self.split[rows]
@@ -158,14 +202,19 @@ class PostVerify:
             else bufs["out"]
         )
         staging, cursor = cache.tentative_staging.gpu, cache.cursor
+        phases = list(phases)
+        here, rest = phases[:MAX_PHASES], phases[MAX_PHASES:]
+        *ph, nph = _phase_args(here) if here else (self.used_seed,) * MAX_PHASES + (0,)
         self.launched.add(rows)
         _post_verify_kernel[(nb,)](
             bufs["out"], bufs["verdict"], bufs["cu"], hook.step_ids, bufs["target"], bufs["bonus"], hook.head_ids,
             cond, hook.step, self.used_seed, cursor, cursor.stride(0), staging, staging.stride(0), staging.stride(1),
-            step.cu_seqlens_q, step.slots, hook.req[REQ_LIVE:], rq - 1, self.seed_base, WIDTH=cache.cursor.shape[1],
-            BLOCK=triton.next_power_of_2(cache.cursor.shape[1]), SP=triton.next_power_of_2(rq),
-            SYNTHETIC=rates is not None, SHADOW=False, num_warps=1,
+            step.cu_seqlens_q, step.slots, hook.req[REQ_LIVE:], rq - 1, self.seed_base, *ph,
+            WIDTH=cache.cursor.shape[1], BLOCK=triton.next_power_of_2(cache.cursor.shape[1]),
+            SP=triton.next_power_of_2(rq), SYNTHETIC=rates is not None, SHADOW=False, NPH=nph, num_warps=1,
         )  # fmt: skip
+        if rest:
+            bump_phases(rest)
 
     def output(self, rows: int):
         """Width ``rows``' outputs, the forward's head output (``HiLayers.head_output``): (output ids [B, rq], verdict
