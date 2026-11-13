@@ -27,6 +27,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+from flydsl.compiler.kernel_function import KernelFunction
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
@@ -113,13 +114,79 @@ def nvfp4_dword_e4m3x8(word, scale_byte):
     return e4m3_dwords(prod)
 
 
-def q_e4m3(frags):
+# aiter's per-scale e4m3 table (``fp4_dword_to_e4m3`` of its scorer): for each positive
+# e4m3 scale byte the 8 bytes e4m3_rn_satfinite(mag * scale), mag the e2m1 magnitudes
+# (equal to ``nvfp4_dword_e4m3x8`` for every code and scale byte 0x00..0x7E: exhaustive
+# check), 2 dwords an entry, in LDS: a K dword is then 2 v_perm_b32 + ~7 ALU, not ~33.
+LUT_ENTRIES = 128
+E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+SIGN8 = -0x7F7F7F80  # 0x80808080 as an i32: the sign bit of each fp8 byte of a dword
+MAG8 = 0x07070707  # the e2m1 magnitude bits of each nibble, spread one a byte
+EVEN_ODD = (0, 2, 4, 6, 1, 3, 5, 7)  # a dword's elements as ``fp4_dword_e4m3x8_lut``
+
+
+@fx.struct
+class LutSmem:
+    tab: fx.Array[fx.Int32, 2 * LUT_ENTRIES, 16]
+
+
+def lut_lds():
+    """The CTA's table in LDS: ``LUT_ENTRIES`` * 8 B more, allocated from the kernel's
+    own allocator (a kernel may make one ``SharedAllocator``, and the callers' Smem
+    structs are not ours to change). shortcut: reaches FlyDSL's current kernel's
+    private ``_shared_allocator``, so it needs FlyDSL's static allocator mode (the
+    default); upgrade when the callers' Smem structs carry the table."""
+    alloc = KernelFunction.get_current()._shared_allocator
+    assert alloc is not None and alloc.is_static, "the kernel's SharedAllocator"
+    return alloc.allocate(LutSmem).peek().tab.ptr
+
+
+def e4m3_lut_row(scale_byte):
+    """The two dwords of the table entry of the scale byte ``scale_byte`` (0..127):
+    e4m3_rn_satfinite(mag * scale) for the 8 e2m1 magnitudes. The scale decodes at f32
+    exactly (``cvt_pk_f32_fp8``)."""
+    sc = fx.Vector(
+        rocdl.cvt_pk_f32_fp8(
+            res=fx.Vector.make_type(2, fx.Float32),
+            src=as_ir_value(fx.Int32(scale_byte)),
+            word_sel=False,
+        )
+    )[0]
+    return fx.Vector.from_elements(
+        e4m3_dwords([fx.Float32(m) * sc for m in E2M1_MAGS]), fx.Int32
+    )
+
+
+def e4m3_lut_entry(tab, scale_byte):
+    """The (t_lo, t_hi) dwords of the table entry of ``scale_byte``'s low 7 bits."""
+    t = fx.Vector(
+        fx.ptr_load(
+            tab + (scale_byte & 0x7F) * 2, result_type=fx.Vector.make_type(2, fx.Int32)
+        )
+    )
+    return t[0], t[1]
+
+
+def fp4_dword_e4m3x8_lut(word, t_lo, t_hi):
+    """Eight e2m1 of ``word`` -> e4m3 K by lookup in a scale's table entry: v_perm_b32
+    takes magnitudes 0..7 (selector bytes) from the 8 table bytes, four a dword; the
+    sign bit of each nibble is OR-ed in afterwards. Two dwords: the even elements
+    (0, 2, 4, 6), then the odd ones (``EVEN_ODD``; ``q_e4m3`` orders q the same way,
+    the MFMA sums over k in any order)."""
+    w = fx.Int32(word)
+    ev = rocdl.perm_b32(t_hi, t_lo, w & MAG8)
+    od = rocdl.perm_b32(t_hi, t_lo, (w >> 4) & MAG8)
+    return fx.Int32(ev) | ((w << 4) & SIGN8), fx.Int32(od) | (w & SIGN8)
+
+
+def q_e4m3(frags, order=range(8)):
     """The four k-chunk fragments (bf16x8 each) of an index q -> the e4m3 B operand
-    of one 16x16x128 MFMA (8 dwords), as vLLM quantizes the index q."""
+    of one 16x16x128 MFMA (8 dwords), as vLLM quantizes the index q; each chunk's
+    elements in ``order``."""
     words = []
     for f in frags:
         v = fx.Vector(f).to(fx.Float32)
-        words += e4m3_dwords([fx.Float32(v[i]) for i in range(8)])
+        words += e4m3_dwords([fx.Float32(v[i]) for i in order])
     return fx.Vector.from_elements(words, fx.Int32)
 
 
@@ -209,6 +276,9 @@ def emit_index_scores(
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g4 = lane // 16
+    # nvfp4: the per-task-wave paths look K up in a CTA table (built before them)
+    tab = lut_lds() if nvfp4 else None
+    tid = wave * 64 + lane
     r_ic = rsrc(index_cache, 0 if "idx" in strip else None)
     rows = step_rows(seq_lens, tokens, q_len, heads)
     seq = rows.seq
@@ -297,15 +367,27 @@ def emit_index_scores(
                 words += [w[e] for e in range(4)]
         return fx.Vector.from_elements(words, fx.Int32)
 
-    def q_operand(frags):
-        return q_e4m3(frags) if const_expr(nvfp4) else frags
+    def q_operand(frags, lut=False):
+        if const_expr(nvfp4):
+            return q_e4m3(frags, EVEN_ODD if lut else range(8))
+        return frags
 
-    def split_tiles(raw, tiles):
+    def split_tiles(raw, tiles, tab=None):
         """``load_raw``'s words -> per tile the MFMA A operands: tile i holds keys
         16 i + lane % 16, k = 32 s + 8 (lane / 16). A 4 x 4 transpose of the 8 B
         parts across the key's four lanes (permlane swaps) gives each lane part
-        g4 of every chunk s."""
+        g4 of every chunk s. ``tab`` (nvfp4): the CTA's e4m3 table, the K operand's
+        elements then in ``EVEN_ODD`` order within each dword pair."""
         out = []
+        if const_expr(nvfp4 and tab is not None):
+            for n in range_constexpr(len(tiles)):
+                sc = raw[5 * n + 4]
+                ent = [e4m3_lut_entry(tab, sc), e4m3_lut_entry(tab, sc >> 8)]
+                words = []
+                for s in range_constexpr(4):
+                    words += fp4_dword_e4m3x8_lut(raw[5 * n + s], *ent[s // 2])
+                out.append(fx.Vector.from_elements(words, fx.Int32))
+            return out
         if const_expr(nvfp4):
             for n in range_constexpr(len(tiles)):
                 out.append(
@@ -358,6 +440,12 @@ def emit_index_scores(
                 v = fx.max(v, (key0 + e < col_seq).select(c[e], float("-inf")))
         return butterfly(v, (32, 16), fx.max)
 
+    def fill_lut():
+        """Fill the CTA's table: thread s < LUT_ENTRIES makes the entry of scale byte
+        s. The caller barriers before a lookup."""
+        if tid < LUT_ENTRIES:
+            fx.ptr_store(e4m3_lut_row(tid), tab + tid * 2)
+
     def put(b, col, v):
         if (lane < 16) & (l16 < q_len):
             mb_put(iscore, col * MAX_INDEX_BLOCKS + b, v * scale)
@@ -366,8 +454,12 @@ def emit_index_scores(
         """The context-parallel requests' tasks, a task a wave: B column f of pass
         p (f = 16 p + lane % 16) is head f / q_len's row f % q_len of the request,
         the key block's operands kept for every pass."""
+        if const_expr(nvfp4):
+            fill_lut()
         if const_expr(prepare_heads is not None):
             prepare_heads()
+        if const_expr(nvfp4):
+            gpu.barrier()
         tiles = range(KEY_TILES)
         seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
         n_cols = TP * q_len
@@ -377,7 +469,7 @@ def emit_index_scores(
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
-            kw = split_tiles(load_raw(page, tiles), tiles)
+            kw = split_tiles(load_raw(page, tiles), tiles, tab)
             # every pass unrolled, the unused ones skipped: a runtime pass loop
             # slowed the whole kernel's short contexts (S = 1, 3k: +0.6 us)
             for p in range_constexpr(TP * MAX_TOKENS // 16):
@@ -386,7 +478,8 @@ def emit_index_scores(
                     head = fx.min(f // q_len, TP - 1)
                     col = tk - (q_len - 1) + f % q_len
                     qb = q_operand(
-                        [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)]
+                        [q_frag_head(col, s, head) for s in range(HEAD_DIM // 32)],
+                        True,
                     )
                     v = tiles_max(b, qb, lane_gather(seq_lane, col), tiles, kw)
                     if (lane < 16) & (f < n_cols):
@@ -439,8 +532,12 @@ def emit_index_scores(
                 put(b, col, v)
             gpu.barrier()
     if total > BLOCKS:
+        if const_expr(nvfp4):
+            fill_lut()
         if const_expr(prepare is not None):
             prepare(fx.Int32(0), fx.Int32(tokens - 1))
+        if const_expr(nvfp4):
+            gpu.barrier()
         tiles = range(KEY_TILES)
         seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
 
@@ -452,8 +549,8 @@ def emit_index_scores(
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
-            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)])
-            put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles)))
+            qb = q_operand([q_frag(col, s) for s in range(HEAD_DIM // 32)], True)
+            put(b, col, tiles_max(b, qb, col_seq, tiles, split_tiles(raw, tiles, tab)))
 
         # Every wave the same task count: task u on wave
         # (u // BLOCKS) % WAVES of CTA u % BLOCKS; lane j decodes task c0 + step j
