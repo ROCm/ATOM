@@ -5045,7 +5045,9 @@ class RapidServeModelRunner(ModelRunner):
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
-        # postprocess (sampling + async CPU copy) always runs on default stream.
+        # postprocess (sampling + async CPU copy) runs on the runner thread's
+        # current stream: the default one, or the High-priority compute stream
+        # when ATOM_HIGH_PRIORITY_COMPUTE_STREAM moved this thread onto it.
         fwd_output = self.postprocess(
             batch,
             logits,
