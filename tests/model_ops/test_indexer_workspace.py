@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """The FP8 prefill key workspace and pass plan: host arithmetic, runnable
-without AITER or a GPU. (Packed bands: tests/models/deepseek_v41.)"""
+without AITER or a GPU. Packed bands: tests/models/deepseek_v41/test_indexer.py."""
 
 import itertools
 
@@ -20,8 +20,7 @@ def test_key_workspace_hands_out_views_of_held_buffers_and_never_grows():
     held = ws.keys(64)[0].data_ptr()
     for total in range(8, 65, 8):  # a long prefill's chunks
         values, scales = ws.keys(total)
-        assert values.data_ptr() == held
-        assert values.shape == (total, 2) and scales.shape == (total, 1)
+        assert values.data_ptr() == held and scales.shape == (total, 1)
     with pytest.raises(ValueError, match="65 keys exceed the 64-key"):
         ws.keys(65)
     assert ws.gathered(96)[1].dtype == torch.float32

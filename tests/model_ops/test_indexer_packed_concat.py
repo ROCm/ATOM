@@ -76,7 +76,7 @@ def _rows(builder, var, table, starts, pcp, prefix, dcp=False):
         var[name].gpu = torch.tensor(var[name].np, device="cuda")
     gathers = None
     if dcp:
-        gathers = builder._build_dcp_indexer_prefill_meta(
+        gathers = builder._dcp_pass_gathers(
             SimpleNamespace(has_cached=True), 2, prefix, staged.passes
         )
     meta = SimpleNamespace(

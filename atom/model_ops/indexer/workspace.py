@@ -7,14 +7,14 @@ the KV budget counts it and nothing is allocated per step (the logits plane
 is `LogitsWorkspace`). PAGE-pool sizing stays with V4.1's builder.
 """
 
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import qsplit_rows
+from atom.model_ops.sparse_indexer_chunk import cdiv, qsplit_rows
 
-# FP4 row-group stores need 256-byte alignment: 64 fp32 logits.
+# Packed rows (V4.1's FP4, FP8 prefill) start 256-byte aligned: 64 fp32 logits.
 ROW_ALIGN = 64
 
 
@@ -24,11 +24,8 @@ def aligned_spans(visible):
 
 
 def band_offsets(visible, capacity, out):
-    """Pack visible rows into fixed-capacity bands and publish their offsets.
-
-    Offsets are relative to the band's start. A row that cannot fit alone is
-    refused instead of growing the workspace during serving.
-    """
+    """Pack visible rows into bands of `capacity`, each row's offset from its
+    band's start into `out`. A row too long for any band is refused."""
     spans = aligned_spans(visible.astype(np.int64))
     if spans.size and int(spans.max()) > capacity:
         raise ValueError(
@@ -45,21 +42,9 @@ def band_offsets(visible, capacity, out):
     return tuple(bands)
 
 
-class PackedRows(NamedTuple):
-    """Visible lengths and logits/block-maxima offsets within each band."""
-
-    visible: torch.Tensor
-    offsets: torch.Tensor
-    block_offsets: torch.Tensor
-    bands: tuple[tuple[int, int], ...]
-
-
 class ConcatKeyWorkspace:
-    """FP8 prefill keys gathered end to end (`ConcatKeys`): FP8 rows and their
-    fp32 scales, and under DCP the all-gathered rank shards they come from.
-
-    The buffers never grow: a step whose keys exceed `capacity` is gathered
-    and scored in passes of whole requests that fit (`concat_passes`)."""
+    """FP8 prefill keys gathered end to end (`ConcatKeys`) and, under DCP, the
+    rank shards they come from. Never grows: a larger step goes in passes."""
 
     def __init__(
         self, capacity: int, dim: int, dtype, device, gathered_capacity: int = 0
@@ -80,13 +65,12 @@ class ConcatKeyWorkspace:
         dcp_world: int = 1,
         interleave: int = 1,
     ) -> "ConcatKeyWorkspace":
-        """One request of the model length plus a step's new tokens. Under DCP
-        also every rank's shard of a pass, each request's padded to its
-        interleave super-block."""
+        """One request of the model length plus a step's tokens; under DCP also
+        every rank's shard of a pass, each request padded to its super-block."""
         keys = max_model_len + max_batched_tokens
         gathered = 0
         if dcp_world > 1:
-            shard = -(-keys // dcp_world) + max_requests * interleave
+            shard = cdiv(keys, dcp_world) + max_requests * interleave
             gathered = dcp_world * shard
         return cls(keys, dim, dtype, device, gathered)
 
@@ -105,11 +89,9 @@ class ConcatKeyWorkspace:
 
 
 class ConcatPass(NamedTuple):
-    """Requests `[first, end)` of an FP8 prefill step, gathered into the key
-    workspace together: their keys `[key_base, key_base + keys)` of the step's
-    run. Their rows start at `row_base`, `stride` a rank's slot of `world`;
-    this rank (`rank`) scores rows `[lo, hi)` in packed `bands`. `dcp`: under
-    DCP, `(local_total, local_cu, gather_index)` for every rank's shard."""
+    """Requests `[first, end)` gathered together: keys `[key_base, +keys)` of the
+    step's run; rows from `row_base`, `stride` a slot of `world`, this rank's
+    `[lo, hi)` in `bands`. `dcp`: `(local_total, local_cu, gather_index)`."""
 
     first: int
     end: int
@@ -122,7 +104,7 @@ class ConcatPass(NamedTuple):
     lo: int
     hi: int
     bands: tuple[tuple[int, int], ...]
-    dcp: Any = None
+    dcp: tuple[int, torch.Tensor, torch.Tensor] | None = None
 
 
 def concat_passes(

@@ -58,7 +58,6 @@ def score_topk(
     stable: bool = False,
     on_band=None,
     out: torch.Tensor | None = None,
-    keys=None,
     request_local: bool = True,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
@@ -73,20 +72,19 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
-    `(values, scales)` already gathered end to end; gathered here from
-    `cache` otherwise. Packed concat rows gather theirs pass by pass
-    (`rows.passes`), every rank its share of each pass.
+    its successors' candidate blocks) does it there. FP8 concat rows' keys
+    are gathered here, packed ones pass by pass (`rows.passes`), every rank
+    its share of each pass.
 
     A striped split (`RowSplit.striped`) scores this rank's rows of `query`
     and `weights` into its slot and returns the gathered slots rank-major:
     slot r holds rows r, r + world, ..., so row i sits at
     `(i % world) * stride + i // world` (`csa_translate_pack` reads it
-    there). `out`, `on_band`, `keys` and `request_local=False`, which assume
-    rows in order, do not apply."""
+    there). `out`, `on_band` and `request_local=False`, which assume rows in
+    order, do not apply."""
     split = rows.split
     if split.stripe:
-        if not (out is None and on_band is None and keys is None and request_local):
+        if not (out is None and on_band is None and request_local):
             raise ValueError(
                 "a striped split returns its rows rank-major, not in place"
             )
@@ -102,9 +100,7 @@ def score_topk(
         return out
     mine = out[split.slot : split.slot + split.stride] if split.stripe else out
     if rows.concat is not None:
-        _score_concat(
-            query, weights, cache, rows, topk, stable, mine, keys, request_local
-        )
+        _score_concat(query, weights, cache, rows, topk, stable, mine, request_local)
     else:
         _score_paged(
             query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
@@ -245,10 +241,8 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
 
 
 def _score_concat_passes(query, weights, cache, rows, topk, stable, out):
-    """Packed FP8 prefill rows, pass by pass (`ConcatPass`): the pass's keys
-    gathered into the key workspace, this rank's rows of it scored band by
-    band into the packed plane, and the ranks' selections gathered back.
-    Ids come back local to each row's request."""
+    """Packed FP8 prefill rows a pass at a time: keys gathered, this rank's rows
+    scored band by band, selections all-gathered. Ids are request-local."""
     keys, scores = rows.concat, rows.workspace.packed_logits()
     for p in rows.passes:
         lo, hi = p.lo, p.hi
@@ -294,9 +288,8 @@ def _score_concat_passes(query, weights, cache, rows, topk, stable, out):
 
 
 def _gather_pass_keys(cache, keys, p):
-    """Pass `p`'s committed keys, end to end, into the key workspace. Under
-    DCP each rank reads its shard into its slot of the gathered buffer, the
-    slots are all-gathered in place and put back in key order."""
+    """Pass `p`'s keys into the key workspace; under DCP each rank's shard via
+    its slot, all-gathered in place and put back in key order."""
     workspace, tables = keys.workspace, keys.block_tables[p.first : p.end]
     k_fp8, k_scale = workspace.keys(p.keys)
     if p.dcp is None:
@@ -349,15 +342,11 @@ def _gather_concat(query, cache, keys):
     return k_fp8, k_scale
 
 
-def _score_concat(
-    query, weights, cache, rows, topk, stable, out, gathered, request_local
-):
+def _score_concat(query, weights, cache, rows, topk, stable, out, request_local):
     """FP8 prefill against the gathered keys. The top-k reports a key's place
     in the gathered run; less its request's start it is the request's own."""
     keys = rows.concat
-    k_fp8, k_scale = (
-        _gather_concat(query, cache, keys) if gathered is None else gathered
-    )
+    k_fp8, k_scale = _gather_concat(query, cache, keys)
     ends = keys.row_starts + rows.row_ends
     for first, end in rows.bands:
         span = slice(first, end)

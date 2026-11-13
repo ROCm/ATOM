@@ -82,6 +82,11 @@ def logits_rows(rows, width):
     )
 
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(-a // b)
+
+
 def plane_capacity(rows, width):
     """fp32 elements of a `width`-column plane for `rows` query rows, in as
     many bands as the logits budget asks."""
@@ -155,7 +160,7 @@ def qsplit_rows(num_rows: int, rank: int, world_size: int) -> tuple[int, int, in
     at ``num_rows=12, world_size=8`` the stride is 2 and the last two ranks are
     already empty. At ``world_size == 1`` the range is the whole of it.
     """
-    rows_per_rank = -(-num_rows // world_size)
+    rows_per_rank = cdiv(num_rows, world_size)
     slot_lo = rank * rows_per_rank
     row_lo = min(slot_lo, num_rows)
     row_hi = min(slot_lo + rows_per_rank, num_rows)

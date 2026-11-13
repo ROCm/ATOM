@@ -11,12 +11,14 @@ import torch
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.sparse_indexer_chunk import (
+    LogitsWorkspace,
     decode_band_rows,
     logits_rows,
     qsplit_rows,
 )
 
 from .layout import MFMA, NATURAL, PRESHUFFLE
+from .workspace import ConcatKeyWorkspace, ConcatPass
 
 # ATOM shares a TABLE schedule across V4 layers only for short decode groups.
 # Longer groups keep the config-selected mode; this is not a prefill detector.
@@ -48,7 +50,7 @@ class ConcatKeys(NamedTuple):
     cu_committed: torch.Tensor
     total: int
     row_starts: torch.Tensor
-    workspace: Any = None
+    workspace: ConcatKeyWorkspace | None = None
 
 
 def _check_split_group(group: str) -> None:
@@ -123,7 +125,7 @@ class IndexRows(NamedTuple):
     band's start, a band holding as many as fit. `concat`: FP8 prefill rows
     against their requests' gathered keys (`ConcatKeys`), `width` then their
     total -- or, packed, the longest row -- and `passes` how they are gathered
-    and scored in the key workspace (`ConcatPass`).
+    and scored in the key workspace (`ConcatPass`), each with its own bands.
     `split`: the bands are this rank's rows alone (`RowSplit`).
     `workspace`: the plane the bands were cut to (`LogitsWorkspace`, or one
     that also packs); None, a plane allocated as the rows are scored."""
@@ -137,8 +139,8 @@ class IndexRows(NamedTuple):
     packed_offsets: torch.Tensor | None = None
     concat: ConcatKeys | None = None
     next_n: int = 1
-    workspace: Any = None
-    passes: tuple | None = None
+    workspace: LogitsWorkspace | None = None
+    passes: tuple[ConcatPass, ...] | None = None
 
     @property
     def out_rows(self) -> int:
@@ -244,16 +246,14 @@ def concat_rows(row_ends, keys: ConcatKeys, split: RowSplit | None = None):
 def packed_concat_rows(
     row_ends, keys: ConcatKeys, split, workspace, passes, packed_offsets, width
 ):
-    """FP8 prefill rows packed into `workspace` as V4.1's FP4 rows are, their
-    keys gathered into `keys.workspace` pass by pass (`ConcatPass`).
-    `width`: the longest row, the plane the top-k picks as."""
+    """FP8 prefill rows packed into `workspace` as V4.1's FP4 rows are, keys
+    gathered pass by pass; `width`: the longest row, for the top-k."""
     if keys.workspace is None:
         raise ValueError("packed concat rows gather into a key workspace")
-    bands = tuple(band for p in passes for band in p.bands)
     return IndexRows(
         row_ends,
         width,
-        bands,
+        (),
         split,
         packed_offsets=packed_offsets,
         concat=keys,

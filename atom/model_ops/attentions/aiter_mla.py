@@ -1912,9 +1912,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ),
         )
 
-    def _build_dcp_indexer_prefill_meta(
-        self, attn_metadata, bs: int, prefix: str, passes=None
-    ):
+    def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, prefix: str):
         """Metadata for the DCP sparse-prefill indexer gather, off the
         ``prefix`` set's host mirrors.
 
@@ -1942,26 +1940,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
         """
-        W = self.dcp_world_size
-        S = self.cp_kv_cache_interleave_size
         var = self.model_runner.forward_vars
-        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
-        g_cu = var[prefix + committed].np[: bs + 1].astype(np.int64)
-        g_lens = g_cu[1:] - g_cu[:bs]
-
-        lpad = ((g_lens + S * W - 1) // (S * W)) * S
-        cu_pad = np.zeros(bs + 1, dtype=np.int64)
-        np.cumsum(lpad, out=cu_pad[1:])
-        # FP8 gathers its keys in passes (`ConcatPass`); FP4 a step at once.
-        ranges = [(0, bs)] if passes is None else [(p.first, p.end) for p in passes]
-        gathers = self._dcp_gathers(ranges, g_cu, g_lens, cu_pad)
-        if passes is not None:
-            return gathers
+        g_cu, g_lens, lpad, cu_pad = self._dcp_shard_lengths(attn_metadata, bs, prefix)
         (
             attn_metadata.dcp_indexer_local_total,
             attn_metadata.dcp_indexer_local_cu_seqlens,
             attn_metadata.dcp_indexer_gather_index,
-        ) = gathers[0]
+        ) = self._dcp_gathers([(0, bs)], g_cu, g_lens, cu_pad)[0]
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
                 attn_metadata,
@@ -2273,11 +2258,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         staged = self._sparse_prefill_staged.pop(prefix)
         if staged is not None:
-            gathers = None
-            if self.dcp_world_size > 1:
-                gathers = self._build_dcp_indexer_prefill_meta(
-                    attn_metadata, bs, prefix, staged.index_rows.passes
-                )
+            gathers, passes = None, staged.index_rows.passes
+            if self.dcp_world_size > 1 and passes is not None:
+                gathers = self._dcp_pass_gathers(attn_metadata, bs, prefix, passes)
+            elif self.dcp_world_size > 1:
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, prefix)
             self._sparse_prefill_work_plan(
                 attn_metadata,
                 prefix,
@@ -2779,11 +2764,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return self.is_sparse and not self._indexer_fp4 and self.index_kpool == 1
 
     def _alloc_prefill_concat(self) -> int:
-        """Allocate the FP8 prefill indexer's gathered keys: a request of the
-        model length plus a step's tokens, a step past it gathered in passes
-        (`concat_passes`). Returns the fp32 elements its packed rows need: a
-        PCP/DCP rank's share of a step's rows within the logits budget, never
-        less than one row of the model length."""
+        """Allocate the FP8 prefill key workspace; return the fp32 elements a
+        PCP/DCP rank's packed rows need within the budget, at least one row."""
         config = self.model_runner.config
         keys = self.index_prefill_key_workspace = ConcatKeyWorkspace.for_config(
             config.max_model_len,
@@ -2807,9 +2789,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return plane_capacity(rows, int(aligned_spans(config.max_model_len)))
 
     def _plan_concat_passes(self, bs, row_ends, pcp_split, has_cached, group, prefix):
-        """The FP8 prefill's passes (`concat_passes`) over the ``prefix`` set's
-        requests -- under PCP the rows this rank owns -- and this rank's rows'
-        packed offsets, on the host."""
+        """The FP8 prefill's passes over the ``prefix`` set's requests (under PCP
+        this rank's rows) and its rows' packed offsets, on the host."""
         var = self.model_runner.forward_vars
         row_cu = var[f"{prefix}cu_seqlens_q"].np[: bs + 1]
         if pcp_split:
@@ -2831,10 +2812,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         group.set_counts({name: len(row_ends)})
         return passes
 
+    def _dcp_shard_lengths(self, attn_metadata, bs, prefix):
+        """Each request's committed keys (`g_cu`, `g_lens`) and its shard,
+        padded to the interleave super-block (`lpad`, cumulated `cu_pad`)."""
+        W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size
+        var = self.model_runner.forward_vars
+        committed = "cu_seqlens_k" if attn_metadata.has_cached else "cu_seqlens_q"
+        g_cu = var[prefix + committed].np[: bs + 1].astype(np.int64)
+        g_lens = g_cu[1:] - g_cu[:bs]
+        lpad = ((g_lens + S * W - 1) // (S * W)) * S
+        cu_pad = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(lpad, out=cu_pad[1:])
+        return g_cu, g_lens, lpad, cu_pad
+
+    def _dcp_pass_gathers(self, attn_metadata, bs, prefix, passes):
+        """The FP8 prefill's DCP key gather, a pass at a time (`ConcatPass.dcp`)."""
+        g_cu, g_lens, _, cu_pad = self._dcp_shard_lengths(attn_metadata, bs, prefix)
+        ranges = [(p.first, p.end) for p in passes]
+        return self._dcp_gathers(ranges, g_cu, g_lens, cu_pad)
+
     def _dcp_gathers(self, ranges, g_cu, g_lens, cu_pad):
-        """Per request range `(first, end)`: the shards' total, their local
-        cu-seqlens and each key's place in their all-gather (global sequence
-        position p lives on rank owner(p) at local_index(p))."""
+        """Per request range: the shards' total, their local cu-seqlens and each
+        key's place in their all-gather (position p: rank owner(p), local_index(p))."""
         from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 
         W, S = self.dcp_world_size, self.cp_kv_cache_interleave_size

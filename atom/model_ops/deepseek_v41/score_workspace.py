@@ -13,6 +13,8 @@ visibility, at a start of its own (`PackedRows`), so the buffer follows the
 batch's live context rather than its rows times the model length.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import torch
 
@@ -40,6 +42,17 @@ def packed_capacity(geometry, pages, max_tokens, plane_elements):
     rows_per_token = 1 + geometry.speculative_tokens
     live = pages * widest * rows_per_token + max_tokens * ROW_ALIGN
     return min(live, plane_elements)
+
+
+class PackedRows(NamedTuple):
+    """A step's rows at one ratio laid out in the packed logits: each row's
+    visibility, where its logits and its block maxima start, counted from its
+    band's start, and the bands' rows (`band_offsets`)."""
+
+    visible: torch.Tensor
+    offsets: torch.Tensor
+    block_offsets: torch.Tensor
+    bands: tuple[tuple[int, int], ...]
 
 
 class ScoreWorkspace(LogitsWorkspace):
