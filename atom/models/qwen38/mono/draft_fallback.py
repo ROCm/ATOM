@@ -20,7 +20,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
-from atom.model_ops.qwen4_exp.qsa_attention import store_rope_positions
 from atom.models.qwen38.mono.draft_experts import NativeExperts
 from atom.models.qwen38.mono.kernels import qsa_index
 from atom.models.qwen38.mono.kernels.qsa_epilogue import qsa_norm_rope_cache
@@ -35,8 +34,6 @@ def forward(model, runner, experts, positions, hidden, selected_rows):
     serves the step, else ``native`` (``experts``: ``prepare_experts``'s)."""
     got = runner.serve(model, hidden, selected_rows)
     if got is not None:
-        slots = get_forward_context().attn_metadata.qsa_metadata.slot_mapping
-        store_rope_positions((runner.qsa,), positions, slots, hidden.shape[0])
         return got
     return native(model, experts, positions, hidden, selected_rows)
 
