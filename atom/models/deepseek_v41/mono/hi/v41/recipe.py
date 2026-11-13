@@ -738,7 +738,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
             weight_format="mxfp8",
             group_rows=k.WQB_ROWS,
         ),
-        KVPrep("kvprep", C.kvb, C.kvn, "pos", "rope"),
+        KVPrep("kvprep", C.kvb, C.kvn, "pos", "rope", kv8=kv8),
         attn,
         RingWrite("ringw", attn),
         # bf16 compute: the reference's wo_a is a plain bf16 einsum (the checkpoint's FP8 times its block scales, the

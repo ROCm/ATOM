@@ -70,6 +70,7 @@ from ...device.gfx950.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
+    fp8_pack4,
     hw_exp2,
     hw_rsq,
     ld_i32,
@@ -275,9 +276,25 @@ def _put_pair(k, a, e, v0, v1, ok):
 
 
 @traced
-def _store_entry(addr, w, ok):
+def _store_entry(addr, w, ok, nbytes=4):
     if ok:
-        paged.global_store(addr, w)
+        paged.global_store(addr, w, nbytes)
+
+
+def _kv8_entry(k, p: _Plan, b, pos, c, entry, ok):
+    """Channel c's ``entry`` (bf16) into entry pos // ratio's MXFP8 row of ATOM's fp8 pool where ``ok``, as ATOM's
+    writer stores it (``paged.kv8_code``: its group the 32 channels of a half wave); -> the value the row holds
+    (QAT: what ATOM's readers take). A lane c % 4 == 0 stores channels c .. c + 3 (a word), lane c % 32 == 0 the
+    group's code."""
+    amax = butterfly(fx.Float32(fx.max(entry, -entry)), (1, 2, 4, 8, 16), fx.max)
+    code = paged.kv8_code(amax)
+    scaled = paged.kv8_scaled(entry, code)
+    n1 = xshfl(scaled, 1)
+    word = fp8_pack4(scaled, n1, xshfl(scaled, 2), xshfl(n1, 2))  # (lane c ^ 2's neighbour: c + 3)
+    row = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio, row_bytes=paged.KV8_ROW_BYTES)
+    _store_entry(row + fx.Int64(c), word, ok & ((c % 4) == 0))
+    _store_entry(row + fx.Int64(HD + c // paged.KV8_GROUP), code, ok & ((c % paged.KV8_GROUP) == 0), 1)
+    return paged.kv8_value(scaled, code)
 
 
 def _state_at(k, p: _Plan, b, slot):
@@ -304,10 +321,6 @@ def _publish_read(k, p: _Plan, b, first):
 
 def _pool(k, t, p: _Plan):
     """Row t; thread c = channel c."""
-    if p.kv8:  # (the cache entry's only store is here: none may write a bf16 entry into an MXFP8 row)
-        raise NotImplementedError(
-            f"Compressor {p.name}: kv8 (ATOM's fp8 pool, the entry quantized on store) is not emitted yet"
-        )
     c = k.tid
     b, j = t // p.spec, t % p.spec
     pos = uniform(ld_i32(k.args[p.pos], b)) + j
@@ -381,18 +394,23 @@ def _pool(k, t, p: _Plan):
         zero = fx.Float32(0.0)
         entry = emits.select(entry, zero)
         lat = emits.select(lat, zero)
+    if const_expr(p.kv8):
+        # ATOM's fp8 pool: the entry as its writer quantizes the bf16 row (``fused_compress``'s ``fp8_groups``), a
+        # group of 32 channels a half wave; this launch's readers (``out``) take the values the row holds
+        entry = _kv8_entry(k, p, b, pos, c, entry, live if emits is None else live & emits)
     # outputs: a pair a even thread
     nxt = xshfl(entry, 1)
     even = (c & 1) == 0
     _put_pair(k, k.mb[p.out], t * HD + c, entry, nxt, even)
-    # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
-    addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
-    ok = even & live
-    _store_entry(
-        addr,
-        bf16_pair(entry, nxt).bitcast(fx.Int32),
-        ok if emits is None else ok & emits,
-    )
+    if const_expr(not p.kv8):
+        # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
+        addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
+        ok = even & live
+        _store_entry(
+            addr,
+            bf16_pair(entry, nxt).bitcast(fx.Int32),
+            ok if emits is None else ok & emits,
+        )
     if p.index_out:
         _index_key(k, t, p, c, b, pos, iload, lat, emits)
     gpu.barrier()  # the next task reuses the LDS

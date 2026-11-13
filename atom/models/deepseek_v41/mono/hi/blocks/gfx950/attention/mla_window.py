@@ -40,7 +40,7 @@ from flydsl.expr.typing import T
 
 from ....device.gfx950 import buffer_ops as bo
 from ....device.gfx950 import channels as chan
-from ....device.gfx950 import gemv
+from ....device.gfx950 import gemv, paged
 from ....device.gfx950 import mailbox as mb
 from ....device.gfx950.ops import (
     bf2_f32,
@@ -110,11 +110,14 @@ def _qat_word(vals, code):
     return word, back
 
 
-def _group_code(vals):
+def _group_code(vals, floor: bool = False):
+    """The E8M0 code of the MX group ``vals`` (its amax): ``gemv.activation_code``, or (``floor``: a key ATOM's fp8
+    pool holds) ATOM's writer's, its amax floored (``paged.kv8_code``: the same code but for groups below the
+    floor)."""
     am = _ab(vals[0])
     for v in vals[1:]:
         am = fx.max(am, _ab(v))
-    return gemv.activation_code(am)
+    return paged.kv8_code(am) if floor else gemv.activation_code(am)
 
 
 def _rope_given(vals, cs):
@@ -151,6 +154,8 @@ class _KVPlan:
     kvn: str  # BF16 channel (512): out
     pos: str
     rope: str
+    # the key's QAT by the code of ATOM's fp8 pool's writer (its amax floor): the rows it lands in are MXFP8
+    kv8: bool = False
 
 
 @traced
@@ -168,7 +173,7 @@ def _kvprep(k, r, p: _KVPlan):
         rot = vals  # (assigned before the dynamic if: its branches only rebind it)
         if g >= (HD - ROPE) // 32:
             rot = _rope_given(vals, cs)
-        code = _group_code(rot)
+        code = _group_code(rot, p.kv8)
         back = []
         for w in range_constexpr(8):
             back += _qat_word(rot[4 * w : 4 * w + 4], code)[1]
@@ -182,13 +187,16 @@ def _kvprep(k, r, p: _KVPlan):
 
 
 class KVPrep(Block):
-    def __init__(self, name: str, kv: Channel, kvn: Channel, pos: str, rope: str):
+    """The window key (RoPE, then the MXFP8 QAT); ``kv8``: by the code of ATOM's fp8 pool's writer."""
+
+    def __init__(self, name: str, kv: Channel, kvn: Channel, pos: str, rope: str, kv8: bool = False):
         for ch in (kv, kvn):
             if ch.fmt is not Fmt.BF16 or ch.width != HD or ch.flagged:
                 raise ValueError(
                     f"KVPrep {name}: kv / kvn are tagged BF16 channels of width {HD}"
                 )
         self.name, self.kv, self.kvn, self.pos, self.rope = name, kv, kvn, pos, rope
+        self.kv8 = kv8
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = _KVPlan(
@@ -199,6 +207,7 @@ class KVPrep(Block):
             self.kvn.name,
             self.pos,
             self.rope,
+            kv8=self.kv8,
         )
         return [Stage(self.name, sc.rows, partial(_kvprep, p=p), writes=tuple(self.kvn.regions(sc.rows, (self.name,))),
                       args=(self.pos, self.rope, rope_sin(self.rope)), key=(p,), row_tasks=1)]  # fmt: skip
