@@ -268,7 +268,8 @@ def cp_gate(nb_k, last_k, lane, tokens, q_len, gate):
     the selection) evaluates this pure function of ``seq_lens`` / ``q_len``, and the ranks all read
     the same ones, so they agree: a long request (> LONG_FROM_BLOCKS blocks, decided by its last
     row) of a graph of >= ``min_batch`` requests (tokens // q_len, ATOM's batch) and of a step whose
-    long requests hold >= ``min_blocks`` blocks in all (0: every long request). ``gate``:
+    long requests hold >= ``min_blocks * q_len`` blocks in all (0: every long request; the break-even
+    grows with the query rows). ``gate``:
     (min_blocks, min_batch)."""
     min_blocks, min_batch = gate
     last_of = fx.min(lane - lane % q_len + (q_len - 1), tokens - 1)
@@ -277,7 +278,7 @@ def cp_gate(nb_k, last_k, lane, tokens, q_len, gate):
         wave_incl_scan((last_k & long_k).select(nb_k, fx.Int32(0)), lane), 63
     )
     return (
-        (lane < tokens) & long_k & (total >= min_blocks)
+        (lane < tokens) & long_k & (total >= min_blocks * q_len)
         & (tokens // q_len >= min_batch) & (q_len <= CP_MAX_Q)
     )  # fmt: skip
 

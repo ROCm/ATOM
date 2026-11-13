@@ -122,11 +122,17 @@ class WidthPolicy:
 # contexts (``index_score.cp_gate``): a long request (> LONG_FROM_BLOCKS blocks) of a graph whose batch is
 # at least ``min_batch`` requests and whose long requests together hold at least ``min_blocks`` blocks.
 # min_batch: ATOM's ``ATOM_M3_INDEXER_CP_MIN_BATCH`` (rows // max_query_len; 16 for NVFP4 / FP4 index caches,
-# 1 for the others). min_blocks: ATOM's measurements (task-atom-nvfp4-cp, TP4 nvfp4, uniform context, TPOT
-# CP on vs off: 16 requests 8K/32K/131K +6.0 / +3.5 / -1.8 %, 32 requests +3.3 / -0.2 / -6.4 %) put the break-even
-# at ~8-16K blocks summed over the requests (32 x 32K = 8K blocks: even; 16 x 128K = 16K blocks: -1.8 %);
-# the default is the cautious end; the mono measurements replace it.
-DEFAULT_CP_MIN_BLOCKS = 16_384
+# 1 for the others). min_blocks: a step takes the CP arm when its long requests hold >= min_blocks * q_len
+# blocks in all (q_len: query rows a request). Measured on the merged scorer (TP4 nvfp4, 4 cards, front half a
+# layer, CP off vs on, tables byte-equal, 32 and 64 rows, uniform contexts, per-request block counts 2K-215K):
+# q1 loses below ~20K blocks in all (one live request +2.5..+3.8 us, 4-8K +6..+13, 16.4K +5.5..+6.2) and wins
+# above (26.9K -3.5 / -4.3 us, 33K -8.4, 65K -36, 108K -68); q2 +9..+12 at 8-13K blocks, -6.8 at 33K, -26 at 54K;
+# q4 +3.6..+12.5 at 8-20K, -1.9 at 27K, -6.2 at 31K; q8 (8 requests at most: < 16K blocks) +3..+16 everywhere. A
+# step without a long request pays +0.2..+0.9 us for the gate whatever the threshold. The break-even grows
+# with q_len, so the default 24576 blocks is per query row: q1 from 24.6K (past the ~20K crossing), q2 from 49K,
+# q4 from 98K (above the 31K blocks 16 requests of 250K hold: never), q8 never. ATOM's 16384 (its own
+# implementation, 16 requests x 128K) is a loss on mono (16.4K blocks: +5.5..+6.2 us).
+DEFAULT_CP_MIN_BLOCKS = 24_576
 NVFP4_CP_MIN_BATCH = 16
 
 
