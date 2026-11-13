@@ -1089,10 +1089,12 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, ready_event=None, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id, engine)
+        lambda request, target, src, dst, data, req_id, ready_event, *, engine=None: (
+            captured.append(
+                (request, target, src, dst, data, req_id, ready_event, engine)
+            )
+            or True
         )
-        or True
     )
     conn._send_write_done = lambda *_args, **_kwargs: None
     return conn
@@ -1132,7 +1134,22 @@ def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
     assert transferred["swa_block_ids"] == [7]
     # The slot path takes the engine `_execute_transfer` picked, so #2276's
     # matched-rail routing reaches it too.
-    assert captured[0][6] is conn.transfer_engine
+    assert captured[0][7] is conn.transfer_engine
+
+
+def test_tp_transfer_hands_the_slot_gather_its_prefill_ready_event():
+    """Staging the state slot gathers it on a send-worker stream, which only
+    this event orders against the forward that wrote it."""
+    captured = []
+    conn = _make_transfer_connector(
+        {"block_ids": [3], "slot_index": 3, "swa_block_ids": [3]}, captured
+    )
+    ready_event = object()
+    conn._kv_cache_ready_events["prefill-1"] = ready_event
+
+    conn._execute_transfer(_stateful_write_request())
+
+    assert captured[0][6] is ready_event
 
 
 @pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
@@ -1998,6 +2015,47 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+@pytest.mark.parametrize(
+    "staging,recorded",
+    [
+        ({"_staging_slot_bytes": 4}, True),
+        ({"_mla_staging": object()}, True),
+        ({}, False),
+    ],
+)
+def test_mooncake_records_a_ready_event_for_any_staged_path(
+    monkeypatch, staging, recorded
+):
+    """A backend that stages only the state slot needs the event too.
+
+    V4/V4.1 compressor state has no index or MLA staging, and the staged slot
+    gather fails closed without an event rather than reading a partial state.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.is_producer = True
+    connector._index_staging_pool_size = 0
+    connector._mla_staging = None
+    connector._staging_slot_bytes = 0
+    connector._cuda_device = 3
+    connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
+    connector._completed_prefills_lock = threading.Lock()
+    for name, value in staging.items():
+        setattr(connector, name, value)
+    ready_event = MagicMock()
+    monkeypatch.setattr(mc.torch.cuda, "Event", MagicMock(return_value=ready_event))
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", MagicMock())
+
+    connector.record_kv_cache_ready([11])
+
+    assert connector._kv_cache_ready_events == ({11: ready_event} if recorded else {})
 
 
 def _ready_event_producer(mc, monkeypatch):
