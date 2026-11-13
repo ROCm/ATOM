@@ -13,15 +13,11 @@ on:
       - '.github/workflows/atomesh-benchmark-tmpl.yaml'
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'atom/mesh/**'
-      - '.github/benchmark/models_atomesh.yaml'
-      - '.github/scripts/atomesh/**'
-      - 'atom/entrypoints/openai/**'
-      - '.github/scripts/slurm_submit_helpers.sh'
-      - '.github/workflows/atomesh-benchmark.yaml'
-      - '.github/workflows/atomesh-benchmark-tmpl.yaml'
+    types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
+    # Do not use paths here. The required gate must be published for every PR;
+    # ci-gate below keeps the old path filter behavior for expensive jobs.
+  pull_request_review:
+    types: [submitted]
   schedule:
     # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
@@ -250,16 +246,51 @@ env:
 concurrency:
   # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
   # The MoRI IO schedule has a group of its own, or it would queue behind the multi-day nightly.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && (github.event.schedule == '10 4 * * *' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd-mi350') || 'atomesh-cicd') }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
+  # Approval runs queue behind existing work. Other reviews get their own group
+  # so they cannot replace a pending approval run in GitHub's queue.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && (github.event.schedule == '10 4 * * *' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd-mi350') || 'atomesh-cicd') }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 permissions:
   actions: read
   contents: write
 
 jobs:
+  ci-gate:
+    name: Check Heavy CI Gate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Check approval and label gate
+        id: gate
+        env:
+          CI_GATE_WORKFLOW: atomesh-benchmark.yaml
+          CI_GATE_LABELS: ci:full,ci:atomesh
+          CI_GATE_PATHS_INCLUDE: |
+            atom/mesh/**
+            .github/benchmark/models_atomesh.yaml
+            .github/scripts/atomesh/**
+            atom/entrypoints/openai/**
+            .github/scripts/slurm_submit_helpers.sh
+            .github/workflows/atomesh-benchmark.yaml
+            .github/workflows/atomesh-benchmark-tmpl.yaml
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash ./.github/scripts/check_heavy_ci_gate.sh
+
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
+    needs: [ci-gate]
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
@@ -504,7 +535,7 @@ jobs:
 
   rdma-smoke-test:
     name: Mooncake RDMA smoke test
-    needs: [load-config]
+    needs: [ci-gate, load-config]
     # Defense-in-depth: the current smoke path is workflow_dispatch-only.
     # Keep forked PRs off ATOMesh self-hosted runners if that changes later.
     if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
@@ -1500,7 +1531,7 @@ jobs:
 
   run-model-benchmark:
     name: ${{ matrix.group.name }}
-    needs: [load-config]
+    needs: [ci-gate, load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
       && (
@@ -1513,7 +1544,7 @@ jobs:
       # this many of the shared atomesh runners.
       max-parallel: 4
       matrix:
-        group: ${{ fromJson(needs.load-config.outputs.groups_json) }}
+        group: ${{ fromJson(needs.load-config.outputs.groups_json || '[{"name":"skip","matrix_json":"{\"include\":[]}"}]') }}
     uses: ./.github/workflows/atomesh-benchmark-tmpl.yaml
     with:
       matrix_json: ${{ matrix.group.matrix_json }}
@@ -1773,6 +1804,38 @@ jobs:
             atomesh-aiperf-raw.md
             atomesh-case-log-paths.md
           if-no-files-found: ignore
+
+  atomesh-benchmark-gate:
+    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true') && 'ATOMesh Benchmark Gate' || 'ATOMesh Benchmark Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - load-config
+      - rdma-smoke-test
+      - run-model-benchmark
+      - summarize-results
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOMesh benchmark gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOMesh Benchmark Gate
+          suite-name: ATOMesh benchmark tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          optional-results: |
+            rdma-smoke-test=${{ needs.rdma-smoke-test.result }}
+            run-model-benchmark=${{ needs.run-model-benchmark.result }}
+            summarize-results=${{ needs.summarize-results.result }}
+          required-results: |
+            load-config=${{ needs.load-config.result }}
 
   dashboard:
     concurrency:
