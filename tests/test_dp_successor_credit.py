@@ -13,7 +13,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 def _pair(stage):
     mgr = _make_mgr(2, strategy="share_cache")
-    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 512)
+    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 512)
     sent = []
     mgr._send_request = lambda rank, data: sent.append((rank, pickle.loads(data)))
     producer = _chain_seq(1, 100000)

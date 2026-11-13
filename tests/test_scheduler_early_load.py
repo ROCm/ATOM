@@ -312,7 +312,7 @@ def test_a_request_below_the_minimum_load_size_is_not_looked_at(
     monkeypatch, seq_factory
 ):
     sched, _, (seq,) = _make(monkeypatch, seq_factory)
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "1000")
+    sched.config.offload_min_load_tokens = 1000
 
     sched.schedule()
 

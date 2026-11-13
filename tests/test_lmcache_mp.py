@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -83,30 +84,32 @@ def _config(
         head_dim=128,
         kv_lora_rank=kv_lora_rank,
     )
-    return SimpleNamespace(
-        hf_config=hf_config,
-        model="test/model",
-        model_tag="test/model",
-        kv_cache_block_size=4,
-        kv_cache_dtype="fp8",
-        index_cache_dtype="fp8",
-        tensor_parallel_size=tp,
-        pipeline_parallel_size=pp,
-        decode_context_parallel_size=dcp,
-        prefill_context_parallel_size=pcp,
-        enable_dp_attention=enable_dp_attention,
-        enable_expert_parallel=enable_expert_parallel,
-        speculative_config=None,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=dp,
-            data_parallel_size_local=dp if dp_local is None else dp_local,
-            data_parallel_rank=dp_rank,
-        ),
-        kv_transfer_config={
-            "kv_connector": "lmcache_mp",
-            "kv_role": role,
-            "kv_connector_extra_config": extra or {},
-        },
+    return with_min_load(
+        SimpleNamespace(
+            hf_config=hf_config,
+            model="test/model",
+            model_tag="test/model",
+            kv_cache_block_size=4,
+            kv_cache_dtype="fp8",
+            index_cache_dtype="fp8",
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
+            enable_dp_attention=enable_dp_attention,
+            enable_expert_parallel=enable_expert_parallel,
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=dp,
+                data_parallel_size_local=dp if dp_local is None else dp_local,
+                data_parallel_rank=dp_rank,
+            ),
+            kv_transfer_config={
+                "kv_connector": "lmcache_mp",
+                "kv_role": role,
+                "kv_connector_extra_config": extra or {},
+            },
+        )
     )
 
 

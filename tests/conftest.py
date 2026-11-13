@@ -117,6 +117,15 @@ class MockConfig:
             setattr(self, k, v)
 
 
+def with_min_load(config):
+    """Settle on a stand-in config what `Config` settles at construction: the
+    minimum tier load, from the env override or the tier's own default."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
+    return config
+
+
 def atom_config_double(**overrides):
     """A stand-in for `atom.config.Config`, with the real Config's fields.
 

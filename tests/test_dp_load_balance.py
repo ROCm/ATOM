@@ -13,6 +13,7 @@ import pickle
 from threading import Event, Lock, Thread
 
 import pytest
+from conftest import with_min_load
 
 from atom.model_engine.dp_routing.backlog import BacklogLedger
 from atom.model_engine.engine_core_mgr import (
@@ -569,7 +570,7 @@ def test_concurrent_store_dispatch_accounts_in_socket_send_order():
 
     mgr = _make_mgr(1)
 
-    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 100)
+    mgr._share_cache_router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     first_sent, second_started = Event(), Event()
     order = []
 
@@ -1356,7 +1357,9 @@ def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "4096")
 
     def tier(kvc):
-        return KVConnectorFactory.offload_tier(SimpleNamespace(kv_transfer_config=kvc))
+        return KVConnectorFactory.offload_tier(
+            with_min_load(SimpleNamespace(kv_transfer_config=kvc))
+        )
 
     assert not tier({}).loads
     mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
@@ -1396,7 +1399,7 @@ def test_store_prefix_tier_requires_one_pool(nested, multi, different):
     leaf = {"kv_connector": "mooncake_store", "kv_role": "offload"}
     leaf.update({"kv_connector_extra_config": extras} if nested else extras)
     kvc = {"kv_connector": "multi", "connectors": [leaf]} if multi else leaf
-    config = SimpleNamespace(kv_transfer_config=kvc)
+    config = with_min_load(SimpleNamespace(kv_transfer_config=kvc))
     if different:
         with pytest.raises(ValueError, match="requires one shared Mooncake Store pool"):
             KVConnectorFactory.offload_tier(config)
@@ -1410,12 +1413,14 @@ def test_store_prefix_tier_validates_explicit_pool_config(pools):
 
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    config = SimpleNamespace(
-        kv_transfer_config={
-            "kv_connector": "mooncake_store",
-            "kv_role": "offload",
-            "kv_connector_extra_config": {"mooncake_store.pools": pools},
-        }
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={
+                "kv_connector": "mooncake_store",
+                "kv_role": "offload",
+                "kv_connector_extra_config": {"mooncake_store.pools": pools},
+            }
+        )
     )
     with pytest.raises(ValueError):
         KVConnectorFactory.offload_tier(config)
@@ -1449,7 +1454,9 @@ def test_partial_store_hit_does_not_hide_recomputed_prefill(monkeypatch):
         "kv_role": "offload",
         "kv_connector_extra_config": {"mooncake_store.chunk_tokens": 8192},
     }
-    tier = KVConnectorFactory.offload_tier(SimpleNamespace(kv_transfer_config=kvc))
+    tier = KVConnectorFactory.offload_tier(
+        with_min_load(SimpleNamespace(kv_transfer_config=kvc))
+    )
     assert tier.load_chunk_tokens == 8192
     mgr = _make_spread_mgr(n_ranks=3, tier=tier)
     router = mgr._prefix_router
@@ -1659,11 +1666,13 @@ def test_lmcache_mp_declares_its_chunk_through_the_registry(monkeypatch):
         "kv_role": "offload",
         "kv_connector_extra_config": {"lmcache.chunk_size": 512},
     }
-    cfg = SimpleNamespace(kv_transfer_config=mp)
+    cfg = with_min_load(SimpleNamespace(kv_transfer_config=mp))
     assert KVConnectorFactory.offload_tier(cfg).load_chunk_tokens == 512
     monkeypatch.setenv("LMCACHE_CHUNK_SIZE", "1024")
-    cfg = SimpleNamespace(
-        kv_transfer_config={"kv_connector": "lmcache_mp", "kv_role": "offload"}
+    cfg = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_connector": "lmcache_mp", "kv_role": "offload"}
+        )
     )
     assert KVConnectorFactory.offload_tier(cfg).load_chunk_tokens == 1024
 
@@ -1781,12 +1790,14 @@ def test_prefix_spread_is_checked_and_built_only_where_it_routes(
 
     mgr = _make_mgr(ranks, strategy="prefix_spread")
     mgr.global_engine_count = ranks
-    config = SimpleNamespace(
-        enable_prefix_caching=True,
-        dp_load_balance="prefix_spread",
-        pipeline_parallel_size=pp,
-        max_num_seqs=256,
-        kv_transfer_config=None,
+    config = with_min_load(
+        SimpleNamespace(
+            enable_prefix_caching=True,
+            dp_load_balance="prefix_spread",
+            pipeline_parallel_size=pp,
+            max_num_seqs=256,
+            kv_transfer_config=None,
+        )
     )
     monkeypatch.setenv("ATOM_FRONTEND_PREFIX_HASH", "0")
     if builds:
@@ -2284,7 +2295,7 @@ def test_share_cache_explicit_rank_records_completed_prefix():
     from atom.model_engine.dp_routing.policies import ShareCachePolicy
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(OffloadTierProfile(True, 0, 1), 100)
+    router = ShareCacheRouter(OffloadTierProfile(True, 0, 256, True), 100)
     policy = ShareCachePolicy(
         router, lambda: [0, 0], lambda: [0, 0], lambda r: 0, lambda: 0
     )
@@ -2303,12 +2314,14 @@ def test_store_floor_profile_matches_admission_without_double_credit():
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.kv_transfer.offload.tier import OffloadTierProfile
 
-    config = SimpleNamespace(
-        kv_transfer_config={
-            "kv_connector": "mooncake_store",
-            "kv_role": "offload",
-            "kv_connector_extra_config": {"mooncake_store.chunk_tokens": 256},
-        }
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={
+                "kv_connector": "mooncake_store",
+                "kv_role": "offload",
+                "kv_connector_extra_config": {"mooncake_store.chunk_tokens": 256},
+            }
+        )
     )
     tier = KVConnectorFactory.offload_tier(config)
     assert tier.lowers_hbm_hit_to_chunk
@@ -2346,7 +2359,7 @@ def test_share_cache_completed_hit_is_not_a_producing_source():
     from atom.kv_transfer.offload.tier import OffloadTierProfile
     from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
 
-    router = ShareCacheRouter(OffloadTierProfile(True, 128, 1), 100)
+    router = ShareCacheRouter(OffloadTierProfile(True, 128, 256, True), 100)
     first = _chain_seq(21, 768)
     route = router.select(first, [0, 0], [0, 0], None, None)
     router.charge(first.id, route.credit)

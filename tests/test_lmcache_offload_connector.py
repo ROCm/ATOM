@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
@@ -419,9 +419,11 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
 
 def _registration_connector() -> LMCacheOffloadConnector:
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+        )
     )
     connector.block_size = 4
     connector.chunk_size = None
@@ -435,10 +437,12 @@ def _registration_connector() -> LMCacheOffloadConnector:
 
 def _dense_registration_connector() -> DenseOffloadConnector:
     connector = DenseOffloadConnector.__new__(DenseOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=1,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
     )
     connector.block_size = 4
     connector.virtual_block_size = 4
@@ -2082,12 +2086,14 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=16,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=16,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2104,12 +2110,14 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=25,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=25,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2126,12 +2134,14 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=0,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=0,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2145,11 +2155,13 @@ def test_dsv4_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache storage")
 
     monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache storage"):
@@ -2167,11 +2179,13 @@ def test_dsv4_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache TP geometry")
 
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache TP geometry"):
@@ -2184,11 +2198,13 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24.5),
     )
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="LMCache chunk size must be an integer"):
@@ -2200,9 +2216,11 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
     [LMCacheOffloadConnector, LMCacheOffloadConnectorScheduler],
 )
 def test_unknown_kv_role_fails_fast(connector_cls):
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_role": "unknown"},
-        kv_cache_block_size=4,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "unknown"},
+            kv_cache_block_size=4,
+        )
     )
 
     with pytest.raises(ValueError, match="kv_role"):
@@ -6042,8 +6060,10 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
     """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
     the KV shape -- the KDA state is what makes it its own family."""
-    cfg = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    cfg = with_min_load(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+        )
     )
     assert offcfg.select_offload_layout(cfg) == "kimi_k3"
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 from test_lmcache_mp_async_lookup import _Adapter, _Client
 
 from atom.kv_transfer.disaggregation.types import (
@@ -101,14 +101,16 @@ def make_scheduler(
         return adapter
 
     monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
-    config = SimpleNamespace(
-        kv_cache_block_size=4,
-        kv_transfer_config={
-            "kv_role": role,
-            "kv_connector_extra_config": {
-                "lmcache.chunk_size": 8,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_cache_block_size=4,
+            kv_transfer_config={
+                "kv_role": role,
+                "kv_connector_extra_config": {
+                    "lmcache.chunk_size": 8,
+                },
             },
-        },
+        )
     )
     scheduler = NativeStateLMCacheMPConnectorScheduler(config)
     assert connections == []
@@ -1200,6 +1202,9 @@ def _holding_engine(monkeypatch, adapter, **overrides):
     monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", "0.9")
     monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", "0.95")
     engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
+    # Only the Mooncake Store opts in; these tests cover the scheduler's
+    # state-carrying early-load path through a connector that holds state.
+    monkeypatch.setattr(type(connector), "supports_early_load", True)
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
     return engine, connector, delayer
