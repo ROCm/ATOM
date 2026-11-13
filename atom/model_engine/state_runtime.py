@@ -52,12 +52,24 @@ class StateTransfer:
     #: (`conv_kernel - 1`) is sliced out of the step's own conv input. 0 when
     #: not readable.
     midstep_min_offset: int = 0
+    #: Whether a slot holds the committed state once a speculative decode step
+    #: retires, so a decode-step checkpoint may be copied out of it. GDN's does
+    #: not: the verify leaves the accepted state in column `num_accepted - 1`
+    #: (under ReplaySSM, partly in records the image does not carry) and its
+    #: conv windows are rolled back only by the next forward, so an image
+    #: copied in between is not the boundary's state. DeepSeek-V4's ring is
+    #: sized for the drafts and needs no rollback, so it declares True. False
+    #: by default: an undeclared class recomputes past its last prefill
+    #: checkpoint instead of restoring a state it never had.
+    spec_step_settled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
             raise TypeError("fork_tokens must be an integer")
         if not isinstance(self.readable_midstep, bool):
             raise TypeError("readable_midstep must be a bool")
+        if not isinstance(self.spec_step_settled, bool):
+            raise TypeError("spec_step_settled must be a bool")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
         for name in ("midstep_grid", "midstep_min_offset"):
@@ -119,6 +131,7 @@ class StateTransfer:
         readable_midstep: bool = False,
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
+        spec_step_settled: bool = False,
     ) -> "StateTransfer":
         return cls(
             COPY,
@@ -126,6 +139,7 @@ class StateTransfer:
             readable_midstep=readable_midstep,
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
+            spec_step_settled=spec_step_settled,
         )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
@@ -136,6 +150,7 @@ class StateTransfer:
             "readable_midstep": self.readable_midstep,
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
+            "spec_step_settled": self.spec_step_settled,
         }
 
     @classmethod
@@ -149,6 +164,7 @@ class StateTransfer:
             "readable_midstep",
             "midstep_grid",
             "midstep_min_offset",
+            "spec_step_settled",
         }
         if set(wire) != expected:
             raise ValueError(
@@ -162,6 +178,7 @@ class StateTransfer:
             readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
+            spec_step_settled=wire["spec_step_settled"],  # type: ignore[arg-type]
         )
 
     @property

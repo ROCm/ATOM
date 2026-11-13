@@ -240,6 +240,10 @@ class BlockManager:
         # round writes. Set by the scheduler, which knows whether this engine
         # drafts; admission charges for it and `may_append` allocates it.
         self.draft_lookahead = 0
+        # Whether decode steps verify drafts, set by the scheduler alongside
+        # `draft_lookahead`. `checkpointers_at` reads it for a class whose slot
+        # is not settled when a spec step retires.
+        self.speculative_decode = False
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -381,6 +385,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
+                spec_step_settled=state_runtime.transfer.spec_step_settled,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -3286,6 +3291,10 @@ class BlockManager:
             # back on this one. The twin of the `checkpoint_cut` gate; see
             # there for why the two cannot move separately.
             if not (aimed and c.readable_midstep)
+            # A decode keep is copied out of the slot before the next forward,
+            # which is what settles a spec step for a class that is not
+            # `spec_step_settled`.
+            and (aimed or not self.speculative_decode or c.spec_step_settled)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
         ]

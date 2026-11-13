@@ -160,3 +160,9 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
+
+    def test_a_copy_does_not_keep_spec_decode_checkpoints(self):
+        """A verify leaves the KDA state in column `num_accepted - 1` and the
+        conv windows unrolled until the next forward."""
+        with tp_world(TP):
+            assert not Builder.state_transfer(builder()).spec_step_settled
