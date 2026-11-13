@@ -14,8 +14,8 @@ unless ``hi_gate.decide`` says yes.
   invalidates the hook's incremental import for its requests. Its head output (``compute_head``): a served verify
   step's output ids and verdict from the head and the post-verify inside the forward, which the runner takes instead
   of the logits where they stand for the step.
-- ``HiDraftModel``: the DSpark draft's block draft on the hi path (``block_backbone``); its context-KV write on a
-  served step is the target forward's (the proposer skips ATOM's on such a step).
+- ``HiDraftModel``: the bf16 DSpark block draft on hi (``block_backbone``), with FP8 keeping native mono arithmetic;
+  its context-KV write on a served step is the target forward's (the proposer skips ATOM's on such a step).
 - the decode round (``round.HiRound``) for V4.1's metadata builder (``use_decode_round``): the routing decision, the
   device round, the commit; ATOM's Engram staging skipped on served steps (``HiLayers.use_host_tables``).
 """
@@ -46,7 +46,7 @@ _HI_DRAFT = object()
 class HiDecodeModel(MonoDecodeModel):
     """``MonoDecodeModel`` with the hi hook (module docstring): a decode step the hook serves runs every decoder layer
     on the hi path (``_hi_forward``); any other decode step takes ATOM's K1 / K2 (``V41MonoDecodeRunner``, created on
-    the first such step only: none at the served deployment, whose decode steps are all hi widths), and every other
+    the first such step only), and every other
     forward ATOM's model."""
 
     def __init__(

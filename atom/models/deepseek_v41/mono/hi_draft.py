@@ -288,7 +288,7 @@ class HiDraft:
         self.dr_requests = 1
         log_once(
             logging.INFO,
-            "V4.1 mono hi: block draft plans by requests: %s",
+            "V4.1 mono hi: available block draft plans by requests: %s",
             {n: p.describe() for n, p in self.dr_plans.items()},
         )
         self.dr_w, nbytes, plain = [], 0, 0

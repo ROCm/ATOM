@@ -29,8 +29,10 @@ One served step:
    (``post_verify``: verdict and Engram cursor commit), all inside
    the target graph.
 
-The block draft runs on the hi path too (``draft_run``: three chained stage
-launches and the Markov head a step, from ``MonoDraftModel.block_backbone``).
+With bf16 KV, the block draft runs on hi too (``draft_run``: three chained
+stage launches and the Markov head a step). FP8 KV keeps the native K1/K2
+block draft through ``HiDraftModel.block_backbone``; its context write stays
+on hi inside the served target forward.
 
 **Widths.** ``hi_compose.ROWS`` lists the bf16 step widths. An fp8 pool
 initially serves ``hi_compose.FP8_ROWS`` (6 and 12), with the other widths
@@ -348,18 +350,23 @@ class HiLayers(HiDraft, HiPrograms):
         if self.eng:
             nbytes += self._engram_tables(model, dev)
         nbytes += self._head_tables(model, dev)
-        # ---- the DSpark draft on the hi path: its context-KV write and the block draft (module docstring)
+        # ---- DSpark context writes and available block-draft programs (serving policy: hi_dispatch)
         self.cx_tables = {}
         self.cx_layers, self.cx_drafter = None, None
         nbytes += self._ctx_build(draft, dev)
         nbytes += self._draft_build(model, draft, dev)
         self.aux = None
+        block_draft_route = (
+            "native K1/K2 (fp8 KV)"
+            if self.kv_dtype == "fp8"
+            else f"hi (launches {DRAFT_LAUNCH})"
+        )
         logger.info(
             "V4.1 mono hi: %d layers on the hi path (TP%d rank %d), widths %s (requests x rows), ctx bucket %d, "
-            "%d programs, weights %.1f GiB, peer %d B, draft context write (launch %d) and block draft (launches %s) "
-            "on the hi path, residual %s, built in %.0f s",
+            "%d programs, weights %.1f GiB, peer %d B, draft context write (launch %d) on hi, "
+            "block draft %s, residual %s, built in %.0f s",
             len(self.mf), self.tp, self.rank, self.split, max_ctx, len(self.programs), nbytes / 2**30, peer_bytes,
-            CTX_LAUNCH, DRAFT_LAUNCH, {s: L.residual_layout(self.tp, rows=s) for s in self.widths}, time.time() - t0,
+            CTX_LAUNCH, block_draft_route, {s: L.residual_layout(self.tp, rows=s) for s in self.widths}, time.time() - t0,
         )  # fmt: skip
         log_once(
             logging.INFO,
