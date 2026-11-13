@@ -502,6 +502,7 @@ def transfer_args(src_slot, dst_slot):
         "dst_block_ids": [],
         "prefill_data": {"slot_index": src_slot},
         "req_id": "r0",
+        "kv_cache_ready_event": None,
     }
 
 
