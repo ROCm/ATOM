@@ -225,6 +225,45 @@ def test_an_unavailable_mailbox_is_voted_once_on_the_cpu(monkeypatch):
 
 
 @needs_dcp_ops
+@pytest.mark.parametrize(
+    "ranks, heads, dim, widest, sized",
+    [
+        (4, 16, 256, 1024, 64),  # GLM-5.2 DCP4, 256 seqs x MTP3: 2^20 caps it
+        (4, 16, 256, 16, 16),
+        (8, 12, 128, 80, 80),  # Kimi-K3 DCP8, 80 seqs: under the cap (85)
+        (8, 12, 128, 2048, 85),
+    ],
+)
+def test_the_workspace_is_sized_for_merges_the_mailbox_can_take(
+    monkeypatch, ranks, heads, dim, widest, sized
+):
+    """Merges over _MAILBOX_MAX_ELEMS take a2a, so the peer buffer stops there
+    instead of growing with max_num_seqs."""
+    built = []
+
+    class Workspace:
+        def __init__(self, group, device, heads, dim, max_tokens):
+            built.append(max_tokens)
+            self.peers = SimpleNamespace(bytes=torch.empty(0))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(
+            CombineWorkspace=Workspace,
+            dcp_lse_combine=lambda ws, out, lse, base_e=True, row_counts=None: out,
+        ),
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", _min_vote(lambda t: None))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_GROUPS", {})
+    group = SimpleNamespace(world_size=ranks, rank_in_group=0, cpu_group="gloo")
+    assert dcp_ops.prepare_dcp_mailbox(group, heads, dim, widest)
+    assert built == [sized]
+
+
+@needs_dcp_ops
 def test_max_tokens_is_the_widest_decode_step():
     spec = SimpleNamespace(num_speculative_tokens=3)
     cfg = SimpleNamespace(max_num_seqs=16, speculative_config=spec)

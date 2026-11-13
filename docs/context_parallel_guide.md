@@ -456,9 +456,10 @@ set `comm_backend` to `a2a` to opt out.
 A merge larger than `2^20` elements (tokens x all heads x head dim; GLM-5.2
 at DCP4 has 16384 per token, so up to 64 tokens take the mailbox) takes `a2a`:
 past that the mailbox's tagged stores are bandwidth bound and lose to RCCL (on
-MI355X from about 1.3e6 elements on GLM-5.2). Its peer buffer, `2 x ranks x max_num_seqs x (1 +
-num_speculative_tokens) x local heads x (4 x head dim + 8)` bytes, is mapped at
-model build, so it comes out of the KV budget. The combine does not quantize:
+MI355X from about 1.3e6 elements on GLM-5.2). Its peer buffer, `2 x ranks x
+tokens x local heads x (4 x head dim + 8)` bytes with `tokens = min(max_num_seqs
+x (1 + num_speculative_tokens), 2^20 / (ranks x local heads x head dim))`, is
+mapped at model build, so it comes out of the KV budget. The combine does not quantize:
 with a per-token FP8 `o_proj` its output is quantized by `o_proj` itself.
 
 ## Launching server

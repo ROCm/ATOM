@@ -902,12 +902,20 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     memory sits outside torch's allocator, so it must exist before the KV
     cache is sized. Returns False on every rank, and the merge stays on
     all-to-all, when any rank's aiter has no mailbox combine (or one without
-    ``row_counts``) or the peer memory cannot be mapped.
+    ``row_counts``) or the peer memory cannot be mapped. ``max_tokens`` is
+    capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
+    all-to-all, so room for them would never be used.
     """
     key = _mailbox_key(cp_group, heads, dim)
     if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
         return _MAILBOX_WORKSPACES[key] is not None
     _MAILBOX_WORKSPACES[key] = None
+    # Same shapes on every rank, so every rank returns here alike.
+    max_tokens = min(
+        max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
+    )
+    if max_tokens < 1:
+        return False
     try:
         from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace, dcp_lse_combine
 
