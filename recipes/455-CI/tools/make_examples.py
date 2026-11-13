@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Build an example 455-CI data dir in ./examples and draw its charts and reports.
+"""Build an example 455-CI data dir in ./examples, draw its charts, and write
+the example result, recipes/result/example.md.
 
-Made-up numbers in the real layout (perf.csv, accuracy.csv, runs/, reports/)
-to show what the reports look like. Each week has two sessions on one image:
-Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. In the newest Saturday
-session (11-14) DeepSeek-V4.1-Flash gains 6%, Kimi-K3 recovers from a failed
-11-07 and Qwen-35B-A3B fails at c64; in the Wednesday session after it
-(11-18) GLM-5.2 c64 drops 4% and MiniMax-M3 loses 4.7 GSM8K points. Each
-problem has a follow-up, one of each kind: a repro for Qwen, our verified PR
-for GLM, someone else's open PR for MiniMax. The charts and reports say
-EXAMPLE.
+Made-up numbers in the real layout (perf.csv, accuracy.csv, followups.csv,
+runs/) to show what a session's result looks like. Each week has two sessions
+on one image: Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. The example
+result is the newest Saturday session (11-14), which has one of everything:
+Qwen-35B-A3B fails at c64 (a repro), DeepSeek R1 c64 drops 5% (our verified
+PR), DeepSeek-V4.1-Flash gains 6% but loses 5 GSM8K points (someone else's open
+PR), and Kimi-K3 recovers from a failed 11-07. The Wednesday session after it
+(11-18) only feeds the 8K/1K charts: GLM-5.2 c64 drops 4% and MiniMax-M3 loses
+4.7 GSM8K points. The charts and the result say EXAMPLE.
 """
 
 import csv
@@ -25,6 +26,9 @@ from make_report import main as make_report
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "examples")
+RESULT = os.path.normpath(
+    os.path.join(HERE, os.pardir, os.pardir, "result", "example.md")
+)
 IMAGES = [
     "2026-09-26",
     "2026-10-03",
@@ -98,20 +102,28 @@ FOLLOWUPS = [
         "note": "(mock) OOM while capturing CUDA graphs, at c64 only",
     },
     {
-        "test_date": WEDNESDAY,
-        "model": "glm-5.2",
+        "test_date": NEWEST,
+        "model": "deepseek-r1",
         "action": "our_pr",
         "link": "https://github.com/ROCm/ATOM/pull/99901",
-        "note": "(mock) verified on 455: c64 back to 12,830 tok/s/GPU",
+        "note": "(mock) verified on 455: c64 back to 1,560 tok/s/GPU",
     },
     {
-        "test_date": WEDNESDAY,
-        "model": "minimax-m3",
+        "test_date": NEWEST,
+        "model": "deepseek-v4.1-flash",
         "action": "open_pr",
         "link": "https://github.com/ROCm/aiter/pull/99902",
         "note": "(mock) the open aiter PR fixes the MoE scale rounding",
     },
 ]
+FINDINGS = """\
+- (mock) Kimi-K3: the server took 41 min to start on the new image, most of it
+  JIT compiling; plan an hour for the first start.
+- (mock) DeepSeek R1: the c64 drop comes from the new MoE dispatch default in
+  ATOM main; turning it off restores the 11-07 number (fix in the follow-ups).
+- (mock) DeepSeek-V4.1-Flash: faster at both concurrencies, but GSM8K fell at the
+  same time; the aiter MoE change behind the speedup also rounds the scales.
+"""
 REPRO = """\
 > ⚠️ **EXAMPLE**: a made-up repro that only illustrates the format.
 
@@ -170,6 +182,8 @@ def scale(model, conc, image):
     m = 1 + 0.004 * week
     if model == "deepseek-v4.1-flash" and image == NEWEST:
         m *= 1.06
+    if model == "deepseek-r1" and conc == 64 and image == NEWEST:
+        m *= 0.95
     if model == "glm-5.2" and conc == 64 and image == NEWEST:
         m *= 0.96
     return m
@@ -229,6 +243,8 @@ def mock_rows():
                     s = GSM8K[model] + rng.uniform(-0.004, 0.004)
                     if (model, image) == ("minimax-m3", NEWEST):
                         s -= 0.047
+                    if (model, image) == ("deepseek-v4.1-flash", NEWEST):
+                        s -= 0.05
                     row.update(
                         status="ok", gsm8k=f"{s:.4f}", gsm8k_strict=f"{s - 0.008:.4f}"
                     )
@@ -266,6 +282,8 @@ def main():
         f.write(ERROR_LOG)
     with open(os.path.join(OUT, FOLLOWUPS[0]["link"]), "w", encoding="utf-8") as f:
         f.write(REPRO)
+    with open(os.path.join(run, "findings.md"), "w", encoding="utf-8") as f:
+        f.write(FINDINGS)
     write_csv(os.path.join(OUT, "followups.csv"), FOLLOWUP_COLUMNS, FOLLOWUPS)
     with open(os.path.join(run, "image.json"), "w", encoding="utf-8") as f:
         json.dump(
@@ -291,7 +309,7 @@ def main():
         )
     for day in (NEWEST, WEDNESDAY):  # the two sessions on the newest image
         make_charts(["--date", day, "--data-dir", OUT, "--mock"])
-        make_report(["--date", day, "--data-dir", OUT, "--mock"])
+    make_report(["--date", NEWEST, "--data-dir", OUT, "--out", RESULT, "--mock"])
 
 
 if __name__ == "__main__":

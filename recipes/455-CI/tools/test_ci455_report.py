@@ -251,6 +251,7 @@ def test_one_report_holds_the_summary_and_then_the_details():
         "\n## Summary\n",
         "\n### Highlights\n",
         "\n| Model | Scenario |",
+        "\n## Findings\n",
         "\n## Details\n",
         "\n### Environment\n",
         "\n### Performance · MLPerf Endpoint\n",
@@ -540,3 +541,11 @@ def test_a_fix_that_takes_two_prs_links_both():
     )
     want = "Fix in progress: [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)."
     assert line.endswith(want)
+
+
+def test_the_findings_text_goes_into_its_own_section():
+    text = report_md(
+        "2026-11-14", {}, [model("Alpha", **FLAT)], "c", "r", findings="- Note one.\n"
+    )
+    assert "\n## Findings\n\n- Note one.\n\n## Details\n" in text
+    assert text.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")

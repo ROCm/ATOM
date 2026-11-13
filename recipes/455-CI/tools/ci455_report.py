@@ -1,7 +1,7 @@
-"""Build the 455-CI report of one session, in English and in one file: a short
-summary for the boss (highlights and a table), then the details (environment,
-every number, trend charts and each failure's core error log)
-(455-CI-guide.md §5)."""
+"""Build the 455-CI result of one session, in English and in one file: a short
+summary for the boss (highlights and a table), the session's findings, then the
+details (environment, every number, trend charts, follow-ups and each failure's
+core error log) (455-CI-guide.md §5)."""
 
 import re
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ LOG_LINES = 60  # core error log lines shown in the details
 NONE = "No failures or major changes."
 EXAMPLE = [
     (
-        "> ⚠️ **EXAMPLE**: this report only illustrates the format. All numbers are made up; "
+        "> ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; "
         "they are not real test results."
     ),
     "",
@@ -541,13 +541,21 @@ def _details(date, env, results, charts_dir, runs_dir, owners=None, followups=No
 
 
 def report_md(
-    date, env, results, charts_dir, runs_dir, mock=False, owners=None, followups=None
+    date,
+    env,
+    results,
+    charts_dir,
+    runs_dir,
+    mock=False,
+    owners=None,
+    followups=None,
+    findings=None,
 ):
-    """One session's report: the short summary (highlights and the table),
-    then the details. `charts_dir` and `runs_dir` are relative to the report's
-    directory."""
+    """One session's result: the short summary (highlights and the table), the
+    findings written down during the session, then the details. `charts_dir`
+    and `runs_dir` are relative to the result file's directory."""
     out = [
-        f"# 455-CI report · {date} · {' + '.join(_labels(results))}"
+        f"# 455-CI result · {date} · {' + '.join(_labels(results))}"
         + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
@@ -557,6 +565,10 @@ def report_md(
         ),
         "",
         *_summary(date, results, owners, followups),
+        "",
+        "## Findings",
+        "",
+        (findings or "").strip() or "None recorded.",
         "",
         *_details(date, env, results, charts_dir, runs_dir, owners, followups),
     ]

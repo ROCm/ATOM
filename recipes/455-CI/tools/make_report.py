@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Write the 455-CI report of one session from perf.csv and accuracy.csv.
+"""Write the 455-CI result of one session from perf.csv and accuracy.csv.
 
-    python3 make_report.py --date 2026-11-18 [--scenario endpoint|8k1k] [--data-dir recipes/455-CI] [--mock]
+    python3 make_report.py --date 2026-11-18 [--scenario endpoint|8k1k] [--data-dir recipes/455-CI] [--out FILE] [--mock]
 
 A session is one day's run (Saturday: MLPerf Endpoint on the image built that
 day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
-reports/455-CI-report-<YYYYMMDD>.md: the short summary (highlights, tagging
-each model's owner from owners.csv, and the summary table), then the details
-(environment, every number, the trend charts of make_charts.py and each
-failure's core error log from runs/<YYYYMMDD>/<slug>/error.log). Each problem
+recipes/result/<YYYYMMDD>-result.md (the result dir next to the data dir, or
+--out): the short summary (highlights, tagging each model's owner from
+owners.csv, and the summary table), the findings from
+runs/<YYYYMMDD>/findings.md, then the details (environment, every number, the
+trend charts of make_charts.py and each failure's core error log from
+runs/<YYYYMMDD>/<slug>/error.log). Each problem
 in the highlights gets its next step from followups.csv (455-CI-guide.md §3.7);
 for one without, the unmerged PRs pending_fixes.csv lists for the model are
 suggested as a ready followups.csv row.
@@ -74,7 +76,11 @@ def main(argv=None):
         default=os.path.dirname(HERE),
         help="dir of perf.csv / accuracy.csv",
     )
-    ap.add_argument("--mock", action="store_true", help="mark the report as an example")
+    ap.add_argument(
+        "--out",
+        help="result file; default ../result/<YYYYMMDD>-result.md of the data dir",
+    )
+    ap.add_argument("--mock", action="store_true", help="mark the result as an example")
     args = ap.parse_args(argv)
 
     day, tag = args.date, args.date.replace("-", "")
@@ -108,15 +114,17 @@ def main(argv=None):
         for r in _rows(os.path.join(args.data_dir, "owners.csv"))
     }
 
-    out = os.path.join(args.data_dir, "reports")
-    path = os.path.abspath(os.path.join(out, f"455-CI-report-{tag}.md"))
+    path = os.path.abspath(
+        args.out or os.path.join(args.data_dir, os.pardir, "result", f"{tag}-result.md")
+    )
+    out = os.path.dirname(path)  # links in the result are relative to it
     followups = {}
     for row in _rows(os.path.join(args.data_dir, "followups.csv")):
         if row.get("test_date") != day:
             continue
         link = (row.get("link") or "").strip()
         if row.get("action") == "repro" and link and "://" not in link:
-            # A repro's path is relative to the data dir; the report is in reports/.
+            # A repro's path is relative to the data dir, not to the result.
             link = os.path.relpath(os.path.join(args.data_dir, link), out)
             row = {**row, "link": link}
         followups[row["model"]] = row  # the same session rewritten: the last row wins
@@ -132,6 +140,7 @@ def main(argv=None):
                 args.mock,
                 owners,
                 followups,
+                _read(os.path.join(run_dir, "findings.md")),
             )
         )
     for line in highlights(results, owners, followups):

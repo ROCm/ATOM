@@ -1,4 +1,4 @@
 test_date,model,action,link,owner,note
 2026-11-14,qwen-35b-a3b,repro,runs/20261114/qwen-35b-a3b/repro.md,,"(mock) OOM while capturing CUDA graphs, at c64 only"
-2026-11-18,glm-5.2,our_pr,https://github.com/ROCm/ATOM/pull/99901,,"(mock) verified on 455: c64 back to 12,830 tok/s/GPU"
-2026-11-18,minimax-m3,open_pr,https://github.com/ROCm/aiter/pull/99902,,(mock) the open aiter PR fixes the MoE scale rounding
+2026-11-14,deepseek-r1,our_pr,https://github.com/ROCm/ATOM/pull/99901,,"(mock) verified on 455: c64 back to 1,560 tok/s/GPU"
+2026-11-14,deepseek-v4.1-flash,open_pr,https://github.com/ROCm/aiter/pull/99902,,(mock) the open aiter PR fixes the MoE scale rounding

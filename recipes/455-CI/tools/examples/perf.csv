@@ -112,7 +112,7 @@ image_date,test_date,scenario,model,gpus,parallel,concurrency,status,tok_s_per_g
 2026-11-07,2026-11-11,8k1k,qwen-3.8-flash,1,tp1,4,ok,4902.46,,5.824,6.005,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261107,,main,,main,,,
 2026-11-07,2026-11-11,8k1k,qwen-3.8-flash,1,tp1,64,ok,26558.11,,15.416,15.893,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261107,,main,,main,,,
 2026-11-14,2026-11-14,endpoint,deepseek-r1,4,tp4,4,ok,164.05,149.37,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,
-2026-11-14,2026-11-14,endpoint,deepseek-r1,4,tp4,64,ok,1490.63,57.78,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,
+2026-11-14,2026-11-14,endpoint,deepseek-r1,4,tp4,64,ok,1416.10,57.78,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,
 2026-11-14,2026-11-14,endpoint,deepseek-v4.1-flash,4,dp4ep4,4,ok,250.15,209.00,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,
 2026-11-14,2026-11-14,endpoint,deepseek-v4.1-flash,4,dp4ep4,64,ok,2838.05,94.54,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,
 2026-11-14,2026-11-14,endpoint,kimi-k3,8,tp8dcp8,4,ok,56.53,104.58,,,rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114,,main,,main,,,

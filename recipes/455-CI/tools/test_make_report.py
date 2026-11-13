@@ -4,6 +4,7 @@ import csv
 import json
 import re
 
+import pytest
 from ci455_data import (
     ACCURACY_COLUMNS,
     FOLLOWUP_COLUMNS,
@@ -11,6 +12,20 @@ from ci455_data import (
     PERF_COLUMNS,
 )
 from make_report import main
+
+
+@pytest.fixture
+def ci(tmp_path):
+    """A 455-CI data dir laid out as in the repo (recipes/455-CI); a session's
+    result lands next to it, in ../result (recipes/result)."""
+    d = tmp_path / "455-CI"
+    d.mkdir()
+    return d
+
+
+def result(ci, tag):
+    return ci.parent / "result" / f"{tag}-result.md"
+
 
 CJK = "[\u4e00-\u9fff]"
 
@@ -78,10 +93,10 @@ def image_json(run, digest):
 
 
 def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
-    tmp_path,
+    ci,
 ):
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf("2026-11-07", 4, "100"),
@@ -97,26 +112,25 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
         ],
     )
     write_csv(
-        tmp_path / "accuracy.csv",
+        ci / "accuracy.csv",
         ACCURACY_COLUMNS,
         [acc("2026-11-07", "0.95"), acc("2026-11-14", "0.95")],
     )
-    run = tmp_path / "runs" / "20261114"
+    run = ci / "runs" / "20261114"
     image_json(run, "sha256:abc")
     (run / "kimi-k3").mkdir()
     (run / "kimi-k3" / "error.log").write_text(
         "Traceback (most recent call last):\nRuntimeError: HIP error: out of memory\n"
     )
 
-    (tmp_path / "owners.csv").write_text("model,owner\nkimi-k3,@k3_owner\n")
+    (ci / "owners.csv").write_text("model,owner\nkimi-k3,@k3_owner\n")
 
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
 
-    reports = tmp_path / "reports"
-    assert [p.name for p in reports.iterdir()] == ["455-CI-report-20261114.md"]
-    report = (reports / "455-CI-report-20261114.md").read_text()
+    assert [p.name for p in (ci.parent / "result").iterdir()] == ["20261114-result.md"]
+    report = result(ci, "20261114").read_text()
     summary, details = report.split("\n## Details\n")
-    assert summary.startswith("# 455-CI report · 2026-11-14 · MLPerf Endpoint")
+    assert summary.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")
     assert "## Summary" in summary and "### Highlights" in summary and "❌" in summary
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
     assert "base" not in summary.split("### Highlights")[0].lower()
@@ -124,17 +138,17 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
     assert "Base image" not in details and "Dependency" not in details
     assert (
         "Traceback" in details
-        and "../runs/20261114/charts/perf-endpoint.png" in details
+        and "../455-CI/runs/20261114/charts/perf-endpoint.png" in details
     )
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in details
     assert "@k3_owner" in summary and "please" not in summary
     assert not re.search(CJK, report)
 
 
-def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_path):
+def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(ci):
     g = {"scenario": "8k1k", "model": "glm-5.2"}
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf(
@@ -144,14 +158,13 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_pat
             perf("2026-11-18", 64, "12300", tpot="30", image_date="2026-11-14", **g),
         ],
     )
-    image_json(tmp_path / "runs" / "20261114", "sha256:saturday")
+    image_json(ci / "runs" / "20261114", "sha256:saturday")
 
-    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    main(["--date", "2026-11-18", "--data-dir", str(ci)])
 
-    reports = tmp_path / "reports"
-    assert [p.name for p in reports.iterdir()] == ["455-CI-report-20261118.md"]
-    report = (reports / "455-CI-report-20261118.md").read_text()
-    assert report.startswith("# 455-CI report · 2026-11-18 · 8K/1K")
+    assert [p.name for p in (ci.parent / "result").iterdir()] == ["20261118-result.md"]
+    report = result(ci, "20261118").read_text()
+    assert report.startswith("# 455-CI result · 2026-11-18 · 8K/1K")
     assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in report
     assert "MLPerf Endpoint" not in report
     assert (
@@ -159,44 +172,42 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(tmp_pat
         in report
     )
     assert "sha256:saturday" in report and "| Test date | 2026-11-18 |" in report
-    assert "../runs/20261118/charts/perf-8k1k.png" in report
+    assert "../455-CI/runs/20261118/charts/perf-8k1k.png" in report
 
 
-def test_a_mock_report_says_example_at_the_top(tmp_path):
-    write_csv(tmp_path / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 4, "100")])
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path), "--mock"])
-    report = tmp_path / "reports" / "455-CI-report-20261114.md"
-    assert any("EXAMPLE" in line for line in report.read_text().splitlines()[:4])
+def test_a_mock_report_says_example_at_the_top(ci):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 4, "100")])
+    main(["--date", "2026-11-14", "--data-dir", str(ci), "--mock"])
+    head = result(ci, "20261114").read_text().splitlines()[:4]
+    assert any("EXAMPLE" in line for line in head)
 
 
-def test_the_console_ends_with_the_report_path(tmp_path, capsys):
-    write_csv(tmp_path / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+def test_the_console_ends_with_the_report_path(ci, capsys):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
     last = capsys.readouterr().out.rstrip().splitlines()[-1]
-    assert last == f"Report: {tmp_path / 'reports' / '455-CI-report-20261114.md'}"
+    assert last == f"Report: {result(ci, '20261114')}"
 
 
-def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(
-    tmp_path, capsys
-):
+def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(ci, capsys):
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf("2026-11-07", 64, "1000"),
             perf("2026-11-14", 64, "", status="fail", error="RuntimeError: x"),
         ],
     )
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
     out = capsys.readouterr().out
     assert "no owner" in out and "Kimi-K3" in out
 
 
-def test_a_model_left_untested_by_a_machine_failure_is_not_news(tmp_path):
+def test_a_model_left_untested_by_a_machine_failure_is_not_news(ci):
     # Kimi-K3 failed on 11-07; on 11-14 its node went down before it ran, so it
     # has no rows (455-CI-guide.md §3.6): no failure, no recovery, only dashes.
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf("2026-10-31", 64, "1000"),
@@ -204,18 +215,18 @@ def test_a_model_left_untested_by_a_machine_failure_is_not_news(tmp_path):
             perf("2026-11-14", 64, "1500", model="deepseek-r1"),
         ],
     )
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
-    report = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    report = result(ci, "20261114").read_text()
     assert "Kimi-K3" not in report.split("### Results")[0]
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | — | — | — |" in report
 
 
 def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
-    tmp_path, capsys
+    ci, capsys
 ):
     r1 = {"model": "deepseek-r1"}
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf("2026-11-07", 64, "1000"),
@@ -225,7 +236,7 @@ def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
         ],
     )
     write_csv(
-        tmp_path / "followups.csv",
+        ci / "followups.csv",
         FOLLOWUP_COLUMNS,
         [
             {
@@ -236,10 +247,11 @@ def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
             }
         ],
     )
-    main(["--date", "2026-11-14", "--data-dir", str(tmp_path)])
-    report = (tmp_path / "reports" / "455-CI-report-20261114.md").read_text()
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    report = result(ci, "20261114").read_text()
     assert (
-        "No fix yet; [repro](../runs/20261114/kimi-k3/repro.md). @owner_tbd" in report
+        "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md). @owner_tbd"
+        in report
     )
     out = capsys.readouterr().out
     assert "DeepSeek R1" in out and "no follow-up" in out
@@ -251,10 +263,10 @@ QWEN38_PRS = (
 )
 
 
-def qwen38_failure(tmp_path):
+def qwen38_failure(ci):
     q = {"scenario": "8k1k", "model": "qwen-3.8-flash"}
     write_csv(
-        tmp_path / "perf.csv",
+        ci / "perf.csv",
         PERF_COLUMNS,
         [
             perf("2026-11-11", 64, "26000", tpot="16", **q),
@@ -262,7 +274,7 @@ def qwen38_failure(tmp_path):
         ],
     )
     write_csv(
-        tmp_path / "pending_fixes.csv",
+        ci / "pending_fixes.csv",
         PENDING_COLUMNS,
         [
             {
@@ -275,20 +287,18 @@ def qwen38_failure(tmp_path):
     )
 
 
-def test_a_failure_with_a_known_unmerged_fix_gets_a_ready_follow_up_row(
-    tmp_path, capsys
-):
-    qwen38_failure(tmp_path)
-    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+def test_a_failure_with_a_known_unmerged_fix_gets_a_ready_follow_up_row(ci, capsys):
+    qwen38_failure(ci)
+    main(["--date", "2026-11-18", "--data-dir", str(ci)])
     out = capsys.readouterr().out
     assert "ROCm/ATOM#3225 + ROCm/aiter#7847" in out
     assert f"2026-11-18,qwen-3.8-flash,open_pr,{QWEN38_PRS},," in out
 
 
-def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(tmp_path, capsys):
-    qwen38_failure(tmp_path)
+def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(ci, capsys):
+    qwen38_failure(ci)
     write_csv(
-        tmp_path / "followups.csv",
+        ci / "followups.csv",
         FOLLOWUP_COLUMNS,
         [
             {
@@ -299,8 +309,35 @@ def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(tmp_path, c
             }
         ],
     )
-    main(["--date", "2026-11-18", "--data-dir", str(tmp_path)])
+    main(["--date", "2026-11-18", "--data-dir", str(ci)])
     out = capsys.readouterr().out
     assert "pending_fixes.csv" not in out and "no follow-up" not in out
-    report = (tmp_path / "reports" / "455-CI-report-20261118.md").read_text()
+    report = result(ci, "20261118").read_text()
     assert "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)." in report
+
+
+def test_the_findings_of_the_session_sit_between_the_summary_and_the_details(ci):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    run = ci / "runs" / "20261114"
+    run.mkdir(parents=True)
+    (run / "findings.md").write_text("- The K3 server took 41 min to start (JIT).\n")
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    text = result(ci, "20261114").read_text()
+    summary, rest = text.split("\n## Findings\n")
+    findings, _details = rest.split("\n## Details\n")
+    assert "## Summary" in summary
+    assert "- The K3 server took 41 min to start (JIT)." in findings
+
+
+def test_a_session_without_findings_says_so(ci):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    assert "\n## Findings\n\nNone recorded.\n" in result(ci, "20261114").read_text()
+
+
+def test_out_writes_the_result_elsewhere_with_links_from_there(ci):
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "1000")])
+    out = ci.parent / "elsewhere" / "example.md"
+    main(["--date", "2026-11-14", "--data-dir", str(ci), "--out", str(out)])
+    assert "../455-CI/runs/20261114/charts/perf-endpoint.png" in out.read_text()
+    assert not (ci.parent / "result").exists()

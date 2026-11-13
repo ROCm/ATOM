@@ -1,16 +1,16 @@
 # 455-CI 图和报告的生成脚本
 
-按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和报告。报告是一个英文 md，前面是简短 summary，后面是详细 summary。每周两场：周六测 MLPerf Endpoint（当天构建的镜像），周三测 8K/1K（复用上一个周六的镜像）；一场一份报告，以场次日期命名。
+按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和结果。结果是一个英文 md，`recipes/result/<YYYYMMDD>-result.md`：简短 summary、发现、详细 summary。每周两场：周六测 MLPerf Endpoint（当天构建的镜像），周三测 8K/1K（复用上一个周六的镜像）；一场一份报告，以场次日期命名。
 
 | 文件 | 作用 |
 |---|---|
 | `make_charts.py` | 入口：画一场的趋势图（一张性能、一张精度） |
-| `make_report.py` | 入口：写本场的报告（一个 md），打印 Highlights 草稿，最后一行是报告路径 |
+| `make_report.py` | 入口：写本场的结果 `../../result/<YYYYMMDD>-result.md`，打印 Highlights 草稿，最后一行是它的路径 |
 | `ci455_data.py` | 从两个 CSV 里按场次取数据、和上一场成功的结果比较：重跑以最后一行为准，跑挂的点不算 |
-| `ci455_report.py` | Highlights 规则（门槛见 guide §5.1）和报告的 markdown |
+| `ci455_report.py` | Highlights 规则（门槛见 guide §5.1）和结果的 markdown |
 | `ci455_charts.py` | 趋势图，照 ATOM benchmark dashboard 的样式 |
 | `endpoint_chart.py`、`fetch_fonts.py` | 原样取自 [LLM-Booster#246](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，提供字体和页面配色，不要改 |
-| `make_examples.py` | 用编出来的数据生成 `examples/` |
+| `make_examples.py` | 用编出来的数据生成 `examples/` 和 `../../result/example.md` |
 | `test_*.py` | 测试 |
 
 ## 用法
@@ -19,7 +19,7 @@
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                       # 第一次用时下载 Instrument Sans 到 fonts/（不提交）
 python3 make_charts.py --date 2026-11-18     # 场次日期；写 ../runs/20261118/charts/
-python3 make_report.py --date 2026-11-18     # 写 ../reports/455-CI-report-20261118.md，最后打印它的路径
+python3 make_report.py --date 2026-11-18     # 写 ../../result/20261118-result.md，最后打印它的路径
 python3 -m pytest -q                         # 改了脚本先跑测试
 ```
 
@@ -31,10 +31,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 ## 样例
 
-`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，报告和图上都标了 EXAMPLE。里面是最近一周的两场：
-
-- 周六 11-14，MLPerf Endpoint：[报告](examples/reports/455-CI-report-20261114.md)。DeepSeek-V4.1-Flash 提升 6%，Kimi-K3 上一场跑挂这场恢复，Qwen-35B-A3B 的 c64 跑挂（说法：[复现文档](examples/runs/20261114/qwen-35b-a3b/repro.md)，owner 是占位名）。
-- 周三 11-18，8K/1K（用 11-14 的镜像）：[报告](examples/reports/455-CI-report-20261118.md)。GLM-5.2 的 c64 回退 4%（说法：我们修好并验证的 PR），MiniMax-M3 的 GSM8K 掉了 4.7 个点（说法：别人正在修的 PR）。PR 链接是编的，指不到真实的 PR。
+`examples/` 是 **EXAMPLE（示例）**：一份编出来的数据目录，结构和 `recipes/455-CI/` 一样，数字都不是真实测试数据，结果和图上都标了 EXAMPLE。用它生成的样例结果是 [`recipes/result/example.md`](../../result/example.md)：周六 11-14 那场 MLPerf Endpoint，各种情况都有一个。Qwen-35B-A3B 的 c64 跑挂（说法是复现文档，owner 是占位名）；DeepSeek R1 回退 5%（说法是我们修好并验证的 PR）；DeepSeek-V4.1-Flash 快了 6%、GSM8K 掉了 5 个点（说法是别人正在修的 PR）；Kimi-K3 上一场跑挂、这场恢复。PR 链接是编的，指不到真实的 PR。周三 11-18 那场只用来画 8K/1K 的图。
 
 ![MLPerf Endpoint 每卡吞吐趋势（EXAMPLE）](examples/runs/20261114/charts/perf-endpoint.png)
 

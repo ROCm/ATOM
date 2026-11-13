@@ -16,7 +16,19 @@
   ```
 
 - `MODEL_PATH` 是容器内的模型路径，也是 server 的 `--model`。没有加 `--served-model-name` 的模型，请求里的模型名就是它（ATOM 会校验这个名字）。
-- 8K/1K 的 bench 都是 ATOM 的 `benchmark_serving`：随机数据，输入 8192、输出 1024，`--random-range-ratio 0.8`，请求数 `10 × CONC`，warmup `2 × CONC`（不计入结果），`--ignore-eos`。每卡吞吐按指南 §4.1 取 `total_token_throughput ÷ GPU 数`。
+- **8K/1K 的 bench 所有模型用同一条命令**（指南 §3.1），只有 `MODEL_PATH` 和 `PORT` 取自各模型那一节：ATOM 的 `benchmark_serving`，随机数据，输入 8192、输出 1024，`--random-range-ratio 0.8`，请求数 `10 × CONC`，warmup `2 × CONC`（不计入结果），`--ignore-eos`。每卡吞吐按指南 §4.1 取 `total_token_throughput ÷ GPU 数`。
+
+  ```bash
+  python3 -m atom.benchmarks.benchmark_serving \
+    --model=$MODEL_PATH --backend=vllm --base-url=http://127.0.0.1:$PORT \
+    --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
+    --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
+    --request-rate=inf --ignore-eos --trust-remote-code \
+    --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
+    --percentile-metrics="ttft,tpot,itl,e2el"
+  ```
+
+- MLPerf Endpoint 的 bench 还没有统一：DeepSeek R1 用 MLPerf 的 DeepSeek-R1 数据集（completions 接口），Kimi-K3 和 DeepSeek-V4.1-Flash 用 agentic 数据集，但两者的 client 版本、warmup 和配置写法不同。统一的写法定下来之前，按各模型那一节跑。
 - "参考值"是 2026-11-11 摸底时测的，用的不是 455-CI 镜像，GSM8K 也不是 §3.3 的口径。只用来判断量级，不是 baseline。
 
 ---
@@ -207,15 +219,7 @@ python3 -m atom.entrypoints.openai_server \
 
 ### bench
 
-```bash
-python3 -m atom.benchmarks.benchmark_serving \
-  --model=/models/GLM-5.2-MXFP4 --backend=vllm --base-url=http://127.0.0.1:8000 \
-  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
-  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
-  --request-rate=inf --ignore-eos --trust-remote-code \
-  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
+按通用约定的 8K/1K 命令，`MODEL_PATH=/models/GLM-5.2-MXFP4`，`PORT=8000`。
 
 ### 已知问题
 
@@ -271,16 +275,7 @@ python3 -u -m atom.entrypoints.openai_server \
 
 ### bench
 
-```bash
-python3 -m atom.benchmarks.benchmark_serving \
-  --model=/models/MiniMax-M3-MXFP4 --tokenizer=/models/MiniMax-M3-MXFP4 \
-  --served-model-name=/models/MiniMax-M3-MXFP4 --backend=vllm --base-url=http://127.0.0.1:8890 \
-  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
-  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
-  --request-rate=inf --ignore-eos --trust-remote-code \
-  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
+按通用约定的 8K/1K 命令，`MODEL_PATH=/models/MiniMax-M3-MXFP4`，`PORT=8890`。
 
 结果 JSON 里的 `acceptance_rate` 是 server 启动以来的累计值（读的是 `/debug/mtp_stats`），会把 GSM8K 和前一个并发都算进去。要看单个并发的接受率，就在 bench 前后各读一次 `curl -s http://127.0.0.1:8890/debug/mtp_stats`，用 `total_accepted_tokens / total_draft_tokens` 的差值算。
 
@@ -550,15 +545,7 @@ HF_HUB_OFFLINE=0 lm_eval --model local-completions \
 
 ### bench
 
-```bash
-python3 -m atom.benchmarks.benchmark_serving \
-  --model=/models/DeepSeek-V4-Pro --backend=vllm --base-url=http://127.0.0.1:8000 \
-  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
-  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
-  --request-rate=inf --ignore-eos --trust-remote-code \
-  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
+按通用约定的 8K/1K 命令，`MODEL_PATH=/models/DeepSeek-V4-Pro`，`PORT=8000`。
 
 ### 参考值
 
@@ -615,12 +602,4 @@ python3 -m atom.entrypoints.openai_server \
 
 ### bench
 
-```bash
-python3 -m atom.benchmarks.benchmark_serving \
-  --model=/models/Qwen3.8-Flash-Next-Quark-MXFP4 --backend=vllm --base-url=http://127.0.0.1:8000 \
-  --dataset-name=random --random-input-len=8192 --random-output-len=1024 --random-range-ratio=0.8 \
-  --max-concurrency=$CONC --num-prompts=$((CONC * 10)) --num-warmups=$((CONC * 2)) \
-  --request-rate=inf --ignore-eos --trust-remote-code \
-  --save-result --result-dir=$RESULT_DIR --result-filename=raw.json \
-  --percentile-metrics="ttft,tpot,itl,e2el"
-```
+按通用约定的 8K/1K 命令，`MODEL_PATH=/models/Qwen3.8-Flash-Next-Quark-MXFP4`，`PORT=8000`。

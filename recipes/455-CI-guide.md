@@ -14,7 +14,7 @@
 - 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。机器挂了不算跑挂：告诉 user，等 user 重启恢复机器后接着测没测完的（§3.6）。
 - **跑挂或大幅回退不能只报问题，每个都要给出说法**（§3.7）：按顺序找已经在修的公开 PR；没有就自己修好、验证、开 PR；修不了就写好复现文档，owner 先放占位名。
 - **每测完一个模型，就把它的精度和性能数据推到 `455-CI` 分支**（§3.5），不攒到最后。数据按 §4 记录，历史数据都留在 `recipes/455-CI/` 里。
-- 全部测完后按 §5 出本场的报告 `455-CI-report-<场次日期>.md`：一个 md 文件，前面是简短 summary（Highlights 和总表，给老板看），后面是详细 summary。推到 `455-CI` 后，最后给出这个 md 文件的路径（§5.6）。
+- **每场的结果记在 `recipes/result/<YYYYMMDD>-result.md`**（§5）：镜像和环境、跑出来的结果、发现、说法、跑挂的 error log 都在里面。测完一个模型就更新一次（§3.5），全部测完再补上图和说法、生成最终版，最后给出这个 md 文件的路径（§5.6）。格式见 [`result/example.md`](result/example.md)。
 - 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
 
 **前置条件**：
@@ -222,6 +222,7 @@ docker pull "$NEW_IMAGE"
 
 - server 和 bench 命令一律取自 `455-CI-recipe.md`。GSM8K 用 §3.3 的统一命令；某个模型需要不同参数时，写进 recipe，以 recipe 为准。
 - 只替换和机器相关的部分（模型路径、端口、节点地址、结果目录），不改参数。要调参数，先改 recipe 再测，并在报告里注明。
+- **同一个场景的性能命令，所有模型都一样**，只有模型（`MODEL_PATH`、端口）不同，这样不同模型、不同场次之间才能比。8K/1K 的命令写在 recipe 的"通用约定"里，各模型只给 `MODEL_PATH` 和 `PORT`。精度命令可以按模型不同。
 - 实际执行的命令（变量展开后）存成 `server_cmd.sh`、`gsm8k_cmd.sh`、`bench_cmd.sh`，跟结果一起提交。提交前把内网地址和 token 换成占位符：455-CI 分支在公开仓库里。
 - recipe 里没有某个模型时，该模型记 N/A，error 写"recipe 缺失"。
 
@@ -350,12 +351,14 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
 
 1. 按 §4.4 挑出要提交的结果文件，从 `$RUN_DIR/$MODEL` 拷到 `$CI_DIR/runs/<YYYYMMDD>/$MODEL/`。跑挂的话要包括 `error.log`。
 2. 往 `$CI_DIR/perf.csv` 追加这个模型的 c4、c64 两行，往 `accuracy.csv` 追加一行（§4.2、§4.3）。跑挂的也写，数字留空。
-3. 提交并推送：
+3. 有发现就记到 `$CI_DIR/runs/<YYYYMMDD>/findings.md`（§5）：跑挂或回退的线索、绕过的办法、异常的耗时、和 recipe 对不上的地方等。
+4. 更新本场的 result，和数据一起提交并推送：
 
    ```bash
-   D=<YYYYMMDD>                            # 场次日期
+   DAY=<YYYY-MM-DD>; D=${DAY//-/}          # 场次日期
    cd "$CI_DIR"
-   git add perf.csv accuracy.csv "runs/$D"
+   (cd tools && python3 make_report.py --date $DAY > /dev/null)    # 更新 ../result/$D-result.md
+   git add perf.csv accuracy.csv "runs/$D" "../result/$D-result.md"
    git commit -q -m "[455-CI] $D $MODEL"
    for i in 1 2 3; do                      # 另一个节点可能刚推过：先 rebase 到远端最新，再推
      git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI && break
@@ -560,14 +563,17 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 ### 4.4 455-CI 分支的目录结构
 
-`perf.csv`、`accuracy.csv`、`followups.csv` 已经建好，只有表头；`README.md` 在第一次提交报告时创建。
+`perf.csv`、`accuracy.csv`、`followups.csv` 已经建好，只有表头。每场的结果放在 `recipes/result/`。
 
 ```text
 recipes/
 ├── 455-CI-guide.md        本文件
 ├── 455-CI-recipe.md       各模型的命令
+├── result/                每场的结果，英文（§5）
+│   ├── README.md          索引，一场一行，最新的在最上面
+│   ├── example.md         样例，数字是编的
+│   └── <YYYYMMDD>-result.md   一场一份，YYYYMMDD 是场次日期
 └── 455-CI/
-    ├── README.md          报告索引，一场一行，最新的在最上面
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
     ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
@@ -575,11 +581,10 @@ recipes/
     ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
     ├── pending_fixes.csv  已知还没合入、某个模型在等的 PR（§3.7）
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
-    ├── tools/             生成图和报告的脚本、样例（§5.5）
-    ├── reports/           一场一份，YYYYMMDD 是场次日期
-    │   └── 455-CI-report-<YYYYMMDD>.md   简短 summary（Highlights 和总表）+ 详细 summary
+    ├── tools/             生成图和结果的脚本、样例数据（§5.5）
     └── runs/<YYYYMMDD>/   一场一个目录：本场的原始结果和图
         ├── image.json     只在周六的目录里：本周镜像的信息（§2.4）
+        ├── findings.md    本场的发现，放进 result 的 Findings（§5）
         ├── charts/        perf-<scenario>.png、accuracy-<scenario>.png
         └── <slug>/        本场每个模型一个目录
             ├── server_cmd.sh  gsm8k_cmd.sh  bench_cmd.sh
@@ -601,16 +606,17 @@ recipes/
 
 - 不提交完整的 server log 和 lm_eval.log、模型文件、token 或密码。单个文件不超过 1 MB。
 
-## 5. 报告
+## 5. 结果（报告）
 
-全部模型测完、数据都按 §3.5 推上去之后，生成本场的报告。**一场一个 md 文件**：`reports/455-CI-report-<YYYYMMDD>.md`，日期是场次日期，例如周六 `455-CI-report-20261114.md`、周三 `455-CI-report-20261118.md`。**报告用英文写**，分两部分：
+**每场的结果记在 `recipes/result/<YYYYMMDD>-result.md`**，日期是场次日期，例如周六 `20261114-result.md`、周三 `20261118-result.md`。测完一个模型就更新一次（§3.5）；全部测完、每个问题都有了说法（§3.7）之后，补上趋势图，生成最终版（§5.6）。**用英文写**，一个文件三部分：
 
 | 部分 | 给谁看 | 内容 |
 |---|---|---|
 | 简短 summary（`## Summary`） | 老板 | Highlights 和总表（§5.1、§5.2） |
-| 详细 summary（`## Details`） | 要看细节的人 | 测试环境、全部数字、趋势图、跑挂 case 的核心 error log（§5.3、§5.4） |
+| 发现（`## Findings`） | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
+| 详细 summary（`## Details`） | 要看细节的人 | 测试镜像和环境、全部数字、趋势图、说法、跑挂 case 的核心 error log（§5.3、§5.4） |
 
-报告和图都用 §5.5 的脚本从 `perf.csv`、`accuracy.csv` 生成，不手填数字。样例见 [`455-CI/tools/examples/reports/`](455-CI/tools/examples/reports/)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
+结果和图都用 §5.5 的脚本从 CSV 生成，不手填数字。唯一手写的是发现：写进 `runs/<YYYYMMDD>/findings.md`，英文，每条以 `- ` 开头，链接用完整 URL；脚本原样放进 Findings，没有这个文件就显示 `None recorded.`。跑挂或回退的线索、绕过的办法、异常的耗时（例如 server 启动特别慢）、和 recipe 对不上的地方，都算发现。样例见 [`result/example.md`](result/example.md)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
@@ -642,10 +648,10 @@ recipes/
 
 ### 5.2 简短 summary：Highlights 和总表
 
-报告开头的格式如下（周六那场，数字是编的，owner 是占位名）：
+结果开头的格式如下（取自 `result/example.md`：周六那场，数字是编的，owner 是占位名）：
 
 ```markdown
-# 455-CI report · <YYYY-MM-DD> · MLPerf Endpoint
+# 455-CI result · <YYYY-MM-DD> · MLPerf Endpoint
 
 Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>`
 
@@ -653,7 +659,9 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). No fix yet; [repro](../runs/20261114/qwen-35b-a3b/repro.md). @owner_tbd
+- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). No fix yet; [repro](…). @owner_tbd
+- ⚠️ DeepSeek R1: throughput down 4.5%. Fixed by us in [ROCm/ATOM#…](…), verified. @r1_owner
+- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Fix in progress: [ROCm/aiter#…](…). @v41_flash_owner
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%. @v41_flash_owner
 - ✅ Kimi-K3: recovered from the previous failure. @k3_owner
 
@@ -661,9 +669,14 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | −0.2 pts (now 93.9%) |
+| DeepSeek R1 | MLPerf Endpoint | 1,482 | 1,416 | ⚠️ −4.5% | −0.6 pts (now 95.0%) |
+| DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | ⚠️ −5.2 pts (now 88.9%) |
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
+
+## Findings
+
+……（runs/<YYYYMMDD>/findings.md 的内容）
 
 ## Details
 
@@ -677,7 +690,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 ### 5.3 详细 summary
 
-紧接在简短 summary 后面，`## Details` 下依次是以下几节，全部英文：
+在 Findings 后面，`## Details` 下依次是以下几节，全部英文：
 
 1. **Environment**：测试 image 和 digest、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
@@ -694,7 +707,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 - **`accuracy-<scenario>.png`**：照 ATOM benchmark dashboard 的精度趋势图，一个模型一格，最近 12 场。flexible-extract 实线，strict-match 虚线；baseline 是灰色虚线，在 `accuracy_baseline.csv` 里设了才画，数值写在格子标题行右侧；最新分数标在最后一个点右边。
 - 两张图都用 dashboard 的浅色样式和深红 `#9B1C1C`，字体 Instrument Sans，2 倍分辨率 PNG，2640 px 宽。图里文字用英文，脚注两行写数据来源和口径。
 
-### 5.5 生成图和报告
+### 5.5 生成图和结果
 
 脚本在 `recipes/455-CI/tools/`，需要 Python 3.10 以上和 matplotlib，说明见那里的 [`README.md`](455-CI/tools/README.md)：
 
@@ -702,7 +715,7 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
 python3 make_charts.py --date <YYYY-MM-DD>          # 场次日期（周六或周三），写 runs/<YYYYMMDD>/charts/
-python3 make_report.py --date <YYYY-MM-DD>          # 写本场的报告（一个 md），打印 Highlights 草稿，最后一行是报告路径
+python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMMDD>-result.md，打印 Highlights 草稿，最后一行是它的路径
 ```
 
 - 每场测完跑一次，连同历史数据重新生成。
@@ -710,16 +723,16 @@ python3 make_report.py --date <YYYY-MM-DD>          # 写本场的报告（一�
 - 输出里有 `no follow-up` 的 WARNING，说明还有问题没写说法：按 §3.7 补上，再重新生成。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
-### 5.6 提交报告，给出路径
+### 5.6 提交最终的结果，给出路径
 
-各模型的数据已经在 §3.5 推上去了，这里提交本场的说法（`followups.csv` 和复现文档）、图、报告和 README 索引：
+各模型的数据和中间版的结果已经在 §3.5 推上去了，这里提交本场的说法（`followups.csv` 和复现文档）、图、最终的结果和索引：
 
 ```bash
 cd "$CI_DIR"
-git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，报告才完整
-# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和报告，审过 Highlights，在 README.md 的索引最上面加一行（见下）
-git add README.md reports followups.csv runs/<YYYYMMDD>
-git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint report"    # 周三写 8K/1K report
+git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，结果才完整
+# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和结果，审过 Highlights，在 ../result/README.md 的索引最上面加一行（见下）
+git add followups.csv runs/<YYYYMMDD> ../result/<YYYYMMDD>-result.md ../result/README.md
+git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint result"    # 周三写 8K/1K result
 git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI
 git status -sb | head -1                # 不能有 [ahead N]
 ```
@@ -727,18 +740,18 @@ git status -sb | head -1                # 不能有 [ahead N]
 - **还有问题没有说法时不提交**：`make_report.py` 打了 `no follow-up` 的 WARNING，就先回到 §3.7。
 - 不 force push，不改写历史；commit message 不加 `Co-Authored-By` trailer。
 
-`recipes/455-CI/README.md` 的索引表一场一行，最新的在最上面：
+`recipes/result/README.md` 的索引表一场一行，最新的在最上面（英文）：
 
 ```markdown
-| 报告 | 场景 | 镜像 | ATOM / aiter | 结果 |
+| Session | Scenario | Image | ATOM / aiter | Result |
 |---|---|---|---|---|
-| [<YYYY-MM-DD>](reports/455-CI-report-<YYYYMMDD>.md) | MLPerf Endpoint | `gfx1250-atom-ci455-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | 例：3/4 跑通，❌ 1 项，⚠️ 1 项 |
+| [<YYYY-MM-DD>](<YYYYMMDD>-result.md) | MLPerf Endpoint | `gfx1250-atom-ci455-<YYYYMMDD>` | `<sha 前 9 位>` / `<sha 前 9 位>` | e.g. 3/4 passed, ❌ 1, ⚠️ 2 |
 ```
 
-**最后给出报告 md 文件的路径。** push 成功后，在本场的收尾消息里写出报告的仓库路径和 GitHub 链接。`make_report.py` 输出的最后一行就是它的本地路径。例如：
+**最后给出结果 md 文件的路径。** push 成功后，在本场的收尾消息里写出它的仓库路径和 GitHub 链接。`make_report.py` 输出的最后一行就是它的本地路径。例如：
 
-- `recipes/455-CI/reports/455-CI-report-20261114.md`
-- https://github.com/ROCm/ATOM/blob/455-CI/recipes/455-CI/reports/455-CI-report-20261114.md
+- `recipes/result/20261114-result.md`
+- https://github.com/ROCm/ATOM/blob/455-CI/recipes/result/20261114-result.md
 
 ## 6. 待补充
 
