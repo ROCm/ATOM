@@ -137,6 +137,7 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         max_num_batched_tokens=16384,
         block_manager=SimpleNamespace(block_size=128),
         _tick_cost_limit=math.inf,  # no DP prefill cost balancing
+        _tick_cold_partial_cap=0,  # no pending Store restore
         _dynamic_chunk_limit=lambda history_len, kind: None,
     )
     scheduler._chunk_alignment = lambda: Scheduler._chunk_alignment(scheduler)
@@ -144,6 +145,9 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         scheduler, *a, **kw
     )
     scheduler._prefill_room = lambda *a: Scheduler._prefill_room(scheduler, *a)
+    scheduler._slice_cold_partial = lambda *a: Scheduler._slice_cold_partial(
+        scheduler, *a
+    )
     seq = SimpleNamespace(num_tokens=16484)
     chunk = Scheduler._partial_prefill_chunk
     # backed off one block: 128 recomputed rows plus the 100 left

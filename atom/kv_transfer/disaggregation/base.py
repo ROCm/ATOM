@@ -168,6 +168,8 @@ class KVConnectorSchedulerBase(ABC):
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
 
+    pending_load_partial_token_cap: int = 0
+
     def admission_ready(self, seq: Any) -> bool:
         """Whether the scheduler may allocate this request and start prefill."""
         return True

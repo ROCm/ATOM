@@ -489,6 +489,8 @@ class _StoreLookup(LookupClient):
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
+    pending_load_partial_token_cap = 8192
+
     # It answers `lookup_ready`, so the scheduler may start its loads early.
     supports_early_load = True
 
