@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The daemon (``ATOM_WEIGHT_CACHE=daemon``): one process per GPU that builds
-and loads its shard as a server does (``init_model_env``, ``get_model``),
-then serves it.
+and loads its shard as a server does (``init_model_env``, ``get_model``, and
+the drafter's own weights), then serves it.
 
 No engine, runner, scheduler or HTTP server: the daemon shares no port, store
 or communicator with the servers that use it, and serving features need no
@@ -20,11 +20,13 @@ import queue
 import signal
 import threading
 import time
+from types import SimpleNamespace
 
 import torch
 
 from atom.model_engine.model_setup import (
     build_model,
+    construct_drafter,
     get_model,
     init_model_env,
     load_weights,
@@ -32,6 +34,8 @@ from atom.model_engine.model_setup import (
 from atom.model_loader.weight_cache.export import (
     _skip_prepare_finalize,
     build_export,
+    process_export,
+    process_snapshot,
     share_storages,
     snapshot,
 )
@@ -55,6 +59,7 @@ from atom.model_loader.weight_cache.transport import (
 from atom.model_loader.weight_cache.values import (
     _TAG,
     logger,
+    rank_label,
     release_digest_buffers,
 )
 from atom.utils import envs
@@ -67,7 +72,10 @@ def run_daemon(engine_args) -> None:
     idle timeout) or when one of them fails."""
     from torch.distributed import TCPStore
 
+    from atom.model_engine.engine_core_mgr import engine_config, layout_engines
+
     config = _engine_config(engine_args)
+    engines = layout_engines(config)
     # The processes' rendezvous, as the engine's CoreManager hosts it.
     pc = config.parallel_config
     store = TCPStore(
@@ -76,14 +84,21 @@ def run_daemon(engine_args) -> None:
     pc.data_parallel_base_port = store.port
     pc._managed_distributed_store = True
 
-    n = config.tp_world_size * config.pcp_group_size
+    # Every rank of every DP rank's engine, as the engines would run them.
+    span = config.tp_world_size * config.pcp_group_size
+    ranks = [
+        (rank, cfg)
+        for cfg in (engine_config(config, dp, local) for dp, local in engines)
+        for rank in range(span)
+    ]
+    n = len(ranks)
     ctx = multiprocessing.get_context("spawn")
     ready = ctx.Queue()
     procs = [
         ctx.Process(
-            target=_serve_rank, args=(rank, config, ready), name=f"WeightCache{rank}"
+            target=_serve_rank, args=(rank, cfg, ready, i), name=f"WeightCache{i}"
         )
-        for rank in range(n)
+        for i, (rank, cfg) in enumerate(ranks)
     ]
     stop = threading.Event()
 
@@ -146,9 +161,9 @@ def _engine_config(engine_args):
     return config
 
 
-def _serve_rank(rank: int, config, ready) -> None:
+def _serve_rank(rank: int, config, ready, index: int) -> None:
     """One GPU's daemon process: load this rank's shard, serve it, and wait
-    to be stopped."""
+    to be stopped. ``index``: what it reports on ``ready`` once serving."""
     from atom.config import local_device_index
     from atom.utils import enable_orphan_reaping, set_process_title, worker_process_name
     from atom.utils.gc_utils import tune_gc
@@ -184,14 +199,14 @@ def _serve_rank(rank: int, config, ready) -> None:
     )
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
-    ready.put(rank)
+    ready.put(index)
     while not stop.wait(1.0):
         pass
     # Clients that mapped the weights keep them until they exit.
     server.close()
     lock.release()
     del pool  # held while the weights in it are served
-    logger.info(f"{_TAG} rank {rank}: stopped serving")
+    logger.info(f"{_TAG} {rank_label(config, rank)}: stopped serving")
 
 
 def _stop_launch(lock, stop: threading.Event) -> None:
@@ -206,12 +221,14 @@ def _stop_launch(lock, stop: threading.Event) -> None:
 
 
 class _RecordingLoad:
-    """get_model's loader in the daemon: the disk load, recording what it
-    reads and runs, and the model's state before loading."""
+    """get_model's loader in the daemon: the disk load, and the drafter's
+    own weights, recording what they read and run, and the state they
+    started from."""
 
     def __init__(self, rank: int, recorder: InputRecorder):
         self.rank, self.recorder = rank, recorder
         self.tracer, self.kernels = _CodeTracer(), {}
+        self.draft = None
 
     def __call__(self, config, model_class, device):
         self.key = compute_key(config, self.rank, device)
@@ -221,20 +238,51 @@ class _RecordingLoad:
             self.built, self.before = structure(model), snapshot(model)
             with self.tracer, _record_jit(self.kernels):
                 self.recorder.enter_load(model)
+                # Around each load only: what constructing does, clients do.
+                self.states = [process_snapshot()]
                 with _skip_prepare_finalize(model):
                     load_weights(model, config)
+                self.states.append(process_snapshot())
+                if config.speculative_config:
+                    self.draft = self._load_draft(config, device, model)
         finally:
             # Before anything else reads the model.
             self.recorder.finish_load(self.tracer.codes)
         return model
 
+    def _load_draft(self, config, device, target):
+        """The drafter's own weights, loaded as a server's runner loads them
+        (each client binds them to its own target). None: not cached, and
+        servers load the drafter from disk."""
+        # What building a drafter reads from its runner.
+        runner = SimpleNamespace(
+            model=target, config=config, device=device, rank=self.rank
+        )
+        try:
+            self.recorder.enter_construct(config)
+            drafter = construct_drafter(config, device, runner)
+            built, before = structure(drafter.model), snapshot(drafter.model)
+            self.recorder.enter_load(drafter.model, kind="draft")
+            states = [process_snapshot()]
+            with _skip_prepare_finalize(drafter.model):
+                loaded = drafter.load_weights()
+            states.append(process_snapshot())
+        except Exception as e:  # noqa: BLE001 - only the drafter goes uncached
+            logger.warning(
+                f"{_TAG} {rank_label(config, self.rank)}: the drafter is not cached "
+                f"({e!r}); servers load it from disk"
+            )
+            return None
+        self.states += states
+        return drafter.model, built, before, loaded
+
 
 def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
-    label = f"rank {rank}"
+    label = rank_label(config, rank)
     load = _RecordingLoad(rank, recorder)
     model = get_model(config, device, load)
     reads = recorder.key_reads(config.model)
-    after = snapshot(model)
+    draft_reads = {"draft_attrs": reads.pop("draft_attrs")}
     try:
         codes = code_fingerprint(load.tracer.codes, load.kernels.values())
     except _SourceChanged as e:
@@ -242,10 +290,34 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
             f"{_TAG} {label}: {e} changed after this daemon started, so the weights it "
             "loaded may not match the file; restart the daemon"
         ) from None
-    export = build_export(model, load.before, after)
-    views = export.pop("views")
+    export = build_export(model, load.before, snapshot(model))
+    process = process_export(load.states)
+    export["unshippable"] += process["unshippable"]
+    parts = [export, process]
+    draft = None
+    if load.draft is not None:
+        dmodel, dbuilt, dbefore, loaded = load.draft
+        dexport = build_export(dmodel, dbefore, snapshot(dmodel))
+        if dexport["unshippable"]:
+            logger.warning(
+                f"{_TAG} {label}: the drafter's load created state that cannot be "
+                f"shared, so servers load it from disk: {dexport['unshippable'][:10]}"
+            )
+        else:
+            draft = {
+                "export": dexport,
+                "structure": exported_structure(dbuilt, dexport),
+                "reads": draft_reads,
+                "loaded": sorted(loaded),
+            }
+            parts.append(dexport)
+    keys = [list(p["views"]) for p in parts]
+    views = {k: v for p in parts for k, v in p.pop("views").items()}
     pool = _release_other_memory(views, device, label)
-    export["storages"] = share_storages(views)
+    handles = share_storages(views)
+    for p, ks in zip(parts, keys):
+        p["storages"] = {k: handles[k] for k in ks}
+    total = sum(v.numel() for v in views.values())
     payload = {
         "protocol": PROTOCOL_VERSION,
         "key": load.key,
@@ -253,16 +325,19 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
         "code": codes,
         "structure": exported_structure(load.built, export),
         "export": export,
+        "process": process,
+        "draft": draft,
         "summary": {
             "pid": os.getpid(),
             "daemon_pid": lock.info.get("daemon_pid"),
-            "bytes": export["bytes"],
+            "bytes": total,
         },
     }
     logger.info(
         f"{_TAG} {label}: load read {len(reads['env'])} env vars, {len(reads['config'])} config "
         f"fields, {len(reads['attrs'])} construction attributes, {len(reads['classattrs'])} class "
-        f"attributes, {len(reads['globals'])} globals, {len(reads['files'])} files"
+        f"attributes, {len(reads['globals'])} globals, {len(reads['files'])} files; it changed "
+        f"{len(process['changes'])} globals and {len(process['env'])} env vars"
     )
     server = _Server(
         path,
@@ -272,13 +347,14 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
         idle_timeout_s=lock.info["idle_timeout_s"],
         on_idle=on_idle,
     )
-    lock.set_state("serving", bytes=export["bytes"])
+    lock.set_state("serving", bytes=total)
     entries = sum(
         len(i["params"]) + len(i["buffers"]) + len(i["attrs"])
         for i in export["plan"].values()
     )
     logger.info(
-        f"{_TAG} {label}: serving {entries} entries ({export['bytes'] / (1 << 30):.2f} GiB, "
+        f"{_TAG} {label}: serving {entries} entries "
+        f"{'and the drafter ' if draft else ''}({total / (1 << 30):.2f} GiB, "
         f"{len(codes['entries'])} code entries) at {path} after {time.perf_counter() - t0:.1f}s"
     )
     if export["unshippable"]:

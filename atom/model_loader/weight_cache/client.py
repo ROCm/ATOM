@@ -15,11 +15,17 @@ import torch
 from torch import nn
 
 from atom.distributed.group_agreement import group_agree, group_max, group_min
-from atom.model_engine.model_setup import build_model, load_from_disk
+from atom.model_engine.model_setup import (
+    build_model,
+    construct_drafter,
+    load_drafter_from_disk,
+    load_from_disk,
+)
 from atom.model_loader.weight_cache.export import (
     _leftover_meta,
     _run_prepare_finalize,
     apply_export,
+    apply_process,
     params_on_meta,
 )
 from atom.model_loader.weight_cache.key import (
@@ -47,10 +53,13 @@ from atom.model_loader.weight_cache.transport import (
     daemon_state,
     socket_path,
 )
-from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
+from atom.model_loader.weight_cache.values import _TAG, _Miss, logger, rank_label
 from atom.utils import envs
 
 _STOP_HINT = "python -m atom.model_loader.weight_cache stop"
+# The drafter part of the payload this process took its model from, for the
+# drafter's loader (load_drafter_from_cache), which runs after the model's.
+_draft: dict | None = None
 
 
 def _agree_group():
@@ -247,6 +256,53 @@ def load_from_cache(config, model_class, device, *, rank: int) -> nn.Module:
     return load_from_disk(config, model_class, device) if model is None else model
 
 
+def load_drafter_from_cache(config, device, runner, target, *, rank: int):
+    """get_drafter's loader in client mode: the drafter's own weights from
+    the daemon the model came from, else the checkpoint's. A drafter is
+    small, so a mismatch loads it from disk rather than failing."""
+    global _draft
+    draft, _draft = _draft, None
+    if draft is None:
+        return load_drafter_from_disk(config, device, runner, target)
+    t0 = time.perf_counter()
+    label = rank_label(config, rank)
+    ctx = _forward_context(config)
+    layers = set(ctx) if ctx is not None else None
+    with params_on_meta():
+        drafter = construct_drafter(config, device, runner)
+    diffs = _diff_key(
+        draft["structure"],
+        exported_structure(structure(drafter.model), draft["export"]),
+    )
+    diffs += diff_reads(draft["reads"], ("draft_attrs",), model=drafter.model)
+    if diffs:
+        _drop_layers(config, layers)
+        logger.warning(
+            f"{_TAG} {label}: the daemon's drafter was built differently, so this "
+            "server loads its drafter from disk:\n  " + "\n  ".join(diffs[:25])
+        )
+        return load_drafter_from_disk(config, device, runner, target)
+    mapped = apply_export(drafter.model, draft["export"], device)
+    left = [
+        name
+        for m in vars(drafter).values()
+        if isinstance(m, nn.Module)
+        for name in _leftover_meta(m)
+    ]
+    if left:
+        raise RuntimeError(
+            f"{_TAG} {label}: {len(left)} drafter tensors still on meta after "
+            f"mapping: {left[:8]}"
+        )
+    _run_prepare_finalize(drafter.model)
+    drafter.attach_to_target(target, set(draft["loaded"]))
+    logger.info(
+        f"{_TAG} {label}: drafter from the cache, mapped {mapped / (1 << 30):.2f} GiB "
+        f"in {time.perf_counter() - t0:.2f}s"
+    )
+    return drafter
+
+
 def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     """The model with a daemon's weights; None: load from disk.
 
@@ -256,8 +312,9 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     when the one there cannot be used, stops it and starts a new one (once).
     If the daemon it started cannot be used either, or none can be started,
     it loads from disk. Every rank of the launch takes the same decisions."""
+    global _draft
     t0 = time.perf_counter()
-    label = f"rank {rank}"
+    label = rank_label(config, rank)
     group = _agree_group()
     auto = envs.ATOM_PRELOAD
     path = socket_path(device)
@@ -374,6 +431,7 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     error = None
     try:
         mapped = apply_export(model, payload["export"], device)
+        mapped += apply_process(payload["process"], device)
         left = _leftover_meta(model)
         if left:
             error = f"{len(left)} tensors still on meta after mapping: {left[:8]}"
@@ -385,6 +443,7 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     torch.cuda.reset_peak_memory_stats()
     # Collective on EP setups; a failure here must not be swallowed.
     n_moe = _run_prepare_finalize(model)
+    _draft = payload["draft"]
     # Holds the connection open for this process's lifetime: the daemon
     # counts it as a server using its weights.
     threading.Thread(

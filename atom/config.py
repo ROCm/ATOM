@@ -2544,11 +2544,11 @@ class Config:
                     f"ATOM_WEIGHT_CACHE={cache_mode} does not support pipeline "
                     "parallelism yet"
                 )
-            if self.parallel_config.data_parallel_size > 1 or self.enable_dp_attention:
-                # The daemon starts one process per GPU of a single engine.
+            if self.parallel_config.is_multinode_dp:
+                # A daemon serves the GPUs of its own node.
                 raise ValueError(
-                    f"ATOM_WEIGHT_CACHE={cache_mode} does not support data "
-                    "parallelism (or DP attention) yet"
+                    f"ATOM_WEIGHT_CACHE={cache_mode} supports data parallelism "
+                    "on one node only"
                 )
         elif cache_mode != "off":
             raise ValueError(

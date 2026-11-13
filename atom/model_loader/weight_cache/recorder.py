@@ -145,7 +145,7 @@ class InputRecorder:
         self.env_by_line: dict[str, set] = {}
         self.attrs: dict[tuple, dict] = {}  # (kind, path, name) -> info
         self.paths: dict[int, tuple[str, str]] = {}  # id(obj) -> (kind, path)
-        self.pre_load_fps: dict[tuple[str, str], Any] = {}
+        self.pre_load_fps: dict[tuple[str, str, str], Any] = {}  # (kind, path, name)
         self.files: dict[str, set] = {}
         self.globals: dict[tuple, Any] = {}
         self.files_on = False
@@ -178,23 +178,25 @@ class InputRecorder:
         self.files_on = True
         self.attrs_on = True
 
-    def enter_load(self, model) -> None:
+    def enter_load(self, model, kind: str = "model") -> None:
+        """Start the load of ``model``; ``kind``: "model" or "draft", whose
+        attribute reads key_reads reports apart."""
         self.phase = "load"
         self.attrs_on = True
         # The construction-time values: what a client builds, and what loading
         # started from. (The first value loading reads may be one it wrote.)
         values = {}
         for path, obj, is_module in _walk_objects(model):
-            self.paths[id(obj)] = ("model", path)
+            self.paths[id(obj)] = (kind, path)
             for name, v in _attrs(obj, is_module).items():
-                values[(path, name)] = v
+                values[(kind, path, name)] = v
             if is_module:
                 for name, b in obj._buffers.items():
                     if b is not None:
-                        values[(path, f"[buffer]{name}")] = b
+                        values[(kind, path, f"[buffer]{name}")] = b
             self._patch_class(type(obj))
         # Fingerprint now, before loading mutates anything in place.
-        self.pre_load_fps = {k: _safe_key_fp(v) for k, v in values.items()}
+        self.pre_load_fps.update({k: _safe_key_fp(v) for k, v in values.items()})
 
     def finish_load(self, codes) -> None:
         """Stop recording; ``codes``: the code objects that ran during load."""
@@ -406,7 +408,7 @@ class InputRecorder:
             where = [w for w in info["load_where"] if w not in bulk]
             if any(w.startswith(KEY_ENV_PREFIXES) for w in where):
                 env[k] = info["load_value"]
-        config, attrs, classattrs = {}, {}, {}
+        config, attrs, classattrs, draft_attrs = {}, {}, {}, {}
         for (kind, path, name), info in self.attrs.items():
             if "load" not in info["phases"]:
                 continue
@@ -414,8 +416,9 @@ class InputRecorder:
                 config[f"{path}.{name}"] = info["fp"]
             elif kind == "class":
                 classattrs[f"{path}\t{name}"] = info["fp"]
-            elif (path, name) in self.pre_load_fps:
-                attrs[f"{path}\t{name}"] = self.pre_load_fps[(path, name)]
+            elif (kind, path, name) in self.pre_load_fps:
+                out = draft_attrs if kind == "draft" else attrs
+                out[f"{path}\t{name}"] = self.pre_load_fps[(kind, path, name)]
         ckpt = os.path.realpath(checkpoint_dir) + os.sep if checkpoint_dir else None
         files = {}
         for p, phases in self.files.items():
@@ -429,6 +432,7 @@ class InputRecorder:
             "env": env,
             "config": config,
             "attrs": attrs,
+            "draft_attrs": draft_attrs,
             "classattrs": classattrs,
             "globals": {f"{m}\t{n}": fp for (m, n), fp in self.globals.items()},
             "files": files,
@@ -490,6 +494,7 @@ def _describe(kind: str, key: str, then, now) -> str:
             "classattrs": f"class attribute {a.split(':')[-1]}.{name}",
             "globals": f"global {a}.{name}",
             "attrs": f"{a or '<root>'}.{name}",
+            "draft_attrs": f"drafter {a or '<root>'}.{name}",
         }[kind]
     return f"{what}: daemon={str(then)[:80]} client={str(now)[:80]}"
 

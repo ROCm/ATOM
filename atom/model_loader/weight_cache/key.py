@@ -121,7 +121,7 @@ def _versions() -> dict:
 
 
 def compute_key(config, rank: int, device: torch.device) -> dict:
-    """Which checkpoint, model, rank, GPU and libraries."""
+    """Which checkpoint, model, shard, GPU and libraries."""
     import aiter
 
     hf = config.hf_config
@@ -130,11 +130,22 @@ def compute_key(config, rank: int, device: torch.device) -> dict:
     except Exception:  # noqa: BLE001
         hf_dict = vars(hf)
     props = torch.cuda.get_device_properties(device)
+    pc = config.parallel_config
     return {
         "model": os.path.realpath(config.model),
         "checkpoint": _checkpoint_digest(config.model),
         "hf_config": hashlib.sha256(_json(hf_dict).encode()).hexdigest(),
         "rank": rank,
+        # The shard a rank holds depends on the whole layout (EP spans DP).
+        "parallel": {
+            "tp": config.tensor_parallel_size,
+            "tp_world": config.tp_world_size,
+            "pcp": config.pcp_group_size,
+            "dp": pc.data_parallel_size,
+            "dp_rank": pc.data_parallel_rank,
+            "dp_attention": bool(config.enable_dp_attention),
+            "ep": bool(config.enable_expert_parallel),
+        },
         "arch": getattr(props, "gcnArchName", ""),
         "versions": _versions(),
         "aiter": _git_state(

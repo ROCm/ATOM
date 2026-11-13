@@ -65,8 +65,10 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_setup import (
     ModelLoader,
     build_model,
+    get_drafter,
     get_model,
     init_model_env,
+    load_drafter_from_disk,
     load_from_disk,
 )
 from atom.model_engine.output_transfer import D2HQueue
@@ -119,7 +121,6 @@ from atom.models.registry import mono_decode_installers
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
-from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.pp_aux_relay import PPAuxRelay
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils import (
@@ -931,19 +932,16 @@ class ModelRunner:
         maybe_dump_weights_and_exit(self.model)
 
         if self.config.speculative_config and get_pp_group().is_last_rank:
-            from atom.utils.backends import set_model_tag
-
+            self.drafter = get_drafter(
+                self.config, self.device, self, self.model, self._drafter_loader()
+            )
             torch.set_default_device(self.device)
-            with set_model_tag("drafter"):
-                self.drafter = build_drafter(self.config, self.device, self)
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
                 )
             )
             torch.set_default_device(None)
-            logger.info("Loading drafter model...")
-            self.drafter.load_model(self.model)
             # A block drafter's width reads the loaded draft model's window.
             self.tokenID_processor.draft_tokens_per_seq = (
                 self.drafter.draft_tokens_per_seq
@@ -1068,6 +1066,14 @@ class ModelRunner:
 
             return partial(load_from_cache, rank=self.rank)
         return load_from_disk
+
+    def _drafter_loader(self):
+        """How this runner gets its drafter's weights (see _model_loader)."""
+        if envs.ATOM_WEIGHT_CACHE == "client":
+            from atom.model_loader.weight_cache.client import load_drafter_from_cache
+
+            return partial(load_drafter_from_cache, rank=self.rank)
+        return load_drafter_from_disk
 
     def _maybe_warmup(self):
         """Run model warmup. Override point: the rapidserve decode process

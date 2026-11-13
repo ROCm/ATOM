@@ -28,7 +28,7 @@ from atom.model_loader.weight_cache.values import (
 )
 from atom.utils import envs
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 # Set by a daemon's API server for its runners (preload.record_launch).
 _DAEMON_PID_ENV = "ATOM_WEIGHT_CACHE_DAEMON_PID"  # its main process
 _DAEMON_LOG_ENV = "ATOM_WEIGHT_CACHE_DAEMON_LOG"  # a daemon ATOM_PRELOAD started

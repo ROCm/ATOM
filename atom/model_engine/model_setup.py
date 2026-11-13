@@ -207,6 +207,34 @@ def load_weights(model: nn.Module, config: Config) -> None:
     )
 
 
+def get_drafter(config: Config, device: torch.device, runner, target, load=None):
+    """This rank's speculative drafter with its draft weights, after
+    ``get_model`` built ``target``. ``load`` builds and loads it:
+    (config, device, runner, target) -> drafter; ``load_drafter_from_disk``
+    by default."""
+    return (load or load_drafter_from_disk)(config, device, runner, target)
+
+
+def construct_drafter(config: Config, device: torch.device, runner):
+    """Construct the drafter on ``device``, without its draft weights."""
+    from atom.spec_decode.factory import build_drafter
+    from atom.utils.backends import set_model_tag
+
+    torch.set_default_device(device)
+    try:
+        with set_model_tag("drafter"):
+            return build_drafter(config, device, runner)
+    finally:
+        torch.set_default_device(None)
+
+
+def load_drafter_from_disk(config: Config, device: torch.device, runner, target):
+    drafter = construct_drafter(config, device, runner)
+    logger.info("Loading drafter model...")
+    drafter.load_model(target)
+    return drafter
+
+
 def load_from_disk(
     config: Config, model_class: type, device: torch.device
 ) -> nn.Module:

@@ -654,15 +654,20 @@ class Drafter(abc.ABC):
             setattr(owner, attr, source)
 
     def load_model(self, target_model: nn.Module) -> None:
+        self.attach_to_target(target_model, self.load_weights())
+
+    def load_weights(self) -> set[str]:
+        """Load the draft's own weights into ``self.model``; what it loaded."""
         # Three drafter flavors cover three of the four combinations:
         #   eagle3          standalone ckpt, independent embed + lm_head
         #   K3 DSpark       standalone ckpt, SHARED embed + lm_head (Kimi-K3:
         #                   the checkpoint ships neither)
         #   MTP / V4 DSpark weights inside the target ckpt, shared embed/lm_head
-        # so they are decided separately below rather than by one method probe.
+        # so they are decided separately (here and in attach_to_target) rather
+        # than by one method probe.
         spec = self.speculative_config
         standalone_ckpt = spec.method == "eagle3" or spec.use_dspark_with_draft()
-        loaded = load_model(
+        return load_model(
             self.model,
             spec.model if standalone_ckpt else self.config.model,
             spec.draft_model_hf_config,
@@ -670,6 +675,9 @@ class Drafter(abc.ABC):
             not standalone_ckpt,
         )
 
+    def attach_to_target(self, target_model: nn.Module, loaded: set[str]) -> None:
+        """Share with the loaded target what the draft did not load itself."""
+        spec = self.speculative_config
         if spec.method == "eagle3":
             logger.info(
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",

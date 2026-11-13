@@ -14,6 +14,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from types import SimpleNamespace
 
 import psutil
@@ -303,6 +304,62 @@ def test_unshareable_state_is_reported(toy_packages):
     assert any("child: submodule removed" in u for u in exp["unshippable"])
 
 
+def test_change_out_of_the_walks_reach_is_reported(toy_packages):
+    def build():
+        m = Toy()
+        m.holders = [QuantState()]  # in a container: the walk does not export it
+        return m
+
+    def load(m):
+        m.holders[0].mode = "shuffled"
+
+    _, exp = _export(build(), load)
+    assert any("holders[0]::mode: changed during load" in u for u in exp["unshippable"])
+
+
+def test_process_state_loading_changes_travels_or_is_refused(monkeypatch):
+    mod = types.ModuleType("atom._wc_test_state")
+
+    class Settings:
+        LAYOUT = 1
+
+    class Holder:
+        mode = "raw"
+
+    for cls in (Settings, Holder):
+        cls.__module__ = mod.__name__
+    mod.Settings, mod.FLAG, mod.TABLE = Settings, False, {"a": 1}
+    mod.holder = Holder()
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.delenv("ATOM_TEST_LOAD_SET", raising=False)
+    before = export.process_snapshot()
+    mod.FLAG, Settings.LAYOUT = True, 16  # what loading decided
+    mod.TABLE["b"] = 2
+    os.environ["ATOM_TEST_LOAD_SET"] = "1"
+    mod.kernel = lambda: 0  # cannot be shared
+    mod.holder.mode = "set"  # an object's attribute: out of reach
+    new = types.ModuleType("atom._wc_test_imported")  # imported by the load:
+    new.make = lambda: 0  # importing it again builds it again
+    monkeypatch.setitem(sys.modules, new.__name__, new)
+    exp = export.process_export([before, export.process_snapshot()])
+    changed = {(kind, ".".join(rest)) for kind, _, rest, _ in exp["changes"]}
+    assert changed == {
+        ("global", "FLAG"),
+        ("global", "TABLE"),
+        ("class", "Settings.LAYOUT"),
+    }
+    assert exp["env"] == {"ATOM_TEST_LOAD_SET": "1"}
+    assert any(u.startswith(f"{mod.__name__}:kernel") for u in exp["unshippable"])
+    assert any(u.startswith(f"{mod.__name__}:holder.mode") for u in exp["unshippable"])
+    # A client starts from the state before loading.
+    mod.FLAG, mod.TABLE, Settings.LAYOUT = False, {"a": 1}, 1
+    del os.environ["ATOM_TEST_LOAD_SET"]
+    exp["storages"] = export.share_storages(exp.pop("views"))
+    export.apply_process(exp, torch.device("cpu"))
+    assert mod.FLAG and mod.TABLE == {"a": 1, "b": 2} and Settings.LAYOUT == 16
+    assert os.environ["ATOM_TEST_LOAD_SET"] == "1"
+
+
 def test_module_tree_change_is_seen():
     built = key.structure(Toy())
     with export.params_on_meta():
@@ -371,6 +428,21 @@ def test_attribute_written_then_read_keys_its_construction_value(layer_packages)
     reads = _record_load(Layer(), load)
     assert reads["attrs"]["\tinterleave"] == ("V", "true")
     assert ir.diff_reads(reads, ("attrs",), model=Layer()) == []
+
+
+def test_recorder_keeps_the_drafters_reads_apart(layer_packages):
+    target, draft = Layer(), Layer(interleave=False)
+    rec = ir.InputRecorder()
+    rec.enter_load(target)
+    target.process()
+    rec.enter_load(draft, kind="draft")
+    draft.process()
+    rec.finish_load(set())
+    reads = rec.key_reads()
+    assert reads["attrs"]["\tinterleave"] == ("V", "true")
+    assert reads["draft_attrs"]["\tinterleave"] == ("V", "false")
+    assert ir.diff_reads(reads, ("draft_attrs",), model=Layer(interleave=False)) == []
+    assert ir.diff_reads(reads, ("draft_attrs",), model=Layer())
 
 
 def test_recorder_keys_env_read_during_load_only(monkeypatch):
@@ -707,6 +779,32 @@ def test_start_early_only_without_any_daemon(cache_dir, monkeypatch):
     assert calls == [1] and preload._started_by_launch()["pid"] == 4242
 
 
+def test_daemon_lays_out_dp_ranks_as_the_engines_do():
+    from atom.model_engine.engine_core_mgr import engine_config, layout_engines
+
+    pc = SimpleNamespace(
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rank_local=None,
+        pipeline_parallel_rank=0,
+        is_multinode_dp=False,
+    )
+    config = SimpleNamespace(
+        parallel_config=pc,
+        tensor_parallel_size=2,
+        enable_dp_attention=True,
+        pipeline_parallel_size=1,
+        fake_eplb=False,
+    )
+    # DP attention: every TP rank is a DP rank of its own.
+    assert layout_engines(config) == [(0, 0), (1, 1), (2, 2), (3, 3)]
+    assert (pc.data_parallel_size, config.tensor_parallel_size) == (4, 1)
+    rank3 = engine_config(config, 3, 3).parallel_config
+    assert (rank3.data_parallel_rank, rank3.data_parallel_rank_local) == (3, 3)
+    assert pc.data_parallel_rank == 0  # a copy
+
+
 # --------------------------------------------------------------------------
 # The client's decisions (one rank; the daemon-facing calls replaced)
 # --------------------------------------------------------------------------
@@ -723,7 +821,8 @@ class _Model(nn.Module):
 def _config():
     ctx = {"other": 1}
     return SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context=ctx)
+        compilation_config=SimpleNamespace(static_forward_context=ctx),
+        parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
     )
 
 
@@ -748,6 +847,13 @@ def loop(monkeypatch):
         "summary": {"pid": 7, "daemon_pid": 7},
         "structure": {},
         "export": {"plan": {}, "storages": {}},
+        "process": {"changes": [], "env": {}, "storages": {}},
+        "draft": {
+            "structure": {},
+            "export": {"plan": {}, "storages": {}},
+            "reads": {},
+            "loaded": ["mtp.0.w"],
+        },
         "reads": {},
     }
 
@@ -774,11 +880,13 @@ def loop(monkeypatch):
         "exported_structure": lambda built, export: {},
         "diff_reads": lambda reads, kinds, **kw: list(calls.attr_diffs),
         "apply_export": lambda model, export, device: 0,
+        "apply_process": lambda export, device: 0,
         "_leftover_meta": lambda model: [],
         "_run_prepare_finalize": lambda model: 0,
     }.items():
         monkeypatch.setattr(client, name, fn)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *a, **k: None)
+    monkeypatch.setattr(client, "_draft", None)
     monkeypatch.delenv("ATOM_PRELOAD", raising=False)
     monkeypatch.delenv("ATOM_WEIGHT_CACHE", raising=False)
     return calls
@@ -803,6 +911,39 @@ def test_preload_starts_a_daemon_and_maps_it(loop, monkeypatch):
     loop.probes = [(False, []), (True, [])]
     assert isinstance(_from_daemon(), _Model)
     assert loop.spawned == 1
+
+
+class _Drafter:
+    def __init__(self, config):
+        self.model = _Model(config)
+
+    def attach_to_target(self, target, loaded):
+        self.attached = (target, loaded)
+
+
+def test_drafter_comes_from_the_daemon_the_model_came_from(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    monkeypatch.setattr(client, "construct_drafter", lambda c, d, r: _Drafter(c))
+    monkeypatch.setattr(client, "load_drafter_from_disk", lambda *a: "from disk")
+    cpu = torch.device("cpu")
+    loop.probes = [(True, [])]
+    config = _config()
+    target = _from_daemon(config)
+    drafter = client.load_drafter_from_cache(config, cpu, None, target, rank=0)
+    assert drafter.attached == (target, {"mtp.0.w"})
+    # Taken once: a later drafter has nothing to map.
+    assert (
+        client.load_drafter_from_cache(config, cpu, None, target, rank=0) == "from disk"
+    )
+    # One built differently loads from disk, after unregistering its meta build.
+    loop.probes = [(True, [])]
+    target = _from_daemon(config)
+    loop.attr_diffs = ["mtp.0.interleave: daemon=True client=False"]
+    del config.compilation_config.static_forward_context["layers.0"]
+    assert (
+        client.load_drafter_from_cache(config, cpu, None, target, rank=0) == "from disk"
+    )
+    assert config.compilation_config.static_forward_context == {"other": 1}
 
 
 def test_preload_restarts_a_daemon_it_cannot_use_once(loop, monkeypatch):

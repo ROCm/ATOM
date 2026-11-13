@@ -62,6 +62,14 @@ _FUNCTION_TYPES = (
 )
 
 
+def rank_label(config, rank: int) -> str:
+    """How logs name a rank: with its DP rank when there is DP."""
+    pc = config.parallel_config
+    if pc.data_parallel_size > 1:
+        return f"dp {pc.data_parallel_rank} rank {rank}"
+    return f"rank {rank}"
+
+
 class _Miss(Exception):
     """The cache cannot be used; the message says why."""
 
@@ -371,7 +379,11 @@ def _fp(v: Any, depth: int = 0, *, content: bool = True):
             ),
         )
     t = f"{type(v).__module__}.{type(v).__qualname__}"
-    return ("O", t) if not content else ("O", id(v), t)
+    if not content:
+        return ("O", t)
+    if isinstance(v, (dict, set, list, tuple)):  # one changed in place changes size
+        return ("O", id(v), t, len(v))
+    return ("O", id(v), t)
 
 
 def key_fp(v: Any):
