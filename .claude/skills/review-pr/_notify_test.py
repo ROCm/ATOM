@@ -10,7 +10,8 @@ These drive `main()`, not the POST helper. The decision that matters -- whether 
 "notified" -- lives in main(), so a test that calls the helper and then re-implements that
 `if` proves the helper right while leaving the decision uncovered: restore the bug in main()
 and such a test stays green. Only the transport is faked; everything above it is shipping
-code. selftest.sh covers the two no-network paths by running this file as a subprocess.
+code. selftest.sh covers the two no-network paths by running _notify.py as a subprocess,
+and runs this file through its pytest block for the ones that do post.
 
 Usage: python3 -m pytest .claude/skills/review-pr/_notify_test.py
 """
@@ -19,8 +20,9 @@ import io
 import json
 import sys
 import types
-import urllib.request
 from pathlib import Path
+
+import pytest
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "_notify.py"
@@ -34,47 +36,30 @@ def load():
         sys.path.insert(0, str(HERE))
     mod = types.ModuleType("_notify_under_test")
     mod.__file__ = str(SRC)
-    # Executing the shipping file rather than importing a copy is the point: these cannot
-    # keep passing after _notify.py changes underneath them.
     src = compile(SRC.read_text(encoding="utf-8"), str(SRC), "exec")
-    exec(src, mod.__dict__)  # noqa: S102 - deliberate, see above
+    exec(src, mod.__dict__)  # noqa: S102 - deliberate: exec the shipping file
     return mod
 
 
-class FakeResp:
-    """What urlopen hands back: a context manager that is also a byte stream."""
-
-    def __init__(self, status, payload, url=URL):
-        self.status = status
-        self.url = url
-        body = b"" if payload is None else json.dumps(payload).encode()
-        self._body = io.BytesIO(body)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def read(self, *a):
-        return self._body.read(*a)
+# Once, not per test: isolation comes from monkeypatch-managed mutations (env, argv, urlopen),
+# not from re-reading disk; re-exec per test would buy nothing and repeat ~4KB of I/O each call.
+MOD = load()
 
 
-def drive(scn, tmp_path, monkeypatch):
+def drive(scn, tmp_path, monkeypatch, capsys):
     """Run main() end to end over a fake transport -> (rc, stdout, notified)."""
-    mod = load()
 
     def fake_urlopen(req, timeout=None):
         if "raises" in scn:
             raise scn["raises"]
-        return FakeResp(scn["status"], scn["payload"], scn.get("landed", URL))
+        payload = scn["payload"]
+        resp = io.BytesIO(b"" if payload is None else json.dumps(payload).encode())
+        resp.status = scn["status"]
+        resp.url = scn.get("landed", URL)
+        return resp
 
     # Substitute only the socket call; Request, headers, URL and the id check stay real.
-    mod.urllib = types.SimpleNamespace(
-        request=types.SimpleNamespace(
-            Request=urllib.request.Request, urlopen=fake_urlopen
-        )
-    )
+    monkeypatch.setattr(MOD.urllib.request, "urlopen", fake_urlopen)
 
     work = tmp_path / "ws"
     work.mkdir(exist_ok=True)
@@ -89,18 +74,18 @@ def drive(scn, tmp_path, monkeypatch):
         "GITHUB_REPOSITORY": REPO,
     }.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.setattr(mod.sys, "argv", ["_notify.py", PR])
+    monkeypatch.setattr(MOD.sys, "argv", ["_notify.py", PR])
 
-    buf = io.StringIO()
-    monkeypatch.setattr(mod.sys, "stdout", buf)
-    rc = mod.main()
+    rc = MOD.main()
     notified = out_file.exists() and "notified=true" in out_file.read_text()
-    return rc, buf.getvalue(), notified
+    return rc, capsys.readouterr().out, notified
 
 
-def test_a_created_comment_is_reported_and_claims_notified(tmp_path, monkeypatch):
+def test_a_created_comment_is_reported_and_claims_notified(
+    tmp_path, monkeypatch, capsys
+):
     rc, out, notified = drive(
-        {"status": 201, "payload": {"id": 999}}, tmp_path, monkeypatch
+        {"status": 201, "payload": {"id": 999}}, tmp_path, monkeypatch, capsys
     )
     assert rc == 0
     assert notified is True
@@ -108,43 +93,40 @@ def test_a_created_comment_is_reported_and_claims_notified(tmp_path, monkeypatch
     assert "999" in out, "the comment id is the evidence; log it so a reader can check"
 
 
-def test_a_redirected_post_returning_the_comment_list_claims_nothing(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "scn, frags",
+    [
+        pytest.param(
+            {
+                "status": 200,
+                "payload": [{"id": 1}, {"id": 2}],
+                # urllib downgrades POST -> GET across a 301, so a moved repo answers 200
+                # with the existing comments and creates nothing. This shape broke production.
+                "landed": "https://api.github.com/repos/ROCm/atom/issues/42/comments",
+            },
+            ["no comment was created", "redirected to"],
+            id="redirected-post-returning-the-comment-list",
+        ),
+        pytest.param(
+            {"status": 200, "payload": {}},
+            ["no comment was created"],
+            id="2xx-without-an-id",
+        ),
+        pytest.param(
+            {"raises": OSError("boom")},
+            ["boom"],
+            id="raising-transport",
+        ),
+    ],
+)
+def test_a_post_that_creates_nothing_claims_nothing(
+    scn, frags, tmp_path, monkeypatch, capsys
 ):
-    # urllib downgrades POST -> GET across a 301, so a moved repo answers 200 with the
-    # existing comments and creates nothing. This is the shape that broke production.
-    rc, out, notified = drive(
-        {
-            "status": 200,
-            "payload": [{"id": 1}, {"id": 2}],
-            "landed": "https://api.github.com/repos/ROCm/atom/issues/42/comments",
-        },
-        tmp_path,
-        monkeypatch,
-    )
+    rc, out, notified = drive(scn, tmp_path, monkeypatch, capsys)
     assert rc == 0, "a failed notice must not fail CI"
     assert (
         notified is False
     ), "a POST that created nothing must not silence the report job"
-    assert "no comment was created" in out
-    assert "redirected to" in out, "name the redirect, not just the status"
-
-
-def test_a_2xx_without_an_id_claims_nothing(tmp_path, monkeypatch):
-    rc, out, notified = drive({"status": 200, "payload": {}}, tmp_path, monkeypatch)
-    assert rc == 0
-    assert notified is False
-    assert "no comment was created" in out
-
-
-def test_a_raising_transport_claims_nothing(tmp_path, monkeypatch):
-    rc, out, notified = drive({"raises": OSError("boom")}, tmp_path, monkeypatch)
-    assert rc == 0
-    assert notified is False
-    assert "boom" in out
-
-
-def test_every_failure_names_the_url_so_a_log_reader_can_act(tmp_path, monkeypatch):
-    for scn in ({"status": 200, "payload": {}}, {"raises": OSError("boom")}):
-        _, out, _ = drive(scn, tmp_path, monkeypatch)
-        assert URL in out
+    assert URL in out, "every failure names the URL so a log reader can act"
+    for frag in frags:
+        assert frag in out

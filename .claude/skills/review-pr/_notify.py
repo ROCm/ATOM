@@ -51,8 +51,8 @@ def mark_notified():
         fh.write("notified=true\n")
 
 
-def post_comment(repo, pr, body, tok, _open=None):
-    """POST one comment; -> (created comment id, detail). `None` id means nothing landed.
+def post_comment(repo, pr, body, tok):
+    """POST one comment; -> (created comment id, failure detail or None). `None` id means nothing landed.
 
     Returning the id rather than the status is the point. A POST that GitHub answers 2xx but
     does not act on is indistinguishable from a successful one by status alone, and that is
@@ -72,9 +72,8 @@ def post_comment(repo, pr, body, tok, _open=None):
         },
         method="POST",
     )
-    opener = _open or (lambda r: urllib.request.urlopen(r, timeout=15))
     try:
-        with opener(req) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             status = getattr(resp, "status", None)
             landed = getattr(resp, "url", url)
             try:
@@ -94,7 +93,7 @@ def post_comment(repo, pr, body, tok, _open=None):
             f"POST {url} -> HTTP {status} but no comment was created "
             f"(response was {kind}{moved})"
         )
-    return cid, f"HTTP {status}"
+    return cid, None
 
 
 def main():
