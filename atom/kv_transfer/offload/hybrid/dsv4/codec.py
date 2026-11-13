@@ -30,6 +30,8 @@ from numbers import Integral
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
+from atom.kv_transfer.offload.metadata_lease import MetadataLeasePool
+from atom.utils import CpuGpuBuffer
 
 logger = logging.getLogger("atom")
 
@@ -91,6 +93,8 @@ class _PreparedBlockIdGroups:
     _offsets: tuple[int, ...]
     _device_ids: torch.Tensor | None
     _region_plan: object | None
+    _metadata_lease: object | None = None
+    _metadata_generation: int = 0
 
     @property
     def group_count(self) -> int:
@@ -195,6 +199,12 @@ def _snapshot_region_set(
     )
 
 
+class _ThreadMetadata(threading.local):
+    """One lease pool per thread: a pool is used only by its constructing thread."""
+
+    pool: MetadataLeasePool | None = None
+
+
 class DSV4PageSlotCodec:
     """One DSV4 raw-byte codec for forward PAGE and reverse SLOT regions.
 
@@ -252,6 +262,7 @@ class DSV4PageSlotCodec:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self._compiled_region_plans: dict[DSV4PayloadKind, object] = {}
         self._compiled_region_plans_lock = threading.Lock()
+        self._metadata_tls = _ThreadMetadata()
         self._triton_page_slot = None
         if self.device.type == "cuda":
             try:
@@ -613,9 +624,10 @@ class DSV4PageSlotCodec:
 
         The caller must retain the returned owner through the pipeline fence,
         including recovery, and use the same explicit stream for every launch.
-        The upload is blocking, so a preparation error cannot leave a live
-        metadata copy after this method unwinds. Repeated IDs in distinct
-        groups retain the ordinary per-group validation semantics.
+        Dynamic IDs use a pinned CPU/GPU lease with an async upload on this
+        exact stream. The pipeline caller must finish the owner after its
+        operation completion fence; preparation failures quarantine their lease.
+        Repeated IDs retain ordinary per-group validation semantics.
         """
 
         plans = tuple(
@@ -642,6 +654,7 @@ class DSV4PageSlotCodec:
             offsets.append(len(ids))
         device_ids = None
         region_plan = None
+        metadata_lease = None
         if ids:
             with (
                 torch.cuda.device(self.device)
@@ -650,10 +663,74 @@ class DSV4PageSlotCodec:
             ):
                 region_plan = self._region_plan(DSV4PayloadKind.PAGE, stream=stream)
                 with torch.cuda.stream(stream):
-                    device_ids = triton_page_slot._static_device_i64(ids, target)
+                    pool = self._metadata_tls.pool
+                    if pool is None:
+                        pool = MetadataLeasePool(
+                            lambda n: CpuGpuBuffer(n, dtype=torch.int64, device=target)
+                        )
+                        self._metadata_tls.pool = pool
+                    metadata_lease = pool.acquire(len(ids))
+                    try:
+                        metadata_lease.buffer.np[: len(ids)] = ids
+                        device_ids = metadata_lease.buffer.copy_to_gpu(len(ids))
+                    except BaseException:
+                        pool.retire(metadata_lease, safe=False)
+                        raise
         return _PreparedBlockIdGroups(
-            self, stream, plans, tuple(offsets), device_ids, region_plan
+            self,
+            stream,
+            plans,
+            tuple(offsets),
+            device_ids,
+            region_plan,
+            metadata_lease,
+            metadata_lease.generation if metadata_lease is not None else 0,
         )
+
+    supports_strided_restore = True
+
+    def _validate_metadata_lease(self, owner):
+        lease = owner._metadata_lease
+        if lease is not None and (
+            lease.state != "leased" or lease.generation != owner._metadata_generation
+        ):
+            raise ValueError("prepared metadata lease is no longer active")
+
+    def record_prepared_block_id_completion(self, owner):
+        if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
+            raise ValueError("prepared IDs belong to a different codec")
+        lease = owner._metadata_lease
+        self._validate_metadata_lease(owner)
+        if lease is not None:
+            lease.pool.assert_thread()
+            event = torch.cuda.Event()
+            event.record(owner._stream)
+            lease.completion = event
+
+    def finish_prepared_block_id_groups(self, owner, *, safe: bool):
+        """Only the pipeline caller can prove the operation completion fence passed."""
+        if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
+            raise ValueError("prepared IDs belong to a different codec")
+        lease = owner._metadata_lease
+        self._validate_metadata_lease(owner)
+        if lease is None:
+            return
+        pool = lease.pool
+        pool.assert_thread()
+        # Before any launch only the ID upload is on the stream, and its event
+        # says when the buffer is free again; a launched kernel may still read it.
+        safe = safe or not lease.launched
+        event = lease.completion
+        if safe and event is None:
+            try:
+                # A direct prepared caller can still retire after its fence.
+                # Pipelines record at the last group, before terminal sync.
+                event = torch.cuda.Event()
+                event.record(owner._stream)
+            except BaseException:
+                pool.retire(lease, safe=False)
+                raise
+        pool.retire(lease, completion=event, safe=safe)
 
     def _copy_prepared_block_id_group(
         self,
@@ -663,9 +740,12 @@ class DSV4PageSlotCodec:
         *,
         gather: bool,
         stream: torch.cuda.Stream | None,
+        items_per_chunk: int = 1,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
             raise ValueError("prepared block IDs belong to a different codec")
+        self._validate_metadata_lease(owner)
         if stream is not owner._stream:
             raise ValueError("prepared block IDs must use their preparation stream")
         if not self._matches_device(torch.device(stream.device)):
@@ -690,6 +770,20 @@ class DSV4PageSlotCodec:
         ):
             raise ValueError("prepared block IDs have an invalid shape or layout")
         _, item_ids, buffer_offset = sections[0]
+        stride_kwargs = {}
+        if chunk_stride_bytes is not None:
+            if gather:
+                raise ValueError("strided prepared buffers support restore only")
+            count = _integer("items_per_chunk", items_per_chunk)
+            stride = _integer("chunk_stride_bytes", chunk_stride_bytes)
+            chunk_bytes = count * self.bytes_per_block
+            if count <= 0 or stride < chunk_bytes or len(item_ids) % count:
+                raise ValueError("invalid strided PAGE chunk geometry")
+            chunks = len(item_ids) // count
+            required = buffer_offset + (chunks - 1) * stride + chunk_bytes
+            if int(device_buf.numel()) < required:
+                raise ValueError("strided PAGE buffer is too small")
+            stride_kwargs = {"items_per_chunk": count, "chunk_stride_bytes": stride}
         with (
             torch.cuda.device(self.device)
             if self.device.index is not None
@@ -700,12 +794,15 @@ class DSV4PageSlotCodec:
                 if gather
                 else self._triton_page_slot._scatter_region_items_unchecked
             )
+            if owner._metadata_lease is not None:
+                owner._metadata_lease.launched = True
             copy(
                 owner._region_plan,
                 item_ids,
                 device_buf,
                 buffer_offset=buffer_offset,
                 stream=stream,
+                **stride_kwargs,
                 prepared_item_ids=ids[
                     owner._offsets[index] : owner._offsets[index + 1]
                 ],
@@ -733,6 +830,27 @@ class DSV4PageSlotCodec:
     ) -> None:
         self._copy_prepared_block_id_group(
             device_buf, owner, group_index, gather=False, stream=stream
+        )
+
+    def chunk_major_strided_buffer_to_gpu_prepared(
+        self,
+        device_buf,
+        owner,
+        group_index,
+        *,
+        items_per_chunk,
+        chunk_stride_bytes,
+        stream=None,
+    ) -> None:
+        """Restore aligned Store slots without copying away their padding."""
+        self._copy_prepared_block_id_group(
+            device_buf,
+            owner,
+            group_index,
+            gather=False,
+            stream=stream,
+            items_per_chunk=items_per_chunk,
+            chunk_stride_bytes=chunk_stride_bytes,
         )
 
     def gather_slot(

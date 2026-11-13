@@ -71,7 +71,10 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
-from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
+from atom.kv_transfer.offload.mooncake_store.layouts import (
+    build_mooncake_codec,
+    metadata_reserve_bytes,
+)
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -203,14 +206,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         The transfer slot pool, which `register_kv_caches` allocates, and a
         staging buffer per save and load thread (the widths
         `_init_worker_common` gives the executors), each at most
-        `_staging_buffer_bound`.
+        `_staging_buffer_bound`, plus the thread's PAGE metadata lease pool.
         """
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         cfg = parse_mooncake_store_config(kvc)
         threads = envs.OFFLOAD_COPY_WORKERS + envs.OFFLOAD_LOAD_WORKERS
-        return (
-            pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
-            + threads * _staging_buffer_bound()
+        return pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes) + (
+            threads * (_staging_buffer_bound() + metadata_reserve_bytes(config))
         )
 
     def close(self) -> None:
@@ -818,10 +820,21 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             run = pool.contiguous_view(slots) if self._in_place else None
+            chunk_stride_bytes = None
+            if run is None and self._in_place and self._codec.supports_strided_restore:
+                run = pool.strided_view(slots)
+                if run is not None:
+                    chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
             try:
                 if run is not None:
-                    self._copy_in_place(run, window, req.block_ids, pack=False)
+                    self._copy_in_place(
+                        run,
+                        window,
+                        req.block_ids,
+                        pack=False,
+                        chunk_stride_bytes=chunk_stride_bytes,
+                    )
                     in_place_windows += 1
                 else:
                     gpu_connector.batched_to_gpu(
@@ -915,8 +928,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
+        With ``chunk_stride_bytes``, ``run`` holds padded Store slots and is
+        unpacked in place, padding included.
 
         Returns once the copy is done. A pack is ordered after
         ``producer_event`` like the staged pack, so the kernels that produced
@@ -947,8 +963,24 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             if pack
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
-        copy(run, owner, 0, stream=stream)
-        atom_lmcache_staging.fence_submitted_work(stream)
+        try:
+            if chunk_stride_bytes is not None:
+                codec.chunk_major_strided_buffer_to_gpu_prepared(
+                    run,
+                    owner,
+                    0,
+                    stream=stream,
+                    items_per_chunk=per_chunk,
+                    chunk_stride_bytes=chunk_stride_bytes,
+                )
+            else:
+                copy(run, owner, 0, stream=stream)
+            codec.record_prepared_block_id_completion(owner)
+            atom_lmcache_staging.fence_submitted_work(stream)
+        except BaseException:
+            codec.finish_prepared_block_id_groups(owner, safe=False)
+            raise
+        codec.finish_prepared_block_id_groups(owner, safe=True)
 
         # -- slot settlement -----------------------------------------------
 
