@@ -3637,39 +3637,11 @@ async def kv_transfer_info():
     return info
 
 
-def _kv_event_sources() -> dict[str, dict[str, Any]]:
-    """Each KV event publisher this server's engines run, keyed by the DP rank
-    it publishes for: what the rank's `publisher_config` reports, plus how its
-    blocks are hashed and the offload tier's report. Empty without one."""
-    from atom.distributed.kv_events import publisher_config
-    from atom.kv_transfer.offload.report import offload_report
-    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
-    from atom.model_engine.prefix_hash import BLOCK_HASH_ALGO, hash_block_size_for
-
-    cfg = engine.config
-    events = cfg.kv_events_config
-    if not events.enable or events.publisher == "null":
-        return {}
-    shared = {
-        "incarnation": engine.core_mgr.incarnation,
-        "block_size": hash_block_size_for(
-            cfg.kv_cache_block_size, cfg.decode_context_parallel_size
-        ),
-        "hash_algo": BLOCK_HASH_ALGO,
-    }
-    offload = offload_report(cfg)
-    if offload is not None:
-        shared["offload"] = offload
-    return {
-        str(rank): publisher_config(events, rank) | shared
-        for rank, _ in iter_dp_rank_assignments(cfg)
-    }
-
-
 @_engine_route("/kv_event_sources")
 async def kv_event_sources():
-    """Where to subscribe to this server's KV events, as vLLM serves it."""
-    return _kv_event_sources()
+    """Where each DP rank of this server publishes KV events, for the Atomesh
+    router to subscribe to the ranks it registers."""
+    return engine.core_mgr.kv_event_sources
 
 
 @_engine_route("/server_info")
@@ -3678,8 +3650,7 @@ async def server_info():
 
     The router's dp-aware discovery reads ``dp_size`` here to expand the
     per-DP-rank worker set and enable cache-aware routing to the rank that
-    holds a request's prefix, and ``kv_event_sources`` (`/kv_event_sources`)
-    to subscribe to each rank's KV events.
+    holds a request's prefix.
     """
     cfg = engine.config
     return {
@@ -3687,7 +3658,6 @@ async def server_info():
         "served_model_name": model_name,
         "tp_size": cfg.tensor_parallel_size,
         "dp_size": cfg.parallel_config.data_parallel_size,
-        "kv_event_sources": _kv_event_sources(),
     }
 
 

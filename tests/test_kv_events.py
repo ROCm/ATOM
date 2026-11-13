@@ -321,8 +321,8 @@ class TestBlockManagerHooks:
 
     def test_multimodal_blocks_name_the_seed_in_extra_keys(self, seq_factory):
         # The seed starts a multimodal seq's whole hash chain, so every block
-        # carries it, one `((mm_identifier, 0),)` entry per hash, the seed as
-        # 16 hex digits.
+        # carries it, one `((seed, 0),)` entry per hash, the seed as 16 hex
+        # digits at a fixed offset 0.
         import msgpack
 
         bm = _bm_with_events()

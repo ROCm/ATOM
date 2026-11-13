@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import zmq
 
+from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
@@ -78,6 +79,7 @@ def _bare_manager(cls, **kwargs):
             prefill_context_parallel_size=1,
             keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
             asyncio_mode=kwargs.get("asyncio_mode", False),
+            kv_events_config=KVEventsConfig(),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -192,13 +194,11 @@ class OutputThreadStateTest(unittest.TestCase):
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
 
-    def test_every_spawn_has_its_own_incarnation(self):
-        """`/kv_event_sources` reports it so a consumer can tell restarted
-        publishers from a gap in their stream; two spawns may never share one."""
-        first, second = (mgr.incarnation for mgr in self.managers)
-        self.assertRegex(first, r"\A[0-9a-f]{32}\Z")
-        self.assertRegex(second, r"\A[0-9a-f]{32}\Z")
-        self.assertNotEqual(first, second)
+    def test_kv_event_sources_are_built_with_the_shared_state(self):
+        """`/kv_event_sources` serves what the manager built, under either
+        manager; with events off there is no publisher to report."""
+        for mgr in self.managers:
+            self.assertEqual(mgr.kv_event_sources, {})
 
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)

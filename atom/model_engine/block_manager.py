@@ -69,10 +69,12 @@ def _make_block_stored(
     computed in the same unit.
 
     `cache_seed` is the seq's. A multimodal seq's (anything but -1) seeds its
-    whole hash chain, so no block of it can be named from its tokens alone;
-    each carries the seed in `extra_keys` as the `(mm_identifier, offset)`
-    pair vLLM gives a block that covers media, which is how consumers tell
-    such a block apart.
+    whole hash chain, so no block of it can be named from its tokens alone.
+    Every block of such a seq, text-only ones included, then carries
+    `extra_keys` `((seed, 0),)`, the seed in 16 hex digits at a fixed offset 0:
+    an ATOM marker that the hash is seeded by media and the block must not be
+    matched by tokens. It borrows the shape of vLLM's `(mm_identifier, offset)`
+    pair, but not its meaning (vLLM's offset is the media's position).
     """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher

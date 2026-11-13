@@ -878,180 +878,105 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
 # ---- /kv_event_sources: where a router follows each DP rank's KV events ----
 
-_INCARNATION = "0123456789abcdef0123456789abcdef"
 
-
-def _kv_events_engine(monkeypatch, *, kv_transfer_config=None, **events):
-    """A DP=2 engine with KV events configured as `events`."""
+def _kv_events_engine(
+    monkeypatch, parallel=None, *, enable_dp_attention=False, tp=1, **events
+):
+    """An engine with KV events configured as `events`, by default DP=2 on one
+    node, serving the sources its CoreManager builds."""
     from atom.config import KVEventsConfig, ParallelConfig
+    from atom.model_engine.engine_core_mgr import kv_event_sources
 
     config = SimpleNamespace(
         kv_events_config=KVEventsConfig(**events),
-        parallel_config=ParallelConfig(data_parallel_size=2),
-        enable_dp_attention=False,
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
+        parallel_config=parallel or ParallelConfig(data_parallel_size=2),
+        enable_dp_attention=enable_dp_attention,
+        tensor_parallel_size=tp,
         kv_cache_block_size=16,
         decode_context_parallel_size=2,
-        kv_transfer_config=kv_transfer_config,
-        hf_config=SimpleNamespace(num_hidden_layers=4, model_type="glm_moe_dsa"),
-        model="test-model",
-        kv_cache_dtype="fp8",
-        speculative_config=None,
     )
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(
         api_server,
         "engine",
         SimpleNamespace(
-            config=config, core_mgr=SimpleNamespace(incarnation=_INCARNATION)
+            config=config,
+            core_mgr=SimpleNamespace(kv_event_sources=kv_event_sources(config)),
         ),
     )
-    return config
 
 
-@pytest.fixture
-def fake_aiter(monkeypatch):
-    """AITER's fp8 and arch as on gfx950: the Store namespace asks for both."""
-    import torch
-
-    package = types.ModuleType("aiter")
-    package.dtypes = SimpleNamespace(d_dtypes={"fp8": torch.float8_e4m3fn})
-    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
-    chip_info.get_gfx = lambda: "gfx950"
-    for name, module in (
-        ("aiter", package),
-        ("aiter.jit", types.ModuleType("aiter.jit")),
-        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
-        ("aiter.jit.utils.chip_info", chip_info),
-    ):
-        monkeypatch.setitem(sys.modules, name, module)
+def _tcp_sources(ports):
+    # 16-token KV blocks under DCP 2 hash 32 tokens per block.
+    return {
+        str(rank): {"endpoint": f"tcp://*:{port}", "topic": "kv", "block_size": 32}
+        for rank, port in ports.items()
+    }
 
 
 def test_kv_event_sources_reports_every_dp_rank_publisher(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="tcp://*:5557", topic="kv")
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({0: 5557, 1: 5558})
+    assert "kv_event_sources" not in asyncio.run(api_server.server_info())
+
+
+def test_kv_event_sources_keys_the_global_rank_on_a_later_node(monkeypatch):
+    from atom.config import ParallelConfig
+
+    # The second node of a DP=4 run: its engines are global ranks 2 and 3 and
+    # bind their endpoints offset from rank 2, not from 0.
+    parallel = ParallelConfig(
+        data_parallel_size=4, data_parallel_size_local=2, data_parallel_rank=2
+    )
+    _kv_events_engine(
+        monkeypatch, parallel, enable=True, endpoint="tcp://*:5557", topic="kv"
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({2: 5559, 3: 5560})
+
+
+@pytest.mark.parametrize("node_rank, first", [(0, 0), (2, 4)])
+def test_kv_event_sources_lists_every_tp_rank_under_dp_attention(
+    monkeypatch, node_rank, first
+):
+    from atom.config import ParallelConfig
+
+    # DP-attention runs one engine, and so one publisher, per TP rank: DP=2
+    # per node at TP=2 is four, numbered globally in TP units.
+    parallel = ParallelConfig(
+        data_parallel_size=2 + node_rank,
+        data_parallel_size_local=2,
+        data_parallel_rank=node_rank,
+    )
     _kv_events_engine(
         monkeypatch,
-        # A P/D transport: only an offload connector adds `offload`.
-        kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+        parallel,
+        enable_dp_attention=True,
+        tp=2,
         enable=True,
         endpoint="tcp://*:5557",
-        replay_endpoint="tcp://*:5600",
         topic="kv",
-        hwm=100_000,
-        buffer_steps=64,
-        replay_buffer_steps=1_000,
     )
-    shared = {
-        "enable_kv_cache_events": True,
-        "publisher": "zmq",
-        "topic": "kv",
-        "hwm": 100_000,
-        "buffer_steps": 1_000,
-        "max_queue_size": 64,
-        "encoding": "msgpack",
-        "schema_version": 1,
-        "incarnation": _INCARNATION,
-        "block_size": 32,  # 16-token KV blocks under DCP 2
-        "hash_algo": "xxh64-chain-i64le",
-    }
+    ranks = range(first, first + 4)
     sources = asyncio.run(api_server.kv_event_sources())
-    assert sources == {
-        "0": shared | {"endpoint": "tcp://*:5557", "replay_endpoint": "tcp://*:5600"},
-        "1": shared | {"endpoint": "tcp://*:5558", "replay_endpoint": "tcp://*:5601"},
+    assert sources == _tcp_sources({rank: 5557 + rank for rank in ranks})
+
+
+def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="ipc:///tmp/kv")
+    assert asyncio.run(api_server.kv_event_sources()) == {
+        "0": {"endpoint": "ipc:///tmp/kv", "topic": "", "block_size": 32},
+        "1": {"endpoint": "ipc:///tmp/kv_dp1", "topic": "", "block_size": 32},
     }
-    assert asyncio.run(api_server.kv_event_sources()) == sources
-    assert asyncio.run(api_server.server_info())["kv_event_sources"] == sources
-
-
-def test_hash_algo_names_the_block_hash_as_implemented():
-    # xxh64 (seed 0) over the parent's hash, when there is one, as 8
-    # little-endian bytes, then each token as a little-endian int64.
-    import numpy as np
-    import xxhash
-
-    from atom.model_engine.prefix_hash import BLOCK_HASH_ALGO, block_hash
-
-    assert BLOCK_HASH_ALGO == "xxh64-chain-i64le"
-    tokens = [7, 2**40, 151_643]
-    raw = np.array(tokens, dtype="<i8").tobytes()
-    root = block_hash(tokens)
-    assert root == xxhash.xxh64_intdigest(raw)
-    link = root.to_bytes(8, "little") + raw
-    assert block_hash(tokens, root) == xxhash.xxh64_intdigest(link)
 
 
 @pytest.mark.parametrize(
     "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
 )
 def test_kv_event_sources_is_empty_without_a_publisher(monkeypatch, events):
-    _kv_events_engine(
-        monkeypatch,
-        kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "offload"},
-        **events,
-    )
+    _kv_events_engine(monkeypatch, **events)
     assert asyncio.run(api_server.kv_event_sources()) == {}
-    assert asyncio.run(api_server.server_info())["kv_event_sources"] == {}
-
-
-def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
-    monkeypatch, fake_aiter
-):
-    from atom.kv_transfer.offload.mooncake_store import keys
-
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "512")
-    pools = {
-        "rdma0": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.1:8080"},
-        "rdma1": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.9:8080"},
-        "rdma2": {"master": "10.0.0.3:50051", "metadata": "http://10.0.0.3:8080"},
-    }
-    store = {
-        "kv_connector": "mooncake_store",
-        "kv_role": "offload",
-        "kv_connector_extra_config": {
-            "mooncake_store.pools": pools,
-            "mooncake_store.local_hostname": "10.0.0.2",
-            "mooncake_store.chunk_tokens": 64,
-        },
-    }
-    pd = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
-    config = _kv_events_engine(
-        monkeypatch,
-        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
-        enable=True,
-    )
-    # The Store connector's own view of the config under `multi`.
-    leaf = SimpleNamespace(**vars(config) | {"kv_transfer_config": store})
-    sources = asyncio.run(api_server.kv_event_sources())
-    assert sources["1"]["offload"] == sources["0"]["offload"]
-    assert sources["0"]["offload"] == {
-        "backend": "mooncake_store",
-        "masters": ["10.0.0.1:50051", "10.0.0.3:50051"],
-        "namespace": keys.store_namespace(leaf, 64),
-        "chunk_tokens": 64,
-        "world": 1,
-        "min_load_tokens": 512,
-        "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
-    }
-    assert sources["1"]["replay_endpoint"] is None
-
-
-@pytest.mark.parametrize("connector", ["lmcache_offload", "lmcache_mp"])
-def test_kv_event_sources_reports_only_the_lmcache_chunk(monkeypatch, connector):
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "512")
-    _kv_events_engine(
-        monkeypatch,
-        kv_transfer_config={
-            "kv_connector": connector,
-            "kv_role": "offload",
-            "kv_connector_extra_config": {"lmcache.chunk_size": 128},
-        },
-        enable=True,
-    )
-    assert asyncio.run(api_server.kv_event_sources())["1"]["offload"] == {
-        "backend": "lmcache",
-        "chunk_tokens": 128,
-        "min_load_tokens": 512,
-    }
 
 
 # ---- --api-server-count: the worker side of api_server ----

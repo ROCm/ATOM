@@ -478,8 +478,10 @@ The scheduler can publish prefix-cache changes (`BlockStored`, `BlockRemoved`,
 `AllBlocksCleared`; KV received from a PD producer is a `BlockStored` on `GPU`
 like any other) over ZMQ so external routers and cache managers can mirror what
 each engine holds. Events are encoded as vLLM's: a batch is a msgpack array
-`[ts, events, data_parallel_rank]` and each event a map tagged with `type`; the
-blocks of a multimodal request carry its media hash in `extra_keys`. Every batch
+`[ts, events, data_parallel_rank]` and each event a map tagged with `type`. Every
+block of a multimodal request carries `extra_keys` entry `[[seed, 0]]`, `seed`
+the request's cache seed in 16 hex digits: an ATOM marker that the block's hash
+is seeded by its media, so it must not be matched by tokens. Every batch
 carries a monotonic 8-byte sequence number, and the first (seq 0) is a lone
 `AllBlocksCleared`; a consumer that sees a gap can ask for the missed batches
 over the optional replay socket. Events are advisory and never stall inference:
@@ -495,17 +497,11 @@ publishes; downstream stages bind nothing. Prefill/decode disaggregation runs
 separate engine processes, and only decode publishes; if other engines share
 the host, give each its own endpoints.
 
-Discovery: `GET /kv_event_sources`, also under `kv_event_sources` in
-`/server_info`, maps each DP rank the server runs to its publisher as vLLM
-reports it there (`enable_kv_cache_events`, `publisher`, the rank's `endpoint`
-and `replay_endpoint`, `topic`, `hwm`, and vLLM's `buffer_steps` and
-`max_queue_size`, which are ATOM's replay ring `replay_buffer_steps` and send
-queue `buffer_steps`), plus the stream's
-`encoding` and `schema_version`, an `incarnation` that changes whenever the
-engines restart, the `block_size` and `hash_algo` of the block hashes, and an
-`offload` report under a Mooncake Store or LMCache offload connector. It is
-`{}` with events off or the `null` publisher. Endpoints are reported as
-configured, so a consumer replaces a wildcard host with the server's address.
+Discovery: `GET /kv_event_sources` maps the global DP rank of each engine the
+server runs to where its publisher binds: `endpoint`, offset per rank like the
+bind itself (a wildcard host stays a wildcard, so a consumer substitutes the
+server's address), `topic`, and `block_size`, the tokens per hashed block. It is
+`{}` with events off or the `null` publisher.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -516,7 +512,7 @@ configured, so a consumer replaces a wildcard host with the server's address.
 | **ATOM_KV_EVENTS_HWM** | int | 0 | ZMQ high-water mark on the PUB socket (0 = unlimited). |
 | **ATOM_KV_EVENTS_BUFFER_STEPS** | int | 10000 | Depth of the in-process queue between the scheduler and the sender thread. When full, the oldest batch is dropped and counted in the publisher's `dropped` stat; the dropped batch still consumes a sequence number, so subscribers see the loss as a gap. |
 | **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests, served with vLLM's protocol. Empty disables replay (PUB-only). A DEALER sends `[b"", start]`, `start` an 8-byte big-endian sequence, and receives `[b"", topic, seq, payload]` for every retained batch with `seq >= start`, then the end marker `[b"", b"", REPLAY_DONE, window]`: `REPLAY_DONE` is eight `0xff` bytes and `window` the msgpack `[oldest, latest]` seqs retained (vLLM sends it empty). Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
-| **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
+| **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Map-encoded events name every field, so a payload is larger than with the `array_like` encoding before: about +93% for a decode step's single-block events and +32% for a prefill step's 512-block ones. Must be >= 1 when replay is enabled. |
 
 ## Shutdown
 

@@ -13,10 +13,6 @@ from atom.utils import envs
 
 _xxh64 = xxhash.xxh64_intdigest
 
-# `block_hash` as KV event consumers name it (`/kv_event_sources`); any change to
-# `_token_bytes` or `_link` must rename it.
-BLOCK_HASH_ALGO = "xxh64-chain-i64le"
-
 
 def hash_block_size_for(block_size: int, dcp_world_size: int) -> int:
     """Tokens per prefix-cache hash block: one block-table entry under DCP."""

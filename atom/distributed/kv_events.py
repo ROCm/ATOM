@@ -15,12 +15,9 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 import msgspec
-
-if TYPE_CHECKING:
-    from atom.config import KVEventsConfig
 
 logger = logging.getLogger("atom")
 
@@ -37,10 +34,6 @@ MEDIUM_DISK: Final[str] = "DISK"
 # DEALER/ROUTER-style client that can read the multi-message reply; a REQ
 # socket cannot.)
 REPLAY_DONE: Final[bytes] = b"\xff" * 8
-
-# Reported with every publisher (`publisher_config`): bump it with any change to
-# the events or their encoding that a consumer must decode differently.
-SCHEMA_VERSION: Final[int] = 1
 
 
 class KVCacheEvent(
@@ -96,7 +89,7 @@ class AllBlocksCleared(KVCacheEvent):
 class BlockTransferred(KVCacheEvent):
     """A block moved between tiers without changing identity.
 
-    Emitted on GPU↔CPU/DISK swap, REMOTE→GPU receive, and GPU→REMOTE send.
+    Meant for GPU↔CPU/DISK offload; nothing in ATOM emits it yet.
     ATOM-only — strict vLLM consumers should narrow the union to exclude it.
     """
 
@@ -566,28 +559,3 @@ def make_publisher(
         publisher.publish([AllBlocksCleared()])
         return publisher
     raise ValueError(f"unknown KV event publisher: {publisher_kind!r}")
-
-
-def publisher_config(cfg: KVEventsConfig, data_parallel_rank: int) -> dict[str, Any]:
-    """What a DP rank's publisher runs on, as vLLM's `get_publisher_config`
-    reports it: `KVEventsConfig`'s fields under vLLM's names, with the endpoints
-    the rank binds (a wildcard host stays a wildcard), plus the stream encoding.
-    """
-    return {
-        "enable_kv_cache_events": cfg.enable,
-        "publisher": cfg.publisher,
-        "endpoint": offset_endpoint(cfg.endpoint, data_parallel_rank),
-        "replay_endpoint": (
-            offset_endpoint(cfg.replay_endpoint, data_parallel_rank)
-            if cfg.replay_endpoint
-            else None
-        ),
-        "topic": cfg.topic,
-        "hwm": cfg.hwm,
-        # vLLM's `buffer_steps` is the replay ring and `max_queue_size` the send
-        # queue; ATOM names them `replay_buffer_steps` and `buffer_steps`.
-        "buffer_steps": cfg.replay_buffer_steps,
-        "max_queue_size": cfg.buffer_steps,
-        "encoding": "msgpack",
-        "schema_version": SCHEMA_VERSION,
-    }
