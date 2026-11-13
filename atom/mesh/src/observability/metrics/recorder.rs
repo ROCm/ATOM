@@ -498,6 +498,21 @@ impl MeshMetrics {
         .increment(1);
     }
 
+    /// Record the worker and DP rank a request was finally dispatched to.
+    pub fn record_selected_dp_rank(pool: &'static str, base_url: &str, dp_rank: Option<usize>) {
+        let dp_rank: metrics::SharedString = match dp_rank {
+            Some(rank) => intern_string(&rank.to_string()).into(),
+            None => metrics_labels::DP_RANK_NONE.into(),
+        };
+        counter!(
+            names::SELECTED_DP_RANK_TOTAL,
+            "pool" => pool,
+            "worker" => intern_string(base_url),
+            "dp_rank" => dp_rank
+        )
+        .increment(1);
+    }
+
     /// Set running requests per worker.
     pub fn set_worker_requests_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);
