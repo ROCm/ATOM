@@ -299,7 +299,7 @@ python3 -m atom.benchmarks.benchmark_serving \
 - 并行：注意力 DP4（DP attention），MoE EP4；FP8 KV cache，block 64；不开 prefix cache 和 chunked prefill；`q_b_proj` 在线量化成 MXFP4
 - MODEL_PATH：`/models/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4/`（结尾的 `/` 是模型名的一部分，lm_eval 和 bench 要写成一样）；PORT：`8000`
 
-**当前 main 上跑不起来，预期记 N/A**：server 能起来，GSM8K 开始后 rank 0 在一次约 10K token 的 prefill 上退出：`RuntimeError: Triton Error [HIP]: Code: 200, Message: device kernel image is invalid`，位置是 o_proj 的 aiter Triton `gemm_a8w8`（`atom/model_ops/linear.py:615`）刚 JIT 出来的一个新 M 档位变体在加载时失败。同一 recipe 在 `gfx1250-atom-20261111` 原样镜像上能跑完；两边 o_proj 的代码、配置和同档位编出的二进制都相同，根因还没定位，只出现过一次。
+**main 上能跑**（2026-11-13 复测）。偶发问题：2026-11-12 在 main 上第一次跑时，GSM8K 开始后 rank 0 退出过一次，报 `RuntimeError: Triton Error [HIP]: Code: 200, Message: device kernel image is invalid`。出错的是 o_proj 的 aiter Triton `gemm_a8w8`（`atom/model_ops/linear.py:615`）现场 JIT 出的一个新 M 档位 kernel，在加载（`hipModuleLoadDataEx`）时失败。之后同样的代码和命令又跑了两遍 GSM8K 和一轮完整性能测试，都没再出现，同一个 kernel 也能正常加载。这个 recipe 用 `--gpu-memory-utilization 0.975`，c64 时每卡空闲显存只剩 1–2 GiB，推断是新 kernel 加载时正好显存不够，没有证实。再遇到时按指南 §3.4 记失败，`note` 写明是这个问题。
 
 命令取自 `gfx1250-atom-2026111x` 镜像里的 `/app/scripts/dsr1/serve_dsr1fp4_a8w8_dp4ep4_realEPLB.sh`，参数原样。不用同目录的 `serve_dsr1fp4_a8w8_dp4ep4.sh`：它默认 `FAKE_EPLB=1`，加 `--fake-eplb --hf-overrides '{"num_hash_layers": 0}'`，假路由输出乱码，GSM8K 没法测。c4 和 c64 用同一个 server。
 
@@ -367,10 +367,16 @@ run_r1 4388 20000 $RESULT_DIR/report > $RESULT_DIR/bench.log 2>&1
 
 ### 参考值
 
-2026-11-12，`gfx1250-atom-20261111` 原样镜像（ATOM / aiter 在私有分支 `jiaolyu/duty1111-main-rebase`），上面的命令：
-- GSM8K：3-shot，flexible / strict 都是 0.9522；
-- c4：66.90 tok/s/GPU（`tps` 267.59 ÷ 4），E2E avg interactivity 71.20 tok/s/user，20 条；
-- c64：679.99 tok/s/GPU（2719.95 ÷ 4），E2E avg interactivity 53.76 tok/s/user，353 条。
+同一台机器，上面的命令：
+
+| | GSM8K flexible / strict | c4 tok/s/GPU | c4 interactivity | c64 tok/s/GPU | c64 interactivity |
+|---|---|---|---|---|---|
+| 2026-11-13，main（ATOM `f7b8962fd`、aiter `65714259c`） | 0.9538 / 0.9538 | 69.47（277.86 ÷ 4） | 74.57 | 702.71（2,810.84 ÷ 4） | 55.91 |
+| 2026-11-12，`gfx1250-atom-20261111` 原样（私有分支 `jiaolyu/duty1111-main-rebase`） | 0.9522 / 0.9522 | 66.90（267.59 ÷ 4） | 71.20 | 679.99（2,719.95 ÷ 4） | 53.76 |
+
+- tok/s/GPU 是 client 的 `tps` ÷ 4，interactivity 是 `e2e_avg_interactivity`（tok/s/user）。
+- c4 两边各完成 20 条；c64 main 362 条，镜像 353 条。每个点只跑了一次。
+- main 上 GSM8K 另一次复测是 0.9545。
 
 ---
 
