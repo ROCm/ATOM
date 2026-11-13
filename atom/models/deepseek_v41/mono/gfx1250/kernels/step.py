@@ -157,7 +157,7 @@ def gpub(base, b, t):
 def gwait(base, b, t):
     """A front CTA (g, p = b % 16): wait for the 16 TP CTAs of its column group."""
     if t == 0:
-        hx.wait_count(lambda: base + i64(b % 16) * 4, 16, 7)
+        hx.wait_count(lambda: base + i64(b % 16) * 4, 16)
     gpu.barrier()
 
 
@@ -425,7 +425,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
                         if (hf == 0) & (b >= FS.FRONT_CTAS) & (b < FS.FRONT_CTAS + ((TRx + MS.MAXTOK - 1) // MS.MAXTOK) * MS.NUG * MS.SHE_CTAS):
                             tq3 = hx.opaque_v(fx.thread_idx.x)
                             if tq3 == 0:
-                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS, 6)
+                                hx.wait_count(lambda: lc + i64(LY.X8_PUB), FS.FRONT_CTAS)
                             gpu.barrier()
                             ce = dict(t=tq3, b=b, w=tq3 // 32, l=tq3 % 32, sm=sm + FRONT_LDS_OFF, NP=TRx * RTOPK, topk=RTOPK,
                                       x8=fptr(fp, "fx8"), xs=fptr(fp, "fxs"), shplane=ltab(fp, Ly, "shplane")(),

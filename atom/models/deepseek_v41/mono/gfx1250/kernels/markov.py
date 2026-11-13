@@ -124,7 +124,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
         gpu.barrier()
         if t < NREQ:
             gatomic_max64(best + i64(k * NREQ + t) * 8, hx.lload(sm + LB + t * 8, fx.Int64))
-        handoff(cnt + i64(k) * 16, t, 256, site=1)
+        handoff(cnt + i64(k) * 16, t, 256)
         tag = tag0 + k
         if t < NREQ:
             mine = hx.gload(best + i64(k * NREQ + t) * 8, fx.Int64)
@@ -136,7 +136,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                         hx.gstore(recv[o] + roff(k, rank, t), v, nt=True)
         src = t // NREQ
         if (t < 4 * NREQ) & (src != rank):
-            got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag, site=9)
+            got = poll_unit(recv[rank] + roff(k, src, t % NREQ), tag)
             hx.lstore(sm + LP + t * 8, got[0])
             hx.lstore(sm + LP + t * 8 + 4, got[1])
         gpu.barrier()

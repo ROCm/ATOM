@@ -304,8 +304,8 @@ POLL_TICKS = 200000000
 
 
 @_ASTR.transform
-def wait_count(addr, n, site):
-    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, a timeout counted at site).
+def wait_count(addr, n):
+    """Spin until the agent-scope int32 counter at addr reaches n (bounded: POLL_TICKS, then it goes on).
     addr: an address, or a function giving it (evaluated in the loop, as the polls were written before this helper)."""
     t0 = clock()
     while (gload(addr() if callable(addr) else addr, fx.Int32, scope="agent") < n) & (clock() - t0 < fx.Int64(POLL_TICKS)):
@@ -313,7 +313,7 @@ def wait_count(addr, n, site):
 
 
 @_ASTR.transform
-def handoff(cnt, t, hdev, n=256, site=None):
+def handoff(cnt, t, hdev, n=256):
     """Device-wide handoff of n CTAs on counter cnt (thread t). hdev: the stages' exchange stores are device-scope ->
     every wave waits its stores, no fences; else release / acquire fences around the count."""
     if fx.const_expr(hdev):
@@ -321,13 +321,13 @@ def handoff(cnt, t, hdev, n=256, site=None):
         gpu.barrier()
         if t == 0:
             atomic_add(cnt, 1)
-            wait_count(cnt, n, 4 if site is None else site)
+            wait_count(cnt, n)
         gpu.barrier()
     else:
         gpu.barrier()
         if t == 0:
             fence_release("agent")
             atomic_add(cnt, 1)
-            wait_count(cnt, n, 5 if site is None else site)
+            wait_count(cnt, n)
             fence_acquire("agent")
         gpu.barrier()

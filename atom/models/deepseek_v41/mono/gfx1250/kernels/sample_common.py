@@ -89,9 +89,9 @@ def latomic_max64(off, val):
                      syncscope="workgroup", alignment=8)
 
 
-def handoff(cnt, t, nct, site=2):
+def handoff(cnt, t, nct):
     """A fenced device handoff of nct CTAs (device.handoff)."""
-    hx.handoff(cnt, t, False, nct, site)
+    hx.handoff(cnt, t, False, nct)
 
 
 @ASTRewriter.transform
@@ -145,7 +145,7 @@ def zload(base, c0, CH, V, t, k, invT):
 
 
 @ASTRewriter.transform
-def poll_unit(addr, tag, site=3):
+def poll_unit(addr, tag):
     t0 = hx.clock()
     while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
         hx.s_sleep(0)
