@@ -41,6 +41,8 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx
 
+from atom.utils import envs
+
 from .op import exp
 
 __all__ = [
@@ -54,6 +56,23 @@ __all__ = [
 ]
 
 PAD_SLOT_ID = -1
+
+#: aiter's HIP KDA ReplaySSM step (`aiter.ops.kda_replayssm`), imported on first use under
+#: `ATOM_REPLAYSSM_KDA_HIP=1`; False once the import has failed (an aiter without it).
+_KDA_HIP = None
+
+
+def _kda_hip_op():
+    global _KDA_HIP
+    if _KDA_HIP is None:
+        try:
+            from aiter.ops import kda_replayssm
+
+            _KDA_HIP = kda_replayssm
+        except ImportError:
+            _KDA_HIP = False
+    return _KDA_HIP or None
+
 
 #: `route="auto"` switches to the UT-transform kernel at or above this verify
 #: window.  See the measurement table in `replayssm_gated_delta_rule`.
@@ -1810,6 +1829,34 @@ def replayssm_sigmoid_gating_delta_rule(
     seed_forked_slots(ckpt, fork_slots)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
+    if envs.ATOM_REPLAYSSM_KDA_HIP:
+        # HIP kernel: same semantics, no flush race (one block per (request, head) orders the record reads of
+        # the replay before the record writes of a flush).  Calls it does not cover stay on Triton below.
+        hip = _kda_hip_op()
+        if hip is not None and hip.kda_replayssm_decode_supported(
+            q, v, ckpt, buf_k, buf_u, buf_g, A_log, dt_bias, max_query_len
+        ):
+            return hip.kda_replayssm_decode(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                ckpt,
+                buf_k,
+                buf_u,
+                buf_g,
+                write_pos,
+                slot_idx,
+                cu_seqlens,
+                max_query_len,
+                o=o,
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                lower_bound=lower_bound,
+            )
     N = cu_seqlens.numel() - 1
     cap = buf_k.shape[2]
     if scale is None:

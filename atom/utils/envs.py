@@ -792,6 +792,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serial one at verify windows >= ~12 tokens (measured on gfx950), so
     # "auto" keeps practical MTP windows on the serial route.
     "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
+    # 1: run the KDA ReplaySSM decode / verify step (replayssm_sigmoid_gating_delta_rule) on aiter's HIP kernel
+    # (aiter.ops.kda_replayssm) whenever the call is one it supports -- K = V = 128, a verify window of <= 8 tokens,
+    # cache_len <= 16, bf16 activations, fp32 checkpoint -- and on the Triton kernel otherwise.  0 (default): Triton.
+    "ATOM_REPLAYSSM_KDA_HIP": lambda: os.getenv("ATOM_REPLAYSSM_KDA_HIP", "0") == "1",
     # "fp32" | "fp16" | "bf16".  Storage dtype of the KDA temporal state pool,
     # whose per-token traffic dominates KDA decode; the recurrence itself
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
