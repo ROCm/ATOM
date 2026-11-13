@@ -3702,15 +3702,28 @@ class ModelRunner:
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
         # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them.)
+        # broadcast would wait for the work it queued after them. So are a
+        # head's that picked every row in the forward, greedy or drawn seeded
+        # alike on every rank: ATOM_HEAD_IDS_SYNC=check broadcasts them anyway
+        # and counts the steps whose ids differed.)
+        head_ids = isinstance(logits, tuple) and envs.ATOM_HEAD_IDS_SYNC != "1"
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and (not head_ids or envs.ATOM_HEAD_IDS_SYNC == "check")
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            synced = get_tp_group().broadcast(sampled_tokens.clone(), src=0)
+            if head_ids and not torch.equal(synced, sampled_tokens):
+                self._head_ids_mismatch = getattr(self, "_head_ids_mismatch", 0) + 1
+                logger.warning(
+                    "rank %d: head ids differ from rank 0's (%d steps so far)",
+                    self.rank,
+                    self._head_ids_mismatch,
+                )
+            sampled_tokens = synced
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
