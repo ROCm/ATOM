@@ -108,9 +108,9 @@ python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
   as soon as the lookup answers (early tier load), without a flag.
 - Set `ATOM_PREFILL_DELAYER_TARGET_FILL=0.8` (default 0.9). At 0.9 a DP4 shared
   Store had a median TTFT well above main's; at 0.8, against main with session
-  affinity (DP4, AgentX, 1800 s, same time), 256 concurrency gave throughput +5.0%,
-  mean TTFT -47.5%, median -17.9%, ITL -0.3%; 512 gave +2.8%, -27.1%, -31.8%, and
-  ITL +5.9%.
+  affinity (DP4, AgentX, 1800 s, same time, MI355X), 256 concurrency gave throughput
+  +5.2%, mean TTFT -50.9%, median -17.0%, ITL -1.6%; 512 gave +4.7%, -31.4%, -41.2%,
+  and ITL +2.8%.
 - Use one Store every DP rank reaches. `share_cache` refuses
   `mooncake_store.pools` that name more than one (master, metadata) pair:
   each worker reads its own NIC's pool, so a request placed on another rank
