@@ -67,13 +67,16 @@ try:
     import triton
     from aiter import dtypes
 
+    import atom.model_ops.attention_mla as attention_mla_module
     from atom.config import QuantizationConfig
     from atom.model_ops.attention_mla import (
         _MLA_DCP_KERNEL_WIDTHS,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
+        _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        _ps1_multi_token_widths,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
     )
@@ -1955,6 +1958,50 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
                 w in allowed
             ), f"{dtype} persistent={persistent}: {w} not in {allowed}"
             assert w >= gathered, "width must cover the gathered heads"
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("max_seqlen_q", [2, 5, 9])
+@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_gfx1250_multi_token_decode_pads_to_a_ps1_width(
+    num_heads, dcp, dtype, max_seqlen_q, monkeypatch
+):
+    """gfx1250 takes a multi-token persistent decode only at the PS1 widths the
+    installed aiter reports for that query length (16 and 96 always); the
+    gathered width is padded up to one of them, never left on one aiter would
+    abort on."""
+    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
+    gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
+    widths = _ps1_multi_token_widths(max_seqlen_q, dtype)
+    assert set(_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN) <= set(widths)
+    w = mla_dcp_kernel_num_heads(
+        num_heads,
+        dcp,
+        HEAD_WIDTH_MIN,
+        kv_cache_dtype=dtype,
+        persistent=True,
+        multi_token=True,
+        max_seqlen_q=max_seqlen_q,
+    )
+    if gathered <= widths[-1]:  # past the table it falls back and warns
+        assert w in widths, f"{num_heads}x{dcp} q={max_seqlen_q}: {w} not in {widths}"
+        assert w >= gathered, "width must cover the gathered heads"
+
+
+@needs_dcp_ops
+def test_ps1_multi_token_widths_without_the_shape_query(monkeypatch):
+    """An aiter that cannot report shape support keeps the base PS1 widths."""
+    import aiter.ops.attention as aiter_attention
+
+    monkeypatch.delattr(aiter_attention, "get_mla_decode_shape_support")
+    _ps1_multi_token_widths.cache_clear()
+    try:
+        assert (
+            _ps1_multi_token_widths(5, "fp8") == _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN
+        )
+    finally:
+        _ps1_multi_token_widths.cache_clear()
 
 
 @needs_dcp_ops
