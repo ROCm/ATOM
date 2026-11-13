@@ -73,10 +73,9 @@ try:
         _MLA_DCP_KERNEL_WIDTHS,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT,
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
-        _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
-        _ps1_multi_token_widths,
+        mla_dcp_decode_query_len,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
     )
@@ -1314,6 +1313,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         attn_prefill_chunk_size=0,
         enable_tbo=False,
         enable_tbo_decode=False,
+        speculative_config=None,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner = SimpleNamespace(
@@ -1961,47 +1961,117 @@ def test_decode_width_comes_from_the_matching_table(num_heads, dcp, dtype):
 
 
 @needs_dcp_ops
-@pytest.mark.parametrize("max_seqlen_q", [2, 5, 9])
-@pytest.mark.parametrize("num_heads, dcp", HEAD_WIDTH_SHAPES)
-@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
-def test_gfx1250_multi_token_decode_pads_to_a_ps1_width(
-    num_heads, dcp, dtype, max_seqlen_q, monkeypatch
-):
-    """gfx1250 takes a multi-token persistent decode only at the PS1 widths the
-    installed aiter reports for that query length (16 and 96 always); the
-    gathered width is padded up to one of them, never left on one aiter would
-    abort on."""
+def test_dcp_decode_query_len_is_the_verify_pass():
+    """The drafted tokens plus the one they follow; one without speculation."""
+    spec = SimpleNamespace(num_speculative_tokens=7)
+    assert mla_dcp_decode_query_len(SimpleNamespace(speculative_config=spec)) == 8
+    assert mla_dcp_decode_query_len(SimpleNamespace(speculative_config=None)) == 1
+
+
+def _ask_aiter(monkeypatch, answer):
+    """Route gfx1250's multi-token width through a stand-in for aiter's helper."""
+    import aiter.ops.attention as aiter_attention
+
+    calls = []
+
+    def get_mla_decode_num_heads(*args, **kwargs):
+        calls.append((args, kwargs))
+        return answer
+
     monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
-    gathered = max(num_heads * dcp, HEAD_WIDTH_MIN)
-    widths = _ps1_multi_token_widths(max_seqlen_q, dtype)
-    assert set(_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN) <= set(widths)
-    w = mla_dcp_kernel_num_heads(
-        num_heads,
-        dcp,
-        HEAD_WIDTH_MIN,
-        kv_cache_dtype=dtype,
-        persistent=True,
-        multi_token=True,
-        max_seqlen_q=max_seqlen_q,
+    monkeypatch.setattr(
+        aiter_attention,
+        "get_mla_decode_num_heads",
+        get_mla_decode_num_heads,
+        raising=False,
     )
-    if gathered <= widths[-1]:  # past the table it falls back and warns
-        assert w in widths, f"{num_heads}x{dcp} q={max_seqlen_q}: {w} not in {widths}"
-        assert w >= gathered, "width must cover the gathered heads"
+    return calls
 
 
 @needs_dcp_ops
-def test_ps1_multi_token_widths_without_the_shape_query(monkeypatch):
-    """An aiter that cannot report shape support keeps the base PS1 widths."""
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "causal,cp_world_size", [(True, 2), (False, 1)], ids=["verify", "draft_block"]
+)
+def test_gfx1250_multi_token_decode_takes_aiters_width(
+    monkeypatch, dtype, causal, cp_world_size
+):
+    """A gfx1250 persistent decode of more than one row pads to the head count
+    aiter names for the call it makes: a causal verify masks through round-robin
+    KV shards over the DCP group, the DSpark draft's non-causal block does not.
+    A single-row decode keeps the persistent table."""
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    calls = _ask_aiter(monkeypatch, 32)
+
+    def width(max_seqlen_q):
+        return mla_dcp_kernel_num_heads(
+            8,
+            2,
+            16,
+            kv_cache_dtype=dtype,
+            persistent=True,
+            max_seqlen_q=max_seqlen_q,
+            causal=causal,
+        )
+
+    assert width(max_seqlen_q=5) == 32
+    kv = dtypes.fp8 if dtype == "fp8" else torch.bfloat16
+    assert calls == [
+        (
+            (16, 5, kv, kv),
+            {
+                "persistent": True,
+                "page_size": 1,
+                "return_lse": True,
+                "causal": causal,
+                "cp_world_size": cp_world_size,
+                "cp_round_robin": causal,
+            },
+        )
+    ]
+    assert width(max_seqlen_q=1) == 16
+    assert len(calls) == 1, "a single-row decode does not ask"
+
+
+@needs_dcp_ops
+def test_gfx1250_multi_token_decode_without_a_kernel_refuses(monkeypatch):
+    _ask_aiter(monkeypatch, None)
+    with pytest.raises(ValueError, match="16 gathered query heads x 9 rows"):
+        mla_dcp_kernel_num_heads(
+            8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=9
+        )
+
+
+@needs_dcp_ops
+def test_speculative_dcp_decode_refuses_without_a_persistent_kernel(monkeypatch):
+    """The non-persistent decode masks a verify pass on local KV order."""
+    spec = SimpleNamespace(num_speculative_tokens=3)
+    monkeypatch.setattr(
+        attention_mla_module,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(speculative_config=spec),
+    )
+    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        attention_mla_module, "dcp_persistent_supported", lambda *_: False
+    )
+    layer = object.__new__(attention_mla_module.MLAAttention)
+    layer.num_heads, layer.min_query_heads, layer.kv_cache_dtype = 8, 16, "fp8"
+    layer.causal_decode = True
+    with pytest.raises(ValueError, match="persistent round-robin MLA decode"):
+        layer._configure_dcp_decode_head_padding(2)
+
+
+@needs_dcp_ops
+def test_gfx1250_multi_token_decode_needs_aiters_helper(monkeypatch):
     import aiter.ops.attention as aiter_attention
 
-    monkeypatch.delattr(aiter_attention, "get_mla_decode_shape_support")
-    _ps1_multi_token_widths.cache_clear()
-    try:
-        assert (
-            _ps1_multi_token_widths(5, "fp8") == _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN
+    monkeypatch.setattr(attention_mla_module, "get_gfx", lambda: "gfx1250")
+    monkeypatch.delattr(aiter_attention, "get_mla_decode_num_heads", raising=False)
+    with pytest.raises(RuntimeError, match="ROCm/aiter#7913"):
+        mla_dcp_kernel_num_heads(
+            8, 2, 16, kv_cache_dtype="fp8", persistent=True, max_seqlen_q=5
         )
-    finally:
-        _ps1_multi_token_widths.cache_clear()
 
 
 @needs_dcp_ops
@@ -2077,8 +2147,20 @@ def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size)
     ],
 )
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize(
+    "max_seqlen_q,causal,cp_world_size",
+    [(1, True, 1), (8, True, 8), (8, False, 1)],
+    ids=["one_row", "verify", "draft_block"],
+)
 def test_dcp_persistent_supported_reads_aiters_answer(
-    monkeypatch, supported, backend, expected, kv_cache_dtype
+    monkeypatch,
+    supported,
+    backend,
+    expected,
+    kv_cache_dtype,
+    max_seqlen_q,
+    causal,
+    cp_world_size,
 ):
     import enum
     import sys
@@ -2111,19 +2193,22 @@ def test_dcp_persistent_supported_reads_aiters_answer(
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
 
-    assert dcp_persistent_supported(64, kv_cache_dtype, 8) is expected
+    assert (
+        dcp_persistent_supported(64, kv_cache_dtype, 8, max_seqlen_q, causal)
+        is expected
+    )
     dtype = fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
     assert calls == [
         (
-            (64, 1, dtype, dtype),
+            (64, max_seqlen_q, dtype, dtype),
             {
                 "persistent": True,
                 "page_size": 1,
-                # A one-row decode passes no round-robin arguments.
+                # Round-robin only for a causal decode of more than one row.
                 "return_lse": True,
-                "causal": True,
-                "cp_world_size": 1,
-                "cp_round_robin": False,
+                "causal": causal,
+                "cp_world_size": cp_world_size,
+                "cp_round_robin": cp_world_size > 1,
             },
         )
     ]

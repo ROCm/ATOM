@@ -47,6 +47,7 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
+    mla_dcp_decode_query_len,
     mla_dcp_kernel_num_heads,
     mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
@@ -578,11 +579,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
         # Target layers only: min_query_heads is the DSpark draft's, and the
         # draft plans its own descriptors (DSparkProposer).
+        max_seqlen_q = mla_dcp_decode_query_len(config)
         dcp_persistent = (
             mla_dcp_persistent_width(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 kv_cache_dtype=config.kv_cache_dtype,
+                max_seqlen_q=max_seqlen_q,
             )
             is not None
         )
@@ -603,7 +606,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     dcp_persistent,
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
-                multi_token=getattr(model_runner, "num_spec_tokens", 0) > 0,
+                max_seqlen_q=max_seqlen_q,
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads

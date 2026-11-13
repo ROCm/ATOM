@@ -2599,24 +2599,6 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            # Spec-decode + DCP arch gating. Any speculative method (mtp /
-            # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
-            # needs a persistent MLA kernel that applies the causal mask on the
-            # GLOBAL positions of the round-robin KV shard: gfx950's cprr kernel,
-            # or gfx1250's PS1 one, which takes g_kv_indptr. On gfx942 the
-            # non-persistent fallback ignores the cprr masking and silently
-            # produces WRONG output.
-            if self.speculative_config is not None:
-                from aiter.jit.utils.chip_info import get_gfx
-
-                from atom.distributed.dcp_utils import dcp_persistent_supported
-
-                assert dcp_persistent_supported(), (
-                    f"Speculative decode + DCP needs the persistent round-robin CP "
-                    f"MLA decode (gfx950, or gfx1250 with "
-                    f"AITER_MLA_DECODE_PS1_FLYDSL=1); got {get_gfx()}. Disable DCP "
-                    f"or speculative decode on this GPU."
-                )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups
