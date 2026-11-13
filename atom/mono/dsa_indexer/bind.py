@@ -130,6 +130,8 @@ def _static_refusal(cfg, tp: int, rank: int, indexers: dict) -> str:
     if why:
         return why
     dcp = cfg.decode_context_parallel_size
+    if dcp > 1 and shape.fp4:
+        return "FP4 index cache under DCP: the FP4 scorer is the replicated one"
     if dcp > 1 and dcp != tp:
         return f"DCP {dcp} / TP {tp}: the peer exchange runs on the TP group"
     if dcp > 1 and get_dcp_rank() != rank:
@@ -168,6 +170,15 @@ def _cache_refusal(m, shape: IndexerShape) -> str:
     cache = m.k_cache.kv_cache[0]
     if cache.numel() % shape.block_bytes or not cache.is_contiguous():
         return f"index cache {tuple(cache.shape)}"
+    if shape.fp4:
+        scale = getattr(m.k_cache, "kv_cache_scale", None)
+        blocks = cache.numel() // shape.block_bytes
+        if (
+            scale is None
+            or scale.numel() != blocks * shape.scale_block_bytes
+            or not scale.is_contiguous()
+        ):
+            return f"FP4 index scales {None if scale is None else tuple(scale.shape)}"
     return ""
 
 
@@ -282,6 +293,7 @@ def _routed_forward(module):
             weights,
             module.prefix,
             module.k_cache.kv_cache[0],
+            getattr(module.k_cache, "kv_cache_scale", None),
             module.sparse_kv_indices_buffer,
             module.dcp_sparse_kv_indptr_buffer,
             module.dcp_owned_counts_buffer,
@@ -299,6 +311,7 @@ def mono_dsa_indexer(
     weights: torch.Tensor,
     layer_name: str,
     kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor | None,
     sparse_kv_indices_buffer: torch.Tensor,
     dcp_sparse_kv_indptr_buffer: torch.Tensor,
     dcp_owned_counts_buffer: torch.Tensor,
@@ -318,6 +331,7 @@ direct_register_custom_op(
     op_func=mono_dsa_indexer,
     mutates_args=[
         "kv_cache",
+        "kv_cache_scale",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
@@ -374,6 +388,7 @@ def launch_args(
         "kp": p(k), "wp": p(weights), "kw_ld": k.stride(0),
         "kn_w": p(module.k_norm.weight), "kn_b": p(module.k_norm.bias),
         "slots": p(md.slot_mapping), **rope, "cache": p(module.k_cache.kv_cache[0]),
+        "cache_scale": p(module.k_cache.kv_cache_scale) if module._indexer_fp4 else 0,
         "ctx": p(ctx), "bids": p(bids) if md.max_seqlen_q > 1 else 0,
         "bt": p(bt), "bt_ld": bt.stride(0),
         "out_idx": p(module.sparse_kv_indices_buffer),
