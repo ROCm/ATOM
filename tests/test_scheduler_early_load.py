@@ -28,7 +28,7 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import Replay, SequenceStatus
 
 META = object()
 
@@ -715,6 +715,20 @@ def test_a_routed_estimate_is_reported_once_with_the_reuse_found(
     unplaced = seq_factory(list(range(64)))
     sched._note_dp_reuse(unplaced)
     assert sched.dp_reuse_reports == [(seq.id, 16)]
+
+
+def test_a_routed_estimate_reports_the_hit_not_the_replay_start(
+    monkeypatch, seq_factory
+):
+    """A bounded replay rewinds `num_cached_tokens` below the hit; the report
+    carries the hit, or the router counts a real hit as stale."""
+    sched = _sched(monkeypatch)
+    seq = seq_factory(list(range(64)))
+    seq.dp_est_cached_tokens = 48
+    seq.num_cached_tokens = 32
+    seq.replay = Replay(48, False, (), 32)
+    sched._note_dp_reuse(seq)
+    assert sched.dp_reuse_reports == [(seq.id, 48)]
 
 
 def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(

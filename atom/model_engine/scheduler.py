@@ -4050,7 +4050,10 @@ class Scheduler:
         est = getattr(seq, "dp_est_cached_tokens", 0)
         if est:
             seq.dp_est_cached_tokens = 0
-            self.dp_reuse_reports.append((seq.id, int(seq.num_cached_tokens)))
+            # `_resume_prefill` rewound `num_cached_tokens` to the replay start;
+            # the hit itself is where the replay ends.
+            hit = seq.replay.until if seq.replay is not None else seq.num_cached_tokens
+            self.dp_reuse_reports.append((seq.id, int(hit)))
 
     def _allocate_prefill_draft_lookahead(self, seq: Sequence) -> None:
         """Allocate the blocks past the prompt that its draft round writes.
