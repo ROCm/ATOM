@@ -83,6 +83,7 @@ from atom.model_engine.sequence import (
 from atom.model_engine.state_runtime import StateRuntime
 from atom.model_engine.token_constraints import (
     TokenConstraints,
+    apply_required_channel,
     constraint_errors,
     has_constraints,
     needs_constraint_snapshot,
@@ -5308,7 +5309,7 @@ class RapidServeModelRunner(ModelRunner):
             # Masked in place with no pre-mask copy, unlike `postprocess`: this
             # path returns token ids only and computes no logprobs, so nothing
             # reads the unmasked row.
-            TokenConstraints.apply(self, batch, logits, None)
+            apply_required_channel(self, batch, logits)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()

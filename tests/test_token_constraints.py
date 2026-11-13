@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Hard token sets and sampling-boundary invariants, independent of a model."""
+"""Sampling-boundary invariants, independent of a model."""
 
 import sys
 from types import SimpleNamespace

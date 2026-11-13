@@ -1,4 +1,4 @@
-# Constraint parser and execution adapter contract
+# Token constraints
 
 Tool output parsing is done by the shared ToolCallParser stream engine. A model
 format declares its wire syntax and constraint rules. K3 declares its channel
@@ -6,53 +6,44 @@ rule through its `required_call_channel` hook, which compiles it with
 `parse_channel_rule(rule, tokenizer)` to the native RequiredChannel, and its
 grammar through `tool_call_grammar`.
 
-Provider classes and state never cross Sequence IPC; adapters read the native
-scheduled fields at the engine boundary.
 Importing `atom.constraint_parser` (`ChannelRule`, `parse_channel_rule`)
-requires no torch, Triton, AITER or llguidance. Format modules such as the Kimi-K3 tool parser import the tool parser
-and registry stack, which does require torch. Backend imports happen when the
-corresponding adapter runs.
+requires no torch, Triton, AITER or llguidance. Format modules such as the
+Kimi-K3 tool parser import the tool parser and registry stack, which does
+require torch. The Triton kernels are imported when the channel runs.
 
-## Runtime adapter contract
+## Sampling boundary
 
-Register adapters with `register_constraint_provider`. An adapter declares:
+A request carries at most one rule, a grammar (JSON Schema or strict tool
+arguments) or a required channel. Request admission
+(`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
+API server and atomesh call) rejects a request with both. The OpenAI server
+already clears `required_channel` whenever it configures a grammar.
 
-- `backend`: unique name.
-- `enabled(batch)`: cheap host query, without allocations or backend imports.
-- `mask_stage`: source logits = 0; gathered sampler logits = 1. The registry
-  orders masks by this stage, preserving registration order within a stage.
-  A source adapter must finish before any sampler adapter can gather rows.
-- `masks_source(metadata)`: whether logprob capture needs the original source
-  distribution. This is independent of mask_stage; plain channel decode masks
-  alias source logits, while speculative channel copies do not.
-- `prepare(runner, batch, metadata)`: deferred input work before forward.
-- `apply(step)`: apply the native backend mask to the declared stage.
-  Source adapters use step.source; sampler adapters call step.gather and use
-  step.logits/step.target. Adapters preserve existing masks.
-- `commit_order`: explicit lifecycle order independent of mask stage. The
-  channel GPU advance runs at 0 and grammar commit at 10.
-- `commit(step, tokens, batch, deferred)`: receives synchronized
-  accepted output tokens after broadcasts, including rejection sentinels. It
-  never commits merely proposed draft IDs. The current GPU carry envelope allows
-  one adapter to return a native carry tensor; all other adapters return None.
-- `errors(runner)`: backend request errors for output delivery, or None.
-- `release(runner, request_ids)`: release only owned request resources. Release
-  requests are sent for structured (grammar) requests only; stateless channels
-  acquire no cleanup RPC.
-- `release` failures are isolated per adapter: `release_token_constraints`
-  releases every registered adapter, then re-raises the first error.
+`TokenConstraints` in `atom/model_engine/token_constraints.py` is the one
+boundary the runner calls; each step it handles a batch's grammar rows and
+channel rows:
 
-Preparation, application, accepted commit, release, logprob capture, error output
-and sampling-bypass eligibility all query this registry. Unconstrained requests
-return before steps or provider instances are allocated. A new adapter
-must not require a ModelRunner special case to disable head IDs or step override:
-both decline when has_constraints(batch) is true.
+- `prepare_token_constraints`: after deferred input assembly and before
+  forward, snapshots the grammar's draft ids so their D2H overlaps the forward.
+- `TokenConstraints.apply`: the grammar masks the source logits; the step then
+  gathers the bonus and target rows (speculative decode) and the channel masks
+  those, in place. Unconstrained batches return None before any allocation.
+- `needs_constraint_snapshot`: whether logprob capture must copy the logits
+  before they are masked. Grammar masks the source; a plain channel decode masks
+  aliased source logits, while speculative channel masks work on copies.
+- `TokenConstraints.commit`: after the token broadcast, receives the accepted
+  output ids (never proposed drafts). The channel advances first and, for a
+  deferred step, returns its states as the GPU carry; then the grammar commits.
+- `constraint_errors`: the grammar's request errors, delivered with the step
+  output.
+- `release_token_constraints`: releases the grammar's per-request state; the
+  channel's device tables are server resources and its carried states belong to
+  `tokenIDProcessor`'s output/batch lifecycle. Release requests are sent for
+  structured (grammar) requests only.
 
-A request carries at most one rule: `LLMEngine` admission rejects a request with
-both a JSON Schema (or strict tool grammar) and a `required_channel`. The OpenAI
-server already clears `required_channel` whenever it configures a grammar.
+Head-ID bypass (`_head_ids_serve`) and the gfx1250 step override decline when
+`has_constraints(batch)` is true. RapidServe prefill applies the channel
+directly (`apply_required_channel`); structured output is refused there.
 
-Grammar release uses asynchronous copy buffer leases. Channel
-immutable device tables are server resources; tokenIDProcessor owns GPU carried
-request states through its output/batch lifecycle. Adapter release must
-not clear another component's buffers or reuse a still-in-flight buffer.
+Grammar release uses asynchronous copy buffer leases: a release must not clear
+or reuse a still-in-flight buffer.

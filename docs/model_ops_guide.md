@@ -27,7 +27,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
-| `apply_packed_bitmask` | `triton_token_constraints.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
+| `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
@@ -500,17 +500,16 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 ### Shared token constraints
 
 `TokenConstraints` in `atom/model_engine/token_constraints.py` is the shared
-pre-sampling boundary for K3 required channels and JSON Schema. Each backend
-computes its allowed tokens: K3 keeps its GPU state machine, while llguidance
-keeps its packed vocabulary masks. Both use the shared token-column masking
-primitive rather than separate logits-write implementations. Internal
-`TokenConstraint.allow(ids)` compiles the grammar manager's static stop mask.
+pre-sampling boundary for K3 required channels and JSON Schema: K3 keeps its GPU
+state machine, llguidance keeps its packed vocabulary masks.
 
-A request carries at most one of the two: `LLMEngine.add_request` rejects a
-JSON Schema together with a required channel. Accepted tokens advance grammar
-and channel state after verification and broadcasts. Grammar input copies still
-overlap target forward, and channel state uses the existing GPU carry when
-deferred output means the host is one step behind. No constraints means no
+A request carries at most one of the two: request admission
+(`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
+API server and atomesh call) rejects a JSON Schema or strict tool grammar
+together with a required channel. Accepted tokens advance channel and grammar
+state after verification and broadcasts. Grammar input copies still overlap
+target forward, and channel state uses the existing GPU carry when deferred
+output means the host is one step behind. No constraints means no
 constraint-step allocation or new mask kernel.
 
 ### Required channel (`triton_required_channel.py`)
