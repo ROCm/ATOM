@@ -379,16 +379,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MegaMoE runs the layer either way, so both need the mxfp4 weight path;
     # ignored unless ATOM_MORI_V2 is on. Formerly ATOM_MORI_V2_FUSED.
     "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
-    # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
-    # combines in bf16 unless ATOM_MEGA_DECODE_COMBINE_QUANT is on. With
+    # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4, for prefill and
+    # decode steps alike. Steps the Triton experts run combine in bf16. With
     # ATOM_MEGA_STAGE2_FUSED=0 mori's combine has no fp8 wire, so only bf16 | fp4.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
-    # Decode steps combine on ATOM_MEGA_COMBINE_WIRE too, rather than bf16. No
-    # effect on a bf16 ATOM_MEGA_COMBINE_WIRE, or on steps the Triton experts
-    # run (their combine is bf16 only).
-    "ATOM_MEGA_DECODE_COMBINE_QUANT": lambda: (
-        os.getenv("ATOM_MEGA_DECODE_COMBINE_QUANT", "0") == "1"
-    ),
     # MegaMoE stage 1 (aiter stage1_fused), i.e. which dispatch MegaMoEGfx1250
     # runs. 1: the compact plan -- routing/layout planning fused with a flydsl
     # TDM dispatch that writes the grouped GEMM's per-expert rows directly.

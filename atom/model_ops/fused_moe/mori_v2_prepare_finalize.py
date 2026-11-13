@@ -125,12 +125,8 @@ _MEGA_TRANSPORTS: dict = {}
 # $ATOM_MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
 # below, spelled the same bf16|fp8|fp4 way. Unlike the dispatch wire it is a
 # free choice: combine moves post-expert tokens, so nothing downstream demands
-# a particular width.
-#
-# PREFILL only by default -- the quant/dequant pair is a fixed per-token cost
-# against a saving that scales with the tokens on the wire, so decode asks for
-# bf16 back unless $ATOM_MEGA_DECODE_COMBINE_QUANT is on.
-# See MoriV2PrepareAndFinalize.combine_wire_for_step.
+# a particular width. Every step, prefill and decode, combines on it, so every
+# rank names the same wire without agreeing on it per step.
 _COMBINE_WIRES = ("bf16", "fp8", "fp4")
 _MEGA_COMBINE_WIRE = envs.ATOM_MEGA_COMBINE_WIRE
 if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
@@ -138,7 +134,6 @@ if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
         f"ATOM_MEGA_COMBINE_WIRE must be one of {sorted(_COMBINE_WIRES)}, "
         f"got {_MEGA_COMBINE_WIRE!r}"
     )
-_MEGA_DECODE_COMBINE_QUANT = envs.ATOM_MEGA_DECODE_COMBINE_QUANT
 
 # aiter's stage2_fused: the gemm2-fused combine, or mori's combine over
 # fused_moe's rows. Which combine wires each offers is aiter's to check.
@@ -258,13 +253,12 @@ def _broadcast_from_ep_group(value: Any, src: int) -> Any:
 
 def _launch_settings(gate_mode: Any) -> tuple:
     """What each rank reads from its own environment: the dispatch and combine
-    formats, each step's combine wire, and the gate mode ($ATOM_MOE_GU_ITLV)."""
+    formats, the combine wire, and the gate mode ($ATOM_MOE_GU_ITLV)."""
     return (
         _MEGA_DISPATCH_WIRE,
         _MEGA_STAGE1_FUSED,
         _MEGA_STAGE2_FUSED,
         _MEGA_COMBINE_WIRE,
-        _MEGA_DECODE_COMBINE_QUANT,
         gate_mode,
     )
 
@@ -284,8 +278,8 @@ def _check_settings_agree(gate_mode: Any) -> None:
     if any(settings != gathered[0] for settings in gathered):
         raise RuntimeError(
             "MEGA_DISPATCH_WIRE, ATOM_MEGA_STAGE1_FUSED, ATOM_MEGA_STAGE2_FUSED, "
-            "ATOM_MEGA_COMBINE_WIRE, ATOM_MEGA_DECODE_COMBINE_QUANT and "
-            "ATOM_MOE_GU_ITLV must be the same on every EP rank; per rank: "
+            "ATOM_MEGA_COMBINE_WIRE and ATOM_MOE_GU_ITLV must be the same on "
+            "every EP rank; per rank: "
             f"{gathered}"
         )
     _SETTINGS_AGREED = True
@@ -389,10 +383,9 @@ def init_mega_transport(
     arguments, so one instance covers the whole model. Which dispatch and
     combine it runs is set by _MEGA_STAGE1_FUSED / _MEGA_STAGE2_FUSED.
 
-    ``combine_wire`` names the quantized return-trip format this transport is
-    to BUILD ($ATOM_MEGA_COMBINE_WIRE). It is a capability, not the choice:
-    MegaMoE builds a combine for it and for bf16, and every forward then names
-    the one it wants -- bf16 unless it says otherwise. See combine_wire_for_step.
+    ``combine_wire`` names the return-trip format this transport builds
+    ($ATOM_MEGA_COMBINE_WIRE). MegaMoE builds a combine for it and for bf16,
+    and every forward names the configured one.
 
     ``all2all_manager`` is the EP group's MoriV2All2AllManager; its cco
     communicator carries the first MegaMoE's arena (see _mega_communicator).
@@ -553,41 +546,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             combine_wire=_MEGA_COMBINE_WIRE,
             all2all_manager=self._all2all_manager,
         )
-
-    @staticmethod
-    def combine_wire_for_step() -> str:
-        """This step's combine wire, named outright -- and DP-agreed.
-
-        The quantized wire is prefill-only: the quant/dequant pair is a fixed
-        per-token cost against a saving that scales with the tokens on the
-        wire, so it only pays off once the wire is busy.
-        $ATOM_MEGA_DECODE_COMBINE_QUANT opens it on decode too, so every step
-        names it.
-
-        Every rank has to name the SAME wire, and that is why `is_prefill`
-        cannot gate this on its own. Combine is P2P: gemm2's epilogue (or, with
-        stage 2 unfused, mori's fp4 push) writes this rank's rows into every
-        PEER's arena in the format this rank picked, and the peer reads them
-        back in the format IT picked.
-        `is_prefill` is the local batch's (`ForwardMode.decide` never reduces
-        it), so on a ragged step a prefilling rank would scatter fp4 rows into
-        a decoding peer that reduces them as bf16 -- the same rank-local trap
-        select_mega documents. `running_tokens_are_unified` IS the group's
-        answer to "is anybody prefilling", so it is what opens the wire;
-        `is_prefill` then only speaks for dp_size==1, where it is the group.
-
-        No context (warmup, profile runs) counts as prefill -- that is the
-        shape those run at, and it exercises the quantized reduce before a
-        capture rather than first reaching it mid-serve.
-        """
-        if _MEGA_DECODE_COMBINE_QUANT:
-            return _MEGA_COMBINE_WIRE
-        context = get_forward_context().context
-        if context is None:
-            return _MEGA_COMBINE_WIRE
-        if context.is_prefill or not context.running_tokens_are_unified:
-            return _MEGA_COMBINE_WIRE
-        return "bf16"
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -793,7 +751,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             recv_token_bound=self._recv_bound(
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
-            combine_wire=self.prepare_finalize.combine_wire_for_step(),
+            combine_wire=_MEGA_COMBINE_WIRE,
         )
         return out
 
