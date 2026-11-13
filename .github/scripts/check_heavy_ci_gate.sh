@@ -17,6 +17,7 @@ CI_GATE_LABELS="${CI_GATE_LABELS:-ci:full}"
 CURRENT_PR=""
 PREVIOUS_RUNS=""
 PREVIOUS_RUNS_ERROR=""
+PR_CHECK_TAKEOVER="${PR_CHECK_TAKEOVER:-false}"
 
 trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
@@ -68,7 +69,7 @@ check_relevant_paths() {
   local changed_files filter_result
   if ! changed_files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"; then
     echo "Failed to query PR changed files; skipping heavy CI."
-    emit_decision "false" "files-query-failed"
+    emit_undecidable "files-query-failed"
     exit 0
   fi
 
@@ -123,10 +124,25 @@ emit_decision() {
   local review_decision="${4:-}"
   local approval_count="${5:-0}"
   local changes_requested_count="${6:-0}"
+  local decidable="${7:-true}"
+  local smoke_requested="false"
+
+  if [ "${decidable}" != "true" ]; then
+    smoke_requested="false"
+  elif [ "${should_run}" = "true" ] || [ "${PR_CHECK_TAKEOVER}" = "true" ]; then
+    smoke_requested="true"
+  elif [ "${EVENT_NAME}" != "pull_request_review" ] \
+    && [ "${reason}" != "ignored-paths-only" ] \
+    && [ "${reason}" != "draft-pull-request" ] \
+    && [ "${reason}" != "pull-request-closed" ]; then
+    smoke_requested="true"
+  fi
 
   {
     echo "should_run=${should_run}"
     echo "reason=${reason}"
+    echo "decidable=${decidable}"
+    echo "smoke_requested=${smoke_requested}"
     echo "matched_label=${matched_label}"
     echo "review_decision=${review_decision}"
     echo "approval_count=${approval_count}"
@@ -147,6 +163,8 @@ emit_decision() {
       echo "### Heavy CI gate"
       echo "- Decision: \`${should_run}\`"
       echo "- Reason: \`${reason}\`"
+      echo "- Decidable: \`${decidable}\`"
+      echo "- Smoke requested: \`${smoke_requested}\`"
       if [ -n "${matched_label}" ]; then
         echo "- Matched label: \`${matched_label}\`"
       fi
@@ -157,6 +175,10 @@ emit_decision() {
       fi
     } >> "${SUMMARY_FILE}"
   fi
+}
+
+emit_undecidable() {
+  emit_decision "false" "$1" "" "" "0" "0" "false"
 }
 
 load_previous_runs() {
@@ -246,6 +268,7 @@ detect_replaced_pr_run() {
     fi
   done <<< "${later_ids}"
 
+  PR_CHECK_TAKEOVER="true"
   echo "pr_check_takeover=true" >> "${OUTPUT_FILE}"
   echo "replaced_run_id=${run_id}" >> "${OUTPUT_FILE}"
   echo "Approval replaced pending PR run ${run_id} before it started; this run takes over its PR checks."
@@ -265,7 +288,7 @@ allow_heavy_ci() {
 
   local run_ids run_id jobs started
   if ! load_previous_runs; then
-    emit_decision "false" "${PREVIOUS_RUNS_ERROR}"
+    emit_undecidable "${PREVIOUS_RUNS_ERROR}"
     return
   fi
   run_ids="$(jq -r '.[].id' <<< "${PREVIOUS_RUNS}")"
@@ -273,7 +296,7 @@ allow_heavy_ci() {
   while IFS= read -r run_id; do
     [ -n "${run_id}" ] || continue
     if ! jobs="$(query_run_jobs "${run_id}")"; then
-      emit_decision "false" "jobs-query-failed"
+      emit_undecidable "jobs-query-failed"
       return
     fi
     # A successful workflow can contain only skipped GPU jobs. Check whether
@@ -282,7 +305,7 @@ allow_heavy_ci() {
     # them. Leaving a started chain alone preserves successful cells of a
     # partial failure.
     if ! started="$(jq -r 'any(.[].jobs[]; .name == "Check Pre Checkin Signal" and (.conclusion == null or .conclusion == "success"))' <<< "${jobs}")"; then
-      emit_decision "false" "jobs-query-failed"
+      emit_undecidable "jobs-query-failed"
       return
     fi
     if [ "${started}" = "true" ]; then
@@ -308,7 +331,7 @@ case "${EVENT_NAME}" in
 esac
 
 if [ -z "${EVENT_PATH}" ] || [ ! -f "${EVENT_PATH}" ]; then
-  emit_decision "false" "missing-event-payload"
+  emit_undecidable "missing-event-payload"
   exit 0
 fi
 
@@ -330,7 +353,7 @@ fi
 if [ "${EVENT_NAME}" = "pull_request_review" ] \
   && [ -n "${PR_NUMBER}" ] && [ -n "${REPO}" ]; then
   if ! CURRENT_PR="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"; then
-    emit_decision "false" "pr-query-failed"
+    emit_undecidable "pr-query-failed"
     exit 0
   fi
   if [ "$(jq -r '.state' <<< "${CURRENT_PR}")" != "open" ]; then
@@ -360,7 +383,7 @@ if [ "${ACTION}" = "closed" ]; then
 fi
 
 if [ -z "${PR_NUMBER}" ] || [ -z "${REPO}" ]; then
-  emit_decision "false" "missing-pr-context"
+  emit_undecidable "missing-pr-context"
   exit 0
 fi
 
@@ -395,7 +418,7 @@ if ! REVIEW_DECISION="$(
     --jq '.data.repository.pullRequest.reviewDecision // ""'
 )"; then
   echo "Failed to query the current PR review decision; skipping heavy CI."
-  emit_decision "false" "review-query-failed"
+  emit_undecidable "review-query-failed"
   exit 0
 fi
 
