@@ -36,6 +36,11 @@ the producers' MFMA operands, the recurrence and the output: one hand-off after 
 Optionally the merge's window V comes from an exact copy the caller keeps beside the bf16 ring: ``ring8`` the ring's
 MXFP8 copy.
 
+``kv8`` reads ATOM's 528-byte MXFP8 compressed rows, dequantizing each load
+to the same bf16 operands and LDS layout. It also QATs the rotated query,
+matching the FP8 pool's query precision. The window ring stays bf16; a KV
+source publishes its new compressed entries after the same FP8 QAT.
+
 Args: ``pos``, ``ring``, ``rope`` (the layer's table: a compressed layer's YaRN one), ``sink`` as ``MLAWindowAttn``;
 ``sel`` int32 [batch x spec, 512] the step rows' compressed positions (raw: no window offset; -1 pads), ``ckv`` the
 compressed cache: the owner's main rows in ATOM's pool, read in place (``device.gfx950.paged``: a selected position's

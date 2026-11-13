@@ -32,7 +32,9 @@ One served step:
 The block draft runs on the hi path too (``draft_run``: three chained stage
 launches and the Markov head a step, from ``MonoDraftModel.block_backbone``).
 
-**Widths.** ``hi_compose.ROWS`` lists the step widths served: a width of
+**Widths.** ``hi_compose.ROWS`` lists the bf16 step widths. An fp8 pool
+initially serves ``hi_compose.FP8_ROWS`` (6 and 12), with the other widths
+using K1 / K2 on that same pool. A width of
 B x 6 rows serves B requests verifying 6 rows each (DSpark's 5 drafts and the
 anchor; a bs-B graph whose query bucket is 6, ATOM laying request b's rows out
 at b x 6), the hi runtime's ``Scenario(B, 6, tp)``. Up to ``MAX_BATCH`` requests a
@@ -54,6 +56,10 @@ its row's liveness (the begin-step's request words), so a padded request or a
 band's dead one writes none of it. The storage's addresses are bound into the
 programs' pointer tables when the first step sees the KV cache
 (``_bind_cache``).
+On an fp8 pool the rows hold 512 E4M3 values and 16 E8M0 codes. Attention
+dequantizes them for its bf16 MFMA and QATs the rotated query. The new window
+rows retain their first quantization's bytes for export; re-quantizing the
+bf16 QAT result could change its scale code at a rounding boundary.
 
 **Incremental ring import.** A served step that continues the last served step
 of its request slot (the same ATOM slot, its first position at most a step's

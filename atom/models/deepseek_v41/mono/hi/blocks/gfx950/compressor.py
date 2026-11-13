@@ -17,6 +17,9 @@ What one decode row at position ``P`` does in the reference (``x`` = ``attn_norm
   ``e4m3(max(amax, 6 / 512) / 6)``, E2M1 round-to-nearest-even, dequantized) -> ``compress_kv[P // ratio]``.
   ``qat=False`` (an engine whose cache holds the bf16 latent unquantized, e.g. ATOM's bf16 pool: its arithmetic, not
   the official model's) stores the rotated bf16 latent as is.
+  ``kv8=True`` instead stores ATOM's MXFP8 row (E4M3 values plus E8M0
+  codes, with its amax floor) and hands its dequantized value to this
+  launch's attention. The indexer's pre-RoPE latent is unchanged.
 
 So at ratio 2 a row's work is the two 512 x 5120 GEMVs and the state write; the pooling, norm, RoPE, QAT and
 the cache write happen on every other row only. At ratio 1 every row emits.

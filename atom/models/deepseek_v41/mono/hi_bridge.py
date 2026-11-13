@@ -18,6 +18,11 @@ liveness, a row's). Only the window rings are imported and exported:
 |---|---|---|---|---|
 | window ring, every hi layer | bf16 rows ``ring_start(l) + slot * slot_rows + p % ring_slots`` (ring_slots = 128 + drafts) | bf16 [1, 128, 512], slot ``p % 128`` | the 128 positions before the step | the step's rows |
 
+With an fp8 pool the same row indices address 528 bytes: 512 OCP E4M3
+values and 16 E8M0 codes. Import dequantizes to the bf16 ring. KVPrep also
+preserves each new row's original encoded bytes; RingWrite keeps them beside
+the ring, and export copies them to ATOM without a second quantization.
+
 So a rejected draft row never corrupts the next step: ATOM's ring is
 position-addressed with draft slack, and the next import rebuilds the hi
 runtime's 128-slot ring from it (its own 128-slot layout would lose the accepted
@@ -35,7 +40,10 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from atom.model_ops.blockscale_kernels.quantization import FP8_TL_DTYPE
+# The hi gate serves gfx950 only, whose FP8 is OCP E4M3. Keeping this
+# declaration local leaves the bridge importable in CPU interpreter tests
+# without importing ATOM's device-dependent quantizer or aiter.
+FP8_TL_DTYPE = tl.constexpr(tl.float8e4nv)
 
 HC = 4
 MIX = HC * (HC + 2)
