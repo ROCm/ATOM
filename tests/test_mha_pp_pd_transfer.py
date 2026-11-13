@@ -170,7 +170,7 @@ def _refused(producer, request, mem, match, slot=False):
                 dst_slot_index=0,
             )
             producer._execute_block_slot_transfer(
-                request, "consumer", [0], [0], {"slot_index": 0}, "slot"
+                request, "consumer", [0], [0], {"slot_index": 0}, "slot", None
             )
         else:
             producer._execute_block_transfer(request, "consumer", [0], [0], "bad")

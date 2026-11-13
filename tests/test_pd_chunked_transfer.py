@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Chunked P/D protocol tests using CPU buffers and the real address planner."""
 
+import contextlib
 import ctypes
 import queue
 import threading
@@ -46,6 +47,28 @@ class Event:
     def synchronize(self):
         self.waiting.set()
         assert self.ready.wait(5), "fake GPU event was never completed"
+
+
+class Stream:
+    """A send worker's staging stream, recording what was ordered on it."""
+
+    def __init__(self):
+        self.waited = []
+        self.entered = 0
+        self.synchronized = 0
+
+    def wait_event(self, event):
+        self.waited.append(event)
+
+    def synchronize(self):
+        self.synchronized += 1
+
+    @contextlib.contextmanager
+    def as_current(self, stream):
+        """Stand in for `torch.cuda.stream`, which needs a device."""
+        assert stream is self
+        self.entered += 1
+        yield
 
 
 class MemoryEngine:
@@ -596,9 +619,11 @@ def test_producer_abort_publishes_cancel_instead_of_dropping_claim(
     assert not connector.should_defer_free(seq)
 
 
-def test_mutable_slot_is_sent_once_after_final_metadata():
-    c, state, req, _, dst = producer()
-    state.slot_index = 0
+def slot_state(c, req, dst):
+    """One 4-byte slot region on the producer, with the request pointed at it.
+
+    Returns the source and destination buffers; the caller keeps them alive.
+    """
     slot_src = (ctypes.c_ubyte * 8)(*range(1, 9))
     slot_dst = (ctypes.c_ubyte * 8)()
     c._block_regions = [(c.kv_caches_base_addr[0], 4)]
@@ -614,6 +639,13 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
         consumer_slot_base_addrs=[ctypes.addressof(slot_dst)],
         consumer_slot_bps=[4],
     )
+    return slot_src, slot_dst
+
+
+def test_mutable_slot_is_sent_once_after_final_metadata():
+    c, state, req, _, dst = producer()
+    state.slot_index = 0
+    slot_src, slot_dst = slot_state(c, req, dst)
     with ThreadPoolExecutor(1) as pool:
         publish(state, 4)
         future = pool.submit(dispatch, c, req)
@@ -628,6 +660,122 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
     assert bytes(slot_dst[:4]) == bytes(slot_src[4:8])
     assert c.transfer_engine.writes.qsize() == 1
     c._notify_transfer_result.assert_called_once_with(req, success=True)
+
+
+def staged_slot_state(c, req, dst, monkeypatch):
+    """As `slot_state`, with the compressor state staged through a 1-slot pool.
+
+    Returns the slot buffers, the staging buffer and the consumer's staging
+    destination; the caller keeps them alive.
+    """
+    slot_src, slot_dst = slot_state(c, req, dst)
+    staging = (ctypes.c_ubyte * 4)()
+    consumer_staging = (ctypes.c_ubyte * 4)()
+    c._staging_base_addr = ctypes.addressof(staging)
+    c._staging_slot_bytes = 4
+    c._staging_slots = mc.SlotPool(1)
+    req["consumer_staging_addr"] = ctypes.addressof(consumer_staging)
+    stream = Stream()
+    c._send_worker_stream = lambda: stream
+    monkeypatch.setattr(mc.torch.cuda, "stream", stream.as_current)
+    return slot_src, slot_dst, staging, consumer_staging, stream
+
+
+def test_chunked_staged_slot_gather_waits_for_the_final_forward(monkeypatch):
+    """The gather reads compressor state the final forward wrote.
+
+    It runs on a send worker, whose current stream is not the runner's once
+    the forward moves to a High-priority one, so this request's ready event is
+    what orders the two.
+    """
+    c, state, req, _, dst = producer()
+    state.slot_index = 0
+    slot_src, _slot_dst, _staging, consumer_staging, stream = staged_slot_state(
+        c, req, dst, monkeypatch
+    )
+    gathers = []
+
+    def gather_slot(src_slot, pool_idx):
+        gathers.append((src_slot, pool_idx, list(stream.waited), stream.entered))
+        ctypes.memmove(c._staging_base_addr + pool_idx * 4, slot_src, 4)
+
+    c._gather_slot = gather_slot
+    ready = Event()
+    # Keyed by the producer's own request id, as `record_kv_cache_ready` and
+    # `get_finished` key it; the request carries the consumer's.
+    c._kv_cache_ready_events[7] = ready
+
+    publish(state, 10)
+    state.finish({"first_token_id": 42}, slot_index=1)
+    dispatch(c, req)
+
+    c._notify_transfer_result.assert_called_once_with(req, success=True)
+    # Once, for the final state: the per-chunk sends carry blocks only. The
+    # gather waits on the event first, and runs on the worker's own stream.
+    assert gathers == [(1, 0, [ready], 1)]
+    # The NIC must not read the staging slot while the gather is in flight.
+    assert stream.synchronized == 1
+    assert bytes(consumer_staging) == bytes(slot_src[:4])
+    assert c._staging_slots.free == [0]
+
+
+def test_a_staged_slot_gather_without_a_ready_event_keeps_its_pool_intact(monkeypatch):
+    """Nothing to wait on means the gather could read a half-written state.
+
+    Taking the slot before that check would stop the pool from ever filling
+    again: `SlotPool.acquire` has no timeout, so the next send worker would
+    wait on it for good rather than fail.
+    """
+    c, _state, req, _, dst = producer()
+    _slot_src, _slot_dst, _staging, _consumer_staging, _stream = staged_slot_state(
+        c, req, dst, monkeypatch
+    )
+    c._gather_slot = MagicMock()
+
+    with pytest.raises(RuntimeError, match="ready event"):
+        mc.MooncakeConnector._execute_block_slot_transfer(
+            c,
+            req,
+            "cpu:1",
+            [],
+            [],
+            {"slot_index": 1, "swa_block_ids": []},
+            req["request_id"],
+            None,
+        )
+
+    c._gather_slot.assert_not_called()
+    assert c._staging_slots.free == [0]
+    assert c.transfer_engine.writes.empty()
+
+
+@pytest.mark.parametrize("raiser", ["_gather_slot", "_rdma_write"])
+def test_a_raised_staged_slot_transfer_returns_its_slot(monkeypatch, raiser):
+    """Whatever the gather or the RDMA write raises, the slot goes back.
+
+    The NIC reads the staging row, so it is held across the write; one row
+    lost to a raise parks the next send worker on the pool for good.
+    """
+    c, _state, req, _, dst = producer()
+    staged_slot_state(c, req, dst, monkeypatch)
+    c._gather_slot = MagicMock()
+    ready = Event()
+    c._kv_cache_ready_events[7] = ready
+    setattr(c, raiser, MagicMock(side_effect=RuntimeError("transfer blew up")))
+
+    with pytest.raises(RuntimeError, match="transfer blew up"):
+        mc.MooncakeConnector._execute_block_slot_transfer(
+            c,
+            req,
+            "cpu:1",
+            [],
+            [],
+            {"slot_index": 1, "swa_block_ids": []},
+            req["request_id"],
+            ready,
+        )
+
+    assert c._staging_slots.free == [0]
 
 
 @pytest.mark.parametrize("reverse_indexed", [False, True])

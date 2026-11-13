@@ -1759,7 +1759,11 @@ class MooncakeConnector(KVConnectorBase):
         """Record when this prefill batch's KV writes become visible to staging."""
         if (
             not self.is_producer
-            or (self._index_staging_pool_size == 0 and self._mla_staging is None)
+            or (
+                self._index_staging_pool_size == 0
+                and self._mla_staging is None
+                and self._staging_slot_bytes == 0
+            )
             or not req_ids
         ):
             return
@@ -2663,6 +2667,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    kv_cache_ready_event,
                     engine=engine,
                 )
             else:
@@ -2910,6 +2915,7 @@ class MooncakeConnector(KVConnectorBase):
                         chunk_dst_block_ids,
                         prefill_data,
                         req_id,
+                        event,
                         engine=engine,
                         blocks_only=True,
                     )
@@ -2935,6 +2941,9 @@ class MooncakeConnector(KVConnectorBase):
                 }
                 # Mutable recurrent/SWA state is sent exactly once, after the
                 # final forward and sampling, including all local PP layers.
+                # Staging that state gathers it on a send-worker stream, which
+                # orders against the forward through this request's ready
+                # event; the per-chunk events above cover KV pages only.
                 if not self._execute_block_slot_transfer(
                     request_data,
                     target,
@@ -2942,6 +2951,7 @@ class MooncakeConnector(KVConnectorBase):
                     [],
                     prefill_data,
                     req_id,
+                    self._get_kv_cache_ready_event(state.req_id),
                     engine=engine,
                 ):
                     raise RuntimeError("final state RDMA write failed")
@@ -3722,6 +3732,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None,
         *,
         engine=None,
         blocks_only: bool = False,
@@ -3925,44 +3936,63 @@ class MooncakeConnector(KVConnectorBase):
         producer_pool_idx = -1
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
         if self._gather_slot is not None and consumer_staging_addr:
+            # Checked before acquiring: `SlotPool.acquire` has no timeout, so a
+            # slot taken and then abandoned by a raise parks every later send
+            # worker on the pool for good.
+            if kv_cache_ready_event is None:
+                raise RuntimeError(
+                    "Missing prefill KV-cache ready event for staged slot transfer"
+                )
             producer_pool_idx = self._staging_slots.acquire()
-            self._gather_slot(src_slot, producer_pool_idx)
-            # Synchronize on the gather kernel before NIC starts reading the
-            # staging buffer. Without this, the RDMA can race the still-in-flight
-            # gather kernel on TBO prefill (page fault under high concurrency).
-            torch.cuda.current_stream().synchronize()
-            slot_src.append(
-                self._staging_base_addr + producer_pool_idx * self._staging_slot_bytes
+        try:
+            if producer_pool_idx >= 0:
+                # The forward may run on a different stream than this thread's
+                # current one, so the gather waits on this request's prefill
+                # event before reading what the prefill wrote.
+                stream = self._send_worker_stream()
+                stream.wait_event(kv_cache_ready_event)
+                with torch.cuda.stream(stream):
+                    self._gather_slot(src_slot, producer_pool_idx)
+                # Synchronize on the gather kernel before NIC starts reading the
+                # staging buffer. Without this, the RDMA can race the still-in-flight
+                # gather kernel on TBO prefill (page fault under high concurrency).
+                stream.synchronize()
+                slot_src.append(
+                    self._staging_base_addr
+                    + producer_pool_idx * self._staging_slot_bytes
+                )
+                slot_dst.append(consumer_staging_addr)
+                slot_sizes.append(self._staging_slot_bytes)
+
+            logger.debug(
+                "[PRODUCER] slot RDMA: req=%s, %d entries, "
+                "src_slot=%d → dst_slot=%d, total_bytes=%d",
+                req_id,
+                len(slot_src),
+                src_slot,
+                dst_slot,
+                sum(slot_sizes),
             )
-            slot_dst.append(consumer_staging_addr)
-            slot_sizes.append(self._staging_slot_bytes)
 
-        logger.debug(
-            "[PRODUCER] slot RDMA: req=%s, %d entries, "
-            "src_slot=%d → dst_slot=%d, total_bytes=%d",
-            req_id,
-            len(slot_src),
-            src_slot,
-            dst_slot,
-            sum(slot_sizes),
-        )
-
-        slot_ok = self._rdma_write(
-            target,
-            slot_src,
-            slot_dst,
-            slot_sizes,
-            req_id,
-            "slot",
-            engine=engine,
-            deadline=deadline,
-        )
-        if not slot_ok:
-            logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
-
-        if producer_pool_idx >= 0:
-            self._staging_slots.release(producer_pool_idx)
-        return bool(slot_ok)
+            slot_ok = self._rdma_write(
+                target,
+                slot_src,
+                slot_dst,
+                slot_sizes,
+                req_id,
+                "slot",
+                engine=engine,
+                deadline=deadline,
+            )
+            if not slot_ok:
+                logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
+            return bool(slot_ok)
+        finally:
+            # The NIC reads the staging slot, so it is held until the write is
+            # done, and released however this leaves: gather failure, a raise
+            # from the RDMA path, or success.
+            if producer_pool_idx >= 0:
+                self._staging_slots.release(producer_pool_idx)
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
         """Wait until prefill data is available for this request.
@@ -4468,6 +4498,14 @@ class MooncakeConnector(KVConnectorBase):
             compute_slot, pool_idx = slot_info
             if pool_idx >= 0:
                 self._scatter_slot(compute_slot, pool_idx)
+                # The scatter is an async copy on this listener thread's
+                # stream, which the decode forward no longer shares once the
+                # runner computes on a High-priority one. Waiting for it here,
+                # before the request joins `done_recving`, is what keeps decode
+                # from reading a state slot that is still being written -- and
+                # keeps the next RDMA write off a staging row the scatter is
+                # still reading.
+                torch.cuda.current_stream(self._cuda_device).synchronize()
                 self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:

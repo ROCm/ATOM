@@ -233,7 +233,16 @@ def test_pd_checks_physical_layout_before_writing(
         "dst_slot_index": 0,
     }
     run = mooncake_page_writer["_execute_block_slot_transfer"]
-    args = (connector, request, "cpu-test", [0], [1], {"slot_index": 0}, "request")
+    args = (
+        connector,
+        request,
+        "cpu-test",
+        [0],
+        [1],
+        {"slot_index": 0},
+        "request",
+        None,
+    )
     if consumer_layout == "mfma":
         assert run(*args, blocks_only=True)
         writes.assert_called_once()
