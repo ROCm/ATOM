@@ -13,7 +13,6 @@ Needs one GPU; skipped without triton / a device.
 
 import itertools
 import math
-import threading
 
 import numpy as np
 import pytest
@@ -22,6 +21,8 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
+
+from fake_tp_group import run_ranks
 
 from atom.model_ops.dspark_prob_sample import (
     ProbDraftState,
@@ -197,63 +198,6 @@ class ARModel:
         # correlated with the target so acceptance is non-trivial
         noise = self._get(self.tq, prefix, self.sq)
         return self.mix * self.target_logits(prefix) + (1 - self.mix) * noise
-
-
-class _FakeGroup:
-    """All-gather across rank threads on one GPU; launches are serialized by
-    a global lock that all_gather releases while it waits."""
-
-    def __init__(self, world):
-        self.world_size = world
-        self.bar = threading.Barrier(world)
-        self.slots = [None] * world
-        self.lock = threading.Lock()
-
-    def view(self, rank):
-        g = self
-
-        class _R:
-            world_size = g.world_size
-            rank_in_group = rank
-
-            def all_gather(self, t, dim=0, use_custom=True):
-                g.slots[rank] = t
-                g.lock.release()
-                g.bar.wait()
-                g.lock.acquire()
-                out = torch.cat(list(g.slots), dim=0)
-                g.lock.release()
-                g.bar.wait()
-                g.lock.acquire()
-                return out
-
-        return _R()
-
-
-def run_ranks(world, fn):
-    g = _FakeGroup(world)
-    outs = [None] * world
-    errs = []
-
-    def body(rk):
-        g.lock.acquire()
-        try:
-            outs[rk] = fn(rk, g.view(rk))
-            torch.cuda.synchronize()
-        except Exception as e:  # noqa
-            errs.append(e)
-            g.bar.abort()
-        finally:
-            g.lock.release()
-
-    th = [threading.Thread(target=body, args=(rk,)) for rk in range(world)]
-    for t in th:
-        t.start()
-    for t in th:
-        t.join()
-    if errs:
-        raise errs[0]
-    return outs
 
 
 def run_verify(

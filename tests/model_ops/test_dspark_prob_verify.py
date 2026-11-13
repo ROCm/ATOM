@@ -7,6 +7,8 @@ verdict
 - reading the target rows of the full logits in place (`in_place=True`) as
   reading a compacted copy of them;
 - over several vocab chunks as over a single chunk (cross-chunk combine);
+- with q sharded over ranks, each shard spanning several vocab chunks, as
+  with the whole q on one rank;
 - splitting an overflowing top-p interval over the whole row as finishing it
   from the chunked levels, including an interval of tied tokens;
 
@@ -29,6 +31,8 @@ elif os.environ.get("TRITON_INTERPRET") == "1":
     DEV = "cpu"
 else:
     pytest.skip("needs a GPU or TRITON_INTERPRET=1", allow_module_level=True)
+
+from fake_tp_group import run_ranks
 
 import atom.model_ops.dspark_prob_sample as dps
 
@@ -76,15 +80,23 @@ def _case(seed, greedy_rows=(), no_q_rows=()):
     }
 
 
-def _verify(c, top_p, use_block, in_place=False):
+def _state(c, vocab_start=0, cols=V, tp=1):
+    """The draft state of the rank holding q's columns
+    ``[vocab_start, vocab_start + cols)``."""
     state = dps.ProbDraftState(
-        q=c["q"].clone(),
+        q=c["q"][:, :, vocab_start : vocab_start + cols].clone(),
         ids=c["drafts"].clone(),
         temps=c["temps"].clone(),
         seed=torch.zeros(1, dtype=torch.int64, device=DEV),
     )
-    state.set_layout(0, V, 1)
+    state.set_layout(vocab_start, cols, tp)
     state.verify_step = 12345
+    return state
+
+
+def _verify(c, top_p, use_block, in_place=False, state=None, tp_group=None):
+    if state is None:
+        state = _state(c)
     if torch.is_tensor(top_p):
         top_p = top_p.to(DEV)
     logits = c["full"] if in_place else c["full"].index_select(0, c["rows"])
@@ -101,6 +113,7 @@ def _verify(c, top_p, use_block, in_place=False):
         c["src"],
         state,
         use_block=use_block,
+        tp_group=tp_group,
         in_place=in_place,
     )
     return out.cpu(), verdict.cpu()
@@ -169,6 +182,26 @@ def test_vocab_chunks_match_a_single_chunk(
     assert triton.cdiv(V, dps._CHUNK) > 2
     monkeypatch.setattr(dps, "_CHUNK", 4 * dps._CHUNK)  # one chunk per row
     _assert_same(split, _verify(c, top_p, use_block))
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)
+def test_sharded_q_spanning_chunks_matches_one_rank(
+    seed, top_p, use_block, greedy, no_q
+):
+    """Two ranks, each holding half of q's columns: every shard spans more than
+    one vocab chunk, so the stats chunks past a rank's columns carry empty q
+    records and the residual passes clip and offset per shard."""
+    tp, cols = 2, V // 2
+    assert cols > dps._CHUNK and V % tp == 0
+    c = _case(seed, greedy, no_q)
+    states = [_state(c, rk * cols, cols, tp) for rk in range(tp)]
+    ranks = run_ranks(
+        tp,
+        lambda rk, grp: _verify(c, top_p, use_block, state=states[rk], tp_group=grp),
+    )
+    for other in ranks[1:]:
+        _assert_same(other, ranks[0])
+    _assert_same(ranks[0], _verify(c, top_p, use_block))
 
 
 @pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES[1:3] + CASES[4:])
