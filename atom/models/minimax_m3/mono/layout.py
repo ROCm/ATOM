@@ -195,6 +195,10 @@ def sym_layout(npes: int, rows: int = MAX_TOKENS, n_split: int = N_SPLIT):
             # index head, source rank s's half h's r-th best at pairs
             # 2 ((k N_SPLIT + 2 s + h) TOPK_BLOCKS + r) + (0 key, 1 block)
             ("sel_cp", N_SPLIT * TOPK_BLOCKS * 2 * rows),
+            # BIG context parallelism: token k's index q (HEAD_DIM bf16 = HEAD_DIM / 2 words) of the head
+            # source rank s's index head, at pairs (s * rows + k) * HEAD_DIM / 2 + word (last: every
+            # region above keeps its offset)
+            ("iq_x", npes * rows * HEAD_DIM // 2),
         ]
     )
 
@@ -211,6 +215,7 @@ def mailbox_regions(
     moe_a4w4: bool = False,
     front: bool = False,
     moe_back: bool = False,
+    index_cp: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -236,7 +241,7 @@ def mailbox_regions(
     if index_topk:
         regions.append(
             RegionDecl("sel_cp", P, "select_long", exchange=True)
-            if index_heads > 1
+            if index_heads > 1 and tokens <= MAX_TOKENS
             else RegionDecl(
                 "sel_long",
                 S,
@@ -245,6 +250,11 @@ def mailbox_regions(
                 exchange=True,
             )
         )
+        if index_cp:  # BIG context parallelism: both the local shares and the exchanged ones
+            regions += [
+                RegionDecl("sel_cp", P, "split", exchange=True),
+                RegionDecl("iq_x", P, "k1.head", exchange=True),
+            ]
     sp_o = "sp_o32" if sp_f32 else "sp_o"
     regions += [RegionDecl(n, S, "split") for n in (sp_o, "sp_m", "sp_l")]
     if tokens > 1:

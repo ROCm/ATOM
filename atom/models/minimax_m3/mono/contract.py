@@ -42,6 +42,7 @@ def build_layer(
     moe_a16w4: bool = True,
     moe_a4w4: bool = False,
     moe_back: bool = False,
+    index_cp: bool = False,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -54,29 +55,37 @@ def build_layer(
         index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
         kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
         attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4, moe_a4w4=moe_a4w4,
-        moe_back=moe_back,
+        moe_back=moe_back, index_cp=index_cp,
     )  # fmt: skip
 
 
-def build_front(tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True):
+def build_front(
+    tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True, index_cp: bool = False,
+    index_heads: int = 1,
+):  # fmt: skip
     """The front-half kernel (more than MAX_TOKENS rows: K1 .. the post-attention norm, ``front``)
     for ``tokens`` rows, one index head, native MXFP8 attention + NVFP4 K/V / index pages
     (``nvfp4``; else fp8 caches and ptpc attention) with ``n_split`` split tasks a token.
     """
     return build_post_attn_kernel(
         TP, 0.088, 1e-6, 1.0, 1.0, 7.0, 1, 1, tokens, fuse_k1=True,
-        heads=IndexHeads(1, 0), shared_mxfp8=True, kv_nvfp4=nvfp4,
+        heads=IndexHeads(index_heads, 0), shared_mxfp8=True, kv_nvfp4=nvfp4,
         index_nvfp4=nvfp4, attn_mxfp8=nvfp4, front=True, n_split=n_split,
-        pipe=pipe and nvfp4,
+        pipe=pipe and nvfp4, index_cp=index_cp,
     )  # fmt: skip
 
 
-def check_front(tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True):
+def check_front(
+    tokens: int, n_split: int = 8, pipe: bool = False, nvfp4: bool = True, index_cp: bool = False,
+    index_heads: int = 1,
+):  # fmt: skip
     """Trace ``build_front`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
-        build_front(tokens, n_split, pipe, nvfp4),
+        build_front(tokens, n_split, pipe, nvfp4, index_cp, index_heads),
         K4_ABI,
-        mailbox_regions(tokens, 1, True, True, 0, 0, front=True),
+        mailbox_regions(
+            tokens, index_heads, True, True, 0, 0, front=True, index_cp=index_cp
+        ),
     )
 
 
@@ -101,6 +110,7 @@ def check_build(
     moe_a16w4: bool = True,
     moe_a4w4: bool = False,
     moe_back: bool = False,
+    index_cp: bool = False,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -120,6 +130,7 @@ def check_build(
             moe_a16w4,
             moe_a4w4,
             moe_back,
+            index_cp,
         ),
         K4_ABI,
         mailbox_regions(
@@ -134,6 +145,7 @@ def check_build(
             moe_a4w4,
             False,
             moe_back,
+            index_cp,
         ),
     )
 
@@ -152,6 +164,22 @@ if __name__ == "__main__":
                 print(f"S={s} front n_split={ns} pipe={pipe}: contract holds")
             check_front(s, 8, False, False)
             print(f"S={s} front fp8 / ptpc: contract holds")
+            for ns, nv in (
+                (8, False),
+                (4, True),
+            ):  # indexer context parallelism (the index q exchanged)
+                check_front(s, ns, nv, nv, True)
+                print(f"S={s} front n_split={ns} nvfp4={nv} index_cp: contract holds")
+            check_front(
+                s, 4, True, True, True, TP
+            )  # ... on the full-width index q projection (ATOM_M3_INDEXER_CP)
+            print(
+                f"S={s} front index_cp, full-width index q projection: contract holds"
+            )
+            check_front(
+                s, 4, True, True, False, TP
+            )  # ... and the width where CP cannot run (below the batch gate)
+            print(f"S={s} front full-width index q projection, no CP: contract holds")
             if (
                 s % 16 == 0 and s <= 64
             ):  # the 32 / 48 / 64-row whole-layer builds (front half + back half in one launch)
@@ -162,6 +190,11 @@ if __name__ == "__main__":
                 print(
                     f"S={s} moe_back (front + router + a4w4 MoE + shared + FFN reduce): contract holds"
                 )
+                check_build(
+                    s, 1, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=True, index_nvfp4=True, moe_a4w4=True,
+                    sp_f32=False, moe_back=True, index_cp=True,
+                )  # fmt: skip
+                print(f"S={s} moe_back index_cp: contract holds")
             continue
         for ih in (1, TP):
             # a16w4 (the default) and the previous a8w4 experts (only a build with the
