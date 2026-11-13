@@ -12,9 +12,12 @@ import textwrap
 import unittest
 from pathlib import Path
 
-JOB_SCRIPT = (
-    Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_slurm_job.sh"
-)
+import yaml
+from atomesh_workflow_helpers import github_expressions
+
+ROOT = Path(__file__).resolve().parents[1]
+JOB_SCRIPT = ROOT / ".github/scripts/atomesh/pd_slurm_job.sh"
+TEMPLATE = ROOT / ".github/workflows/atomesh-benchmark-tmpl.yaml"
 
 
 class SpurDispatchTest(unittest.TestCase):
@@ -303,6 +306,69 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertIn("GPU 0 already uses 84003 MB VRAM", result.stderr)
         self.assertEqual(len(list((self.run_dir / "gpu-busy").iterdir())), 1)
 
+    def preflight_with_gpu_holder(self, squeue_jobs="", kill="1", **env):
+        """Preflight on a host where one live process has the GPUs open."""
+        holder = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        kfd = self.root / "kfd"
+        (kfd / str(holder.pid)).mkdir(parents=True)
+        self.write_tool(
+            "squeue",
+            """
+            import os
+            import sys
+
+            if os.environ.get("SQUEUE_FAIL"):
+                sys.exit(1)
+            print(os.environ["SQUEUE_JOBS"])
+            """,
+        )
+        self.write_tool(
+            "amd-smi", 'print("GPU  XCP  VRAM_USED   VRAM_FREE  VRAM_TOTAL    VRAM%")'
+        )
+        result = self.run_job(
+            "--spur-preflight",
+            ATOMESH_KILL_GPU_HOLDERS=kill,
+            ATOMESH_KFD_PROC_DIR=str(kfd),
+            ATOMESH_GPU_IDLE_WAIT_SECONDS="0",
+            SQUEUE_JOBS=squeue_jobs,
+            **env,
+        )
+        return holder, result
+
+    def assert_killed(self, holder, result):
+        self.assertEqual(holder.wait(timeout=5), -9, result.stdout + result.stderr)
+        self.assertIn(f"killed pid {holder.pid}", result.stdout)
+
+    def test_manual_preflight_kills_gpu_holders_beside_another_users_job(self):
+        holder, result = self.preflight_with_gpu_holder(
+            f"7 {os.getuid() + 1} other RUNNING"
+        )
+        self.assert_killed(holder, result)
+        self.assertIn("also lists other's job 7 (RUNNING)", result.stdout)
+
+    def test_manual_preflight_kills_gpu_holders_when_squeue_fails(self):
+        holder, result = self.preflight_with_gpu_holder(SQUEUE_FAIL="1")
+        self.assert_killed(holder, result)
+        self.assertIn("did not answer", result.stdout)
+
+    def test_manual_preflight_does_not_count_its_own_job_as_another(self):
+        holder, result = self.preflight_with_gpu_holder(f"42 {os.getuid()} me RUNNING")
+        self.assert_killed(holder, result)
+
+    def test_manual_preflight_keeps_gpu_holders_beside_a_sibling_job(self):
+        holder, result = self.preflight_with_gpu_holder(
+            f"42 {os.getuid()} me RUNNING\n7 {os.getuid()} me RUNNING"
+        )
+        self.assertIsNone(holder.poll())
+        self.assertIn("keep GPU holders", result.stdout)
+
+    def test_other_runs_leave_gpu_holders_alone(self):
+        holder, result = self.preflight_with_gpu_holder(kill="0")
+        self.assertIsNone(holder.poll())
+        self.assertNotIn("kill GPU holders", result.stdout)
+
     def test_large_container_output_stays_in_shared_log(self):
         size = 33 * 1024 * 1024
         result = self.run_job("--spur-worker", CONTAINER_LOG_BYTES=str(size))
@@ -469,6 +535,16 @@ class SpurDispatchTest(unittest.TestCase):
             )
             self.assertEqual(result["status"], "running")
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "8\n")
+
+
+class KillGpuHoldersSwitchTest(unittest.TestCase):
+    def test_only_manual_runs_kill_gpu_holders(self):
+        steps = yaml.safe_load(TEMPLATE.read_text())["jobs"]["benchmark"]["steps"]
+        step = next(s for s in steps if s.get("name") == "Run Slurm benchmark cell")
+        switch = step["env"]["ATOMESH_KILL_GPU_HOLDERS"]
+        self.assertEqual(github_expressions(switch, "workflow_dispatch"), "1")
+        for event in ("schedule", "push", "pull_request"):
+            self.assertEqual(github_expressions(switch, event), "0", event)
 
 
 if __name__ == "__main__":

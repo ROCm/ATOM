@@ -213,14 +213,15 @@ other_jobs_on_node() {
   done <<< "${listing}"
 }
 
-# The scheduler gave this host to this job, so whatever holds its GPUs goes,
-# whether or not the scheduler lists other jobs here or answers at all. The
-# only exception is another job of this CI user (a sibling cell), which is
+# Spur may also run other users' jobs on this host, since it ignores
+# --exclusive. A manual run takes the GPUs anyway: whatever holds them is
+# killed, whether or not the scheduler lists other jobs here or answers at all.
+# The only exception is a listed job of this CI user (a sibling cell), which is
 # left alone together with the GPUs.
 free_gpus_for_this_job() {
   local host others job uid user state
   host="$(hostname -s)"
-  if ! compgen -G '/sys/class/kfd/kfd/proc/[0-9]*' >/dev/null; then
+  if ! compgen -G "${ATOMESH_KFD_PROC_DIR:-/sys/class/kfd/kfd/proc}/[0-9]*" >/dev/null; then
     echo "no process holds the GPUs on ${host}"
     return 0
   fi
@@ -246,7 +247,7 @@ kill_gpu_holders() {
   local proc pid cid name owner
   local -A killed_containers=()
   local found=0
-  for proc in /sys/class/kfd/kfd/proc/[0-9]*; do
+  for proc in "${ATOMESH_KFD_PROC_DIR:-/sys/class/kfd/kfd/proc}"/[0-9]*; do
     [[ -d "${proc}" ]] || continue
     pid="${proc##*/}"
     owner="$(ps -o user:32=,args= -p "${pid}" 2>/dev/null | tr -s ' ' | cut -c1-160)" || true
@@ -699,11 +700,7 @@ if [[ "${1:-}" == "--spur-preflight" ]]; then
 fi
 
 spur_controller_job_state() {
-  local -a cmd=(scontrol)
-  if [[ -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then
-    cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
-  fi
-  timeout "${ATOMESH_SPUR_QUERY_TIMEOUT:-20}" "${cmd[@]}" show job "${JOB_ID}" 2>/dev/null \
+  slurm_cmd scontrol show job "${JOB_ID}" 2>/dev/null \
     | awk -v id="${JOB_ID}" '
         /JobId=/ { selected = 0 }
         { for (i = 1; i <= NF; i++) {

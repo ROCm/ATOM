@@ -335,22 +335,22 @@ class MoriIOScheduleTest(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = load_workflow()
         cls.matrix_script = workflow_step(cls.workflow, "matrix")
-        cls.moriio_cells = cls.matrix(SPUR_MORIIO)
+        cls.moriio_cells = cls.matrix()
 
     @classmethod
-    def lane(cls, schedule: str) -> dict[str, str]:
+    def lane(cls) -> dict[str, str]:
         return {
-            name: github_expressions(value, "schedule", schedule)
+            name: github_expressions(value, "schedule", SPUR_MORIIO)
             for name, value in cls.workflow["env"].items()
         }
 
     @classmethod
-    def matrix(cls, schedule: str) -> list[dict]:
-        """Run the workflow's matrix step as that schedule would."""
+    def matrix(cls) -> list[dict]:
+        """Run the workflow's matrix step as the MoRI IO schedule would."""
         cells, _ = run_matrix_step(
             cls.matrix_script,
             dict(
-                cls.lane(schedule),
+                cls.lane(),
                 GITHUB_EVENT_NAME="schedule",
                 SUITE="nightly",
                 RUN_ALL_MODELS="true",
@@ -370,7 +370,7 @@ class MoriIOScheduleTest(unittest.TestCase):
             [SPUR_MORIIO],
         )
         runner = "ATOMESH_SLURM_SUBMIT_RUNNER"
-        self.assertEqual(self.lane(SPUR_MORIIO)[runner], "atomesh-cicd-mi350")
+        self.assertEqual(self.lane()[runner], "atomesh-cicd-mi350")
 
     def test_scheduled_runs_use_the_moriio_concurrency_group(self):
         group = self.workflow["concurrency"]["group"]
