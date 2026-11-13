@@ -808,15 +808,24 @@ def _bounded_wait(flags, slot, tag, state, bid):
 
 
 def _down_share(union, bid, ups):
-    """CTA ``bid``'s run of the step's down tiles (slot-major, ``DOWN_TILES``
-    an expert): (first, count). With ``ups`` gate/up tasks a CTA, those with
-    one more take fewer, so every CTA streams about the same weight bytes; the
-    CTAs with fewer gate/up tasks start first and take the lowest slots, whose
-    gate/up ran in the first rounds."""
+    """CTA ``bid``'s down tiles (slot-major, ``DOWN_TILES`` an expert): a run
+    of the early experts' and then one of the late experts' -- those whose
+    gate/up is the last round's, by CTAs that run one more task -- as (first
+    early, early count, first late, late count).
+
+    The late tiles are spread over every CTA, a tile or two each and at the
+    end of its run, so a late expert's down runs on several CTAs once its
+    flags are up, not on the one or two whose run it fell in. The early runs
+    keep every CTA's weight bytes about even: those with one more gate/up task
+    take fewer, and the CTAs with fewer start first, on the lowest slots."""
     tasks = union * UP_BLOCKS
     rest = tasks % 256
     tiles = union * DOWN_TILES
-    total = tasks * UP_UNITS + tiles * DOWN_UNITS
+    late_round = (rest > 0).select(ups, fx.max(ups - 1, 0))
+    late_slot = late_round * (256 // UP_BLOCKS)
+    early_tiles = late_slot * DOWN_TILES
+    late_tiles = tiles - early_tiles
+    total = tasks * UP_UNITS + early_tiles * DOWN_UNITS
     more = fx.max(total - 256 * (ups + 1) * UP_UNITS, 0)
     fewer = fx.max(total - 256 * ups * UP_UNITS, 0)
     first_class = 256 - rest
@@ -829,10 +838,12 @@ def _down_share(union, bid, ups):
         )
 
     order = (bid >= rest).select(bid - rest, first_class + bid)
-    whole = before(fx.Int32(256))
-    first = fx.Int32(before(order) * fx.Int64(tiles) // whole)
-    last = fx.Int32(before(order + 1) * fx.Int64(tiles) // whole)
-    return first, last - first
+    whole = fx.max(before(fx.Int32(256)), fx.Int64(1))
+    first = fx.Int32(before(order) * fx.Int64(early_tiles) // whole)
+    last = fx.Int32(before(order + 1) * fx.Int64(early_tiles) // whole)
+    late_first = early_tiles + bid * late_tiles // 256
+    late_last = early_tiles + (bid + 1) * late_tiles // 256
+    return first, last - first, late_first, late_last - late_first
 
 
 def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKernel:
@@ -938,26 +949,34 @@ def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKerne
         tasks = union * blocks
         ups = tasks // 256
         mine = (tasks - bid + 255) // 256
-        first_down, downs = _down_share(union, bid, ups)
+        first_down, early, first_late, late = _down_share(union, bid, ups)
+        downs = early + late
         up_items = mine * k_tiles
         flat = up_items + downs
         stamp(1)
 
         def down_tile(i):
-            g = first_down + i
+            g = (i < early).select(first_down + i, first_late + i - early)
             return g // DOWN_TILES, g % DOWN_TILES
 
         # The experts the CTA streams, a lane each, read where an item issues
         # (no LDS round trip there): lane n < 8 its n-th gate/up task's,
-        # lane 8 + j the j-th slot of its down run's.
+        # lane 8 + j its early run's j-th slot, lane 24 + j its late run's.
         first_slot = first_down // DOWN_TILES
+        late_slot = first_late // DOWN_TILES
         experts = fx.ptr_load(
             lds["expert"]
             + fx.min(
-                (lane < 8).select((bid + lane * 256) // blocks, first_slot + lane - 8),
+                (lane < 8).select(
+                    (bid + lane * 256) // blocks,
+                    (lane < 24).select(first_slot + lane - 8, late_slot + lane - 24),
+                ),
                 union - 1,
             )
         )
+
+        def expert_lane(i, slot):
+            return (i < early).select(8 + slot - first_slot, 24 + slot - late_slot)
 
         def issue(item, stage):
             buffer = smem.stages.ptr + stage * (SLOT_BYTES // 4)
@@ -1002,7 +1021,7 @@ def build_moe(rows: int, profile: bool = False, publish_at: int = 1) -> MoeKerne
                     )
             else:
                 slot, tile = down_tile(item - up_items)
-                expert = readlane(experts, 8 + slot - first_slot)
+                expert = readlane(experts, expert_lane(item - up_items, slot))
                 if wave == WEIGHT_ISSUER:
                     gemv_tdm.load_rows(
                         w2
