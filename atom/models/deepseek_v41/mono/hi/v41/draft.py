@@ -592,8 +592,8 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
 
     blocks = head_blocks(sc.tp, sc.rows, res_out)
     stages = [st for b in blocks for st in b.stages(sc)]
-    # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
-    program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)
+    # off the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
+    program.setdefault("sgpr_spill_ok", sc.tp != KEY_TP)
     return blocks, Program(name, sc, stages, host_regions=H.chain_regions(sc, _draft_knobs()), peer_first=CHAIN_PEER,
                            **program)  # fmt: skip
 
