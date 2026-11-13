@@ -3146,14 +3146,20 @@ class MLAAttention(nn.Module):
                 q,
                 x_scale=q_scale,
                 group=use_qrep,
-                # Match the rope-cache q_out dtype (fp8 for an fp8 KV cache) so
-                # ql_nope is produced fp8 -- from either the fp8 absorb bmm or
-                # the bf16 absorb bmm (ATOM_MLA_ABSORB_BF16) -- and the rope-cache
-                # passthrough avoids the bf16->fp8 read+cast. None (bf16) when KV
-                # isn't fp8.
+                # Emit ql_nope in the rope-cache q_out dtype (fp8 for an fp8 KV
+                # cache) ONLY on the shuffled-KV path: that is the one that calls
+                # the gfx1250 Gluon fused_qk_rope_cat_and_cache_mla, whose fp8
+                # q_nope passthrough (aiter gfx1250-rope-cache-fp8-passthrough)
+                # TDM-stores a q_out-dtype q_nope directly. The HIP consumers --
+                # fused_qk_rope_concat_and_cache_mla_seg (seg) and the ordinary
+                # fused_qk_rope_concat_and_cache_mla (incl. DCP) -- dispatch on
+                # 16-bit types and reinterpret q_nope as the kv_c dtype, so they
+                # would misread an fp8 buffer. Keep ql_nope bf16 for them (and
+                # whenever KV isn't fp8); the downstream kernel then does the
+                # bf16->fp8 read+cast as before. See PR #2490 review.
                 out_dtype=(
                     attn_metadata.dtype_q
-                    if self.kv_cache_dtype.startswith("fp8")
+                    if self.kv_cache_dtype.startswith("fp8") and self.kv_shuffled
                     else None
                 ),
             )
