@@ -7,7 +7,7 @@ Paged rows (decode, and FP4 prefill) are each their own item with their own
 bound: FP8 reads a row's keys off its own block-table row -- or a request's
 `next_n` rows read their request's together -- and FP4 scores a request's
 rows together off the request's table, sharing each key load. FP8 prefill
-instead gathers its requests' keys end to end and scores them densely
+instead gathers its requests' keys end to end and scores each row's range
 (`ConcatKeys`), which reads each key once for all of a request's rows. Either
 way rows run in bands of the plane they were cut to, each band top-k'd as
 soon as it is scored, so nothing wider than one band is ever live. The result
@@ -22,6 +22,7 @@ FP8 launch, the top-k -- follows the rows alone and is recorded.
 """
 
 import inspect
+import os
 
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
@@ -44,6 +45,14 @@ from .workspace import LogitsWorkspace
 # Whether aiter's dense FP8 scorer writes into a caller's plane (`logits=`).
 # Without it each prefill band's logits are allocated per call.
 FP8_MQA_LOGITS_TAKES_OUT = "logits" in inspect.signature(fp8_mqa_logits).parameters
+# Packed output also needs the offset-aware FlyDSL top-k consumer.
+FP8_MQA_LOGITS_TAKES_PACKED = (
+    FP8_MQA_LOGITS_TAKES_OUT
+    and "out_offsets" in inspect.signature(fp8_mqa_logits).parameters
+    and "row_starts" in inspect.signature(top_k_per_row_decode).parameters
+    and os.environ.get("AITER_DISABLE_FLYDSL_TOPK_DECODE", "0")
+    not in ("1", "true", "True", "yes", "YES")
+)
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel
@@ -81,8 +90,9 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. Concat columns are local
-    to the band's key window. `keys`: FP8 concat rows'
+    its successors' candidate blocks) does it there. Rectangular concat columns
+    are local to the band's key window; packed rows start at `packed_offsets`
+    and hold request-local columns. `keys`: FP8 concat rows'
     `(values, scales)` already gathered end to end (DCP's all-gathered
     shards); gathered here from `cache` otherwise.
 
@@ -220,6 +230,7 @@ def _score_bands(
                 cu_ends=stops,
                 clean_logits=False,
                 **({"logits": scores} if scores is not None else {}),
+                **({"out_offsets": offsets} if offsets is not None else {}),
             )
         else:
             _paged_band_logits(
@@ -237,7 +248,28 @@ def _score_bands(
         if on_band is not None:
             on_band(scores, span)
         picked = out[span]
-        if concat is not None:
+        if offsets is not None:
+            top_k_per_row_decode(
+                scores,
+                1,
+                rows.row_ends[span],
+                picked,
+                count,
+                0,
+                1,
+                k=topk,
+                stable=stable,
+                row_starts=offsets,
+                plane_width=rows.width,
+            )
+            if concat is not None and not request_local:
+                torch.where(
+                    picked < 0,
+                    picked,
+                    picked + concat.row_starts[span].unsqueeze(1),
+                    out=picked,
+                )
+        elif concat is not None:
             top_k_per_row_prefill(
                 scores,
                 starts,
@@ -257,7 +289,7 @@ def _score_bands(
                 )
             elif lo:
                 torch.where(picked < 0, picked, picked + lo, out=picked)
-        elif offsets is None:
+        else:
             top_k_per_row_decode(
                 scores,
                 group,
@@ -268,22 +300,6 @@ def _score_bands(
                 scores.stride(1),
                 k=topk,
                 stable=stable,
-            )
-        else:
-            # Packed: a row's logits start at its offset; the top-k is told
-            # the plane width the rows stand for, so it picks as that would.
-            top_k_per_row_decode(
-                scores,
-                1,
-                rows.row_ends[span],
-                picked,
-                count,
-                0,
-                1,
-                k=topk,
-                stable=stable,
-                row_starts=offsets,
-                plane_width=rows.width,
             )
 
 

@@ -198,6 +198,7 @@ def mla_builder_cls():
         "atom.model_ops.indexer": _module(
             "atom.model_ops.indexer",
             FP8_MQA_LOGITS_TAKES_OUT=False,
+            FP8_MQA_LOGITS_TAKES_PACKED=False,
             ConcatKeys=noop,
             RowSplit=noop,
             Fp4LaunchStorages=noop,

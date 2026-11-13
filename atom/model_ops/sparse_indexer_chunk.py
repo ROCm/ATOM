@@ -3,13 +3,13 @@
 
 """Row chunking for the dense ``fp8_mqa_logits`` indexer logits buffer.
 
-Every sparse-MLA indexer prefill path (native DeepSeek V3.2/V4, GLM-5.x, and the
-vLLM plugin) scores queries against the committed KV through a dense
+Rectangular sparse-MLA indexer prefill paths score queries against the committed KV through a dense
 ``[rows, row_width]`` fp32 logits matrix. ``row_width`` is the sum of all
 co-scheduled prefill contexts, which ``max_num_batched_tokens`` does not bound,
 so a burst of long-context requests can push one allocation to tens of GiB
 (issue #1376). Those paths therefore split the Q rows into chunks; this module
-owns the one rule they all need to agree on.
+owns their row limit and persistent storage. Packed FP8/FP4 callers use the
+shared row planner in `indexer.workspace` with the same flat storage.
 """
 
 import logging
@@ -244,6 +244,10 @@ class LogitsWorkspace:
             return flat_view(self._logits, rows, width)
         pitch = max(row_align, -(-width // row_align) * row_align)
         return flat_view(self._logits, rows, pitch)[:, :width]
+
+    def packed_logits(self) -> torch.Tensor:
+        """The flat buffer, addressed by each packed row's band-local offset."""
+        return self._logits
 
 
 # aiter allocates a dense prefill plane with rows padded to this many columns;

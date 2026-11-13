@@ -69,6 +69,7 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.model_ops.indexer import (
     FP8_MQA_LOGITS_TAKES_OUT,
+    FP8_MQA_LOGITS_TAKES_PACKED,
     ConcatKeys,
     Fp4LaunchStorages,
     IndexRows,
@@ -78,7 +79,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
-from atom.model_ops.indexer.workspace import LogitsWorkspace
+from atom.model_ops.indexer.workspace import LogitsWorkspace, band_offsets
 from atom.model_ops.sparse_indexer_chunk import (
     ConcatKeyWorkspace,
     concat_plane_width,
@@ -269,12 +270,14 @@ def _global_index_cache_layer_ids(
 class StagedIndexRows:
     """A prefill's index rows as staged on the host, for the GPU build after
     the upload: `rows` query rows, the widest `width`; FP4 under PCP groups
-    them by its own `query_starts` entries; a pooled indexer's `pools`."""
+    them by its own `query_starts` entries; a pooled indexer's `pools`.
+    `packed_bands` partitions this DCP rank's FP8 rows in the logits buffer."""
 
     rows: int
     width: int
     query_starts: int | None = None
     pools: int | None = None
+    packed_bands: tuple[tuple[int, int], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -726,6 +729,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["index_query_start_loc"] = CpuGpuBuffer(
                 self.max_bs + 2, publication_group="mla_sparse", **i32_kwargs
             )
+        if self._concat_prefill_scored() and FP8_MQA_LOGITS_TAKES_PACKED:
+            mla_metadata["index_logits_offsets"] = CpuGpuBuffer(
+                self.max_num_batched_tokens,
+                publication_group="mla_sparse",
+                **i32_kwargs,
+            )
         if self.index_kpool > 1:
             # A pooled prefill's rows in one upload: where each request's run
             # of closed pools starts, gathered end to end, then where each
@@ -996,6 +1005,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "cu_seqlen_ks",
             "sparse_kv_indptr",
             "index_row_ends",
+            "index_logits_offsets",
             "index_query_start_loc",
             "index_pool_rows",
         )
@@ -1032,6 +1042,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 shapes[name] = (self._ubatch_share(var[name].cpu.shape[0]),)
         if "index_query_start_loc" in var:
             shapes["index_query_start_loc"] = (bs + 2,)
+        if "index_logits_offsets" in var:
+            shapes["index_logits_offsets"] = (tokens,)
         if "index_pool_rows" in var:
             shapes["index_pool_rows"] = (bs + 1 + 3 * tokens,)
         if self.is_sparse:
@@ -2965,8 +2977,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var[f"{prefix}index_row_ends"].np[:rows] = row_ends
         group.set_counts({f"{prefix}index_row_ends": rows})
+        packed_bands = None
+        if self._concat_prefill_scored() and FP8_MQA_LOGITS_TAKES_PACKED:
+            split = RowSplit.of(rows, self.dcp_rank, self.dcp_world_size)
+            name = f"{prefix}index_logits_offsets"
+            offsets = var[name].np[:rows]
+            offsets.fill(0)
+            cuts = band_offsets(
+                row_ends[split.first : split.end],
+                self.index_logits_workspace.capacity,
+                offsets[split.first : split.end],
+            )
+            packed_bands = tuple(
+                (first + split.first, end + split.first) for first, end in cuts
+            )
+            group.set_counts({name: rows})
         return StagedIndexRows(
-            rows, max(int(row_ends.max(initial=0)), 1), query_starts=query_starts
+            rows,
+            max(int(row_ends.max(initial=0)), 1),
+            query_starts=query_starts,
+            packed_bands=packed_bands,
         )
 
     def _finish_prefill_index_rows(
@@ -3017,6 +3047,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 requests=self._concat_requests(
                     attn_metadata, bs, prefix, pcp_split, rows
                 ),
+                bands=staged.packed_bands,
+                packed_offsets=(
+                    var[f"{prefix}index_logits_offsets"].gpu[:rows]
+                    if staged.packed_bands is not None
+                    else None
+                ),
+                width=staged.width if staged.packed_bands is not None else None,
             )
             return
         # A prefill is eager, so its plane is as wide as its longest row.

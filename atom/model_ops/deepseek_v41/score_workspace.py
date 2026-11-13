@@ -174,7 +174,7 @@ class ScoreWorkspace(LogitsWorkspace):
         """The packed logits, flat: a row at its `PackedRows` offset."""
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
-        return self._logits
+        return super().packed_logits()
 
     def packed_maxima(self):
         """The packed block maxima, flat: a row's at its `PackedRows` block
