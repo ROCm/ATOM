@@ -226,10 +226,9 @@ class AttnRes(nn.Module):
             return block_residual, prefix_sum
         assert block_residual is not None
         # as_strided, not select: Inductor reinplaces it even into a bank allocated
-        # in the same graph, where a select's scatter rewrites every slot.
+        # in the same graph, where a select's scatter rewrites every slot. The bank
+        # starts its storage (storage_offset() would break the Dynamo graph).
         row, slot, col = block_residual.stride()
-        start = (
-            block_residual.storage_offset() + self.layer_idx // self.block_size * slot
-        )
+        start = self.layer_idx // self.block_size * slot
         block_residual.as_strided(prefix_sum.shape, (row, col), start).copy_(prefix_sum)
         return block_residual, None
