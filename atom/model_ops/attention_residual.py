@@ -225,5 +225,11 @@ class AttnRes(nn.Module):
         if self.layer_idx % self.block_size != 0:
             return block_residual, prefix_sum
         assert block_residual is not None
-        block_residual[:, self.layer_idx // self.block_size].copy_(prefix_sum)
+        # as_strided, not select: Inductor reinplaces it even into a bank allocated
+        # in the same graph, where a select's scatter rewrites every slot.
+        row, slot, col = block_residual.stride()
+        start = (
+            block_residual.storage_offset() + self.layer_idx // self.block_size * slot
+        )
+        block_residual.as_strided(prefix_sum.shape, (row, col), start).copy_(prefix_sum)
         return block_residual, None
