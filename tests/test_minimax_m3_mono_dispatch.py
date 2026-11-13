@@ -195,6 +195,7 @@ def _mono(monkeypatch, fwd, builds=True, **policy):
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
     mono._mono.runner = SimpleNamespace(prepare=lambda n, *kind: builds)
     mono.policy = dispatch.WidthPolicy(**policy)
+    mono.cp, mono._cp_refused = dispatch.IndexerCp(), set()
     mono.steps = {k: {} for k in ("production", "mono", "hybrid")}
     mono._graph_kind, mono._graph_logged, mono._counted = {}, set(), 0
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
@@ -285,6 +286,23 @@ def test_hybrid_and_wide_widths_follow_the_table(monkeypatch):
         )
         is False
     )
+
+
+def test_indexer_cp_refuses_a_wide_step_it_cannot_serve_and_says_so_once(monkeypatch, caplog):
+    # 4 requests of 16 query rows: the CP scorer's columns (4 heads x q rows) hold 8 rows a request at most
+    slots = torch.zeros(64, dtype=torch.int64)
+    md = _forward_context(_decode_md(rows=4, slots=slots, max_query_len=16))
+    mono = _mono(monkeypatch, md, wide=True)
+    assert mono.supports(*_step(64), None, None)  # ATOM_M3_INDEXER_CP off: taken
+    mono.cp = dispatch.IndexerCp.parse(True, True, 1, 0)
+    with caplog.at_level("WARNING", logger="atom"):
+        assert not mono.supports(*_step(64), None, None)  # refused, not run without CP
+        assert not mono.supports(*_step(64), None, None)
+    assert sum("query rows a request" in r.message for r in caplog.records) == 1
+    q4 = _forward_context(_decode_md(rows=16, slots=torch.zeros(64, dtype=torch.int64), max_query_len=4))
+    mono = _mono(monkeypatch, q4, wide=True)
+    mono.cp = dispatch.IndexerCp.parse(True, True, 1, 0)
+    assert mono.supports(*_step(64), None, None)  # 16 requests x 4 rows: served
 
 
 def test_check_mode_takes_the_same_steps(monkeypatch):

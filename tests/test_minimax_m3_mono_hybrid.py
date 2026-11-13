@@ -11,8 +11,9 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.models.minimax_m3.mono import hybrid
-from atom.models.minimax_m3.mono.config import HIDDEN
+from atom.models.minimax_m3.mono import hybrid  # noqa: E402
+from atom.models.minimax_m3.mono.config import HIDDEN  # noqa: E402
+from atom.models.minimax_m3.mono.policy import IndexerCp  # noqa: E402
 
 N = 3
 N_LAYERS = 3 + 4  # the dense prefix + four MoE layers
@@ -69,6 +70,7 @@ def _runner(aux_taps=()):
             dev=torch.device("cpu"),
             parts=None,
             aux=aux,
+            cp=IndexerCp(),
             rank=0,
             _write_aux=lambda lid, v: written.setdefault(lid, v.clone()),
         ),
@@ -261,7 +263,7 @@ def test_the_kernel_symbol_must_spell_the_measured_front_options(monkeypatch):
     import sys
     import types
 
-    r = SimpleNamespace(attn_mxfp8=True, nvfp4=True)
+    r = SimpleNamespace(attn_mxfp8=True, nvfp4=True, cp=IndexerCp())
     assert hybrid.symbol_tokens(r, 64, True) == {"s64", "mb1", "pp1", "cb13", "ns4"}
     assert hybrid.symbol_tokens(r, 32, False) == {
         "s32",
@@ -270,8 +272,37 @@ def test_the_kernel_symbol_must_spell_the_measured_front_options(monkeypatch):
         "cb13",
     }  # ns8 is the default: not spelled
     assert hybrid.symbol_tokens(
-        SimpleNamespace(attn_mxfp8=False, nvfp4=False), 64, False
-    ) == {"s64", "fr1", "cb13"}
+        SimpleNamespace(attn_mxfp8=False, nvfp4=False, cp=IndexerCp()), 64, False
+    ) == {
+        "s64",
+        "fr1",
+        "cb13",
+    }
+    # indexer CP spells itself (and its thresholds, when not the defaults); the width's options carry it
+    cp = SimpleNamespace(
+        attn_mxfp8=True, nvfp4=True, cp=IndexerCp.parse(True, True, 16, 5000)
+    )
+    assert hybrid.symbol_tokens(cp, 64, True) == {
+        "s64",
+        "mb1",
+        "pp1",
+        "cb13",
+        "ns4",
+        "cp1",
+        "cm5000",
+        "cn16",
+    }
+    assert hybrid.symbol_tokens(
+        SimpleNamespace(**{**vars(cp), "cp": IndexerCp.parse(True, False, 1, 0)}),
+        32,
+        False,
+    ) == {
+        "s32",
+        "fr1",
+        "pp1",
+        "cb13",
+        "cp1",
+    }
 
     class Front64:
         def __init__(self, runner, ars):

@@ -24,6 +24,7 @@ from atom.models.minimax_m3.mono.config import (
     LOCAL_Q_HEADS,
     MAX_ROWS,
     MAX_TOKENS,
+    TP,
 )
 from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI
@@ -51,9 +52,9 @@ class Front64:
     def __init__(self, runner, ars) -> None:
         if len(ars) != 2 or any(a.shape[0] < MAX_ROWS for a in ars):
             raise MonoUnsupported(f"two [{MAX_ROWS}, {HIDDEN}] ar buffers")
-        if runner.index_heads != 1:
+        if runner.index_heads not in (1, TP):
             raise MonoUnsupported(
-                "the front half serves one index head (no indexer CP)"
+                f"{runner.index_heads} index q heads in the projection"
             )
         from aiter.dist.parallel_state import get_tp_group
 
@@ -80,7 +81,9 @@ class Front64:
         self.q = torch.empty(
             self.rows, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
         )
-        self.iq = torch.empty(self.rows, 1, HEAD_DIM, dtype=bf16, device=dev)
+        self.iq = torch.empty(
+            self.rows, TP, HEAD_DIM, dtype=bf16, device=dev
+        )  # [row][head]: CP's, else head 0
         self.k1_args = []
         for i, lw in enumerate(runner.sparse):
             ptrs = {
@@ -93,9 +96,30 @@ class Front64:
             self.k1_args.append(
                 torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
             )
+        self._width_of = {}
         self.builds = WidthBuilds(
-            self._build, lambda built: [(built, K4_ABI)], group, "MiniMax-M3 mono front"
+            self._built,
+            lambda built: [(built, K4_ABI)],
+            group,
+            "MiniMax-M3 mono front",
+            lean=self._lean,
         )
+
+    def _built(self, n: int):
+        built = self._build(n)
+        self._width_of[id(built)] = n
+        return built
+
+    def _lean(self, built, spilled):
+        """A width whose kernel needs scratch (the compiler's two unused SGPR spill slots: any schedule
+        change, a context-parallel build included, flips it) rebuilt with the register-pressure trackers
+        (``runner.LEAN_LLVM_OPTIONS``), same arithmetic, only the instruction order moves.
+        """
+        from atom.models.minimax_m3.mono.runner import LEAN_LLVM_OPTIONS
+
+        lean = self._build(self._width_of[id(built)])
+        lean.compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean
 
     def _build(self, n: int):
         if not MAX_TOKENS < n <= self.rows:
@@ -105,7 +129,7 @@ class Front64:
         r = self.runner
         return r._build_k4(
             n, index_topk=True, front=True, pipe=r.attn_mxfp8, copy_batch=13,
-            n_split=4 if n > 32 and r.nvfp4 else 8,
+            n_split=4 if n > 32 and r.nvfp4 else 8, **r.cp.options(n),
         )  # fmt: skip
 
     def prepare(self, n: int) -> bool:

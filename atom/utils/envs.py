@@ -670,6 +670,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The wide full-mono layer builds (32 / 64 rows: front half + MoE back half kernels, two
     # launches a layer; mono/hybrid.py ``wide``). Off by default.
     "ATOM_MONO_WIDE": lambda: os.getenv("ATOM_MONO_WIDE", "0") == "1",
+    # auto: the least blocks (128 tokens each) of the step's long requests (> 512 blocks) together that take
+    # the indexer-CP arm of a wide mono build (mono/policy.py ``IndexerCp``); unset: the measured default.
+    "ATOM_MONO_CP_MIN_BLOCKS": lambda: os.getenv("ATOM_MONO_CP_MIN_BLOCKS"),
     # The per-width path table over the defaults (mono/policy.py): "17-64:hybrid,48:production".
     "ATOM_MONO_WIDTHS": lambda: os.getenv("ATOM_MONO_WIDTHS"),
     # The hybrid front half: "prod" (the original attention half; the stand-in) or "mono".

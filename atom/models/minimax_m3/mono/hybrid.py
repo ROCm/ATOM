@@ -94,10 +94,9 @@ def front_options(r, n: int) -> dict:
     32 rows keep 8 split tasks a token, wider 4; the group pipeline and 13 copy rounds in flight everywhere).
     """
     return {
-        "pipe": r.attn_mxfp8,
-        "copy_batch": 13,
-        "n_split": 4 if n > 32 and r.nvfp4 else 8,
-    }
+        "pipe": r.attn_mxfp8, "copy_batch": 13, "n_split": 4 if n > 32 and r.nvfp4 else 8,
+        **r.cp.options(n),
+    }  # fmt: skip
 
 
 def symbol_tokens(r, n: int, whole: bool) -> set[str]:
@@ -109,6 +108,9 @@ def symbol_tokens(r, n: int, whole: bool) -> set[str]:
     want |= {"pp1"} if o["pipe"] else set()
     want |= {f"cb{o['copy_batch']}"} if o["copy_batch"] != 8 else set()
     want |= {f"ns{o['n_split']}"} if o["n_split"] != N_SPLIT else set()
+    want |= {"cp1"} if o.get("index_cp") else set()
+    want |= {f"cm{o['cp_min_blocks']}"} if o.get("cp_min_blocks") else set()
+    want |= {f"cn{o['cp_min_batch']}"} if o.get("cp_min_batch", 1) != 1 else set()
     return want
 
 

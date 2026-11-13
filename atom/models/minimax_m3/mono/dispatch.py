@@ -19,6 +19,7 @@ import os
 
 import torch
 
+from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.models.minimax_m3.mono.check import (
     forward_checked,
     forward_probed,
@@ -34,6 +35,7 @@ from atom.models.minimax_m3.mono.policy import (
     MONO,
     PRODUCTION,
     SMALL_MAX_ROWS,
+    IndexerCp,
     WidthPolicy,
 )
 from atom.models.minimax_m3.mono.runner import MonoDecodeRunner
@@ -99,6 +101,15 @@ class MonoDecode:
         self.policy = WidthPolicy(
             envs.ATOM_MONO_HYBRID, envs.ATOM_MONO_WIDE, envs.ATOM_MONO_WIDTHS
         )
+        # indexer context parallelism of the wide builds: ATOM_M3_INDEXER_CP, as every rank's index q is then
+        # full width (a bad threshold is refused here, at startup)
+        self.cp = IndexerCp.parse(
+            indexer_cp_enabled(),
+            (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "nvfp4",
+            envs.ATOM_M3_INDEXER_CP_MIN_BATCH,
+            envs.ATOM_MONO_CP_MIN_BLOCKS,
+        )
+        self._cp_refused: set[str] = set()
         # decode steps by path and token count; ``_graph_kind``: the path each
         # captured graph's rows took (its replays are counted by ``note_replay``)
         self.steps: dict[str, dict[int, int]] = {
@@ -113,6 +124,7 @@ class MonoDecode:
                 causal_lm,
                 drafter=self._drafter,
                 require_aux=self._uses_dspark,
+                cp=self.cp,
             ),
             "MiniMax-M3 mono decode",
         )
@@ -127,6 +139,14 @@ class MonoDecode:
         logger.info(
             "MiniMax-M3 decode paths by token count: %s", self.policy.describe()
         )
+        if self.cp.enabled:
+            logger.info(
+                "MiniMax-M3 mono indexer CP (ATOM_M3_INDEXER_CP): the n <= %d builds as ever (every request"
+                " > 512 blocks); the wide builds from %d requests a graph and %d blocks of long requests a step",
+                SMALL_MAX_ROWS,
+                self.cp.min_batch,
+                self.cp.min_blocks,
+            )
 
     def bind_drafter(self, drafter) -> None:
         if not self._uses_dspark:
@@ -221,6 +241,13 @@ class MonoDecode:
         # row per token by token_rows
         q = decode.max_query_len
         if n % q:
+            return False
+        # indexer CP on: a wide step its scorer cannot serve is refused (production, whose CP arm takes it), said once
+        why_cp = self.cp.refuses(n, q) if kind == MONO else None
+        if why_cp is not None:
+            if why_cp not in self._cp_refused:
+                self._cp_refused.add(why_cp)
+                logger.warning("MiniMax-M3 mono decode, %d rows: %s", n, why_cp)
             return False
         bt = decode.block_table
         if bt.dtype != torch.int32 or decode.seq_lens.dtype != torch.int32:
