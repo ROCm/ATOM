@@ -196,7 +196,11 @@ jobs:
             -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -d '{"content":"eyes"}')
+            -d '{"content":"eyes"}') || true   # `|| true` AFTER the assignment, not inside
+          # the substitution: the step runs under `bash -e`, so an unguarded `code=$(curl ...)`
+          # aborts it on a connection failure (exit 7) -- and this step must never fail the
+          # job. Guarding inside the substitution instead (`... || echo 000`) appends a second
+          # 000 to the one curl's %{http_code} already prints, logging HTTP 000000.
           case "$code" in
             2*) echo "claimed 👀 (HTTP $code)" ;;
             *)  echo "::warning title=atom-review-bot::could not claim 👀 as the bot (HTTP $code): $(head -c 300 /tmp/eyes.json 2>/dev/null)" ;;
