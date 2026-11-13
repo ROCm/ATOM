@@ -155,13 +155,18 @@ def page_digest(views: list[torch.Tensor], block_ids: list[int]) -> int:
     Equal on both ends exactly when every region's blocks hold the same bytes
     in the same order, so producer and consumer digests compare directly.
     """
+    return sum(page_region_digests(views, block_ids))
+
+
+def page_region_digests(views: list[torch.Tensor], block_ids: list[int]) -> list[int]:
+    """Each PAGE view's term of `page_digest`, in view order."""
     device = views[0].device
     idx = torch.as_tensor(block_ids, dtype=torch.int64, device=device)
-    total = torch.zeros((), dtype=torch.int64, device=device)
+    terms = []
     for i, view in enumerate(views):
         rows = view.index_select(0, idx).reshape(-1).to(torch.int64)
         weights = (
             torch.arange(rows.numel(), dtype=torch.int64, device=device) + 7919 * i
         ) % 65521 + 1
-        total += torch.sum(rows * weights)
-    return int(total.item())
+        terms.append(torch.sum(rows * weights))
+    return [int(t) for t in torch.stack(terms).tolist()]
