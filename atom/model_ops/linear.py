@@ -161,18 +161,10 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
 
 
 def native_group32_runs_bf16() -> bool:
-    """Whether native group32 FP8 linears run in BF16 here (no microscaling MFMA).
-
-    The weights are dequantized once at load; activations stay BF16, without
-    the A8 (MXFP8) rounding.
-    """
+    """Whether native group32 FP8 linears run in BF16 (no MX MFMA, no A8 rounding)."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     return get_gfx_runtime().startswith("gfx94")
-
-
-def _e8m0_to_float(code: torch.Tensor) -> torch.Tensor:
-    return torch.exp2(code.view(torch.uint8).float() - 127.0)
 
 
 def dequantize_native_group32_weight(
@@ -180,7 +172,7 @@ def dequantize_native_group32_weight(
 ) -> torch.Tensor:
     """FP8 [N, K] with E8M0 [ceil(N/group_rows), K/32] scales -> BF16 [N, K]."""
     n, k = weight.shape
-    scale = _e8m0_to_float(weight_scale)
+    scale = fp4_utils.e8m0_to_f32(weight_scale)
     scale = scale.repeat_interleave(group_rows, 0)[:n].repeat_interleave(32, 1)[:, :k]
     return (weight.float() * scale).to(torch.bfloat16)
 

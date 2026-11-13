@@ -486,8 +486,7 @@ def dequant_mxfp4(
     n_blocks = K // block_size
     assert s.shape == (M, n_blocks), f"scale shape {tuple(s.shape)} != {(M, n_blocks)}"
     y = fp4_utils.mxfp4_to_f32(x.view(torch.uint8)).reshape(M, n_blocks, block_size)
-    scale = torch.exp2(s.view(torch.uint8).to(torch.float32) - 127.0)
-    y = y * scale.unsqueeze(-1)
+    y = y * fp4_utils.e8m0_to_f32(s).unsqueeze(-1)
     return y.reshape(M, K).to(torch.get_default_dtype())
 
 
