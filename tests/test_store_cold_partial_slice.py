@@ -148,7 +148,7 @@ def test_cold_progresses_until_complete_with_load_pending():
     assert total == 65536 - 256
 
 
-def test_multiconnector_only_prefill_exposes_store_cap():
+def test_multiconnector_exposes_the_offload_tiers_switches():
     from atom.kv_transfer.disaggregation.multi.multi_connector import (
         MultiConnectorScheduler,
     )
@@ -161,10 +161,9 @@ def test_multiconnector_only_prefill_exposes_store_cap():
             ready_suffix_first=True,
         )
     ]
-    c.is_producer = True
     assert c.pending_load_partial_token_cap == 8192
     assert c.ready_suffix_first
-    c.is_producer = False
+    c._connectors = [SimpleNamespace(is_offload=False)]
     assert c.pending_load_partial_token_cap == 0
     assert not c.ready_suffix_first
 

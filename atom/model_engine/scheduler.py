@@ -4090,10 +4090,8 @@ class Scheduler:
                 seq, seq.num_cached_tokens, hit=False
             )
         else:
-            if seq.status not in (
-                SequenceStatus.WAITING,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ) or not (self._tier_load_succeeded(seq) or seq.offload_loaded):
+            # A completed restore was resolved at the top of the tick.
+            if seq.status != SequenceStatus.WAITING:
                 return False
             pair = self._tier_waiter_resume(seq)
             if pair is None:
@@ -4165,11 +4163,8 @@ class Scheduler:
             ):
                 continue
             # The sequence stays in waiting until real admission succeeds. A
-            # resolved but budget-rejected load remains an allocated resume;
-            # neither this stage nor Phase2 re-lookups or reallocates its KV.
-            resolved = self._resolve_waiting_remote_kv(seq, deque())
-            if resolved is not False or not self._is_offload_prefill_resume(seq):
-                continue
+            # budget-rejected resume remains an allocated resume; neither this
+            # stage nor Phase 2 re-lookups or reallocates its KV.
             resumed = self._schedule_offload_prefill_resume(
                 seq,
                 scheduled_seqs,
