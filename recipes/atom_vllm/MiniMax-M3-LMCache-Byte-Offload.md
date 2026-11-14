@@ -61,7 +61,7 @@ vllm serve /path/to/MiniMax-M3-MXFP4 \
   --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
   --enable-prefix-caching \
   --enable-prompt-tokens-details \
-  --kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both"}'
+  --kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'
 ```
 
 Select the connector through vLLM's **out-of-tree entry point** (the
@@ -179,6 +179,10 @@ counts do not.
 
 - **`PYTHONHASHSEED=0` is mandatory.** Without it each TP rank derives a
   different cache key for the same prompt and the hit ratio collapses to 0.
+- **`kv_load_failure_policy` must be `"recompute"`.** vLLM defaults to
+  `"fail"`, which turns a chunk that disappears between lookup and load into a
+  request failure. Recompute discards the unusable external prefix and refills
+  those blocks locally instead.
 - **`LMCACHE_CHUNK_SIZE` must equal `--block-size` (128).** ATOM refuses a load
   whose HBM frontier is not chunk-aligned; with prefix caching on that frontier
   is block-aligned, so at chunk 256 roughly every other hit is dropped.
