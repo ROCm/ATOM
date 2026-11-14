@@ -475,15 +475,15 @@ def build_qwen_vl_inputs(
         raise ValueError(
             f"Prompt has {num_placeholders} image placeholders but {len(images)} images"
         )
+    multimodal_config = atom_config.multimodal_config
+    if multimodal_config is None:
+        raise ValueError("This model has no multimodal config, so it takes no images")
     processed = processor(text=[text], images=images, return_tensors="pt")
     input_ids = processed["input_ids"][0].tolist()
     multimodal_data = {
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": processed["image_grid_thw"],
     }
-    multimodal_config = atom_config.multimodal_config
-    if multimodal_config is None:
-        raise ValueError("This model has no multimodal config, so it takes no images")
     if multimodal_config.model_type in QWEN3_5_MULTIMODAL_MODEL_TYPES:
         multimodal_data["embedding_spans"] = qwen3_5_image_spans(
             input_ids,

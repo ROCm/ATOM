@@ -88,11 +88,11 @@ def build_minimax_m3_inputs(
     input_ids = processed["input_ids"][0].tolist()
     grid_thw = processed["image_grid_thw"]
     merge_length = processor.image_processor.merge_size**2
-    expected = [int(n) // merge_length for n in grid_thw.prod(-1).tolist()]
+    counts = [int(n) // merge_length for n in grid_thw.prod(-1).tolist()]
     data = {
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": grid_thw,
-        "embedding_spans": media_token_spans(input_ids, expected, token_id),
+        "embedding_spans": media_token_spans(input_ids, counts, token_id),
     }
     data["cache_seed"] = multimodal_cache_seed(data)
     return input_ids, data

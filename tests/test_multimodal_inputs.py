@@ -436,6 +436,25 @@ def test_qwen_placeholder_count_mismatch_fails_before_processing(
         )
 
 
+def test_qwen_model_without_multimodal_config_rejects_images_before_processing(
+    image_module,
+):
+    def processor(**kwargs):
+        raise AssertionError("the processor must not run")
+
+    text_only = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Qwen3_5ForConditionalGeneration"]),
+        multimodal_config=None,
+    )
+    with pytest.raises(ValueError, match="no multimodal config"):
+        prepare_multimodal_inputs(
+            text_only,
+            processor,
+            "<|image_pad|> prompt",
+            {"image": image_module.new("RGB", (2, 2))},
+        )
+
+
 def test_kimi_rendered_prompt_reports_required_conversation_before_loading():
     with pytest.raises(ValueError, match="requires a chat conversation"):
         prepare_multimodal_inputs(
