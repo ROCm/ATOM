@@ -83,6 +83,9 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
             mc._pack_unit_layout(pages) and tuple(p.unit_spec for p in pages)
         ),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _unit_plans={},
         _slot_regions=[],
         _swa_block_regions=[],

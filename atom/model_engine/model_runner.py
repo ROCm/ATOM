@@ -2011,7 +2011,6 @@ class ModelRunner:
             )
         units = max(entry[3] for entry in stages)
         op_bytes = sum(entry[1] for entry in stages)
-        largest_image = max(entry[1] for entry in stages)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
         layout_id = f"pp{len(stages)}-joint:{digest}"
         logger.info(
@@ -2023,7 +2022,7 @@ class ModelRunner:
             op_bytes,
             layout_id,
         )
-        return spec.for_pipeline(layout_id, units, op_bytes, largest_image)
+        return spec.for_pipeline(layout_id, units, op_bytes)
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)

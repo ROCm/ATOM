@@ -517,9 +517,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def _receive_prefix(
         self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
     ) -> tuple[int, int]:
-        if geometry is None or seq.has_per_req_cache:
+        if geometry is None:
             return 0, 1
-        return num_cached_blocks, self.dcp_size // geometry[1]
+        # A full transfer still pairs blocks at this ratio: the producer
+        # checks its source count against the destination count by it.
+        factor = self.dcp_size // geometry[1]
+        if seq.has_per_req_cache:
+            return 0, factor
+        return num_cached_blocks, factor
 
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
         params = seq.kv_transfer_params or {}
@@ -1168,6 +1173,9 @@ class MooncakeConnector(KVConnectorBase):
         self._swa_block_regions: list[KVTransferRegion] = []
         # (base_addr, bytes_per_slot) per region
         self._slot_regions: list[tuple[int, int]] = []
+        self._slot_region_consumer_indices: list[int] | None = None
+        self._slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
+        self._slot_region_tp_replicated: list[bool] | None = None
         self._gather_slot = None
         self._scatter_slot = None
         self._staging_base_addr: int = 0
@@ -1439,6 +1447,27 @@ class MooncakeConnector(KVConnectorBase):
         # Window regions, transferred one whole entry per state slot.
         self._swa_block_regions = list(tt.swa_block_regions)
         self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
+        self._slot_region_consumer_indices = tt.slot_region_consumer_indices
+        self._slot_region_tp_segments = tt.slot_region_tp_segments
+        self._slot_region_tp_replicated = tt.slot_region_tp_replicated
+        for name, values in (
+            ("slot_region_consumer_indices", self._slot_region_consumer_indices),
+            ("slot_region_tp_segments", self._slot_region_tp_segments),
+            ("slot_region_tp_replicated", self._slot_region_tp_replicated),
+        ):
+            if values is not None and len(values) != len(self._slot_regions):
+                raise ValueError(
+                    f"{name} must match slot_regions: "
+                    f"{len(values)} != {len(self._slot_regions)}"
+                )
+        for (_, unit_bytes), segments in zip(
+            self._slot_regions, self._slot_region_tp_segments or ()
+        ):
+            if segments is not None and sum(segments) != unit_bytes:
+                raise ValueError(
+                    f"slot region TP segments {segments} do not cover its "
+                    f"{unit_bytes}-byte unit"
+                )
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
@@ -1474,19 +1503,24 @@ class MooncakeConnector(KVConnectorBase):
             self._start_layer = get_pp_indices(
                 self.num_hidden_layers, self.pp_rank, self.pp_size
             )[0]
-            if self.is_producer and self._has_slot_regions:
-                # Per-request slot/state regions are only routed for stage 0 in
-                # this path: the consumer sends one dst_slot/staging address and
-                # downstream stages run with src_slot=-1 (slot phase skipped).
-                # Fine when all slot regions live on stage 0 (e.g. MLA has none);
-                # a real per-layer slot backend (V4/DSA sparse) under PP would
-                # drop downstream slot state — not yet supported here.
+            if (
+                self.is_producer
+                and self._has_slot_regions
+                and self._slot_region_consumer_indices is None
+            ):
+                # Every stage writes its slot regions from the head's final
+                # slot. Without explicit indices, `consumer_region_indices`
+                # puts layer l of group g at g * (peer regions / groups) +
+                # `start_layer` + l, which is right only for a backend with one
+                # slot region per layer per group.
                 logger.warning(
-                    "PP-prefill with per-request slot regions: only stage-0 slot "
-                    "state is transferred (pp_rank=%d, %d slot regions). Verify "
-                    "the backend keeps slot state off downstream stages.",
+                    "PP-prefill with per-request slot regions and no explicit "
+                    "consumer indices (pp_rank=%d, %d slot regions): they are "
+                    "placed group-major by layer from start_layer=%d. Verify "
+                    "the backend keeps one slot region per layer.",
                     self.pp_rank,
                     len(self._slot_regions),
+                    self._start_layer,
                 )
         else:
             self._start_layer = 0
@@ -1805,9 +1839,11 @@ class MooncakeConnector(KVConnectorBase):
         with self._completed_prefills_lock:
             return self._kv_cache_ready_events.get(req_id)
 
-    def _discard_kv_cache_ready_event(self, req_id: ReqId) -> None:
+    def _drop_completed_prefill(self, transfer_id: TransferId) -> None:
+        """Forget a prefill no write reads again, with its KV ready event."""
         with self._completed_prefills_lock:
-            self._kv_cache_ready_events.pop(req_id, None)
+            self._completed_prefills.pop(transfer_id, None)
+            self._kv_cache_ready_events.pop(transfer_id, None)
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         """Initiate KV transfers for pending requests.
@@ -1973,6 +2009,7 @@ class MooncakeConnector(KVConnectorBase):
                 "notify_host": self.local_ip,
                 "notify_port": self.notification_port,
                 "consumer_tp_size": self.tp_size,
+                # Which head shard of TP-sharded slot state this rank holds.
                 "consumer_tp_rank": self.tp_rank,
                 "write_nonce": write_nonce,
                 # Ask each producer rank to acknowledge receipt: that starts
@@ -2492,9 +2529,7 @@ class MooncakeConnector(KVConnectorBase):
             self._release_count.pop(transfer_id, None)
             self._released_transfers.add(transfer_id)
             self.done_sending.add(transfer_id)
-        with self._completed_prefills_lock:
-            self._completed_prefills.pop(transfer_id, None)
-            self._kv_cache_ready_events.pop(transfer_id, None)
+        self._drop_completed_prefill(transfer_id)
         logger.debug(
             "[PRODUCER] All %d decode ranks released transfer_id=%s; page freed",
             consumer_tp_size,
@@ -2610,8 +2645,11 @@ class MooncakeConnector(KVConnectorBase):
             if (
                 has_slot_data
                 and consumer_dcp_size > 1
-                and self.dcp_size != consumer_dcp_size
+                and self.dcp_size not in (1, consumer_dcp_size)
             ):
+                # An unsharded producer relayouts its MLA pages per token
+                # (`_execute_block_slot_transfer`); a sharded one would have
+                # to reshard, which nothing here does.
                 raise RuntimeError(
                     "P/D slot-region transfer does not support asymmetric DCP "
                     f"(producer_dcp={self.dcp_size}, consumer_dcp={consumer_dcp_size})"
@@ -2702,7 +2740,9 @@ class MooncakeConnector(KVConnectorBase):
             if all_done:
                 if self.pp_size > 1:
                     if self.pp_rank != 0:
-                        self._discard_kv_cache_ready_event(transfer_id)
+                        # Stage 0 drops its entry on release, which only it
+                        # receives; nothing here reads this one again.
+                        self._drop_completed_prefill(transfer_id)
                     # PP-prefill: this stage's write is done, but stage-0 must not
                     # reuse the shared page until ALL stages finish. Freeing is
                     # deferred to _record_release (driven by consumer releases).
@@ -2716,9 +2756,7 @@ class MooncakeConnector(KVConnectorBase):
                 else:
                     with self._completion_lock:
                         self.done_sending.add(transfer_id)
-                    with self._completed_prefills_lock:
-                        self._completed_prefills.pop(transfer_id, None)
-                        self._kv_cache_ready_events.pop(transfer_id, None)
+                    self._drop_completed_prefill(transfer_id)
                     logger.debug(
                         "[PRODUCER] All %d consumers served for transfer_id=%s",
                         consumers_per_rank,
@@ -3124,6 +3162,45 @@ class MooncakeConnector(KVConnectorBase):
         ]
         return _UnitPlan(cmap, cuts, len(specs))
 
+    def _consumer_dcp_plan(
+        self, request_data: dict, src_block_ids: list[int], dst_block_ids: list[int]
+    ):
+        """The token plan an unsharded producer pushes to a DCP consumer."""
+        return build_dcp_shard_plan(
+            src_block_ids,
+            block_size=self.block_size,
+            dcp_size=request_data["consumer_dcp_size"],
+            dcp_rank=request_data["consumer_dcp_rank"],
+            interleave_size=request_data.get("consumer_dcp_interleave", 1),
+            dst_pages=len(dst_block_ids),
+        )
+
+    def _dcp_token_descriptors(
+        self, region_idx: int, src_base: int, dst_base: int, bpb: int, token_runs
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One PAGE region's share of a DCP token relayout, as RDMA descriptors."""
+        role = self._block_region_roles[region_idx]
+        if role != MLA_KV_ROLE:
+            raise RuntimeError(
+                f"DCP token relayout refuses region {region_idx} with "
+                f"semantic_role={role!r}; declare {MLA_KV_ROLE} for "
+                "token-contiguous MLA pages or "
+                f"{INDEX_CACHE_ROLE} for staged index pages"
+            )
+        # The destination page is wider only in whole tokens and the plan
+        # already counts in its token space, so both ends scale by the
+        # source's per-token width.
+        if bpb % self.block_size:
+            raise RuntimeError(
+                f"Region {region_idx} stores {bpb} bytes per block, which "
+                f"block_size {self.block_size} does not divide. Addressing "
+                "a single token needs its bytes contiguous, which holds for "
+                "the MLA layout the token-unit relayout is built on."
+            )
+        unit = bpb // self.block_size
+        run_src, run_dst, run_len = token_runs
+        return src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
+
     def _execute_block_transfer(
         self,
         request_data: dict,
@@ -3172,13 +3249,8 @@ class MooncakeConnector(KVConnectorBase):
                     f"dcp={self.dcp_size}, consumer dcp={dcp_size}"
                 )
         elif dcp_size > 1:
-            sharded_plan = build_dcp_shard_plan(
-                src_block_ids,
-                block_size=self.block_size,
-                dcp_size=dcp_size,
-                dcp_rank=request_data["consumer_dcp_rank"],
-                interleave_size=interleave,
-                dst_pages=len(dst_block_ids),
+            sharded_plan = self._consumer_dcp_plan(
+                request_data, src_block_ids, dst_block_ids
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
             # Without the ready event the gather could read KV still being
@@ -3239,31 +3311,13 @@ class MooncakeConnector(KVConnectorBase):
                     logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                     return False
                 continue
-            if role != MLA_KV_ROLE:
-                raise RuntimeError(
-                    f"DCP token relayout refuses region {region_idx} with "
-                    f"semantic_role={role!r}; declare {MLA_KV_ROLE} for "
-                    "token-contiguous MLA pages or "
-                    f"{INDEX_CACHE_ROLE} for staged index pages"
-                )
-            # The destination page is wider only in whole tokens and the plan
-            # already counts in its token space, so both ends scale by the
-            # source's per-token width.
-            if bpb % self.block_size:
-                raise RuntimeError(
-                    f"Region {region_idx} stores {bpb} bytes per block, which "
-                    f"block_size {self.block_size} does not divide. Addressing "
-                    "a single token needs its bytes contiguous, which holds for "
-                    "the MLA layout the token-unit relayout is built on."
-                )
+            descriptors = self._dcp_token_descriptors(
+                region_idx, src_base, dst_base, bpb, sharded_runs
+            )
             if stages_sharded_mla and region_idx in self._mla_token_views:
                 staged_mla_regions.append((region_idx, dst_base, bpb))
                 continue
-            unit = bpb // self.block_size
-            run_src, run_dst, run_len = sharded_runs
-            if not batch.add(
-                src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
-            ):
+            if not batch.add(*descriptors):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
@@ -3753,16 +3807,81 @@ class MooncakeConnector(KVConnectorBase):
         # any page moves; the consumer also checks once on first contact
         # (`_verify_producer`).
         slot_cmap = self._consumer_region_map(
-            len(self._slot_regions), len(consumer_slot_addrs)
+            len(self._slot_regions),
+            len(consumer_slot_addrs),
+            None,
+            self._slot_region_consumer_indices,
         )
+        if any(not 0 <= cidx < len(consumer_slot_addrs) for cidx in slot_cmap):
+            raise RuntimeError(
+                f"Slot region map out of range for req {req_id}: {slot_cmap} "
+                f"onto {len(consumer_slot_addrs)} consumer regions"
+            )
+        # A consumer at k times this TP holds the q-th k-th of every head
+        # shard this rank holds, which is only this rank's when q's group is.
+        # A backend that publishes no segments keeps whole-unit writes.
+        consumer_tp_size = request_data.get("consumer_tp_size")
+        tp_segments = self._slot_region_tp_segments
+        tp_replicated = self._slot_region_tp_replicated
+        # Any other consumer TP would floor to whole-unit writes and fail
+        # below as a model or spec mismatch.
+        if (
+            tp_segments is not None
+            and consumer_tp_size is not None
+            and consumer_tp_size % self.tp_size
+        ):
+            raise RuntimeError(
+                f"Decode TP {consumer_tp_size} is not a multiple of prefill TP "
+                f"{self.tp_size} for req {req_id}: only then does each decode "
+                "rank hold part of exactly one prefill rank's TP-sharded slot "
+                "state"
+            )
+        tp_ratio = (
+            1 if consumer_tp_size is None else max(1, consumer_tp_size // self.tp_size)
+        )
+        split = tp_ratio > 1 and tp_segments is not None
+        tp_part = 0
+        if split:
+            consumer_tp_rank = int(request_data["consumer_tp_rank"])
+            if consumer_tp_rank // tp_ratio != self.tp_rank:
+                raise RuntimeError(
+                    f"Consumer TP rank {consumer_tp_rank} of {consumer_tp_size} "
+                    f"holds no part of producer TP rank {self.tp_rank} of "
+                    f"{self.tp_size}'s sharded slot state (req {req_id})"
+                )
+            tp_part = consumer_tp_rank % tp_ratio
+        # A split slot is a k-th of this one, cut along its segments; a
+        # replicated region moves whole.
         for region_idx, (_, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
-            if consumer_slot_bps[cidx] != bps:
+            dst_bps = consumer_slot_bps[cidx]
+            if not split and dst_bps != bps:
                 raise RuntimeError(
                     f"State slot size mismatch for req {req_id}: producer "
                     f"region {region_idx} has {bps} B, consumer region {cidx} "
-                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
-                    "run the same model and spec config"
+                    f"has {dst_bps} B; prefill and decode must run the same "
+                    "model and spec config"
+                )
+            if not split:
+                continue
+            if tp_replicated and tp_replicated[region_idx]:
+                if dst_bps != bps:
+                    raise RuntimeError(
+                        f"Slot region {region_idx} is TP-replicated, but its "
+                        f"consumer unit differs for req {req_id}: {bps} B "
+                        f"here, {dst_bps} B there"
+                    )
+                continue
+            segments = tp_segments[region_idx]
+            if (
+                segments is None
+                or any(seg % tp_ratio for seg in segments)
+                or dst_bps * tp_ratio != bps
+            ):
+                raise RuntimeError(
+                    f"Slot region {region_idx} cannot split {tp_ratio} ways "
+                    f"for req {req_id}: segments={segments}, producer unit "
+                    f"{bps} B, consumer unit {dst_bps} B"
                 )
 
         # ---- Phase 1: Block transfer ----
@@ -3818,6 +3937,15 @@ class MooncakeConnector(KVConnectorBase):
                 f"roles, but req {req_id} carries none; the peer predates the "
                 "two-region indexer layout"
             )
+        # A DCP consumer owns only part of each block, so an unsharded
+        # producer pushes its token runs instead of whole blocks, exactly as
+        # the block-only path does.
+        consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        sharded_runs = None
+        if consumer_dcp_size > 1 and self.dcp_size == 1:
+            sharded_runs = self._consumer_dcp_plan(
+                request_data, src_block_ids, dst_block_ids
+            ).token_runs(dst_block_ids)
         deadline = request_data.get("_deadline")
         batch = _RdmaBatch(
             lambda srcs, dsts, lens: self._rdma_write(
@@ -3836,11 +3964,16 @@ class MooncakeConnector(KVConnectorBase):
         dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
-            if not batch.add(
-                src_base + src_ids * bpb,
-                consumer_block_addrs[cidx] + dst_ids * consumer_block_bpb[cidx],
-                np.full(src_ids.size, bpb, dtype=np.int64),
-            ):
+            dst_base = consumer_block_addrs[cidx]
+            if sharded_runs is None:
+                srcs = src_base + src_ids * bpb
+                dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
+                lens = np.full(src_ids.size, bpb, dtype=np.int64)
+            else:
+                srcs, dsts, lens = self._dcp_token_descriptors(
+                    region_idx, src_base, dst_base, bpb, sharded_runs
+                )
+            if not batch.add(srcs, dsts, lens):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
@@ -3910,16 +4043,26 @@ class MooncakeConnector(KVConnectorBase):
         slot_dst: list[int] = []
         slot_sizes: list[int] = []
 
-        # Phase 2a: slot-indexed state, written direct (no staging)
-        slot_cmap = self._consumer_region_map(
-            len(self._slot_regions), len(consumer_slot_addrs)
-        )
+        # Phase 2a: slot-indexed state, written direct (no staging). Every
+        # unit and split was checked before Phase 1.
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
-            slot_src.append(src_base + src_slot * bps)
-            slot_dst.append(dst_base + dst_slot * consumer_slot_bps[cidx])
-            slot_sizes.append(bps)
+            dst_bps = consumer_slot_bps[cidx]
+            if not split or (tp_replicated and tp_replicated[region_idx]):
+                slot_src.append(src_base + src_slot * bps)
+                slot_dst.append(dst_base + dst_slot * dst_bps)
+                slot_sizes.append(bps)
+                continue
+            src_offset = src_base + src_slot * bps
+            dst_offset = dst_base + dst_slot * dst_bps
+            for seg in tp_segments[region_idx]:
+                piece = seg // tp_ratio
+                slot_src.append(src_offset + tp_part * piece)
+                slot_dst.append(dst_offset)
+                slot_sizes.append(piece)
+                src_offset += seg
+                dst_offset += piece
 
         # Phase 2b: compressor states via staging buffer (182 → 1)
         producer_pool_idx = -1
