@@ -3,13 +3,13 @@
 
 Each CP rank scores every index head over its 1/P of the blocks with aiter's MXFP4
 decode scorer (`indexer_context_scores_mxfp4`), keeps its shard's top-k, and the
-rank owning head h merges every shard's head-h candidates. The CPU tests pin the
-wiring: the shard's map, bound and workspace, what the scorer is handed, which
-scorer the CP decode runs with what page geometry its merge emits, and that the
-installed aiter's signatures take those calls. The gfx950 test runs the four ranks
-in one process, the exchange done by indexing, and pins the selection itself: the
-merged top-k, sparse block table and context equal the native TP selector's for the
-same head, bit for bit.
+rank owning head h merges every shard's head-h candidates. The tests that launch no
+kernel pin the wiring: the shard's map, bound and workspace, what the scorer is
+handed, which scorer the CP decode runs, the page geometry its merge emits, and that
+the installed aiter's signatures take those calls. Like every test here they need
+aiter installed. The gfx950 test runs the four ranks in one process, the exchange
+done by indexing, and pins the selection itself: the merged top-k, sparse block
+table and context equal the native TP selector's for the same head, bit for bit.
 """
 
 import inspect
