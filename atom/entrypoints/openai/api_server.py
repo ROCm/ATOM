@@ -3637,6 +3637,13 @@ async def kv_transfer_info():
     return info
 
 
+@_engine_route("/kv_event_sources")
+async def kv_event_sources():
+    """Where each DP rank of this server publishes KV events, for the Atomesh
+    router to subscribe to the ranks it registers."""
+    return engine.core_mgr.kv_event_sources
+
+
 @_engine_route("/server_info")
 async def server_info():
     """Server metadata for the Atomesh router.

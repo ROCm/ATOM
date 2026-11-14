@@ -5052,8 +5052,8 @@ class Scheduler:
         if prefix_caching and not self._connector_flag("is_offload"):
             bm.register_received_prefix(seq)
 
-        # Emit BlockStored(REMOTE) for delta blocks so external consumers
-        # can track remote-resident KV.
+        # Emit BlockStored for the delta blocks so external consumers can track
+        # the KV that arrived from the producer.
         if kv_events:
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
@@ -5090,6 +5090,7 @@ class Scheduler:
                     # Block-table index -> global token position: under DCP
                     # each entry spans hash_block_size tokens, not block_size.
                     token_offset=first_remote_index * bm.hash_block_size,
+                    cache_seed=seq.cache_seed,
                 )
         return True
 

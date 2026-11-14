@@ -16,11 +16,13 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Lock, RLock, Thread, local
+from typing import Any
 
 import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
@@ -53,7 +55,7 @@ from atom.model_engine.engine_utility import (
     completes_weight_sync,
     kv_change,
 )
-from atom.model_engine.prefix_hash import take_shipped_chains
+from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -167,6 +169,27 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
     ]
 
 
+def kv_event_sources(config) -> dict[str, dict[str, Any]]:
+    """Where each engine on this node publishes KV events (`/kv_event_sources`),
+    keyed by the global DP rank its publisher binds for: the endpoint after the
+    per-rank offset (a wildcard host stays a wildcard), the topic, and the
+    tokens per hashed block. Empty with events off or the null publisher."""
+    events = config.kv_events_config
+    if not events.enable or events.publisher == "null":
+        return {}
+    block_size = hash_block_size_for(
+        config.kv_cache_block_size, config.decode_context_parallel_size
+    )
+    return {
+        str(rank): {
+            "endpoint": offset_endpoint(events.endpoint, rank),
+            "topic": events.topic,
+            "block_size": block_size,
+        }
+        for rank, _ in iter_dp_rank_assignments(config)
+    }
+
+
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     """How many DP-attention EngineCores to launch for a `logical`-wide run.
 
@@ -259,6 +282,8 @@ class CoreManager:
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
+        # Fixed for the engines' lifetime, so `/kv_event_sources` serves it as is.
+        self.kv_event_sources = kv_event_sources(config)
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
