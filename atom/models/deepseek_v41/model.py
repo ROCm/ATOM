@@ -9,6 +9,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom import plugin_host
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
@@ -64,6 +65,15 @@ class Block(nn.Module):
             prefix=f"{prefix}.ffn",
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
+        )
+        # The FFN sublayer, as `ffn_forward` calls it: `self.ffn` itself unless
+        # a plugin plan owns the seam (then one opaque op, routed per run).
+        self._ffn = plugin_host.bind(
+            "v41.block.ffn",
+            self.ffn.__call__,
+            capability={"flags": {"layer_id": spec.layer_id}},
+            layer=self.layer_name,
+            fake=torch.empty_like,
         )
         # Weights only: each norm runs inside its seam (`pre_delayed`).
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -209,7 +219,7 @@ class Block(nn.Module):
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
+        return self.finish_ffn(self._ffn(normed), residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):

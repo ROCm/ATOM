@@ -25,6 +25,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_qu
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
+from atom import plugin_host
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
@@ -1355,6 +1356,11 @@ class DualRMSNormMXFP8:
         self.k_norm = k_norm
         self.prefix = prefix
         self.amax_floor = amax_floor
+        self._kernel = plugin_host.bind(
+            "v41.attn.qk_norm",
+            fused_dual_rmsnorm_mxfp8_quant,
+            capability={"quant": plugin_host.MX, "flags": {"amax_floor": amax_floor}},
+        )
 
     @mark_trace
     def __call__(
@@ -1363,7 +1369,7 @@ class DualRMSNormMXFP8:
         # The kernel takes matrices; fold the leading dims away and give them
         # back, as the RMSNorm branches do, so a caller does not.
         lead = q.shape[:-1]
-        q_fp8, q_scale, k_out = fused_dual_rmsnorm_mxfp8_quant(
+        q_fp8, q_scale, k_out = self._kernel(
             q.reshape(-1, q.shape[-1]),
             k.reshape(-1, k.shape[-1]),
             self.q_norm.weight,

@@ -23,6 +23,7 @@ from aiter.ops.shuffle import (
 from torch import nn
 from transformers import PretrainedConfig
 
+from atom import plugin_host
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -5304,7 +5305,9 @@ class FusedMoE(torch.nn.Module):
                     if fuse_shared or scoring_func == "sqrtsoftplus"
                     else 1.0
                 )
-                topk_gating(
+                plugin_host.call(
+                    "v41.moe.topk",
+                    topk_gating,
                     topk_weights,
                     topk_ids,
                     router_logits,
