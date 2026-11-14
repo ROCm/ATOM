@@ -431,11 +431,12 @@ def pk_fp4_bf16(old, word, scale, j):
 
 # ---------------------------------------------------------------- early
 @traced
-def early_out(c, kind, i, q, red, t0=0):
+def early_out(c, kind, i, q, red, t0=0, scales=None):
     """Task (i, q) of ``kind`` (0 router, 1 latent, 2 sgu): its 16 rows for
     tokens t0 .. (``red`` holds that token group). The router's parts q > 0
     publish fp32 partials, part 0 adds them in part order and sends the fp32
-    rows to every rank's RLOG; the latent: ``latent_out``; sgu bf16 to SGU."""
+    rows to every rank's RLOG; the latent: ``latent_out``; sgu bf16 to SGU
+    (``scales``: a ``w8`` sgu's, ``gemv.pair_scales``)."""
     s, tid = c["S"], c["tid"]
     sg = group_rows(s, t0 // TG)
     if const_expr(kind == 1):
@@ -445,8 +446,7 @@ def early_out(c, kind, i, q, red, t0=0):
         if tid < (ROWS // 2) * sg:
             rp = tid % (ROWS // 2)
             t = tid // (ROWS // 2)
-            v0 = bf16_round(row_sum(red, 2 * rp, t))
-            v1 = bf16_round(row_sum(red, 2 * rp + 1, t))
+            v0, v1 = gemv.row_pair(red, rp, t, scales)
             c["put_bf"](c["sgu"], (t0 + t) * 2 * SI + i * ROWS + 2 * rp, [v0, v1])
     else:
         if tid < ROWS * sg:
@@ -560,6 +560,12 @@ def early_shape(kind):
     }[kind]
 
 
+def early_w8(c, kind):
+    """Whether early ``kind``'s weight is FP8 (``w8``): sgu's alone, the
+    router and the latent are not dense linears of the quant."""
+    return kind == 2 and c["w8"]
+
+
 def early_loads(c, kind, i, q):
     """Early task (i, q) of ``kind``'s weights for this wave: issued as early as
     the CTA can, then ``early_compute`` takes them."""
@@ -581,6 +587,7 @@ def early_loads(c, kind, i, q):
             ldk=HIDDEN,
             k0=q * klen + k0,
             paired=True,
+            w8=early_w8(c, kind),
         )
         for k0, n in gemv.slabs(klen, min(c["S"], TG))
     ]
@@ -600,16 +607,21 @@ def early_compute(c, kind, i, q, ops):
     klen, _ = early_shape(kind)
     plan = gemv.slabs(klen, sg)
     xrow = gemv.slab_width(klen, sg) + gemv.LDS_PAD
+    scales = None
+    if const_expr(early_w8(c, kind)):
+        scales = gemv.pair_scales(c["args"]["w_sgu_s"], i * ROWS, tid)
     if const_expr(c.get("xflags") is not None):
         if tid < c["xflags"]:
             c["poll"]([(c["xrdy"], tid, 1)])
         gpu.barrier()
     if const_expr(groups(s) > 1):
-        acc = early_units(c, q, klen, [op for sl_ops in ops for op in sl_ops])
+        acc = early_units(
+            c, q, klen, [op for sl_ops in ops for op in sl_ops], early_w8(c, kind)
+        )
         for g in range_constexpr(groups(s)):
             fx.ptr_store(acc[g], red + (wave * 64 + lane) * 4)
             gpu.barrier()
-            early_out(c, kind, i, q, red, TG * g)
+            early_out(c, kind, i, q, red, TG * g, scales)
         return
     # one token group: its rows staged a slab at a time against the slab's
     # weights. ``range_constexpr`` + indexing, not ``enumerate``: this body is
@@ -627,13 +639,15 @@ def early_compute(c, kind, i, q, ops):
         gemv.rows_to_lds(
             tid, src, n, sg, c["xl"], xrow, cm, ldk=HIDDEN, k0=q * klen + k0
         )
-        acc = gemv.mfmas(lane, wave, c["xl"], xrow, n, sg, ops[sl], acc)
+        acc = gemv.mfmas(
+            lane, wave, c["xl"], xrow, n, sg, ops[sl], acc, early_w8(c, kind)
+        )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    early_out(c, kind, i, q, red, 0)
+    early_out(c, kind, i, q, red, 0, scales)
 
 
-def early_units(c, q, klen, ops):
+def early_units(c, q, klen, ops, w8=False):
     """``early_compute`` past one token group: ``gemv.staged_units`` over the
     units -- a column group (``gemv.KGROUP``) of a token group -- with x one
     unit ahead (``ops``: ``gemv.loads``' entries, one a column group, all in
@@ -672,7 +686,7 @@ def early_units(c, q, klen, ops):
     def multiply(u, buf):
         i, g = units[u]
         acc[g] = gemv.mfmas_unit(
-            lane, wave, buf, xrow, i, klen, rows(g), ops[i], acc[g]
+            lane, wave, buf, xrow, i, klen, rows(g), ops[i], acc[g], w8
         )
 
     gemv.staged_units(
@@ -1357,10 +1371,13 @@ def stage_sdown(c, j, ops):
     tid = c["tid"]
     lo = c["rank"] * UP_TASKS
     mine = (j >= lo) & (j < lo + UP_TASKS)
+    scales = None
+    if const_expr(c["w8"]):
+        scales = gemv.pair_scales(c["args"]["w_sd_s"], j * ROWS, tid)
     for g in range_constexpr(groups(c["S"])):
         if const_expr(g):
             gpu.barrier()  # the previous group's readers of ``red``
-        sdown_rows(group_view(c, g), j, ops, TG * g)
+        sdown_rows(group_view(c, g), j, ops, TG * g, scales)
     publish(
         c["put"],
         c["shrdy"],
@@ -1372,11 +1389,12 @@ def stage_sdown(c, j, ops):
 
 
 @traced
-def sdown_rows(c, j, ops, t0):
-    """``stage_sdown`` for one token group: h rows t0 .. of LDS."""
+def sdown_rows(c, j, ops, t0, scales=None):
+    """``stage_sdown`` for one token group: h rows t0 .. of LDS (``scales``: a
+    ``w8`` shared down's, ``gemv.pair_scales``)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     hrow = SI + gemv.LDS_PAD
-    acc = gemv.mfmas(lane, wave, c["xl"] + t0 * hrow // 2, hrow, SI, s, ops)
+    acc = gemv.mfmas(lane, wave, c["xl"] + t0 * hrow // 2, hrow, SI, s, ops, w8=c["w8"])
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     lo = c["rank"] * UP_TASKS
@@ -1384,8 +1402,7 @@ def sdown_rows(c, j, ops, t0):
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0, v1 = gemv.row_pair(red, rp, tt, scales)
         if mine:
             w = (
                 fx.Vector.from_elements([v0, v1], fx.Float32)
@@ -1450,7 +1467,9 @@ def run_sdown(c, bid, w_sd):
             stage_sdown(
                 c,
                 j,
-                gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI, paired=True),
+                gemv.loads(
+                    c["lane"], c["wave"], w_sd, j * ROWS, SI, paired=True, w8=c["w8"]
+                ),
             )
         more = k < SD_TASKS
 
@@ -1812,6 +1831,8 @@ def build(key: MoeBuild):
             "wave": tid // 64,
             "rank": rank,
             "ln_eps": key.eps,
+            # this build takes no row scales: the shared experts in bf16 only
+            "w8": False,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,

@@ -7,7 +7,7 @@ keeps it, so a layout the kernels were not written for is refused here rather
 than read wrong. Every tensor is checked against the shape and dtype the kernels
 assume for the rank's shard.
 
-Three groups are the exception, and each says why:
+Two groups are the exception, and each says why:
 
 * four small vectors the kernels read as fp32 that the model holds in bf16 (the
   causal-conv weights, ``A_log``, ``dt_bias``, the router's correction bias) --
@@ -19,10 +19,14 @@ Three groups are the exception, and each says why:
   deployment that cannot spare it has to turn mono off, not run it degraded. A
   bf16 checkpoint has no scale: its down-projection is bound as is, and only the
   up-projection's rank band is copied (that is the whole cost there).
-* the fused KDA in-projection, which must be unquantized. ATOM's online quant
-  turns it into preshuffled per-token FP8 padded to 6400 rows; the kernels read
-  bf16. It is refused rather than dequantized, because at 90 MB a layer that
-  copy is larger than everything else here put together.
+
+The dense projections (the fused KDA in-projection, ``f_b``, ``o_proj`` and the
+shared experts) are read in place either way: plain bf16, or -- when ATOM's
+online quant made them per-token FP8 -- the production GEMM's own plane, E4M3
+in AITER's (16, 16) preshuffle with rows padded to its tile and an fp32 scale a
+row (``_dense``). Dequantizing them would cost ~150 MB a layer, and excluding
+them from the quant keeps their GEMMs bf16 on every step production serves,
+prefill included.
 
 What is *not* copied is everything large: the expert planes (1.2 GB and 616 MB a
 layer) and their E8M0 scales are read exactly where ``FusedMoE`` left them.
@@ -54,11 +58,13 @@ from atom.models.kimi_k3.mono.layouts import (
     unshuffle_weight,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.weights.layer import linear_ptpc_fp8
 
 logger = logging.getLogger("atom")
 
 BF16 = torch.bfloat16
 F32 = torch.float32
+FP8 = torch.float8_e4m3fn
 # an E8M0 scale covers this many weight elements along K
 MX_GROUP = 32
 
@@ -93,16 +99,46 @@ def _plain_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     """A linear's weight as the kernels read it: bf16, unshuffled, exactly
     ``shape``."""
     w = _param(module, name)
-    _need(
-        w.dtype == BF16,
-        f"{name} is {w.dtype}: the kernels read bf16, so this projection must "
-        "stay out of the online quant (it is unquantized in the checkpoint)",
-    )
+    _need(w.dtype == BF16, f"{name} is {w.dtype}, expected bf16")
     _need(not getattr(w, "is_shuffled", False), f"{name} is preshuffled")
     _need(not getattr(module, "is_output_padded", False), f"{name} output padded")
     _need(tuple(w.shape) == shape, f"{name} is {tuple(w.shape)}, expected {shape}")
     _need(w.is_contiguous(), f"{name} not contiguous")
     return w.data
+
+
+def _dense(module, name: str, shape: tuple[int, ...]):
+    """A dense linear's weight and its row scale as the kernels read them:
+    ``_plain_bf16`` (scale ``None``), or the production per-token FP8 plane in
+    place -- E4M3 preshuffled by AITER's ``shuffle_weight`` at its default
+    (16, 16) layout (``shuffle_weights``), rows padded past ``shape[0]`` to the
+    GEMM's tile, an fp32 scale a padded row. ``linear_ptpc_fp8`` checks that
+    much; the kernels index the layout (``gemv.w8_offset``) and need the rest
+    checked here, so any other plane those records describe is refused. The
+    shuffle's layout itself is not recorded on the tensor: ATOM's linears
+    shuffle at that default only."""
+    w = _param(module, name)
+    # the kernels add no bias, in either layout
+    _need(getattr(module, "bias", None) is None, f"{name} has a bias")
+    if w.dtype == BF16:
+        return _plain_bf16(module, name, shape), None
+    n, k = shape
+    _need(
+        w.dtype == FP8,
+        f"{name} is {w.dtype}: the kernels read bf16 or preshuffled {FP8}",
+    )
+    sc = getattr(module, "weight_scale", None)
+    _need(sc is None or sc.is_contiguous(), f"{name}: weight_scale not contiguous")
+    w, sc = linear_ptpc_fp8(module, name=name, logical_rows=n, logical_cols=k)
+    _need(
+        getattr(module, "native_a8_group_rows", None) is None,
+        f"{name}: a native-a8 grouped plane",
+    )
+    _need(w.shape[0] % 16 == 0, f"{name} is {tuple(w.shape)}: rows not padded to 16")
+    # the binders' constant K: the GEMVs walk it in 128-wide chunks
+    assert k % 128 == 0, f"{name}: K {k} not a multiple of 128"
+    _need(w.is_contiguous(), f"{name} not contiguous")
+    return w, sc
 
 
 def _vec(param, n: int, name: str, dtype: torch.dtype = BF16) -> torch.Tensor:
@@ -185,6 +221,9 @@ class KdaLayer:
     seam: AttnRes
     w_in: torch.Tensor
     w_fb: torch.Tensor
+    # FP8 row scales (``_dense``): both set, or both None for plain bf16
+    w_in_s: torch.Tensor | None
+    w_fb_s: torch.Tensor | None
     conv_w: torch.Tensor
     a_log: torch.Tensor
     dt_bias: torch.Tensor
@@ -209,6 +248,10 @@ class MoeLayer:
     w_up: torch.Tensor
     w_sgu: torch.Tensor
     w_sd: torch.Tensor
+    # FP8 row scales (``_dense``): all set, or all None for plain bf16
+    w_o_s: torch.Tensor | None
+    w_sgu_s: torch.Tensor | None
+    w_sd_s: torch.Tensor | None
     w13: torch.Tensor
     w13s: torch.Tensor
     w2: torch.Tensor
@@ -248,14 +291,23 @@ def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
     lower = attn._kda_gate_lower_bound
     _need(lower is not None, f"{name}: no KDA gate lower bound")
     blocks, write_idx = layer_block(layer_id)
+    # [q | k | v | g | beta | f_a]; the kernels' offsets follow this order
+    w_in, w_in_s = _dense(attn.in_proj, f"{name} in_proj", (dims.fused, HIDDEN))
+    w_fb, w_fb_s = _dense(attn.f_b_proj, f"{name} f_b_proj", (dims.proj, HEAD_DIM))
+    # one K1 build reads both in one format
+    _need(
+        (w_in_s is None) == (w_fb_s is None),
+        f"{name}: in_proj and f_b_proj are not both bf16 or both FP8",
+    )
     return KdaLayer(
         layer_id=layer_id,
         blocks=blocks,
         write_idx=write_idx,
         seam=_seam(layer.self_attention_attn_res, f"{name} attn seam"),
-        # [q | k | v | g | beta | f_a]; the kernels' offsets follow this order
-        w_in=_plain_bf16(attn.in_proj, f"{name} in_proj", (dims.fused, HIDDEN)),
-        w_fb=_plain_bf16(attn.f_b_proj, f"{name} f_b_proj", (dims.proj, HEAD_DIM)),
+        w_in=w_in,
+        w_fb=w_fb,
+        w_in_s=w_in_s,
+        w_fb_s=w_fb_s,
         conv_w=_as_f32(attn.conv_weight, dims.qkv * 4, f"{name} conv_weight").view(
             dims.qkv, 4
         ),
@@ -362,12 +414,28 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     w_up = _mxfp4_to_bf16(
         moe.routed_expert_up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT)
     )
+    w_o, w_o_s = _dense(layer.self_attn.o_proj, f"{name} o_proj", (HIDDEN, dims.proj))
+    w_sgu, w_sgu_s = _dense(
+        moe.shared_experts.gate_up_proj,
+        f"{name} shared gate_up_proj",
+        (2 * dims.sh_inter, HIDDEN),
+    )
+    w_sd, w_sd_s = _dense(
+        moe.shared_experts.down_proj,
+        f"{name} shared down_proj",
+        (HIDDEN, dims.sh_inter),
+    )
+    # one K2 build reads all three in one format
+    _need(
+        len({w_o_s is None, w_sgu_s is None, w_sd_s is None}) == 1,
+        f"{name}: o_proj and the shared experts are not all bf16 or all FP8",
+    )
     return MoeLayer(
         layer_id=layer_id,
         blocks=layer_block(layer_id)[0],
         write_idx=layer_block(layer_id)[1],
         seam=_seam(layer.mlp_attn_res, f"{name} mlp seam"),
-        w_o=_plain_bf16(layer.self_attn.o_proj, f"{name} o_proj", (HIDDEN, dims.proj)),
+        w_o=w_o,
         w_gate=gate.data,
         bias=_as_f32(moe.gate.e_score_correction_bias, EXPERTS, f"{name} gate bias"),
         w_ld=_mxfp4_to_bf16(
@@ -377,16 +445,11 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
         ),
         ln_w=_vec(moe.routed_expert_norm.weight, LATENT, f"{name} routed_expert_norm"),
         w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
-        w_sgu=_plain_bf16(
-            moe.shared_experts.gate_up_proj,
-            f"{name} shared gate_up_proj",
-            (2 * dims.sh_inter, HIDDEN),
-        ),
-        w_sd=_plain_bf16(
-            moe.shared_experts.down_proj,
-            f"{name} shared down_proj",
-            (HIDDEN, dims.sh_inter),
-        ),
+        w_sgu=w_sgu,
+        w_sd=w_sd,
+        w_o_s=w_o_s,
+        w_sgu_s=w_sgu_s,
+        w_sd_s=w_sd_s,
         w13=w13,
         w13s=s13,
         w2=w2,

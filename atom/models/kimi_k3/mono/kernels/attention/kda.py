@@ -63,7 +63,6 @@ from atom.mono.device.ops import (
     ld_i32,
     load_ptr64,
     mfma_bf16,
-    row_sum,
     rsrc,
     traced,
     uniform,
@@ -262,6 +261,9 @@ class KdaPreBuild:
     timeline: bool = field(default=False, metadata={"sym": "t"})
     # a block-write layer's block: the updated prefix stored there
     write_idx: int = field(default=-1, metadata={"sym": "wi"})
+    # in_proj and f_b as the production per-token FP8 GEMMs hold them
+    # (``gemv.w8_offset``, a row scale each) rather than plain bf16
+    w8: bool = field(default=False, metadata={"sym": "q"})
     # ReplaySSM (``fla_ops.replayssm``): the record buffer's length (its
     # ``cache_len``), 0 without. A request's state is its checkpoint plus the
     # (k, u, g) records committed since (``write_pos``), rebuilt here; each
@@ -319,6 +321,11 @@ ABI = KernelAbi(
         "plain",
         "layer",
         "tl",
+        # in_proj / f_b's FP8 row scales (``w8``; 0 and unread without). Last:
+        # an argument ahead of others moves their kernarg offsets, and with
+        # them every bf16 build's schedule
+        "w_in_s",
+        "w_fb_s",
     )
 )
 
@@ -607,19 +614,37 @@ def stage_mix(c, task):
 # ---------------------------------------------------------------- gemv CTAs
 def gemv_loads(c, rg, chunks, paired: bool = False):
     """This wave's weight operands of rows 16 rg .. for its K chunks ``chunks``
-    (indices into wave, wave + 8, ..), ``gemv.chunk_ops``' each. ``rg`` past
-    the last group loads the last group. ``paired`` (whole 128 B lines a load)
-    from ``gemv_groups`` only: the one-group path, at the VGPR edge, spills
-    with it."""
+    (indices into wave, wave + 8, ..), ``gemv.chunk_operands``' each. ``rg``
+    past the last group loads the last group. ``paired`` (whole 128 B lines a
+    load) from ``gemv_groups`` only: the one-group path, at the VGPR edge,
+    spills with it."""
     lane, wave = c["lane"], c["wave"]
-    # bounded: the last task's rows past ``FUSED`` are not in the weight,
-    # and a buffer load past num_records returns zero
-    r_w = rsrc(c["args"]["w_in"], FUSED * HIDDEN * 2)
+    if const_expr(c["w8"]):
+        # the plane holds the last task's tile, past ``FUSED`` to ``NPROJ``:
+        # ``weights._dense`` binds only a plane padded to 16 rows
+        r_w = rsrc(c["args"]["w_in"], NPROJ * HIDDEN)
+    else:
+        # bounded: the last task's rows past ``FUSED`` are not in the weight,
+        # and a buffer load past num_records returns zero
+        r_w = rsrc(c["args"]["w_in"], FUSED * HIDDEN * 2)
     row0 = fx.min(rg, GEMV_TASKS - 1) * ROWS
     return [
-        gemv.chunk_ops(r_w, row0, HIDDEN, (wave + WAVES * i) * KCH, lane, paired)
+        gemv.chunk_operands(
+            r_w, row0, HIDDEN, (wave + WAVES * i) * KCH, lane, paired, w8=c["w8"]
+        )
         for i in chunks
     ]
+
+
+def gemv_scale(c, rg):
+    """``w8``: in_proj's scale of the row this thread reduces in
+    ``gemv_finish`` (rows 16 rg .., the last group's past the last), issued
+    with the task's first weights so that it lands under the MFMAs; else
+    None."""
+    if not c["w8"]:
+        return None
+    row = fx.min(rg, GEMV_TASKS - 1) * ROWS + c["tid"] % ROWS
+    return ld_f32(c["args"]["w_in_s"], row)
 
 
 @traced
@@ -727,21 +752,22 @@ def gemv_slab(c, ops, ni: int, acc):
                 )
             )
             acc = mfma_bf16(
-                ops[j][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                gemv.operand(ops[j][q], c["w8"]), xb.bitcast(fx.BFloat16), acc
             )
     return acc
 
 
 @traced
-def gemv_finish(c, rg, acc):
-    """A finished accumulator reduced across waves -> bf16 PROJ (and proj_dbg)."""
+def gemv_finish(c, rg, acc, scale=None):
+    """A finished accumulator reduced across waves (``w8``: times the row's
+    ``scale``, ``gemv_scale``) -> bf16 PROJ (and proj_dbg)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if (tid < ROWS * s) & (rg < GEMV_TASKS):
         r = tid % ROWS
         tt = tid // ROWS
-        v = bf16r(row_sum(red, r, tt))
+        v = gemv.row_value(red, r, tt, scale)
         c["put"](c["proj"], tt * NPROJ + rg * ROWS + r, v)
         if const_expr(c["debug"]):
             bo.buffer_store(
@@ -822,6 +848,7 @@ def gemv_groups(c, gi):
         ]
 
     ops = {0: unit_ops(0)}
+    scales = [gemv_scale(c, rg0), gemv_scale(c, rg1)]
     # every group's slices ready (XRDY, NA a group)
     if c["tid"] < NA * G:
         c["poll"]([(c["xrdy"], c["tid"], 1)])
@@ -847,8 +874,8 @@ def gemv_groups(c, gi):
     gemv.staged_units(len(units), c["x_ahead"], bufs, x_of, x_put, multiply)
     stamp(c["on"], c["tls"], c["tid"], 5)
     for g in range_constexpr(G):
-        gemv_finish(group_view(c, g), rg0, acc0[g])
-        gemv_finish(group_view(c, g), rg1, acc1[g])
+        gemv_finish(group_view(c, g), rg0, acc0[g], scales[0])
+        gemv_finish(group_view(c, g), rg1, acc1[g], scales[1])
 
 
 # ---------------------------------------------------------------- kda, ReplaySSM
@@ -1041,15 +1068,53 @@ def fb_loads(c, k):
     """This wave's f_b rows (``kda_gates``' MFMA A operands) into ``k["fb"]``:
     with a task's other inputs on a plain decode, after ``kda_gates``' polls
     on a verify (its f_a poll is L tokens' worth, and in vmcnt order it would
-    wait for the 32 KB)."""
-    k["fb"] = [
-        fx.Vector(
-            bo.buffer_load(
-                rsrc(c["args"]["w_fb"]), k["fb_at"] + 4 * q, vec_width=4, dtype=T.i32
+    wait for the 32 KB). ``w8``: each 16 B half of the lane's 32-column K
+    block holds two operands (``fb_w8_dword``), and the lane's four output
+    rows' scales go into ``k["fbs"]``."""
+    if const_expr(c["w8"]):
+        halves = [
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["args"]["w_fb"]),
+                    fb_w8_dword(k["fb_at"], 2 * j),
+                    vec_width=4,
+                    dtype=T.i32,
+                )
             )
-        )
-        for q in range(4)
-    ]
+            for j in range(2)
+        ]
+        k["fb"] = [[halves[q // 2][q % 2 * 2 + d] for d in range(2)] for q in range(4)]
+        k["fbs"] = [ld_f32(c["args"]["w_fb_s"], k["fb_row"] + i) for i in range(4)]
+    else:
+        k["fb"] = [
+            fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["args"]["w_fb"]),
+                    k["fb_at"] + 4 * q,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+            for q in range(4)
+        ]
+
+
+def fb_offset(c, h):
+    """The dword of the lane's first f_b operand: wave w's rows 16 w .. of head
+    h, a lane 64 B of its row (K columns 32 g .., g = lane / 16). ``w8``: the
+    same columns' in the preshuffled E4M3 plane (``gemv.w8_offset``)."""
+    lane, wave = c["lane"], c["wave"]
+    if const_expr(c["w8"]):
+        return gemv.w8_offset(h * HD + wave * 16, lane % 16, lane // 16 * 32, HD) // 4
+    fr = h * HD + wave * 16 + lane % 16
+    return (fr * HD + (lane // 16) * 32) // 2
+
+
+def fb_w8_dword(at, q):
+    """The dword of f_b operand q (K columns 32 g + 8 q of the lane's row) in
+    the preshuffled E4M3 plane, ``at`` the lane's first (``fb_offset``): 16 B
+    half q / 2 of its 32-column K block, 8 B q % 2 into it."""
+    return at + gemv.w8_offset(0, 0, 16 * (q // 2), HD) // 4 + q % 2 * 2
 
 
 def kda_task_inputs(c, req, h, m0, channels, rows):
@@ -1102,17 +1167,14 @@ def kda_task_inputs(c, req, h, m0, channels, rows):
     )
     if const_expr(not state_late(c["S"])):
         state_loads(k)
-    # f_b: wave w's rows 16 w .. of head h, a lane 64 B of its row
-    fr = h * HD + wave * 16 + lane % 16
-    fb = (fr * HD + (lane // 16) * 32) // 2
-    k["fb_at"] = fb
+    k["fb_at"] = fb_offset(c, h)
+    # the lane's rows of the f_b MFMA's output (``gates_compute``): their
+    # dt_bias and (``w8``) their scales
+    k["fb_row"] = h * HD + wave * 16 + 4 * (lane // 16)
     if const_expr(L == 1):
         fb_loads(c, k)
     k["aa"] = hw_exp2(ld_f32(a["a_log"], h) * fx.Float32(LOG2E))
-    k["dtb"] = [
-        ld_f32(a["dt_bias"], h * HD + wave * 16 + 4 * (lane // 16) + i)
-        for i in range(4)
-    ]
+    k["dtb"] = [ld_f32(a["dt_bias"], k["fb_row"] + i) for i in range(4)]
     return k
 
 
@@ -1210,10 +1272,13 @@ def gates_compute(c, k, h):
         kb = (lane // 16) * 32 + 8 * q
         xs = [fx.ptr_load(c["fa"] + (t * HD + kb + e)) for e in range(8)]
         xb = fx.Vector.from_elements(xs, fx.Float32).to(fx.BFloat16)
-        acc = mfma_bf16(k["fb"][q].bitcast(fx.BFloat16), xb, acc)
+        acc = mfma_bf16(gemv.operand(k["fb"][q], c["w8"]), xb, acc)
     for i in range_constexpr(4):
         kk = wave * 16 + 4 * (lane // 16) + i
-        g = bf16r(acc[i]) + k["dtb"][i]
+        g1 = acc[i]
+        if const_expr(c["w8"]):
+            g1 = g1 * k["fbs"][i]
+        g = bf16r(g1) + k["dtb"][i]
         gate = fx.Float32(c["lb"]) * sigmoid(k["aa"] * g)
         if lane % 16 < L:
             fx.ptr_store(hw_exp2(gate * fx.Float32(LOG2E)), c["decay"] + (t * HD + kk))
@@ -1697,6 +1762,8 @@ def build(key: KdaPreBuild):
         plain: Int64,
         layer: Int32,
         tl: Int64,
+        w_in_s: Int64,
+        w_fb_s: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -1731,6 +1798,7 @@ def build(key: KdaPreBuild):
             "lb": key.lower_bound,
             "kda0": key.kda0,
             "write_idx": key.write_idx,
+            "w8": key.w8,
             "put": mb.put,
             "poll": mb.poll,
             "red": lds.red.ptr,
@@ -1763,6 +1831,8 @@ def build(key: KdaPreBuild):
                 "in_nw": in_nw,
                 "w_in": w_in,
                 "w_fb": w_fb,
+                "w_in_s": w_in_s,
+                "w_fb_s": w_fb_s,
                 "conv_w": conv_w,
                 "conv_st": conv_st,
                 "cs_seq": cs_seq,
@@ -1814,6 +1884,8 @@ def build(key: KdaPreBuild):
                 ops0 = gemv_loads(c, rg0, range(plan[0][0], plan[0][0] + plan[0][1]))
                 half0 = min(4, plan[0][1])
                 ops1_0 = gemv_loads(c, rg1, range(plan[0][0], plan[0][0] + half0))
+                sc0 = gemv_scale(c, rg0)
+                sc1 = gemv_scale(c, rg1)
                 if const_expr(xw):
                     gpu.barrier()
                 else:
@@ -1847,9 +1919,9 @@ def build(key: KdaPreBuild):
                     acc0 = gemv_slab(c, ops0, ni, acc0)
                     ops1 = ops1 + gemv_loads(c, rg1, range(i0 + half, i0 + ni))
                     acc1 = gemv_slab(c, ops1, ni, acc1)
-                gemv_finish(c, rg0, acc0)
+                gemv_finish(c, rg0, acc0, sc0)
                 stamp(on, tls, tid, 5)
-                gemv_finish(c, rg1, acc1)
+                gemv_finish(c, rg1, acc1, sc1)
                 stamp(on, tls, tid, 6)
         kda_tasks(c, on, tls)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
@@ -1887,6 +1959,8 @@ def build(key: KdaPreBuild):
         plain: Int64,
         layer: Int32,
         tl: Int64,
+        w_in_s: Int64,
+        w_fb_s: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1922,6 +1996,8 @@ def build(key: KdaPreBuild):
             plain,
             layer,
             tl,
+            w_in_s,
+            w_fb_s,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(kda_pre, launch)

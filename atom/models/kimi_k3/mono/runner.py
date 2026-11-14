@@ -88,6 +88,12 @@ K2_TAG0 = 128
 IX_TAG0 = 2 * K2_TAG0
 
 
+def _ptr(t: torch.Tensor | None) -> int:
+    """A kernel argument's address, 0 for an operand the build does not read
+    (a bf16 weight's FP8 row scale)."""
+    return 0 if t is None else t.data_ptr()
+
+
 def inner_model(model):
     """The layer stack under whatever outer class the checkpoint registered.
     K3's text-only and vision classes both hold it one level deeper than the
@@ -395,6 +401,7 @@ class K3MonoDecodeRunner:
                 onorm_eps=p.kda.onorm_eps,
                 lower_bound=p.kda.lower_bound,
                 write_idx=p.kda.write_idx,
+                w8=p.kda.w_in_s is not None,
                 replay_cap=self.replay_cap,
                 replay_window=window,
                 **k1.gemv_staging(rows),
@@ -417,6 +424,7 @@ class K3MonoDecodeRunner:
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
                 diag=self.debug,
+                w8=p.moe.w_o_s is not None,
             )
             for p in self.plans
             if p.moe is not None
@@ -626,6 +634,7 @@ class K3MonoDecodeRunner:
             "blk_sm": blocks.stride(0), "blk_sr": blocks.stride(1),
             "ares_nw": p(w.seam.nw), "ares_qk": p(w.seam.qk),
             "in_nw": p(w.seam.out_nw), "w_in": p(w.w_in), "w_fb": p(w.w_fb),
+            "w_in_s": _ptr(w.w_in_s), "w_fb_s": _ptr(w.w_fb_s),
             "conv_w": p(w.conv_w), "conv_st": p(state),
             "cs_seq": state.stride(0), "cs_dim": state.stride(1),
             "cs_tok": state.stride(2), "a_log": p(w.a_log),
@@ -686,7 +695,8 @@ class K3MonoDecodeRunner:
             "blk_sr": blocks.stride(1), "ares_nw": p(w.seam.nw),
             "ares_qk": p(w.seam.qk), "in_nw": p(w.seam.out_nw),
             "w_gate": p(w.w_gate), "bias": p(w.bias), "w_ld": p(w.w_ld),
-            "w_sgu": p(w.w_sgu), "w_sd": p(w.w_sd), "w13": p(w.w13),
+            "w_sgu": p(w.w_sgu), "w_sd": p(w.w_sd), "w_o_s": _ptr(w.w_o_s),
+            "w_sgu_s": _ptr(w.w_sgu_s), "w_sd_s": _ptr(w.w_sd_s), "w13": p(w.w13),
             "w13s": p(w.w13s), "w2": p(w.w2), "w2s": p(w.w2s),
             "ln_w": p(w.ln_w), "w_up": p(w.w_up), "out": p(out),
             # not ``peers.kernel_args()``: that also hands over ``sym``, this

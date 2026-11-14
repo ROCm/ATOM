@@ -99,6 +99,9 @@ class K2Build:
     reduce: bool = field(default=True, metadata={"sym": "r"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
+    # o_proj, shared_gate_up and shared_down are FP8 (E4M3, AITER's 16x16
+    # preshuffle) with a per-row fp32 scale (``gemv`` ``w8``), else bf16
+    w8: bool = field(default=False, metadata={"sym": "q"})
 
 
 ABI = KernelAbi(
@@ -135,6 +138,12 @@ ABI = KernelAbi(
         "reset",
         "diag",
         "tl",
+        # o_proj / the shared experts' FP8 row scales (``w8``; 0 and unread
+        # without). Last: an argument ahead of others moves their kernarg
+        # offsets, and with them every bf16 build's schedule
+        "w_o_s",
+        "w_sgu_s",
+        "w_sd_s",
     )
 )
 
@@ -184,8 +193,9 @@ def stage_oproj(c, gi):
     once (one memory latency, not two), then the MFMAs, a token group's core
     rows at a time. A CTA with one task loads its own slab again for the
     round it skips (cache hits), not task 447's on 64 CTAs at once."""
-    # K2's bf16 GEMV weights (here, the MoE's early / shared down / up) a load
-    # two slabs of 8 rows (``gemv.chunk_ops`` paired)
+    # a bf16 weight two slabs of 8 rows a load (``gemv.chunk_ops`` paired), as
+    # K2's other GEMVs (the MoE's early / shared down / up); ``w8`` has no
+    # paired form
     ops = [
         k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
         for j in range(O_ROUNDS)
@@ -325,6 +335,9 @@ def build(key: K2Build):
         reset: Int32,
         diag: Int64,
         tl: Int64,
+        w_o_s: Int64,
+        w_sgu_s: Int64,
+        w_sd_s: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -361,6 +374,7 @@ def build(key: K2Build):
             "delta": True,
             "reset": reset,
             "debug": False,
+            "w8": key.w8,
             "eps": key.eps,
             "out_eps": key.out_eps,
             "ln_eps": key.ln_eps,
@@ -410,6 +424,9 @@ def build(key: K2Build):
                 "w_ld": w_ld,
                 "w_sgu": w_sgu,
                 "w_sd": w_sd,
+                "w_o_s": w_o_s,
+                "w_sgu_s": w_sgu_s,
+                "w_sd_s": w_sd_s,
                 "w13": w13,
                 "w13s": w13s,
                 "w2": w2,
@@ -544,6 +561,9 @@ def build(key: K2Build):
         reset: Int32,
         diag: Int64,
         tl: Int64,
+        w_o_s: Int64,
+        w_sgu_s: Int64,
+        w_sd_s: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -578,6 +598,9 @@ def build(key: K2Build):
             reset,
             diag,
             tl,
+            w_o_s,
+            w_sgu_s,
+            w_sd_s,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k2, launch)

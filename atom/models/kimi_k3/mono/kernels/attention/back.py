@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.kernels import token_groups
@@ -56,7 +56,6 @@ from atom.mono.device.ops import (
     bf16_round,
     kernel_symbol,
     mfma_bf16,
-    row_sum,
     rsrc,
     traced,
 )
@@ -175,12 +174,18 @@ def o_task_or(own, task):
 
 def o_loads(c, rg, paired=False):
     """Rows 16 rg .. of o_proj, this wave's K chunks (wave, wave + 8 < 12),
-    ``gemv.chunk_ops``' each."""
+    ``gemv.chunk_operands``' each."""
     lane, wave = c["lane"], c["wave"]
     r_w = rsrc(c["args"]["w_o"])
     return [
-        gemv.chunk_ops(
-            r_w, rg * ROWS, OK, fx.min(wave + WAVES * i, OKCH - 1) * 128, lane, paired
+        gemv.chunk_operands(
+            r_w,
+            rg * ROWS,
+            OK,
+            fx.min(wave + WAVES * i, OKCH - 1) * 128,
+            lane,
+            paired,
+            w8=c["w8"],
         )
         for i in range(2)
     ]
@@ -212,6 +217,9 @@ def stage_o(c, rg, ops):
     g = lane // ROWS
     t = fx.min(lane % ROWS, s - 1)
     row = OK + LDS_PAD
+    scales = None
+    if const_expr(c["w8"]):
+        scales = gemv.pair_scales(c["args"]["w_o_s"], rg * ROWS, tid)
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(2):
         ch = wave + WAVES * i
@@ -228,15 +236,14 @@ def stage_o(c, rg, ops):
                 [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
             )
             acc = mfma_bf16(
-                ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                gemv.operand(ops[i][q], c["w8"]), xb.bitcast(fx.BFloat16), acc
             )
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if tid < s * (ROWS // 2):
         tt = tid // (ROWS // 2)
         rp = tid % (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
+        v0, v1 = gemv.row_pair(red, rp, tt, scales)
         groups_own = OWN_COLS // ROWS
         for p in range_constexpr(TP):
             if rg // groups_own == p:
@@ -344,6 +351,8 @@ def build(key: AttnPostBuild):
             "rank": rank,
             "delta": True,
             "debug": False,
+            # this build takes no row scales: o_proj in bf16 only
+            "w8": False,
             "eps": key.eps,
             "out_eps": key.out_eps,
             "put": mb.put,
