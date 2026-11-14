@@ -954,11 +954,6 @@ class MLAAttention(nn.Module):
         The vLLM plugin initializes its process groups independently from the
         native ATOM config, so it calls this again with vLLM's DCP size.
         """
-        # DCP decode all-gathers Q on the head dim, so the width reaching
-        # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
-        # dispatchable one. The pad sits entirely inside _forward_decode: it goes
-        # on after the gather and comes off before the cross-rank combine, so it
-        # never costs collective traffic.
         # Whether aiter runs this layer's DCP decode persistent, at the width
         # the persistent path gathers to.
         self.dcp_persistent_supported = (
@@ -970,6 +965,11 @@ class MLAAttention(nn.Module):
             )
             is not None
         )
+        # DCP decode all-gathers Q on the head dim, so the width reaching
+        # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
+        # dispatchable one. The pad sits entirely inside _forward_decode: it goes
+        # on after the gather and comes off before the cross-rank combine, so it
+        # never costs collective traffic.
         self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
         if dcp_world_size > 1:

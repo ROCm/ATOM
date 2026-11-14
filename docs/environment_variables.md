@@ -43,9 +43,9 @@ One TP group over several nodes (`--tensor-parallel-size-local`, `--tensor-paral
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | How many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, the engine waits this long for every remote rank to subscribe to its broadcast queue, and a rank waits this long on the model-runner store (for the NCCL id of a communicator created on first use). The process groups' own timeout is `ATOM_MULTINODE_PG_TIMEOUT_S`. Must be finite and positive. |
+| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | How many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, the engine waits this long for every remote rank to subscribe to its broadcast queue, and a rank waits this long on the model-runner store (for the NCCL id of a communicator created on first use). The process groups' own timeout is `ATOM_MULTINODE_PG_TIMEOUT_S`. A value that is not a finite positive number is warned about and replaced by the default. |
 
-Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. A worker node refuses to start when one it knows of differs from the engine node's: on gfx1250 `AITER_MLA_DECODE_PS1_FLYDSL`, which decides whether DCP decode runs persistent.
+Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. A worker node refuses to start when one it knows of differs from the engine node's: `AITER_MLA_DECODE_PS1_FLYDSL`, which decides whether DCP decode runs persistent on gfx1250.
 
 The nodes trust each other: the engine's store and the workers' reply channels are unauthenticated TCP on `--data-parallel-master-ip` and carry pickled objects, so that address must be on a network only the nodes can reach.
 

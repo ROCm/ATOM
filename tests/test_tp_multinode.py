@@ -76,6 +76,66 @@ def test_tp_slices_are_checked_once_either_flag_is_set(local, start, dp, error):
             config._check_multinode_tp()
 
 
+@pytest.mark.parametrize(
+    "field, value, error",
+    [
+        ("enable_dp_attention", True, "--enable-dp-attention"),
+        ("pipeline_parallel_size", 2, "pipeline parallelism"),
+        ("prefill_context_parallel_size", 2, "prefill context parallelism"),
+        ("fake_eplb", True, "--fake-eplb"),
+        ("enable_rapidserve", True, "RapidServe"),
+    ],
+)
+def test_a_tp_group_across_nodes_refuses_what_it_does_not_support(field, value, error):
+    config = _config(4, 0)
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=f"does not support {error}"):
+        config._check_multinode_tp()
+
+
+@pytest.mark.parametrize(
+    "ip, port", [("127.0.0.1", 29600), ("localhost", 29600), ("10.0.0.1", 0)]
+)
+def test_a_tp_group_across_nodes_needs_a_reachable_store(ip, port):
+    config = _config(4, 4)
+    config.parallel_config.data_parallel_master_ip = ip
+    config.parallel_config.data_parallel_base_port = port
+    with pytest.raises(ValueError, match="needs --data-parallel-master-ip"):
+        config._check_multinode_tp()
+
+
+@pytest.mark.parametrize("multinode_tp", [False, True])
+def test_the_engine_serves_its_store_to_other_nodes_for_cross_node_tp(
+    monkeypatch, multinode_tp
+):
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    class Stop(Exception):
+        pass
+
+    seen = []
+
+    def start_store(self, config, *, multinode=False):
+        seen.append(multinode)
+        raise Stop
+
+    monkeypatch.setattr(CoreManager, "_init_shared_state", lambda *a, **k: None)
+    monkeypatch.setattr(CoreManager, "_start_distributed_store", start_store)
+    monkeypatch.setattr(CoreManager, "close", lambda self: None)
+    config = SimpleNamespace(
+        parallel_config=ParallelConfig(),
+        pipeline_parallel_size=1,
+        enable_dp_attention=False,
+        tensor_parallel_size=8,
+        is_multinode_tp=multinode_tp,
+    )
+    manager = CoreManager.__new__(CoreManager)
+    manager.label = "test"
+    with pytest.raises(Stop):
+        CoreManager.__init__(manager, config)
+    assert seen == [multinode_tp]
+
+
 def test_a_worker_node_reads_the_engine_address_the_way_the_engine_does(
     monkeypatch,
 ):
