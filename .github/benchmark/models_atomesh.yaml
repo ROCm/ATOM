@@ -17059,6 +17059,27 @@ models:
             common:
               <<: *m31_m75_c80_env
               ATOMESH_M31_D_COMPILATION_CONFIG: '{"max_cudagraph_capture_size":2048}'
+        # D caps under the decode peaks of C48 and C72 on this image (Mooncake there: running p90 5 and
+        # 9-11, TTFT p90 0.7 s and 1.2 s): shorter decode batches for some wait before decode. PR 65822 laid over.
+        - <<: *m31_moriio_1p2d_m75_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75s-c48-dcap4
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_m75_env
+              ATOMESH_M31_VLLM_REPO: https://github.com/whx-sjtu/vllm.git
+              ATOMESH_M31_VLLM_SHA: 8c7e9724ea67ba7c116c9c623798670ff7552fc1
+              ATOMESH_M31_D_MAX_SEQS: "4"
+        - <<: *m31_moriio_1p2d_m75_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75s-c72-dcap8-cpu15
+          concurrency: [72]
+          env:
+            common:
+              <<: *m31_m75_env
+              ATOMESH_M31_VLLM_REPO: https://github.com/whx-sjtu/vllm.git
+              ATOMESH_M31_VLLM_SHA: 8c7e9724ea67ba7c116c9c623798670ff7552fc1
+              ATOMESH_M31_D_MAX_SEQS: "8"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
