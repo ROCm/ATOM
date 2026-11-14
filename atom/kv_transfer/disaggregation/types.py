@@ -243,10 +243,18 @@ class KVTransferRegion:
     # makes equal-sized planes distinguishable across code versions.
     semantic_role: str | None = None
 
+    @staticmethod
+    def unit_offset(
+        index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
+    ) -> int:
+        if reverse_indexed:
+            return total_bytes - (index + 1) * unit_bytes
+        return index * unit_bytes
+
     def unit_addr(self, index: int) -> int:
-        if self.reverse_indexed:
-            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
-        return self.base_addr + index * self.unit_bytes
+        return self.base_addr + self.unit_offset(
+            index, self.total_bytes, self.unit_bytes, self.reverse_indexed
+        )
 
 
 @dataclass(frozen=True)

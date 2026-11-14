@@ -10,6 +10,7 @@ KV cache migration between producer (prefill) and consumer (decode) nodes.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -17,6 +18,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import msgpack
@@ -41,6 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
     KVConnectorOutput,
+    KVTransferRegion,
     ReqId,
     ReqMeta,
     TransferId,
@@ -271,6 +274,11 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
+        # Region mode (backends that publish KVTransferTensors and no
+        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
+        self._regions: list[_Region] | None = None
+        self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -288,8 +296,15 @@ class MoRIIOConnector(KVConnectorBase):
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
         ``self.num_k_chunks`` marks the K/V boundary.
+
+        A backend with no per-layer block caches (DeepSeek-V4) publishes its
+        storage only as ``transfer_tensors`` regions; those are registered
+        instead, see :meth:`_register_regions`.
         """
         self.kv_caches = kv_caches
+        if all(getattr(c, "per_request_state", False) for c in kv_caches.values()):
+            self._start_handshake_listener(self._register_regions(transfer_tensors))
+            return
         cache_tensor = None
 
         for layer_name, kv_cache in kv_caches.items():
@@ -380,6 +395,9 @@ class MoRIIOConnector(KVConnectorBase):
             state_slot_bytes={n: b for n, (_, b, _) in state.items()} or None,
             num_state_slots=self._num_state_slots,
         )
+        self._start_handshake_listener(metadata)
+
+    def _start_handshake_listener(self, metadata: MoRIIOAgentMetadata) -> None:
         ready_event = threading.Event()
         self._handshake_listener_thread = threading.Thread(
             target=self._handshake_listener,
@@ -395,6 +413,146 @@ class MoRIIOConnector(KVConnectorBase):
             name="moriio-handshake-listener",
         )
         self._handshake_listener_thread.start()
+
+    def _register_regions(self, transfer_tensors: Any) -> MoRIIOAgentMetadata:
+        """Register a backend's PAGE and full-SLOT regions for RDMA.
+
+        PAGE regions (``transfer_tensors.pages``) are indexed forward by
+        scheduler block. Full per-request SLOT regions (``swa_block_regions``)
+        are indexed by state slot and may be reverse-indexed. Each region is
+        cut into unit-aligned chunks under the ``ibv_reg_mr`` limit, so no unit
+        straddles two registrations. The compressor-only staging pool is not
+        registered: a full SLOT already carries the compressor state.
+        """
+        tt = transfer_tensors
+        if tt is None or not tt.block_regions:
+            raise ValueError(
+                "MoRIIO: the attention backend registered neither per-layer KV "
+                "caches nor transfer regions, so there is nothing to transfer"
+            )
+        if not self.is_producer and self.transfer_mode != "write":
+            raise NotImplementedError(
+                "MoRIIO transfer regions are only moved in write mode; set "
+                "moriio_mode=write (or ATOM_MORIIO_MODE=write) on the consumer"
+            )
+        if tt.slot_regions or self._verify_kv:
+            raise NotImplementedError(
+                "MoRIIO region mode moves PAGE and full SLOT regions only, "
+                "without ATOM_MORIIO_VERIFY"
+            )
+
+        regions = [
+            _Region.of(f"page.{i}.{p.region.semantic_role}", "page", p.region)
+            for i, p in enumerate(tt.pages)
+        ] + [
+            _Region.of(f"slot.{i}.{r.semantic_role}", "slot", r)
+            for i, r in enumerate(tt.swa_block_regions)
+        ]
+        device_id = tt.pages[0].view.device.index
+        local_meta: dict[str, list[bytes]] = {}
+        for region in regions:
+            local_meta[region.name] = [
+                self.moriio_wrapper.register_local_buffer(ptr, size, device_id)
+                for ptr, size in region.chunks()
+            ]
+
+        self._regions = regions
+        self.layer_name_to_local_kv_cache_metadata = local_meta
+        return MoRIIOAgentMetadata(
+            engine_id=self.engine_id,
+            agent_metadata=self.moriio_wrapper.get_agent_metadata(),
+            region_layout=json.dumps([r.layout() for r in regions]),
+        )
+
+    def _remote_regions(self, engine_id: EngineId) -> list[_Region]:
+        """The peer's regions, checked against ours."""
+        meta = self.remote_moriio_metadata[engine_id]
+        if not meta.region_layout:
+            raise ValueError(
+                f"{engine_id} registered per-layer KV caches but this rank "
+                "registered transfer regions; P and D must run the same model"
+            )
+        remote = [_Region.from_layout(e) for e in json.loads(meta.region_layout)]
+        if [r.shape() for r in remote] != [r.shape() for r in self._regions]:
+            raise ValueError(
+                f"transfer regions differ from {engine_id}: local "
+                f"{[r.layout() for r in self._regions]} vs remote {meta.region_layout}"
+            )
+        return remote
+
+    def _region_session(
+        self, engine_id: EngineId, region_idx: int, local_chunk: int, remote_chunk: int
+    ) -> Any:
+        """The session for one (local chunk, remote chunk) pair, built on use."""
+        sessions = self._region_sessions.setdefault(engine_id, {})
+        key = (region_idx, local_chunk, remote_chunk)
+        session = sessions.get(key)
+        if session is None:
+            name = self._regions[region_idx].name
+            unpack = self.moriio_wrapper.get_unpack_memory_metadata
+            session = self.moriio_wrapper.build_session(
+                unpack(self.layer_name_to_local_kv_cache_metadata[name][local_chunk]),
+                unpack(
+                    self.layer_name_to_remote_kv_cache_metadata[engine_id][name][
+                        remote_chunk
+                    ]
+                ),
+            )
+            sessions[key] = session
+        return session
+
+    def _region_plan(
+        self, request: dict[str, Any], engine_id: EngineId
+    ) -> list[tuple[Any, list[int], list[int], list[int]]]:
+        """Every ``(session, local_offs, remote_offs, sizes)`` batch of a push."""
+        dst = [int(b) for b in request["dst_block_ids"]]
+        src = [int(b) for b in request["src_block_ids"]]
+        src_slot = int(request.get("src_slot_index", -1))
+        dst_slot = int(request.get("dst_slot_index", -1))
+        remote = self._remote_regions(engine_id)
+        plan: list[tuple[Any, list[int], list[int], list[int]]] = []
+        for ri, (local, peer) in enumerate(zip(self._regions, remote)):
+            if local.kind == "page":
+                pairs = list(zip(src, dst))
+            else:
+                pairs = [(src_slot, dst_slot)]
+            groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
+            for su, du in pairs:
+                lc, lo = local.locate(su)
+                rc, ro = peer.locate(du)
+                group = groups.setdefault((lc, rc), ([], [], []))
+                group[0].append(lo)
+                group[1].append(ro)
+                group[2].append(local.unit)
+            for (lc, rc), (l_offs, r_offs, sizes) in groups.items():
+                l_offs, r_offs, sizes = self.merge_contiguous_blocks(
+                    l_offs, r_offs, sizes
+                )
+                plan.append(
+                    (self._region_session(engine_id, ri, lc, rc), l_offs, r_offs, sizes)
+                )
+        return plan
+
+    def _write_regions(self, request: dict[str, Any], engine_id: EngineId) -> list[Any]:
+        """Push a request's PAGE blocks and SLOT units; return the statuses."""
+        plan = self._region_plan(request, engine_id)
+        statuses: list[Any] = []
+        try:
+            for session, l_offs, r_offs, sizes in plan:
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        sizes, l_offs, r_offs, session
+                    )
+                )
+        except Exception:
+            if not statuses:
+                raise
+            # The queued write has to settle before the source blocks are released.
+            logger.exception(
+                "transfer %s: could not post every write", request["transfer_id"]
+            )
+            statuses.append(_POST_FAILED)
+        return statuses
 
     def _register_state(self, layer_name: str, kv_cache: Any) -> None:
         """Register one layer's per-request state, one slot per dim-0 row.
@@ -640,7 +798,24 @@ class MoRIIOConnector(KVConnectorBase):
             return
         src_slot = int(getattr(meta, "remote_slot_index", -1))
         dst_slot = int(getattr(meta, "local_slot_index", -1))
-        if self._state_tensors and (src_slot < 0 or dst_slot < 0):
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        if self._regions is not None:
+            has_slots = any(r.kind == "slot" for r in self._regions)
+            if remote_tp_size != self.tp_size or (
+                has_slots and (src_slot < 0 or dst_slot < 0)
+            ):
+                logger.error(
+                    "req %s: region transfer needs equal TP (producer %d, "
+                    "consumer %d) and a state slot on both ends (src=%d, dst=%d)",
+                    req_id,
+                    remote_tp_size,
+                    self.tp_size,
+                    src_slot,
+                    dst_slot,
+                )
+                self._fail_before_transfer(req_id, meta)
+                return
+        elif self._state_tensors and (src_slot < 0 or dst_slot < 0):
             # The KV alone would land, and decode would resume the recurrent
             # state from whatever its slot last held.
             logger.error(
@@ -664,8 +839,6 @@ class MoRIIOConnector(KVConnectorBase):
                     dst_slot,
                     self._state_digest(dst_slot),
                 )
-
-        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
         port = int(meta.remote_handshake_port) + get_port_offset(
             int(meta.remote_dp_rank or 0), self.tp_rank, remote_tp_size
         )
@@ -1228,6 +1401,8 @@ class MoRIIOConnector(KVConnectorBase):
         dst = [int(b) for b in request["dst_block_ids"]]
         src = [int(b) for b in request["src_block_ids"]]
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
+        if self._regions is not None:
+            return self._write_regions(request, engine_id)
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
@@ -1874,6 +2049,9 @@ class MoRIIOConnector(KVConnectorBase):
             sessions = self._built_sessions.pop(engine_id, None)
             if sessions is not None:
                 self._retired_sessions.append(sessions)
+            region_sessions = self._region_sessions.pop(engine_id, None)
+            if region_sessions is not None:
+                self._retired_sessions.append(region_sessions)
             state_sessions = self._built_state_sessions.pop(engine_id, None)
             if state_sessions is not None:
                 self._retired_sessions.append(state_sessions)
@@ -2110,6 +2288,73 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
+
+
+@dataclass(frozen=True)
+class _Region:
+    """One registered transfer region, as both ends address it.
+
+    ``kind`` is ``"page"`` (indexed by scheduler block) or ``"slot"`` (indexed
+    by per-request state slot). ``chunk_bytes`` is a whole number of units, so
+    a unit always sits inside a single registered chunk.
+    """
+
+    name: str
+    kind: str
+    base: int
+    total: int
+    unit: int
+    reverse: bool
+    chunk_bytes: int
+
+    @classmethod
+    def of(cls, name: str, kind: str, region: Any) -> _Region:
+        unit = int(region.unit_bytes)
+        if unit > MAX_RDMA_CHUNK_BYTES:
+            raise ValueError(f"region {name}: a {unit} B unit exceeds one RDMA chunk")
+        return cls(
+            name,
+            kind,
+            int(region.base_addr),
+            int(region.total_bytes),
+            unit,
+            bool(region.reverse_indexed),
+            (MAX_RDMA_CHUNK_BYTES // unit) * unit,
+        )
+
+    @classmethod
+    def from_layout(cls, entry: list[Any]) -> _Region:
+        name, kind, unit, total, reverse, chunk_bytes = entry
+        return cls(name, kind, 0, total, unit, reverse, chunk_bytes)
+
+    def layout(self) -> list[Any]:
+        return [
+            self.name,
+            self.kind,
+            self.unit,
+            self.total,
+            self.reverse,
+            self.chunk_bytes,
+        ]
+
+    def shape(self) -> tuple[Any, ...]:
+        """What the handshake compares. Pool totals may differ."""
+        return (self.name, self.kind, self.unit, self.reverse, self.chunk_bytes)
+
+    def chunks(self) -> list[tuple[int, int]]:
+        return [
+            (self.base + offset, min(self.chunk_bytes, self.total - offset))
+            for offset in range(0, self.total, self.chunk_bytes)
+        ]
+
+    def locate(self, index: int) -> tuple[int, int]:
+        """``(chunk, offset within chunk)`` of unit ``index``."""
+        if not 0 <= index < self.total // self.unit:
+            raise ValueError(f"region {self.name}: unit {index} is out of range")
+        offset = KVTransferRegion.unit_offset(
+            index, self.total, self.unit, self.reverse
+        )
+        return offset // self.chunk_bytes, offset % self.chunk_bytes
 
 
 class _PostFailed:
