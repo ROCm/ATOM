@@ -1120,11 +1120,11 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
     assert build(64, fp8).casts_q
     (p,) = seen
     assert (p.head_size, p.head_size_v, p.block_size) == (64, 64, 1024)
-    assert p.q_dtype == p.kv_cache_dtype == fp8
+    assert p.q_dtype == p.kv_cache_dtype == p.v_cache_dtype == fp8
     assert (p.num_query_heads, p.num_kv_heads, p.num_queries_per_kv) == (56, 2, 28)
     assert (p.softmax_scale, p.max_seqlen_k, p.num_sms) == (0.125, 4096, 256)
     assert p.softcap == 0 and p.causal and p.sliding_window == 0
-    assert p.max_seqlen_q == 1 and p.all_decode
+    assert p.max_seqlen_q == 1 and p.all_decode and p.spec_decode is False
     assert not (p.shuffled_kv_cache or p.use_alibi_slopes or p.use_qq_bias)
     unset = {f for f in ua._UAParams._fields if getattr(p, f) is None}
     optional = set(ua._UAParams._field_defaults)
@@ -1134,9 +1134,6 @@ def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch)
     # A bf16 pool takes q as it is, without asking.
     assert not build(64, torch.bfloat16).casts_q
     assert len(seen) == 2
-
-    monkeypatch.delattr(ua, "_gfx950_gluon_supported")
-    assert not build(64, fp8).casts_q
 
 
 def test_the_block_read_refuses_a_pool_it_was_not_built_for():

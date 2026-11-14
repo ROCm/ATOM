@@ -31,14 +31,9 @@ pool is not, so q stays bf16 there, as everywhere else.
 
 from __future__ import annotations
 
-import logging
-
 import torch
 from aiter.ops.triton.attention import unified_attention as ua
 from aiter.ops.triton.utils.device_info import get_num_sms
-
-logger = logging.getLogger("atom")
-
 
 # The `_UAParams` fields a deployment does not fix: a call's tensors and the
 # counts read off them, and what aiter derives inside the call from its own
@@ -79,18 +74,10 @@ def gluon_takes_pool_dtype_q(
     read fixes for the deployment, as `DSparkGQABlockAttention.__call__`
     passes it: ``num_query_heads`` is the folded query's. Only
     ``_UNFIXED_FIELDS`` are ``None``; the optional fields keep aiter's own
-    defaults. A missing gate leaves q uncast and says so; a renamed
-    or added field raises.
+    defaults. A renamed symbol, or a new required field, raises; a new
+    defaulted field keeps its default.
     """
-    supported = getattr(ua, "_gfx950_gluon_supported", None)
-    params_t = getattr(ua, "_UAParams", None)
-    if supported is None or params_t is None:
-        logger.warning(
-            "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
-            "the DSpark block read keeps q in bf16 over an fp8 pool"
-        )
-        return False
-    params = params_t(
+    params = ua._UAParams(
         **dict.fromkeys(_UNFIXED_FIELDS),
         softmax_scale=softmax_scale,
         softcap=0,
@@ -106,13 +93,15 @@ def gluon_takes_pool_dtype_q(
         block_size=block_size,
         q_dtype=kv_dtype,
         kv_cache_dtype=kv_dtype,
+        v_cache_dtype=kv_dtype,  # K and V share the one pool's dtype
         all_decode=True,
+        spec_decode=False,  # aiter: equal_seqlen_q and not all_decode
         shuffled_kv_cache=False,
         use_alibi_slopes=False,
         use_qq_bias=False,
         num_sms=get_num_sms(),
     )
-    return bool(supported(params))
+    return bool(ua._gfx950_gluon_supported(params))
 
 
 def fold_block_queries(
