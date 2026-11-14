@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom import plugin_host
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import (
     native_quant_linear,
@@ -259,6 +260,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # module tree so the loader looks for no new weight; it holds
         # main_norm's own weight tensor, so loads and weight syncs reach it.
         self._build_main_norm_quant()
+        self._ctx_seam = plugin_host.bind(
+            "v41.draft.ctx", self._quantize_taps, capability=self._ctx_capability
+        )
 
     def _build_main_norm_quant(self):
         main = self.mtp[0].main_norm
@@ -319,11 +323,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
         residual = inputs[0].settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
-    def project_context(self, taps):
+    def project_context(self, taps, x_scale=None):
         """`main_norm(main_proj(concat(taps)))` as `[1, N, hidden]`."""
-        return self.mtp[0].main_norm(self._project_taps(taps))
+        return self.mtp[0].main_norm(self._project_taps(taps, x_scale))
 
-    def project_context_quant(self, taps):
+    def project_context_quant(self, taps, x_scale=None):
         """`project_context`, emitted as the fused KV GEMM's quantized input.
 
         Returns E4M3 values and their row-major group-32 UE8M0 scales, the
@@ -337,19 +341,24 @@ class DeepseekV41DSpark(DSparkDraftModel):
         `ATOM_USE_MODEL_SENSITIVE_RMSNORM` rounding mode, so `write_context_kv`
         keeps the chain when that is set.
         """
-        return self._main_norm_quant()(self._project_taps(taps))
+        return self._main_norm_quant()(self._project_taps(taps, x_scale))
 
-    def _project_taps(self, taps):
+    def _project_taps(self, taps, x_scale=None):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
         `main_proj` quantizes its input with `quantize_fp8`; the taps are
         quantized where they lie instead, to the same fp8 rows and scales,
         minus the concatenated copy. `quantize_fp8_taps` joins them itself for
         a shape its kernel does not take, and passes a single joined block
-        (a PP relay) through as it is.
+        (a PP relay) through as it is. With `x_scale`, `taps` is main_proj's
+        quantized input itself; a lone tensor is one bf16 block (both are what
+        `v41.draft.ctx` may give).
         """
-        x, x_scale = quantize_fp8_taps(taps)
-        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
+        if x_scale is None:
+            if isinstance(taps, torch.Tensor):
+                taps = [taps]
+            taps, x_scale = quantize_fp8_taps(taps)
+        return self.mtp[0].main_proj(taps.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""
@@ -359,6 +368,19 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def context_layers(self):
         return tuple(layer.attn for layer in self.mtp)
 
+    @staticmethod
+    def _quantize_taps(taps, rows, running_tokens):
+        """main_proj's input pair: the taps on the window's rows, cut to the
+        forward's width and quantized where they lie."""
+        if rows is not None:
+            taps = [tap[rows] for tap in taps]
+        return quantize_fp8_taps([tap[:running_tokens] for tap in taps])
+
+    def _ctx_capability(self, *inputs, **kwargs):
+        """What a `v41.draft.ctx` plugin may rely on: main_proj's input format."""
+        group32 = self.mtp[0].main_proj.native_a8_group_rows == 32
+        return {"quant": plugin_host.MX if group32 else None, "flags": {}}
+
     def write_context_kv(self, taps, positions, slot_mapping=None):
         from atom.utils.forward_context import get_forward_context
 
@@ -367,26 +389,26 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step
-        plan = step.replay
+        plan, rows = step.replay, None
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
             if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
-            taps, positions = [tap[rows] for tap in taps], positions[rows]
+            positions = positions[rows]
         # The forward's own width, padding included, because that is what the
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
-        # projected and then written nowhere. The rows are cut here, as views,
-        # and `project_context` takes every row it is given.
+        # projected and then written nowhere. The seam takes the window's rows
+        # and cuts them to it; `project_context` takes every row it is given.
         tokens = step.running_tokens
-        taps = [tap[:tokens] for tap in taps]
+        ctx, ctx_scale = self._ctx_seam(taps, rows, tokens)
         positions = positions[:tokens][None]
         layers = self.context_layers
         fused = self._context_kv_fusion()
         if fused is None:
-            hidden = self.project_context(taps)
+            hidden = self.project_context(ctx, ctx_scale)
             for attention in layers:
                 keys = attention.project_context(
                     hidden, positions, self.rope, packed=cache.window_fp8
@@ -395,11 +417,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         weight, weight_scale, group_rows, width, preshuffled = fused
         if envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM:
-            hidden, hidden_scale = self.project_context(taps), None
+            hidden, hidden_scale = self.project_context(ctx, ctx_scale), None
         else:
             # The norm emits the GEMM's quantized input, so the GEMM does not
             # run its own quantize_fp8 on the bf16 norm output.
-            hidden, hidden_scale = self.project_context_quant(taps)
+            hidden, hidden_scale = self.project_context_quant(ctx, ctx_scale)
         kv = native_quant_linear(
             hidden,
             weight,
