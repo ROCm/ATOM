@@ -1,0 +1,36 @@
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+  File "/app/ATOM/atom/models/qwen4_exp.py", line 393, in forward
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+  File "/app/ATOM/atom/model_ops/moe.py", line 5353, in forward
+  File "/usr/local/lib/python3.12/dist-packages/torch/_ops.py", line 1269, in __call__
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 116, in __torch_function__
+  File "/usr/local/lib/python3.12/dist-packages/torch/_ops.py", line 1269, in __call__
+  File "/app/ATOM/atom/model_ops/moe.py", line 3460, in moe_forward
+  File "/app/ATOM/atom/model_ops/moe.py", line 5663, in forward_impl
+  File "/app/ATOM/atom/model_ops/moe.py", line 5495, in _run_experts
+  File "/app/ATOM/atom/utils/decorators.py", line 88, in _wrapped
+  File "/app/ATOM/atom/model_ops/moe.py", line 900, in apply
+  File "/app/aiter/aiter/presorted_moe.py", line 230, in wrapper
+  File "/app/aiter/aiter/fused_moe.py", line 1342, in fused_moe
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 341, in wrapper_custom
+  File "/usr/local/lib/python3.12/dist-packages/torch/_ops.py", line 1269, in __call__
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 372, in outer_wrapper
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 254, in wrapper
+  File "/app/aiter/aiter/fused_moe.py", line 1508, in fused_moe_
+  File "/app/aiter/aiter/fused_moe.py", line 1656, in _fused_moe_impl
+    raise ValueError(
+ValueError: gfx1250 fused_moe requires gu_interleave weight layout (gate_mode='interleave'), got 'separated'
+----- (same error in server_perf.log) -----
+ValueError: gfx1250 fused_moe requires gu_interleave weight layout (gate_mode='interleave'), got 'separated'
+----- last 10 lines (acc) -----
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 98, in __init__
+    self.core_mgr = CoreManager(config)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 665, in __init__
+    self._wait_for_all_ready_signals()
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 750, in _wait_for_all_ready_signals
+    raise RuntimeError(
+RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization
