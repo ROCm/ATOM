@@ -148,6 +148,19 @@ def test_both_kv_formats_are_served(mi355x, kv):
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 
+def test_auto_serves_fp8_kv_only_when_asked(mi355x, served, monkeypatch, caplog):
+    """The fp8 pool is opt-in (``AUTO_KV_DTYPES``: measured on MI350X, not yet on MI355X): "auto" keeps ATOM's mono
+    path with one info line naming the opt-in; "1" serves it."""
+    cfg = _config(served, kv_cache_dtype="fp8")
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert hi_gate.decide(cfg, _drafter(), _builder(), 0) is False
+    line = "V4.1 mono hi off: --kv_cache_dtype fp8 (served with ATOM_DSV41_MONO_HI=1 only); ATOM's mono path"
+    assert [r.getMessage() for r in caplog.records] == [line]
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
+    assert hi_gate.decide(cfg, _drafter(), _builder(), 0) is True
+
+
 @pytest.mark.parametrize("block", [1, 16, 64, 256])
 def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
     """ATOM lays V4.1's KV out in 128-token pages whatever ``--block-size`` asks: served either way."""
