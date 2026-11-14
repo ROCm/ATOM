@@ -621,13 +621,13 @@ def stage_D(c):
     if cl < (TR + RPC - 1) // RPC:
         _kg_rows(c, t, r0, jj, sm, o, RPC, TR)
         # the merge's RoPE cos / sin (last 64 dims; position -> table row: two dependent loads) fetched now, used at the end
-        rrow = r0 + fx.min(t, I32(QV - 1)) // H
+        rrow = r0 + fx.min(t // 8, I32(QV - 1)) // H   # (the merge: 8 lanes a qv)
         if fx.const_expr(TR % RPC != 0):
             rrow = fx.min(rrow, I32(TR - 1))
         rf0 = fx.max(jj * 32 - (HD - 64), I32(0)) // 2
         rpp = hx.gload(c["rpos"] + i64(rrow) * 8, fx.Int64)
-        rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
-        rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
+        rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
+        rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         gpu.barrier()
         for rr in range_constexpr(RPC):
             for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
@@ -789,40 +789,34 @@ def _d_merge(c, cl, jj, rcv, rsv):
                 num = num + pv8[p][e].to(F32) * wq[p // 4][p % 4]
             hx.lstore(ob + (qv * 32 + dd8) * 4, (num * hx.lload(sm + o["wgt"] + (qv * WG + CL) * 4, F32)).to(BF16).to(F32))
     gpu.barrier()
-    if (jj * 32 >= HD - 64) & (t < QV):   # RoPE of the last 64 dims: cos/sin and x as vector loads (all in flight)
-        row = r0 + t // H
-        f0 = (jj * 32 - (HD - 64)) // 2
-        csv = [[rcv[4 * k + e].to(F32) for e in range(4)] for k in range(4)]
-        snv = [[rsv[4 * k + e].to(F32) for e in range(4)] for k in range(4)]
-        xq = [hx.lload(ob + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
-        outv = []
-        for e2 in range_constexpr(16):
-            cs = csv[e2 // 4][e2 % 4]
-            sn = snv[e2 // 4][e2 % 4]
-            x0 = xq[(2 * e2) // 4][(2 * e2) % 4]
-            x1 = xq[(2 * e2 + 1) // 4][(2 * e2 + 1) % 4]
-            outv.append((x0 * cs + x1 * sn).to(BF16).to(F32))
-            outv.append((F32(0.0) - x0 * sn + x1 * cs).to(BF16).to(F32))
-        for k in range_constexpr(8):
-            hx.lstore(ob + (t * 32 + 4 * k) * 4, fx.Vector.from_elements(outv[4 * k:4 * k + 4], F32))
-    gpu.barrier()
-    live_q = t < QV
+    # RoPE (the last 64 dims) and MXFP8 of each qv's 32 dims in registers: 8 lanes a qv (4 dims = 2 RoPE pairs each; the
+    # block amax over the 8 lanes by xor shuffles -- the same values / code / words as one thread's 32: bit-identical)
+    assert QV * 8 <= THREADS
+    qm = fx.min(t // 8, I32(QV - 1))
+    pq = t % 8
+    live_q = t < QV * 8
     if fx.const_expr(TR % RPC != 0):   # the last cluster's rows past TR: not stored
-        live_q = live_q & (r0 + t // H < TR)
+        live_q = live_q & (r0 + qm // H < TR)
+    v4 = hx.lload(ob + (qm * 32 + pq * 4) * 4, F32, 4)
+    x = [v4[e] for e in range(4)]
+    rot = []
+    for k in range_constexpr(2):
+        cs = rcv[k].to(F32)
+        sn = rsv[k].to(F32)
+        rot.append((x[2 * k] * cs + x[2 * k + 1] * sn).to(BF16).to(F32))
+        rot.append((F32(0.0) - x[2 * k] * sn + x[2 * k + 1] * cs).to(BF16).to(F32))
+    is_rope = jj * 32 >= HD - 64
+    vals = [is_rope.select(rot[e], x[e]) for e in range(4)]
+    amax = fx.max(fx.max(abs(vals[0]), abs(vals[1])), fx.max(abs(vals[2]), abs(vals[3])))
+    for sh in range_constexpr(3):
+        amax = fx.max(amax, amax.shuffle_xor(1 << sh, 32))
+    code = e8m0_of(amax)
+    word = q8words(vals, inv_pow2(code))[0]
     if live_q:
-        row = r0 + t // H
-        vq = [hx.lload(ob + (t * 32 + 4 * k) * 4, F32, 4) for k in range(8)]
-        vals = [vq[e // 4][e % 4] for e in range(32)]
-        amax = F32(0.0)
-        for e in range_constexpr(32):
-            amax = fx.max(amax, abs(vals[e]))
-        code = e8m0_of(amax)
-        inv = inv_pow2(code)
-        c["stx"](c["os"] + i64(row * (NQ // 32) + (t % H) * (HD // 32) + jj), code.to(fx.Int8))
-        words = q8words([vals[e] for e in range(32)], inv)
-        ob8 = c["o8"] + i64(row * NQ + (t % H) * HD + jj * 32)
-        c["stx"](ob8, fx.Vector.from_elements(words[:4], I32))
-        c["stx"](ob8 + i64(16), fx.Vector.from_elements(words[4:], I32))
+        row = r0 + qm // H
+        if pq == 0:
+            c["stx"](c["os"] + i64(row * (NQ // 32) + (qm % H) * (HD // 32) + jj), code.to(fx.Int8))
+        c["stx"](c["o8"] + i64(row * NQ + (qm % H) * HD + jj * 32 + pq * 4), word)
     if fx.const_expr("dflag" in c):   # (v3 e6) this (row cluster, key segment)'s o8 / os out: one LL flag
         hx.wait_storecnt0()
         gpu.barrier()
@@ -841,13 +835,13 @@ def stage_D2(c):
         cl = bb // CL
         jj = bb % CL
         r0 = cl * RPC
-        rrow = r0 + fx.min(t, I32(QV - 1)) // H
+        rrow = r0 + fx.min(t // 8, I32(QV - 1)) // H   # (the merge: 8 lanes a qv)
         if fx.const_expr(TR % RPC != 0):
             rrow = fx.min(rrow, I32(TR - 1))
         rf0 = fx.max(jj * 32 - (HD - 64), I32(0)) // 2
         rpp = hx.gload(c["rpos"] + i64(rrow) * 8, fx.Int64)
-        rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
-        rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0)) * 2, BF16, 16)
+        rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
+        rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         hx.wait_flags(c["a1flag"] + i64(cl * CL) * 8, CL, c["a1tag"], w, l, 8)
         gpu.barrier()
         _d_merge(c, cl, jj, rcv, rsv)
