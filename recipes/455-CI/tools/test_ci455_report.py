@@ -5,7 +5,6 @@ from ci455_report import (
     ModelResult,
     highlights,
     missing_followups,
-    missing_owners,
     report_md,
     summary_row,
 )
@@ -275,25 +274,13 @@ GAINING = {
 }
 
 
-def test_good_news_tags_the_owner_without_asking():
-    (line,) = highlights(
-        [model("Alpha", **GAINING)], owners={"alpha": "@alpha_owner @alpha_backup"}
+def test_the_highlights_tag_no_one():
+    # The owners are added where the highlights are posted, not in the result.
+    lines = highlights(
+        [model("Alpha", **GAINING), model("Bravo", **FAILING)],
+        followups={"bravo": {"action": "repro", "link": "r.md"}},
     )
-    assert line.endswith("@alpha_owner @alpha_backup") and "please" not in line
-
-
-def test_a_model_without_an_owner_gets_no_mention():
-    (line,) = highlights([model("Alpha", **GAINING)], owners={"bravo": "@bravo_owner"})
-    assert "@" not in line
-
-
-def test_missing_owners_names_the_models_with_news_and_no_owner():
-    results = [
-        model("Alpha", **GAINING),
-        model("Bravo", **FAILING),
-        model("Charlie", **FLAT),
-    ]
-    assert missing_owners(results, {"alpha": "@alpha_owner"}) == ["Bravo"]
+    assert len(lines) == 2 and not any("@" in line for line in lines)
 
 
 def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
@@ -361,11 +348,11 @@ def test_summary_row_of_a_first_run_has_no_delta():
     ]
 
 
-def test_a_problem_just_tags_the_owner():
-    (line,) = highlights([model("Bravo", **FAILING)], owners={"bravo": "@bravo_owner"})
+def test_a_problem_without_a_follow_up_is_just_the_problem():
+    (line,) = highlights([model("Bravo", **FAILING)])
     assert (
-        line.startswith("❌ Bravo: ")
-        and line.endswith(" @bravo_owner")
+        line.startswith("❌ Bravo: c64 failed")
+        and "@" not in line
         and "please" not in line
     )
 
@@ -437,18 +424,17 @@ PR_OPEN = "https://github.com/ROCm/aiter/pull/1234"
 PR_OURS = "https://github.com/ROCm/ATOM/pull/2601"
 
 
-def follow(action, link, owner="", note=""):
-    return {"action": action, "link": link, "owner": owner, "note": note}
+def follow(action, link, note=""):
+    return {"action": action, "link": link, "note": note}
 
 
-def test_a_failure_carries_the_open_pr_that_fixes_it_before_the_owner():
+def test_a_failure_carries_the_open_pr_that_fixes_it():
     (line,) = highlights(
         [model("Bravo", **FAILING)],
-        owners={"bravo": "@bravo_owner"},
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
     assert line.startswith("❌ Bravo: c64 failed")
-    assert line.endswith(f"Fix in progress: [ROCm/aiter#1234]({PR_OPEN}). @bravo_owner")
+    assert line.endswith(f"Fix in progress: [ROCm/aiter#1234]({PR_OPEN}).")
 
 
 def test_a_regression_we_fixed_links_our_verified_pr():
@@ -460,24 +446,12 @@ def test_a_regression_we_fixed_links_our_verified_pr():
     assert line.endswith(f"Fixed by us in [ROCm/ATOM#2601]({PR_OURS}), verified.")
 
 
-def test_a_problem_with_only_a_repro_gets_the_placeholder_owner():
+def test_a_problem_with_only_a_repro_links_it():
     (line,) = highlights(
         [model("Bravo", **FAILING)],
-        owners={"bravo": "@bravo_owner"},
         followups={"bravo": follow("repro", "../runs/20261114/bravo/repro.md")},
     )
-    assert line.endswith(
-        "No fix yet; [repro](../runs/20261114/bravo/repro.md). @owner_tbd"
-    )
-
-
-def test_the_follow_up_owner_replaces_the_model_owner():
-    (line,) = highlights(
-        [model("Bravo", **FAILING)],
-        owners={"bravo": "@bravo_owner"},
-        followups={"bravo": follow("repro", "r.md", owner="@fixer_name")},
-    )
-    assert line.endswith(" @fixer_name") and "@bravo_owner" not in line
+    assert line.endswith("No fix yet; [repro](../runs/20261114/bravo/repro.md).")
 
 
 def test_good_news_takes_no_follow_up():
@@ -503,13 +477,7 @@ def test_missing_followups_names_problems_without_a_usable_follow_up():
     assert missing_followups(results, followups) == ["Bravo", "Delta", "Echo"]
 
 
-def test_a_placeholder_owner_counts_as_an_owner():
-    results = [model("Bravo", **FAILING)]
-    assert missing_owners(results, {}, {"bravo": follow("repro", "r.md")}) == []
-    assert missing_owners(results, {}, {}) == ["Bravo"]
-
-
-def test_the_details_list_each_problem_with_its_next_step_owner_and_note():
+def test_the_details_list_each_problem_with_its_next_step_and_note():
     text = report_md(
         "2026-11-14",
         {},
@@ -525,10 +493,10 @@ def test_the_details_list_each_problem_with_its_next_step_owner_and_note():
     details = text.split("\n## Details\n")[1]
     table = details.split("\n### Follow-ups\n")[1].split("\n### ")[0]
     assert (
-        f"| Bravo | Fixed by us in [ROCm/ATOM#2601]({PR_OURS}), verified. | — | c64 905 tok/s/GPU on 455 |"
+        f"| Bravo | Fixed by us in [ROCm/ATOM#2601]({PR_OURS}), verified. | c64 905 tok/s/GPU on 455 |"
         in table
     )
-    assert "| Charlie | Missing: needs a follow-up | — | — |" in table
+    assert "| Charlie | Missing: needs a follow-up | — |" in table
     assert "Alpha" not in table
 
 

@@ -56,7 +56,7 @@ ACCURACY_COLUMNS = (
 )
 # Columns of followups.csv: the next step for each problem in the highlights
 # (455-CI-guide.md §3.7).
-FOLLOWUP_COLUMNS = ("test_date", "model", "action", "link", "owner", "note")
+FOLLOWUP_COLUMNS = ("test_date", "model", "action", "link", "note")
 # Columns of pending_fixes.csv: unmerged PRs a model is known to need on main,
 # all of `prs` together (455-CI-guide.md §3.7).
 PENDING_COLUMNS = ("model", "prs", "note", "since")

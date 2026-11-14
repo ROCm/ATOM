@@ -6,16 +6,15 @@
 A session is one day's run (Saturday: MLPerf Endpoint on the image built that
 day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
 recipes/result/<YYYYMMDD>-result.md (the result dir next to the data dir, or
---out): the short summary (highlights, tagging each model's owner from
-owners.csv, and the summary table), the findings from
+--out): the short summary (highlights and the summary table), the findings from
 runs/<YYYYMMDD>/findings.md, then the details (environment, every number, the
 trend charts of make_charts.py and each failure's core error log from
 runs/<YYYYMMDD>/<slug>/error.log). Each problem
 in the highlights gets its next step from followups.csv (455-CI-guide.md §3.7);
 for one without, the unmerged PRs pending_fixes.csv lists for the model are
 suggested as a ready followups.csv row.
-Prints the highlights, a warning for news without an owner or a problem without
-a follow-up, and last the report's path.
+Prints the highlights, a warning for a problem without a follow-up, and last the
+report's path. The result tags no one: the owners are added where it is posted.
 The image comes from runs/<image date>/image.json, written when the image was
 built (455-CI-guide.md §2.4), else from the CSV rows.
 """
@@ -31,7 +30,6 @@ from ci455_report import (
     ModelResult,
     highlights,
     missing_followups,
-    missing_owners,
     pr_label,
     report_md,
 )
@@ -109,10 +107,6 @@ def main(argv=None):
         for slug, name in MODELS[s]
     ]
     env = environment(args.data_dir, [r for r in today if r["scenario"] in scenarios])
-    owners = {
-        r["model"]: r.get("owner", "")
-        for r in _rows(os.path.join(args.data_dir, "owners.csv"))
-    }
 
     path = os.path.abspath(
         args.out or os.path.join(args.data_dir, os.pardir, "result", f"{tag}-result.md")
@@ -138,17 +132,12 @@ def main(argv=None):
                 os.path.relpath(os.path.join(run_dir, "charts"), out),
                 os.path.relpath(run_dir, out),
                 args.mock,
-                owners,
                 followups,
                 _read(os.path.join(run_dir, "findings.md")),
             )
         )
-    for line in highlights(results, owners, followups):
+    for line in highlights(results, followups):
         print("-", line)
-    for name in missing_owners(results, owners, followups):
-        print(
-            f"WARNING: {name} is in the highlights but has no owner in owners.csv, so nobody is tagged."
-        )
     pending = {
         r["model"]: (r.get("prs") or "").split()
         for r in _rows(os.path.join(args.data_dir, "pending_fixes.csv"))

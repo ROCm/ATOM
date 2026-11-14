@@ -123,8 +123,6 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
         "Traceback (most recent call last):\nRuntimeError: HIP error: out of memory\n"
     )
 
-    (ci / "owners.csv").write_text("model,owner\nkimi-k3,@k3_owner\n")
-
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
 
     assert [p.name for p in (ci.parent / "result").iterdir()] == ["20261114-result.md"]
@@ -141,7 +139,7 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
         and "../455-CI/runs/20261114/charts/perf-endpoint.png" in details
     )
     assert "| Kimi-K3 (2.8T) | tp8dcp8 | 4 |" in details
-    assert "@k3_owner" in summary and "please" not in summary
+    assert not re.search(r"\s@[\w-]", summary) and "please" not in summary
     assert not re.search(CJK, report)
 
 
@@ -187,20 +185,6 @@ def test_the_console_ends_with_the_report_path(ci, capsys):
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
     last = capsys.readouterr().out.rstrip().splitlines()[-1]
     assert last == f"Report: {result(ci, '20261114')}"
-
-
-def test_news_about_a_model_without_an_owner_is_flagged_on_the_console(ci, capsys):
-    write_csv(
-        ci / "perf.csv",
-        PERF_COLUMNS,
-        [
-            perf("2026-11-07", 64, "1000"),
-            perf("2026-11-14", 64, "", status="fail", error="RuntimeError: x"),
-        ],
-    )
-    main(["--date", "2026-11-14", "--data-dir", str(ci)])
-    out = capsys.readouterr().out
-    assert "no owner" in out and "Kimi-K3" in out
 
 
 def test_a_model_left_untested_by_a_machine_failure_is_not_news(ci):
@@ -249,10 +233,8 @@ def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
     )
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
     report = result(ci, "20261114").read_text()
-    assert (
-        "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md). @owner_tbd"
-        in report
-    )
+    assert "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md)." in report
+    assert "@owner_tbd" not in report
     out = capsys.readouterr().out
     assert "DeepSeek R1" in out and "no follow-up" in out
     assert out.rstrip().splitlines()[-1].startswith("Report: ")

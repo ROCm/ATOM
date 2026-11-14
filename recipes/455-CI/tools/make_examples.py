@@ -67,18 +67,6 @@ PARALLEL = {
     "minimax-m3": "tp4",
     "qwen-3.8-flash": "tp1",
 }
-# Placeholder owners: underscores are not allowed in GitHub logins, so these
-# can never tag a real person.
-OWNERS = {
-    "deepseek-r1": "@r1_owner",
-    "deepseek-v4.1-flash": "@v41_flash_owner",
-    "kimi-k3": "@k3_owner",
-    "qwen-35b-a3b": "@qwen35b_owner",
-    "deepseek-v4-pro": "@v4_pro_owner",
-    "glm-5.2": "@glm52_owner",
-    "minimax-m3": "@m3_owner",
-    "qwen-3.8-flash": "@qwen38_owner",
-}
 GSM8K = {
     "deepseek-r1": 0.952,
     "deepseek-v4.1-flash": 0.941,
@@ -266,11 +254,6 @@ def main():
     perf, acc = mock_rows()
     write_csv(os.path.join(OUT, "perf.csv"), PERF_COLUMNS, perf)
     write_csv(os.path.join(OUT, "accuracy.csv"), ACCURACY_COLUMNS, acc)
-    write_csv(
-        os.path.join(OUT, "owners.csv"),
-        ("model", "owner"),
-        [{"model": m, "owner": o} for m, o in OWNERS.items()],
-    )
     write_csv(
         os.path.join(OUT, "accuracy_baseline.csv"),
         ("model", "baseline"),
