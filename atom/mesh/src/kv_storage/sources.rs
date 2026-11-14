@@ -34,6 +34,17 @@ pub struct OffloadReport {
     pub chain_check: String,
 }
 
+impl OffloadReport {
+    /// The engine's report sizes what the router hashes per chunk, the keys it builds
+    /// per rank and the masters it asks, so it must stay within reason.
+    fn in_bounds(&self) -> bool {
+        (1..=65_536).contains(&self.chunk_tokens)
+            && (1..=1024).contains(&self.world)
+            && self.namespace.len() <= 128
+            && self.masters.len() <= 64
+    }
+}
+
 /// A store as `/kv_storage/sources` shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageSource {
@@ -83,6 +94,16 @@ impl StorageSources {
         let mut sources = self.sources.lock();
         remove_reader(&mut sources, worker);
         if offload.backend != MOONCAKE_STORE {
+            return;
+        }
+        if !offload.in_bounds() {
+            warn!(
+                worker,
+                chunk_tokens = offload.chunk_tokens,
+                world = offload.world,
+                masters = offload.masters.len(),
+                "The engine's offload report is out of bounds"
+            );
             return;
         }
         let mut report = offload.clone();
@@ -275,5 +296,34 @@ mod tests {
         sources.remove("http://a:8000@0");
         sources.remove("http://a:8000@1");
         assert!(listed(&sources).is_empty());
+    }
+
+    #[test]
+    fn a_report_out_of_bounds_is_not_read() {
+        let sources = StorageSources::new(9003);
+        let good = store("atomkv1-0123456789abcdef01234567", &["10.0.0.1:50051"]);
+        let masters = (0..65).map(|port| format!("10.0.0.1:{port}")).collect();
+        for bad in [
+            OffloadReport {
+                chunk_tokens: u32::MAX,
+                ..good.clone()
+            },
+            OffloadReport {
+                world: 0,
+                ..good.clone()
+            },
+            OffloadReport {
+                namespace: "a".repeat(129),
+                ..good.clone()
+            },
+            OffloadReport {
+                masters,
+                ..good.clone()
+            },
+        ] {
+            sources.add("http://a:8000", "m", &good);
+            sources.add("http://a:8000", "m", &bad);
+            assert!(listed(&sources).is_empty(), "{bad:?}");
+        }
     }
 }
