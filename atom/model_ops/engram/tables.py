@@ -120,9 +120,13 @@ class HostEmbeddingTable:
         """Page-lock rows `[row_start, row_end)` so a device kernel can read
         them (`host_memory.pin_rows`); all-or-nothing.
 
+        A copy goes into GTT host memory, as device tensors, where the GPU
+        allows (`host_memory.pin_rows(device=True)`).
+
         `shared`: every DP-attention rank of the node page-locks this same
         whole table, so it is registered in place rather than copied unless
-        `ATOM_ENGRAM_UVA_COPY` is set (`host_memory.copies`).
+        `ATOM_ENGRAM_UVA_COPY` is set (`host_memory.copies`), and a copy is
+        one per NUMA node.
 
         A table holds one range: enabling a different one while a range is
         held raises -- `disable_uva()` first.
@@ -143,7 +147,7 @@ class HostEmbeddingTable:
         sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
             sources.append(self._scale[row_start:row_end])
-        shard = host_memory.pin_rows(sources, shared=shared)
+        shard = host_memory.pin_rows(sources, shared=shared, device=True)
         if shard is None:
             return False
         self._shard = shard
