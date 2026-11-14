@@ -5610,10 +5610,24 @@ class Scheduler:
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.
 
-        Runs only when a load completed or failed, or an early-loaded request
-        is settled and waiting. Offload completions are resolved here, and every settled resume that keeps its blocks (not only
-        the ones that just completed) moves ahead of the other waiters in one
-        stable pass. Nothing is re-sorted on the ticks after: the ways a
+        Re-sorts `waiting` in one stable pass, and only on one of two triggers:
+
+        * A receive completed or failed (`finished_recving_kv_req_ids` /
+          `failed_recving_kv_req_ids` is non-empty). Offload completions are
+          resolved here, and every settled resume that keeps its blocks (not
+          only the ones that just completed) moves ahead of the other waiters.
+          A settled early load stays where it is unless trigger two holds.
+        * The head is blocked while an early load is settled and waiting
+          behind it. The head is the first entry Phase 2 would try; it is
+          blocked on slots (`len(running) + parked >= max_num_seqs`) or on
+          blocks (`can_allocate_memoized(head) < 0`). Then the settled early
+          loads move ahead too, so the owner can run and release its
+          blocks/slot. This can happen on a later tick than the completion,
+          after the completion event was consumed.
+
+        With neither trigger the method returns without copying `waiting`: a
+        settled early load behind a head that can run keeps its arrival
+        position, and nothing is re-sorted on those ticks. The other ways a
         blocker gets ahead of a resume are `preempt` and parking
         (`_park_ready_offload_partial_prefills`), which both queue behind them.
         A P/D-only receive is only reordered here; admission resolves it before
