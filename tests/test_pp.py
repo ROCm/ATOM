@@ -209,21 +209,26 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "pp_rank,pp_size,arch,method,holds",
+    "pp_rank,pp_size,arch,method,holds,producer",
     [
-        (0, 2, "KimiK3ForConditionalGeneration", None, True),
-        (1, 2, "KimiK3ForConditionalGeneration", None, False),
+        (0, 2, "KimiK3ForConditionalGeneration", None, True, False),
+        (1, 2, "KimiK3ForConditionalGeneration", None, False, False),
         # A declared PP method's drafter shares the target's embedding.
-        (1, 2, "KimiK3ForConditionalGeneration", "dspark", True),
-        (1, 4, "KimiK3ForConditionalGeneration", "dspark", False),
-        (3, 4, "KimiK3ForConditionalGeneration", "dspark", True),
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        (1, 4, "KimiK3ForConditionalGeneration", "dspark", False, False),
+        (3, 4, "KimiK3ForConditionalGeneration", "dspark", True, False),
         # Undeclared: the drafter keeps its own, so build none for it.
-        (1, 2, "KimiK3ForConditionalGeneration", "eagle", False),
-        (1, 2, "MiniMaxM3SparseForCausalLM", "dspark", False),
-        (0, 1, "KimiK3ForConditionalGeneration", "dspark", True),
+        (1, 2, "KimiK3ForConditionalGeneration", "eagle", False, False),
+        (1, 2, "MiniMaxM3SparseForCausalLM", "dspark", False, False),
+        (0, 1, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        # A P/D producer's draft only writes context K/V: no last-stage copy.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", False, True),
+        (0, 2, "KimiK3ForConditionalGeneration", "dspark", True, True),
     ],
 )
-def test_pp_holds_embedding(monkeypatch, pp_rank, pp_size, arch, method, holds):
+def test_pp_holds_embedding(
+    monkeypatch, pp_rank, pp_size, arch, method, holds, producer
+):
     grp = MagicMock(is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1)
     fake_ps = MagicMock()
     fake_ps.get_pp_group.return_value = grp
@@ -234,6 +239,7 @@ def test_pp_holds_embedding(monkeypatch, pp_rank, pp_size, arch, method, holds):
     config = types.SimpleNamespace(
         hf_config=types.SimpleNamespace(architectures=[arch]),
         speculative_config=spec,
+        kv_transfer_config={"kv_role": "kv_producer"} if producer else {},
     )
     assert pp_holds_embedding(config) is holds
 
