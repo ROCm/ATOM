@@ -51,7 +51,7 @@ def test_split_pass_gathers_once_and_counts_only_sp_real_rows(
     monkeypatch.setattr(moe, "all_gatherv", gatherv)
     monkeypatch.setattr(moe, "reassign_gathered_shared_ids", reassign)
     monkeypatch.setattr(moe, "pcp_reduce_scatter", scatter)
-    monkeypatch.setattr(moe, "tbo_active", lambda: False)
+    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args: fn(*args))
 
     out = moe.FusedMoE._run_experts(layer, hidden, weights, ids)
 

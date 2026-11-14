@@ -105,7 +105,7 @@ def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
     fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
     ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
     is the same handle the native server resolves this cache through
-    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
+    (``atom.model_ops.attentions.aiter_attention._index_cache_spec``),
     which keeps the two paths on one arch-correct fp8 dtype instead of a
     hard-coded ``torch.float8_e4m3fn``.
 

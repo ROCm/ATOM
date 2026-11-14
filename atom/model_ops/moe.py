@@ -28,6 +28,7 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.distributed.comm_utils import gather_rows
 from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_reduce_scatter,
@@ -72,7 +73,6 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
 )
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
-    gather_rows,
     pack_routed_rows,
     resolve_routed_rows_wire,
 )
@@ -115,12 +115,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_enabled,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 
 logger = logging.getLogger("atom")
 
@@ -1469,14 +1464,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
+        gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # aiter's gfx1250 fused_moe rejects the separated gate/up layout for every
+        # G1U1 MoE, so on gfx1250 GU interleave is required, not opt-in.
+        self.is_guinterleave = (
+            envs.ATOM_MOE_GU_ITLV or self.fp8_activations or self.is_gfx1250
+        )
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        gfx = get_gfx()
-        self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         ep_moe = self.moe.use_ep
         if envs.is_set("ATOM_USE_TRITON_MOE"):
@@ -1786,15 +1785,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_triton_decode:
             assert self.is_gfx1250 and self.is_guinterleave and is_silu, (
                 "ATOM_USE_TRITON_MOE_DECODE=1 shares one weight copy between the "
-                "FlyDSL and Triton kernels, which only matches on gfx1250 + "
-                "ATOM_MOE_GU_ITLV=1 + SiLU (got gfx1250="
-                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu}). "
-                "NOTE the ATOM_MOE_GU_ITLV requirement is INVERTED from earlier "
-                "builds: this flag used to be skipped when GU interleaving was on "
-                "and to run with ATOM_MOE_GU_ITLV=0, which is now the "
-                "unsupported combination. A launch line carrying "
-                "ATOM_MOE_GU_ITLV=0 with ATOM_USE_TRITON_MOE_DECODE=1 needs "
-                "ATOM_MOE_GU_ITLV=1, or drop ATOM_USE_TRITON_MOE_DECODE."
+                "FlyDSL and Triton kernels, which only matches on gfx1250 + SiLU "
+                "with the gate/up interleaved layout, which gfx1250 always uses "
+                f"(got gfx1250={self.is_gfx1250}, interleaved={self.is_guinterleave}, "
+                f"silu={is_silu}). Elsewhere, drop ATOM_USE_TRITON_MOE_DECODE."
             )
             # FlyDSL trims the create_weights padding via hidden_pad /
             # intermediate_pad; the Triton kernels take no such argument and read
@@ -2135,6 +2129,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         prefix: str = "",
         x_scale: torch.Tensor | None = None,
         scheduled_tokens_gpu: torch.Tensor | None = None,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2179,6 +2175,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # block further down.
         if self.use_triton and self.use_triton_decode:
             use_triton_now = all_ranks_decode
+        # `shared_add` (FusedMoE.combine_accepts_shared) is only handed down to
+        # the modular kernel, whose combine adds it.
+        if shared_add is not None and (use_triton_now or self.fused_experts is None):
+            raise RuntimeError(
+                "a shared output to add reached an expert path without a combine "
+                "that adds it"
+            )
 
         if use_triton_now:
             from atom.model_ops.fused_moe_triton import (
@@ -2467,6 +2470,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_local_tokens=scheduled_tokens_gpu,
                 **moe_extra_args,
             )
+        # Only the mori v2 modular kernel takes a shared output
+        # (FusedMoE.combine_accepts_shared); the other kernels are not passed one.
+        shared_kwargs = (
+            {}
+            if shared_add is None
+            else {"shared_add": shared_add, "shared_ready": shared_ready}
+        )
         return self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -2490,6 +2500,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_pad=self.intermediate_pad,
             moe_extra_args=moe_extra_args,
             x_scale=x_scale,
+            **shared_kwargs,
         )
 
     def _apply_shared_experts_dense(self, layer, x, activation):
@@ -5321,22 +5332,52 @@ class FusedMoE(torch.nn.Module):
 
         return topk_weights, topk_ids
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if self.balance_router_logits is not None:
-            # Match the dtype of the logits being replaced. The table is built
-            # once at the default dtype, but aiter's `biased_grouped_topk`
-            # dispatches on `gating_output.dtype()` and then reinterpret_casts
-            # `correction_bias` to that same scalar_t -- so handing it a bf16
-            # table for a router whose bias is fp32 makes the kernel read that
-            # fp32 buffer at half width, i.e. garbage bias over half the
-            # experts. Only fake-EPLB reaches this, so the cast costs nothing
-            # on a real run.
-            router_logits = self.balance_router_logits[: hidden_states.shape[0]].to(
-                router_logits.dtype
-            )
-        return torch.ops.aiter.moe_forward(
-            hidden_states, router_logits, self.layer_name
+    def _routing_logits(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        if self.balance_router_logits is None:
+            return router_logits
+        # Match the dtype of the logits being replaced. The table is built
+        # once at the default dtype, but aiter's `biased_grouped_topk`
+        # dispatches on `gating_output.dtype()` and then reinterpret_casts
+        # `correction_bias` to that same scalar_t -- so handing it a bf16
+        # table for a router whose bias is fp32 makes the kernel read that
+        # fp32 buffer at half width, i.e. garbage bias over half the
+        # experts. Only fake-EPLB reaches this, so the cast costs nothing
+        # on a real run.
+        return self.balance_router_logits[: hidden_states.shape[0]].to(
+            router_logits.dtype
         )
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        return torch.ops.aiter.moe_forward(
+            hidden_states,
+            self._routing_logits(hidden_states, router_logits),
+            self.layer_name,
+        )
+
+    def combine_accepts_shared(self, rows: int) -> bool:
+        """Whether this layer's routed combine adds a shared-expert output
+        (`forward_maybe_comm_fused`'s ``shared_ready``) on a `rows`-row step:
+        MegaMoE behind the mori v2 modular kernel, on a step the comm-fused
+        backend (which joins the shared output its own way) and the SP MegaMoE
+        do not take, with no reduction after the combine that would count the
+        shared output more than once."""
+        backend = self._comm_fused_moe
+        if backend is not None and backend.supports(rows):
+            return False
+        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(rows):
+            return False
+        parallel = self.moe_parallel_config
+        if self.reduce_results or parallel.pcp_merge or parallel.dp_logical_ratio > 1:
+            return False
+        if not isinstance(self.quant_method, Mxfp4MoEMethod):
+            return False
+        from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+            MoriV2ModularKernel,
+        )
+
+        return isinstance(self.quant_method.fused_experts, MoriV2ModularKernel)
 
     def forward_maybe_comm_fused(
         self,
@@ -5346,10 +5387,16 @@ class FusedMoE(torch.nn.Module):
         before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
         before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Return ``(output, complete)`` after fused or ordinary dispatch.
 
         A complete output already contains the shared expert and TP reduction.
+        Off the comm-fused path, ``shared_ready`` (recorded on the stream that
+        produced ``shared_partial``; `combine_accepts_shared` must hold) has
+        the routed combine add ``shared_partial``: the output then contains the
+        shared expert, but not the TP reduction. Without it the caller adds
+        ``shared_partial`` itself.
         """
         backend = self._comm_fused_moe
         if backend is not None and backend.supports(hidden_states.shape[0]):
@@ -5365,7 +5412,27 @@ class FusedMoE(torch.nn.Module):
                 ),
                 True,
             )
-        return self(hidden_states, router_logits), False
+        if shared_ready is None:
+            return self(hidden_states, router_logits), False
+        if shared_partial is None or not self.combine_accepts_shared(
+            hidden_states.shape[0]
+        ):
+            raise RuntimeError(
+                "the routed combine was asked to add a shared output it cannot "
+                "take; check combine_accepts_shared first"
+            )
+        # Like the comm-fused backend, called directly rather than through the
+        # moe_forward custom op, which cannot carry the event: the caller runs
+        # inside its own opaque dual-stream op.
+        return (
+            self.forward_impl(
+                hidden_states,
+                self._routing_logits(hidden_states, router_logits),
+                shared_add=shared_partial,
+                shared_ready=shared_ready,
+            ),
+            False,
+        )
 
     def _run_experts(
         self,
@@ -5374,6 +5441,8 @@ class FusedMoE(torch.nn.Module):
         topk_ids: torch.Tensor,
         x_scale: torch.Tensor | None = None,
         gathered: bool = False,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
@@ -5385,7 +5454,8 @@ class FusedMoE(torch.nn.Module):
         other real pass already holds the same rows on every PCP rank and
         all-reduces. Rows no gather moved are counted
         (`pass_scheduled_tokens_gpu`), and so are an SP gather's: its shards
-        are contiguous, so the step's real rows lead."""
+        are contiguous, so the step's real rows lead. `shared_add` /
+        `shared_ready`: see `forward_maybe_comm_fused`."""
         context = get_forward_context().context
         merge = self.moe_parallel_config.pcp_merge
         pcp = merge and not context.is_dummy_run
@@ -5399,22 +5469,26 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
                 x_scale,
             )
-            tbo = tbo_active()
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             # One grouped collective, rank-major: every PCP shard is one height.
             pcp_group = get_pcp_group()
             heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
-            )
+
+            def gather():
+                out = gather_rows(lambda ts: all_gatherv(ts, heights, pcp_group), rows)
+                reassign_gathered_shared_ids(self, out[2])
+                return out
+
+            hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
-            if tbo:
-                tbo_switch_to_compute_sync()
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
+        )
+        # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared).
+        shared_kwargs = (
+            {}
+            if shared_add is None
+            else {"shared_add": shared_add, "shared_ready": shared_ready}
         )
         output = self.quant_method.apply(
             layer=self,
@@ -5436,19 +5510,20 @@ class FusedMoE(torch.nn.Module):
                 if split and sp_is_enabled()
                 else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
+            **shared_kwargs,
         )
         if split:
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            output = pcp_reduce_scatter(output)
-            if tbo:
-                tbo_switch_to_compute_sync()
+            output = tbo_on_comm(pcp_reduce_scatter, output)
         elif pcp:
             output = pcp_all_reduce(output)
         return output
 
     def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
     ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
@@ -5482,29 +5557,32 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
             )
 
-            _tbo = tbo_active()
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-
-            rows, local_tokens, sizes = dp_gather_routed_rows(
-                rows, dp_eager_mode, ctx, dp_group
-            )
-
             # Stand in for the DP ranks a simulated run did not launch. Same row
             # order for every tensor, so a copied token keeps its own routing.
             dp_repeat = self.moe_parallel_config.dp_logical_ratio
-            gathered_rows = rows[0].shape[0]
-            if dp_repeat > 1:
-                rows = tuple(repeat_rows(t, dp_repeat) for t in rows)
-            hidden_states, topk_weights, topk_ids, *scale = rows
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
 
-            if _tbo:
-                tbo_switch_to_compute_sync()
+            def gather():
+                out, local_tokens, sizes = dp_gather_routed_rows(
+                    rows, dp_eager_mode, ctx, dp_group
+                )
+                gathered_rows = out[0].shape[0]
+                if dp_repeat > 1:
+                    out = tuple(repeat_rows(t, dp_repeat) for t in out)
+                reassign_gathered_shared_ids(self, out[2])
+                return out, local_tokens, sizes, gathered_rows
+
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather)
+            hidden_states, topk_weights, topk_ids, *scale = out
+            x_scale = scale[0] if scale else None
 
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, x_scale, use_dp_gather_scatter
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_scale,
+            use_dp_gather_scatter,
+            shared_add=shared_add,
+            shared_ready=shared_ready,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -5512,18 +5590,14 @@ class FusedMoE(torch.nn.Module):
             # `sizes` and the scatter below are sized for the real ranks.
             if dp_repeat > 1:
                 final_hidden_states = final_hidden_states[:gathered_rows]
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
-                final_hidden_states = reduce_scatterv(
-                    final_hidden_states, sizes, dp_group
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatterv, final_hidden_states, sizes, dp_group
                 )
             else:
-                final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, local_tokens
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatter_with_unpadding, final_hidden_states, local_tokens
                 )
-            if _tbo:
-                tbo_switch_to_compute_sync()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
@@ -5533,7 +5607,14 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_add: torch.Tensor | None = None,
+        shared_ready: torch.cuda.Event | None = None,
+    ):
+        """`shared_add` / `shared_ready`: see `forward_maybe_comm_fused`."""
         assert self.quant_method is not None
 
         # Decided here, at run time: the row count is symbolic while compiling.
@@ -5543,7 +5624,12 @@ class FusedMoE(torch.nn.Module):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            return self.forward_impl_graph(
+                hidden_states,
+                router_logits,
+                shared_add=shared_add,
+                shared_ready=shared_ready,
+            )
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
@@ -5562,7 +5648,12 @@ class FusedMoE(torch.nn.Module):
         # The stand-in copies make the rows the logical group's, as a gather
         # would.
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            gathered=dp_repeat > 1,
+            shared_add=shared_add,
+            shared_ready=shared_ready,
         )
 
         if dp_repeat > 1:

@@ -80,6 +80,7 @@ def test_supported_deployment_has_no_refusal(native):
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"sequence_parallel_size": 4}, "Ulysses SP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
+        ({"kv_cache_dtype": "fp4"}, "kv cache fp4"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
         ({"max_model_len": (1 << 20) + 1}, "max_model_len"),

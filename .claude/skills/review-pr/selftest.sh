@@ -221,9 +221,11 @@ fi
 
 echo "[notify handoff]"
 # The report job stays quiet when _notify.py says it already spoke, so that flag must mean a
-# comment actually landed. _notify.py returns 0 without posting in three cases -- no status
-# file, no token, a POST that threw -- and claiming "notified" in any of them would trade a
-# visible failure for a silent one. Two of the three are testable without a network.
+# comment actually landed. _notify.py returns 0 without posting in four cases -- no status
+# file, no token, a POST that threw, and a POST GitHub answered 2xx without creating a comment
+# -- and claiming "notified" in any of them would trade a visible failure for a silent one.
+# Two of the four need no network and are checked here; _notify_test.py drives main() over a
+# fake transport for the two that do.
 notified_flag() {  # <status file contents or empty> -> what _notify.py wrote to GITHUB_OUTPUT
   local w o; w=$(mktemp -d); o=$(mktemp)
   [ -n "$1" ] && printf '%s\n' "$1" > "$w/.atom-review-status"
@@ -545,6 +547,28 @@ else
   echo "  ⏭️  _publish_test.py NOT RUN — no pytest on this box. The --post closure, the"
   echo "      anchoring rule (spans, permalinks) and the degrade-to-summary fallback are"
   echo "      unverified here."
+fi
+
+echo "[notify decision]"
+# _notify_test.py drives main() over a fake transport: the decision that guarded the first
+# live run's silent failure -- set notified=true only when a comment actually landed. The two
+# no-network paths are driven above as subprocesses of _notify.py; the posting paths live in
+# these pytest cases. Same rule as the publish block: run from here so the suite cannot sit
+# as a file nobody executes, and a missing pytest is said out loud, not skipped into silence.
+if python3 -c "import pytest" 2>/dev/null; then
+  pt=$(cd "$S" && python3 -m pytest _notify_test.py -q 2>&1); pt_rc=$?
+  n=$(printf '%s\n' "$pt" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' || echo 0)
+  if [ "$pt_rc" -eq 0 ]; then
+    echo "  ✅ _notify_test.py: ${n:-0} passed (created/redirected/empty-2xx/raising transports -> notified only on landing)"
+    ok=$((ok + 1))
+  else
+    printf '%s\n' "$pt" | grep -E '^(FAILED|ERROR)' | sed 's/^/  ❌ /' || true
+    echo "  ❌ _notify_test.py failed — run: python3 -m pytest $S/_notify_test.py"
+    bad=$((bad + 1))
+  fi
+else
+  echo "  ⏭️  _notify_test.py NOT RUN — no pytest on this box. The notified-only-on-landing"
+  echo "      decision is unverified here."
 fi
 
 echo "=== $ok green / $bad red ==="
