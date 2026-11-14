@@ -2064,9 +2064,22 @@ class ModelRunner:
             if torch.distributed.is_initialized()
             else ()
         )
-        free, available_for_kv_budget, free_for_kv, available_for_kv = agree_kv_budget(
-            free, available_for_kv_budget, connector_bytes, groups
+        free, available_for_kv_budget = agree_kv_budget(
+            free, available_for_kv_budget, groups
         )
+        # Free HBM has to cover the buffers the connector allocates after the
+        # KV cache is sized, or the cache is planned into memory that is not
+        # there. `free` is agreed above, so every rank raises here or none does.
+        free_for_kv = free - connector_bytes
+        if connector_bytes and free_for_kv <= 0:
+            raise RuntimeError(
+                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
+                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
+                "buffers need after the KV cache is sized; free GPU memory or "
+                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
+                "ATOM_PD_MLA_LANDING=0)."
+            )
+        available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
 
