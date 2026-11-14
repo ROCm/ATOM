@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -764,6 +765,57 @@ stop_mooncake_store
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
+        # The decode node's owners failed to mount and its launcher exited 1:
+        # the prefill node fails within seconds rather than when its wait times
+        # out, and a node that exited 0, or its own rank's file, does not stop it.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        (run_dir / "rank-rc-2").write_text("0\n")
+        started = time.monotonic()
+        result = self.run_shell(
+            """
+(
+  until [[ "$(wc -l < "${STUB_DIR}/segments" 2>/dev/null)" -ge 1 ]]; do
+    sleep 0.2
+  done
+  sleep 2
+  echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
+) >/dev/null 2>&1 &
+start_mooncake_store
+""",
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            MOONCAKE_STORE_OWNERS="0:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="30",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="30",
+        )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_a_wait_for_a_server_stops_once_another_node_failed(self):
+        # A decode node waits up to WAIT_SERVER_TIMEOUT for the router of a
+        # prefill node whose Store failed to start.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http + '\n}\nwait_http "http://127.0.0.1:9/health" router 600\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn(
+            "router: another node's launcher exited (rank-rc-0=1)", result.stderr
+        )
 
     def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
         # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900
