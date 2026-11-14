@@ -172,9 +172,10 @@ class AddedTokenSplitter:
         if not _deterministic(description.get("model")):
             return False
         # A normalizer runs per segment too, and a normalized added token is
-        # matched after it runs; with one, only the identity is accepted.
-        # Without, the backend normalizes each piece between extracted tokens
-        # on its own as well (MiniMax-M3's NFC).
+        # matched after it runs, so with a normalized added token only the
+        # identity normalizer is accepted. Without one, the backend extracts
+        # the added tokens first and normalizes each piece between them on its
+        # own, as encoding by pieces does.
         if self._normalized and not _normalizer_is_identity(description):
             return False
         if _offset_sensitive(description.get("pre_tokenizer")):
