@@ -21,7 +21,7 @@ from atom.models.qwen38.mono.kernels.target import device_arch
 from atom.mono.plan.check import RegionDecl, check
 from atom.mono.plan.trace import recording
 from atom.mono.runtime import compile as _main
-from atom.mono.runtime.compile import _code_object, _note_uint
+from atom.mono.runtime.compile import _code_object, _note_uint, keep_compiled
 
 _RESOURCE_KEYS = {**_main._RESOURCE_KEYS, "agpr": b".agpr_count"}
 _OPTIONAL = (*_main._OPTIONAL, "agpr")
@@ -46,21 +46,21 @@ def _env(**values):
 
 
 def compile_traced(launcher, program: Program):
-    """Compile ``launcher`` (no launch, no disk cache so the body is traced) and hold its recorded hand-offs to the
-    program's regions (``atom.mono.plan.check``). Raises ContractError."""
+    """Compile ``launcher`` (no launch) and hold its recorded hand-offs to the program's regions
+    (``atom.mono.plan.check``), its build kept for the first launch (``keep_compiled``). Raises ContractError.
+
+    FlyDSL's disk cache as the process sets it (on by default): FlyDSL traces a build before it looks it up (its key
+    is the traced module), so a cached build is still traced, recorded and checked, only not compiled again.
+    """
     arch = program.target.mcpu
     with (
         recording() as rec,
-        _env(
-            COMPILE_ONLY=1,
-            FLYDSL_RUNTIME_ENABLE_CACHE=0,
-            ARCH=arch,
-            FLYDSL_GPU_ARCH=arch,
-        ),
+        _env(COMPILE_ONLY=1, ARCH=arch, FLYDSL_GPU_ARCH=arch),
     ):
         launcher(0, 0, 0, 0, 0)
+    keep_compiled(launcher, 0, 0, 0, 0, 0)  # (the first launch: not traced again)
     if not rec.stages:
-        raise RuntimeError("nothing traced (a cached build?)")
+        raise RuntimeError("nothing traced")
     check(
         rec,
         [RegionDecl(r.name, r.space, r.writers, r.exchange) for r in program.regions],

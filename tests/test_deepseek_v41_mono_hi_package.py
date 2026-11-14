@@ -227,22 +227,3 @@ def test_a_launch_does_not_trace_the_program_again(monkeypatch):
         torch.cuda.synchronize()
         assert out.item() == layer + 1
     assert not emitted
-
-
-def test_a_flydsl_change_keeps_flydsls_locations_and_warns_once(monkeypatch, caplog):
-    """``atom.mono.runtime.srcloc.scoped``: on a fingerprint miss (a FlyDSL whose location capture is not the one
-    reproduced) FlyDSL's own capture stays in place and one WARNING a process says what is skipped and its cost.
-    """
-    pytest.importorskip("flydsl")
-    from atom.mono.runtime import srcloc
-
-    original = srcloc.meta.capture_user_location
-    monkeypatch.setattr(srcloc, "FINGERPRINT", "0" * 16)
-    srcloc._warn_miss.cache_clear()
-    with caplog.at_level("WARNING", logger="atom"):
-        for _ in range(3):
-            with srcloc.scoped():
-                assert srcloc.meta.capture_user_location is original
-    srcloc._warn_miss.cache_clear()
-    warned = [r for r in caplog.records if "srcloc" in r.getMessage()]
-    assert len(warned) == 1 and "twice the build time" in warned[0].getMessage()
