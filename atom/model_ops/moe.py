@@ -1458,14 +1458,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
+        gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # aiter's gfx1250 fused_moe rejects the separated gate/up layout for every
+        # G1U1 MoE, so on gfx1250 GU interleave is required, not opt-in.
+        self.is_guinterleave = (
+            envs.ATOM_MOE_GU_ITLV or self.fp8_activations or self.is_gfx1250
+        )
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        gfx = get_gfx()
-        self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         ep_moe = self.moe.use_ep
         if envs.is_set("ATOM_USE_TRITON_MOE"):
@@ -1775,15 +1779,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_triton_decode:
             assert self.is_gfx1250 and self.is_guinterleave and is_silu, (
                 "ATOM_USE_TRITON_MOE_DECODE=1 shares one weight copy between the "
-                "FlyDSL and Triton kernels, which only matches on gfx1250 + "
-                "ATOM_MOE_GU_ITLV=1 + SiLU (got gfx1250="
-                f"{self.is_gfx1250}, gu_itlv={self.is_guinterleave}, silu={is_silu}). "
-                "NOTE the ATOM_MOE_GU_ITLV requirement is INVERTED from earlier "
-                "builds: this flag used to be skipped when GU interleaving was on "
-                "and to run with ATOM_MOE_GU_ITLV=0, which is now the "
-                "unsupported combination. A launch line carrying "
-                "ATOM_MOE_GU_ITLV=0 with ATOM_USE_TRITON_MOE_DECODE=1 needs "
-                "ATOM_MOE_GU_ITLV=1, or drop ATOM_USE_TRITON_MOE_DECODE."
+                "FlyDSL and Triton kernels, which only matches on gfx1250 + SiLU "
+                "with the gate/up interleaved layout, which gfx1250 always uses "
+                f"(got gfx1250={self.is_gfx1250}, interleaved={self.is_guinterleave}, "
+                f"silu={is_silu}). Elsewhere, drop ATOM_USE_TRITON_MOE_DECODE."
             )
             # FlyDSL trims the create_weights padding via hidden_pad /
             # intermediate_pad; the Triton kernels take no such argument and read

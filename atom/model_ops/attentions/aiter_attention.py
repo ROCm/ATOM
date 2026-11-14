@@ -992,7 +992,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if not query_is_uniform(lengths, max_seqlen_q):
             self._refuse_ragged_on_rectangular_layers(lengths, max_seqlen_q)
         positions = decode_positions(context_lens, lengths, cu_seqlens_q)
-        max_seqlen_k = context_lens.max(initial=0)
+        max_seqlen_k = int(context_lens.max(initial=0))
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
         self.prepare_block_tables(batch, running_bs)

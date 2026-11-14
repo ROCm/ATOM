@@ -331,12 +331,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
-    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
-    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
-    # and hands Triton a zero-copy view of it -- which is only valid where the
-    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
-    # buys, and why the prep asserts it: only the interleaved layout is shared,
-    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # flag, it cannot enable Triton on its own) plus gfx1250 + SiLU, because it
+    # keeps a single copy of the weights in the FlyDSL layout and hands Triton a
+    # zero-copy view of it -- which is only valid where the two preshuffles agree
+    # byte-for-byte. They agree only for the gate/up interleaved layout, which
+    # the MXFP4 MoE always uses on gfx1250, and the prep asserts it.
     # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
     #
     # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
@@ -1069,7 +1068,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
-    # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
+    # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
+    # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",

@@ -174,6 +174,7 @@ def _make_layer(num_experts, hidden, intermediate, seed=0):
     torch.manual_seed(seed)
     return SimpleNamespace(
         activation=moe_mod.ActivationType.Silu,
+        global_num_experts=num_experts,
         num_fused_shared_experts=0,
         w13_bias=None,
         w2_bias=None,
@@ -279,14 +280,14 @@ def test_triton_views_reproduce_the_triton_prep():
 
 @gfx1250_only
 def test_decode_prep_rejects_a_layout_the_two_kernels_do_not_share():
-    """GGUU (ATOM_MOE_GU_ITLV=0) gives FlyDSL and Triton genuinely different
+    """The separated (GGUU) layout gives FlyDSL and Triton genuinely different
     layouts, so sharing one copy must be refused rather than read as garbage."""
     method = _prep_method(
         use_triton=True, use_triton_decode=True, num_experts=3, intermediate=128
     )
     method.is_guinterleave = False
 
-    with pytest.raises(AssertionError, match="ATOM_MOE_GU_ITLV"):
+    with pytest.raises(AssertionError, match="interleaved=False"):
         method._process_weight_layout_after_loading(_make_layer(3, 256, 128))
 
 
