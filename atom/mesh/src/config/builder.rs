@@ -369,6 +369,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn mooncake_admin_port(mut self, port: u16) -> Self {
+        self.config.mooncake_admin_port = port;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

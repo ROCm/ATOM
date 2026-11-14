@@ -81,6 +81,9 @@ pub struct RouterConfig {
     /// Follow the KV cache events each worker reports at `/kv_event_sources`.
     #[serde(default)]
     pub kv_events: bool,
+    /// The admin port of each master of the Mooncake Store a worker offloads to.
+    #[serde(default = "default_mooncake_admin_port")]
+    pub mooncake_admin_port: u16,
     pub api_key: Option<String>,
     pub metrics: Option<MetricsConfig>,
     pub log_dir: Option<String>,
@@ -430,6 +433,11 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Mooncake's `--metrics_port`.
+fn default_mooncake_admin_port() -> u16 {
+    9003
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -449,6 +457,7 @@ impl Default for RouterConfig {
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             kv_events: false,
+            mooncake_admin_port: default_mooncake_admin_port(),
             api_key: None,
             metrics: None,
             log_dir: None,

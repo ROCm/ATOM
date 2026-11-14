@@ -1,6 +1,7 @@
 //! With `--kv-events`, the KV event stream of each worker rank is followed from its
 //! registration to its removal, at the endpoint the worker reports for the rank at
-//! `/kv_event_sources` (ROCm/ATOM#3275).
+//! `/kv_event_sources` (ROCm/ATOM#3275), and the rank reads meanwhile the store it
+//! reports offloading to.
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -71,6 +72,11 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                 Some((&rank, source)) => {
                     let pool = worker.worker_type().as_metric_label();
                     monitor.attach(worker.url(), worker.model_id(), pool, rank, source.clone());
+                    if let (Some(storage), Some(offload)) =
+                        (&app_context.kv_storage, &source.offload)
+                    {
+                        storage.add(worker.url(), worker.model_id(), offload);
+                    }
                 }
                 None => warn!(
                     worker = worker.url(),
@@ -99,6 +105,11 @@ impl StepExecutor<WorkerRemovalWorkflowData> for StopFollowingKvEventsStep {
         if let Some(monitor) = &app_context.kv_event_monitor {
             for url in &context.data.worker_urls {
                 monitor.detach(url);
+            }
+        }
+        if let Some(storage) = &app_context.kv_storage {
+            for url in &context.data.worker_urls {
+                storage.remove(url);
             }
         }
         Ok(StepResult::Success)

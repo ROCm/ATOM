@@ -503,7 +503,12 @@ server runs to where its publisher binds: `endpoint`, offset per rank like the
 bind itself (a wildcard host stays a wildcard, so a consumer substitutes the
 server's address), `topic`, `block_size`, the tokens per hashed block, and
 `replay_endpoint`, offset alike, when replay is on. It is `{}` with events off or
-the `null` publisher.
+the `null` publisher. A server that offloads to a Mooncake Store
+(`mooncake_store`) also reports `offload`, the same for every rank: `backend`,
+the pools' `masters`, and the key rule's `namespace`, `chunk_tokens` and `world`,
+with `min_load_tokens` (`OFFLOAD_MIN_LOAD_TOKENS`) and `chain_check`, the hex
+digest of the first chunk of tokens `0..chunk_tokens`, by which a router checks
+that it computes the same keys.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

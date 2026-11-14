@@ -173,14 +173,18 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     """Where each engine on this node publishes KV events (`/kv_event_sources`),
     keyed by the global DP rank its publisher binds for: the endpoint after the
     per-rank offset (a wildcard host stays a wildcard), the topic, the tokens
-    per hashed block, and the replay endpoint, offset alike, when replay is on.
-    Empty with events off or the null publisher."""
+    per hashed block, the replay endpoint, offset alike, when replay is on, and
+    the Mooncake Store the ranks offload to, if any. Empty with events off or
+    the null publisher."""
+    from atom.kv_transfer.offload.report import offload_report
+
     events = config.kv_events_config
     if not events.enable or events.publisher == "null":
         return {}
     block_size = hash_block_size_for(
         config.kv_cache_block_size, config.decode_context_parallel_size
     )
+    offload = offload_report(config)
     sources = {}
     for rank, _ in iter_dp_rank_assignments(config):
         source = {
@@ -190,6 +194,8 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
         }
         if events.replay_endpoint:
             source["replay_endpoint"] = offset_endpoint(events.replay_endpoint, rank)
+        if offload is not None:
+            source["offload"] = offload
         sources[str(rank)] = source
     return sources
 

@@ -880,7 +880,13 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
 
 def _kv_events_engine(
-    monkeypatch, parallel=None, *, enable_dp_attention=False, tp=1, **events
+    monkeypatch,
+    parallel=None,
+    *,
+    enable_dp_attention=False,
+    tp=1,
+    kv_transfer_config=None,
+    **events,
 ):
     """An engine with KV events configured as `events`, by default DP=2 on one
     node, serving the sources its CoreManager builds."""
@@ -892,8 +898,14 @@ def _kv_events_engine(
         parallel_config=parallel or ParallelConfig(data_parallel_size=2),
         enable_dp_attention=enable_dp_attention,
         tensor_parallel_size=tp,
+        pipeline_parallel_size=1,
         kv_cache_block_size=16,
         decode_context_parallel_size=2,
+        kv_transfer_config=kv_transfer_config,
+        hf_config=SimpleNamespace(num_hidden_layers=4, model_type="glm_moe_dsa"),
+        model="test-model",
+        kv_cache_dtype="fp8",
+        speculative_config=None,
     )
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(
@@ -904,6 +916,7 @@ def _kv_events_engine(
             core_mgr=SimpleNamespace(kv_event_sources=kv_event_sources(config)),
         ),
     )
+    return config
 
 
 def _tcp_sources(ports):
@@ -992,6 +1005,68 @@ def test_kv_event_sources_offsets_the_replay_endpoint_per_rank(monkeypatch):
 def test_kv_event_sources_is_empty_without_a_publisher(monkeypatch, events):
     _kv_events_engine(monkeypatch, **events)
     assert asyncio.run(api_server.kv_event_sources()) == {}
+
+
+@pytest.fixture
+def fake_aiter(monkeypatch):
+    """AITER's fp8 and arch as on gfx950: the Store namespace asks for both."""
+    import torch
+
+    package = types.ModuleType("aiter")
+    package.dtypes = SimpleNamespace(d_dtypes={"fp8": torch.float8_e4m3fn})
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx = lambda: "gfx950"
+    for name, module in (
+        ("aiter", package),
+        ("aiter.jit", types.ModuleType("aiter.jit")),
+        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
+        ("aiter.jit.utils.chip_info", chip_info),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
+    monkeypatch, fake_aiter
+):
+    from atom.kv_transfer.offload.mooncake_store import keys
+
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "512")
+    pools = {
+        "rdma0": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.1:8080"},
+        "rdma1": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.9:8080"},
+        "rdma2": {"master": "10.0.0.3:50051", "metadata": "http://10.0.0.3:8080"},
+    }
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": {
+            "mooncake_store.pools": pools,
+            "mooncake_store.local_hostname": "10.0.0.2",
+            "mooncake_store.chunk_tokens": 64,
+        },
+    }
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    config = _kv_events_engine(
+        monkeypatch,
+        kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    # The Store connector's own view of the config under `multi`.
+    leaf = SimpleNamespace(**vars(config) | {"kv_transfer_config": store})
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    for source in expected.values():
+        source["offload"] = {
+            "backend": "mooncake_store",
+            "masters": ["10.0.0.1:50051", "10.0.0.3:50051"],
+            "namespace": keys.store_namespace(leaf, 64),
+            "chunk_tokens": 64,
+            "world": 1,
+            "min_load_tokens": 512,
+            "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
+        }
+    assert asyncio.run(api_server.kv_event_sources()) == expected
 
 
 # ---- --api-server-count: the worker side of api_server ----
