@@ -157,7 +157,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     # run concurrently with the forward, and on ROCm a forward kernel that
     # needs every CU co-resident (a persistent kernel) can then wait for CUs
     # those kernels hold while they wait for it: the engine hangs. A backend
-    # turns this off only where it has shown not to.
+    # turns this off only where it has shown not to, and then picks its side
+    # streams' priority (`_copy_stream_priority`).
     STAGES_ON_FORWARD_STREAM = True
 
     def __init__(self, config: Any) -> None:
@@ -300,6 +301,12 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         """
         raise NotImplementedError
 
+    def _copy_stream_priority(self, device: torch.device) -> int:
+        """The priority of this worker's side pack, copy and in-place streams,
+        on a backend that does not stage on the forward's stream: torch's
+        default, 0, unless the backend asks for another."""
+        return 0
+
     def _distrust_store(self, why: str) -> None:
         """Load nothing more from the store after a put that may still write.
 
@@ -390,6 +397,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 if self.STAGES_ON_FORWARD_STREAM
                 else None
             ),
+            stream_priority=self._copy_stream_priority(torch.device(device)),
         )
         client = pool = None
         try:
@@ -915,7 +923,10 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             return shared
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self._codec.device)
+            device = torch.device(self._codec.device)
+            stream = torch.cuda.Stream(
+                device=device, priority=self._copy_stream_priority(device)
+            )
             self._in_place_tls.stream = stream
         return stream
 

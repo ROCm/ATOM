@@ -3,10 +3,10 @@
 
 """The store-agnostic half of the KV-store offload connectors.
 
-A KV-store backend such as ``mooncake_store`` moves 256-token KV chunks
-between the worker's KV cache and an external key-value store; backends share
-that machinery and differ only in the store client and what its answers mean.
-This package is that machinery, parameterized by a small client protocol:
+A KV-store backend (``mooncake_store``, ``umbp_store``) moves 256-token KV
+chunks between the worker's KV cache and an external key-value store; backends
+share that machinery and differ only in the store client and what its answers
+mean. This package is that machinery, parameterized by a small client protocol:
 
 * ``client`` -- the protocol a backend's client implements, and ``CallRefused``;
 * ``keys`` -- the layout namespace, the prompt's chunk hash chain, object keys;
