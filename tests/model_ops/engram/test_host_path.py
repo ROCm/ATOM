@@ -1343,12 +1343,18 @@ def test_the_allocator_disables_huge_pages_only_around_the_allocation():
         ptr._obj.value = 4096
         return 0
 
+    def madvise(addr, length, advice):
+        calls.append(("madvise", addr, length, advice))
+        return 0
+
     # Plain functions: the allocator sets `argtypes` on them, as on ctypes'.
-    libc = SimpleNamespace(prctl=prctl)
+    libc = SimpleNamespace(prctl=prctl, madvise=madvise)
     hip = SimpleNamespace(hipHostMalloc=malloc, hipHostFree=lambda ptr: 0)
     alloc = hm._HipHostAllocator(hip, libc)
     assert alloc.alloc(1 << 20) == 4096
     assert ("malloc", 1) in calls and state["thp_off"] == 0
+    # khugepaged never collapses the range afterwards (its pages are the GPU's)
+    assert ("madvise", 4096, 1 << 20, hm._MADV_NOHUGEPAGE) in calls
     state["thp_off"] = 1  # a process that disabled THP itself keeps it off
     calls.clear()
     alloc.alloc(1 << 20)
@@ -1803,7 +1809,7 @@ def test_failed_hip_allocations_and_frees_clear_the_hip_error(monkeypatch):
 
     hip = FakeHip()
     monkeypatch.setattr(hm, "_hip_runtime", lambda: hip)
-    libc = SimpleNamespace(prctl=lambda op, *rest: 0)
+    libc = SimpleNamespace(prctl=lambda op, *rest: 0, madvise=lambda *a: 0)
     fake = SimpleNamespace(
         hipHostMalloc=lambda ptr, nbytes, flags: 2,  # hipErrorOutOfMemory
         hipHostFree=lambda ptr: 1,
