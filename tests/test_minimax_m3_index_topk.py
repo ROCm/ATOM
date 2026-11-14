@@ -439,6 +439,59 @@ class TestMetadataRowBounds:
         )  # fmt: skip
         TestForcedSelection._check(idx, sctx, causal)
 
+    @pytest.mark.parametrize("q_per_req", [1, 4])
+    def test_decode_launches_only_the_requests_that_have_rows(
+        self, monkeypatch, q_per_req
+    ):
+        """A decoding rank's lengths can be longer than its rows.
+
+        Under DP the lengths are padded to the batch the group agreed on, and
+        the query rows are the rank's own whenever a peer rank is prefilling.
+        The pad sequence has no rows in topk_idx / sparse_bt / sparse_ctx, so
+        launching it writes past all three: the grid has to stop at the rows.
+        """
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        heads, ctx = 2, 1677
+        kw = _inputs([q_per_req], [ctx - q_per_req], heads, "cuda")
+
+        def decode(seq_lens, block_table, bounds=None):
+            return m.minimax_m3_index_topk_decode(
+                kw["idx_q"], kw["index_kv_cache"], block_table, seq_lens,
+                ctx, TOPK, INIT, LOCAL, heads, kw["sm_scale"],
+                emit_sparse_block_table=True, max_query_len=q_per_req,
+                n_valid_column_per_row=bounds,
+            )  # fmt: skip
+
+        want = decode(kw["seq_lens"], kw["block_table"])
+
+        # One real request and one pad, the way `prepare_decode` hands them:
+        # length 0 and a zeroed block-table row.
+        seq_lens = torch.cat([kw["seq_lens"], torch.zeros_like(kw["seq_lens"])])
+        block_table = torch.cat(
+            [kw["block_table"], torch.zeros_like(kw["block_table"])]
+        )
+        md = make_sparse_decode_metadata(
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=self._dummy_slot_mapping(),
+            max_seq_len=ctx,
+            max_query_len=q_per_req,
+            num_idx_heads=heads,
+        )
+        launched = []
+        launch = m._launch_select
+
+        def record(*args, **kwargs):
+            launched.append(args[4])  # batch
+            return launch(*args, **kwargs)
+
+        monkeypatch.setattr(m, "_launch_select", record)
+        got = decode(seq_lens, block_table, md.n_valid_column_per_row)
+        assert launched == [1]
+        for g, w in zip(got, want):
+            assert torch.equal(g, w)
+
     def test_empty_batch_publishes_nothing(self):
         from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 

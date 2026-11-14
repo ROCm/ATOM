@@ -1286,7 +1286,21 @@ def minimax_m3_index_topk_decode(
         "carries no draft tokens) has to be routed to the prefill path by the "
         "attention metadata builder."
     )
-    batch = seq_lens.shape[0]
+    # Not `seq_lens.shape[0]`: the two are settled in different units.
+    # `seq_lens` is `running_bs` long, which a DP group agrees on every step,
+    # while `idx_q` is `running_tokens` high, which is this rank's own count
+    # whenever a peer rank is prefilling (`ForwardMode`: the step is ragged). A
+    # rank decoding one request beside a peer that holds two is then handed two
+    # lengths for one request's rows, and a grid over the lengths launches the
+    # pad sequence too -- whose rows of topk_idx, sparse_bt and sparse_ctx do
+    # not exist. That wrote up to 8 KB past each buffer per sparse layer, and
+    # under a mixed prefill/decode load ended in a GPU memory violation.
+    batch = min(seq_lens.shape[0], total_q // max_query_len)
+    if batch != seq_lens.shape[0]:
+        # The published bounds are laid out head-major over `running_bs`
+        # requests, so their rows are not this call's rows. The Triton selector
+        # derives the same bound in registers.
+        n_valid_column_per_row = None
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
     topk_idx = torch.empty(
