@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import dataclass, fields
 
-from atom import LLMEngine
+from atom import LLMEngine, plugin_recipe
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -185,6 +185,9 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
+    plugin_recipe: str | None = None
+    plugin_enable: str | None = None
+    plugin_arm: str = "plugin"
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -818,6 +821,30 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
+        plugins = parser.add_argument_group("Plugin options")
+        plugins.add_argument(
+            "--plugin-recipe",
+            type=str,
+            default=None,
+            help="A plugin recipe (atom.plugin_recipe/1), or a directory holding "
+            "one strategy's recipes (one per graph-capture bucket set). "
+            "Default: no plugin. Check one with `python -m atom.plugin_recipe`.",
+        )
+        plugins.add_argument(
+            "--plugin-enable",
+            type=str,
+            default=None,
+            help="Comma-separated plugins, in preference order: shorthand for a "
+            "recipe of whatever they register. With --plugin-recipe it can only "
+            "narrow it. ATOM_PLUGIN_HOST=0 disables them all.",
+        )
+        plugins.add_argument(
+            "--plugin-arm",
+            type=str,
+            default="plugin",
+            help="Which planned plugins serve: plugin (all), native (none), "
+            "identity (decide, run native) or a recipe arm.",
+        )
         dcp_group = parser.add_argument_group("DCP options")
         dcp_group.add_argument(
             "--dcp-config",
@@ -973,6 +1000,11 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # Resolved here, once, so a bad recipe refuses the start before any
+        # worker exists; the Plan rides Config to every worker.
+        kwargs["plugin_source"] = plugin_recipe.from_cli(
+            kwargs.pop("plugin_recipe"), kwargs.pop("plugin_enable"), self.plugin_arm
+        )
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))

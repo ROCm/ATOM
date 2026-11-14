@@ -806,15 +806,18 @@ def test_cli_may_only_narrow_a_recipe(tmp_path):
     path = tmp_path / "r.json"
     doc = _recipe({OUT: ["a", "b"]}, defaults={"allow_partition": True})
     path.write_text(json.dumps(doc))
-    plan = recipes.from_cli(str(path), "b")
-    assert plan.arms["plugin"] == ("b",)
+    narrowed = recipes.from_cli(str(path), "b").resolve()
+    assert narrowed.arms["plugin"] == ("b",)
+    assert narrowed.plan_id != recipes.from_cli(str(path), None).plan_id
     with pytest.raises(recipes.RecipeRefused):
         recipes.from_cli(str(path), "c")
     with pytest.raises(recipes.RecipeRefused) as refused:
         recipes.from_cli(str(path), None, arm="ghost")
     assert refused.value.reason == "recipe-unknown-arm"
     assert recipes.from_cli(None, None) is None
-    assert recipes.from_cli(None, "a, b").providers == ("a", "b")
+    source = recipes.from_cli(None, "a, b")
+    assert source.enable == ("a", "b") and source.documents == ()
+    assert source.resolve().providers == ("a", "b")
 
 
 def test_runtime_expect_checks_the_server():
@@ -835,3 +838,177 @@ def test_recipe_check_command(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["tables"] == {"any": {OUT: ["a"]}}
     assert recipes.main([str(path), "--installed", "a=v41.attn.qk_norm"]) == 2
     assert "recipe-plugin-drift" in capsys.readouterr().out
+
+
+# -- wiring: CLI, Config, compile cache, ModelRunner -----------------------------
+
+REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+
+
+@pytest.mark.parametrize(
+    "argv, providers, arm",
+    [
+        ([], None, "plugin"),
+        (["--plugin-enable", " bmm8k,,silu8k "], ("bmm8k", "silu8k"), "plugin"),
+        (["--plugin-enable", "a", "--plugin-arm", "native"], ("a",), "native"),
+    ],
+)
+def test_plugin_args_reach_the_config(argv, providers, arm):
+    from atom.config import Config
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    kwargs = EngineArgs.from_cli_args(parser.parse_args(argv))._get_engine_kwargs()
+    source = kwargs["plugin_source"]
+    assert (None if source is None else source.resolve().providers) == providers
+    assert kwargs["plugin_arm"] == arm
+    assert {"plugin_source", "plugin_arm"} <= set(Config.__dataclass_fields__)
+
+
+def _config_with(source):
+    """A Config carrying ``source``, as a rank's copy would (no model load)."""
+    from atom.config import Config
+
+    config = object.__new__(Config)
+    config.__dict__.update(plugin_source=source, plugin_arm="plugin")
+    return config
+
+
+def _a_recipe_source(tmp_path):
+    seams = {OUT: ["a", "b"], ACT: ["c"]}
+    capture = _recipe(seams, mode="capture", buckets=[8, 16])
+    capture["defaults"] = {"allow_partition": True}
+    eager = _recipe({OUT: ["a"]}, mode="eager")
+    (tmp_path / "b8.json").write_text(json.dumps(capture))
+    (tmp_path / "eager.json").write_text(json.dumps(eager))
+    return recipes.from_cli(str(tmp_path), "a,c", "plugin")
+
+
+def test_a_config_with_a_plan_copies_and_pickles(tmp_path):
+    """engine_core_mgr deep-copies the Config per rank and ranks unpickle it."""
+    import copy
+    import pickle
+
+    source = _a_recipe_source(tmp_path)
+    assert not source.empty
+    config = _config_with(source)
+    for clone in (copy.deepcopy(config), pickle.loads(pickle.dumps(config))):
+        assert clone.plugin_source == source
+        assert clone.plugin_source.resolve().plan_id == source.plan_id
+    plan = source.resolve()
+    assert pickle.loads(pickle.dumps(plan)) == plan == copy.deepcopy(plan)
+    assert set(plan.tables) == {"eager", 8, 16}
+    assert plan.arms["plugin"] == ("a", "c")
+
+
+def _plan_id_in_a_child(config):
+    return config.plugin_source.resolve().plan_id
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ATOM workers are Linux")
+def test_a_config_with_a_plan_crosses_a_spawned_process(tmp_path):
+    import multiprocessing
+
+    source = _a_recipe_source(tmp_path)
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        assert pool.apply(_plan_id_in_a_child, (_config_with(source),)) == (
+            source.plan_id
+        )
+
+
+def test_a_source_that_resolves_otherwise_refuses():
+    source = recipes.from_cli(None, "a")
+    forged = recipes.RecipeSource(source.documents, ("b",), source.plan_id, False)
+    with pytest.raises(recipes.RecipeRefused):
+        forged.resolve()
+
+
+def test_status_lists_the_capture_rows_of_a_recipe_set(tmp_path, monkeypatch):
+    """A strategy's directory, one file per capture batch size, keyed by rows
+    (DSpark k=5: verify bs*6, draft bs*5), as a worker gets it: a pickled
+    RecipeSource resolved in configure."""
+    import pickle
+
+    for bs in (1, 2, 8):
+        doc = _recipe(
+            {OUT: ["bmm"], "v41.draft.ctx": ["aux"]},
+            mode="capture",
+            buckets=[bs * 6, bs * 5],
+        )
+        doc["defaults"] = {"strict_overlap": True}
+        (tmp_path / f"{bs}.json").write_text(json.dumps(doc))
+    eager = _recipe({QUANT: ["q16k"]}, mode="eager")
+    eager["defaults"] = {"strict_overlap": True}
+    (tmp_path / "eager.json").write_text(json.dumps(eager))
+    source = pickle.loads(pickle.dumps(recipes.from_cli(str(tmp_path), None)))
+
+    def both(h):
+        _offer(OUT, "bmm")(h)
+
+    _plugins(
+        monkeypatch,
+        bmm=both,
+        aux=_offer("v41.draft.ctx", "aux"),
+        q16k=_offer(QUANT, "q16k", impl=lambda x, **k: (x, x)),
+    )
+    host.configure(source, kill_switch=False)
+    rows = [5, 6, 10, 12, 40, 48]
+    assert host.status()["capture_rows"] == rows
+    host.bind(OUT, _native)
+    for arm in ("native", "identity", "plugin"):
+        host.set_arm(arm)
+        assert host.status()["capture_rows"] == rows
+    assert host.owners(OUT, 48) == ("bmm",) and host.owners(QUANT) == ("q16k",)
+
+
+def test_a_bad_recipe_refuses_at_argument_time(tmp_path):
+    from atom.model_engine.arg_utils import EngineArgs
+    from atom.utils.arg_parser import FlexibleArgumentParser
+
+    bad = tmp_path / "r.json"
+    bad.write_text(json.dumps({"schema": "nope"}))
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(["--plugin-recipe", str(bad)]))
+    with pytest.raises(recipes.RecipeRefused):
+        args._get_engine_kwargs()
+
+
+def test_the_plan_keys_the_compile_cache_only_when_set():
+    from atom.config import Config
+
+    base = {
+        "quant_config": None,
+        "compilation_config": None,
+        "parallel_config": None,
+        "tensor_parallel_size": 4,
+        "prefill_context_parallel_size": 1,
+        "sequence_parallel_size": 1,
+        "dcp_config": None,
+        "enable_dp_attention": False,
+        "index_cache_dtype": None,
+        "index_cache_layout": None,
+        "hf_config": types.SimpleNamespace(),
+        "max_model_len": 4096,
+        "max_num_seqs": 256,
+        "max_num_batched_tokens": 16384,
+        "kv_cache_dtype": "fp8",
+        "speculative_config": None,
+    }
+
+    def key(**kw):
+        return Config.compute_hash(types.SimpleNamespace(**base, **kw))
+
+    a, b = recipes.from_cli(None, "a"), recipes.from_cli(None, "b")
+    assert key() == key(plugin_source=None)
+    assert key(plugin_source=a) not in (key(), key(plugin_source=b))
+
+
+def test_model_runner_configures_the_host_before_building():
+    source = (REPO_ROOT / "atom/model_engine/model_runner.py").read_text(
+        encoding="utf-8"
+    )
+    configure = source.index("plugin_host.configure(")
+    assert source.index("config.plugin_source, arm=config.plugin_arm", configure) < (
+        source.index("self._build_and_load_model(model_class)")
+    )

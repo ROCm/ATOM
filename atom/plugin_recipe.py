@@ -23,7 +23,7 @@ import hashlib
 import json
 import sys
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -71,6 +71,16 @@ class Plan:
     def empty(self) -> bool:
         return not self.providers and not self.aiter
 
+    def __reduce__(self):
+        # Copies and pickles go through plain dicts (a mappingproxy has neither).
+        state = {f.name: getattr(self, f.name) for f in fields(self)}
+        state["tables"] = {
+            k: None if t is None else dict(t) for k, t in self.tables.items()
+        }
+        for name in ("arms", "expect", "requires"):
+            state[name] = dict(state[name])
+        return _rebuild_plan, (state,)
+
     def dump(self) -> dict[str, Any]:
         return {
             "plan_id": self.plan_id,
@@ -92,6 +102,18 @@ class Plan:
             "requires": dict(self.requires),
             "recipe_digests": list(self.recipe_digests),
         }
+
+
+def _rebuild_plan(state: dict[str, Any]) -> Plan:
+    state["tables"] = MappingProxyType(
+        {
+            k: None if t is None else MappingProxyType(t)
+            for k, t in state["tables"].items()
+        }
+    )
+    for name in ("arms", "expect", "requires"):
+        state[name] = MappingProxyType(state[name])
+    return Plan(**state)
 
 
 def _canonical(value: Any) -> str:
@@ -343,8 +365,9 @@ def resolve(
     )
 
 
-def load(path: str | Path, *, model_arch: str | None = None) -> Plan:
-    """A recipe file, or a directory holding one strategy's recipes."""
+def _read(path: str | Path) -> tuple[str, ...]:
+    """A recipe file, or a directory holding one strategy's recipes, as
+    canonical JSON text."""
     path = Path(path)
     files = sorted(path.glob("*.json")) if path.is_dir() else [path]
     if not files:
@@ -352,36 +375,71 @@ def load(path: str | Path, *, model_arch: str | None = None) -> Plan:
     documents = []
     for file in files:
         try:
-            documents.append(json.loads(file.read_text(encoding="utf-8")))
+            documents.append(_canonical(json.loads(file.read_text(encoding="utf-8"))))
         except (OSError, ValueError) as error:
             raise RecipeRefused("recipe-schema", f"{file}: {error}") from error
-    return resolve(documents, model_arch=model_arch)
+    return tuple(documents)
+
+
+def load(path: str | Path, *, model_arch: str | None = None) -> Plan:
+    """A recipe file, or a directory holding one strategy's recipes."""
+    return resolve([json.loads(d) for d in _read(path)], model_arch=model_arch)
+
+
+def _plan_of(documents: tuple[str, ...], enable: tuple[str, ...]) -> Plan | None:
+    """Recipes plus ``--plugin-enable``, which may only narrow them."""
+    names = shorthand(enable)
+    if not documents:
+        return names
+    plan = resolve([json.loads(d) for d in documents])
+    if names is None:
+        return plan
+    extra = [n for n in names.providers if n not in plan.arms["plugin"]]
+    if extra:
+        raise RecipeRefused("recipe-unknown-provider", f"--plugin-enable adds {extra}")
+    arms = dict(plan.arms)
+    arms["plugin"] = arms["identity"] = names.providers
+    return replace(
+        plan,
+        arms=MappingProxyType(arms),
+        plan_id=_digest([plan.plan_id, "enable", names.providers]),
+    )
+
+
+@dataclass(frozen=True)
+class RecipeSource:
+    """What ``Config`` carries: the recipes as canonical JSON text and the
+    ``--plugin-enable`` names, plain data a rank's config copies and pickles;
+    every process resolves it to the same ``Plan`` (``plan_id`` checks it)."""
+
+    documents: tuple[str, ...] = ()
+    enable: tuple[str, ...] = ()
+    plan_id: str = ""
+    empty: bool = True
+
+    def resolve(self) -> Plan | None:
+        plan = _plan_of(self.documents, self.enable)
+        if plan is not None and plan.plan_id != self.plan_id:
+            raise RecipeRefused(
+                "recipe-set-conflict", "the recipes resolved to another plan here"
+            )
+        return plan
 
 
 def from_cli(
     recipe: str | None, enable: str | None, arm: str = "plugin"
-) -> Plan | None:
-    """``--plugin-recipe`` / ``--plugin-enable`` / ``--plugin-arm`` -> Plan.
-
-    With both, ``--plugin-enable`` may only narrow the recipe (an arm of it).
-    """
-    if not recipe:
-        plan = shorthand(enable)
-    else:
-        plan = load(recipe)
-        names = shorthand(enable)
-        if names is not None:
-            extra = [n for n in names.providers if n not in plan.arms["plugin"]]
-            if extra:
-                raise RecipeRefused(
-                    "recipe-unknown-provider", f"--plugin-enable adds {extra}"
-                )
-            arms = dict(plan.arms)
-            arms["plugin"] = arms["identity"] = names.providers
-            plan = Plan(**{**plan.__dict__, "arms": MappingProxyType(arms)})
-    if plan is not None and arm not in plan.arms:
+) -> RecipeSource | None:
+    """``--plugin-recipe`` / ``--plugin-enable`` / ``--plugin-arm``, resolved
+    once to refuse a bad recipe before any worker starts; None: no plugin."""
+    documents = _read(recipe) if recipe else ()
+    names = shorthand(enable)
+    names = () if names is None else names.providers
+    plan = _plan_of(documents, names)
+    if plan is None:
+        return None
+    if arm not in plan.arms:
         raise RecipeRefused("recipe-unknown-arm", f"{arm!r} not in {sorted(plan.arms)}")
-    return plan
+    return RecipeSource(documents, names, plan.plan_id, plan.empty)
 
 
 def check_runtime(plan: Plan, config: Any) -> None:

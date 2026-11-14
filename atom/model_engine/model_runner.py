@@ -31,7 +31,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
-from atom import structured_output
+from atom import plugin_host, structured_output
 from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
@@ -926,6 +926,10 @@ class ModelRunner:
             ),
         )
 
+        # Before the build: seams bind at construction, and capture freezes them.
+        plugin_host.configure(
+            config.plugin_source, arm=config.plugin_arm, config=config
+        )
         self._build_and_load_model(model_class)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
