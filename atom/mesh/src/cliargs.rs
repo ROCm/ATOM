@@ -268,6 +268,11 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
 
+    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM);
+    /// /kv_events/sources shows every subscription
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    pub kv_events: bool,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -680,6 +685,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .dp_aware(self.dp_aware)
+            .kv_events(self.kv_events)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -882,6 +888,7 @@ impl Default for CliArgs {
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
             dp_aware: false,
+            kv_events: false,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,
