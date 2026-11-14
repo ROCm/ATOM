@@ -19,7 +19,9 @@ from ..plan.program import (
     PEERS_ARG,
     RANK_ARG,
     Program,
+    phase_word,
     plan,
+    step_words,
 )
 
 
@@ -48,8 +50,8 @@ def bind_group(bufs: "Buffers", peers, name: str, layer: int) -> None:
                 f"{name}: a Buffers with its own step counter joins a peer group inside or after a graph capture: "
                 "launch it on the group once eagerly first (or build it on the group's step)"
             )
-        if (
-            bufs.step.numel() > peers.step.numel()
+        if has_live(bufs.step) and not has_live(
+            peers.step
         ):  # (a dyn_rows build reads the live words after the counter)
             raise TagError(
                 f"{name}: a Program.dyn_rows Buffers joins a peer group whose step counter has no live words (its "
@@ -63,6 +65,18 @@ def bind_group(bufs: "Buffers", peers, name: str, layer: int) -> None:
             peers.ids.clear()
             bufs.launched.clear()
     bufs.group = peers
+
+
+def has_live(step: torch.Tensor) -> bool:
+    """Whether step tensor ``step`` holds the live words after the counter (``Program.dyn_rows``): 4 words or more,
+    unless made without them (``static_step``: a static counter with the fast entry's step-phase words)."""
+    return step.numel() >= 4 and not getattr(step, "_hi_static", False)
+
+
+def static_step(step: torch.Tensor) -> torch.Tensor:
+    """Mark ``step`` a counter without live words (``has_live``); -> ``step``."""
+    step._hi_static = True
+    return step
 
 
 def _zeros(nbytes: int, device, uncached: bool = False) -> torch.Tensor:
@@ -131,7 +145,7 @@ class Buffers:
         tensor is the group's (``bind_group``): the live words are then every bound ``Buffers``' (one live shape a
         step), and a ``Buffers`` set before its first launch on the group takes the group's at that launch.
         """
-        if self.step.numel() < 4:
+        if not has_live(self.step):
             raise ValueError(
                 "set_live: these buffers have no live words (a program without dyn_rows)"
             )
@@ -264,18 +278,19 @@ class MonoKernel:
                 word - (1 << 32) if word >= 1 << 31 else word
             )  # (as int32 bits: page 3's XCD 7 is bit 31)
             private[:4].view(torch.int32)[0] = word
-        # the step counter: one int32
+        # the step counter: one int32 (with the fast entry: and the step-phase words, ``plan.program.step_words``)
         if (
             p.dyn_rows
         ):  # the step word, then live rows, spec, batch: all of them until set_live
-            step = torch.zeros(4, dtype=torch.int32, device=device)
-            step[1:] = torch.tensor(
+            step = torch.zeros(step_words(4), dtype=torch.int32, device=device)
+            step[1:4] = torch.tensor(
                 [p.scenario.rows, p.scenario.spec, p.scenario.batch], dtype=torch.int32
             )
             return Buffers(scratch=scratch, step=step, private=private)
+        step = torch.zeros(step_words(1), dtype=torch.int32, device=device)
         return Buffers(
             scratch=scratch,
-            step=torch.zeros(1, dtype=torch.int32, device=device),
+            step=static_step(step) if step.numel() > 1 else step,
             private=private,
         )
 
@@ -335,6 +350,14 @@ class MonoKernel:
             raise TagError(
                 f"{self.program.name}: layer id {layer} launched twice in one step (bump the step)"
             )
+        if peers is not None and self.program.phase_slot >= 0:
+            # the group's step phase in this step tensor's slot (``Program.phase_slot``: checked to be there, the
+            # group's one word)
+            slot = self.program.phase_slot
+            if bufs.step.numel() < phase_word(slot) + 2:
+                raise TagError(f"{self.program.name}: its step tensor of {bufs.step.numel()} words has no step-phase "
+                               f"slot {slot} (plan.program.step_words)")  # fmt: skip
+            peers.bind_phase(bufs.step, slot, self.program.name)
         bufs.launched.add(layer)
         if peers is not None:
             peers.launched(layer, self.program.name)

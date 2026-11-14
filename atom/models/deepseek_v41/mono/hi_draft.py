@@ -340,7 +340,13 @@ class HiDraft:
         self.dr_peers = PeerGroup(
             max(k.program.peer_bytes for k in self.dr_kerns.values()), self._cpu_group
         )
-        self.dr_step = torch.zeros(1, dtype=torch.int32, device=dev)
+        from .hi.plan.program import step_words
+        from .hi.runtime.kernel import static_step
+
+        # (with the fast entry: its peer group's step-phase word after it, hi ``plan.program.step_words``)
+        self.dr_step = torch.zeros(step_words(1), dtype=torch.int32, device=dev)
+        if self.dr_step.numel() > 1:
+            static_step(self.dr_step)
         self.dr_bufs = _buffers(
             self.dr_kerns,
             _Arena("draft", self.dr_kerns.values(), dev),

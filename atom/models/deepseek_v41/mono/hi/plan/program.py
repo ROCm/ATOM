@@ -44,12 +44,22 @@ first launch (often one that reads nothing of its launch: a step's first layer) 
 copy. A shared program adds its group's step phase to its tag's parity (the peer table's entry ``tp``, low word),
 which ``PeerGroup.end_step`` after a step's last launch flips when the step's launch count was odd: consecutive
 launches alternate across steps of any widths.
+
+**The fast entry** (``FAST_ENTRY_ENV``, off by default): every TP program takes ``Program.fast_entry`` and a shared
+program reads its group's step phase next to the step counter (``Program.phase_slot``: the int64 word at int32 word
+``phase_word(slot)`` of the step tensor, the kernel's ``step`` argument) instead of the peer table's entry ``tp``.
+The phase load is then a scalar load off a kernel argument, issued with the table's: two dependent memory round trips
+before the first stage instead of three. Groups that share one step counter (the layers', the Engram kv launch's,
+the DSpark context write's) take distinct slots (``phase_slot``, set by the composition); ``PeerGroup`` bumps the
+word its programs read (``runtime.peer``). Off: every program's layout, key and code of before.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
 from ..target import MI355X, Target
@@ -69,6 +79,14 @@ PEERS_ARG, RANK_ARG = (
 OWN_ARG = "_own"  # ... and with ``Program.fast_entry``: this rank's peer buffer
 PEER_TOP_ARG = "_peer_top"  # ... and with ``Program.peer_shared``: the group's peer buffer bytes, as a value
 _SHARE_PEER_GROUPS = False  # ``share_peer_groups``: ``Program.peer_shared``'s default for programs planned from now
+# the fast entry (module docstring): "1" turns it on for programs planned from now on (read at ``plan``)
+FAST_ENTRY_ENV = "ATOM_DSV41_MONO_HI_FAST_ENTRY"
+# the step tensor with the fast entry: the counter (word 0), the live words (1-3, ``Program.dyn_rows``), then
+# ``PHASE_SLOTS`` int64 step-phase words from int32 word ``PHASE_WORD`` (8 B aligned: a peer group's int64 word)
+PHASE_WORD = 4
+PHASE_SLOTS = 4
+STEP_WORDS = PHASE_WORD + 2 * PHASE_SLOTS
+_PHASE_SLOT = 0  # ``phase_slot``: ``Program.phase_slot``'s value for fast-entry programs planned from now
 DUAL_PAGE = (
     2 << 20
 )  # dual-copy regions: the home rule's page (a region's runs lie in one page)
@@ -88,6 +106,37 @@ def share_peer_groups(on: bool = True) -> None:
     """
     global _SHARE_PEER_GROUPS
     _SHARE_PEER_GROUPS = bool(on)
+
+
+def fast_entry_on() -> bool:
+    """Whether the fast entry (module docstring) is on: ``FAST_ENTRY_ENV`` = 1."""
+    return os.environ.get(FAST_ENTRY_ENV, "0").strip() == "1"
+
+
+def phase_word(slot: int) -> int:
+    """The int32 word of the step tensor where step-phase slot ``slot``'s int64 word starts (module docstring)."""
+    if not 0 <= slot < PHASE_SLOTS:
+        raise PlanError(f"step-phase slot {slot} outside 0..{PHASE_SLOTS - 1}")
+    return PHASE_WORD + 2 * slot
+
+
+def step_words(words: int) -> int:
+    """The int32 words of a step tensor of ``words`` (1, or 4 with the live words): with the fast entry on, the
+    step-phase words too (``STEP_WORDS``)."""
+    return max(words, STEP_WORDS) if fast_entry_on() else words
+
+
+@contextmanager
+def phase_slot(slot: int):
+    """Shared TP programs planned inside read their group's step phase at slot ``slot`` of the step tensor (with the
+    fast entry on; module docstring): a composition gives each peer group on one step counter its own slot."""
+    global _PHASE_SLOT
+    phase_word(slot)  # (checked)
+    old, _PHASE_SLOT = _PHASE_SLOT, slot
+    try:
+        yield
+    finally:
+        _PHASE_SLOT = old
 
 
 @dataclass(frozen=True)
@@ -286,6 +335,10 @@ class Program:
     # None (resolved by plan()): on when a stage asks for an entry issue (``Stage.pre``: its first loads are only as
     # early as the peer base they address)
     fast_entry: bool | None = None
+    # The step-phase slot a shared TP program reads (module docstring, "The fast entry"): its group's phase is the
+    # int64 word at int32 word ``phase_word(slot)`` of the step tensor. -1: the peer table's entry ``tp`` (the layout
+    # of before). None (resolved by plan()): ``phase_slot``'s with ``FAST_ENTRY_ENV`` on for a shared program, else -1
+    phase_slot: int | None = None
     # Symbolic shapes (the dyn measurements): the program is planned for its scenario (the maximum: R
     # rows, B x S) and every launch serves the live rows ``n``, spec ``s`` and batch ``b`` read from the words after
     # the step counter (``Buffers.set_live``): stages see them as ``k.n``, ``k.s``, ``k.b`` (uniform Int32s; without
@@ -349,6 +402,8 @@ class Program:
         out = [self.name, self.scenario.name, self.target.arch, False, False]
         if self.fast_entry and self.peer:  # keyed only when it changes the build
             out.append("fast_entry")
+        if self.phase_slot is not None and self.phase_slot >= 0:  # keyed only when on
+            out.append(f"phase@{self.phase_slot}")
         if self.dyn_rows:  # keyed only when on
             out.append("dyn_rows")
         if (
@@ -640,8 +695,19 @@ def plan(program: Program) -> Program:
         nxt = s.base + s.tasks
     _check_carried(program)
     _check_kept(program)
+    fast = fast_entry_on()
     if program.fast_entry is None:
-        program.fast_entry = any(s.pre is not None for s in program.stages)
+        program.fast_entry = any(s.pre is not None for s in program.stages) or (
+            fast and bool(program.peer)
+        )
+    if program.phase_slot is None:
+        program.phase_slot = (
+            _PHASE_SLOT if fast and program.peer and program.peer_shared else -1
+        )
+    if program.phase_slot >= 0:
+        if not (program.peer and program.peer_shared):
+            raise PlanError(f"{program.name}: a step-phase slot without a shared peer group")
+        phase_word(program.phase_slot)  # (checked)
     args = []
     for s in program.stages:
         args += [a for a in s.args if a not in args]

@@ -163,6 +163,8 @@ class HiLayers(HiDraft, HiPrograms):
             get_tp_group,
         )
 
+        from .hi.plan.program import step_words
+        from .hi.runtime.kernel import static_step
         from .hi.runtime.peer import PeerGroup
         from .hi.v41 import layer as L
 
@@ -292,7 +294,10 @@ class HiLayers(HiDraft, HiPrograms):
         # the launch-tag step counter, every program's (one counter a peer group); with bands, the live words after it
         # (rows, spec, batch: ``Program.dyn_rows``, the band programs' live requests, staged each step by
         # ``begin_step``; the static programs read the counter only)
-        self.step = z(4 if self.band_of else 1, dt=i32)
+        # (with the fast entry: the peer groups' step-phase words after them, hi ``plan.program.step_words``)
+        self.step = z(step_words(4 if self.band_of else 1), dt=i32)
+        if not self.band_of and self.step.numel() > 1:
+            static_step(self.step)
         self.live = LiveWords(self.step, self.width_plan) if self.band_of else None
         if self.peers is not None and self.band_of:
             # (the group's counter is this tensor, live words and all)
@@ -336,7 +341,7 @@ class HiLayers(HiDraft, HiPrograms):
                     set(kern.program.args)
                     - set(packed)
                     - set(at)
-                    - {"_peers", "_rank", "_peer_top"}
+                    - {"_peers", "_rank", "_peer_top", "_own"}
                 )
                 if missing:
                     raise KeyError(
@@ -480,7 +485,7 @@ class HiLayers(HiDraft, HiPrograms):
         self.eng_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         for s, kern in self.eng_programs.items():
             missing = (
-                set(kern.program.args) - set(args) - {"_peers", "_rank", "_peer_top"}
+                set(kern.program.args) - set(args) - {"_peers", "_rank", "_peer_top", "_own"}
             )
             if missing:
                 raise KeyError(f"Engram kv launch: no pointer for {sorted(missing)}")
@@ -605,7 +610,7 @@ class HiLayers(HiDraft, HiPrograms):
                 set(kern.program.args)
                 - set(args)
                 - set(at)
-                - {"_peers", "_rank", "_peer_top"}
+                - {"_peers", "_rank", "_peer_top", "_own"}
             )
             if missing:
                 raise KeyError(f"verify head: no pointer for {sorted(missing)}")

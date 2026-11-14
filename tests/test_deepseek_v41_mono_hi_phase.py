@@ -77,3 +77,77 @@ def test_the_forward_bumps_its_due_phases_once_at_its_end(monkeypatch, verify):
     hook.phase_due = []
     hook.end_step(None, SimpleNamespace(max_q_len=3), 6)
     assert calls == ["end", "ctx"]
+
+
+# ---------------------------------------------------------------- the fast entry (hi ``plan.program.FAST_ENTRY_ENV``)
+
+
+def _step(words=None):
+    from atom.models.deepseek_v41.mono.hi.plan.program import STEP_WORDS
+
+    return torch.zeros(STEP_WORDS if words is None else words, dtype=torch.int32)
+
+
+def test_fast_entry_phase_word_next_to_the_step_counter():
+    """A group whose programs read the step phase at a slot of their step tensor (``bind_phase``, at their launch):
+    ``end_step`` adds to / hands back that int64 word (the step tensor's ``phase_word(slot)``), not the peer table's
+    entry; the counter and the live words are untouched."""
+    from atom.models.deepseek_v41.mono.hi.plan.program import phase_word
+
+    g, step = _group(), _step()
+    step[:4] = torch.tensor([7, 6, 6, 1], dtype=torch.int32)
+    g.bind_phase(step, 2, "p")
+    g.bind_phase(step, 2, "p")  # (every launch: the same word)
+    g.since_step = 41
+    assert g.end_step() is None and g._phase == 1
+    w = phase_word(2)
+    assert step[w : w + 2].view(torch.int64).item() == 1 and step[:4].tolist() == [7, 6, 6, 1]
+    assert g.addresses.tolist() == [100, 200, 0]
+    g.since_step = 1
+    word = g.end_step(defer=True)
+    assert word.dtype == torch.int64 and word.numel() == 1 and word.data_ptr() == step[w:].data_ptr()
+    assert int(word.item()) == 1  # (the caller bumps it)
+    with pytest.raises(ValueError):
+        g.bind_phase(step, 1, "p")  # (one word a group)
+
+
+def test_fast_entry_slots_are_a_groups_own():
+    """Two live groups on one step tensor take distinct slots; a retired group's slot can be taken over (cleared);
+    a step tensor without the phase words is refused (no out-of-bounds phase read)."""
+    a, b, c, step = _group(), _group(), _group(), _step()
+    a._retired = b._retired = c._retired = False
+    a.bind_phase(step, 0, "a")
+    with pytest.raises(ValueError):
+        b.bind_phase(step, 0, "b")
+    b.bind_phase(step, 1, "b")
+    a._retired = True
+    step[4:6].view(torch.int64).fill_(5)
+    c.bind_phase(step, 0, "c")
+    assert step[4:6].view(torch.int64).item() == 0
+    with pytest.raises(ValueError):
+        _group().bind_phase(_step(4), 0, "short")
+
+
+def test_fast_entry_plan(monkeypatch):
+    """With the env on, a shared TP program takes the fast entry and the composition's slot (keyed); off: neither, its
+    key of before."""
+    from atom.models.deepseek_v41.mono.hi.plan import program as P
+    from atom.models.deepseek_v41.mono.hi.plan.trace import Space
+
+    def make():
+        r = P.Region("x", 64, ("s",), Space.PEER)
+        return P.Program("t", P.Scenario(1, 1, 2), [P.Stage("s", 4, lambda k, t: None, writes=(r,))],
+                         peer_shared=True)  # fmt: skip
+
+    monkeypatch.delenv(P.FAST_ENTRY_ENV, raising=False)
+    off = P.plan(make())
+    assert not off.fast_entry and off.phase_slot == -1 and P.OWN_ARG not in off.args
+    assert not any(str(x).startswith("phase@") for x in off.key())
+    monkeypatch.setenv(P.FAST_ENTRY_ENV, "1")
+    with P.phase_slot(2):
+        on = P.plan(make())
+    assert on.fast_entry and on.phase_slot == 2 and P.OWN_ARG in on.args and "phase@2" in on.key()
+    assert P.plan(make()).phase_slot == 0  # (the default slot outside the context)
+    assert P.step_words(1) == P.STEP_WORDS and P.step_words(4) == P.STEP_WORDS
+    with pytest.raises(P.PlanError):
+        P.phase_word(P.PHASE_SLOTS)

@@ -20,7 +20,8 @@ A TP program with peer regions also reads ``PEERS_ARG`` (every rank's peer buffe
 (this rank, as a value) from the table; its stages see ``k.tp``, ``k.rank``, ``k.peers`` and their
 peer regions' ``k.mb`` entries in this rank's peer buffer (``device.gfx950.peer``); a shared program
 (``Program.peer_shared``) also ``PEER_TOP_ARG``, its group's peer buffer bytes (``k.peer_top``), and its group's
-step phase (``k.peer_phase``: the peer table's entry ``tp``, ``PeerGroup.end_step``).
+step phase (``k.peer_phase``: the peer table's entry ``tp``, ``PeerGroup.end_step``; with ``Program.phase_slot``
+the step tensor's word ``phase_word(slot)``, a scalar load off ``step``: ``plan.program``, "The fast entry").
 
 The body walks the stages in order. Each stage gets a fresh context (``_stage_ctx``): wave
 index, pointer-table loads and region addresses recomputed behind opaque moves,
@@ -66,6 +67,7 @@ from ..plan.program import (
     RANK_ARG,
     PlanError,
     Program,
+    phase_word,
 )
 from ..plan.trace import Space, enter_stage
 
@@ -141,6 +143,25 @@ def _load_step(step):
         ir.Type.parse("!llvm.ptr<4>"), fx.Int64(step).ir_value()
     ).result
     return fx.Int32(llvm.LoadOp(T.i32, ptr, alignment=4, invariant=True).result)
+
+
+def _entry_step(step, table, priv):
+    """``step``, as an opaque copy that waits for the kernel arguments ``table`` and ``priv`` too (``Program.phase_slot``:
+    the fast entry). The scalar loads return out of order, so their counter has one useful wait (``lgkmcnt(0)``): a load
+    issued after a wait the scheduler put between the arguments' loads, or after the step word's first use, is a round
+    trip of its own (as was the step word's after a copy of a table entry, the table's loads before this copy: the
+    verify head, the draft). The fast entry's prologue issues the arguments' loads, waits once, then the table's
+    entries, the step word, the step phase and the private word together after this copy, and waits once (two
+    dependent round trips; the build of before: three, the last two vector loads, the phase behind the peer table's
+    entry)."""
+    asm = llvm.InlineAsmOp(
+        T.i64,
+        [fx.Int64(step).ir_value(), fx.Int64(table).ir_value(), fx.Int64(priv).ir_value()],
+        "; entry $0 $2 $3",
+        "=s,0,s,s",
+        has_side_effects=True,
+    )
+    return fx.Int64(asm.result)
 
 
 def _load_live(step, word: int = 1):
@@ -546,6 +567,16 @@ def build(program: Program):
             trace.root(v, trace.INTERNAL, name)  # the memory-model record (no IR)
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
         if const_expr(
+            program.peer and program.peer_shared and program.phase_slot >= 0
+        ):  # the fast entry (``_entry_step``): the table's entries, the step word, the phase and the private word
+            # issued together after it (the step word's uses below must not split them off)
+            step_at = _entry_step(step, table, priv)
+            args_at = load_table(table, program.args)
+            phase_at = _load_live(step_at, phase_word(program.phase_slot))
+            if const_expr(program.dual_on):  # (and the private word: its copy bits, with the others)
+                dual_at = _load_live(priv, 0)
+            tag = _load_step(step_at) * LAYER_SLOTS + layer + 1
+        elif const_expr(
             program.peer and program.fast_entry
         ):  # a scalar load with the table's (no vector round trip)
             tag = _load_step(step) * LAYER_SLOTS + layer + 1
@@ -564,6 +595,8 @@ def build(program: Program):
             scratch=scratch,
             priv=priv,
         )
+        if const_expr(program.peer and program.peer_shared and program.phase_slot >= 0):
+            base.args = args_at  # (the namespace's own loads: dead code)
         if const_expr(
             program.dual_on
         ):  # the copy bits of this CTA's XCD, bit 8 p for page p (word 0 of priv)
@@ -573,6 +606,8 @@ def build(program: Program):
             w = fx.Int32(
                 llvm.LoadOp(T.i32, hdr.result, alignment=4, invariant=True).result
             )
+            if const_expr(program.peer and program.peer_shared and program.phase_slot >= 0):
+                w = dual_at  # (issued with the table's: the load above is dead code)
             # the hardware's XCD: CTA id mod 8 is one only up to the launch's first XCD
             xcc = llvm.InlineAsmOp(
                 T.i32,
@@ -598,6 +633,10 @@ def build(program: Program):
         _roots(base)
         base.peer_phase = None
         if const_expr(
+            program.peer and program.peer_shared and program.phase_slot >= 0
+        ):  # the group's step phase next to the step counter (its low word): a scalar load with the table's
+            base.peer_phase = phase_at
+        elif const_expr(
             program.peer and program.peer_shared
         ):  # the group's step phase (peer table entry tp, low word)
             base.peer_phase = uniform(ld_i32(base.peers, 2 * program.scenario.tp))

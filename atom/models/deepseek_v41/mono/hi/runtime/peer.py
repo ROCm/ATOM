@@ -23,6 +23,11 @@ row: the next step's early puts over this step's last slots). ``end_step`` after
 one to the group's step phase then (a device add, captured with the step's launches; the peer table's entry ``tp``),
 which shared programs add to their tag's parity: consecutive launches alternate across steps too, whatever the steps'
 widths.
+
+With the fast entry (``plan.program``, "The fast entry"; ``Program.phase_slot``) the group's programs read the phase
+from their step tensor's slot instead (the int64 word at ``phase_word(slot)``). The group learns it from its
+launches (``bind_phase``) and ``end_step`` hands back / bumps that word: one word a group, whichever programs (of one
+slot: ``bind`` refuses a mix), and no two groups on one word of one step tensor (``bind_phase`` refuses).
 """
 
 from __future__ import annotations
@@ -74,6 +79,10 @@ class PeerGroup:
         self._phase = (
             0  # the step phase as the host last set it (the launch order check's)
         )
+        # the step-phase slot its shared programs read (``Program.phase_slot``; -1: the peer table's entry) and, once a
+        # launch bound it (``bind_phase``), (step tensor, slot)
+        self.phase_slot: int | None = None
+        self._phase_at: tuple | None = None
         if self._reuse(
             nbytes, group
         ):  # a retired group's memory (``close``), zeroed again
@@ -116,6 +125,14 @@ class PeerGroup:
             tuple(sorted((n, o, pairs[n]) for n, o in program.peer.items())),
         )
         self.layouts.setdefault(layout, program.name)
+        if program.peer_shared:  # (only shared programs read the step phase)
+            slot = program.phase_slot
+            if getattr(self, "phase_slot", None) is None:
+                self.phase_slot = slot
+            elif slot != self.phase_slot:
+                raise ValueError(f"dsv41hi PeerGroup: {program.name} reads the step phase at slot {slot}, the group's "
+                                 f"other programs at {self.phase_slot} (one word a group: build them alike, "
+                                 "plan.program.FAST_ENTRY_ENV)")  # fmt: skip
         unshared = [name for (shared, _), name in self.layouts.items() if not shared]
         if len(self.layouts) > 1 and unshared and not self._warned:
             self._warned = True
@@ -124,6 +141,50 @@ class PeerGroup:
                           "land on a slot the previous launch still polls on a slower rank (Program.peer_shared, "
                           "plan.program.share_peer_groups)", stacklevel=3)  # fmt: skip
 
+    def bind_phase(self, step: torch.Tensor, slot: int, name: str) -> None:
+        """A launch of a program reading the group's step phase at ``slot`` of its step tensor ``step``
+        (``Program.phase_slot``, ``MonoKernel.launch``): the group's phase word from now on. One (tensor, slot) a
+        group, and no other live group on it (its flips would land on this one's word: a poll that never completes).
+        Only the word's changes matter (a constant offset of every launch's parity), as long as every rank's word is
+        equal: a fresh step tensor's is 0 on every rank; one a retired group flipped is cleared here (on the current
+        stream, outside a capture) as ``_reuse`` clears the peer table's."""
+        at = getattr(self, "_phase_at", None)
+        if at is not None:
+            if at[0] is step and at[1] == slot:
+                return
+            raise ValueError(f"{name}: the group's step phase is at slot {at[1]} of another step tensor or slot "
+                             f"({slot}): one word a group")  # fmt: skip
+        from ..plan.program import phase_word
+
+        w = phase_word(slot)
+        if step.dtype != torch.int32 or step.numel() < w + 2:
+            raise ValueError(f"{name}: a step tensor of {step.numel()} {step.dtype} words holds no step-phase slot "
+                             f"{slot} (plan.program.step_words)")  # fmt: skip
+        owners = getattr(step, "_hi_phase_owners", None)
+        if owners is None:
+            owners = step._hi_phase_owners = {}
+        other = owners.get(slot)
+        if other is not None and other is not self and not getattr(other, "_retired", False):
+            raise ValueError(f"{name}: step-phase slot {slot} of this step tensor is another peer group's "
+                             "(plan.program.phase_slot: a slot a group)")  # fmt: skip
+        if other is not None and other is not self:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise ValueError(f"{name}: a retired group's step-phase slot {slot} taken over inside a graph capture")
+            step[w : w + 2].zero_()
+        owners[slot] = self
+        self._phase_at = (step, slot)
+
+    def phase_word(self) -> torch.Tensor:
+        """The group's step-phase word (int64 [1]): its step tensor's slot (``bind_phase``), else the peer table's
+        entry ``tp``."""
+        at = getattr(self, "_phase_at", None)
+        if at is None:
+            return self.addresses[self.tp :]
+        from ..plan.program import phase_word
+
+        w = phase_word(at[1])
+        return at[0][w : w + 2].view(torch.int64)
+
     def end_step(self, defer: bool = False) -> torch.Tensor | None:
         """A step's last launch on the group is issued (module docstring, "The step phase"): after an odd number of
         launches since the last call, the step phase flips (a device add on the current stream, graph-capturable), so
@@ -131,10 +192,11 @@ class PeerGroup:
 
         ``defer``: the caller adds one to the returned phase word itself (int64 [1], the peer table's entry ``tp``) on
         the same stream before the group's next launch (one kernel bumping several groups' words); None when no flip is
-        due. The host's phase flips here either way."""
+        due. The host's phase flips here either way. The word: ``phase_word`` (the fast entry's step-tensor slot, or the
+        peer table's entry ``tp``)."""
         due = None
         if self.since_step % 2:
-            due = self.addresses[self.tp :]
+            due = self.phase_word()
             if not defer:
                 due.add_(1)
                 due = None

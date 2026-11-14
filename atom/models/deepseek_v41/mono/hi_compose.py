@@ -40,6 +40,10 @@ HEAD_MORE = (
     49,
 )
 MAX_BATCH = 4  # the most requests a static width serves
+# the step-phase slots of the peer groups (hi ``Program.phase_slot``, with the fast entry on: hi
+# ``plan.program.FAST_ENTRY_ENV``): the layers' and heads' group, the Engram kv launch's and the DSpark context
+# write's share one step counter, a slot each; the draft's group has a counter of its own
+PHASE_MAIN, PHASE_ENGKV, PHASE_CTX, PHASE_DRAFT = 0, 1, 2, 3
 # the step widths served (rows): B x 6 rows is B requests verifying 6 rows each (DSpark's 5 drafts and the anchor);
 # 1-4 requests on a width's own programs, 5-8 on the batch bands
 ROWS = tuple(REQ_ROWS * b for b in range(1, 9))
@@ -260,10 +264,11 @@ class HiPrograms:
                 if s in self.eng_merged:  # (in the first hi layer's launch)
                     continue
                 sc = Scenario(*self.split[s], self.tp)
-                self.eng_programs[s] = MonoKernel(
-                    Program(f"atom_v41_engkv_r{s}", sc, L.engram_kv_stages(sc, self.eng, max_ctx + 16),
-                            sgpr_spill_ok=L.engram_kv_spill_ok(self.tp))
-                )  # fmt: skip
+                with mf_program.phase_slot(PHASE_ENGKV):  # (its own peer group on the layers' step counter)
+                    self.eng_programs[s] = MonoKernel(
+                        Program(f"atom_v41_engkv_r{s}", sc, L.engram_kv_stages(sc, self.eng, max_ctx + 16),
+                                sgpr_spill_ok=L.engram_kv_spill_ok(self.tp))
+                    )  # fmt: skip
         # ---- the DSpark draft: its context-KV write a width (the hi runtime's RingStore at B requests, each row at
         # its request's position and slot), then the block draft's plans by requests
         self.D = D
@@ -273,7 +278,8 @@ class HiPrograms:
                 continue
             _, prog = D.context_program(f"atom_v41_ctx{self._kv8_tag}_r{s}", Scenario(*self.split[s], self.tp),
                                         "shard", False, knobs=self._kv_knobs or None)  # fmt: skip
-            self.ctx_programs[s] = MonoKernel(prog)
+            with mf_program.phase_slot(PHASE_CTX):  # (its own peer group on the layers' step counter)
+                self.ctx_programs[s] = MonoKernel(prog)
         W = int(getattr(cfg, "dspark_block_size", 5) or 5)
         if self.tp < 2:
             raise ValueError("V4.1 mono hi draft: TP (the stages are chained)")
@@ -492,7 +498,10 @@ class HiPrograms:
         from .hi.runtime.kernel import MonoKernel
 
         if key not in self.dr_kerns:
-            self.dr_kerns[key] = MonoKernel(make())
+            from .hi.plan import program as mf_program
+
+            with mf_program.phase_slot(PHASE_DRAFT):  # (its own peer group and step counter)
+                self.dr_kerns[key] = MonoKernel(make())
         return self.dr_kerns[key]
 
     def _draft_plan(self, n: int, W: int) -> _DraftPlan:
