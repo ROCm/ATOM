@@ -219,7 +219,7 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
-# The zero addends row-sharded MoE layers handed back, by weak reference.
+# The zero addends MoE layers on a sharded tail handed back, by weak reference.
 _folded_zeros: list[weakref.ref] = []
 
 

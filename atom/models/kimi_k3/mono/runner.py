@@ -511,7 +511,8 @@ class K3MonoDecodeRunner:
                     plan, positions, prefix, blocks, add, add2
                 )
             else:
-                # a row-sharded fallback layer's addends are unwritten folded zeros
+                # a fallback layer on either sharded tail hands back unwritten
+                # folded zeros
                 materialize_folded_zeros(add, add2)
                 delta = add if add2 is None else (add2 if add is None else add + add2)
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)

@@ -101,6 +101,16 @@ def _latent_tail_kernel(
             tl.store(cnt_ptr + tile, 0)
 
 
+def fits(latent_size: int, columns: int) -> bool:
+    """Whether the kernel tiles a ``latent_size`` latent onto ``columns``
+    up-projection rows."""
+    return (
+        latent_size % (_SPLIT * _BLOCK_K) == 0
+        and columns % _BLOCK_N == 0
+        and columns // _BLOCK_N <= _COUNTERS
+    )
+
+
 def _counters(device: torch.device) -> torch.Tensor:
     cnt = _arrival_counters.get(device)
     if cnt is None:
@@ -124,9 +134,7 @@ def _latent_tail_op(
     N = up_proj_rows.shape[0]
     if not 1 <= T <= MAX_TOKENS:
         raise ValueError(f"latent_tail takes 1..{MAX_TOKENS} tokens, got {T}")
-    assert up_proj_rows.shape[1] == L and shared.shape == (T, N)
-    assert L % (_SPLIT * _BLOCK_K) == 0 and N % _BLOCK_N == 0
-    assert N // _BLOCK_N <= _COUNTERS
+    assert up_proj_rows.shape[1] == L and shared.shape == (T, N) and fits(L, N)
     assert up_proj_rows.stride(1) == 1 and shared.stride(1) == 1
 
     x = rmsnorm2d_fwd_(latent, norm_weight, eps, L)
