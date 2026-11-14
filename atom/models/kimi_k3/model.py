@@ -1461,6 +1461,7 @@ class KimiKDAAttention(nn.Module):
         state_indices: torch.Tensor,
         cu_seqlens: torch.Tensor,
         kda_metadata,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Prefill on the state pool in place (aiter FlashKDA's paged state
         cache): each sequence's initial state is read from its slot (zeros
@@ -1470,7 +1471,9 @@ class KimiKDAAttention(nn.Module):
         kernels, same results.  None when that does not apply:
         ATOM_KDA_PAGED_PREFILL=0, a state fork (read slot != write slot), a
         pool that is not dense fp32 ``[slots, H, V, K]``, or a call FlashKDA
-        does not serve; the caller then gathers.
+        does not serve; the caller then gathers.  ``out``, when given, is a
+        contiguous buffer shaped like ``v`` that FlashKDA writes directly
+        (the caller's destination rows), saving the copy out of a fresh one.
         """
         if (
             not envs.ATOM_KDA_PAGED_PREFILL
@@ -1483,7 +1486,13 @@ class KimiKDAAttention(nn.Module):
             or not _flash_kda_serves(q, v, self.A_log, self._kda_gate_lower_bound)
         ):
             return None
-        out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+        if (
+            out is None
+            or out.shape != v.shape
+            or out.dtype != v.dtype
+            or not out.is_contiguous()
+        ):
+            out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
         self._run_kda(
             q,
             k,
@@ -1816,11 +1825,13 @@ class KimiKDAAttention(nn.Module):
         return mixed_qkv, out_gate, beta, gate
 
     def _prefill_recurrence(
-        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
+        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state, out=None
     ) -> torch.Tensor:
         """A prefill's causal conv and chunked recurrence, reading and writing
         each request's conv/ssm state slots: ``[T, heads, head_dim]``.
-        ``gate`` is ``[1, T, heads, head_dim]``, ``beta`` ``[1, T, heads]``."""
+        ``gate`` is ``[1, T, heads, head_dim]``, ``beta`` ``[1, T, heads]``.
+        ``out`` (optional, ``[T, heads, head_dim]`` contiguous) is where the
+        paged FlashKDA path writes; the result is then a view of it."""
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
@@ -1857,6 +1868,7 @@ class KimiKDAAttention(nn.Module):
             state_indices,
             query_start_loc,
             kda_metadata,
+            out=None if out is None else out.unsqueeze(0),
         )
         if kda_out is None:
             # Fused masked gather: ssm_state[state_indices] with fresh
@@ -1944,11 +1956,21 @@ class KimiKDAAttention(nn.Module):
         _, conv_state, ssm_state = self._state(fwd_ctx)
         n = kda_metadata.num_actual_tokens
         gate, beta = self._recurrence_gate_beta(gate[:n], beta[:n])
-        out[:n].copy_(
-            self._prefill_recurrence(
-                mixed_qkv[:n], gate, beta, kda_metadata, conv_state, ssm_state
-            )
+        dst = out[:n]
+        # The paged FlashKDA path writes the scheduled rows of `out` itself
+        # (a contiguous row slice); only the gather fallback returns a fresh
+        # tensor that still has to be copied in (the per-layer DtoD memcpy).
+        res = self._prefill_recurrence(
+            mixed_qkv[:n],
+            gate,
+            beta,
+            kda_metadata,
+            conv_state,
+            ssm_state,
+            out=dst,
         )
+        if res.data_ptr() != dst.data_ptr():
+            dst.copy_(res)
 
 
 class KimiDecoderLayer(nn.Module):

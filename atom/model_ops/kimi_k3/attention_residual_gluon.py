@@ -213,10 +213,17 @@ def _attn_res_tdm_kernel(
         q = gl.maximum(q, -FP8_MAX, propagate_nan=_PROPAGATE_NAN)
         q = gl.minimum(q, FP8_MAX, propagate_nan=_PROPAGATE_NAN)
         b_o = gl.convert_layout(gl.reshape(q, [BD]), layout)
-        g = gl.max(gl.reshape(o_d, [BD // 128, 128]), axis=1) // 128
+        # Store each scale byte from one lane. In the reduction's slice layout a
+        # code is replicated over the 16 lanes that reduced its group, and the
+        # store goes out as eight masked byte stores per wave; from a one-per-lane
+        # layout it is two store instructions per program. Column-major scales put
+        # every byte of a token on a different line, so each of those stores is
+        # its own request, all at the program's tail (MI455, T=30 B=1: 4.45 -> 4.0 us).
+        one: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        g = gl.arange(0, BD // 128, layout=one)
         gl.store(
             ys_ptr + t * stride_ys_t + g * stride_ys_g,
-            code.to(gl.uint8),
+            gl.convert_layout(code, one).to(gl.uint8),
             mask=g < H // 128,
         )
     gl.amd.cdna5.buffer_store(
@@ -250,8 +257,9 @@ def launch_attn_res_tdm(
     br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
 ):
     T, B, H = br.shape
+    e8m0 = flags.get("E8M0_SCALE", False)
     # Only column-major E8M0 scales (stride_ys_t == 1) share lines across tokens.
-    col_scales = flags.get("E8M0_SCALE", False) and flags.get("stride_ys_t") == 1
+    col_scales = e8m0 and flags.get("stride_ys_t") == 1
     _attn_res_tdm_kernel[(T,)](
         br,
         ps,
@@ -280,5 +288,10 @@ def launch_attn_res_tdm(
         _PREFETCH,
         num_warps=_NUM_WARPS,
         NUM_XCDS=_num_xcds() if col_scales else 1,
+        # The E8M0 epilogue lands at 261 VGPRs, past the 256 that four waves per
+        # SIMD allow; the hint fits it in 254 without spills. Register allocation
+        # only, the result is bit-identical (MI455, T=8192 B=8: 116 -> 109 us). From T=1024 only: at decode T
+        # (T=550, B=8) it costs ~0.26 us, while the one-lane scale store alone already helps there.
+        **({"waves_per_eu": 4} if e8m0 and T >= 1024 else {}),
         **flags,
     )

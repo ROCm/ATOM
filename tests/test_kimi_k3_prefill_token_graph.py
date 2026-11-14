@@ -539,7 +539,9 @@ def _kda_layer(model, calls):
     w_in = torch.randn(4 * width + KDA_HEADS + KDA_DIM, HIDDEN)
     w_f, w_o = torch.randn(width, KDA_DIM), torch.randn(HIDDEN, width)
 
-    def recurrence(mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state):
+    def recurrence(
+        mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state, out=None
+    ):
         calls.append((mixed_qkv.clone(), gate.clone(), beta.clone()))
         x = mixed_qkv[:, :width].unflatten(-1, (KDA_HEADS, KDA_DIM))
         return torch.cumsum(x * gate[0].sigmoid() * beta[0, ..., None], dim=0)
