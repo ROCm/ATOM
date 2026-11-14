@@ -43,8 +43,10 @@ pub fn chain_check(chunk_tokens: u32) -> String {
     check
 }
 
-/// The key of each chunk of `chain` at rank 0 of `world`. The master evicts a chunk's
-/// objects of every rank together, so rank 0's tells whether the chunk is stored.
+/// The key of each chunk of `chain` at rank 0 of `world`: one key per chunk, where ATOM's
+/// own lookup asks every rank and takes the shortest run. The master evicts a chunk's
+/// objects of every rank together, so the two agree except on a chunk still being
+/// written, or whose put failed, at another rank, which counts as stored here.
 pub fn rank0_keys(namespace: &str, world: u32, chain: &[[u8; DIGEST_BYTES]]) -> Vec<String> {
     let prefix = format!("{namespace}/w0of{world}/");
     let key = |digest: &[u8; DIGEST_BYTES]| {
