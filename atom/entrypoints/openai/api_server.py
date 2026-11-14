@@ -90,6 +90,7 @@ from .chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
 )
 from .fim import FimFormat, resolve_fim_format
 from .images import check_chat_images, load_chat_images
@@ -3884,6 +3885,14 @@ def _setup_reasoning_and_tools(args) -> None:
         rendered_probe=tools_probe,
     )
     preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
+    if not preserve_tool_call_arguments and template_needs_tool_call_argument_strings(
+        tokenizer, custom_message_encoder
+    ):
+        preserve_tool_call_arguments = True
+        logger.info(
+            "The chat template renders history tool-call arguments as strings; "
+            "passing them as sent."
+        )
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
 

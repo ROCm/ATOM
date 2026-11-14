@@ -1181,3 +1181,38 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
     assert api_server.tool_call_parser_cls == "parser"
     assert api_server.preserve_tool_call_arguments is True
     assert api_server.required_tool_channel == "channel"
+
+
+@pytest.mark.parametrize(
+    "keeps, needs_strings, expected",
+    [(True, False, True), (False, True, True), (False, False, False)],
+    ids=["kimi-k3", "concatenating-template", "mapping-template"],
+)
+def test_tool_call_argument_probe_sets_preserve(
+    monkeypatch, keeps, needs_strings, expected
+):
+    # The startup probe flips preservation on for templates that concatenate
+    # history tool-call arguments (DeepSeek-R1/V3).
+    dialect = SimpleNamespace(think_end_marker="</think>")
+    stubs = {
+        "chat_template_source": lambda *_a: "template",
+        "resolve_dialect": lambda *_a: (dialect, True),
+        "render_probe_prompt": lambda *_a, **_kw: "probe",
+        "template_opens_reasoning_implicitly": lambda *_a: False,
+        "resolve_reasoning_toggle": lambda *_a: None,
+        "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
+        "template_keeps_tool_call_arguments": lambda *_a: keeps,
+        "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
+        "required_call_channel": lambda *_a: "channel",
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(api_server, name, stub)
+    monkeypatch.setattr(api_server, "tokenizer", object())
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "preserve_tool_call_arguments", "unset")
+
+    api_server._setup_reasoning_and_tools(
+        SimpleNamespace(tool_call_parser="auto", model="m")
+    )
+
+    assert api_server.preserve_tool_call_arguments is expected
