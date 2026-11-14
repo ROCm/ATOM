@@ -1517,9 +1517,14 @@ class MLAAttention(nn.Module):
         elif W_V_scale is None:
             # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
-            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V), then
-            # -> (B,N,V) to match the fp8/fp4 output layout.
-            x = _aiter_triton_bf16_bmm(x, W_V).transpose(0, 1)
+            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V),
+            # stored through output strides into a contiguous (B,N,V) buffer so
+            # the (B, N*V) view o_proj takes needs no transpose copy.
+            out = torch.empty(
+                x.shape[1], x.shape[0], W_V.shape[1], device=x.device, dtype=x.dtype
+            )
+            _aiter_triton_bf16_bmm(x, W_V, YQ=out.transpose(0, 1))
+            x = out
         else:
             x = _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, transpose_bm=True
