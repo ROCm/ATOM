@@ -305,6 +305,23 @@ def test_page_capacity_fallback_preserves_bytes_and_completion(
     assert h.finished == [(21, False)]
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_a_retired_pool_sends_the_head_slices_directly(rank):
+    """Another transfer's uncertain write retired the pool after this one chose
+    to stage: every head slice still arrives, through direct writes."""
+    h = Harness(LAST, rank)
+    h.c._kv_staging_slots.fail(RuntimeError("another transfer's write"))
+    assert h.send([3, 1, 2], [2, 0, 3])
+    h.check([3, 1, 2], [2, 0, 3])
+    assert h.ready == []
+    base, size = h.c._kv_staging.data_ptr(), h.c._kv_staging.numel()
+    assert not any(
+        base <= address < base + size for srcs, _, _ in h.writes for address in srcs
+    )
+    h.recv.stage_done(21, h.pp_rank, 3, True, h.req.get("_landed_slots", []))
+    assert h.finished == [(21, False)]
+
+
 def test_bad_unit_layout_fails_before_any_rdma():
     h = Harness(LAST, 0)
     units = msgpack.loads(h.req["consumer_unit_layout"])
