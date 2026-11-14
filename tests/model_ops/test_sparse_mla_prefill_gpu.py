@@ -13,8 +13,42 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _forward_work_plan(meta, heads, dtype, topk_out):
+    """Plan `meta`'s DCP sparse prefill as the metadata builder does once a
+    forward, into its `sparse_prefill_*` buffers; each layer then patches it."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+
+    builder = SimpleNamespace(
+        dcp_sparse_prefill_nonps=False,
+        dcp_world_size=8,
+        block_size=1,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+        index_topk_out=topk_out,
+        model_runner=SimpleNamespace(
+            forward_vars={
+                name: value
+                for name, value in vars(meta).items()
+                if name.startswith("sparse_prefill_")
+            }
+        ),
+    )
+    AiterMLAMetadataBuilder._sparse_prefill_work_plan(
+        builder, meta, "", heads, meta.sparse_kv_last_page_lens
+    )
+
+
+@pytest.mark.parametrize(
+    "mla_heads,mla_dtype", [(16, "bf16"), (96, "bf16"), (96, "fp8")]
+)
 @pytest.mark.parametrize("length", [1024, 2048, 4096, 32768, 131072])
-def test_indexer_to_sparse_mla_matches_attention_reference(length):
+def test_indexer_to_sparse_mla_matches_attention_reference(
+    monkeypatch, length, mla_heads, mla_dtype
+):
+    from types import SimpleNamespace
+
     from aiter import (
         QuantType,
         dtypes,
@@ -25,15 +59,20 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 
+    from atom.model_ops import attention_mla
     from atom.model_ops.attention_mla import (
+        MLAAttention,
         triton_convert_req_index_to_global_index,
         triton_convert_req_index_to_global_index_dsa_prefill,
+    )
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        PERSISTENT_WORK_BUFFERS,
     )
     from atom.model_ops.indexer import IndexCache, fp8_rows, score_topk
 
     gen = torch.Generator(device="cuda").manual_seed(731)
     block, topk, rows = 128, 2048, 2
-    heads, index_dim, mla_heads, mla_dim, value_dim = 32, 128, 16, 576, 512
+    heads, index_dim, mla_dim, value_dim = 32, 128, 576, 512
     pages = (length + block - 1) // block
 
     def normal(*shape):
@@ -110,6 +149,12 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
 
     # Separate logical K/V from the shuffled physical cache used by the kernel.
     logical_kv = normal(length, mla_dim)
+    mla_q = normal(rows, mla_heads, mla_dim)
+    fp8 = mla_dtype == "fp8"
+    if fp8:
+        # The FP32 reference reads the FP8 values the kernel reads.
+        logical_kv = logical_kv.to(dtypes.fp8).bfloat16()
+        mla_q = mla_q.to(dtypes.fp8).bfloat16()
     kv = torch.full(
         (pages * block, 1, 1, mla_dim),
         float("nan"),
@@ -117,10 +162,10 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
         device="cuda",
     )
     kv[slots, 0, 0] = logical_kv
-    mla_q = normal(rows, mla_heads, mla_dim)
-    # 12 real heads per rank, padded to the assembly kernel's width of 16.
-    # The padded head outputs are discarded.
-    mla_q[:, 12:] = 0
+    if mla_heads == 16:
+        # 12 real heads per rank, padded to the assembly kernel's width of 16.
+        # The padded head outputs are discarded.
+        mla_q[:, 12:] = 0
     scale = 192**-0.5  # An unabsorbed qk dimension of 128 + 64.
     expected_out = []
     for row, end in enumerate(ends.tolist()):
@@ -137,7 +182,68 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
     last = torch.ones(rows, dtype=torch.int32, device="cuda")
     dense_ptr = torch.arange(rows + 1, dtype=torch.int32, device="cuda") * length
     dense_indices = slots.int().repeat(rows)
-    for mode in ("prefill", "decode", "decode_persistent"):
+
+    def dcp_sparse_prefill(kv_indices, width=mla_heads):
+        """MLAAttention's DCP sparse prefill of 12 heads x DCP8, its gathered
+        `mla_heads` zero-padded to `width`, on the persistent kernel."""
+        monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+        monkeypatch.setattr(
+            attention_mla,
+            "get_forward_context",
+            lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=rows)),
+        )
+        q = mla_q.to(dtypes.fp8) if fp8 else mla_q
+        cache = kv.to(dtypes.fp8) if fp8 else kv
+        unit = torch.ones(1, dtype=torch.float32, device="cuda")
+        attn = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(attn)
+        for name, value in {
+            "is_sparse_mla": True,
+            "dcp_world_size": 8,
+            "num_heads": 12,
+            "use_seg_mla": False,
+            "kv_lora_rank": value_dim,
+            "dtype": torch.bfloat16,
+            "kv_cache_dtype": "fp8" if fp8 else "auto",
+            "_q_scale": unit,
+            "_k_scale": unit,
+            "scale": scale,
+            "dcp_sparse_prefill_num_heads": width,
+            "dcp_sparse_prefill_persistent": True,
+            "sparse_dcp_metadata_rebuild": True,
+            "dcp_persistent_supported": True,
+            "dcp_sparse_prefill_nonps": False,
+            "owns_sparse_indexer": True,
+            "sparse_prefill_head_groups": None,
+            "_sparse_prefill_kv_granularity": topk,
+        }.items():
+            setattr(attn, name, value)
+        sizes = get_mla_metadata_info_v1(
+            rows, 1, width, q.dtype, cache.dtype, is_sparse=True, fast_mode=True
+        )
+        meta = SimpleNamespace(
+            cu_seqlens_q=qptr,
+            max_seqlen_q=1,
+            kv_indptr=None,
+            kv_indices=None,
+            kv_last_page_lens=None,
+            sparse_cu_seqlens_q=qptr,
+            sparse_kv_indptr=ptr,
+            sparse_kv_indices=kv_indices,
+            dcp_sparse_kv_indptr=ptr,
+            sparse_kv_last_page_lens=last,
+            **{
+                f"sparse_prefill_{name}": torch.empty(shape, dtype=dtype, device="cuda")
+                for name, (shape, dtype) in zip(PERSISTENT_WORK_BUFFERS, sizes)
+            },
+        )
+        _forward_work_plan(meta, width, q.dtype, topk)
+        return attn._forward_prefill_mla(q, cache, meta, return_lse=True)[0]
+
+    modes = ("prefill", "decode", "decode_persistent")
+    if mla_heads != 16:
+        modes = ("dcp_sparse_prefill",)
+    for mode in modes:
         if mode == "prefill":
             indices = triton_convert_req_index_to_global_index_dsa_prefill(
                 qptr,
@@ -159,6 +265,9 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
         )
         if mode == "prefill":
             mla_prefill_fwd(mla_q, kv, output, qptr, ptr, indices, last, 1, scale)
+        elif mode == "dcp_sparse_prefill":
+            output = dcp_sparse_prefill(indices)
+            assert torch.equal(output, dcp_sparse_prefill(indices, width=128))
         else:
             metadata = {}
             if mode == "decode_persistent":
@@ -219,11 +328,14 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
                 num_kv_splits=16,
                 **metadata,
             )
-        # Includes BF16 output rounding and the assembly softmax/matmul error.
+        # Includes BF16 output rounding and the assembly softmax/matmul error,
+        # which the FP8 kernel's rounding widens.
         torch.testing.assert_close(
-            output.cpu().float(), expected_out, rtol=0.02, atol=0.002
+            output.cpu().float(), expected_out, rtol=0.02, atol=0.02 if fp8 else 0.002
         )
-        assert (output.cpu().float() - expected_out).norm() / expected_out.norm() < 0.01
+        # FP8 reduces each row in one work item, as it does in any large batch.
+        rel_error = (output.cpu().float() - expected_out).norm() / expected_out.norm()
+        assert rel_error < (0.02 if fp8 else 0.01)
 
         if length <= topk:
             # Independent dense attention over all causally visible keys.
@@ -251,6 +363,8 @@ def test_indexer_to_sparse_mla_matches_attention_reference(length):
                     1,
                     scale,
                 )
+            elif mode == "dcp_sparse_prefill":
+                dense_output = dcp_sparse_prefill(dense_kernel_indices)
             else:
                 mla_decode_fwd(
                     mla_q,
@@ -279,11 +393,10 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
     from itertools import accumulate
     from types import SimpleNamespace
 
-    import triton
     from aiter import get_mla_metadata_info_v1
     from aiter.mla import mla_decode_fwd
 
-    from atom.model_ops.attention_mla import MLAAttention
+    from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 
     lengths = [1, 63, 64, 127, 128, 255, 256, 394, 479, 511, 512, 1025, candidate_width]
     gen = torch.Generator(device="cuda").manual_seed(3165 + candidate_width)
@@ -302,9 +415,6 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
         "reduce_partial_map",
     )
     first = None
-    impl = SimpleNamespace(
-        _sparse_prefill_kv_granularity=triton.next_power_of_2(candidate_width)
-    )
     for rows in (65, 97, 162, 481):
         repeats = (rows + len(lengths) - 1) // len(lengths)
         q = fixed.repeat(repeats, 1, 1)[:rows].contiguous()
@@ -332,11 +442,13 @@ def test_bf16_sparse_prefill_is_independent_of_batch_composition(candidate_width
             for name, (shape, dtype) in zip(names, sizes)
         }
         meta = SimpleNamespace(
-            **{"sparse_prefill_" + name: value for name, value in work.items()}
+            sparse_cu_seqlens_q=qptr,
+            sparse_kv_indptr=kvptr,
+            sparse_kv_last_page_lens=last,
+            **{"sparse_prefill_" + name: value for name, value in work.items()},
         )
-        MLAAttention._rebuild_sparse_dcp_persistent_metadata(
-            impl, meta, q, kv, qptr, kvptr, last, 96, work_prefix="sparse_prefill_"
-        )
+        _forward_work_plan(meta, 96, q.dtype, candidate_width)
+        patch_work_kv_ranges(work["work_info_set"], work["work_indptr"], kvptr, rows)
         # Each live row has one whole interval, even at the smallest batch.
         info = work["work_info_set"][: int(work["work_indptr"][-1])].cpu()
         starts = kvptr.cpu().tolist()
@@ -486,6 +598,9 @@ def test_small_prefill_head_groups_refresh_graph_metadata(
         return lengths, packed
 
     update(0)
+    # One plan serves every state: no row outgrows its whole-row work item.
+    _forward_work_plan(meta, 128, q.dtype, 2048)
+    _forward_work_plan(base_meta, 128, q.dtype, 2048)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):

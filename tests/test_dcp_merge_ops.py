@@ -74,6 +74,7 @@ try:
         _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS,
         _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT,
+        MLAAttention,
         mla_dcp_kernel_num_heads,
         mla_dcp_sparse_prefill_num_heads,
     )
@@ -89,6 +90,7 @@ try:
         reorg_kvcache,
     )
     from atom.model_ops.linear import ColumnParallelLinear
+    from atom.model_ops.utils import dynamic_per_batched_tensor_quant
     from atom.quant_spec import LayerQuantConfig, QuantType
 
     _DCP_OPS_ERR = None
@@ -791,6 +793,182 @@ def test_a2a_scrubs_the_empty_rank():
     torch.testing.assert_close(got[0].float(), o[1][0].float(), rtol=8e-3, atol=8e-3)
 
 
+def _on_every_rank(monkeypatch, n, run):
+    """``run(rank)`` as each rank in turn, its all-to-alls fed by every rank's sends.
+
+    What a rank sends depends on its own inputs alone, so a first pass records
+    each rank's sends and a second hands rank j, call by call, chunk j of every
+    rank's send -- the permutation ``all_to_all_single`` performs. Returns the
+    outputs and how many all-to-alls a rank ran.
+    """
+    sent = [[] for _ in range(n)]
+    rank, calls = 0, iter(())
+
+    def record(recv, send, group):
+        sent[rank].append(send.clone())
+
+    def serve(recv, send, group):
+        k = next(calls)
+        chunks = [sent[r][k].view(n, -1)[rank] for r in range(n)]
+        recv.view(n, -1).copy_(torch.stack(chunks))
+
+    for fake in (record, serve):
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", fake)
+        outs = []
+        for rank in range(n):
+            calls = iter(range(len(sent[rank])))
+            outs.append(run(rank))
+    return outs, len(sent[0])
+
+
+def _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs):
+    from atom.model_ops.dcp_ops import cp_lse_a2a
+
+    group = SimpleNamespace(world_size=len(o), device_group=None)
+
+    def run(rank):
+        x = (
+            o[rank].transpose(0, 1).contiguous()
+            if kwargs.get("head_major")
+            else o[rank]
+        )
+        return cp_lse_a2a(
+            x, lse[rank], group, owned_counts=owned_counts[rank], **kwargs
+        )
+
+    return _on_every_rank(monkeypatch, len(o), run)[0]
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "dtype, quant",
+    [(torch.float32, False), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_head_major_a2a_matches_the_packed_one_bitwise(monkeypatch, dtype, quant):
+    """Sending the head-major output with its LSE apart feeds the combine the
+    same values the pack did, so every rank's result is the same bits, the
+    dummy-backed empty row included. The fused quant keeps the packed path."""
+    b, h, d, n_ranks = 5, 16, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(3)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(dtype) for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    o[0][1] = float("nan")
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+    kwargs = {"quant_dtype": dtypes.fp8} if quant else {"return_lse": True}
+
+    packed = _cp_lse_a2a_on_every_rank(monkeypatch, o, lse, owned_counts, **kwargs)
+    head_major = _cp_lse_a2a_on_every_rank(
+        monkeypatch, o, lse, owned_counts, head_major=True, **kwargs
+    )
+
+    if not quant:
+        roundtrip = _a2a_roundtrip(o, lse, n_ranks, owned_counts)
+        assert torch.equal(torch.cat([out for out, _ in packed], dim=1), roundtrip)
+    for want, got in zip(packed, head_major, strict=True):
+        for x, y in zip(want, got, strict=True):
+            assert torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+
+
+@needs_gpu
+@pytest.mark.parametrize("merge_in_fp32", [False, True])
+@pytest.mark.parametrize("fp8_absorb", [False, True])
+def test_project_merge_out_head_major_matches_the_packed_one(
+    monkeypatch, fp8_absorb, merge_in_fp32
+):
+    """The DCP tail returns the same bits with ``head_major`` as without. Only
+    the bf16 projection stores ``[H, B, V]``, so only it skips the pack and
+    sends the LSE in a second all-to-all."""
+    b, h, latent, v_dim, n_ranks = 8, 16, 128, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(9)
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.pbm_enabled, layer.dcp_comm_backend = True, "a2a"
+    layer.dcp_group = SimpleNamespace(world_size=n_ranks, device_group=None)
+    layer.num_heads, layer.kv_lora_rank, layer.v_head_dim = h // n_ranks, latent, v_dim
+    layer.o_proj = lambda x: x
+    w_v = torch.randn(h, v_dim, latent, generator=g, device=DEV).bfloat16()
+    layer.W_V_dcp, layer.W_V_dcp_scale = (
+        dynamic_per_batched_tensor_quant(w_v, dtype=dtypes.fp8)
+        if fp8_absorb
+        else (w_v, None)
+    )
+    layer.W_V_scale = layer.W_V_dcp_scale  # what _v_up_proj reads for a None scale
+    o = [
+        torch.randn(b, h, latent, generator=g, device=DEV).bfloat16()
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+    owned_counts = [
+        torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)
+    ]
+    owned_counts[0][1] = 0
+
+    def tail(head_major):
+        return _on_every_rank(
+            monkeypatch,
+            n_ranks,
+            lambda r: layer._dcp_project_merge_out(
+                o[r],
+                lse[r],
+                merge_in_fp32=merge_in_fp32,
+                owned_counts=owned_counts[r],
+                head_major=head_major,
+            ),
+        )
+
+    packed, packed_a2as = tail(False)
+    head_major, head_major_a2as = tail(True)
+    assert (packed_a2as, head_major_a2as) == (1, 1 if fp8_absorb else 2)
+    for want, got in zip(packed, head_major, strict=True):
+        assert torch.equal(want, got)
+
+
+@needs_gpu
+def test_fp8_head_major_a2a_stays_within_e4m3_rounding_of_bf16(monkeypatch):
+    """The FP8 payload against the bf16 one at sparse prefill's DCP8 shape,
+    a dummy-backed empty row and a row empty on every rank included.
+
+    e4m3 moves a value by at most 2**-4 of it, or 2**-10 of its row's scale
+    below the normal range. The merge is a convex sum over ranks, and both
+    outputs round to bf16 (2**-9 each); 1% covers the cross terms.
+    """
+    b, h, d, n_ranks = 64, 96, 128, 8
+    g = torch.Generator(device=DEV).manual_seed(13)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).bfloat16() for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) * 3 for _ in range(n_ranks)]
+    counts = [torch.ones(b, dtype=torch.int32, device=DEV) for _ in range(n_ranks)]
+    o[0][1] = float("nan")
+    counts[0][1] = 0
+    for r in range(n_ranks):
+        counts[r][2] = 0
+    ref, got = (
+        torch.cat(
+            _cp_lse_a2a_on_every_rank(
+                monkeypatch, o, lse, counts, head_major=True, payload_dtype=payload
+            ),
+            dim=1,
+        ).float()
+        for payload in (None, dtypes.fp8)
+    )
+
+    empty = torch.stack(counts)[:, :, None] == 0
+    w = torch.softmax(torch.stack(lse).masked_fill(empty, NEG_INF), dim=0)
+    w = w.nan_to_num(0.0)[..., None]
+    x = torch.stack(o).float().masked_fill(empty[..., None], 0.0)
+    scale = x.abs().amax(-1, keepdim=True) / torch.finfo(dtypes.fp8).max
+    bound = (w * (x.abs() * 2.0**-4 + scale * 2.0**-10)).sum(0) + ref.abs() * 2.0**-8
+    assert torch.isfinite(got).all() and torch.all(got[2] == 0)
+    assert torch.all((got - ref).abs() <= bound * 1.01)
+    assert not torch.equal(got, ref)
+
+
 @needs_dcp_ops
 def test_lse_pack_slots_covers_the_transfer_dtypes():
     """fp32 needs one slot, 16-bit dtypes need two; anything else must raise
@@ -813,6 +991,19 @@ def test_cp_lse_a2a_is_a_no_op_without_a_dcp_group():
     assert cp_lse_a2a(o, lse, group) is o
     out, out_lse = cp_lse_a2a(o, lse, group, return_lse=True)
     assert out is o and out_lse is lse
+
+
+@needs_dcp_ops
+@pytest.mark.parametrize("backend", ["a2a", "ag_rs"])
+def test_head_major_merge_without_a_dcp_group_returns_b_h_d(backend):
+    """dcp==1: a head-major input comes back as the ``[B, H, D]`` o_proj reads."""
+    from atom.model_ops.dcp_ops import dcp_lse_merge
+
+    o = torch.randn(2, 4, 8)
+    group = SimpleNamespace(world_size=1)
+    head_major = o.transpose(0, 1).contiguous()
+    got = dcp_lse_merge(head_major, torch.randn(2, 4), group, backend, head_major=True)
+    assert torch.equal(got, o)
 
 
 # ─────────────────────────────────────────────────────────── DCPConfig parsing ──
@@ -1022,6 +1213,7 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         device="cpu",
         index_topk=2048,
         dcp_sparse_prefill_nonps=nonps,
+        dcp_world_size=1,
         padded_num_attention_heads=64,
         block_size=1,
         dtype_q=None,
@@ -1253,7 +1445,7 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
 
 @needs_gpu
 @pytest.mark.parametrize(
-    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
@@ -1378,14 +1570,15 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
 
 
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Pins gathered_num_heads at both call sites, not just the function.
+    """Pins gathered_num_heads at the decode call site, not just the function.
 
     Decode and sparse prefill round the gathered query width through
     different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
-    num_heads) and can disagree (e.g. num_heads=12, dcp=8 -> 96 vs 128).
+    num_heads) and can disagree (e.g. num_heads=12, dcp=4 -> 48 vs 64).
     Passing the wrong one plans persistent work descriptors for the wrong
     nhead; nothing importable on the CPU gate would notice a regression
-    here, so read the two call sites from source instead.
+    here, so read the call sites from source instead. Sparse prefill does
+    not rebuild: the metadata builder plans it once a forward.
     """
     tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
 
@@ -1412,7 +1605,6 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 
     assert by_enclosing_func == {
         "_forward_decode": "self.dcp_kernel_num_heads",
-        "_forward_prefill_mla": "self.dcp_sparse_prefill_num_heads",
     }, (
         "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
         f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
@@ -1422,19 +1614,23 @@ def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width()
 @needs_dcp_ops
 def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
     """Demonstrates the gap the test above guards against is real, not just
-    hypothetical: at this head count the two width tables actually disagree.
+    hypothetical: at 12 heads x DCP4 the two width tables actually disagree.
+    At DCP8 both run aiter's native gqa96 kernel, unpadded.
     """
-    decode_width = mla_dcp_kernel_num_heads(
-        12, 8, kv_cache_dtype="bf16", persistent=True
+    widths = {
+        dcp: (
+            mla_dcp_kernel_num_heads(12, dcp, kv_cache_dtype="bf16", persistent=True),
+            mla_dcp_sparse_prefill_num_heads(12, dcp, persistent=True),
+        )
+        for dcp in (4, 8)
+    }
+    assert widths == {4: (48, 64), 8: (96, 96)}, (
+        "expected decode's and sparse prefill's width tables to disagree at "
+        f"DCP4 and agree on 96 at DCP8; got {widths} -- if DCP4 now agrees, "
+        "the case above no longer proves the two call sites must use their "
+        "own width, pick another num_heads/dcp pair that still diverges"
     )
-    prefill_width = mla_dcp_sparse_prefill_num_heads(12, 8, persistent=True)
-    assert (decode_width, prefill_width) == (96, 128), (
-        "expected decode's and sparse prefill's width tables to disagree "
-        f"here; got decode={decode_width}, prefill={prefill_width} -- if "
-        "they now agree, the case above no longer proves the two call sites "
-        "must use their own width, pick another num_heads/dcp pair that "
-        "still diverges"
-    )
+    assert mla_dcp_sparse_prefill_num_heads(12, 8, persistent=False) == 128
 
 
 # ──────────────── QREP wiring at the q_proj producers (CPU, source-level) ──
