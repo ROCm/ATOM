@@ -242,7 +242,7 @@ class tokenIDProcessor:
         # The scheduler never speculates for a P/D producer, though the runner
         # keeps its drafter loaded: every decode it runs is q=1.
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
-        self.is_deferred_out = defers_output(runner.config, runner.attn_family)
+        self.is_deferred_out = defers_output(runner.config)
 
         self.runner = runner
         device = runner.device
@@ -2722,9 +2722,8 @@ class ModelRunner:
         """Whether this forward scores drafts with the rejection sampler.
 
         A P/D producer keeps the drafter only to write its context KV; the
-        scheduler never pads drafts for it, so its decodes (the step that
-        surfaces a deferred T0) are q=1 and have nothing to verify. Nor has a
-        step with no request (an idle DP rank's).
+        scheduler never pads drafts for it, so its decodes are q=1 and have
+        nothing to verify. Nor has a step with no request (an idle DP rank's).
         """
         return (
             not is_prefill

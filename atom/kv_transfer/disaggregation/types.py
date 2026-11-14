@@ -32,8 +32,8 @@ def kv_config_has_producer(kv_config: object) -> bool:
 
     Both the scheduler and the model runner branch on this: a producer
     prefills and hands the request off after one token, so it never
-    speculates. It still defers output (unless its attention keeps recurrent
-    state), so surfacing that token can take one extra q=1 decode.
+    speculates, and it reports that token from the forward that samples it
+    rather than deferring output.
     """
     if not isinstance(kv_config, dict):
         return False
