@@ -2198,6 +2198,11 @@ class Config:
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
+    # Native, colocated DP-attention phase policy. DeepInfer replaces the
+    # PrefillDelayer, including its chunk-cost balancing and decode interval.
+    dp_scheduler: str = "atom"
+    deepinfer_prefill_interval: int = 70
+    deepinfer_prefill_any_interval: int = 100
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -2741,6 +2746,7 @@ class Config:
 
         # After the parse above: the P/D clause reads `kv_role` off
         # `kv_transfer_config`, which arrives from the CLI as a string.
+        self._validate_dp_scheduler()
         self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
@@ -3018,6 +3024,31 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _validate_dp_scheduler(self) -> None:
+        if self.dp_scheduler not in ("atom", "deepinfer"):
+            raise ValueError("dp_scheduler must be 'atom' or 'deepinfer'")
+        if self.dp_scheduler == "atom":
+            return
+        from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
+        if (
+            not self.enable_dp_attention
+            or self.pipeline_parallel_size != 1
+            or self.enable_rapidserve
+            or self.disagg_is_decode
+            or disaggregated_kv_role(self) is not None
+            or is_plugin_mode()
+        ):
+            raise ValueError(
+                "dp_scheduler='deepinfer' requires native, colocated DP attention "
+                "without pipeline parallelism or RapidServe"
+            )
+        if (
+            self.deepinfer_prefill_interval < 1
+            or self.deepinfer_prefill_any_interval < 1
+        ):
+            raise ValueError("DeepInfer prefill intervals must be positive")
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None

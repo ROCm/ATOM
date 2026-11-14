@@ -72,6 +72,7 @@ from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import attn_family
 
 if TYPE_CHECKING:
+    from atom.model_engine.deepinfer_scheduler import DeepInferDPPolicy
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
 logger = logging.getLogger("atom")
@@ -981,6 +982,7 @@ class Scheduler:
 
         # Set by EngineCore for cross-DP alignment or opt-in TP decode protection.
         self.prefill_delayer: PrefillDelayer | None = None
+        self.dp_phase_policy: DeepInferDPPolicy | None = None
         # requests added since the previous schedule, the delayer's to weigh
         self._arrived_requests = 0
         self._local_prefill_coalescing = False
@@ -999,9 +1001,28 @@ class Scheduler:
         )
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
+        if delayer is not None and self.dp_phase_policy is not None:
+            raise ValueError("PrefillDelayer and DeepInfer DP scheduling are exclusive")
         self.prefill_delayer = delayer
         self._local_prefill_coalescing = delayer is not None and delayer.is_local
         self._inflight_prefix_wait = {}
+
+    def set_dp_phase_policy(self, policy: DeepInferDPPolicy) -> None:
+        if self.prefill_delayer is not None:
+            raise ValueError("PrefillDelayer and DeepInfer DP scheduling are exclusive")
+        self.dp_phase_policy = policy
+        # The reference policy decides the phase, then lets the native batch
+        # allocator use its token budget. Do not add ATOM's coalescing/cost gate.
+        self.cost_balance = False
+
+    def _has_deepinfer_prefill_work(self) -> bool:
+        # DeepInfer keeps partial prefills in waiting; ATOM keeps them in
+        # running. Include both, without probing slot/KV allocation success.
+        if self._partial_prefill_count:
+            return True
+        return bool(self.waiting) and (
+            self.waiting[0].status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+        )
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
@@ -2123,7 +2144,16 @@ class Scheduler:
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
-        if self.prefill_delayer is not None:
+        if self.dp_phase_policy is not None:
+            decision = PrefillDecision(
+                allow=self.dp_phase_policy.begin_step(
+                    has_prefill=self._has_deepinfer_prefill_work(),
+                    kv_usage=self._kv_usage(),
+                ),
+                prefillable_ranks=0,
+            )
+            prefill_cost = 0.0
+        elif self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
             running_decode_batch = max(
@@ -2197,26 +2227,31 @@ class Scheduler:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
             prefill_cost = 0.0
         self._arrived_requests = 0
-        delayer_allows = decision.allow
+        allow_prefill = decision.allow
 
         # Before the early return below: an idle rank keeps its peers' prefill
         # company too.
         group_prefill_tick = self._group_prefill_tick(decision)
 
-        if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
+        if self.cost_balance and allow_prefill and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:
+            if self.dp_phase_policy is not None:
+                # An idle rank must join the second vote before returning.
+                # Its empty runner batch takes the peers' phase in ForwardMode.
+                self.dp_phase_policy.finish_step(prefill_scheduled=False)
             return None
 
+        rejected_before_prefill = len(self._rejected)
         # ---- Phase 1: resume partial prefills from running ----
-        # Gated by `delayer_allows` so cross-DP alignment still holds when one
+        # Gated by `allow_prefill` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        if delayer_allows and self._partial_prefill_count > 0:
+        if allow_prefill and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -2249,7 +2284,7 @@ class Scheduler:
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
         while (
-            delayer_allows
+            allow_prefill
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
@@ -2780,6 +2815,13 @@ class Scheduler:
                 )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
+        if self.dp_phase_policy is not None:
+            group_prefill_tick = self.dp_phase_policy.finish_step(
+                prefill_scheduled=(
+                    num_seqs_prefill > 0
+                    or len(self._rejected) > rejected_before_prefill
+                )
+            )
         if self._tick_cost_limit < math.inf:
             self._log_prefill_balance(total_tokens_num_prefill)
 
@@ -2875,9 +2917,9 @@ class Scheduler:
             return (prefill_batch, scheduled_seqs)
 
         if group_prefill_tick:
-            # The group's prefill step, with no prefill of this rank's own: it
-            # keeps its peers company on an idle step rather than decode, so
-            # every rank's forward replays its token graph (`ForwardMode.decide`).
+            # No local prefill: pause decode and let ForwardMode give the empty
+            # batch its peers' phase. DeepInfer requires this even without
+            # prefill token graphs.
             return None
 
         # --- Decode scheduling ---
