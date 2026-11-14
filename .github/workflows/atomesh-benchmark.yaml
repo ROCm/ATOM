@@ -23,8 +23,6 @@ on:
       - '.github/workflows/atomesh-benchmark.yaml'
       - '.github/workflows/atomesh-benchmark-tmpl.yaml'
   schedule:
-    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
-    - cron: '10 16 * * *'
     # Spur MI350X MoRI IO accuracy at 12:10 Beijing time (04:10 UTC).
     - cron: '10 4 * * *'
   workflow_dispatch:
@@ -249,8 +247,7 @@ env:
 
 concurrency:
   # Keep manual benchmark dispatches independent so different cases on the same branch can run together.
-  # The MoRI IO schedule has a group of its own, or it would queue behind the multi-day nightly.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && (github.event.schedule == '10 4 * * *' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd-mi350') || 'atomesh-cicd') }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event_name == 'schedule' && 'atomesh-cicd-mi350-moriio' || 'atomesh-cicd') }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -379,7 +376,6 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
-          EVENT_SCHEDULE: ${{ github.event_name == 'schedule' && github.event.schedule || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -419,7 +415,7 @@ jobs:
             exit 0
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "10 4 * * *" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             python3 .github/scripts/atomesh/pd_matrix.py \
               --suite accuracy \
               --kv-connector moriio \
@@ -668,7 +664,6 @@ jobs:
           docker_args=(
             run -i --name "${container}"
             --network host --ipc host
-            --privileged
             --device=/dev/kfd
             --device=/dev/dri
             --device=/dev/infiniband

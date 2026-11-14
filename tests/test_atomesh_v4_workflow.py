@@ -20,10 +20,9 @@ class V4WorkflowTest(unittest.TestCase):
     def setUpClass(cls):
         cls.script = workflow_step(load_workflow(), "matrix")
 
-    def matrix(self, event="schedule", schedule="10 16 * * *", **overrides):
+    def matrix(self, event="push", **overrides):
         env = {
             "GITHUB_EVENT_NAME": event,
-            "EVENT_SCHEDULE": schedule,
             "SUITE": "nightly",
             "RUN_ALL_MODELS": "true",
             "MODEL_NAMES": "",
@@ -47,20 +46,9 @@ class V4WorkflowTest(unittest.TestCase):
         self.assertIn("has_matrix=true", output)
         return cells
 
-    def test_push_and_mi350_daily_exclude_v4_weekly(self):
-        for event, schedule, runner in (
-            ("push", "", "atomesh-cicd"),
-            ("schedule", "10 16 * * *", "atomesh-cicd-mi350"),
-        ):
-            with self.subTest(event=event, runner=runner):
-                cells = self.matrix(
-                    event=event,
-                    schedule=schedule,
-                    ATOMESH_SLURM_SUBMIT_RUNNER=runner,
-                    ATOMESH_1P1D_NODES="n1,n2,n3,n4" if "mi350" in runner else "",
-                    ATOMESH_2P1D_NODES="n1,n2,n3,n4" if "mi350" in runner else "",
-                )
-                self.assertTrue(all(cell["model"] != MODEL for cell in cells))
+    def test_push_excludes_v4_weekly(self):
+        cells = self.matrix()
+        self.assertTrue(all(cell["model"] != MODEL for cell in cells))
 
     def test_manual_weekly_case_selection_preserves_256_threshold(self):
         cells = self.matrix(
