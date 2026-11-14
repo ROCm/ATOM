@@ -19,6 +19,7 @@ from aiter.ops.shuffle import (
     interleave_gate_up_rows,
     moe_shuffle_scale,
     moe_shuffle_weight,
+    moe_shuffle_weight_iod,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -1996,6 +1997,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
         layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+        # When aiter enables IOD placement (gfx1250) it re-lays these weights
+        # in place, a layout neither the Triton decode views nor EPLB's
+        # expert-major migration can read; otherwise the calls are no-ops.
+        if not (
+            self.use_triton_decode
+            or getattr(get_current_atom_config(), "eplb_enable", False)
+        ):
+            moe_shuffle_weight_iod(
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                self.num_experts,
+                gate_up=True,
+            )
+            moe_shuffle_weight_iod(
+                layer.w2_weight, layer.w2_weight_scale, self.num_experts
+            )
 
     def _triton_views_of_flydsl_weights(self, layer) -> tuple:
         """Zero-copy Triton/gluon views of the FlyDSL-shuffled MXFP4 weights.
