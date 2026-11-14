@@ -206,6 +206,12 @@ def sym_layout(npes: int, rows: int = MAX_TOKENS, n_split: int = N_SPLIT):
             ("attnb_ag", rows * HIDDEN // 4),
             ("attnb_f", npes * N_O),
             ("attnb_agf", N_O),
+            # ``ar_flag`` (the whole-layer FFN all-reduce without tags): plain bf16 payloads [src][token][HIDDEN] and the
+            # owners' sums, then their flag pairs (last: every region above keeps its offset)
+            ("ffnb", npes * rows * HIDDEN // 4),
+            ("ffnb_ag", rows * HIDDEN // 4),
+            ("ffnb_f", npes * N_DN),
+            ("ffnb_agf", N_DN),
         ]
     )
 
@@ -224,6 +230,7 @@ def mailbox_regions(
     moe_back: bool = False,
     index_cp: bool = False,
     o_flag: bool = False,
+    ar_flag: int = 0,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -305,6 +312,9 @@ def mailbox_regions(
             else RegionDecl("mid", S, "ug")
         )
     regions.append(RegionDecl("sel", S, "ug"))  # the routing record (tests)
+    if ar_flag:  # the FFN all-reduce's flag pairs (``ffn_finish_flag``): payloads are plain words, not regions
+        regions += [RegionDecl(n, P, "down", exchange=True) for n in ("ffnb_f", "ffnb_agf")]
+        return regions
     regions.append(RegionDecl("ffn", P, "down", exchange=True))
     if tokens >= AG_RS_FROM:
         regions.append(RegionDecl("ffn_ag", P, "down", exchange=True))

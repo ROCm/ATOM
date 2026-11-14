@@ -44,6 +44,7 @@ def build_layer(
     moe_back: bool = False,
     index_cp: bool = False,
     o_flag: int = 0,
+    ar_flag: int = 0,
 ):
     """The layer kernel for ``tokens`` and ``index_heads`` (1 or TP), K1 fused in
     or not (``fuse_k1``), selecting or reusing a selection (``index_topk``), its
@@ -56,7 +57,7 @@ def build_layer(
         index_topk=index_topk, xn_flag=xn_flag, shared_mxfp8=shared_mxfp8, mid_flag=mid_flag,
         kv_nvfp4=kv_nvfp4, index_nvfp4=index_nvfp4, sh_first=sh_first,
         attn_mxfp8=attn_mxfp8, sp_f32=sp_f32, moe_a16w4=moe_a16w4, moe_a4w4=moe_a4w4,
-        moe_back=moe_back, index_cp=index_cp, o_flag=o_flag,
+        moe_back=moe_back, index_cp=index_cp, o_flag=o_flag, ar_flag=ar_flag,
     )  # fmt: skip
 
 
@@ -114,6 +115,7 @@ def check_build(
     moe_back: bool = False,
     index_cp: bool = False,
     o_flag: int = 0,
+    ar_flag: int = 0,
 ) -> None:
     """Trace ``build_layer`` and check its hand-offs; raises ``ContractError``."""
     check_traced(
@@ -135,6 +137,7 @@ def check_build(
             moe_back,
             index_cp,
             o_flag,
+            ar_flag,
         ),
         K4_ABI,
         mailbox_regions(
@@ -151,6 +154,7 @@ def check_build(
             moe_back,
             index_cp,
             bool(o_flag),
+            ar_flag,
         ),
     )
 
@@ -207,6 +211,9 @@ if __name__ == "__main__":
                 print(f"S={s} moe_back o_flag (tag-free attention all-reduce): contract holds")
                 check_front(s, 4, True, True, False, 1, 1)
                 print(f"S={s} front o_flag: contract holds")
+                    sp_f32=False, moe_back=True, ar_flag=1,
+                )  # fmt: skip
+                print(f"S={s} moe_back ar_flag (tag-free FFN all-reduce): contract holds")
             continue
         for ih in (1, TP):
             # a16w4 (the default) and the previous a8w4 experts (only a build with the
