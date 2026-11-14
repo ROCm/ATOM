@@ -35,6 +35,7 @@ from atom.mono.device.ops import (
     traced,
 )
 from atom.mono.device.sync import DIAG_TICKS
+from atom.mono.polling import POLL_SLEEP_UNITS
 from atom.mono.plan.build_key import key_tuple, source_digest
 from atom.mono.plan.execution import BLOCKS, THREADS
 
@@ -102,7 +103,7 @@ def _wait_arrived(state, e):
         return ballot(bad) != 0
 
     while late():
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(POLL_SLEEP_UNITS)
 
 
 @traced
@@ -126,13 +127,13 @@ def _fence(peers, fence_off, rank, state, e, tp, debug):
     seen = seen_now()
     if const_expr(not debug):
         while ballot(seen < e) != 0:
-            rocdl.s_sleep(1)
+            rocdl.s_sleep(POLL_SLEEP_UNITS)
             seen = seen_now()
     else:
         t0 = memrealtime()
         late = fx.Int32(0)
         while (ballot(seen < e) != 0) & (late == 0):
-            rocdl.s_sleep(1)
+            rocdl.s_sleep(POLL_SLEEP_UNITS)
             seen = seen_now()
             late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
         if (tid < tp) & (seen < e):

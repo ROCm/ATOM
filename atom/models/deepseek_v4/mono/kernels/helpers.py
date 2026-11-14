@@ -26,6 +26,7 @@ from flydsl.expr.typing import T
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels import dpp_utils
 from atom.models.deepseek_v4.mono.kernels import primitives as ops
+from atom.mono import polling
 
 EPS, FP8_MAX, SCALE_BM = 1e-5, 448.0, 128
 CM_DEV, CM_SYS, POLL_MAX = 16, 17, 12
@@ -53,7 +54,9 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 # A kernel's JIT disk-cache key covers only the sources in its own directory. A kernel that binds these
 # helpers captures this digest of the shared device sources, so editing this file or ops.py recompiles it.
 SHARED_SOURCE_KEY = hashlib.sha256(
-    b"".join(Path(module.__file__).read_bytes() for module in (ops, bo, dpp_utils))
+    b"".join(
+        Path(module.__file__).read_bytes() for module in (ops, bo, dpp_utils, polling)
+    )
     + Path(__file__).read_bytes()
 ).hexdigest()[:16]
 
@@ -173,7 +176,7 @@ def poll(
         t0 = mem_realtime()
         stop = fx.Int32(0)
         while pending(v) & (stop == 0):
-            rocdl.s_nop(0)
+            rocdl.s_sleep(polling.POLL_SLEEP_UNITS)
             v = load_all()
             flagged = (
                 uniform(
@@ -192,7 +195,7 @@ def poll(
             if const_expr(retry_spin_pause):
                 spin_pause()
             else:
-                rocdl.s_nop(0)
+                rocdl.s_sleep(polling.POLL_SLEEP_UNITS)
             v = load_all()
     return unpack(v)
 

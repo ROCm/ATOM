@@ -25,6 +25,8 @@ from __future__ import annotations
 import re
 
 import flydsl.compiler as flyc
+from atom.mono.polling import POLL_SLEEP_UNITS
+
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
@@ -590,7 +592,7 @@ def uniform_f32(value):
 def spin_pause() -> None:
     """Keep tagged-mailbox polling loads inside the retry loop."""
 
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    llvm.InlineAsmOp(None, [], f"s_sleep {POLL_SLEEP_UNITS}", "", has_side_effects=True)
 
 
 def read_lane_i32(value, lane):

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import re
 
+from atom.mono.polling import POLL_SLEEP_UNITS
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
@@ -178,7 +180,7 @@ def fresh_s64(v):
 
 def spin_pause():
     """An opaque, side-effecting op inside a poll loop: keeps its loads from being hoisted."""
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    llvm.InlineAsmOp(None, [], f"s_sleep {POLL_SLEEP_UNITS}", "", has_side_effects=True)
 
 
 # ------------------------------------------------------------------ hardware math

@@ -47,6 +47,8 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.mono import polling
+
 from ..device.gfx950 import mailbox
 from ..device.gfx950.ops import (
     fresh_s,
@@ -86,7 +88,7 @@ def _source_files() -> list[tuple[tuple[str, ...], str]]:
         out += [
             (parts + (n,), os.path.join(root, n)) for n in names if n.endswith(".py")
         ]
-    return sorted(out)
+    return sorted(out + [(("shared", "mono", "polling.py"), polling.__file__)])
 
 
 def source_digest() -> str:
