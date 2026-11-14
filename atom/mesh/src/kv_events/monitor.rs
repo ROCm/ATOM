@@ -161,6 +161,7 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
             },
             message = socket.recv() => match message {
                 Ok(message) => {
+                    recv_failed = false;
                     let batch = batch(&message.into_vec(), source.block_size, dp_rank);
                     record(&mut status.lock(), &mut admission, batch);
                 }
