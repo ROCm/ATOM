@@ -123,6 +123,7 @@ def build_v41(unallocated_moe):
             enforce_eager=True,
             compilation_config=SimpleNamespace(level=0, static_forward_context={}),
             online_quant_config=online,
+            max_num_seqs=4,
             dspark=DSparkConfig(),
         )
         with torch.device("meta"):
