@@ -605,12 +605,16 @@ jobs:
           if-no-files-found: ignore
 
   # ---------- Profiler analysis (lightweight, runs on regression OR manual profiler) ----------
+  # Also runs when a regression was detected but no rerun cell was generated
+  # (regression-rerun and collect-regression-traces are then skipped), so the
+  # [Perf Regression] issue created by the last step is still filed.
   profiler-analysis:
     if: >-
       always()
       && (needs.collect-regression-traces.result != 'cancelled'
           && needs.collect-regression-traces.result != 'skipped'
-          || inputs.enable_profiler == true)
+          || inputs.enable_profiler == true
+          || needs.summarize-benchmark-result.outputs.has_regression == 'true')
     name: Profiler trace analysis
     needs: [benchmark, summarize-benchmark-result, generate-regression-matrix, regression-rerun, collect-regression-traces]
     runs-on: ubuntu-latest

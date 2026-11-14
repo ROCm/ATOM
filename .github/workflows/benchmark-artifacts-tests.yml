@@ -12,6 +12,7 @@ on:
       - '.github/scripts/resolve_atom_image.py'
       - '.github/scripts/atomesh/pd_server_atom.sh'
       - '.github/scripts/catalog.py'
+      - '.github/scripts/regression_rerun.py'
       - '.github/workflows/*benchmark*'
       - 'tests/benchmarks/**'
       - 'tests/test_benchmark*'
@@ -31,7 +32,7 @@ jobs:
       - name: Validate producer, streaming client and catalog
         run: |
           python -m pytest -q --confcutdir=tests/benchmarks/results \
-            tests/benchmarks/results tests/test_benchmark_catalog.py tests/test_benchmark_random_dataset.py tests/test_benchmark_aiter_wheel.py
+            tests/benchmarks/results tests/test_benchmark_catalog.py tests/test_benchmark_regression_rerun.py tests/test_benchmark_random_dataset.py tests/test_benchmark_aiter_wheel.py
           bash -n .github/scripts/download_aiter_wheel.sh .github/scripts/install_aiter_wheel.sh
           bash -n .github/scripts/atom_test.sh
           bash -n .github/scripts/aiperf_agentic.sh
