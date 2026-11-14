@@ -431,8 +431,8 @@ class MlaModule:
 
 
 def extract(output, layer):
-    """The aux tap: prefix + addends (the layer's own ``aux_hidden_state`` call
-    carries a trailing block-residual slot that the tap ignores)."""
+    """The aux tap (``AuxTaps.extract``): prefix + addends (the runner hands
+    ``(*out, blocks)``: a trailing block-residual slot that the tap ignores)."""
     ps = output[0].float() + sum(a.float() for a in output[1:-1] if a is not None)
     return ps.to(BF)
 
@@ -559,7 +559,6 @@ def run(mode, post, rows_steps, only=None):
             layer_idx=lid,
             self_attention_attn_res=SeamModule(lid),
             self_attn=MlaModule(lid),
-            aux_hidden_state=lambda out, lid=lid: extract(out, NS(layer_idx=lid)),
         )
         for lid in range(LAYERS)
     ]
@@ -592,7 +591,7 @@ def run(mode, post, rows_steps, only=None):
     r.peers = NS(addresses=torch.zeros(8), rank=0)
     r.mailboxes = NS(begin_step=lambda *a: None)
     r.ix = None
-    r.aux = AuxTaps(TAPS, tuple(torch.zeros(48, H, dtype=BF) for _ in TAPS))
+    r.aux = AuxTaps(TAPS, tuple(torch.zeros(48, H, dtype=BF) for _ in TAPS), extract)
     r.mla_post = {}
     if post:
         heads, lora = HEADS, KVL
