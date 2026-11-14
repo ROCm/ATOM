@@ -394,8 +394,12 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());
+    // Preparation workers encode with copies they load from the source.
+    let source = dir.path().join("tokenizer.json");
     (ctx.app_context.tokenizer_registry)
-        .load("bos", "test-model", "test", || async { Ok(tokenizer) })
+        .load("bos", "test-model", source.to_str().unwrap(), || async {
+            Ok(tokenizer)
+        })
         .await
         .unwrap();
     let app = ctx.create_app().await;
