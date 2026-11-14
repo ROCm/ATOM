@@ -233,10 +233,12 @@ def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
     )
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
     report = result(ci, "20261114").read_text()
-    assert "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md)." in report
+    assert "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md)" in report
     assert "@owner_tbd" not in report
     out = capsys.readouterr().out
-    assert "DeepSeek R1" in out and "no follow-up" in out
+    assert "| Model | What happened | Cause | Fix |" in out  # the draft is the table
+    assert "| 🔴 DeepSeek R1 | throughput down 20.0% | — | — |" in out
+    assert "no follow-up" in out
     assert out.rstrip().splitlines()[-1].startswith("Report: ")
 
 
@@ -296,7 +298,7 @@ def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(ci, capsys)
     assert "pending_fixes.csv" not in out and "no follow-up" not in out
     report = result(ci, "20261118").read_text()
     assert (
-        "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)." in report
+        "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)" in report
     )
 
 

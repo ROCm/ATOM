@@ -4,6 +4,7 @@ from ci455_data import AccCell, PerfCell
 from ci455_report import (
     ModelResult,
     highlights,
+    highlights_md,
     missing_followups,
     report_md,
     summary_row,
@@ -59,11 +60,9 @@ FLAT = {
 }
 
 
-def about(lines, name):
-    return [h for h in lines if name in h]
-
-
-NONE = ["No failures or major changes."]
+def about(rows, name):
+    """The highlight rows of one model: [flag and model, what happened, cause, fix]."""
+    return [row for row in rows if name in row[0]]
 
 
 def test_a_highlight_leads_with_the_short_model_name_and_leaves_out_the_scenario():
@@ -78,9 +77,11 @@ def test_a_highlight_leads_with_the_short_model_name_and_leaves_out_the_scenario
             )
         ]
     )
-    (line,) = about(hl, "Kimi-K3")
-    assert line.startswith("🟢 Kimi-K3: ")
-    assert "(2.8T)" not in line and "8K/1K" not in line and "MLPerf" not in line
+    (row,) = about(hl, "Kimi-K3")
+    assert row[0] == "🟢 Kimi-K3"
+    assert not any(
+        word in cell for cell in row for word in ("(2.8T)", "8K/1K", "MLPerf")
+    )
 
 
 def test_a_failure_leads_with_the_failed_point_and_the_error():
@@ -101,11 +102,7 @@ def test_a_failure_leads_with_the_failed_point_and_the_error():
             ),
         ]
     )
-    assert (
-        hl[0].startswith("❌ Bravo: ")
-        and "c64 failed" in hl[0]
-        and "out of memory" in hl[0]
-    )
+    assert hl[0][:2] == ["❌ Bravo", "c64 failed"] and "out of memory" in hl[0][2]
     assert len(about(hl, "Bravo")) == 1
 
 
@@ -120,8 +117,8 @@ def test_a_throughput_drop_of_3_percent_is_a_regression_and_10_percent_is_severe
         ]
     )
     (alpha,), (bravo,) = about(hl, "Alpha"), about(hl, "Bravo")
-    assert alpha.startswith("⚠️ Alpha: ") and "throughput down 3.0%" in alpha
-    assert bravo.startswith("🔴 Bravo: ") and "throughput down 11.0%" in bravo
+    assert alpha[:2] == ["⚠️ Alpha", "throughput down 3.0%"]
+    assert bravo[:2] == ["🔴 Bravo", "throughput down 11.0%"]
     assert about(hl, "Charlie") == []  # −2%: not news
 
 
@@ -130,7 +127,7 @@ def test_a_change_only_at_low_concurrency_says_so():
         [model("Alpha", pc(4, 95.0, 100.0), pc(64, 1000.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
-    assert alpha.startswith("⚠️ Alpha: ") and "c4 throughput down 5.0%" in alpha
+    assert alpha[:2] == ["⚠️ Alpha", "c4 throughput down 5.0%"]
 
 
 def test_the_low_concurrency_is_mentioned_when_it_is_worse_than_c64():
@@ -138,11 +135,7 @@ def test_the_low_concurrency_is_mentioned_when_it_is_worse_than_c64():
         [model("Alpha", pc(4, 88.0, 100.0), pc(64, 960.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
-    assert (
-        alpha.startswith("🔴 Alpha: ")
-        and "throughput down 4.0%" in alpha
-        and "c4 down 12.0%" in alpha
-    )
+    assert alpha[:2] == ["🔴 Alpha", "throughput down 4.0%, c4 down 12.0%"]
 
 
 def test_the_low_concurrency_is_left_out_when_c64_already_says_it():
@@ -150,7 +143,7 @@ def test_the_low_concurrency_is_left_out_when_c64_already_says_it():
         [model("Alpha", pc(4, 96.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
-    assert "throughput down 5.0%" in alpha and "c4" not in alpha
+    assert alpha[1] == "throughput down 5.0%"
 
 
 def test_a_gain_of_3_percent_is_progress():
@@ -158,7 +151,7 @@ def test_a_gain_of_3_percent_is_progress():
         [model("Alpha", pc(4, 100.0, 100.0), pc(64, 1040.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
-    assert alpha.startswith("🟢 Alpha: ") and "throughput up 4.0%" in alpha
+    assert alpha == ["🟢 Alpha", "throughput up 4.0%", "—", "—"]
 
 
 def test_an_accuracy_drop_over_004_is_flagged_and_over_006_is_severe():
@@ -172,8 +165,8 @@ def test_an_accuracy_drop_over_004_is_flagged_and_over_006_is_severe():
         ]
     )
     (alpha,), (bravo,) = about(hl, "Alpha"), about(hl, "Bravo")
-    assert alpha.startswith("⚠️ Alpha: ") and "GSM8K down 4.5 points to 90.5%" in alpha
-    assert bravo.startswith("🔴 Bravo: ") and "down 7.0 points" in bravo
+    assert alpha[:2] == ["⚠️ Alpha", "GSM8K down 4.5 points to 90.5%"]
+    assert bravo[0] == "🔴 Bravo" and "down 7.0 points" in bravo[1]
     assert about(hl, "Charlie") == []
 
 
@@ -189,11 +182,18 @@ def test_a_model_that_failed_last_time_and_runs_now_is_a_recovery():
         ]
     )
     (alpha,) = about(hl, "Alpha")
-    assert alpha.startswith("✅ Alpha: ")
+    assert alpha == ["✅ Alpha", "recovered from the previous failure", "—", "—"]
 
 
 def test_flat_models_are_not_mentioned():
-    assert highlights([model(n, **FLAT) for n in ("Alpha", "Bravo", "Charlie")]) == NONE
+    assert highlights([model(n, **FLAT) for n in ("Alpha", "Bravo", "Charlie")]) == []
+
+
+def test_without_news_the_highlights_are_one_line_not_an_empty_table():
+    flat = [model("Alpha", **FLAT)]
+    assert highlights_md(flat) == ["No failures or major changes."]
+    text = report_md("2026-11-14", {}, flat, "c", "r")
+    assert "\n### Highlights\n\nNo failures or major changes.\n\n### Results\n" in text
 
 
 def test_a_first_result_is_not_news():
@@ -201,7 +201,7 @@ def test_a_first_result_is_not_news():
         highlights(
             [model("Alpha", pc(4, 100.0, None), pc(64, 1000.0, None), ac(0.95, None))]
         )
-        == NONE
+        == []
     )
 
 
@@ -249,6 +249,7 @@ def test_one_report_holds_the_summary_and_then_the_details():
     order = [
         "\n## Summary\n",
         "\n### Highlights\n",
+        "\n| Model | What happened | Cause | Fix |",
         "\n| Model | Scenario |",
         "\n## Findings\n",
         "\n## Details\n",
@@ -276,11 +277,37 @@ GAINING = {
 
 def test_the_highlights_tag_no_one():
     # The owners are added where the highlights are posted, not in the result.
-    lines = highlights(
+    rows = highlights(
         [model("Alpha", **GAINING), model("Bravo", **FAILING)],
         followups={"bravo": {"action": "repro", "link": "r.md"}},
     )
-    assert len(lines) == 2 and not any("@" in line for line in lines)
+    assert len(rows) == 2 and not any("@" in cell for row in rows for cell in row)
+
+
+def test_the_highlights_are_a_table_in_the_summary():
+    text = report_md(
+        "2026-11-14",
+        {},
+        [model("Alpha", **GAINING), model("Bravo", **FAILING)],
+        "c",
+        "r",
+        followups={"bravo": follow("open_pr", PR_OPEN)},
+    )
+    table = text.split("\n### Highlights\n\n")[1].split("\n\n")[0].splitlines()
+    assert table == [
+        "| Model | What happened | Cause | Fix |",
+        "|---|---|---|---|",
+        f"| ❌ Bravo | c64 failed | `RuntimeError: x` | Needs [ROCm/aiter#1234]({PR_OPEN}) (open) |",
+        "| 🟢 Alpha | throughput up 4.0% | — | — |",
+    ]
+
+
+def test_a_pipe_in_a_cause_does_not_break_the_table():
+    (line,) = highlights_md(
+        [model("Bravo", **FAILING)],
+        followups={"bravo": {"problem": "a|b layout"}},
+    )[2:]
+    assert line == "| ❌ Bravo | c64 failed | a\\|b layout | — |"
 
 
 def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
@@ -349,12 +376,8 @@ def test_summary_row_of_a_first_run_has_no_delta():
 
 
 def test_a_problem_without_a_follow_up_is_just_the_problem():
-    (line,) = highlights([model("Bravo", **FAILING)])
-    assert (
-        line.startswith("❌ Bravo: c64 failed")
-        and "@" not in line
-        and "please" not in line
-    )
+    (row,) = highlights([model("Bravo", **FAILING)])
+    assert row == ["❌ Bravo", "c64 failed", "`RuntimeError: x`", "—"]
 
 
 def test_only_the_previous_session_counts_not_an_older_best():
@@ -388,7 +411,7 @@ def test_only_the_previous_session_counts_not_an_older_best():
         perf_cells(rows, "endpoint", "alpha", "2026-11-14", (64,)),
         acc_cell([], "endpoint", "alpha", "2026-11-14"),
     )
-    assert highlights([result]) == NONE
+    assert highlights([result]) == []
 
 
 def test_a_model_that_did_not_run_this_session_has_not_recovered():
@@ -403,7 +426,7 @@ def test_a_model_that_did_not_run_this_session_has_not_recovered():
             )
         ]
     )
-    assert hl == NONE
+    assert hl == []
 
 
 def test_summary_row_of_a_model_that_did_not_run_shows_dashes_not_na():
@@ -429,36 +452,51 @@ def follow(action, link, note=""):
 
 
 def test_a_failure_carries_the_open_pr_that_fixes_it():
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
-    assert line.startswith("❌ Bravo: c64 failed")
-    assert line.endswith(f"Needs [ROCm/aiter#1234]({PR_OPEN}) (open).")
+    assert row[:2] == ["❌ Bravo", "c64 failed"]
+    assert row[3] == f"Needs [ROCm/aiter#1234]({PR_OPEN}) (open)"
 
 
 def test_a_regression_we_fixed_links_our_verified_pr():
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Alpha", pc(4, 100.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))],
         followups={"alpha": follow("our_pr", PR_OURS)},
     )
-    assert line.startswith("⚠️ Alpha: throughput down 5.0%.")
-    assert line.endswith(f"Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified).")
+    assert row == [
+        "⚠️ Alpha",
+        "throughput down 5.0%",
+        "—",
+        f"Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified)",
+    ]
+
+
+def test_a_regression_takes_its_cause_from_the_follow_up_problem():
+    (row,) = highlights(
+        [model("Alpha", pc(4, 100.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))],
+        followups={
+            "alpha": {**follow("open_pr", PR_OPEN), "problem": "MoE sorting default"}
+        },
+    )
+    assert row[2] == "MoE sorting default"
 
 
 def test_a_problem_with_only_a_repro_links_it():
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("repro", "../runs/20261114/bravo/repro.md")},
     )
-    assert line.endswith("No fix yet; [repro](../runs/20261114/bravo/repro.md).")
+    assert row[3] == "No fix yet; [repro](../runs/20261114/bravo/repro.md)"
 
 
 def test_good_news_takes_no_follow_up():
-    (line,) = highlights(
-        [model("Alpha", **GAINING)], followups={"alpha": follow("open_pr", PR_OPEN)}
+    (row,) = highlights(
+        [model("Alpha", **GAINING)],
+        followups={"alpha": {**follow("open_pr", PR_OPEN), "problem": "x"}},
     )
-    assert "Fix" not in line and "repro" not in line
+    assert row[2:] == ["—", "—"]
 
 
 def test_missing_followups_names_problems_without_a_usable_follow_up():
@@ -493,7 +531,7 @@ def test_the_details_list_each_problem_with_its_next_step_and_note():
     details = text.split("\n## Details\n")[1]
     table = details.split("\n### Follow-ups\n")[1].split("\n### ")[0]
     assert (
-        f"| Bravo | — | Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified). | c64 905 tok/s/GPU on 455 |"
+        f"| Bravo | — | Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified) | c64 905 tok/s/GPU on 455 |"
         in table
     )
     assert "| Charlie | — | Missing: needs a follow-up | — |" in table
@@ -504,11 +542,11 @@ def test_a_fix_that_takes_two_prs_links_both():
     links = (
         "https://github.com/ROCm/ATOM/pull/3225 https://github.com/ROCm/aiter/pull/7847"
     )
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)], followups={"bravo": follow("open_pr", links)}
     )
-    want = "Needs [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)."
-    assert line.endswith(want)
+    want = "Needs [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)"
+    assert row[3] == want
 
 
 def test_the_findings_text_goes_into_its_own_section():
@@ -520,7 +558,7 @@ def test_the_findings_text_goes_into_its_own_section():
 
 
 def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)],
         followups={
             "bravo": {
@@ -530,17 +568,20 @@ def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
             }
         },
     )
-    assert line == (
-        f"❌ Bravo: c64 failed — no cross-node TP on main. Needs [ROCm/aiter#1234]({PR_OPEN}) (open)."
-    )
+    assert row == [
+        "❌ Bravo",
+        "c64 failed",
+        "no cross-node TP on main",
+        f"Needs [ROCm/aiter#1234]({PR_OPEN}) (open)",
+    ]
 
 
 def test_a_fix_merged_after_the_image_was_built_says_main_has_it():
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)], followups={"bravo": follow("merged_pr", PR_OURS)}
     )
-    assert line.endswith(
-        f"Fixed on main by [ROCm/ATOM#2601]({PR_OURS}) (merged after the image was built)."
+    assert row[3] == (
+        f"Fixed on main by [ROCm/ATOM#2601]({PR_OURS}) (merged after the image was built)"
     )
     assert (
         missing_followups(
@@ -556,12 +597,12 @@ def test_prs_of_one_repo_name_the_repo_once():
         "https://github.com/ROCm/ATOM/pull/2760",
     )
     b1 = "https://github.com/ROCm/aiter/pull/7913"
-    (line,) = highlights(
+    (row,) = highlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("our_pr", f"{a1} {a2} {b1}")},
     )
-    assert line.endswith(
-        f"Passes with [ROCm/ATOM#2647]({a1}) + [#2760]({a2}) + [ROCm/aiter#7913]({b1}) (verified)."
+    assert row[3] == (
+        f"Passes with [ROCm/ATOM#2647]({a1}) + [#2760]({a2}) + [ROCm/aiter#7913]({b1}) (verified)"
     )
 
 

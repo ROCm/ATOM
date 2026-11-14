@@ -1,7 +1,7 @@
 """Build the 455-CI result of one session, in English and in one file: a short
-summary for the boss (highlights and a table), the session's findings, then the
-details (environment, every number, trend charts, follow-ups and each failure's
-core error log) (455-CI-guide.md §5)."""
+summary for the boss (the highlights table and the results table), the session's
+findings, then the details (environment, every number, trend charts, follow-ups
+and each failure's core error log) (455-CI-guide.md §5)."""
 
 import re
 from dataclasses import dataclass, field
@@ -126,11 +126,11 @@ def _phrase(cells, top, key, template, flag=perf_flag):
 
 
 def _news(results):
-    """(category, slug, line, err) per piece of news, most important first:
-    failures, severe and plain regressions (throughput, then GSM8K),
-    progress, recoveries. Everything is against the previous success. A
-    failure's line stops after what failed, and `err` is its short error (the
-    highlight adds the cause); other news has a whole line and `err` None."""
+    """(category, slug, flag, model, what happened, err) per piece of news,
+    most important first: failures, severe and plain regressions (throughput,
+    then GSM8K), progress, recoveries. Everything is against the previous
+    success. `err` is a failure's short error (its cause when the follow-up
+    gives none); other news has `err` None."""
     items = []
     for r in results:
         who, top = short_name(r.name), headline(r)
@@ -142,47 +142,28 @@ def _news(results):
             )
             err = _short(errors[0]) if errors else ""
             what = "all runs failed" if everything else f"{' and '.join(parts)} failed"
-            items.append((0, r.slug, f"❌ {who}: {what}", err))
+            items.append((0, r.slug, "❌", who, what, err))
             continue
         down = [c for c in r.perf if perf_flag(c.delta) in ("⚠️", "🔴")]
         if down:
             icon = "🔴" if any(perf_flag(c.delta) == "🔴" for c in down) else "⚠️"
-            items.append(
-                (
-                    1 if icon == "🔴" else 2,
-                    r.slug,
-                    f"{icon} {who}: {_phrase(down, top, lambda c: c.delta, '{subject} down {pct}')}.",
-                    None,
-                )
-            )
+            what = _phrase(down, top, lambda c: c.delta, "{subject} down {pct}")
+            items.append((1 if icon == "🔴" else 2, r.slug, icon, who, what, None))
         flag = acc_flag(r.acc.delta)
         if flag:
-            items.append(
-                (
-                    1 if flag == "🔴" else 2,
-                    r.slug,
-                    f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}.",
-                    None,
-                )
-            )
+            what = f"GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}"
+            items.append((1 if flag == "🔴" else 2, r.slug, flag, who, what, None))
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
         if up:
-            items.append(
-                (
-                    4,
-                    r.slug,
-                    f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}.",
-                    None,
-                )
-            )
+            what = _phrase(up, top, lambda c: c.delta, "{subject} up {pct}")
+            items.append((4, r.slug, "🟢", who, what, None))
         # Only what ran this session can have recovered: a model left untested
         # (say its machine went down, guide §3.6) has no rows and no news.
         ran = [c for c in r.perf if c.status == "ok"]
         ran += [r.acc] if r.acc.status == "ok" else []
         if any(c.prev_failed for c in ran):
-            items.append(
-                (5, r.slug, f"✅ {who}: recovered from the previous failure.", None)
-            )
+            what = "recovered from the previous failure"
+            items.append((5, r.slug, "✅", who, what, None))
     return sorted(
         items, key=lambda item: item[0]
     )  # stable: model order within a category
@@ -221,34 +202,56 @@ def _prs(links):
 
 
 def _follow_text(f):
-    """A problem's next step, from its followups.csv row: short, because the
+    """A problem's fix, from its followups.csv row: short, because the
     highlights go to the boss as they are."""
     action, link = (f or {}).get("action"), ((f or {}).get("link") or "").strip()
     if action == "open_pr":
-        return f"Needs {_prs(link)} (open)."
+        return f"Needs {_prs(link)} (open)"
     if action == "our_pr":
-        return f"Passes with {_prs(link)} (verified)."
+        return f"Passes with {_prs(link)} (verified)"
     if action == "merged_pr":
-        return f"Fixed on main by {_prs(link)} (merged after the image was built)."
+        return f"Fixed on main by {_prs(link)} (merged after the image was built)"
     if action == "repro":
-        return f"No fix yet; [repro]({link})."
+        return f"No fix yet; [repro]({link})"
     return ""
 
 
+HIGHLIGHT_COLUMNS = ("Model", "What happened", "Cause", "Fix")
+
+
 def highlights(results, followups=None):
-    """One short line per piece of news: "<flag> <model>: <what happened>". A
-    failure says what failed and why (followups.csv's `problem`, else the
-    error), and every problem (❌ 🔴 ⚠️) ends with its next step. Flat models
-    and first results are not news; with no news the list says so."""
-    lines = []
-    for category, slug, line, err in _news(results):
+    """The rows of the highlights table, one per piece of news: the flag and
+    the short model name, what happened, its cause and its fix. A problem (❌
+    🔴 ⚠️) takes its cause from followups.csv's `problem` (a failure without
+    one: its short error) and its fix from the follow-up's action and links.
+    Flat models and first results are not news."""
+    rows = []
+    for category, slug, flag, who, what, err in _news(results):
         f = (followups or {}).get(slug) or {}
-        if err is not None:
-            why = (f.get("problem") or "").strip()
-            line += (f" — {why}" if why else (f" ({err})" if err else "")) + "."
-        step = _follow_text(f) if category in PROBLEM else ""
-        lines.append(" ".join(x for x in (line, step) if x))
-    return lines or [NONE]
+        cause, fix = "", ""
+        if category in PROBLEM:
+            code = (err or "").replace("`", "'")
+            cause = (f.get("problem") or "").strip() or (f"`{code}`" if code else "")
+            fix = _follow_text(f)
+        rows.append([f"{flag} {who}", what, cause or "—", fix or "—"])
+    return rows
+
+
+def highlights_md(results, followups=None):
+    """The Highlights section: its table, or one line when nothing is news."""
+    rows = highlights(results, followups)
+    if not rows:
+        return [NONE]
+    return [
+        _md_row(HIGHLIGHT_COLUMNS),
+        "|" + "---|" * len(HIGHLIGHT_COLUMNS),
+        *map(_md_row, rows),
+    ]
+
+
+def _md_row(cells):
+    """A markdown table row; a "|" inside a cell is escaped."""
+    return "| " + " | ".join(c.replace("|", "\\|") for c in cells) + " |"
 
 
 def missing_followups(results, followups):
@@ -360,15 +363,15 @@ def _labels(results):
 
 
 def _summary(date, results, followups):
-    """The short summary, for the boss: the highlights, then each model's c64
-    throughput against the previous session and its GSM8K change."""
+    """The short summary, for the boss: the highlights table, then each
+    model's c64 throughput against the previous session and its GSM8K change."""
     ref = previous_column(results)
     return [
         "## Summary",
         "",
         "### Highlights",
         "",
-        *[f"- {h}" for h in highlights(results, followups)],
+        *highlights_md(results, followups),
         "",
         "### Results",
         "",
@@ -498,9 +501,9 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
             step = (
                 "Missing: needs a follow-up" if r.name in missing else _follow_text(f)
             )
-            note = (f.get("note") or "").strip().replace("|", "\\|") or "—"
-            why = (f.get("problem") or "").strip().replace("|", "\\|") or "—"
-            out.append(f"| {r.name} | {why} | {step} | {note} |")
+            note = (f.get("note") or "").strip() or "—"
+            why = (f.get("problem") or "").strip() or "—"
+            out.append(_md_row([r.name, why, step, note]))
     out += ["", "### Failures", ""]
     shared = {}  # scenario -> the MLPerf Endpoint client its bench commands share
     broken = [r for r in results if _failed_parts(r)]
@@ -602,7 +605,7 @@ def report_md(
     followups=None,
     findings=None,
 ):
-    """One session's result: the short summary (highlights and the table), the
+    """One session's result: the short summary (highlights and results tables), the
     findings written down during the session, then the details. `charts_dir`
     and `runs_dir` are relative to the result file's directory."""
     out = [

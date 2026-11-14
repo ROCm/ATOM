@@ -10,11 +10,13 @@
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed — (mock) out of memory capturing CUDA graphs. No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md).
-- ⚠️ DeepSeek R1: throughput down 4.5%. Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified).
-- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open).
-- 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
-- ✅ Kimi-K3: recovered from the previous failure.
+| Model | What happened | Cause | Fix |
+|---|---|---|---|
+| ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |
+| ⚠️ DeepSeek R1 | throughput down 4.5% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |
+| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% | — | — |
+| ✅ Kimi-K3 | recovered from the previous failure | — | — |
 
 ### Results
 
@@ -77,9 +79,9 @@
 
 | Model | Problem | Next step | Note |
 |---|---|---|---|
-| DeepSeek R1 | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified). | (mock) verified on 455: c64 back to 1,560 tok/s/GPU |
-| DeepSeek-V4.1-Flash | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open). | (mock) the open aiter PR fixes the MoE scale rounding |
-| Qwen-35B-A3B | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md). | (mock) OOM while capturing CUDA graphs, at c64 only |
+| DeepSeek R1 | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) | (mock) verified on 455: c64 back to 1,560 tok/s/GPU |
+| DeepSeek-V4.1-Flash | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) | (mock) the open aiter PR fixes the MoE scale rounding |
+| Qwen-35B-A3B | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) | (mock) OOM while capturing CUDA graphs, at c64 only |
 
 ### Failures
 

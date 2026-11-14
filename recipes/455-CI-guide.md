@@ -419,7 +419,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 ### 3.7 跑挂和大幅回退都要给出说法（重点）
 
-我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Highlights 里的每一条 ❌、🔴、⚠️（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Highlights 草稿，再对每个问题按下面的顺序找说法：
+我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Highlights 表里每一行 ❌、🔴、⚠️（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Highlights 草稿，再对每个问题按下面的顺序找说法：
 
 1. **先查有没有人在修**：先看 `pending_fixes.csv` 里有没有登记这个模型在等的 PR（见本节末尾），例如 Qwen-3.8 Flash 在等 ROCm/ATOM#3225 + ROCm/aiter#7847。登记的 PR 还开着、这次的问题正是它们修的，就用它们。没有登记或对不上，再到 `ROCm/ATOM` 和 `ROCm/aiter` 的公开 PR 里找正在解决这个问题的。开着的 PR 算；镜像构建之后才合进 main 的也算，说明 main 上已经修了。用报错里的关键字、kernel 名、模型名搜，点开确认修的就是这个问题：
 
@@ -474,10 +474,10 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 | `model` | §1 的 slug |
 | `action` | `open_pr`、`merged_pr`、`our_pr` 或 `repro`，对应上面三步。我们的修复还要配合别人开着的 PR 才能跑通时，记 `our_pr`，`link` 把那些 PR 也写上 |
 | `link` | PR 的链接，多个用空格隔开；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
-| `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。Highlights 用它说原因；不填就用一句话报错 |
+| `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。它就是 Highlights 表的 Cause 列；不填时，跑挂的模型用一句话报错 |
 | `note` | 英文一句话：验证结果、怀疑的方向等 |
 
-`make_report.py` 把说法接在 Highlights 那一条后面，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
+`make_report.py` 把说法写进 Highlights 表那一行的 Fix 列，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
 
 **已知还没合入的修复**登记在 `recipes/455-CI/pending_fixes.csv`。知道某个模型在 main 上要等一组 PR 合入才能跑通（或才有正常性能），就登记一行；PR 合入 main 后删掉这一行。这个模型出了问题又还没写说法时，`make_report.py` 会在 WARNING 下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。贴之前先用 `gh pr view` 确认 PR 还开着，并对一下这次的报错是不是它们修的。
 
@@ -615,32 +615,43 @@ recipes/
 | 发现（`## Findings`） | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | 详细 summary（`## Details`） | 要看细节的人 | 测试镜像和环境、全部数字、趋势图、说法、跑挂 case 的核心 error log（§5.3、§5.4） |
 
-这个文件会原样贴到 Teams 发给老板们，所以：开头写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Highlights 要短（§5.1）；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
+这个文件会原样贴到 Teams 发给老板们，所以：开头写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Highlights 是一张短表（§5.1）；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
 
 结果和图都用 §5.5 的脚本从 CSV 生成，不手填数字。唯一手写的是发现：写进 `runs/<YYYYMMDD>/findings.md`，英文，每条以 `- ` 开头，链接用完整 URL；脚本原样放进 Findings，没有这个文件就显示 `None recorded.`。跑挂或回退的线索、绕过的办法、异常的耗时（例如 server 启动特别慢）、和 recipe 对不上的地方，都算发现。样例见 [`result/example.md`](result/example.md)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
-大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行，写清是什么模型、发生了什么（跑挂、性能升降多少）、需要什么 PR：`<标记> <模型>: <什么挂了或变了>[ — <原因>]. <说法>`。原因取自 `followups.csv` 的 `problem`（§3.7），没有就用一句话报错。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Kimi-K3: all runs failed — no cross-node TP on main.`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
+大老板只看 Highlights，所以只写本次出了大事或跑挂的模型。Highlights 是一张表，每件事一行，四列：
 
-❌、🔴、⚠️ 这几条后面要接上说法（§3.7），不能只报问题。例如：
+| 列 | 写什么 |
+|---|---|
+| Model | 标记加模型名，例如 `❌ Kimi-K3`；不写场景 |
+| What happened | 什么挂了，或变了多少（只给一个关键数字），例如 `all runs failed`、`throughput down 4.2%` |
+| Cause | 原因，取自 `followups.csv` 的 `problem`（§3.7）；跑挂又没写 `problem` 时，用一句话报错 |
+| Fix | 说法（§3.7）：需要什么 PR，验证过没有 |
 
-- `❌ Kimi-K3: all runs failed — no cross-node TP on main. Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified).`（`our_pr`）
-- `❌ Qwen-35B-A3B: all runs failed — gfx1250 fused-MoE layout check. Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built).`（`merged_pr`）
-- `⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%. Needs [ROCm/aiter#…](…) (open).`（`open_pr`）
-- `❌ GLM-5.2: c64 failed — out of memory capturing CUDA graphs. No fix yet; [repro](…).`（`repro`）
+持平、变化不大或第一次有数据的模型都不提；一个都没有时不画表，只写 `No failures or major changes.`。
 
-同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。
+❌、🔴、⚠️ 这几行的 Fix 列要写上说法，不能只报问题。下面四行的 Fix 依次对应 `followups.csv` 的 `our_pr`、`merged_pr`、`open_pr`、`repro`：
+
+| Model | What happened | Cause | Fix |
+|---|---|---|---|
+| ❌ Kimi-K3 | all runs failed | no cross-node TP on main | Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified) |
+| ❌ Qwen-35B-A3B | all runs failed | gfx1250 fused-MoE layout check | Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built) |
+| ⚠️ MiniMax-M3 | GSM8K down 4.6 points to 88.1% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |
+| ❌ GLM-5.2 | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |
+
+🟢 和 ✅ 不是问题，Cause 和 Fix 写 —。同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。
 
 结果里不 @ 任何人：负责人由 user 把 Highlights 贴到 Teams 给老板汇报时自己加上。
 
-`make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的条目，也不能改数字。
+`make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的行，也不能改数字。
 
 所有比较都对该模型最近一次成功的那一场（"上一场"），不和更早的最好成绩比。
 
-| 标记 | 什么时候算 | 写法 |
+| 标记 | 什么时候算 | What happened 列 |
 |---|---|---|
-| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed — <problem>`、`all runs failed — <problem>` |
+| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed`、`all runs failed`（原因写在 Cause 列） |
 | 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
 | ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
 | 🟢 | 吞吐比上一场高 3% 及以上 | `throughput up 6.9%` |
@@ -665,11 +676,13 @@ recipes/
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed — out of memory capturing CUDA graphs. No fix yet; [repro](…).
-- ⚠️ DeepSeek R1: throughput down 4.5%. Passes with [ROCm/ATOM#…](…) (verified).
-- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Needs [ROCm/aiter#…](…) (open).
-- 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
-- ✅ Kimi-K3: recovered from the previous failure.
+| Model | What happened | Cause | Fix |
+|---|---|---|---|
+| ❌ Qwen-35B-A3B | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |
+| ⚠️ DeepSeek R1 | throughput down 4.5% | a new MoE dispatch default | Passes with [ROCm/ATOM#…](…) (verified) |
+| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% | — | — |
+| ✅ Kimi-K3 | recovered from the previous failure | — | — |
 
 ### Results
 
@@ -689,7 +702,7 @@ recipes/
 ……（详细 summary，§5.3）
 ```
 
-- 一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
+- 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。

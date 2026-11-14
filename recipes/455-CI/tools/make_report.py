@@ -6,7 +6,7 @@
 A session is one day's run (Saturday: MLPerf Endpoint on the image built that
 day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
 recipes/result/<YYYYMMDD>-result.md (the result dir next to the data dir, or
---out): the short summary (highlights and the summary table), the findings from
+--out): the short summary (the highlights and results tables), the findings from
 runs/<YYYYMMDD>/findings.md, then the details (environment, every number, the
 trend charts of make_charts.py and each failure's core error log from
 runs/<YYYYMMDD>/<slug>/error.log). Each problem
@@ -28,7 +28,7 @@ import os
 from ci455_data import FOLLOWUP_COLUMNS, MODELS, acc_cell, perf_cells, read_csv
 from ci455_report import (
     ModelResult,
-    highlights,
+    highlights_md,
     missing_followups,
     pr_label,
     report_md,
@@ -159,8 +159,8 @@ def main(argv=None):
                 _read(os.path.join(run_dir, "findings.md")),
             )
         )
-    for line in highlights(results, followups):
-        print("-", line)
+    for line in highlights_md(results, followups):
+        print(line)
     pending = {
         r["model"]: (r.get("prs") or "").split()
         for r in _rows(os.path.join(args.data_dir, "pending_fixes.csv"))
