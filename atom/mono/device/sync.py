@@ -26,7 +26,7 @@ def _spin(load_all, pending):
     loop keeps the loads from being hoisted."""
     v = load_all()
     while pending(v):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(16)
         v = load_all()
     return v
 
