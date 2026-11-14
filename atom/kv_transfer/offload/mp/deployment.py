@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -23,6 +24,26 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 _MP_LAYOUT_VERSION = 3
+
+# Optional LMCache ATOM adapter arguments and their defaults, by adapter half.
+# Each is passed only when the installed adapter accepts it, so an older LMCache
+# build keeps working and simply goes without.
+# - pooled_ipc_events: reuse producer and completion IPC events instead of
+#   creating, exporting and destroying them per transfer (destroying an imported
+#   one waits for all of the server's GPU work on ROCm 7.2). An older server
+#   ignores the key hint and takes its per-operation path.
+# - submit_after_producer: send a store/retrieve only once its producer event
+#   has fired, so the server never queues a device-side wait (a polling kernel)
+#   that can deadlock with a persistent kernel on the forward stream.
+# - client_chunk_hashes: send chunk hashes instead of the token prefix. Off by
+#   default: a server without this support sees an empty prefix (every lookup
+#   misses and transfers fail), so enable it only once the server has it.
+_WORKER_ADAPTER_OPTIONS = {
+    "pooled_ipc_events": True,
+    "submit_after_producer": True,
+    "client_chunk_hashes": False,
+}
+_SCHEDULER_ADAPTER_OPTIONS = {"client_chunk_hashes": False}
 
 
 def _extra_config(config: Any) -> dict[str, Any]:
@@ -322,6 +343,30 @@ def _parallel_strategy(config: Any, worker_id: int) -> Any:
     )
 
 
+def _adapter_options(
+    config: Any, adapter_cls: Any, defaults: dict[str, bool]
+) -> dict[str, bool]:
+    """Optional adapter arguments from ``lmcache.mp.<name>``, where accepted."""
+
+    extra = _extra_config(config)
+    accepted = inspect.signature(adapter_cls).parameters
+    options = {}
+    for name, default in defaults.items():
+        key = f"lmcache.mp.{name}"
+        value = extra.get(key, default)
+        if type(value) is not bool:
+            raise TypeError(f"{key} must be true or false")
+        if name in accepted:
+            options[name] = value
+        elif key in extra and value:
+            logger.warning(
+                "%s is set but %s does not support it; ignoring",
+                key,
+                adapter_cls.__name__,
+            )
+    return options
+
+
 def _make_scheduler_adapter(
     config: Any, *, checkpoint_spec: Any = None, images: bool = True
 ) -> Any:
@@ -362,6 +407,7 @@ def _make_scheduler_adapter(
         block_size=int(config.kv_cache_block_size),
         parallel_config=_parallel_strategy(config, 0),
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
+        **_adapter_options(config, AtomMPSchedulerAdapter, _SCHEDULER_ADAPTER_OPTIONS),
     )
 
 
@@ -390,6 +436,7 @@ def _make_worker_adapter(
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),
+        **_adapter_options(config, AtomMPWorkerAdapter, _WORKER_ADAPTER_OPTIONS),
     )
 
 

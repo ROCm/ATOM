@@ -280,6 +280,25 @@ requires a longer deadline. The value must be finite and positive. The default
 is a failure-detection policy, not a guarantee that every overloaded deployment
 can complete transfers within 30 s.
 
+Three `kv_connector_extra_config` booleans select optional LMCache adapter
+behavior. Each is passed only when the installed LMCache adapter accepts it; an
+older LMCache build runs without it (a value set to `true` logs a warning).
+
+- `lmcache.mp.pooled_ipc_events` (default `true`): workers and the server reuse
+  pooled interprocess events instead of creating, exporting and destroying one
+  per transfer. On ROCm 7.2 destroying an imported event waits for all of the
+  server's GPU work on that device. A server without pooling ignores the hint.
+- `lmcache.mp.submit_after_producer` (default `true`): a worker sends each
+  store/retrieve only once its producer event has fired, so the server never
+  queues a device-side wait on unfinished engine work. On ROCm 7.2 that wait is
+  a polling kernel that can deadlock with a persistent kernel holding every CU
+  (the mono decode kernels).
+- `lmcache.mp.client_chunk_hashes` (default `false`): the scheduler and workers
+  send the blake3 chunk hashes of a prefix instead of its tokens, so the server
+  neither decodes nor re-hashes them. Enable it only once the server supports
+  it and hashes with blake3 (not with CacheBlend): an older server sees an empty
+  prefix, misses every lookup and fails every transfer.
+
 The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
 optional `lmcache.mp.model_revision`. Set that revision when weights are

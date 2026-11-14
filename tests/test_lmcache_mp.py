@@ -212,6 +212,142 @@ def test_worker_adapter_normalizes_transfer_mode(
     assert adapter.transfer_mode == expected
 
 
+class _FakeParallelConfig:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _OlderWorkerAdapter:
+    """An LMCache ATOM adapter from before the optional arguments."""
+
+    def __init__(
+        self,
+        server_url,
+        context,
+        model_name,
+        block_size,
+        parallel_config,
+        *,
+        mq_timeout=300.0,
+        heartbeat_interval=10.0,
+        transfer_mode=None,
+    ):
+        self.kwargs = {}
+
+
+class _NewerWorkerAdapter(_OlderWorkerAdapter):
+    def __init__(
+        self,
+        *args,
+        pooled_ipc_events=False,
+        submit_after_producer=False,
+        client_chunk_hashes=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.kwargs = {
+            "pooled_ipc_events": pooled_ipc_events,
+            "submit_after_producer": submit_after_producer,
+            "client_chunk_hashes": client_chunk_hashes,
+        }
+
+
+class _OlderSchedulerAdapter:
+    def __init__(
+        self,
+        server_url,
+        context,
+        model_name,
+        block_size,
+        parallel_config,
+        *,
+        mq_timeout=300.0,
+    ):
+        self.kwargs = {}
+
+
+class _NewerSchedulerAdapter(_OlderSchedulerAdapter):
+    def __init__(self, *args, client_chunk_hashes=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kwargs = {"client_chunk_hashes": client_chunk_hashes}
+
+
+def _fake_adapter_module(monkeypatch, *, newer: bool) -> None:
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = _FakeParallelConfig
+    adapter_module.AtomMPWorkerAdapter = (
+        _NewerWorkerAdapter if newer else _OlderWorkerAdapter
+    )
+    adapter_module.AtomMPSchedulerAdapter = (
+        _NewerSchedulerAdapter if newer else _OlderSchedulerAdapter
+    )
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+
+
+def test_adapter_options_default_when_supported(monkeypatch):
+    _fake_adapter_module(monkeypatch, newer=True)
+
+    worker = deployment._make_worker_adapter(_config(), rank=0)
+    scheduler = mp_scheduler._make_scheduler_adapter(_config())
+
+    assert worker.kwargs == {
+        "pooled_ipc_events": True,
+        "submit_after_producer": True,
+        "client_chunk_hashes": False,
+    }
+    assert scheduler.kwargs == {"client_chunk_hashes": False}
+
+
+def test_adapter_options_follow_extra_config(monkeypatch):
+    _fake_adapter_module(monkeypatch, newer=True)
+    config = _config(
+        extra={
+            "lmcache.mp.pooled_ipc_events": False,
+            "lmcache.mp.submit_after_producer": False,
+            "lmcache.mp.client_chunk_hashes": True,
+        }
+    )
+
+    worker = deployment._make_worker_adapter(config, rank=0)
+    scheduler = mp_scheduler._make_scheduler_adapter(config)
+
+    assert worker.kwargs == {
+        "pooled_ipc_events": False,
+        "submit_after_producer": False,
+        "client_chunk_hashes": True,
+    }
+    assert scheduler.kwargs == {"client_chunk_hashes": True}
+
+
+def test_adapter_options_skipped_by_older_lmcache(monkeypatch, caplog):
+    _fake_adapter_module(monkeypatch, newer=False)
+    config = _config(extra={"lmcache.mp.client_chunk_hashes": True})
+
+    with caplog.at_level("WARNING", logger="atom"):
+        worker = deployment._make_worker_adapter(config, rank=0)
+        scheduler = mp_scheduler._make_scheduler_adapter(config)
+
+    assert worker.kwargs == {} and scheduler.kwargs == {}
+    # Only an option set to true is worth a warning, once per adapter half.
+    warned = [
+        r.getMessage() for r in caplog.records if "does not support" in r.getMessage()
+    ]
+    assert len(warned) == 2
+    assert all("lmcache.mp.client_chunk_hashes" in m for m in warned)
+
+
+def test_adapter_options_must_be_booleans(monkeypatch):
+    _fake_adapter_module(monkeypatch, newer=True)
+
+    with pytest.raises(TypeError, match="lmcache.mp.pooled_ipc_events"):
+        deployment._make_worker_adapter(
+            _config(extra={"lmcache.mp.pooled_ipc_events": "yes"}), rank=0
+        )
+
+
 def test_parallel_strategy_keeps_every_tp_rank(monkeypatch):
     class AtomMPParallelConfig:
         def __init__(self, **kwargs):
