@@ -211,9 +211,12 @@ if __name__ == "__main__":
                 print(f"S={s} moe_back o_flag (tag-free attention all-reduce): contract holds")
                 check_front(s, 4, True, True, False, 1, 1)
                 print(f"S={s} front o_flag: contract holds")
-                    sp_f32=False, moe_back=True, ar_flag=1,
-                )  # fmt: skip
-                print(f"S={s} moe_back ar_flag (tag-free FFN all-reduce): contract holds")
+                for fl in ({"ar_flag": 1}, {"o_flag": 1, "ar_flag": 1}):
+                    check_build(
+                        s, 1, shared_mxfp8=True, attn_mxfp8=True, kv_nvfp4=True, index_nvfp4=True, moe_a4w4=True,
+                        sp_f32=False, moe_back=True, **fl,
+                    )  # fmt: skip
+                    print(f"S={s} moe_back {fl} (tag-free FFN all-reduce): contract holds")
             continue
         for ih in (1, TP):
             # a16w4 (the default) and the previous a8w4 experts (only a build with the
