@@ -1,12 +1,67 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Mooncake KV landing: bounded receive slots, credits and byte scatter.
+"""KV landing for Mooncake P/D: decode-side receive slots, credits and scatter.
 
-The caller declares eligible regions and units_per_page. Units are contiguous
-within the wire slot; they may represent token rows or complete physical PAGEs.
-Ownership and source layout are resolved by transfer_plan before transport.
-The legacy `mla_landing` wire field and message codes remain compatible.
+A decode rank that owns only part of each prefill block cannot take its KV as
+whole blocks. The staged path (``MooncakeConnector._execute_staged_transfer``
+without a landing offer) sends one RDMA descriptor per destination page, which
+caps a NIC at about 10 GB/s with fragmented decode block tables. Landing sends
+a rank's units packed in rank order instead: one descriptor per slot of a
+decode-side GPU landing pool, which the decode rank then scatters into its
+paged KV cache. A unit is what ``transfer_plan`` packs; unit ``j`` of a request
+belongs at unit ``j % units_per_page`` of destination page
+``dst_block_ids[j // units_per_page]``. MLA rows to a DCP decode
+(``ATOM_PD_MLA_LANDING``, default on) are token rows, ``units_per_page`` the
+block size.
+
+Protocol, per decode rank (every rank has its own pool and connector):
+
+1. On first contact the rank gives a prefill stage endpoint a partition of
+   ``pool_slots // pp_size`` slots (``pp_size`` is the prefill's), first
+   come, first served, and takes it back only from a stage that reports it
+   cannot land (no KV staging pool: a DCP prefill, ``ATOM_PD_MLA_STAGING=0``
+   or a build without landing); such an endpoint is not offered slots
+   again. With several landing prefill instances per decode rank, a later
+   one may get fewer slots, or none and keep the staged path. The rank
+   advertises the stage's partition in every ``write_request`` under the
+   ``mla_landing`` key, kept for wire compatibility
+   (``{epoch, base, slot_bytes, slots}``; no ``layout`` means token rows).
+2. The stage keeps the partition as credits (``LandingCredits``), shared by
+   all its requests to that rank. A send worker takes a credit, gathers units
+   into its staging slot, writes the slot to ``base + slot * slot_bytes`` and
+   sends ``MSG_LANDING_READY`` (request, nonce, stage, seq, slot, items). With
+   no credit within ``LANDING_CREDIT_WAIT_S`` it sends the rest of the
+   transfer through the staged path. Write-done then lists the slot of every
+   READY it sent (``landed_slots``), so a lost READY is detected and its slot
+   still returned; a stage that cannot land sends ``None`` instead. A slot
+   whose write may still land is quarantined on the stage for
+   ``ATOM_PD_FAILED_WRITE_HOLD_S`` instead of being reused.
+3. The rank (``LandingReceiver``) scatters READY slots on its own stream and
+   returns their credits (``MSG_LANDING_CREDIT``) once the scatter finished.
+4. A request completes when every stage's write-done arrived, every landed
+   slot it announced was received, and every scatter finished. A failed
+   request is reported only after all its stages ended: a stage still
+   running may yet write the final KV pages directly (staged path, index
+   regions), and reporting the failure lets the scheduler reuse them. A stage
+   that acknowledged the request (``MSG_WRITE_ACK``) and stays silent past
+   the write window the ack named has stopped writing (its transfer deadline
+   started before the ack), so once every silent stage is past its window
+   the request fails anyway. A stage that never acknowledged may still get
+   the request, so it keeps the request open. READY slots that arrive after
+   the request failed or their stage ended are dropped, so they never reach
+   the KV cache. Each slot goes back
+   once: after its scatter, with its READY if that is dropped, or with the
+   write-done if its READY had not arrived by then. ZMQ keeps order only
+   within one connection, so a READY can still trail its write-done after a
+   reconnect; it then returns nothing. This holds while the write-done lists
+   every READY's slot at its seq, as the producer sends it. A malformed list
+   counts no READY lost, so a READY that arrives after its request retired
+   leaves its slot in flight on the stage.
+
+Credits never move between stages or ranks (a partition taken back comes
+from a stage that never takes a credit), so no slot is reused while a stage
+may still write it, and no side waits on another stage's or rank's progress.
 """
 
 from __future__ import annotations

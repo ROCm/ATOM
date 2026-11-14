@@ -161,6 +161,11 @@ class _StagingWrite:
     uncertain: bool = False
 
 
+class _StagingRetired(Exception):
+    """A transfer wanted a staging slot after another transfer's uncertain
+    write retired the pool; it sends the rest without staging instead."""
+
+
 class SlotPool:
     """Free slot indices of one staging pool, shared across threads.
 
@@ -171,7 +176,7 @@ class SlotPool:
     is permanent: every later ``acquire`` raises too, free rows or not, since
     the consumer that reports it cannot run on (see
     ``MooncakeConnector._post_queued_write_requests``). The consumer staging
-    rows, the DSA index staging slots and the MLA staging slots each keep one.
+    rows, the DSA index staging slots and the KV staging slots each keep one.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -3178,6 +3183,16 @@ class MooncakeConnector(KVConnectorBase):
         staged_token_regions: list[tuple[int, int, int]] = []
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
+
+        def add_token_runs(region_idx: int, dst_base: int, bpb: int) -> bool:
+            unit = bpb // self.block_size
+            run_src, run_dst, run_len = sharded_runs
+            return batch.add(
+                self.kv_caches_base_addr[region_idx] + run_src * unit,
+                dst_base + run_dst * unit,
+                run_len * unit,
+            )
+
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -3232,11 +3247,7 @@ class MooncakeConnector(KVConnectorBase):
             ):
                 staged_token_regions.append((region_idx, dst_base, bpb))
                 continue
-            unit = bpb // self.block_size
-            run_src, run_dst, run_len = sharded_runs
-            if not batch.add(
-                src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
-            ):
+            if not add_token_runs(region_idx, dst_base, bpb):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
@@ -3262,9 +3273,23 @@ class MooncakeConnector(KVConnectorBase):
                 [i for i, _, _ in staged_token_regions],
                 token_ownership=sharded_plan,
             )
-            if not self._execute_staged_transfer(
-                request_data, target, plan, req_id, kv_cache_ready_event, engine=engine
-            ):
+            try:
+                staged = self._execute_staged_transfer(
+                    request_data,
+                    target,
+                    plan,
+                    req_id,
+                    kv_cache_ready_event,
+                    engine=engine,
+                )
+            except _StagingRetired:
+                # Rows already landed are written again with the same bytes;
+                # the decode still scatters their slots, which is harmless.
+                staged = (
+                    all(add_token_runs(*region) for region in staged_token_regions)
+                    and batch.flush()
+                )
+            if not staged:
                 return False
         if staged_regions:
             if kv_cache_ready_event is None:
@@ -3479,7 +3504,10 @@ class MooncakeConnector(KVConnectorBase):
         """
         if deadline is not None and time.monotonic() > deadline:
             return None
-        pool_idx = self._kv_staging_slots.acquire()
+        try:
+            pool_idx = self._kv_staging_slots.acquire()
+        except RuntimeError as e:  # only a retired pool raises
+            raise _StagingRetired from e
         submitted = False
         settled = False
         try:
@@ -3523,10 +3551,26 @@ class MooncakeConnector(KVConnectorBase):
         finally:
             if submitted and not settled:
                 outcome.uncertain = True
-                self._kv_staging_failed = True
-                self._kv_staging_slots.fail(RuntimeError("KV staged RDMA failed"))
+                self._retire_kv_staging(req_id)
             else:
                 self._kv_staging_slots.release(pool_idx)
+
+    def _retire_kv_staging(self, req_id) -> None:
+        """Take the staging pool out of use after a write that may still land.
+
+        The NIC may still read that write's slot, so it is never released.
+        Transfers waiting for a slot get ``_StagingRetired`` and send without
+        staging; later transfers do not stage at all.
+        """
+        if not self._kv_staging_failed:
+            self._kv_staging_failed = True
+            logger.warning(
+                "[PRODUCER] KV staged RDMA for req %s may still be in flight; "
+                "KV staging and landing are off on this connector for the rest "
+                "of the process, and transfers use direct writes",
+                req_id,
+            )
+        self._kv_staging_slots.fail(RuntimeError("KV staged RDMA failed"))
 
     def _execute_staged_index_layer_chunk(
         self,
