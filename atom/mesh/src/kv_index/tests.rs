@@ -408,7 +408,7 @@ fn bench_memory_1m_blocks() {
         "{entries} entries, {blocks} blocks: resident +{} MB (index slots {} MB); applied in {applying:?}, {:?} a block",
         (after - before) >> 20,
         bytes >> 20,
-        applying / blocks as u32
+        applying / blocks
     );
     assert!(after - before < (200 << 20) * wanted as u64 / 1_000_000);
 }
