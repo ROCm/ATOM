@@ -297,16 +297,26 @@ fn resident_bytes() -> u64 {
         * 4096
 }
 
-/// 16 holders sharing 1M entries of other prefixes, a deterministic 100k-token prompt and
-/// its prefix hashes in blocks of 16.
+/// A bench's size: `name` from the environment, `default` without it.
+fn size(name: &str, default: usize) -> usize {
+    std::env::var(name).map_or(default, |value| value.parse().unwrap())
+}
+
+/// `KV_BENCH_WORKERS` (16) holders sharing `KV_BENCH_ENTRIES` (1M) entries of other
+/// prefixes, a deterministic prompt of `KV_BENCH_TOKENS` (100k) tokens and its prefix
+/// hashes in blocks of 16.
 fn filled(index: &PrefixIndex) -> (Vec<HolderId>, Vec<u32>, Vec<PrefixHash>) {
-    let holders: Vec<HolderId> = (0..16).map(HolderId).collect();
+    let workers = size("KV_BENCH_WORKERS", 16);
+    let holders: Vec<HolderId> = (0..workers as u8).map(HolderId).collect();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for holder in &holders {
-        let other = (0..62_500).map(|_| Op::Store(PrefixHash(rng.below(usize::MAX) as u64)));
+        let other = (0..size("KV_BENCH_ENTRIES", 1_000_000) / workers)
+            .map(|_| Op::Store(PrefixHash(rng.below(usize::MAX) as u64)));
         index.apply(*holder, &mut other.collect());
     }
-    let tokens: Vec<u32> = (0..100_000).map(|i| (i * 7919 % 150_000) as u32).collect();
+    let tokens: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000))
+        .map(|i| (i * 7919 % 150_000) as u32)
+        .collect();
     let prefix = hash::prefix_hashes(&tokens, 16);
     (holders, tokens, prefix)
 }
@@ -317,25 +327,36 @@ fn percentiles(mut samples: Vec<Duration>) -> String {
     format!("p50 {:?}, p99 {:?}", at(0.5), at(0.99))
 }
 
-/// `cargo test --release --lib kv_index::tests::bench -- --ignored --nocapture --test-threads=1`
+/// `cargo test --release --lib kv_index::tests::bench -- --ignored --nocapture --test-threads=1`;
+/// `filled` reads the sizes, and `KV_BENCH_SAMPLES` (2000) the samples.
 #[test]
 #[ignore]
 fn bench_query_16_workers_100k_tokens() {
     let index = PrefixIndex::default();
     let (holders, tokens, prefix) = filled(&index);
-    let started = Instant::now();
-    hash::prefix_hashes(&tokens, 16);
-    println!("prefix hashes of 100k tokens: {:?}", started.elapsed());
-    let mut held = [0; 16];
+    let (workers, count) = (holders.len(), size("KV_BENCH_SAMPLES", 2000));
+    let hashing = (0..count)
+        .map(|_| {
+            let started = Instant::now();
+            std::hint::black_box(hash::prefix_hashes(&tokens, 16));
+            started.elapsed()
+        })
+        .collect();
+    println!(
+        "prefix hashes of {} tokens: {}",
+        tokens.len(),
+        percentiles(hashing)
+    );
+    let mut held = vec![0; workers];
     for (name, full) in [
-        ("staggered, worker k holds (k+1)/16 of the prefix", false),
-        ("worst, all 16 hold all of it", true),
+        ("staggered, worker k holds (k+1)/n of the prefix", false),
+        ("worst, all hold all of it", true),
     ] {
         for (k, holder) in holders.iter().enumerate() {
             let target = if full {
                 prefix.len()
             } else {
-                prefix.len() * (k + 1) / 16
+                prefix.len() * (k + 1) / workers
             };
             index.apply(
                 *holder,
@@ -348,12 +369,12 @@ fn bench_query_16_workers_100k_tokens() {
             held[k] = target;
         }
         for hashing in [false, true] {
-            let samples = (0..2000)
+            let samples = (0..count)
                 .map(|_| {
                     let started = Instant::now();
                     let fresh = hashing.then(|| hash::prefix_hashes(&tokens, 16));
                     let found = index.find_matches(fresh.as_deref().unwrap_or(&prefix), &holders);
-                    assert_eq!(found.len(), 16);
+                    assert_eq!(found.len(), workers);
                     started.elapsed()
                 })
                 .collect();
@@ -362,27 +383,34 @@ fn bench_query_16_workers_100k_tokens() {
     }
 }
 
+/// `KV_BENCH_BLOCKS` (1M) blocks: the memory they take, and applying them, hashing
+/// included.
 #[test]
 #[ignore]
 fn bench_memory_1m_blocks() {
+    let wanted = size("KV_BENCH_BLOCKS", 1_000_000);
     let before = resident_bytes();
     let index = PrefixIndex::default();
     let mut tables: Vec<HolderTable> = (0..16).map(|_| HolderTable::default()).collect();
-    // 16 holders, chains of 64 blocks of 16 tokens, 1M blocks in all.
-    for chain in 0..15_625usize {
+    let mut applying = Duration::ZERO;
+    // 16 holders, chains of 64 blocks of 16 tokens.
+    for chain in 0..wanted / 64 {
         let h = chain % 16;
         let seq: Vec<u32> = (0..64 * 16).map(|i| (chain * 1024 + i) as u32).collect();
         let event = stored(h, &seq, 0..64, 16);
+        let started = Instant::now();
         apply(&index, &mut tables[h], HolderId(h as u8), &event).unwrap();
+        applying += started.elapsed();
     }
     let after = resident_bytes();
     let (entries, blocks, bytes) = index.stats();
     println!(
-        "{entries} entries, {blocks} blocks: resident +{} MB (index slots {} MB)",
+        "{entries} entries, {blocks} blocks: resident +{} MB (index slots {} MB); applied in {applying:?}, {:?} a block",
         (after - before) >> 20,
-        bytes >> 20
+        bytes >> 20,
+        applying / blocks as u32
     );
-    assert!(after - before < 200 << 20);
+    assert!(after - before < (200 << 20) * wanted as u64 / 1_000_000);
 }
 
 /// What `cache_aware` asks, hashing the request included: 16 workers, worker k holding
@@ -420,7 +448,7 @@ async fn bench_match_workers_16_workers() {
 
 /// Both sides of the shard locks: a prefill step's store of 512 blocks applied to a
 /// 1M-entry index, alone and while walkers query a 100k-token prompt without pause, and
-/// those walks meanwhile.
+/// those walks meanwhile. `KV_BENCH_WALKERS` (0,4) lists the walker counts.
 #[test]
 #[ignore]
 fn bench_writer_with_walkers() {
@@ -432,7 +460,12 @@ fn bench_writer_with_walkers() {
             &mut prefix.iter().copied().map(Op::Store).collect(),
         );
     }
-    for walkers in [0, 4] {
+    let counts = std::env::var("KV_BENCH_WALKERS").map_or(vec![0, 4], |list| {
+        list.split(',')
+            .map(|walkers| walkers.parse().unwrap())
+            .collect()
+    });
+    for walkers in counts {
         let stop = AtomicBool::new(false);
         let walks = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
