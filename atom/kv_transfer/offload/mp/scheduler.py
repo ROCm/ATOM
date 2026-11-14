@@ -56,9 +56,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
     _supports_same_step_save = True
-    # Nesting of `build_connector_meta`: the shared builder advances lookups once
-    # per step, so the retirements inside it must not advance them again.
-    _metadata_build_depth = 0
 
     def __init__(
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
@@ -247,16 +244,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self._token_shipper.ship(seq, end)
 
     def build_connector_meta(self) -> MPOffloadMetadata:
-        # Shared base advances lookups before it builds metadata. Retirements
-        # inside that build must not pump the same client a second time.
-        depth = self._metadata_build_depth
-        self._metadata_build_depth = depth + 1
-        try:
-            return self._build_mp_connector_meta()
-        finally:
-            self._metadata_build_depth = depth
-
-    def _build_mp_connector_meta(self) -> MPOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
         finally:
@@ -279,8 +266,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(end),
                 )
         # Also catches retirements that bypass _finish_retired_request, such as
-        # a late save with nothing left to store.
-        self._end_finished_sessions()
+        # a late save with nothing left to store. The shared builder above has
+        # already advanced the lookups this step.
+        self._end_finished_sessions(reconcile=False)
         stats = getattr(self._lookup_client, "driver_stats", None)
         if stats:
             for key, value in stats.items():
@@ -424,7 +412,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         return self.__dict__.setdefault("_sessions_to_end", {})
 
-    def _end_finished_sessions(self) -> None:
+    def _end_finished_sessions(self, *, reconcile: bool = True) -> None:
         """End each finished request's session once no save or lookup remains.
 
         A detached lookup (`detach_lookup`) can outlive its request. If
@@ -437,9 +425,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Pumped on every pass: a detached lookup must be released even while
         # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
-        # Metadata has already advanced this step; terminal-only calls still
-        # need the shared reconciliation to free detached lookup locks.
-        if not self._metadata_build_depth:
+        # Terminal-only calls still need the shared reconciliation to free
+        # detached lookup locks; the metadata build has already done it.
+        if reconcile:
             self._reconcile_lookups_each_step()
         client = self._lookup_client
         pending = self._pending_session_ends()

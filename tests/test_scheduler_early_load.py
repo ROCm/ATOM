@@ -9,6 +9,7 @@ for its turn and for a FIRE.
 """
 
 import logging
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -640,7 +641,7 @@ def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_f
     assert sched._can_admit_head_prefill()
 
 
-# -- slots, age and failed loads (review of #3097) -------------------------------------
+# -- slots, age and failed loads -------------------------------------
 
 
 def _parked(sched, seq_factory, n, *, early=True):
@@ -758,6 +759,38 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
     assert owner.block_table
+
+
+def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
+    monkeypatch, seq_factory
+):
+    class Counting(deque):
+        clears = 0
+
+        def clear(self):
+            Counting.clears += 1
+            super().clear()
+
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    sched.schedule()  # consumes the completion event
+    sched.waiting = Counting(sched.waiting)
+    for _ in range(3):
+        sched._prioritize_ready_remote_kv_requests()
+    assert Counting.clears == 0
+    assert list(sched.waiting) == [head, owner]
+    # The same queue is rebuilt once the head cannot allocate.
+    original = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: -1 if seq is head else original(seq),
+    )
+    sched._prioritize_ready_remote_kv_requests()
+    assert Counting.clears == 1
+    assert list(sched.waiting) == [owner, head]
 
 
 def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(

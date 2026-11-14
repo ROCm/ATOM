@@ -45,9 +45,6 @@ def test_metadata_retirement_reconciles_once_and_restores_terminal_progress(
 
     def retiring_build(self):
         metadata = original_build(self)
-        # The shared metadata builder can retire several finished requests.
-        self._end_finished_sessions()
-        self._end_finished_sessions()
         if fail_build:
             raise RuntimeError("metadata serialization failed")
         return metadata

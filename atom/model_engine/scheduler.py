@@ -2738,7 +2738,7 @@ class Scheduler:
 
             if needs_remote_load:
                 if not self._drop_state_leg_of_kv_load(seq):
-                    # Disown could not be backed (finding #2); requeue for a
+                    # Disown could not be backed; requeue for a
                     # clean recompute instead of parking a load into shared
                     # blocks.
                     self._take_back_admission(seq)
@@ -4452,7 +4452,7 @@ class Scheduler:
                 state.skip(seq.id, "inflight_prefix")
                 continue
             # KV pressure. Counted only for a request that would load: one that
-            # would not never reached here.
+            # would not load never reached here.
             need = bm.num_pool_blocks(len(seq))
             if total_blocks > 0:
                 if (bm.kv.num_used + need) / total_blocks > watermark:
@@ -5640,23 +5640,22 @@ class Scheduler:
 
         # O(early loads), not O(waiting): an early load in flight leaves the
         # queue as it is.
-        if not recving and not any(completed(seq) for seq, _ in early.values()):
+        settled_early = any(completed(seq) for seq, _ in early.values())
+        if not recving and not settled_early:
             return
-        resolve = self._connector_flag("is_offload")
-        queue = list(self.waiting)
 
         # An early load reserves resources without changing arrival order.
         # Keep that order while the head can progress; if it cannot, the ready
         # owner must run to release its blocks/slot, including on later ticks
         # after its completion event has already been consumed.
         head_blocked = False
-        if early and any(completed(seq) and seq.id in early for seq in queue):
+        if settled_early:
             # The head is the first entry Phase 2 would try: it walks past the
             # loads in flight and the settled resumes this pass promotes.
             head = next(
                 (
                     seq
-                    for seq in queue
+                    for seq in self.waiting
                     if seq.status == SequenceStatus.WAITING and not completed(seq)
                 ),
                 None,
@@ -5667,6 +5666,11 @@ class Scheduler:
             head_blocked = head is not None and (
                 slots_full or self.block_manager.can_allocate_memoized(head) < 0
             )
+        # A settled early load waiting behind a head that can run stays put.
+        if not recving and not head_blocked:
+            return
+        resolve = self._connector_flag("is_offload")
+        queue = list(self.waiting)
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
         for seq in queue:
