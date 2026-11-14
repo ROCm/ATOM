@@ -994,34 +994,19 @@ class KimiFullAttention(nn.Module):
 
     def forward_prepped(
         self,
-        positions: torch.Tensor,
         x: torch.Tensor,
         x_scale: torch.Tensor,
-        q: torch.Tensor | None = None,
-        q_scale: torch.Tensor | None = None,
-        kv: torch.Tensor | None = None,
-        k_rope: torch.Tensor | None = None,
-        q_out: torch.Tensor | None = None,
+        q_out: torch.Tensor,
         latent_out: bool = False,
     ) -> torch.Tensor:
         """K3 mono decode, ``ATOM_MONO_MLA_PREP``: ``forward_pre_o`` (or, with
         ``latent_out``, ``forward_latent``'s latent) from where the preceding
-        layer's K2 launch stopped: after ``_mla_inputs`` (sub-mode 2: ``q`` /
-        ``q_scale``, q_a_layernorm's per-token FP8, ``kv``, ``k_rope``) or after
-        the rope / KV-cache write (sub-mode 3: ``q_out``). ``x`` / ``x_scale``:
-        the seam's per-token FP8 activation, g_proj's input."""
-        if q_out is not None:
-            attn_out = self.attn.impl.forward_decode_prebuilt(
-                q_out, latent_out=latent_out
-            )
-            if latent_out:
-                return attn_out
-        elif latent_out:
-            return self.attn.impl.forward_impl(
-                q, kv, k_rope, positions=positions, q_scale=q_scale, latent_out=True
-            )
-        else:
-            attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        layer's K2 launch stopped: the MLA decode's ``q_out`` and this step's
+        KV-cache rows written. ``x`` / ``x_scale``: the seam's per-token FP8
+        activation, g_proj's input."""
+        attn_out = self.attn.impl.forward_decode_prebuilt(q_out, latent_out=latent_out)
+        if latent_out:
+            return attn_out
         gate = self.g_proj(x, x_scale)
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
             attn_out,

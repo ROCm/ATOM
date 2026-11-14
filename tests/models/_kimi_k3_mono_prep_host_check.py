@@ -5,9 +5,9 @@
 The REAL ``K3MonoDecodeRunner.forward`` (``_layer``, ``_k2``, ``_pre_o_core``,
 ``_post_core``, ``_prep_args``, ``_prepped_seam``, ``_seam_mirror``,
 ``_write_aux``) over the full 93-layer Kimi-K3 stack: ``ATOM_MONO_MLA_POST``
-off / on against ``ATOM_MONO_MLA_PREP`` 0 / 1 / 2 / 3, and 1 / 3 with only a
-subset of the MLA layers folded (gaps between folded layers, 92 unfolded); three decode steps, one of them past the folds' 16-row width (the
-unfused path).
+off / on against ``ATOM_MONO_MLA_PREP`` off / on, and on with only a subset
+of the MLA layers folded (gaps between folded layers, 92 unfolded); three
+decode steps, one of them past the folds' 16-row width (the unfused path).
 
 The attention seam is the tree's own ``_apply_attn_res_impl`` (its
 allocations, which always copy a strided block slice), only its triton kernel
@@ -26,8 +26,8 @@ at every step:
 * every buffer a K2 launch is handed is still allocated when it is launched;
 * the step's explicit pool allocations and releases (``torch.empty`` /
   ``empty_like`` / ``zeros`` / ``new_empty`` / a copying ``contiguous``), in
-  order and size: identical to flag-off for PREP 1; for PREP 2 / 3 identical
-  outside the production attention internals the stages replace.
+  order and size: identical to flag-off outside the production attention
+  internals the stages replace.
 
 It cannot say whether the kernels are right: that needs a GPU.
 """
@@ -278,9 +278,9 @@ W_EXTRA = [
 reg(*W_EXTRA)
 
 
-def mla_for(lid, mode):
+def mla_for(lid):
     w = NS(**vars(MW))
-    w.seam, w.blocks, w.mode, w.layer_id = SEAMS[lid], layer_block(lid)[0], mode, lid
+    w.seam, w.blocks, w.layer_id = SEAMS[lid], layer_block(lid)[0], lid
     return w
 
 
@@ -408,21 +408,8 @@ class MlaModule:
         TR.tag = ""
         return o, x, xs
 
-    def forward_prepped(
-        self,
-        positions,
-        x,
-        xs,
-        q=None,
-        q_scale=None,
-        kv=None,
-        k_rope=None,
-        q_out=None,
-        latent_out=False,
-    ):
+    def forward_prepped(self, x, xs, q_out, latent_out=False):
         TR.tag = "attn"
-        if q_out is None:
-            q_out = self._rope_cache(q, q_scale, kv, k_rope, positions)
         o = self._decode(q_out)
         out = o if latent_out else self._core(o, x, xs)
         TR.tag = ""
@@ -480,21 +467,19 @@ class K2Launch:
             at(a["pref"], (s, H), BF).copy_(pref)
             at(a["x8"], (s, H), FP8).copy_(x8)
             at(a["xs"], (s, 1), torch.float32).copy_(xs)
-            assert key.mla_prep in (1, 2, 3) and m in MLA
-            if key.mla_prep >= 2:
-                qkv, q8, qs, kvn = qa_ref(x8, xs, MW)
-                at(a["qkv"], (s, QKV_A), BF).copy_(qkv)
-                at(a["q8"], (s, QL), FP8).copy_(q8)
-                at(a["qs"], (s, 1), torch.float32).copy_(qs)
-                at(a["kvn"], (s, KVL), BF).copy_(kvn)
-            if key.mla_prep >= 3:
-                pos = at(a["pos"], (s,), torch.int64)
-                q_out, kv = qb_ref(q8, qs, kvn, qkv[:, QL + KVL :], pos, MW)
-                at(a["qout"], (s, HEADS, ENTRY), FP8).copy_(q_out)
-                # one row a slot, whatever the cache's block size
-                assert a["kvc_sr"] == ENTRY, f"kvc_sr {a['kvc_sr']}"
-                kvc = at(a["kvc"], (NSLOTS, 1, ENTRY), FP8)
-                kv_write(kvc, at(a["slots"], (s,), torch.int64), kv)
+            assert m in MLA
+            qkv, q8, qs, kvn = qa_ref(x8, xs, MW)
+            at(a["qkv"], (s, QKV_A), BF).copy_(qkv)
+            at(a["q8"], (s, QL), FP8).copy_(q8)
+            at(a["qs"], (s, 1), torch.float32).copy_(qs)
+            at(a["kvn"], (s, KVL), BF).copy_(kvn)
+            pos = at(a["pos"], (s,), torch.int64)
+            q_out, kv = qb_ref(q8, qs, kvn, qkv[:, QL + KVL :], pos, MW)
+            at(a["qout"], (s, HEADS, ENTRY), FP8).copy_(q_out)
+            # one row a slot, whatever the cache's block size
+            assert a["kvc_sr"] == ENTRY, f"kvc_sr {a['kvc_sr']}"
+            kvc = at(a["kvc"], (NSLOTS, 1, ENTRY), FP8)
+            kv_write(kvc, at(a["slots"], (s,), torch.int64), kv)
 
 
 def k1_stub(self, build, plan, prefix, delta, blocks, metadata, taps=None, tag=0):
@@ -540,7 +525,7 @@ def moe_w(lid):
     )
 
 
-def run(mode, post, rows_steps, only=None):
+def run(prep, post, rows_steps, only=None):
     """Returns ([per-step snapshots], allocation trace)."""
     r = object.__new__(R.K3MonoDecodeRunner)
     plans = [
@@ -607,11 +592,11 @@ def run(mode, post, rows_steps, only=None):
     r._prep_pending, r._pref_hold_next = {}, None
     r.max_rows, r.device = 48, "cpu"
     r._k1 = k1_stub.__get__(r)
-    if mode:
+    if prep:
         # every M - 1 is a K2 layer (91 -> 92 included); ``only``: the MLA
         # layers folded
         for m in sorted(MLA if only is None else MLA & only):
-            r.mla_prep[m] = mla_for(m, mode)
+            r.mla_prep[m] = mla_for(m)
             r.mla_prep_prev[m - 1] = m
         R.K3MonoDecodeRunner._alloc_prep_buffers(r)
         reg(
@@ -701,26 +686,28 @@ def compare(tag, ref, got):
         )
 
 
+def pool_events(ev):
+    """The step's pool allocations / releases, but the production attention
+    internals the prep stages replace."""
+    return [(k, n) for k, n, t, _ in ev if t != "attn"]
+
+
 base = None
 # ``POSTS=1``: only the POST-on half (a quicker rerun)
 POSTS = [p == "1" for p in os.environ.get("POSTS", "0,1").split(",")]
 for post in POSTS:
-    ref, ref_ev = run(0, post, STEPS)
+    ref, ref_ev = run(False, post, STEPS)
     check(
-        ref is not None, f"post {int(post)} mode 0: every K2 launch writes live buffers"
+        ref is not None,
+        f"post {int(post)} prep off: every K2 launch writes live buffers",
     )
     if base is None:
         base = ref
     else:
-        compare("post 1 vs post 0, mode 0", base, ref)
-    matrix = [(1, None), (1, ONLY), (2, None), (3, None)] + (
-        [(3, ONLY)] if post else []
-    )
-    # ``MODES=3``: only those PREP sub-modes (a quicker rerun)
-    want = {int(m) for m in os.environ.get("MODES", "1,2,3").split(",")}
-    for mode, only in [(m, o) for m, o in matrix if m in want]:
-        got, ev = run(mode, post, STEPS, only)
-        tag = f"post {int(post)} mode {mode}" + (" layers subset" if only else "")
+        compare("post 1 vs post 0, prep off", base, ref)
+    for only in (None, ONLY):
+        got, ev = run(True, post, STEPS, only)
+        tag = f"post {int(post)} prep on" + (" layers subset" if only else "")
         check(
             got is not None,
             f"{tag}: every K2 launch writes live buffers{'' if got else ' -- ' + ev}",
@@ -728,21 +715,11 @@ for post in POSTS:
         if got is None:
             continue
         compare(tag, ref, got)
-        if mode == 1:
-            strip = lambda e: [(k, n) for k, n, t, _ in e]
-            check(
-                strip(ev) == strip(ref_ev),
-                f"{tag}: pool allocations / releases == flag-off "
-                f"({sum(1 for e in ref_ev if e[0] == 'a')} allocations)",
-            )
-        else:
-            # sub-mode 2 replaces the production q_a / kv_a and norms
-            keep = lambda e: [(k, n) for k, n, t, _ in e if t != "attn"]
-            check(
-                keep(ev) == keep(ref_ev),
-                f"{tag}: pool allocations / releases outside the attention "
-                "internals == flag-off",
-            )
+        check(
+            pool_events(ev) == pool_events(ref_ev),
+            f"{tag}: pool allocations / releases outside the attention internals "
+            "== flag-off",
+        )
 
 print("ALL OK" if not fails else f"{len(fails)} FAILED")
 sys.exit(1 if fails else 0)

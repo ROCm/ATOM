@@ -27,7 +27,7 @@ applied to the previous stage's own output. References:
   E4M3's steps are finest, 2^-14 of the dot's sum |a w| (``ABSORB_ACC_TOL``);
   each side's distance to the exact dot is reported. Padded tokens (negative
   slot) keep their q_out rows;
-* P5 (P2's kv CTAs in sub-mode 3): the same rope / cache kernel's FP8 KV rows,
+* P5 (on P2's kv CTAs): the same rope / cache kernel's FP8 KV rows,
   bit for bit; a negative slot writes nothing.
 
 Skips without a GPU (the module collects on CPU);
@@ -79,8 +79,7 @@ PTRS = (
 BUILDS = {
     "p0": ("p0",),
     "p1": ("p1",),
-    "p2": ("p2",),  # sub-mode 2: q8 / qs / kvn
-    "p2p5": ("p2",),  # sub-mode 3: also P5's KV rows
+    "p2p5": ("p2",),  # q8 / qs / kvn, and P5's KV rows
     "p3": ("p3",),
     "p4": ("p4",),
     "chain": ("p0", "p1", "p2", "p3", "p4"),
@@ -97,16 +96,11 @@ def scratch_bytes(s: int) -> int:
     return max(o + n for o, n in scratch_layout(s).values())
 
 
-def _mode(build: str) -> int:
-    return 2 if build == "p2" else 3
-
-
 def _build(s: int, build: str, neox: bool = True):
     key = (s, build, neox)
     if key in _BUILDS:
         return _BUILDS[key]
     stages = BUILDS[build]
-    mode = _mode(build)
     assert s <= pr.MAX_ROWS and 2 * s <= NA and pr.red_fits(s, NS)
     lay = scratch_layout(s)
     slabs = tuple(pl.slabs(s, XQ_BUDGET))
@@ -124,7 +118,6 @@ def _build(s: int, build: str, neox: bool = True):
         s=s,
         st=list(BUILDS).index(build),
         nx=int(neox),
-        pp=mode,
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -158,7 +151,6 @@ def _build(s: int, build: str, neox: bool = True):
             "prep_slabs": slabs,
             "qa_eps": EPS,
             "kva_eps": EPS,
-            "prep_mode": mode,
             "rope_neox": neox,
             "rope_maxpos": MAXPOS,
             "args": args,
@@ -294,7 +286,6 @@ def _publish(d: dict, s: int, region: str) -> None:
 # a stage alone: the region its first wait polls
 UPSTREAM = {
     "p1": "pxrdy",
-    "p2": "p1done",
     "p2p5": "p1done",
     "p3": "p2done",
     "p4": "p3done",
@@ -610,18 +601,14 @@ def test_p1_qkv_a(s):
 
 
 @pytest.mark.parametrize("s", [1, 4, 16])
-@pytest.mark.parametrize("build", ["p2", "p2p5"])
-def test_p2_norms_and_p5_kv_rows(s, build):
+def test_p2_norms_and_p5_kv_rows(s):
     d = _inputs(s)
     d["q8"].view(torch.uint8).fill_(0x7F)
     d["qs"].fill_(float("nan"))
     kvc0 = d["kvc"].clone()
-    _run(s, build, d)
+    _run(s, "p2p5", d)
     _check_p2(d, s)
-    if build == "p2p5":
-        _check_p5(d, s, True, kvc0)
-    else:
-        assert _ndiff(d["kvc"], kvc0) == 0, "sub-mode 2 wrote the KV cache"
+    _check_p5(d, s, True, kvc0)
 
 
 @pytest.mark.parametrize("s", [1, 4, 16])

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""K2 MLA prep (``ATOM_MONO_MLA_PREP``), P0: an MLA layer M's attention seam as
-a stage at the tail of the PRECEDING layer's K2 launch -- no new launch, no
-grid barrier.
+"""K2 MLA prep (``ATOM_MONO_MLA_PREP``): an MLA layer M's prep -- its attention
+seam (P0), fused_qkv_a_proj and the q_a / kv_a RMSNorms (P1 / P2), q_b, the
+absorb, rope and the FP8 KV-cache write (P3 .. P5) -- as stages at the tail of
+the PRECEDING layer's K2 launch: no new launch, no grid barrier.
 
 Without it, between K2(M-1) and layer M's ``fused_qkv_a_proj`` the production
 path runs a copy of ``blocks[:, :before]`` and the triton
@@ -28,7 +29,7 @@ K2: the triton kernel's per-element arithmetic, the row reductions split
 differently), then the triton kernel's per-token quant (amax * (1/448), IEEE
 1 / scale, clamp, RNE E4M3).
 
-Sub-mode 2 adds, after P0 (``ATOM_MONO_MLA_PREP=2``):
+After P0:
 
     P1  CTAs 84 .. 215 (132 tasks of 16 of fused_qkv_a_proj's 2112 rows), past
         the lnorm CTAs, after their own K2 work: the FP8 weight rows, then
@@ -46,7 +47,7 @@ Sub-mode 2 adds, after P0 (``ATOM_MONO_MLA_PREP=2``):
 
 P1 sums the same exact FP8 products as the FlyDSL GEMM in a different order.
 
-Sub-mode 3 adds (``ATOM_MONO_MLA_PREP=3``):
+Then:
 
     P3  CTAs 56 .. 199 (144 tasks of 16 of q_b_proj's 2304 rows), after their
         P1: the FP8 weight rows, then P2DONE of the q rows, q8 at device scope,
@@ -131,7 +132,7 @@ P2_THREADS = 256
 P2_TDS = 8
 FLT_MIN = 1.1754943508222875e-38
 
-# mode 3 (P3 .. P5)
+# P3 .. P5
 HEADS = 12  # a TP8 rank's MLA heads
 QK_NOPE = 128
 QH = QK_NOPE + ROPE  # 192: q_b_proj's columns a head
@@ -147,8 +148,7 @@ P4_CTA0 = 208  # 208 .. 255 (208 .. 215 after their P1, the rest after reduce)
 
 REGIONS = ("ppart", "pwgt", "pmsq", "pamx", "pxrdy", "p1done", "p2done", "p3done")
 
-# the prep build's arguments past K2's (and the MLA post stage's): one ABI for
-# every sub-mode, a later mode's 0 below it
+# the prep build's arguments past K2's (and the MLA post stage's)
 ARGS = (
     "pref",  # bf16 [S, 7168]: prefix(M) (the triton kernel's ``pref`` output)
     "x8",  # fp8 [S, 7168]: input_layernorm's per-token FP8 activation
@@ -156,7 +156,7 @@ ARGS = (
     "p_nw",  # layer M's attention seam: norm weight
     "p_qk",  # ... its query projection
     "p_onw",  # ... input_layernorm weight
-    "w_qa",  # mode 2: fused_qkv_a_proj FP8 plane (AITER (16, 16) preshuffle)
+    "w_qa",  # P1: fused_qkv_a_proj FP8 plane (AITER (16, 16) preshuffle)
     "w_qa_s",  # ... its fp32 row scales
     "qkv",  # bf16 [S, 2112]: q_c | kv_c | k_rope
     "q8",  # fp8 [S, 1536]: q_a_layernorm(q_c), per-token quant
@@ -164,7 +164,7 @@ ARGS = (
     "kvn",  # bf16 [S, 512]: kv_a_layernorm(kv_c)
     "qa_nw",  # q_a_layernorm weight
     "kva_nw",  # kv_a_layernorm weight
-    "w_qb",  # mode 3: q_b_proj FP8 plane (AITER (16, 16) preshuffle)
+    "w_qb",  # P3: q_b_proj FP8 plane (AITER (16, 16) preshuffle)
     "w_qb_s",  # ... its fp32 row scales
     "w_k",  # W_K [12, 512, 128] E4M3
     "w_k_s",  # ... its fp32 scale
@@ -491,10 +491,9 @@ def p2_norm(c, k):
     a = c["args"]
     is_kv = k >= s
     t = k % s
-    # q needs tasks 0 .. 95, kv 96 .. 127 (mode 3: and k_rope's 128 .. 131): a
+    # q needs tasks 0 .. 95, kv 96 .. 127 and k_rope's 128 .. 131 (P5): a
     # thread a task, the other kind's threads idle
-    kv_end = P1_TASKS if c["prep_mode"] >= 3 else P1_Q + P1_KV
-    if tid < kv_end:
+    if tid < P1_TASKS:
         want = is_kv.select(tid >= P1_Q, tid < P1_Q)
         if want:
             c["poll"]([(c["p1done"], tid, 1)])
@@ -551,32 +550,31 @@ def p2_norm(c, k):
                 (t * KVL + off) // 2,
                 cache_modifier=CM_DEV,
             )
-        if const_expr(c["prep_mode"] >= 3):
-            # P5's KV row: the rope kernel's nope part from the bf16 kv it read
-            # (RNE E4M3 of clamp(kv * inv_k)), then the rope part
-            slot, neg = _ld_i64_lo(a["slots"], t)
-            inv_k = _inv_scale(a["k_sc"])
-            kq = [
-                fx.min(
-                    fx.max(ftz(bf16_round(y[i]) * inv_k), _f32(-FP8_MAX)),
-                    _f32(FP8_MAX),
-                )
-                for i in range(P2_TDS)
-            ]
-            if active & ~neg:
-                kbase = a["kvc"] + fx.Int64(slot) * fx.Int64(a["kvc_sr"])
-                bo.buffer_store(
-                    fx.Vector.from_elements(
-                        [
-                            fp8_pack4(kq[0], kq[1], kq[2], kq[3]),
-                            fp8_pack4(kq[4], kq[5], kq[6], kq[7]),
-                        ],
-                        fx.Int32,
-                    ),
-                    rsrc(kbase),
-                    off // 4,
-                )
-            p5_kv_rope(c, t, slot, neg)
+        # P5's KV row: the rope kernel's nope part from the bf16 kv it read
+        # (RNE E4M3 of clamp(kv * inv_k)), then the rope part
+        slot, neg = _ld_i64_lo(a["slots"], t)
+        inv_k = _inv_scale(a["k_sc"])
+        kq = [
+            fx.min(
+                fx.max(ftz(bf16_round(y[i]) * inv_k), _f32(-FP8_MAX)),
+                _f32(FP8_MAX),
+            )
+            for i in range(P2_TDS)
+        ]
+        if active & ~neg:
+            kbase = a["kvc"] + fx.Int64(slot) * fx.Int64(a["kvc_sr"])
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [
+                        fp8_pack4(kq[0], kq[1], kq[2], kq[3]),
+                        fp8_pack4(kq[4], kq[5], kq[6], kq[7]),
+                    ],
+                    fx.Int32,
+                ),
+                rsrc(kbase),
+                off // 4,
+            )
+        p5_kv_rope(c, t, slot, neg)
     else:
         tm = active.select(_f32(AMAX_FLOOR), _f32(0.0))
         for i in range_constexpr(P2_TDS):
@@ -614,7 +612,7 @@ def p2_norm(c, k):
     gpu.barrier()
 
 
-# ------------------------------------------------------------ mode 3 (P3 .. P5)
+# ------------------------------------------------------------------ P3 .. P5
 def _ld_bf_dev(ptr, i):
     """bf16 element ``i`` (written by this launch) as f32, past the L2."""
     return fx.Float32(

@@ -4,9 +4,10 @@
 
 An MLA layer's v-up BMM, g_proj, sigmoid and mul run as the first stage of its
 K2 launch. These tests pin the plain-Python parts: the stage's task geometry,
-the bind-time refusals, the elementwise tail's arithmetic against torch on a CPU,
-and the flag defaults. Whether the stage is right and faster on a GPU (and what
-the changed GEMM summation order does to accuracy) needs a GPU.
+the bind-time refusals, the elementwise tail's arithmetic against torch on a
+CPU, and the fold flags' defaults and parsing. Whether the stage is right and
+faster on a GPU (and what the changed GEMM summation order does to accuracy)
+needs a GPU.
 """
 
 import inspect
@@ -240,11 +241,27 @@ def test_attention_hooks_exist():
 
 
 # ---------------------------------------------------------------------- the flags
-def test_flags_default_off(monkeypatch):
-    monkeypatch.delenv("ATOM_MONO_MLA_POST", raising=False)
-    assert envs.ATOM_MONO_MLA_POST is False
-    monkeypatch.setenv("ATOM_MONO_MLA_POST", "1")
-    assert envs.ATOM_MONO_MLA_POST is True
+@pytest.mark.parametrize("name", ["ATOM_MONO_MLA_POST", "ATOM_MONO_MLA_PREP"])
+def test_fold_flags_default_on_and_parse_strictly(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is True
+    for raw, want in (("", True), ("1", True), (" 0 ", False), ("0", False)):
+        monkeypatch.setenv(name, raw)
+        assert getattr(envs, name) is want, raw
+    for bad in ("2", "3", "yes", "true", "off"):
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValueError, match=name):
+            getattr(envs, name)
+
+
+def test_a_bad_fold_flag_fails_the_load(monkeypatch):
+    """Rejected where the model is wrapped, before the runner's bind (which
+    would turn any error into a refusal of mono as a whole)."""
+    from atom.models.kimi_k3.mono import dispatch
+
+    monkeypatch.setenv("ATOM_MONO_MLA_PREP", "3")
+    with pytest.raises(ValueError, match="ATOM_MONO_MLA_PREP"):
+        dispatch.install_mono_decode(None, None, None)
 
 
 # ------------------------------------------------------- the FP8 weight layout

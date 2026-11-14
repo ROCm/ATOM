@@ -26,6 +26,7 @@ from atom.models.kimi_k3.mono.config import config_refusal
 from atom.models.kimi_k3.mono.plan import kda_metadata, step_shape
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -120,6 +121,9 @@ def install_mono_decode(
 ) -> nn.Module:
     """``model`` wrapped for K3 mono decode, or ``model`` itself when this
     deployment is one mono does not serve."""
+    # the MLA fold flags parse strictly (``envs``): a bad value fails the load
+    # here, where the runner's bind would turn it into a refusal of mono itself
+    _ = envs.ATOM_MONO_MLA_POST, envs.ATOM_MONO_MLA_PREP
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("Kimi-K3 mono decode off: %s", why)
