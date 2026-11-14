@@ -117,6 +117,20 @@ mod b_chat_aggregator {
     }
 
     #[tokio::test]
+    async fn test_aggregator_reports_cached_prompt_tokens() {
+        let mut done = complete(vec![1]);
+        if let TokenChunk::Complete { meta, .. } = &mut done {
+            meta.cached_tokens = 2;
+        }
+        let resp =
+            chat_aggregator::process(synthetic_single_stream(vec![Ok(done)]), chat_ctx()).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+    }
+
+    #[tokio::test]
     async fn test_aggregator_finish_reason_maps_into_body() {
         let stream = synthetic_single_stream(vec![Ok(TokenChunk::Complete {
             token_ids: vec![1],
@@ -337,25 +351,6 @@ mod b2_chat_aggregator_branches {
             },
         }]);
         req.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Required));
-        let stream = synthetic_single_stream(vec![Ok(cmpl(vec![1], FinishReason::Stop, None))]);
-        let resp = chat_aggregator::process(stream, ctx_with(req)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_aggregator_with_tools_tool_choice_none_skips_tool_parse() {
-        let mut req = ChatCompletionRequest::default();
-        req.stream = false;
-        req.tools = Some(vec![Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "myfn".to_string(),
-                description: None,
-                parameters: serde_json::json!({}),
-                strict: None,
-            },
-        }]);
-        req.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::None));
         let stream = synthetic_single_stream(vec![Ok(cmpl(vec![1], FinishReason::Stop, None))]);
         let resp = chat_aggregator::process(stream, ctx_with(req)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1166,6 +1161,7 @@ mod c2_chat_streaming_branches {
         let s = body_of(resp).await;
         assert!(s.contains("usage"));
         assert!(s.contains("\"total_tokens\":8") || s.contains("total_tokens"));
+        assert!(s.contains("\"prompt_tokens_details\":{\"cached_tokens\":0}"));
     }
 
     #[tokio::test]
@@ -2211,6 +2207,68 @@ mod c4_chat_streaming_coverage {
         let s = body_of(resp).await;
         assert!(s.contains("\"stop\""));
         assert!(s.contains("[DONE]"));
+    }
+
+    /// Text the stop decoder holds as a stop string's possible start comes
+    /// out at Complete, and goes through the reasoning parser: an output cut
+    /// off inside the think block streams it as reasoning, as non-streaming
+    /// returns it.
+    #[tokio::test]
+    async fn test_flushed_text_goes_through_the_reasoning_parser() {
+        use crate::protocols::common::StringOrArray;
+        use crate::routers::prepare::chat_template::ProcessedMessages;
+
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let stop = StringOrArray::String("world!".to_string());
+        let stop_decoder = create_stop_decoder(&tokenizer, Some(&stop), None, true, false);
+        let mut req = ChatCompletionRequest::default();
+        req.separate_reasoning = true;
+        let ctx = ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some("m".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: Some(ProcessedMessages {
+                text: "<|im_start|>assistant\n<think>\n".into(),
+                stop_sequences: None,
+            }),
+            tokenizer,
+            stop_decoder,
+            request_id: "rid".to_string(),
+            created: 0,
+            tool_parser_factory: None,
+            reasoning_parser_factory: Some(test_mocks::reasoning_parser_factory()),
+            configured_tool_parser: None,
+            configured_reasoning_parser: Some("qwen3".to_string()),
+        };
+        // `Hello world`: `world` is held, as `world!` may follow.
+        let stream = synthetic_single_stream(vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![1, 5, 2],
+                logprobs: None,
+            }),
+            Ok(TokenChunk::Complete {
+                token_ids: vec![],
+                finish_reason: FinishReason::Length,
+                matched_stop: None,
+                usage: usage(1, 3),
+                logprobs: None,
+                input_logprobs: None,
+                meta: meta_plain(),
+            }),
+        ]);
+        let s = body_of(chat_streaming::process(stream, ctx, "regular")).await;
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for event in s.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(event) else {
+                continue;
+            };
+            let delta = &v["choices"][0]["delta"];
+            reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(delta["content"].as_str().unwrap_or_default());
+        }
+        assert!(reasoning.ends_with("world"), "reasoning: {reasoning:?}");
+        assert_eq!(content, "");
     }
 
     #[tokio::test]
@@ -3652,5 +3710,202 @@ mod e2_generate_streaming_branches {
         })]);
         let resp = generate_streaming::process(stream, generate_ctx(), "pd");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod prompt_opened_reasoning {
+    use super::test_support::chat_ctx;
+    use crate::{
+        reasoning_parser::ParserFactory,
+        routers::prepare::{chat_template::ProcessedMessages, response_context::REASONING_OPEN},
+    };
+
+    fn prompted(text: &str) -> bool {
+        let mut ctx = chat_ctx();
+        ctx.processed_messages = Some(ProcessedMessages {
+            text: text.into(),
+            stop_sequences: None,
+        });
+        ctx.starts_in_reasoning()
+    }
+
+    #[test]
+    fn only_a_prompt_ending_in_an_open_block_starts_in_reasoning() {
+        assert!(prompted("<|assistant|><think>\n"));
+        assert!(!prompted("<|assistant|><think></think>"));
+        assert!(!prompted("<|assistant|>"));
+        assert!(!chat_ctx().starts_in_reasoning());
+    }
+
+    /// The output of such a prompt: reasoning, then `</think>`, then the answer.
+    #[test]
+    fn a_primed_parser_splits_an_output_with_no_open_tag() {
+        let factory = ParserFactory::new();
+        let mut parser = factory.create("qwen3").unwrap();
+        let primed = format!("{REASONING_OPEN}17 * 3 = 51</think>51");
+        let whole = parser.detect_and_parse_reasoning(&primed).unwrap();
+        assert_eq!(
+            (whole.reasoning_text.as_str(), whole.normal_text.as_str()),
+            ("17 * 3 = 51", "51")
+        );
+
+        let mut parser = factory.create("qwen3").unwrap();
+        let _ = parser.parse_reasoning_streaming_incremental(REASONING_OPEN);
+        let (mut reasoning, mut normal) = (String::new(), String::new());
+        // `</think>` is one special token, so a delta carries it whole.
+        for delta in ["17 * 3", " = 51", "</think>5", "1"] {
+            let r = parser.parse_reasoning_streaming_incremental(delta).unwrap();
+            reasoning.push_str(&r.reasoning_text);
+            normal.push_str(&r.normal_text);
+        }
+        assert_eq!((reasoning.as_str(), normal.as_str()), ("17 * 3 = 51", "51"));
+    }
+}
+
+/// A Qwen-format tool call as the model writes it, read with each
+/// `tool_choice` and finish reason.
+#[cfg(test)]
+mod tool_call_output {
+    use std::sync::Arc;
+
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    use crate::protocols::{
+        chat::ChatCompletionRequest,
+        common::{Function, Tool, ToolChoice, ToolChoiceValue},
+    };
+    use crate::routers::prepare::response_context::{ProtocolRequest, ResponseContext};
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::render::{chat_aggregator, chat_streaming};
+    use crate::routers::test_mocks;
+    use crate::routers::token_handle::test_support::synthetic_single_stream;
+    use crate::routers::token_handle::token_chunk::{FinishReason, TokenChunk, Usage, WorkerMeta};
+    use crate::tokenizer::{huggingface::HuggingFaceTokenizer, traits::Tokenizer};
+
+    const CALL: &str =
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+
+    /// A tokenizer whose token 0 decodes to the whole of `CALL`.
+    fn call_tokenizer() -> Arc<dyn Tokenizer> {
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [],
+            "model": {"type": "WordLevel", "vocab": {CALL: 0, "<unk>": 1}, "unk_token": "<unk>"},
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, json.to_string()).unwrap();
+        Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+    }
+
+    fn ctx(tool_choice: Option<ToolChoice>, stream: bool) -> ResponseContext {
+        let req = ChatCompletionRequest {
+            model: "qwen3".to_string(),
+            stream,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "get_weather".to_string(),
+                    description: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: None,
+                },
+            }]),
+            tool_choice,
+            ..Default::default()
+        };
+        let tokenizer = call_tokenizer();
+        let stop_decoder = create_stop_decoder(&tokenizer, None, None, true, false);
+        ResponseContext {
+            original: ProtocolRequest::Chat(Arc::new(req)),
+            model_id: Some("qwen3".to_string()),
+            headers: None,
+            original_text: None,
+            processed_messages: None,
+            tokenizer,
+            stop_decoder,
+            request_id: "rid".to_string(),
+            created: 0,
+            tool_parser_factory: Some(test_mocks::tool_parser_factory()),
+            reasoning_parser_factory: None,
+            configured_tool_parser: Some("qwen".to_string()),
+            configured_reasoning_parser: None,
+        }
+    }
+
+    fn complete(finish_reason: FinishReason) -> TokenChunk {
+        TokenChunk::Complete {
+            token_ids: vec![0],
+            finish_reason,
+            matched_stop: None,
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            logprobs: None,
+            input_logprobs: None,
+            meta: WorkerMeta {
+                request_id: "rid".to_string(),
+                weight_version: None,
+                cached_tokens: 0,
+            },
+        }
+    }
+
+    async fn aggregated(tool_choice: Option<ToolChoice>, finish_reason: FinishReason) -> Value {
+        let stream = synthetic_single_stream(vec![Ok(complete(finish_reason))]);
+        let resp = chat_aggregator::process(stream, ctx(tool_choice, false)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["choices"][0].clone()
+    }
+
+    #[test]
+    fn the_tokenizer_decodes_the_call() {
+        assert_eq!(call_tokenizer().decode(&[0], true).unwrap(), CALL);
+    }
+
+    #[tokio::test]
+    async fn an_auto_call_is_returned_as_a_call() {
+        let choice = aggregated(None, FinishReason::Stop).await;
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        let call = &choice["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn a_call_cut_off_by_length_finishes_on_length() {
+        let choice = aggregated(None, FinishReason::Length).await;
+        assert_eq!(choice["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn tool_choice_none_drops_the_call_and_its_markup() {
+        let none = Some(ToolChoice::Value(ToolChoiceValue::None));
+        let choice = aggregated(none, FinishReason::Stop).await;
+        assert_eq!(choice["finish_reason"], "stop");
+        assert!(choice["message"]["tool_calls"].is_null(), "{choice}");
+        let content = choice["message"]["content"].as_str().unwrap_or_default();
+        assert!(!content.contains("<tool_call>"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn tool_choice_none_streams_no_call_and_no_markup() {
+        let none = Some(ToolChoice::Value(ToolChoiceValue::None));
+        let stream = synthetic_single_stream(vec![
+            Ok(TokenChunk::Partial {
+                token_ids: vec![0],
+                logprobs: None,
+            }),
+            Ok(complete(FinishReason::Stop)),
+        ]);
+        let resp = chat_streaming::process(stream, ctx(none, true), "regular");
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let s = String::from_utf8_lossy(&body);
+        assert!(!s.contains("tool_calls"), "{s}");
+        assert!(!s.contains("<tool_call>"), "{s}");
+        assert!(s.contains("\"finish_reason\":\"stop\""), "{s}");
     }
 }

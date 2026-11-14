@@ -28,6 +28,10 @@ impl ProtocolRequest {
     }
 }
 
+/// What a prompt ends with when its template already opened the reasoning
+/// block, so the output starts mid-reasoning with only `</think>` to show it.
+pub const REASONING_OPEN: &str = "<think>";
+
 pub struct ResponseContext {
     pub original: ProtocolRequest,
     pub model_id: Option<String>,
@@ -42,4 +46,14 @@ pub struct ResponseContext {
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub configured_tool_parser: Option<String>,
     pub configured_reasoning_parser: Option<String>,
+}
+
+impl ResponseContext {
+    /// Does the rendered prompt end inside a reasoning block (GLM-5, Qwen3
+    /// thinking templates)? Its reasoning parser then has to start there too.
+    pub fn starts_in_reasoning(&self) -> bool {
+        self.processed_messages
+            .as_ref()
+            .is_some_and(|p| p.text.trim_end().ends_with(REASONING_OPEN))
+    }
 }

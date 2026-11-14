@@ -100,13 +100,13 @@ jobs:
       # The ci profile, not release: release's fat LTO and single codegen unit
       # made this build the slowest step, and only the benchmark measures the
       # binary's speed.
-      - name: Test P/D router request lifecycle
+      - name: Run mesh unit tests
         run: |
           set -euo pipefail
           cargo test \
             --manifest-path atom/mesh/Cargo.toml \
             --target-dir atom/mesh/mocker/target/mesh \
-            --profile ci --lib routers::http_pd_router
+            --profile ci --lib
 
       # The mocker is its own cargo root: atom/mesh's profiles, ci included,
       # do not apply, and its release profile is cargo's default (no fat LTO).

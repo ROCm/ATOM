@@ -22,7 +22,7 @@ use crate::{
     routers::{
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext},
+            response_context::{ProtocolRequest, ResponseContext, REASONING_OPEN},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
         render::logprob_conversion::token_logprobs_to_chat,
@@ -102,6 +102,7 @@ async fn run_chat_stream(
                 )
             })
             .unwrap_or(false);
+    let starts_in_reasoning = ctx.starts_in_reasoning();
 
     let used_json_schema = match tool_choice {
         Some(ToolChoice::Function { .. }) => true,
@@ -110,6 +111,8 @@ async fn run_chat_stream(
         _ => false,
     };
     let is_specific_function = matches!(tool_choice, Some(ToolChoice::Function { .. }));
+    let tool_choice_enabled =
+        !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
 
     let tool_parser_available = tools.is_some()
         && ctx
@@ -133,6 +136,7 @@ async fn run_chat_stream(
     let mut matched_stop_value: Option<Value> = None;
     let mut prompt_tokens: u32 = 0;
     let mut completion_tokens: u32 = 0;
+    let mut cached_tokens: u32 = 0;
     let mut has_tool_call = false;
 
     let mut stop_decoder = ctx.stop_decoder;
@@ -143,7 +147,7 @@ async fn run_chat_stream(
 
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(engine_error_to_string)?;
-        match chunk {
+        let (chunk_text, logprobs) = match chunk {
             TokenChunk::Partial {
                 token_ids,
                 logprobs,
@@ -154,100 +158,7 @@ async fn run_chat_stream(
                 completion_tokens += token_ids.len() as u32;
 
                 let (chunk_text, _stopped) = process_chunk_tokens(&mut stop_decoder, &token_ids);
-                if chunk_text.is_empty() {
-                    continue;
-                }
-
-                if is_first {
-                    let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_role(INDEX, "assistant")
-                        .maybe_system_fingerprint(system_fingerprint.clone())
-                        .build();
-                    format_sse_chunk_into(&mut sse_buffer, &first_chunk);
-                    send_bytes(tx, &sse_buffer, "first chunk")?;
-                    is_first = false;
-                }
-
-                let mut delta = chunk_text;
-
-                let in_reasoning = if reasoning_parser_available {
-                    let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
-                        &delta,
-                        &mut reasoning_parser,
-                        ctx.reasoning_parser_factory.as_ref(),
-                        ctx.configured_reasoning_parser.as_deref(),
-                        request_id,
-                        model,
-                        created,
-                        system_fingerprint.as_deref(),
-                    )
-                    .await;
-                    if let Some(c) = reasoning_chunk {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
-                        send_bytes(tx, &sse_buffer, "reasoning chunk")?;
-                    }
-                    delta = normal_text;
-                    in_reasoning
-                } else {
-                    false
-                };
-
-                let tool_choice_enabled =
-                    !matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)));
-                if !in_reasoning
-                    && tool_choice_enabled
-                    && tools.is_some()
-                    && (tool_parser_available || used_json_schema)
-                {
-                    let tool_chunks = if is_specific_function {
-                        process_specific_function_stream(
-                            &delta,
-                            &mut has_tool_call,
-                            tool_choice,
-                            request_id,
-                            model,
-                            created,
-                            system_fingerprint.as_deref(),
-                            history_tool_calls_count,
-                        )
-                    } else {
-                        process_tool_calls_stream(
-                            &delta,
-                            &mut tool_parser,
-                            &mut has_tool_call,
-                            tools.as_ref().unwrap(),
-                            ctx.tool_parser_factory.as_ref(),
-                            ctx.configured_tool_parser.as_deref(),
-                            request_id,
-                            model,
-                            created,
-                            system_fingerprint.as_deref(),
-                            history_tool_calls_count,
-                            used_json_schema,
-                        )
-                        .await
-                    };
-
-                    for c in tool_chunks {
-                        format_sse_chunk_into(&mut sse_buffer, &c);
-                        send_bytes(tx, &sse_buffer, "tool call chunk")?;
-                    }
-                    continue;
-                }
-
-                if !delta.is_empty() {
-                    let chat_logprobs = logprobs
-                        .as_ref()
-                        .map(|lp| token_logprobs_to_chat(lp, &ctx.tokenizer));
-                    let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
-                        .maybe_system_fingerprint(system_fingerprint.clone())
-                        .build();
-                    format_sse_chunk_into(&mut sse_buffer, &content_chunk);
-                    send_bytes(tx, &sse_buffer, "content chunk")?;
-                }
+                (chunk_text, logprobs)
             }
             TokenChunk::Complete {
                 finish_reason,
@@ -256,20 +167,9 @@ async fn run_chat_stream(
                 meta,
                 ..
             } => {
-                if let SequenceDecoderOutput::Text(text) = stop_decoder.flush() {
-                    if !text.is_empty() {
-                        let chunk = ChatCompletionStreamResponse::builder(request_id, model)
-                            .created(created)
-                            .add_choice_content(INDEX, "assistant", text)
-                            .maybe_system_fingerprint(system_fingerprint.clone())
-                            .build();
-                        format_sse_chunk_into(&mut sse_buffer, &chunk);
-                        send_bytes(tx, &sse_buffer, "flushed content")?;
-                    }
-                }
-
                 prompt_tokens = usage.prompt_tokens;
                 completion_tokens = usage.completion_tokens;
+                cached_tokens = meta.cached_tokens;
                 finish_reason_str = Some(finish_reason_to_string(&finish_reason));
                 matched_stop_value = matched_stop.map(|ms| match ms {
                     MatchedStop::Str(s) => Value::String(s),
@@ -278,11 +178,117 @@ async fn run_chat_stream(
                 if system_fingerprint.is_none() {
                     system_fingerprint = meta.weight_version;
                 }
+                // What the stop decoder held is the output's last text, and
+                // goes through the parsers like any other.
+                let held = match stop_decoder.flush() {
+                    SequenceDecoderOutput::Text(text) => text,
+                    _ => String::new(),
+                };
+                (held, None)
             }
+        };
+        if chunk_text.is_empty() {
+            continue;
+        }
+
+        if is_first {
+            let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_role(INDEX, "assistant")
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+            send_bytes(tx, &sse_buffer, "first chunk")?;
+            is_first = false;
+        }
+
+        let mut delta = chunk_text;
+
+        let in_reasoning = if reasoning_parser_available {
+            let (normal_text, reasoning_chunk, in_reasoning) = process_reasoning_stream(
+                &delta,
+                &mut reasoning_parser,
+                ctx.reasoning_parser_factory.as_ref(),
+                ctx.configured_reasoning_parser.as_deref(),
+                starts_in_reasoning,
+                request_id,
+                model,
+                created,
+                system_fingerprint.as_deref(),
+            )
+            .await;
+            if let Some(c) = reasoning_chunk {
+                format_sse_chunk_into(&mut sse_buffer, &c);
+                send_bytes(tx, &sse_buffer, "reasoning chunk")?;
+            }
+            delta = normal_text;
+            in_reasoning
+        } else {
+            false
+        };
+
+        if !in_reasoning
+            && tools.is_some()
+            && (tool_parser_available || (used_json_schema && tool_choice_enabled))
+        {
+            let tool_chunks = if is_specific_function {
+                process_specific_function_stream(
+                    &delta,
+                    &mut has_tool_call,
+                    tool_choice,
+                    request_id,
+                    model,
+                    created,
+                    system_fingerprint.as_deref(),
+                    history_tool_calls_count,
+                )
+            } else {
+                process_tool_calls_stream(
+                    &delta,
+                    &mut tool_parser,
+                    &mut has_tool_call,
+                    tools.as_ref().unwrap(),
+                    ctx.tool_parser_factory.as_ref(),
+                    ctx.configured_tool_parser.as_deref(),
+                    request_id,
+                    model,
+                    created,
+                    system_fingerprint.as_deref(),
+                    history_tool_calls_count,
+                    used_json_schema,
+                    !tool_choice_enabled,
+                )
+                .await
+            };
+
+            for c in tool_chunks {
+                format_sse_chunk_into(&mut sse_buffer, &c);
+                send_bytes(tx, &sse_buffer, "tool call chunk")?;
+            }
+            continue;
+        }
+
+        if !delta.is_empty() {
+            let chat_logprobs = logprobs
+                .as_ref()
+                .map(|lp| token_logprobs_to_chat(lp, &ctx.tokenizer));
+            let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
+                .created(created)
+                .add_choice_content_with_logprobs(INDEX, "assistant", delta, chat_logprobs)
+                .maybe_system_fingerprint(system_fingerprint.clone())
+                .build();
+            format_sse_chunk_into(&mut sse_buffer, &content_chunk);
+            send_bytes(tx, &sse_buffer, "content chunk")?;
         }
     }
 
-    if let Some(parser) = &tool_parser {
+    // `tool_choice: "none"`: the parser read the calls, none go out.
+    let unstreamed_parser = if tool_choice_enabled {
+        tool_parser.as_ref()
+    } else {
+        None
+    };
+    if let Some(parser) = unstreamed_parser {
         let guard = parser.lock().await;
         if let Some(unstreamed) = guard.get_unstreamed_tool_args() {
             for item in unstreamed {
@@ -341,7 +347,7 @@ async fn run_chat_stream(
                 })
                 .maybe_system_fingerprint(system_fingerprint.clone())
                 .build();
-            let s = serde_json::to_string(&usage_chunk)
+            let s = serde_json::to_string(&super::with_cached_tokens(usage_chunk, cached_tokens))
                 .map_err(|e| format!("Failed to serialize usage chunk: {}", e))?;
             tx.send(Ok(Bytes::from(format!("data: {}\n\n", s))))
                 .map_err(|_| "send usage".to_string())?;
@@ -395,6 +401,7 @@ async fn process_reasoning_stream(
     reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
     factory: Option<&ReasoningParserFactory>,
     configured: Option<&str>,
+    starts_in_reasoning: bool,
     request_id: &str,
     model: &str,
     created: u64,
@@ -406,7 +413,12 @@ async fn process_reasoning_stream(
             None => return (delta.to_string(), None, false),
         };
         match create_reasoning_parser(factory, configured, model) {
-            Some(p) => *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p))),
+            Some(mut p) => {
+                if starts_in_reasoning {
+                    let _ = p.parse_reasoning_streaming_incremental(REASONING_OPEN);
+                }
+                *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(p)));
+            }
             None => return (delta.to_string(), None, false),
         }
     }
@@ -497,6 +509,9 @@ async fn process_tool_calls_stream(
     system_fingerprint: Option<&str>,
     history_tool_calls_count: usize,
     use_json_parser: bool,
+    // `tool_choice: "none"`: the format is read, so its markup leaves the
+    // content, but no call is sent.
+    suppress_calls: bool,
 ) -> Vec<ChatCompletionStreamResponse> {
     let mut chunks = Vec::new();
     if tool_parser.is_none() {
@@ -531,35 +546,37 @@ async fn process_tool_calls_stream(
                         .build(),
                 );
             }
-            for item in calls {
-                *has_tool_call = true;
-                let id = item.name.as_ref().map(|n| {
-                    generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)
-                });
-                let delta = ToolCallDelta {
-                    index: item.tool_index as u32,
-                    id,
-                    tool_type: if item.name.is_some() {
-                        Some("function".to_string())
-                    } else {
-                        None
-                    },
-                    function: Some(FunctionCallDelta {
-                        name: item.name,
-                        arguments: if item.parameters.is_empty() {
-                            None
+            if !suppress_calls {
+                for item in calls {
+                    *has_tool_call = true;
+                    let id = item.name.as_ref().map(|n| {
+                        generate_tool_call_id(model, n, item.tool_index, history_tool_calls_count)
+                    });
+                    let delta = ToolCallDelta {
+                        index: item.tool_index as u32,
+                        id,
+                        tool_type: if item.name.is_some() {
+                            Some("function".to_string())
                         } else {
-                            Some(item.parameters)
+                            None
                         },
-                    }),
-                };
-                chunks.push(
-                    ChatCompletionStreamResponse::builder(request_id, model)
-                        .created(created)
-                        .add_choice_tool_call_delta(0, delta)
-                        .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
-                        .build(),
-                );
+                        function: Some(FunctionCallDelta {
+                            name: item.name,
+                            arguments: if item.parameters.is_empty() {
+                                None
+                            } else {
+                                Some(item.parameters)
+                            },
+                        }),
+                    };
+                    chunks.push(
+                        ChatCompletionStreamResponse::builder(request_id, model)
+                            .created(created)
+                            .add_choice_tool_call_delta(0, delta)
+                            .maybe_system_fingerprint(system_fingerprint.map(|s| s.to_string()))
+                            .build(),
+                    );
+                }
             }
         }
         Err(e) => error!("Tool call parsing error: {}", e),

@@ -18,14 +18,13 @@ use crate::{
         comm::error,
         prepare::{
             parser_factory_lookup::{check_reasoning_parser_availability, get_reasoning_parser},
-            response_context::{ProtocolRequest, ResponseContext},
+            response_context::{ProtocolRequest, ResponseContext, REASONING_OPEN},
             tool_constraints::{
                 generate_tool_call_id, get_history_tool_calls_count, parse_json_schema_response,
             },
         },
         render::logprob_conversion::token_logprobs_to_chat,
         token_handle::{
-            engine_error::EngineError,
             token_chunk::{FinishReason, MatchedStop, TokenChunk},
             token_handle::TokenHandle,
         },
@@ -41,8 +40,8 @@ use crate::{
 };
 
 pub async fn process(stream: TokenHandle, ctx: ResponseContext) -> Response {
-    match process_typed(stream, ctx).await {
-        Ok(resp) => axum::Json(resp).into_response(),
+    match aggregate(stream, ctx).await {
+        Ok((resp, cached)) => axum::Json(super::with_cached_tokens(resp, cached)).into_response(),
         Err(resp) => resp,
     }
 }
@@ -51,6 +50,15 @@ pub async fn process_typed(
     stream: TokenHandle,
     ctx: ResponseContext,
 ) -> Result<ChatCompletionResponse, Response> {
+    aggregate(stream, ctx).await.map(|(resp, _)| resp)
+}
+
+/// The response and the first choice's cached prompt tokens (the prompt is
+/// shared, so that is the request's).
+async fn aggregate(
+    stream: TokenHandle,
+    ctx: ResponseContext,
+) -> Result<(ChatCompletionResponse, u32), Response> {
     let chat_request = match &ctx.original {
         ProtocolRequest::Chat(r) => Arc::clone(r),
         ProtocolRequest::Generate(_) => {
@@ -84,12 +92,9 @@ pub async fn process_typed(
             })
             .unwrap_or(false);
 
-    let tool_choice_enabled = !matches!(
-        &chat_request.tool_choice,
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-    );
-    let tool_available = tool_choice_enabled
-        && chat_request.tools.is_some()
+    // Read with `tool_choice: "none"` too, so the markup leaves the content;
+    // `process_choice` then drops the calls.
+    let tool_available = chat_request.tools.is_some()
         && ctx
             .tool_parser_factory
             .as_ref()
@@ -102,6 +107,7 @@ pub async fn process_typed(
             })
             .unwrap_or(false);
 
+    let starts_in_reasoning = ctx.starts_in_reasoning();
     let mut stop_decoder = ctx.stop_decoder;
     let mut choices = Vec::with_capacity(completes.len());
     for (idx, complete) in completes.iter().enumerate() {
@@ -113,6 +119,7 @@ pub async fn process_typed(
             &mut stop_decoder,
             history_tool_calls_count,
             reasoning_available,
+            starts_in_reasoning,
             tool_available,
             ctx.tool_parser_factory.as_ref(),
             ctx.reasoning_parser_factory.as_ref(),
@@ -135,6 +142,10 @@ pub async fn process_typed(
         TokenChunk::Complete { meta, .. } => meta.weight_version.clone(),
         _ => None,
     });
+    let cached_tokens = match completes.first() {
+        Some(TokenChunk::Complete { meta, .. }) => meta.cached_tokens,
+        _ => 0,
+    };
 
     let response = ChatCompletionResponse::builder(
         &ctx.request_id,
@@ -146,7 +157,7 @@ pub async fn process_typed(
     .maybe_system_fingerprint(weight_version)
     .build();
 
-    Ok(response)
+    Ok((response, cached_tokens))
 }
 
 async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, Response> {
@@ -155,7 +166,7 @@ async fn collect_completes(mut stream: TokenHandle) -> Result<Vec<TokenChunk>, R
         match item {
             Ok(chunk @ TokenChunk::Complete { .. }) => completes.push(chunk),
             Ok(TokenChunk::Partial { .. }) => continue,
-            Err(e) => return Err(engine_error_to_response(e)),
+            Err(e) => return Err(e.into_response()),
         }
     }
     stream.mark_completed();
@@ -171,6 +182,7 @@ async fn process_choice(
     stop_decoder: &mut StopSequenceDecoder,
     history_tool_calls_count: usize,
     reasoning_available: bool,
+    starts_in_reasoning: bool,
     tool_available: bool,
     tool_parser_factory: Option<&ToolParserFactory>,
     reasoning_parser_factory: Option<&ReasoningParserFactory>,
@@ -217,6 +229,9 @@ async fn process_choice(
             let pooled =
                 get_reasoning_parser(factory, configured_reasoning_parser, &chat_request.model);
             let mut parser = pooled.lock().await;
+            if starts_in_reasoning {
+                processed_text.insert_str(0, REASONING_OPEN);
+            }
             match parser.detect_and_parse_reasoning(&processed_text) {
                 Ok(result) => {
                     if !result.reasoning_text.is_empty() {
@@ -230,12 +245,12 @@ async fn process_choice(
     }
 
     let mut tool_calls: Option<Vec<ToolCall>> = None;
-    let tool_choice_enabled = !matches!(
+    let tool_choice_none = matches!(
         &chat_request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
     );
 
-    if tool_choice_enabled && chat_request.tools.is_some() {
+    if chat_request.tools.is_some() {
         let used_json_schema = match &chat_request.tool_choice {
             Some(ToolChoice::Function { .. }) => true,
             Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
@@ -260,12 +275,18 @@ async fn process_choice(
                     history_tool_calls_count,
                 )
                 .await;
+                if tool_choice_none {
+                    // Read, not dispatched: `tool_choice: "none"` forbids calls.
+                    tool_calls = None;
+                }
             }
         }
     }
 
+    // `length` outranks `tool_calls`: a call cut off mid-arguments must not
+    // read as one to run (`openai_stop_reason_with_calls`).
     let finish_reason_str = finish_reason_to_str(finish_reason);
-    let final_finish_reason = if tool_calls.is_some() {
+    let final_finish_reason = if tool_calls.is_some() && finish_reason_str != "length" {
         "tool_calls"
     } else {
         finish_reason_str
@@ -365,31 +386,5 @@ fn finish_reason_to_str(r: &FinishReason) -> &'static str {
         FinishReason::ToolCalls => "tool_calls",
         FinishReason::Abort => "abort",
         FinishReason::Other(_) => "stop",
-    }
-}
-
-fn engine_error_to_response(err: EngineError) -> Response {
-    match err {
-        EngineError::Transport(s) => {
-            error::service_unavailable("engine_transport_error", format!("transport error: {}", s))
-        }
-        EngineError::Prefill(m) => {
-            error::internal_error("engine_prefill_error", format!("prefill error: {}", m))
-        }
-        EngineError::DecodeError(m) => {
-            error::internal_error("engine_decode_error", format!("decode error: {}", m))
-        }
-        EngineError::PrefillEarlyClose => error::internal_error(
-            "engine_prefill_early_close",
-            "prefill stream closed without Complete",
-        ),
-        EngineError::DecodeIncomplete => error::internal_error(
-            "engine_decode_incomplete",
-            "decode stream closed without Complete",
-        ),
-        EngineError::ConnectionAcquireFailed(r) => {
-            error::service_unavailable("engine_connection_failed", r)
-        }
-        EngineError::RequestBuildFailed(r) => error::bad_request("engine_request_build_failed", r),
     }
 }

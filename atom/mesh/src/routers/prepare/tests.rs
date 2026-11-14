@@ -1407,3 +1407,129 @@ mod h_prepare_chat_generate {
         assert!(!std::any::type_name::<ResponseContext>().contains("mesh_grpc"));
     }
 }
+
+mod empty_stop_string {
+    use crate::protocols::common::StringOrArray;
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::routers::test_mocks;
+    use crate::tokenizer::stop::SequenceDecoderOutput;
+
+    /// An empty stop string matches nothing; the output goes on.
+    #[test]
+    fn an_empty_stop_string_stops_nothing() {
+        let tok = test_mocks::tokenizer();
+        let stop = StringOrArray::Array(vec![String::new()]);
+        let mut decoder = create_stop_decoder(&tok, Some(&stop), None, true, false);
+        let mut text = String::new();
+        for id in [1, 5, 2] {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(t) => text.push_str(&t),
+                SequenceDecoderOutput::Held => {}
+                other => panic!("stopped on {other:?}"),
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.flush() {
+            text.push_str(&t);
+        }
+        assert_eq!(text, tok.decode(&[1, 5, 2], true).unwrap());
+    }
+}
+
+mod incremental_decode {
+    use std::sync::Arc;
+
+    use crate::routers::prepare::stop_decoder_builder::create_stop_decoder;
+    use crate::tokenizer::{
+        stop::SequenceDecoderOutput,
+        traits::{self, Decoder, Encoder, SpecialTokens, Tokenizer},
+        TokenIdType,
+    };
+
+    /// Tokens are raw byte pieces, so one character can span two tokens.
+    struct ByteTokenizer(Vec<&'static [u8]>, SpecialTokens);
+
+    impl Encoder for ByteTokenizer {
+        fn encode(&self, _: &str, _: bool) -> anyhow::Result<traits::Encoding> {
+            unimplemented!()
+        }
+        fn encode_batch(&self, _: &[&str], _: bool) -> anyhow::Result<Vec<traits::Encoding>> {
+            unimplemented!()
+        }
+    }
+
+    impl Decoder for ByteTokenizer {
+        fn decode(&self, ids: &[TokenIdType], _: bool) -> anyhow::Result<String> {
+            let bytes: Vec<u8> = ids
+                .iter()
+                .flat_map(|&i| self.0[i as usize].to_vec())
+                .collect();
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+    }
+
+    impl Tokenizer for ByteTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.0.len()
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.1
+        }
+        fn token_to_id(&self, _: &str) -> Option<TokenIdType> {
+            None
+        }
+        fn id_to_token(&self, _: TokenIdType) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// llm-tokenizer 1.0.0 dropped the text before a character held across
+    /// two tokens (here the space before 😊); 1.11.0 keeps it.
+    #[test]
+    fn a_held_partial_character_keeps_the_text_before_it() {
+        // "Bob!", then " " plus the first 3 bytes of 😊, then its last byte.
+        let pieces: Vec<&'static [u8]> = vec![b"Bob!", b" \xF0\x9F\x98", b"\x8A"];
+        let tok: Arc<dyn Tokenizer> = Arc::new(ByteTokenizer(pieces, SpecialTokens::default()));
+        let mut decoder = create_stop_decoder(&tok, None, None, true, false);
+        let mut text = String::new();
+        for id in [0, 1, 2] {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(t) => text.push_str(&t),
+                SequenceDecoderOutput::Held => {}
+                other => panic!("stopped on {other:?}"),
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.flush() {
+            text.push_str(&t);
+        }
+        assert_eq!(text, "Bob! 😊");
+    }
+}
+
+mod template_loop_controls {
+    use serde_json::json;
+
+    use crate::tokenizer::chat_template::{ChatTemplateParams, ChatTemplateProcessor};
+
+    /// GLM-5.x chat templates use `{% break %}` / `{% continue %}`.
+    #[test]
+    fn break_and_continue_render() {
+        let template = concat!(
+            "{% for m in messages %}{% if m.role == 'system' %}{% continue %}{% endif %}",
+            "{{ m.content }}{% if m.content == 'b' %}{% break %}{% endif %}{% endfor %}",
+        );
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "a"}),
+            json!({"role": "assistant", "content": "b"}),
+            json!({"role": "user", "content": "c"}),
+        ];
+        let prompt = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(prompt, "ab");
+    }
+}
