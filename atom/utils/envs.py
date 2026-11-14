@@ -596,6 +596,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3: write the MXFP8 (E4M3 + E8M0 group32) input of a native
+    # group32 A8 linear from the op before it -- the MLP's SwiGLU ahead of
+    # down_proj -- instead of a separate quantize_fp8 launch. Byte-identical to
+    # the separate quant, so this is an exact A/B. 0 disables it.
+    "ATOM_M3_FUSE_MXFP8_QUANT": lambda: (
+        os.getenv("ATOM_M3_FUSE_MXFP8_QUANT", "1") == "1"
+    ),
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
