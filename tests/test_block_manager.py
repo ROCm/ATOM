@@ -1010,10 +1010,29 @@ def test_a_dense_layout_hosts_no_state_tier_however_it_is_configured(monkeypatch
         assert layout in bm.state_tier_capability.reason
 
 
-def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
-    """The worker refuses PP outright -- `CacheEngineKey` has no PP component,
-    so two stages at one TP rank would overwrite each other. The engine used to
-    build an index anyway and emit stores with nowhere to go."""
+def test_pipeline_parallelism_hosts_the_state_tier(monkeypatch):
+    """Every PP stage builds its own tier, keyed by its PP-aware worker id, and
+    `PPKVAggregator` takes each operation's verdict across the stages. Refusing
+    PP here left K3 under PP with no CPU state and so no joint LMCache hit."""
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(cfg)
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_store and bm.state_offload.can_load
+    assert bm.state_tier_capability.reason == ""
+
+
+def test_qwen_keeps_no_state_tier_under_pipeline_parallelism(monkeypatch):
+    """Qwen keeps fork checkpoints under PP, which do not span the stages, so
+    its worker turns the tier off and no index may offer loads against it."""
+    from atom.kv_transfer.offload import config as offcfg
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
     cfg = MockConfig(
         enable_prefix_caching=True,
         kv_transfer_config=_OFFLOAD_KVC,
@@ -1064,6 +1083,35 @@ def test_the_index_cap_counts_images_not_slots(monkeypatch):
     )
     # 1 GiB / 1 MiB = 1024 codec entries, minus the 1024 // 32 margin.
     assert bm.state_offload._hash_cap == 1024 - 32
+
+
+def test_pp_stages_split_the_state_budget_by_image(monkeypatch):
+    """Two stages pool 2 GiB over a 3 MiB joint image, so each keeps 682. An
+    even split kept 512 on the 2 MiB stage and 1024 on the 1 MiB one, half of
+    them images the other stage had already evicted."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    spec = PagedStateCheckpointSpec(
+        1 << 19, 3 << 19, "cap-test", image_bytes=1 << 20
+    ).for_pipeline("pp2-joint:cap-test", 4, 3 << 20, 2 << 20)
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    assert state_tier_cpu_entries(spec, cfg) == 682
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    assert bm.state_offload._hash_cap == 682 - 682 // 32
 
 
 def test_a_multi_listing_two_offload_connectors_is_refused(monkeypatch):

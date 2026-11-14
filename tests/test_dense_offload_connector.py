@@ -379,7 +379,8 @@ def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
                     block_ids=[3],
                     save_spec=SaveSpec(skip_leading_tokens=skip),
                     save_operation=operation,
-                )
+                ),
+                producer_event=SimpleNamespace(synchronize=lambda: None),
             )
             outputs.append(worker.get_finished())
 
@@ -410,6 +411,9 @@ def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
             assert threading.get_ident() == rpc_thread
             assert stream is rpc_stream
             trace.append(("record", self))
+
+        def synchronize(self):
+            pass
 
     monkeypatch.setattr(torch.cuda, "Event", Event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: rpc_stream)
@@ -1516,7 +1520,9 @@ def test_dense_worker_loads_and_stores_under_the_prompts_salt(cache_salt, config
     try:
         worker._engine = Engine()
         worker._do_load_req(load)
-        worker._do_save_req(save)
+        worker._do_save_req(
+            save, producer_event=SimpleNamespace(synchronize=lambda: None)
+        )
     finally:
         worker._save_executor.shutdown(wait=True)
         worker._load_executor.shutdown(wait=True)
