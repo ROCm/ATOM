@@ -582,13 +582,14 @@ STAGE_ROLES = {
 # load of a wave issued before the first lands, the kv8 rows converted at the landing, the ring positions stepped
 # instead of three divisions a key. Off (the code of before), each fp8 row's conversion waits on its loads: a wave's
 # 16 rows one HBM round trip after another (stage timeline TP8 c1 fp8: the attention task ~19 us of a ~60 us stage).
-# Env ATOM_DSV41_MONO_HI_DR_RING_PIPE (0 / 1; every rank the same), off by default until a GPU A/B
+# On by default (TP8 c1 fp8 step bench: with RING_FIRST -1.1 % a step, 2 pairs); env ATOM_DSV41_MONO_HI_DR_RING_PIPE=0
+# (every rank the same) turns it off
 DR_RING_PIPE_ENV = "ATOM_DSV41_MONO_HI_DR_RING_PIPE"
 
 # The block attention's window rows landed in LDS before its q poll (``MLABlockAttn(ring_first=)``, the target window
 # layers' RING_FIRST: the same bits): the ring needs nothing of the stage's launch, so its round trip overlaps the
-# wait for wq_b instead of following it. Env ATOM_DSV41_MONO_HI_DR_RING_FIRST (0 / 1; every rank the same), off by
-# default until a GPU A/B
+# wait for wq_b instead of following it. On by default; env ATOM_DSV41_MONO_HI_DR_RING_FIRST=0 (every rank the same)
+# turns it off
 DR_RING_FIRST_ENV = "ATOM_DSV41_MONO_HI_DR_RING_FIRST"
 
 
@@ -605,8 +606,10 @@ def stage_blocks(
     first, push, prev = STAGE_ROLES[stage]
     # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
     kv8 = (knobs or {}).get("KV_FMT", "bf16") == "fp8"
-    pipe = bool(env_int(DR_RING_PIPE_ENV, 0, 1) or 0)
-    ring_first = bool(env_int(DR_RING_FIRST_ENV, 0, 1) or 0)
+    pipe, ring_first = (
+        bool(1 if v is None else v)
+        for v in (env_int(DR_RING_PIPE_ENV, 0, 1), env_int(DR_RING_FIRST_ENV, 0, 1))
+    )
     # (the draft's own chain keeps its residual replicated and its rs partials as pairs: the target's ``RESIDUAL`` /
     # ``RS_PACK`` are the target layers')
     knobs = {**(knobs or {}), "RESIDUAL": "replicated", "RS_PACK": "pair"}
