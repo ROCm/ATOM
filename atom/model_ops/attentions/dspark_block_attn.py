@@ -79,18 +79,10 @@ def gluon_takes_pool_dtype_q(
     read fixes for the deployment, as `DSparkGQABlockAttention.__call__`
     passes it: ``num_query_heads`` is the folded query's. Only
     ``_UNFIXED_FIELDS`` are ``None``; the optional fields keep aiter's own
-    defaults. A missing gate leaves q uncast and says so; a renamed
-    or added field raises.
+    defaults. A renamed symbol, or a new required field, raises; a new
+    defaulted field keeps its default.
     """
-    supported = getattr(ua, "_gfx950_gluon_supported", None)
-    params_t = getattr(ua, "_UAParams", None)
-    if supported is None or params_t is None:
-        logger.warning(
-            "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
-            "the DSpark block read keeps q in bf16 over an fp8 pool"
-        )
-        return False
-    params = params_t(
+    params = ua._UAParams(
         **dict.fromkeys(_UNFIXED_FIELDS),
         softmax_scale=softmax_scale,
         softcap=0,
@@ -114,7 +106,7 @@ def gluon_takes_pool_dtype_q(
         use_qq_bias=False,
         num_sms=get_num_sms(),
     )
-    return bool(supported(params))
+    return bool(ua._gfx950_gluon_supported(params))
 
 
 def fold_block_queries(
