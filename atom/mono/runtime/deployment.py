@@ -186,11 +186,16 @@ def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
     and spin on each other (``plan.execution.BLOCKS``). ``connectors``: the KV
     connectors a model admits, whose copy kernels finish on their own."""
+    from atom.kv_transfer.disaggregation import KVConnectorFactory
+
     cus = _cu_count()
     kv = getattr(atom_config, "kv_transfer_config", None)
     connector = kv.get("kv_connector") if isinstance(kv, dict) else None
-    # The factory takes a connector name in any casing or padding.
-    name = connector.strip().casefold() if isinstance(connector, str) else connector
+    # The name the factory builds: any casing or padding, or a registered alias.
+    try:
+        name = KVConnectorFactory.canonical_name(connector)
+    except (TypeError, ValueError):
+        name = None
     return [
         # a spin wait on another CTA only makes progress while that CTA runs
         (cus in (None, BLOCKS), f"{cus} CUs, the kernels need {BLOCKS}"),
