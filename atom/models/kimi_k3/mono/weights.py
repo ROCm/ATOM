@@ -32,7 +32,6 @@ the same layout the MoE kernel's scale readers were written for. That holds only
 for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
 """
 
-import inspect
 import logging
 from dataclasses import dataclass
 
@@ -55,6 +54,7 @@ from atom.models.kimi_k3.mono.layouts import (
     unshuffle_weight,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.weights.layer import linear_ptpc_fp8
 
 logger = logging.getLogger("atom")
 
@@ -491,48 +491,14 @@ class MlaPost:
     w_g_s: torch.Tensor  # fp32 a row
 
 
-def _fp8_dense(module, name: str, shape: tuple[int, ...]):
-    """A dense linear's production per-token FP8 plane and its row scale as the
-    GEMVs read them: E4M3 preshuffled by AITER's ``shuffle_weight`` at its
-    default (16, 16) layout, rows padded past ``shape[0]`` to the GEMM's tile,
-    an fp32 scale a padded row (``gemv.w8_dword`` indexes that layout). A
-    projection that is not that is refused."""
-    w = _param(module, name)
-    n, k = shape
-    _need(
-        w.dtype == FP8,
-        f"{name} is {w.dtype}: the stage reads a preshuffled {FP8} plane, so this "
-        "projection must stay in the online quant",
-    )
-    qt = getattr(module, "quant_type", None)
-    _need(
-        getattr(qt, "name", None) == "per_Token",
-        f"{name}: {qt}, the stage reads a per-token FP8 plane",
-    )
-    _need(
-        getattr(module, "native_a8_group_rows", None) is None,
-        f"{name}: a native-a8 grouped plane",
-    )
-    _need(getattr(w, "is_shuffled", False), f"{name}: FP8 but not preshuffled")
-    _need(
-        w.dim() == 2 and w.shape[1] == k and w.shape[0] >= n and w.shape[0] % 16 == 0,
-        f"{name} is {tuple(w.shape)}, expected {shape} padded to 16 rows",
-    )
-    # the GEMVs walk K in 128-wide chunks; the shuffle's K block is 32
-    _need(k % 128 == 0, f"{name}: K {k} not a multiple of 128")
+def _ptpc_fp8(module, name: str, rows: int, cols: int):
+    """``linear_ptpc_fp8``'s preshuffled per-token FP8 plane and row scales,
+    refused where the stages' GEMVs would read them wrong: not OCP E4M3 (the
+    stages decode gfx950's FP8), or with a bias (the stages add none)."""
+    w, sc = linear_ptpc_fp8(module, name=name, logical_rows=rows, logical_cols=cols)
+    _need(w.dtype == FP8, f"{name} is {w.dtype}, the stages read {FP8}")
     _need(getattr(module, "bias", None) is None, f"{name} has a bias")
-    _need(w.is_contiguous(), f"{name} not contiguous")
-    sc = getattr(module, "weight_scale", None)
-    _need(
-        sc is not None
-        and sc.dtype == F32
-        and sc.numel() == w.shape[0]
-        and sc.is_contiguous(),
-        f"{name}: weight_scale "
-        + ("missing" if sc is None else f"{sc.dtype} {tuple(sc.shape)}")
-        + f", expected fp32 a row of {w.shape[0]}",
-    )
-    return w.data, sc.data.view(-1)
+    return w, sc
 
 
 def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
@@ -542,13 +508,7 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
     BMM), g_proj per-token FP8 fed by the input RMSNorm's fused per-token quant."""
     name = f"layer {layer_id}"
     sa = layer.self_attn
-    impl = getattr(getattr(sa, "attn", None), "impl", None)
-    _need(impl is not None and hasattr(impl, "W_V"), f"{name}: no MLA impl with W_V")
-    _need(
-        "latent_out" in inspect.signature(impl.forward_impl).parameters,
-        f"{name}: MLA forward_impl has no latent_out",
-    )
-    _need(hasattr(sa, "forward_latent"), f"{name}: no KimiFullAttention.forward_latent")
+    impl = sa.attn.impl
     _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
     for flag in (
         "use_seg_mla",
@@ -580,7 +540,7 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
         bool(getattr(sa, "fuse_input_norm_quant", False)),
         f"{name}: the input RMSNorm does not emit the FP8 activation g_proj reads",
     )
-    w_g, w_g_s = _fp8_dense(sa.g_proj, f"{name} g_proj", (dims.proj, HIDDEN))
+    w_g, w_g_s = _ptpc_fp8(sa.g_proj, f"{name} g_proj", dims.proj, HIDDEN)
     _need(w_g.shape[0] == dims.proj, f"{name}: g_proj rows padded to {w_g.shape[0]}")
     return MlaPost(layer_id, w_v, w_v_s.reshape(-1), w_g, w_g_s)
 
@@ -625,8 +585,7 @@ class MlaPrep:
 def _mla_impl_checks(sa, name: str):
     """The plain DCP-1 decode path the prep stages reproduce (``bind_mla_post``'s
     checks), returning the MLA impl."""
-    impl = getattr(getattr(sa, "attn", None), "impl", None)
-    _need(impl is not None and hasattr(impl, "W_K"), f"{name}: no MLA impl with W_K")
+    impl = sa.attn.impl
     _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
     for flag in (
         "use_seg_mla",
@@ -688,8 +647,8 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
             split == (MLA_QL, MLA_LORA, MLA_QH - MLA_NOPE),
             f"{name}: fused_qkv_a_proj splits {split}",
         )
-        w_qa, w_qa_s = _fp8_dense(
-            sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", (MLA_QKV_A, HIDDEN)
+        w_qa, w_qa_s = _ptpc_fp8(
+            sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", MLA_QKV_A, HIDDEN
         )
         _need(
             sa.qknorm_dtype == FP8
@@ -706,8 +665,8 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
             kva_eps=_eps(sa.kv_a_layernorm, f"{name} kv_a_layernorm"),
         )
     if mode >= 3:
-        w_qb, w_qb_s = _fp8_dense(
-            impl.q_proj, f"{name} q_b_proj", (MLA_HEADS * MLA_QH, MLA_QL)
+        w_qb, w_qb_s = _ptpc_fp8(
+            impl.q_proj, f"{name} q_b_proj", MLA_HEADS * MLA_QH, MLA_QL
         )
         w_k, w_k_s = impl.W_K, impl.W_K_scale
         _need(

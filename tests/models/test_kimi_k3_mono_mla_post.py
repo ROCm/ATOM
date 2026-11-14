@@ -151,15 +151,10 @@ def _param(t, shuffled=True):
     return p
 
 
-def _forward_impl(q, k_nope, k_rope, positions=None, q_scale=None, latent_out=False):
-    raise NotImplementedError
-
-
 def _layer(**over):
     impl = SimpleNamespace(
         W_V=torch.zeros(12, 128, 512, dtype=torch.uint8).view(FP8),
         W_V_scale=torch.ones(1),
-        forward_impl=_forward_impl,
         dcp_world_size=1,
         num_heads=12,
         kv_lora_rank=512,
@@ -169,11 +164,11 @@ def _layer(**over):
         weight=_param(torch.zeros(1536, HIDDEN, dtype=torch.uint8).view(FP8)),
         weight_scale=torch.ones(1536),
         quant_type=SimpleNamespace(name="per_Token"),
+        params_dtype=FP8,
         bias=None,
     )
     sa = SimpleNamespace(
         attn=SimpleNamespace(impl=impl),
-        forward_latent=lambda *a: None,
         fuse_input_norm_quant=True,
         g_proj=g_proj,
     )
@@ -211,25 +206,27 @@ def test_bind_accepts_the_plain_fp8_decode_layer():
                     torch.zeros(1536, HIDDEN, dtype=torch.uint8).view(FP8), False
                 )
             },
-            "not preshuffled",
+            "preshuffle",
+        ),
+        (
+            {
+                "g_proj__weight": _param(
+                    torch.zeros(1536, HIDDEN, dtype=torch.uint8).view(
+                        torch.float8_e4m3fnuz
+                    )
+                ),
+                "g_proj__params_dtype": torch.float8_e4m3fnuz,
+            },
+            "the stages read",
         ),
         ({"g_proj__quant_type": SimpleNamespace(name="per_1x128")}, "per-token"),
-        ({"g_proj__weight_scale": torch.ones(7)}, "weight_scale"),
+        ({"g_proj__weight_scale": torch.ones(7)}, "per-output-channel scale"),
         ({"g_proj__bias": torch.zeros(1)}, "bias"),
     ],
 )
 def test_bind_refuses_what_the_stage_cannot_reproduce(over, why):
     with pytest.raises(MonoUnsupported, match=why):
         weights.bind_mla_post(_layer(**over), 3, DIMS)
-
-
-def test_bind_refuses_an_mla_without_latent_out():
-    def old(q, k_nope, k_rope, positions=None, q_scale=None):
-        return None
-
-    layer = _layer(impl__forward_impl=old)
-    with pytest.raises(MonoUnsupported, match="latent_out"):
-        weights.bind_mla_post(layer, 3, DIMS)
 
 
 def test_attention_hooks_exist():
