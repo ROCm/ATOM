@@ -584,8 +584,10 @@ def state_tier_cpu_bytes() -> int:
     Under PP this is the stages' average, not each stage's cap: the stages pool
     it and every stage keeps the same number of images
     (`state_tier_cpu_entries`), so a stage holds that count times its own image.
-    A stage whose image is larger than the average holds more than this, and
-    its LMCache CPU pool has to fit that.
+    A stage whose image is larger than the average holds more than this, while
+    `scale_cpu_size_for_pp` gives it a pool by layer count, so
+    `LMCACHE_MAX_LOCAL_CPU_SIZE` has to fit the stage with the most state per
+    layer (stage 0 of Kimi-K3 at PP8).
     """
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
