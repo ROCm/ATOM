@@ -40,7 +40,11 @@ enum Tokens {
     Unused,
     /// Used when the router can tokenize the request and it carries no media.
     Wanted,
-    Needed,
+    /// `wanted`: another policy wants them as well, so they are encoded as for `Wanted`;
+    /// `prefix_hash`, which needs them, only hashes them.
+    Needed {
+        wanted: bool,
+    },
 }
 
 /// Models whose requests could not be tokenized for the KV event index, each warned of
@@ -662,9 +666,10 @@ impl IngressRouting {
         let any = |uses: fn(&dyn LoadBalancingPolicy) -> bool| {
             policies.iter().any(|policy| uses(policy.as_ref()))
         };
+        let wanted = any(|policy| policy.wants_tokens());
         let tokens = if any(|policy| policy.needs_tokens()) {
-            Tokens::Needed
-        } else if any(|policy| policy.wants_tokens()) {
+            Tokens::Needed { wanted }
+        } else if wanted {
             Tokens::Wanted
         } else {
             Tokens::Unused
@@ -674,7 +679,7 @@ impl IngressRouting {
 
     #[cfg(feature = "ext-proc")]
     pub(crate) fn needs_tokens(&self, model: Option<&str>) -> bool {
-        self.requirements(model).1 == Tokens::Needed
+        matches!(self.requirements(model).1, Tokens::Needed { .. })
     }
 
     /// Validate the request against this topology and prepare what its policy needs.
@@ -710,7 +715,7 @@ impl IngressRouting {
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
         let tokens = match tokens {
-            Tokens::Needed => Some(self.tokens(parsed, &metadata, ctx, false)?),
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
             Tokens::Wanted if parsed.carries_media() => None,
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
             Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
