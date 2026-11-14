@@ -82,6 +82,7 @@ from atom.model_ops.utils import (
     get_and_maybe_dequant_weights,
     quant_fp8_per_tensor,
 )
+from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import (
@@ -231,6 +232,86 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+# The one width below 16 aiter's MLA decode dispatches; see mla_decode_min_heads.
+_MLA_NARROW_MIN_HEADS = 12
+_MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def mla_decode_min_heads(
+    q_dtype: torch.dtype | None,
+    kv_dtype: torch.dtype | None,
+    max_seqlen_q: int,
+    persistent: bool,
+    arch: str,
+) -> int:
+    """Fewest query heads aiter's MLA decode dispatches for this shape: 12 or 16.
+
+    Mirrors aiter's gate (csrc/py_itfs_cu/asm_mla.cu, mla_asm_decode_remap):
+    on gfx950 an fp8-Q, fp8-KV persistent decode with ``12 * qlen <= 128``
+    takes exactly 12 heads, remapped onto the gqa=32 qseqlen=4 kernel, and the
+    fast-mode planner treats 12 as native (csrc/include/mla_decode_shape.h).
+    Everything else needs 16. ``max_seqlen_q`` is the widest decode query,
+    speculative tokens included. Head counts between the floor and 16 still pad
+    to 16; see ``mla_kernel_num_heads``.
+
+    Kept in step with aiter by hand until aiter exposes the same answer as
+    ``aiter.mla.mla_decode_min_heads``; ATOM calls that once it lands.
+    """
+    if (
+        arch == "gfx950"
+        and q_dtype in _MLA_FP8_DTYPES
+        and kv_dtype in _MLA_FP8_DTYPES
+        and persistent
+        and _MLA_NARROW_MIN_HEADS * max_seqlen_q <= 128
+    ):
+        return _MLA_NARROW_MIN_HEADS
+    return _MLA_MIN_HEADS
+
+
+def _gfx() -> str:
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx()
+
+
+def mla_dense_min_query_heads(atom_config, num_heads: int) -> int:
+    """Query-head floor of a NON-sparse MLA layer's decode in native ATOM.
+
+    The one model-level value MLAAttention pads a non-sparse layer with
+    ``num_heads`` heads a rank to and AiterMLAMetadataBuilder plans that
+    layer's work for, so the two cannot disagree. 12 only for a rank with
+    exactly 12 heads (Kimi-K3 at tp8), where it drops the padding altogether;
+    fewer heads keep 16 rather than move onto a different kernel unmeasured.
+    Sparse (DSA) layers keep 16: their plans and prefill kernels are sized for
+    it. Plugin mode keeps 16 too -- vLLM, SGLang and RTP-LLM plan the decode in
+    their own builders, which plan one width, and vLLM runs it non-persistent
+    under DP. DCP keeps 16: its decode dispatches the gathered width.
+    """
+    if (
+        num_heads != _MLA_NARROW_MIN_HEADS
+        or is_plugin_mode()
+        or get_dcp_world_size() > 1
+    ):
+        return _MLA_MIN_HEADS
+    spec = atom_config.speculative_config
+    max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
+    # The decode runs aiter's persistent kernel over the builder's plan only on
+    # the plain page_size=1 asm path (see MLAAttention.decode_is_persistent).
+    persistent = (
+        not envs.ATOM_USE_TRITON_MLA
+        and not envs.ATOM_MLA_KV_SHUFFLED
+        and should_use_persistent_mode(
+            dp_size=get_dp_group().world_size,
+            # supports_dpa_persistent_mode: True for every MLA model.
+            dpa_persistent_supported=True,
+            page_size=envs.ATOM_MLA_PAGE_SIZE,
+            dcp_world_size=1,
+            dcp_persistent_supported=True,
+        )
+    )
+    # ATOM decodes with Q in the KV cache's dtype (the builder's dtype_q).
+    kv_dtype = dtypes.d_dtypes.get(str(atom_config.kv_cache_dtype))
+    return mla_decode_min_heads(kv_dtype, kv_dtype, max_seqlen_q, persistent, _gfx())
 
 
 def check_kv_shuffled_supported(
@@ -280,15 +361,48 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
     return _MLA_MIN_HEADS
 
 
-def mla_kernel_num_heads(num_heads: int) -> int:
+def mla_kernel_num_heads(num_heads: int, min_heads: int = _MLA_MIN_HEADS) -> int:
     """Round a query-head count up to a width ``mla_decode_fwd`` will dispatch.
 
     aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
     folds those onto the 16-head kernel); any other value aborts the dispatch.
+    The one narrower width is 12, which only a gfx950 fp8 persistent decode
+    takes (``mla_decode_min_heads``): pass it as ``min_heads`` and up to 12
+    heads pad to 12, 13 to 16 to 16. ``min_heads`` is the layer's floor
+    (``MLAAttention.min_query_heads``); a count at or below it pads to it.
     """
+    if num_heads <= min_heads:
+        return min_heads
     if num_heads <= _MLA_MIN_HEADS:
         return _MLA_MIN_HEADS
     return -(-num_heads // _MLA_MIN_HEADS) * _MLA_MIN_HEADS
+
+
+def mla_layers_query_heads(layers, num_heads: int) -> tuple[int, int]:
+    """``(heads a rank, query-head floor)`` of the MLA layers one plugin
+    metadata builder plans for: it pads like they do
+    (``mla_kernel_num_heads(heads, floor)``), so both come off the layers.
+    ``num_heads`` (the model config's) and 16 are the fallback for a builder
+    without layers or whose layers differ in head count. Layers with
+    different floors raise: one plan describes one padding.
+    """
+    layer_heads = {layer.num_heads for layer in layers}
+    if len(layer_heads) != 1:
+        if layer_heads:
+            logger.warning(
+                "MLA metadata builder spans layers of differing query-head "
+                "counts %s; falling back to the model config (%d per rank).",
+                sorted(layer_heads),
+                num_heads,
+            )
+        return num_heads, _MLA_MIN_HEADS
+    floors = {getattr(layer, "min_query_heads", _MLA_MIN_HEADS) for layer in layers}
+    if len(floors) != 1:
+        raise ValueError(
+            f"MLA layers of one metadata builder pad their queries to different "
+            f"floors {sorted(floors)}; one work plan cannot serve them"
+        )
+    return layer_heads.pop(), floors.pop()
 
 
 # Gathered widths aiter serves with a dedicated kernel.
@@ -627,6 +741,9 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # (real heads, dispatched heads, sparse) widths already logged.
+    _decode_widths_logged: ClassVar[set[tuple[int, int, bool]]] = set()
+
     def __init__(
         self,
         num_heads: int,
@@ -649,12 +766,21 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        # aiter MLA only serves multiples of 16 heads; round up so a per-rank
-        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
-        self.padded_num_heads = mla_kernel_num_heads(
-            max(num_heads, self.min_query_heads)
-        )
+        # The same test as `self.is_sparse_mla` below.
+        is_sparse_mla = mla_modules.is_sparse or mla_modules.indexer is not None
+        self.min_query_heads = kwargs.get("min_query_heads")
+        if self.min_query_heads is None:
+            # Sparse layers keep 16; a non-sparse one takes the model's floor,
+            # which the metadata builder plans that layer's work for.
+            self.min_query_heads = (
+                _MLA_MIN_HEADS
+                if is_sparse_mla
+                else mla_dense_min_query_heads(get_current_atom_config(), num_heads)
+            )
+        # aiter MLA only serves multiples of 16 heads (and 12 on its gfx950 fp8
+        # persistent decode); round up so a per-rank count like 24 (K3 at tp4)
+        # does not abort in get_mla_metadata.
+        self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
         # repeats of the real heads because zeros are what a producer can write
@@ -662,10 +788,15 @@ class MLAAttention(nn.Module):
         # slice of an already-zeroed padded buffer, which a repeat could not do
         # (no producer kernel writes a head twice).
         self.head_pad = self.padded_num_heads - num_heads
-        if self.head_pad and not getattr(MLAAttention, "_head_pad_logged", False):
-            MLAAttention._head_pad_logged = True
+        # Once per distinct width, so a model whose dense and sparse layers
+        # dispatch differently shows both.
+        decode_width = (num_heads, self.padded_num_heads, is_sparse_mla)
+        if decode_width not in MLAAttention._decode_widths_logged:
+            MLAAttention._decode_widths_logged.add(decode_width)
             logger.info(
-                f"MLA query-head padding: {num_heads} -> {self.padded_num_heads}"
+                f"MLA decode query heads: {num_heads} -> {self.padded_num_heads} "
+                f"(floor {self.min_query_heads}, "
+                f"{'sparse' if is_sparse_mla else 'dense'} layer)"
             )
 
         self.q_lora_rank = mla_modules.q_lora_rank
@@ -2874,12 +3005,38 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.sparse_mtp_reduce_final_map
                 reduce_partial_map = attn_metadata.sparse_mtp_reduce_partial_map
             else:
-                work_meta_data = attn_metadata.work_meta_data
-                work_indptr = attn_metadata.work_indptr
-                work_info_set = attn_metadata.work_info_set
-                reduce_indptr = attn_metadata.reduce_indptr
-                reduce_final_map = attn_metadata.reduce_final_map
-                reduce_partial_map = attn_metadata.reduce_partial_map
+                plan = (
+                    None
+                    if self.is_sparse_mla
+                    else getattr(attn_metadata, "dense_work_plan", None)
+                )
+                if plan is not None:
+                    planned_heads = plan.num_heads
+                    work_meta_data = plan.work_meta_data
+                    work_indptr = plan.work_indptr
+                    work_info_set = plan.work_info_set
+                    reduce_indptr = plan.reduce_indptr
+                    reduce_final_map = plan.reduce_final_map
+                    reduce_partial_map = plan.reduce_partial_map
+                else:
+                    planned_heads = getattr(attn_metadata, "work_num_heads", None)
+                    work_meta_data = attn_metadata.work_meta_data
+                    work_indptr = attn_metadata.work_indptr
+                    work_info_set = attn_metadata.work_info_set
+                    reduce_indptr = attn_metadata.reduce_indptr
+                    reduce_final_map = attn_metadata.reduce_final_map
+                    reduce_partial_map = attn_metadata.reduce_partial_map
+                # A plan laid out for one width and a query of another reads
+                # partials nothing wrote. Host ints only: safe under capture.
+                # DCP dispatches the gathered width, which its own helpers pad.
+                assert (
+                    planned_heads is None
+                    or self.dcp_world_size > 1
+                    or planned_heads == q.shape[1]
+                ), (
+                    f"MLA decode work plan is for {planned_heads} query heads "
+                    f"but layer {self.layer_num} dispatches {q.shape[1]}"
+                )
 
             # persistent lets metadata (reduce_partial_map) drive the split, so
             # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs

@@ -201,6 +201,8 @@ class MLAModules:
    - Prefill (sparse): `mla_prefill_fwd`.
 3. V up-projection + O projection via batched BMM (`_v_up_proj_and_o_proj`).
 
+**Decode query-head width.** `mla_decode_fwd` dispatches 16 query heads and multiples of 16 up to 128, so a rank with fewer heads pads its query with zero heads (`padded_num_heads`, dropped again after the kernel). The one narrower width is 12: on gfx950, an fp8-Q / fp8-KV decode in persistent mode with `12 * qlen <= 128` (qlen counting speculative tokens) dispatches 12 heads natively (`mla_decode_min_heads`, mirroring aiter's `asm_mla.cu` gate). Native ATOM uses it for non-sparse layers without DCP on a rank with exactly 12 heads (Kimi-K3 at `-tp 8`), which then decodes unpadded; a rank with fewer heads still pads to 16. Sparse (DSA) layers, DCP, bf16 KV, page size > 1, the Triton MLA decode, gfx942 and a verify too wide for 12 keep 16. In a sparse model with non-sparse layers (Kimi-K3 with DSA layers, GLM-5 under `ATOM_GLM5_FORCE_DENSE_MLA=1`), `AiterMLAMetadataBuilder` plans those layers a second persistent work plan (`dense_work_plan`), over the dense KV and at their width, while the sparse layers keep `work_*`; a layer handed a plan for another width fails an assertion in `_forward_decode`. The vLLM, SGLang and RTP-LLM plugins keep 16 for every layer: their builders plan one width, and vLLM runs the decode non-persistent under DP, where 12 has no kernel.
+
 **Batched GEMM backends for MLA projections:**
 
 | Condition | Kernel |

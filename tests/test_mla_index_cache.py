@@ -793,6 +793,8 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
         is_sparse, dcp_world_size, builder.index_kpool
     )
     builder.dtype_q = None
+    builder.persistent_num_heads = 16
+    builder.dense_work_num_heads = None
     builder.index_topk_out = 2
     builder._sparse_kv_indices_gpu = torch.zeros(bs * 2, dtype=torch.int32)
     builder._dcp_sparse_kv_indptr_gpu = torch.zeros(bs + 1, dtype=torch.int32)

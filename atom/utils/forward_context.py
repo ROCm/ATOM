@@ -7,7 +7,7 @@ from collections.abc import Container
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, NamedTuple, Union
 
 import numpy as np
 import torch
@@ -651,6 +651,19 @@ class Context:
         self.scheduled_tokens_gpu = scheduled_tokens_gpu
 
 
+class MlaWorkPlan(NamedTuple):
+    """A persistent MLA decode work plan and the query-head width it was
+    planned for; the kernel must be handed a query of exactly that width."""
+
+    num_heads: int
+    work_meta_data: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+
+
 @dataclass
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
@@ -720,6 +733,13 @@ class AttentionMetaData:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+    # The query-head width the work_* plan above was planned for; None when
+    # its producer does not say (plugin backends).
+    work_num_heads: int | None = None
+    # MLA only: a sparse model's plan for its non-sparse layers, over the dense
+    # KV and at their width (12 heads where its sparse layers run 16). None
+    # when every layer reads work_*.
+    dense_work_plan: MlaWorkPlan | None = None
 
     # The model's decode round's share of this step (`RoundService`): set once
     # by the attention builder; the builder, its cache, Engram staging, the
@@ -772,6 +792,8 @@ class AttentionMetaData:
         reduce_indptr: torch.Tensor | None = None,
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
+        work_num_heads: int | None = None,
+        dense_work_plan: MlaWorkPlan | None = None,
         sparse_cu_seqlens_q: torch.Tensor | None = None,
         batch_id_per_q_token: torch.Tensor | None = None,
         batch_id_per_k_token: torch.Tensor | None = None,
@@ -810,6 +832,8 @@ class AttentionMetaData:
         self.reduce_indptr = reduce_indptr
         self.reduce_final_map = reduce_final_map
         self.reduce_partial_map = reduce_partial_map
+        self.work_num_heads = work_num_heads
+        self.dense_work_plan = dense_work_plan
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.batch_id_per_q_token = batch_id_per_q_token
         # [total_kv] int32 — the KV-axis twin, over the gathered cached+new KV.
