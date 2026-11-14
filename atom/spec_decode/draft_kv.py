@@ -336,12 +336,16 @@ class DraftKvBuilder(PoolRowsMixin):
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
+        # A declared per-tensor scale is one shared scalar, not per-block data:
+        # the draft's attention reads it off its own binding, and anything that
+        # walks `kv_cache_data` by block (the offload codec) must not see it.
+        per_tensor = self._kv_scale is not None
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=k_cache,
             v_cache=v_cache,
-            k_scale=getattr(module, "k_scale", None),
-            v_scale=getattr(module, "v_scale", None),
+            k_scale=None if per_tensor else getattr(module, "k_scale", None),
+            v_scale=None if per_tensor else getattr(module, "v_scale", None),
         )
 
     def get_kv_transfer_tensors(self):
