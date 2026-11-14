@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import logging
 from collections.abc import Callable
 from typing import ClassVar
 
@@ -82,6 +83,8 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
+
+logger = logging.getLogger("atom")
 
 
 def _text_config(config):
@@ -556,6 +559,9 @@ class KimiSparseMoeBlock(nn.Module):
                 and _custom_all_gather_on()
             ):
                 self.column_tail_rows = latent_tail.MAX_TOKENS
+        # Where set (`_attach_column_gather`), the next layer's attention
+        # residual gathers the column tail's sum in place of the all-gather.
+        self.column_gather = None
         if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
@@ -614,7 +620,8 @@ class KimiSparseMoeBlock(nn.Module):
         When ``shared`` is a tensor the two branches are left unsummed and
         ``first`` is the routed branch alone (on a row- or column-sharded tail,
         the sum, with ``shared`` a folded zero: unwritten, so a caller that adds
-        it in torch zeroes it first through ``materialize_folded_zeros``): the
+        it in torch zeroes it first through ``materialize_folded_zeros``; with
+        `column_gather`, ``first`` too is unwritten until gathered): the
         caller's next apply_attn_res folds both into its prefix on-load, so
         deferring the add removes a whole [T, H] elementwise kernel and its HBM
         round-trip per MoE layer.
@@ -829,7 +836,8 @@ class KimiSparseMoeBlock(nn.Module):
 
         Up to `column_tail_rows` rows, `latent_tail` runs the routed norm,
         up-projection and shared add on this rank's columns, and an all-gather
-        hands back their sum."""
+        hands back their sum: with `column_gather`, a deferred one that the
+        next layer's attention residual runs."""
         latent_numel = routed_input.numel()
         partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
         self.experts(
@@ -855,6 +863,8 @@ class KimiSparseMoeBlock(nn.Module):
                 self.routed_expert_up_proj.weight[cols],
                 shared[:, cols],
             )
+            if self.column_gather is not None:
+                return self.column_gather.defer(output), None
             output = tensor_model_parallel_all_gather(output, use_custom=True, dim=-1)
             return output, None
         return self._apply_routed_norm_and_up_proj(latent), shared
@@ -2164,8 +2174,8 @@ class KimiDecoderLayer(nn.Module):
         NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
         layer defers its routed and shared outputs separately so that same fold
         absorbs their sum too. So add the pendings back here. Each is None on
-        the layers that already folded it in, and an unwritten folded zero on
-        a row- or column-sharded step.
+        the layers that already folded it in, and an unwritten folded zero or
+        deferred column all-gather on a row- or column-sharded step.
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
@@ -2182,6 +2192,39 @@ class KimiDecoderLayer(nn.Module):
             if pending is not None:
                 prefix_sum = prefix_sum + pending
         return prefix_sum
+
+
+def _attach_column_gather(layers) -> None:
+    """Hand the column tail's all-gather of every layer but the stage's last
+    to the next layer's attention residual (`PeerColumnGather`); the last
+    one's output goes to the final norm or the next stage whole."""
+    from atom.model_ops.kimi_k3.attention_residual import PeerColumnGather
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    blocks = [
+        moe
+        for layer in layers[:-1]
+        if (moe := getattr(layer, "block_sparse_moe", None)) is not None
+        and moe.column_tail_rows
+    ]
+    if not blocks:
+        return
+    hidden, tp = blocks[0].hidden_dim, blocks[0].tp_size
+    if not PeerColumnGather.fits(hidden, tp):
+        return
+    try:
+        gather = PeerColumnGather(
+            hidden,
+            max(moe.column_tail_rows for moe in blocks),
+            get_tensor_model_parallel_rank(),
+            tp,
+            get_tp_group().cpu_group,
+        )
+    except MonoUnsupported as error:
+        logger.warning("Kimi-K3 column tail keeps its all-gather: %s", error)
+        return
+    for moe in blocks:
+        moe.column_gather = gather
 
 
 @token_graph
@@ -2221,6 +2264,7 @@ class KimiLinearModel(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        _attach_column_gather(self.layers[self.start_layer : self.end_layer])
         use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(
