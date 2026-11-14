@@ -280,7 +280,7 @@ def _gfx() -> str:
     return get_gfx()
 
 
-def mla_dense_min_query_heads(atom_config, num_heads: int) -> int:
+def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) -> int:
     """Query-head floor of a NON-sparse MLA layer's decode in native ATOM.
 
     The one model-level value MLAAttention pads a non-sparse layer with
@@ -296,11 +296,7 @@ def mla_dense_min_query_heads(atom_config, num_heads: int) -> int:
     their own builders, which plan one width, and vLLM runs it non-persistent
     under DP. DCP keeps 16: its decode dispatches the gathered width.
     """
-    if (
-        num_heads != _MLA_NARROW_MIN_HEADS
-        or is_plugin_mode()
-        or get_dcp_world_size() > 1
-    ):
+    if num_heads != _MLA_NARROW_MIN_HEADS or is_plugin_mode() or dcp_world_size > 1:
         return _MLA_MIN_HEADS
     spec = atom_config.speculative_config
     max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
@@ -786,7 +782,9 @@ class MLAAttention(nn.Module):
             self.min_query_heads = (
                 _MLA_MIN_HEADS
                 if is_sparse_mla
-                else mla_dense_min_query_heads(get_current_atom_config(), num_heads)
+                else mla_dense_min_query_heads(
+                    get_current_atom_config(), num_heads, get_dcp_world_size()
+                )
             )
         # aiter MLA only serves multiples of 16 heads (and 12 on its gfx950 fp8
         # persistent decode); round up so a per-rank count like 24 (K3 at tp4)

@@ -1042,7 +1042,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
         dense_heads = mla_kernel_num_heads(
             self.num_attention_heads,
-            mla_dense_min_query_heads(config, self.num_attention_heads),
+            mla_dense_min_query_heads(
+                config, self.num_attention_heads, get_dcp_world_size()
+            ),
         )
         self.dense_work_num_heads = None
         if not self.is_sparse:

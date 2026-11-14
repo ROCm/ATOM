@@ -254,10 +254,9 @@ def test_fewer_heads_keep_sixteen(native):
     assert layer.padded_num_heads == builder.padded_num_attention_heads == 16
 
 
-def test_dcp_keeps_sixteen(native, monkeypatch):
-    monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: 2)
-
-    assert attention_mla.mla_dense_min_query_heads(native, 12) == 16
+def test_dcp_keeps_sixteen(native):
+    assert attention_mla.mla_dense_min_query_heads(native, 12, 1) == 12
+    assert attention_mla.mla_dense_min_query_heads(native, 12, 2) == 16
 
 
 def test_vllm_builder_plans_the_layers_padding(native, monkeypatch):
