@@ -31,9 +31,19 @@ from atom.utils import envs, mark_spliting_op
 HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
 
 
-def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
+def ulysses_attention(
+    attn, query, key, value, positions, q_scale, qkv, output_transform=None
+):
     """Run this rank's head slice over the full sequence. Returns the impl's
     output and the padded sequence length, for `gather_heads`.
+
+    ``output_transform(out, padded_tokens)``, when given, owns the tail after
+    the attention impl: it receives the pre-head-exchange BF16 output (the SP
+    send buffer's source rows, ``[real_tokens, heads/world * head_dim]``) and
+    returns whatever the caller's path returns instead of the ``(out, rows)``
+    pair. The fused ``a2a_gemm`` seam uses it to consume the pre-exchange FP8
+    send buffer; the default (None) keeps the head-exchange + o_proj
+    composition unchanged.
 
     Called inside the attention custom op, keeping collectives and padding
     slices opaque to Dynamo.
@@ -60,6 +70,8 @@ def ulysses_attention(attn, query, key, value, positions, q_scale, qkv):
         # Preserve the caller's choice of fused or separate Q/K/V kernels.
         qkv=packed if qkv is not None else None,
     )
+    if output_transform is not None:
+        return output_transform(out, padded_tokens)
     return out, padded_tokens
 
 

@@ -863,6 +863,17 @@ class ModelRunner:
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
 
+        # aiter kernel providers: opt-in, one configure() per worker process,
+        # after device/distributed state is up and before the model is built /
+        # loaded / warmed / captured. aiter snapshots config+discovery at the
+        # first dispatch, so a later hook would silently serve native; every
+        # spawned worker is its own interpreter and must configure here.
+        # Default off: configure_aiter_providers() returns without calling
+        # aiter.plugin.configure(), so the native path is unchanged.
+        from atom.aiter_provider import configure_aiter_providers
+
+        configure_aiter_providers(self.config)
+
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
         # `ForwardMode.decide` searches. Separate from the list because the list
@@ -932,6 +943,15 @@ class ModelRunner:
         from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
 
         self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
+
+        # a2a_gemm o_proj call site: installed after weight load and before
+        # warm-up/compile/CUDA-graph capture. It owns the provider warm-up over
+        # the bound o_proj shapes (the aiter plugin interface has no lifecycle
+        # hook) and agrees its class table across the SP4 ranks once, here.
+        # Default off / unsupported deployment: returns None, native path.
+        from atom.model_ops.a2a_gemm import initialize_a2a_gemm
+
+        self.a2a_gemm = initialize_a2a_gemm(self.model, config)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -3400,6 +3420,10 @@ class ModelRunner:
                 # The head output the capture recorded (`_head_output`), or
                 # None.
                 head = self.req_graph.replay(key=graph_key)
+                if getattr(self, "a2a_gemm", None) is not None and self.rank == 0:
+                    # Replay-side proof that the captured graph re-entered the
+                    # fused tail (Python does not run inside a replay).
+                    self.a2a_gemm.note_graph_replay(running_bs)
                 hidden_states = self.forward_vars["outputs"][:running_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -4510,6 +4534,11 @@ class ModelRunner:
             # made by the drafter and ragged bucket builder.
             return self._build_capture(stage_and_build, *args, **kwargs)
 
+        if getattr(self, "a2a_gemm", None) is not None:
+            # A new capture phase: per-layer/per-M pre-bind decisions are made
+            # below, eagerly and rank-uniformly, before any graph is recorded.
+            self.a2a_gemm.begin_capture()
+
         with pause_gc(), graph_capture(), self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
@@ -4562,6 +4591,12 @@ class ModelRunner:
                         ubatch_slices=ubatch_slices,
                         in_hipgraph=True,
                     )
+
+                    # CUDA-graph capture must not bind or decide: pre-bind this
+                    # capture M class eagerly (rank-uniform vote first), so the
+                    # recorded graph replays an already-bound provider class.
+                    if getattr(self, "a2a_gemm", None) is not None:
+                        self.a2a_gemm.prepare_capture(sp_local_len(running_tokens))
 
                     # Warmup
                     model_positions = (
@@ -4789,6 +4824,10 @@ class ModelRunner:
             in_hipgraph=True,
         )
         get_forward_context().tr_graph = mode
+        if getattr(self, "a2a_gemm", None) is not None:
+            # A recorded prefill is also captured: pre-bind its M class eagerly
+            # (rank-uniformly) before the recording forward runs.
+            self.a2a_gemm.prepare_capture(sp_local_len(context.scheduled_tokens))
         self.model(
             self.forward_vars["input_ids"].gpu[: context.scheduled_tokens],
             context.positions,

@@ -1005,6 +1005,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # --- aiter kernel providers ---
+    # Operator/deployment override for Config.aiter_provider_enable. Comma-separated
+    # provider names, order = preference order; unset/empty = ATOM's default (off).
+    # Read once while Config is built; the enable call itself is aiter.plugin.configure().
+    "ATOM_AITER_PROVIDER_ENABLE": lambda: os.getenv(
+        "ATOM_AITER_PROVIDER_ENABLE", ""
+    ).strip(),
+    # Operator/deployment override for Config.enable_a2a_gemm (the routed
+    # MiniMax-M3 SP4 o_proj call site). 1 = on, but still requires
+    # ATOM_AITER_PROVIDER_ENABLE to name a provider that serves a2a_gemm_fused;
+    # the per-layer/deployment gate in atom/model_ops/a2a_gemm.py stays authoritative.
+    "ATOM_ENABLE_A2A_GEMM": lambda: (
+        os.getenv("ATOM_ENABLE_A2A_GEMM", "0").lower() in ("1", "true")
+    ),
+    # Opt-in for the *non-captured* fused tail (the routed a2a_gemm_fused call
+    # outside a CUDA graph). Default off: in a captured deployment the fused
+    # path serves decode from the captured graphs, while a non-captured prefill
+    # would pay the provider's collective SP4 bind on the first call of every
+    # new M class per layer (seconds per class), so prefill stays native. 1 =
+    # fuse the non-captured/eager path too (eager scratch buffers are
+    # pointer-stable, so steady state is binding-hit; the first call per class
+    # still pays the bind).
+    "ATOM_A2A_GEMM_EAGER_FUSED": lambda: (
+        os.getenv("ATOM_A2A_GEMM_EAGER_FUSED", "0").lower() in ("1", "true")
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
@@ -1479,6 +1504,10 @@ def __getattr__(name: str):
 # MASTER_ADDR, MASTER_PORT        — PyTorch distributed; set in model_runner.py
 # AITER_LOG_LEVEL                 — AITER library log verbosity
 # AITER_QUICK_REDUCE_QUANTIZATION — AITER; set conditionally in model_runner.py
+# AITER_PLUGINS                   — AITER provider interface kill switch; the only
+#                                   env control for aiter kernel providers and it can
+#                                   only turn routing OFF (no Decision recorded).
+#                                   ATOM does not manage it.
 # TORCHINDUCTOR_CACHE_DIR         — PyTorch Inductor; set in compiler_inferface.py
 # TRITON_CACHE_DIR                — Triton compiler; set in compiler_inferface.py
 # HF_TOKEN                        — HuggingFace Hub auth token
