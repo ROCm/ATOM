@@ -108,6 +108,7 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.flydsl_gemm_warmup import pretrace_mxscale_gemms
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import (
@@ -1496,6 +1497,8 @@ class ModelRunner:
         )
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
+        # One warmup pass reaches one M bucket; trace the GEMM's other configs.
+        pretrace_mxscale_gemms(self.model, warmup_max_tokens, self.label)
         torch.cuda.empty_cache()
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
