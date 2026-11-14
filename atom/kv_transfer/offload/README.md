@@ -1,13 +1,16 @@
 # LMCache CPU/NVMe KV Cache Offload (ATOM standalone)
 
 This module adds a **CPU DRAM (L2) and optional NVMe (L3) cache tier** on top of
-ATOM's native HBM prefix and state caches. It exposes three standalone connector
+ATOM's native HBM prefix and state caches. It exposes four standalone connector
 paths:
 
 - `lmcache_offload` embeds an LMCache engine in each ATOM worker;
 - `lmcache_mp` connects ATOM workers to an external LMCache multiprocess server;
 - `mooncake_store` puts and gets KV chunks straight to and from a Mooncake Store,
-  with no LMCache anywhere ([its own section](#mooncake-store-offload-without-lmcache-mooncake_store)).
+  with no LMCache anywhere ([its own section](#mooncake-store-offload-without-lmcache-mooncake_store));
+- `umbp_store` does the same against a Mori UMBP standalone server
+  ([its own section](#mori-umbp-offload-umbp_store)). The two KV-store
+  backends share the store-agnostic `kv_store/` layer.
 
 The in-process path keeps dense MHA/MLA data as opaque KV blocks. Stateful
 DeepSeek V4 (DSV4) uses a stricter pair:
@@ -135,6 +138,10 @@ Four rules carry the module:
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
 | `mooncake_store/pool.py` | `TransferSlotPool` named for the Mooncake Store. |
 | `mooncake_store/taint.py` | The Store's taint marker, placed after a put Mooncake gave up on, which every client of the Store checks before it loads. |
+| `umbp_store/config.py` | The `umbp_store.*` settings, the layouts UMBP moves (dense, M3 PAGE), the `atomumbp1-` key namespace, and the startup refusals. |
+| `umbp_store/client.py` | `mori.umbp.UMBPClient` against one standalone server: bool-per-key answers, one deregister for every region, per-call counters. |
+| `umbp_store/taint.py` | Which servers this process no longer loads from, after a put that raised (UMBP has no pinned object for a shared mark). |
+| `umbp_store/scheduler.py`, `umbp_store/worker.py` | `umbp_store` scheduler (lookups against the one server, which hold nothing) and worker (a call settles by its answer, the process-local mark, a startup probe that cannot remove its object). |
 | `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (lookups across the Store pools, the taint marker, read-lease renewal) and worker (NIC selection, Mooncake groups, RDMA-aware slot settlement, the taint marker, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
@@ -800,6 +807,41 @@ this worker config.
 - A second offload connector beside it in one `multi`.
 - Sharing the P/D transfer engine: the Store client opens its own, on its own
   NIC.
+
+## Mori UMBP offload (`umbp_store`)
+
+`umbp_store` is the KV-store offload pointed at a Mori UMBP standalone server
+(one per node, started outside ATOM) instead of a Mooncake Store. Like
+`mooncake_store` it is built on `kv_store/`: `ChunkedOffloadSchedulerBase` with
+digest-carrying requests, the `DenseOffloadConnector` worker plumbing, the
+chunk hash chain keys, the HBM transfer slot pool, the windowed put/get loop
+(held chunks skipped) and the dense or M3 PAGE codecs. What differs:
+
+- The copies run on side streams of the device's highest priority, not on
+  the forward's stream as `mooncake_store`'s do. A UMBP put or get is a
+  synchronous call on the save or load thread, and each window ends in host
+  waits on its copy stream; on the forward's stream those wait behind every
+  queued forward kernel.
+- One server per node over a unix socket; no master, NIC selection or RDMA
+  setup. The server reads and writes the registered staging pools through
+  HIP IPC, before it answers each call, so a call that returned settles its
+  slots whatever it answered; only one that raised quarantines them.
+- The client uses UMBP's per-key `bool` results. There is no per-key remove
+  (the startup probe's object stays until evicted), no read lease (nothing is
+  renewed before a load) and no eviction groups; the taint mark after a put
+  that raised is kept in-process.
+- Keys use the `atomumbp1-` namespace prefix, so they never collide with
+  Mooncake Store objects.
+- Dense and M3 PAGE layouts only; V4.1's replay PAGEs and other stateful
+  layouts are refused at startup.
+
+Select it with
+`{"kv_connector": "umbp_store", "kv_role": "offload", "kv_connector_extra_config": {"umbp_store.address": "unix:///tmp/umbp/server.sock"}}`.
+Offload only: beside a P/D producer under `multi` it is not supported yet.
+How to install, start and check UMBP, with the settings table, is in
+[`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md); the
+MiniMax-M3 aggregated TP4 walkthrough is
+[`recipes/MiniMax-M3-UMBP.md`](../../../recipes/MiniMax-M3-UMBP.md).
 
 ## In-process `lmcache_offload` Architecture
 

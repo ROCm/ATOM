@@ -207,11 +207,15 @@ class BlockGPUConnector:
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
         max_staging_bytes: int | None = None,
         compute_stream_provider: Callable[[], Any] | None = None,
+        stream_priority: int | None = None,
     ) -> None:
         self.codec = codec
         # Set by a connector that stages on the forward's stream (the Mooncake
         # Store); every other user keeps side streams.
         self._compute_stream_provider = compute_stream_provider
+        # Priority of every copy thread's side pack and copy streams; None
+        # keeps the default. See `_ThreadTransferState`.
+        self._stream_priority = stream_priority
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -444,6 +448,7 @@ class BlockGPUConnector:
                 self.device,
                 self._use_cuda(),
                 self._compute_stream_provider,
+                priority=self._stream_priority,
             )
             states[key] = state
         return state
