@@ -1502,20 +1502,13 @@ def test_gqa_fused_qk_rope_is_inert_on_a_fnuz_pool_and_says_so_once(
     mod._fused_qk_rope_takes.cache_clear()
 
 
-def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch):
-    """On a GPU, against the real aiter launches: the block pass and the
-    context write with ATOM_K3_DRAFT_QKROPE=1 against =0, through the real
-    layer at Kimi-K3's per-rank TP8 heads on an fp8 pool. The fp32 sum of
-    squares may round otherwise: a normed value one bf16 ulp off, which the
-    rope carries into q and k, and a k byte an fp8 step off. v is copied and
-    must match exactly. Opt in with RUN_QKROPE_GPU_TESTS=1."""
-    import os
+def _gpu_qkrope_ab(monkeypatch, n, kv_dtype):
+    """The block pass and the context write through the real layer at
+    Kimi-K3's per-rank TP8 heads (8 q, 2 kv, head 64), with the real aiter
+    launches, for ATOM_K3_DRAFT_QKROPE=1 and =0. Returns, per flag, the q the
+    read took and the K / V pools after each pass."""
+    import torch
 
-    torch = pytest.importorskip("torch")
-    if os.environ.get("RUN_QKROPE_GPU_TESTS") != "1" or not torch.cuda.is_available():
-        pytest.skip(
-            "GPU A/B against the unfused aiter launches: RUN_QKROPE_GPU_TESTS=1"
-        )
     from atom.config import SpeculativeConfig
 
     mod = gpu_stack_import("atom.models.kimi_k3_dspark_gqa")
@@ -1528,7 +1521,7 @@ def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch):
         "get_tensor_model_parallel_world_size",
         lambda: 1,
     )
-    hq, hkv, d, n, dev = 8, 2, 64, 24, torch.device("cuda")
+    hq, hkv, d, dev = 8, 2, 64, torch.device("cuda")
     hf = _radixark_cfg(
         hidden_size=hq * d, num_attention_heads=hq, num_key_value_heads=hkv
     )
@@ -1561,7 +1554,7 @@ def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch):
                 attn = mod.KimiK3DSparkGQAAttention(hf, 0)
         finally:
             torch.set_default_dtype(default_dtype)
-        read = _BlockRead(torch.float8_e4m3fn)
+        read = _BlockRead(kv_dtype)
         attn.use_block_read(read)
         assert attn.fused_qk_rope is (flag == "1")
         with torch.no_grad():
@@ -1570,7 +1563,7 @@ def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch):
             attn.qkv_proj.weight.copy_(w_qkv)
         monkeypatch.setattr(attn.qkv_proj, "forward", lambda x: x.clone())
         monkeypatch.setattr(attn.o_proj, "forward", lambda o: o)
-        k_cache = torch.zeros(64, 16, hkv, d, device=dev).to(torch.float8_e4m3fn)
+        k_cache = torch.zeros(64, 16, hkv, d, device=dev).to(kv_dtype)
         v_cache = torch.zeros_like(k_cache)
         attn.kv.check_cache(k_cache, v_cache)
         attn.kv.k_scale = attn.kv.v_scale = torch.ones(1, device=dev)
@@ -1581,6 +1574,26 @@ def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch):
         attn.write_context_kv(ctx, positions, slots)
         out[flag] = block + (k_cache.clone(), v_cache.clone())
     torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.parametrize("n", [24, 512])
+@pytest.mark.parametrize("fp8", [True, False])
+def test_gqa_fused_qk_rope_matches_the_unfused_launches_on_gpu(monkeypatch, n, fp8):
+    """On a GPU, `_gpu_qkrope_ab`: flag on against off. The fp32 sum of squares
+    may round otherwise: a normed value one bf16 ulp off, which the rope
+    carries into q and k, and a k element an fp8 (or bf16) step off. v is
+    copied and must match exactly. Opt in with RUN_QKROPE_GPU_TESTS=1."""
+    import os
+
+    torch = pytest.importorskip("torch")
+    if os.environ.get("RUN_QKROPE_GPU_TESTS") != "1" or not torch.cuda.is_available():
+        pytest.skip(
+            "GPU A/B against the unfused aiter launches: RUN_QKROPE_GPU_TESTS=1"
+        )
+    kv_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    out = _gpu_qkrope_ab(monkeypatch, n, kv_dtype)
+    d = 64
 
     def close(got, want, step):
         """Mostly exact; a value that moved, moved at most `step` of its
