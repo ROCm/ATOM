@@ -21,6 +21,7 @@ from atom.entrypoints.openai.chat_encoders import (
     chat_template_source,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
 )
 from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
 
@@ -380,15 +381,16 @@ class TestAModelWithNoChatTemplateStillBoots:
         assert render_probe_prompt(self.NoTemplate(), None, tools=True) is None
 
     @pytest.mark.parametrize(
-        "probe",
+        "probe, expected",
         [
-            lambda t: resolve_reasoning_toggle(t, None),
-            lambda t: resolve_tool_call_parser(None, t, None),
+            (lambda t: resolve_reasoning_toggle(t, None), None),
+            (lambda t: resolve_tool_call_parser(None, t, None), None),
+            (lambda t: template_needs_tool_call_argument_strings(t, None), False),
         ],
-        ids=["reasoning", "tool-parser"],
+        ids=["reasoning", "tool-parser", "tool-call-arguments"],
     )
-    def test_neither_startup_probe_raises(self, probe):
-        assert probe(self.NoTemplate()) is None
+    def test_no_startup_probe_raises(self, probe, expected):
+        assert probe(self.NoTemplate()) is expected
 
 
 class TestToolCallArgumentStrings:
@@ -417,26 +419,14 @@ class TestToolCallArgumentStrings:
             return self.template.render(messages=messages)
 
     def test_a_template_that_concatenates_arguments_gets_strings(self):
-        from atom.entrypoints.openai.chat_encoders import (
-            template_needs_tool_call_argument_strings,
-        )
-
         assert template_needs_tool_call_argument_strings(self.Tok(self.CONCAT), None)
 
     def test_a_template_that_iterates_arguments_keeps_the_mapping(self):
-        from atom.entrypoints.openai.chat_encoders import (
-            template_needs_tool_call_argument_strings,
-        )
-
         assert not template_needs_tool_call_argument_strings(
             self.Tok(self.ITERATE), None
         )
 
     def test_a_custom_encoder_is_not_probed(self):
-        from atom.entrypoints.openai.chat_encoders import (
-            template_needs_tool_call_argument_strings,
-        )
-
         assert not template_needs_tool_call_argument_strings(
             self.Tok(self.CONCAT), object()
         )

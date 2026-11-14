@@ -284,6 +284,9 @@ def template_needs_tool_call_argument_strings(
     iterate them; DeepSeek-R1/V3's concatenates them as a string and raises
     ``TypeError`` on a mapping, failing every turn after a tool call.
     """
+    # Custom encoders are model-scoped Python with their own message preparation,
+    # not Jinja; their argument handling stays theirs (DeepSeek-V4.1's takes the
+    # mapping).
     if custom_encoder is not None:
         return False
 
