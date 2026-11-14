@@ -1,0 +1,87 @@
+[atom 03:11:52] Request 1321 arrived, input tokens: 26621, pending requests: 3
+[atom 03:11:52] Engine Core Mgr: add rank1: 1 req / 26621 tok | in-flight reqs=[1, 1, 0, 1] queued_prefill_tokens=[2105, 26621, 0, 1226]
+INFO:     127.0.0.1:54428 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 03:11:52] Request 1322 arrived, input tokens: 26605, pending requests: 4
+[atom 03:11:52] Engine Core Mgr: add rank2: 1 req / 26605 tok | in-flight reqs=[1, 1, 1, 1] queued_prefill_tokens=[2105, 26621, 26605, 1226]
+INFO:     127.0.0.1:54440 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 03:11:52] Request 1321 will never be scheduled: input tokens=26621 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom 03:11:52] Request 1322 will never be scheduled: input tokens=26605 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[aiter] Ignoring invalid OPUS tuned row for gfx=gfx1250, shape=(1,129280,7168), kid=13, splitK=1; trying the next padded row or default backend
+[atom 03:11:52] Scheduled prefill batch: 1 reqs, 2105 new tokens (done: [0], new: [2105]), req_ids: (1320,)
+[atom 03:11:52] Engine Core: output send 1 reqs
+[atom 03:11:52] Engine Core: output send 1 reqs
+[atom 03:11:52] Engine Core Mgr: seq 1322 returned without running: unschedulable: input tokens=26605 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom 03:11:52] Engine Core Mgr: seq 1321 returned without running: unschedulable: input tokens=26621 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom 03:11:53] Error in chat_completions
+Traceback (most recent call last):
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 2235, in _chat_completions
+    prompt_or_tokens = await asyncio.to_thread(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/entrypoints/openai/chat_encoders.py", line 320, in apply_chat_template
+    return tokenizer.apply_chat_template(messages, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/tokenization_utils_base.py", line 3108, in apply_chat_template
+    rendered_chat, generation_indices = render_jinja_template(
+                                        ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/utils/chat_template_utils.py", line 581, in render_jinja_template
+    rendered_chat = compiled_template.render(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/jinja2/environment.py", line 1295, in render
+    self.environment.handle_exception()
+  File "/usr/local/lib/python3.12/dist-packages/jinja2/environment.py", line 942, in handle_exception
+    raise rewrite_traceback_stack(source=source)
+  File "<template>", line 1, in top-level template code
+TypeError: can only concatenate str (not "dict") to str
+INFO:     127.0.0.1:54462 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Server Error
+[atom 03:11:53] Request 1323 arrived, input tokens: 26584, pending requests: 3
+[atom 03:11:53] Engine Core Mgr: add rank1: 1 req / 26584 tok | in-flight reqs=[1, 1, 0, 1] queued_prefill_tokens=[0, 26584, 0, 0]
+INFO:     127.0.0.1:54464 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 03:11:53] Request 1323 will never be scheduled: input tokens=26584 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom 03:11:53] Engine Core: output send 1 reqs
+[atom 03:11:53] Engine Core Mgr: seq 1323 returned without running: unschedulable: input tokens=26584 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom.model_engine.prefill_delayer 03:11:54] [PrefillDelayer stats] total=5000 fire_fill=0 fire_stall=51 fire_cost=6 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=1 fire_queue_ms=0 fire_vacuous=1902 hold_decode_interval=0 hold=3040 (hold_rate=60.80%)
+[atom.model_engine.prefill_delayer 03:11:54] [PrefillDelayer stats] total=5000 fire_fill=0 fire_stall=51 fire_cost=6 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=1 fire_queue_ms=0 fire_vacuous=1902 hold_decode_interval=0 hold=3040 (hold_rate=60.80%)
+[atom.model_engine.prefill_delayer 03:11:54] [PrefillDelayer stats] total=5000 fire_fill=0 fire_stall=51 fire_cost=6 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=1 fire_queue_ms=0 fire_vacuous=1902 hold_decode_interval=0 hold=3040 (hold_rate=60.80%)
+[atom.model_engine.prefill_delayer 03:11:54] [PrefillDelayer stats] total=5000 fire_fill=0 fire_stall=51 fire_cost=6 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=1 fire_queue_ms=0 fire_vacuous=1902 hold_decode_interval=0 hold=3040 (hold_rate=60.80%)
+[atom 03:11:58] Request 1324 arrived, input tokens: 26682, pending requests: 3
+[atom 03:11:58] Engine Core Mgr: add rank1: 1 req / 26682 tok | in-flight reqs=[1, 1, 0, 1] queued_prefill_tokens=[0, 26682, 0, 0]
+INFO:     127.0.0.1:54476 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 03:11:58] Request 1324 will never be scheduled: input tokens=26682 > max_num_batched_tokens=16384. Increase --max-num-batched-tokens, enable chunked prefill, or shorten the prompt.
+[atom 03:11:58] Engine Core: output send 1 reqs
+----- last 30 lines -----
+[atom.model_engine.prefill_delayer 03:29:16] [PrefillDelayer stats] total=97000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=92395 hold_decode_interval=0 hold=4422 (hold_rate=4.56%)
+[atom.model_engine.prefill_delayer 03:29:16] [PrefillDelayer stats] total=97000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=92395 hold_decode_interval=0 hold=4422 (hold_rate=4.56%)
+[atom.model_engine.prefill_delayer 03:29:16] [PrefillDelayer stats] total=97000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=92395 hold_decode_interval=0 hold=4422 (hold_rate=4.56%)
+[atom 03:29:16] Engine Core: output send 1 reqs
+[atom 03:29:18] Engine Core: output send 1 reqs
+[atom 03:29:18] Engine Core: output send 1 reqs
+[atom 03:29:22] Engine Core: output send 1 reqs
+[atom 03:29:22] Engine 003: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 247.8 tokens/s, Running: 2 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.2%, Prefix cache hit rate: n/a
+[atom 03:29:22] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 84.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: n/a
+[atom 03:29:22] Engine 002: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 135.2 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: n/a
+[atom 03:29:22] Engine 001: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 270.7 tokens/s, Running: 2 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.2%, Prefix cache hit rate: n/a
+[atom 03:29:26] Engine Core: output send 1 reqs
+[atom 03:29:27] Engine Core: output send 1 reqs
+[atom.model_engine.prefill_delayer 03:29:27] [PrefillDelayer stats] total=98000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=93395 hold_decode_interval=0 hold=4422 (hold_rate=4.51%)
+[atom.model_engine.prefill_delayer 03:29:27] [PrefillDelayer stats] total=98000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=93395 hold_decode_interval=0 hold=4422 (hold_rate=4.51%)
+[atom.model_engine.prefill_delayer 03:29:27] [PrefillDelayer stats] total=98000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=93395 hold_decode_interval=0 hold=4422 (hold_rate=4.51%)
+[atom.model_engine.prefill_delayer 03:29:27] [PrefillDelayer stats] total=98000 fire_fill=0 fire_stall=138 fire_cost=41 fire_ttft=0 fire_kv=0 fire_partial=0 fire_nodecode=4 fire_queue_ms=0 fire_vacuous=93395 hold_decode_interval=0 hold=4422 (hold_rate=4.51%)
+[atom 03:29:31] Engine Core: output send 1 reqs
+[atom 03:29:32] Engine Core: output send 1 reqs
+[atom 03:29:32] Engine 003: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 167.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: n/a
+[atom 03:29:32] Engine 001: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 115.8 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: n/a
+[atom 03:29:32] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 40.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: n/a
+[atom 03:29:32] Engine 002: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 87.4 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: n/a
+[atom 03:29:33] Engine Core: output send 1 reqs
+[atom 03:29:36] Engine Core: output send 1 reqs
+/results/deepseek-r1/server_cmd.sh: line 17:    20 Killed                  env ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 ATOM_MLA_KV_SHUFFLED=1 ATOM_MEGA_MASK_PAD_ROWS=1 MEGA_COMBINE_WIRE=bf16 AITER_DISABLE_KERNARG_PRELOAD=1 HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_DP_LM_HEAD_MODE=allgather ATOM_USE_UNIFIED_ATTN=1 ATOM_USE_TRITON_MLA=0 ATOM_MLA_PAGE_SIZE=1 AITER_MLA_DECODE_PS1_FLYDSL=1 AITER_ROPE_TRITON_BACKEND=1 ATOM_ENABLE_DS_QKNORM_FUSION=0 ATOM_LOADER_NUM_THREADS=4 ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION=0 ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=0 ATOM_USE_TRITON_GEMM=1 ATOM_USE_TRITON_MLA_SHUFFLE_KV=0 ENABLE_CK=0 AITER_USE_GROUPED_GEMM=1 AITER_FORCE_A8W4=0 AITER_USE_OPUS_MOE_SORTING=1 ATOM_MOE_GU_ITLV=1 ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1 ATOM_MEGA_STAGE1_FUSED=0 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS=-1 ATOM_GC_THRESHOLD=20000,50,50 MEGA_DISPATCH_WIRE=fp4 python3 -m atom.entrypoints.openai_server -tp 4 --model /models/Deepseek-S3_sq_a05_v2_mlperf6_1/ --kv_cache_dtype fp8 --block-size 64 --no-enable_prefix_caching --no-enable-chunked-prefill --enable-expert-parallel --enable-dp-attention --online_quant_config '{"layer_quant_config":{"*.self_attn.q_b_proj":"mxfp4"}}' --max-num-seqs 2048 --gpu-memory-utilization 0.975 --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,128,256,512,1024,1536,2048]'
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 20 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 4 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

@@ -1,0 +1,19 @@
+{
+ "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114",
+ "digest": "sha256:9c38aef6ad030885b5309ad90b30ff778da4f764161aecdf7b7c7d8ae3ea1eb9",
+ "base_image": "rocm/fw-bringup-mlperf:gfx1250-atom-20261113",
+ "atom": {
+  "commit": "9fec99786b088168aec7729858c1176e99d818e6",
+  "date": "2026-11-13",
+  "title": "perf(dsv41): add the shared expert output in the MegaMoE combine on the mori v2 EP path (#3132)"
+ },
+ "aiter": {
+  "commit": "b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47",
+  "date": "2026-11-13",
+  "title": "[CI] FFM Triton: fall back to main when the suite source ref is gone (#7930)"
+ },
+ "dependency_changes": [
+  "transformers 5.16.0.dev0 -> 5.16.1",
+  "prometheus_client 0.23.1 -> 0.25.0"
+ ]
+}
