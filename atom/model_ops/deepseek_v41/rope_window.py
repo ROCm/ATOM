@@ -9,7 +9,10 @@ and a program this far under the launch floor does not notice the extra rows.
 
 The RMSNorm ahead of this stays where it is. It shares a launch with Q's, so
 pulling its half in saves nothing and would leave Q's on a different kernel
-than the one whose bytes the checkpoint was validated against.
+than the one whose bytes the checkpoint was validated against. The exception
+is fused attention, which rotates Q itself: this launch is then the KV half
+alone, and `norm_rope_quant_window` runs it inside the dual RMSNorm instead,
+Q's half kept op for op with AITER's `_fused_dual_rmsnorm_mxfp8_quant_kernel`.
 
 The row this writes is `packed_rows`': `head_dim` FP8 values then
 `head_dim // 32` E8M0 scales. Where it lands is the cache's, not this file's.
@@ -20,6 +23,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 
 from atom.model_ops.blockscale_kernels.quantization import fp8_groups
 from atom.model_ops.v4_kernels.pool_index import window_row
@@ -95,11 +99,16 @@ def _rotate_heads(query, token, position, cos, sin, HEADS, D, ROPE):
 def _quantized_row(row, position, cos, sin, D, ROPE):
     """Rotate and quantize one row (a normed KV row or a query head); returns
     its bytes, E8M0 codes and power-of-two steps."""
-    half: tl.constexpr = ROPE // 2
     dim = tl.arange(0, D)
-    activation = row.dtype.element_ty
     normed = tl.load(row + dim).to(tl.float32)
+    return _quantized_values(normed, row.dtype.element_ty, position, cos, sin, D, ROPE)
 
+
+@triton.jit
+def _quantized_values(normed, activation, position, cos, sin, D, ROPE):
+    """`_quantized_row` of a row already in registers, as fp32 that
+    `activation` holds exactly."""
+    half: tl.constexpr = ROPE // 2
     even, odd = tl.split(tl.reshape(normed, (D // 2, 2)))
     # Every pair reads the table row, unmasked so the reads stay contiguous;
     # a NoPE pair then takes cos 1 with sin 0, the identity rotation.
@@ -268,37 +277,81 @@ def _rope_window_kernel(
             tl.store(values + token * values_stride + dim, tl.reshape(quantized, (D,)))
             tl.store(scales + token * scales_stride + tl.arange(0, D // 32), code)
         if WRITE_RING:
-            # Two exits, the ones both window writers already have: a padding
-            # row owns no request, and a row the ring has scrolled past has
-            # nowhere to land. The second is also what keeps two tokens of one
-            # request off the same row -- it admits exactly the last
-            # `RING_SLOTS` of them. The grid stays the forward's width either
-            # way, because that is the width a captured replay runs.
-            batch = tl.load(batches + token)
-            if batch >= 0 and token >= tl.load(cu + batch + 1) - RING_SLOTS:
-                base = (
-                    window_row(
-                        tl.load(slots + batch).to(tl.int64),
-                        position,
-                        ring_start,
-                        RING_SLOTS,
-                        SLOT_ROWS,
-                        RING_STRIDE,
-                        RUN_ROWS,
-                    )
-                    * ROW_UNITS
-                )
-                if PACKED_RING:
-                    tl.store(
-                        pool + base + dim,
-                        tl.reshape(quantized, (D,)).to(tl.uint8, bitcast=True),
-                    )
-                    tl.store(pool + base + D + tl.arange(0, D // 32), code)
-                else:
-                    tl.store(
-                        pool + base + dim,
-                        tl.reshape(quantized.to(tl.float32) * step[:, None], (D,)),
-                    )
+            _store_ring(
+                quantized,
+                code,
+                step,
+                token,
+                position,
+                pool,
+                batches,
+                cu,
+                slots,
+                ring_start,
+                D,
+                RING_SLOTS,
+                SLOT_ROWS,
+                RING_STRIDE,
+                RUN_ROWS,
+                ROW_UNITS,
+                PACKED_RING,
+            )
+
+
+@triton.jit
+def _store_ring(
+    quantized,
+    code,
+    step,
+    token,
+    position,
+    pool,
+    batches,
+    cu,
+    slots,
+    ring_start,
+    D,
+    RING_SLOTS,
+    SLOT_ROWS,
+    RING_STRIDE,
+    RUN_ROWS,
+    ROW_UNITS,
+    PACKED_RING,
+):
+    """A decode's KV row into its window ring.
+
+    Two exits, the ones both window writers already have: a padding row owns
+    no request, and a row the ring has scrolled past has nowhere to land. The
+    second is also what keeps two tokens of one request off the same row -- it
+    admits exactly the last `RING_SLOTS` of them. The grid stays the forward's
+    width either way, because that is the width a captured replay runs.
+    """
+    dim = tl.arange(0, D)
+    batch = tl.load(batches + token)
+    if batch >= 0 and token >= tl.load(cu + batch + 1) - RING_SLOTS:
+        base = (
+            window_row(
+                tl.load(slots + batch).to(tl.int64),
+                position,
+                ring_start,
+                RING_SLOTS,
+                SLOT_ROWS,
+                RING_STRIDE,
+                RUN_ROWS,
+            )
+            * ROW_UNITS
+        )
+        if PACKED_RING:
+            tl.store(
+                pool + base + dim,
+                tl.reshape(quantized, (D,)).to(tl.uint8, bitcast=True),
+            )
+            tl.store(pool + base + D + tl.arange(0, D // 32), code)
+        else:
+            tl.store(
+                pool + base + dim,
+                tl.reshape(quantized.to(tl.float32) * step[:, None], (D,)),
+            )
 
 
 def rope_quant_window(
@@ -396,3 +449,224 @@ def rope_quant_window(
             2 if fp8_heads > 1 else max(1, dim * query.element_size() // (64 * 16))
         ),
     )
+
+
+@triton.jit
+def _norm_rope_window_kernel(
+    q,
+    kv,
+    q_weight,
+    kv_weight,
+    q_values,
+    q_scales,
+    cos,
+    sin,
+    positions,
+    values,
+    scales,
+    values_stride,
+    scales_stride,
+    pool,
+    batches,
+    cu,
+    slots,
+    ring_start,
+    q_stride,
+    kv_stride,
+    eps_q,
+    eps_kv,
+    KQ: tl.constexpr,
+    BLOCK_KQ: tl.constexpr,
+    SPLIT_Q: tl.constexpr,
+    Q_AMAX_FLOOR: tl.constexpr,
+    D: tl.constexpr,
+    ROPE: tl.constexpr,
+    RING_SLOTS: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
+    RUN_ROWS: tl.constexpr,
+    ROW_UNITS: tl.constexpr,
+    EMIT_PACKED: tl.constexpr,
+    WRITE_RING: tl.constexpr,
+    PACKED_RING: tl.constexpr,
+):
+    """One program per token: Q's RMSNorm to MXFP8, and the KV row's RMSNorm
+    through `_rope_window_kernel`'s KV chain. `SPLIT_Q` holds Q as a
+    `BLOCK_KQ` head and a power-of-two tail rather than one padded tile.
+
+    This extends AITER's dual latent RMSNorm with ATOM's window address and
+    byte-layout contract. AITER's QK norm/RoPE/SWA op instead normalizes
+    projected per-head Q and emits BF16 rows: it cannot consume Q's latent
+    width or emit this MXFP8 ring. Quantization reuses `_mxfp8_quant_op`;
+    the KV chain reuses the shared `_quantized_values` and `_store_ring` helpers.
+    """
+    groups: tl.constexpr = BLOCK_KQ // 32
+    cols = tl.arange(0, BLOCK_KQ)
+    mask = cols < KQ
+    group = tl.arange(0, groups)
+    dim = tl.arange(0, D)
+    activation = kv.dtype.element_ty
+    g = tl.load(q_weight + cols, mask=mask, other=0.0).to(tl.float32)
+    gk = tl.load(kv_weight + dim).to(tl.float32)
+    if SPLIT_Q:
+        TAIL: tl.constexpr = KQ - BLOCK_KQ
+        cols_t = BLOCK_KQ + tl.arange(0, TAIL)
+        g_t = tl.load(q_weight + cols_t).to(tl.float32)
+    token = tl.program_id(0).to(tl.int64)
+    x = tl.load(q + token * q_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    if SPLIT_Q:
+        x_t = tl.load(q + token * q_stride + cols_t).to(tl.float32)
+        norm = tl.math.rsqrt(
+            ((tl.sum(x * x, axis=-1) + tl.sum(x_t * x_t, axis=-1)) / KQ) + eps_q
+        )
+        y_t = tl.reshape(x_t * norm * g_t, (TAIL // 32, 32))
+        t_code, t_step = _mxfp8_quant_op(y_t, QUANT_AXIS=1, AMAX_FLOOR=Q_AMAX_FLOOR)
+        tl.store(
+            q_values + token * KQ + cols_t,
+            tl.reshape(y_t * t_step, (TAIL,)).to(q_values.dtype.element_ty),
+        )
+        tl.store(
+            q_scales + token * (KQ // 32) + groups + tl.arange(0, TAIL // 32),
+            tl.reshape(t_code, (TAIL // 32,)),
+        )
+    else:
+        norm = tl.math.rsqrt((tl.sum(x * x, axis=-1) / KQ) + eps_q)
+    y = x * norm * g
+    y = tl.reshape(y, (groups, 32))
+    q_code, q_step = _mxfp8_quant_op(y, QUANT_AXIS=1, AMAX_FLOOR=Q_AMAX_FLOOR)
+    tl.store(
+        q_values + token * KQ + cols,
+        tl.reshape(y * q_step, (BLOCK_KQ,)).to(q_values.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        q_scales + token * (KQ // 32) + group,
+        tl.reshape(q_code, (groups,)),
+        mask=group < KQ // 32,
+    )
+
+    xk = tl.load(kv + token * kv_stride + dim).to(tl.float32)
+    # Rounded where the dual RMSNorm stored its BF16 row, for the same bytes.
+    normed = (
+        (xk * tl.math.rsqrt((tl.sum(xk * xk, axis=-1) / D) + eps_kv) * gk)
+        .to(activation)
+        .to(tl.float32)
+    )
+    position = tl.load(positions + token)
+    quantized, code, step = _quantized_values(
+        normed, activation, position, cos, sin, D, ROPE
+    )
+    if EMIT_PACKED:
+        tl.store(values + token * values_stride + dim, tl.reshape(quantized, (D,)))
+        tl.store(scales + token * scales_stride + tl.arange(0, D // 32), code)
+    if WRITE_RING:
+        _store_ring(
+            quantized,
+            code,
+            step,
+            token,
+            position,
+            pool,
+            batches,
+            cu,
+            slots,
+            ring_start,
+            D,
+            RING_SLOTS,
+            SLOT_ROWS,
+            RING_STRIDE,
+            RUN_ROWS,
+            ROW_UNITS,
+            PACKED_RING,
+        )
+
+
+def norm_rope_quant_window(
+    q,
+    kv,
+    q_norm,
+    kv_norm,
+    cos,
+    sin,
+    positions,
+    *,
+    rope_dim,
+    q_amax_floor=0.0,
+    values=None,
+    scales=None,
+    ring=None,
+):
+    """The dual RMSNorm and `rope_quant_window`'s KV half in one launch.
+
+    Returns Q's `(e4m3, e8m0)` pair, as `DualRMSNormMXFP8` does; the KV row
+    goes to `values`/`scales` (an FP8 attention's extend rows) or `ring`
+    (`(pool, step, window)`, a decode's store), and is not returned.
+    """
+    tokens, q_dim = q.shape
+    dim = kv.shape[-1]
+    q_values = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    q_scales = torch.empty(
+        (tokens, q_dim // 32), device=q.device, dtype=torch.float8_e8m0fnu
+    )
+    if not tokens:
+        return q_values, q_scales
+    pool, step, window = ring or (None, None, None)
+    byte_ring = pool is not None and pool.dtype == torch.uint8
+    # A long prefill is bound by the padded lanes of a 2048-wide tile for a
+    # 1280-wide Q; a decode bucket is too short to notice them.
+    block_kq = triton.next_power_of_2(q_dim)
+    tail = q_dim - block_kq // 2
+    # Both pieces are reshaped into group-32 rows. In particular, a 32-wide
+    # Q must stay unsplit: two 16-wide pieces contain no quantization group.
+    split_q = (
+        tokens >= 768
+        and block_kq // 2 % 32 == 0
+        and tail > 0
+        and tail % 32 == 0
+        and tail & (tail - 1) == 0
+    )
+    if split_q:
+        block_kq //= 2
+    _norm_rope_window_kernel[(tokens,)](
+        q,
+        kv,
+        q_norm.weight,
+        kv_norm.weight,
+        q_values,
+        q_scales.view(torch.uint8),
+        cos,
+        sin,
+        positions,
+        values,
+        None if scales is None else scales.view(torch.uint8),
+        0 if values is None else values.stride(-2),
+        0 if scales is None else scales.stride(-2),
+        pool,
+        None if step is None else step.batch_ids,
+        None if step is None else step.cu_seqlens_q,
+        None if step is None else step.slots,
+        0 if window is None else window.ring_start,
+        q.stride(0),
+        kv.stride(0),
+        q_norm.eps,
+        kv_norm.eps,
+        KQ=q_dim,
+        BLOCK_KQ=block_kq,
+        SPLIT_Q=split_q,
+        Q_AMAX_FLOOR=q_amax_floor,
+        D=dim,
+        ROPE=rope_dim,
+        RING_SLOTS=1 if window is None else window.ring_slots,
+        SLOT_ROWS=0 if window is None else window.slot_rows,
+        RING_STRIDE=1 if window is None else window.ring_stride,
+        RUN_ROWS=0 if window is None else window.run_rows,
+        ROW_UNITS=1 if pool is None or byte_ring else dim,
+        EMIT_PACKED=values is not None,
+        WRITE_RING=ring is not None,
+        PACKED_RING=byte_ring,
+        # Four warps hide a decode bucket's latency; past a few hundred rows
+        # the grid fills the device and one-warp programs win (MI355X, 8192
+        # rows: 14.6us at four warps, 10.5us at one with `SPLIT_Q`).
+        num_warps=4 if tokens < 768 else 1,
+    )
+    return q_values, q_scales

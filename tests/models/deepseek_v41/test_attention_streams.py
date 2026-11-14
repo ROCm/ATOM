@@ -225,22 +225,33 @@ def test_indexer_forks_and_carries_the_compressor_join_into_its_own_stream(
     ]
 
 
-def test_a_compressor_forked_alone_is_joined_before_attention(monkeypatch, recorded):
-    """`ATOM_DSV41_SIDE_STREAMS` 1 forks the compressor and no scorer: the
-    layer still joins it, or a TR recording ends with it pending."""
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("fork_index", [False, True])
+def test_forward_orders_window_and_side_stream_joins(
+    monkeypatch, recorded, fused, fork_index
+):
+    """Norm/window writes precede the scorer fork; attention joins both readers."""
     log, streams = recorded
     context(monkeypatch, streams.main, in_hipgraph=True)
-    instance = stub(log, compress=streams.compress)
+    instance = stub(
+        log, compress=streams.compress, index=streams.index if fork_index else None
+    )
     instance._fork_compress = lambda *a: Attention._fork_compress(instance, *a)
     instance._fork_select = lambda *a, **k: Attention._fork_select(instance, *a, **k)
     instance.project_qkv = lambda *a: (None, None)
     instance.qk_norm = lambda *a: (None, None, None)
-    instance.wq_b = lambda *a, **k: torch.zeros(1, 4)
-    instance.heads, instance.head_dim = 2, 2
+    instance.wq_b = lambda *a, **k: torch.zeros(1, 32)
+    instance.heads, instance.head_dim, instance.groups = 8, 4, 1
     instance.spec = SimpleNamespace(layer_id=0)
-    instance._attend = lambda query, *a: (log.append("attend"), query)[1]
+    instance._use_fused_attention = lambda *a: fused
+    instance._attend = lambda query, *a, **k: (log.append("attend"), query)[1]
     instance._project_out = lambda *a: None
+    instance._project_quantized_out = lambda *a: None
     cache = SimpleNamespace(
+        norm_rope_quant_window=lambda *a: (
+            log.append("norm/window"),
+            (None, None, None, None),
+        )[1],
         rope_quant_window=lambda *a: (None, None),
         rope_positions=lambda step: None,
         query_fp8=lambda query: None,
@@ -249,6 +260,12 @@ def test_a_compressor_forked_alone_is_joined_before_attention(monkeypatch, recor
     Attention.forward(instance, None, None, cache, SELECT_ARGS[4], None)
 
     assert log.index("main waits compress") < log.index("attend")
+    if fork_index:
+        assert log.index("main waits index") < log.index("attend")
+    if fused:
+        assert log.index("norm/window") < log.index("project")
+        if fork_index:
+            assert log.index("norm/window") < log.index("index waits main")
 
 
 def test_a_layer_without_an_indexer_forks_nothing_to_select(monkeypatch, recorded):

@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
 CORE_PREPARE_DIGEST = "50a174931df035a4"
-CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
+CORE_FORWARD_DIGEST = "cf3b6f63a9e378be"
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def plugin_attention():
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
     assert {node.name for node in functions} == names
-    scope = {"torch": torch}
+    scope = {"torch": torch, "FP8_DTYPE": torch.float8_e4m3fn}
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=functions, type_ignores=[]), str(PLUGIN), "exec"),
         scope,
@@ -69,6 +69,7 @@ def test_plugin_forward_passes_fused_quant_into_capture_break(
     calls = []
 
     class Attention:
+        _use_fused_attention = staticmethod(lambda *args: False)
         heads = 2
         head_dim = 16
 
@@ -119,6 +120,7 @@ def test_plugin_forward_carries_mx_scale_across_the_break_as_bytes(
     calls = []
 
     class Attention:
+        _use_fused_attention = staticmethod(lambda *args: False)
         heads = 2
         head_dim = 16
 
@@ -220,6 +222,98 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
     )
 
 
+@pytest.fixture
+def core_attention():
+    """Exercise native eager-boundary arguments without loading GPU kernels."""
+    cls = next(
+        node
+        for node in ast.parse(CORE.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "Attention"
+    )
+    functions = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"forward", "_attend"}
+    ]
+    assert len(functions) == 2
+    for node in functions:
+        node.decorator_list = []
+    scope = {
+        "torch": torch,
+        "FP8_DTYPE": torch.float8_e4m3fn,
+        "join_stream": lambda *args: None,
+        "fused_sparse_attn_v41_paged_2src": Mock(),
+    }
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
+        compile(ast.Module(body=functions, type_ignores=[]), str(CORE), "exec"),
+        scope,
+    )
+    return SimpleNamespace(**scope)
+
+
+@pytest.mark.parametrize("stage", ["idle", "decode", "prefill"])
+def test_core_fused_output_scale_crosses_break_without_copy(core_attention, stage):
+    """A byte-only weak-ref boundary must preserve the kernel's E8M0 storage."""
+    hidden = torch.zeros(1, 2, 32, dtype=torch.bfloat16)
+    kv = torch.zeros(1, 2, 4, dtype=torch.bfloat16)
+    cache = SimpleNamespace(
+        norm_rope_quant_window=Mock(return_value=(hidden, None, kv, None)),
+        attention_indices=Mock(return_value=(None, None, None, None)),
+        rope_positions=Mock(return_value=torch.zeros(2, dtype=torch.int64)),
+        ring_view=Mock(return_value=object()),
+        write_window=Mock(),
+        pool=object(),
+        packed=False,
+    )
+    step = SimpleNamespace(
+        requests=() if stage == "idle" else (object(),), decode=stage == "decode"
+    )
+    attention = SimpleNamespace(
+        spec=SimpleNamespace(layer_id=0),
+        heads=8,
+        head_dim=4,
+        groups=1,
+        attn_sink=None,
+        softmax_scale=1.0,
+        index_stream=None,
+        compress_stream=None,
+        qk_norm=object(),
+        _fork_compress=Mock(),
+        project_qkv=Mock(return_value=(hidden, kv)),
+        _use_fused_attention=Mock(return_value=True),
+        _fork_select=Mock(),
+        wq_b=Mock(return_value=hidden),
+        _project_quantized_out=Mock(),
+    )
+    addresses = []
+
+    def byte_only_boundary(*args, **kwargs):
+        scale = kwargs["out_scale"]
+        assert scale.dtype == torch.uint8
+        addresses.append(scale.data_ptr())
+        return core_attention._attend(attention, *args, **kwargs)
+
+    def kernel(*args, out, out_scale, **kwargs):
+        assert out_scale.dtype == torch.float8_e8m0fnu
+        assert out_scale.data_ptr() == addresses[-1]
+        out.view(torch.uint8).zero_()
+        out_scale.view(torch.uint8).fill_(127)
+
+    attention._attend = byte_only_boundary
+    core_attention.fused_sparse_attn_v41_paged_2src.side_effect = kernel
+    core_attention.forward(attention, hidden, None, cache, step, object())
+
+    assert len(addresses) == 1
+    output, scale, _, _ = attention._project_quantized_out.call_args.args
+    assert scale.dtype == torch.float8_e8m0fnu
+    assert scale.data_ptr() == addresses[0]
+    assert torch.all(scale.view(torch.uint8) == 127)
+    assert torch.count_nonzero(output.view(torch.uint8)) == 0
+    assert core_attention.fused_sparse_attn_v41_paged_2src.call_count == (
+        stage != "idle"
+    )
+
+
 def _core_forward() -> str:
     """The source of the attention half the plugin copies: `Attention.forward`
     and `_attend`, the region it attends in, by AST rather than by text
@@ -314,6 +408,9 @@ def test_the_copy_still_covers_both_dispatch_arms():
         "sparse_attn_v4_paged_2src",
         "write_window",
         "rope_quant_window",
+        "norm_rope_quant_window",
+        "fused_sparse_attn_v41_paged_2src",
+        "_project_quantized_out",
     ):
         assert name in copy, f"the attention copy lost {name}"
 
@@ -369,3 +466,168 @@ def test_copied_model_and_staging_sources_have_not_drifted(
         "the vLLM plugin copy before updating this source digest. "
         f"Observed digest: {digest}"
     )
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_plugin_fused_forward_owns_both_output_planes(plugin_attention, bounded):
+    calls = []
+
+    class Attention:
+        heads, head_dim, groups = 16, 64, 2
+        _use_fused_attention = staticmethod(lambda *args: True)
+
+        def _atom_v41_attend_block(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            args[0].view(torch.uint8).fill_(5)
+            kwargs["attn_out_scale"].fill_(127)
+
+    model = Attention()
+    model._project_out = Mock()
+    model._project_quantized_out = Mock(return_value=object())
+    hidden = torch.empty(1, 4, 32, dtype=torch.bfloat16)
+    hidden_scale = torch.empty(1, 4, 1, dtype=torch.float8_e8m0fnu)
+    queries = (
+        SimpleNamespace(rows=torch.tensor([1, 3]), positions=object())
+        if bounded
+        else None
+    )
+    result = plugin_attention._forward(
+        model, hidden, hidden_scale, object(), object(), object(), queries
+    )
+    ((args, kwargs),) = calls
+    values, scales, leading, dtype = model._project_quantized_out.call_args.args
+    rows = 2 if bounded else 4
+    assert values is args[0]
+    assert values.shape == (rows, 2, 8 * model.head_dim)
+    assert values.dtype == torch.float8_e4m3fn
+    assert scales.shape == (rows, 2, 8 * model.head_dim // 32)
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert kwargs["attn_out_scale"].dtype == torch.uint8
+    assert kwargs["attn_out_scale"].data_ptr() == scales.data_ptr()
+    assert args[2].dtype == torch.uint8
+    assert args[2].data_ptr() == hidden_scale.data_ptr()
+    assert kwargs["hidden_scale_dtype"] == hidden_scale.dtype
+    assert tuple(leading) == (1, rows) and dtype == hidden.dtype
+    assert torch.all(values.view(torch.uint8) == 5)
+    assert torch.all(scales.view(torch.uint8) == 127)
+    model._project_out.assert_not_called()
+    assert result is model._project_quantized_out.return_value
+
+
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("bounded", [False, True])
+def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
+    plugin_attention, monkeypatch, decode, bounded
+):
+    events = []
+    hidden = torch.empty(1, 4, 32, dtype=torch.bfloat16)
+    q = torch.empty_like(hidden)
+    kv = torch.empty(1, 4, 4, dtype=torch.bfloat16)
+    q_scale = torch.empty(1, 4, 1, dtype=torch.uint8)
+    window = None if decode else object()
+    live = SimpleNamespace(decode=decode, requests=(object(),), width=4)
+    frozen = SimpleNamespace(decode=not decode, requests=(), width=8)
+    positions, rope = object(), object()
+
+    def norm(*args):
+        assert args[-1] is live
+        events.append("norm/ring" if decode else "norm")
+        return q, q_scale, None if decode else kv, window
+
+    def write(layer, rows, step):
+        assert step is live and rows is window
+        if rows is not None:
+            events.append("write")
+
+    cache = SimpleNamespace(
+        current_step=live,
+        norm_rope_quant_window=norm,
+        query_fp8=Mock(side_effect=AssertionError("fused Q must remain BF16")),
+        rope_quant_window=Mock(side_effect=AssertionError("KV is already prepared")),
+        attention_indices=Mock(return_value=(0, 1, 2, 3)),
+        rope_positions=Mock(return_value=positions),
+        write_window=write,
+        ring_view=Mock(return_value=object()),
+        pool=object(),
+        packed=False,
+        kv_fp8=True,
+    )
+    model = SimpleNamespace(
+        heads=8,
+        head_dim=4,
+        spec=SimpleNamespace(layer_id=0),
+        attn_sink=object(),
+        softmax_scale=0.5,
+        _fork_compress=Mock(return_value=True),
+        project_qkv=Mock(return_value=(q, kv)),
+        qk_norm=Mock(side_effect=AssertionError("norm should be fused")),
+        _fork_select=lambda *a, **k: events.append("select"),
+        wq_b=lambda q, **k: q,
+    )
+    queries = None
+    rows = 4
+    if bounded:
+        rows = 2
+        queries = SimpleNamespace(
+            positions=object(),
+            take=lambda *xs: tuple(x[:, [1, 3]] for x in xs),
+            indices=Mock(return_value=(4, 5, 6, 7)),
+        )
+    values = torch.empty(rows, 1, 32, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(rows, 1, 1, dtype=torch.uint8)
+
+    def attend(query, pool, *args, **kwargs):
+        events.append("attend")
+        assert query.shape == (rows, 8, 4) and query.dtype == torch.bfloat16
+        assert pool is cache.pool
+        assert kwargs["out"] is values
+        assert kwargs["out_scale"].data_ptr() == scales.data_ptr()
+        assert kwargs["out_scale"].dtype == torch.float8_e8m0fnu
+        assert kwargs["positions"] is (queries.positions if bounded else positions)
+        kwargs["out"].view(torch.uint8).fill_(7)
+        kwargs["out_scale"].view(torch.uint8).fill_(127)
+        return kwargs["out"], kwargs["out_scale"]
+
+    scope = plugin_attention._attend_block.__globals__
+    monkeypatch.setitem(scope, "fused_sparse_attn_v41_paged_2src", attend)
+    monkeypatch.setitem(scope, "join_stream", lambda *args: events.append("join"))
+    model.index_stream, model.compress_stream = object(), object()
+    result = plugin_attention._attend_block(
+        model,
+        values,
+        hidden,
+        None,
+        cache,
+        frozen,
+        rope,
+        queries,
+        attn_out_scale=scales,
+    )
+    assert result is None
+    assert torch.all(values.view(torch.uint8) == 7) and torch.all(scales == 127)
+    model._fork_compress.assert_called_once_with(hidden, cache, live, rope)
+    assert events == (
+        ["norm/ring", "select", "join", "attend"]
+        if decode
+        else ["norm", "select", "join", "attend", "write"]
+    )
+    cache.rope_quant_window.assert_not_called()
+
+
+def test_plugin_fused_idle_replay_initializes_both_planes(plugin_attention):
+    values = torch.full((2, 1, 32), 255, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    scales = torch.full((2, 1, 1), 255, dtype=torch.uint8)
+    cache = SimpleNamespace(current_step=SimpleNamespace(requests=()))
+    plugin_attention._attend_block(
+        object(),
+        values,
+        None,
+        None,
+        cache,
+        object(),
+        None,
+        None,
+        attn_out_scale=scales,
+    )
+    assert values.view(torch.uint8).count_nonzero() == 0
+    assert torch.all(scales == 127)

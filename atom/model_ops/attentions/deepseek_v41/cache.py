@@ -24,7 +24,10 @@ from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
     write_index_rows_fp4,
 )
-from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+from atom.model_ops.deepseek_v41.rope_window import (
+    norm_rope_quant_window,
+    rope_quant_window,
+)
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.model_ops.v4_kernels.state_writes import (
@@ -881,6 +884,48 @@ class PagedAttentionCache:
             *seam, rope_dim=rope.rope_dim, qat=qat, values=values, scales=scales
         )
         return qat, (values, scales) if window_fp8 else qat
+
+    def norm_rope_quant_window(self, layer, qk_norm, q, kv, rope, step):
+        """`qk_norm` and `rope_quant_window`'s KV half in one launch, for an
+        attention that rotates the query itself; FP8 pool only.
+
+        Returns `(qr, qr_scale)` as `qk_norm` does, then the KV pair
+        `rope_quant_window(layer, None, ...)` returns: a decode stores its row,
+        a prefill gets the extend rows and the window's `(values, scales)`.
+        """
+        dim = self.geometry.head_dim
+        seam = (
+            q.reshape(-1, q.shape[-1]),
+            kv.reshape(-1, dim),
+            qk_norm.q_norm,
+            qk_norm.k_norm,
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+        )
+        options = {"rope_dim": rope.rope_dim, "q_amax_floor": qk_norm.amax_floor}
+        if step.decode:
+            ring = (
+                (self.backing, step, self.geometry.window_bytes(layer, self.num_pages))
+                if self.window_fp8
+                else (self.pool, step, self.geometry.window(layer, self.num_pages))
+            )
+            qr, qr_scale = norm_rope_quant_window(*seam, ring=ring, **options)
+            kv_out, window_kv = None, None
+        else:
+            rows = torch.empty(
+                (step.running_tokens, self.geometry.row_bytes),
+                device=kv.device,
+                dtype=torch.uint8,
+            )
+            values = rows[:, :dim].view(FP8_DTYPE)
+            scales = rows[:, dim:].view(torch.float8_e8m0fnu)
+            qr, qr_scale = norm_rope_quant_window(
+                *seam, values=values, scales=scales, **options
+            )
+            kv_out, window_kv = rows, (values, scales)
+        lead = q.shape[:-1]
+        return qr.view(*lead, -1), qr_scale.view(*lead, -1), kv_out, window_kv
 
     def rotate_query(self, query, rope, positions, query_fp8=None):
         """`rope_quant_window`'s query half alone, at `positions`."""

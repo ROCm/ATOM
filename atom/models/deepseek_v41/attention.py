@@ -22,6 +22,8 @@ from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    fused_attention_available,
+    fused_sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src,
 )
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
@@ -29,7 +31,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_prefill,
 )
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
-from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
+from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR, FP8_DTYPE
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import (
     quantize_query_fp4,
@@ -265,6 +267,15 @@ class Attention(nn.Module):
             config.num_attention_heads // tp_size,
             config.o_groups // tp_size,
         )
+        # AITER's fused kernel exists for gfx950 at D512, H16/32/64/128 per
+        # rank, and writes `wo_a`'s input in eight-head output groups.
+        # `_use_fused_attention` adds the per-forward conditions.
+        self.fused_attn = (
+            fused_attention_available()
+            and self.head_dim == 512
+            and self.heads in (16, 32, 64, 128)
+            and self.groups * 8 == self.heads
+        )
         self.softmax_scale = self.head_dim**-0.5
         self.attn_sink = atom_parameter(torch.empty(self.heads, dtype=torch.float32))
         # Fused [wq_a; wkv], as V4 declares it: one GEMM, and one
@@ -415,6 +426,11 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        return self._project_quantized_out(
+            x_fp8, x_scale, output.shape[:-2], output.dtype
+        )
+
+    def _project_quantized_out(self, x_fp8, x_scale, leading_shape, dtype):
         wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
         if self._fuse_woa_quant:
@@ -424,17 +440,33 @@ class Attention(nn.Module):
                 x_fp8, wo_a_w, x_scale, wo_a_ws
             )
             return self.wo_b(
-                y8.view(*output.shape[:-2], -1),
-                x_scale=y_scale.view(*output.shape[:-2], -1),
+                y8.view(*leading_shape, -1),
+                x_scale=y_scale.view(*leading_shape, -1),
             )
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
             wo_a_w,
             x_scale,
             wo_a_ws,
-            dtype=output.dtype,
+            dtype=dtype,
         )
-        return self.wo_b(y.view(*output.shape[:-2], -1))
+        return self.wo_b(y.view(*leading_shape, -1))
+
+    def _use_fused_attention(self, activation, cache, rope):
+        """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
+        the layer qualifies (`fused_attn`), the pool holds unpacked MXFP8 rows
+        and the activations (Q follows `wq_a`'s) and the 64-dimension RoPE
+        tables are BF16. A BF16 or packed pool, and every other case, keeps
+        the unfused path."""
+        return (
+            self.fused_attn
+            and cache.kv_fp8
+            and not cache.packed
+            and activation.dtype == torch.bfloat16
+            and rope.cos_cache.dtype == torch.bfloat16
+            and rope.sin_cache.dtype == torch.bfloat16
+            and rope.cos_cache.shape[-1] == 32
+        )
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -490,7 +522,17 @@ class Attention(nn.Module):
         q_lora, kv_pre = self.project_qkv(
             hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
         )
-        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+        # The fused kernel rotates and quantizes Q itself, which leaves the
+        # KV row alone on `rope_quant_window`; it rides on the dual RMSNorm
+        # instead. A decode's window store moving ahead of the scorer is
+        # safe: the scorer reads the index plane, the compressor its arena.
+        fused = self._use_fused_attention(kv_pre, cache, rope)
+        if fused:
+            qr, qr_scale, kv, window_kv = cache.norm_rope_quant_window(
+                self.spec.layer_id, self.qk_norm, q_lora, kv_pre, rope, step
+            )
+        else:
+            qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
@@ -499,25 +541,57 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        # One launch for both rotations, the KV row's FP8 bytes and, where a
-        # decode allows it, the window write. `window_kv` is what is left for
-        # `write_window` below, which is nothing when that fold happened. The
-        # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-        query_fp8 = cache.query_fp8(query)
-        if queries is None:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
-            )
-        else:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, None, kv_normed, rope, step
-            )
-            cache.rotate_query(query, rope, queries.positions, query_fp8)
+        # Unfused: one launch for both rotations, the KV row's FP8 bytes and,
+        # where a decode allows it, the window write. `window_kv` is what is
+        # left for `write_window` below, which is nothing when that fold
+        # happened. The FP8 pool's attention reads the query as MXFP8
+        # (`query_fp8`).
+        query_fp8 = None
+        if not fused:
+            query_fp8 = cache.query_fp8(query)
+            if queries is None:
+                kv, window_kv = cache.rope_quant_window(
+                    self.spec.layer_id, query, kv_normed, rope, step, query_fp8
+                )
+            else:
+                kv, window_kv = cache.rope_quant_window(
+                    self.spec.layer_id, None, kv_normed, rope, step
+                )
+                cache.rotate_query(query, rope, queries.positions, query_fp8)
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
+        if fused:
+            rows = query.shape[:-2].numel()
+            group_dim = 8 * self.head_dim
+            x_fp8 = torch.empty(
+                (rows, self.groups, group_dim),
+                dtype=FP8_DTYPE,
+                device=query.device,
+            )
+            x_scale = torch.empty(
+                (rows, self.groups, group_dim // 32),
+                dtype=torch.float8_e8m0fnu,
+                device=query.device,
+            )
+            self._attend(
+                query,
+                query_fp8,
+                kv,
+                window_kv,
+                cache,
+                step,
+                queries,
+                rope=rope,
+                out=x_fp8,
+                # The eager recorder weak-refs bytes; vLLM may reject E8M0.
+                out_scale=x_scale.view(torch.uint8),
+            )
+            return self._project_quantized_out(
+                x_fp8, x_scale, query.shape[:-2], query.dtype
+            )
         output = self._attend(query, query_fp8, kv, window_kv, cache, step, queries)
         return self._project_out(
             output.view_as(query),
@@ -526,12 +600,32 @@ class Attention(nn.Module):
         )
 
     @eager_region(live=_live_rows)
-    def _attend(self, query, query_fp8, kv, window_kv, cache, step, queries):
+    def _attend(
+        self,
+        query,
+        query_fp8,
+        kv,
+        window_kv,
+        cache,
+        step,
+        queries,
+        *,
+        rope=None,
+        out=None,
+        out_scale=None,
+    ):
         """Indices, sparse attention and the window write: the TR-graph break
         whose launches follow each request's query length and context. The
         result is written over ``query`` in place wherever the kernel takes
-        ``out=``. The FP8 pool attends with ``query_fp8``, its MXFP8 copy."""
+        ``out=``. Fused attention writes both graph-owned FP8 output buffers
+        and returns None so replay needs no result copy."""
+        if out_scale is not None:
+            out_scale = out_scale.view(torch.float8_e8m0fnu)
         if not step.requests:  # a dummy prefill on a token graph
+            if out is not None:
+                out.view(torch.uint8).zero_()
+                out_scale.view(torch.uint8).fill_(127)
+                return None
             return query
         prefix, prefix_indptr, second, second_indptr = (
             cache.attention_indices(self.spec, step)
@@ -539,7 +633,23 @@ class Attention(nn.Module):
             else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
-        if cache.kv_fp8:
+        kwargs = {"out": flat_query}
+        if out is not None:
+            attend = fused_sparse_attn_v41_paged_2src
+            attending = (
+                flat_query
+                if query_fp8 is None
+                else tuple(part.flatten(0, 1) for part in query_fp8)
+            )
+            kwargs = {
+                "rope": rope,
+                "positions": (
+                    cache.rope_positions(step) if queries is None else queries.positions
+                ),
+                "out": out,
+                "out_scale": out_scale,
+            }
+        elif cache.kv_fp8:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
         else:
@@ -569,7 +679,7 @@ class Attention(nn.Module):
                     second_indptr,
                     self.attn_sink,
                     self.softmax_scale,
-                    out=flat_query,
+                    **kwargs,
                 )
         else:
             output = attend(
@@ -582,8 +692,8 @@ class Attention(nn.Module):
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query,
+                **kwargs,
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        return output
+        return None if out is not None else output

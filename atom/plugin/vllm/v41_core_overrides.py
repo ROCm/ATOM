@@ -28,6 +28,7 @@ from atom.model_ops.attentions.deepseek_v41.backend import (
 )
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    fused_sparse_attn_v41_paged_2src,
     sparse_attn_v41_paged_2src,
 )
 from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
@@ -35,6 +36,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
 from atom.model_ops.engram.device.uva import uva_gather_into
@@ -533,6 +535,7 @@ def _attend_block(
     queries,
     hidden_fp8=None,
     hidden_scale_dtype=None,
+    attn_out_scale=None,
 ):
     """Everything from the compressor fork to the attention rows, in place.
 
@@ -548,12 +551,24 @@ def _attend_block(
     if hidden_scale_dtype is not None:
         hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
+    fused = attn_out_scale is not None
+    if fused and not step.requests:
+        attn_out.view(torch.uint8).zero_()
+        attn_out_scale.fill_(127)
+        return
     compressed = self._fork_compress(hidden, cache, step, rope)
     # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
     q_lora, kv_pre = self.project_qkv(
         hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
     )
-    qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+    if fused:
+        # The norm/window write precedes the scorer's fork; it writes the ring,
+        # while the compressor and scorer use their arena and index planes.
+        qr, qr_scale, kv, window_kv = cache.norm_rope_quant_window(
+            self.spec.layer_id, self.qk_norm, q_lora, kv_pre, rope, step
+        )
+    else:
+        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
     self._fork_select(hidden, qr, qr_scale, cache, step, rope, compressed=compressed)
     if queries is not None:
         qr, qr_scale = queries.take(qr, qr_scale)
@@ -562,16 +577,18 @@ def _attend_block(
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
     # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-    query_fp8 = cache.query_fp8(query)
-    if queries is None:
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step, query_fp8
-        )
-    else:
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, None, kv_normed, rope, step
-        )
-        cache.rotate_query(query, rope, queries.positions, query_fp8)
+    query_fp8 = None
+    if not fused:
+        query_fp8 = cache.query_fp8(query)
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step
+            )
+            cache.rotate_query(query, rope, queries.positions, query_fp8)
     # A forked compressor was already waited at the scorer, on whichever
     # stream that ran; joining it again costs one wait and keeps one rule.
     join_stream(self.index_stream, self.compress_stream)
@@ -581,7 +598,19 @@ def _attend_block(
         else queries.indices(cache, self.spec)
     )
     flat_query = query.flatten(0, 1)
-    if cache.kv_fp8:
+    kwargs = {"out": flat_query}
+    if fused:
+        attend = fused_sparse_attn_v41_paged_2src
+        attending = flat_query
+        kwargs = {
+            "rope": rope,
+            "positions": (
+                cache.rope_positions(step) if queries is None else queries.positions
+            ),
+            "out": attn_out,
+            "out_scale": attn_out_scale.view(torch.float8_e8m0fnu),
+        }
+    elif cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
     else:
@@ -611,7 +640,7 @@ def _attend_block(
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query,
+                **kwargs,
             )
     else:
         output = attend(
@@ -624,10 +653,13 @@ def _attend_block(
             second_indptr,
             self.attn_sink,
             self.softmax_scale,
-            out=flat_query,
+            **kwargs,
         )
         # Preserve the prior ring until every query has consumed its prefix.
         cache.write_window(self.spec.layer_id, window_kv, step)
+    if fused:
+        # AITER wrote both caller-owned planes; neither may be rebound on replay.
+        return
     flat_out = attn_out.flatten(0, 1)
     # `out=` is a request, not a guarantee: these kernels are shared with
     # V4 and may answer in a buffer of their own, and the decode pair is
@@ -643,14 +675,35 @@ def _forward(
     self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
 ):
     """`Attention.forward` with its attention half inside a capture break."""
-    attn_out = _attn_out_buffer(self, hidden)
+    fused = self._use_fused_attention(hidden, cache, rope)
+    scale_view_kwargs = {}
+    if fused:
+        leading_shape = (
+            hidden.shape[:-1]
+            if queries is None
+            else torch.Size((*hidden.shape[:-2], queries.rows.numel()))
+        )
+        group_dim = 8 * self.head_dim
+        attn_out = torch.empty(
+            (leading_shape.numel(), self.groups, group_dim),
+            dtype=FP8_DTYPE,
+            device=hidden.device,
+        )
+        attn_out_scale = torch.empty(
+            (leading_shape.numel(), self.groups, group_dim // 32),
+            dtype=torch.float8_e8m0fnu,
+            device=hidden.device,
+        )
+        # E8M0 output scales obey the same weak-ref restriction as input scales.
+        scale_view_kwargs["attn_out_scale"] = attn_out_scale.view(torch.uint8)
+    else:
+        attn_out = _attn_out_buffer(self, hidden)
     # The break weak-refs every argument through a stable-ABI op that refuses
     # float8_e8m0fnu ("Not yet supported ScalarType 44"), the MX scale the
     # fused MHC quant hands QKV. The scale crosses as a uint8 view of the same
     # bytes, so the weak ref still points at the caller's buffer on replay.
-    scale_view_kwargs = {}
     if hidden_scale is not None and hidden_scale.dtype == torch.float8_e8m0fnu:
-        scale_view_kwargs = {"hidden_scale_dtype": hidden_scale.dtype}
+        scale_view_kwargs["hidden_scale_dtype"] = hidden_scale.dtype
         hidden_scale = hidden_scale.view(torch.uint8)
     type(self)._atom_v41_attend_block(
         self,
@@ -664,6 +717,10 @@ def _forward(
         hidden_fp8,
         **scale_view_kwargs,
     )
+    if fused:
+        return self._project_quantized_out(
+            attn_out, attn_out_scale, leading_shape, hidden.dtype
+        )
     return self._project_out(
         attn_out,
         rope,
