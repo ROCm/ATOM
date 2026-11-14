@@ -4189,9 +4189,10 @@ class Scheduler:
             seq.routed_forwarded_end = min(
                 seq.routed_forwarded_end, seq.routed_expert_rows
             )
-            # The in-flight patch is dropped (it is no longer running); the
-            # resumed forward owes these positions afresh.
+            # The in-flight and held patches are dropped (it is no longer
+            # running); the resumed forward owes these positions afresh.
             seq.routed_owed_from = None
+            seq.routed_held_from = None
         # This free runs no `request_finished`; drop any stall-escaped save
         # tracker now so the connector's save loop cannot later read these
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
@@ -4343,17 +4344,20 @@ class Scheduler:
         """Set each running request's ``routed_owed_from`` after this output.
 
         ``batch`` was scheduled before the forward whose output this is, and
-        that output carries every earlier step's routes -- unless ``batch`` is
-        an output-less middle chunk: its forward skips the runner's
-        postprocess and holds them, with its own, for the next output. Either
-        way ``batch``'s own routes are still owed. Under DP a dummy step's
-        output (``batch=None``) carries them all.
+        that output carries the previous copy's routes. ``batch``'s own routes
+        are still owed. An output-less middle chunk queues no copy: its rows
+        stay on the device (``routed_held_from``) and ride the next step that
+        does -- any step with output, a DP dummy (``batch=None``) included --
+        so they are owed until the output after that one.
         """
         if batch is None or batch.produces_output():
+            # This step's copy took every held row: they are owed with it.
             for seq in self.running:
-                seq.routed_owed_from = None
+                seq.routed_owed_from = seq.routed_held_from
+                seq.routed_held_from = None
         if batch is None:
             return
+        holds = not batch.produces_output()
         firsts = (
             np.asarray(batch.context_lens, dtype=np.int64)
             - np.asarray(batch.num_scheduled_tokens, dtype=np.int64)
@@ -4370,6 +4374,9 @@ class Scheduler:
             # that only widens what an early finish may leave out.
             owed = seq.routed_owed_from
             seq.routed_owed_from = first if owed is None else min(owed, first)
+            if holds:
+                held = seq.routed_held_from
+                seq.routed_held_from = first if held is None else min(held, first)
 
     def postprocess(
         self,
@@ -5023,15 +5030,23 @@ class Scheduler:
         if self._return_routed_experts:
             # Routes cover every position but the last token's, which never ran.
             keep = int(num_tokens) - 1
+            # Rows lost are measured against what was forwarded. An abort
+            # between prefill chunks leaves the prompt's tail never run, so
+            # only positions before `routed_forwarded_end` are expected; it is
+            # advanced by prefill steps alone, so it bounds nothing past the
+            # prompt.
+            expected = keep
+            if seq.routed_forwarded_end < seq.num_prompt_tokens:
+                expected = min(keep, seq.routed_forwarded_end)
             # An early finish (abort, structured-output or logprob error) can
             # land while a scheduled forward still owes the request routes; it
-            # returns what arrived. Rows short of `keep` with nothing owed
+            # returns what arrived. Rows short of `expected` with nothing owed
             # before it are rows lost.
             owed = seq.routed_owed_from
-            if seq.routed_expert_rows < keep and (owed is None or owed >= keep):
+            if seq.routed_expert_rows < expected and (owed is None or owed >= expected):
                 raise RuntimeError(
                     f"routed experts: request {seq.id} finished ({reason}) "
-                    f"with {seq.routed_expert_rows} of {keep} rows"
+                    f"with {seq.routed_expert_rows} of {expected} rows"
                 )
             seq.finish_routed_experts(keep)
         seq.multimodal_data = None

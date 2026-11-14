@@ -311,6 +311,12 @@ class tokenIDProcessor:
         gpu_routed_experts: RoutedExpertsPatch | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
+        # Held middle-chunk routes (older) first: `data_ready` follows their
+        # forwards, so this copy_done covers them with no extra wait.
+        gpu_patches = self._held_routed_experts
+        self._held_routed_experts = []
+        if gpu_routed_experts is not None:
+            gpu_patches.append(gpu_routed_experts)
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -319,47 +325,29 @@ class tokenIDProcessor:
                 if gpu_logprobs is not None
                 else None
             )
-            cpu_routes = (
-                gpu_routed_experts._replace(
-                    rows=gpu_routed_experts.rows.to("cpu", non_blocking=True)
-                )
-                if gpu_routed_experts is not None
-                else None
-            )
+            cpu_routes = [
+                patch._replace(rows=patch.rows.to("cpu", non_blocking=True))
+                for patch in gpu_patches
+            ]
             copy_done.record(self.async_copy_stream)
         # The sampled ids, logprobs and routes are fresh every step; the entry
         # holds them until recv_async_output has waited on copy_done.
         sources = [gpu_tensor, gpu_logprobs]
-        if gpu_routed_experts is not None:
-            sources.append(gpu_routed_experts.rows)
+        sources.extend(patch.rows for patch in gpu_patches)
         cpu_tensor_handle.append((cpu_tensor, copy_done, sources))
         self.logprobs_cpu.append(cpu_logprobs)
-        self.routed_experts_cpu.append([] if cpu_routes is None else [cpu_routes])
+        self.routed_experts_cpu.append(cpu_routes)
 
     def add_held_routed_experts(self, gpu_routed_experts: RoutedExpertsPatch) -> None:
-        """Carry an output-less forward's routes on the pending token copy.
+        """Keep an output-less forward's routes on the device for the next copy.
 
-        A pure middle prefill chunk queues no copy of its own, so its rows join
-        the entry the next ``prepare_sampled_ids`` receives, behind that
-        entry's own (older) step. Before any output there is no entry; a
-        routes-only one stands in, which that receive reads with no previous
-        batch and so no tokens.
+        A pure middle prefill chunk queues no copy of its own. Its rows ride
+        the next ``send_to_cpu_async``, whose ``data_ready`` already orders
+        after this forward, so they arrive one output later than its own step
+        would (``Scheduler._record_routes_owed`` counts them owed until then)
+        and no pending entry waits on this forward.
         """
-        if not self.token_ids_cpu:
-            self.token_ids_cpu.append(
-                (torch.empty(0, dtype=torch.int32), torch.cuda.Event(), [])
-            )
-            self.logprobs_cpu.append(None)
-            self.routed_experts_cpu.append([])
-        _, copy_done, sources = self.token_ids_cpu[-1]
-        stream = self.async_copy_stream
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            rows = gpu_routed_experts.rows.to("cpu", non_blocking=True)
-            # Re-recorded behind this copy, so the receive's one wait covers it.
-            copy_done.record(stream)
-        sources.append(gpu_routed_experts.rows)
-        self.routed_experts_cpu[-1].append(gpu_routed_experts._replace(rows=rows))
+        self._held_routed_experts.append(gpu_routed_experts)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
@@ -422,6 +410,7 @@ class tokenIDProcessor:
         self.token_ids_cpu: list[tuple] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
         self.routed_experts_cpu: list[list[RoutedExpertsPatch]] = []
+        self._held_routed_experts: list[RoutedExpertsPatch] = []
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None

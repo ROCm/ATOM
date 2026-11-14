@@ -514,44 +514,78 @@ def test_routes_ride_the_token_copy_and_its_wait(cpu_processor):
     assert processor.recv_routed_experts() is None
 
 
-def test_middle_chunk_routes_join_the_pending_entry_behind_its_own(cpu_processor):
-    """An output-less middle chunk queues no copy: its rows join the pending
-    entry after that entry's own (older) step, and the entry's copy_done is
-    re-recorded so the receive's one wait covers both."""
+def test_middle_chunk_routes_ride_the_next_copy_not_the_pending_one(cpu_processor):
+    """An output-less middle chunk queues no copy and touches no pending entry
+    (whose copy_done would then wait on the chunk's whole forward). Its rows
+    ride the next send, ahead of that step's own, under that send's one
+    copy_done."""
     processor = cpu_processor
-    copy_done = mock.Mock()
+    pending_done = mock.Mock()
     processor.send_to_cpu_async(
         _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
         processor.token_ids_cpu,
         mock.Mock(),
-        copy_done,
+        pending_done,
         gpu_routed_experts=_gpu_patch(7, 0, [1, 1]),
     )
     processor.add_held_routed_experts(_gpu_patch(7, 2, [2, 2]))
-    assert copy_done.record.call_count == 2
+    processor.add_held_routed_experts(_gpu_patch(7, 4, [3]))
+    assert pending_done.record.call_count == 1
     assert len(processor.token_ids_cpu) == 1
 
     processor.recv_async_output(processor.token_ids_cpu)
+    assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [1, 1]
+
+    held = _gpu_patch(7, 4, [3])
+    refs = [weakref.ref(held.rows)]
+    processor._held_routed_experts[-1] = held
+    del held
+    next_done = mock.Mock()
+    seen = _record_alive_at(next_done, refs)
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([4], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        next_done,
+        gpu_routed_experts=_gpu_patch(8, 0, [9]),
+    )
+    assert processor._held_routed_experts == []
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert seen == [[True]]
+    assert refs[0]() is None
     got = processor.recv_routed_experts()
-    assert got.starts.tolist() == [0, 2]
-    assert got.rows[:, 0, 0].tolist() == [1, 1, 2, 2]
+    assert got.req_ids.tolist() == [7, 7, 8]
+    assert got.starts.tolist() == [2, 4, 0]
+    assert got.rows[:, 0, 0].tolist() == [2, 2, 3, 9]
 
 
-def test_middle_chunk_before_any_output_gets_a_routes_only_entry(cpu_processor):
-    """Before the first output no entry is pending; the next receive reads the
-    routes-only one, with no tokens."""
+def test_middle_chunk_before_any_output_waits_for_the_first_copy(cpu_processor):
+    """Before the first output no entry is pending, and none is made up: the
+    rows wait on the device for the first send."""
     processor = cpu_processor
     processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
-    processor.add_held_routed_experts(_gpu_patch(9, 1, [5]))
-    assert len(processor.token_ids_cpu) == 1
+    assert processor.token_ids_cpu == []
     assert processor.recv_async_output(processor.token_ids_cpu).numel() == 0
-    assert processor.recv_logprobs() is None
-    assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [4, 5]
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        mock.Mock(),
+    )
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [4]
 
 
-def test_clean_drops_pending_routes(cpu_processor):
+def test_clean_drops_held_routes(cpu_processor):
     """Sleep's `clean()` drops the routes with the batch they belong to."""
     processor = cpu_processor
     processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
     processor.clean()
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        mock.Mock(),
+    )
+    processor.recv_async_output(processor.token_ids_cpu)
     assert processor.recv_routed_experts() is None

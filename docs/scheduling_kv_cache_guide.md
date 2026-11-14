@@ -260,8 +260,9 @@ With `enable_return_routed_experts`, each request accumulates its MoE routes
   token order and copies them to the host on the async copy stream. The rows
   ride the next `ScheduledBatchOutput` as `routed_experts`, the same deferral as
   the tokens. A prefix-cache hit adds its `routed_prefix_ranges`, read from the
-  cached blocks; a pure middle prefill chunk's rows are held until the next
-  output.
+  cached blocks. A pure middle prefill chunk queues no copy: its rows stay on
+  the device and ride the next step's copy (any step with output, a DP dummy
+  included), so they arrive one output later than a step's own.
 - **Merge.** `postprocess` applies each segment to its request by id.
   Overlap overwrites; a segment starting past the rows held raises. Rows for a
   request that has left `running` are dropped: a finished request's extra row
@@ -270,9 +271,12 @@ With `enable_return_routed_experts`, each request accumulates its MoE routes
 - **Finish.** The routes are trimmed to `num_tokens - 1` rows and frozen.
   After each output `postprocess` records `routed_owed_from`, the first
   position a scheduled forward still owes routes for: the just-scheduled
-  batch's, plus any held middle chunks'. A request finishing early (abort,
+  batch's, plus any middle chunks' whose rows have not arrived
+  (`routed_held_from` until a copy takes them). A request finishing early (abort,
   structured-output or logprob error) may return fewer rows when the missing
   ones are owed; fewer rows with nothing owed before `num_tokens - 1` raises.
+  Mid-prefill the bound is `routed_forwarded_end` instead: an abort between
+  chunks returns the forwarded rows, since the prompt's tail never ran.
 
 ## Block manager
 

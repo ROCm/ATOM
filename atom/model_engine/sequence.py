@@ -509,6 +509,10 @@ class Sequence:
         # not yet received), or None. A request finishing early can be that
         # short; one finishing with nothing owed must hold every row.
         self.routed_owed_from: int | None = None
+        # First position of a pure middle chunk whose routes are still on the
+        # device, waiting for the next step's copy (`add_held_routed_experts`),
+        # or None. They stay owed one output past that step.
+        self.routed_held_from: int | None = None
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
