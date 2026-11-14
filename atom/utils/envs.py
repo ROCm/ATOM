@@ -663,8 +663,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # launches a layer; mono/hybrid.py ``wide``). Off by default.
     "ATOM_MONO_WIDE": lambda: os.getenv("ATOM_MONO_WIDE", "0") == "1",
     # auto: the least blocks (128 tokens each) per query row of the step's long requests (> 512 blocks) together
-    # that take the indexer-CP arm of a wide mono build (mono/policy.py ``IndexerCp``); unset: 4096 (measured
-    # break-even ~2K blocks at q_len 1, ~8K at q_len 4; the CP arm loses a little below it).
+    # that take the indexer-CP arm of a wide mono build (mono/policy.py ``IndexerCp``); unset: 1024 (task-mono-wide-lc
+    # results/F: the CP arm of the wide builds did not lose at any measured >= 840 blocks per query row).
     "ATOM_MONO_CP_MIN_BLOCKS": lambda: os.getenv("ATOM_MONO_CP_MIN_BLOCKS"),
     # The per-width path table over the defaults (mono/policy.py): "17-64:hybrid,48:production".
     "ATOM_MONO_WIDTHS": lambda: os.getenv("ATOM_MONO_WIDTHS"),

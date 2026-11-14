@@ -129,17 +129,17 @@ class WidthPolicy:
 # own CP: the index q projection is then full width on every rank). The kernel decides per step from the
 # contexts (``index_score.cp_gate``): a long request (> LONG_FROM_BLOCKS blocks) of a graph whose batch is
 # at least ``min_batch`` requests and whose long requests together hold at least ``min_blocks`` blocks.
-# min_batch: ATOM's ``ATOM_M3_INDEXER_CP_MIN_BATCH`` (rows // max_query_len; 16 for NVFP4 / FP4 index caches,
-# 1 for the others). min_blocks: a step takes the CP arm when its long requests hold >= min_blocks * q_len
-# blocks in all (q_len: query rows a request). Measured with the CP list on the scorer's tile queue (TP4 nvfp4,
-# 4 cards, front half a layer, CP off vs on, tables byte-equal, 64 / 48 / 32 rows, per-request blocks 0.5K-1.7K,
-# live requests padded): CP on wins at q1 from ~2K blocks (live 1: +0.1 us at 1K blocks; 2K -1.0; 4K -2.4; 8K -3.2;
-# 16K -11.3; 33K -30; 65K -61) and at q4 from ~8K (6K -0.1, 8K -2.7, 16K -10.2, 27K -22); the gate and the q
-# exchange cost +0.4..+0.5 us when CP has nothing to win. The break-even grows with q_len, so the default is per
-# query row: 4096 blocks = q1 from 4.1K blocks, q2 from 8.2K, q4 from 16.4K (each past the measured crossing),
-# q8 from 32.8K (8 requests of 215K hold 13.4K: never).
-DEFAULT_CP_MIN_BLOCKS = 4_096
-NVFP4_CP_MIN_BATCH = 16
+# min_batch: 1 here (a wide build may take CP from any batch; ATOM's ``ATOM_M3_INDEXER_CP_MIN_BATCH`` still
+# overrides it, and is the production chain's own 16). min_blocks: a step takes the CP arm when its long
+# requests hold >= min_blocks * q_len blocks in all (q_len: query rows a request).
+# Measured (task-mono-wide-lc results/F/gate_table.txt: cp_front, TP4 nvfp4, 4 cards, the wide front half a layer,
+# CP forced on vs off, selection tables and outputs byte-equal incl. a ties pass, live requests padded with
+# --pad in REQUESTS, 32 / 48 / 64 rows, q4 and q8, 98K-491K contexts): CP on never lost above 840 blocks per query
+# row (q4 64 rows 6.1K total blocks -1.4 us, 8.2K -3.7, 12.3K -5.5, 16.4K -10.1; 48 rows 6.1K -1.0, 12.3K -4.3, 20.2K
+# -13.0; 32 rows 6.1K -6.3; q8 64 rows 8.2K -1.4, 13.4K -7.1, 30.7K -21.2; q8 32 rows 6.7K -1.2). So the break-even
+# per query row (~1K blocks, q1: ``+0.1 us`` at 1K blocks) is the default: 1024 blocks per query row.
+DEFAULT_CP_MIN_BLOCKS = 1_024
+MONO_CP_MIN_BATCH = 1
 
 
 class IndexerCp(NamedTuple):
@@ -157,9 +157,7 @@ class IndexerCp(NamedTuple):
         min_batch: int | None = None,
         min_blocks: str | int | None = None,
     ) -> IndexerCp:
-        batch = (
-            min_batch if min_batch is not None else (NVFP4_CP_MIN_BATCH if nvfp4 else 1)
-        )
+        batch = min_batch if min_batch is not None else MONO_CP_MIN_BATCH
         blocks = DEFAULT_CP_MIN_BLOCKS if min_blocks in (None, "") else int(min_blocks)
         if batch < 1 or blocks < 0:
             raise ValueError(

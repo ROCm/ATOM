@@ -94,11 +94,9 @@ def test_indexer_cp_is_off_without_the_flag_and_changes_no_build():
         assert cp.refuses(64, 16) is None
 
 
-def test_indexer_cp_defaults_follow_atoms_batch_threshold_by_index_cache():
+def test_indexer_cp_default_batch_is_one_for_every_index_cache():
     nv, other = IndexerCp.parse(True, True), IndexerCp.parse(True, False)
-    assert (
-        nv.min_batch == 16 and other.min_batch == 1
-    )  # ATOM_M3_INDEXER_CP_MIN_BATCH unset
+    assert nv.min_batch == other.min_batch == 1  # ATOM_M3_INDEXER_CP_MIN_BATCH unset
     assert nv.min_blocks == other.min_blocks == DEFAULT_CP_MIN_BLOCKS
     assert IndexerCp.parse(True, True, 4, "7000") == IndexerCp(True, 4, 7000)
     assert IndexerCp.parse(True, True, None, "0").min_blocks == 0  # every long request
@@ -108,7 +106,7 @@ def test_indexer_cp_options_are_for_the_wide_builds_a_graph_can_fill():
     cp = IndexerCp.parse(True, True)
     assert cp.options(32) == {
         "index_cp": True,
-        "cp_min_batch": 16,
+        "cp_min_batch": 1,
         "cp_min_blocks": DEFAULT_CP_MIN_BLOCKS,
     }
     assert (
