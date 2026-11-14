@@ -706,6 +706,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # interior states instead of cutting prefill chunks onto them. PAGE path
     # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
+    # gfx1250 IOD-local A8K4V8 KV cache (aiter.ops.kv_iod): each attention layer's K / V slices re-laid so every
+    # block's granules are homed on one IOD (the block id's parity), sequences placed in CHUNK-block chunks that
+    # alternate IODs, and the decode's KV segments run on the IOD their chunks are homed on (aiter kv_loc MODE:
+    # 2 that schedule, 1 stock workgroup order, 3 the other IOD).
+    "ATOM_KV_IOD": lambda: os.getenv("ATOM_KV_IOD", "0") == "1",
+    "ATOM_KV_IOD_CHUNK": lambda: int(os.getenv("ATOM_KV_IOD_CHUNK", "16")),
+    "ATOM_KV_IOD_MODE": lambda: int(os.getenv("ATOM_KV_IOD_MODE", "2")),
+    # gfx1250: an IOD-placed copy of the LM head weight (aiter.ops.lmhead_iod; one more copy of the weight in VRAM),
+    # read by aiter's a16w16 GEMM at 128 x 128 tiles when AITER_LMHEAD_LOC=2.
+    "ATOM_LMHEAD_IOD": lambda: os.getenv("ATOM_LMHEAD_IOD", "0") == "1",
     # A PAGE checkpoint's units go back to the KV pool zeroed: their bytes are a
     # state image, and the attention tail tile reads unwritten KV positions.
     "ATOM_ZERO_RELEASED_CHECKPOINT_UNITS": lambda: (

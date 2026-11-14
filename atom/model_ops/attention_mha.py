@@ -57,6 +57,9 @@ def _gate_kwarg(gate):
 
 
 class PagedAttentionImpl(nn.Module):
+    # ATOM_KV_IOD: this layer's placed KV (atom.model_ops.attentions.kv_iod.KvIodLayerHandle), bound with the cache
+    kv_iod = None
+
     """
     Attention paged implementation
     """
@@ -707,7 +710,16 @@ class PagedAttentionImpl(nn.Module):
                 v_cache,
                 fwd_ctx.attn_metadata.slot_mapping,
                 kv_scale=self.kv_scale_float,
+                kv_loc=(
+                    self.kv_iod.write_loc(v_cache.dtype)
+                    if self.kv_iod is not None
+                    else None
+                ),
             )
+            if fused is None and self.kv_iod is not None:
+                raise RuntimeError(
+                    "ATOM_KV_IOD: the fused norm + MRoPE + cache write did not apply"
+                )
             if fused is not None:
                 self.per_token_quant = False
                 self._cache_format = "SHUFFLE"
@@ -722,6 +734,10 @@ class PagedAttentionImpl(nn.Module):
                 )
             q, k, v = self._gemma_norm_rope(
                 q_raw, k_raw, v_raw, position, one_launch=True
+            )
+        elif self.kv_iod is not None:
+            raise RuntimeError(
+                "ATOM_KV_IOD writes the cache through the fused Gemma norm + MRoPE kernel only"
             )
         else:
             # as the generic path: the module's rotary, then any norms
@@ -951,6 +967,10 @@ class PagedAttentionImpl(nn.Module):
                 and unified_attention_takes_split_reduce_oneshot()
             ):
                 split["split_reduce_oneshot"] = True
+        block_table, loc = attn_metadata.block_tables, {}
+        if self.kv_iod is not None:
+            block_table, kv_loc = self.kv_iod.attn(fwd_ctx, block_table, v_cache.dtype)
+            loc["kv_loc"] = kv_loc
         unified_attention(
             q,
             k_cache,
@@ -964,7 +984,8 @@ class PagedAttentionImpl(nn.Module):
             causal=True,
             alibi_slopes=None,
             window_size=sliding_window,
-            block_table=attn_metadata.block_tables,
+            block_table=block_table,
+            **loc,
             softcap=0,
             q_descale=None,
             k_descale=None if self.k4v8 else self.kv_scale,
@@ -1444,6 +1465,14 @@ class PagedAttentionImpl(nn.Module):
             q_attn, o_attn = q[:n_tok], o[:n_tok]
             if out is None:
                 o[n_tok:].zero_()
+        block_table, loc = attn_metadata.block_tables, {}
+        if self.kv_iod is not None:
+            if not (envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached):
+                raise RuntimeError(
+                    "ATOM_KV_IOD prefill reads the paged cache (ATOM_USE_UNIFIED_ATTN=1)"
+                )
+            block_table, kv_loc = self.kv_iod.attn(fwd_ctx, block_table, v_cache.dtype)
+            loc["kv_loc"] = kv_loc
         unified_attention(
             q_attn,
             k_for_attn,
@@ -1459,7 +1488,8 @@ class PagedAttentionImpl(nn.Module):
             causal=True,
             alibi_slopes=None,
             window_size=sliding_window,
-            block_table=attn_metadata.block_tables,
+            block_table=block_table,
+            **loc,
             softcap=0,
             q_descale=None,
             k_descale=None if self.k4v8 else self.kv_scale,

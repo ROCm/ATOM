@@ -363,6 +363,7 @@ def try_fused_qk_norm_mrope_cache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_scale: float | None = None,
+    kv_loc: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """The Q/K Gemma RMSNorm, the Qwen3.5 MRoPE and the K/V write into the SHUFFLE
     KV cache in one aiter Gluon kernel on gfx1250.
@@ -418,6 +419,8 @@ def try_fused_qk_norm_mrope_cache(
         v_cache,
         slot_mapping,
         **({"kv_scale": kv_scale} if fp8 else {}),
+        # ATOM_KV_IOD: (k_base, v_base, x_table) of the layer's placed regions
+        **({"kv_loc": kv_loc} if kv_loc is not None else {}),
     )
 
 

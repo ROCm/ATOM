@@ -706,6 +706,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         for pool, region in zip(pools, regions):
             pool.allocate(blocks, self.model_runner.device, buf=region)
         self.num_blocks = blocks * self.block_ratio
+        # ATOM_KV_IOD: each layer's K / V slices re-laid IOD-local (probed here, before any request)
+        self.kv_iod = None
+        if envs.ATOM_KV_IOD and pools:
+            from atom.model_ops.attentions.kv_iod import KvIodPools
+
+            self.kv_iod = KvIodPools(
+                pools,
+                int(self.model_runner.config.num_kvcache_blocks),
+                self.model_runner.device,
+            )
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Allocate this model's MHA pools inside the runner's paged region.
@@ -790,6 +800,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
+        kv_iod = getattr(self, "kv_iod", None)
+        if kv_iod is not None:
+            # the placed layer this module reads and writes (aiter kv_loc)
+            module.impl.kv_iod = kv_iod.handle(
+                pool, row, getattr(self, "_kv_iod_group", "target")
+            )
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=k_cache,

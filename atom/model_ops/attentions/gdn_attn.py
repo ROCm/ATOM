@@ -1971,6 +1971,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return regions
 
     def _page_unit_bases(self, unit_ids):
+        kv_iod = getattr(self, "kv_iod", None)
+        if kv_iod is not None:
+            # ATOM_KV_IOD: unit u is block code u's placed granules (the same bytes no live KV block holds)
+            return kv_iod.unit_segments(kv_iod.region_keys(), unit_ids)[0]
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
             mha_page_unit_bases,
         )
@@ -1978,6 +1982,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return mha_page_unit_bases(self._page_unit_regions(), unit_ids)
 
     def _page_unit_stream_sizes(self, units: int):
+        kv_iod = getattr(self, "kv_iod", None)
+        if kv_iod is not None:
+            sizes = kv_iod.unit_segments(kv_iod.region_keys(), [0])[1]
+            return np.tile(sizes, units)
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
             mha_page_unit_stream_sizes,
         )
@@ -1993,6 +2001,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         ``image_bytes``.
         """
 
+        if getattr(self, "kv_iod", None) is not None:
+            raise NotImplementedError("ATOM_KV_IOD: PAGE unit views for a state tier are not placed")
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
             mha_page_unit_views,
         )
@@ -2007,6 +2017,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
+        if getattr(self, "kv_iod", None) is not None:
+            raise NotImplementedError("ATOM_KV_IOD: PAGE unit segments for a state tier are not placed")
 
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
             mha_page_unit_segments,

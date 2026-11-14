@@ -599,7 +599,7 @@ class BlockManager:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
 
-    def _fresh_block(self) -> int:
+    def _fresh_block(self, table=None, pos: int | None = None) -> int:
         """Take a block for content this step is about to compute.
 
         The raise is unreachable through `Scheduler` and the checkpoint cache
@@ -622,7 +622,15 @@ class BlockManager:
         """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
-        block_id = self.kv.pop()
+        parity = None
+        if envs.ATOM_KV_IOD and table is not None and pos is not None:
+            # IOD-local KV: block `pos` of a sequence on its chunk's IOD; a first block alternates
+            from atom.model_ops.attentions.kv_iod import preferred_parity
+
+            parity = preferred_parity(table, pos)
+            if parity is None:
+                self._kv_iod_salt = parity = 1 - getattr(self, "_kv_iod_salt", 1)
+        block_id = self.kv.pop(parity)
         self.kv.allocate(block_id)
         return block_id
 
@@ -665,7 +673,7 @@ class BlockManager:
             if self.kv.block(table[i]).hash == -1:
                 continue  # already-private fresh tail (or a prior disown)
             self.kv.free(table[i])
-            table[i] = self._fresh_block()
+            table[i] = self._fresh_block(table, i)
         return True
 
     def _checkpoint_has_room(
@@ -1585,7 +1593,9 @@ class BlockManager:
                 seq, joint_hash if joint_hash != -1 else hit_hash
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
-            seq.block_table.append(self._fresh_block())
+            seq.block_table.append(
+                self._fresh_block(seq.block_table, len(seq.block_table))
+            )
         seq.num_cached_tokens = num_cached_blocks * hbs
 
         # Per-request cache: claim this seq's slot indices from the
@@ -3347,7 +3357,7 @@ class BlockManager:
             # Decode-generated blocks: token not finalized yet (depends on
             # sampling / speculative verification), so we cannot compute a
             # correct hash here.  Just allocate the block without hashing.
-            block_table.append(self._fresh_block())
+            block_table.append(self._fresh_block(block_table, len(block_table)))
 
     def draft_writes_allocated(self, seq: Sequence) -> bool:
         """Whether `seq`'s blocks reach the end of this forward's draft round.

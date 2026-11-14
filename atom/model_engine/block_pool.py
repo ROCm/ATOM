@@ -308,8 +308,42 @@ class BlockPool:
                 return block_id
         return -1
 
-    def pop(self) -> int:
-        block_id = self._take_free()
+    def _take_free_parity(self, parity: int, tries: int = 64) -> int:
+        """A free block id of `parity` (ATOM_KV_IOD: the IOD its placed bytes are homed on), in the same preference
+        order as `_take_free` (vacant lowest id first, then cached / protected least recently freed), looking at
+        most `tries` candidates of each; -1 if none was found."""
+        skipped = []
+        found = -1
+        while self._vacant and len(skipped) < tries:
+            block_id = heappop(self._vacant)
+            if block_id in self._free and self.blocks[block_id].hash == -1:
+                if (block_id & 1) == parity:
+                    found = block_id
+                    break
+                skipped.append(block_id)
+        for block_id in skipped:
+            heappush(self._vacant, block_id)
+        if found >= 0:
+            self._free.discard(found)
+            return found
+        for container in (self._cached, self._protected):
+            for n, block_id in enumerate(container):
+                if n >= tries:
+                    break
+                if (
+                    (block_id & 1) == parity
+                    and block_id in self._free
+                    and self.blocks[block_id].hash != -1
+                ):
+                    del container[block_id]
+                    self._free.discard(block_id)
+                    return block_id
+        return -1
+
+    def pop(self, parity: int | None = None) -> int:
+        block_id = self._take_free_parity(parity) if parity is not None else -1
+        if block_id < 0:
+            block_id = self._take_free()
         if block_id < 0:
             raise AssertionError("No free blocks available")
         return block_id

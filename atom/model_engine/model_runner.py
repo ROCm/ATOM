@@ -997,6 +997,8 @@ class ModelRunner:
             # NOTE: aux-hidden-state capture is armed AFTER the optional TBO wrap
             # below, so the drafter's capture hook lands on the object whose
             # forward returns the final (concatenated) output. See arm_aux_capture.
+        if envs.ATOM_LMHEAD_IOD:
+            self._place_lm_heads_iod()
 
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
@@ -1088,6 +1090,34 @@ class ModelRunner:
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()
+
+    def _place_lm_heads_iod(self):
+        """ATOM_LMHEAD_IOD: an IOD-placed copy of each distinct LM-head weight (aiter.ops.lmhead_iod), which aiter's
+        gfx1250 a16w16 GEMM reads at 128 x 128 tiles under AITER_LMHEAD_LOC (2: each workgroup on a weight tile
+        homed on its own IOD). Placed right after loading: before the KV budget is measured and before any capture."""
+        from aiter.ops import lmhead_iod
+
+        from atom.model_ops.embed_head import ParallelLMHead
+
+        models = [self.model] + ([self.drafter.model] if hasattr(self, "drafter") else [])
+        done = set()
+        for model in models:
+            for module in model.modules():
+                if isinstance(module, ParallelLMHead):
+                    w = module.weight
+                    key = (w.data_ptr(), tuple(w.shape))
+                    if key in done:
+                        continue
+                    done.add(key)
+                    try:
+                        pw = lmhead_iod.place(w.data)
+                    except (AssertionError, RuntimeError) as e:
+                        logger.warning("ATOM_LMHEAD_IOD: %s %s not placed: %s", type(module).__name__, tuple(w.shape), e)
+                        continue
+                    logger.info(
+                        "ATOM_LMHEAD_IOD: placed LM head %s (label_xor %d, %d tiles a domain), AITER_LMHEAD_LOC=%s",
+                        tuple(w.shape), pw.label_xor, pw.half, os.environ.get("AITER_LMHEAD_LOC", "0"),
+                    )
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -2205,6 +2235,17 @@ class ModelRunner:
         # BlockManager. Ship the whole per-class entry table across instead of
         # a hand-picked field per architecture; consumers over there look up
         # the class they declared.
+        if envs.ATOM_KV_IOD:
+            # IOD-local placement: the scheduler's block ids are the placed codes every layer holds, a little under
+            # the entries the pool is allocated at (allocate_kv_cache backs plan.paged_entries).
+            from atom.model_ops.attentions.kv_iod import capacity
+
+            codes = capacity(num_kvcache_blocks)
+            logger.info(
+                "ATOM_KV_IOD: %d block codes of %d pool entries (%.2f%%)",
+                codes, num_kvcache_blocks, 100.0 * codes / max(num_kvcache_blocks, 1),
+            )
+            num_kvcache_blocks = codes
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
@@ -2314,7 +2355,10 @@ class ModelRunner:
         # What comes back is only what a region cannot carry: scalars like
         # `aligned_index_dim` and the compact layer maps, setattr'd here so
         # their readers find them where they always have.
-        pool = self._back_paged_pools(num_kvcache_blocks)
+        # ATOM_KV_IOD: the pool at its planned entries; num_kvcache_blocks counts the placed codes in it
+        pool = self._back_paged_pools(
+            self.pool_plan.paged_entries if envs.ATOM_KV_IOD else num_kvcache_blocks
+        )
         if pool.numel():
             self.kv_cache = pool
 
@@ -2350,6 +2394,10 @@ class ModelRunner:
         kv_cache_data = {}
         for model_name, model in models_to_bind:
             logger.info("Binding KV cache for the %s model", model_name)
+            # ATOM_KV_IOD: a pass resolves only its own model's layers' block tables
+            for b in (self.attn_metadata_builder, getattr(self, "draft_kv_builder", None)):
+                if b is not None:
+                    b._kv_iod_group = model_name
             for module in model.modules():
                 # A draft that owns an independent KV pool binds through its
                 # sibling builder first; for unrecognized modules it returns
@@ -2387,7 +2435,13 @@ class ModelRunner:
             # scheduler's block count. The builders cannot answer this: each
             # counts in its own page, and the transfer protocol addresses
             # ``req.block_ids``, which are the scheduler's.
-            transfer_tensors.set_block_count(num_kvcache_blocks)
+            if envs.ATOM_KV_IOD:
+                # Placed blocks are not `base + id * unit` rows, so no stock-unit transfer can move them; the
+                # regions stay registered for the state tier's bookkeeping only.
+                if config.kv_transfer_config:
+                    raise RuntimeError("ATOM_KV_IOD does not support KV transfer connectors")
+            else:
+                transfer_tensors.set_block_count(num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as

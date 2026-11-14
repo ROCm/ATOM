@@ -336,6 +336,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         pools = getattr(self, "kv_pools", None)
         if not pools or not blocks:
             return
+        kv_iod = getattr(self, "kv_iod", None)
+        if kv_iod is not None:
+            # ATOM_KV_IOD: the blocks' placed granules in every layer
+            kv_iod.zero_blocks(blocks)
+            return
         if envs.ATOM_FUSED_ZERO_FILL:
             views = [
                 view
