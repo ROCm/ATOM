@@ -77,8 +77,17 @@ def test_online_requantized_source_drops_the_native_layout(linear_modules):
     assert module.weight_scale.shape == (256, 4)
 
 
+def _skip_without_ocp_fp8():
+    """No native MXFP8 layout where the platform FP8 is E4M3FNUZ."""
+    from aiter import dtypes
+
+    if dtypes.fp8 != torch.float8_e4m3fn:
+        pytest.skip("the platform FP8 is E4M3FNUZ: no native MXFP8 layout")
+
+
 def test_online_excluded_source_keeps_the_native_layout(linear_modules):
     linear, group = linear_modules
+    _skip_without_ocp_fp8()
     group.world_size = 1
     module = linear.ColumnParallelLinear(
         128,
@@ -92,6 +101,7 @@ def test_online_excluded_source_keeps_the_native_layout(linear_modules):
 
 def test_online_requantized_32x32_source_still_rejected(linear_modules):
     linear, group = linear_modules
+    _skip_without_ocp_fp8()
     group.world_size = 1
     with pytest.raises(ValueError, match="Native group32 A8"):
         linear.ColumnParallelLinear(
@@ -119,18 +129,26 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         module.weight_loader(module.weight, weight)
         module.weight_loader(module.weight_scale, scales)
         module.process_weights_after_loading()
+        shard = weight.chunk(4, axis)[rank].contiguous()
+        scale_shard = scales.chunk(4, axis)[rank]
+        if linear.native_group32_runs_bf16():
+            # Dequantized to BF16 at load, scales folded in.
+            block_scale = scale_shard.float().repeat_interleave(32, 0)
+            expected = shard.float() * block_scale.repeat_interleave(32, 1)
+            assert module.weight.dtype == torch.bfloat16
+            assert torch.equal(module.weight.float(), expected.bfloat16().float())
+            assert module.weight_scale is None
+            continue
         # The shard's bytes, (16, 16)-shuffled where the preshuffled group32
         # GEMM reads it (gfx950); the compact scales stay as loaded.
         preshuffled = linear.weight_is_stored_preshuffled(
             module.quant_type, module.params_dtype, native_group_rows=32
         )
-        shard = weight.chunk(4, axis)[rank].contiguous()
         if preshuffled:
             shard = shuffle_weight(shard, layout=(16, 16))
         assert torch.equal(module.weight.view(torch.uint8), shard.view(torch.uint8))
         assert torch.equal(
-            module.weight_scale.view(torch.uint8),
-            scales.chunk(4, axis)[rank].view(torch.uint8),
+            module.weight_scale.view(torch.uint8), scale_shard.view(torch.uint8)
         )
         assert getattr(module.weight, "is_shuffled", False) == preshuffled
 
@@ -187,12 +205,8 @@ def test_column_row_views_use_source_scale_groups(linear_modules):
         module.make_row_view(16, 64)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
-    from . import oracle_kernels as oracle
-
-    linear, group = linear_modules
-    group.world_size = 1
+def _native_dispatch_case(linear, monkeypatch):
+    """A 288 -> 96 native 32x32 FP8 linear, a BF16 input and its FP32 weight."""
     # FP32 output is the row-major group32 GEMM's; the preshuffled one emits BF16.
     monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "0")
     torch.manual_seed(991)
@@ -203,11 +217,23 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
     module.weight_loader(module.weight_scale, scale)
     module.process_weights_after_loading()
     x = torch.randn(5, 288, dtype=torch.bfloat16)
-    q, s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
-    activation = (q.float().reshape(5, 9, 32) * s.float()[:, :, None]).reshape(5, 288)
     full_weight = weight.float() * scale.float().repeat_interleave(
         32, 0
     ).repeat_interleave(32, 1)
+    return module, x, full_weight
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
+    from . import oracle_kernels as oracle
+
+    linear, group = linear_modules
+    if linear.native_group32_runs_bf16():
+        pytest.skip("no group32 FP8 GEMM here; see test_native_linear_bf16_fallback")
+    group.world_size = 1
+    module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
+    q, s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    activation = (q.float().reshape(5, 9, 32) * s.float()[:, :, None]).reshape(5, 288)
     expected = torch.nn.functional.linear(activation, full_weight)
     # Bound tied to the output magnitude; see test_quant_gpu for why the
     # native microscaling MFMA cannot be held to a per-element rtol.
@@ -216,6 +242,28 @@ def test_native_linear_dispatch_keeps_a8_qat(linear_modules, monkeypatch):
         expected,
         rtol=3e-5,
         atol=5e-5 * expected.abs().max().item(),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_native_linear_bf16_fallback(linear_modules, monkeypatch):
+    """Exact BF16 weight, BF16 input without the A8 rounding."""
+    linear, group = linear_modules
+    if not linear.native_group32_runs_bf16():
+        pytest.skip(
+            "group32 FP8 GEMM here; see test_native_linear_dispatch_keeps_a8_qat"
+        )
+    group.world_size = 1
+    module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
+    assert module.weight_scale is None
+    assert torch.equal(module.weight.float().cpu(), full_weight)
+    expected = torch.nn.functional.linear(x.float(), full_weight)
+    # BF16 operands, so only the GEMM's own rounding is left: a few BF16 ulps.
+    torch.testing.assert_close(
+        module(x.cuda(), otype=torch.float32).cpu(),
+        expected,
+        rtol=2**-7,
+        atol=1e-3 * expected.abs().max().item(),
     )
 
 

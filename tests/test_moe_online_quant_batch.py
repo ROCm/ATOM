@@ -218,6 +218,8 @@ def test_batched_path_matches_expertwise_fp8_targets(monkeypatch, target_quant_t
 
     layer = SimpleNamespace(
         local_num_experts=experts,
+        intermediate_size_per_partition=intermediate,
+        hidden_size=hidden,
         w13_weight=SimpleNamespace(data=target_w13),
         w2_weight=SimpleNamespace(data=target_w2),
         w13_weight_scale=SimpleNamespace(data=target_w13_scale),
@@ -353,6 +355,8 @@ def test_batched_path_preserves_target_padding(monkeypatch):
     )
     layer = SimpleNamespace(
         local_num_experts=experts,
+        intermediate_size_per_partition=intermediate,
+        hidden_size=hidden,
         w13_weight=SimpleNamespace(data=target_w13),
         w2_weight=SimpleNamespace(data=target_w2),
         w13_weight_scale=SimpleNamespace(data=target_w13_scale),

@@ -259,6 +259,31 @@ def fuses_mxfp8_shared_into_mxfp4(
     )
 
 
+def fuses_ptpc_shared_into_online_ptpc(
+    quant_config, routed_prefix: str, shared: LayerQuantConfig, routed: LayerQuantConfig
+) -> bool:
+    """Whether a per-channel FP8 shared expert is fused into routed experts that
+    online quantization makes per-channel FP8 (V4.1 FP4PTPC): FusedMoE stages it
+    while loading and copies it into its slot after the online quant.
+    """
+    # Same-format routed experts fuse without staging; an unquantized source has
+    # no weight-scale params to stage the scales through.
+    if (
+        shared.quant_type != QuantType.per_Token
+        or routed.quant_type in (QuantType.per_Token, QuantType.No)
+        or not will_online_requant(
+            quant_config, routed_prefix, routed.quant_type, routed.quant_dtype
+        )
+    ):
+        return False
+    online = quant_config.get_layer_quant_config(routed_prefix, use_online_quant=True)
+    return (shared.quant_type, shared.quant_dtype, shared.is_dynamic) == (
+        online.quant_type,
+        online.quant_dtype,
+        online.is_dynamic,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Structured parsed config
 # ──────────────────────────────────────────────────────────────────────

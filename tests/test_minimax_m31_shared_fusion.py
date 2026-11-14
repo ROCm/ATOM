@@ -2,7 +2,8 @@
 """MiniMax-M3.1 Quark MXFP4 export: the MXFP8 shared expert fused into the MXFP4
 routed experts (ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4), one 129-expert / top-5 MoE.
 The shared expert is staged in MXFP8 while loading and re-quantized into its
-MXFP4 slot afterwards."""
+MXFP4 slot afterwards. With ``ptpc``, a per-channel FP8 shared expert is copied
+into routed experts that online quant makes per-channel FP8 (V4.1 FP4PTPC)."""
 
 import importlib
 from types import SimpleNamespace
@@ -36,22 +37,26 @@ def _param(*shape, dtype=torch.float32):
     return nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=False)
 
 
-def _fused_mxfp4_layer():
+def _fused_mxfp4_layer(ptpc=False, tp_size=1, tp_rank=0):
     """An MXFP4 FusedMoE with one fused shared slot, buffers as the target
-    lays them out (w13 halves padded), its shared expert staged in MXFP8."""
+    lays them out (w13 halves padded), its shared expert staged in MXFP8
+    (per-channel FP8 with ``ptpc``)."""
     layer = object.__new__(FusedMoE)
     nn.Module.__init__(layer)
+    layer.quant_method = None
+    layer._stream_online_quant = False
     layer.has_bias = False
     layer.prefix = layer.layer_name = "model.layers.3.block_sparse_moe.experts"
     layer.layer_quant_config = _spec(dtypes.fp4x2)
     layer.moe_parallel_config = SimpleNamespace(
-        tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
+        tp_size=tp_size, tp_rank=tp_rank, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
     )
     layer.expert_map = None
     layer.expert_layout = SimpleNamespace(
         routed_physical_per_rank=ROUTED,
         num_fused_shared_experts=SHARED,
         shared_is_routed=False,
+        uses_all2all_fusion=False,
     )
     layer.local_num_experts = ROUTED + SHARED
     e, half = ROUTED + SHARED, I_LOCAL + PAD
@@ -62,7 +67,7 @@ def _fused_mxfp4_layer():
     layer.w2_weight = _param(e, H, I_LOCAL // 2)
     layer.w2_weight_scale = _param(e, H, I_LOCAL // 32)
     layer.shared_mxfp8_into_mxfp4 = staging_mod.Mxfp8SharedIntoMxfp4(
-        layer, None, H, I_LOCAL
+        layer, None, H, I_LOCAL, ptpc=ptpc
     )
     return layer
 
@@ -200,6 +205,61 @@ def test_refuses_eplb_routed_shared_expert():
     layer.expert_layout.shared_is_routed = True
     with pytest.raises(NotImplementedError, match="EPLB"):
         staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL)
+
+
+@pytest.mark.parametrize("fnuz", [False, True])
+@pytest.mark.parametrize(("tp_size", "tp_rank"), [(1, 0), (2, 1)])
+def test_per_channel_fp8_shared_expert_is_copied_into_its_slot(fnuz, tp_size, tp_rank):
+    """FP4PTPC: once online quant made the routed experts per-channel FP8, this
+    rank's shard of the shared expert goes into its slot as it is (FNUZ bytes
+    and doubled scales where the routed experts are FNUZ); a w2 row keeps its
+    whole scale."""
+    layer = _fused_mxfp4_layer(ptpc=True, tp_size=tp_size, tp_rank=tp_rank)
+    torch.manual_seed(0)
+    inter = I_LOCAL * tp_size
+    w = {k: (torch.randn(*s) * 4).to(FP8) for k, s in
+         (("w1", (inter, H)), ("w3", (inter, H)), ("w2", (H, inter)))}  # fmt: skip
+    s = {k: torch.rand(v.shape[0], 1) + 0.5 for k, v in w.items()}
+    _load_shared(layer, w, s)
+    # What `_online_quant` leaves: unpadded per-channel FP8 buffers.
+    e = ROUTED + SHARED
+    f8 = torch.float8_e4m3fnuz if fnuz else FP8
+    layer.w13_weight = nn.Parameter(_param(e, 2 * I_LOCAL, H).fill_(9).to(f8), False)
+    layer.w13_weight_scale = _param(e, 2 * I_LOCAL).fill_(9)
+    layer.w2_weight = nn.Parameter(_param(e, H, I_LOCAL).fill_(9).to(f8), False)
+    layer.w2_weight_scale = _param(e, H).fill_(9)
+    layer.shared_mxfp8_into_mxfp4.fuse(layer)
+
+    k = 2.0 if fnuz else 1.0
+    rows = slice(tp_rank * I_LOCAL, (tp_rank + 1) * I_LOCAL)
+    w13, w13_s = layer.w13_weight.data[ROUTED], layer.w13_weight_scale.data[ROUTED]
+    for shard, off in (("w1", 0), ("w3", I_LOCAL)):
+        got = w13[off : off + I_LOCAL].float() * w13_s[off : off + I_LOCAL, None]
+        assert torch.equal(got, w[shard][rows].float() * s[shard][rows])
+        assert torch.equal(w13_s[off : off + I_LOCAL], k * s[shard][rows].flatten())
+    w2, w2_s = layer.w2_weight.data[ROUTED], layer.w2_weight_scale.data[ROUTED]
+    assert torch.equal(w2.float() * w2_s[:, None], w["w2"][:, rows].float() * s["w2"])
+    assert torch.equal(w2_s, k * s["w2"].flatten())
+    assert (layer.w13_weight.data[:ROUTED].float() == 9).all()  # routed untouched
+
+
+def test_per_channel_fp8_shared_expert_refuses_all2all():
+    """The FP8 online method has no all2all shared-expert dispatch."""
+    layer = _fused_mxfp4_layer()
+    layer.expert_layout.uses_all2all_fusion = True
+    with pytest.raises(NotImplementedError, match="all2all"):
+        staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL, ptpc=True)
+
+
+def test_dummy_load_leaves_the_slot_alone(monkeypatch):
+    layer = _fused_mxfp4_layer(ptpc=True)
+    monkeypatch.setattr(
+        staging_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(load_dummy="zero"),
+    )
+    layer.shared_mxfp8_into_mxfp4.fuse(layer)
+    assert layer.shared_mxfp8_into_mxfp4.staged is None
 
 
 def test_refuses_online_requant_of_the_routed_experts(monkeypatch):

@@ -258,8 +258,13 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
+        # Shared experts keep the native spec; online patterns may convert the
+        # routed experts.
         self.moe_quant_config = make_v4_quant_config(
-            config, online_quant_config=online_quant_config
+            config,
+            online_quant_config=online_quant_config,
+            shared_expert_spec=native_quant_config().global_spec,
+            online_routed_experts=True,
         )
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model

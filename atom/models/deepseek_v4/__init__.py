@@ -613,7 +613,14 @@ def _wo_a_is_bf16_on_disk(model_path):
     return False
 
 
-def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
+def make_v4_quant_config(
+    hf_config,
+    model_path=None,
+    online_quant_config=None,
+    *,
+    shared_expert_spec=None,
+    online_routed_experts=False,
+):
     """Build a QuantizationConfig that knows V4's per-layer quant scheme.
 
     Two V4 SKUs supported:
@@ -645,6 +652,10 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
     preserved on BOTH the source lookup AND the online lookup — returning
     the same spec on the online path triggers the FusedMoE/Linear
     ``source == online_target`` early-return so those layers stay untouched.
+
+    ``shared_expert_spec`` pins the shared experts on both lookups.
+    ``online_routed_experts`` lets an online layer pattern convert the routed
+    experts.
     """
 
     base = QuantizationConfig(hf_config, online_quant_config=online_quant_config)
@@ -694,7 +705,17 @@ def make_v4_quant_config(hf_config, model_path=None, online_quant_config=None):
         # dequant→requant round-trip for these layers (which would either
         # crash on the moe assert or further damage already-quantized weights).
         if ".ffn.experts" in layer_name:
+            if (
+                online_routed_experts
+                and use_online_quant
+                and base.online_pattern_spec(layer_name) is not None
+            ):
+                return orig_lookup(
+                    layer_name, use_online_quant=True, check_children=check_children
+                )
             return routed_spec
+        if shared_expert_spec is not None and ".shared_experts" in layer_name:
+            return shared_expert_spec
         # BF16 / fp32 raw paths
         if (
             ".compressor.wkv" in layer_name
@@ -3851,12 +3872,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         """True when shared experts are NOT fused into the routed MoE kernel, so
         the weight loader must keep `ffn.shared_experts.*` on the standalone
         Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure.
+        the actual built MoE layers so it always agrees with model structure;
+        where only some fuse (online quant excluding a layer), the loader
+        decides per layer.
         """
-        for m in self.model.modules():
-            if m.__class__.__name__ == "MoE":
-                return not getattr(m, "_fuse_shared_into_routed", True)
-        return False
+        return not any(
+            getattr(m, "_fuse_shared_into_routed", False)
+            for m in self.model.modules()
+            if m.__class__.__name__ == "MoE"
+        )
 
     def forward(
         self,

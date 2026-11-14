@@ -407,7 +407,6 @@ def validate_runtime_config(config):
             and not config.enable_encoder_swa_bounded_replay,
         ),
         ("RapidServe", config.enable_rapidserve),
-        ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group

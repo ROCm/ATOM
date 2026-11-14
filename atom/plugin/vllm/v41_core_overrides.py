@@ -556,7 +556,10 @@ def _attend_block(
     qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
     self._fork_select(hidden, qr, qr_scale, cache, step, rope, compressed=compressed)
     if queries is not None:
-        qr, qr_scale = queries.take(qr, qr_scale)
+        if qr_scale is None:  # BF16 Q
+            (qr,) = queries.take(qr)
+        else:
+            qr, qr_scale = queries.take(qr, qr_scale)
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
     # One launch for both rotations, the KV row's FP8 bytes and, where a
     # decode allows it, the window write. `window_kv` is what is left for

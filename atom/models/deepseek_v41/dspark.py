@@ -172,8 +172,12 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=native_quant_config().global_spec,
+            online_routed_experts=True,
         )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a
@@ -435,7 +439,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
+        bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
             fused = (

@@ -1381,6 +1381,58 @@ class DualRMSNormMXFP8:
         return q_fp8, q_scale, k_out
 
 
+@triton.jit
+def _dual_rmsnorm_bf16_kernel(
+    Q, K, WQ, WK, YQ, YK, stride_q, stride_k, eps_q, eps_k,
+    KQ: tl.constexpr, KK: tl.constexpr, BQ: tl.constexpr, BK: tl.constexpr,
+):  # fmt: skip
+    row = tl.program_id(0).to(tl.int64)
+    oq = tl.arange(0, BQ)
+    mq = oq < KQ
+    q = tl.load(Q + row * stride_q + oq, mask=mq, other=0.0).to(tl.float32)
+    rq = tl.rsqrt(tl.sum(q * q, axis=0) / KQ + eps_q)
+    wq = tl.load(WQ + oq, mask=mq, other=0.0).to(tl.float32)
+    tl.store(YQ + row * KQ + oq, (q * rq * wq).to(YQ.dtype.element_ty), mask=mq)
+    ok = tl.arange(0, BK)
+    mk = ok < KK
+    k = tl.load(K + row * stride_k + ok, mask=mk, other=0.0).to(tl.float32)
+    rk = tl.rsqrt(tl.sum(k * k, axis=0) / KK + eps_k)
+    wk = tl.load(WK + ok, mask=mk, other=0.0).to(tl.float32)
+    tl.store(YK + row * KK + ok, (k * rk * wk).to(YK.dtype.element_ty), mask=mk)
+
+
+class DualRMSNormBF16:
+    """BF16 `DualRMSNormMXFP8`: both norms in one launch, Q unquantized (scale
+    None), for where the Q GEMMs run in BF16."""
+
+    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str = "") -> None:
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.prefix = prefix
+
+    @mark_trace
+    def __call__(self, q: torch.Tensor, k: torch.Tensor):
+        lead = q.shape[:-1]
+        q2 = q.reshape(-1, q.shape[-1])
+        k2 = k.reshape(-1, k.shape[-1])
+        if q2.stride(-1) != 1:
+            q2 = q2.contiguous()
+        if k2.stride(-1) != 1:
+            k2 = k2.contiguous()
+        rows, kq = q2.shape
+        kk = k2.shape[1]
+        yq = torch.empty((rows, kq), dtype=q.dtype, device=q.device)
+        yk = torch.empty((rows, kk), dtype=k.dtype, device=k.device)
+        if rows:
+            _dual_rmsnorm_bf16_kernel[(rows,)](
+                q2, k2, self.q_norm.weight, self.k_norm.weight, yq, yk,
+                q2.stride(0), k2.stride(0), self.q_norm.eps, self.k_norm.eps,
+                KQ=kq, KK=kk, BQ=triton.next_power_of_2(kq), BK=triton.next_power_of_2(kk),
+                num_warps=4,
+            )  # fmt: skip
+        return yq.view(*lead, kq), None, yk.view(*lead, kk)
+
+
 # ---------------------------------------------------------------------------
 # Fused dual RMSNorm + concat — single Triton launch.
 #

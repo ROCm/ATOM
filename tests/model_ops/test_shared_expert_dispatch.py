@@ -6,6 +6,8 @@ from conftest import atom_config_double
 
 pytest.importorskip("aiter", reason="full dispatch tests require aiter")
 
+from aiter import QuantType, dtypes
+
 import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module
@@ -15,6 +17,7 @@ from atom.model_ops.moe import FusedMoE, FusedMoEParallelConfig, Mxfp4MoEMethod
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
+from atom.quant_spec import LayerQuantConfig, fuses_ptpc_shared_into_online_ptpc
 
 
 class _FakeMoELayer(SimpleNamespace):
@@ -253,6 +256,133 @@ def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expe
     enabled = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
 
     assert enabled is expected
+
+
+class _QuantConfig:
+    """Checkpoint specs by layer, and the routed experts' online target."""
+
+    online_quant = True
+
+    def __init__(self, shared, routed, online):
+        self.shared, self.routed, self.online = shared, routed, online
+
+    def get_layer_quant_config(self, name, use_online_quant=False, **_):
+        if "shared" in name:
+            return self.shared
+        return self.online if use_online_quant else self.routed
+
+
+def _spec(quant_type, quant_dtype):
+    return LayerQuantConfig(quant_type=quant_type, quant_dtype=quant_dtype)
+
+
+_PTPC = _spec(QuantType.per_Token, dtypes.fp8)
+_BLOCK = _spec(QuantType.per_1x128, dtypes.fp8)
+_MXFP8 = _spec(QuantType.per_1x32, dtypes.fp8)
+_MXFP4 = _spec(QuantType.per_1x32, dtypes.fp4x2)
+_BF16 = _spec(QuantType.No, torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "shared, routed, online, staged",
+    [
+        (_PTPC, _MXFP4, _PTPC, True),
+        # Already per-channel: same-format fusion, nothing to stage.
+        (_PTPC, _PTPC, _PTPC, False),
+        # The online target has to be the shared expert's format.
+        (_PTPC, _MXFP4, _MXFP4, False),
+        (_PTPC, _BLOCK, _MXFP4, False),
+        # No weight-scale params to stage the scales through.
+        (_PTPC, _BF16, _PTPC, False),
+    ],
+)
+def test_ptpc_shared_expert_staging(shared, routed, online, staged):
+    quant_config = _QuantConfig(shared, routed, online)
+    prefix = "model.layers.3.mlp.experts"
+    assert (
+        fuses_ptpc_shared_into_online_ptpc(quant_config, prefix, shared, routed)
+        is staged
+    )
+
+
+@pytest.mark.parametrize(
+    "shared, routed, online, fused",
+    [
+        # FP4PTPC: the MXFP4 routed experts become per-channel FP8 online.
+        (_PTPC, _MXFP4, _PTPC, True),
+        # One checkpoint format: the slot is re-quantized with the routed experts.
+        (_BLOCK, _BLOCK, _MXFP4, True),
+        # Only a per-channel FP8 shared expert is staged into an online slot.
+        (_MXFP8, _MXFP4, _MXFP8, False),
+        # A native shared expert (original V4.1, DSpark draft) stays its own MLP.
+        (_MXFP8, _MXFP4, _PTPC, False),
+    ],
+)
+def test_online_quant_shared_expert_fusion(monkeypatch, shared, routed, online, fused):
+    monkeypatch.setenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0")
+    monkeypatch.setattr(
+        topK_module,
+        "get_current_atom_config",
+        lambda: atom_config_double(
+            parallel_config=SimpleNamespace(data_parallel_size=1)
+        ),
+    )
+    enabled = is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+        _QuantConfig(shared, routed, online),
+        shared_expert_prefix="model.layers.3.mlp.shared_experts",
+        routed_expert_prefix="model.layers.3.mlp.experts",
+    )
+    assert bool(enabled) is fused
+
+
+def test_ptpc_shared_expert_stays_unfused_under_dp_expert_parallel(monkeypatch):
+    monkeypatch.setattr(
+        topK_module,
+        "get_current_atom_config",
+        lambda: atom_config_double(
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8, enable_expert_parallel=True
+            )
+        ),
+    )
+    assert not is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+        _QuantConfig(_PTPC, _MXFP4, _PTPC),
+        shared_expert_prefix="model.layers.3.mlp.shared_experts",
+        routed_expert_prefix="model.layers.3.mlp.experts",
+    )
+
+
+def test_loader_decides_with_the_models_own_moe_quant_config(monkeypatch):
+    """The loader's shared-expert rename must agree with the config the MoE
+    layers were built with, not the engine-wide one."""
+    from atom.model_loader import loader
+
+    class _Stop(Exception):
+        pass
+
+    captured, asked = {}, []
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(loader, "load_weights_into_model", capture)
+    monkeypatch.setattr(
+        loader,
+        "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config",
+        lambda quant_config, **_: asked.append(quant_config) or True,
+    )
+    own = SimpleNamespace(get_layer_quant_config=None)
+    model = torch.nn.Module()
+    model.moe_quant_config = own
+    model.atom_config = SimpleNamespace(
+        quant_config=SimpleNamespace(get_layer_quant_config=None)
+    )
+    with pytest.raises(_Stop):
+        loader.load_model(model, "unused", hf_config=None)
+    fuse = captured["fuse_shared_expert"]
+    assert fuse("layers.0.ffn.shared_experts", "layers.0.ffn.experts")
+    assert asked == [own]
 
 
 def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
