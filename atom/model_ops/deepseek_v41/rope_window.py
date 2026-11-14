@@ -11,9 +11,12 @@ The RMSNorm ahead of this stays where it is. It shares a launch with Q's, so
 pulling its half in saves nothing and would leave Q's on a different kernel
 than the one whose bytes the checkpoint was validated against.
 
-The row this writes is `packed_rows`': `head_dim` FP8 values then
-`head_dim // 32` E8M0 scales. Where it lands is the cache's, not this file's.
+Quantized rows contain `head_dim` FP8 values and `head_dim // 32` E8M0
+scales. A quantized ring stores them in separate contiguous planes; a BF16
+ring stores the dequantized values.
 """
+
+import functools
 
 import torch
 import triton
@@ -29,6 +32,22 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # token up, with the same bytes out. False only for the tests' per-head
 # reference.
 _HEAD_BLOCK = True
+
+# The MXFP8 query's heads quantized by one program rather than one each, with
+# the same bytes out. 8 heads on 2 warps, 64 heads at 1344 / 16384 tokens:
+# MI455X 31.8 -> 16.2 / 422 -> 205 us (c1024 serving +4.1%), MI355X 22.4 ->
+# 21.6 / 322 -> 287 us. 1 only for the tests' per-head reference.
+_FP8_HEADS = 8
+# A program a head below this many grouped query programs a CU: measured on
+# MI455X and MI355X (256 CUs each), not derived. 64/32/16 heads cross over at
+# about this on MI455X and between 1x and 1.5x it on MI355X (at 1x up to 3%,
+# 0.1 us, slower); 8 heads below it on both. Other CU counts are unmeasured.
+_FP8_HEADS_MIN_PROGRAMS_PER_CU = 2
+
+
+@functools.lru_cache
+def _cu_count(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 @triton.jit
@@ -110,6 +129,43 @@ def _quantized_row(row, position, cos, sin, D, ROPE):
 
 
 @triton.jit
+def _quantize_heads(
+    query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
+):
+    """`_quantized_row` over query heads `row0 .. row0 + HB` as one `[HB, D]`
+    tile, stored as MXFP8: the same arithmetic per element, so the same bytes."""
+    half: tl.constexpr = ROPE // 2
+    rows = (row0 + tl.arange(0, HB))[:, None]
+    dim = tl.arange(0, D)[None, :]
+    activation = query.dtype.element_ty
+    normed = tl.load(query + rows * D + dim).to(tl.float32)
+    even, odd = tl.split(tl.reshape(normed, (HB, D // 2, 2)))
+    tl.static_assert((D - ROPE) % ROPE == 0)
+    pair = tl.arange(0, D // 2)
+    rope_pair = pair >= (D - ROPE) // 2
+    cosine = tl.where(
+        rope_pair, tl.load(cos + position * half + pair % half).to(tl.float32), 1.0
+    )[None, :]
+    sine = tl.where(
+        rope_pair, tl.load(sin + position * half + pair % half).to(tl.float32), 0.0
+    )[None, :]
+    groups = (
+        tl.reshape(
+            tl.join(even * cosine - odd * sine, even * sine + odd * cosine),
+            (HB * D // 32, 32),
+        )
+        .to(activation)
+        .to(tl.float32)
+    )
+    quantized, code, _ = fp8_groups(groups)
+    tl.store(query_values + rows * D + dim, tl.reshape(quantized, (HB, D)))
+    tl.store(
+        query_scales + rows * (D // 32) + tl.arange(0, D // 32)[None, :],
+        tl.reshape(code, (HB, D // 32)),
+    )
+
+
+@triton.jit
 def _rope_window_kernel(
     query,
     kv,
@@ -124,6 +180,7 @@ def _rope_window_kernel(
     query_values,
     query_scales,
     pool,
+    pool_scale,
     batches,
     cu,
     slots,
@@ -137,46 +194,56 @@ def _rope_window_kernel(
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
-    ROW_UNITS: tl.constexpr,
     EMIT_QAT: tl.constexpr,
     EMIT_PACKED: tl.constexpr,
     EMIT_QUERY_FP8: tl.constexpr,
     WRITE_RING: tl.constexpr,
-    PACKED_RING: tl.constexpr,
+    PLANAR_RING: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
+    FP8_HEADS: tl.constexpr,
     QUERY_PROGRAMS: tl.constexpr,  # a token's query slots
 ):
     """One program per (token, slot); slot `QUERY_PROGRAMS` of a token is its KV.
 
     With `HEAD_BLOCK` (the in-place BF16 query) slot 0 rotates all of a
     token's heads and slot 1 runs the whole KV chain: one query program per
-    token. Otherwise (the MXFP8 query, odd shapes) `HEADS` slots each rotate
-    or quantize one query head and slot `HEADS` is the KV. Either way the KV
+    token. Otherwise `QUERY_PROGRAMS` slots rotate or quantize the query
+    heads and slot `QUERY_PROGRAMS` is the KV. Either way the KV
     chain has its own program rather than sharing the token's, which keeps a
     decode bucket -- a few dozen rows -- wide enough to fill the device; the
-    two branches are otherwise independent.
+    two branches are otherwise independent. `FP8_HEADS` > 1: each MXFP8 query
+    slot quantizes that many consecutive heads.
 
     One grid axis (the token count may pass the second's limit): every
     query program, then every KV program, each run in memory order, so
     neighbouring programs read and write neighbouring rows.
     """
-    # The head-blocked query is the in-place BF16 rotation only; the host
-    # keeps an MXFP8-emitting query on a program a head.
+    # `HEAD_BLOCK` is the in-place BF16 rotation only; an MXFP8-emitting query
+    # groups its heads with `FP8_HEADS` instead.
     tl.static_assert(not (HEAD_BLOCK and EMIT_QUERY_FP8))
     pid = tl.program_id(0)
     query_rows = tokens * QUERY_PROGRAMS
     is_query = pid < query_rows
     token = tl.where(is_query, pid // max(QUERY_PROGRAMS, 1), pid - query_rows)
-    slot = tl.where(is_query, pid % max(QUERY_PROGRAMS, 1), QUERY_PROGRAMS)
     position = tl.load(positions + token)
     dim = tl.arange(0, D)
-    if HEAD_BLOCK:
-        query_slot = slot == 0
-    else:
-        query_slot = slot < HEADS
-    if query_slot:
+    if is_query:
+        slot = pid % max(QUERY_PROGRAMS, 1)
         if HEAD_BLOCK:
             _rotate_heads(query, token, position, cos, sin, HEADS, D, ROPE)
+        elif EMIT_QUERY_FP8 and FP8_HEADS > 1:
+            _quantize_heads(
+                query,
+                query_values,
+                query_scales,
+                token * HEADS + slot * FP8_HEADS,
+                position,
+                cos,
+                sin,
+                FP8_HEADS,
+                D,
+                ROPE,
+            )
         elif EMIT_QUERY_FP8:
             # The FP8 pool's attention reads the query as MXFP8, by the KV
             # row's rule; the BF16 head is not written.
@@ -210,27 +277,24 @@ def _rope_window_kernel(
             # way, because that is the width a captured replay runs.
             batch = tl.load(batches + token)
             if batch >= 0 and token >= tl.load(cu + batch + 1) - RING_SLOTS:
-                base = (
-                    window_row(
-                        tl.load(slots + batch).to(tl.int64),
-                        position,
-                        ring_start,
-                        RING_SLOTS,
-                        SLOT_ROWS,
-                        RING_STRIDE,
-                        RUN_ROWS,
-                    )
-                    * ROW_UNITS
+                row = window_row(
+                    tl.load(slots + batch).to(tl.int64),
+                    position,
+                    ring_start,
+                    RING_SLOTS,
+                    SLOT_ROWS,
+                    RING_STRIDE,
+                    RUN_ROWS,
                 )
-                if PACKED_RING:
+                if PLANAR_RING:
                     tl.store(
-                        pool + base + dim,
+                        pool + row * D + dim,
                         tl.reshape(quantized, (D,)).to(tl.uint8, bitcast=True),
                     )
-                    tl.store(pool + base + D + tl.arange(0, D // 32), code)
+                    tl.store(pool_scale + row * (D // 32) + tl.arange(0, D // 32), code)
                 else:
                     tl.store(
-                        pool + base + dim,
+                        pool + row * D + dim,
                         tl.reshape(quantized.to(tl.float32) * step[:, None], (D,)),
                     )
 
@@ -258,14 +322,17 @@ def rope_quant_window(
     be None. `query_fp8`: `(values, scales)` the rotated query is quantized
     into instead of being rotated in place.
 
-    One address serves both ring layouts: `window_row` returns a byte offset
-    for a byte pool (FP8 values then codes, `V41PoolGeometry.window_bytes`)
-    and a row index for a `[rows, head_dim]` BF16 one.
+    `ring`'s pool is either `(data, scale)` with contiguous uint8 planes or a
+    `[rows, head_dim]` BF16 tensor. `window_row` returns a row index in both
+    layouts; the data and scale planes have their own row strides.
     """
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
     pool, step, window = ring or (None, None, None)
-    byte_ring = pool is not None and pool.dtype == torch.uint8
+    planar_ring = isinstance(pool, tuple)
+    pool, pool_scale = pool if planar_ring else (pool, None)
+    if pool is not None and not planar_ring and pool.dtype == torch.uint8:
+        raise ValueError("Quantized rings require separate (data, scale) planes")
     query_values, query_scales = query_fp8 or (None, None)
     # The tile's shape must be powers of two; anything else, a query-less KV
     # launch (no heads: slot 0 must stay the KV), and the MXFP8 query keep a
@@ -278,7 +345,17 @@ def rope_quant_window(
         and rope_dim >= 2
         and (rope_dim & (rope_dim - 1)) == 0
     )
-    query_programs = 1 if head_block else heads
+    fp8_heads = _FP8_HEADS
+    if not (
+        query_fp8 is not None
+        and fp8_heads > 1
+        and (fp8_heads & (fp8_heads - 1)) == 0
+        and heads % fp8_heads == 0
+        and tokens * heads // fp8_heads
+        >= _FP8_HEADS_MIN_PROGRAMS_PER_CU * _cu_count(query.device)
+    ):
+        fp8_heads = 1
+    query_programs = 1 if head_block else heads // fp8_heads
     _rope_window_kernel[(tokens * (query_programs + kv_half),)](
         query,
         kv if kv_half else query,
@@ -293,6 +370,7 @@ def rope_quant_window(
         query_values,
         None if query_scales is None else query_scales.view(torch.uint8),
         pool,
+        pool_scale,
         None if step is None else step.batch_ids,
         None if step is None else step.cu_seqlens_q,
         None if step is None else step.slots,
@@ -306,14 +384,16 @@ def rope_quant_window(
         SLOT_ROWS=0 if window is None else window.slot_rows,
         RING_STRIDE=1 if window is None else window.ring_stride,
         RUN_ROWS=0 if window is None else window.run_rows,
-        ROW_UNITS=1 if pool is None or byte_ring else dim,
-        PACKED_RING=byte_ring,
+        PLANAR_RING=planar_ring,
         EMIT_QAT=qat is not None,
         EMIT_PACKED=values is not None,
         EMIT_QUERY_FP8=query_fp8 is not None,
         WRITE_RING=ring is not None,
         HEAD_BLOCK=head_block,
+        FP8_HEADS=fp8_heads,
         QUERY_PROGRAMS=query_programs,
         # The most waves a row splits over with every lane still loading 16 B.
-        num_warps=max(1, dim * query.element_size() // (64 * 16)),
+        num_warps=(
+            2 if fp8_heads > 1 else max(1, dim * query.element_size() // (64 * 16))
+        ),
     )

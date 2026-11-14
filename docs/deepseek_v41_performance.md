@@ -57,12 +57,18 @@ The main pool accepts `kv_cache_dtype="fp8"` (the deployed configuration),
 
 | Region | FP8 main-pool configuration | BF16 main-pool configuration | FP4 main-pool configuration |
 |---|---|---|---|
-| Main KV, 512 dimensions | MXFP8: E4M3 with E8M0 scales, group 32 (528 B a row) | BF16 | E2M1 FP4 with E4M3 scales, group 16 |
-| SWA, 512 dimensions | Same MXFP8 rows | BF16 | E4M3 FP8 with E8M0 scales, group 32 |
+| Main KV, 512 dimensions | MXFP8: separate E4M3 data and E8M0 scale planes, group 32 (512 + 16 B per logical row) | BF16 | Separate E2M1 FP4 data and E4M3 scale planes, group 16 (256 + 32 B per logical row) |
+| SWA, 512 dimensions | Same MXFP8 planes | BF16 | Separate E4M3 data and E8M0 scale planes, group 32 |
 | Index keys, 128 dimensions | Per `index_cache_dtype` | E4M3 FP8 with a per-key power-of-two scale | Same FP8 index format |
 
-The FP8 pool holds 1.84x the rows of the BF16 one. Its rows are addressed like
-BF16 ones (int32 row indices), and attention reads them as they are stored:
+Each quantized CSA source and each layer's SWA source exposes contiguous
+data and scale planes. The 528 B MXFP8 cost is a logical row's total across
+those planes, not an interleaved physical row stride. CSA and SWA have
+independent row spaces; prefill stages the batch's rings followed by current
+KV in the SWA source, while decode reads the persistent ring directly.
+
+The FP8 pool holds 1.84x the rows of the BF16 one. Its sources use int32 row
+indices, and attention reads the data and scale planes as they are stored:
 the query is quantized to the same MXFP8 format, and AITER's
 `mla_sparse_prefill_v41` (`fp8_attention.sparse_attn_v41_paged_2src`) attends
 over the pool and the window, prefill and decode alike.
@@ -73,8 +79,14 @@ tails and committed Engram histories retain their precision and checkpoint
 semantics. `V41PoolGeometry` declares allocation sizes, alignment and image
 layout identity; memory planning and checkpoint copies use those declarations.
 
-`packed_rows.py` owns packed row encoding and decoding.
-`packed_attention.py` decodes selected history into bounded BF16 scratch and
+For FP4 KV, `ATOM_DSV41_A8W4_ATTN=auto` (the default) asks AITER whether
+the live query can use A8W4 over NVFP4 CSA and MXFP8 SWA planes. On supported
+gfx950 configurations this is the native path. `off`, or an ineligible
+query/backend, uses the BF16 adapter. AITER's public V4.1 capability API is
+required by this revision.
+
+On that adapter, `packed_rows.py` decodes selected plane rows, and
+`packed_attention.py` uses bounded BF16 scratch and
 passes ordinary int32 row indices to V4 attention. Prefill keeps the current
 chunk in BF16; decode preserves V4's batch size and split-K dispatch. Neither
 path materializes the entire historical main KV pool.
@@ -89,8 +101,9 @@ fill the GPU.
 
 A compressed main row is written by the compressor's own kernel
 (`fused_compress_attn`) in the pool's row format: BF16, or on the FP8 / FP4
-pools (`quant_mode` "packed_fp8" / "packed_fp4") the row rounded to BF16 and
-quantized by `quantize_fp8` / `quantize_fp4`'s rule, values then scales. The
+pools (`quant_mode` "planar_fp8" / "planar_fp4") the row rounded to BF16 and
+quantized by `quantize_fp8` / `quantize_fp4`'s rule into separate data and
+scale planes. The
 kernel resolves each plan row's PAGE through the block table; padding rows are
 skipped on the device, including during graph replay.
 

@@ -28,6 +28,14 @@ mod = pytest.importorskip(
 )
 
 
+@pytest.fixture(autouse=True)
+def _without_context_parallelism(monkeypatch):
+    # These row/broadcast tests use TP only and build no global engine config.
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
+
+
 def _batch(seqs, mask=None):
     from atom.model_engine.token_logprobs import LogprobRows, host_logprob_rows
 
@@ -55,6 +63,7 @@ def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
     runner.rank = 0
+    runner._served = None
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -62,7 +71,7 @@ def _runner(seen):
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     runner.sampler = _sampler
-    runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
+    runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
     runner.tokenID_processor = types.SimpleNamespace(
         is_deferred_out=False,
         prev_batch=None,
@@ -345,3 +354,75 @@ def _payload_tensors(payload):
         payload[..., k + 1 : 2 * k + 1].view(torch.int32),
         payload[..., -1].view(torch.int32),
     )
+
+
+@pytest.mark.parametrize("context_kv_only", [False, True])
+def test_a_context_only_producer_leaves_dp_draft_lockstep(context_kv_only):
+    """No DP peer is owed the collectives of a propose nobody runs."""
+    runner = object.__new__(mod.ModelRunner)
+    runner.drafter = types.SimpleNamespace(context_kv_only=context_kv_only)
+    runner.tokenID_processor = types.SimpleNamespace(is_pipeline_parallel=False)
+    runner.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=2)
+    )
+    assert runner._dp_draft_lockstep_active() is not context_kv_only
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("producer", [False, True])
+def test_a_producer_skips_propose_on_either_output_path(
+    monkeypatch, deferred, producer
+):
+    """Either output path skips propose on a producer, keeps the step's
+    bookkeeping, and still commits the target's tentative step (V4.1)."""
+    forward_mode = types.SimpleNamespace(running_tokens=2)
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(
+            spec_decode_metadata=None,
+            attn_metadata="step",
+            context=types.SimpleNamespace(forward_mode=forward_mode),
+        ),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    monkeypatch.setattr(mod, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(mod, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(mod, "sp_is_enabled", lambda: False)
+    runner = _runner({})
+    runner._served = None
+    runner.forward_done_event = types.SimpleNamespace(record=lambda stream=None: None)
+    runner.drafter = types.SimpleNamespace(
+        context_kv_only=producer, prepare_inputs=torch.arange
+    )
+    proposed, sent, commits = [], [], []
+    runner.attn_metadata_builder = types.SimpleNamespace(
+        commit_speculative_state=lambda md, rows: commits.append((md, rows.tolist()))
+    )
+    drafts = np.array([[5], [6]], dtype=np.int32)
+    runner.propose_draft_token_ids = lambda *a: proposed.append(a) or drafts
+    runner.tokenID_processor.__dict__.update(
+        is_deferred_out=deferred,
+        is_pd_producer=producer,
+        prev_rejected_num=np.array([1, 2], dtype=np.int32),
+        prev_bonus_num=np.array([3, 4], dtype=np.int32),
+        spec_status_queue=types.SimpleNamespace(
+            send=lambda counts, ready: sent.append(counts)
+        ),
+        input_ids=types.SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32)),
+    )
+
+    out = runner.postprocess(
+        _batch(2), torch.zeros(2, 8), torch.ones(2), None, None, False, None
+    )
+
+    assert len(proposed) == (0 if producer else 1)
+    assert out.draft_token_ids is (None if producer else drafts)
+    # Propose commits for the others; it is faked here.
+    assert commits == ([("step", [0, 1])] if producer else [])
+    if deferred:
+        assert len(sent) == 1
+        assert out.num_rejected.tolist() == [1, 2]
+        assert runner.tokenID_processor.prev_token_ids.shape == (2,)

@@ -137,6 +137,19 @@ parent process and pickled into every engine-core worker (see `DSparkConfig` in
 | `ragged_graph_sizes` | str | Comma-separated per-seq CUDA-graph query-length buckets to capture for the ragged path, e.g. `"1,3,6"` or `"8"`. Smaller buckets are what actually free dense/MoE compute; a single full bucket (`mtp_k+1`) only saves attention. |
 | `q_buckets` | str | CUDA-graph query-length buckets for the older batch-uniform q-bucket verify path (independent of the ragged path). |
 | `disable_sps_calib` | bool | Skip SPS calibration (replays captured graphs at warmup) and use the synthetic SPS stub. |
+| `draft_kv_dtype` | str | Native DeepSeek-V4.1 draft **attention precision**: `"auto"` (default) retains BF16 attention, including when the target stores FP8/FP4 KV; `"fp8"` uses MXFP8 history/current KV with AITER OPUS A8W8 attention. Requires native V4.1 DSpark, FP8 or FP4 target KV, and an eligible AITER backend; unsupported configurations fail at startup. |
+
+For V4.1, add `--dspark-config '{"draft_kv_dtype": "fp8"}'` to opt into
+FP8 draft attention, or include that key alongside the other DSpark settings.
+This option controls attention precision independently of the target KV dtype;
+it is distinct from the internally resolved `SpeculativeConfig.draft_kv_dtype`,
+which describes the draft's page storage. FP8 drafting uses AITER and bypasses
+Mono's draft path. See the [V4.1 recipe](DeepSeek-V4.1-Flash.md) for launch options.
+
+Offline calibration profiles distinguish FP8 draft attention and an enabled
+A8W4 target. Profiles measured before these choices remain compatible with
+BF16 drafting and the target's original attention path; changing either
+precision/path requires a matching profile.
 
 Tips on server configuration:
 - **`--num-speculative-tokens 7`** sets the draft block; the max verify length is

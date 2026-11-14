@@ -68,6 +68,7 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    pp_holds_embedding,
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
@@ -1868,7 +1869,7 @@ class KimiLinearModel(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank:
+        if pp_holds_embedding(atom_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size, config.hidden_size
             )

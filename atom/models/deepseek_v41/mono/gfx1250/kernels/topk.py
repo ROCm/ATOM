@@ -15,7 +15,6 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
-from atom.models.deepseek_v41.mono.gfx1250.kernels import stamps
 from atom.models.deepseek_v41.mono.gfx1250.kernels import index_plan as IP
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import T
 
@@ -112,7 +111,6 @@ def lds_topk(n, k, load, emit, sm, tid):
         if cz0 < 2 * HIST_WORDS:
             hx.lstore(hist + cz0 * 4, I32(0))
     gpu.barrier()
-    stamps.point(2)
     prefix = I32(0)
     mask = I32(0)
     need = I32(k)
@@ -156,7 +154,6 @@ def lds_topk(n, k, load, emit, sm, tid):
             prefix = prefix | (((found >> 16) & 255) << shift)
             mask = mask | (I32(255) << shift)
             need = found & 0xFFFF
-    stamps.point(3)
     take_all = n <= k
     gt_bits = I32(0)
     eq_bits = I32(0)
@@ -189,7 +186,6 @@ def lds_topk(n, k, load, emit, sm, tid):
                 hx.lstore(outs + at * 8, fx.Vector.from_elements([(kd < 0).select(kd & I32(0x7FFFFFFF), ~kd), iw], I32))
             ab = ab + gtw
             tb = tb + tiew
-    stamps.point(4)
     n_out = fx.min(n, I32(k))
     for rp in range((I32(k) + (THREADS - 1)) // THREADS):   # k traced: runtime loops, one copy of the emit code
         posp = hx.fresh(tid) + THREADS * rp
@@ -202,7 +198,6 @@ def lds_topk(n, k, load, emit, sm, tid):
             ve = hx.lload(outs + pose * 8, I32, 2)
             emit(pose, ve[0], ve[1])
     gpu.barrier()
-    stamps.point(5)
 
 
 SEG, KSEL, KBLK, NCAND, NLMAX = IP.SEG, IP.KSEL, IP.KBLK, IP.NCAND, IP.NLMAX

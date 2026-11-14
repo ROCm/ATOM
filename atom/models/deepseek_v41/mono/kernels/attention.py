@@ -55,7 +55,6 @@ from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
     HEAD_TILE,
-    KV_FP8_ROW_BYTES,
 )
 from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.step_meta import KMETA
@@ -157,8 +156,16 @@ def tile_head(d, tile, h):
     return fx.min(head, d.heads - 1), head < d.heads
 
 
-def _row_bytes(c):
-    return KV_FP8_ROW_BYTES if c["kv_fp8"] else ROW_BYTES
+def _plane_ptr(c, row, scale=False):
+    """The row space concatenates this owner's CSA and this layer's SWA."""
+    a = c["args"]
+    is_window = row >= a["ring_off"]
+    base = is_window.select(
+        a["window_scale"] if scale else a["window"],
+        a["pool_scale"] if scale else a["pool"],
+    )
+    local = is_window.select(row - a["ring_off"], row)
+    return base + fx.Int64(local) * (HEAD_DIM // 32 if scale else HEAD_DIM)
 
 
 def _row_ptr(pool, row, byte, row_bytes):
@@ -251,22 +258,38 @@ def _q_shared(c, row, g):
     return out
 
 
+@traced
 def _rows_to_lds(c, pool, slot, kv):
     """A split's 16 key rows (row ``slot`` of lane k, k < 16) whole into this
-    wave's LDS ``kv``: one LDS DMA a row, 16 B a lane, read back in the MFMA's
-    layout (``_rows_from_lds``). A descriptor a row: the pool passes the 4 GiB
-    a buffer descriptor reaches, so no one view of it can be copied from. An
-    FP8 row's descriptor ends with it: the lanes past its 528 B read zeros."""
-    row_bytes = _row_bytes(c)
+    wave's LDS ``kv``, 16 B a lane, read back in the MFMA's layout
+    (``_rows_from_lds``). Descriptors are row-local because the pool can exceed
+    4 GiB. FP8 uses separate data and scale descriptors: lanes 0..31 load the
+    data, lane 32 loads the scales, and later lanes read out-of-range zeros."""
     for r in range_constexpr(BK):
         row = readlane(slot, r)
-        base = pool + fx.Int64(row) * row_bytes
-        rocdl.buffer_load_to_lds(
-            rsrc(base, row_bytes) if const_expr(c["kv_fp8"]) else rsrc(base),
-            fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
-            c["lane"] * 16,
-            size_bytes=16,
-        )
+        if const_expr(c["kv_fp8"]):
+            # Preserve the LDS row layout while sourcing data and scales apart.
+            if c["lane"] < HEAD_DIM // 16:
+                rocdl.buffer_load_to_lds(
+                    rsrc(_plane_ptr(c, row), HEAD_DIM),
+                    fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                    c["lane"] * 16,
+                    size_bytes=16,
+                )
+            else:
+                rocdl.buffer_load_to_lds(
+                    rsrc(_plane_ptr(c, row, scale=True), HEAD_DIM // 32),
+                    fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                    (c["lane"] - HEAD_DIM // 16) * 16,
+                    size_bytes=16,
+                )
+        else:
+            rocdl.buffer_load_to_lds(
+                rsrc(pool + fx.Int64(row) * ROW_BYTES),
+                fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+                c["lane"] * 16,
+                size_bytes=16,
+            )
 
 
 def _rows_from_lds(c, kv):
@@ -321,17 +344,17 @@ def _ld_row4(c, pool, row, col):
         return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
     values = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8),
-        _row_ptr(pool, row, col, KV_FP8_ROW_BYTES),
+        _plane_ptr(c, row) + fx.Int64(col),
     )
     return fx.Vector(fx.ptr_load(values, result_type=fx.Vector.make_type(2, fx.Int32)))
 
 
-def _ld_codes(pool, row, dc):
+def _ld_codes(c, row, dc):
     """FP8 row ``row``'s E8M0 codes of column groups 4 (dc // 4) .. + 4, a byte
     each in one word: a PV task's consecutive groups take one load a row."""
     ptr = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
-        _row_ptr(pool, row, HEAD_DIM + dc // 4 * 4, KV_FP8_ROW_BYTES),
+        _plane_ptr(c, row, scale=True) + fx.Int64(dc // 4 * 4),
     )
     return fx.Int32(fx.ptr_load(ptr, result_type=T.i32))
 
@@ -571,7 +594,7 @@ def stage_attn_pv(c, task, groups):
     # an FP8 row's E8M0 codes of the task's groups (consecutive, from a
     # multiple of their count): a word a row for every 4 of them
     code_words = [
-        [_ld_codes(a["pool"], rows[r], g0 * groups + 4 * k) for k in range(-(-groups // 4))]
+        [_ld_codes(c, rows[r], g0 * groups + 4 * k) for k in range(-(-groups // 4))]
         for r in range(8)
     ] if c["kv_fp8"] else None  # fmt: skip
 

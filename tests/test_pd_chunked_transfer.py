@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
     PrefillHandoff,
 )
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -1380,8 +1381,9 @@ def pd_sequence(seq_factory, transfer_id="xfer-a", producer=True):
     )
 
 
+@pytest.mark.parametrize("byte_limit", [False, True])
 def test_opposite_admission_order_progresses_without_recompute(
-    monkeypatch, seq_factory
+    monkeypatch, seq_factory, byte_limit
 ):
     import msgpack
     from conftest import MockConfig
@@ -1389,9 +1391,14 @@ def test_opposite_admission_order_progresses_without_recompute(
     from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 
     p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
-    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
+    # With credits enabled, both prompts physically fit. Only W should stop
+    # the second reservation; P must follow D's admitted order even then.
+    d_blocks = 6 if byte_limit else 3
+    d = Scheduler(MockConfig(num_kvcache_blocks=d_blocks, max_num_batched_tokens=4))
     p.kv_connector = scheduler_connector(monkeypatch, True)
     d.kv_connector = scheduler_connector(monkeypatch, False)
+    if byte_limit:
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
     da, db = [pd_sequence(seq_factory, name, False) for name in ("xfer-a", "xfer-b")]
     p.extend([pa, pb])
@@ -1436,7 +1443,13 @@ def test_opposite_admission_order_progresses_without_recompute(
         batch, seqs = d.schedule()
         assert not seqs
         # A 4-token batch budget still reserves all 10 prompt tokens on D.
-        assert len(ds.block_table) == 3 and d.block_manager.kv.num_free == 0
+        assert len(ds.block_table) == 3
+        assert d.block_manager.kv.num_free == d_blocks - 3
+        if byte_limit:
+            assert set(d.pd_admission.pending) == {str(ds.id)}
+            assert d.pd_admission.pending_bytes == 12
+            if ds is db:
+                assert not da.block_table
         dw.start_load_kv(batch.connector_meta_output)
         # Reserving D's pages alone cannot admit P: the write request still
         # waits in D's queue until prior GPU writes to those pages finish.
@@ -1458,6 +1471,11 @@ def test_opposite_admission_order_progresses_without_recompute(
                 publish(state, end)
                 pw._dispatch_ready_chunked_requests()
                 assert pw.transfer_engine.writes.get(timeout=5)[2] == [4]
+                if byte_limit:
+                    # Bytes are credited for the full destination, not each
+                    # completed chunk. P's final sampling still lies ahead.
+                    assert d.pd_admission.pending_bytes == 12
+                    assert not d.pd_admission.pending[str(ds.id)].ready
                 p.postprocess(
                     list(seqs.values()),
                     ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
@@ -1471,7 +1489,12 @@ def test_opposite_admission_order_progresses_without_recompute(
         p._update_from_kv_xfer_finished(pw.get_finished())
         assert not ps.block_table and p.block_manager.kv.num_free == 3
         d._update_from_kv_xfer_finished(dw.get_finished())
+        if byte_limit:
+            assert d.pd_admission.pending_bytes == 12
+            assert d.pd_admission.pending[str(ds.id)].ready
         batch, seqs = d.schedule()
+        if byte_limit:
+            assert not d.pd_admission.pending
         assert list(seqs) == [ds.id]
         assert batch.total_seqs_num_decode == 1 and batch.total_seqs_num_prefill == 0
         assert d.postprocess(
@@ -1479,7 +1502,8 @@ def test_opposite_admission_order_progresses_without_recompute(
             ScheduledBatchOutput([ds.id], [(43,)], None, None, None),
             batch=batch,
         ) == [ds]
-    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 3
+    assert p.block_manager.kv.num_free == 3
+    assert d.block_manager.kv.num_free == d_blocks
     assert not p.deferred_free_blocks and not d.deferred_free_blocks
     assert not pw._pending_chunked_requests and not pw._chunked_local_ids
     assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
@@ -1991,8 +2015,9 @@ def test_admission_timeout_without_decode_retires_all_stages(
 
 @pytest.mark.parametrize("pp_size", [1, 3])
 @pytest.mark.parametrize("cancel_decode", [False, True])
+@pytest.mark.parametrize("admission", [False, True])
 def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
-    monkeypatch, seq_factory, pp_size, cancel_decode
+    monkeypatch, seq_factory, pp_size, cancel_decode, admission
 ):
     import msgpack
     from conftest import MockConfig
@@ -2008,6 +2033,8 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
         monkeypatch, True, pp_size, admission_timeout_s=10
     )
     d.kv_connector = scheduler_connector(monkeypatch, False)
+    if admission:
+        d.pd_admission = PdAdmissionController(12, 4, d.kv_connector, d.block_manager)
     occupied = seq_factory(list(range(10)))
     assert p.block_manager.allocate(occupied)
     ps = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
@@ -2061,9 +2088,14 @@ def test_ready_but_capacity_blocked_timeout_preserves_decode_write_safety(
     now[0] = 139.0
     d._update_from_kv_xfer_finished(dw.get_finished())
     assert ds.block_table and d.block_manager.kv.num_free == 0
+    if admission:
+        assert d.pd_admission.pending_bytes == 12
+        assert d.pd_admission.pending[str(ds.id)].cancelled is cancel_decode
     now[0] = 140.0
     d._update_from_kv_xfer_finished(dw.get_finished())
     assert not ds.block_table and d.block_manager.kv.num_free == 3
+    if admission:
+        assert not d.pd_admission.pending
     assert ds.leave_reason == "aborted"
     batch, scheduled = d.schedule()
     assert not scheduled and batch.total_seqs_num_prefill == 0

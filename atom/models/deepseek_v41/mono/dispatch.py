@@ -137,7 +137,8 @@ class MonoDraftModel(nn.Module):
         width = self.model.block_size if num_draft is None else num_draft
         requests = input_ids.numel()
         if (
-            0 < requests <= self._max_requests
+            self.model.draft_kv_dtype != "fp8"
+            and 0 < requests <= self._max_requests
             and width == self.model.block_size
             and self._mono.ready(requests * width)
         ):

@@ -4,12 +4,14 @@
 """Relay a block drafter's target aux hidden states across PP stages.
 
 The drafter lives only on the last PP stage, so hooks on taps owned by earlier
-stages land on ``PPMissingLayer`` and never fire, leaving zero aux buffers and
-garbage drafts. Earlier stages capture their own taps and forward them in the
-intermediate-tensor payload, concatenated along the hidden axis in the
-spec's ``layer_ids`` order, which ``install_aux_taps`` requires strictly
-increasing (-1, the embedding, first). Stages own contiguous ascending layer
-ranges, so every stage derives the same columns from ``layer_ids`` alone.
+stages would never fire: their layers are ``PPMissingLayer``, and the last
+stage's copy of the embedding (held for the drafter) is not run by the target
+forward. That would leave zero aux buffers and garbage drafts. Earlier stages
+capture their own taps and forward them in the intermediate-tensor payload,
+concatenated along the hidden axis in the spec's ``layer_ids`` order, which
+``install_aux_taps`` requires strictly increasing (-1, the embedding, first).
+Stages own contiguous ascending layer ranges, so every stage derives the same
+columns from ``layer_ids`` alone.
 """
 
 import logging
@@ -49,15 +51,13 @@ class PPAuxRelay:
         taps = spec.layer_ids
 
         self.spec = spec
-        self.own_ids = tuple(
-            lid for lid in taps if tap_is_resident(target_model, layers, lid)
-        )
+        self.own_ids = tuple(lid for lid in taps if tap_is_resident(layers, lid))
         # Every tap below this stage's first layer was captured upstream, which
         # is exactly what the previous stage sent, even if it owned none itself.
         self.incoming_ids = tuple(
             lid
             for lid in taps
-            if not tap_is_resident(target_model, layers, lid) and lid < stage_start
+            if not tap_is_resident(layers, lid) and lid < stage_start
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
