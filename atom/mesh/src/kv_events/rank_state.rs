@@ -1,13 +1,14 @@
 //! Admission of a rank's batches by sequence number. Ranks are independent: a broken
-//! stream affects only its own holder. A batch that does not follow the last one, or the
+//! stream affects only its own rank. A batch that does not follow the last one, or the
 //! first one after the socket lost its connection, means batches may have been lost or
-//! the engine restarted, so the holder is cleared. It then holds a lower bound of the
-//! engine's cache, unless it starts over from the stream's first batch, until the next
-//! `AllBlocksCleared`.
+//! the engine restarted, so the caller drops what it kept of the rank's earlier batches.
+//! What it keeps is then a lower bound of the engine's cache, unless the stream starts
+//! over from its first batch, until the next `AllBlocksCleared`.
 
 use serde::Serialize;
 
-/// Whether a holder matches its engine's cache (`Exact`) or is a lower bound of it.
+/// Whether what the caller keeps of a rank's batches matches its engine's cache (`Exact`)
+/// or is a lower bound of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
@@ -19,7 +20,7 @@ pub enum Trust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit {
     Apply,
-    /// Clear the holder, then apply.
+    /// Drop what was kept of the rank's earlier batches, then apply.
     ClearAndApply,
 }
 
@@ -27,7 +28,7 @@ pub enum Admit {
 pub struct RankState {
     next: Option<u64>,
     trust: Trust,
-    /// The holder keeps what an earlier connection carried.
+    /// What was kept came from an earlier connection.
     stale: bool,
 }
 
@@ -37,10 +38,12 @@ impl RankState {
     }
 
     /// The socket lost its connection: an engine that restarted meanwhile may go on at the
-    /// very seq that would follow, so the next batch starts the holder over.
+    /// very seq that would follow, so the next batch starts over, and batches may be lost
+    /// until then.
     pub fn disconnected(&mut self) {
         if self.next.take().is_some() {
             self.stale = true;
+            self.trust = Trust::Partial;
         }
     }
 
@@ -84,6 +87,7 @@ mod tests {
         restart                          | 0 apply, 1 apply, 0C clear     | exact
         restart, startup clear missed    | 0 apply, 1 apply, 2 apply, 1 clear | exact
         restart, more missed             | 0 apply, 5 clear, 6 apply, 3 clear | partial
+        connection lost                  | 0 apply, 1 apply, D            | partial
         restart at the seq that follows  | 0 apply, 1 apply, 2 apply, 3 apply, D, 4 clear | partial
         restart seen at its first batch  | 0 apply, 1 apply, D, 1 clear   | exact
         restart seen at its clear        | 0 apply, 3 clear, D, 0C clear  | exact
