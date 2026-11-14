@@ -145,10 +145,17 @@ def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 
 
+def test_tp8_is_served(mi355x, served):
+    """TP8 next to TP4 (``hi_runner.install`` builds one request's verify width there; wider steps stay on ATOM's
+    mono path)."""
+    cfg = _config(served, tensor_parallel_size=8)
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
+
+
 UNSUPPORTED = {
     "TP1": ({"tensor_parallel_size": 1}, {}, "TP1"),
     "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
-    "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
+    "TP16": ({"tensor_parallel_size": 16}, {}, "TP16"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
     "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
@@ -256,9 +263,9 @@ def test_off(mi355x, served, monkeypatch, caplog):
 def test_forced(mi355x, served, monkeypatch):
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
     assert hi_gate.decide(served, _drafter(), _builder(), 0)
-    with pytest.raises(RuntimeError, match="TP8"):
+    with pytest.raises(RuntimeError, match="TP2"):
         hi_gate.decide(
-            _config(served, tensor_parallel_size=8), _drafter(), _builder(), 0
+            _config(served, tensor_parallel_size=2), _drafter(), _builder(), 0
         )
 
 

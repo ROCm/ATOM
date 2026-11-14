@@ -123,7 +123,7 @@ from atom.models.deepseek_v41.mono.hi_draft import (
     _end_step,
     _Streams,
 )
-from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
+from atom.models.deepseek_v41.mono.hi_gate import (
     BLOCK_SIZE,
     MAX_CTX,
     REQ_ROWS,
@@ -1056,6 +1056,10 @@ def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors). Collective (the
     peer groups): every rank calls it at the same point."""
     widths = list(ROWS)
+    if int(getattr(atom_config, "tensor_parallel_size", 1) or 1) == 8:
+        # TP8 serves one request's verify only: its batched widths hang or crawl (a c8 GSM8K hung; AgentX's
+        # 2-3-request steps ran 9-20 ms a token), so those steps take ATOM's mono path
+        widths = [REQ_ROWS]
     max_ctx = MAX_CTX
     for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True
