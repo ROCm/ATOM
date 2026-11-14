@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
+    mla_dcp_decode_query_len,
     mla_dcp_persistent_width,
     mla_kernel_num_heads,
 )
@@ -1383,6 +1384,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             dcp_size,
             self.min_query_heads,
             kv_cache_dtype=config.cache_config.cache_dtype,
+            max_seqlen_q=mla_dcp_decode_query_len(get_current_atom_config()),
         )
         self.dcp_persistent_supported = dcp_persistent_width is not None
         self.persistent_num_heads = (
@@ -1771,8 +1773,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             # wrong output, no error. Refuse the batch rather than serve it.
             assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
                 f"causal decode of query length {max_qo_len} under DCP"
-                f"{self.dcp_world_size} needs the persistent round-robin kernel, "
-                "which aiter does not run at this width here, or DP > 1"
+                f"{self.dcp_world_size} needs the persistent round-robin kernel: "
+                "gfx950, or gfx1250 with AITER_MLA_DECODE_PS1_FLYDSL=1, and "
+                "ATOM_MLA_PAGE_SIZE <= 1 and DP == 1"
             )
             g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]
             # [0] stays 0 (zero-init, never written). cumsum promotes to int64,

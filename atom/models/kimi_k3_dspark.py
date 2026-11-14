@@ -267,6 +267,7 @@ class K3DSparkMLAAttention(nn.Module):
             min_query_heads=mla_min_query_heads(
                 atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
             ),
+            causal_decode=False,
             layer_num=layer_num,
             use_mla=True,
             mla_modules=mla_modules,
