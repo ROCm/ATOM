@@ -78,6 +78,70 @@ if _HAS_TRITON:
         return b_m, b_acc, b_o
 
     @triton.jit
+    def _finish_prefix(
+        ps,
+        t,
+        o_d,
+        m_d,
+        flag,
+        rank,
+        scratch_ptr,
+        share_ptr,
+        epochs_ptr,
+        hs2_ptr,
+        pref_ptr,
+        stride_share_t,
+        stride_hs2_t,
+        stride_pref_t,
+        PEERS: tl.constexpr,
+        COLS: tl.constexpr,
+        ROWS: tl.constexpr,
+        GATHER: tl.constexpr,
+        DO_ADD2: tl.constexpr,
+        WRITE_PREF: tl.constexpr,
+    ):
+        # The prefix's last adds and its store: the gathered columns, the
+        # second addend, then the summed prefix back to pref_ptr.
+        W: tl.constexpr = COLS // 2
+        if GATHER:
+            # This rank's columns from its share, the others' from the scratch
+            # once their words carry the epoch. .cv reads past the caches,
+            # where a stale line would hide the peer's store.
+            src = o_d // COLS
+            col = o_d % COLS
+            words = scratch_ptr + (((flag & 1) * PEERS + src) * ROWS + t) * W + col // 2
+            remote = m_d & (src != rank)
+            ready = flag.to(tl.int64) << 32
+            w = tl.load(
+                words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+            )
+            while tl.min(((w >> 32).to(tl.int32) == flag).to(tl.int32), axis=0) == 0:
+                w = tl.load(
+                    words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+                )
+            bits = ((w >> ((col % 2) * 16).to(tl.int64)) & 0xFFFF).to(tl.int32)
+            mine = tl.load(
+                share_ptr + t * stride_share_t + o_d - rank * COLS,
+                mask=m_d & (src == rank),
+                other=0.0,
+            ).to(tl.float32)
+            ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
+            # Every warp loaded the epoch before the poll's cross-warp min, so
+            # no warp reads this store back as its own.
+            tl.store(epochs_ptr + t, flag)
+        if DO_ADD2:
+            ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
+        if WRITE_PREF:
+            tl.store(
+                pref_ptr + t * stride_pref_t + o_d,
+                ps.to(pref_ptr.dtype.element_ty),
+                mask=m_d,
+            )
+        return ps
+
+    @triton.jit
     def _attn_res_fused_kernel(
         br_ptr,
         ps_ptr,
@@ -166,6 +230,7 @@ if _HAS_TRITON:
         t = tl.program_id(0)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
+        flag = 0
         if GATHER:
             # Row t of this rank's share goes to slot (parity, rank, t) of
             # every rank's scratch as int64 words, two columns under the row's
@@ -206,55 +271,65 @@ if _HAS_TRITON:
 
         # Tiles of bank rows alone run first, with or without a gather, so the
         # mix's multiply-adds fuse alike in both. The compiler merges a single
-        # such tile into the prefix's tile only without a gather, so then every
-        # tile waits for the prefix instead.
+        # such tile into the prefix's tile only without a gather, so there both
+        # tiles stay in one loop and a gather finishes the prefix between them.
         BANK_TILES: tl.constexpr = B // BL if B >= 2 * BL else 0
+        FINISH_AFTER: tl.constexpr = 0 if GATHER and B // BL == 1 else -1
         br_row = br_ptr + t * stride_br_t
         for i_l in range(BANK_TILES):
             b_m, b_acc, b_o = _mix_tile(
                 br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
             )
-        if GATHER:
-            # This rank's columns from its share, the others' from the scratch
-            # once their words carry the epoch. .cv reads past the caches,
-            # where a stale line would hide the peer's store.
-            src = o_d // COLS
-            col = o_d % COLS
-            words = scratch_ptr + (((flag & 1) * PEERS + src) * ROWS + t) * W + col // 2
-            remote = m_d & (src != rank)
-            ready = flag.to(tl.int64) << 32
-            w = tl.load(
-                words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+        if FINISH_AFTER < 0:
+            ps = _finish_prefix(
+                ps,
+                t,
+                o_d,
+                m_d,
+                flag,
+                rank,
+                scratch_ptr,
+                share_ptr,
+                epochs_ptr,
+                hs2_ptr,
+                pref_ptr,
+                stride_share_t,
+                stride_hs2_t,
+                stride_pref_t,
+                PEERS,
+                COLS,
+                ROWS,
+                GATHER,
+                DO_ADD2,
+                WRITE_PREF,
             )
-            while tl.min(((w >> 32).to(tl.int32) == flag).to(tl.int32), axis=0) == 0:
-                w = tl.load(
-                    words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
-                )
-            bits = ((w >> ((col % 2) * 16).to(tl.int64)) & 0xFFFF).to(tl.int32)
-            mine = tl.load(
-                share_ptr + t * stride_share_t + o_d - rank * COLS,
-                mask=m_d & (src == rank),
-                other=0.0,
-            ).to(tl.float32)
-            ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
-            # Every warp loaded the epoch before the poll's cross-warp min, so
-            # no warp reads this store back as its own.
-            tl.store(epochs_ptr + t, flag)
-        if DO_ADD2:
-            ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
-                tl.float32
-            )
-        if WRITE_PREF:
-            tl.store(
-                pref_ptr + t * stride_pref_t + o_d,
-                ps.to(pref_ptr.dtype.element_ty),
-                mask=m_d,
-            )
-
         for i_l in range(BANK_TILES, tl.cdiv(Bp, BL)):
             b_m, b_acc, b_o = _mix_tile(
                 br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
             )
+            if i_l == FINISH_AFTER:
+                ps = _finish_prefix(
+                    ps,
+                    t,
+                    o_d,
+                    m_d,
+                    flag,
+                    rank,
+                    scratch_ptr,
+                    share_ptr,
+                    epochs_ptr,
+                    hs2_ptr,
+                    pref_ptr,
+                    stride_share_t,
+                    stride_hs2_t,
+                    stride_pref_t,
+                    PEERS,
+                    COLS,
+                    ROWS,
+                    GATHER,
+                    DO_ADD2,
+                    WRITE_PREF,
+                )
 
         b_o = b_o / b_acc
         if OUT_NORM:
