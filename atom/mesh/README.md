@@ -249,6 +249,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
 | `GET` | `/kv_events/sources` | With `--kv-events`: each worker rank's KV event stream and what it carried |
+| `GET` | `/kv_storage/sources` | With `--kv-events`: each Mooncake Store the workers report offloading to, its readers, and each pool master's answer, asked meanwhile at `--mooncake-admin-port`: tainted or not |
 
 ## Load balancing
 

@@ -16,6 +16,7 @@ use crate::{
         WorkerService,
     },
     kv_events::KvEventMonitor,
+    kv_storage::StorageSources,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -63,6 +64,8 @@ pub struct AppContext {
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
     /// Set with `kv_events` in the router config.
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// Set with `kv_events` in the router config.
+    pub kv_storage: Option<Arc<StorageSources>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -269,6 +272,8 @@ impl AppContextBuilder {
         if let Some(monitor) = &kv_event_monitor {
             policy_registry.set_kv_events(monitor.clone());
         }
+        let kv_storage = (router_config.kv_events)
+            .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
@@ -305,6 +310,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             atom_standalone_runtime: self.atom_standalone_runtime,
             kv_event_monitor,
+            kv_storage,
         })
     }
 

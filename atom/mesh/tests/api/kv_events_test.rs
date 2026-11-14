@@ -1,15 +1,25 @@
 //! With `--kv-events`, a worker registered through `/workers`, or each rank of a DP-aware
 //! one, is followed at the endpoint it reports at `/kv_event_sources` until it is
-//! removed, as `/kv_events/sources` shows, and `cache_aware` places requests by the blocks
-//! it holds. The batches are ATOM's own, from the decoder's samples.
+//! removed, as `/kv_events/sources` shows, reading meanwhile the Mooncake Store it
+//! reports offloading to, as `/kv_storage/sources` shows, and `cache_aware` places
+//! requests by the blocks it holds. The batches are ATOM's own, from the decoder's samples.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Query, Request},
     http::{header::CONTENT_TYPE, StatusCode},
-    Router,
+    routing::get,
+    Json, Router,
 };
 use bytes::Bytes;
 use mesh::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
@@ -82,6 +92,39 @@ async fn sources_once(
     panic!("timed out at {sources}; workers {workers}");
 }
 
+async fn storage_once(app: &Router, done: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..1500 {
+        let (status, sources) = call(app, "GET", "/kv_storage/sources", None).await;
+        assert_eq!(status, StatusCode::OK);
+        if done(&sources) {
+            return sources;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out at /kv_storage/sources");
+}
+
+/// A Mooncake master's admin service, its port, holding the taint key when `tainted`.
+async fn mooncake_admin(tainted: Arc<AtomicBool>) -> u16 {
+    let answer = move |Query(query): Query<HashMap<String, String>>| {
+        let tainted = tainted.load(Ordering::Relaxed);
+        async move {
+            let state = |key: &str| match key == "atomkv/store-tainted" && tainted {
+                true => json!({"ok": true, "values": [{"size_": 4096}]}),
+                false => json!({"ok": false, "error": "OBJECT_NOT_FOUND", "values": null}),
+            };
+            let keys = query["keys"].split(',');
+            let data: Map<String, Value> = keys.map(|key| (key.into(), state(key))).collect();
+            Json(json!({"success": true, "data": data}))
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let admin = Router::new().route("/batch_query_keys", get(answer));
+    tokio::spawn(async move { axum::serve(listener, admin).await });
+    port
+}
+
 // The worker's tokenizer job may block a thread while it tries to download.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_registered_worker_is_followed_until_removed() {
@@ -128,8 +171,12 @@ async fn a_registered_worker_is_followed_until_removed() {
     worker.stop().await;
 }
 
+/// Each rank also reads the Mooncake Store it reports offloading to, with a pool whose
+/// master answers and one whose master is down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed() {
+    let tainted = Arc::new(AtomicBool::new(false));
+    let admin_port = mooncake_admin(tainted.clone()).await;
     let mut publishers = Vec::new();
     let mut ports = Vec::new();
     for _ in 0..2 {
@@ -147,14 +194,20 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
     });
     let url = worker.start().await.unwrap();
     worker.set_dp_size(2).await;
-    let source =
-        |port: &str| json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.2:50051", "127.0.0.1:50051"],
+        "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 64, "world": 1,
+        "min_load_tokens": 512, "chain_check": "a1aef9c4be290e35c90734297b3e6c8a"});
+    let source = |port: &str| {
+        json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4,
+            "offload": offload})
+    };
     worker
         .set_kv_event_sources(json!({"0": source(&ports[0]), "1": source(&ports[1])}))
         .await;
     let mut config = TestRouterConfig::random(3992);
     config.kv_events = true;
     config.dp_aware = true;
+    config.mooncake_admin_port = admin_port;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let app = ctx.create_app().await;
 
@@ -172,11 +225,32 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
             assert_eq!(&sources[rank][key], value, "rank {rank} {key}");
         }
     }
+    let read = |sources: &Value| sources[0]["readers"].as_array().map(Vec::len) == Some(2);
+    let stores = storage_once(&app, read).await;
+    assert_eq!(stores.as_array().map(Vec::len), Some(1));
+    let want = json!({"id": "atom-mooncake-01234567", "chain_check_passed": true,
+        "masters": ["127.0.0.1:50051", "127.0.0.2:50051"], "chunk_tokens": 64,
+        "readers": [format!("{url}@0"), format!("{url}@1")]});
+    for (key, value) in want.as_object().unwrap() {
+        assert_eq!(&stores[0][key], value, "{key}");
+    }
+    let pools = &stores[0]["pools"];
+    let admin = format!("http://127.0.0.1:{admin_port}");
+    let up = json!({"master": "127.0.0.1:50051", "admin": admin, "tainted": false, "error": null});
+    assert_eq!(pools[0], up);
+    assert!(
+        pools[1]["tainted"].is_null() && pools[1]["error"].is_string(),
+        "{pools}"
+    );
+    tainted.store(true, Ordering::Relaxed);
+    let (_, stores) = call(&app, "GET", "/kv_storage/sources", None).await;
+    assert_eq!(stores[0]["pools"][0]["tainted"], true);
 
     let id = added["worker_id"].as_str().unwrap();
     let (status, _) = call(&app, "DELETE", &format!("/workers/{id}"), None).await;
     assert!(status.is_success(), "{status}");
     sources_once(&app, None, |sources| sources == &json!([])).await;
+    storage_once(&app, |stores| stores == &json!([])).await;
     ctx.shutdown().await;
     worker.stop().await;
 }
@@ -329,7 +403,9 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
 async fn kv_event_sources_are_not_found_without_kv_events() {
     let ctx = AppTestContext::new(vec![]).await;
     let app = ctx.create_app().await;
-    let (status, _) = call(&app, "GET", "/kv_events/sources", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    for path in ["/kv_events/sources", "/kv_storage/sources"] {
+        let (status, _) = call(&app, "GET", path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
     ctx.shutdown().await;
 }

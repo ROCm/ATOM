@@ -713,6 +713,7 @@ mod tests {
             topic: "kv".into(),
             block_size: 4,
             replay_endpoint: Some(replay_endpoint),
+            ..Default::default()
         };
         monitor.attach(WORKER, "model", "regular", 1, source);
         let base = clear_until(&mut publisher, &monitor, |s| s.batches > 0).await;
