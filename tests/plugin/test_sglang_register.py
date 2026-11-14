@@ -409,3 +409,86 @@ def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
 
     register_processor.assert_called_once_with()
     apply_load_config_patch.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# EagleDraftWorker.init_cuda_graphs wrapper - draft-extend graph runner
+# ---------------------------------------------------------------------------
+
+
+def test_qwen_drafter_keeps_sglang_captured_draft_extend_runner(monkeypatch):
+    """SGLang >= 0.5.22 captures the Qwen drafter's draft-extend graph itself;
+    the wrapper must keep that runner, or every decode step's draft extend runs
+    eager."""
+    from atom.plugin import register
+
+    def _module(name, **attrs):
+        module = ModuleType(name)
+        module.__path__ = []
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    class _CudaGraphRunner:
+        _atom_dsv4_spec_can_run_patched = True
+
+    class _DraftRunner:
+        _atom_dsv4_replay_patched = True
+
+    class _DraftExtendRunner:
+        _atom_dsv4_replay_patched = True
+
+        def __init__(self, worker):
+            self.worker = worker
+
+    sglang_captured = object()
+
+    class _EagleDraftWorker:
+        _atom_qwen4_draft_mrope_patched = True
+        _atom_dsv4_draft_extend_accept_patched = True
+
+        def init_cuda_graphs(self):
+            self.cuda_graph_runner_for_draft_extend = sglang_captured
+
+    srt = "sglang.srt"
+    spec = f"{srt}.speculative"
+    fake_modules = {
+        "sglang": _module("sglang"),
+        srt: _module(srt),
+        f"{srt}.model_executor": _module(f"{srt}.model_executor"),
+        f"{srt}.model_executor.runner": _module(
+            f"{srt}.model_executor.runner", DecodeCudaGraphRunner=_CudaGraphRunner
+        ),
+        spec: _module(spec),
+        f"{spec}.eagle_draft_cuda_graph_runner": _module(
+            f"{spec}.eagle_draft_cuda_graph_runner",
+            EAGLEDraftCudaGraphRunner=_DraftRunner,
+        ),
+        f"{spec}.eagle_draft_extend_cuda_graph_runner": _module(
+            f"{spec}.eagle_draft_extend_cuda_graph_runner",
+            EAGLEDraftExtendCudaGraphRunner=_DraftExtendRunner,
+        ),
+        f"{spec}.eagle_worker_v2": _module(
+            f"{spec}.eagle_worker_v2", EagleDraftWorker=_EagleDraftWorker
+        ),
+        "atom.plugin.sglang.glm52_dsa_bridge": _module(
+            "atom.plugin.sglang.glm52_dsa_bridge", GLM52_GRAPH_SEQ_LEN_CAPACITY=4096
+        ),
+    }
+    for name in (
+        "ATOM_SGLANG_V4_DISABLE_DRAFT_CG",
+        "ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with patch.dict(sys.modules, fake_modules):
+        register._patch_sglang_dsv4_spec_cuda_graph()
+
+    worker = _EagleDraftWorker()
+    worker.draft_runner = _Obj(
+        model_config=_Obj(hf_config=_Obj(architectures=["Qwen4ExpForCausalLMNextN"]))
+    )
+    worker.draft_extend_attn_backend = object()
+    worker.server_args = _Obj(disable_cuda_graph=False, speculative_num_draft_tokens=3)
+    worker.init_cuda_graphs()
+
+    assert worker.cuda_graph_runner_for_draft_extend is sglang_captured

@@ -981,10 +981,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
-                # The Flash drafter also takes this plugin-built draft-extend
-                # runner (its [3, N] mRoPE input is staged on replay by
-                # stage_draft_graph_mrope); SGLang's own HIP gate only admits
-                # aiter multi-step / DSV4 / DSA backends.
+                # The Flash drafter also uses a draft-extend graph (its [3, N]
+                # mRoPE input is staged on replay by stage_draft_graph_mrope).
+                # Keep a runner SGLang already captured (0.5.22+ admits
+                # QwenSparseAttnBackend to its HIP capture); build one only
+                # when SGLang did not.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
                     getattr(self, "draft_runner", None)
                 ) or _is_qwen4_exp_nextn_runner(getattr(self, "draft_runner", None))
@@ -1031,8 +1032,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self.cuda_graph_runner_for_draft_extend = (
                         EAGLEDraftExtendCudaGraphRunner(self)
                     )
-                elif supports_plugin_graph:
-                    self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
                     "Failed to enable draft-extend cuda graph in ATOM plugin: %s",
