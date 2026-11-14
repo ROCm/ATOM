@@ -67,7 +67,11 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             shared_spec.quant_dtype == routed_spec.quant_dtype
             and shared_spec.quant_type == routed_spec.quant_type
             and shared_spec.is_dynamic == routed_spec.is_dynamic
-        ) or fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
+        ) or (
+            fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
+            # A DSpark drafter (mtp.*) loads its shared expert as its own MLP.
+            and not (routed_expert_prefix or "").startswith("mtp.")
+        )
 
     # Resolve actual dtypes for shared experts vs routed experts.
     # Find a representative shared expert entry from the exclude list to
