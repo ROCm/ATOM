@@ -1,30 +1,31 @@
 # SPDX-License-Identifier: MIT
-"""Sparse attention over the FP8 pool's MXFP8 rows.
+"""Sparse attention over contiguous MXFP8 or NVFP4 CSA and MXFP8 SWA planes.
 
-A row is `head_dim` E4M3 values then `head_dim // 32` E8M0 scales, RoPE dims
-included (`V41PoolGeometry.row_bytes`); the query is quantized the same way
-(`rope_quant_window`'s `query_fp8`). Only AITER's `mla_sparse_prefill_v41`
-reads this record: the V3 (576 dims, a scale a tensor) and V4 (FP8 NoPE + BF16
-RoPE) FP8 kernels take the same dtypes and compute garbage on it, so nothing
-here dispatches by dtype.
+CSA and SWA have independent row spaces. A prefill's SWA source contains
+the current batch's rings followed by the current chunk; decode uses the ring directly.
+Legacy packed rows remain accepted by the standalone wrappers.
 """
 
 import torch
+from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
 from atom.utils.decorators import mark_trace
 
-try:
-    from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
-except ImportError:
-    mla_sparse_prefill_v41 = None
 
-
-def _split(rows, dim):
-    """`[n, dim + dim // 32]` byte rows as their (values, scales) views, at the
-    rows' own stride."""
-    return rows[:, :dim].view(FP8_DTYPE), rows[:, dim:].view(torch.float8_e8m0fnu)
+def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):
+    """View the data and scale bytes for MXFP8 (D + D/32) or NVFP4
+    (D/2 + D/16) rows without copying either source."""
+    fp4 = scale_dtype == torch.float8_e4m3fn
+    data_dtype = torch.uint8 if fp4 else FP8_DTYPE
+    width = dim // 2 if fp4 else dim
+    if isinstance(rows, tuple):
+        values, scales = rows
+        if not values.is_contiguous() or not scales.is_contiguous():
+            raise ValueError("KV data and scale planes must each be contiguous")
+        return values.view(data_dtype), scales.view(scale_dtype)
+    return rows[:, :width].view(data_dtype), rows[:, width:].view(scale_dtype)
 
 
 @mark_trace
@@ -39,28 +40,30 @@ def sparse_attn_v41_paged_2src(
     attn_sink,
     softmax_scale,
     out=None,
+    *,
+    pool_scale_dtype=torch.float8_e8m0fnu,
+    num_kv_splits=None,
 ):
-    """`sparse_attn_v4_paged_2src` on MXFP8 rows: each token attends to its
+    """Sparse attention with MXFP8 queries: each token attends to its
     prefix rows of `pool` and its extend rows of `kv`.
 
     Args:
       query:   `(values [T, H, D] fp8, scales [T, H, D // 32] E8M0)`.
-      pool:    `[rows, D + D // 32]` uint8, the prefix source (the cache's pool).
-      kv:      `[rows, D + D // 32]` uint8 at `pool`'s row stride, the extend
-        source: this forward's rows (prefill) or the layer's ring (decode).
+      pool:    CSA planes: MXFP8 `(data [rows, D], scale [rows, D // 32])`,
+        or NVFP4 `(data [rows, D // 2], scale [rows, D // 16])`.
+      kv:      the SWA pair: ring plus current chunk (prefill), or ring (decode).
+        Both planes are contiguous; each source has its own CSR row space.
       kv_indices_* / kv_indptr_*: int32 CSR row lists into each source.
       out:     optional `[T, H, D]` bf16 output.
+      pool_scale_dtype: E8M0 for MXFP8 CSA, or E4M3 for NVFP4 CSA.
+      num_kv_splits: optional AITER split override; otherwise AITER chooses it.
     """
-    if mla_sparse_prefill_v41 is None:
-        raise RuntimeError(
-            "The FP8 V4.1 KV cache needs AITER's mla_sparse_prefill_v41 (aiter#6675)"
-        )
     values, scales = query
     dim = values.shape[-1]
     return mla_sparse_prefill_v41(
         values,
         scales,
-        *_split(pool, dim),
+        *_split(pool, dim, pool_scale_dtype),
         kv_indices_prefix,
         kv_indptr_prefix,
         *_split(kv, dim),
@@ -69,6 +72,7 @@ def sparse_attn_v41_paged_2src(
         attn_sink,
         softmax_scale,
         out=out,
+        num_kv_splits=num_kv_splits,
     )
 
 

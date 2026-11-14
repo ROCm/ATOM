@@ -21,6 +21,7 @@ from .ubatching import (
     tbo_get_comm_stream,
     tbo_get_compute_stream,
     tbo_maybe_run_recv_hook,
+    tbo_on_comm,
     tbo_overlap_enabled,
     tbo_register_recv_hook,
     tbo_switch_to_comm,
@@ -28,7 +29,6 @@ from .ubatching import (
     tbo_switch_to_compute_sync,
     tbo_yield,
     tbo_yield_and_switch_from_comm_to_compute,
-    tbo_yield_and_switch_from_compute_to_comm,
 )
 
 __all__ = [
@@ -49,6 +49,7 @@ __all__ = [
     "tbo_get_comm_stream",
     "tbo_get_compute_stream",
     "tbo_maybe_run_recv_hook",
+    "tbo_on_comm",
     "tbo_overlap_enabled",
     "tbo_register_recv_hook",
     "tbo_switch_to_comm",
@@ -56,5 +57,4 @@ __all__ = [
     "tbo_switch_to_compute_sync",
     "tbo_yield",
     "tbo_yield_and_switch_from_comm_to_compute",
-    "tbo_yield_and_switch_from_compute_to_comm",
 ]

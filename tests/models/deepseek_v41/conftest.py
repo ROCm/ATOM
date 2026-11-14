@@ -105,12 +105,13 @@ def unallocated_moe(monkeypatch):
 def build_v41(unallocated_moe):
     """Build one V4.1 entry point by name, on the meta device.
 
-    All four are here because the model is reachable four ways and each
+    All three are here because the model is reachable three ways and each
     reaches its layers by its own path: what one hands them is not evidence
     about what another does.
     """
     import torch
 
+    from atom.config import DSparkConfig
     from atom.models.deepseek_v41 import dspark, model, runtime
 
     hf = unallocated_moe
@@ -122,6 +123,7 @@ def build_v41(unallocated_moe):
             enforce_eager=True,
             compilation_config=SimpleNamespace(level=0, static_forward_context={}),
             online_quant_config=online,
+            dspark=DSparkConfig(),
         )
         with torch.device("meta"):
             if entrypoint == "runtime":
@@ -134,10 +136,6 @@ def build_v41(unallocated_moe):
             # from `DSparkProposer`, which is where the backbone is.
             if entrypoint == "draft":
                 return dspark.DeepseekV41DSpark(engine, alt_stream=alt_stream)
-            if entrypoint == "draft_offline":
-                return dspark.DeepseekV41DSpark(
-                    hf, max_length=32, alt_stream=alt_stream
-                )
             raise ValueError(f"No V4.1 entry point named {entrypoint!r}")
 
     return build

@@ -2293,6 +2293,7 @@ def _non_mla_draft(monkeypatch, module, cls_name, *, dcp, max_model_len, block_s
         kv_cache_block_size=block_size,
         decode_context_parallel_size=dcp,
         kv_cache_dtype="bf16",
+        kv_transfer_config={},
         speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
     )
     return getattr(mod, cls_name)(atom_config), hf
@@ -2775,8 +2776,80 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    atom_config = types.SimpleNamespace(kv_transfer_config={})
     with pytest.raises(ValueError, match="needs TP >= 4"):
-        m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+        m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=0)
+
+
+def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
+    monkeypatch,
+):
+    """A TP1 P/D producer builds the draft with all 4 KV heads; its block pass,
+    which decodes one head per rank, refuses before writing anything."""
+    import atom.models.minimax_m3.dspark as m3_dspark
+
+    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "GemmaRMSNorm", "get_rope"):
+        monkeypatch.setattr(m3_dspark, name, lambda *a, **k: torch.nn.Identity())
+    config = types.SimpleNamespace(
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=6144,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=5e6,
+    )
+    atom_config = types.SimpleNamespace(
+        kv_transfer_config={"kv_role": "kv_producer"}, kv_cache_dtype="fp8"
+    )
+    attn = m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
+    assert attn.num_kv_heads == 4
+    with pytest.raises(RuntimeError, match="one KV head per rank"):
+        attn(torch.zeros(2, dtype=torch.long), torch.zeros(2, 6144))
+
+
+def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
+    """The draft model reads its KV dtype off the config it is built with: the shallow
+    copy carries the draft's (bf16 under a target fp4); the target's keeps its own."""
+    from atom.config import CompilationConfig
+    from atom.spec_decode import draft_kv
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    seen = {}
+    monkeypatch.setattr(draft_kv, "draft_kv_builder", lambda runner, hf, model: None)
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(),
+        draft_kv_dtype="bf16",  # as `Config` resolved it, under an fp4 target
+        use_dspark_with_draft=lambda: True,
+    )
+    p.runner = types.SimpleNamespace()
+    p.config = types.SimpleNamespace(
+        kv_cache_dtype="fp4",
+        hf_config=types.SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    p._build_draft_model(model_class)
+
+    assert seen == {"dtype": "bf16"} and p.config.kv_cache_dtype == "fp4"
+
+
+def test_dtype_q_follows_the_drafts_dtype_not_the_targets():
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.config = types.SimpleNamespace(kv_cache_dtype="fp4")
+    p.dtype = torch.bfloat16
+    p.speculative_config = types.SimpleNamespace(draft_kv_dtype="bf16")
+    p._bound_draft_k_cache = lambda fc: None
+
+    assert p._resolve_dtype_q(None) == (torch.bfloat16, False)
 
 
 # ---- shared across the DSpark drafts: aux capture, slots, block plan ------

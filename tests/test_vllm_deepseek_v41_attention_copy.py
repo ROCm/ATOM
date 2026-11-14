@@ -37,10 +37,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
-# sha256 of core's `Attention.forward` and `_attend`, comments and blank
-# lines stripped.
-CORE_PREPARE_DIGEST = "50a174931df035a4"
-CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
+# sha256 of core's attention forward/preparation helpers, comments and blank
+# lines stripped. vLLM keeps preparation inside its existing attention break;
+# native TokenGraph's fixed/live placement does not change the copied math.
+CORE_PREPARE_DIGEST = "1f897780d89a3205"
+CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
 
 
 @pytest.fixture
@@ -222,8 +223,7 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
 
 def _core_forward() -> str:
     """The source of the attention half the plugin copies: `Attention.forward`
-    and `_attend`, the region it attends in, by AST rather than by text
-    markers.
+    and its preparation/attention helpers, by AST rather than text markers.
 
     A "next def" marker would have nothing to find after the class's last
     method -- and a marker that silently matches to end-of-file would fold
@@ -238,7 +238,13 @@ def _core_forward() -> str:
     lines = src.split("\n")
     return "\n".join(
         line.rstrip()
-        for name in ("forward", "_attend")
+        for name in (
+            "forward",
+            "_prepare_attention",
+            "_prepare_attention_live",
+            "_attention_inputs",
+            "_attend",
+        )
         for fn in cls.body
         if isinstance(fn, ast.FunctionDef) and fn.name == name
         for line in lines[fn.lineno - 1 : fn.end_lineno]
