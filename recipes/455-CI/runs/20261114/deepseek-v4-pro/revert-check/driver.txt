@@ -1,0 +1,4 @@
+2026-11-14 22:23:19 [v4pro-revert5899] reverted:  14 files changed, 251 insertions(+), 959 deletions(-)
+2026-11-14 22:34:41 [v4pro-revert5899] server READY after 682s (main failed at warmup after 782 s)
+2026-11-14 22:37:32 [v4pro-revert5899] gsm8k rc=0 flexible-extract: 0.9476876421531463  strict-match: 0.9484457922668689
+2026-11-14 22:37:34 [v4pro-revert5899] DONE kfd=0
