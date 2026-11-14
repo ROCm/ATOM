@@ -883,10 +883,6 @@ wait_http() {
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
-    if peer="$(failed_peer_node)"; then
-      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
-      exit 1
-    fi
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -895,6 +891,12 @@ wait_http() {
       [[ "${rc}" -eq 0 ]] && rc=1
       echo "[wait][FAIL] ${name} process exited before becoming ready rc=${rc}" >&2
       exit "${rc}"
+    fi
+    # After this node's own checks: when both failed, its own failure is the
+    # one to report.
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
+      exit 1
     fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "[wait][FAIL] ${name} not ready after ${timeout}s" >&2
@@ -1605,9 +1607,10 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
-# Prints the rank-rc-* of another node whose launcher exited non-zero
-# (pd_slurm_job.sh publishes one per node as it exits): the servers, router or
-# Store owners that node was to bring never come.
+# Prints the rank-rc-* of another node whose launcher exited non-zero: the
+# servers, router or Store owners that node was to bring never come. Only Spur
+# workers publish rank-rc-* (cleanup_spur in pd_slurm_job.sh); under plain
+# Slurm there are none, and srun --kill-on-bad-exit=1 stops the other nodes.
 failed_peer_node() {
   local f rc
   for f in "${RUN_DIR}"/rank-rc-*; do
@@ -1622,8 +1625,11 @@ failed_peer_node() {
 }
 
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process, or another node's launcher
-# exiting non-zero, fails it at once.
+# <timeout> seconds. It fails at once when a Store process dies, when a Store
+# log reports a failure (Failed to setup client, Failed to mount, Check failed,
+# FATAL), or when another node's launcher exits non-zero, checked in that
+# order: when this node and another both failed, this node's failure is the
+# one to report.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
@@ -1635,11 +1641,6 @@ wait_for_mooncake_store() {
       stop_mooncake_store || true
       exit "${mooncake_store_failed_rc}"
     fi
-    if peer="$(failed_peer_node)"; then
-      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
-      stop_mooncake_store || true
-      exit 1
-    fi
     for log in "${mooncake_store_logs[@]}"; do
       if grep -q -E "Failed to setup client|Failed to mount|Check failed|FATAL" "${log}" 2>/dev/null; then
         tail -n 50 "${log}" >&2 || true
@@ -1648,6 +1649,11 @@ wait_for_mooncake_store() {
         exit 1
       fi
     done
+    if peer="$(failed_peer_node)"; then
+      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       for log in "${mooncake_store_logs[@]}"; do
         tail -n 20 "${log}" >&2 || true
