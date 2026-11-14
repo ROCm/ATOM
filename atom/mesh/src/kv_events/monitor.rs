@@ -64,7 +64,7 @@ pub struct SourceStatus {
     #[serde(flatten)]
     pub source: KvEventSource,
     pub connected: bool,
-    /// Why the subscription stopped, if it did.
+    /// Why the subscription stopped, if it did: its socket could not connect or subscribe.
     pub error: Option<String>,
     pub trust: Trust,
     pub last_seq: Option<u64>,
@@ -74,10 +74,12 @@ pub struct SourceStatus {
     pub stored_blocks: u64,
     pub removed_blocks: u64,
     pub clears: u64,
-    /// Holder clears after lost batches or an engine restart.
+    /// Batches admitted as `ClearAndApply`: after lost batches, a lost connection or an
+    /// engine restart.
     pub resets: u64,
     pub dropped_events: BTreeMap<DropReason, u64>,
-    /// Payloads that are not a batch of this rank.
+    /// Messages dropped whole: not `[topic, seq, payload]`, a seq that is not 8 bytes, a
+    /// payload that does not decode, or a batch of another DP rank.
     pub dropped_batches: u64,
 }
 
@@ -142,6 +144,7 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
     }
     status.lock().connected = true;
     let mut admission = RankState::default();
+    let mut recv_failed = false;
     loop {
         tokio::select! {
             // A lost connection counts before the batches of the next one.
@@ -149,8 +152,10 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
             Some(event) = events.next() => match event {
                 SocketEvent::Connected(..) => status.lock().connected = true,
                 SocketEvent::Disconnected(_) => {
-                    status.lock().connected = false;
                     admission.disconnected();
+                    let mut status = status.lock();
+                    status.connected = false;
+                    status.trust = admission.trust();
                 }
                 _ => {}
             },
@@ -160,7 +165,16 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
                     record(&mut status.lock(), &mut admission, batch);
                 }
                 // The socket reconnects by itself.
-                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(e) => {
+                    if !std::mem::replace(&mut recv_failed, true) {
+                        warn!(
+                            endpoint = %source.endpoint,
+                            error = %e,
+                            "Cannot receive KV events; retrying"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                }
             },
         }
     }
@@ -335,6 +349,10 @@ mod tests {
         let restarted = clear_until(&mut publisher, &monitor, |s| s.last_seq == Some(0)).await;
         assert!(restarted.connected && restarted.resets > status.resets);
         assert_eq!(restarted.trust, Trust::Exact);
+        // Batches may be lost from the moment the connection is.
+        drop(publisher);
+        let lost = status_once(&monitor, |s| !s.connected).await;
+        assert_eq!(lost.trust, Trust::Partial);
 
         monitor.detach(WORKER);
         assert!(monitor.sources().is_empty());
