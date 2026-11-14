@@ -753,7 +753,8 @@ def test_terminal_without_consumer_expires_but_live_rdma_cannot_expire(monkeypat
 
 
 @pytest.mark.parametrize("pp_size", [1, 3])
-def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size, chunked):
     from aiter_stub import stubbed_aiter
 
     with stubbed_aiter():
@@ -769,7 +770,7 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
         kv_connector=SimpleNamespace(
             is_producer=True,
             is_offload=False,
-            enable_chunked_transfer=True,
+            enable_chunked_transfer=chunked,
             build_connector_meta=lambda: meta,
         )
     )
@@ -1288,14 +1289,14 @@ def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypa
 @pytest.mark.parametrize(
     "is_offload,enabled,is_producer,dispatches",
     [
-        (False, False, True, False),
+        (False, False, True, True),
         (False, False, False, False),
         (False, True, False, False),
         (False, True, True, True),
         (True, False, False, True),
     ],
 )
-def test_idle_dispatch_remains_opt_in(
+def test_idle_dispatch_accepts_terminal_producers_and_offload(
     pp_size, is_offload, enabled, is_producer, dispatches
 ):
     with stubbed_aiter():
@@ -2232,3 +2233,52 @@ def test_a_preempted_producer_request_rejected_on_readmission_hands_nothing_off(
     assert str(seq.id) not in producer._awaiting_send
     assert seq.id not in producer._reqs_need_save
     assert seq.id not in sched.deferred_free_blocks
+
+
+def test_a_withdrawn_producer_admission_dispatches_no_source_blocks(
+    monkeypatch, seq_factory
+):
+    """A chunked producer is told of every allocation (`update_state_after_alloc`
+    queues its block ids for the worker). An admission the scheduler takes back
+    after that must be cancelled before its blocks are freed, or the same tick's
+    metadata sends the freed ids and claims the source."""
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    sched = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_num_seqs=8,
+        )
+    )
+    producer = sched.kv_connector = scheduler_connector(monkeypatch, True)
+
+    def producer_seq(transfer_id):
+        return seq_factory(
+            list(range(10)),
+            kv_transfer_params={
+                "chunked_transfer": True,
+                "do_remote_decode": True,
+                "transfer_id": transfer_id,
+            },
+        )
+
+    first, withdrawn = producer_seq("a"), producer_seq("b")
+    sched.add(first)
+    sched.add(withdrawn)
+    producer._chunked_ready.update({first.id, withdrawn.id})  # D reserved both
+    # The post-allocation re-assert withdraws the second request's admission.
+    monkeypatch.setattr(
+        sched,
+        "_waits_below_resume",
+        lambda seq, start, chunk, resume: seq is withdrawn and bool(seq.block_table),
+    )
+    batch, scheduled = sched.schedule()
+    meta = batch.connector_meta_output
+    assert list(scheduled) == [first.id]
+    assert set(meta.reqs_to_save) == {first.id}
+    assert str(withdrawn.id) not in producer._awaiting_send
+    assert not withdrawn.block_table

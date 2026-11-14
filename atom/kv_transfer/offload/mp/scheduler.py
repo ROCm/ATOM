@@ -266,8 +266,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                     int(end),
                 )
         # Also catches retirements that bypass _finish_retired_request, such as
-        # a late save with nothing left to store.
-        self._end_finished_sessions()
+        # a late save with nothing left to store. The shared builder above has
+        # already advanced the lookups this step.
+        self._end_finished_sessions(reconcile=False)
         stats = getattr(self._lookup_client, "driver_stats", None)
         if stats:
             for key, value in stats.items():
@@ -411,7 +412,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """
         return self.__dict__.setdefault("_sessions_to_end", {})
 
-    def _end_finished_sessions(self) -> None:
+    def _end_finished_sessions(self, *, reconcile: bool = True) -> None:
         """End each finished request's session once no save or lookup remains.
 
         A detached lookup (`detach_lookup`) can outlive its request. If
@@ -424,18 +425,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Pumped on every pass: a detached lookup must be released even while
         # its request is still transferring and the waiting queue, which
         # drives `prefetch_lookups`, is empty.
+        # Terminal-only calls still need the shared reconciliation to free
+        # detached lookup locks; the metadata build has already done it.
+        if reconcile:
+            self._reconcile_lookups_each_step()
         client = self._lookup_client
-        pump = getattr(client, "pump", None)
-        if callable(pump):
-            pump()
-        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
-        in_flight = getattr(client, "is_pending", None)
+
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
                 continue
-            if callable(in_flight) and in_flight(sid):
+            if client is not None and client.is_pending(sid):
                 continue
             del pending[sid]
             # No save can follow now: the workers' copy of its tokens goes.

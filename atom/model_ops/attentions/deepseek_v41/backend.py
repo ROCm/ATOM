@@ -507,9 +507,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
         state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
         slot_unit = int(state.shape[1])
-        p_d = (
-            KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
-            == "mooncake"
+        p_d = any(
+            name == "mooncake"
+            for name, _ in (KVConnectorFactory.leaf_connectors(runner.config) or [])
         )
         return KVTransferTensors(
             pages=pages,

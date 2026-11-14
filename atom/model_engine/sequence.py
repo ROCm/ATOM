@@ -186,10 +186,7 @@ def resumes_offload_prefill(seq) -> bool:
     lookup prefetch, which must agree: a lookup sent for a request that skips
     the match is never consumed and only holds read locks.
     """
-    return (
-        getattr(seq, "offload_loaded", False)
-        or getattr(seq, "offload_load_failed", False)
-    ) and len(seq.block_table) > 0
+    return (seq.offload_loaded or seq.offload_load_failed) and len(seq.block_table) > 0
 
 
 @dataclass
@@ -455,6 +452,16 @@ class Sequence:
         # move together through admission and load. Grouped so a joint reset
         # cannot forget a field; see `OffloadJointRecord`.
         self.offload_joint = OffloadJointRecord()
+        self.offload_loaded = False
+        self.offload_load_failed = False
+        # Tokens its tier load covers once the connector planned it.
+        self.offload_loaded_tokens = 0
+        # `hbm_cached_tokens` the planned load started from (P/D / early load
+        # publication); None until a connector plans one.
+        self.offload_load_start_tokens = None
+        # Prefix tokens `share_cache` routing credited this request when it
+        # placed it, until its rank reports what it really reused.
+        self.dp_est_cached_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

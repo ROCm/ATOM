@@ -19,6 +19,8 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+
 Snapshot = dict[str, Any]
 SnapshotState = tuple[Snapshot, int, float]
 
@@ -155,6 +157,11 @@ class _AtomMetricsCollector:
             yield metric
 
         dp_router = snapshot.get("dp_router", {})
+        for key, documentation in ShareCacheRouter.DECISIONS.items():
+            name = "atom:dp_" + key.removesuffix("_total")
+            metric = CounterMetricFamily(name, documentation)
+            metric.add_metric([], float(dp_router.get(key, 0)))
+            yield metric
         for name, documentation, value in (
             (
                 "atom:dp_affinity_new",

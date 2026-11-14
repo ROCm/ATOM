@@ -34,7 +34,9 @@ def test_time_mode_is_unchanged_by_default(monkeypatch):
     for _ in range(1000):
         s.bump_step()
     assert not s.window_expired(s._throughput_last_log_time + 1.0)
-    assert s.window_expired(s._throughput_last_log_time + 10.0)
+    # A hair past the interval: `last + 10.0 - last` is not exactly 10.0 for a
+    # clock reading like 508.68, so the boundary itself is not a stable probe.
+    assert s.window_expired(s._throughput_last_log_time + 10.0 + 1e-6)
 
 
 def test_step_mode_ignores_the_clock():
@@ -333,4 +335,6 @@ def test_a_negative_interval_falls_back_to_the_clock(steps, monkeypatch):
     assert s.throughput_log_interval_steps == 0
     s.bump_step()
     assert not s.window_expired(s._throughput_last_log_time + 1.0)
-    assert s.window_expired(s._throughput_last_log_time + 10.0)
+    # A hair past the interval: `last + 10.0 - last` is not exactly 10.0 for a
+    # clock reading like 508.68, so the boundary itself is not a stable probe.
+    assert s.window_expired(s._throughput_last_log_time + 10.0 + 1e-6)

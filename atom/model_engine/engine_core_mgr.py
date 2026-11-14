@@ -32,10 +32,12 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
+from atom.model_engine.dp_routing.backlog import BacklogLedger
 from atom.model_engine.dp_routing.policies import (
     LoadPolicy,
     PrefixPolicy,
     SessionPolicy,
+    ShareCachePolicy,
 )
 from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.dp_routing.route import (
@@ -44,7 +46,11 @@ from atom.model_engine.dp_routing.route import (
     PREFIX_OWNER,
     Route,
 )
-from atom.model_engine.dp_routing.topology import prefix_spread_enabled
+from atom.model_engine.dp_routing.share_cache import ShareCacheRouter
+from atom.model_engine.dp_routing.topology import (
+    prefix_spread_enabled,
+    shared_prefix_routing_enabled,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -89,7 +95,13 @@ def _pp_head_first(cmd: str, args: dict) -> bool:
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
+DP_LB_STRATEGIES = (
+    "round_robin",
+    "least_requests",
+    "least_tokens",
+    "share_cache",
+    "prefix_spread",
+)
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -220,9 +232,13 @@ class CoreManager:
     # _input_send_lock with their own in _init_shared_state; _bp_depth defaults
     # to 0 (backpressure disabled).
     _bp_depth = 0
+    # No prefix router, and so no backlog ledger, unless __init__ builds one.
+    _prefix_router = None
+    _backlog = None
     _bp_offline_batch = False
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
+    _dispatch_send_lock = Lock()
 
     def _init_shared_state(
         self,
@@ -336,12 +352,23 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
-        # Prefix-spread routing (`atom/model_engine/dp_routing/prefix_spread.py`):
-        # keeps a request on the rank holding its prompt's prefix unless that
-        # rank has a prefill backlog and another is about to idle. Created only
-        # when this manager actually routes between eligible DP ranks.
+        # Prefix routing, `prefix_spread` (`dp_routing/prefix_spread.py`: keeps
+        # a request on the rank holding its prompt's prefix unless that rank
+        # has a prefill backlog and another is about to idle) or `share_cache`
+        # (`dp_routing/share_cache.py`: the same index balanced on each rank's
+        # reported prefill backlog, tracked by the ledger). Created only when
+        # this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
-        if self._prefix_router is not None:
+        # The ledger holds each rank's reported prefill backlog and the charges
+        # it does not cover yet (`EngineCoreRequestType.PREFILL_BACKLOG`).
+        self._backlog = (
+            BacklogLedger(self.global_engine_count)
+            if isinstance(self._prefix_router, ShareCacheRouter)
+            else None
+        )
+        if self._dp_lb_strategy == "share_cache":
+            self._dp_route_counters.update(dict.fromkeys(ShareCacheRouter.DECISIONS, 0))
+        elif self._prefix_router is not None:
             self._dp_route_counters.update(
                 dict.fromkeys(
                     PrefixSpreadRouter.DECISIONS + (PrefixSpreadRouter.MOVED_TOKENS,), 0
@@ -412,6 +439,7 @@ class CoreManager:
         # input_sockets send is serialized through this lock (see _send_request).
         # Uncontended in the legacy path, so it costs nothing when disabled.
         self._input_send_lock = Lock()
+        self._dispatch_send_lock = Lock()
         # Control traffic (utility commands, abort, shutdown) travels on its own
         # sockets so that input_sockets keeps a single writer -- see
         # _send_request. These have several writer threads and so do need
@@ -861,6 +889,16 @@ class CoreManager:
                                 )
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
+                    elif (
+                        request_type == EngineCoreRequestType.PREFILL_BACKLOG
+                        and self._backlog is not None
+                    ):
+                        with self._lb_lock:
+                            self._backlog.on_report(dp_rank, *data)
+                        self._flush_credit_updates()
+                    elif request_type == EngineCoreRequestType.DP_REUSE:
+                        with self._lb_lock:
+                            self._note_dp_reuse_locked(data)
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -1112,38 +1150,50 @@ class CoreManager:
             self._dispatch_to_dp_ranks(seqs)
 
     def _build_prefix_router(self, config) -> PrefixSpreadRouter | None:
-        """The `prefix_spread` router, or None.
+        """The `prefix_spread` or `share_cache` router, or None.
 
         None for another strategy, and when there is nothing to route: one
-        DP rank, or pipeline parallelism (requests enter at stage 0). The
-        strategy has no effect there, so its requirements are not enforced.
+        DP rank, pipeline parallelism (requests enter at stage 0), and, for
+        `share_cache`, RapidServe. The strategy has no effect there, so its
+        requirements are not enforced.
         """
-        if not prefix_spread_enabled(
-            config, routable_engines=self._routable_engine_count
-        ):
+        strategy = self._dp_lb_strategy
+        if strategy == "prefix_spread":
+            enabled = prefix_spread_enabled
+        elif strategy == "share_cache":
+            enabled = shared_prefix_routing_enabled
+        else:
+            return None
+        if not enabled(config, routable_engines=self._routable_engine_count):
             return None
         if self._dp_session_affinity_enabled:
             # Both place every request by their own rule; a session pin
             # would undo every move.
             raise ValueError(
-                "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
+                f"--dp-load-balance {strategy} and ATOM_DP_SESSION_AFFINITY=1 "
                 "are two routing policies; set only one"
             )
-        if not (
-            getattr(config, "enable_prefix_caching", False)
-            and envs.ATOM_FRONTEND_PREFIX_HASH
-        ):
+        if not (config.enable_prefix_caching and envs.ATOM_FRONTEND_PREFIX_HASH):
             # No prompt hash chain reaches the router: every request is
             # cold and goes to the lightest rank.
             raise ValueError(
-                "--dp-load-balance prefix_spread needs --enable_prefix_caching "
+                f"--dp-load-balance {strategy} needs --enable_prefix_caching "
                 "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
             )
-        return PrefixSpreadRouter(
-            envs.ATOM_DP_PREFIX_IDLE_TOKENS,
-            KVConnectorFactory.offload_tier(config),
-            config.max_num_seqs,
-        )
+        tier = KVConnectorFactory.offload_tier(config)
+        if strategy == "prefix_spread":
+            return PrefixSpreadRouter(
+                envs.ATOM_DP_PREFIX_IDLE_TOKENS, tier, config.max_num_seqs
+            )
+        if not tier.loads:
+            names = [name for name, _ in KVConnectorFactory.leaf_connectors(config)]
+            shared = sorted(KVConnectorFactory.shared_offload_connectors())
+            raise ValueError(
+                "--dp-load-balance share_cache needs an offload tier every DP "
+                f"rank shares and loads from ({', '.join(shared)}, kv_role "
+                f"offload or kv_both); the KV connectors are {names!r}"
+            )
+        return ShareCacheRouter(tier, self._dp_lb_req_equiv)
 
     @property
     def _routable_engine_count(self) -> int:
@@ -1228,6 +1278,10 @@ class CoreManager:
                 dp_rank = route.rank
                 if track_load:
                     self._charge_seq_load_locked(seq, dp_rank, credit=route.credit)
+                    if self._backlog is not None:
+                        self._backlog.note_charged(
+                            seq, dp_rank, self._seq_load[seq.id][2]
+                        )
                 dp_seqs[dp_rank].append(seq)
             # Copy the counters under the lock so the snapshot log below is a
             # consistent instant, not a torn read racing a release.
@@ -1247,8 +1301,21 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self._send_request(dp_rank, _add_frame(rank_seqs))
-                dispatched[dp_rank] = True
+                frame = _add_frame(rank_seqs)
+                if self._backlog is None:
+                    self._send_request(dp_rank, frame)
+                    dispatched[dp_rank] = True
+                else:
+                    # The ledger counts seqs in the order the rank ingests
+                    # them, so the send and its accounting are one step.
+                    # _send_request takes its own socket lock; neither lock is
+                    # acquired while holding _lb_lock in the selection phase.
+                    with self._dispatch_send_lock:
+                        self._send_request(dp_rank, frame)
+                        dispatched[dp_rank] = True
+                        with self._lb_lock:
+                            self._backlog.note_sent(dp_rank, rank_seqs, self._seq_load)
+                        self._flush_credit_updates()
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
                 )
@@ -1272,12 +1339,17 @@ class CoreManager:
         # load-aware strategies) the resulting in-flight distribution across all
         # ranks, so a single grep shows both what changed and how balanced it is.
         if reqs_snapshot is not None:
+            backlog = ""
+            if self._backlog is not None:
+                with self._lb_lock:
+                    backlog = f" rank_backlog={self._backlog_effective_tokens_locked()}"
             logger.info(
-                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s",
+                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s%s",
                 self.label,
                 ", ".join(added),
                 reqs_snapshot,
                 tokens_snapshot,
+                backlog,
             )
         else:
             logger.info("%s: add %s", self.label, ", ".join(added))
@@ -1392,7 +1464,8 @@ class CoreManager:
             stalled = sum(self._rank_reqs) == 0 and bool(self._bp_pending)
             if pause_always or stalled:
                 self._bp_dispatch_paused = True
-            return stalled
+        self._flush_credit_updates()
+        return stalled
 
     def _bp_fail_stalled_run(self) -> None:
         """Fail ``generate`` when a refill cannot send and nothing will retry.
@@ -1442,7 +1515,7 @@ class CoreManager:
           the lighter in-flight prompt-token load. Request count keeps the
           lockstep DP ranks in phase; the token tie-break packs pending prefill
           work evenly across the equal-request ranks.
-        - "least_tokens" and cold "prefix_spread": lowest combined load
+        - "least_tokens" and cold "prefix_spread" / "share_cache": lowest combined load
           ``tokens + req_equiv * reqs``
           (prefill pressure + decode-slot pressure).
 
@@ -1460,7 +1533,12 @@ class CoreManager:
         # of fully-equal ranks spreads evenly. Scores are computed inline (no
         # intermediate list) — the loop reads the counters directly.
         least_requests = strategy == "least_requests"
-        if strategy not in ("least_requests", "least_tokens", "prefix_spread"):
+        if strategy not in (
+            "least_requests",
+            "least_tokens",
+            "prefix_spread",
+            "share_cache",
+        ):
             raise ValueError(f"Unknown DP load-balancing strategy {strategy!r}")
         best_rank = 0
         best_score = None
@@ -1471,7 +1549,7 @@ class CoreManager:
                 # Lexicographic (request count, prompt-token load): tuples compare
                 # element-wise, so tokens only decide among request-count ties.
                 score = (self._rank_reqs[r], self._rank_tokens[r])
-            else:  # explicitly least_tokens or prefix_spread's cold placement
+            else:  # least_tokens, or a prefix policy's cold placement
                 score = self._rank_load(r)
             if best_score is None or score < best_score:
                 best_score = score
@@ -1535,6 +1613,45 @@ class CoreManager:
                 best_hash = tie_hash
         return best_rank
 
+    def _flush_credit_updates(self) -> None:
+        """Send the successor credit corrections that are due, once, with no
+        lock held. A failed send is offered again at the next flush."""
+        if self._backlog is None or not self._backlog.credit_updates:
+            return
+        with self._lb_lock:
+            batches = self._backlog.take_credit_updates()
+        for rank, updates in batches:
+            try:
+                self._send_request(
+                    rank,
+                    pickle.dumps((EngineCoreRequestType.DP_PREFIX_CREDIT, updates)),
+                )
+            except Exception:
+                logger.exception(
+                    "%s: successor credit update retained for retry on rank %d",
+                    self.label,
+                    rank,
+                )
+                with self._lb_lock:
+                    self._backlog.unsend(updates)
+
+    def _note_dp_reuse_locked(self, reports) -> None:
+        """A rank's (seq id, prompt tokens reused) reports for requests placed
+        on an estimated prefix; the router drops what the rank did not find."""
+        router = self._prefix_router
+        if router is None:
+            return
+        for seq_id, reused in reports:
+            if router.note_reuse(seq_id, reused):
+                self._dp_route_counters["share_cache_stale_total"] += 1
+
+    def _backlog_effective_tokens_locked(self) -> list[int]:
+        """Per rank, the prefill left that routing balances on."""
+        return [
+            self._backlog.tokens(r, self._rank_tokens[r])
+            for r in range(self._routable_engine_count)
+        ]
+
     def _record_dp_route_locked(self, decision: str, rank: int) -> int:
         """Account for one routing decision and return its target rank."""
         self._dp_route_counters[decision] += 1
@@ -1546,10 +1663,16 @@ class CoreManager:
         policy = getattr(self, "_dp_policy", None)
         router = self._prefix_router
         if router is not None:
-            if not isinstance(policy, PrefixPolicy) or policy.router is not router:
-                policy = PrefixPolicy(
+            shared = isinstance(router, ShareCacheRouter)
+            wanted = ShareCachePolicy if shared else PrefixPolicy
+            if type(policy) is not wanted or policy.router is not router:
+                policy = wanted(
                     router,
-                    lambda: self._rank_tokens,
+                    (
+                        self._backlog_effective_tokens_locked
+                        if shared
+                        else lambda: self._rank_tokens
+                    ),
                     lambda: self._rank_reqs,
                     self._rank_load,
                     lambda: self._select_dp_rank_locked(strategy="least_tokens"),
@@ -1679,6 +1802,8 @@ class CoreManager:
 
     def _release_load_locked(self, seq_id) -> None:
         """``_release_load`` for a caller that already holds ``_lb_lock``."""
+        if self._backlog is not None:
+            self._backlog.release(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1690,6 +1815,7 @@ class CoreManager:
         """Release a seq's prefix-router state, then its per-rank charge."""
         with self._lb_lock:
             self._release_seq_locked(seq_id)
+        self._flush_credit_updates()
 
     def _release_seq_locked(self, seq_id) -> None:
         """``_release_seq`` for a caller that already holds ``_lb_lock``."""
@@ -1702,12 +1828,16 @@ class CoreManager:
         A prefix producer leaving before prefill hands its provisional entries
         to a waiter, which is charged the credit it loses.
         """
-        for successor, extra in self._get_dp_policy().release(seq_id).items():
+        for successor, (extra, retained) in (
+            self._get_dp_policy().release(seq_id).items()
+        ):
             successor_load = self._seq_load.get(successor)
             if successor_load is not None:
                 rank, req_cost, tok_cost = successor_load
                 self._rank_tokens[rank] += extra
                 self._seq_load[successor] = (rank, req_cost, tok_cost + extra)
+                if self._backlog is not None:
+                    self._backlog.add_successor_debt(successor, rank, extra, retained)
 
     def _release_terminal_seq(self, seq) -> None:
         """Release a returned sequence using its completed-forward fact,
@@ -1730,6 +1860,8 @@ class CoreManager:
                 return
         with self._lb_lock:
             policy.prefill_complete(seq_id)
+            if self._backlog is not None:
+                self._backlog.release(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1780,6 +1912,8 @@ class CoreManager:
                 )
                 pending.clear()
             self._bp_dispatch_paused = False
+            if self._backlog is not None:
+                self._backlog.reset()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         self._refuse_unowned_weight_sync_cmd(cmd, None)

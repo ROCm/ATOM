@@ -74,6 +74,11 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _non_negative_or_none(value: int | None) -> int | None:
+    """A negative value clamps to 0; None stays None."""
+    return None if value is None else max(0, value)
+
+
 def _int_env(name: str, default: int) -> int:
     """Unset or empty reads as ``default``; anything else must be an integer."""
     value = _optional_int_env(name)
@@ -1366,12 +1371,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
     "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
-    # Minimum external-tier hit worth loading, in tokens. And the shortest
-    # prefix native lmcache_mp stores: an absolute boundary, for normal and
-    # late saves alike (other connectors ignore it).
-    "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
-        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+    # Early tier load (a waiting request whose async lookup answered gets its
+    # blocks and its load on any scheduler tick): the KV-pressure bounds.
+    # No early allocation once the KV pool would be fuller than this fraction.
+    "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.7, allow_zero=True
     ),
+    # Cap on the blocks held by early-loaded requests, as a fraction of the pool.
+    "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
+    ),
+    # Minimum external-tier hit worth loading, in tokens. None when unset: each
+    # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
+    "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
+        _optional_int_env("OFFLOAD_MIN_LOAD_TOKENS")
+    ),
+    # The shortest prefix native lmcache_mp stores: an absolute boundary, for
+    # normal and late saves alike (other connectors ignore it).
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
     ),
@@ -1391,7 +1407,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
     # How long admission may pass over a request whose async lookup has not
-    # answered before it waits for the answer instead.
+    # answered; after it `lmcache_mp` waits for the answer and the Mooncake
+    # Store admits the request without one.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),

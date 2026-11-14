@@ -33,7 +33,7 @@ except ModuleNotFoundError:
     _torch_stub = types.ModuleType("torch")
     sys.modules["torch"] = _torch_stub
 
-from conftest import MockConfig
+from conftest import MockConfig, with_min_load
 
 from atom.kv_transfer.disaggregation import (
     ConnectorCompletion,
@@ -99,6 +99,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotSaveSpec,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import OffloadJointRecord, SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -418,9 +419,11 @@ def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
 
 def _registration_connector() -> LMCacheOffloadConnector:
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+        )
     )
     connector.block_size = 4
     connector.chunk_size = None
@@ -434,10 +437,12 @@ def _registration_connector() -> LMCacheOffloadConnector:
 
 def _dense_registration_connector() -> DenseOffloadConnector:
     connector = DenseOffloadConnector.__new__(DenseOffloadConnector)
-    connector._config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=1,
+    connector._config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+        )
     )
     connector.block_size = 4
     connector.virtual_block_size = 4
@@ -1269,6 +1274,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
         def record(self, stream):
             trace.append(("record", self.name, stream.name))
 
+        def synchronize(self):
+            trace.append(("host_wait", self.name))
+
     class _StreamContext:
         def __init__(self, state, stream):
             self.state = state
@@ -1284,6 +1292,9 @@ def test_staged_pipeline_allocates_on_first_consumer_stream(
             self.state.current_stream = None
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.current_stream = None
             self.staging_buffer = SimpleNamespace(
@@ -1366,7 +1377,13 @@ def test_staged_pipeline_skips_the_handshake_on_a_shared_stream(shared_stream):
         def record(self, stream):
             calls.append(("record", self.name))
 
+        def synchronize(self):
+            calls.append(("host_wait", self.name))
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self):
             self.staging_buffer = SimpleNamespace(
                 tensor=None,
@@ -1441,7 +1458,13 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         def record(self, stream) -> None:
             self.record_calls += 1
 
+        def synchronize(self) -> None:
+            pass
+
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             self.pack_stream = _FakeStream("pack")
             self.copy_stream = _FakeStream("copy")
@@ -1632,6 +1655,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
 
     class _FakeState:
+        def begin_transfer(self):
+            pass
+
         def __init__(self) -> None:
             # Real streams and events, not doubles: the connector hands these
             # to `torch.cuda.stream()` and to `Stream.wait_event`, which read a
@@ -2060,12 +2086,14 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=16,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=16,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2082,12 +2110,14 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=25,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=25,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2104,12 +2134,14 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
         lambda _config: SimpleNamespace(chunk_size=24),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        state_checkpoint_interval_tokens=0,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            state_checkpoint_interval_tokens=0,
+            tensor_parallel_size=1,
+        )
     )
 
     sched = LMCacheOffloadConnectorScheduler(config)
@@ -2123,11 +2155,13 @@ def test_dsv4_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache storage")
 
     monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache storage"):
@@ -2145,11 +2179,13 @@ def test_dsv4_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
         raise ValueError("invalid LMCache TP geometry")
 
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="invalid LMCache TP geometry"):
@@ -2162,11 +2198,13 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24.5),
     )
-    config = SimpleNamespace(
-        kv_transfer_config={},
-        kv_cache_block_size=4,
-        decode_context_parallel_size=2,
-        tensor_parallel_size=1,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={},
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            tensor_parallel_size=1,
+        )
     )
 
     with pytest.raises(ValueError, match="LMCache chunk size must be an integer"):
@@ -2178,9 +2216,11 @@ def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
     [LMCacheOffloadConnector, LMCacheOffloadConnectorScheduler],
 )
 def test_unknown_kv_role_fails_fast(connector_cls):
-    config = SimpleNamespace(
-        kv_transfer_config={"kv_role": "unknown"},
-        kv_cache_block_size=4,
+    config = with_min_load(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "unknown"},
+            kv_cache_block_size=4,
+        )
     )
 
     with pytest.raises(ValueError, match="kv_role"):
@@ -3587,6 +3627,7 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
     boundary_hash = boundary.slot_save_spec.boundary_block_hash
     aggregator = KVOutputAggregator(world_size=2)
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3681,6 +3722,7 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     sched._save_inflight["723"] = {prior_operation}
     boundary_operation = sched.build_connector_meta().requests[0].save_operation
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     host.finished_recving_kv_req_ids = []
@@ -3744,6 +3786,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     seq = SimpleNamespace(
         id=729,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[10, 11],
         has_per_req_cache=True,
         state_slot=3,
@@ -3769,6 +3813,8 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3811,6 +3857,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     seq = SimpleNamespace(
         id=731,
         status=SequenceStatus.ABORTED,
+        offload_loaded=False,
+        offload_load_failed=False,
         block_table=[12, 13],
         has_per_req_cache=True,
         state_slot=4,
@@ -3836,6 +3884,8 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(deallocate=deallocate)
@@ -3910,6 +3960,8 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         value.state_slot = -1
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host._inflight_prefix_wait = {}
     host.kv_connector = _Connector()
     host.block_manager = SimpleNamespace(
@@ -3961,6 +4013,8 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
             calls.append(req_id)
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = _Connector()
     host.failed_recving_kv_req_ids = [seq.id]
     host._num_parked_remote_kv = 0
@@ -4098,6 +4152,7 @@ def test_tp_partial_sidecar_completion_never_commits():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -4158,6 +4213,7 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
     save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     host = Scheduler.__new__(Scheduler)
+    host._early_load = EarlyLoadState()
     host.kv_connector = sched
     host.deferred_free_blocks = {}
     aggregator = KVOutputAggregator(world_size=2)
@@ -5112,6 +5168,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight(
     pending_send = {str(seq.id)}
     freed = []
     engine_sched = Scheduler.__new__(Scheduler)
+    engine_sched._early_load = EarlyLoadState()
     engine_sched.deferred_free_blocks = {seq.id: seq}
     engine_sched.block_manager = SimpleNamespace(deallocate=freed.append)
     engine_sched.kv_connector = SimpleNamespace(
@@ -5214,6 +5271,8 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
             return str(seq.id) in self.inflight
 
     sched = Scheduler.__new__(Scheduler)
+
+    sched._early_load = EarlyLoadState()
     sched.block_manager = _BlockManager()
     sched.kv_connector = _Connector()
     seq = SimpleNamespace(id=9)
@@ -5243,6 +5302,8 @@ def test_producer_waits_for_send_and_final_save(send_first):
             return self.pending_save or self.pending_send
 
     host = Scheduler.__new__(Scheduler)
+
+    host._early_load = EarlyLoadState()
     host.kv_connector = Connector()
     freed = []
     host.block_manager = SimpleNamespace(deallocate=lambda seq: freed.append(seq.id))
@@ -5261,6 +5322,7 @@ def test_producer_waits_for_send_and_final_save(send_first):
 
 def test_finished_recv_matches_string_req_id():
     sched = Scheduler.__new__(Scheduler)
+    sched._early_load = EarlyLoadState()
     sched.finished_recving_kv_req_ids = ["123"]
     # kv_events disabled: skip the remote-store recording path so this test
     # only exercises string/int req_id matching in _pop_req_id.
@@ -5958,6 +6020,7 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s.block_size = 256
     s._do_save = True
     s._do_load = False
+    s._lookup_client = None
     s._reqs_need_recv = {}
     s._lookup_in_step = []
     s._save_tracker = {}
@@ -5997,8 +6060,10 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
 def test_layout_selection_picks_kimi_k3_for_a_kda_config():
     """K3's paged KV is ordinary dense MLA, so the layout cannot be read off
     the KV shape -- the KDA state is what makes it its own family."""
-    cfg = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+    cfg = with_min_load(
+        SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="kimi_linear"), kv_transfer_config={}
+        )
     )
     assert offcfg.select_offload_layout(cfg) == "kimi_k3"
 
@@ -7823,6 +7888,22 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)
 
 
 @pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])

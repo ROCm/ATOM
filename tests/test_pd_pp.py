@@ -270,6 +270,7 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
+    sched._producer_admission_undo = {}
     sched._pending_chunked_admissions = {}
     sched._chunked_waiting = {}
     sched._chunked_ready = set()
@@ -287,6 +288,7 @@ def _remote_prefill_seq(remote_hash_block_size):
         per_req_cache_group=-1,
         has_per_req_cache=False,
         num_cached_tokens=128,
+        state_slot=-1,
     )
 
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.offload._offload_common import CACHE_SALT_TAG
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
 
@@ -69,7 +70,7 @@ class _LookupState:
     retrieve_end: int | None = None
 
 
-class _MPLookupClient:
+class _MPLookupClient(LookupClient):
     """Synchronous lookup facade used by ATOM's existing scheduler policy."""
 
     token_database = None

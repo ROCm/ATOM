@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -31,6 +32,7 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_STORE_CHANNEL,
     ChunkedOffloadSchedulerBase,
 )
+from atom.kv_transfer.offload.lookup_client import as_lookup_client
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -82,30 +84,32 @@ def _config(
         head_dim=128,
         kv_lora_rank=kv_lora_rank,
     )
-    return SimpleNamespace(
-        hf_config=hf_config,
-        model="test/model",
-        model_tag="test/model",
-        kv_cache_block_size=4,
-        kv_cache_dtype="fp8",
-        index_cache_dtype="fp8",
-        tensor_parallel_size=tp,
-        pipeline_parallel_size=pp,
-        decode_context_parallel_size=dcp,
-        prefill_context_parallel_size=pcp,
-        enable_dp_attention=enable_dp_attention,
-        enable_expert_parallel=enable_expert_parallel,
-        speculative_config=None,
-        parallel_config=SimpleNamespace(
-            data_parallel_size=dp,
-            data_parallel_size_local=dp if dp_local is None else dp_local,
-            data_parallel_rank=dp_rank,
-        ),
-        kv_transfer_config={
-            "kv_connector": "lmcache_mp",
-            "kv_role": role,
-            "kv_connector_extra_config": extra or {},
-        },
+    return with_min_load(
+        SimpleNamespace(
+            hf_config=hf_config,
+            model="test/model",
+            model_tag="test/model",
+            kv_cache_block_size=4,
+            kv_cache_dtype="fp8",
+            index_cache_dtype="fp8",
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=pcp,
+            enable_dp_attention=enable_dp_attention,
+            enable_expert_parallel=enable_expert_parallel,
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=dp,
+                data_parallel_size_local=dp if dp_local is None else dp_local,
+                data_parallel_rank=dp_rank,
+            ),
+            kv_transfer_config={
+                "kv_connector": "lmcache_mp",
+                "kv_role": role,
+                "kv_connector_extra_config": extra or {},
+            },
+        )
     )
 
 
@@ -467,6 +471,8 @@ def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
         token_ids=list(range(16)),
         block_table=[1, 2, 3, 4],
         cache_seed=cache_seed,
+        offload_loaded=False,
+        offload_load_failed=False,
         status=SequenceStatus.WAITING,
     )
 
@@ -476,14 +482,16 @@ def test_mp_keys_carry_the_prompts_salt(monkeypatch, cache_seed, salt):
     assert adapter.cache_salts == {}
 
     sent = []
-    sched._lookup_client = SimpleNamespace(
-        driving=True,
-        offer=lambda _sid, _tokens, **kwargs: sent.append(kwargs),
-        submit=lambda _tokens, _sid, **kwargs: sent.append(kwargs) or True,
-        pump=lambda: None,
-        pending_ids=set,
-        supports_async=lambda: True,
-        discard=lambda _sid: None,
+    sched._lookup_client = as_lookup_client(
+        SimpleNamespace(
+            driving=True,
+            offer=lambda _sid, _tokens, **kwargs: sent.append(kwargs),
+            submit=lambda _tokens, _sid, **kwargs: sent.append(kwargs) or True,
+            pump=lambda: None,
+            pending_ids=set,
+            supports_async=lambda: True,
+            discard=lambda _sid: None,
+        )
     )
     sched.offer_lookups([seq])
     fresh = SimpleNamespace(**{**vars(seq), "id": 8})
@@ -2530,7 +2538,9 @@ def test_the_session_end_drops_the_workers_copy(monkeypatch):
     sched = _bare_mp_scheduler()
     seq = SimpleNamespace(id=7, token_ids=array.array("i", range(64)))
     sched._token_shipper.ship(seq, 32)
-    sched._lookup_client = SimpleNamespace()
+    from atom.kv_transfer.offload.lookup_client import LookupClient
+
+    sched._lookup_client = LookupClient()
     sched._save_tracker, sched._save_inflight = {}, {}
     sched._mp_adapter = SimpleNamespace(end_session=lambda rid: None)
     sched._config = SimpleNamespace()
@@ -2579,10 +2589,11 @@ def test_drops_reach_the_workers_without_a_transfer():
         (2, 1, True, True),
     ],
 )
+@pytest.mark.parametrize("policy", ["prefix_spread", "share_cache"])
 def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
-    monkeypatch, dp, tp, enable_dp_attention, requires_match
+    monkeypatch, dp, tp, enable_dp_attention, requires_match, policy
 ):
-    """Only `prefix_spread` reads the configured chunk (to predict loads), so
+    """Shared-prefix routing reads the configured chunk to predict loads, so
     only an active prefix router is refused when the server runs on another
     one. Ordinary DP=1 and other strategies use the server's chunk as before;
     DP-attention's TP ranks are routable engines too."""
@@ -2591,7 +2602,7 @@ def test_a_chunk_configured_differently_from_the_mp_server_stops_startup(
     config = _config(dp=dp, tp=tp, enable_dp_attention=enable_dp_attention)
     config.dp_load_balance = "least_requests"
     deployment.require_chunk_matches_server(server_512, config)
-    config.dp_load_balance = "prefix_spread"
+    config.dp_load_balance = policy
     if requires_match:
         with pytest.raises(ValueError, match="configured chunk to match the server"):
             deployment.require_chunk_matches_server(server_512, config)

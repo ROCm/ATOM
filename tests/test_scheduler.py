@@ -13,11 +13,13 @@ import pytest
 from conftest import MockConfig
 from test_state_checkpoint import ckpt_config, make_scheduler, stateful_seq
 
+from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
@@ -29,7 +31,28 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
 
-class _OffloadMixinStub(OffloadSchedulerMixin):
+class _ConnectorStub(KVConnectorSchedulerBase):
+    """Concrete shared interface with no retained resources."""
+
+    def get_num_new_matched_tokens(self, seq):
+        return 0, False
+
+    def update_state_after_alloc(self, seq): ...
+    def build_connector_meta(self):
+        return None
+
+    def request_finished(self, seq): ...
+    def send_finished(self, req_id): ...
+    def source_blocks_released(self, seq): ...
+    def should_defer_free(self, seq):
+        return False
+
+
+class _ConnectorNamespace(SimpleNamespace, _ConnectorStub):
+    """A partial test double with the shared scheduler capability defaults."""
+
+
+class _OffloadMixinStub(OffloadSchedulerMixin, _ConnectorStub):
     """Concrete `OffloadSchedulerMixin` for scheduler tests.
 
     `OffloadSchedulerMixin` declares the seven save/load lifecycle methods
@@ -449,16 +472,19 @@ class TestSchedule:
         seq = SimpleNamespace(
             id=96,
             status=SequenceStatus.ABORTED,
+            offload_loaded=False,
+            offload_load_failed=False,
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
+        sched._early_load = EarlyLoadState()
         sched._rejected = []
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
         sched.finished_recving_kv_req_ids = []
         sched.failed_recving_kv_req_ids = []
         sched._num_parked_remote_kv = 1
-        sched.kv_connector = SimpleNamespace(is_offload=False)
+        sched.kv_connector = _ConnectorNamespace(is_offload=False)
 
         sched._finish_rejected_waiting(seq)
 
@@ -477,7 +503,7 @@ class TestSchedule:
                 num_kvcache_blocks=100,
             )
         )
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=False,
             is_offload=False,
             build_connector_meta=lambda: None,
@@ -535,6 +561,8 @@ class TestSchedule:
         seq = SimpleNamespace(
             id=97,
             status=SequenceStatus.ABORTED,
+            offload_loaded=False,
+            offload_load_failed=False,
             block_table=[1],
             has_per_req_cache=False,
             _counted_as_inflight_load=True,
@@ -578,6 +606,8 @@ class TestSchedule:
                 events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
+
+        sched._early_load = EarlyLoadState()
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
@@ -1039,6 +1069,7 @@ class TestSchedule:
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
+        sched._early_load = EarlyLoadState()
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
         ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
         blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
@@ -1315,7 +1346,7 @@ class TestSchedule:
                 num_kvcache_blocks=100,
             )
         )
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
         )
@@ -1367,7 +1398,7 @@ class TestSchedule:
                 num_kvcache_blocks=100,
             )
         )
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
         )
@@ -1417,7 +1448,7 @@ class TestSchedule:
                 num_kvcache_blocks=100,
             )
         )
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
         )
@@ -1443,11 +1474,13 @@ class TestSchedule:
         assert seq.prefix_cache_hit_tokens == 6
 
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
-        class _Connector:
+        class _Connector(_ConnectorStub):
             def should_park_partial_prefill_for_load(self, seq):
                 return seq.id == 2
 
         sched = Scheduler.__new__(Scheduler)
+
+        sched._early_load = EarlyLoadState()
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
@@ -1582,7 +1615,7 @@ class TestWaitingNewTokenCount:
         sched = self._sched()
         events = []
 
-        class _Connector:
+        class _Connector(_ConnectorStub):
             is_offload = True
 
             def cancel_pending_load(self, seq):
@@ -2234,7 +2267,7 @@ class TestPreempt:
         events: list[str] = []
         block_table_at_release: list = []
 
-        class _Connector:
+        class _Connector(_ConnectorStub):
             def should_defer_free(self, s):
                 return False  # stall-escaped -> preemptable
 
@@ -2309,7 +2342,7 @@ class TestProducerPreemptability:
         scheduler.add(seq)
         scheduler.schedule()
         published: set[str] = set()
-        scheduler.kv_connector = SimpleNamespace(
+        scheduler.kv_connector = _ConnectorNamespace(
             is_producer=True,
             # Claim only once the peer has the addresses, as the real ones do.
             request_finished=lambda s: published.add(str(s.id)),
@@ -2783,7 +2816,7 @@ class TestPostprocess:
         sched = Scheduler(MockConfig(pipeline_parallel_size=pp_size))
         seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
         pending_send: set[str] = set()
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=True,
             request_finished=lambda s: pending_send.add(str(s.id)),
             should_defer_free=lambda s: str(s.id) in pending_send,
@@ -2813,7 +2846,7 @@ class TestPostprocess:
             seq_factory([1, 2, 3, 4], has_per_req_cache=True),
         )
         pending: set[str] = set()
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             request_finished=lambda s: pending.add(str(s.id)),
             should_defer_free=lambda s: str(s.id) in pending,
             protected_block_ids=lambda _s: frozenset(),
@@ -2874,7 +2907,7 @@ class TestPostprocess:
             if getattr(s, "leave_reason", None) != "aborted":
                 pending_send.add(str(s.id))
 
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=True,
             request_finished=_finish,
             should_defer_free=lambda s: str(s.id) in pending_send,
@@ -2906,7 +2939,7 @@ class TestPostprocess:
         sched = Scheduler(MockConfig())
         seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
         pending_send: set[str] = set()
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=True,
             request_finished=lambda s: pending_send.add(str(s.id)),
             should_defer_free=lambda s: str(s.id) in pending_send,
@@ -2932,7 +2965,7 @@ class TestPostprocess:
         saving = {str(seq.id)}
         finished: list = []
         released: list = []
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=False,
             request_finished=finished.append,
             should_defer_free=lambda s: str(s.id) in saving,
@@ -2955,7 +2988,7 @@ class TestPostprocess:
         # anyway, waiting for a send that was never issued.
         sched = Scheduler(MockConfig())
         seq = self._prefill(sched, seq_factory([1, 2, 3, 4]))
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_producer=True, should_defer_free=lambda s: False
         )
         sched.postprocess([seq], self._output(seq.id, [2]))
@@ -3125,7 +3158,7 @@ class TestOffloadResumeAdmission:
                 **overrides,
             )
         )
-        sched.kv_connector = SimpleNamespace(
+        sched.kv_connector = _ConnectorNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
             # Reached only by a sequence that is not resuming: nothing on the
@@ -3641,7 +3674,7 @@ class TestStalledOffloadSaveReclaim:
         s._abandoned_saves = 0
         s._next_save_reconcile_at = 0.0
         # A connector reporting a non-positive window disables reclamation.
-        s.kv_connector = SimpleNamespace(save_abandon_timeout_s=lambda: 0.0)
+        s.kv_connector = _ConnectorNamespace(save_abandon_timeout_s=lambda: 0.0)
         s.block_manager = SimpleNamespace(deallocate=lambda q: pytest.fail("reclaimed"))
 
         assert s._reconcile_stalled_deferred_saves() == 0
@@ -3676,7 +3709,7 @@ class TestStalledOffloadSaveReclaim:
         s = object.__new__(sched_mod.Scheduler)
         s.kv_connector = None
         assert s._save_abandon_timeout_s() == 0.0
-        s.kv_connector = SimpleNamespace()  # a connector without the offload face
+        s.kv_connector = _ConnectorNamespace()  # a connector without the offload face
         assert s._save_abandon_timeout_s() == 0.0
 
 
@@ -3829,7 +3862,7 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     scheduler.postprocess(list(seqs.values()), empty, batch=batch)
     assert seq.is_partial_prefill == partial
     assert seq.state_slot >= 0 and seq.block_table
-    scheduler.kv_connector = SimpleNamespace(
+    scheduler.kv_connector = _ConnectorNamespace(
         request_finished=mock.Mock(),
         send_finished=mock.Mock(),
         should_defer_free=lambda seq: False,
@@ -3912,7 +3945,7 @@ def test_coalescing_ready_resume_consumes_one_slot(
     seq_factory, resumes, settled, counted
 ):
     sched = _probe_sched(max_num_seqs=resumes + 2, max_num_batched_tokens=64)
-    sched.kv_connector = SimpleNamespace(is_offload=True)
+    sched.kv_connector = _ConnectorNamespace(is_offload=True)
     decode = seq_factory([1000] * 4)
     assert sched.block_manager.allocate(decode)
     decode.status = SequenceStatus.RUNNING
@@ -3948,7 +3981,7 @@ def test_coalescing_ready_resume_consumes_one_slot(
 
 def test_coalescing_keeps_inflight_load_slot_reserved(seq_factory):
     sched = _probe_sched(max_num_seqs=2, max_num_batched_tokens=64)
-    sched.kv_connector = SimpleNamespace(is_offload=True)
+    sched.kv_connector = _ConnectorNamespace(is_offload=True)
     ready = seq_factory([2000] * 16)
     assert sched.block_manager.allocate(ready)
     ready.num_cached_tokens = 8

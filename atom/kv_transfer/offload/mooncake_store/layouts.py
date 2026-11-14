@@ -81,7 +81,9 @@ def _build_replay_pages(
     """V4.1 PAGE bytes. The replay contract is what rebuilds request state."""
     if not replays_state(transfer_tensors):
         raise ValueError("Mooncake Store V4.1 requires the PAGE replay contract")
-    return pure_page_codec(transfer_tensors, num_blocks)
+    # A P/D leg also publishes the live SLOT. Store prefixes carry only PAGEs,
+    # so the codec is built on a copy without it (as the MP tier does).
+    return pure_page_codec(transfer_tensors.without_slots(), num_blocks)
 
 
 MOONCAKE_LAYOUTS: dict[str, MooncakeLayout] = {

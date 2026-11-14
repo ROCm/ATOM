@@ -63,6 +63,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
@@ -77,20 +78,12 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
-def _build_subconnectors(config: Any, role: str) -> list:
-    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
-
-    Each entry is a full ``kv_transfer_config`` dict (with its own
-    ``kv_connector`` name). We shallow-copy the engine config, swap in the
-    sub-dict, and route through the normal factory — no recursion, since each
-    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+def validate_multi_config(kv_transfer_config: dict) -> list:
+    """The sub-connector configs of a ``multi`` transfer config, after refusing
+    a topology the composite cannot run. Builds nothing, so `Config` calls it
+    before the model loads and `_build_subconnectors` before any sub is built.
     """
-    # Imported lazily: the factory module registers backends at import time and
-    # we must not create an import cycle with it.
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    kvc = getattr(config, "kv_transfer_config", None) or {}
-    subs = kvc.get("connectors")
+    subs = kv_transfer_config.get("connectors")
     if not subs:
         raise ValueError(
             "multi connector requires a non-empty 'connectors' list in "
@@ -120,6 +113,41 @@ def _build_subconnectors(config: Any, role: str) -> list:
             "multi permits at most one offload sub-connector; got "
             + ", ".join(offload_subs)
         )
+    # A P/D consumer (decode instance) with an offload tier: the scheduler
+    # keys its handling of a completed receive on the connector being an
+    # offload one, so a received prefill would be resumed as a tier load and
+    # its prompt prefilled again, never handed to first decode. No recipe runs
+    # this; refuse it rather than recompute every received prompt. A P/D leaf
+    # is a consumer unless its role is ``kv_producer``, as it builds itself
+    # (``kv_both`` included).
+    consumers = [
+        sub["kv_connector"]
+        for sub in subs
+        if not KVConnectorFactory.is_offload_backend(
+            KVConnectorFactory.canonical_name(sub["kv_connector"])
+        )
+        and sub.get("kv_role", "kv_producer") != "kv_producer"
+    ]
+    if offload_subs and consumers:
+        raise ValueError(
+            "multi does not support a P/D consumer with an offload tier ("
+            + ", ".join(consumers + offload_subs)
+            + "): a received prefill would be prefilled again on the decode "
+            "instance. Run the decode instance with the P/D connector alone."
+        )
+    return subs
+
+
+def _build_subconnectors(config: Any, role: str) -> list:
+    """Instantiate each sub-connector listed in ``kv_transfer_config.connectors``.
+
+    Each entry is a full ``kv_transfer_config`` dict (with its own
+    ``kv_connector`` name). We shallow-copy the engine config, swap in the
+    sub-dict, and route through the normal factory — no recursion, since each
+    sub names a concrete backend (moriio / lmcache_offload / ...), not ``multi``.
+    """
+    kvc = getattr(config, "kv_transfer_config", None) or {}
+    subs = validate_multi_config(kvc)
 
     connectors = []
     for i, sub in enumerate(subs):
@@ -321,6 +349,11 @@ class MultiConnector(KVConnectorBase):
             if callable(callback):
                 callback()
 
+    def set_forward_stream(self, stream) -> None:
+        """Tell every child which stream the forward runs on."""
+        for connector in self._connectors:
+            connector.set_forward_stream(stream)
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()
@@ -382,6 +415,34 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def _prefetch_tier(self):
+        # The one offload sub (`validate_multi_config` refuses a second, and a
+        # P/D consumer beside it).
+        return next((c for c in self._connectors if c.is_offload), None)
+
+    @property
+    def chunk_size(self):
+        tier = self._prefetch_tier()
+        return 0 if tier is None else tier.chunk_size
+
+    @property
+    def supports_early_load(self):
+        tier = self._prefetch_tier()
+        return tier is not None and tier.supports_early_load
+
+    def lookup_ready(self, seq):
+        tier = self._prefetch_tier()
+        return tier is not None and tier.lookup_ready(seq)
+
+    @property
+    def lowers_hbm_hit_to_chunk(self):
+        tier = self._prefetch_tier()
+        return tier is not None and tier.lowers_hbm_hit_to_chunk
+
+    def held_tier_hit(self, seq):
+        tier = self._prefetch_tier()
+        return 0 if tier is None else int(tier.held_tier_hit(seq))
+
     def bind_block_manager(self, block_manager: Any) -> None:
         """Bind native checkpoint owners before any request can be admitted."""
         for connector in self._connectors:
@@ -391,11 +452,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def lookup_pending(self, seq: Any) -> bool:
         """True while any sub's external-tier lookup for `seq` is in flight."""
+        return any(c.lookup_pending(seq) for c in self._connectors)
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        return any(c.lookup_would_defer(seq) for c in self._connectors)
+
+    def close(self) -> None:
+        """Close every sub-connector that holds threads (the offload tier's)."""
         for connector in self._connectors:
-            pending = getattr(connector, "lookup_pending", None)
-            if callable(pending) and pending(seq):
-                return True
-        return False
+            connector.close()
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Take back an early admission, including each tier's held state."""
+        self._load_winner.pop(seq.id, None)
+        for connector in self._connectors:
+            connector.cancel_preadmission(seq)
 
     def _sub_methods(self, name: str) -> list:
         """Bound `name` of every sub-connector that implements it."""
@@ -456,7 +527,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
-        self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        self.is_offload = any(c.is_offload for c in self._connectors)
         self.enable_chunked_transfer = any(
             getattr(c, "enable_chunked_transfer", False) and c.is_producer
             for c in self._connectors
@@ -546,9 +617,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             self._load_winner[sid] = winner
             for c in self._connectors:
                 if c is not winner:
-                    fn = getattr(c, "cancel_pending_load", None)
-                    if callable(fn):
-                        fn(seq)
+                    c.cancel_pending_load(seq)
         else:
             self._load_winner.pop(sid, None)
         return result
@@ -580,11 +649,9 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         and the abandoned request stayed recv-queued. Idempotent per sub (the
         `_load_lifecycles` guard), so fanning to all is safe.
         """
-        self._load_winner.pop(getattr(seq, "id", None), None)
+        self._load_winner.pop(seq.id, None)
         for c in self._connectors:
-            fn = getattr(c, "cancel_pending_load", None)
-            if callable(fn):
-                fn(seq)
+            c.cancel_pending_load(seq)
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
         return MultiConnectorMetadata(
@@ -596,7 +663,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             c.update_state_after_alloc(seq)
 
     def request_finished(self, seq: Any) -> None:
-        self._load_winner.pop(getattr(seq, "id", None), None)
+        self._load_winner.pop(seq.id, None)
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)

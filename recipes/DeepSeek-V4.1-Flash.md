@@ -81,6 +81,51 @@ run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no
 collective policy of its own.
 
+## Shared Mooncake Store across data-parallel ranks
+
+A Mooncake Store shared by every DP rank lets a request run on any rank and load
+the prefix another rank computed, so requests need no session affinity. Start a
+Mooncake master (with its HTTP metadata server) and a DRAM owner on the host, then
+start the server with the Store as the offload tier and the `share_cache` router:
+
+```bash
+export ATOM_KV_OFFLOAD=mooncake_store
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
+  "mooncake_store.master": "127.0.0.1:19861",
+  "mooncake_store.metadata": "http://127.0.0.1:19862/metadata",
+  "mooncake_store.protocol": "rdma",
+  "mooncake_store.rdma_devices": "<rdma device>",
+  "mooncake_store.local_hostname": "127.0.0.1"}'
+python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
+  --enable_prefix_caching --enable-dp-attention -tp 4 \
+  --dp-load-balance share_cache
+```
+
+- `share_cache` needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`
+  (the default), and excludes `ATOM_DP_SESSION_AFFINITY=1`. It places a request on
+  the rank with the least prefill left, charging it only what it will compute.
+- The Store tier loads from 512 tokens (`OFFLOAD_MIN_LOAD_TOKENS`) and starts a load
+  as soon as the lookup answers (early tier load), without a flag.
+- Set `ATOM_PREFILL_DELAYER_TARGET_FILL=0.8` (default 0.9). At 0.9 a DP4 shared
+  Store had a median TTFT well above main's; at 0.8, against main with session
+  affinity (DP4, AgentX, 1800 s, same time, MI355X), 256 concurrency gave throughput
+  +5.2%, mean TTFT -50.9%, median -17.0%, ITL -1.6%; 512 gave +4.7%, -31.4%, -41.2%,
+  and ITL +2.8%.
+- Use one Store every DP rank reaches. `share_cache` refuses
+  `mooncake_store.pools` that name more than one (master, metadata) pair:
+  each worker reads its own NIC's pool, so a request placed on another rank
+  would miss every load. NIC aliases of one pair are accepted.
+- Give the owner enough DRAM for the prefixes you expect (768 GB held a 30-minute
+  agentic run at 256 concurrency), and watch `OFFLOAD-STORE-STATS`: repeated
+  `NO_AVAILABLE_HANDLE` failures mean the master dropped the owner's segment (raise
+  the master's `--client_ttl` if the owner can be starved of CPU while the engine
+  starts).
+- Prefill/decode disaggregation: on the prefill side set the same variables and
+  add the Mooncake transfer connector (`kv_role: kv_producer`) through
+  `--kv-transfer-config`; ATOM composes the two into one `multi` connector. The
+  decode side runs the Mooncake consumer only and does not use the Store.
+  `share_cache` accepts that composite on the prefill side.
+
 ## gfx1250 (MI455X)
 
 V4.1 runs on gfx1250 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without

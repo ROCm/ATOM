@@ -371,7 +371,9 @@ Each attention backend provides its own `prepare_mtp_decode()` implementation:
 | `atom/model_engine/model_runner.py` | `ModelRunner` per-GPU execution (model loading, CUDA graph capture, forward pass), `tokenIDProcessor` deferred output handling |
 | `atom/model_engine/model_hooks.py` | `DecodeRound`, the decode round a model's install may give DeepSeek-V4.1's metadata builder |
 | `atom/model_engine/dp_routing/prefix_spread.py` | `PrefixSpreadRouter`: the `--dp-load-balance prefix_spread` prefix index and placement rule `CoreManager` calls under its load-balancing lock |
-| `atom/model_engine/dp_routing/policies.py` | Stateless, session-affinity and prefix-spread placement policies with common request lifecycle hooks |
+| `atom/model_engine/dp_routing/share_cache.py` | `ShareCacheRouter`: the `--dp-load-balance share_cache` placement over the prefix index, balanced on each rank's reported prefill backlog |
+| `atom/model_engine/dp_routing/backlog.py` | `BacklogLedger`: per-rank prefill backlog as `CoreManager` sees it (reports plus the charges they do not cover yet) |
+| `atom/model_engine/dp_routing/policies.py` | Stateless, session-affinity, prefix-spread and share-cache placement policies with common request lifecycle hooks |
 | `atom/model_engine/dp_routing/route.py` | Placement rank, prefix credit, moved tokens and routing counter/label names |
 | `atom/model_engine/dp_routing/topology.py` | Effective prefix-routing topology used by the manager and MP deployment checks |
 | `atom/model_engine/scheduler.py` | `Scheduler` prefill-first scheduling, `ScheduledBatch` batch descriptor, `ScheduledBatchOutput` forward results |

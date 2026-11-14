@@ -115,3 +115,14 @@ def test_preempt_after_each_acceptance_length_preserves_emitted_prefix(accepted)
     preempt(sched, seq)
     assert list(seq.token_ids) == [10, 11, 12, 13, 88] + emitted
     assert seq.num_tokens == seq.num_finalized_tokens == 5 + accepted
+
+
+def test_preemption_drops_routing_credit_only_when_allocation_is_released(monkeypatch):
+    sched, seq = setup_request()
+    seq.dp_est_cached_tokens = 1234
+    monkeypatch.setattr(sched, "_is_preemptable", lambda _seq: False)
+    assert not sched.preempt(seq)
+    assert seq.dp_est_cached_tokens == 1234
+    monkeypatch.setattr(sched, "_is_preemptable", lambda _seq: True)
+    preempt(sched, seq)
+    assert seq.dp_est_cached_tokens == 0

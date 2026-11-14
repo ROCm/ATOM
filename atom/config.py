@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -2208,6 +2210,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     # A frontend's own stable form of its speculative config, which the offload
     # PAGE namespace hashes in place of `speculative_config`: only the frontend
     # knows which of its fields differ between processes. None hashes
@@ -2642,6 +2645,14 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if (
+            isinstance(self.kv_transfer_config, dict)
+            and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
+            == "multi"
+        ):
+            # Refuse a composite the engine cannot run now, not when a worker
+            # builds it after the weights are loaded.
+            validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -2759,6 +2770,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
         self._resolve_tbo()
         self._check_pp_support()
@@ -3249,6 +3261,10 @@ class Config:
                 "The DSpark confidence scheduler (confidence_schedule) is not "
                 "supported with pipeline_parallel_size > 1."
             )
+
+    def _resolve_offload_min_load_tokens(self) -> None:
+        # Resolve once before spawning workers, identically for CLI and API.
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

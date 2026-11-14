@@ -29,6 +29,11 @@ class KVConnectorBase(ABC):
 
     is_producer: bool
 
+    def set_forward_stream(self, stream: Any) -> None:
+        """The stream the model runner is about to run a forward on; only
+        `RapidServeModelRunner` reports one, per forward. Only a connector that
+        stages transfers on it (the Mooncake Store) keeps it."""
+
     @classmethod
     def kv_budget_reserve_bytes(cls, config: Any) -> int:
         """GPU bytes this backend allocates once the KV cache is sized.
@@ -95,7 +100,42 @@ class KVConnectorSchedulerBase(ABC):
     for lifecycle events it does not own.
     """
 
+    is_offload = False
     is_producer: bool
+
+    # Offload-tier hooks the scheduler reads from any connector; one without a
+    # tier keeps these defaults.
+    chunk_size: int = 0
+    lowers_hbm_hit_to_chunk: bool = False
+    supports_early_load: bool = False
+
+    def lookup_ready(self, seq: Any) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip."""
+        return False
+
+    def lookup_pending(self, seq: Any) -> bool:
+        """Whether admission should pass over `seq` for its in-flight tier
+        lookup; the first call starts the request's defer window."""
+        return False
+
+    def lookup_would_defer(self, seq: Any) -> bool:
+        """`lookup_pending` without starting the window, for probes."""
+        return False
+
+    def held_tier_hit(self, seq: Any) -> int:
+        """The tier hit armed for `seq`'s coming load, 0 when none."""
+        return 0
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        """Forget the load armed for `seq`."""
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Take back an admission the scheduler withdraws before any dispatch;
+        by default that is cancelling the pending load."""
+        self.cancel_pending_load(seq)
+
+    def close(self) -> None:
+        """Release threads or sockets the connector holds at engine shutdown."""
 
     supports_pd_admission = False
 
@@ -141,7 +181,7 @@ class KVConnectorSchedulerBase(ABC):
         can drop its store it answers False, and the engine refuses the weight
         change rather than serve old-weight KV from it.
         """
-        return not getattr(self, "is_offload", False)
+        return not self.is_offload
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

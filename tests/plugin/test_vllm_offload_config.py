@@ -41,6 +41,7 @@ def test_projects_the_fields_offload_reads():
     assert cfg.kv_cache_dtype == "fp8"
     assert cfg.hf_config.num_hidden_layers == 60
     assert cfg.kv_transfer_config["kv_role"] == "kv_both"
+    assert cfg.offload_min_load_tokens == 8192
 
 
 def test_auto_kv_dtype_resolves_to_the_model_dtype():

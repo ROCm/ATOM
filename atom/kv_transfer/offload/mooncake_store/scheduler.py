@@ -16,9 +16,9 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
@@ -26,8 +26,13 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
+from atom.kv_transfer.offload.mooncake_store.async_lookup import (
+    AsyncStoreLookup,
+    DaemonExecutor,
+)
 from atom.kv_transfer.offload.mooncake_store.config import (
     MooncakeStoreOffloadConfig,
     StorePool,
@@ -43,6 +48,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     rank_key_prefix,
     store_namespace,
 )
+from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -66,6 +72,8 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
+# Store lookups an arrival batch may queue at once (`offer_lookups`).
+_MAX_OFFERS_PER_BATCH = 64
 # After a failed save the base retries, no save is emitted for this long,
 # doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
 # stored save ends the pause and starts the doubling over, whenever it reports.
@@ -141,21 +149,23 @@ class _PoolLookups:
 
     Its client is opened on the first lookup that asks it. A pool that cannot
     be reached, or fails a lookup, is not asked until ``paused_until``: every
-    call to it blocks the scheduler thread, and the other pools answer
-    meanwhile. A pool found to carry the taint marker is ``tainted`` for good
+    call to it holds the lookup worker, and the other pools answer meanwhile. A pool found to carry the taint marker is ``tainted`` for good
     and holds nothing for the lookups from then on.
     """
 
-    __slots__ = ("client", "paused_until", "pool", "tainted")
+    __slots__ = ("client", "executor", "paused_until", "pool", "tainted")
 
     def __init__(self, pool: StorePool) -> None:
         self.pool = pool
         self.client: store_client.MooncakeStoreClient | None = None
+        # Its own daemon worker when several pools are asked at once
+        # (`_StoreLookup._exists_on`); None for a single pool.
+        self.executor: DaemonExecutor | None = None
         self.paused_until = 0.0
         self.tainted = False
 
 
-class _StoreLookup:
+class _StoreLookup(LookupClient):
     """The chunked scheduler's lookup client, answered by the Store's masters.
 
     A hit is the prefix every rank holds: per rank, the run of chunks present
@@ -179,9 +189,8 @@ class _StoreLookup:
 
     A pool's Store client is opened on the first lookup that asks it, not at
     construction: every PP stage builds a scheduler, and only the head ever
-    schedules. A lookup blocks the scheduler thread, so a pool the scheduler
-    cannot reach, or that fails a lookup, is not asked for a while
-    (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
+    schedules. A pool the scheduler cannot reach, or that fails a lookup, is
+    not asked for a while (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -199,16 +208,12 @@ class _StoreLookup:
         # Exact while every server on these pools puts each rank on the same
         # NIC; see the offload README for what a different placement costs.
         self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
-        # Several pools are asked at once; the executor starts no thread until
-        # the first lookup.
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=len(self._pools),
-                thread_name_prefix="mooncake-store-lookup",
-            )
-            if len(self._pools) > 1
-            else None
-        )
+        # Several pools are asked at once, each on a daemon worker of its own:
+        # a master RPC that hangs must not keep the engine process alive at
+        # exit, as a `ThreadPoolExecutor` worker would (it is joined then).
+        if len(self._pools) > 1:
+            for index, pool in enumerate(self._pools):
+                pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
         self._next_warning_at: dict[str, float] = {}
         # Answered lookups; those where the ranks held prefixes of different
@@ -226,6 +231,9 @@ class _StoreLookup:
         None, not 0, when the Store did not answer -- no pool reached, or the
         keys no pool answered decide the hit: the scheduler retries a
         non-answer later, where a 0 would be remembered as a miss.
+
+        Store keys chain from `Sequence.cache_seed`, the source of the media
+        salt, so the lookup takes no salt argument.
         """
         started = time.perf_counter()
         hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
@@ -298,6 +306,12 @@ class _StoreLookup:
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
+    def close(self) -> None:
+        """Stop the pool workers; one inside a hung RPC is a daemon thread."""
+        for pool in self._pools:
+            if pool.executor is not None:
+                pool.executor.shutdown()
+
     def _ask(self, keys: list[str]) -> list[int | None] | None:
         """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
         it, None if no pool answered. None when no pool answered any key.
@@ -348,8 +362,8 @@ class _StoreLookup:
         asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
         futures = (
-            [self._executor.submit(pool.client.exists, asked) for pool in pools]
-            if self._executor is not None
+            [pool.executor.submit(pool.client.exists, asked) for pool in pools]
+            if all(pool.executor is not None for pool in pools)
             else None
         )
         answers: list[list[int] | None] = []
@@ -475,6 +489,9 @@ class _StoreLookup:
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     """Chunked offload scheduling with the Mooncake Store as the tier."""
 
+    # It answers `lookup_ready`, so the scheduler may start its loads early.
+    supports_early_load = True
+
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.
     _supports_early_block_release = True
@@ -497,9 +514,18 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         super().__init__(
             config,
             chunk_size=cfg.chunk_tokens,
-            lookup_client=_StoreLookup(
-                cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
+            lookup_client=AsyncStoreLookup(
+                _StoreLookup(
+                    cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
+                )
             ),
+        )
+        # The Store reads whole chunks into fresh blocks, so an HBM hit that
+        # ends inside a chunk is lowered to the chunk floor
+        # (`BlockManager.lower_hit_to_chunk`). The registry holds the flag, one
+        # source for this and the DP router's tier profile.
+        self.lowers_hbm_hit_to_chunk = KVConnectorFactory.lowers_hbm_hit_to_chunk(
+            "mooncake_store"
         )
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
         # Unbounded unless asked for, in the connector config or through
@@ -522,6 +548,27 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             cfg.save_abandon_timeout_s,
         )
 
+    def offer_lookups(self, seqs):
+        # Called on arrival after tokenization, before admission/prefill.
+        if not self._do_load:
+            return
+        offered = 0
+        for seq in seqs:
+            # Not a request that left WAITING meanwhile, and a bounded number per
+            # arrival batch: the rest reach their lookup through the scheduler's
+            # own prefetch (`prefetch_lookups`), as the queue drains.
+            if offered >= _MAX_OFFERS_PER_BATCH:
+                break
+            if self._lookup_wanted(seq) and self._lookup_client.submit_if(
+                seq, str(seq.id), lambda seq=seq: seq.status == SequenceStatus.WAITING
+            ):
+                offered += 1
+
+    def _tier_lookup_kwargs(self, seq: Any) -> dict:
+        # Native Store keys chain from `Sequence.cache_seed`, the source of the
+        # media salt, so the lookup takes no salt argument.
+        return {}
+
     def _lookup_token_ids(self, seq: Any) -> Any:
         """The sequence itself: the lookup hashes its prompt once per sequence.
 
@@ -530,17 +577,26 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         """
         return seq
 
-    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+    def _lookup_wanted(self, seq: Any) -> bool:
         # A prompt too short to load from the Store, whatever it holds, is not
         # asked about: no hit is longer than the prompt less a token, floored
         # to a chunk (`_loadable_hit`), and no shorter one reaches the load
-        # threshold. The lookup would block the scheduler thread for nothing.
+        # threshold. The query would only hold the lookup worker, and park the
+        # request while it ran.
         num_prompt = int(seq.num_prompt_tokens)
-        if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
+        return self._loadable_hit(num_prompt, num_prompt) >= self._min_load_tokens
+
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+        if not self._lookup_wanted(seq):
             return 0
-        # Stamped before asking: the lease runs from the master's answer.
+        # Stamped before asking: the lease runs from the master's answer. An
+        # answer the asynchronous lookup took earlier is as old as its query.
         self._looked_up_at[sid] = time.monotonic()
-        return super()._fresh_tier_lookup(seq, sid)
+        hit = super()._fresh_tier_lookup(seq, sid)
+        started = self._lookup_client.query_started(sid)
+        if started is not None and started < self._looked_up_at.get(sid, started):
+            self._looked_up_at[sid] = started
+        return hit
 
     def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
         """Renew the read leases of what a load reads; the load always goes ahead.

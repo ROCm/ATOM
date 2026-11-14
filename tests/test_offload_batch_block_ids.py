@@ -12,6 +12,19 @@ import torch
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 
 
+@pytest.fixture(autouse=True)
+def _fake_terminal_completion(monkeypatch):
+    # These ownership tests use synthetic streams. The dedicated completion
+    # test checks CUDA Event ordering without touching a GPU runtime.
+    from atom.kv_transfer.offload import atom_lmcache_staging
+
+    monkeypatch.setattr(
+        atom_lmcache_staging,
+        "fence_submitted_work",
+        lambda stream: stream.synchronize(),
+    )
+
+
 class _Tensor:
     """Record host-copy submissions without allocating on a CUDA device."""
 
@@ -68,6 +81,7 @@ class _Case:
         self.fail_stream = None
         self.fail_allocation = False
         self.state = SimpleNamespace(
+            begin_transfer=lambda: None,
             pack_stream=self.Stream(self, "pack"),
             copy_stream=self.Stream(self, "copy"),
             stream_ctx=self.stream_ctx,
@@ -136,6 +150,9 @@ class _Case:
 
         def record(self, stream):
             self.case.trace.append(("record", self.name, stream.name))
+
+        def synchronize(self):
+            self.case.trace.append(("host_wait", self.name))
 
     def ensure_buffer(self, staging_buffer, nbytes):
         self.trace.append(("allocate", nbytes))

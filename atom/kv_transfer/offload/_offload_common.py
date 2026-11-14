@@ -487,6 +487,9 @@ class OffloadSchedulerMixin(ABC):
     # halfway through a lookup. `_remember_tier_hit` replaces the None with a
     # per-instance dict on first use.
     _tier_hit_memo: dict | None = None
+    # The smallest tier hit worth loading; a scheduler sets its configuration's
+    # value (`offcfg.min_load_tokens`) in `__init__`.
+    _min_load_tokens: int = offcfg.DEFAULT_MIN_LOAD_TOKENS
     _tier_memo_steps = 32
     _tier_retry_steps = 32
     total_lookups_skipped_by_memo = 0
@@ -931,7 +934,7 @@ class OffloadSchedulerMixin(ABC):
     ) -> bool:
         boundary = ((hbm + chunk - 1) // chunk) * chunk
         remaining_after_boundary = lmc - boundary
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         if boundary <= hbm or not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False
 
@@ -1057,7 +1060,7 @@ class OffloadSchedulerMixin(ABC):
         seq.offload_loaded_tokens = hbm
         self._perf_bump("skip_" + reason)
         self._perf_bump("skip_tokens_" + reason, max(0, lmc - hbm))
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
             "need=%d min_load=%d chunk=%d reason=%s",

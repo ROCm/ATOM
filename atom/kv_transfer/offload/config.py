@@ -839,3 +839,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         # collide on it.
         engine_id=lmcache_engine_id(config),
     )
+
+
+# The smallest tier hit worth loading unless the user or the tier says otherwise.
+DEFAULT_MIN_LOAD_TOKENS = 8192

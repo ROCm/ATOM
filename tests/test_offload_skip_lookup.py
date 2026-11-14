@@ -28,6 +28,41 @@ from tests.lmcache_mp_support import bare_mp_scheduler
 MIN_LOAD = 32
 
 
+@pytest.mark.parametrize("fail_build", [False, True])
+def test_metadata_retirement_reconciles_once_and_restores_terminal_progress(
+    monkeypatch, fail_build
+):
+    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=True)
+    calls = []
+    original_pump = client.pump
+
+    def pump():
+        calls.append("pump")
+        original_pump()
+
+    client.pump = pump
+    original_build = ChunkedOffloadSchedulerBase.build_connector_meta
+
+    def retiring_build(self):
+        metadata = original_build(self)
+        if fail_build:
+            raise RuntimeError("metadata serialization failed")
+        return metadata
+
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase, "build_connector_meta", retiring_build
+    )
+    if fail_build:
+        with pytest.raises(RuntimeError, match="serialization failed"):
+            sched.build_connector_meta()
+    else:
+        sched.build_connector_meta()
+    assert calls == ["pump"]
+    # Outside metadata construction the terminal path must advance lookups.
+    sched._end_finished_sessions()
+    assert calls == ["pump", "pump"]
+
+
 def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     """An MP scheduler over the async-capable fake adapter."""
     adapter = _Adapter(_Client(chunks, lookup_done=lookup_done))
@@ -51,6 +86,8 @@ def _seq(n=64, sid=7):
         num_cached_tokens=0,
         token_ids=list(range(n)),
         block_table=[],
+        offload_loaded=False,
+        offload_load_failed=False,
     )
 
 
@@ -166,7 +203,10 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
     seq = SimpleNamespace(id=7, kv_transfer_params=None)
     if not s._lookup_detach_enabled(seq):
         return False, conn
-    return s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq)), conn
+    return (
+        s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq).num_cached_blocks),
+        conn,
+    )
 
 
 def test_scheduler_probe_is_pure_and_uses_the_hbm_frontier(monkeypatch):
@@ -525,7 +565,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     probe = s._probe_hbm_prefix(SimpleNamespace())
     assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
     assert walks == [False]
-    assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
+    assert s._can_detach_tier_lookup(SimpleNamespace(), probe.num_cached_blocks)
     assert walks == [False]  # the decision itself does not walk again
 
 
@@ -536,3 +576,25 @@ def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
     monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
+
+
+@pytest.mark.parametrize(
+    "floor,prompt,hbm,disabled,ruled_out",
+    [
+        (True, 800, 384, False, False),
+        (False, 800, 384, False, True),
+        (True, 700, 384, False, True),
+        (True, 800, 512, False, True),
+        (True, 800, 384, True, False),
+    ],
+)
+def test_detach_respects_the_connectors_hbm_load_boundary(
+    floor, prompt, hbm, disabled, ruled_out
+):
+    sched = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    sched._do_load = not disabled
+    sched._lookup_client = object()
+    sched._min_load_tokens = 512
+    sched.chunk_size = 256
+    sched.lowers_hbm_hit_to_chunk = floor
+    assert sched._load_ruled_out(_seq(prompt), hbm) is ruled_out
