@@ -46,6 +46,7 @@ This module builds the kernel and runs its program: the stages' functions live i
 in program order.
 """
 
+import hashlib
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
@@ -57,6 +58,7 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
+    MAX_ROWS,
     MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
@@ -71,13 +73,9 @@ from atom.models.minimax_m3.mono.kernels.index_score import (
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ARGS,
+    TG,
     emit_k1,
-)
-from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    SCRATCH_HDONE as K1_SCRATCH_HDONE,
-)
-from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    SCRATCH_RDONE as K1_SCRATCH_RDONE,
+    k1_scratch,
 )
 from atom.models.minimax_m3.mono.kernels.stages.attention import (
     merge_defs,
@@ -85,9 +83,15 @@ from atom.models.minimax_m3.mono.kernels.stages.attention import (
     split_defs,
 )
 from atom.models.minimax_m3.mono.kernels.stages.ffn_reduce import ffn_reduce_defs
+from atom.models.minimax_m3.mono.kernels.stages.moe_back64 import N_DN as N_DN_BACK
+from atom.models.minimax_m3.mono.kernels.stages.moe_back64 import (
+    back_lds_layout,
+    moe_back_defs,
+)
 from atom.models.minimax_m3.mono.kernels.stages.moe_common import moe_common_defs
 from atom.models.minimax_m3.mono.kernels.stages.moe_narrow import moe_narrow_defs
 from atom.models.minimax_m3.mono.kernels.stages.moe_wide import moe_wide_defs
+from atom.models.minimax_m3.mono.kernels.stages.post_norm import post_norm_defs
 from atom.models.minimax_m3.mono.kernels.stages.router import router_defs
 from atom.models.minimax_m3.mono.kernels.stages.select import select_defs
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
@@ -96,34 +100,61 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
 )
 from atom.models.minimax_m3.mono.layout import (
     AG_RS_FROM,
+    MID4N_WORDS,
     MID_ROW,
+    N_SPLIT,
     O_K,
+    O_ROW,
     O_ROWS,
-    SCRATCH,
+    OSC_ROW,
     SPLIT_KEYS,
     UG_PER_SLOT,
+    WIDE_FROM,
+    XN4_ROW,
     XN8_ROW,
     XSC_ROW,
+    XSCB_ROW,
     H,
+    front_stage_bases,
     mailbox_regions,
     pool_words,
+    row_cap,
+    scratch_layout,
     stage_bases,
     sym_layout,
     ug_ctas_per_token,
     ug_tasks_of,
+    wide_down4_layout,
+    wide_down_layout,
     wide_moe,
+    xb_lds_base,
+    xb_lds_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, load_ptr64
+from atom.mono.device.ops import (
+    CM_DEV,
+    kernel_symbol,
+    launcher,
+    load_ptr64,
+    rsrc,
+    uniform,
+)
 from atom.mono.device.ops import block_max as block_max_of
 from atom.mono.device.stamps import stamp as stamp_point
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg, shift, sreg
+from atom.mono.device.sync import Addr, Mailbox, preg, shift, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
-from atom.mono.plan.trace import enter_stage
+from atom.mono.plan.probe import parse as parse_probe
+from atom.mono.plan.trace import Space, enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
+
+
+def hash_probe(text: str) -> int:
+    """A stable number for a probe string (the symbol names the probe build)."""
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
+
 
 # The launch goes on the caller's current stream (graph capture included).
 _CURRENT_STREAM = fx.Stream(None)
@@ -136,7 +167,7 @@ K4_ABI = KernelAbi(
         "h_in", "q", "block_table", "seq_lens", "k_cache", "v_cache", "k_scale",
         "v_scale", "w_o", "s_o", "g_post", "w_gate", "bias", "w13", "s13", "w2", "s2",
         "h_mid", "ar_out", "scratch", "sym", "peers", "rank", "layer", "bt_width",
-        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
+        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids", "w13s", "s13s", "w2s", "s2s",
     )
 )  # fmt: skip
 
@@ -161,6 +192,56 @@ class K4Build:
     shared_weight: float
     swiglu_limit: float
     debug: bool
+    xn_flag: int = 0
+    shared_mxfp8: bool = False
+    mid_flag: int = 0
+    kv_nvfp4: bool = False
+    index_nvfp4: bool = False
+    probe: str = ""  # a timing probe (``atom.mono.plan.probe``); empty: production
+    sh_first: int = (
+        0  # wide MoE: the shared pairs first, their tiles loaded early; 0 off, else ``UG_SHARED_UNITS``
+    )
+    attn_mxfp8: bool = (
+        False  # qkv / o_proj are native MXFP8 1x32 (E8M0 scales), not ptpc fp8
+    )
+    # numerics aligned with the production path (task-mono-align/PLAN.md); False = the
+    # previous behaviour, code object for code object
+    moe_a16w4: bool = True  # routed experts: bf16 activations (F1); False: MXFP8 (a8w4)
+    sp_f32: bool = True  # split -> merge partition outputs in f32 (F2); False: bf16
+    prod_round: bool = (
+        True  # shared swiglu on bf16 gate / up, production's output-sum roundings (F3, F4)
+    )
+    # routed experts on MXFP4 activations (a4w4: xn and the swiglu mid per 1x32 E8M0 RoundUp, aiter's a4w4
+    # convention), the shared expert stays MXFP8; wins over ``moe_a16w4`` (compiled out when set)
+    moe_a4w4: bool = False
+    front: bool = (
+        False  # the front half only (more than MAX_TOKENS rows): ends at ``post_norm``
+    )
+    # the whole layer for 32 / 64 rows in one launch: the front half, then the back half (``stages/moe_back64.py``): router,
+    # a4w4 routed experts + MXFP8 shared expert on expert-tile units, FFN reduce
+    moe_back: bool = False
+    back_dn_depth: int = 3  # moe_back: down units whose weights are in flight a wave
+    back_sh_units: int = (
+        8  # moe_back: routed pairs a shared pair displaces on its host CTA
+    )
+    back_dn_split: int = (
+        0  # moe_back: the down stage polls the up / gate flags in two halves
+    )
+    back_dn_bdepth: int = 1  # moe_back: down units whose mid rows are in flight
+    back_steal: int = (
+        0  # moe_back: the up / gate pairs by atomic work stealing (``sh_units`` unused)
+    )
+    # split tasks a token (8: 256-key partitions; 4: 512-key ones, a wave two quarters: nvfp4 front builds)
+    n_split: int = N_SPLIT
+    # front builds with ``attn_mxfp8``: K1's GEMV and the o stage load a token group's rows while the
+    # group before it computes, and wait for every row's flag once up front
+    pipe: bool = False
+    # s_sleep units between the re-loads of the index scorers' waits for the head tasks' flags
+    # (front builds: ~200 waves spin on the same lines, which slows the heads' own stores)
+    score_sleep: int = 1
+    # 16 B load rounds of a token group's x8 copy (K1, front builds) that go out together: the whole
+    # group (13 rounds) in flight hides the memory latency the copy is bound by
+    copy_batch: int = 8
 
 
 def build_post_attn_kernel(
@@ -178,6 +259,29 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    xn_flag: int = 0,
+    shared_mxfp8: bool = False,
+    mid_flag: int = 0,
+    kv_nvfp4: bool = False,
+    index_nvfp4: bool = False,
+    probe: str = "",
+    sh_first: int = 0,
+    attn_mxfp8: bool = False,
+    moe_a16w4: bool = True,
+    sp_f32: bool = True,
+    prod_round: bool = True,
+    moe_a4w4: bool = False,
+    front: bool = False,
+    moe_back: bool = False,
+    back_dn_depth: int = 3,
+    back_sh_units: int = 8,
+    back_steal: int = 0,
+    back_dn_split: int = 0,
+    back_dn_bdepth: int = 1,
+    n_split: int = N_SPLIT,
+    pipe: bool = False,
+    score_sleep: int = 1,
+    copy_batch: int = 8,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -188,28 +292,121 @@ def build_post_attn_kernel(
     a wait that gives up recorded in scratch ``diag`` (``Mailbox``).
     ``index_topk``: the layer scores and selects its blocks; else (the original
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
-    selecting layer of the step left in scratch."""
-    assert 1 <= tokens <= MAX_TOKENS
+    selecting layer of the step left in scratch. ``shared_mxfp8``: the shared
+    expert is not one of the MXFP4 experts (``w13`` / ``w2`` hold the routed 128)
+    but an MXFP8 MLP of its own (``w13s`` / ``s13s`` / ``w2s`` / ``s2s``: (16, 16)-
+    preshuffled fp8 weights and their row-major per-1x32 E8M0 scales), run by the narrow MoE as its shared window, by the wide one as task pairs after
+    the grouped loop. ``kv_nvfp4`` / ``index_nvfp4``: the K/V pool / the index cache
+    hold single-buffer NVFP4 pages: K4's split reads them (``split_nvfp4``; ``k_cache``
+    and ``v_cache`` are both the pool, ``k_scale`` / ``v_scale`` the layer's f32 global
+    scales), and with ``fuse_k1`` K1 writes and scores them. The index cache is read
+    only by K1's scores, so ``index_nvfp4`` needs ``fuse_k1`` here.
+    ``attn_mxfp8``: the qkv (K1, ``fuse_k1``) and o_proj weights are native MXFP8 1x32:
+    (16, 16)-preshuffled fp8, their ``s_qkv`` / ``s_o`` row-major E8M0 ``[rows, K / 32]``;
+    the activations are quantized per 32 elements (E8M0 ceil-pow2) instead of per token.
+    """
+    assert not index_nvfp4 or fuse_k1, "the index cache is read by K1's scores"
+    moe_a16w4 = moe_a16w4 and not moe_a4w4  # a4w4 wins, a16w4 is compiled out
+    assert not (
+        moe_a16w4 and shared_mxfp8 and tokens < WIDE_FROM and (xn_flag or mid_flag)
+    ), "the narrow moe_a16w4 publishes its bf16 xn as tagged pairs: xn_flag = mid_flag = 0"
+    assert (
+        not moe_a4w4 or shared_mxfp8
+    ), "the a4w4 experts need the unfused MXFP8 shared expert"
+    assert not (
+        moe_a4w4 and tokens < WIDE_FROM and xn_flag
+    ), "the narrow moe_a4w4 publishes its MXFP4 xn as tagged words: xn_flag = 0 (mid_flag 0 / 1 / 2 as for a8w4)"
+    assert 1 <= tokens <= MAX_ROWS
+    # more than MAX_TOKENS rows: the front half only (attention through the post-attention norm;
+    # the MoE half of such a step is another build's), K1 fused, selecting
+    assert tokens <= MAX_TOKENS or ((front or moe_back) and fuse_k1 and index_topk)
+    assert not front or tokens > MAX_TOKENS
+    assert not moe_back or (
+        not front
+        and tokens % 16 == 0
+        and tokens <= 64
+        and tokens > MAX_TOKENS
+        and moe_a4w4
+        and shared_mxfp8
+    ), "moe_back: 32 / 48 / 64 rows, a4w4 routed experts + MXFP8 shared expert, not a front-only build"
+    assert n_split == N_SPLIT or (
+        n_split == N_SPLIT // 2 and kv_nvfp4 and (front or moe_back)
+    )
+    assert not pipe or ((front or moe_back) and attn_mxfp8)
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
-        swiglu_limit=swiglu_limit, debug=debug,
+        swiglu_limit=swiglu_limit, debug=debug, xn_flag=xn_flag,
+        shared_mxfp8=shared_mxfp8, mid_flag=mid_flag, kv_nvfp4=kv_nvfp4,
+        index_nvfp4=index_nvfp4, probe=probe, sh_first=sh_first, attn_mxfp8=attn_mxfp8,
+        moe_a16w4=moe_a16w4, sp_f32=sp_f32, prod_round=prod_round,
+        moe_a4w4=moe_a4w4,
+        front=front, moe_back=moe_back, back_dn_depth=back_dn_depth, back_sh_units=back_sh_units, back_steal=back_steal, back_dn_split=back_dn_split, back_dn_bdepth=back_dn_bdepth,
+        n_split=n_split, pipe=pipe, score_sleep=score_sleep, copy_batch=copy_batch,
     )  # fmt: skip
+    P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
     REGION_IDS = region_ids(
-        d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
+        d.name
+        for d in mailbox_regions(
+            tokens,
+            heads.count,
+            fuse_k1,
+            index_topk,
+            xn_flag,
+            mid_flag,
+            sp_f32,
+            True,
+            moe_a4w4,
+            front,
+            moe_back,
+        )
     )
     W = npes
     G = BLOCKS
-    BASE = stage_bases(tokens)
-    SY = sym_layout(W)
+    BIG = tokens > MAX_TOKENS
+    ROWS = row_cap(tokens)  # token rows the scratch / peer regions hold
+    NS = n_split  # split tasks a token
+    BASE = front_stage_bases(tokens, NS) if BIG else stage_bases(tokens)
+    SCR = scratch_layout(ROWS, NS)
+    SY = sym_layout(W, ROWS, NS)
+    K1S = k1_scratch(ROWS)
     # fuse_k1: K1's outputs are read device-coherent (K1 stores them so)
     CM_K1 = CM_DEV if fuse_k1 else 0
     WIDE = wide_moe(tokens)
-    POOL = pool_words(tokens)
+    # the narrow MoE's routed experts on bf16 activations (the wide one: pending); a build
+    # whose shared expert is one of the MXFP4 experts (no ``shared_mxfp8``) keeps a8w4
+    A16N = moe_a16w4 and not WIDE and shared_mxfp8
+    A16W = moe_a16w4 and WIDE and shared_mxfp8  # the wide (expert-grouped) one
+    A4N = moe_a4w4 and not WIDE  # (a4w4 implies shared_mxfp8)
+    A4W = moe_a4w4 and WIDE
+    # the router tasks' xn goes out as plain words behind one flag a task (always
+    # in the wide MoE; ``xn_flag`` 1 / 2 in the narrow one: the flag after / before
+    # the logits), not as tagged pairs
+    XN_FLAG = WIDE or xn_flag != 0
+    XN_EARLY = xn_flag == 2 and not WIDE
+    # the narrow MoE's mid rows likewise: plain bf16 behind one flag a up / gate task
+    # (``mid_flag`` 1), or (2) bf16 pairs with a tag each, half the bytes of f32 ones
+    MID_FLAG = mid_flag == 1 and not WIDE
+    MID_BF = mid_flag == 2 and not WIDE
+    POOL = pool_words(tokens, A16N or A16W, A4N or A4W)
+    GT = min(tokens, TG)  # token rows K1 / o_proj hold in LDS at a time
+    if BIG:
+        # the front-half build: the largest of K1's group rows (+ codes), the split's PV
+        # partials, the o stage's group rows (+ codes), the selection's keys
+        POOL = max(
+            GT * (HIDDEN // 4 + (XSCB_ROW if attn_mxfp8 else 0)),
+            WAVES * O_K,
+            GT * (O_ROW + (OSC_ROW if attn_mxfp8 else 0)),
+            2 * THREADS * 2 + 512 + 2 + WAVES * TOPK_BLOCKS,
+        )
+        if (
+            moe_back
+        ):  # the back half carves its arrays out of the pool (``back_lds_layout``)
+            POOL = max(POOL, back_lds_layout(tokens)["end"])
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
 
     @fx.struct
@@ -225,22 +422,41 @@ def build_post_attn_kernel(
         uexp: fx.Array[fx.Int32, U_MAX + 2, 16]
         umask: fx.Array[fx.Int32, U_MAX + 2, 16]
         # and per (expert, B column) the down stage's mid row and route weight
-        urow: fx.Array[fx.Int32, U_MAX * 16 if WIDE else 1, 16]
-        uwt: fx.Array[fx.Float32, U_MAX * 16 if WIDE else 1, 16]
+        urow: fx.Array[fx.Int32, U_MAX * 16 if WIDE and not BIG else 1, 16]
+        uwt: fx.Array[fx.Float32, U_MAX * 16 if WIDE and not BIG else 1, 16]
         hst: fx.Array[
             fx.Float32, 3 * WAVES * H + WAVES, 16
         ]  # head max / sum, max, v_scale max
-        misc: fx.Array[fx.Float32, O_ROWS * MAX_TOKENS, 16]  # a task's output rows
+        misc: fx.Array[fx.Float32, O_ROWS * ROWS, 16]  # a task's output rows
         route: fx.Array[fx.Int32, 8 * MAX_TOKENS, 16]  # token k's slots at 8 k
         rwt: fx.Array[fx.Float32, 8 * MAX_TOKENS, 16]  # and their routing weights
-        blk: fx.Array[fx.Int32, 32, 16]  # this split's 16 pages, n_ctx, tail flag
+        # this split's pages, n_ctx, tail flag
+        blk: fx.Array[fx.Int32, max(32, TOPK_BLOCKS // NS * 8 + 2), 16]
         tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]  # timeline stamps
         # fuse_k1: index q (every head's: in the pool)
-        qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens if heads.count == 1 else 1, 16]
+        qs: fx.Array[
+            fx.Float32,
+            HEAD_DIM // 2 * tokens if heads.count == 1 and not BIG else 1,
+            16,
+        ]
 
+    sym_extra = {"pb": abs(hash_probe(probe)) % 10**8} if probe else {}
+    if front:  # a front build's symbol differs from a full build's of the same rows
+        sym_extra["fr"] = 1
+    if moe_back:
+        sym_extra["mb"] = 1
+    if n_split != N_SPLIT:
+        sym_extra["ns"] = n_split
+    if pipe:
+        sym_extra["pp"] = 1
+    if score_sleep != 1:
+        sym_extra["ss"] = score_sleep
+    if copy_batch != 8:
+        sym_extra["cb"] = copy_batch
     kernel_name = kernel_symbol(
         "minimax_m3_mono_layer" if fuse_k1 else "minimax_m3_post_attn",
         **symbol_params(key),
+        **sym_extra,
     )
 
     # the kernel body rebuilds IndexHeads from ints: an object in a closure is not
@@ -248,7 +464,10 @@ def build_post_attn_kernel(
     ih_count, ih_own = heads.count, heads.own
     # fuse_k1 with every index head: K1's index q of every head (qs) after its x8
     # rows in the pool (K1 is done with the pool before K4's stages use it)
-    QS_CP = tokens * HIDDEN // 4
+    # (attn_mxfp8: K1's E8M0 codes sit between, ``XSCB_ROW`` words a token)
+    QS_CP = GT * (HIDDEN // 4 + (XSCB_ROW if attn_mxfp8 else 0))
+    assert not attn_mxfp8 or QS_CP <= POOL, "K1's x8 rows + codes outgrow the pool"
+    assert not attn_mxfp8 or GT * (O_ROW + OSC_ROW) <= POOL, "o_proj rows + codes"
     assert not (fuse_k1 and heads.count > 1) or (
         QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
     )
@@ -290,6 +509,10 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
         batch_ids: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -322,8 +545,8 @@ def build_post_attn_kernel(
         v4f = fx.Vector.make_type(4, fx.Float32)
         v2i = fx.Vector.make_type(2, fx.Int32)
 
-        diag = scratch + fx.Int64(SCRATCH["diag"]) if debug else None
-        mbox = Mailbox(layer, diag, REGION_IDS)
+        diag = scratch + fx.Int64(SCR["diag"]) if debug else None
+        mbox = Mailbox(layer, diag, REGION_IDS, P.skip)
         # Plain names, not method calls: flydsl's AST rewriter carries every local
         # whose method is called inside a dynamic if/for as loop state.
         mb_put = mbox.put
@@ -333,11 +556,11 @@ def build_post_attn_kernel(
 
         def mb(name):
             """Scratch region ``name``'s raw address (plain loads / stores)."""
-            return scratch + fx.Int64(SCRATCH[name])
+            return scratch + fx.Int64(SCR[name])
 
         def mr(name):
             """Scratch mailbox region ``name`` (puts / polls)."""
-            return sreg(scratch, SCRATCH[name], name)
+            return sreg(scratch, SCR[name], name)
 
         def acquire():
             fx.memory_fence(
@@ -351,6 +574,20 @@ def build_post_attn_kernel(
                 mr("scores"), (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16)
             )
 
+        def scores_read(c, k=0):
+            """Where a consumer reads copy c of token k's router outputs: the mailbox,
+            or (a probe skipping the ``scores`` wait) the pinned table's image of the
+            real step's pairs, so the route is the real one without the wait."""
+            if const_expr(P.pin and "scores" in P.skip):
+                return Addr(
+                    "scores",
+                    Space.SCRATCH,
+                    tl
+                    + fx.Int64(layer) * (MAX_TOKENS * N_ROUTED * 16)
+                    + fx.Int64(k) * (N_ROUTED * 16),
+                )
+            return scores_copy(c, k)
+
         def route_key(v, e):
             """Signed-orderable i32 of score ``v`` with its low 7 bits replaced by
             127 - expert ``e``: a pick is one integer max, a tie goes to the lower
@@ -359,12 +596,21 @@ def build_post_attn_kernel(
             b = (b < 0).select(b ^ fx.Int32(0x7FFFFFFF), b)
             return (b & fx.Int32(-128)) | (127 - e)
 
-        # each wave pushes to one peer
+        # each wave pushes to one peer (a ``loop`` probe: to this rank's own buffer)
         peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
         AG_RS = tokens >= AG_RS_FROM
 
-        def peer_addr(w):
-            return load_ptr64(peers, w)
+        def peer_addr(w, region=""):
+            return sym if region in P.loop else load_ptr64(peers, w)
+
+        def own_task(t, region=""):
+            """Whether this rank sums (and gathers) row group t's all-reduce."""
+            return (t >= 0) if region in P.loop else (t % W == rank)
+
+        def wrsrc(kind, addr, nbytes=None):
+            """A weight / cache buffer; a probe's ``nb`` kinds read through a
+            zero-sized one (the loads issue, no byte comes from memory)."""
+            return rsrc(addr, 0 if kind in P.nb else nbytes)
 
         def start(name):
             return first_task(bid, BASE[name])
@@ -381,18 +627,22 @@ def build_post_attn_kernel(
             the peers' ``region``, a pair a lane, wave w -> peer w (itself too);
             ``only``: to that peer alone."""
             half = n_rows // 2
-            to = (wave < W) if only is None else (wave == only)
+            looped = region in P.loop
+            to = (wave < W) if (only is None or looped) else (wave == only)
+            dst = sym if looped else peer_dst
             for c in range_constexpr((half * tokens + 63) // 64):
                 i = lane + 64 * c
                 if to & (i < half * tokens):
                     mb_put_bf(
-                        preg(peer_dst, SY[region], region),
-                        (rank * MAX_TOKENS + i // half) * HIDDEN
+                        preg(dst, SY[region], region),
+                        ((wave if looped else rank) * ROWS + i // half) * HIDDEN
                         + row0
                         + (i % half) * 2,
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],
                     )
 
+        if const_expr(P.exit == "start"):
+            return
         stamp_begin(timeline, tls, tid, TL_POINTS)
 
         if const_expr(fuse_k1):
@@ -423,31 +673,45 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                kv_nvfp4=kv_nvfp4,
+                index_nvfp4=index_nvfp4,
+                skip=P.skip,
+                strip=P.nb,
+                attn_mxfp8=attn_mxfp8,
+                xsc=xs + GT * (HIDDEN // 4) if attn_mxfp8 else None,
+                pipe=pipe,
+                score_sleep=score_sleep,
+                copy_batch=copy_batch,
             )  # fmt: skip
             gpu.barrier()
-            k1_mbox = Mailbox(layer, diag, REGION_IDS)
+            k1_mbox = Mailbox(layer, diag, REGION_IDS, P.skip)
             k1_poll = k1_mbox.poll
-            hdone_mb = sreg(scratch1, K1_SCRATCH_HDONE, "k1.hdone")
-            rdone_mb = sreg(scratch1, K1_SCRATCH_RDONE, "k1.rdone")
+            hdone_mb = sreg(scratch1, K1S["HDONE"], "k1.hdone")
+            rdone_mb = sreg(scratch1, K1S["RDONE"], "k1.rdone")
         else:
             # K1's hand-offs: the stage factories bind every name they read, used
             # only under fuse_k1 or not (``stages``)
             k1_poll = hdone_mb = rdone_mb = None
+        if const_expr(P.exit == "k1"):
+            return
 
         # ============================================================ 0. index
         # Indexer: K1 scored every block the selection does not pin (index_score);
         # here only the selection runs.
         # a graph's pad rows carry seq_len 0 and an all-zero block-table row: as one
         # key of page 0 they stay finite and select a real page
-        seq_lens_k, n_blks, long_rows = step_rows(
-            seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
-        )
+        if const_expr(BIG):  # per row, where it is used (``select_defs``)
+            seq_lens_k = n_blks = long_rows = None
+        else:
+            seq_lens_k, n_blks, long_rows = step_rows(
+                seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
+            )
         # Up to TOPK_BLOCKS blocks the top-k keeps every block and the scores would
         # only order them. The original selector's own contract calls either order
         # equally correct (index_topk._pack_score_key), so a short context is not
         # scored and takes the blocks in id order -- the tail block is last either
         # way -- instead of putting the scoring chain in front of the attention.
-        scored = [nb > TOPK_BLOCKS for nb in n_blks]
+        scored = None if BIG else [nb > TOPK_BLOCKS for nb in n_blks]
 
         # every name the stage factories read: the builder's, the body's so far,
         # and the functions the factories define
@@ -458,14 +722,18 @@ def build_post_attn_kernel(
 
         k4ctx.update(locals())
         k4ctx.update(split_defs(k4ctx))
-        stage_split = k4ctx["stage_split"]
+        stage_split = k4ctx["stage_split_nvfp4" if kv_nvfp4 else "stage_split"]
 
         if const_expr(index_topk):
             enter_stage("select_long")
             stage_select_long()
+        if const_expr(P.exit == "sel"):
+            return
         enter_stage("split")
         stage_split()
         stamp(1)
+        if const_expr(P.exit == "split"):
+            return
 
         k4ctx.update(locals())
         k4ctx.update(merge_defs(k4ctx))
@@ -473,14 +741,60 @@ def build_post_attn_kernel(
 
         enter_stage("merge")
         stage_merge()
+        if const_expr(P.exit == "merge"):
+            return
 
         k4ctx.update(locals())
         k4ctx.update(o_defs(k4ctx))
-        stage_o = k4ctx["stage_o"]
+        stage_o = k4ctx["stage_o_big" if BIG else "stage_o"]
 
         enter_stage("o")
         stage_o()
         stamp(4)
+        if const_expr(P.exit == "o"):
+            return
+
+        if const_expr(front or moe_back):
+            # the front half's end: hidden (h_mid) and the MoE input (the scratch region ``xmoe``, and ar_out in a
+            # front-only build), flagged per token
+            k4ctx.update(locals())
+            k4ctx.update(post_norm_defs(k4ctx))
+            enter_stage("post")
+            k4ctx["stage_post_norm"]()
+            stamp(5)
+        if const_expr(front):
+            stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
+            return
+        if const_expr(moe_back):
+            # the back half (32 / 64 rows): router -> routing units -> up / gate -> down + FFN reduce, over the pool
+            k4ctx.update(locals())
+            k4ctx.update(
+                n=tokens,
+                DEP=back_dn_depth,
+                SU=back_sh_units,
+                STEAL=back_steal,
+                DN_SPLIT=back_dn_split,
+                DEPB=back_dn_bdepth,
+                stop=P.exit,
+                MERGED=True,
+                AR_FLAG=0,
+                x_base=mb("xmoe"),
+            )
+            k4ctx.update(moe_back_defs(k4ctx))
+            enter_stage("router")
+            k4ctx["stage_router"]()
+            stamp(5)
+            enter_stage("ug")
+            k4ctx["stage_shared_host"]()
+            k4ctx["stage_routing"]()
+            nu_back = uniform(fx.ptr_load(k4ctx["wscan"] + 2))
+            k4ctx["stage_ug"](nu_back)
+            stamp(8)
+            if bid < N_DN_BACK:
+                enter_stage("down")
+                k4ctx["stage_down"](nu_back)
+            stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
+            return
 
         # a8w4 operands in xs (Int32 words, never through f32 arithmetic): the up /
         # gate stage holds every token's MXFP8 xn then its E8M0 scales; the down
@@ -488,11 +802,20 @@ def build_post_attn_kernel(
         XN8_WORDS = HIDDEN // 4
         XSC_WORDS = HIDDEN // 32
         XSC_LDS = tokens * XN8_ROW
+        # moe_a16w4 (narrow): the routed tasks' bf16 xn rows follow the MXFP8 rows and scales
+        XB_ROW = HIDDEN // 2
+        XB_LDS = xb_lds_base(tokens)
         MID16_WORDS = MOE_SLOTS * INTER // 2  # bf16 pairs, as the mids land
         MID8_WORDS = MOE_SLOTS * INTER // 4
         MID8_LDS = tokens * MID16_WORDS
         MIDSC_WORDS = MOE_SLOTS * INTER // 32
         MIDSC_LDS = MID8_LDS + tokens * MID8_WORDS
+        # moe_a4w4 (narrow): the routed tasks' MXFP4 xn rows (``XN4_ROW`` words a row) and their codes
+        # follow the MXFP8 rows; the down stage's MXFP4 routed mids and codes follow the MXFP8 mids
+        X4_LDS = xb_lds_base(tokens)
+        X4S_LDS = X4_LDS + xb_lds_rows(tokens) * XN4_ROW
+        MID4_LDS = MIDSC_LDS + tokens * MIDSC_WORDS
+        MIDSC4_LDS = MID4_LDS + tokens * MID4N_WORDS
 
         k4ctx.update(locals())
         k4ctx.update(router_defs(k4ctx))
@@ -501,6 +824,8 @@ def build_post_attn_kernel(
         enter_stage("router")
         stage_router()
         stamp(5)
+        if const_expr(P.exit == "router"):
+            return
 
         # ================================ 5. experts: up / gate -> down -> FFN reduce
         UG_KC = HIDDEN // 128  # 128-k chunks
@@ -509,6 +834,9 @@ def build_post_attn_kernel(
         DN_UNITS = TOP_K * DN_KC  # routed (slot, 128-k chunk) units per row group
         DN_UPW = (DN_UNITS + 3) // 4  # 4 waves per row group
         SH_UPW = (DN_KC + 3) // 4  # the shared expert's chunks, once for all tokens
+        assert (
+            not (A16N or A4N) or DN_UPW == DN_KC
+        )  # a wave a slot, its chunks the units
         # routed (token, slot, row group) tasks t < ROUTED_TASKS; the shared expert's
         # row groups (one GEMV with a column per token) are tasks ROUTED_TASKS + j,
         # run as task j of stage "shared" while the routing is still on its way, so
@@ -532,13 +860,38 @@ def build_post_attn_kernel(
         MID_ROW_WORDS = INTER // 4
         MIDSC_ROW_WORDS = INTER // 32
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
+        # moe_a16w4: the down stage's pool (``layout.wide_down_layout``)
+        DNL = wide_down_layout(tokens)
+        MIDB_ROWS = DNL[
+            "rows"
+        ]  # the routed experts' bf16 mid rows, the zero row's index
+        assert not A16W or DNL["end"] <= POOL
+        DN4 = wide_down4_layout(tokens)  # moe_a4w4 (wide): the down stage's pool
+        assert not A4W or DN4["end"] <= POOL
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
-        UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)  # up / gate tasks a CTA runs
+        # the MXFP8 shared expert's pairs sit on UG_PAIRS CTAs, one each, that take
+        # UG_SHARED_UNITS routed pairs fewer (``stage_moe_wide``); a shared pair costs
+        # its host as much as that many routed pairs: measured
+        # layer time at S = 8 / 16 with 2 / 3 / 4 / 5 / 6: 87.2 / 83.2 / 83.2 / 82.8 / 84.5
+        # and 127.3 / 123.0 / 123.0 / 122.7 / 124.5 us (the shared pair's loads and
+        # sync are latency, not bytes, so it weighs more than its 2 pairs' bytes)
+        UG_SHARED_UNITS = sh_first or 4
+        UGW_ITERS = (
+            2
+            * (
+                (U_MAX - 1) * UG_PAIRS
+                + (UG_SHARED_UNITS * UG_PAIRS if shared_mxfp8 else UG_PAIRS)
+                + G
+                - 1
+            )
+            // G
+        )  # up / gate tasks a CTA runs
         # a wave takes chunks q and q + 4 of an expert (``wide_down``)
         assert 4 < DN_KC <= 8
         DN_WITERS = 2 * U_MAX  # (expert, chunk) units a wave runs, at most
-        DN_DEPTH = 12  # units whose weights are in flight
+        DN_DEPTH = 20  # units whose weights are in flight
+        DN_ROWS_AHEAD = 4  # of them, those whose B rows are read already
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES  # tokens a wave routes
 
         k4ctx.update(locals())
@@ -589,6 +942,10 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
         batch_ids: Int64,
+        w13s: Int64,
+        s13s: Int64,
+        w2s: Int64,
+        s2s: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
         _ = build_key  # every build parameter in the JIT cache key
@@ -625,6 +982,10 @@ def build_post_attn_kernel(
             slot_mapping,
             res,
             batch_ids,
+            w13s,
+            s13s,
+            w2s,
+            s2s,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     K4_ABI.check(post_attn_kernel, launch_post_attn)

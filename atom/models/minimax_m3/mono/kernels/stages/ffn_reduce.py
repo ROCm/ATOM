@@ -24,9 +24,9 @@ def ffn_reduce_defs(k4ctx):
     mb_poll = k4ctx["mb_poll"]
     mb_put_bf = k4ctx["mb_put_bf"]
     misc = k4ctx["misc"]
+    own_task = k4ctx["own_task"]
     peer_addr = k4ctx["peer_addr"]
     push_rows = k4ctx["push_rows"]
-    rank = k4ctx["rank"]
     sym = k4ctx["sym"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
@@ -60,11 +60,11 @@ def ffn_reduce_defs(k4ctx):
                 if const_expr(AG_RS):
                     t0 = fx.Float32(0.0)
                     t1 = fx.Float32(0.0)
-                    if t % W == rank:  # the owner: sum, gather to every rank
+                    if own_task(t, "ffn"):  # the owner: sum, gather to every rank
                         t0, t1 = rank_sum()
                         for w in range_constexpr(W):
                             mb_put_bf(
-                                preg(peer_addr(w), SY["ffn_ag"], "ffn_ag"),
+                                preg(peer_addr(w, "ffn"), SY["ffn_ag"], "ffn_ag"),
                                 row_tok * HIDDEN + row,
                                 [t0, t1],
                             )

@@ -52,6 +52,7 @@ from atom.models.minimax_m3.mono.config import (
     TP,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.common import KV_PAGE_BYTES
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -93,6 +94,8 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 N_DENSE = 3
+# LLVM options of the rebuild of a layer kernel that needs scratch (``MonoDecodeRunner._lean_layer_kernels``)
+LEAN_LLVM_OPTIONS = {"amdgpu-use-amdgpu-trackers": True}
 # a width's kernels by kind (``_build_layer_kernels``): the sparse ones' is K4's
 _KERNEL_ABI = {
     "dense_pre0": K1_ABI,
@@ -154,12 +157,22 @@ class MonoDecodeRunner:
         group = get_tp_group().cpu_group
         bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
+        self._refused: set[str] = set()
+        self.pipelines = (
+            {}
+        )  # name -> ``hybrid.HybridDecode``, made by ``prepare(n, name)``
+        self.parts = None  # ``hybrid._Parts``
         # per decode batch size (every graph captures its own) a sparse layer
         # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
         # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
         # | "dense_pre" | "dense_post"]``), built and compiled on its first step
+        self._width_of: dict[int, int] = {}
         self.k4 = WidthBuilds(
-            self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
+            self._build_layer_kernels,
+            self._layer_kernels,
+            group,
+            "MiniMax-M3 mono",
+            lean=self._lean_layer_kernels,
         )
 
     def _build_layer_kernels(self, n: int) -> dict:
@@ -171,7 +184,22 @@ class MonoDecodeRunner:
             kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
             kernels["dense_pre"] = self._build_dense_pre(n)
             kernels["dense_post"] = self._build_dense_post(n)
+        self._width_of[id(kernels)] = n
         return kernels
+
+    def _lean_layer_kernels(self, built: dict, spilled: list) -> dict | None:
+        """A width whose layer kernel needs scratch (fp8 caches + a4w4 at 6 and 8 tokens: the
+        compiler keeps a 36 B frame of two SGPR spill slots that no instruction touches, and any
+        schedule change flips it) is rebuilt unchanged except for the machine scheduler's
+        register-pressure trackers (``LEAN_LLVM_OPTIONS``), scratch-free at every width 1..16
+        (same arithmetic: only the instruction order moves)."""
+        lean = dict(built)
+        for kind, launch in built.items():
+            if isinstance(kind, bool) and launch in spilled:
+                n = self._width_of[id(built)]
+                lean[kind] = self._build_k4(n, index_topk=kind)
+                lean[kind].compile_hints["llvm_options"] = LEAN_LLVM_OPTIONS
+        return lean
 
     @staticmethod
     def _layer_kernels(kernels: dict) -> list:
@@ -227,12 +255,40 @@ class MonoDecodeRunner:
         experts = layers[N_DENSE].block_sparse_moe.experts
         eps = config.rms_norm_eps
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
-        # the fused shared expert's routing weight is whatever the topK metadata holds
-        # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        self.shared_mxfp8 = self.sparse[0].shared_mxfp8
+        # routed experts on MXFP4 activations (a4w4): wins over a16w4; needs the unfused MXFP8 shared expert
+        self.moe_a4w4 = envs.ATOM_MONO_MOE_A4W4 and self.shared_mxfp8
+        # NVFP4 K/V + index pages (single-buffer): every layer alike, both caches together
+        self.nvfp4 = impl.kv_cache_dtype == "nvfp4"
+        if any(
+            lw.attn_impl.kv_cache_dtype != impl.kv_cache_dtype for lw in self.sparse
+        ):
+            raise MonoUnsupported("KV cache dtype differs between layers")
+        if any(lw.shared_mxfp8 != self.shared_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("shared expert fused in some layers only")
+        # the checkpoint's MXFP8 1x32 attention linears (native quantization) or the
+        # ptpc-FP8 requantization: every layer alike (the K1 / K4 builds read one kind)
+        self.attn_mxfp8 = self.sparse[0].attn_mxfp8
+        if any(lw.attn_mxfp8 != self.attn_mxfp8 for lw in self.sparse):
+            raise MonoUnsupported("attention linears quantized differently per layer")
+        if self.attn_mxfp8 and self.dense_mono:
+            raise MonoUnsupported("native MXFP8 attention with a mono dense prefix")
+        logger.info(
+            "MiniMax-M3 mono: attention linears %s",
+            "native MXFP8 1x32" if self.attn_mxfp8 else "ptpc FP8",
+        )
+        if self.shared_mxfp8:
+            # the unfused shared expert is added to the routed sum as it is (a check of
+            # the routed experts alone: not at all)
+            shared_weight = 0.0 if envs.ATOM_MONO_CHECK_ROUTED_ONLY else 1.0
+        else:
+            # the fused shared expert's routing weight is whatever the topK metadata
+            # holds, read through the module: the metadata is assigned after this
+            # file is imported
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -266,6 +322,17 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            xn_flag=envs.ATOM_MONO_XN_FLAG,
+            mid_flag=envs.ATOM_MONO_MID_MODE,
+            shared_mxfp8=self.shared_mxfp8,
+            kv_nvfp4=self.nvfp4,
+            index_nvfp4=self.nvfp4,
+            sh_first=envs.ATOM_MONO_SH_FIRST,
+            attn_mxfp8=self.attn_mxfp8,
+            moe_a16w4=envs.ATOM_MONO_MOE_A16W4,
+            moe_a4w4=self.moe_a4w4,
+            sp_f32=envs.ATOM_MONO_SP_F32,
+            prod_round=envs.ATOM_MONO_PROD_ROUND,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -333,9 +400,32 @@ class MonoDecodeRunner:
                 torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
             )
 
-    def prepare(self, n: int) -> bool:
-        """Whether every rank holds the n-token kernel (``WidthBuilds``)."""
+    def prepare(self, n: int, kind: str = "mono") -> bool:
+        """Whether every rank holds the n-token kernel (``WidthBuilds``); kind
+        "hybrid" | "wide": the n-row step of that pipeline (``hybrid.HybridDecode``)."""
+        if kind != "mono":
+            return self._pipeline(kind) is not None and self.pipelines[kind].prepare(n)
         return self.k4.prepare(n)
+
+    def _pipeline(self, kind: str):
+        """The ``kind`` pipeline, made on first use (collective): None if any rank
+        could not make it (a half's kernel module missing, a buffer that did not
+        fit), and then it stays refused."""
+        if kind not in self.pipelines and kind not in self._refused:
+            from atom.distributed.group_agreement import group_agree
+
+            made = None
+            try:
+                from atom.models.minimax_m3.mono.hybrid import HybridDecode
+
+                made = HybridDecode(self, kind)
+            except Exception:
+                logger.exception("MiniMax-M3 %s decode: building it failed", kind)
+            if group_agree(made is not None, get_tp_group().cpu_group):
+                self.pipelines[kind] = made
+            else:
+                self._refused.add(kind)
+        return self.pipelines.get(kind)
 
     def close(self) -> None:
         """Free the peer memory now (once no rank can launch another step)."""
@@ -482,9 +572,19 @@ class MonoDecodeRunner:
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.nvfp4:
+            # the pool's page view is both K and V; the kernels step pages by KV_PAGE_BYTES
+            pages = kv.k_cache
+            if pages.stride() != (KV_PAGE_BYTES, 1) or pages.dtype != torch.uint8:
+                raise MonoUnsupported(
+                    f"NVFP4 KV pages {pages.dtype} {tuple(pages.shape)} {pages.stride()}"
+                )
+            k16 = v16 = pages
+            ks16, vs16 = lw.attn_impl.nvfp4_k_scale, lw.attn_impl.nvfp4_v_scale
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
@@ -500,6 +600,10 @@ class MonoDecodeRunner:
             "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
+            "w13s": _ptr(lw.w13s) if lw.shared_mxfp8 else 0,
+            "s13s": _ptr(lw.s13s) if lw.shared_mxfp8 else 0,
+            "w2s": _ptr(lw.w2s) if lw.shared_mxfp8 else 0,
+            "s2s": _ptr(lw.s2s) if lw.shared_mxfp8 else 0,
         }  # fmt: skip
         _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]

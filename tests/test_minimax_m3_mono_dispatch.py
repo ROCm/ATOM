@@ -57,6 +57,21 @@ def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
 
 
+def test_nvfp4_caches_are_supported_together_only(native):
+    nv = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "nvfp4"}
+    assert dispatch._config_refusal(_atom_config(**nv)) is None
+    assert (
+        dispatch._config_refusal(_atom_config(**{**nv, "index_cache_dtype": None}))
+        is None
+    )
+    assert "index cache fp8 with kv cache nvfp4" in dispatch._config_refusal(
+        _atom_config(kv_cache_dtype="nvfp4")
+    )
+    assert "index cache nvfp4 with kv cache fp8" in dispatch._config_refusal(
+        _atom_config(index_cache_dtype="nvfp4")
+    )
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -171,15 +186,48 @@ def _forward_context(md=None, is_prefill=False, ubatch_slices=None):
     )
 
 
-def _mono(monkeypatch, fwd, builds=True):
+def _mono(monkeypatch, fwd, builds=True, **policy):
     """An enabled MonoDecode whose runner already exists (no GPU work); its kernels
     build on every rank when ``builds``."""
     mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
-    mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
+    mono._mono.runner = SimpleNamespace(prepare=lambda n, *kind: builds)
+    mono.policy = dispatch.WidthPolicy(**policy)
+    mono.steps = {k: {} for k in ("production", "mono", "hybrid")}
+    mono._graph_kind, mono._graph_logged, mono._counted = {}, set(), 0
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
+
+
+def test_steps_are_counted_by_token_count(monkeypatch):
+    md = _forward_context(_decode_md(rows=4))
+    mono = _mono(monkeypatch, md)
+    assert mono.supports(*_step(4), None, None)
+    assert not mono.supports(*_step(17), None, None)
+    mono.note_replay(4)  # a graph replay: mono's only if its capture took mono
+    mono._graph_kind[4] = "mono"
+    mono.note_replay(4)
+    mono.note_replay(32)
+    assert mono.steps == {
+        "mono": {4: 2},
+        "production": {4: 1, 17: 1, 32: 1},
+        "hybrid": {},
+    }
+
+
+def test_install_hands_the_runner_its_replay_counter(monkeypatch):
+    """The model definition carries no replay hook: the installer attaches it, on the
+    causal LM itself or through a wrapper's ``language_model``."""
+    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=4)))
+    lm = SimpleNamespace(_mono=mono, bind_mono_drafter=lambda drafter: None)
+    for model in (
+        lm,
+        SimpleNamespace(language_model=lm, bind_mono_drafter=lambda d: None),
+    ):
+        assert dispatch.install_mono_decode(model, None, None) is model
+        model.mono_note_replay(4)
+    assert mono.steps["production"] == {4: 2}
 
 
 def _step(n, pos_dtype=torch.int64):
@@ -213,6 +261,29 @@ def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
     md = _forward_context(_decode_md(rows=32))
     assert not _mono(monkeypatch, md).supports(*_step(17), None, None)
+
+
+def test_hybrid_and_wide_widths_follow_the_table(monkeypatch):
+    md = _forward_context(_decode_md(rows=64, slots=torch.zeros(64, dtype=torch.int64)))
+    on = _mono(
+        monkeypatch,
+        md,
+        hybrid=True,
+        wide=True,
+        spec="17-31:hybrid,33-63:hybrid,64:mono",
+    )
+    assert on.supports(*_step(17), None, None)  # hybrid
+    assert on.supports(*_step(32), None, None)  # wide mono
+    assert on.supports(*_step(64), None, None)  # wide mono
+    assert not on.supports(*_step(65), None, None)  # above the table
+    assert not _mono(monkeypatch, md).supports(*_step(17), None, None)  # switches off
+    # a pipeline no rank could build declines its widths only
+    assert (
+        _mono(monkeypatch, md, builds=False, hybrid=True).supports(
+            *_step(4), None, None
+        )
+        is False
+    )
 
 
 def test_check_mode_takes_the_same_steps(monkeypatch):

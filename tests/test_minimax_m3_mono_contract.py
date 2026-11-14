@@ -39,7 +39,10 @@ def traces():
 
 
 def test_the_layer_kernel_holds(traces):
-    check(traces["layer"], mailbox_regions(TOKENS, INDEX_HEADS, True, True))
+    check(
+        traces["layer"],
+        mailbox_regions(TOKENS, INDEX_HEADS, True, True, moe_a16w4=False),
+    )
 
 
 def test_the_dense_layer_kernel_holds(traces):
@@ -49,10 +52,21 @@ def test_the_dense_layer_kernel_holds(traces):
 def test_a_wrong_declaration_is_caught(traces):
     """The positive control: the same build against a table that names the wrong
     writer for the MoE mid rows."""
-    decls = mailbox_regions(TOKENS, INDEX_HEADS, True, True)
+    decls = mailbox_regions(TOKENS, INDEX_HEADS, True, True, moe_a16w4=False)
     assert any(d.name == "mid" for d in decls)
     wrong = [
         dataclasses.replace(d, writer="down") if d.name == "mid" else d for d in decls
     ]
     with pytest.raises(ContractError, match="mid put by ug, its writer is down"):
         check(traces["layer"], wrong)
+
+
+@pytest.mark.parametrize("tokens", [32, 48, 64])
+@pytest.mark.parametrize("n_split, pipe", [(8, False), (4, True)])
+def test_the_front_half_kernel_holds(tokens, n_split, pipe):
+    """The front-half build (more than MAX_TOKENS rows: the split rounds hold the long
+    selection's shares, ``xmoe_done`` is the hand-off to the router stage)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("ARCH", "gfx950")
+        patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+        contract.check_front(tokens, n_split, pipe)

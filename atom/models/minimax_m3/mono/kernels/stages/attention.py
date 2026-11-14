@@ -11,9 +11,17 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.minimax_m3.mono.config import HEAD_DIM, HIDDEN, MAX_TOKENS, PAGE16
+from atom.models.minimax_m3.mono.config import (
+    HEAD_DIM,
+    HIDDEN,
+    MAX_TOKENS,
+    PAGE16,
+    TOPK_BLOCKS,
+)
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x4, per_token_fp8_scale
 from atom.models.minimax_m3.mono.kernels.pre_attn import N_HEAD_TASKS as K1_HEAD_TASKS
+from atom.models.minimax_m3.mono.kernels.pre_attn import TG
+from atom.models.minimax_m3.mono.kernels.split_nvfp4 import split_nvfp4_task
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG, PAGE_BYTES
 from atom.models.minimax_m3.mono.layout import (
     N_O,
@@ -21,19 +29,32 @@ from atom.models.minimax_m3.mono.layout import (
     O_K,
     O_ROW,
     O_ROWS,
+    OSC_ROW,
+    PAGES_PER_BLOCK,
+    SCRATCH,
     SPLIT_KEYS,
     H,
 )
-from atom.mono.device.mx import FP8_MAX, UNIT_SCALE, mfma_scaled
+from atom.mono.device.mx import (
+    FP8_MAX,
+    UNIT_SCALE,
+    clamp_fp8,
+    code_ceil,
+    mfma_scaled,
+    rcp_pow2,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    batched_rounds,
     bf2_f32,
     bf16_round,
     butterfly,
+    first_rounds,
     fp8_pack4,
     hw_exp2,
     hw_rcp,
+    ld_dev,
     mfma_fp8,
     row_sum,
     rows_to_lds,
@@ -46,7 +67,7 @@ from atom.mono.device.ops import (
 from atom.mono.device.ranks import sum_partials
 from atom.mono.device.sync import preg, publish
 from atom.mono.plan.arith import pick
-from atom.mono.plan.execution import WAVES
+from atom.mono.plan.execution import THREADS, WAVES
 
 
 @traced
@@ -68,6 +89,7 @@ def split_defs(k4ctx):
     lane = k4ctx["lane"]
     mb_put = k4ctx["mb_put"]
     mb_put_bf = k4ctx["mb_put_bf"]
+    mb_put_words = k4ctx["mb_put_words"]
     mr = k4ctx["mr"]
     opart = k4ctx["opart"]
     p8 = k4ctx["p8"]
@@ -84,18 +106,45 @@ def split_defs(k4ctx):
     v_cache = k4ctx["v_cache"]
     v_scale = k4ctx["v_scale"]
     wave = k4ctx["wave"]
+    wrsrc = k4ctx["wrsrc"]
+    sp_f32 = k4ctx["sp_f32"]
+
+    def put_sp_o_f32(i, ov):
+        """The partition's 4 outputs at element ``i`` (a multiple of 4) as f32 words."""
+        for h in range_constexpr(2):
+            mb_put_words(
+                mr("sp_o32"),
+                i + 2 * h,
+                [ov[2 * h].bitcast(fx.Int32), ov[2 * h + 1].bitcast(fx.Int32)],
+            )
+
+    q_len = k4ctx["q_len"]
+    NS = k4ctx["NS"]  # split tasks a token (partitions of 2048 // NS keys)
+    BLK_CTX = (
+        TOPK_BLOCKS // NS * PAGES_PER_BLOCK
+    )  # blk: the task's pages, then its context length
+    NS_QUARTERS = N_SPLIT // NS  # 32-key quarters a wave works in a task (nvfp4 split)
+
+    def kv_row(tok, kv):
+        """The row whose new K / V head tasks (K: 2 j, V: 2 j + 1) lane H + kv waits on: every
+        token's (a request's tokens attend to each other's new keys), or from MAX_TOKENS
+        rows on only the request's own (``q_len`` rows from its first)."""
+        if const_expr(tokens > MAX_TOKENS):
+            return tok - tok % q_len + fx.min(kv // 2, q_len - 1)
+        return fx.min(kv // 2, tokens - 1)
 
     # Each stage is its own function: flydsl carries a local reassigned inside a
     # dynamic if / for as region state, so names must not be shared across stages.
     # ============================================================ 1. split
     def stage_split():
-        r_k, r_v = rsrc(k_cache), rsrc(v_cache)
-        r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
+        r_k, r_v = wrsrc("kv", k_cache), wrsrc("kv", v_cache)
+        r_ks, r_vs = wrsrc("kv", k_scale), wrsrc("kv", v_scale)
+        assert NS == N_SPLIT, "the fp8 split serves 256-key partitions"
         PPW = SPLIT_KEYS // WAVES // PAGE16  # pages per wave
-        for ts in range(start("split"), N_SPLIT * tokens, G):
-            ts = fx.Int32(ts)  # token tok's partition t: ts = tok N_SPLIT + t
-            tok = ts // N_SPLIT
-            t = ts % N_SPLIT
+        for ts in range(start("split"), NS * tokens, G):
+            ts = fx.Int32(ts)  # token tok's partition t: ts = tok NS + t
+            tok = ts // NS
+            t = ts % NS
             task_blocks(tok, t)
             stamp(17)
             if const_expr(fuse_k1):
@@ -109,9 +158,7 @@ def split_defs(k4ctx):
                                 hdone_mb,
                                 (lane < H).select(
                                     tok * K1_HEAD_TASKS + lane,
-                                    fx.min(kv // 2, tokens - 1) * K1_HEAD_TASKS
-                                    + H
-                                    + kv % 2,
+                                    kv_row(tok, kv) * K1_HEAD_TASKS + H + kv % 2,
                                 ),
                                 1,
                             )
@@ -121,7 +168,7 @@ def split_defs(k4ctx):
                 acquire()
             # Every independent load goes out first: this wave's pages and q.
             # Pages past the context read junk masked below.
-            n_ctx = uniform(fx.ptr_load(blk + 16))
+            n_ctx = uniform(fx.ptr_load(blk + BLK_CTX))
             pages = [uniform(fx.ptr_load(blk + (wave * PPW + j))) for j in range(PPW)]
             qv = ld_bf16x4(rsrc(q), tok * O_K + tid * 4, CM_K1)
             # K (QK B operand, key = lane % 16 of page j), V (PV B operand: dims
@@ -294,7 +341,10 @@ def split_defs(k4ctx):
                 for w in range_constexpr(1, WAVES):
                     acc = acc + fx.ptr_load(opart + (w * O_K + e0 + k))
                 ov.append((pscale * acc) * inv_l)
-            mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
+            if const_expr(sp_f32):
+                put_sp_o_f32(ts * O_K + e0, ov)
+            else:
+                mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
             if tid < H:
                 mb_put(
                     mr("sp_m"),
@@ -307,19 +357,72 @@ def split_defs(k4ctx):
                 mb_put(mr("sp_l"), ts * H + tid, lt)
             gpu.barrier()
 
-    return {"stage_split": stage_split}
+    def stage_split_nvfp4():
+        """``stage_split`` over single-buffer NVFP4 K/V pages (``k_cache`` the pool,
+        ``k_scale`` / ``v_scale`` the layer's f32 global scales): the task of
+        ``split_nvfp4_task``, the same page lists, flags and hand-offs."""
+        kg = fx.Float32(bo.buffer_load(rsrc(k_scale), 0, vec_width=1, dtype=T.f32))
+        vg = fx.Float32(bo.buffer_load(rsrc(v_scale), 0, vec_width=1, dtype=T.f32))
+        for ts in range(start("split"), NS * tokens, G):
+            ts = fx.Int32(ts)
+            tok = ts // NS
+            t = ts % NS
+            task_blocks(tok, t)
+            stamp(17)
+            if const_expr(fuse_k1):
+                if wave == 0:
+                    kv = lane - H
+                    k1_poll(
+                        [
+                            (
+                                hdone_mb,
+                                (lane < H).select(
+                                    tok * K1_HEAD_TASKS + lane,
+                                    kv_row(tok, kv) * K1_HEAD_TASKS + H + kv % 2,
+                                ),
+                                1,
+                            )
+                        ]
+                    )
+                gpu.barrier()
+                acquire()
+            n_ctx = uniform(fx.ptr_load(blk + BLK_CTX))
+
+            # (the task runs them before the loop moves on: ``ts`` is this task's)
+            def put_o(e0, ov):
+                if const_expr(sp_f32):
+                    put_sp_o_f32(ts * O_K + e0, ov)  # noqa: B023
+                else:
+                    mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)  # noqa: B023
+
+            def put_m(head, m):
+                mb_put(mr("sp_m"), ts * H + head, m)  # noqa: B023
+
+            def put_l(head, lt):
+                mb_put(mr("sp_l"), ts * H + head, lt)  # noqa: B023
+
+            split_nvfp4_task(
+                tid, lane, wave, tok, t, blk, q, k_cache, kg, vg, sm_scale, hst, opart,
+                n_ctx, put_o, put_m, put_l, CM_K1, stamp, NS_QUARTERS,
+            )  # fmt: skip
+
+    return {"stage_split": stage_split, "stage_split_nvfp4": stage_split_nvfp4}
 
 
 @traced
 def merge_defs(k4ctx):
-    """The functions of the partitions' merge and per-token FP8 quantization."""
+    """The functions of the partitions' merge and per-token FP8 quantization (per 1x32
+    E8M0 under ``attn_mxfp8``)."""
     G = k4ctx["G"]
+    NS = k4ctx["NS"]
+    attn_mxfp8 = k4ctx["attn_mxfp8"]
     block_max = k4ctx["block_max"]
     lane = k4ctx["lane"]
     mb = k4ctx["mb"]
     mb_poll = k4ctx["mb_poll"]
     mb_put = k4ctx["mb_put"]
     mr = k4ctx["mr"]
+    sp_f32 = k4ctx["sp_f32"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
     tid = k4ctx["tid"]
@@ -332,43 +435,52 @@ def merge_defs(k4ctx):
         (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 word, scale)."""
         hm = tid // (HEAD_DIM // 4)
         e0 = tid * 4
-        sp0 = k * N_SPLIT  # token k's partitions
+        sp0 = k * NS  # token k's partitions
         # wave 0 waits on every partition's l, then the CTA polls once: 512
         # threads x 24 loads spinning through the whole split load the memory
         # system the split itself reads (-0.4 us)
         if wave == 0:
             mb_poll(
-                [
-                    (mr("sp_l"), sp0 * H + lane + 64 * i, 1)
-                    for i in range(N_SPLIT * H // 64)
-                ]
+                [(mr("sp_l"), sp0 * H + lane + 64 * i, 1) for i in range(NS * H // 64)]
             )
         gpu.barrier()
         # one batch: every partition's (m, l) and this thread's 4 outputs
         got = mb_poll(
-            [(mr("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-            + [(mr("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
-            + [(mr("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2) for i in range(N_SPLIT)],
-            batch=3 * N_SPLIT,
+            [(mr("sp_m"), (sp0 + i) * H + hm, 1) for i in range(NS)]
+            + [(mr("sp_l"), (sp0 + i) * H + hm, 1) for i in range(NS)]
+            + (
+                [
+                    (mr("sp_o32"), (sp0 + i) * O_K + e0 + 2 * h, 2)
+                    for i in range(NS)
+                    for h in range(2)
+                ]
+                if sp_f32
+                else [(mr("sp_o"), ((sp0 + i) * O_K + e0) // 2, 2) for i in range(NS)]
+            ),
+            batch=3 * NS,
         )
-        mls = got[: 2 * N_SPLIT]
-        ovs = got[2 * N_SPLIT :]
+        mls = got[: 2 * NS]
+        ovs = got[2 * NS :]
         stamp(3)
-        m_i = [mls[i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
-        l_i = [mls[N_SPLIT + i][0].bitcast(fx.Float32) for i in range(N_SPLIT)]
+        m_i = [mls[i][0].bitcast(fx.Float32) for i in range(NS)]
+        l_i = [mls[NS + i][0].bitcast(fx.Float32) for i in range(NS)]
         gm = m_i[0]
-        for i in range_constexpr(1, N_SPLIT):
+        for i in range_constexpr(1, NS):
             gm = fx.max(gm, m_i[i])
-        sl = [l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(N_SPLIT)]
+        sl = [l_i[i] * hw_exp2((m_i[i] - gm) * LOG2E) for i in range(NS)]
         gs = sl[0]
-        for i in range_constexpr(1, N_SPLIT):
+        for i in range_constexpr(1, NS):
             gs = gs + sl[i]
         gs = (gs > 0.0).select(gs, fx.Float32(1.0))
         av = [fx.Float32(0.0) for _ in range(4)]
-        for i in range_constexpr(N_SPLIT):
+        for i in range_constexpr(NS):
             wi = sl[i] / gs
-            o01 = bf2_f32(ovs[i][0])
-            o23 = bf2_f32(ovs[i][1])
+            if const_expr(sp_f32):
+                o01 = [ovs[2 * i][e].bitcast(fx.Float32) for e in range(2)]
+                o23 = [ovs[2 * i + 1][e].bitcast(fx.Float32) for e in range(2)]
+            else:
+                o01 = bf2_f32(ovs[i][0])
+                o23 = bf2_f32(ovs[i][1])
             av = [
                 av[0] + wi * o01[0],
                 av[1] + wi * o01[1],
@@ -376,6 +488,31 @@ def merge_defs(k4ctx):
                 av[3] + wi * o23[1],
             ]
         a0, a1, a2, a3 = (bf16_round(x) for x in av)
+        if const_expr(attn_mxfp8):
+            # per 1x32 (the native linear's quantize_fp8): 8 threads share a block
+            am = butterfly(
+                fx.max(
+                    fx.max(fmath.absf(a0), fmath.absf(a1)),
+                    fx.max(fmath.absf(a2), fmath.absf(a3)),
+                ),
+                (1, 2, 4),
+                fx.max,
+            )
+            code = code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
+            inv = rcp_pow2(code)
+            # the 4 blocks of a head (threads 8 k of its 32) in one word, byte k
+            code = butterfly(
+                code << (8 * ((tid // 8) % 4)), (8, 16), lambda a, b: a | b
+            )
+            return (
+                fp8_pack4(
+                    clamp_fp8(a0 * inv),
+                    clamp_fp8(a1 * inv),
+                    clamp_fp8(a2 * inv),
+                    clamp_fp8(a3 * inv),
+                ),
+                code,
+            )
         amax = block_max(
             fx.max(
                 fx.max(fmath.absf(a0), fmath.absf(a1)),
@@ -400,7 +537,19 @@ def merge_defs(k4ctx):
                     k * (O_K // 4) + tid,
                     cache_modifier=CM_DEV,
                 )
-                publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
+                if const_expr(attn_mxfp8):
+                    # the codes as plain words too (a head's four in one); the flag carries
+                    # no scale
+                    if tid % 32 == 0:
+                        bo.buffer_store(
+                            x_scale,
+                            rsrc(mb("attnq_sc")),
+                            k * (O_K // 128) + tid // 32,
+                            cache_modifier=CM_DEV,
+                        )
+                    publish(mb_put, mr("attnq_s"), k, fx.Float32(1.0), tid == 0)
+                else:
+                    publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
 
     return {"merge_token": merge_token, "stage_merge": stage_merge}
 
@@ -409,6 +558,7 @@ def merge_defs(k4ctx):
 def o_defs(k4ctx):
     """The functions of o_proj and the attention all-reduce."""
     AG_RS = k4ctx["AG_RS"]
+    attn_mxfp8 = k4ctx["attn_mxfp8"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
     SY = k4ctx["SY"]
@@ -429,7 +579,6 @@ def o_defs(k4ctx):
     mr = k4ctx["mr"]
     peer_addr = k4ctx["peer_addr"]
     push_rows = k4ctx["push_rows"]
-    rank = k4ctx["rank"]
     rdone_mb = k4ctx["rdone_mb"]
     red = k4ctx["red"]
     s_o = k4ctx["s_o"]
@@ -439,14 +588,53 @@ def o_defs(k4ctx):
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     v4f = k4ctx["v4f"]
+    own_task = k4ctx["own_task"]
     w_o = k4ctx["w_o"]
+    wrsrc = k4ctx["wrsrc"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
+    ROWS = k4ctx["ROWS"]
+    SCR = k4ctx["SCR"]
+    PIPE = k4ctx["pipe"]
 
     # ================================================ 3. o_proj + attn reduce
     def stage_o():
-        r_wo = rsrc(w_o)
+        r_wo = wrsrc("o", w_o)
         O_CPW = O_K // 64 // 4  # 64-k chunks per wave: 4 waves per 16-row group
+        if const_expr(attn_mxfp8):
+            osc = xs + tokens * O_ROW  # the activation's codes, 4 to a word
+            # the rows and their codes in one batched loop (a second would add a round
+            # trip): loads v < n_a are the rows'
+            n_a, n_c = tokens * (O_K // 4) // 4, tokens * (O_K // 128) // 4
+            to_codes = (SCRATCH["attnq_sc"] - SCRATCH["attnq"]) // 4
+
+            def put_row_or_codes(v, w):
+                if v < n_a:
+                    fx.ptr_store(
+                        w, xs + (v * 4 // (O_K // 4) * O_ROW + v * 4 % (O_K // 4))
+                    )
+                else:
+                    u = v - n_a
+                    fx.ptr_store(
+                        w,
+                        osc + (u * 4 // (O_K // 128) * OSC_ROW + u * 4 % (O_K // 128)),
+                    )
+
+            def copy_rows_and_codes():
+                batched_rounds(
+                    tid,
+                    n_a + n_c,
+                    lambda v: fx.Vector(
+                        ld_dev(
+                            mb("attnq"),
+                            (v < n_a).select(v * 4, to_codes + (v - n_a) * 4),
+                            4,
+                        )
+                    ),
+                    put_row_or_codes,
+                    batch=8,  # S = 16: 5 rounds in one trip, not 4 + 1
+                )
+
         for t in range(start("o"), N_O, G):
             t = fx.Int32(t)
             rg = t * 2 + wave // 4
@@ -465,25 +653,49 @@ def o_defs(k4ctx):
                     )
                 )
             # this task's row scales, before the wait
-            ws = fx.Float32(
-                bo.buffer_load(
-                    rsrc(s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32
+            if const_expr(attn_mxfp8):
+                # lane (row l16, block g): the E8M0 bytes of this wave's 16 blocks
+                # (4 MFMAs x 4), the row's 64 bytes at 16 (wave % 4); MFMA p takes block
+                # g of dword p (shifted to byte 0)
+                ws_dw = fx.Vector(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        ((rg * 16 + l16) * (O_K // 32) + 16 * (wave % 4)) // 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
                 )
-            )
+            else:
+                ws = fx.Float32(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        t * O_ROWS + tid % O_ROWS,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                )
 
             if const_expr(tokens == 1):
                 # the merge folded in: the partitions -> this CTA's fp8 input
                 word, x_scale = merge_token(0)
-                x_scales = [x_scale]
+                if const_expr(attn_mxfp8):
+                    if tid % 32 == 0:
+                        fx.ptr_store(x_scale.bitcast(fx.Float32), osc + tid // 32)
+                else:
+                    x_scales = [x_scale]
                 fx.ptr_store(word, xs + tid)
             else:
                 # the merge tasks' fp8 inputs: every token's scale (published
                 # after its plain words), then the words, 16 B a load
                 got = mb_poll([(mr("attnq_s"), k, 1) for k in range(tokens)])
                 stamp(3)
-                x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
+                if const_expr(not attn_mxfp8):
+                    x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
-                rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
+                if const_expr(attn_mxfp8):
+                    copy_rows_and_codes()
+                else:
+                    rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
             gpu.barrier()
             # B column l % 16 is token l % 16 (token 0 past the last): C column k
             # is token k's rows, the weight stream is the same for any token count
@@ -491,6 +703,17 @@ def o_defs(k4ctx):
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             # chunks kc, kc + 1 in one 16x16x128 FP8 MFMA (unit scales): its lane
             # holds k 16 (l / 16) .. + 16 of each 64-k half -- the chunks' packing
+            if const_expr(attn_mxfp8):
+                sas = [ws_dw[p] >> (g4 * 8) for p in range(O_CPW // 2)]
+                sbs = [
+                    fx.ptr_load(
+                        osc + (col_tok * OSC_ROW + (wave % 4) * (O_CPW // 2) + p)
+                    ).bitcast(fx.Int32)
+                    >> (g4 * 8)
+                    for p in range(O_CPW // 2)
+                ]
+            else:
+                sas = sbs = [fx.Int32(UNIT_SCALE)] * (O_CPW // 2)
             for p in range_constexpr(O_CPW // 2):
                 xb = [
                     fx.Vector(
@@ -515,8 +738,8 @@ def o_defs(k4ctx):
                         [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
                     ),
                     c,
-                    fx.Int32(UNIT_SCALE),
-                    fx.Int32(UNIT_SCALE),
+                    sas[p],
+                    sbs[p],
                 )
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
@@ -525,7 +748,10 @@ def o_defs(k4ctx):
                 grp = (tid % O_ROWS) // 16
                 rr = tid % 16
                 tot = row_sum(red, rr, tk, [grp * 4 + w for w in range(4)])
-                fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
+                if const_expr(attn_mxfp8):  # the scales are inside the MFMA
+                    fx.ptr_store(bf16_round(tot), misc + tid)
+                else:
+                    fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
             gpu.barrier()
             # push bf16 partial rows, wave w -> peer w (to itself too); with AG_RS
             # to the row group's owner rank only
@@ -534,7 +760,7 @@ def o_defs(k4ctx):
             if const_expr(AG_RS):  # noqa: SIM102
                 # the owner sums every peer's partials in rank order and gathers
                 # the sums to every rank's a_ag (h_mid: the router tasks)
-                if (t % W == rank) & (tid < O_ROWS // 2 * tokens):
+                if own_task(t, "attn") & (tid < O_ROWS // 2 * tokens):
                     ptk = tid // (O_ROWS // 2)
                     row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
                     own = preg(sym, SY["attn"], "attn")
@@ -542,13 +768,13 @@ def o_defs(k4ctx):
                         mb_poll,
                         own,
                         lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                            ((src * ROWS + k) * HIDDEN + r) // 2
                         ),
                         W,
                     )
                     for w in range_constexpr(W):
                         mb_put_bf(
-                            preg(peer_addr(w), SY["a_ag"], "a_ag"),
+                            preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
                             ptk * HIDDEN + row,
                             [t0, t1],
                         )
@@ -577,7 +803,7 @@ def o_defs(k4ctx):
                         mb_poll,
                         own,
                         lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                            ((src * ROWS + k) * HIDDEN + r) // 2
                         ),
                         W,
                     )
@@ -593,4 +819,191 @@ def o_defs(k4ctx):
                         ptk * HIDDEN + row,
                     )
 
-    return {"stage_o": stage_o}
+    def stage_o_big():
+        """``stage_o`` for more than MAX_TOKENS rows (reduce-scatter + all-gather form): the
+        task's O_ROWS hidden rows over every token, TG-row token groups at a time as the MFMA's B
+        columns, the task's weights and scales read once. The groups' rows land in ``misc``
+        (token-major), then one push / owner sum for all tokens."""
+        assert AG_RS and not k4ctx["P"].loop
+        r_wo = wrsrc("o", w_o)
+        O_CPW = O_K // 64 // 4
+        groups = -(-tokens // TG)
+        osc = xs + TG * O_ROW  # (attn_mxfp8) the activation's codes
+        to_codes = (SCR["attnq_sc"] - SCR["attnq"]) // 4
+
+        def o_copy_parts(t0, gt):
+            """(attn_mxfp8) group rows t0 .. t0 + gt's attention words and codes as one batched
+            16 B copy: (loads n, ``load(v)``, ``put(v, w)`` into LDS)."""
+            n_a, n_c = gt * (O_K // 4) // 4, gt * (O_K // 128) // 4
+
+            def put_row_or_codes(v, w):
+                if v < n_a:
+                    fx.ptr_store(
+                        w, xs + (v * 4 // (O_K // 4) * O_ROW + v * 4 % (O_K // 4))
+                    )
+                else:
+                    u = v - n_a
+                    fx.ptr_store(
+                        w,
+                        osc + (u * 4 // (O_K // 128) * OSC_ROW + u * 4 % (O_K // 128)),
+                    )
+
+            def load(v):
+                return fx.Vector(
+                    ld_dev(
+                        mb("attnq"),
+                        (v < n_a).select(
+                            t0 * (O_K // 4) + v * 4,
+                            to_codes + t0 * (O_K // 128) + (v - n_a) * 4,
+                        ),
+                        4,
+                    )
+                )
+
+            return n_a + n_c, load, put_row_or_codes
+
+        for t in range(start("o"), N_O, G):
+            t = fx.Int32(t)
+            rg = t * 2 + wave // 4
+            wts = []
+            for cc in range_constexpr(O_CPW):
+                kc = (wave % 4) * O_CPW + cc
+                wts.append(
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_wo,
+                            ((rg * (O_K // 32) + kc * 2) * 512 + lane * 16) // 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                            cache_modifier=CM_NT,
+                        )
+                    )
+                )
+            if const_expr(attn_mxfp8):
+                ws_dw = fx.Vector(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        ((rg * 16 + l16) * (O_K // 32) + 16 * (wave % 4)) // 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+            else:
+                ws = fx.Float32(
+                    bo.buffer_load(
+                        wrsrc("o", s_o),
+                        t * O_ROWS + tid % O_ROWS,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                )
+            if const_expr(PIPE):
+                # every token's merge task done: one wait, a flag a thread
+                mb_poll([(mr("attnq_s"), fx.min(tid, tokens - 1), 1)])
+                gpu.barrier()
+                acquire()
+            pre = None
+            for g in range_constexpr(groups):
+                t0 = g * TG
+                gt = min(TG, tokens - t0)
+                if const_expr(not PIPE):
+                    got = mb_poll(
+                        [(mr("attnq_s"), t0 + k, 1) for k in range(gt)], batch=TG
+                    )
+                    if const_expr(not attn_mxfp8):
+                        x_scales = [got[k][0].bitcast(fx.Float32) for k in range(gt)]
+                    acquire()
+                if const_expr(attn_mxfp8):
+                    n_c, load, put = o_copy_parts(t0, gt)
+                    batched_rounds(tid, n_c, load, put, batch=8, first=pre)
+                else:
+                    rows_to_lds(
+                        tid, mb("attnq") + fx.Int64(t0 * O_K), gt, O_K // 4, xs, O_ROW
+                    )
+                if const_expr(PIPE and g + 1 < groups):
+                    # the next group's first batch of loads goes out under this group's MFMAs
+                    n_n, load_n, _ = o_copy_parts(t0 + TG, min(TG, tokens - t0 - TG))
+                    pre = first_rounds(tid, n_n, load_n, 8)
+                gpu.barrier()
+                col_tok = fx.min(l16, gt - 1)
+                c = fx.Vector.filled(4, 0.0, fx.Float32)
+                if const_expr(attn_mxfp8):
+                    sas = [ws_dw[p] >> (g4 * 8) for p in range(O_CPW // 2)]
+                    sbs = [
+                        fx.ptr_load(
+                            osc + (col_tok * OSC_ROW + (wave % 4) * (O_CPW // 2) + p)
+                        ).bitcast(fx.Int32)
+                        >> (g4 * 8)
+                        for p in range(O_CPW // 2)
+                    ]
+                else:
+                    sas = sbs = [fx.Int32(UNIT_SCALE)] * (O_CPW // 2)
+                for p in range_constexpr(O_CPW // 2):
+                    xb = [
+                        fx.Vector(
+                            fx.ptr_load(
+                                xs
+                                + (
+                                    col_tok * O_ROW
+                                    + ((wave % 4) * O_CPW + 2 * p + h) * 16
+                                    + g4 * 4
+                                ),
+                                result_type=v4f,
+                            )
+                        ).bitcast(fx.Int32)
+                        for h in range(2)
+                    ]
+                    c = mfma_scaled(
+                        fx.Vector.from_elements(
+                            [wts[2 * p + h][e] for h in range(2) for e in range(4)],
+                            fx.Int32,
+                        ),
+                        fx.Vector.from_elements(
+                            [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                        ),
+                        c,
+                        sas[p],
+                        sbs[p],
+                    )
+                fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+                gpu.barrier()
+                if tid < O_ROWS * gt:
+                    tk = tid // O_ROWS
+                    grp = (tid % O_ROWS) // 16
+                    rr = tid % 16
+                    tot = row_sum(red, rr, tk, [grp * 4 + w for w in range(4)])
+                    if const_expr(attn_mxfp8):
+                        fx.ptr_store(bf16_round(tot), misc + (t0 * O_ROWS + tid))
+                    else:
+                        fx.ptr_store(
+                            bf16_round(tot * pick(x_scales, tk) * ws),
+                            misc + (t0 * O_ROWS + tid),
+                        )
+                gpu.barrier()
+            push_rows("attn", t * O_ROWS, O_ROWS, t % W)
+            gpu.barrier()
+            # the owner sums every peer's partials in rank order and gathers the sums to
+            # every rank's a_ag (the post-attention norm reads them)
+            if own_task(t, "attn"):
+                for c0 in range_constexpr(0, O_ROWS // 2 * tokens, THREADS):
+                    idx = tid + c0
+                    if idx < O_ROWS // 2 * tokens:
+                        ptk = idx // (O_ROWS // 2)
+                        row = t * O_ROWS + (idx % (O_ROWS // 2)) * 2
+                        own = preg(sym, SY["attn"], "attn")
+                        t0_, t1_ = sum_partials(
+                            mb_poll,
+                            own,
+                            lambda src, k=ptk, r=row: (
+                                ((src * ROWS + k) * HIDDEN + r) // 2
+                            ),
+                            W,
+                        )
+                        for w in range_constexpr(W):
+                            mb_put_bf(
+                                preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
+                                ptk * HIDDEN + row,
+                                [t0_, t1_],
+                            )
+
+    return {"stage_o": stage_o, "stage_o_big": stage_o_big}
