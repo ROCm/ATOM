@@ -3022,7 +3022,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             passes = staged.passes
             if gathers is not None:
                 # Under DCP each pass gathers every rank's shard of its keys.
-                passes = tuple(p._replace(dcp=g) for p, g in zip(passes, gathers))
+                passes = tuple(
+                    p._replace(dcp=g) for p, g in zip(passes, gathers, strict=True)
+                )
             attn_metadata.index_rows = packed_concat_rows(
                 ends,
                 keys,

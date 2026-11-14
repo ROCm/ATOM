@@ -154,24 +154,14 @@ def concat_passes(
                 f"request {first}'s {keys} keys exceed the {key_capacity}-key "
                 "FP8 prefill indexer key workspace"
             )
-        row_base = int(row_cu[first])
+        key_base, row_base = int(key_cu[first]), int(row_cu[first])
         stride, _, lo, hi = qsplit_rows(int(row_cu[end]) - row_base, rank, world)
         lo, hi = lo + row_base, hi + row_base
         cuts = band_offsets(row_ends[lo:hi], plane_capacity, offsets[lo:hi])
         bands = tuple((a + lo, b + lo) for a, b in cuts)
         passes.append(
             ConcatPass(
-                first,
-                end,
-                int(key_cu[first]),
-                keys,
-                row_base,
-                stride,
-                rank,
-                world,
-                lo,
-                hi,
-                bands,
+                first, end, key_base, keys, row_base, stride, rank, world, lo, hi, bands
             )
         )
         first = end
