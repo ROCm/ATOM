@@ -214,6 +214,11 @@ class Qwen3_5MTP(nn.Module):
         return self.lm_head.compute_argmax_token(hidden_states, out=out)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # The MTP layer has experts only on a MoE target: the same predicate
+        # `Qwen3_5DecoderLayer` builds its MLP by. A dense target's layer is a
+        # plain MLP, and its config has no expert count to read.
+        if self.config.model_type != "qwen3_5_moe_text":
+            return []
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
