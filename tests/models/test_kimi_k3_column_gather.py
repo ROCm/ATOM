@@ -107,6 +107,36 @@ def test_kernel_mix_equals_all_gather_then_mix(monkeypatch, quant):
             assert torch.equal(pushed, _pushed(shares[rank], epoch))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the Triton kernel")
+@pytest.mark.parametrize("quant", [None, dtypes.fp8], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("slots", [2, 3, 4, 11])
+def test_kernel_mix_is_bitwise_for_any_bank(monkeypatch, quant, slots):
+    """The bank rows' tiles go before the poll, and the mix stays bitwise the
+    all-gather's at every bank size, a short bank included."""
+    monkeypatch.setattr(peer_memory, "SymmetricPeerBuffer", _Peers)
+    rank, hidden, tokens = 3, 7168, 256
+    gather = attention_residual.PeerColumnGather(hidden, tokens, rank, WORLD, None)
+    gen = torch.Generator(device="cuda").manual_seed(slots)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=gen)
+
+    shares = randn(WORLD, tokens, gather.cols).bfloat16()
+    for src in set(range(WORLD)) - {rank}:
+        _slots(gather.scratch, gather)[1, src] = _pushed(shares[src], gather.epochs + 1)
+    operands = (
+        randn(tokens, hidden).bfloat16(),
+        randn(tokens, slots, hidden).bfloat16(),
+        randn(hidden),
+        (1 + 0.1 * randn(hidden)).bfloat16(),
+        quant,
+    )
+    want = _mix(torch.cat(list(shares), -1), *operands)
+    got = _mix(gather.defer(shares[rank]), *operands)
+    for g, w in zip(got, want, strict=True):
+        assert torch.equal(g.view(torch.uint8), w.view(torch.uint8))
+
+
 @pytest.fixture
 def column_gather(monkeypatch, tail_calls):  # noqa: F811
     """Peer buffers on CPU, and the all-gather a torch consumer runs."""
