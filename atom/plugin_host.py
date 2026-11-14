@@ -415,8 +415,9 @@ def configure(
     kill_switch: bool | None = None,
     strict: bool | None = None,
 ) -> None:
-    """Load and route ``plan`` (a ``plugin_recipe.Plan``, or names for the
-    ``--plugin-enable`` shorthand) before the model is built.
+    """Load and route ``plan`` (a ``plugin_recipe.Plan``, the
+    ``RecipeSource`` a Config carries, or names for the ``--plugin-enable``
+    shorthand) before the model is built.
 
     A recipe plan is all or nothing: a plugin that fails to load, or a planned
     owner that did not register, refuses the start. Under the shorthand a
@@ -427,7 +428,9 @@ def configure(
     from atom.utils import envs
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
-    if not isinstance(plan, (plugin_recipe.Plan, type(None))):
+    if isinstance(plan, plugin_recipe.RecipeSource):
+        plan = plan.resolve()  # Config carries the recipes; each process resolves
+    elif not isinstance(plan, (plugin_recipe.Plan, type(None))):
         plan = plugin_recipe.shorthand(plan)
     requested = None if plan is None else plan.plan_id
     if _bound:
