@@ -7,7 +7,7 @@ all-reduce."""
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -46,8 +46,10 @@ from atom.mono.device.mx import (
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    CM_SYS,
     batched_rounds,
     bf2_f32,
+    bf16_pair,
     bf16_round,
     butterfly,
     first_rounds,
@@ -573,6 +575,7 @@ def o_defs(k4ctx):
     lane = k4ctx["lane"]
     mb = k4ctx["mb"]
     mb_poll = k4ctx["mb_poll"]
+    mb_put = k4ctx["mb_put"]
     mb_put_bf = k4ctx["mb_put_bf"]
     merge_token = k4ctx["merge_token"]
     misc = k4ctx["misc"]
@@ -596,6 +599,8 @@ def o_defs(k4ctx):
     ROWS = k4ctx["ROWS"]
     SCR = k4ctx["SCR"]
     PIPE = k4ctx["pipe"]
+    O_FLAG = k4ctx["o_flag"]
+    rank = k4ctx["rank"]
 
     # ================================================ 3. o_proj + attn reduce
     def stage_o():
@@ -819,6 +824,96 @@ def o_defs(k4ctx):
                         ptk * HIDDEN + row,
                     )
 
+    def o_publish(dst, i):
+        """The CTA's plain peer stores drained, then flag pair ``i`` of ``dst`` (a peer-region address, tid 0): a flag
+        may not overtake the payload it announces (``sync.publish``)."""
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        if tid == 0:
+            mb_put(dst, i, fx.Int32(1))
+        gpu.barrier()
+
+    def o_finish_flag(t):
+        """``o_flag``: this task's rows (``misc``: token k's O_ROWS from k O_ROWS, bf16 values) -> the owner rank t % W as plain bf16
+        (8 B a thread: 4 columns of one token), a drain, one flag pair a (source, t); the owner sums the W partials in rank order in f32,
+        rounds to bf16 (as the tagged path: bit-equal) and writes the sums to every rank's ``attnb_ag``, a drain, one flag pair a rank."""
+        assert tokens * 8 <= THREADS
+        tk = tid // 8
+        q4 = (tid % 8) * 4
+        owner = t % W
+        dst = peer_addr(owner, "attn")
+        if tid < tokens * 8:
+            v = [fx.ptr_load(misc + (tk * O_ROWS + q4 + e)) for e in range(4)]
+            bo.buffer_store(
+                fx.Vector.from_elements(
+                    [
+                        bf16_pair(v[0], v[1]).bitcast(fx.Int32),
+                        bf16_pair(v[2], v[3]).bitcast(fx.Int32),
+                    ],
+                    fx.Int32,
+                ),
+                rsrc(dst + fx.Int64(SY["attnb"])),
+                ((rank * ROWS + tk) * HIDDEN + t * O_ROWS + q4) // 2,
+                cache_modifier=CM_SYS,
+            )
+        o_publish(preg(dst, SY["attnb_f"], "attnb_f"), rank * N_O + t)
+        stamp(6)
+        if own_task(t, "attn"):
+            if wave == 0:
+                mb_poll(
+                    [
+                        (preg(sym, SY["attnb_f"], "attnb_f"), src * N_O + t, 1)
+                        for src in range(W)
+                    ]
+                )
+            gpu.barrier()
+            stamp(23)
+            if tid < tokens * 8:
+                pw_ = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            rsrc(sym + fx.Int64(SY["attnb"])),
+                            ((src * ROWS + tk) * HIDDEN + t * O_ROWS + q4) // 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                            cache_modifier=CM_SYS,
+                        )
+                    )
+                    for src in range(W)
+                ]
+                acc = []
+                for h in range_constexpr(2):  # rank order 0 .. W - 1, f32 (``sum_partials``)
+                    a_lo, a_hi = bf2_f32(pw_[0][h])
+                    for src in range_constexpr(1, W):
+                        lo, hi = bf2_f32(pw_[src][h])
+                        a_lo = a_lo + lo
+                        a_hi = a_hi + hi
+                    acc += [a_lo, a_hi]
+                ow = fx.Vector.from_elements(
+                    [
+                        bf16_pair(acc[0], acc[1]).bitcast(fx.Int32),
+                        bf16_pair(acc[2], acc[3]).bitcast(fx.Int32),
+                    ],
+                    fx.Int32,
+                )
+                for w in range_constexpr(W):
+                    bo.buffer_store(
+                        ow,
+                        rsrc(peer_addr(w, "attn") + fx.Int64(SY["attnb_ag"])),
+                        (tk * HIDDEN + t * O_ROWS + q4) // 2,
+                        cache_modifier=CM_SYS,
+                    )
+            rocdl.s_waitcnt(vmcnt=0)
+            gpu.barrier()
+            if tid < W:  # one flag a rank (lane w -> rank w)
+                mb_put(
+                    preg(peer_addr(fx.min(tid, W - 1), "attn"), SY["attnb_agf"], "attnb_agf"),
+                    t,
+                    fx.Int32(1),
+                )
+            gpu.barrier()
+        stamp(24)
+
     def stage_o_big():
         """``stage_o`` for more than MAX_TOKENS rows (reduce-scatter + all-gather form): the
         task's O_ROWS hidden rows over every token, TG-row token groups at a time as the MFMA's B
@@ -981,33 +1076,36 @@ def o_defs(k4ctx):
                         )
                 gpu.barrier()
             stamp(2)
-            push_rows("attn", t * O_ROWS, O_ROWS, t % W)
-            gpu.barrier()
-            stamp(6)
-            # the owner sums every peer's partials in rank order and gathers the sums to
-            # every rank's a_ag (the post-attention norm reads them)
-            if own_task(t, "attn"):
-                for c0 in range_constexpr(0, O_ROWS // 2 * tokens, THREADS):
-                    idx = tid + c0
-                    if idx < O_ROWS // 2 * tokens:
-                        ptk = idx // (O_ROWS // 2)
-                        row = t * O_ROWS + (idx % (O_ROWS // 2)) * 2
-                        own = preg(sym, SY["attn"], "attn")
-                        t0_, t1_ = sum_partials(
-                            mb_poll,
-                            own,
-                            lambda src, k=ptk, r=row: (
-                                ((src * ROWS + k) * HIDDEN + r) // 2
-                            ),
-                            W,
-                        )
-                        stamp(23)
-                        for w in range_constexpr(W):
-                            mb_put_bf(
-                                preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
-                                ptk * HIDDEN + row,
-                                [t0_, t1_],
+            if const_expr(O_FLAG):
+                o_finish_flag(t)
+            else:
+                push_rows("attn", t * O_ROWS, O_ROWS, t % W)
+                gpu.barrier()
+                stamp(6)
+                # the owner sums every peer's partials in rank order and gathers the sums to
+                # every rank's a_ag (the post-attention norm reads them)
+                if own_task(t, "attn"):
+                    for c0 in range_constexpr(0, O_ROWS // 2 * tokens, THREADS):
+                        idx = tid + c0
+                        if idx < O_ROWS // 2 * tokens:
+                            ptk = idx // (O_ROWS // 2)
+                            row = t * O_ROWS + (idx % (O_ROWS // 2)) * 2
+                            own = preg(sym, SY["attn"], "attn")
+                            t0_, t1_ = sum_partials(
+                                mb_poll,
+                                own,
+                                lambda src, k=ptk, r=row: (
+                                    ((src * ROWS + k) * HIDDEN + r) // 2
+                                ),
+                                W,
                             )
+                            stamp(23)
+                            for w in range_constexpr(W):
+                                mb_put_bf(
+                                    preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
+                                    ptk * HIDDEN + row,
+                                    [t0_, t1_],
+                                )
                 stamp(24)
 
     return {"stage_o": stage_o, "stage_o_big": stage_o_big}

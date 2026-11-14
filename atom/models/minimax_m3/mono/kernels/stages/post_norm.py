@@ -7,11 +7,14 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
+from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.mono.config import HIDDEN
+from atom.models.minimax_m3.mono.layout import N_O
 from atom.models.minimax_m3.mono.kernels.common import ld_bf16x12
 from atom.mono.device.ops import (
     CM_DEV,
+    CM_SYS,
     bf2_f32,
     bf16_pair,
     hw_rsq,
@@ -62,6 +65,8 @@ def post_norm_defs(k4ctx):
     wave = k4ctx["wave"]
     front = k4ctx["front"]
     assert k4ctx["AG_RS"]
+    O_FLAG = k4ctx["o_flag"]
+    assert not O_FLAG or N_O % 64 == 0
 
     def stage_post_norm():
         r_g = rsrc(g_post)
@@ -79,16 +84,41 @@ def post_norm_defs(k4ctx):
                 gpu.barrier()
                 acquire()
             hres = ld_bf16x12(rsrc(h_in), k * (HIDDEN // 2) + rw0, 0)
-            arow = mb_poll(
-                [
-                    (
-                        preg(sym, SY["a_ag"], "a_ag"),
-                        (k * HIDDEN + tid * RE) // 2 + 2 * h,
-                        2,
+            if const_expr(O_FLAG):
+                # tag-free all-reduce (``o_flag``): every owner's flag for this rank, then plain loads of the sums
+                if wave == 0:
+                    mb_poll(
+                        [
+                            (preg(sym, SY["attnb_agf"], "attnb_agf"), lane + 64 * c, 1)
+                            for c in range(N_O // 64)
+                        ]
+                    )
+                gpu.barrier()
+                acquire()
+                words = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            rsrc(sym + fx.Int64(SY["attnb_ag"])),
+                            (k * HIDDEN + tid * RE) // 2 + 2 * h,
+                            vec_width=2,
+                            dtype=T.i32,
+                            cache_modifier=CM_SYS,
+                        )
                     )
                     for h in range(RE // 4)
                 ]
-            )
+                arow = [[w[0], w[1]] for w in words]
+            else:
+                arow = mb_poll(
+                    [
+                        (
+                            preg(sym, SY["a_ag"], "a_ag"),
+                            (k * HIDDEN + tid * RE) // 2 + 2 * h,
+                            2,
+                        )
+                        for h in range(RE // 4)
+                    ]
+                )
             stamp(25)
             v = [
                 f + fx.Float32(hres[4 * h + 2 * qq + i])

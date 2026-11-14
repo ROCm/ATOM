@@ -199,6 +199,13 @@ def sym_layout(npes: int, rows: int = MAX_TOKENS, n_split: int = N_SPLIT):
             # source rank s's index head, at pairs (s * rows + k) * HEAD_DIM / 2 + word (last: every
             # region above keeps its offset)
             ("iq_x", npes * rows * HEAD_DIM // 2),
+            # ``o_flag`` (wide builds' tag-free attention all-reduce): plain bf16 partial rows [src][token][HIDDEN]
+            # sent to the row group's owner, the owners' bf16 sums [token][HIDDEN], then the flag pairs
+            # (a flag per (source, row group) and per row group); every region above keeps its offset
+            ("attnb", npes * rows * HIDDEN // 4),
+            ("attnb_ag", rows * HIDDEN // 4),
+            ("attnb_f", npes * N_O),
+            ("attnb_agf", N_O),
         ]
     )
 
@@ -216,6 +223,7 @@ def mailbox_regions(
     front: bool = False,
     moe_back: bool = False,
     index_cp: bool = False,
+    o_flag: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -261,10 +269,18 @@ def mailbox_regions(
     regions += [RegionDecl(n, S, "split") for n in (sp_o, "sp_m", "sp_l")]
     if tokens > 1:
         regions.append(RegionDecl("attnq_s", S, "merge"))
-    regions.append(RegionDecl("attn", P, "o", exchange=True))
-    regions.append(
-        RegionDecl("a_ag", P, "o") if tokens >= AG_RS_FROM else RegionDecl("a", S, "o")
-    )
+    if o_flag:  # the wide tag-free all-reduce: the payload is plain, only the flags are pairs
+        regions += [
+            RegionDecl("attnb_f", P, "o", exchange=True),
+            RegionDecl("attnb_agf", P, "o"),
+        ]
+    else:
+        regions.append(RegionDecl("attn", P, "o", exchange=True))
+        regions.append(
+            RegionDecl("a_ag", P, "o")
+            if tokens >= AG_RS_FROM
+            else RegionDecl("a", S, "o")
+        )
     if (
         front or moe_back
     ):  # the front half ends with the post-attention norm (``post_norm``)
