@@ -249,6 +249,9 @@ class K4Build:
     index_cp: bool = False
     cp_min_blocks: int = 0
     cp_min_batch: int = 1
+    # the wide o stage's all-reduce without tags (a BIG front / whole-layer build): plain bf16 payload and one
+    # flag pair a (source, row group) and a row group, not a tag next to every 32-bit value (half the wire bytes)
+    o_flag: int = 0
 
 
 def build_post_attn_kernel(
@@ -292,6 +295,7 @@ def build_post_attn_kernel(
     index_cp: bool = False,
     cp_min_blocks: int = 0,
     cp_min_batch: int = 1,
+    o_flag: int = 0,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -343,6 +347,7 @@ def build_post_attn_kernel(
         n_split == N_SPLIT // 2 and kv_nvfp4 and (front or moe_back)
     )
     assert not pipe or ((front or moe_back) and attn_mxfp8)
+    assert not o_flag or (tokens > MAX_TOKENS and (front or moe_back)), "o_flag: a wide front / whole-layer build"
     assert not index_cp or (
         tokens > MAX_TOKENS and fuse_k1 and index_topk
     ), "BIG context parallelism: a front / whole-layer build, K1 fused"
@@ -358,7 +363,7 @@ def build_post_attn_kernel(
         moe_a4w4=moe_a4w4,
         front=front, moe_back=moe_back, back_dn_depth=back_dn_depth, back_sh_units=back_sh_units, back_steal=back_steal, back_dn_split=back_dn_split, back_dn_bdepth=back_dn_bdepth,
         n_split=n_split, pipe=pipe, score_sleep=score_sleep, copy_batch=copy_batch,
-        index_cp=index_cp, cp_min_blocks=cp_min_blocks, cp_min_batch=cp_min_batch,
+        index_cp=index_cp, cp_min_blocks=cp_min_blocks, cp_min_batch=cp_min_batch, o_flag=o_flag,
     )  # fmt: skip
     P = parse_probe(probe)
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
@@ -378,6 +383,7 @@ def build_post_attn_kernel(
             front,
             moe_back,
             index_cp,
+            bool(o_flag),
         )
     )
     W = npes
@@ -468,6 +474,8 @@ def build_post_attn_kernel(
         sym_extra["ss"] = score_sleep
     if copy_batch != 8:
         sym_extra["cb"] = copy_batch
+    if o_flag:
+        sym_extra["of"] = o_flag
     if index_cp:
         sym_extra["cp"] = 1
         if cp_min_blocks:
