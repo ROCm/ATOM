@@ -588,6 +588,10 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
     )
     assert cfg.tensor_parallel_size == tp
     assert cfg.parallel_config.data_parallel_size == dp
+    assert cfg.parallel_mapping is not None
+    assert cfg.moe_execution_plan is not None
+    assert cfg.parallel_mapping.dp_size == tp * dp
+    assert cfg.parallel_mapping.tp_size == 1
     assert len(iter_dp_rank_assignments(cfg)) == tp * dp
 
 

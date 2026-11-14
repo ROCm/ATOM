@@ -4,7 +4,7 @@
 import logging
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from functools import lru_cache
 
@@ -24,7 +24,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import (
-    Config,
     QuantizationConfig,
     get_current_atom_config,
 )
@@ -84,11 +83,16 @@ from atom.model_ops.topK import (
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
 from atom.model_ops.utils import (
-    _has_module,
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     per_tensor_dequantize,
     shuffle_weights,
+)
+from atom.moe_config import (
+    MoEExecutionPlan,
+    MoEParallelMapping,
+    get_moe_backend_config,
+    resolve_moe_execution_plan,
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import (
@@ -213,161 +217,73 @@ def init_balance_router_logits(
     return router_logits
 
 
-@dataclass
-class FusedMoEParallelConfig:
-    tp_size: int
-    dp_size: int
-    ep_size: int
-    tp_rank: int
-    dp_rank: int
-    ep_rank: int
+@dataclass(frozen=True)
+class FusedMoEParallelConfig(MoEParallelMapping):
+    """Compatibility facade over the resolved mapping and execution plan."""
 
-    use_ep: bool  # whether to use EP or not
-    local_ep_size: int
-
-    # Config.dp_logical_size / dp_size: >1 when DP-attention simulates a
-    # deployment wider than the box, in which case experts shard that many
-    # times finer and each rank repeats the gathered tokens that many times.
-    dp_logical_ratio: int = 1
+    # Legacy direct constructors already described their EP/DP dispatch group.
+    # make() always supplies this flag from the actual flattening decision.
+    dp_is_sharded: bool = True
     requested_all2all_backend: str = "auto"
-    # The other half of --all2all-backend: which MoRI kernel family to ask for.
     low_latency: bool = False
-    # ATOM_PCP_MOE_MERGE folded the PCP group into the expert sharding above:
-    # every PCP rank must run the experts over the same rows.
-    pcp_merge: bool = False
+    execution_plan: MoEExecutionPlan | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        mapping = MoEParallelMapping(
+            **{
+                name: getattr(self, name)
+                for name in MoEParallelMapping.__dataclass_fields__
+            }
+        )
+        if self.execution_plan is None:
+            # Direct construction remains available to external callers. The
+            # normal worker path below supplies a plan from Config's snapshot.
+            from types import SimpleNamespace
+
+            backend = get_moe_backend_config(
+                SimpleNamespace(
+                    moe_all2all_backend=self.requested_all2all_backend,
+                    enable_low_latency=self.low_latency,
+                )
+            )
+            object.__setattr__(
+                self, "execution_plan", resolve_moe_execution_plan(mapping, backend)
+            )
+            object.__setattr__(
+                self, "requested_all2all_backend", backend.all2all_backend
+            )
+        elif mapping != self.execution_plan.mapping or (
+            self.requested_all2all_backend
+            != self.execution_plan.backend_config.all2all_backend
+            or self.low_latency != self.execution_plan.backend_config.low_latency
+        ):
+            raise ValueError(
+                "FusedMoEParallelConfig must agree with its execution plan"
+            )
 
     @property
     def selected_all2all_backend(self) -> str | None:
-        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
-            return None
-        if self.requested_all2all_backend == "none":
-            return None
-        if self.requested_all2all_backend == "rccl":
-            return "rccl"
-        if not envs.ATOM_DISABLE_MORI_EP and _has_module("mori"):
-            return "mori"
-        return None
+        return self.execution_plan.selected_all2all_backend
 
     @property
-    def use_all2all_kernels(self):
-        # Routed all-to-all requires real peers. Simulated DP has a finer
-        # expert map than the launched process group and stays on the fallback.
-        return self.selected_all2all_backend is not None
+    def use_all2all_kernels(self) -> bool:
+        return self.execution_plan.uses_routed_dispatch
 
     @property
-    def use_mori_kernels(self):
-        return self.selected_all2all_backend == "mori"
+    def use_mori_kernels(self) -> bool:
+        return self.execution_plan.transport in {"mori", "mori_v2"}
 
     @property
-    def use_rccl_kernels(self):
-        return self.selected_all2all_backend == "rccl"
+    def use_rccl_kernels(self) -> bool:
+        return self.execution_plan.transport == "rccl"
 
     @staticmethod
-    def make(
-        tp_size_: int, dp_size_: int, parallel_config: Config
-    ) -> "FusedMoEParallelConfig":
-        # Width the expert sharding is cut for; wider than the real DP size only
-        # while simulating. The rank stays real, so this device keeps the slice
-        # it would own in the full deployment.
-        dp_logical = getattr(parallel_config, "dp_logical_size", 0) or dp_size_
-
-        def flatten_tp_across_dp(dp_rank: int):
-            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-            # There are actually dp_logical * tp_size_ devices. Update tp_size
-            # and tp_rank so we shard across all devices.
-            tp_size = dp_logical * tp_size_
-            tp_rank = dp_rank * tp_size_ + tp_rank
-            return tp_size, tp_rank
-
-        # Only flatten DP into TP/EP when enable_dp_attention is True.
-        # Otherwise, use pure DP for MoE.
-        enable_dp_attention = parallel_config.enable_dp_attention
-        requested_all2all_backend = getattr(
-            parallel_config, "moe_all2all_backend", "auto"
-        )
-        low_latency = getattr(parallel_config, "enable_low_latency", False)
-
-        # When EP shards across the flattened DP * TP space (vLLM plugin under
-        # EP), the ep rank must be computed in that flattened group space.
-        flatten_tp_across_dp_for_moe = (
-            enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
-        )
-
-        # dp_logical, not dp_size_: with DP-attention simulated down to a single
-        # rank the real product is 1, but the deployment being reproduced still
-        # shards experts, so EP must stay on.
-        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
-
-        dp_size = dp_size_
-        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
-
-        if flatten_tp_across_dp_for_moe:
-            tp_size, tp_rank = flatten_tp_across_dp(dp_rank)
-        else:
-            tp_size = tp_size_
-            tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-
-        # PCP moe_pcp_merge: fold the prefill-context-parallel dim into the MoE
-        # tensor/expert sharding so the W=pcp_size redundant copies become real
-        # shards (intermediate//W*tp or expert//W*tp). The flattened rank MUST be
-        # `pcp_rank * tp_size + tp_rank`: this makes each TP group [0..tp-1] own a
-        # contiguous half and its PCP partner own the other half, so the existing
-        # tp all_reduce + the new pcp reduce_scatter (two orthogonal groups) sum
-        # all W*tp shards. The reversed mapping would make PCP partners overlap
-        # and double-count. ep_size/ep_rank below inherit tp_size/tp_rank, so EP
-        # is covered by the same flatten.
-        from aiter.dist.parallel_state import (
-            get_prefill_context_model_parallel_rank,
-            get_prefill_context_model_parallel_world_size,
-        )
-
-        pcp_size = get_prefill_context_model_parallel_world_size()
-        # SP always folds its group, which shares the PCP rank dimension.
-        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
-        if pcp_merge:
-            pcp_rank = get_prefill_context_model_parallel_rank()
-            tp_rank = pcp_rank * tp_size + tp_rank
-            tp_size = pcp_size * tp_size
-
-        atom_config = get_current_atom_config()
-
-        if not use_ep:
-            return FusedMoEParallelConfig(
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                dp_size=dp_size,
-                dp_rank=dp_rank,
-                ep_size=1,
-                ep_rank=0,
-                use_ep=False,
-                local_ep_size=1,
-                requested_all2all_backend=requested_all2all_backend,
-                low_latency=low_latency,
-                pcp_merge=pcp_merge,
-            )
-        # DP + EP / TP + EP / DP + TP + EP
-        assert use_ep
-        # In EP, each device owns a set of experts fully. There is no tensor
-        # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
-        ep_size = tp_size
-        ep_rank = tp_rank
+    def from_plan(plan: MoEExecutionPlan) -> "FusedMoEParallelConfig":
         return FusedMoEParallelConfig(
-            tp_size=1,
-            tp_rank=0,
-            dp_size=dp_size,
-            dp_rank=dp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            use_ep=True,
-            # CoreManager guarantees the division is exact.
-            dp_logical_ratio=(
-                dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
-            ),
-            local_ep_size=atom_config.parallel_config.data_parallel_size_local
-            * tp_size_,
-            requested_all2all_backend=requested_all2all_backend,
-            low_latency=low_latency,
-            pcp_merge=pcp_merge,
+            **asdict(plan.mapping),
+            requested_all2all_backend=plan.backend_config.all2all_backend,
+            low_latency=plan.backend_config.low_latency,
+            execution_plan=plan,
         )
 
 
@@ -538,9 +454,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # wire in MXFP4; a method whose experts take MXFP8 sets that instead.
         self.routed_rows_wire: RoutedRowsWire | None = (
             resolve_routed_rows_wire(moe.in_dtype, moe.hidden_dim, fp4=True)
-            if envs.ATOM_MORI_FP4_DISPATCH
-            and not envs.ATOM_MORI_V2
-            and moe.use_mori_kernels
+            if moe.moe_parallel_config.execution_plan.use_fp4_dispatch
             else None
         )
 
@@ -644,7 +558,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
         # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
         # .all2all_manager, which would pin the default (v1) manager.
-        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+        if moe.moe_parallel_config.execution_plan.transport == "mori_v2":
             from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                 make_mori_v2_prepare_finalize,
             )
@@ -685,7 +599,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # MoRI config. "none" (the MoRI default) sends bf16 back; "fp8_blockwise"
             # selects EpCombineIntraNodeKernel_*_fp8bwq_*. Independent of the dispatch
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
-            mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
+            mori_combine_quant_type = (
+                moe.moe_parallel_config.execution_plan.backend_config.combine_quant
+            )
             tbo_is_enabled = tbo_enabled()
             low_latency = use_mori_low_latency(
                 moe.moe_parallel_config.low_latency, all2all_manager.internode
@@ -743,13 +659,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return prepare_finalize
 
     def maybe_make_prepare_finalize(self) -> FusedMoEPrepareAndFinalize | None:
-        # if True:
-        if self.moe.moe_parallel_config.use_all2all_kernels:
+        if self.moe.moe_parallel_config.execution_plan.needs_prepare_finalize:
             return FusedMoEMethodBase._maybe_make_prepare_finalize(
                 self.moe, self.moe_quant_config, self.routed_rows_wire
             )
-        else:
-            return None
+        return None
 
     # Called once after weight post-processing and before graph capture.
     def init_prepare_finalize(self, layer: torch.nn.Module):
@@ -2650,7 +2564,7 @@ def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
     # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    if moe.moe_parallel_config.execution_plan.implementation == "mega":
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3555,16 +3469,20 @@ class FusedMoE(torch.nn.Module):
             validate_nvfp4_online_target(quant_config, prefix)
         self.has_bias = has_bias
 
-        # Note: here we guard against accessing the TP and DP groups when
-        # uninitialized (this happens when testing)
-        # self.tp_size = 1
-        tp_size = tp_size if tp_size is not None else get_tp_group().world_size
-        dp_size = dp_size if dp_size is not None else get_dp_group().world_size
-
         atom_config = get_current_atom_config()
-        self.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size, dp_size, atom_config
-        )
+        topology = atom_config.parallel_mapping
+        tp_size = tp_size if tp_size is not None else topology.tp_size
+        dp_size = dp_size if dp_size is not None else topology.dp_size
+        plan = atom_config.worker_moe_execution_plan
+        if plan is None:
+            raise ValueError(
+                "Bind the worker parallel mapping before constructing MoE layers"
+            )
+        if (tp_size, dp_size) != (topology.tp_size, topology.dp_size):
+            raise ValueError(
+                "MoE layer TP/DP sizes must match the resolved parallel mapping"
+            )
+        self.moe_parallel_config = FusedMoEParallelConfig.from_plan(plan)
         # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.
         self.sp_mega_moe = None
         self._comm_fused_moe = None
@@ -3592,6 +3510,7 @@ class FusedMoE(torch.nn.Module):
                 quant_config,
                 shared_expert_prefix=shared_expert_prefix,
                 routed_expert_prefix=prefix,
+                execution_plan=self.moe_parallel_config.execution_plan,
             )
         )
         num_fused_shared_experts = (
@@ -3929,7 +3848,7 @@ class FusedMoE(torch.nn.Module):
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        if self.moe_parallel_config.execution_plan.implementation != "mega":
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -5457,7 +5376,7 @@ class FusedMoE(torch.nn.Module):
         are contiguous, so the step's real rows lead. `shared_add` /
         `shared_ready`: see `forward_maybe_comm_fused`."""
         context = get_forward_context().context
-        merge = self.moe_parallel_config.pcp_merge
+        merge = self.moe_parallel_config.execution_plan.needs_pcp_collectives
         pcp = merge and not context.is_dummy_run
         # SP marks its dummy and captured passes split too.
         split = merge and context.pcp_split and (pcp or sp_is_enabled())
@@ -5539,11 +5458,8 @@ class FusedMoE(torch.nn.Module):
         # read only inside the scatter block, which tests the same unchanged
         # condition -- pre-seeding them with None would make a state the code
         # cannot reach look representable.
-        # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         use_dp_gather_scatter = (
-            self.dp_size > 1
-            and not self.moe_parallel_config.use_all2all_kernels
-            and get_current_atom_config().enable_dp_attention
+            self.moe_parallel_config.execution_plan.needs_dp_gather_scatter
         )
         # Routed on the rank that owns the rows, before any gather: each rank's
         # routing masks its own pad rows, and the gather then moves top-k
@@ -5612,7 +5528,10 @@ class FusedMoE(torch.nn.Module):
             if _tbo:
                 tbo_switch_to_compute_sync()
 
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+        if (
+            self.reduce_results
+            and self.moe_parallel_config.execution_plan.needs_tp_all_reduce
+        ):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = get_tp_group().all_reduce(
                 final_hidden_states, ca_fp8_quant=False
@@ -5672,7 +5591,10 @@ class FusedMoE(torch.nn.Module):
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
 
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
+        if (
+            self.reduce_results
+            and self.moe_parallel_config.execution_plan.needs_tp_all_reduce
+        ):
             # Default set to False. (May have to add shared expert outputs.)
             final_hidden_states = get_tp_group().all_reduce(
                 final_hidden_states, ca_fp8_quant=False

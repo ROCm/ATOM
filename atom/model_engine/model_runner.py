@@ -1114,6 +1114,10 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
+        from atom.distributed.parallel_mapping import bind_worker_parallel_mapping
+        from atom.parallel_mapping import get_parallel_mapping
+
+        mapping = get_parallel_mapping(config)
         if sp_is_enabled():
             check_aiter_sp_api()
         # `rank` is this worker's local index (0..tp*pcp-1) within its stage.
@@ -1124,7 +1128,6 @@ class ModelRunner:
             # Reject before any collective can wait for nonexistent ranks.
             reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
-        stage_span = config.tp_world_size * config.pcp_group_size
         local_device_rank = local_device_index(config, rank)
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
@@ -1146,10 +1149,9 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        dp_size = config.parallel_config.data_parallel_size
-        world_size = dp_size * pp_size * stage_span
+        world_size = mapping.world_size
         dp_rank = config.parallel_config.data_parallel_rank
-        global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        global_rank = mapping.global_rank(rank, dp_rank, pp_rank)
         raise_timeout_if_dp_spans_nodes(config.parallel_config)
         if (
             config.parallel_config._managed_distributed_store
@@ -1177,20 +1179,20 @@ class ModelRunner:
             # global_rank is already the physical device index. Revisit if
             # either restriction is lifted.
             init_pp_aware_dist_env(
-                tensor_model_parallel_size=config.tensor_parallel_size,
+                tensor_model_parallel_size=mapping.tp_size,
                 pipeline_model_parallel_size=pp_size,
                 global_rank=global_rank,
                 world_size=world_size,
                 distributed_init_method=distributed_init_method,
                 backend="nccl",
-                data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.pcp_group_size,
+                data_parallel_size=mapping.dp_size,
+                prefill_context_model_parallel_size=mapping.pcp_size,
             )
         else:
             # The group spans the devices that exist; apply_simulated_tp then
             # makes it *report* the logical width so layers shard that many ways.
             init_dist_env(
-                config.tp_world_size,
+                mapping.tp_world_size,
                 rankID=rank,
                 backend="nccl",
                 distributed_init_method=distributed_init_method,
@@ -1198,14 +1200,15 @@ class ModelRunner:
                 # local rank from the DP-scaled global rank, which overruns the
                 # device list on every node after the first.
                 local_rank=local_device_rank,
-                data_parallel_size=config.parallel_config.data_parallel_size,
+                data_parallel_size=mapping.dp_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.pcp_group_size,
+                prefill_context_model_parallel_size=mapping.pcp_size,
                 decode_context_parallel_size=getattr(
                     config, "decode_context_parallel_size", 1
                 ),
             )
             apply_simulated_tp(config)
+        bind_worker_parallel_mapping(config, global_rank=global_rank)
 
     def _get_cumsum_and_arange(
         self,

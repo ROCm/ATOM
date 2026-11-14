@@ -276,7 +276,9 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(
         apply=lambda **kw: calls.append(("apply", kw["scheduled_tokens_gpu"])) or 0,
     )
     layer = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(pcp_merge=False),
+        moe_parallel_config=SimpleNamespace(
+            execution_plan=SimpleNamespace(needs_pcp_collectives=False)
+        ),
         quant_method=method,
         global_num_experts=4,
         expert_map=None,

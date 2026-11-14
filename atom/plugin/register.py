@@ -1255,10 +1255,17 @@ def init_aiter_dist(config: Config) -> None:
         "Initialize aiter dist for using aiter custom collective op for plugin mode"
     )
 
+    from atom.distributed.parallel_mapping import bind_worker_parallel_mapping
+    from atom.parallel_mapping import get_parallel_mapping
+
+    mapping = get_parallel_mapping(config)
     rank = config.plugin_config.rank
     if getattr(config.plugin_config, "is_sglang", False):
         rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
-    tensor_parallel_size = config.tensor_parallel_size
+    tensor_parallel_size = mapping.tp_size
+    global_rank = mapping.global_rank(
+        rank, config.parallel_config.data_parallel_rank or 0
+    )
 
     assert (
         config.plugin_config.is_plugin_mode
@@ -1279,6 +1286,7 @@ def init_aiter_dist(config: Config) -> None:
         from atom.plugin.vllm.tp_group_reuse import init_aiter_dist_from_vllm
 
         if init_aiter_dist_from_vllm(tensor_parallel_size):
+            bind_worker_parallel_mapping(config, global_rank=global_rank)
             return
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
@@ -1312,7 +1320,8 @@ def init_aiter_dist(config: Config) -> None:
         rankID=rank,
         backend="nccl",
         distributed_init_method=distributed_init_method,
-        data_parallel_size=config.parallel_config.data_parallel_size,
+        data_parallel_size=mapping.dp_size,
         data_parallel_rank=config.parallel_config.data_parallel_rank,
-        prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+        prefill_context_model_parallel_size=mapping.pcp_size,
     )
+    bind_worker_parallel_mapping(config, global_rank=global_rank)

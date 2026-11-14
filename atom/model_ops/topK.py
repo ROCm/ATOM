@@ -11,7 +11,7 @@ from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-from atom.model_ops.utils import _has_module
+from atom.moe_config import MoEExecutionPlan, get_moe_execution_plan
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -22,6 +22,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
     shared_expert_prefix: str | None = None,
     routed_expert_prefix: str | None = None,
+    execution_plan: MoEExecutionPlan | None = None,
 ) -> bool:
     config = get_current_atom_config()
     if quant_config is None:
@@ -36,12 +37,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # different mechanism, and an explicitly selected RCCL/none backend must
     # not be inferred from the mere presence of the ``mori`` Python package.
     # EPLB always fuses, otherwise the env decides.
-    requested_all2all = getattr(config, "moe_all2all_backend", "auto")
-    mori_selected = (
-        requested_all2all in {"auto", "mori"}
-        and not envs.ATOM_DISABLE_MORI_EP
-        and _has_module("mori")
-    )
+    plan = execution_plan or get_moe_execution_plan(config)
+    mori_selected = plan.transport in {"mori", "mori_v2", "mega"}
     if (
         dp_size > 1
         and mori_selected

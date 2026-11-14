@@ -6,6 +6,7 @@
 from types import SimpleNamespace
 
 from atom.config import Config
+from atom.moe_config import MoEBackendConfig
 
 
 def _hash(**overrides):
@@ -36,6 +37,25 @@ def _hash(**overrides):
 
 def test_hash_is_stable():
     assert _hash() == _hash()
+
+
+def test_hash_changes_with_resolved_moe_backend():
+    base = MoEBackendConfig(mori_available=True)
+    assert _hash(moe_backend_config=base) != _hash(
+        moe_backend_config=MoEBackendConfig(all2all_backend="none")
+    )
+    assert _hash(moe_backend_config=base) != _hash(
+        moe_backend_config=MoEBackendConfig(mori_available=True, mori_v2=True)
+    )
+    assert _hash(moe_backend_config=base) != _hash(
+        moe_backend_config=MoEBackendConfig(backend="mega", mori_available=True)
+    )
+
+
+def test_hash_changes_with_expert_sharding():
+    assert _hash(enable_expert_parallel=True) != _hash()
+    assert _hash(moe_ep_flatten_tp_across_dp=True) != _hash()
+    assert _hash(dp_logical_size=16) != _hash()
 
 
 def test_hash_changes_with_max_model_len():

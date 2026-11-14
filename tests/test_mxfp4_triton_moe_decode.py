@@ -13,6 +13,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEParallelMapping,
+    resolve_moe_execution_plan,
+)
+
 try:
     # aiter/triton absent under bare non-GPU pytest
     from aiter.jit.utils.chip_info import get_gfx
@@ -24,6 +30,15 @@ except Exception as exc:  # noqa: BLE001
 gfx1250_only = pytest.mark.skipif(
     get_gfx() != "gfx1250", reason="the FlyDSL/Triton layouts only coincide on gfx1250"
 )
+
+
+def _parallel(use_ep=False):
+    return SimpleNamespace(
+        execution_plan=resolve_moe_execution_plan(
+            MoEParallelMapping.make(tp_size=8, dp_size=1, enable_ep=use_ep),
+            MoEBackendConfig(),
+        )
+    )
 
 
 def _make_method(
@@ -52,7 +67,10 @@ def _make_method(
         is_dynamic=True,
     )
     moe_config = SimpleNamespace(
-        a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=use_ep
+        moe_parallel_config=_parallel(use_ep),
+        a_quant_dtype=None,
+        mxfp4_fp8_activations=False,
+        use_ep=use_ep,
     )
     return moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
@@ -145,7 +163,12 @@ def test_mega_backend_keeps_decode_triton_off(monkeypatch):
             quant_method=None,
             is_dynamic=True,
         ),
-        SimpleNamespace(a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=True),
+        SimpleNamespace(
+            a_quant_dtype=None,
+            mxfp4_fp8_activations=False,
+            use_ep=True,
+            moe_parallel_config=_parallel(True),
+        ),
     )
 
     assert method.use_triton_decode is False
