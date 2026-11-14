@@ -1145,8 +1145,11 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
         let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(
             crate::tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap(),
         );
+        // Preparation workers encode with copies they load from the source.
         app.tokenizer_registry
-            .load("bos-id", "m", "bos", || async { Ok(tokenizer) })
+            .load("bos-id", "m", path.to_str().unwrap(), || async {
+                Ok(tokenizer)
+            })
             .await
             .unwrap();
         let body = br#"{"model": "m", "text": "a b"}"#;
