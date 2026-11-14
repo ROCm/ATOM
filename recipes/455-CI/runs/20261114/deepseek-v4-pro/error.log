@@ -1,0 +1,55 @@
+    return fn(result_names, *state_values)
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/jit_function.py", line 1133, in __call__
+    return self._compile_or_execute(args, kwargs, execute=True)
+  File "/app/aiter/aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py", line 1579, in gemm_task
+    rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_stage1.py", line 1885, in kernel
+    while code >= fx.Int32(0):
+  File "/app/aiter/aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_stage1.py", line 1990, in __while_after_36
+    g1_task(
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/jit_function.py", line 1141, in _compile_or_execute
+    return self.func(*args, **kwargs)
+  File "/app/aiter/aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py", line 1560, in make_rmem_slot
+    assert slot_width <= 128
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/ast_rewriter.py", line 1497, in scf_while_dispatch
+    body_result = ReplaceIfWithDispatch._call_branch(after_fn, result_names, wrapped_after)
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/jit_function.py", line 1133, in __call__
+    return self._compile_or_execute(args, kwargs, execute=True)
+  File "/app/aiter/aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py", line 1579, in gemm_task
+    rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/ast_rewriter.py", line 719, in _call_branch
+    return fn(result_names, *state_values)
+AssertionError
+  File "/usr/local/lib/python3.12/dist-packages/flydsl/compiler/jit_function.py", line 1141, in _compile_or_execute
+    return self.func(*args, **kwargs)
+----- last 30 lines -----
+[atom 13:46:55] Engine Core: load model runner failed
+[atom 13:46:55] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 13:46:55] [gc] unfroze 375 objects
+[atom 13:46:55] Engine Core: load model runner failed
+[atom 13:46:55] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 13:46:55] [gc] unfroze 375 objects
+[atom 13:46:55] Engine Core: load model runner failed
+[atom 13:46:55] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 13:46:55] [gc] unfroze 375 objects
+[atom 13:46:55] Engine Core: load model runner failed
+[atom 13:47:00] Engine Core Mgr: All EngineCores shut down
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 3795, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1003, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 98, in __init__
+    self.core_mgr = CoreManager(config)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 665, in __init__
+    self._wait_for_all_ready_signals()
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 750, in _wait_for_all_ready_signals
+    raise RuntimeError(
+RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization
