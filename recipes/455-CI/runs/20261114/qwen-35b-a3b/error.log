@@ -1,0 +1,59 @@
+  File "/app/ATOM/atom/utils/decorators.py", line 214, in wrapped
+    return record_wrapped(*args, **kwargs)
+  File "/app/ATOM/atom/utils/decorators.py", line 88, in _wrapped
+    return func(*args, **kwargs)
+  File "/app/ATOM/atom/model_ops/moe.py", line 2454, in apply
+    return fused_moe(
+  File "/app/aiter/aiter/presorted_moe.py", line 230, in wrapper
+    return fn(*args, **kwargs)
+  File "/app/aiter/aiter/fused_moe.py", line 1342, in fused_moe
+    return fused_moe_(
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 341, in wrapper_custom
+    getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
+  File "/usr/local/lib/python3.12/dist-packages/torch/_ops.py", line 1269, in __call__
+    return self._op(*args, **kwargs)
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 372, in outer_wrapper
+    wrapper(*args, **kwargs)
+  File "/app/aiter/aiter/jit/utils/torch_guard.py", line 254, in wrapper
+    return func(*args, **kwargs)
+  File "/app/aiter/aiter/fused_moe.py", line 1508, in fused_moe_
+    return _fused_moe_impl(
+  File "/app/aiter/aiter/fused_moe.py", line 1656, in _fused_moe_impl
+    raise ValueError(
+ValueError: gfx1250 fused_moe requires gu_interleave weight layout (gate_mode='interleave'), got 'separated'
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=1), shutting down.
+[atom 03:35:02] Engine Core Mgr: Failed to initialize all EngineCores, cleaning up: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization
+[atom 03:35:02] Engine Core Mgr: Shutting down 1 EngineCores
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+----- last 30 lines -----
+  File "/app/aiter/aiter/fused_moe.py", line 1656, in _fused_moe_impl
+    raise ValueError(
+ValueError: gfx1250 fused_moe requires gu_interleave weight layout (gate_mode='interleave'), got 'separated'
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=1), shutting down.
+[atom 03:35:02] Engine Core Mgr: Failed to initialize all EngineCores, cleaning up: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization
+[atom 03:35:02] Engine Core Mgr: Shutting down 1 EngineCores
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 03:35:02] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 03:35:02] [gc] unfroze 375 objects
+[atom 03:35:02] Engine Core: load model runner failed
+[atom 03:35:07] Engine Core Mgr: All EngineCores shut down
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 3795, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1003, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 98, in __init__
+    self.core_mgr = CoreManager(config)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 665, in __init__
+    self._wait_for_all_ready_signals()
+  File "/app/ATOM/atom/model_engine/engine_core_mgr.py", line 750, in _wait_for_all_ready_signals
+    raise RuntimeError(
+RuntimeError: Engine Core Mgr: Received unexpected SHUTDOWN signal from DP rank 0 during initialization

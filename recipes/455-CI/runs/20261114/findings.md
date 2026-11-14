@@ -5,3 +5,4 @@
 - The image ENV sets `HF_HUB_OFFLINE=1`, so the generic §3.3 GSM8K command cannot download `openai/gsm8k`. `HF_HUB_OFFLINE=0` was added for Qwen-35B-A3B, as the R1 and V4.1-Flash recipes already do.
 - DeepSeek R1: aiter repeatedly logs `Ignoring invalid OPUS tuned row for gfx=gfx1250, shape=(1,129280,7168), kid=13` (the lm_head GEMM) and falls back to the default backend.
 - DeepSeek R1: the server was ready 501 s after launch with an empty JIT cache.
+- Qwen-35B-A3B: the server dies in warmup (341 s after launch) in aiter `fused_moe` with `ValueError: gfx1250 fused_moe requires gu_interleave weight layout (gate_mode=interleave), got separated`. ATOM main defaults `ATOM_MOE_GU_ITLV` to 0 (`atom/utils/envs.py`). The DeepSeek R1 and Kimi-K3 recipes set `ATOM_MOE_GU_ITLV=1`, but the Qwen-35B-A3B recipe does not, so ATOM keeps the separated gate/up layout that gfx1250 fused MoE rejects. Not retried.
