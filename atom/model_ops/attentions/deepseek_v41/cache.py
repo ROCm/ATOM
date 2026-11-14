@@ -4,9 +4,13 @@
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.packed_rows import (
-    gather_prefix_rows,
-    write_packed_window,
+from atom.model_ops.attentions.deepseek_v41.planes import (
+    gather_window_planes,
+    gather_windows,
+    prefill_window,
+    reset_windows,
+    split_source,
+    write_window_planes,
 )
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryMajorArena
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
@@ -27,9 +31,7 @@ from atom.model_ops.deepseek_v41.index_write import (
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
-from atom.model_ops.v4_kernels.state_writes import (
-    swa_write,
-)
+from atom.model_ops.v4_kernels.state_writes import swa_write
 from atom.utils import CpuGpuBuffer, upload_numpy
 
 from .indices import (
@@ -44,23 +46,100 @@ from .speculative import TentativeState
 
 class PagedAttentionCache:
     def _allocate_backing(self, size, device):
-        """This cache's whole pool, as one flat uint8 arena.
-
-        The one seam a caller that already owns the bytes overrides. PAGE and
-        STATE share a single address space here because
-        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
-        the absolute end of the paged region, and the ``_indices`` kernels
-        dereference page rows and window rows against one base -- so the pool
-        is handed over whole or not at all, and an override returns the whole
-        arena rather than the paged part of it.
-
-        What an override has to return is what this returns: zeroed, flat
-        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
-        region below is a `view` of it with its own strides, which neither a
-        short arena nor a longer tail would divide, and the cursor reset plus
-        every cold read assume the zeros.
-        """
+        """BF16's flat arena, or a frontend-owned slab for source buffers."""
         return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    def _allocate_buffers(self, sizes, device):
+        return tuple(
+            torch.zeros(size, dtype=torch.uint8, device=device) for size in sizes
+        )
+
+    def _allocate_quantized(self, device):
+        g, pages, slots = self.geometry, self.num_pages, self.num_slots
+        main_sizes = [
+            pages * g.rows_per_page(ratio) * g.main_row_bytes for _, ratio in g.owners
+        ]
+        window_size = slots * g.ring_slots * g.window_row_bytes
+        # Compressor rings and cursor retain the original entry-major layout.
+        fields = g.state_fields[1:]
+        state_size = g._aligned_bytes(fields)
+        page_pad = g.page_bytes - sum(size // pages for size in main_sizes)
+        state_pad = (
+            g.state_bytes - g.layers * g.ring_slots * g.window_row_bytes - state_size
+        )
+        offsets, boundary = g.paged_extents(pages)
+        index_bytes = boundary - pages * g.page_bytes
+        auxiliary = (
+            index_bytes + slots * state_size + pages * page_pad + slots * state_pad
+        )
+        self.allocations = self._allocate_buffers(
+            [auxiliary, *main_sizes, *([window_size] * g.layers)], device
+        )
+        # Index rows, compressor state, cursor and alignment padding.
+        self.backing = self.allocations[0]
+        self.main_sources = dict(
+            zip(g.compress_owners, self.allocations[1 : 1 + len(main_sizes)])
+        )
+        self.window_sources = self.allocations[1 + len(main_sizes) :]
+        self.index_planes = {
+            owner: tuple(
+                self._index_plane(
+                    offset - pages * g.page_bytes, g.rows_per_page(ratio), width
+                )
+                for offset, (_, width) in zip(offsets[owner], g.index_planes)
+            )
+            for owner, ratio in g.owners
+        }
+        state_end = index_bytes + slots * state_size
+        self.state = EntryMajorArena(
+            fields,
+            slots,
+            device,
+            buf=self.backing[index_bytes:state_end],
+            slot_stride=state_size,
+        )
+        self.state_bytes = self.backing[index_bytes:state_end].view(slots, state_size)
+        self.pages = self.page_bytes = None
+        self.page_regions = [
+            (f"main_{owner}.{part}", plane.view(pages, -1))
+            for owner, source in self.main_sources.items()
+            for part, plane in zip(
+                ("data", "scale"), split_source(source, g.head_dim, self.packed)
+            )
+        ]
+        self.state_regions = [
+            (f"window.{layer}.{part}", plane.view(slots, -1))
+            for layer, source in enumerate(self.window_sources)
+            for part, plane in zip(("data", "scale"), split_source(source, g.head_dim))
+        ]
+        offset = state_end
+        for name, count, width, regions in (
+            ("page.padding", pages, page_pad, self.page_regions),
+            ("state.padding", slots, state_pad, self.state_regions),
+        ):
+            if width:
+                regions.append(
+                    (
+                        name,
+                        self.backing[offset : offset + count * width].view(
+                            count, width
+                        ),
+                    )
+                )
+                offset += count * width
+        self.state_regions.append(("state_slot", self.state_bytes))
+        self.state_aux_regions = self.state_regions[2 * g.layers :]
+        # Layer pointers let DSpark gather several separately allocated windows
+        # in one kernel, without joining or duplicating the persistent sources.
+        self.window_layer_ids = torch.arange(g.layers, dtype=torch.int64, device=device)
+        self.window_ptrs = torch.tensor(
+            [
+                [v.data_ptr() for v in self.ring_view(layer)]
+                for layer in range(g.layers)
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
 
     def __init__(
         self,
@@ -70,6 +149,7 @@ class PagedAttentionCache:
         device,
         max_tokens=0,
         workspace=None,
+        prefill_window_staging=None,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
@@ -87,35 +167,41 @@ class PagedAttentionCache:
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
+        # Native serving supplies pre-profiled scratch. Other frontends reserve
+        # it at begin_step and retain it across layers and subsequent forwards.
+        self.prefill_window_staging = prefill_window_staging
         self.packed = geometry.packed
         self.window_fp8 = geometry.window_fp8
         # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
         self.kv_fp8 = geometry.kv_dtype == "fp8"
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
-        index_offsets, boundary = geometry.paged_extents(pages)
-        size = boundary + slots * geometry.state_bytes
-        self.backing = self._allocate_backing(size, device)
-        main_bytes = self.num_pages * geometry.page_bytes
-        self.pages = EntryMajorArena(
-            geometry.page_fields,
-            self.num_pages,
-            device,
-            buf=self.backing[:main_bytes],
-            slot_stride=geometry.page_bytes,
-        )
-        # Each owner's `geometry.index_planes`, each `[pages, rows, width]` and
-        # dense in its own rows: the stride a paged reader is handed is the
-        # rows' and not the PAGE's. Both sides of the index plane take the
-        # views from here.
-        self.index_planes = {
-            owner: tuple(
-                self._index_plane(offset, geometry.rows_per_page(ratio), width)
-                for offset, (_, width) in zip(
-                    index_offsets[owner], geometry.index_planes
-                )
+        if self.window_fp8:
+            self._allocate_quantized(device)
+        else:
+            index_offsets, boundary = geometry.paged_extents(pages)
+            size = boundary + slots * geometry.state_bytes
+            self.backing = self._allocate_backing(size, device)
+            main_bytes = self.num_pages * geometry.page_bytes
+            self.pages = EntryMajorArena(
+                geometry.page_fields,
+                self.num_pages,
+                device,
+                buf=self.backing[:main_bytes],
+                slot_stride=geometry.page_bytes,
             )
-            for owner, ratio in geometry.owners
-        }
+            # Each owner's `geometry.index_planes`, each `[pages, rows, width]` and
+            # dense in its own rows: the stride a paged reader is handed is the
+            # rows' and not the PAGE's. Both sides of the index plane take the
+            # views from here.
+            self.index_planes = {
+                owner: tuple(
+                    self._index_plane(offset, geometry.rows_per_page(ratio), width)
+                    for offset, (_, width) in zip(
+                        index_offsets[owner], geometry.index_planes
+                    )
+                )
+                for owner, ratio in geometry.owners
+            }
         # The same bytes as `[tiles, tile rows, width]`, which is what a block
         # id addresses and what the scorer is handed.
         self.index_units = {
@@ -128,17 +214,21 @@ class PagedAttentionCache:
             )
             for owner, planes in self.index_planes.items()
         }
-        self.state = EntryMajorArena(
-            geometry.state_fields,
-            slots,
-            device,
-            buf=self.backing[boundary:],
-            slot_stride=geometry.state_bytes,
-        )
-        self.state_bytes = self.backing[boundary:].view(slots, geometry.state_bytes)
-        self.page_bytes = self.backing[:main_bytes].view(
-            self.num_pages, geometry.page_bytes
-        )
+        if not self.window_fp8:
+            self.state = EntryMajorArena(
+                geometry.state_fields,
+                slots,
+                device,
+                buf=self.backing[boundary:],
+                slot_stride=geometry.state_bytes,
+            )
+            self.state_bytes = self.backing[boundary:].view(slots, geometry.state_bytes)
+            self.page_bytes = self.backing[:main_bytes].view(
+                self.num_pages, geometry.page_bytes
+            )
+            self.page_regions = [("page", self.page_bytes)]
+            self.state_regions = [("state_slot", self.state_bytes)]
+            self.allocations = (self.backing,)
         self.cursor = self.state.view("cursor")[0]
         self.cursor[:, 1:].fill_(-1)
         # `[slot count, end + history]`, staged rather than built per step: a
@@ -191,10 +281,9 @@ class PagedAttentionCache:
         # The requests of the last step whose state was prepared, in batch
         # order: what a device-round step must continue.
         self._prepared_requests = None
-        if geometry.packed:
-            self.pool = self.backing.view(-1, 1)
-        elif self.kv_fp8:
-            self.pool = self.backing.view(-1, geometry.row_bytes)
+        if self.window_fp8:
+            # Device/allocation handle only. Quantized readers use main_view/ring_view.
+            self.pool = self.backing
         else:
             self.pool = self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
         # Owner -> its row in the compressor rings, which hold the raw
@@ -217,7 +306,7 @@ class PagedAttentionCache:
         so a region's stride is its own size and unit `u` is at `base + u *
         bytes`. This is the destination stream a checkpoint image is cut into.
         """
-        regions = [(self.page_bytes.data_ptr(), self.geometry.page_bytes)]
+        regions = [(view.data_ptr(), view.shape[1]) for _, view in self.page_regions]
         regions += [
             (plane.data_ptr(), plane.stride(0) * plane.element_size())
             for planes in self.index_planes.values()
@@ -227,7 +316,7 @@ class PagedAttentionCache:
 
     def unit_views(self, unit):
         """The same regions for one unit, named as `uint8` views."""
-        return [self.page_bytes[unit]] + [
+        return [view[unit] for _, view in self.page_regions] + [
             plane[unit].flatten().view(torch.uint8)
             for planes in self.index_planes.values()
             for plane in planes
@@ -263,7 +352,10 @@ class PagedAttentionCache:
         """
         if tokens <= self.max_tokens and self.indptr_buffers:
             return
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if (
+            torch.device(self.indptr_device).type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
             raise RuntimeError("Indptr buffers cannot be reallocated under capture")
         self.max_tokens = max(tokens, self.max_tokens)
         self.indptr_buffers = {
@@ -281,6 +373,30 @@ class PagedAttentionCache:
             raise RuntimeError(
                 "Commit the accepted prefix before reusing or checkpointing state"
             )
+
+    def _reserve_prefill_window(self, step):
+        """Bind parent scratch before any layer launches; TBO binds child storage.
+
+        Attention and the ring commit finish on the compute stream before the
+        next layer reuses these bytes. A larger eager step may grow the buffer;
+        native serving reserves its configured maximum before profiling.
+        """
+        if not self.window_fp8 or step.decode:
+            return
+        batches = step.cu_seqlens_q.numel() - 1
+        size = (batches * self.geometry.ring_slots + step.running_tokens) * (
+            self.geometry.window_row_bytes
+        )
+        source = self.prefill_window_staging
+        if source is None or source.numel() < size:
+            if self.pool.is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Prefill window staging must be reserved before capture"
+                )
+            source = self.prefill_window_staging = torch.empty(
+                size, dtype=torch.uint8, device=self.pool.device
+            )
+        step.prefill_window_staging = source
 
     def begin_step(
         self,
@@ -372,6 +488,7 @@ class PagedAttentionCache:
             np.ones(count, np.bool_) if finals is None else np.asarray(finals)
         )
         step.start_histories = start_histories
+        self._reserve_prefill_window(step)
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
@@ -413,7 +530,10 @@ class PagedAttentionCache:
         rows = max(running_bs, self.num_slots, 1)
         zeros = getattr(self, "_replay_zeros", None)
         if zeros is None or zeros.numel() < rows:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if (
+                torch.device(self.indptr_device).type == "cuda"
+                and torch.cuda.is_current_stream_capturing()
+            ):
                 raise RuntimeError("The replay-start buffer cannot grow under capture")
             zeros = self._replay_zeros = torch.zeros(
                 rows, dtype=torch.int32, device=self.indptr_device
@@ -486,6 +606,23 @@ class PagedAttentionCache:
         self._report_stale_state(
             self._probe[: starts.size].numpy(), starts, requests, fresh
         )
+
+    def _reset_state_slots(self, slots):
+        """Clear fresh request slots without a launch for each window plane."""
+        if not slots.numel():
+            return
+        regions = self.state_regions
+        if self.packed or self.kv_fp8:
+            reset_windows(
+                self.window_sources,
+                self.window_ptrs,
+                slots,
+                self.geometry.ring_slots,
+                self.geometry.head_dim,
+            )
+            regions = self.state_aux_regions
+        for _, region in regions:
+            region.index_fill_(0, slots, 0)
 
     def prepare_device_round_state(self, step, *, histories=True):
         """`prepare_state` for a device-round step (`RoundService.DEVICE`: the
@@ -571,7 +708,7 @@ class PagedAttentionCache:
             slots = self._reset_slots.np[: restarted.size]
             slots[:] = [step.requests[i].slot for i in restarted]
             index = self._reset_slots.copy_to_gpu(slots.size)
-            self.state_bytes.index_fill_(0, index[: int(fresh.sum())], 0)
+            self._reset_state_slots(index[: int(fresh.sum())])
             if step.start_histories is None:
                 self.cursor[:, 1:].index_fill_(0, index, -1)
                 started = -1
@@ -622,20 +759,30 @@ class PagedAttentionCache:
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
-        """The boundaries' rotated latents into this owner's main rows, in the
-        pool's own row format; returns the latent the index key projects from."""
+        scale = None
+        mode = "none"
+        if self.window_fp8:
+            pages, scale = (
+                plane.view(
+                    self.num_pages, self.geometry.rows_per_page(compressor.ratio), -1
+                )
+                for plane in self.main_view(owner)
+            )
+            mode = "planar_fp4" if self.packed else "planar_fp8"
+        else:
+            pages = self.pages.view(f"main_{owner}")[0]
         return compress_batch(
-            self, owner, compressor, values, scores, step, rope,
-            pages=self.pages.view(f"main_{owner}")[0],
-            quant_mode=self.main_quant_mode,
-        )  # fmt: skip
-
-    @property
-    def main_quant_mode(self):
-        """How `fused_compress_attn` stores a main row in this pool."""
-        if self.packed:
-            return "packed_fp4"
-        return "packed_fp8" if self.kv_fp8 else "none"
+            self,
+            owner,
+            compressor,
+            values,
+            scores,
+            step,
+            rope,
+            scatter=(pages, step.block_tables),
+            quant_mode=mode,
+            cache_scale=scale,
+        )
 
     def write_index(self, owner, step, index, ratio):
         """One pass quantizes, preshuffles and scatters.
@@ -670,11 +817,28 @@ class PagedAttentionCache:
             rope=rope,
         )
 
-    def indptrs(self, step):
+    def indptrs(self, step, *, a8w4=False):
         """`step`'s `{ratio: (prefix indptr, extend indptr, reserved top-k)}`
         (`fill_step_indptrs`), into its fixed buffers: a TBO microbatch's own,
         else the cache's. Memoized as `unit_tiles` is, so a forward that builds
         no index (mono's) fills none."""
+        if a8w4:
+            if not step.a8w4_indptrs:
+                # Owned by this step, inside its attention capture region.
+                # A TBO child or bounded query step must not overwrite the
+                # parent's BF16 adapter indptrs or another child's buffers.
+                buffers = {
+                    ratio: torch.empty(
+                        (2, step.running_tokens + 1),
+                        dtype=torch.int32,
+                        device=step.positions.device,
+                    ).unbind()
+                    for ratio in self.geometry.layer_ratios
+                }
+                step.a8w4_indptrs = fill_step_indptrs(
+                    step, self.geometry, buffers, split=True
+                )
+            return step.a8w4_indptrs
         if not step.indptrs:
             step.indptrs = fill_step_indptrs(
                 step, self.geometry, step.indptr_buffers or self.indptr_buffers
@@ -771,30 +935,35 @@ class PagedAttentionCache:
         """FP8 windows decoded to BF16: `[slots, ring, dim]` for an int layer,
         `[layers, slots, ring, dim]` for a `[layers, 1, 1]` device column.
 
-        A layer's ring starts `layer` rings past layer 0's, so the layers move
-        the addresses without a host read: a draft graph captures this.
+        The device pointer table selects each layer's allocation without a
+        host read, so a draft graph can capture changing layer/slot IDs.
         """
-        first = self.geometry.window_bytes(0, self.num_pages)
-        addresses = (
-            first.ring_start
-            + layers * (first.ring_slots * first.run_rows)
-            + slots.long()[:, None] * first.slot_rows
-            + torch.arange(first.ring_slots, device=slots.device) * first.run_rows
+        return gather_windows(
+            self.window_sources,
+            self.window_ptrs,
+            self.window_layer_ids,
+            layers,
+            slots,
+            self.geometry.ring_slots,
+            self.geometry.head_dim,
         )
-        tagged = ((addresses << 1) | 1).flatten()
-        # [0, rows] built on the device: no host copy inside a capture
-        ptr = torch.arange(2, dtype=torch.int32, device=slots.device) * tagged.numel()
-        dim = self.geometry.head_dim
-        output = torch.empty(
-            tagged.numel(), dim, dtype=torch.bfloat16, device=slots.device
-        )
-        gather_prefix_rows(self.backing, tagged, ptr, output, 0, 1)
-        return output.view(*addresses.shape, dim)
 
-    def query_fp8(self, query):
-        """`(values, scales)` for `query`'s MXFP8 copy, which the FP8 pool's
-        attention reads (`rope_quant_window`'s `query_fp8`); None otherwise."""
-        if not self.kv_fp8:
+    def read_window_planes(self, layers, slots):
+        """Gather raw MXFP8 draft windows with live layer and slot IDs."""
+        self.require_committed()
+        if not self.window_fp8:
+            raise ValueError("A8W8 drafting requires MXFP8 window storage")
+        return gather_window_planes(
+            self.window_ptrs,
+            layers,
+            slots,
+            self.geometry.ring_slots,
+            self.geometry.head_dim,
+        )
+
+    def query_fp8(self, query, *, a8w4=False):
+        """MXFP8 Q for A8W8 or A8W4 attention; None for the BF16 adapter."""
+        if not (self.kv_fp8 or a8w4):
             return None
         *rows, dim = query.shape
         return (
@@ -804,7 +973,9 @@ class PagedAttentionCache:
             ),
         )
 
-    def rope_quant_window(self, layer, query, kv, rope, step, query_fp8=None):
+    def rope_quant_window(
+        self, layer, query, kv, rope, step, query_fp8=None, *, a8w4=False
+    ):
         """Rotate the query, quantize the KV row, and store it where it can be.
 
         A decode stores the row and produces nothing: no query of a decode
@@ -814,8 +985,8 @@ class PagedAttentionCache:
         attention, in `write_window`. The cache layout only decides the
         payload, so both halves of that read the same either way.
 
-        Returns the rows an extend pass attends to -- BF16, or on the FP8 pool
-        `[tokens, row_bytes]` MXFP8 rows at the pool's row stride -- and
+        Returns the attention's second source -- BF16 current KV, or for
+        A8W8/A8W4 a contiguous pair with batch-local history and current KV -- and
         whatever the window still owes, `None` for each the caller has no use
         for. `query` None: the KV row alone, for a prefill whose queries are
         not its rows (`rotate_query`). `query_fp8`: `query_fp8(query)`, the
@@ -840,7 +1011,11 @@ class PagedAttentionCache:
             # An FP8 window is stored as bytes, a BF16 one into the
             # `[rows, head_dim]` pool, which is the whole difference.
             ring = (
-                (self.backing, step, self.geometry.window_bytes(layer, self.num_pages))
+                (
+                    self.ring_view(layer),
+                    step,
+                    self.geometry.window(layer, self.num_pages),
+                )
                 if window_fp8
                 else (self.pool, step, self.geometry.window(layer, self.num_pages))
             )
@@ -848,39 +1023,35 @@ class PagedAttentionCache:
                 *seam, rope_dim=rope.rope_dim, ring=ring, query_fp8=query_fp8
             )
             return None, None
-        if self.kv_fp8:
-            # Values then scales a row, the pool's own row: the attention's
-            # extend source has to share the prefix's strides.
-            rows = torch.empty(
-                (step.running_tokens, self.geometry.row_bytes),
-                device=kv.device,
-                dtype=torch.uint8,
+        quantized_attn = self.kv_fp8 or a8w4
+        qat = None if quantized_attn else torch.empty_like(kv)
+        values = scales = None
+        attention_source = qat
+        if window_fp8:
+            if quantized_attn:
+                attention_source, current = prefill_window(
+                    self.ring_view(layer), step, self.geometry.ring_slots
+                )
+            else:
+                source = torch.empty(
+                    step.running_tokens * self.geometry.window_row_bytes,
+                    dtype=torch.uint8,
+                    device=kv.device,
+                )
+                current = split_source(source, dim)
+            values = current[0].view(FP8_DTYPE).view_as(kv)
+            scales = (
+                current[1].view(torch.float8_e8m0fnu).view(*kv.shape[:-1], dim // 32)
             )
-            values = rows[:, :dim].view(FP8_DTYPE)
-            scales = rows[:, dim:].view(torch.float8_e8m0fnu)
-            rope_quant_window(
-                *seam,
-                rope_dim=rope.rope_dim,
-                values=values,
-                scales=scales,
-                query_fp8=query_fp8,
-            )
-            return rows, (values, scales)
-        qat = torch.empty_like(kv)
-        values = torch.empty_like(kv, dtype=FP8_DTYPE) if window_fp8 else None
-        scales = (
-            torch.empty(
-                (*kv.shape[:-1], dim // 32),
-                device=kv.device,
-                dtype=torch.float8_e8m0fnu,
-            )
-            if window_fp8
-            else None
-        )
         rope_quant_window(
-            *seam, rope_dim=rope.rope_dim, qat=qat, values=values, scales=scales
+            *seam,
+            rope_dim=rope.rope_dim,
+            qat=qat,
+            values=values,
+            scales=scales,
+            query_fp8=query_fp8,
         )
-        return qat, (values, scales) if window_fp8 else qat
+        return attention_source, (values, scales) if window_fp8 else qat
 
     def rotate_query(self, query, rope, positions, query_fp8=None):
         """`rope_quant_window`'s query half alone, at `positions`."""
@@ -904,11 +1075,11 @@ class PagedAttentionCache:
             # rows below where a request's ring already holds them stay
             cached = step.swa_cached_until if step.request_cached_until.any() else None
             if self.window_fp8:
-                write_packed_window(
+                write_window_planes(
                     *kv,
-                    self.backing,
+                    self.ring_view(layer),
                     step,
-                    self.geometry.window_bytes(layer, self.num_pages),
+                    window,
                     self.geometry.head_dim,
                     cached,
                 )
@@ -928,16 +1099,15 @@ class PagedAttentionCache:
                 cached_until=cached,
             )
 
-    def attention_indices(self, spec, step):
+    def attention_indices(self, spec, step, *, a8w4=False):
         """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
         rows into the attention's second source.
 
-        Prefill and decode alike build their index group's in one launch:
-        every layer's prefix, window included, or on a split decode
-        (`splits_window`) the selection alone, one plane the group shares. A
-        prefill's second source is its own KV (`extend`, one list for the
-        group); a decode's is the layer's ring (`ring_view`), and a split
-        decode's window rows one list for every layer.
+        Quantized sources use layer-local row IDs, so all layers in an index
+        group share one list. The FP4 BF16 adapter retains its mixed tagged
+        prefix; A8W4 and A8W8 separate CSA and SWA: prefill SWA uses compact
+        batch-local rings plus current KV; decode reads the ring directly.
+        BF16 keeps its existing pool addressing.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
@@ -945,26 +1115,68 @@ class PagedAttentionCache:
         """
         # a spec that declares no group never names a start: its own
         first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
-        split = splits_window(step, self.geometry)
-        built = step.group_indices.get(first)
+        split = a8w4 or splits_window(step, self.geometry)
+        key = (first, "a8w4") if a8w4 else first
+        built = step.group_indices.get(key)
         if built is None:
-            layers = 1 if split else spec.index_group_size
-            built = self._index_group(spec, step, first, layers)
-            step.group_indices[first] = built
+            layers = 1 if split or self.window_fp8 else spec.index_group_size
+            built = self._index_group(spec, step, first, layers, a8w4=a8w4)
+            step.group_indices[key] = built
         prefix, pptr, extend, eptr = built
         if not split:
-            return prefix[spec.layer_id - first], pptr, extend, eptr
+            return (
+                prefix[0 if self.window_fp8 else spec.layer_id - first],
+                pptr,
+                extend,
+                eptr,
+            )
+        if (self.kv_fp8 or a8w4) and not step.decode:
+            return prefix[0], pptr, extend, eptr
         if step.window_rows is None:
             window = self.geometry.window(first, self.num_pages)
             step.window_rows = build_window_rows(step, self.geometry, window, eptr)
         return prefix[0], pptr, step.window_rows, eptr
 
+    def main_view(self, owner):
+        if not self.window_fp8:
+            return self.pool
+        source = self.backing[:0] if owner is None else self.main_sources[owner]
+        return split_source(source, self.geometry.head_dim, self.packed)
+
     def ring_view(self, layer):
-        """The row-addressed pool (BF16 or FP8 rows) from `layer`'s ring
-        start: a split decode's second source, which its window rows index."""
+        if self.window_fp8:
+            return split_source(self.window_sources[layer], self.geometry.head_dim)
         return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
-    def _index_group(self, spec, step, first, layers):
+    def window_view(self, layer):
+        """The layer's window data as [slots, ring, dim], for state inspection."""
+        if not self.window_fp8:
+            return self.state.view("window")[layer]
+        return self.ring_view(layer)[0].view(
+            self.num_slots, self.geometry.ring_slots, self.geometry.head_dim
+        )
+
+    def state_views(self, slot, *, checkpoint=False):
+        self.require_committed()
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"STATE slot {slot} is out of range")
+        if self.window_fp8:
+            if not checkpoint:
+                return [region[slot] for _, region in self.state_regions]
+            windows = [
+                region[slot]
+                for name, region in self.state_regions
+                if name.startswith("window.")
+            ]
+            return windows + [self.state.view("cursor")[0, slot].view(torch.uint8)]
+        if checkpoint:
+            return [
+                self.state_bytes[slot, start : start + size]
+                for start, size in self.geometry.checkpoint_image_ranges
+            ]
+        return [self.state_bytes[slot]]
+
+    def _index_group(self, spec, step, first, layers, *, a8w4=False):
         """One build covering `layers` consecutive layers from `first`.
 
         The per-layer ring offset is read off the geometry rather than
@@ -979,7 +1191,7 @@ class PagedAttentionCache:
         )
         return build_indices(
             step.selected[spec.topk_owner] if spec.ratio else None,
-            self.indptrs(step)[spec.ratio],
+            self.indptrs(step, a8w4=a8w4)[spec.ratio],
             step,
             self.geometry,
             window,
@@ -987,4 +1199,5 @@ class PagedAttentionCache:
             spec.ratio,
             layers,
             stride,
+            split=True if a8w4 else None,
         )

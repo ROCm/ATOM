@@ -647,6 +647,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # Direct NVFP4 CSA / MXFP8 SWA attention; off retains the BF16 adapter.
+    "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
+    .strip()
+    .lower(),
     # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
     # `mono/hi` package, imported only with this on): on the decode steps it
     # serves, every decoder layer, the verify head, the DSpark draft and the

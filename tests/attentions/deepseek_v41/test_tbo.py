@@ -28,6 +28,19 @@ def attach_ubatch_buffers(builder, max_tokens):
     runner's forward_vars and each microbatch's indptrs."""
     builder.max_num_batched_tokens = max_tokens
     builder.model_runner.forward_vars.update(builder._ubatch_step_buffers())
+    builder._ubatch_prefill_window_staging = [
+        (
+            torch.empty(
+                (4 * builder.geometry.ring_slots + max_tokens)
+                * builder.geometry.window_row_bytes,
+                dtype=torch.uint8,
+                device=builder.device,
+            )
+            if builder.geometry.window_fp8
+            else None
+        )
+        for _ in range(NUM_TBO_UBATCHES)
+    ]
     builder._ubatch_indptrs = [
         {
             ratio: tuple(
@@ -40,7 +53,7 @@ def attach_ubatch_buffers(builder, max_tokens):
     ]
 
 
-def make_builder(device):
+def make_builder(device, kv_dtype="bf16"):
     geo = V41PoolGeometry(
         4,
         ((0, 2), (2, 1)),
@@ -50,6 +63,7 @@ def make_builder(device):
         32,
         layer_ratios=(0, 1, 2),
         index_topk=4,
+        kv_dtype=kv_dtype,
     )
     cache = PagedAttentionCache(geo, 8, 4, device, max_tokens=32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
@@ -70,11 +84,12 @@ def make_parent(
     replaying=None,
     parts=None,
     builder=None,
+    kv_dtype="bf16",
 ):
     """A prefill step of ``lengths`` requests at ``starts``, cut into
     micro-batches ``parts`` (`AttentionMetaData.ubatches`), on ``builder`` or a
     fresh one."""
-    builder = make_builder(device) if builder is None else builder
+    builder = make_builder(device, kv_dtype) if builder is None else builder
     batch = SimpleNamespace(
         is_dummy_run=False,
         is_final_chunk=None,
@@ -99,6 +114,45 @@ def make_parent(
         },
     )
     return builder, parent
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_children_keep_disjoint_staging_across_layers_and_forwards(
+    kv_dtype, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.model_ops.attentions.deepseek_v41.planes import prefill_window
+
+    builder, parent = make_parent(device, kv_dtype=kv_dtype)
+    parts = (
+        UBatchSlice(slice(0, 1), slice(0, 7)),
+        UBatchSlice(slice(0, 2), slice(7, 14)),
+    )
+    pointers = [s.data_ptr() for s in builder._ubatch_prefill_window_staging]
+    assert len(set(pointers + [parent.step.prefill_window_staging.data_ptr()])) == 3
+    for _ in range(2):
+        _, parent = make_parent(device, builder=builder, parts=parts)
+        children = parent.ubatches
+        for layer in range(4):
+            saved = None
+            for i, child in enumerate(children):
+                child.step.begin_forward()
+                assert child.step.prefill_window_staging.data_ptr() == pointers[i]
+                source, tail = prefill_window(
+                    parent.cache.ring_view(layer),
+                    child.step,
+                    builder.geometry.ring_slots,
+                )
+                for plane in tail:
+                    plane.fill_(17 + i + layer)
+                if i == 0:
+                    first = source
+                    saved = tuple(plane.clone() for plane in source)
+                else:
+                    for actual, expected in zip(first, saved):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def attach_engram(parent, rows):
@@ -1059,7 +1113,7 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     assert replayable(child, width) is False
 
 
-@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", 0), ("v41", -1)])
+@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", -1), ("v41", -1)])
 def test_tbo_communication_priority_is_backend_owned(monkeypatch, backend, expected):
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
@@ -1110,7 +1164,8 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     torch.testing.assert_close(context.context.input_ids, ids)
 
 
-def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp4", "fp8"])
+def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv_dtype):
     import json
     from pathlib import Path
 
@@ -1125,8 +1180,9 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
         config=SimpleNamespace(
             hf_config=hf,
             speculative_config=None,
-            kv_cache_dtype="bf16",
+            kv_cache_dtype=kv_dtype,
             index_cache_dtype="fp4",
+            index_cache_layout="preshuffle",
             enable_tbo=True,
             load_dummy=True,
             gpu_memory_utilization=0.75,
@@ -1160,6 +1216,19 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
                 for pair in indptrs.values()
                 for t in pair
             )
+            staging = [
+                self._prefill_window_staging,
+                *self._ubatch_prefill_window_staging,
+            ]
+            if kv_dtype == "bf16":
+                assert staging == [None, None, None]
+            else:
+                assert len({t.data_ptr() for t in staging}) == 3
+                expected = (
+                    2 * self.geometry.ring_slots + 16
+                ) * self.geometry.window_row_bytes
+                assert all(t.numel() == expected for t in staging)
+                used += sum(t.numel() for t in staging)
             monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: used)
             total = self.geometry.paged_bytes * 100
             monkeypatch.setattr(

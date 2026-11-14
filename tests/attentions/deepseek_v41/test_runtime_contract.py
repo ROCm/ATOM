@@ -414,12 +414,16 @@ def test_an_fp8_or_fp4_index_plane_is_admitted(index_dtype):
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("level", [0, 3])
-def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, level):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_native_dspark_passes_production_admission(
+    graph, dynamic, tp_size, level, kv_dtype
+):
     from atom.config import CUDAGraphMode, DSparkConfig
 
     value = runtime_config(
         model="/model",
         tensor_parallel_size=tp_size,
+        kv_cache_dtype=kv_dtype,
         enable_expert_parallel=False,
         enforce_eager=not graph,
         compilation_config=SimpleNamespace(
@@ -442,9 +446,6 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         ),
     )
     validate_runtime_config(value)
-    value.kv_cache_dtype = "fp4"
-    with pytest.raises(ValueError, match="BF16"):
-        validate_runtime_config(value)
 
 
 def test_level3_requires_full_graph_or_eager_runtime():

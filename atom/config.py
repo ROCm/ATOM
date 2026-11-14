@@ -1703,8 +1703,13 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
+    # auto retains the existing BF16 path, independently of target CSA precision.
+    draft_kv_dtype: str = "auto"
 
     def __post_init__(self):
+        if self.draft_kv_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1713,6 +1718,26 @@ class DSparkConfig:
             raise ValueError(
                 "DSpark calibration_profile requires a path and confidence_schedule=True"
             )
+
+    def validate_draft_kv(self, config):
+        if self.draft_kv_dtype == "auto":
+            return
+        spec = config.speculative_config
+        target_dtypes = ("fp8", "fp4")
+        if (
+            config.hf_config.model_type != "deepseek_v41_text"
+            or config.kv_cache_dtype not in target_dtypes
+            or spec is None
+            or spec.method != "dspark"
+            or config.plugin_config is not None
+        ):
+            raise ValueError(
+                f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
+                f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
+            )
+        from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
+
+        validate_fp8_draft_support(config)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -2481,6 +2506,8 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
+        if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
+            raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2631,6 +2658,8 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        self._check_kv_cache_dtype()
+        self.dspark.validate_draft_kv(self)
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
@@ -3018,6 +3047,29 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_kv_cache_dtype(self) -> None:
+        """Validate FP4 support and report performance guidance before sizing."""
+        if self.kv_cache_dtype != "fp4":
+            return
+        from atom.utils.selector import Family, attn_family
+
+        if _is_minimax_m3_config(self.hf_config):
+            # MiniMax's model-specific restrictions are checked later in startup.
+            return
+        if attn_family(self.hf_config) is not Family.CSA2:
+            raise ValueError(
+                "--kv_cache_dtype=fp4 is only supported by MiniMax-M3.1 and "
+                "DeepSeek-V4.1 (CSA2); use bf16 or fp8 for this model."
+            )
+        from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
+
+        warn_fp4_performance(
+            num_heads=self.hf_config.num_attention_heads,
+            attention_tp_size=(
+                1 if self.enable_dp_attention else self.tensor_parallel_size
+            ),
+        )
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None

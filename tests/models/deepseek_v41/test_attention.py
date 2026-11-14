@@ -65,17 +65,21 @@ class _Step:
         self.slots = torch.tensor([slot], device=device, dtype=torch.int32)
 
 
-def _window(packed, start, slot_rows, ring, run_rows):
+def _window(start, ring):
     """`WindowParams` as `geometry.window` builds it for either layout."""
     params = type("Window", (), {})()
-    params.ring_start, params.slot_rows, params.ring_slots = start, slot_rows, ring
-    params.ring_stride, params.run_rows = (1, run_rows) if packed else (ring, ring)
+    params.ring_start, params.slot_rows, params.ring_slots = start, ring, ring
+    params.ring_stride, params.run_rows = ring, ring
     return params
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("packed", [True, False])
-def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
+@pytest.mark.parametrize("planar", [True, False])
+@pytest.mark.parametrize("tokens", [5, 13])
+@pytest.mark.parametrize("start", [0, 4096])
+def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(
+    planar, tokens, start
+):
     """The fused KV seam against the launches it replaces, in both layouts.
 
     Bytes, not a tolerance: the quantization shares its exponent helper with
@@ -83,40 +87,43 @@ def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
     removed kernel boundaries used to round to. A tolerance here would pass
     while the cache and the extend rows disagreed by a code.
 
-    The BF16 arm is the one a server reaches -- `--kv_cache_dtype` offers no
-    `fp4` -- and its reference writer walks the ring per request rather than
-    per token, so agreeing with it also pins that the two grids select the
-    same rows.
+    The planar arm uses an independent host scatter of quantized bytes. The
+    BF16 reference writer walks the ring per request rather than per token.
+    Both check the entire allocation, including untouched rows and padding.
     """
-    from atom.model_ops.attentions.deepseek_v41.packed_rows import write_packed_window
+    from atom.model_ops.attentions.deepseek_v41.planes import split_source
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
     from atom.model_ops.v4_kernels.state_writes import swa_write
 
     torch.manual_seed(725)
-    device, tokens, heads, dim, rope_dim, ring = "cuda", 13, 4, 512, 64, 8
-    slot, start = 3, 4096
-    # A packed ring is addressed in bytes and a BF16 one in rows, so every
-    # length below carries the unit its own pool is indexed in.
-    run_rows = dim + dim // 32 if packed else 1
-    slot_rows = ring * run_rows
-    units_per_row = run_rows if packed else dim
+    device, heads, dim, rope_dim, ring = "cuda", 4, 512, 64, 8
+    slot = 3
     rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
     step = _Step(tokens, slot, device)
     # The RoPE entry reads its row count off the first two dims, so both stay
     # in the batched shape the attention hands over and the kernel takes views.
     query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
     normed = torch.randn(1, tokens, dim, device=device, dtype=torch.bfloat16)
-    window = _window(packed, start, slot_rows, ring, run_rows)
+    window = _window(start, ring)
 
     rotated = rope(normed.clone(), step.positions)
     values, scales = quantize_fp8(rotated)
     qat = quantize_fp8(rotated, dequantize=True)
-    rows = start + (slot + 1) * slot_rows
-    if packed:
-        pool = torch.zeros(rows, device=device, dtype=torch.uint8)
-        write_packed_window(values, scales, pool, step, window, dim)
-        base = start + slot * slot_rows
+    rows = start + (slot + 1) * ring
+    base = start + slot * ring
+    if planar:
+        backing = torch.zeros(
+            rows * (dim + dim // 32), device=device, dtype=torch.uint8
+        )
+        pool = split_source(backing, dim)
+        for token in range(max(0, tokens - 1 - ring), tokens - 1):
+            row = base + int(step.positions[token]) % ring
+            pool[0][row] = values.view(torch.uint8).view(-1, dim)[token]
+            pool[1][row] = scales.view(torch.uint8).view(-1, dim // 32)[token]
+        actual_backing = torch.zeros_like(backing)
+        actual_pool = split_source(actual_backing, dim)
+        written = pool[0][base : base + ring]
     else:
         pool = torch.zeros(rows, dim, device=device, dtype=torch.bfloat16)
         swa_write(
@@ -128,15 +135,12 @@ def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
             window,
             ring,
         )
-        base = (start + slot * slot_rows) * dim
+        actual_pool = torch.zeros_like(pool)
+        written = pool[base : base + ring]
     # Without this the ring arms compare two untouched buffers. Rows, not
     # elements: an element is free to be zero, a whole row is not.
-    written = pool.reshape(-1)[base : base + ring * units_per_row]
-    assert int((written.view(ring, units_per_row) != 0).any(-1).sum()) == min(
-        tokens - 1, ring
-    )
+    assert int((written != 0).any(-1).sum()) == min(tokens - 1, ring)
 
-    actual_pool = torch.zeros_like(pool)
     actual_query = query.clone()
     rope_quant_window(
         actual_query.view(tokens, heads, dim),
@@ -149,7 +153,10 @@ def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
     )
 
     assert torch.equal(actual_query, rope(query.clone(), step.positions))
-    assert torch.equal(actual_pool, pool)
+    if planar:
+        assert torch.equal(actual_backing, backing)
+    else:
+        assert torch.equal(actual_pool, pool)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -298,7 +305,7 @@ class _GridSpy:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("heads", [64, 4, 6])
 @pytest.mark.parametrize(
-    "sink", ["packed_ring", "bf16_ring", "prefill", "query", "query_fp8", "no_query"]
+    "sink", ["planar_ring", "bf16_ring", "prefill", "query", "query_fp8", "no_query"]
 )
 def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink):
     """The head-blocked query grid against a program a head, byte for byte.
@@ -312,6 +319,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     queries rotate separately) has no heads: all three keep a program a head,
     except that the MXFP8 query quantizes 8 heads a program where they divide.
     """
+    from atom.model_ops.attentions.deepseek_v41.planes import split_source
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
@@ -324,12 +332,10 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     query_heads = 0 if sink == "no_query" else heads
     query = torch.randn(tokens, query_heads, dim, device=device, dtype=torch.bfloat16)
     normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
-    packed = sink == "packed_ring"
-    run_rows = dim + dim // 32 if packed else 1
-    window = _window(packed, start, ring * run_rows, ring, run_rows)
-    rows = start + (slot + 1) * ring * run_rows
+    window = _window(start, ring)
+    rows = start + (slot + 1) * ring
     kv_half = sink != "query"
-    head_block = sink in ("packed_ring", "bf16_ring", "prefill", "query") and (
+    head_block = sink in ("planar_ring", "bf16_ring", "prefill", "query") and (
         (heads & (heads - 1)) == 0
     )
     fp8_heads = 8 if sink == "query_fp8" and heads % 8 == 0 else 1
@@ -345,9 +351,11 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
         monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
         out = {"query": query.clone()}
         kwargs = {}
-        if sink == "packed_ring":
-            out["pool"] = torch.zeros(rows, device=device, dtype=torch.uint8)
-            kwargs["ring"] = (out["pool"], step, window)
+        if sink == "planar_ring":
+            out["pool"] = torch.zeros(
+                rows * (dim + dim // 32), device=device, dtype=torch.uint8
+            )
+            kwargs["ring"] = (split_source(out["pool"], dim), step, window)
         elif sink == "bf16_ring":
             out["pool"] = torch.zeros(rows, dim, device=device, dtype=torch.bfloat16)
             kwargs["ring"] = (out["pool"], step, window)

@@ -169,6 +169,14 @@ def test_m3_index_default_follows_the_kv(monkeypatch, kv, index, want):
         monkeypatch, kv_cache_dtype=kv, index_cache_dtype=index, hf=sparse_hf()
     )
     assert (config.kv_cache_dtype, config.index_cache_dtype) == want
+    if kv == "fp4":
+        with pytest.raises(ValueError, match="indexed sparse"):
+            _m3(
+                monkeypatch,
+                kv_cache_dtype=kv,
+                index_cache_dtype=index,
+                hf=sparse_hf(freq=[1, 1, 0, 1]),
+            )
 
 
 # ────────────────────────────────────────────── the draft's own KV dtype ──
