@@ -10,7 +10,14 @@ from atom.models.deepseek_v41.mono.hi_compose import ROWS
 from atom.models.deepseek_v41.mono.hi_runner import served_rows
 
 
-def test_default_serves_every_width():
+def test_default_is_five(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_DSV41_MONO_HI_MAX_REQUESTS", raising=False)
+    assert envs.ATOM_DSV41_MONO_HI_MAX_REQUESTS == 5
+
+
+def test_eight_serves_every_width():
     assert served_rows(8) == list(ROWS)
 
 
