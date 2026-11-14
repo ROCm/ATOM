@@ -798,6 +798,8 @@ class ModelRunner:
     # logits; whether this step deferred the previous verify's status past
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
+    # The LM head whose greedy ids a decode step takes (`_head_output`).
+    dp_argmax_head = None
     spec_status_deferred = False
 
     def __init__(self, rank: int, config: Config):
@@ -1027,6 +1029,20 @@ class ModelRunner:
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
+        if envs.ATOM_DP_MAIN_ARGMAX:
+            from atom.model_ops.embed_head import ParallelLMHead
+
+            heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+            if (
+                self.compute_head is None
+                and getattr(self, "drafter", None) is None
+                and len(heads) == 1
+            ):
+                self.dp_argmax_head = heads[0]
+            logger.info(
+                "ATOM_DP_MAIN_ARGMAX: on=%s (needs one LM head, no drafter)",
+                self.dp_argmax_head is not None,
+            )
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -3421,6 +3437,8 @@ class ModelRunner:
         with `logits`, the logits. A decode graph's capture records it
         (`capture_cudagraph`), the logits at TP 1."""
         head = None if self.compute_head is None else self.compute_head(hidden_states)
+        if head is None and logits and self.dp_argmax_head is not None:
+            head = self.dp_argmax_head.dp_argmax_token(hidden_states)
         if head is None and logits:
             head = self.model.compute_logits(hidden_states)
         return head
@@ -3431,6 +3449,23 @@ class ModelRunner:
         where they stand for the step (`_head_ids_serve`), else the logits."""
         if isinstance(head, tuple) and self._head_ids_serve(head, batch):
             return head
+        if (
+            self.dp_argmax_head is not None
+            and isinstance(head, torch.Tensor)
+            and head.dim() == 1
+        ):
+            # `dp_argmax_token`'s ids stand for a greedy step reading nothing
+            # else; any other takes logits with no collective, as its DP
+            # peers may be taking their ids.
+            if (
+                batch is not None
+                and (batch.temperatures == 0).all()
+                and not batch.any_logprobs
+                and not getattr(batch, "structured_requests", None)
+                and batch.required_channel is None
+            ):
+                return head.to(torch.int32)
+            return self.dp_argmax_head.local_logits(hidden_states[: head.shape[0]])
         if head is None or isinstance(head, tuple):
             return self.model.compute_logits(hidden_states)
         return head
@@ -3604,14 +3639,18 @@ class ModelRunner:
                     logits, batch, rows=logprob_rows
                 )
             channel = self._constrain_required_channel(batch, logits)
-            sampled_tokens = self.sampler(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
+            if self.dp_argmax_head is not None and logits.dim() == 1:
+                # Greedy ids from the DP argmax head (`_step_head`).
+                sampled_tokens = logits
+            else:
+                sampled_tokens = self.sampler(
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    needs_independent_noise=needs_independent_noise,
+                )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
             spec_counts = self.tokenID_processor.zero_spec_counts[: 2 * bs].view(2, bs)
