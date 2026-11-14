@@ -1,0 +1,437 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// The wire protocol between a client and an EngineCore.
+//
+// This file is the specification: what follows is everything a client in any
+// language needs, beyond the messages themselves, to drive an EngineCore.
+// atom/mesh/build.rs compiles it into the Rust binding
+// (atom/mesh/src/atom_engine/wire.rs).
+//
+// ============================================================== SOCKETS ===
+//
+// Each EngineCore has three ZMQ sockets to its one client. The client binds,
+// the Core connects; addresses are ipc:// on one node and tcp:// across nodes.
+//
+//   input    client ROUTER  <- Core DEALER   client -> Core: SubmitBatch only
+//   control  client ROUTER  <- Core DEALER   client -> Core: Abort, Utility,
+//                                            AdminCommand, Shutdown
+//   output   client PULL    <- Core PUSH     Core -> client: everything else
+//
+// input carries requests alone, so a control message never queues behind a
+// large SubmitBatch. A client that writes a socket from several threads
+// serializes those writes.
+//
+// Handshake. On connecting, the Core sends one empty frame on input and one on
+// control. The client reads it on each ROUTER to learn the Core's routing
+// identity, and from then on prefixes every message to that Core with it:
+// [identity, Envelope, data frames...]. The Core's first output message is
+// `Ready`, sent once it can serve; the client sends nothing on input before.
+//
+// ============================================================== MESSAGES ==
+//
+// One message is one ZMQ multipart: frame 0 is a serialized `Envelope`, every
+// later frame is raw bytes that `BufferRef`s in the envelope point into. Bulk
+// data (prompt tokens, media tensors, completion tokens, pickled payloads)
+// never passes through protobuf `bytes`, which would copy it on both ends.
+//
+//   * `protocol_version` is set on every envelope. A receiver drops a message
+//     whose version is not its own; a client treats a Core whose `Ready` has
+//     another version as unusable.
+//   * Frames are numbered from 1. A `BufferRef` names a frame and a byte range
+//     inside it; several refs may share one frame. A writer may pack small
+//     buffers into a shared frame (each starting at a 64-byte-aligned offset)
+//     and give large ones a frame of their own; a reader must not assume
+//     either, only follow the refs.
+//   * Every number in a data frame is little-endian.
+//
+// The data plane -- SubmitBatch, Abort, Shutdown, AdminCommand and every
+// Core output except UtilityReply -- carries no Python-specific type. Two
+// things are Python-only on purpose:
+//   * `Utility` / `UtilityReply` payloads are pickled. Their commands (weight
+//     sync, CUDA IPC handles, collective RPC) only exist for Python callers.
+//     A client that is not Python may still forward them as opaque bytes and
+//     match replies by `request_id`.
+//   * `Value.pickled_value`, for an object the typed kinds cannot express.
+//     Only Python clients send it; any other client treats it as an error.
+//
+// ============================================================== REQUESTS ==
+//
+// Ids. The client assigns `RequestSpec.seq_id` and the Core uses it as the
+// sequence's id; 0 is a valid id. One Core serves one client at a time, which
+// is what keeps the ids unique. Outputs name sequences by `seq_id`.
+//
+// Lifecycle of a request, all on the output socket, in order:
+//   * zero or more `StreamBatch` entries for it; if it ran, the last one has
+//     `finished` set;
+//   * then exactly one `Completions` item, whose `leave_reason` says why it
+//     ended -- or, if the Core could not admit it at all, one `Rejected` item
+//     instead.
+// Output is FIFO per Core, so a request's stream always precedes its
+// completion. A request that ended without running (aborted while still
+// waiting, or one the scheduler can never fit) has no finished stream entry:
+// its Completion is the only terminal signal, and a streaming client must end
+// the stream on it.
+//
+// What the client decides (the Core does as told):
+//   * n > 1 sampling: the client sends n RequestSpecs with distinct seq_ids,
+//     `needs_independent_noise` set and `sibling_index` 0..n-1. They may share
+//     one prompt buffer.
+//   * stop strings: the client tokenizes `SamplingParams.stop_strings` into
+//     `stop_token_sequences`; both travel.
+//   * data parallelism: the client picks the Core; `data_parallel_rank` is
+//     only carried along for the record.
+//   * disaggregated prefill/decode on one GPU: the client sends each request
+//     to both Cores, the prefill one with `max_tokens` = 1.
+//   * aborting: `Abort` names seq_ids; aborting a finished id is a no-op. An
+//     Abort the Core handles before the Submit it follows (the two ride
+//     different sockets) is held for a while and applied on admission.
+//   * structured output: a request whose `SamplingParams.json_schema` is set
+//     must have had its grammar prepared on every rank first (the
+//     `prepare_structured_output` utility); a client that cannot prepare it
+//     must not send one.
+//
+// What the Core derives when the client leaves it out:
+//   * block size, draft token count and per-request cache: always, from the
+//     Core's own config -- they are not on the wire;
+//   * `cache_seed`: hashed from `multimodal_data`;
+//   * `mrope_positions` / `mrope_position_delta`: computed from the prompt and
+//     `multimodal_data` for models that use MRoPE;
+//   * model-specific request validation runs in the Core either way; a request
+//     it refuses comes back `Rejected` with code INVALID.
+//
+// ============================================================== EVOLUTION =
+//
+// Field numbers are never reused; a removed field's number and name go into
+// `reserved`. A change an older peer could misread -- a field changing meaning
+// or type, a new message an older Core would drop -- bumps
+// PROTOCOL_VERSION, the constant every implementation carries
+// (atom_engine::wire::PROTOCOL_VERSION in Rust).
+
+syntax = "proto3";
+
+package atom.engine.v1;
+
+// ---------------------------------------------------------------- common ---
+
+// A byte range inside frame `frame` (>= 1) of the same multipart message.
+message BufferRef {
+  uint32 frame = 1;
+  uint64 offset = 2;
+  uint64 nbytes = 3;
+}
+
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  BOOL = 1;
+  UINT8 = 2;
+  INT8 = 3;
+  INT16 = 4;
+  UINT16 = 5;
+  INT32 = 6;
+  UINT32 = 7;
+  INT64 = 8;
+  UINT64 = 9;
+  FLOAT16 = 10;
+  BFLOAT16 = 11;
+  FLOAT32 = 12;
+  FLOAT64 = 13;
+}
+
+enum TensorKind {
+  NUMPY = 0;         // numpy.ndarray
+  TORCH = 1;         // torch.Tensor
+  NUMPY_SCALAR = 2;  // numpy scalar (a 0-d array on the wire)
+}
+
+// A dense little-endian C-contiguous array.
+message Tensor {
+  BufferRef data = 1;
+  DType dtype = 2;
+  repeated int64 shape = 3;
+  TensorKind kind = 4;
+}
+
+message ValueList {
+  repeated Value items = 1;
+}
+
+message MapEntry {
+  Value key = 1;
+  Value value = 2;
+}
+
+message ValueMap {
+  repeated MapEntry entries = 1;  // insertion order is preserved
+}
+
+// A typed value tree for the dict-shaped fields (multimodal data, KV-transfer
+// params, metrics, admin results). Keeps the distinctions a Python consumer
+// can observe -- tuple vs list, int vs float -- so a decoded value is the
+// value that was encoded. What keys a dict holds is up to the component that
+// owns it; the protocol only carries it.
+message Value {
+  oneof kind {
+    bool null_value = 1;      // set to true; the value is None
+    bool bool_value = 2;
+    sint64 int_value = 3;
+    double float_value = 4;
+    string string_value = 5;
+    bytes bytes_value = 6;
+    ValueList list_value = 7;
+    ValueList tuple_value = 8;
+    ValueMap map_value = 9;
+    Tensor tensor_value = 10;
+    // Python-only escape hatch: a pickled object the typed kinds cannot
+    // express. Non-Python clients never send it.
+    BufferRef pickled_value = 15;
+  }
+}
+
+// ---------------------------------------------------------------- envelope -
+
+message Envelope {
+  uint32 protocol_version = 1;
+  oneof body {
+    // Client -> Core
+    SubmitBatch submit = 10;
+    Abort abort = 11;
+    Utility utility = 12;
+    Shutdown shutdown = 13;
+    AdminCommand admin = 14;
+    // Core -> Client
+    Ready ready = 20;
+    Completions completions = 21;
+    StreamBatch stream = 22;
+    Metrics metrics = 23;
+    UtilityReply utility_reply = 24;
+    Rejected rejected = 25;
+    Stopped stopped = 26;
+    AdminReply admin_reply = 27;
+  }
+}
+
+// ---------------------------------------------------------------- requests -
+
+message StringList {
+  repeated string items = 1;
+}
+
+message StopStrings {
+  oneof value {
+    string single = 1;
+    StringList many = 2;
+  }
+}
+
+// Mirrors atom.sampling_params.RequiredChannel: the channel a
+// `tool_choice="required"` output must open before it may end.
+message RequiredChannel {
+  repeated int32 after = 1;
+  repeated int32 opening = 2;
+  uint32 opens_at = 3;
+  repeated int32 end_ids = 4;
+}
+
+// Mirrors atom.SamplingParams field for field. An absent optional is None,
+// except `temperature`, `top_k` and `top_p`, which take SamplingParams'
+// defaults. `max_tokens` is the request's own and is not shared with the
+// request's other parameters on the Core.
+message SamplingParams {
+  optional double temperature = 1;
+  optional int64 top_k = 2;
+  optional double top_p = 3;
+  optional int64 max_tokens = 4;
+  bool ignore_eos = 5;
+  StopStrings stop_strings = 6;  // absent: None
+  uint32 n = 7;
+  oneof logprobs {               // absent: None
+    bool logprobs_flag = 8;
+    int64 logprobs_count = 9;
+  }
+  RequiredChannel required_channel = 10;  // absent: None
+  uint32 top_logprobs = 11;
+  optional string json_schema = 12;
+  optional string structured_tool_format = 13;
+  string structured_reasoning_end = 14;
+  bool max_tokens_is_default = 15;
+}
+
+message TokenIds {
+  repeated int32 ids = 1;
+}
+
+// The prompt's prefix-cache block-hash chain as the client computed it
+// (atom.model_engine.prefix_hash.ShippedChain). The Core adopts it only after
+// checking it against the prompt, and hashes the prompt itself otherwise.
+message PromptHashChain {
+  uint32 hash_block_size = 1;
+  optional uint64 cache_seed = 2;  // absent: -1, a prompt without media
+  uint32 num_prompt_tokens = 3;
+  uint64 fingerprint = 4;          // xxh64 of the prompt's int32 token bytes
+  BufferRef hashes = 5;            // uint64, one per full hash block
+}
+
+// OpenTelemetry context the Core's request spans join
+// (atom.observability.tracing).
+message TraceContext {
+  map<string, string> carrier = 1;
+  string model = 2;
+  optional string request_id = 3;
+}
+
+// One sequence for the Core to admit. Mirrors the `Sequence` constructor;
+// what the Core derives from its own config is not on the wire (see REQUESTS).
+message RequestSpec {
+  uint64 seq_id = 1;
+  BufferRef prompt_token_ids = 2;  // int32 little-endian, at least one token
+  SamplingParams sampling = 3;
+  repeated TokenIds stop_token_sequences = 4;
+  optional string external_request_id = 5;
+  optional string parent_request_id = 6;
+  uint32 sibling_index = 7;
+  bool needs_independent_noise = 8;
+  Value kv_transfer_params = 9;   // absent: None
+  Value multimodal_data = 10;     // absent: None (a text request)
+  optional uint64 cache_seed = 11;  // absent: the Core hashes the media
+  Value mrope_positions = 12;     // absent: the Core computes them if needed
+  int64 mrope_position_delta = 13;
+  optional int64 data_parallel_rank = 14;
+  optional string dp_session_id = 15;
+  optional string dp_parent_session_id = 16;
+  double arrive_time = 17;        // client wall clock, seconds
+  PromptHashChain prompt_hash_chain = 18;  // absent: the Core hashes the prompt
+  TraceContext trace = 19;        // absent: the request is not traced
+}
+
+message SubmitBatch {
+  repeated RequestSpec requests = 1;
+}
+
+message Abort {
+  repeated uint64 seq_ids = 1;
+}
+
+// A Python-only admin command; `payload` is a pickled dict that holds `cmd`
+// and, for a command its sender waits on, `request_id`.
+message Utility {
+  string cmd = 1;
+  BufferRef payload = 2;
+  optional string request_id = 3;  // the payload's, readable without pickle
+}
+
+// An admin command any client can send. Each Core answers it with one
+// AdminReply carrying the same request_id.
+message AdminCommand {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    START_PROFILE = 1;
+    STOP_PROFILE = 2;
+    GET_MTP_STATISTICS = 3;
+    GET_CACHE_STATISTICS = 4;
+    CLEAR_KV_CACHE = 5;
+  }
+  Kind kind = 1;
+  optional string request_id = 2;
+  optional double timeout = 3;  // seconds the sender will wait
+}
+
+message Shutdown {}
+
+// ---------------------------------------------------------------- outputs --
+
+// The Core is initialized and serving.
+message Ready {
+  // The longest prompt this Core's KV pool can hold, in tokens; absent when
+  // the Core does not own the pool (the prefill half of a disaggregated pair).
+  optional uint64 max_pool_tokens = 1;
+}
+
+// A finished sequence, as much of it as a client reads.
+message Completion {
+  uint64 seq_id = 1;
+  BufferRef completion_token_ids = 2;  // int32
+  BufferRef logprobs = 3;              // float64, one per completion token
+  uint32 num_prompt_tokens = 4;
+  // Prompt tokens whose KV the Core holds: the whole prompt once prefill is
+  // done. Not the prefix-cache hit -- that is StreamBatch.num_cached_tokens.
+  uint32 num_cached_tokens = 5;
+  double arrive_time = 6;
+  double first_token_time = 7;
+  double leave_time = 8;
+  string leave_reason = 9;
+  Value kv_transfer_params_output = 10;  // absent: None
+  optional string external_request_id = 11;
+  optional string parent_request_id = 12;
+  uint32 sibling_index = 13;
+}
+
+message Completions {
+  repeated Completion items = 1;
+}
+
+// One decode step's streamed deltas, column by column: entry i of every
+// repeated field belongs to the same RequestOutput
+// (atom.model_engine.request.RequestOutput). Columns, because this message is
+// sent every step for every running sequence, and a packed column decodes in
+// one call where a message per sequence costs one per field.
+message StreamBatch {
+  repeated uint64 seq_ids = 1;
+  repeated uint32 token_counts = 2;  // how many of `tokens` each entry owns
+  repeated int32 tokens = 3;         // every entry's output tokens, in order
+  repeated bool finished = 4;
+  repeated int64 num_cached_tokens = 5;  // prefix-cache hit, as of this step
+  map<uint32, string> finish_reasons = 6;            // by entry; absent: None
+  map<uint32, Value> kv_transfer_params_outputs = 7;  // by entry; absent: None
+  // Token logprobs, as columns too. An entry listed in `logprob_entries` has
+  // `logprob_counts` records (one per output token, possibly none) of
+  // `logprob_widths` candidates each; an entry not listed has none (None).
+  // A record (atom.model_engine.token_logprobs.TokenLogprob) is
+  // (logprob, rank, top_id_0, top_logprob_0, ...): its floats -- logprob, then
+  // each top_logprob -- go to `logprob_floats`, its ints -- rank, then each
+  // top_id -- to `logprob_ints`, records in entry order.
+  repeated uint32 logprob_entries = 8;
+  repeated uint32 logprob_counts = 9;
+  repeated uint32 logprob_widths = 10;
+  BufferRef logprob_floats = 11;  // float64
+  BufferRef logprob_ints = 12;    // int32
+}
+
+// The Core's metrics snapshot, pushed on its own clock. The dict's keys are
+// owned by EngineUtilityHandler.collect_metrics.
+message Metrics {
+  Value snapshot = 1;
+}
+
+// The reply to a `Utility`; `payload` is a pickled object.
+message UtilityReply {
+  BufferRef payload = 1;
+  optional string request_id = 2;  // the payload's, readable without pickle
+}
+
+message AdminReply {
+  AdminCommand.Kind kind = 1;
+  optional string request_id = 2;
+  Value result = 3;              // absent on error
+  optional string error = 4;
+}
+
+// Sequences the Core could not admit. Each ends the request it names.
+message RejectedRequest {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    INVALID = 1;     // the request itself is malformed or unsupported
+    OVERLOADED = 2;  // the Core cannot take it now; retrying may succeed
+    INTERNAL = 3;    // the Core failed; not the request's fault
+  }
+  uint64 seq_id = 1;
+  string reason = 2;
+  Code code = 3;
+}
+
+message Rejected {
+  repeated RejectedRequest items = 1;
+}
+
+// The Core is going away; no message follows.
+message Stopped {}

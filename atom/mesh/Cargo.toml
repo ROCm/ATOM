@@ -6,7 +6,9 @@ edition = "2021"
 [features]
 default = ["grpc-client"]
 grpc-client = []
-ext-proc = ["dep:prost-types", "dep:tonic-prost", "dep:tonic-prost-build", "tonic/tls-ring"]
+ext-proc = ["dep:prost-types", "dep:tonic-prost", "dep:tonic-prost-build", "dep:protox", "tonic/tls-ring"]
+# The Rust client of the EngineCores (src/atom_engine), off until a caller exists.
+atom-engine = ["dep:zmq", "dep:tonic-prost-build", "dep:protox"]
 
 [lints.rust]
 unused_qualifications = "warn"
@@ -89,10 +91,12 @@ tonic-prost = { version = "0.14.2", optional = true }
 once_cell = "1.21.3"
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
 portpicker = "0.1"
+zmq = { version = "0.10", optional = true }  # zmq-sys 0.12 builds the bundled libzmq from source and links it statically; no system libzmq needed
 
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }
+protox = { version = "0.9", optional = true }  # compiles .proto in-process; no protoc binary
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 

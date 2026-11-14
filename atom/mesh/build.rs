@@ -11,17 +11,30 @@ macro_rules! set_env {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Every .proto is compiled by protox, so no build needs a protoc binary.
+    #[cfg(feature = "atom-engine")]
+    {
+        // The EngineCore's wire protocol, kept beside the EngineCore.
+        const ENGINE_PROTO_DIR: &str = "../model_engine/zmq_protocol";
+        let engine_proto = protox::compile(["engine_v1.proto"], [ENGINE_PROTO_DIR])?;
+        tonic_prost_build::configure()
+            .build_client(false)
+            .build_server(false)
+            .compile_fds(engine_proto)?;
+        println!("cargo:rerun-if-changed={ENGINE_PROTO_DIR}");
+    }
     #[cfg(feature = "ext-proc")]
     {
+        let ext_proc_protos = protox::compile(
+            [
+                "envoy/service/ext_proc/v3/external_processor.proto",
+                "grpc/health/v1/health.proto",
+            ],
+            ["proto"],
+        )?;
         tonic_prost_build::configure()
             .include_file("ext_proc.rs")
-            .compile_protos(
-                &[
-                    "proto/envoy/service/ext_proc/v3/external_processor.proto",
-                    "proto/grpc/health/v1/health.proto",
-                ],
-                &["proto"],
-            )?;
+            .compile_fds(ext_proc_protos)?;
         println!("cargo:rerun-if-changed=proto");
     }
     // Rebuild triggers
