@@ -1,7 +1,5 @@
-#!/bin/bash
-# needs CONC and RESULT_DIR; recipe "MLPerf Endpoint 的 bench（所有模型共用）"
-SERVED_NAME='/models/Deepseek-S3_sq_a05_v2_mlperf6_1/'; TOKENIZER='/data/Deepseek-S3_sq_a05_v2_mlperf6_1'; SERVER='127.0.0.1:8000'; CLIENT='/mnt/data/qichu/ci455/client'
-# Recipe "MLPerf Endpoint 的 bench（所有模型共用）", verbatim. Caller sets SERVED_NAME TOKENIZER SERVER CLIENT CONC RESULT_DIR.
+SERVED_NAME='/models/Deepseek-S3_sq_a05_v2_mlperf6_1/'; TOKENIZER='/data/Deepseek-S3_sq_a05_v2_mlperf6_1'; SERVER='127.0.0.1:8000'; CLIENT='/mnt/data/zejchen/ci455/client'
+# point_yaml <name> <并发> <轨迹数> <warmup|run> <report_dir>
 point_yaml() {
   cat << YAML
 name: "$1"

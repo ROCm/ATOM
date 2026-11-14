@@ -4,11 +4,11 @@
       "dataset_name": "performance",
       "extractor": null,
       "ground_truth_column": null,
-      "score": 0.0,
+      "score": 0.0148,
       "unit_samples": 20403,
       "num_repeats": 1,
-      "total_samples": 5886,
-      "duration_s": 631.026,
+      "total_samples": 3157,
+      "duration_s": 676.999,
       "complete": true,
       "dataset_type": "performance"
     }
