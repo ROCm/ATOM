@@ -82,6 +82,7 @@ try:
         _dcp_a2a_unpack_combine_kernel,
         _lse_pack_slots,
         correct_attn_out,
+        cp_lse_a2a,
         dcp_global_pos,
         dcp_local_index,
         dcp_owner_rank,
@@ -266,6 +267,26 @@ def test_non_power_of_two_world_size_is_rejected():
     lses = torch.randn(3, 2, 2, device=DEV)
     with pytest.raises(AssertionError, match="power of two"):
         correct_attn_out(out, lses, 0)
+
+
+# ───────────────────────────────────────────────────────── fused merge hook ──
+
+
+@needs_dcp_ops
+def test_cp_lse_a2a_takes_the_groups_fused_merge():
+    """A group whose dcp_lse_merge takes the inputs serves the whole merge."""
+    calls = []
+
+    def merge(o, lse, owned_counts=None, return_lse=False):
+        calls.append((tuple(o.shape), lse.dtype, owned_counts, return_lse))
+        return "merged"
+
+    group = SimpleNamespace(world_size=8, dcp_lse_merge=merge)
+    o = torch.zeros(3, 96, 128, dtype=torch.bfloat16)
+    lse = torch.zeros(3, 96, dtype=torch.bfloat16)
+    assert cp_lse_a2a(o, lse, group, return_lse=True) == "merged"
+    # The LSE reaches it as fp32, whatever the caller passed.
+    assert calls == [((3, 96, 128), torch.float32, None, True)]
 
 
 # ─────────────────────────────────────────────────────── get_dcp_local_seq_lens ──
