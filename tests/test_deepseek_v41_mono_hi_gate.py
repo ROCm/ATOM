@@ -115,6 +115,16 @@ def test_auto_serves_the_served_command_line(mi355x, served, caplog):
     assert not [m for m in set(sys.modules) - before if ".mono.hi" in m]
 
 
+def test_auto_serves_tp2(mi355x, served):
+    """TP2 is a served tensor-parallel size beside TP4: the same deployment otherwise."""
+    assert (
+        hi_gate.refusal(
+            _config(served, tensor_parallel_size=2), _drafter(), _builder(), 0
+        )
+        == ""
+    )
+
+
 def test_the_gate_reads_the_values_atom_settled_on(served):
     """Every configuration field the gate reads, as ATOM's ``Config`` holds it for the served command line: the value
     the hook and ATOM's cache use (``--block-size 16`` becomes V4.1's 128-token page).
@@ -147,7 +157,6 @@ def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
 
 UNSUPPORTED = {
     "TP1": ({"tensor_parallel_size": 1}, {}, "TP1"),
-    "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
     "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
     "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),

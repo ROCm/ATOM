@@ -9,9 +9,10 @@ The engine's builds at load skip both (``serving``: FlyDSL's disk cache on) and 
 programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--fits]
-(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108
-programs and their fits, about 10 minutes on 8 CPUs). The Linear prefetch fits are derived and held to the frozen
-table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to regenerate it).
+(``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``, at every served
+TP size, ``hi_gate.SERVED_TPS``: about 10 minutes a TP size on 8 CPUs). The Linear prefetch fits are derived and held
+to the frozen table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the table instead (to regenerate it: every
+served TP size's fits).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from types import SimpleNamespace
 
 from atom.models.deepseek_v41.config import build_attention_topology
 from atom.models.deepseek_v41.mono import hi_compose
-from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX
+from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, SERVED_TPS
 
 TP = 4
 
@@ -104,17 +105,24 @@ def main(argv: list[str]) -> int:
         return 2
     write = "--fits" in argv
     argv = [a for a in argv if a != "--fits"]
-    t0 = time.time()
-    progs = check(config(argv[0]), [int(w) for w in argv[1:]] or None)
+    cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
+    built = {}
+    for tp in SERVED_TPS:
+        t0 = time.time()
+        progs = check(cfg, widths, tp=tp)
+        built[tp] = (len(progs.kernels()), progs.widths, time.time() - t0)
     if (
         write
-    ):  # the frozen table, every fit of the composition (the derived ones it lacked included)
+    ):  # the frozen table, every fit of the compositions (the derived ones it lacked included)
         from .hi.blocks.gfx950 import linear
 
         print(fits_module(dict(linear.DERIVED)), end="")
         return 0
-    print(f"{len(progs.kernels())} hi programs built and checked in {time.time() - t0:.0f} s; "
-          f"{len(missing_fits())} fits not in the frozen table")  # fmt: skip
+    for tp, (n, served, secs) in built.items():
+        print(
+            f"TP{tp}: {n} hi programs built and checked in {secs:.0f} s, widths {served}"
+        )
+    print(f"{len(missing_fits())} fits not in the frozen table")
     return 0
 
 

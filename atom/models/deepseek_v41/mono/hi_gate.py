@@ -2,11 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Whether DeepSeek-V4.1's high-interactivity (hi) monokernels serve this deployment (``ATOM_DSV41_MONO_HI``).
 
-- "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP4 without
-  DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout, ``INDEX_LAYOUTS``), ATOM's 128-token
-  V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA lookup with overlap staging, no KV
-  transfer, a context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry and FlyDSL
-  installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
+- "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP2 or TP4
+  without DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout, ``INDEX_LAYOUTS``), ATOM's
+  128-token V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA lookup with overlap
+  staging, no KV transfer, a context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry
+  and FlyDSL installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
 - "1": the same, but a deployment they do not serve is an error (raised, naming why).
 - "0": never.
 
@@ -28,7 +28,9 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 MODES = ("auto", "1", "0")
-SERVED_TP = 4  # the tensor-parallel size the hi programs are built for (MI355X, the validated configuration)
+# the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations; the schedules' entries
+# were measured at ``schedules.KEY_TP``)
+SERVED_TPS = (2, 4)
 REQ_ROWS = 6  # a verify's rows a request: DSpark's 5 drafts + the anchor
 # the KV cache's page in tokens: ATOM's for V4.1 (``Config`` sets ``kv_cache_block_size`` to 128 for
 # ``deepseek_v41_text`` whatever ``--block-size`` asks); the cache bridge reads the page geometry from ATOM's cache
@@ -101,8 +103,8 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     tp = int(getattr(cfg, "tensor_parallel_size", 1) or 1)
     if dp_ranks:
         return "DP attention"
-    if tp != SERVED_TP:
-        return f"TP{tp} (the hi path serves TP{SERVED_TP})"
+    if tp not in SERVED_TPS:
+        return f"TP{tp} (the hi path serves {' / '.join(f'TP{t}' for t in SERVED_TPS)})"
     arch, cus = _device()
     if arch is not None and arch != ARCH:
         return f"{arch} (the hi path serves {ARCH})"
