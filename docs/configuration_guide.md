@@ -21,6 +21,46 @@ controls ATOM's runtime behaviour.
 | `SamplingParams` | Temperature, max tokens, stop strings, ignore-EOS flag |
 | `EngineArgs` | CLI argument parser that builds a `Config` for `LLMEngine` |
 
+## Expert parallel load balancing (`EPLBConfig`)
+
+Enable expert load balancing with `--eplb-enable` (alias `--enable-eplb`) and
+configure it through the `--eplb-config` JSON object. For example, to select hot
+experts with DeepInfer's history-based replica policy:
+
+```bash
+--eplb-enable --eplb-config '{"num_redundant_experts": 8, "placement_policy": "deepinfer"}'
+```
+
+`num_redundant_experts` is the additional physical-expert budget per MoE layer.
+The total number of physical experts must be divisible by the EP group size.
+`placement_policy` accepts:
+
+- `naive` (default): greedily replicate the expert with the largest current
+  per-replica window-total load, then balance physical experts across ranks.
+- `biased`: fully replicate the hottest experts on every rank in the placement
+  group (within each node for hierarchical placement), then pack the remaining
+  experts into the remaining slots.
+- `deepinfer`: retain each step's logical-expert token counts. For each additional
+  replica, choose the expert that minimizes the sum, over recorded steps, of the
+  maximum per-replica expert load. An expert can receive more than one additional
+  replica. The selected replicas use ATOM's existing balanced packing and weight
+  migration.
+
+The `deepinfer` choice ports the replica selection from
+[DeepInfer's EPLB policy](https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/deepinfer/model_executor/eplb/policy.py).
+It preserves the step dimension: with histories `[100, 60, 0]` and `[0, 60, 80]`,
+the first replica goes to expert 0 even though expert 1 has the highest window
+total. ATOM's prefill sampling and rebalance gate still apply; this option does
+not enable rebalancing during pure decode.
+
+`load_window_size` (default `1000`) sets the history window and
+`rebalance_interval` (default `3000`) sets the prefill-forward rebalance interval;
+the interval must be at least the window size. The balancedness gate can skip an
+interval, and `rebalance_layers_per_chunk` (default `64`) limits how many layers
+migrate between forward passes. See
+[EPLB environment variables](environment_variables.md#eplb) for the optional
+limit on the number of rebalances.
+
 ## Master configuration (`Config`)
 
 Defined in `atom/config.py`. The root dataclass that the engine consumes.
