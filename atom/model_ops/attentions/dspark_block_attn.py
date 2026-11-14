@@ -31,14 +31,9 @@ pool is not, so q stays bf16 there, as everywhere else.
 
 from __future__ import annotations
 
-import logging
-
 import torch
 from aiter.ops.triton.attention import unified_attention as ua
 from aiter.ops.triton.utils.device_info import get_num_sms
-
-logger = logging.getLogger("atom")
-
 
 # The `_UAParams` fields a deployment does not fix: a call's tensors and the
 # counts read off them, and what aiter derives inside the call from its own
