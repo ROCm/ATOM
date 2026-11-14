@@ -147,6 +147,9 @@ DEFAULT: dict = {
     "MOE_DOWN_G": "auto",  # ... down_g, as MOE_UG_G
     "MOE_RT_POLL": "picks",  # MoEExperts rt_poll: "all" or "picks"
     "MOE_RT_LEAN": "auto",  # MoEExperts rt_lean: the rt table on fewer barriers (same table), a bool or "auto"
+    "MOE_RT_WAVE": False,  # MoEExperts rt_wave: the rt table built by wave 0 in registers (a sort, one barrier, no
+    #                       LDS atomics; the same table) where the step's picks fit in a wave (up to 10 rows at K 6);
+    #                       it replaces MOE_RT_LEAN / MOE_RT_POLL's build there
     "MOE_UG_RING": 0,  # MoEExperts ug_ring: a ug task's first units a wave in an LDS ring the previous one fills
     "MOE_DOWN_RING": 0,  # MoEExperts down_ring: a down task's first units a wave copied into an LDS ring before it
     #                     polls mid (they stream during the wait)

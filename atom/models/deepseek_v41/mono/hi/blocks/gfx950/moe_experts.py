@@ -81,12 +81,17 @@ from ...device.gfx950.ops import (
     CM_DEV,
     bf2_f32,
     bf16_round,
+    _xpartner,
+    ballot,
     block_excl_scan,
+    popcount,
     rsrc,
     traced,
     uniform,
     wave_incl_scan,
 )
+from atom.mono.device.ops import lane_gather, lanes_below
+
 from ...device.gfx950.peer import (
     partial3_pairs,
     partial_pairs,
@@ -196,6 +201,9 @@ class _Cfg:
     )
     rt_lean: bool = (
         False  # rt (with rt_picks): the counts zeroed before the poll, both scans on one barrier pair
+    )
+    rt_wave: bool = (
+        False  # rt, at most a wave of picks (route "cta", up to 16 rows): wave 0 builds the table (``_rt_wave``)
     )
     # the activation and its options, always these values (w silu(g) u, the route weight on the act, the combine's
     # one fp32 rounding); kept: the stage keys hash every field
@@ -615,6 +623,9 @@ def _cta_route(k, t, c: _Cfg):
     threads: thread t takes picks t, t + THREADS, .. (``rt_pp``); over 32 rows an expert's mask has ``rt_mw`` words,
     word w at ``w x experts`` (past the first: the slot words, written after the masks are read).
     """
+    if const_expr(c.rt_wave):
+        _rt_wave(k, t, c)
+        return
     n, ne = c.slots, c.e_route
     p = fx.min(k.tid, fx.Int32(n - 1))
     ps = [p] + [fx.min(k.tid + j * THREADS, fx.Int32(n - 1)) for j in range(1, c.rt_pp)]
@@ -704,6 +715,62 @@ def _cta_route(k, t, c: _Cfg):
         c.dq
     ):  # CTA 0 restarts the down queue: the counter (device scope, drained), then the ready flag
         _dq_reset(k, c, (t == 0) & (k.tid == 0))
+
+
+def _rt_wave(k, t, c: _Cfg):
+    """``_cta_route``'s table (rt_wave: at most a wave of picks, no 16-row runs) built by wave 0 in registers: lane
+    p polls pick p (lanes past the picks a clamped duplicate), the wave sorts the keys ``expert << 6 | p`` (a bitonic
+    network over lane ^ j partners; dead picks last), and sorted lane i then holds the pick at place i of the list
+    (the slots' picks in slot order). A slot starts where the expert changes (a ballot: its number the starts
+    below). The same table as the counts and scans: slots ascending by id, each slot's run at the exclusive prefix
+    of the picks; a slot's picks in pick (row) order, where the LDS atomics' arrival order only permuted a slot's
+    MFMA columns. No LDS atomics; one barrier (the readers' and the next task's) instead of five."""
+    _rt_wave_w0(k, c, k.wave == 0)
+    gpu.barrier()
+    if (
+        c.dq
+    ):  # CTA 0 restarts the down queue: the counter (device scope, drained), then the ready flag
+        _dq_reset(k, c, (t == 0) & (k.tid == 0))
+
+
+@traced
+def _rt_wave_w0(k, c: _Cfg, w0):
+    if w0:
+        _rt_wave_build(k, c)
+
+
+def _rt_wave_build(k, c: _Cfg):
+    n, lane = c.slots, k.lane
+    p = fx.min(lane, fx.Int32(n - 1))
+    e, wt = (fx.Int32(v[0]) for v in mb.poll([(k.mb[c.idx], p, 1), (k.mb[c.wts], p, 1)], k.tag))
+    nl = _live_picks(k, c)  # n, or (``Program.dyn_rows``) the live rows' picks
+    dead = fx.Int32(0x7FFFFFFF)
+    key = (lane < nl).select((e << 6) | lane, dead)
+    size = 2
+    while size <= 64:  # bitonic: blocks of ``size`` ascending where lane & size is 0, the last one ascending
+        j = size // 2
+        while j >= 1:
+            o = _xpartner(key, j, lane)
+            lo, hi = fx.min(key, o), fx.max(key, o)
+            lj, ls = j.bit_length() - 1, size.bit_length() - 1
+            keep_lo = (((lane >> lj) ^ (lane >> ls)) & 1) == 0  # the lower lane of an ascending block's pair
+            key = keep_lo.select(lo, hi)
+            j //= 2
+        size *= 2
+    live = lane < nl  # sorted: the live picks first, at their places in the list
+    es, q = key >> 6, key & 63
+    prev = lane_gather(es, fx.max(lane - 1, fx.Int32(0)))
+    wq = lane_gather(wt, q)
+    new = live & ((lane == 0) | (es != prev))
+    starts = ballot(new)
+    slot = lanes_below(starts, lane)
+    count = popcount(starts)
+    _lds_put_if(k, new, c.rt_expert(fx.min(slot, fx.Int32(n - 1))), es)
+    _lds_put_if(k, new, c.rt_start(fx.min(slot, fx.Int32(n - 1))), lane)
+    _lds_put_if(k, live, c.rt_pick(fx.min(lane, fx.Int32(n - 1))), q)
+    _lds_put_if(k, live, c.rt_wt(fx.min(lane, fx.Int32(n - 1))), wq)
+    _lds_put_if(k, lane == 0, c.rt, count)
+    _lds_put_if(k, lane == 0, c.rt_start(count), nl)
 
 
 def _rt_runs(k, c: _Cfg, used, slot, e, start):
@@ -1578,7 +1645,7 @@ class MoEExperts(Block):
                  sh_fmt: str = "mxfp8",
                  down_queue: bool | None = None, sh_own: bool | None = None,
                  weight: str = "ffn.experts", rt_poll: str = "all", chain_own: bool = False,
-                 own_quads: int = THREADS, rt_lean: bool = False, out_arg: str = "",
+                 own_quads: int = THREADS, rt_lean: bool = False, rt_wave: bool = False, out_arg: str = "",
                  route_from=None, ug_ring: int = 0, rs_fmt: str = "f32", down_ring: int = 0,
                  part_fmt: str = "f32", acts: str = "mxfp8", x_lds: bool = False,
                  atom_scales: bool = False):  # fmt: skip
@@ -1672,6 +1739,9 @@ class MoEExperts(Block):
         # a clamped duplicate) or by the threads with a pick ("picks": through LDS to the rest; the same table)
         self.rt_poll = rt_poll
         self.rt_lean = rt_lean  # rt_poll "picks": the rt table on fewer barriers (``_Cfg.rt_lean``; same table)
+        # route "cta": the rt table built by one wave where the step's picks fit in a wave and no expert takes more
+        # than a slot (up to 16 rows; ``_Cfg.rt_wave``; the same table; rt_lean / rt_poll then do not apply)
+        self.rt_wave = rt_wave
         self.shared_inter = shared_inter  # the folded shared expert's width (0: none)
         if down not in ("cols", "slots"):
             raise ValueError(f"MoEExperts: down 'cols' or 'slots', got {down!r}")
@@ -1978,6 +2048,9 @@ class MoEExperts(Block):
             sh_prefetch=self.sh_prefetch, sh_ks=sh_ks, dq=dq, sh_fmt=self.sh_fmt,
             route_mode=self.route, sh_own=own, rt_picks=self.rt_poll == "picks",
             rt_lean=self.rt_lean and self.rt_poll == "picks",
+            rt_wave=bool(self.rt_wave) and self.route == "cta" and sc.rows <= TILE
+            and sc.rows * self.idx.width <= MI355X.wave and not (sc.tp > 1 and self.layout == "expert")
+            and not (self.route_from is not None and (sc.tp == 1 or self.route_from.consumer)),
             own_quads=self.own_quads,
             out_arg=self.out_arg,
             rplan=(self.route_from.route_plan(sc) if self.route_from is not None

@@ -807,7 +807,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
                    layout=k.MOE_LAYOUT, reduce="push" if m_out == "push" else "2shot", chain_own=m_out == "own",
                    own_quads=(128 if m_out == "own" else 512) if k.MOE_OWN_QUADS == "auto" else k.MOE_OWN_QUADS,
                    ug_g=k.MOE_UG_G, down_g=k.MOE_DOWN_G, rt_poll=k.MOE_RT_POLL,
-                   rt_lean=k.MOE_RT_LEAN, ug_ring=int(k.MOE_UG_RING), down_ring=int(k.MOE_DOWN_RING),
+                   rt_lean=k.MOE_RT_LEAN, rt_wave=bool(k.MOE_RT_WAVE), ug_ring=int(k.MOE_UG_RING), down_ring=int(k.MOE_DOWN_RING),
                    rs_fmt=rq if m_out != "push" else "f32",
                    # (TP intra: the routed experts' scale codes are ATOM's, read in place: ``hi_weights.expert_packs``)
                    atom_scales=tp > 1 and k.MOE_LAYOUT == "intra",
