@@ -70,8 +70,8 @@ def _attn_res(prefix, bank, score_weight, eps, add, norm_weight, out_eps, add2, 
 @pytest.fixture(autouse=True)
 def tail_calls(monkeypatch, ranks, split_op_on_cpu):  # noqa: F811
     """Stub sub-modules at TP8 with dual-stream off
-    (ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0); `latent_tail` in torch, logging
-    each call's rank and operands."""
+    (ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0) and an enabled custom all-gather;
+    `latent_tail` in torch, logging each call's rank and operands."""
     for name in ("ReplicatedLinear", "FusedMoE", "KimiMLP", "RMSNorm"):
         monkeypatch.setattr(kimi, name, _Stub)
     monkeypatch.setattr(kimi, "MergedBF16Linears", _Stub)
@@ -84,6 +84,11 @@ def tail_calls(monkeypatch, ranks, split_op_on_cpu):  # noqa: F811
     monkeypatch.setattr(kimi, "get_current_atom_config", lambda: config)
     monkeypatch.setattr(module_dispatch_ops, "get_current_atom_config", lambda: config)
     monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "0")
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
+    group = SimpleNamespace(
+        device_communicator=SimpleNamespace(ca_comm=SimpleNamespace(disabled=False))
+    )
+    monkeypatch.setattr(kimi, "get_tp_group", lambda: group)
     monkeypatch.setattr(
         torch.ops.aiter,
         "kimi_k3_post_attention_forward",
@@ -199,6 +204,30 @@ def test_block_gathers_the_column_tail(ranks, tail_calls, tokens):  # noqa: F811
     for (routed, shared), (output, none), (first, second) in results:
         assert none is None and torch.equal(first, output) and _folded(second)
         assert _is_sum(output, routed, shared)
+
+
+@pytest.mark.parametrize(
+    "custom_gather, ca_comm",
+    [
+        ("0", SimpleNamespace(disabled=False)),
+        ("1", None),
+        ("1", SimpleNamespace(disabled=True)),
+    ],
+    ids=["variable-off", "no-ca-comm", "ca-comm-disabled"],
+)
+def test_block_keeps_the_replicated_tail_without_custom_gather(
+    monkeypatch, ranks, tail_calls, custom_gather, ca_comm  # noqa: F811
+):
+    """With `ATOM_USE_CUSTOM_ALL_GATHER=0` or no enabled `ca_comm`, where
+    aiter's custom all-gather raises, every rank keeps the replicated tail."""
+    monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", custom_gather)
+    group = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=ca_comm))
+    monkeypatch.setattr(kimi, "get_tp_group", lambda: group)
+    blocks = _blocks(_weights())
+    assert all(block.column_tail_rows == 0 for block in blocks)
+    x = torch.randn(8, HIDDEN, generator=torch.Generator().manual_seed(8)).bfloat16()
+    results = ranks(lambda rank: blocks[rank].split_moe_forward(x))
+    assert not tail_calls and all(shared is not None for _, shared in results)
 
 
 def _layers(blocks, layer_num=5):

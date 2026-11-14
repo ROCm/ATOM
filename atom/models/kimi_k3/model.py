@@ -21,6 +21,7 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.tuned_gemm import tgemm
@@ -193,6 +194,16 @@ def _is_e8m0_blockscale(
         and quant_type.value == QuantType.per_1x128.value
         and quant_config.blockscale_e8m0_scale
     )
+
+
+def _custom_all_gather_on() -> bool:
+    """Whether the TP group's all-gather takes aiter's custom kernel:
+    `ATOM_USE_CUSTOM_ALL_GATHER` on and a `ca_comm` built and enabled, both
+    fixed at group build and so alike on every rank."""
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+        return False
+    ca_comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    return ca_comm is not None and not ca_comm.disabled
 
 
 class SituAndMul(nn.Module):
@@ -538,8 +549,11 @@ class KimiSparseMoeBlock(nn.Module):
         ):
             from atom.model_ops.kimi_k3 import latent_tail
 
-            if latent_tail.fits(
-                self.moe_hidden_size, config.hidden_size // self.tp_size
+            if (
+                latent_tail.fits(
+                    self.moe_hidden_size, config.hidden_size // self.tp_size
+                )
+                and _custom_all_gather_on()
             ):
                 self.column_tail_rows = latent_tail.MAX_TOKENS
         if self._use_dispatch_op:
