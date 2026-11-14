@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+from atom.multimodal.processing import media_token_spans
+
 
 class Qwen3VisionPatchEmbed(nn.Module):
     def __init__(
@@ -413,6 +416,31 @@ def _images_before_text(messages: list[dict]) -> list[dict]:
     return reordered
 
 
+# Qwen3.5 multimodal checkpoints: the model types whose image prompts carry
+# explicit embedding spans here and whose MRoPE positions `qwen3_5.py` builds.
+# Defined here rather than in `qwen3_5.py`, which imports AITER: the input
+# builder below is resolved for image requests, so this module must stay free
+# of AITER imports.
+QWEN3_5_MULTIMODAL_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def qwen3_5_image_spans(
+    input_ids: list[int],
+    image_grid_thw: torch.Tensor,
+    image_token_id: int,
+    spatial_merge_size: int,
+) -> tuple[tuple[int, int], ...]:
+    """Each image's ``(start, count)`` run of image tokens, in image order.
+
+    The HF Qwen processor has already expanded every ``<|image_pad|>`` into
+    ``t * h * w / spatial_merge_size**2`` image tokens, one per row the vision
+    tower returns for that grid.
+    """
+    merge_unit = spatial_merge_size**2
+    counts = [t * h * w // merge_unit for t, h, w in image_grid_thw.tolist()]
+    return media_token_spans(input_ids, counts, image_token_id)
+
+
 def build_qwen_vl_inputs(
     atom_config,
     processor,
@@ -421,7 +449,15 @@ def build_qwen_vl_inputs(
     chat_template_kwargs: dict,
     tools=None,
 ) -> tuple[list[int], dict]:
-    """Apply the existing template/processor convention and validate image slots."""
+    """Apply the existing template/processor convention and validate image slots.
+
+    For Qwen3.5 the image token runs are also returned as ``embedding_spans``,
+    so the runner scatters only the slice of each image a forward contains.
+    Without spans the prompt goes through the whole-image merge, which assumes
+    every image token is in the forward; a prefix-cache hit that ends inside or
+    past an image breaks that assumption (ROCm/ATOM#2865). Spans also let an
+    image prompt be chunked instead of prefilled in one forward.
+    """
     if isinstance(prompt, str):
         text = prompt
     else:
@@ -440,7 +476,20 @@ def build_qwen_vl_inputs(
             f"Prompt has {num_placeholders} image placeholders but {len(images)} images"
         )
     processed = processor(text=[text], images=images, return_tensors="pt")
-    return processed["input_ids"][0].tolist(), {
+    input_ids = processed["input_ids"][0].tolist()
+    multimodal_data = {
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": processed["image_grid_thw"],
     }
+    multimodal_config = atom_config.multimodal_config
+    if multimodal_config is None:
+        raise ValueError("This model has no multimodal config, so it takes no images")
+    if multimodal_config.model_type in QWEN3_5_MULTIMODAL_MODEL_TYPES:
+        multimodal_data["embedding_spans"] = qwen3_5_image_spans(
+            input_ids,
+            multimodal_data["image_grid_thw"],
+            image_token_id=multimodal_config.image_token_id,
+            spatial_merge_size=multimodal_config.vision_config.spatial_merge_size,
+        )
+        multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
+    return input_ids, multimodal_data

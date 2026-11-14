@@ -16,7 +16,7 @@ from atom.multimodal import (
     normalize_multimodal_data,
 )
 from atom.multimodal.media import load_multimodal_data
-from atom.multimodal.processing import prepare_multimodal_inputs
+from atom.multimodal.processing import media_token_spans, prepare_multimodal_inputs
 
 
 @pytest.fixture
@@ -28,12 +28,14 @@ def chat(*parts):
     return [{"role": "user", "content": list(parts)}]
 
 
-def config(architecture="Qwen3_5ForConditionalGeneration"):
+def config(architecture="Qwen3_5ForConditionalGeneration", model_type="qwen3_5"):
     return SimpleNamespace(
         hf_config=SimpleNamespace(architectures=[architecture]),
         multimodal_config=SimpleNamespace(
+            model_type=model_type,
+            image_token_id=42,
             media_placeholder_token_id=42,
-            vision_config=SimpleNamespace(merge_kernel_size=2),
+            vision_config=SimpleNamespace(merge_kernel_size=2, spatial_merge_size=2),
         ),
     )
 
@@ -256,8 +258,10 @@ def test_qwen_preparation_preserves_template_options_and_hf_tokens_and_tensors(
     first = image_module.new("RGB", (2, 2), "red")
     second = image_module.new("RGB", (2, 2), "blue")
     hf_output = {
-        "input_ids": np.array([[1, 2, 3]]),
-        "pixel_values": np.ones((4, 3)),
+        # One image token per 2x2 grid after the 2x2 merge, as the processor
+        # expands each <|image_pad|>.
+        "input_ids": np.array([[1, 42, 42, 3]]),
+        "pixel_values": np.ones((8, 3)),
         "image_grid_thw": np.array([[1, 2, 2], [1, 2, 2]]),
     }
     seen = {}
@@ -286,7 +290,7 @@ def test_qwen_preparation_preserves_template_options_and_hf_tokens_and_tensors(
     token_ids, model_inputs = prepare_multimodal_inputs(
         config(), Processor(), messages, {"image": [first, second]}, kwargs
     )
-    assert token_ids == [1, 2, 3]
+    assert token_ids == [1, 42, 42, 3]
     assert model_inputs["pixel_values"] is hf_output["pixel_values"]
     assert model_inputs["image_grid_thw"] is hf_output["image_grid_thw"]
     assert seen["messages"][0]["name"] == "user_1"
@@ -440,3 +444,110 @@ def test_kimi_rendered_prompt_reports_required_conversation_before_loading():
             "prompt",
             {"image": "unused.png"},
         )
+
+
+IMG = 248056  # Qwen3.5 <|image_pad|>
+
+
+def qwen3_5_config(model_type="qwen3_5_moe"):
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
+        multimodal_config=SimpleNamespace(
+            model_type=model_type,
+            image_token_id=IMG,
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        ),
+    )
+
+
+def prepare_qwen3_5(image_module, input_ids, image_grid_thw, model_type="qwen3_5_moe"):
+    hf_output = {
+        "input_ids": np.array([input_ids]),
+        "pixel_values": np.ones((sum(t * h * w for t, h, w in image_grid_thw), 3)),
+        "image_grid_thw": np.array(image_grid_thw),
+    }
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return "<|image_pad|>" * len(image_grid_thw) + " prompt"
+
+        def __call__(self, **kwargs):
+            return hf_output
+
+    images = [image_module.new("RGB", (2, 2)) for _ in image_grid_thw]
+    conversation = chat(*({"type": "image"} for _ in images))
+    return prepare_multimodal_inputs(
+        qwen3_5_config(model_type), Processor(), conversation, {"image": images}
+    )
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+def test_qwen3_5_image_prompts_carry_one_span_per_image(image_module, model_type):
+    # Two images: a 4x4 grid (4 tokens after the 2x2 merge) and a 2x4 grid
+    # (2 tokens), the second directly after the first with no separator.
+    input_ids = [1, 2, IMG, IMG, IMG, IMG, IMG, IMG, 3]
+    token_ids, data = prepare_qwen3_5(
+        image_module, input_ids, [[1, 4, 4], [1, 2, 4]], model_type
+    )
+    assert token_ids == input_ids
+    assert data["embedding_spans"] == ((2, 4), (6, 2))
+    assert isinstance(data["cache_seed"], int)
+
+
+def test_qwen3_5_cache_seed_tells_images_apart(image_module):
+    _, first = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]])
+    _, same = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]])
+    _, other_grid = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 2, 8]])
+    assert first["cache_seed"] == same["cache_seed"]
+    assert first["cache_seed"] != other_grid["cache_seed"]
+
+
+@pytest.mark.parametrize(
+    "input_ids",
+    [
+        [1, IMG, IMG, IMG, 2],  # one token short of the grid's 4
+        [1, IMG, IMG, 2, IMG, IMG],  # the run is split
+        [1, IMG, IMG, IMG, IMG, IMG],  # one image token too many
+    ],
+)
+def test_qwen3_5_image_tokens_that_disagree_with_the_grid_are_rejected(
+    image_module, input_ids
+):
+    with pytest.raises(ValueError, match="placeholder tokens"):
+        prepare_qwen3_5(image_module, input_ids, [[1, 4, 4]])
+
+
+def test_other_qwen_model_types_keep_the_whole_image_merge(image_module):
+    _, data = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]], "qwen4_exp")
+    assert "embedding_spans" not in data and "cache_seed" not in data
+
+
+P = 9  # a placeholder id for the shared span scan
+
+
+@pytest.mark.parametrize(
+    "input_ids, counts, spans",
+    [
+        # MiniMax-M3: each run wrapped in start / end-of-image tokens.
+        ([1, 5, P, P, P, 6, 2, 5, P, P, 6], [3, 2], ((2, 3), (8, 2))),
+        # Qwen3.5: adjacent runs with no separator, split by their counts.
+        ([1, P, P, P, P, P, 2], [3, 2], ((1, 3), (4, 2))),
+        ([1, 2, 3], [], ()),
+    ],
+)
+def test_media_token_spans_claims_each_items_run_in_order(input_ids, counts, spans):
+    assert media_token_spans(input_ids, counts, P) == spans
+
+
+@pytest.mark.parametrize(
+    "input_ids, counts",
+    [
+        ([1, P, P, 2], [3]),  # run shorter than the item needs
+        ([1, P, P, 2, P], [3]),  # run split by another token
+        ([1, P, P, P, P], [3]),  # placeholder left over after the last item
+        ([1, P, P, P], [3, 1]),  # an item with no run at all
+    ],
+)
+def test_media_token_spans_rejects_runs_that_disagree_with_the_items(input_ids, counts):
+    with pytest.raises(ValueError, match="placeholder tokens"):
+        media_token_spans(input_ids, counts, P)
