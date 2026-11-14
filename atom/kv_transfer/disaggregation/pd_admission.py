@@ -4,13 +4,37 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any
 
 from atom.model_engine.capabilities import pcp_group_size_of
 
 logger = logging.getLogger("atom")
+
+_LIMITS = (
+    "max_pending_kv_bytes",
+    "max_pending_kv_fraction",
+    "num_reserved_decode_tokens",
+)
+
+
+def _fraction(name: str, value):
+    if value is None:
+        return None
+    # NaN and infinities fail the range check too.
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 < value <= 1
+    ):
+        raise ValueError(f"pd_admission.{name} must be in (0, 1]")
+    return value
+
+
+def _positive_int(name: str, value):
+    if value is not None and (type(value) is not int or value <= 0):
+        raise ValueError(f"pd_admission.{name} must be a positive integer")
+    return value
 
 
 @dataclass
@@ -41,11 +65,7 @@ class PdAdmissionController:
             raise ValueError("pd_admission.enabled must be a boolean")
         if not options.get("enabled", False):
             return None
-        unknown = options.keys() - {
-            "enabled",
-            "max_pending_kv_bytes",
-            "max_pending_kv_fraction",
-        }
+        unknown = options.keys() - {"enabled", *_LIMITS}
         if unknown:
             raise ValueError(f"Unknown pd_admission options: {sorted(unknown)}")
         if connector is None or not connector.supports_pd_admission:
@@ -62,48 +82,56 @@ class PdAdmissionController:
         if len(entry_bytes) != 1 or entry_bytes[0] <= 0:
             raise ValueError("pd_admission requires a single paged KV pool layout")
         block_bytes = entry_bytes[0]
-        byte_limit = options.get("max_pending_kv_bytes")
-        fraction = options.get(
-            "max_pending_kv_fraction", None if byte_limit is not None else 0.15
+        limits = [name for name in _LIMITS if name in options]
+        for name in limits:
+            if options[name] is None:
+                raise ValueError(f"pd_admission.{name} cannot be null; omit it")
+        byte_limit = _positive_int(
+            "max_pending_kv_bytes", options.get("max_pending_kv_bytes")
         )
-        if byte_limit is not None and (type(byte_limit) is not int or byte_limit <= 0):
-            raise ValueError(
-                "pd_admission.max_pending_kv_bytes must be a positive integer or null"
-            )
+        # Each limit is opt-in; the 0.15 byte budget applies only when none is set.
+        fraction = _fraction(
+            "max_pending_kv_fraction",
+            options.get("max_pending_kv_fraction", None if limits else 0.15),
+        )
+        reserve_tokens = _positive_int(
+            "num_reserved_decode_tokens", options.get("num_reserved_decode_tokens")
+        )
         if fraction is not None:
-            if (
-                isinstance(fraction, bool)
-                or not isinstance(fraction, (int, float))
-                or not math.isfinite(fraction)
-                or not 0 < fraction <= 1
-            ):
-                raise ValueError(
-                    "pd_admission.max_pending_kv_fraction must be in (0, 1]"
-                )
             if byte_limit is not None:
                 raise ValueError("Set only one PD byte limit: bytes or fraction")
             byte_limit = max(1, int(config.num_kvcache_blocks * block_bytes * fraction))
-        if byte_limit is None:
-            raise ValueError("pd_admission requires a receive-byte limit")
-        return cls(byte_limit, block_bytes, connector, block_manager)
+        return cls(
+            byte_limit,
+            block_bytes,
+            connector,
+            block_manager,
+            reserve_tokens=reserve_tokens,
+        )
 
-    def __init__(self, max_bytes, block_bytes, connector, block_manager):
+    def __init__(
+        self, max_bytes, block_bytes, connector, block_manager, *, reserve_tokens=None
+    ):
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
         # The receive range is the connector's prefix-skip rule over the
         # allocator's destination table; neither is the scheduler's to know.
         self._connector = connector
         self._block_manager = block_manager
+        # Decode tokens kept free for each admitted request to grow by.
+        self.reserve_tokens = reserve_tokens
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
         # Requests deferred, once per admission wait and limit, for the metrics
         # snapshot. `_deferred_by` holds the limits each waiting request hit.
-        self.deferred = {"bytes": 0}
+        self.deferred = {"bytes": 0, "free_kv": 0}
         self._deferred_by: dict[str, set[str]] = {}
         logger.info(
-            "PD admission enabled: pending_kv_bytes=%d per D rank, "
-            "block_bytes=%d; credits held until first forward",
+            "PD admission enabled: pending_kv_bytes=%s per D rank, "
+            "reserved_decode_tokens=%s per request, block_bytes=%d; credits held "
+            "until first forward",
             max_bytes,
+            reserve_tokens,
             block_bytes,
         )
 
@@ -124,12 +152,13 @@ class PdAdmissionController:
                 states["receiving"] += 1
         return states
 
-    def check(self, seq, probe) -> tuple[bool, ReceivePlan | None]:
+    def check(self, seq, probe, *, running) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
         Takes no credit and publishes nothing, so a caller that does not reach
         `commit` (allocation or detach declined) just drops the result. The
-        plan is `None` when this is not a PD receive.
+        plan is `None` when this is not a PD receive. `running` is the
+        scheduler's running requests on this D rank.
         """
         num_blocks = self._block_manager.num_pool_blocks(len(seq))
         offset = self._connector.pd_receive_block_offset(
@@ -138,25 +167,68 @@ class PdAdmissionController:
         if offset is None:
             return True, None
         plan = ReceivePlan(offset, num_blocks)
-        # With no pending receive, allow a single request past the soft
-        # limit. The normal allocator still enforces the hard capacity and
-        # lookahead checks.
-        if not self.pending:
+        # The normal allocator still enforces the hard capacity and lookahead
+        # checks past either soft limit.
+        hit = []
+        # With no pending receive, one request may pass the byte budget, so a
+        # prompt larger than it is not starved.
+        if self.pending and self.max_bytes is not None:
+            receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
+            if self.pending_bytes + receive_blocks * self.block_bytes > self.max_bytes:
+                hit.append("bytes")
+        # The reserve is growth room for every admitted request, including
+        # those past their first batch and so no longer pending. Only an idle D
+        # admits below it, so a request that alone exceeds it is not starved.
+        if (self.pending or running) and self.reserve_tokens is not None:
+            # What this request takes off the free list now: the allocator's
+            # demand, where a hit on a cached-but-free block counts and one on
+            # a block another request holds does not. The draft lookahead in it
+            # is decode growth, which a PD receive allocates at its first decode.
+            demand = probe.num_new_blocks - self._block_manager.draft_lookahead_blocks(
+                len(seq)
+            )
+            reserve = self._growth_reserve(seq, num_blocks, running)
+            if self._block_manager.kv.num_free - demand < reserve:
+                hit.append("free_kv")
+        if not hit:
             return True, plan
-        receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
-        if self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes:
-            return True, plan
-        reason = "bytes"
         # One deferral per admission wait and limit, however many passes it
         # takes; a repeated pass allocates nothing.
         key = str(seq.id)
         reasons = self._deferred_by.get(key)
         if reasons is None:
             reasons = self._deferred_by[key] = set()
-        if reason not in reasons:
-            reasons.add(reason)
-            self.deferred[reason] += 1
+        for reason in hit:
+            if reason not in reasons:
+                reasons.add(reason)
+                self.deferred[reason] += 1
         return False, plan
+
+    def _growth_reserve(self, seq, num_blocks, running) -> int:
+        """Blocks `seq` and every admitted request need to grow by the reserve.
+
+        An admitted request is pending or running, counted once: a ready one
+        can already be RUNNING. A cancelled receive drains without decoding.
+        """
+        growing = {s.id: s for s in running}
+        for entry in self.pending.values():
+            if not entry.cancelled:
+                growing.setdefault(entry.sequence.id, entry.sequence)
+        # `seq` will hold just its prompt's `num_blocks`; `check` left its
+        # draft lookahead to this reserve.
+        reserve = self._growth_blocks(seq, num_blocks)
+        for admitted in growing.values():
+            reserve += self._growth_blocks(admitted, len(admitted.block_table))
+        return reserve
+
+    def _growth_blocks(self, seq, held: int) -> int:
+        # Past the blocks `seq` holds, which can lead its length by a draft
+        # lookahead already allocated or trail it by the block this step's
+        # decode has yet to take. No more than it may still generate.
+        tokens = min(
+            self.reserve_tokens, max(0, seq.max_tokens - seq.num_completion_tokens)
+        )
+        return max(0, self._block_manager.num_pool_blocks(len(seq) + tokens) - held)
 
     def _charged_hits(self, probe, offset: int) -> int:
         """Prefix hits inside the receive range that pending credits already hold.
