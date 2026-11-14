@@ -281,3 +281,24 @@ def test_merged_replicated_splits_v41_qkv_a_scale_rows(linear_modules):
     assert torch.equal(module.weight[1280:].float(), shards[1][0].float())
     assert torch.equal(module.weight_scale[:40].float(), shards[0][1].float())
     assert torch.equal(module.weight_scale[40:].float(), shards[1][1].float())
+
+
+@pytest.mark.parametrize(
+    "gfx, k, want",
+    [("gfx950", 288, False), ("gfx950", 512, True), ("gfx1250", 288, True)],
+)
+def test_gfx950_group32_weight_whose_k_is_not_a_multiple_of_64_stays_row_major(
+    linear_modules, monkeypatch, gfx, k, want
+):
+    """V4.1-Flash's shared-expert down projection at TP8 (K = 2304 / 8 = 288): gfx950's preshuffled group32 GEMM
+    runs no such K, so the weight stays row-major for AITER's plain group32 GEMM."""
+    linear, _ = linear_modules
+    from aiter import QuantType
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: gfx)
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1")
+    got = linear.weight_is_stored_preshuffled(
+        QuantType.per_1x32, linear.dtypes.fp8, native_group_rows=32, input_size=k
+    )
+    assert got == want

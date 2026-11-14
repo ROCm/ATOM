@@ -664,6 +664,7 @@ def weight_is_stored_preshuffled(
     *,
     needs_preshuffled_weight: bool = False,
     native_group_rows: int | None = None,
+    input_size: int | None = None,
 ) -> bool:
     """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
 
@@ -712,6 +713,12 @@ def weight_is_stored_preshuffled(
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
+        if gfx == "gfx950" and input_size is not None and input_size % 64:
+            # gfx950's preshuffled group32 GEMM runs no K that is not a
+            # multiple of 64 (V4.1-Flash's shared-expert down projection at
+            # TP8, K = 288): such a weight stays row-major for the plain
+            # group32 GEMM, which does
+            return False
         return gfx == "gfx1250" or (
             envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and gfx == "gfx950"
         )
@@ -1348,6 +1355,7 @@ class LinearBase(nn.Module):
                     self, "needs_preshuffled_weight", False
                 ),
                 native_group_rows=self.native_a8_group_rows,
+                input_size=self.weight.shape[-1],
             ):
                 shuffle_weights(self.weight)
             return
