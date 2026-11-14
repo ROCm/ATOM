@@ -117,6 +117,7 @@ DP-state barrier drives shutdown.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import NamedTuple
@@ -408,7 +409,9 @@ class PrefillDelayer:
         #                                decode completion within the hold)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
-        #                → every rank's cost), read back as rank_prefill_costs
+        #                → every rank's cost), read back as rank_prefill_costs,
+        #                rounded up: a cost target set to the costliest rank's
+        #                cost then never falls below that rank's own chunk
         # With cost_gate (on top of the costs), a `_Gate` after them, from
         #   `_gate_at`: waiting requests, the rank's decode step in µs and its
         #   prefill time a cost unit in ps, ranks that timed both (the divisor
@@ -581,8 +584,8 @@ class PrefillDelayer:
                 rank flags the age guard; all ranks release after decode
                 protection. No waiting prefill / max_queue_ms=None → inactive.
             prefill_cost: this rank's estimated prefill chunk cost (0 if none).
-                With exchange_prefill_costs every rank's value is in
-                ``rank_prefill_costs`` after the call.
+                With exchange_prefill_costs every rank's value, rounded up, is
+                in ``rank_prefill_costs`` after the call.
             waiting_requests: requests on this rank a hold keeps waiting
                 (fresh prefills and resumable partials); read by the cost gate.
             arrived_requests: requests added to this rank since the previous
@@ -640,7 +643,7 @@ class PrefillDelayer:
         self._reduce_buf[10] = 1 if unreachable else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
-            self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
+            self._reduce_buf[_FIXED_SLOTS + self._rank] = math.ceil(prefill_cost)
         # one scheduler step since the previous decision (0: none yet, or untimed)
         step_s = 0.0
         if self._cost_gate:
