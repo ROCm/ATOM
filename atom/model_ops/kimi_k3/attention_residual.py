@@ -200,6 +200,8 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
             ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
+            # Every warp loaded the epoch before the poll's cross-warp min, so
+            # no warp reads this store back as its own.
             tl.store(epochs_ptr + t, flag)
         if DO_ADD2:
             ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
