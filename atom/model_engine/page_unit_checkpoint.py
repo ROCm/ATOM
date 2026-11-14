@@ -182,7 +182,9 @@ def published_page_unit_bytes(builder) -> int:
 
     The state image lives in the target's own PAGE rows, so the unit is the
     target builder's share of the paged class, not the merged entry: a draft
-    KV pool joined to the same class is ordinary KV after those rows. A
+    KV pool joined to the same class is ordinary KV after those rows, and the
+    routed-expert capture rows are charged to the block id but not declared
+    by the builder. A
     backend whose charged share exceeds what it publishes (alignment padding
     that is not a region) narrows it with `checkpoint_page_unit_bytes()`;
     `None` keeps the share.

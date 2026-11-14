@@ -23,6 +23,9 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     plan_pools,
     state_pool,
 )
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    capture_bytes_per_kv_block,
+)
 
 
 def make_store(num_units=20, unit_bytes=10, slot_bytes=25):
@@ -753,3 +756,14 @@ def test_backend_published_unit_overrides_the_share():
 def test_page_unit_needs_target_page_bytes():
     with pytest.raises(RuntimeError, match="declares no PAGE bytes"):
         published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
+
+
+def test_page_unit_excludes_draft_kv_and_routed_expert_surcharge():
+    """The draft pool and the R3 capture rows share the PAGE block id, so the
+    plan charges them, but they are not part of the state image."""
+    target = _Builder([page_pool(4096), state_pool("ssm", 777, entries_per_req=1)])
+    draft = [page_pool(1024)]
+    surcharge = page_pool(capture_bytes_per_kv_block(16, 4, 2))
+    plan = plan_pools(list(target.sub_pool_specs()) + draft + [surcharge], 1 << 30, 4)
+    assert plan.entry_bytes[plan.paged_class] == 4096 + 1024 + surcharge.entry_bytes
+    assert published_page_unit_bytes(target) == 4096

@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -107,6 +107,11 @@ class AttentionBackend(ABC):
 
 class AttentionMetadataBuilder(ABC, Generic[T]):
     """Abstract class for attention metadata builders."""
+
+    # Every forward's `attn_metadata.slot_mapping` holds one KV slot per token
+    # the step runs, graph capture included. Routed-expert capture indexes by
+    # it, so `enable_return_routed_experts` refuses a builder that does not.
+    supplies_token_slots: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(self, block_size: int) -> None:

@@ -2097,8 +2097,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs, var["max_qlen"])
         else:
             ctx_pa_ps = {}
+        # The graph runs bs * max_qlen tokens (max_qlen > 1 for an MTP verify),
+        # so slot_mapping needs one entry per token, as in `prepare_decode`:
+        # routed-expert capture refuses a slot_mapping shorter than the
+        # tokens it routes.
+        capture_tokens = bs * int(var["max_qlen"])
         attn_metadata = AttentionMetaData(
-            slot_mapping=var["slot_mapping"].gpu[:bs],
+            slot_mapping=var["slot_mapping"].gpu[:capture_tokens],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
             max_seqlen_q=var["max_qlen"],
@@ -2120,7 +2125,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         # A capture runs a full synthetic batch, so nothing is padded and the
         # scheduled shape is the running one.
-        capture_tokens = bs * int(var["max_qlen"])
         positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(
             positions=positions,

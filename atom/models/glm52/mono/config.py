@@ -21,7 +21,11 @@ from atom.models.glm52.mono.kernels.geometry_config import (
 from atom.models.glm52.mono.kernels.layout import INDEX_SEG, index_cp_world
 from atom.models.utils import is_neox_rope_style
 from atom.mono.plan.shard import Shard
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    routed_experts_refusal,
+)
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 
@@ -263,6 +267,7 @@ def config_refusal(atom_config) -> str | None:
     checks += common_refusals(
         atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False
     ) + [
+        routed_experts_refusal(atom_config),
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),
         (not atom_config.enable_dp_attention, "DP attention"),

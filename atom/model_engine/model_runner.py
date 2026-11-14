@@ -98,6 +98,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     PoolPlan,
     SubPoolSpec,
     page_entry_bytes,
+    page_pool,
     plan_pools,
 )
 from atom.model_ops.decode_input_ids import (
@@ -108,6 +109,16 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    RoutedExpertsPatch,
+    batch_prefix_slots,
+    capture_bytes_per_kv_block,
+    capture_row_bytes,
+    current_slot_mapping,
+    fused_moe_modules,
+    merge_routed_patches,
+)
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
 from atom.model_ops.required_channel import (
@@ -117,6 +128,7 @@ from atom.model_ops.required_channel import (
 )
 from atom.model_ops.sampler import SAMPLER_EPS, sampler_from_config
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.models.utils import extract_layer_index
 from atom.mono.runtime.step_override import StepOverrideModel
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
@@ -296,8 +308,15 @@ class tokenIDProcessor:
         data_ready: torch.cuda.Event,
         copy_done: torch.cuda.Event | None = None,
         gpu_logprobs: torch.Tensor | None = None,
+        gpu_routed_experts: RoutedExpertsPatch | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
+        # Held middle-chunk routes (older) first: `data_ready` follows their
+        # forwards, so this copy_done covers them with no extra wait.
+        gpu_patches = self._held_routed_experts
+        self._held_routed_experts = []
+        if gpu_routed_experts is not None:
+            gpu_patches.append(gpu_routed_experts)
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
@@ -306,11 +325,29 @@ class tokenIDProcessor:
                 if gpu_logprobs is not None
                 else None
             )
+            cpu_routes = [
+                patch._replace(rows=patch.rows.to("cpu", non_blocking=True))
+                for patch in gpu_patches
+            ]
             copy_done.record(self.async_copy_stream)
-        # The sampled ids and logprobs are fresh every step; the entry holds
-        # them until recv_async_output has waited on copy_done.
-        cpu_tensor_handle.append((cpu_tensor, copy_done, (gpu_tensor, gpu_logprobs)))
+        # The sampled ids, logprobs and routes are fresh every step; the entry
+        # holds them until recv_async_output has waited on copy_done.
+        sources = [gpu_tensor, gpu_logprobs]
+        sources.extend(patch.rows for patch in gpu_patches)
+        cpu_tensor_handle.append((cpu_tensor, copy_done, sources))
         self.logprobs_cpu.append(cpu_logprobs)
+        self.routed_experts_cpu.append(cpu_routes)
+
+    def add_held_routed_experts(self, gpu_routed_experts: RoutedExpertsPatch) -> None:
+        """Keep an output-less forward's routes on the device for the next copy.
+
+        A pure middle prefill chunk queues no copy of its own. Its rows ride
+        the next ``send_to_cpu_async``, whose ``data_ready`` already orders
+        after this forward, so they arrive one output later than its own step
+        would (``Scheduler._record_routes_owed`` counts them owed until then)
+        and no pending entry waits on this forward.
+        """
+        self._held_routed_experts.append(gpu_routed_experts)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
@@ -330,6 +367,15 @@ class tokenIDProcessor:
         if not self.logprobs_cpu:
             return None
         return self.logprobs_cpu.pop(0)
+
+    def recv_routed_experts(self) -> RoutedExpertsPatch | None:
+        """Pop the earliest entry's routes as one host patch, oldest step first.
+        Must be called after recv_async_output, whose wait covers their copy.
+        """
+        if not self.routed_experts_cpu:
+            return None
+        patches = self.routed_experts_cpu.pop(0)
+        return merge_routed_patches(patches) if patches else None
 
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
         # The next replay of this draft output follows a whole target forward.
@@ -363,6 +409,8 @@ class tokenIDProcessor:
         self._wait_for_pending_copies()
         self.token_ids_cpu: list[tuple] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
+        self.routed_experts_cpu: list[list[RoutedExpertsPatch]] = []
+        self._held_routed_experts: list[RoutedExpertsPatch] = []
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
@@ -432,7 +480,17 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
-    ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
+        gpu_routed_experts: RoutedExpertsPatch | None = None,
+    ) -> tuple[
+        dict[int, tuple[int, ...]],
+        dict[int, list[TokenLogprob]] | None,
+        RoutedExpertsPatch | None,
+    ]:
+        """The previous step's ids, logprobs and routes; queues this step's.
+
+        Undeferred, this step's own ids and logprobs, and no routes: routed-
+        expert capture refuses every undeferred configuration.
+        """
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
@@ -447,15 +505,17 @@ class tokenIDProcessor:
             logprobs_map = unpack_token_logprobs(
                 payload, req_ids, ret, batch.return_logprobs
             )
-            return ret, logprobs_map
+            return ret, logprobs_map, None
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
+        routed_experts = self.recv_routed_experts()
         self.send_to_cpu_async(
             sampled_token_ids,
             self.token_ids_cpu,
             sync_event,
             gpu_logprobs=sampled_logprobs,
+            gpu_routed_experts=gpu_routed_experts,
         )
         token_id_dict = {}
         logprobs_map = None
@@ -485,7 +545,7 @@ class tokenIDProcessor:
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         self.prev_channel_states = channel_states
-        return token_id_dict, logprobs_map
+        return token_id_dict, logprobs_map, routed_experts
 
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
         prev_req_ids = self.prev_batch.req_ids
@@ -800,11 +860,16 @@ class ModelRunner:
     compute_head: Callable | None = None
     spec_status_deferred = False
 
+    # Read on every step; the per-step route hooks run only when it is set.
+    _return_routed_experts: bool = False
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
+        self._return_routed_experts = bool(config.enable_return_routed_experts)
+        self._routed_experts_capturer: RoutedExpertsCapturer | None = None
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1283,6 +1348,7 @@ class ModelRunner:
                 del self.model
             if hasattr(self, "drafter"):
                 del self.drafter
+            self._routed_experts_capturer = None
             torch.cuda.empty_cache()
         return True
 
@@ -1838,6 +1904,14 @@ class ModelRunner:
         specs = list(self.attn_metadata_builder.sub_pool_specs())
         if hasattr(self, "draft_kv_builder"):
             specs += self.draft_kv_builder.sub_pool_specs()
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            num_layers, top_k = geo
+            specs.append(
+                page_pool(
+                    capture_bytes_per_kv_block(self.block_size, num_layers, top_k)
+                )
+            )
         return specs
 
     def _state_pool_names(self) -> list[str]:
@@ -2069,6 +2143,11 @@ class ModelRunner:
         )
 
         torch.set_default_device(None)
+
+        geo = self._routed_experts_geometry()
+        if geo is not None:
+            # The capture buffer's pad row, charged once rather than per block.
+            available_for_kv = max(0, int(available_for_kv) - capture_row_bytes(*geo))
 
         specs = self._sub_pool_specs()
 
@@ -2475,6 +2554,11 @@ class ModelRunner:
             num_blocks=num_kvcache_blocks,
         )
 
+        # Capture buffer is part of the PAGE budget (per-slot int32 routes).
+        # Allocate it before the expected-vs-actual check so the measurement
+        # includes those bytes rather than warning on a false mismatch.
+        self._bind_routed_experts_layers(num_kvcache_blocks)
+
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
         # `block_bytes × num_blocks`) AND the per-request cache tensors (state
@@ -2488,7 +2572,7 @@ class ModelRunner:
         # straight from the sizing plan — which already absorbed the pipeline-
         # parallel reconciliation — so this mirrors the budget by construction
         # rather than re-deriving it.
-        expected_kv_bytes = self.pool_plan.total_reserved_bytes
+        expected_kv_bytes = self._expected_kv_bytes(num_kvcache_blocks)
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the
@@ -2514,6 +2598,125 @@ class ModelRunner:
         ):
             torch.distributed.barrier()
         return True
+
+    def _expected_kv_bytes(self, num_kvcache_blocks: int) -> int:
+        """Bytes this rank's KV allocation should measure.
+
+        The plan's reservation, less the capture rows on a rank other than
+        TP 0: every rank is charged them, so all plan one block count, but
+        only rank 0 allocates them.
+        """
+        expected = self.pool_plan.total_reserved_bytes
+        geo = self._routed_experts_geometry()
+        if geo is not None and self.rank != 0:
+            expected -= int(num_kvcache_blocks) * capture_bytes_per_kv_block(
+                self.block_size, *geo
+            )
+        return expected
+
+    def _routed_experts_geometry(self) -> tuple[int, int] | None:
+        """``(num_layers, top_k)`` for the capture buffer, or None if unused.
+
+        Raises for a model or attention backend whose routes cannot be
+        captured. Cached so every pool plan sizes the buffer from one walk.
+        """
+        if hasattr(self, "_routed_experts_geo"):
+            return self._routed_experts_geo
+        if not self._return_routed_experts:
+            self._routed_experts_geo = None
+            return None
+        if not hasattr(self, "model"):
+            return None
+        layers = self._routed_experts_layers()
+        if not layers:
+            raise ValueError(
+                "enable_return_routed_experts requires at least one FusedMoE "
+                "module; this model has none (dense checkpoints cannot "
+                "return routed_experts)"
+            )
+        builder_cls = type(self.attn_metadata_builder)
+        if not builder_cls.supplies_token_slots:
+            raise ValueError(
+                "enable_return_routed_experts requires per-token KV slots in the "
+                f"attention metadata; {builder_cls.__name__} does not supply them, "
+                "so routes would never be written"
+            )
+        num_layers = int(self.hf_text_config.num_hidden_layers)
+        layer_ids = [idx for _, idx in layers]
+        for moe, idx in layers:
+            if not 0 <= idx < num_layers:
+                raise ValueError(
+                    f"FusedMoE {moe.prefix!r} resolves to layer {idx}, outside the "
+                    f"model's {num_layers} decoder layers"
+                )
+        if len(set(layer_ids)) != len(layer_ids):
+            dup = sorted({i for i in layer_ids if layer_ids.count(i) > 1})
+            raise ValueError(
+                f"FusedMoE modules share decoder layer ids {dup}; their routes "
+                "would overwrite each other"
+            )
+        self._routed_experts_geo = (
+            num_layers,
+            max(int(moe.top_k) for moe, _ in layers),
+        )
+        return self._routed_experts_geo
+
+    def _routed_experts_layers(self) -> list[tuple[Any, int]]:
+        """The target model's FusedMoE modules and their decoder layers.
+
+        The exported layer axis is the decoder's, dense layers included, so a
+        consumer indexes it by decoder layer. The drafter is not walked: its
+        MoE must not write over the target's routes.
+        """
+        return [
+            (moe, extract_layer_index(moe.prefix))
+            for moe in fused_moe_modules(self.model)
+        ]
+
+    def _bind_routed_experts_layers(self, num_kvcache_blocks: int) -> None:
+        """Allocate the capture buffer and bind each target FusedMoE its layer's
+        view, as part of binding the KV cache, so both share one lifecycle."""
+        geo = self._routed_experts_geometry()
+        # Only TP rank 0 exports routes; the others keep the KV-pool charge,
+        # so every rank plans the same block count, but bind nothing.
+        if geo is None or self.rank != 0:
+            return
+        num_layers, top_k = geo
+        num_slots = int(num_kvcache_blocks) * int(self.block_size)
+        capturer = RoutedExpertsCapturer(
+            num_slots=num_slots,
+            num_layers=num_layers,
+            top_k=top_k,
+            device=self.device,
+        )
+        for moe, idx in self._routed_experts_layers():
+            capturer.bind(moe, idx)
+        self._routed_experts_capturer = capturer
+
+    def _gather_routed_experts_step(
+        self, batch: ScheduledBatch
+    ) -> RoutedExpertsPatch | None:
+        """This step's routes on the device, for its token copy to carry.
+
+        None off TP rank 0, with capture off, and on warmup passes. Must run in
+        the same forward as ``prepare_model`` and before the drafter rewrites
+        its ``slot_mapping``: each request's first position is read from that
+        forward's ``positions`` mirror.
+        """
+        if not self._return_routed_experts or batch.is_dummy_run:
+            return None
+        capturer = self._routed_experts_capturer
+        if capturer is None:
+            return None
+        lens = batch.num_scheduled_tokens
+        first = np.cumsum(lens) - lens
+        return capturer.gather_step(
+            current_slot_mapping(),
+            batch.req_ids,
+            self.forward_vars["positions"].np[first],
+            lens,
+            prefix=batch_prefix_slots(batch, self.block_size),
+        )
 
     def _local_tbo_eligibility(
         self, batch: ScheduledBatch
@@ -3736,6 +3939,10 @@ class ModelRunner:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
+        # Gathered before the event, so the token copy that waits on it carries
+        # the rows too. R3 refuses PP and P/D, the only undeferred configs, and
+        # the mono models that override the step.
+        gpu_routes = self._gather_routed_experts_step(batch)
         # An overridden step's outputs are ready on its output stream, before
         # the work it queued after them on this one.
         self.forward_done_event.record(
@@ -3743,12 +3950,15 @@ class ModelRunner:
         )
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch,
-            sampled_tokens,
-            self.forward_done_event,
-            sampled_logprobs,
-            channel_states=channel_states,
+        token_id_dict, logprobs_map, routed_experts = (
+            self.tokenID_processor.prepare_sampled_ids(
+                batch,
+                sampled_tokens,
+                self.forward_done_event,
+                sampled_logprobs,
+                channel_states=channel_states,
+                gpu_routed_experts=gpu_routes,
+            )
         )
         req_ids_out = list(token_id_dict)
         token_ids_out = list(token_id_dict.values())
@@ -3808,7 +4018,7 @@ class ModelRunner:
         if verify_scheduler is not None:
             dspark_ell = verify_scheduler.ell_nonblocking()
 
-        return ScheduledBatchOutput(
+        output = ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
             draft_token_ids=draft_token_ids,
@@ -3820,7 +4030,9 @@ class ModelRunner:
             structured_errors=(
                 dict(structured.errors) if structured is not None else None
             ),
+            routed_experts=routed_experts,
         )
+        return output
 
     def _kv_after_forward(self) -> None:
         """Let the KV connector act behind this step's enqueued KV writes.
@@ -3925,6 +4137,12 @@ class ModelRunner:
         # Every KV write of this forward is enqueued; sampling is not needed.
         self._kv_after_forward()
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            # Before the propose below: the drafter rewrites this forward's
+            # slot_mapping in place (its decode metadata views the same staging
+            # buffer), so a gather queued after it would read draft slots.
+            held = self._gather_routed_experts_step(batch)
+            if held is not None:
+                self.tokenID_processor.add_held_routed_experts(held)
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
             if will_align_draft:

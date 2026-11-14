@@ -76,7 +76,7 @@ def _runner(seen):
         is_deferred_out=False,
         prev_batch=None,
         zero_spec_counts=torch.zeros(128, dtype=torch.int32),
-        prepare_sampled_ids=lambda *a, **k: ({}, {}),
+        prepare_sampled_ids=lambda *a, **k: ({}, {}, None),
     )
     return runner
 
@@ -165,7 +165,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     captured = {}
     runner = _runner(seen)
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
-        captured.update(logprobs=lp) or ({}, {})
+        captured.update(logprobs=lp) or ({}, {}, None)
     )
 
     runner.postprocess(
@@ -298,7 +298,7 @@ def test_a_masked_row_still_reports_the_models_logprob(
 
     runner._constrain_required_channel = force_column_zero
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
-        captured.update(logprobs=lp) or ({}, {})
+        captured.update(logprobs=lp) or ({}, {}, None)
     )
     logits = torch.randn(2, 8)
     expected = torch.log_softmax(logits, dim=-1)[:, 0]
@@ -319,6 +319,45 @@ def test_a_masked_row_still_reports_the_models_logprob(
     torch.testing.assert_close(values[:, 0, 1:], expected_top)
     torch.testing.assert_close(candidates[:, 0].long(), expected_ids)
     torch.testing.assert_close(ranks[:, 0].long(), (logits > logits[:, :1]).sum(-1) + 1)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_route_capture_off_runs_none_of_its_step_hooks(monkeypatch, deferred):
+    """With `enable_return_routed_experts` off, postprocess never reads slots
+    and gives the token copy no routes."""
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("route hook ran with capture off")
+
+    monkeypatch.setattr(mod, "current_slot_mapping", _forbidden)
+    runner = _runner({})
+    runner._routed_experts_capturer = None
+    runner.tokenID_processor.is_deferred_out = deferred
+    runner.tokenID_processor.prev_batch = _batch(2) if deferred else None
+    routes = []
+    runner.tokenID_processor.prepare_sampled_ids = lambda *a, **k: (
+        routes.append(k.get("gpu_routed_experts", "missing")) or ({}, {}, None)
+    )
+
+    runner.postprocess(
+        batch=_batch(2),
+        logits=torch.zeros(2, 8),
+        temperatures=torch.ones(2),
+        top_ks=None,
+        top_ps=None,
+        all_greedy=False,
+        hidden_states=None,
+    )
+
+    assert routes == [None]
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():

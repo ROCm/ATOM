@@ -74,7 +74,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         prev_batch=None,
         prev_rejected_num=None,
         prev_bonus_num=None,
-        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,)}, None)),
+        prepare_sampled_ids=mock.Mock(return_value=({7: (3,), 8: (5,)}, None, None)),
         spec_status_queue=SimpleNamespace(send=send_status),
     )
     runner = SimpleNamespace(
@@ -85,6 +85,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=SimpleNamespace(lossless=None),
         forward_done_event=mock.Mock(),
+        _return_routed_experts=False,
     )
     runner._constrain_required_channel = MethodType(
         runner_module.ModelRunner._constrain_required_channel, runner
@@ -472,3 +473,119 @@ def test_an_armed_runner_binds_the_draft_and_arms_the_ratio_verify(monkeypatch, 
     runner.rejection_sampler.arm_ratio.assert_called_once_with(
         8, 3, 160, torch.bfloat16, "cpu"
     )
+
+
+def _gpu_patch(req_id, start, values):
+    from atom.model_ops.fused_moe.routed_experts_capturer import RoutedExpertsPatch
+
+    rows = torch.tensor(values, dtype=torch.int16).reshape(len(values), 1, 1)
+    return RoutedExpertsPatch(
+        np.array([req_id]),
+        np.array([start]),
+        np.array([0, len(values)]),
+        _FakeGpuTensor(rows),
+    )
+
+
+def test_routes_ride_the_token_copy_and_its_wait(cpu_processor):
+    """A step's routes are a third payload of its token entry: one copy_done
+    covers them, and the entry holds their GPU source until it is waited on."""
+    processor = cpu_processor
+    ids = _FakeGpuTensor(torch.tensor([3], dtype=torch.int32))
+    routes = _gpu_patch(7, 0, [5, 6])
+    refs = [weakref.ref(routes.rows)]
+    copy_done = mock.Mock()
+    seen = _record_alive_at(copy_done, refs)
+    processor.send_to_cpu_async(
+        ids,
+        processor.token_ids_cpu,
+        mock.Mock(),
+        copy_done,
+        gpu_routed_experts=routes,
+    )
+    del routes
+
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert seen == [[True]]
+    assert refs[0]() is None
+    got = processor.recv_routed_experts()
+    assert isinstance(got.rows, np.ndarray)
+    assert got.rows[:, 0, 0].tolist() == [5, 6]
+    assert processor.recv_routed_experts() is None
+
+
+def test_middle_chunk_routes_ride_the_next_copy_not_the_pending_one(cpu_processor):
+    """An output-less middle chunk queues no copy and touches no pending entry
+    (whose copy_done would then wait on the chunk's whole forward). Its rows
+    ride the next send, ahead of that step's own, under that send's one
+    copy_done."""
+    processor = cpu_processor
+    pending_done = mock.Mock()
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        pending_done,
+        gpu_routed_experts=_gpu_patch(7, 0, [1, 1]),
+    )
+    processor.add_held_routed_experts(_gpu_patch(7, 2, [2, 2]))
+    processor.add_held_routed_experts(_gpu_patch(7, 4, [3]))
+    assert pending_done.record.call_count == 1
+    assert len(processor.token_ids_cpu) == 1
+
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [1, 1]
+
+    held = _gpu_patch(7, 4, [3])
+    refs = [weakref.ref(held.rows)]
+    processor._held_routed_experts[-1] = held
+    del held
+    next_done = mock.Mock()
+    seen = _record_alive_at(next_done, refs)
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([4], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        next_done,
+        gpu_routed_experts=_gpu_patch(8, 0, [9]),
+    )
+    assert processor._held_routed_experts == []
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert seen == [[True]]
+    assert refs[0]() is None
+    got = processor.recv_routed_experts()
+    assert got.req_ids.tolist() == [7, 7, 8]
+    assert got.starts.tolist() == [2, 4, 0]
+    assert got.rows[:, 0, 0].tolist() == [2, 2, 3, 9]
+
+
+def test_middle_chunk_before_any_output_waits_for_the_first_copy(cpu_processor):
+    """Before the first output no entry is pending, and none is made up: the
+    rows wait on the device for the first send."""
+    processor = cpu_processor
+    processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
+    assert processor.token_ids_cpu == []
+    assert processor.recv_async_output(processor.token_ids_cpu).numel() == 0
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        mock.Mock(),
+    )
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert processor.recv_routed_experts().rows[:, 0, 0].tolist() == [4]
+
+
+def test_clean_drops_held_routes(cpu_processor):
+    """Sleep's `clean()` drops the routes with the batch they belong to."""
+    processor = cpu_processor
+    processor.add_held_routed_experts(_gpu_patch(9, 0, [4]))
+    processor.clean()
+    processor.send_to_cpu_async(
+        _FakeGpuTensor(torch.tensor([3], dtype=torch.int32)),
+        processor.token_ids_cpu,
+        mock.Mock(),
+        mock.Mock(),
+    )
+    processor.recv_async_output(processor.token_ids_cpu)
+    assert processor.recv_routed_experts() is None

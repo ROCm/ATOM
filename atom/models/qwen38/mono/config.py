@@ -22,6 +22,7 @@ from atom.mono.runtime.deployment import (
     common_refusals,
     first_refusal,
     resident_grid_refusals,
+    routed_experts_refusal,
 )
 from atom.utils import envs
 
@@ -145,6 +146,7 @@ def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
     """The checkpoint, parallelism, speculative decode and cache format Mono serves."""
     spec = getattr(atom_config, "speculative_config", None)
     checks = common_refusals(atom_config, Shard, SUPPORTED_TP)
+    checks.append(routed_experts_refusal(atom_config))
     # every program's CTAs are resident, one a CU, and spin on each other
     checks += resident_grid_refusals(atom_config, connectors=OFFLOAD_CONNECTORS)
     checks += [

@@ -4,7 +4,11 @@
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    routed_experts_refusal,
+)
 from atom.utils import envs
 
 # the TP sizes the kernels are built for (``kernels.dims``): TP2 and TP4 run on
@@ -40,6 +44,7 @@ def config_refusal(atom_config) -> str | None:
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+        routed_experts_refusal(atom_config),
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",

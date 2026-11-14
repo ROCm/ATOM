@@ -187,7 +187,7 @@ def json_object_arg(raw_value: str) -> dict[str, Any]:
 
 
 def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
-    from atom.model_engine.arg_utils import EngineArgs
+    from atom.model_engine.arg_utils import EngineArgs, refuse_server_routed_experts
     from atom.utils.arg_parser import FlexibleArgumentParser
 
     parser = FlexibleArgumentParser(
@@ -215,6 +215,7 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
 
     python_raw_args, mesh_network_args = split_standalone_mesh_args(raw_args)
     engine_args, mesh_args = parser.parse_known_args(python_raw_args)
+    refuse_server_routed_experts(parser, engine_args)
     forwarded = engine_args.tool_call_parser
 
     # Not validated against ATOM's vocabulary here, and that is the point.

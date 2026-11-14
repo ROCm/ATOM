@@ -80,6 +80,16 @@ def dp_attention_ranks(atom_config) -> int:
     return dp if dpa and dp > 1 else 0
 
 
+def routed_experts_refusal(atom_config) -> tuple[bool, str]:
+    """``(holds, why not)`` for a mono model whose kernels route experts
+    in-kernel: they never write the routed-expert capture, so it would
+    return ``-1`` rows for those layers."""
+    return (
+        not getattr(atom_config, "enable_return_routed_experts", False),
+        "routed-expert capture",
+    )
+
+
 def common_refusals(
     atom_config,
     dims,

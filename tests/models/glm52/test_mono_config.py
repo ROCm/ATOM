@@ -93,6 +93,7 @@ def _served_tp4_fp8_config(*, speculative_config, compilation_config=None):
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,
+        enable_return_routed_experts=False,
         speculative_config=speculative_config,
         kv_cache_dtype="fp8",
         compilation_config=compilation_config,

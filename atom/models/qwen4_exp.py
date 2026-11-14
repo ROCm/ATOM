@@ -16,6 +16,10 @@ from torch import nn
 from atom.config import Config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    ROUTES_VIEW_ATTR,
+    maybe_capture_routed_experts,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -418,14 +422,20 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             and ex.routed_scaling_factor == 1.0
             and n == self.n_routed_experts + 1
         ):
-            return moe_decode_single_token(
+            capturing = getattr(ex, ROUTES_VIEW_ATTR, None) is not None
+            out = moe_decode_single_token(
                 hidden_states,
                 None,
                 None,
                 *weights,
                 router_logits=logits,
                 top_k=ex.top_k,
+                return_topk_ids=capturing,
             )
+            if capturing:
+                out, topk_ids = out
+                maybe_capture_routed_experts(ex, topk_ids)
+            return out
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=hidden_states,
             router_logits=logits,
@@ -442,6 +452,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             num_fused_shared_experts=ex.num_fused_shared_experts,
             routed_scaling_factor=ex.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(ex, topk_ids)
         return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 
 
