@@ -128,6 +128,43 @@ async fn a_registered_worker_is_followed_until_removed() {
     worker.stop().await;
 }
 
+/// An engine with KV events off serves `{}` at `/kv_event_sources`: its worker is
+/// registered, and not followed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_whose_engine_has_kv_events_off_is_not_followed() {
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let url = worker.start().await.unwrap();
+    let mut config = TestRouterConfig::random(3993);
+    config.kv_events = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let app = ctx.create_app().await;
+
+    let (status, created) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+    assert!(status.is_success(), "{status}");
+    // The job's status goes once every step of the registration ran, this one included.
+    let uri = format!("/workers/{}", created["worker_id"].as_str().unwrap());
+    let mut registered = Value::Null;
+    for _ in 0..1500 {
+        let (status, worker) = call(&app, "GET", &uri, None).await;
+        if status == StatusCode::OK && worker["job_status"].is_null() {
+            registered = worker;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(registered["url"], url, "{registered}");
+    let (status, sources) = call(&app, "GET", "/kv_events/sources", None).await;
+    assert_eq!((status, sources), (StatusCode::OK, json!([])));
+    ctx.shutdown().await;
+    worker.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed() {
     let mut publishers = Vec::new();

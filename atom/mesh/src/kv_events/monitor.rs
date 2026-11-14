@@ -235,6 +235,7 @@ async fn follow(
             },
             message = socket.recv() => match message {
                 Ok(message) => {
+                    recv_failed = false;
                     let batch = batch(&message.into_vec(), source.block_size, dp_rank);
                     let admitted = record(&mut status.lock(), &mut admission, batch);
                     if let (Some(holder), Some((reset, events))) = (&holder, admitted) {
