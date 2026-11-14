@@ -14,7 +14,6 @@ the kernels read the (16, 16)-preshuffled layout, so they get a shuffled copy.
 from dataclasses import dataclass
 
 import torch
-from aiter.ops.shuffle import shuffle_weight
 
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
@@ -135,6 +134,8 @@ def bind_layer(block, config, dims: Dims, moe_tp: int = 1) -> LayerWeights:
         if not tensor.is_contiguous():
             raise MonoUnsupported(f"layer {spec.layer_id}: {name} not contiguous")
         if dtype == FP8 and not getattr(tensor, "is_shuffled", False):
+            from aiter.ops.shuffle import shuffle_weight
+
             params[name] = shuffle_weight(tensor.data, layout=(16, 16))
     return LayerWeights(spec.layer_id, spec.mode, params)
 
