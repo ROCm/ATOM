@@ -53,6 +53,13 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
                     message,
                 }
             })?;
+        if sources.is_empty() {
+            warn!(
+                worker = first.base_url(),
+                "The engine has KV events off (ATOM_KV_EVENTS_ENABLE), or its publisher is null"
+            );
+            return Ok(StepResult::Skip);
+        }
         for worker in workers {
             // Each subscription follows one rank: a DP-aware worker's own, or the only
             // rank of a worker that is not.

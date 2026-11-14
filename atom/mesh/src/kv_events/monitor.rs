@@ -115,7 +115,7 @@ pub struct SourceStatus {
     #[serde(flatten)]
     pub source: KvEventSource,
     pub connected: bool,
-    /// Why the subscription stopped, if it did.
+    /// Why the subscription stopped, if it did: its socket could not connect or subscribe.
     pub error: Option<String>,
     pub trust: Trust,
     pub last_seq: Option<u64>,
@@ -125,13 +125,14 @@ pub struct SourceStatus {
     pub stored_blocks: u64,
     pub removed_blocks: u64,
     pub clears: u64,
-    /// Holder clears after lost batches or an engine restart.
+    /// Holder clears after lost batches, a lost connection or an engine restart.
     pub resets: u64,
     /// Replays of missed batches, and those that could not get them all.
     pub replays: u64,
     pub failed_replays: u64,
     pub dropped_events: BTreeMap<DropReason, u64>,
-    /// Payloads that are not a batch of this rank.
+    /// Messages dropped whole: not `[topic, seq, payload]`, a seq that is not 8 bytes, a
+    /// payload that does not decode, or a batch of another DP rank.
     pub dropped_batches: u64,
     /// The rank's blocks in the router's index; null when its partition had no lane left.
     pub indexed_blocks: Option<u64>,
@@ -286,22 +287,29 @@ async fn follow(
         admission: RankState::default(),
         holder,
     };
+    let mut recv_failed = false;
     loop {
         let message = tokio::select! {
             // A lost connection counts before the batches of the next one.
             biased;
             Some(event) = events.next() => {
                 if rank.lost_connection(event) {
-                    rank.admission.disconnected();
+                    rank.disconnected();
                 }
                 continue;
             }
             message = socket.recv() => message,
         };
-        let Ok(message) = message else {
+        let message = match message {
+            Ok(message) => message,
             // The socket reconnects by itself.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
+            Err(e) => {
+                if !std::mem::replace(&mut recv_failed, true) {
+                    warn!(endpoint = %source.endpoint, error = %e, "Cannot receive KV events; retrying");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let Some(batch) = rank.decode(&message.into_vec()) else {
             continue;
@@ -324,15 +332,25 @@ struct Rank {
 }
 
 impl Rank {
-    /// Shows a socket event; true when the connection was lost.
+    /// Shows a socket event; true when the connection was lost, and batches with it.
     fn lost_connection(&self, event: SocketEvent) -> bool {
         let connected = match event {
             SocketEvent::Connected(..) => true,
             SocketEvent::Disconnected(_) => false,
             _ => return false,
         };
-        self.status.lock().connected = connected;
+        let mut status = self.status.lock();
+        status.connected = connected;
+        if !connected {
+            status.trust = Trust::Partial;
+        }
         !connected
+    }
+
+    /// Starts the rank over at its next batch, the connection lost since the last.
+    fn disconnected(&mut self) {
+        self.admission.disconnected();
+        self.status.lock().trust = self.admission.trust();
     }
 
     /// The batch in `[topic, seq, payload]`, or None, counted, if there is none.
@@ -404,7 +422,7 @@ impl Rank {
                 Some(batch) => {
                     self.admit(batch, false).await;
                 }
-                None => self.admission.disconnected(),
+                None => self.disconnected(),
             }
         }
     }
@@ -696,6 +714,10 @@ mod tests {
         let restarted = clear_until(&mut publisher, &monitor, |s| s.last_seq == Some(0)).await;
         assert!(restarted.connected && restarted.resets > status.resets);
         assert_eq!(restarted.trust, Trust::Exact);
+        // Batches may be lost from the moment the connection is.
+        drop(publisher);
+        let lost = status_once(&monitor, |s| !s.connected).await;
+        assert_eq!(lost.trust, Trust::Partial);
 
         monitor.detach(WORKER);
         assert!(monitor.sources().is_empty());
