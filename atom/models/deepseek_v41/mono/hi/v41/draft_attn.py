@@ -64,6 +64,11 @@ class _BPlan(mw._APlan):
     kv8: bool = (
         False  # the ring is in ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized on load
     )
+    # every ring load of a wave in flight before the first lands (``_ring_issue`` / ``_ring_land``: the kv8 rows'
+    # dequantization at the landing, as ``mla_sparse._kv8_issue`` / ``_kv8_land``; the rows' ring positions stepped,
+    # not divided, key by key): the same rows, the same words. False: each kv8 row converted where it is loaded, so
+    # the wave's 16 loads wait one after another (the code of before)
+    pipe: bool = False
 
     @property
     def a_b(self):  # the block's key rows [spec][PITCH]
@@ -88,9 +93,34 @@ class _BPlan(mw._APlan):
         return -(-(self.a_c2 + TILE) // 4) * 4
 
 
+def _ring_rows(k, p: _BPlan, slot, pos_w):
+    """``pipe``: the pool rows of the wave's window keys ``pos_w - 127 + 16 wave ..`` (+ 16), the first key's ring
+    position q, q // stride and q % stride divided once, then stepped key by key (q + 1 wraps to 0 at ring_slots,
+    q % stride carries into q // stride at stride): the rows ``_ring_issue``'s divisions give each key."""
+    g = k.args[p.geo]
+    slot_rows, ring_slots = uniform(ld_i32(g, 1)), uniform(ld_i32(g, 2))
+    stride, run = uniform(ld_i32(g, 3)), uniform(ld_i32(g, 4))
+    n = WINDOW // WAVES
+    kp = pos_w - (WINDOW - 1) + k.wave * n
+    q = ((kp % ring_slots) + ring_slots) % ring_slots
+    d, m = q // stride, q % stride
+    zero, rows = fx.Int32(0), []
+    for i in range(n):
+        rows.append(slot * slot_rows + d * run + m)
+        if i + 1 < n:
+            q, m = q + 1, m + 1
+            carry = m >= stride
+            d, m = carry.select(d + 1, d), carry.select(zero, m)
+            wrap = q >= ring_slots
+            q, d, m = wrap.select(zero, q), wrap.select(zero, d), wrap.select(zero, m)
+    return rows
+
+
 def _ring_issue(k, p: _BPlan, slot, pos_w):
     """``mla_window._ring_issue`` from the engine's ring: the window's keys ``pos_w - 127 .. pos_w`` at their rows
-    (a position below 0 reads a clamped row, dropped by ``_key_land``)."""
+    (a position below 0 reads a clamped row, dropped by ``_key_land``). ``pipe``: ``_ring_issue_pipe``."""
+    if p.pipe:
+        return _ring_issue_pipe(k, p, slot, pos_w)
     g = k.args[p.geo]
     slot_rows, ring_slots = uniform(ld_i32(g, 1)), uniform(ld_i32(g, 2))
     stride, run = uniform(ld_i32(g, 3)), uniform(ld_i32(g, 4))
@@ -121,6 +151,48 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
             )
         )
     return out
+
+
+def _ring_issue_pipe(k, p: _BPlan, slot, pos_w):
+    """``_ring_issue`` with every load of the wave issued before any lands: the rows from ``_ring_rows``, a kv8 row
+    as loaded ((the lane's 8 E4M3, the code word), converted by ``_ring_land``; converted here, as ``_ring_issue``
+    does, each row's conversion waits on its loads, so the wave's 16 rows came one round trip after another)."""
+    rows = _ring_rows(k, p, slot, pos_w)
+    r_ring = rsrc(k.args[p.ring_arg])
+    out = []
+    for row in rows:
+        if p.kv8:
+            at = row * (paged.KV8_ROW_BYTES // 4)
+            v = fx.Vector(
+                bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32)
+            )
+            cw = bo.buffer_load(
+                r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32
+            )
+            out.append((v, cw))
+            continue
+        out.append(
+            fx.Vector(
+                bo.buffer_load(
+                    r_ring, row * (HD // 2) + k.lane * 4, vec_width=4, dtype=T.i32
+                )
+            )
+        )
+    return out
+
+
+def _ring_land(k, p: _BPlan, pos_w, vs, base):
+    """``_ring_issue``'s rows into LDS (``mla_window._key_land``); kv8 with ``pipe``: each row's bf16 pair words
+    converted here (``paged.kv8_words``: the words ``_ring_issue`` converts without ``pipe``)."""
+    if p.kv8 and p.pipe:
+        vs = [
+            fx.Vector.from_elements(
+                paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4)),
+                fx.Int32,
+            )
+            for v, cw in vs
+        ]
+    mw._key_land(k, p, pos_w, vs, base)
 
 
 @traced
@@ -243,7 +315,7 @@ def _attn(k, t, p: _BPlan):
     rcs = mw._rope_issue(k, p, pos)
     mw._q_tile(k, p, r, ht, pos)
     mw._rope_land(k, p, rcs)
-    mw._key_land(k, p, pos_w, _ring_issue(k, p, slot, pos_w), base)
+    _ring_land(k, p, pos_w, _ring_issue(k, p, slot, pos_w), base)
     _block_keys(k, p, b)
     gpu.barrier()
     _scores_block(k, p)
@@ -268,7 +340,7 @@ class MLABlockAttn(Block):
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, pos: str, rope: str, sink: str, ring: str,
                  geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False,
-                 kv8: bool = False):  # fmt: skip
+                 kv8: bool = False, pipe: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -297,6 +369,8 @@ class MLABlockAttn(Block):
         self.unrope_f32 = unrope_f32
         # the ring's rows: ATOM's fp8 pool (MXFP8, ``_BPlan.kv8``) or its bf16 one; the deployment's
         self.kv8 = kv8
+        # the ring loads all in flight before they land (``_BPlan.pipe``: the same bits; a schedule choice)
+        self.pipe = pipe
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
@@ -306,7 +380,7 @@ class MLABlockAttn(Block):
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
                       unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot,
-                      kv8=self.kv8)  # fmt: skip
+                      kv8=self.kv8, pipe=self.pipe)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

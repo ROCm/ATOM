@@ -578,6 +578,13 @@ STAGE_ROLES = {
     2: (False, True, True),
 }  # (first, push, prev)
 
+# The block attention's window ring loads (``MLABlockAttn(pipe=)``: the same rows and words, so the same bits): every
+# load of a wave issued before the first lands, the kv8 rows converted at the landing, the ring positions stepped
+# instead of three divisions a key. Off (the code of before), each fp8 row's conversion waits on its loads: a wave's
+# 16 rows one HBM round trip after another (stage timeline TP8 c1 fp8: the attention task ~19 us of a ~60 us stage).
+# Env ATOM_DSV41_MONO_HI_DR_RING_PIPE (0 / 1; every rank the same), off by default until a GPU A/B
+DR_RING_PIPE_ENV = "ATOM_DSV41_MONO_HI_DR_RING_PIPE"
+
 
 def stage_blocks(
     stage: int, tp: int = 4, rows: int = 5, knobs: dict | None = None
@@ -587,9 +594,12 @@ def stage_blocks(
     from .draft_attn import MLABlockAttn
     from .recipe import window_layer_blocks
 
+    from .head import env_int
+
     first, push, prev = STAGE_ROLES[stage]
     # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
     kv8 = (knobs or {}).get("KV_FMT", "bf16") == "fp8"
+    pipe = bool(env_int(DR_RING_PIPE_ENV, 0, 1) or 0)
     # (the draft's own chain keeps its residual replicated and its rs partials as pairs: the target's ``RESIDUAL`` /
     # ``RS_PACK`` are the target layers')
     knobs = {**(knobs or {}), "RESIDUAL": "replicated", "RS_PACK": "pair"}
@@ -603,7 +613,7 @@ def stage_blocks(
             b.name == "attn"
         ):  # (its output's inverse RoPE as the window attention's: ATTN_OUT_F32_ROPE)
             b = MLABlockAttn("attn", b.q, b.kvn, b.out, b.pos, b.rope, b.sink, "dr.ring", "dr.geo", "dr.slot",
-                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8)  # fmt: skip
+                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8, pipe=pipe)  # fmt: skip
         out.append(b)
     return out
 
