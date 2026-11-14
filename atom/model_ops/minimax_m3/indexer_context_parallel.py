@@ -183,7 +183,9 @@ def indexer_context_scores_mxfp4(
     shard's block bound ``max_block`` it was built at, and the workspace the scores
     go into as a contiguous ``[heads, tokens, max_block]`` view, in the same
     round-robin order. Unlike the BF16 scorer this one writes a row only up to its
-    own blocks; `local_candidate_keys` reads none past them.
+    own blocks. `local_candidate_keys` still loads each row up to ``max_block`` and
+    masks the lanes past the row's blocks with ``valid``, so what the workspace
+    holds there never reaches a key.
     """
     if index_scorer.work_map is None:
         raise ValueError(

@@ -365,7 +365,7 @@ def make_case(batch, S, seed, max_len, fp8_q):
 def _step_record(table, seq, S, cp):
     """This rank's builder record and the step's map built from it, as the builder
     and `make_sparse_decode_metadata` make them, the workspace filled with values no
-    selector may read (it is never filled: a row is read only up to its blocks)."""
+    selection may depend on."""
     from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
