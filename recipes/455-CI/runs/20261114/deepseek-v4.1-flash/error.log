@@ -1,0 +1,68 @@
+[atom 04:03:05] Raised RLIMIT_NOFILE soft limit 1024 -> 65535 (hard=524288)
+[atom 04:03:05] Loading tokenizer from /models/DeepSeek-V4.1-Flash...
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[atom 04:03:06] Loaded message encoder from /models/DeepSeek-V4.1-Flash/encoding/encoding.py
+[atom 04:03:06] Initializing engine with model /models/DeepSeek-V4.1-Flash...
+[atom 04:03:06] Reasoning channel: </think>
+[atom 04:03:06] Reasoning switches on thinking_mode: 'thinking' on, 'chat' off.
+[atom 04:03:06] Tool-call format: dsml_v41 (from the chat template)
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[atom 04:03:07] Engine kwargs: {'trust_remote_code': True, 'tensor_parallel_size': 4, 'decode_context_parallel_size': 1, 'pipeline_parallel_size': 1, 'prefill_context_parallel_size': 1, 'sequence_parallel_size': 1, 'data_parallel_size': 1, 'enforce_eager': False, 'enable_prefix_caching': True, 'port': 8006, 'kv_cache_dtype': 'fp4', 'index_cache_dtype': 'fp4', 'max_model_len': None, 'max_num_batched_tokens': 16384, 'long_prefill_token_threshold': 0, 'attn_prefill_chunk_size': 16384, 'state_checkpoint_interval_tokens': 8192, 'state_checkpoint_demand': True, 'enable_decoder_swa_bounded_replay': True, 'enable_encoder_swa_bounded_replay': True, 'enable_chunked_prefill': True, 'enable_log_stats': True, 'enable_request_context_metrics': False, 'sampler_independent_noise': False, 'throughput_log_interval': 10.0, 'throughput_log_interval_steps': 0, 'cache_hit_rate_window': 1000, 'enable_dynamic_chunking': False, 'dynamic_chunking_smooth_factor': None, 'dynamic_chunking_min_chunk_size': 4096, 'scheduler_delay_factor': 0.0, 'prefill_admit_policy': 'interval', 'max_num_seqs': 64, 'gpu_memory_utilization': 0.9, 'load_dummy': None, 'enable_expert_parallel': True, 'fake_eplb': False, 'torch_profiler_dir': None, 'enable_dp_attention': True, 'dp_load_balance': 'least_requests', 'moe_backend': 'standard', 'kv_transfer_config': '{}', 'mark_trace': False, 'enable_rapidserve': False, 'disagg_prefill_max_num_seqs': None, 'disagg_constrained': False, 'online_quant_config': None, 'hf_overrides': None, 'eplb_enable': False, 'kv_cache_block_size': 16, 'compilation_config': CompilationConfig(level=0, use_cudagraph=True, local_cache_dir=None, cudagraph_capture_sizes=[1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 40, 48, 56, 64], cuda_graph_sizes=[512], debug_dump_path='', traced_files=set(), cache_dir='', use_inductor=True, cudagraph_mode=<CUDAGraphMode.FULL: 2>, compilation_time=0.0, splitting_ops=None, cudagraph_copy_inputs=False, inductor_compile_config={}, compile_sizes=None, static_forward_context={}), 'speculative_config': SpeculativeConfig(method='dspark', num_spec_tokens=5), 'enable_tbo': False, 'enable_tbo_decode': False, 'enable_low_latency': False, 'moe_all2all_backend': 'mori', 'dspark': DSparkConfig(confidence_schedule=False, ragged=False, ragged_graph_sizes='', q_buckets='', disable_sps_calib=False, calibration_profile=None), 'eplb_config': EPLBConfig(load_window_size=1000, rebalance_interval=3000, rebalance_layers_per_chunk=64, num_redundant_experts=0, rebalance_min_balancedness=2.0, rebalance_balancedness_agg='min', p2p_batch_chunk_size=32, placement_policy='naive'), 'dcp_config': DCPConfig(interleave_size=1, enable_query_replication=True, enable_project_before_merge=True, comm_backend='a2a', indexer_dcp_only=False), 'parallel_config': ParallelConfig(data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=None, decode_context_parallel_size=1, pipeline_parallel_rank=0, pp_meta_addrs=[], pp_token_addr='', control_address='', pp_kv_status_addr='', data_parallel_master_port=29500, data_parallel_base_port=0, server_instance_id='', data_parallel_master_ip='127.0.0.1')}
+[atom 04:03:07] dcp_config.enable_query_replication disabled: decode_context_parallel_size <= 1 (no DCP group) not supported.
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 3795, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1003, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 50, in __init__
+    config = Config(model, **config_kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 88, in __init__
+  File "/app/ATOM/atom/config.py", line 3011, in __post_init__
+    validate_runtime_config(self)
+  File "/app/ATOM/atom/models/deepseek_v41/config.py", line 439, in validate_runtime_config
+    validate_speculative_config(config)
+  File "/app/ATOM/atom/models/deepseek_v41/config.py", line 325, in validate_speculative_config
+    raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache")
+ValueError: DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache
+----- last 30 lines -----
+[atom 04:03:06] Tool-call format: dsml_v41 (from the chat template)
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[atom 04:03:07] Engine kwargs: {'trust_remote_code': True, 'tensor_parallel_size': 4, 'decode_context_parallel_size': 1, 'pipeline_parallel_size': 1, 'prefill_context_parallel_size': 1, 'sequence_parallel_size': 1, 'data_parallel_size': 1, 'enforce_eager': False, 'enable_prefix_caching': True, 'port': 8006, 'kv_cache_dtype': 'fp4', 'index_cache_dtype': 'fp4', 'max_model_len': None, 'max_num_batched_tokens': 16384, 'long_prefill_token_threshold': 0, 'attn_prefill_chunk_size': 16384, 'state_checkpoint_interval_tokens': 8192, 'state_checkpoint_demand': True, 'enable_decoder_swa_bounded_replay': True, 'enable_encoder_swa_bounded_replay': True, 'enable_chunked_prefill': True, 'enable_log_stats': True, 'enable_request_context_metrics': False, 'sampler_independent_noise': False, 'throughput_log_interval': 10.0, 'throughput_log_interval_steps': 0, 'cache_hit_rate_window': 1000, 'enable_dynamic_chunking': False, 'dynamic_chunking_smooth_factor': None, 'dynamic_chunking_min_chunk_size': 4096, 'scheduler_delay_factor': 0.0, 'prefill_admit_policy': 'interval', 'max_num_seqs': 64, 'gpu_memory_utilization': 0.9, 'load_dummy': None, 'enable_expert_parallel': True, 'fake_eplb': False, 'torch_profiler_dir': None, 'enable_dp_attention': True, 'dp_load_balance': 'least_requests', 'moe_backend': 'standard', 'kv_transfer_config': '{}', 'mark_trace': False, 'enable_rapidserve': False, 'disagg_prefill_max_num_seqs': None, 'disagg_constrained': False, 'online_quant_config': None, 'hf_overrides': None, 'eplb_enable': False, 'kv_cache_block_size': 16, 'compilation_config': CompilationConfig(level=0, use_cudagraph=True, local_cache_dir=None, cudagraph_capture_sizes=[1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 40, 48, 56, 64], cuda_graph_sizes=[512], debug_dump_path='', traced_files=set(), cache_dir='', use_inductor=True, cudagraph_mode=<CUDAGraphMode.FULL: 2>, compilation_time=0.0, splitting_ops=None, cudagraph_copy_inputs=False, inductor_compile_config={}, compile_sizes=None, static_forward_context={}), 'speculative_config': SpeculativeConfig(method='dspark', num_spec_tokens=5), 'enable_tbo': False, 'enable_tbo_decode': False, 'enable_low_latency': False, 'moe_all2all_backend': 'mori', 'dspark': DSparkConfig(confidence_schedule=False, ragged=False, ragged_graph_sizes='', q_buckets='', disable_sps_calib=False, calibration_profile=None), 'eplb_config': EPLBConfig(load_window_size=1000, rebalance_interval=3000, rebalance_layers_per_chunk=64, num_redundant_experts=0, rebalance_min_balancedness=2.0, rebalance_balancedness_agg='min', p2p_batch_chunk_size=32, placement_policy='naive'), 'dcp_config': DCPConfig(interleave_size=1, enable_query_replication=True, enable_project_before_merge=True, comm_backend='a2a', indexer_dcp_only=False), 'parallel_config': ParallelConfig(data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=None, decode_context_parallel_size=1, pipeline_parallel_rank=0, pp_meta_addrs=[], pp_token_addr='', control_address='', pp_kv_status_addr='', data_parallel_master_port=29500, data_parallel_base_port=0, server_instance_id='', data_parallel_master_ip='127.0.0.1')}
+[atom 04:03:07] dcp_config.enable_query_replication disabled: decode_context_parallel_size <= 1 (no DCP group) not supported.
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config. 
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/ATOM/atom/entrypoints/openai_server.py", line 27, in <module>
+    main()
+  File "/app/ATOM/atom/entrypoints/openai/api_server.py", line 3795, in main
+    engine = engine_args.create_engine(tokenizer=tokenizer)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/arg_utils.py", line 1003, in create_engine
+    return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/ATOM/atom/model_engine/llm_engine.py", line 50, in __init__
+    config = Config(model, **config_kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 88, in __init__
+  File "/app/ATOM/atom/config.py", line 3011, in __post_init__
+    validate_runtime_config(self)
+  File "/app/ATOM/atom/models/deepseek_v41/config.py", line 439, in validate_runtime_config
+    validate_speculative_config(config)
+  File "/app/ATOM/atom/models/deepseek_v41/config.py", line 325, in validate_speculative_config
+    raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache")
+ValueError: DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache

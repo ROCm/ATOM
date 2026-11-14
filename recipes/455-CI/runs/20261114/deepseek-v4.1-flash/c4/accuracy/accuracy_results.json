@@ -1,0 +1,16 @@
+{
+  "accuracy_scores": [
+    {
+      "dataset_name": "performance",
+      "extractor": null,
+      "ground_truth_column": null,
+      "score": 0.513,
+      "unit_samples": 20403,
+      "num_repeats": 1,
+      "total_samples": 1061,
+      "duration_s": 601.436,
+      "complete": true,
+      "dataset_type": "performance"
+    }
+  ]
+}
