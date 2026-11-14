@@ -118,7 +118,6 @@ def symbol_tokens(r, n: int, whole: bool) -> set[str]:
     if whole:
         b = back_options(n)
         want |= {f"af{b['ar_flag']}"} if b.get("ar_flag") else set()
-        want |= {f"bnr{b['back_sh_noroute']}"} if b.get("back_sh_noroute") else set()
     want |= {"cp1"} if o.get("index_cp") else set()
     want |= {f"cm{o['cp_min_blocks']}"} if o.get("cp_min_blocks") else set()
     want |= {f"cn{o['cp_min_batch']}"} if o.get("cp_min_batch", 1) != 1 else set()
