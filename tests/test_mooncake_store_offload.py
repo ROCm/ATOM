@@ -3416,6 +3416,56 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
     assert store.closed and store.registered == {}
 
 
+def test_copy_streams_take_the_highest_priority_on_the_gpu_only(monkeypatch):
+    # (least, greatest): HIP and CUDA both count priority downwards. The
+    # CPU-only torch of the unit tests has no priority range to ask.
+    monkeypatch.setattr(
+        torch.cuda.Stream,
+        "priority_range",
+        staticmethod(lambda: (0, -1)),
+        raising=False,
+    )
+    assert store_worker_mod._copy_stream_priority(torch.device("cuda", 0)) == -1
+    assert store_worker_mod._copy_stream_priority(torch.device("cpu")) is None
+
+
+def test_registration_hands_the_copy_stream_priority_to_the_gpu_connector(
+    cluster, one_rank, monkeypatch
+):
+    seen = []
+    monkeypatch.setattr(
+        store_worker_mod,
+        "_copy_stream_priority",
+        lambda device: seen.append(device) or -7,
+    )
+    worker = MooncakeStoreOffloadConnector(_registering_config())
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        assert seen == [torch.device(worker._codec.device)]
+        assert worker._gpu_connector._stream_priority == -7
+    finally:
+        worker.close()
+
+
+def test_the_in_place_stream_takes_the_copy_stream_priority(cluster, monkeypatch):
+    made = []
+
+    class PriorityStream:
+        def __init__(self, device=None, priority=0):
+            made.append((device, priority))
+
+    monkeypatch.setattr(store_worker_mod.torch.cuda, "Stream", PriorityStream)
+    monkeypatch.setattr(store_worker_mod, "_copy_stream_priority", lambda device: -3)
+    worker = MooncakeStoreOffloadConnector(_config())
+    try:
+        worker._codec = SimpleNamespace(device="cuda:0")
+        first = worker._in_place_stream()
+        assert worker._in_place_stream() is first  # one per copy thread
+        assert made == [(torch.device("cuda:0"), -3)]
+    finally:
+        worker.close()
+
+
 def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(
     cluster, one_rank, monkeypatch
 ):

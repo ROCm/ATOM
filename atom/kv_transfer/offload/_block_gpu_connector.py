@@ -202,8 +202,12 @@ class BlockGPUConnector:
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
         max_staging_bytes: int | None = None,
+        stream_priority: int | None = None,
     ) -> None:
         self.codec = codec
+        # Priority of every copy thread's pack and copy streams; None keeps the
+        # default. See `_ThreadTransferState`.
+        self._stream_priority = stream_priority
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -435,6 +439,7 @@ class BlockGPUConnector:
             state = _ThreadTransferState(
                 self.device,
                 self._use_cuda(),
+                priority=self._stream_priority,
             )
             states[key] = state
         return state
