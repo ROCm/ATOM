@@ -19,6 +19,7 @@ import triton.language as tl
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_NUM_WARPS,
+    PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _emit_sparse_block_table_row,
     _pack_score_key,
@@ -116,6 +117,7 @@ def _merge_topk(
     LOCAL_KEEP: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
+    BLOCK_PAGE_STRIDE: tl.constexpr,
     KEYS_PER_SHARD: tl.constexpr,
     SRC_STRIDE,
     ROW_STRIDE: tl.constexpr,
@@ -174,11 +176,10 @@ def _merge_topk(
             0,
             128,
             PAGES_PER_BLOCK,
-            # This path's cache has its blocks back to back, so the stride
-            # equals the pages a block fills. Passed by keyword: the parameter
-            # sits between `pages_per_block` and `NUM_KV_HEADS`, so a
-            # positional list silently shifts the two constexprs after it.
-            block_page_stride=PAGES_PER_BLOCK,
+            # Passed by keyword: the parameter sits between `pages_per_block`
+            # and `NUM_KV_HEADS`, so a positional list silently shifts the two
+            # constexprs after it.
+            block_page_stride=BLOCK_PAGE_STRIDE,
             NUM_KV_HEADS=NUM_KV_HEADS,
             BLOCK_SIZE_T=BLOCK_SIZE_T,
         )
@@ -253,7 +254,15 @@ def local_candidate_keys(
 
 
 def merge_candidate_keys(
-    keys, block_table, seq_lens, topk, init_blocks, local_blocks, max_query_len
+    keys,
+    block_table,
+    seq_lens,
+    topk,
+    init_blocks,
+    local_blocks,
+    max_query_len,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+    block_page_stride=PAGES_PER_SPARSE_BLOCK,
 ):
     """Select the global top-k from gathered candidates for this rank's head.
 
@@ -261,6 +270,10 @@ def merge_candidate_keys(
     after the exchange, either already flattened to [tokens, world*topk] or in
     the [world, tokens, topk] layout the all-to-all writes. The 3D form is read
     with a stride rather than copied.
+
+    ``pages_per_block`` / ``block_page_stride`` shape the emitted sparse block
+    table as for the native selector: the page-16 SHUFFLE cache by default, one
+    page-128 page a block (1, 1) for the MXFP4 KV.
     """
     if keys.dtype != torch.int64 or keys.ndim not in (2, 3):
         raise ValueError(
@@ -296,7 +309,9 @@ def merge_candidate_keys(
     ):
         raise ValueError("merge inputs must share a GPU")
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
-    output, _ = _alloc_emit(tokens, 1, topk, block_table, True, keys.device)
+    output, _ = _alloc_emit(
+        tokens, 1, topk, block_table, True, keys.device, pages_per_block
+    )
     if tokens:
         _merge_topk[(tokens,)](
             keys,
@@ -312,7 +327,8 @@ def merge_candidate_keys(
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             NUM_KV_HEADS=1,
-            PAGES_PER_BLOCK=8,
+            PAGES_PER_BLOCK=pages_per_block,
+            BLOCK_PAGE_STRIDE=block_page_stride,
             KEYS_PER_SHARD=per_shard,
             SRC_STRIDE=src_stride,
             ROW_STRIDE=row_stride,
