@@ -61,7 +61,9 @@ class _BPlan(mw._APlan):
     ring_arg: str = ""
     geo: str = ""
     slot: str = ""
-    kv8: bool = False  # the ring is in ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized on load
+    kv8: bool = (
+        False  # the ring is in ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized on load
+    )
 
     @property
     def a_b(self):  # the block's key rows [spec][PITCH]
@@ -98,10 +100,16 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
         kp = pos_w - (WINDOW - 1) + k.wave * (WINDOW // WAVES) + i
         q = ((kp % ring_slots) + ring_slots) % ring_slots
         row = slot * slot_rows + (q // stride) * run + q % stride
-        if p.kv8:  # ATOM's fp8 pool: the lane's 8 E4M3 (dims 8 lane ..) and its group's code, as bf16 pairs
+        if (
+            p.kv8
+        ):  # ATOM's fp8 pool: the lane's 8 E4M3 (dims 8 lane ..) and its group's code, as bf16 pairs
             at = row * (paged.KV8_ROW_BYTES // 4)
-            v = fx.Vector(bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32))
-            cw = bo.buffer_load(r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32)
+            v = fx.Vector(
+                bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32)
+            )
+            cw = bo.buffer_load(
+                r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32
+            )
             words = paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4))
             out.append(fx.Vector.from_elements(words, fx.Int32))
             continue

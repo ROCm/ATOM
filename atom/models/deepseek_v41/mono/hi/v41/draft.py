@@ -261,7 +261,9 @@ class _SPlan:
     spec: int = (
         0  # B > 1 requests (``Scenario(B, spec)``): rows a request; 0: one request (the original build)
     )
-    kv8: bool = False  # the ring is in ATOM's fp8 pool: the row stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
+    kv8: bool = (
+        False  # the ring is in ATOM's fp8 pool: the row stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
+    )
 
 
 @traced
@@ -301,7 +303,8 @@ def _ring_store(k, r, p: _SPlan):
 def _ring_store8(k, p: _SPlan, row, w, live):
     """``_ring_store``'s row into ATOM's fp8 pool: thread tid's pair (dims 2 tid, + 1; 16 threads a 32-dim group) as
     ATOM's writer quantizes it (``paged.kv8_code``; the key is QAT'd already, ``KVPrep(kv8=True)``: the same values),
-    an even thread storing its pair and its neighbour's as one word, a group's first thread its code."""
+    an even thread storing its pair and its neighbour's as one word, a group's first thread its code.
+    """
     v0, v1 = bf2_f32(w)
     amax = butterfly(fx.max(fx.max(v0, -v0), fx.max(v1, -v1)), (1, 2, 4, 8), fx.max)
     code = paged.kv8_code(amax)
@@ -317,7 +320,8 @@ def _ring_store8(k, p: _SPlan, row, w, live):
 class RingStore(Block):
     """Row r of ``kvn`` (a key, bf16 [KVD]) into an engine-owned window ring (module docstring: the address, the
     slot and the liveness), one task a row. Rows that are not the step's request's (padding, a dummy step) store
-    nothing; nothing else of the ring is written. ``kv8``: the ring is in ATOM's fp8 pool (MXFP8 rows)."""
+    nothing; nothing else of the ring is written. ``kv8``: the ring is in ATOM's fp8 pool (MXFP8 rows).
+    """
 
     def __init__(self, name: str, kvn: Channel, ring: str, geo: str, stage: int, pos: str = "pos",
                  bids: str = "cx.bids", slots: str = "cx.slots", meta: str = "", kv8: bool = False):  # fmt: skip
@@ -410,7 +414,9 @@ def context_blocks(
         blocks.append(NormQuant(f"cx_kvn{s}", C["kv"][s], C["kvq"][s], f"cx.kv_norm{s}.g", bf16_out=C["kvb"][s],
                                 spec=_nspec(KVD, 64, 4)))  # fmt: skip
     for s in range(STAGES):
-        blocks.append(KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope", kv8=kv8))
+        blocks.append(
+            KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope", kv8=kv8)
+        )
     for s in range(STAGES):
         blocks.append(
             RingStore(

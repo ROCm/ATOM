@@ -466,9 +466,7 @@ def _check_entries() -> None:
     the deployment's storage (``STORAGE_KNOBS``)."""
     for key, entry in SCHEDULES.items():
         bad = [
-            n
-            for n in (*CHAIN_KNOBS, *PRECISION_KNOBS, *STORAGE_KNOBS)
-            if n in entry
+            n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS, *STORAGE_KNOBS) if n in entry
         ]
         if bad:
             raise ValueError(

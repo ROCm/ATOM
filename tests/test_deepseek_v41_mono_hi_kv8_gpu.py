@@ -30,11 +30,23 @@ import torch  # noqa: E402
 from flydsl.expr.typing import T  # noqa: E402
 
 from atom.models.deepseek_v41.mono.hi.blocks.gfx950 import compressor  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.blocks.gfx950.attention import mla_sparse  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.device.gfx950 import buffer_ops as bo  # noqa: E402
+from atom.models.deepseek_v41.mono.hi.blocks.gfx950.attention import (
+    mla_sparse,
+)  # noqa: E402
+from atom.models.deepseek_v41.mono.hi.device.gfx950 import (
+    buffer_ops as bo,
+)  # noqa: E402
 from atom.models.deepseek_v41.mono.hi.device.gfx950 import paged  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import ld_i32, rsrc, traced  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.plan.program import Program, Scenario, Stage  # noqa: E402
+from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import (
+    ld_i32,
+    rsrc,
+    traced,
+)  # noqa: E402
+from atom.models.deepseek_v41.mono.hi.plan.program import (
+    Program,
+    Scenario,
+    Stage,
+)  # noqa: E402
 from atom.models.deepseek_v41.mono.hi.v41 import draft  # noqa: E402
 
 ROWS, HD, ROW8 = 64, 512, 528
@@ -51,7 +63,9 @@ _RING = SimpleNamespace(ring="ring")  # (draft._ring_store8's)
 def _entry_task(k, t):
     """Thread c: channel c of row t (``x`` f32) -> ``compressor._kv8_entry`` (entry t of the request), its value."""
     c = k.tid
-    v = fx.Float32(bo.buffer_load(rsrc(k.args["x"]), t * HD + c, vec_width=1, dtype=T.f32))
+    v = fx.Float32(
+        bo.buffer_load(rsrc(k.args["x"]), t * HD + c, vec_width=1, dtype=T.f32)
+    )
     got = compressor._kv8_entry(k, _PAGED, 0, t, c, v, c >= 0)
     bo.buffer_store(got, rsrc(k.args["out"]), t * HD + c)
 
@@ -65,7 +79,11 @@ def _ring_task(k, t):
 
 
 def _store_words(k, t, words):
-    bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(k.args["out"]), t * (HD // 2) + k.lane * 4)
+    bo.buffer_store(
+        fx.Vector.from_elements(words, fx.Int32),
+        rsrc(k.args["out"]),
+        t * (HD // 2) + k.lane * 4,
+    )
 
 
 @traced
@@ -74,7 +92,13 @@ def _load_task(k, t, uni):
     tasks' wave-uniform row; else the merge's lane-own row)."""
     if k.wave == 0:
         addr = fx.Int64(k.args["pool"]) + fx.Int64(t) * ROW8
-        _store_words(k, t, mla_sparse._kv8_land(mla_sparse._kv8_issue(addr, k.lane * 8, uni), k.lane * 8))
+        _store_words(
+            k,
+            t,
+            mla_sparse._kv8_land(
+                mla_sparse._kv8_issue(addr, k.lane * 8, uni), k.lane * 8
+            ),
+        )
 
 
 @traced
@@ -84,15 +108,21 @@ def _ring_read_task(k, t):
         r_ring = rsrc(k.args["pool"])
         at = t * (ROW8 // 4)
         v = fx.Vector(bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32))
-        cw = bo.buffer_load(r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32)
-        _store_words(k, t, paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4)))
+        cw = bo.buffer_load(
+            r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32
+        )
+        _store_words(
+            k, t, paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4))
+        )
 
 
 def build(name, emit, args):
     """The one-stage program of ``emit`` over ``ROWS`` tasks (compiled; a GPU only to launch it)."""
     from atom.models.deepseek_v41.mono.hi.runtime.kernel import MonoKernel
 
-    return MonoKernel(Program(name, Scenario(1, ROWS), [Stage(name, ROWS, emit, args=args, base=0)]))
+    return MonoKernel(
+        Program(name, Scenario(1, ROWS), [Stage(name, ROWS, emit, args=args, base=0)])
+    )
 
 
 PROGRAMS = {
@@ -137,7 +167,11 @@ def _paged_args(pool):
     req = torch.zeros(paged.REQ_WORDS, dtype=torch.int32, device="cuda")
     req[paged.GEO], req[paged.GEO + 1] = 1, paged.PAGE  # table stride, page rows
     req[paged.BID] = 0
-    return {"ckv": pool, "req": req, "ptab": torch.zeros(1, dtype=torch.int32, device="cuda")}
+    return {
+        "ckv": pool,
+        "req": req,
+        "ptab": torch.zeros(1, dtype=torch.int32, device="cuda"),
+    }
 
 
 @pytest.fixture(scope="module")

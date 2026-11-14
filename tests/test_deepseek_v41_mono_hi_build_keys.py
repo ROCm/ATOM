@@ -86,9 +86,9 @@ def bf16():
 
 def test_the_bf16_programs_are_the_snapshots(bf16):
     want = json.loads(FIXTURE.read_text())
-    assert sorted(bf16) == sorted(want), (
-        f"programs added {sorted(set(bf16) - set(want))}, gone {sorted(set(want) - set(bf16))}"
-    )
+    assert sorted(bf16) == sorted(
+        want
+    ), f"programs added {sorted(set(bf16) - set(want))}, gone {sorted(set(want) - set(bf16))}"
     changed = sorted(n for n in want if bf16[n] != want[n])
     assert not changed, f"bf16 build keys changed: {changed}"
     assert not [n for n in bf16 if "kv8" in n]
@@ -100,7 +100,9 @@ def test_the_fp8_pool_builds_only_the_kv_programs_apart(bf16):
     same = {n: k for n, k in fp8.items() if "_kv8" not in n}
     # the rest: the bf16 programs as they are (the window layers, the verify and draft heads, the Engram launch)
     assert same == {n: bf16[n] for n in same}
-    assert not [n for n in same if re.match(r"atom_v41_(consumer|kv|index|ctx|draft\d)", n)], sorted(same)
+    assert not [
+        n for n in same if re.match(r"atom_v41_(consumer|kv|index|ctx|draft\d)", n)
+    ], sorted(same)
     # each KV program: its bf16 twin's name with "_kv8", keyed apart
     twins = {n: n.replace("_kv8", "") for n in kv8}
     assert set(twins.values()) | set(same) == set(bf16)

@@ -128,7 +128,9 @@ class _Plan:
     qat: bool = (
         True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
     )
-    kv8: bool = False  # the cache is ATOM's fp8 pool: the entry stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
+    kv8: bool = (
+        False  # the cache is ATOM's fp8 pool: the entry stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
+    )
 
     @property
     def rd(self) -> str:
@@ -290,10 +292,19 @@ def _kv8_entry(k, p: _Plan, b, pos, c, entry, ok):
     code = paged.kv8_code(amax)
     scaled = paged.kv8_scaled(entry, code)
     n1 = xshfl(scaled, 1)
-    word = fp8_pack4(scaled, n1, xshfl(scaled, 2), xshfl(n1, 2))  # (lane c ^ 2's neighbour: c + 3)
-    row = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio, row_bytes=paged.KV8_ROW_BYTES)
+    word = fp8_pack4(
+        scaled, n1, xshfl(scaled, 2), xshfl(n1, 2)
+    )  # (lane c ^ 2's neighbour: c + 3)
+    row = paged.row_addr(
+        k, p.cache, b, pos // p.ratio, p.ratio, row_bytes=paged.KV8_ROW_BYTES
+    )
     _store_entry(row + fx.Int64(c), word, ok & ((c % 4) == 0))
-    _store_entry(row + fx.Int64(HD + c // paged.KV8_GROUP), code, ok & ((c % paged.KV8_GROUP) == 0), 1)
+    _store_entry(
+        row + fx.Int64(HD + c // paged.KV8_GROUP),
+        code,
+        ok & ((c % paged.KV8_GROUP) == 0),
+        1,
+    )
     return paged.kv8_value(scaled, code)
 
 
@@ -397,7 +408,9 @@ def _pool(k, t, p: _Plan):
     if const_expr(p.kv8):
         # ATOM's fp8 pool: the entry as its writer quantizes the bf16 row (``fused_compress``'s ``fp8_groups``), a
         # group of 32 channels a half wave; this launch's readers (``out``) take the values the row holds
-        entry = _kv8_entry(k, p, b, pos, c, entry, live if emits is None else live & emits)
+        entry = _kv8_entry(
+            k, p, b, pos, c, entry, live if emits is None else live & emits
+        )
     # outputs: a pair a even thread
     nxt = xshfl(entry, 1)
     even = (c & 1) == 0

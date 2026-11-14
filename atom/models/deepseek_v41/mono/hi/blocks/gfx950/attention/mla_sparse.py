@@ -434,7 +434,9 @@ def _ckv_addr(k, p: _SPlan, b, idx, uni: bool = True):
     """
     e = fx.min(fx.max(idx, 0), fx.Int32(p.cache_len - 1))
     if p.kv8:  # ATOM's fp8 pool: its MXFP8 rows
-        return paged.row_addr(k, p.ckv, b, e, p.cratio, uni, row_bytes=paged.KV8_ROW_BYTES)
+        return paged.row_addr(
+            k, p.ckv, b, e, p.cratio, uni, row_bytes=paged.KV8_ROW_BYTES
+        )
     return paged.row_addr(k, p.ckv, b, e, p.cratio, uni)
 
 
@@ -472,7 +474,9 @@ def _gather_issue(k, p: _SPlan, b, r, c):
                                                   dtype=T.i32)))  # fmt: skip
         oks.append(idx >= 0)
         idxs.append(idx)
-        if p.kv8:  # (ATOM's fp8 pool: a lane's 8 B of the 528 B row and its group's code)
+        if (
+            p.kv8
+        ):  # (ATOM's fp8 pool: a lane's 8 B of the 528 B row and its group's code)
             vs.append(_kv8_issue(_ckv_addr(k, p, b, idx), k.lane * 8, True))
             continue
         # (the row's page from the block table: a scalar load, then the 1 KiB row from its own base)
@@ -1000,7 +1004,11 @@ def _smerge(k, t, p: _SPlan):
         # (a lane's own key: its page by a vector table load, the 16 B by a 64-bit global load; ATOM's fp8 pool: 8 B
         # and its group's code)
         if p.kv8:
-            cv.append(_kv8_issue(_ckv_addr(k, p, b, idx, uni=False), s * SLICE + piece * 8, False))
+            cv.append(
+                _kv8_issue(
+                    _ckv_addr(k, p, b, idx, uni=False), s * SLICE + piece * 8, False
+                )
+            )
             continue
         off = fx.Int64((s * (SLICE // 2) + piece * 4) * 4)
         cv.append(fx.Vector(global_load(_ckv_addr(k, p, b, idx, uni=False) + off, 4)))

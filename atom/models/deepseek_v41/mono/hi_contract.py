@@ -50,7 +50,9 @@ def check(cfg, widths=None, tp: int = TP, fits: bool = True, kv_dtype: str = "bf
     widths = list(hi_compose.ROWS) if widths is None else list(widths)
     frozen, linear.FROZEN = linear.FROZEN, not fits
     try:
-        progs = hi_compose.HiPrograms(cfg, topology, widths, MAX_CTX, tp, kv_dtype=kv_dtype)
+        progs = hi_compose.HiPrograms(
+            cfg, topology, widths, MAX_CTX, tp, kv_dtype=kv_dtype
+        )
     finally:
         linear.FROZEN = frozen
     if fits:

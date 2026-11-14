@@ -189,7 +189,15 @@ def _kvprep(k, r, p: _KVPlan):
 class KVPrep(Block):
     """The window key (RoPE, then the MXFP8 QAT); ``kv8``: by the code of ATOM's fp8 pool's writer."""
 
-    def __init__(self, name: str, kv: Channel, kvn: Channel, pos: str, rope: str, kv8: bool = False):
+    def __init__(
+        self,
+        name: str,
+        kv: Channel,
+        kvn: Channel,
+        pos: str,
+        rope: str,
+        kv8: bool = False,
+    ):
         for ch in (kv, kvn):
             if ch.fmt is not Fmt.BF16 or ch.width != HD or ch.flagged:
                 raise ValueError(

@@ -141,7 +141,9 @@ def test_the_gate_reads_the_values_atom_settled_on(served):
 def test_both_kv_formats_are_served(mi355x, kv):
     """ATOM's bf16 pool, or its MXFP8 one (``--kv_cache_dtype fp8``: the programs dequantize on load and quantize on
     store), from the served command line's ``Config``."""
-    cfg = _atom_config(SERVED_ARGS.replace("--kv_cache_dtype bf16", f"--kv_cache_dtype {kv}"))
+    cfg = _atom_config(
+        SERVED_ARGS.replace("--kv_cache_dtype bf16", f"--kv_cache_dtype {kv}")
+    )
     assert cfg.kv_cache_dtype == kv
     assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
 

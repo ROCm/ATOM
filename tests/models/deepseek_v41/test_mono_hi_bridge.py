@@ -157,7 +157,9 @@ def _atom_dequantize_rows():
         )
 
         return dequantize_rows
-    except Exception:  # noqa: BLE001 - its module needs AITER's attention (and what it imports)
+    except (
+        Exception
+    ):  # noqa: BLE001 - its module needs AITER's attention (and what it imports)
 
         def dequantize_rows(values, scales):
             groups = values.float().unflatten(-1, (-1, 32))
@@ -180,8 +182,12 @@ def kv8_encode(x: torch.Tensor) -> torch.Tensor:
     reciprocal (``pow2_reciprocal``), clamped to +-448, E4M3 rounded to nearest even."""
     n = x.shape[0]
     g = x.float().reshape(n, 16, 32)
-    amax = torch.maximum(g.abs().amax(-1), torch.tensor(1e-10, dtype=torch.float32, device=x.device))
-    t = (amax * torch.tensor(1 / 448, dtype=torch.float32, device=x.device)).view(torch.int32)
+    amax = torch.maximum(
+        g.abs().amax(-1), torch.tensor(1e-10, dtype=torch.float32, device=x.device)
+    )
+    t = (amax * torch.tensor(1 / 448, dtype=torch.float32, device=x.device)).view(
+        torch.int32
+    )
     code = (t >> 23) + ((t & 0x7FFFFF) != 0).int()
     rcp = ((254 - code).clamp_min(0) << 23).view(torch.float32)
     q = (g * rcp[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
@@ -329,16 +335,23 @@ def check_kv8_codec():
     # ATOM's rows of random value bytes (no NaN: 0x7f / 0xff are its clamp's) and codes 85 .. 200 (the amax floor's
     # code is 85)
     g = torch.Generator().manual_seed(1)
-    rows = torch.randint(0, 256, (n, ml.KV8_ROW_BYTES), generator=g, dtype=torch.int32).to(torch.uint8)
+    rows = torch.randint(
+        0, 256, (n, ml.KV8_ROW_BYTES), generator=g, dtype=torch.int32
+    ).to(torch.uint8)
     rows[:, :dim][(rows[:, :dim] & 0x7F) == 0x7F] = 0x7E
-    rows[:, dim:] = torch.randint(85, 201, (n, dim // 32), generator=g, dtype=torch.int32).to(torch.uint8)
+    rows[:, dim:] = torch.randint(
+        85, 201, (n, dim // 32), generator=g, dtype=torch.int32
+    ).to(torch.uint8)
     ml._kv8_load_kernel[(n,)](rows, back, DIM=dim)
     report("[2k] import: random ATOM rows", torch.equal(back.float(), kv8_decode(rows)))
     # a row the hi path re-exports after importing it decodes to the same values (its bytes may differ: a group whose
     # largest value rounded down to 224 x scale re-encodes at half the scale, every value doubled)
     again = torch.zeros_like(got)
     ml._kv8_store_kernel[(n,)](back, again, DIM=dim)
-    report("[2k] export after import: the same values", torch.equal(kv8_decode(again), kv8_decode(rows)))
+    report(
+        "[2k] export after import: the same values",
+        torch.equal(kv8_decode(again), kv8_decode(rows)),
+    )
 
 
 def check_req_words():
@@ -483,7 +496,10 @@ def check_fused(engram: bool = False, kv8: bool = False):
     }  # fmt: skip
     kv = {"KV8": 1} if kv8 else {}
     if kv8:  # ATOM's writer's rows of keys over many scales
-        base["pool"] = kv8_encode(base["pool"].float() * torch.exp2(torch.randint(-30, 20, (len(base["pool"]), 1))))
+        base["pool"] = kv8_encode(
+            base["pool"].float()
+            * torch.exp2(torch.randint(-30, 20, (len(base["pool"]), 1)))
+        )
     if (
         engram
     ):  # ATOM's staged rows (views of a wider buffer), the kv launch's row buffers, the cursor, hist
@@ -586,7 +602,9 @@ def check_fused(engram: bool = False, kv8: bool = False):
             )
             diff += [] if ok_rows else ["eng_rows (vs the staged rows)"]
         tag = "[5e] fused bridge + Engram segments," if engram else "[5] fused bridge,"
-        tag = tag.replace("bridge", "bridge (fp8 pool)").replace("[5", "[5k" if kv8 else "[5")
+        tag = tag.replace("bridge", "bridge (fp8 pool)").replace(
+            "[5", "[5k" if kv8 else "[5"
+        )
         report(f"{tag} == separate kernels, ctx {ctx} request {b} pad {pad}", not diff,
                f"({len(base) - len(diff)} / {len(base)} tensors equal; {len(changed)} written"
                + (f"; DIFF {diff}" if diff else "") + ")")  # fmt: skip
@@ -1747,7 +1765,8 @@ def check_glue_folds():
 
 def check_kv8_atom():
     """[2ka] The bridge's fp8 row export / import, compiled, against ATOM's own launches on the same bf16 rows:
-    ``quantize_fp8`` (``fp8_groups``: the bytes ATOM's writers store) and ``dequantize_rows`` (its reader)."""
+    ``quantize_fp8`` (``fp8_groups``: the bytes ATOM's writers store) and ``dequantize_rows`` (its reader).
+    """
     from atom.model_ops.blockscale import quantize_fp8
 
     n, dim = 64, 512
@@ -1758,10 +1777,16 @@ def check_kv8_atom():
     want = torch.cat([values.view(torch.uint8), scales.view(torch.uint8)], -1)
     report("[2ka] export == ATOM's quantize_fp8 bytes", torch.equal(got, want),
            f"({int((got != want).sum())} bytes differ)")  # fmt: skip
-    report("[2ka] the torch model == ATOM's quantize_fp8 bytes", torch.equal(kv8_encode(x.cpu()), want.cpu()))
+    report(
+        "[2ka] the torch model == ATOM's quantize_fp8 bytes",
+        torch.equal(kv8_encode(x.cpu()), want.cpu()),
+    )
     back = torch.zeros(n, dim, dtype=torch.bfloat16)
     ml._kv8_load_kernel[(n,)](want, back, DIM=dim)
-    report("[2ka] import == ATOM's dequantize_rows", torch.equal(back.float(), kv8_decode(want)))
+    report(
+        "[2ka] import == ATOM's dequantize_rows",
+        torch.equal(back.float(), kv8_decode(want)),
+    )
 
 
 # ---------------------------------------------------------------- the tests

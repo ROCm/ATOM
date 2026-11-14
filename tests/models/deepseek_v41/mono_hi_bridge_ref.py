@@ -48,7 +48,10 @@ def _kv8_store_kernel(src, pool, DIM: tl.constexpr):
 def _kv8_load_kernel(pool, dst, DIM: tl.constexpr):
     """Program r: ATOM's MXFP8 row r of ``pool`` -> bf16 row r of ``dst`` [rows, DIM] (``_kv8_load``)."""
     r = tl.program_id(0)
-    tl.store(dst + r.to(tl.int64) * DIM + tl.arange(0, DIM), _kv8_load(pool, r.to(tl.int64), r >= 0, DIM))
+    tl.store(
+        dst + r.to(tl.int64) * DIM + tl.arange(0, DIM),
+        _kv8_load(pool, r.to(tl.int64), r >= 0, DIM),
+    )
 
 
 @triton.jit

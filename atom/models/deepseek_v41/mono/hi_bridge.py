@@ -169,7 +169,8 @@ def _ring_row(
 @triton.jit
 def _kv8_load(pool, row, ok, DIM: tl.constexpr):
     """ATOM's MXFP8 row ``row`` of ``pool`` (uint8) as bf16 [DIM]: each E4M3 value x 2^(code - 127), exact (a 4-bit
-    significand by a power of two, in bf16's range for every code ATOM writes); zeros where not ``ok``."""
+    significand by a power of two, in bf16's range for every code ATOM writes); zeros where not ``ok``.
+    """
     base = pool + row * (DIM + DIM // 32)
     g = tl.arange(0, DIM // 32)
     e = tl.arange(0, 32)
@@ -235,7 +236,8 @@ def _ring_out(
 ):  # fmt: skip
     """The hi runtime layer m's key row of step row j (request b = j // rq, its ring
     slot (ctx_b + j - b rq) % WIN) -> ATOM's ring at that position (the
-    request's own rows only); ``KV8``: quantized to ATOM's MXFP8 row (``_kv8_store``)."""
+    request's own rows only); ``KV8``: quantized to ATOM's MXFP8 row (``_kv8_store``).
+    """
     layer = tl.load(layer_ids + m).to(tl.int64)
     b = j // rq
     b0, slot, live, ctx = _request(
@@ -523,7 +525,8 @@ def _begin_step_kernel(
     The full import (``INCR`` = 0): a program a ring slot (RP = WIN). The incremental import (``INCR`` = 1, the hook's
     served path): RP programs a layer loop over only what changed since ``imp[b]`` (the request slot's last served
     step, ``_end_step_kernel``'s ``TRACK``), or over everything when the request does not continue it
-    (``_import_state``). ``KV8``: ATOM's pool is its fp8 one (``pool`` its uint8 rows, ``KV8_ROW_BYTES``)."""
+    (``_import_state``). ``KV8``: ATOM's pool is its fp8 one (``pool`` its uint8 rows, ``KV8_ROW_BYTES``).
+    """
     pid = tl.program_id(0)
     rq = rows // NB
     n0 = NMF * NB * RP
@@ -586,7 +589,8 @@ def _end_step_kernel(
     j // (rows / NB) (``_ring_out``). ``TRACK`` (the
     incremental import): program b < NB records request b's step in ``imp[b]``
     (int32 [slot, ctx, rows a request]; slot -1 on a pad request) for the next
-    step's import (``_begin_step_kernel``'s ``INCR``). ``KV8``: ATOM's pool is its fp8 one (``_ring_out``)."""
+    step's import (``_begin_step_kernel``'s ``INCR``). ``KV8``: ATOM's pool is its fp8 one (``_ring_out``).
+    """
     pid = tl.program_id(0)
     seg = pid // rows
     j = pid % rows
