@@ -1,9 +1,13 @@
 //! The prefix index of one partition, and the per-holder tables its writer translates
 //! events with.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Instant,
+};
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::{hash, HolderId, PrefixHash};
 use crate::kv_events::model::{DropReason, EngineHash, KvEvent, StoredBlock};
@@ -12,6 +16,15 @@ const SHARDS: usize = 64;
 
 /// Blocks a walk prefetches ahead of its lookup.
 const PREFETCH: usize = 16;
+
+/// Ops the writer applies per hold of the shards they touch.
+const HOLD_OPS: usize = 512;
+
+/// Blocks a walk looks up between giving up the shards the writer waits for.
+const YIELD_BLOCKS: usize = 16;
+
+/// Spins of a wait before it yields the thread instead.
+const SPINS: u32 = 100;
 
 /// Blocks one holder may index, more than a device holds: a stream that stores without
 /// ever removing stops growing the index here.
@@ -86,6 +99,20 @@ impl Shard {
         self.find(key).map_or(0, |i| self.slots[i].1)
     }
 
+    fn apply(&mut self, op: Op, lane: u64) {
+        match op {
+            Op::Store(hash) => *self.upsert(key(hash)) |= lane,
+            Op::Remove(hash) => {
+                if let Some(i) = self.find(key(hash)) {
+                    self.slots[i].1 &= !lane;
+                    if self.slots[i].1 == 0 {
+                        self.remove(i);
+                    }
+                }
+            }
+        }
+    }
+
     fn upsert(&mut self, key: u64) -> &mut u64 {
         if (self.len + 1) * 4 > self.slots.len() * 3 {
             self.resize((self.slots.len() * 2).max(16));
@@ -145,68 +172,98 @@ impl Shard {
 /// For each prefix hash, the lanes of the holders whose device cache holds it.
 pub(super) struct PrefixIndex {
     shards: Box<[RwLock<Shard>]>,
+    /// The shards the writer waits for, by bit.
+    wanted: AtomicU64,
+    /// A walk waited for the writer.
+    waited: AtomicBool,
+    /// One writer at a time: walks waiting behind two could wait for each other.
+    writer: Mutex<()>,
 }
 
 impl Default for PrefixIndex {
     fn default() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
+            wanted: AtomicU64::new(0),
+            waited: AtomicBool::new(false),
+            writer: Mutex::new(()),
         }
     }
 }
 
 impl PrefixIndex {
-    /// Applies and drains one holder's ops, in order, under the write locks of the shards
-    /// they touch. Writers and walks lock shards in ascending order, so neither waits on
-    /// the other in a cycle: a writer waits for the walks under way, and a walk for at
-    /// most one writer's ops.
+    /// Applies and drains one holder's ops, each shard's in order, `HOLD_OPS` at most per
+    /// hold of the shards they touch, so a walk may see part of the batch. Walks soon give
+    /// up the shards the writer waits for, and a writer that kept a walk waiting then
+    /// pauses as long as it held the shards, so that even a writer without pause leaves
+    /// the walks half the time.
     pub(super) fn apply(&self, holder: HolderId, ops: &mut Vec<Op>) {
+        let _writer = self.writer.lock();
         let lane = lane(holder);
-        let touched = ops.iter().fold(0u64, |shards, op| shards | 1 << op.shard());
-        let mut shards: [Option<RwLockWriteGuard<'_, Shard>>; SHARDS] = [const { None }; SHARDS];
-        for (i, shard) in shards.iter_mut().enumerate() {
-            if touched >> i & 1 == 1 {
-                *shard = Some(self.shards[i].write());
-            }
-        }
-        for op in ops.drain(..) {
-            let Some(shard) = shards[op.shard()].as_mut() else {
-                continue;
-            };
-            match op {
-                Op::Store(hash) => *shard.upsert(key(hash)) |= lane,
-                Op::Remove(hash) => {
-                    if let Some(i) = shard.find(key(hash)) {
-                        shard.slots[i].1 &= !lane;
-                        if shard.slots[i].1 == 0 {
-                            shard.remove(i);
-                        }
-                    }
+        ops.sort_by_key(|op| op.shard());
+        for held in ops.chunks(HOLD_OPS) {
+            let started = Instant::now();
+            let touched = held.iter().fold(0, |shards, op| shards | 1 << op.shard());
+            let mut shards = self.write(touched);
+            for &op in held {
+                if let Some(shard) = shards[op.shard()].as_mut() {
+                    shard.apply(op, lane);
                 }
             }
+            drop(shards);
+            if self.waited.swap(false, Ordering::Relaxed) {
+                let held = started.elapsed();
+                spin(|| (started.elapsed() >= held * 2).then_some(()));
+            }
         }
+        ops.clear();
     }
 
-    /// The leading blocks of `prefix` each of `holders` holds, in their order. The walk
-    /// read-locks every shard, in ascending order, once, and stops when no holder is left.
+    /// The write locks of the shards in `touched`, by bit. While the writer waits for any,
+    /// walks give them up, and take them again only after the writer.
+    fn write(&self, touched: u64) -> [Option<RwLockWriteGuard<'_, Shard>>; SHARDS] {
+        let mut shards = [const { None }; SHARDS];
+        let mut busy = 0;
+        for i in bits(touched) {
+            shards[i] = self.shards[i].try_write();
+            busy |= u64::from(shards[i].is_none()) << i;
+        }
+        if busy != 0 {
+            self.wanted.fetch_or(busy, Ordering::Relaxed);
+            for i in bits(busy) {
+                let shard = &self.shards[i];
+                shards[i] = Some(spin(|| match shard.is_locked() {
+                    true => None,
+                    false => shard.try_write(),
+                }));
+            }
+            self.wanted.fetch_and(!busy, Ordering::Relaxed);
+        }
+        shards
+    }
+
+    /// The leading blocks of `prefix` each of `holders` holds, in their order. One walk,
+    /// which stops when no holder is left.
     pub(super) fn find_matches(&self, prefix: &[PrefixHash], holders: &[HolderId]) -> Vec<u32> {
         let mut open = holders
             .iter()
             .fold(0, |lanes, &holder| lanes | lane(holder));
         let mut depth = [prefix.len() as u32; 64];
-        let shards: [RwLockReadGuard<'_, Shard>; SHARDS] =
-            std::array::from_fn(|i| self.shards[i].read());
+        let mut walk = Walk::new(self);
         for &hash in prefix.iter().take(PREFETCH) {
-            shards[shard_of(hash)].prefetch(key(hash));
+            walk.prefetch(hash);
         }
         for (i, &hash) in prefix.iter().enumerate() {
             if open == 0 {
                 break;
             }
-            if let Some(&ahead) = prefix.get(i + PREFETCH) {
-                shards[shard_of(ahead)].prefetch(key(ahead));
+            if i % YIELD_BLOCKS == 0 {
+                walk.yield_to_writer();
             }
-            let mut gone = open & !shards[shard_of(hash)].get(key(hash));
+            if let Some(&ahead) = prefix.get(i + PREFETCH) {
+                walk.prefetch(ahead);
+            }
+            let mut gone = open & !walk.get(hash);
             open &= !gone;
             while gone != 0 {
                 depth[gone.trailing_zeros() as usize] = i as u32;
@@ -232,6 +289,98 @@ impl PrefixIndex {
             }
         }
         (entries, blocks, slots * size_of::<(u64, u64)>())
+    }
+}
+
+/// A walk's read locks, each shard's taken once and past a waiting writer, so that a walk
+/// never waits behind it for the walks under way. Every `YIELD_BLOCKS` blocks, and while
+/// it waits, the walk gives up the shards the writer waits for, and to take one again it
+/// waits for the writer.
+struct Walk<'a> {
+    index: &'a PrefixIndex,
+    shards: [Option<RwLockReadGuard<'a, Shard>>; SHARDS],
+}
+
+impl<'a> Walk<'a> {
+    fn new(index: &'a PrefixIndex) -> Self {
+        let wanted = index.wanted.load(Ordering::Relaxed);
+        let shards = std::array::from_fn(|i| match wanted >> i & 1 {
+            0 => index.shards[i].try_read(),
+            _ => None,
+        });
+        Self { index, shards }
+    }
+
+    fn yield_to_writer(&mut self) {
+        let wanted = self.index.wanted.load(Ordering::Relaxed);
+        if wanted != 0 {
+            self.give_up(wanted);
+        }
+    }
+
+    #[cold]
+    fn give_up(&mut self, wanted: u64) {
+        for i in bits(wanted) {
+            self.shards[i] = None;
+        }
+    }
+
+    fn prefetch(&self, hash: PrefixHash) {
+        if let Some(shard) = &self.shards[shard_of(hash)] {
+            shard.prefetch(key(hash));
+        }
+    }
+
+    fn get(&mut self, hash: PrefixHash) -> u64 {
+        match &self.shards[shard_of(hash)] {
+            Some(shard) => shard.get(key(hash)),
+            None => self.take(hash),
+        }
+    }
+
+    /// Takes the shard of `hash` again, behind the writer, and looks it up.
+    #[cold]
+    fn take(&mut self, hash: PrefixHash) -> u64 {
+        let (index, i) = (self.index, shard_of(hash));
+        let take = || match index.wanted.load(Ordering::Relaxed) >> i & 1 {
+            0 => index.shards[i].try_read(),
+            _ => None,
+        };
+        let shard = take().unwrap_or_else(|| {
+            index.waited.store(true, Ordering::Relaxed);
+            spin(|| {
+                self.yield_to_writer();
+                take()
+            })
+        });
+        let found = shard.get(key(hash));
+        self.shards[i] = Some(shard);
+        found
+    }
+}
+
+/// The set bits of `mask`, lowest first.
+fn bits(mut mask: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        let i = mask.trailing_zeros() as usize;
+        mask &= mask.wrapping_sub(1);
+        (i < 64).then_some(i)
+    })
+}
+
+/// Spins until `ready` gives a value, yielding the thread once it takes long.
+fn spin<T>(mut ready: impl FnMut() -> Option<T>) -> T {
+    let mut spins = 0;
+    loop {
+        if let Some(value) = ready() {
+            return value;
+        }
+        if spins < SPINS {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
     }
 }
 
