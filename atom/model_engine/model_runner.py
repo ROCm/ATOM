@@ -4651,6 +4651,11 @@ class ModelRunner:
         # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
         self._maybe_calibrate_dspark_sps(full_q_len)
 
+        if self.config.dcp_config.comm_backend == "mailbox":
+            from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
+
+            check_dcp_mailbox_launches()
+
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
         _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)

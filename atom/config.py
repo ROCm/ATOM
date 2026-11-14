@@ -1797,7 +1797,7 @@ class EPLBConfig:
         return cls(**cfg)
 
 
-DCP_COMM_BACKENDS = ("ag_rs", "a2a")
+DCP_COMM_BACKENDS = ("auto", "ag_rs", "a2a", "mailbox")
 
 
 @dataclass
@@ -1809,7 +1809,8 @@ class DCPConfig:
     interleave_size: int = 1
     enable_query_replication: bool = True
     enable_project_before_merge: bool = True
-    comm_backend: str = "a2a"
+    # "auto" is resolved by Config: "mailbox" where it is validated, else "a2a".
+    comm_backend: str = "auto"
     # Context-parallelize the MiniMax-M3 lightning indexer INSTEAD of the KV
     # cache: every rank scores all index heads over 1/P of the blocks, then an
     # all-to-all routes each head's candidates to the rank that owns it. Sparse
@@ -2478,6 +2479,35 @@ class Config:
                 "experimental RCCL prepare/finalize backend"
             )
 
+    def _resolve_dcp_comm_backend(self) -> None:
+        """``dcp.comm_backend="auto"``: the mailbox combine where it has been
+        validated (gfx950, DCP > 1, no decode TBO, not plugin mode), else
+        all-to-all. An explicit backend is kept as given."""
+        dcp = self.dcp_config
+        if dcp.comm_backend != "auto":
+            return
+        if self.decode_context_parallel_size <= 1:
+            reason = "no DCP"
+        elif is_plugin_mode():
+            reason = "plugin mode"
+        elif self.enable_tbo_decode:
+            reason = "decode TBO (--enable-tbo all)"
+        else:
+            try:
+                from aiter.jit.utils.chip_info import get_gfx
+
+                gfx = get_gfx()
+            except Exception:  # noqa: BLE001 - no GPU / aiter: keep a2a
+                gfx = "unknown"
+            reason = None if gfx == "gfx950" else f"validated on gfx950 only, not {gfx}"
+        dcp.comm_backend = "a2a" if reason else "mailbox"
+        if self.decode_context_parallel_size > 1:
+            logger.info(
+                "DCP comm_backend auto -> %s%s",
+                dcp.comm_backend,
+                f" ({reason})" if reason else "",
+            )
+
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
@@ -2574,6 +2604,14 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+            # The mailbox combine spins in-kernel on its peers; next to decode
+            # TBO's comm-stream collectives that is unverified.
+            assert not (
+                self.enable_tbo_decode and self.dcp_config.comm_backend == "mailbox"
+            ), (
+                "DCP comm_backend 'mailbox' with decode TBO (--enable-tbo all) is "
+                "unverified. Use --enable-tbo (prefill only) or comm_backend 'a2a'."
+            )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups
@@ -2763,6 +2801,8 @@ class Config:
         self._resolve_tbo()
         self._check_pp_support()
         self._check_tbo_support()
+        # After TBO is final: "auto" never picks the mailbox next to decode TBO.
+        self._resolve_dcp_comm_backend()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens

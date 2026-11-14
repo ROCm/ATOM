@@ -328,7 +328,7 @@ nothing.
 | `interleave_size` | int | `1` | KV-cache interleave granularity `S`: token `i` lives on DCP rank `(i // S) % W`. `1` = token-level round-robin |
 | `enable_query_replication` | bool | `true` | Replicate the MLA query projection across the DCP group at load time, so each rank produces the whole group's head set locally and the per-step decode AllGather Q disappears |
 | `enable_project_before_merge` | bool | `true` | Apply the V up-projection *before* the DCP output merge, so the merge exchanges `v_head_dim` per head instead of `kv_lora_rank` |
-| `comm_backend` | str | `"a2a"` | Which collective pattern merges the per-rank partial attention: `"a2a"` or `"ag_rs"` |
+| `comm_backend` | str | `"auto"` | Which collective pattern merges the per-rank partial attention: `"auto"`, `"a2a"`, `"ag_rs"` or `"mailbox"` |
 
 > **Three of the four default to the new behaviour.** A control run that wants
 > the old path must say so **explicitly** — passing nothing re-runs the new
@@ -426,17 +426,41 @@ Covers both decode and sparse prefill. Costs a DCP-group-wide copy of `W_V`
 
 ### `comm_backend`
 
-Both backends compute the same thing and are **mathematically equivalent but not
+All backends compute the same thing and are **mathematically equivalent but not
 bitwise identical** (different summation order, and `a2a` round-trips the fp32
 LSE through two 16-bit halves of a bf16 buffer).
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
-| `a2a` (default) | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
+| `auto` (default) | `mailbox` on gfx950 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
+| `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
+| `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
 
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
+
+`mailbox` needs aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972, in
+main from `d223b16cf`) and FlyDSL >= 0.5.0,
+whose `dcp_lse_combine` takes `row_counts` (sparse MLA's empty-row mask) on
+every rank; without it, when the peer memory cannot be mapped (e.g. a DCP
+group spanning nodes), and in plugin mode, the layer logs a warning and merges
+with `a2a`. Only graph-captured decode steps take it (each token count is its
+own kernel build, ~0.4-0.8 s on first use, so eager steps and prefill merge
+with `a2a`). An explicit `mailbox` is refused together with decode TBO
+(`--enable-tbo all`); `auto` takes `a2a` there. After graph capture the ranks
+check that they captured the same number of mailbox merges and refuse to serve
+otherwise, since a rank one launch ahead would pair every later merge with the
+wrong peer call. The first startup builds one kernel per captured decode width;
+set `comm_backend` to `a2a` to opt out.
+A merge larger than `2^20` elements (tokens x all heads x head dim; GLM-5.2
+at DCP4 has 16384 per token, so up to 64 tokens take the mailbox) takes `a2a`:
+past that the mailbox's tagged stores are bandwidth bound and lose to RCCL (on
+MI355X from about 1.3e6 elements on GLM-5.2). Its peer buffer, `2 x ranks x
+tokens x local heads x (4 x head dim + 8)` bytes with `tokens = min(max_num_seqs
+x (1 + num_speculative_tokens), 2^20 / (ranks x local heads x head dim))`, is
+mapped at model build, so it comes out of the KV budget. The combine does not quantize:
+with a per-token FP8 `o_proj` its output is quantized by `o_proj` itself.
 
 ## Launching server
 

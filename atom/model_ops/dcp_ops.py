@@ -3,11 +3,14 @@
 
 """DCP (Decode Context Parallel) communication ops for ATOM.
 
-Two backends combine the per-rank partial attention outputs into the global
+Three backends combine the per-rank partial attention outputs into the global
 softmax, selected by ``DCPConfig.comm_backend``:
 
-  * ``ag_rs`` -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
-  * ``a2a``   -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``ag_rs``   -- AllGather LSE -> correct local output -> ReduceScatter (2 calls)
+  * ``a2a``     -- one all-to-all carrying output+LSE, combine locally (1 call)
+  * ``mailbox`` -- small decode merges in aiter's FlyDSL mailbox combine, which
+    stores straight into the owners' IPC-mapped memory (no collective call);
+    everything else as ``a2a``
 
 They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
@@ -15,6 +18,9 @@ section below for why one collective can replace two.
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
+
+import inspect
+import logging
 
 import numpy as np
 import torch
@@ -849,6 +855,158 @@ def mask_empty_dcp_lse(
     return cp_attn_lse.masked_fill(owned_counts[:, None] == 0, float("-inf"))
 
 
+# ─────────────────────────────────────────── mailbox merge backend ──
+#
+# aiter's ``dcp_lse_combine`` (FlyDSL, aiter PR #6972): one launch in which
+# every rank stores each owner's head rows and LSEs straight into the owner's
+# IPC-mapped mailbox as (value, launch tag) pairs, then polls its own heads and
+# combines them. It replaces pack -> all_to_all_single -> combine. Decode only:
+# its peer buffer is sized for the widest decode step, and its launch epoch
+# lives on each rank, so every rank must launch it the same number of times in
+# the same order -- which a DCP group's lock-step decode does. Each token count
+# is its own kernel build (~0.4-0.8 s on first use), so only graph-captured
+# steps take it: the build lands in capture, and eager steps stay on a2a.
+# Sparse MLA's empty rows (owned_counts == 0) are masked inside the combine
+# through its ``row_counts``; an aiter without that argument keeps a2a.
+
+_MAILBOX_WORKSPACES: dict = {}
+# Mailbox merges taken, per workspace. A merge can only take the mailbox inside
+# a graph capture, so after capture this is every launch a replay makes.
+_MAILBOX_LAUNCHES: dict = {}
+_MAILBOX_GROUPS: dict = {}
+# Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
+# system-scope stores beat pack -> RCCL -> combine while the merge is latency
+# bound and lose once it is bandwidth bound. On MI355X (token tiling,
+# row_counts) GLM-5.2 DCP4 16 x 256 leads through 1.18e6 elements and loses
+# from 1.31e6; Kimi-K3 DCP8 12 x 128 still leads at 1.57e6.
+_MAILBOX_MAX_ELEMS = 1 << 20
+logger = logging.getLogger("atom")
+
+
+def _mailbox_key(cp_group, heads, dim):
+    return (id(cp_group), heads, dim)
+
+
+def dcp_mailbox_max_tokens(atom_config) -> int:
+    """The widest decode step: every sequence verifying all its draft tokens."""
+    spec = atom_config.speculative_config
+    drafts = (spec.num_speculative_tokens or 0) if spec is not None else 0
+    return atom_config.max_num_seqs * (1 + drafts)
+
+
+def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
+    """Create the shared mailbox workspace of (group, heads a rank, head dim).
+
+    Collective (it maps every rank's peer buffer): call it on every rank of
+    ``cp_group`` in the same order, before any CUDA graph is captured. Its
+    memory sits outside torch's allocator, so it must exist before the KV
+    cache is sized. Returns False on every rank, and the merge stays on
+    all-to-all, when any rank's aiter has no mailbox combine (or one without
+    ``row_counts``) or the peer memory cannot be mapped. ``max_tokens`` is
+    capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
+    all-to-all, so room for them would never be used.
+    """
+    key = _mailbox_key(cp_group, heads, dim)
+    if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
+        return _MAILBOX_WORKSPACES[key] is not None
+    _MAILBOX_WORKSPACES[key] = None
+    # Same shapes on every rank, so every rank returns here alike.
+    max_tokens = min(
+        max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
+    )
+    if max_tokens < 1:
+        return False
+    try:
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace, dcp_lse_combine
+
+        usable = "row_counts" in inspect.signature(dcp_lse_combine).parameters
+        if not usable:
+            logger.warning("DCP mailbox: aiter's dcp_lse_combine has no row_counts")
+    except Exception as error:  # noqa: BLE001 - any failure must reach the vote
+        usable = False
+        logger.warning("DCP mailbox: aiter mailbox combine unavailable: %r", error)
+    # agree first: a rank that skipped the mapping would leave its peers
+    # waiting in it
+    ok = torch.tensor([int(usable)], dtype=torch.int32, device="cpu")
+    torch.distributed.all_reduce(
+        ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
+    )
+    if not ok.item():
+        if usable:
+            logger.warning("DCP mailbox: another rank cannot run it; using a2a")
+        return False
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        # its handshake agrees across the group before raising
+        ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
+    except RuntimeError as error:
+        logger.warning("DCP mailbox peer memory: %s", error)
+        return False
+    _MAILBOX_WORKSPACES[key] = ws
+    _MAILBOX_GROUPS[key] = cp_group
+    logger.info(
+        "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
+        "%.1f MiB of peer memory",
+        heads,
+        dim,
+        max_tokens,
+        ws.peers.bytes.numel() / (1 << 20),
+    )
+    return True
+
+
+def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
+    """The mailbox merge, or None when this call cannot take it."""
+    if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
+        return None
+    tokens, heads, dim = cp_attn_out.shape
+    key = _mailbox_key(cp_group, heads // cp_group.world_size, dim)
+    ws = _MAILBOX_WORKSPACES.get(key)
+    if (
+        ws is None
+        or tokens == 0
+        or tokens > ws.max_tokens
+        or tokens * heads * dim > _MAILBOX_MAX_ELEMS
+        or cp_attn_out.dtype != torch.bfloat16
+    ):
+        return None
+    from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
+
+    _MAILBOX_LAUNCHES[key] = _MAILBOX_LAUNCHES.get(key, 0) + 1
+    # The combine takes exactly one int32 count per row, where the a2a path
+    # accepts any buffer at least `tokens` long.
+    out = dcp_lse_combine(
+        ws,
+        cp_attn_out,
+        cp_attn_lse.to(torch.float32).contiguous(),
+        base_e=True,
+        row_counts=None if owned_counts is None else owned_counts[:tokens],
+    )
+    # No quantizing combine here: hand back the bf16 rows unquantized, which
+    # the caller then quantizes as it would without the fused path.
+    return out if quant_dtype is None else (out, None)
+
+
+def check_dcp_mailbox_launches() -> None:
+    """Raise unless every rank of each mailbox group captured the same number
+    of mailbox merges. A launch pairs with the same launch on every peer, so a
+    rank that took one more would pair each later merge with the wrong call and
+    hang at the last one. Collective: call on every rank after graph capture."""
+    for key, group in _MAILBOX_GROUPS.items():
+        n = _MAILBOX_LAUNCHES.get(key, 0)
+        t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        lo, hi = t[0].item(), -t[1].item()
+        if lo != hi:
+            raise RuntimeError(
+                f"DCP mailbox: ranks captured between {lo} and {hi} mailbox "
+                f"merges (this rank {n}); replay would pair them wrongly. Set "
+                '--dcp-config \'{"comm_backend": "a2a"}\' and report this.'
+            )
+
+
 def dcp_lse_merge(
     cp_attn_out,
     cp_attn_lse,
@@ -860,7 +1018,7 @@ def dcp_lse_merge(
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
-    Dispatches to one of the two backends above. Both compute the same weighted
+    Dispatches to one of the backends above. All compute the same weighted
     sum over KV shards and leave this rank owning the same head slice; they
     differ only in how many collectives it takes (see the A2A section above for
     why one all-to-all can replace AllGather-LSE + ReduceScatter). Equivalent
@@ -873,7 +1031,19 @@ def dcp_lse_merge(
 
     ``ctx`` is the Triton context the AG+RS backend caches its launches in; the
     a2a backend does not use one.
+
+    ``backend="mailbox"`` takes aiter's mailbox combine in a graph capture
+    when its workspace was prepared (``prepare_dcp_mailbox``) and the call
+    fits it, else all-to-all. Every input to that choice is the same on every
+    rank of the group.
     """
+    if backend == "mailbox":
+        merged = _dcp_mailbox_merge(
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+        )
+        if merged is not None:
+            return merged
+        backend = "a2a"
     if backend == "a2a":
         return cp_lse_a2a(
             cp_attn_out,

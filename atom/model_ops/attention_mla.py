@@ -879,6 +879,11 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+        assert self.dcp_comm_backend != "auto", "Config resolves comm_backend"
+        # Collective, once per (DCP group, heads, head dim): every DCP rank
+        # builds the same MLA layers in the same order, as for the weights.
+        if self.dcp_world_size > 1 and self.dcp_comm_backend == "mailbox":
+            self._prepare_dcp_mailbox()
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -1336,32 +1341,60 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
-        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
+    def _prepare_dcp_mailbox(self):
+        """Map the mailbox merge's peer buffer while every rank builds the same
+        layer (collective, and before the KV cache is sized); plugin mode
+        rebinds its DCP group later, so it keeps all-to-all."""
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
+        from atom.plugin.prepare import is_plugin_mode
+
+        if is_plugin_mode() or not prepare_dcp_mailbox(
+            self.dcp_group,
+            self.num_heads,
+            self.v_head_dim if self.pbm_enabled else self.kv_lora_rank,
+            dcp_mailbox_max_tokens(get_current_atom_config()),
+        ):
+            if not getattr(type(self), "_dcp_mailbox_off_logged", False):
+                type(self)._dcp_mailbox_off_logged = True
+                logger.warning(
+                    "DCP comm_backend 'mailbox' unavailable; merging with 'a2a'"
+                )
+            self.dcp_comm_backend = "a2a"
+
+    def _dcp_merge(
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, decode=False
+    ):
+        """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``.
+        The mailbox backend serves decode only; prefill merges with a2a."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
+        backend = self.dcp_comm_backend
+        if backend == "mailbox" and not decode:
+            backend = "a2a"
         return dcp_lse_merge(
             o,
             lse,
             self.dcp_group,
-            self.dcp_comm_backend,
+            backend,
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
         )
 
     def _dcp_fused_quant_dtype(self):
-        """o_proj's activation dtype if the combine can emit it, else None.
+        """o_proj's activation dtype if the combine may emit it, else None.
 
         The combine can only absorb the quant when o_proj reads its output
-        directly (PBM) and wants exactly a per-token FP8 activation. A static
+        directly (PBM) and wants exactly a per-token FP8 activation. The
+        mailbox combine emits bf16 even then (``(rows, None)``); the a2a
+        combine it falls back to quantizes. A static
         input_scale is not a per-token scale, and the block schemes need a scale
         per channel GROUP with a layout choice; all of those keep the standalone
         quant kernel they have today.
         """
         if not self.pbm_enabled:
             return None
-        if self.dcp_comm_backend != "a2a":
+        if self.dcp_comm_backend not in ("a2a", "mailbox"):
             return None
         op = getattr(self, "o_proj", None)
         qt = getattr(op, "quant_type", None)
@@ -1383,7 +1416,7 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, decode=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
@@ -1406,7 +1439,12 @@ class MLAAttention(nn.Module):
             )
         else:
             o = self._dcp_merge(
-                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+                o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=fused_quant,
+                decode=decode,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1414,8 +1452,8 @@ class MLAAttention(nn.Module):
                 return self.o_proj(
                     o.reshape(-1, self.num_heads * self.v_head_dim), o_scale
                 )
-            # Single-rank DCP: there was no combine to fold into, so the tensor
-            # came back unquantized and o_proj quantizes it as it always has.
+            # Single-rank DCP, or the mailbox combine: the rows came back
+            # unquantized and o_proj quantizes them as it always has.
         if self.pbm_enabled:
             return self.o_proj(o.reshape(-1, self.num_heads * self.v_head_dim))
         return self._v_up_proj_and_o_proj(o)
@@ -1476,6 +1514,7 @@ class MLAAttention(nn.Module):
             lse,
             ctx=self._cp_triton_ctx,
             owned_counts=owned_counts,
+            decode=True,
         )
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
