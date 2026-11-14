@@ -19,7 +19,6 @@ from atom.model_ops.deepseek_v41.dspark import (
     DraftSrcBuffers,
     build_block_state,
     draft_attention,
-    draft_attention_csr,
     draft_attention_fp8,
     draft_src_indices,
     draft_step_indices,
@@ -623,9 +622,17 @@ class DeepseekV41DSpark(DSparkDraftModel):
         step_positions, indices, context_positions = draft_step_indices(
             positions, ring, self.window_size, width
         )
-        # The op picks the attention path; None keeps the concatenating one.
+        # One build for whichever draft runs: the FP8 draft always reads these
+        # lists (`DraftAttention.forward` picks it by the window's type); the
+        # BF16 one only where `two_source_draft()` says, None keeping its
+        # concatenating path.
         src = draft_src_indices(
-            positions, ring, self.window_size, width, self.draft_src_buffers
+            positions,
+            ring,
+            self.window_size,
+            width,
+            self.draft_src_buffers,
+            fp8=self.draft_kv_dtype == "fp8",
         )
         return self.draft_hidden(
             input_ids,
@@ -678,11 +685,20 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if step is None:
             step = draft_step(context_positions, anchors, width, self.window_size)
         context = context_kv[self.mtp[0].attn.spec.layer_id]
-        if isinstance(context, tuple):
-            # Each stage shares visibility; graph replay rebuilds the CSR
-            # once per draft round using the live request mask.
+        if isinstance(context, tuple) and step.src_indices is None:
+            # The FP8 draft reads only the two source lists, and every stage
+            # shares them. `block_backbone` hands them over; a caller without
+            # a step gets them from the anchors, whose ring the window is.
             step = replace(
-                step, csr=draft_attention_csr(step.indices, context[0].shape[-2])
+                step,
+                src_indices=draft_src_indices(
+                    anchors,
+                    context[0].shape[-2],
+                    self.window_size,
+                    width,
+                    self.draft_src_buffers,
+                    fp8=True,
+                ),
             )
         for layer in self.mtp:
             state = layer(state, context_kv, step, self.rope)

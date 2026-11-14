@@ -107,6 +107,8 @@ def test_draft_src_indices_follows_the_arch_gate(monkeypatch):
     monkeypatch.setattr(dspark, "two_source_draft", lambda: False)
     assert draft_src_indices(anchors, 8, 4, 5, buffers) is None
     assert buffers.context is None  # nothing allocated off the gated arch
+    # The FP8 draft has no concatenating path: it builds whatever the gate.
+    assert draft_src_indices(anchors, 8, 4, 5, buffers, fp8=True) is not None
     monkeypatch.setattr(dspark, "two_source_draft", lambda: True)
     assert draft_src_indices(anchors, 8, 4, 5, buffers) is not None
 

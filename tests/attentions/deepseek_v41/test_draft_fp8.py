@@ -16,8 +16,9 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeome
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.draft_block import DraftStep
 from atom.model_ops.deepseek_v41.dspark import (
-    draft_attention_csr,
+    DraftSrcBuffers,
     draft_attention_fp8,
+    draft_src_indices,
     draft_step_indices,
 )
 from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
@@ -69,7 +70,9 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         qk_rope_head_dim=64,
         rope_theta=10000,
     )
-    config = SimpleNamespace(hf_config=args, dspark=DSparkConfig(draft_kv_dtype=dtype))
+    config = SimpleNamespace(
+        hf_config=args, dspark=DSparkConfig(draft_kv_dtype=dtype), max_num_seqs=4
+    )
     monkeypatch.setattr(dspark, "make_v4_quant_config", lambda *a, **kw: None)
     monkeypatch.setattr(
         dspark, "build_attention_topology", lambda *a: [SimpleNamespace(layer_id=40)]
@@ -139,29 +142,28 @@ def assert_csr_equal(actual, expected):
         (65, 6, 128),
     ],
 )
-def test_fused_csr_matches_host_enumeration(batch, width, window):
+def test_fp8_source_lists_match_host_enumeration(monkeypatch, batch, width, window):
+    from atom.model_ops.deepseek_v41 import dspark
+
+    # The FP8 draft builds whatever the BF16 arch gate says.
+    monkeypatch.setattr(dspark, "two_source_draft", lambda: False)
     anchors = torch.tensor(
         ([-1, 0, 3, window - 1, window + 4, 2 * window + 7] * (batch + 1))[:batch],
         device="cuda",
     )
     _, indices, _ = draft_step_indices(anchors, window + 5, window, width)
     expected = csr_oracle(indices, window + 5)
-    assert_csr_equal(draft_attention_csr(indices, window + 5), expected)
-
-
-def test_fused_csr_preserves_shared_sparse_masks_and_noncontiguous_input():
-    # The offline draft_step path can contain arbitrary historical holes.
-    ids = torch.tensor(
-        [[7, -1, 0, 9, -1, 3, 8, 10, -1, -1, -1]] * 19, device="cuda", dtype=torch.int32
+    src = draft_src_indices(
+        anchors, window + 5, window, width, DraftSrcBuffers(batch, width), fp8=True
     )
-    indices = ids[:, None, :].expand(-1, 3, -1)
-    assert not indices.is_contiguous()
-    assert_csr_equal(draft_attention_csr(indices, 8), csr_oracle(indices, 8))
+    assert_csr_equal(src, expected)
 
 
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("supplied_step", [False, True])
-def test_stages_share_one_live_csr_per_draft_round(monkeypatch, dtype, supplied_step):
+def test_stages_share_one_source_build_per_draft_round(
+    monkeypatch, dtype, supplied_step
+):
     from torch import nn
 
     from atom.models.deepseek_v41 import dspark
@@ -178,19 +180,19 @@ def test_stages_share_one_live_csr_per_draft_round(monkeypatch, dtype, supplied_
             seen.append(step)
             return state
 
-    def build(indices, ring):
-        assert dtype != "bf16", "BF16 drafting must not construct CSR"
-        result = draft_attention_csr(indices, ring)
+    def build(*args, **kwargs):
+        result = draft_src_indices(*args, **kwargs)
         builds.append(result)
         return result
 
-    monkeypatch.setattr(dspark, "draft_attention_csr", build)
+    monkeypatch.setattr(dspark, "draft_src_indices", build)
     draft = dspark.DeepseekV41DSpark.__new__(dspark.DeepseekV41DSpark)
     nn.Module.__init__(draft)
     draft.embed = nn.Embedding(8, 32, device="cuda", dtype=torch.bfloat16)
     draft.head = nn.Identity()
     draft.block_size, draft.window_size = 5, 128
     draft.draft_kv_dtype = "fp8" if dtype == "fp8" else "auto"
+    draft.draft_src_buffers = DraftSrcBuffers(3, 5)
     draft.config = SimpleNamespace(hc_mult=4)
     draft.rope = None
     draft._noise_embedding = lambda: draft.embed.weight[0]
@@ -198,10 +200,17 @@ def test_stages_share_one_live_csr_per_draft_round(monkeypatch, dtype, supplied_
     raw = torch.zeros(3, 133, 512, device="cuda", dtype=torch.bfloat16)
     history = quantize_fp8(raw) if dtype == "fp8" else raw
     context = dict.fromkeys((40, 41, 42), history)
-    previous = None
     for anchors in ([-1, 3, 260], [400, -1, 2]):
         anchors = torch.tensor(anchors, device="cuda")
         positions, indices, context_positions = draft_step_indices(anchors, 133, 128, 5)
+        step = None
+        if supplied_step:
+            # What `block_backbone` hands over: the lists it built for the
+            # draft that runs, None on a BF16 draft off the two-source arch.
+            src = draft_src_indices(
+                anchors, 133, 128, 5, draft.draft_src_buffers, fp8=dtype == "fp8"
+            )
+            step = DraftStep(positions, indices, True, src)
         seen.clear()
         before = len(builds)
         draft.draft_hidden(
@@ -209,22 +218,20 @@ def test_stages_share_one_live_csr_per_draft_round(monkeypatch, dtype, supplied_
             anchors,
             context,
             context_positions,
-            # Even if a caller reuses a step with old CSR, this invocation
-            # must build from its live visibility rather than keep old rows.
-            step=(
-                DraftStep(positions, indices, True, previous) if supplied_step else None
-            ),
+            step=step,
         )
         assert len(seen) == 3 and all(step is seen[0] for step in seen)
         assert seen[0].decode == supplied_step
-        assert len(builds) == before + int(dtype != "bf16")
-        if dtype != "bf16":
-            assert all(step.csr is builds[-1] for step in seen)
-            assert_csr_equal(seen[0].csr, csr_oracle(indices, 133))
-            assert seen[0].csr is not previous
-            previous = seen[0].csr
+        # A handed-over step is not rebuilt; without one, only FP8 builds.
+        built = int(dtype == "fp8" and not supplied_step)
+        assert len(builds) == before + built
+        if dtype == "fp8":
+            src = seen[0].src_indices
+            assert all(step.src_indices is src for step in seen)
+            assert_csr_equal(src, csr_oracle(indices, 133))
+            assert src.context.data_ptr() == draft.draft_src_buffers.context.data_ptr()
         else:
-            assert all(step.csr is None for step in seen)
+            assert all(step.src_indices is None for step in seen)
 
 
 @pytest.mark.parametrize("heads", [16, 64])
@@ -251,12 +258,15 @@ def test_draft_matches_dense_bidirectional_attention(
     q8 = quantize_fp8(query)
     sink = torch.linspace(-1, 1, heads, device="cuda")
     before = [p.clone() for p in cache.window_sources]
-    step = DraftStep(positions, indices, csr=draft_attention_csr(indices, window + 5))
+    src = draft_src_indices(
+        anchors, window + 5, window, width, DraftSrcBuffers(3, width), fp8=True
+    )
+    step = DraftStep(positions, indices, src_indices=src)
 
-    def unexpected(*args):
-        pytest.fail("An attention stage rebuilt the shared CSR")
+    def unexpected(*args, **kwargs):
+        pytest.fail("An attention stage rebuilt the shared source lists")
 
-    monkeypatch.setattr(dspark, "draft_attention_csr", unexpected)
+    monkeypatch.setattr(dspark, "draft_src_indices", unexpected)
     out = draft_attention_fp8(q8, context, current, sink, step, 512**-0.5)
     expected = oracle(
         mxfp8(q8),
@@ -323,7 +333,7 @@ def test_gather_reset_and_graph_follow_live_layer_and_slot_ids(target_dtype):
 
 
 @pytest.mark.parametrize("target_dtype", ["fp8", "fp4"])
-def test_native_draft_graph_replays_live_requests_queries_and_csr(
+def test_native_draft_graph_replays_live_requests_queries_and_sources(
     monkeypatch, target_dtype
 ):
     from atom.spec_decode.draft_graph import DraftGraph, StagedInput
@@ -332,16 +342,17 @@ def test_native_draft_graph_replays_live_requests_queries_and_csr(
     cache = make_cache(target_dtype=target_dtype)
     layers = torch.tensor([2], device="cuda")
     sink = torch.linspace(-1, 1, 64, device="cuda")
+    buffers = DraftSrcBuffers(4, 5)
     captured = []
 
     def forward(bs, slots, anchors, query, kv):
         context = tuple(p[0] for p in cache.read_window_planes(layers, slots))
         pos, indices, _ = draft_step_indices(anchors, 133, 128, 5)
-        csr = draft_attention_csr(indices, 133)
-        captured.append(csr)
+        src = draft_src_indices(anchors, 133, 128, 5, buffers, fp8=True)
+        captured.append(src)
         q8, k8 = quantize_fp8(query), quantize_fp8(kv)
         out = draft_attention_fp8(
-            q8, context, k8, sink, DraftStep(pos, indices, csr=csr), 512**-0.5
+            q8, context, k8, sink, DraftStep(pos, indices, src_indices=src), 512**-0.5
         )
         return out
 
@@ -465,7 +476,9 @@ def test_real_draft_forward_produces_quantized_queries_after_rope(target_dtype):
         softmax_scale=512**-0.5,
         _project_out=lambda out, *args: out,
     )
-    step = DraftStep(positions, indices)
+    # What `block_backbone` hands an FP8 draft: the step's source lists.
+    src = draft_src_indices(anchors, 133, 128, 5, DraftSrcBuffers(2, 5), fp8=True)
+    step = DraftStep(positions, indices, src_indices=src)
     out = DraftAttention.forward(instance, None, None, {2: history}, step, rope)
     q8 = quantize_fp8(rotate_rows(rope, query.clone(), positions))
     k8 = quantize_fp8(rotate_rows(rope, kv.clone(), positions))

@@ -59,10 +59,12 @@ def draft_attention(query, context_kv, draft_kv, sink, step, scale):
 
 @cache
 def two_source_draft() -> bool:
-    """Whether the draft stages read the window and the block as two sources.
+    """Whether the BF16 draft stages read the window and the block as two
+    sources.
 
     Only measured on gfx1250, and not bit-identical to the concatenating path
-    (it can move draft acceptance), so every other arch keeps that path.
+    (it can move draft acceptance), so every other arch keeps that path. The
+    FP8 draft has no concatenating path and does not ask.
     """
     return get_gfx_runtime() == "gfx1250"
 
@@ -89,7 +91,7 @@ def _history_slots(anchor, slot, ring, window):
     return context, valid
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size"])
 def _draft_src_kernel(
     positions_ptr,  # [B] anchor position per request
     context_ptr,  # out: window rows, packed
@@ -155,8 +157,9 @@ class DraftSrcBuffers:
     The `DSparkIndexBuffers` idiom: sized at `max_num_seqs` requests of the
     full block width and only ever sliced, every slice prefix-stable in the
     batch, so a captured draft graph replays the build. Allocated on the first
-    build, where the ring is known; an arch that keeps the concatenating path
-    never allocates.
+    build, where the ring is known; a BF16 draft that keeps the concatenating
+    path never allocates. The indptrs start zeroed: their first entry is
+    always 0, so an empty batch's one-entry slice reads 0 with nothing built.
     """
 
     def __init__(self, max_batch: int, max_width: int):
@@ -181,7 +184,7 @@ class DraftSrcBuffers:
             i32 = {"dtype": torch.int32, "device": device}
             self.context = torch.empty(rows * ring, **i32)
             self.block = torch.empty(rows * self.max_width, **i32)
-            self.indptr = torch.empty(2, rows + 1, **i32)
+            self.indptr = torch.zeros(2, rows + 1, **i32)
             self.ring = ring
         elif ring != self.ring:
             raise ValueError(f"Draft source buffers were cut for ring {self.ring}")
@@ -194,16 +197,20 @@ class DraftSrcBuffers:
         )
 
 
-def draft_src_indices(positions, ring, window, width, buffers: DraftSrcBuffers):
-    """`draft_step_indices`' index list as `draft_attention`'s two sources,
-    or None where the stages keep the concatenating path.
+def draft_src_indices(
+    positions, ring, window, width, buffers: DraftSrcBuffers, *, fp8: bool = False
+):
+    """`draft_step_indices`' index list as the two sources both draft
+    attentions read, or None where the BF16 stages keep the concatenating path.
 
-    This is where the path is chosen, by `two_source_draft()` alone: None off
-    it, and nothing is allocated. Otherwise fills `buffers` in one launch with
-    no host read; built once per step, every stage reads the same rows. With no rows
-    nothing is launched, and the attention has no query row to read an indptr.
+    The one builder for both drafts. `draft_attention_fp8` has only the
+    two-source kernel, so with `fp8` the lists are always built. For the BF16
+    draft this is where the path is chosen, by `two_source_draft()` alone: None
+    off it, and nothing is allocated. Otherwise fills `buffers` in one launch
+    with no host read; built once per step, every stage reads the same rows.
+    With no rows nothing is launched, and the indptrs read 0.
     """
-    if not two_source_draft():
+    if not (fp8 or two_source_draft()):
         return None
     batch = positions.shape[0]
     src = buffers.claim(batch, width, ring, positions.device)
@@ -226,110 +233,19 @@ def draft_src_indices(positions, ring, window, width, buffers: DraftSrcBuffers):
     return src
 
 
-@triton.jit(do_not_specialize=["BATCH"])
-def _draft_csr(
-    indices,
-    prefix,
-    pp,
-    extend,
-    ep,
-    WIDTH: tl.constexpr,
-    RING: tl.constexpr,
-    BATCH,
-    BLOCK_BATCH: tl.constexpr,
-    ENTRIES: tl.constexpr,
-):
-    batch = tl.program_id(0)
-    i = tl.arange(0, ENTRIES)
-    # Every query in a request has the same bidirectional mask. Count only
-    # its first row, in bounded tiles to avoid a B * ENTRIES register tensor.
-    # Each program computes its own prefix, so no cross-program barrier or
-    # separate scan launch is needed at the small batches used by drafting.
-    previous = tl.arange(0, BLOCK_BATCH)
-    pbase = tl.full((), 0, tl.int32)
-    ebase = tl.full((), 0, tl.int32)
-    for start in range(tl.cdiv(batch, BLOCK_BATCH)):
-        requests = start * BLOCK_BATCH + previous
-        earlier = tl.load(
-            indices + requests[:, None] * WIDTH * (RING + WIDTH) + i[None, :],
-            (requests[:, None] < batch) & (i[None, :] < RING + WIDTH),
-            other=-1,
-        )
-        pbase += (
-            tl.sum(tl.sum(((earlier >= 0) & (earlier < RING)).to(tl.int32), 1), 0)
-            * WIDTH
-        )
-        ebase += tl.sum(tl.sum((earlier >= RING).to(tl.int32), 1), 0) * WIDTH
-    ids = tl.load(
-        indices + batch * WIDTH * (RING + WIDTH) + i, i < RING + WIDTH, other=-1
-    )
-    history = (ids >= 0) & (ids < RING)
-    current = ids >= RING
-    pi = tl.cumsum(history.to(tl.int32)) - 1
-    ei = tl.cumsum(current.to(tl.int32)) - 1
-    pc = tl.sum(history.to(tl.int32), 0)
-    ec = tl.sum(current.to(tl.int32), 0)
-    for query in tl.static_range(WIDTH):
-        row = batch * WIDTH + query
-        pb = pbase + query * pc
-        eb = ebase + query * ec
-        tl.store(pp + row, pb)
-        tl.store(ep + row, eb)
-        tl.store(prefix + pb + pi, batch * RING + ids, history)
-        tl.store(extend + eb + ei, batch * WIDTH + ids - RING, current)
-    if batch == BATCH - 1:
-        tl.store(pp + BATCH * WIDTH, pbase + WIDTH * pc)
-        tl.store(ep + BATCH * WIDTH, ebase + WIDTH * ec)
-
-
-def draft_attention_csr(indices, ring):
-    """Two CSR sources for request-shared bidirectional draft masks, in one launch.
-
-    Capacities follow the graph's tensor shapes. Counts and slot-relative row
-    IDs are rebuilt on device, including after rejection or request reordering.
-    All queries of a request must share one mask, as produced by ``draft_step``
-    and ``draft_step_indices``. The physical ring order is preserved.
-    """
-    batch, width, entries = indices.shape
-    if entries != ring + width:
-        raise ValueError("Draft indices must cover the history ring and whole block")
-    indices = indices.contiguous()
-    rows = batch * width
-    pp, ep = [
-        torch.empty(rows + 1, device=indices.device, dtype=torch.int32)
-        for _ in range(2)
-    ]
-    prefix = torch.empty(rows * ring, device=indices.device, dtype=torch.int32)
-    extend = torch.empty(rows * width, device=indices.device, dtype=torch.int32)
-    if rows:
-        _draft_csr[(batch,)](
-            indices,
-            prefix,
-            pp,
-            extend,
-            ep,
-            width,
-            ring,
-            batch,
-            min(16, triton.next_power_of_2(batch)),
-            triton.next_power_of_2(entries),
-        )
-    else:
-        pp.zero_()
-        ep.zero_()
-    return prefix, pp, extend, ep
-
-
 def draft_attention_fp8(query, context_kv, draft_kv, sink, step, scale):
-    """OPUS A8W8 over MXFP8 query, history and the whole current draft block."""
+    """OPUS A8W8 over MXFP8 query, history and the whole current draft block.
+
+    Reads the window and the block through `step.src_indices`, which
+    `draft_src_indices(..., fp8=True)` builds once per draft step.
+    """
     from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
         sparse_attn_v41_paged_2src,
     )
 
-    csr = step.csr
-    if csr is None:
-        csr = draft_attention_csr(step.indices, context_kv[0].shape[-2])
-    pi, pp, ei, ep = csr
+    src = step.src_indices
+    assert src is not None, "FP8 draft attention needs the step's source lists"
+    pi, pp, ei, ep = src
     output = torch.empty_like(query[0], dtype=torch.bfloat16)
     sparse_attn_v41_paged_2src(
         tuple(p.flatten(0, 1) for p in query),
