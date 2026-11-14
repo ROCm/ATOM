@@ -97,10 +97,20 @@ class ScoreWorkspace(LogitsWorkspace):
     `max_tokens` bounds a forward's query rows and `columns` a block table's
     width: the two dimensions every later request is checked against.
     `pages` bounds the PAGE pool the FP4 plane's packed rows can see.
+    `lane_max_elems`: aiter's lane-maxima sizing
+    (`mqa_logits_mxfp4_lane_max_elems`) where the FP4 scorer writes lane
+    maxima beside the packed logits, else None.
     """
 
     def __init__(
-        self, geometry, max_tokens, columns, device, pages=None, candidate_blocks=0
+        self,
+        geometry,
+        max_tokens,
+        columns,
+        device,
+        pages=None,
+        candidate_blocks=0,
+        lane_max_elems=None,
     ):
         self._max_tokens = max_tokens
         ratios = sorted({ratio for _, ratio in geometry.owners})
@@ -150,6 +160,18 @@ class ScoreWorkspace(LogitsWorkspace):
                 self.capacity // self.block_rows, dtype=torch.float32, device=device
             )
             if self.packed
+            else None
+        )
+        # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
+        # beside them for the top-k of the same band (`packed_lane_max`).
+        # Allocated here with the rest, so the memory profile counts them.
+        self._lane_max = (
+            torch.empty(
+                lane_max_elems(self.capacity, max_tokens),
+                dtype=torch.float32,
+                device=device,
+            )
+            if self.packed and lane_max_elems is not None
             else None
         )
         self._row_starts = torch.arange(
@@ -212,6 +234,11 @@ class ScoreWorkspace(LogitsWorkspace):
         if not self.packed:
             raise ValueError("only the FP4 plane packs its logits")
         return self._maxima
+
+    def packed_lane_max(self):
+        """The packed logits' lane maxima (``mqa_logits_mxfp4(lane_max=...)``),
+        flat, or None where the scorer writes none."""
+        return self._lane_max
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""

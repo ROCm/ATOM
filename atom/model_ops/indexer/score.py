@@ -163,9 +163,13 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         # A band's bounds and tables: its rows', or its requests' when a
         # request's rows share them.
         items = slice(first // group, end // group)
+        lane_max = None
         if rows.packed_offsets is not None:
             scores = workspace.packed_logits()
             offsets = rows.packed_offsets[span]
+            # Whether this band's scorer writes them is `_fp4_band_logits`'s
+            # call; the top-k selects the same whatever the buffer holds.
+            lane_max = workspace.packed_lane_max()
         else:
             scores = (
                 plane[:count]
@@ -185,6 +189,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 weight_scale,
                 index,
                 rows,
+                lane_max,
             )
         else:
             _fp8_paged_mqa_logits(
@@ -229,7 +234,17 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 stable=stable,
                 row_starts=offsets,
                 plane_width=rows.width,
+                lane_max=lane_max,
             )
+
+
+def _writes_lane_max(cache, launch):
+    """Whether an FP4 band launch writes lane maxima: OPUS, schedule-free."""
+    return (
+        cache.layout in (NATURAL, MFMA)
+        and launch["schedule"] is None
+        and launch["cfg"].writes_lane_max
+    )
 
 
 def _gather_concat(query, cache, keys):
@@ -297,11 +312,23 @@ def _live_rows():
 
 @eager_region(live=_live_rows)
 def _fp4_band_logits(
-    values, scales, weights, cache, scores, offsets, weight_scale, band, rows
+    values,
+    scales,
+    weights,
+    cache,
+    scores,
+    offsets,
+    weight_scale,
+    band,
+    rows,
+    lane_max=None,
 ):
     """FP4 band `band`'s logits into `scores`, launched as the step planned it
-    (`IndexRows.fp4_bands`): a token graph's break. `offsets`: packed rows."""
+    (`IndexRows.fp4_bands`): a token graph's break. `offsets`: packed rows.
+    `lane_max`: their lane maxima too, where this launch writes them."""
     launch = rows.fp4_bands[band]
+    if lane_max is not None and not _writes_lane_max(cache, launch):
+        lane_max = None
     if cache.layout in (NATURAL, MFMA):
         from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4
 
@@ -316,6 +343,7 @@ def _fp4_band_logits(
             weight_scale=weight_scale,
             out=scores,
             out_offsets=offsets,
+            lane_max=lane_max,
             **launch,
         )
         return scores

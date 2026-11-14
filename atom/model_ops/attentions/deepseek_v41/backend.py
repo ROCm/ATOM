@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4_lane_max_elems
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_hooks import DecodeRound
@@ -226,6 +228,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # list, which the checkpoint fixes and `max_model_len` does not
             # bound. Short contexts make it the widest plane in the model.
             candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
+            # gfx1250's OPUS FP4 scorer writes lane maxima beside the packed
+            # logits for the top-k of the same band.
+            lane_max_elems=(
+                mqa_logits_mxfp4_lane_max_elems if get_gfx() == "gfx1250" else None
+            ),
         )
         logger.info(
             "V4.1 score workspace: %s logits, %.2f GiB",
