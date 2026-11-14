@@ -32,7 +32,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from atom.config import Config
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
-from atom.models import qwen3_5 as qwen3_5_base
 from atom.models.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5GatedDeltaNet,
@@ -49,6 +48,7 @@ from atom.models.qwen3_5 import (
 from atom.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
 )
+from atom.models.qwen3_5 import model as qwen3_5_base
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 
 

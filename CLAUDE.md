@@ -141,7 +141,8 @@ Key entry points:
   (the runtime in `deepseek_v41/mono/hi/`), the host hook in `hi_runner.py` /
   `hi_compose.py` / `hi_dispatch.py`, its head output
   (`HiDecodeModel.compute_head`: `round/post_verify.py`) and its decode round in
-  `round/` (`HiRound`)
+  `round/` (`HiRound`); Qwen3.5-MoE, wrapped through `mono_decode_installers` too,
+  runs one launch a decoder layer, the MTP draft's layer on the same kernel)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
