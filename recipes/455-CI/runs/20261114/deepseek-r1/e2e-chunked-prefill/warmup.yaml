@@ -1,0 +1,39 @@
+name: "warmup-c64"
+version: "1.0"
+type: "online"
+model_params:
+  name: "/models/Deepseek-S3_sq_a05_v2_mlperf6_1/"
+  tokenizer_name: "/data/Deepseek-S3_sq_a05_v2_mlperf6_1"
+  temperature: 1.0
+  top_p: 1.0
+  max_new_tokens: 8192
+  streaming: "on"
+datasets:
+  - name: agentic_combined
+    type: performance
+    path: /mnt/data/qichu/ci455/client/data/mlperf_agentic_inference_dataset.jsonl
+    accuracy_config:
+      eval_method: agentic_inference_inline
+      num_repeats: 1
+    agentic_inference:
+      turn_timeout_s: 86400.0
+      enable_salt: true
+      inject_tool_delay: true
+      num_trajectories_to_issue: 64
+      stop_issuing_on_first_user_complete: true
+settings:
+  runtime:
+    scheduler_random_seed: 1
+    dataloader_random_seed: 2
+  timeouts:
+    run_timeout_s: 14400
+  load_pattern:
+    type: agentic_inference
+    target_concurrency: 64
+  client:
+    warmup_connections: 0
+    max_idle_time: 0.5
+endpoint_config:
+  endpoints: ["http://127.0.0.1:8000"]
+  api_type: openai
+report_dir: /mnt/data/qichu/ci455/e2e_r1_20261114/c64/warmup
