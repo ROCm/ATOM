@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import functools
 from typing import ClassVar
 
 import torch
@@ -32,7 +33,7 @@ from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
-    fused_sigmoid_gating_delta_rule_update,
+    fused_sigmoid_gating_delta_rule_update as _atom_kda_gating_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
@@ -75,6 +76,46 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
+
+try:
+    # aiter's gfx1250 entry: same parameter names as the ATOM kernel above.
+    from aiter.ops.triton.attention.kda_atom import (
+        fused_sigmoid_gating_delta_rule_update as _aiter_kda_gating_update,
+    )
+except ImportError:  # aiter without the gfx1250 KDA entry
+    _aiter_kda_gating_update = None
+
+
+@functools.cache
+def _current_gfx() -> str:
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx()
+
+
+def _use_aiter_kda_gating(kwargs) -> bool:
+    """aiter's entry covers gfx1250 KDA with the lower-bound gate and bf16
+    activations over an fp32 state. Everything else stays on ATOM's kernel."""
+    if _aiter_kda_gating_update is None:
+        return False
+    if not kwargs.get("is_kda") or kwargs.get("lower_bound") is None:
+        return False
+    if _current_gfx() != "gfx1250":
+        return False
+    acts = (kwargs["q"], kwargs["k"], kwargs["v"], kwargs["a"], kwargs["b"])
+    state = kwargs.get("initial_state")
+    return (
+        all(t.dtype == torch.bfloat16 for t in acts)
+        and state is not None
+        and state.dtype == torch.float32
+    )
+
+
+def fused_sigmoid_gating_delta_rule_update(**kwargs):
+    """KDA gating update for decode and spec verify. Call sites pass keywords."""
+    if _use_aiter_kda_gating(kwargs):
+        return _aiter_kda_gating_update(**kwargs)
+    return _atom_kda_gating_update(**kwargs)
 
 
 def _text_config(config):
