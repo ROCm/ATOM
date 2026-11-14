@@ -418,6 +418,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
+    # Diffusion VAE conv3d: the fastest backend a call may take, one of
+    # flydsl > triton > torch. A call takes the first rung at or below it
+    # that supports it (device, dtype); validated in models/wan/conv_dispatch.py.
+    "ATOM_DIFFUSION_CONV3D_BACKEND": lambda: (
+        os.getenv("ATOM_DIFFUSION_CONV3D_BACKEND", "flydsl").strip().lower() or "flydsl"
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

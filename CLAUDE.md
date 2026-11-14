@@ -144,7 +144,10 @@ Key entry points:
   `round/` (`HiRound`)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
-  and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
+  and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`.
+  `models/wan/` holds only the Wan2.1 VAE so far (`vae.py`), every conv of it
+  through one dispatch point (`conv_dispatch.py`: AITER FlyDSL > Triton > torch,
+  `ATOM_DIFFUSION_CONV3D_BACKEND`); GPU check: `atom.diffusion.examples.wan_vae_bench`
 
 ## Critical Rules
 
