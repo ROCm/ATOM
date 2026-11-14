@@ -414,7 +414,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, mega_mhc's gfx942
+    # ASM seam for seams with a post where AITER supports it, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),

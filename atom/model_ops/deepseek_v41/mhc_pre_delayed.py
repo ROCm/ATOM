@@ -6,7 +6,10 @@ pre-mix carried from the PREVIOUS sublayer while the one computed here is
 carried to the next. HIP Mega-MHC and the Triton implementation cover that seam --
 the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950
-and gfx1250; Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
+and gfx1250. On gfx942, seams with a post pass the FP32 weight to mega_mhc,
+which runs AITER's ASM seam and RMSNorm wherever
+mhc_fused_post_pre_delayed_asm_supported holds (H=5120); seams without a post
+stay on Triton. ATOM_DSV41_MHC_BACKEND=triton forces Triton everywhere.
 
 The norm is the sublayer's own. Attention can request HIP's fused MXFP8
 output alongside BF16 for its other readers; FFN keeps the BF16 interface.
@@ -22,6 +25,7 @@ from functools import cache
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.mhc import mhc_fused_post_pre_delayed_asm_supported
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
@@ -56,6 +60,15 @@ def _row_major_scale_options():
     ):
         return {"scale_row_major": True}
     return None
+
+
+def use_asm_seam(hc_mult, hidden) -> bool:
+    """Whether a seam with a post passes the FP32 weight to mega_mhc for AITER's
+    gfx942 ASM seam: wherever AITER supports it, unless
+    ATOM_DSV41_MHC_BACKEND=triton."""
+    return envs.ATOM_DSV41_MHC_BACKEND != "triton" and (
+        mhc_fused_post_pre_delayed_asm_supported(hidden, hc_mult)
+    )
 
 
 def fuse_quant_supported() -> bool:
@@ -118,7 +131,8 @@ def pre_delayed(
     Returns `(residual, normed_input, next_pre_mix, post_mix, combination)`.
     `residual` is the caller's own tensor when no post was requested.
     `hc_fn` is a HIP BF16 hi/lo pack when `w_preshuffle_bf16=True`,
-    or the original FP32 weight for Triton otherwise.
+    or the original FP32 weight otherwise (Triton, or gfx942's ASM seam for
+    seams with a post, see `use_asm_seam`).
     With `fuse_quant`, `normed_input` is `(bf16, fp8, e8m0_scale)` with
     row-major scales; it needs the HIP backend and `fuse_quant_supported()`.
     """
@@ -220,6 +234,10 @@ def v41_mhc_pre_delayed(
         options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
         if fuse_quant:
             options.update(_row_major_scale_options())
+    elif with_post and use_asm_seam(hc_mult, hidden):
+        # FP32 fn: mega_mhc runs AITER's ASM seam, then RMSNorm.
+        kernel = _hip_ops()[0]
+        options["out_dtype"] = "bf16"
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
