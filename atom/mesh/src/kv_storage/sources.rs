@@ -1,7 +1,7 @@
 //! The Mooncake Stores the workers offload to, one source per store a model's
 //! workers report, read by every worker that reports it.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures::future::join_all;
 use parking_lot::Mutex;
@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use super::{
     keys,
+    lookup::{Lookups, Read},
     mooncake::{self, KeyState},
 };
 
@@ -55,12 +56,17 @@ pub struct StorageSource {
     /// Whether the router computes the reported `chain_check`, and so the engine's keys.
     pub chain_check_passed: bool,
     pub readers: BTreeSet<String>,
+    #[serde(skip)]
+    lookups: Arc<Lookups>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageSourceStatus {
     #[serde(flatten)]
     pub source: StorageSource,
+    /// Open after lookups failed in a row: requests skip the store meanwhile.
+    pub breaker_open: bool,
+    pub last_lookup_us: Option<u64>,
     pub pools: Vec<PoolStatus>,
 }
 
@@ -78,13 +84,18 @@ pub struct PoolStatus {
 pub struct StorageSources {
     /// Each master's admin port.
     admin_port: u16,
+    /// How long a lookup waits, from its first request to its last answer.
+    deadline: Duration,
+    client: reqwest::Client,
     sources: Mutex<Vec<StorageSource>>,
 }
 
 impl StorageSources {
-    pub fn new(admin_port: u16) -> Self {
+    pub fn new(admin_port: u16, deadline: Duration, client: reqwest::Client) -> Self {
         Self {
             admin_port,
+            deadline,
+            client,
             sources: Mutex::new(Vec::new()),
         }
     }
@@ -132,6 +143,7 @@ impl StorageSources {
             report,
             chain_check_passed,
             readers: BTreeSet::from([worker.into()]),
+            lookups: Arc::default(),
         });
     }
 
@@ -139,20 +151,51 @@ impl StorageSources {
         remove_reader(&mut self.sources.lock(), worker);
     }
 
+    /// The tokens of `tokens` `worker`'s engine reports cached when its device cache holds
+    /// `device` of them, after it loads what it will from the store it reads, if any; None
+    /// when that store does not answer.
+    pub async fn cached_tokens(&self, worker: &str, tokens: &[u32], device: u32) -> Option<u32> {
+        let read = self
+            .sources
+            .lock()
+            .iter()
+            .find(|s| s.readers.contains(worker))
+            .map(|s| Read {
+                id: s.id.clone(),
+                report: s.report.clone(),
+                admins: (s.report.masters.iter())
+                    .map(|master| mooncake::admin_url(master, self.admin_port))
+                    .collect(),
+                readable: s.chain_check_passed,
+                lookups: s.lookups.clone(),
+                deadline: self.deadline,
+            });
+        match read {
+            Some(read) => read.cached_tokens(&self.client, tokens, device).await,
+            None => Some(device),
+        }
+    }
+
     /// Every source, its pools' masters asked meanwhile.
-    pub async fn status(&self, client: &reqwest::Client) -> Vec<StorageSourceStatus> {
+    pub async fn status(&self) -> Vec<StorageSourceStatus> {
         let sources = self.sources.lock().clone();
         join_all(sources.into_iter().map(|source| async move {
-            let pools = join_all(source.report.masters.iter().map(|m| self.probe(client, m))).await;
-            StorageSourceStatus { source, pools }
+            let pools = join_all(source.report.masters.iter().map(|m| self.probe(m))).await;
+            StorageSourceStatus {
+                breaker_open: source.lookups.breaker_open(),
+                last_lookup_us: source.lookups.last_lookup_us(),
+                source,
+                pools,
+            }
         }))
         .await
     }
 
-    async fn probe(&self, client: &reqwest::Client, master: &str) -> PoolStatus {
+    async fn probe(&self, master: &str) -> PoolStatus {
         let admin = mooncake::admin_url(master, self.admin_port);
         let taint = [keys::TAINT_KEY.to_string()];
-        let (tainted, error) = match mooncake::query(client, &admin, &taint, PROBE_TIMEOUT).await {
+        let probed = mooncake::query(&self.client, &admin, &taint, Some(PROBE_TIMEOUT)).await;
+        let (tainted, error) = match probed {
             Ok(states) => match states[..] {
                 [KeyState::Absent] => (Some(false), None),
                 [KeyState::Memory | KeyState::SsdOnly] => (Some(true), None),
@@ -215,7 +258,7 @@ mod tests {
 
     #[test]
     fn a_store_is_read_by_the_workers_that_report_it() {
-        let sources = StorageSources::new(9003);
+        let sources = StorageSources::new(9003, Duration::from_millis(3), Default::default());
         let ns = "atomkv1-0123456789abcdef01234567";
         sources.add(
             "http://a:8000@0",
@@ -300,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_report_out_of_bounds_is_not_read() {
-        let sources = StorageSources::new(9003);
+        let sources = StorageSources::new(9003, Duration::from_millis(3), Default::default());
         let good = store("atomkv1-0123456789abcdef01234567", &["10.0.0.1:50051"]);
         let masters = (0..65).map(|port| format!("10.0.0.1:{port}")).collect();
         for bad in [

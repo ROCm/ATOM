@@ -15,6 +15,7 @@ mod tests;
 
 use std::{fmt::Debug, sync::Arc};
 
+use async_trait::async_trait;
 pub(crate) use partition::{match_lanes, Holder, Lane, Partition, Predictor};
 
 use crate::core::Worker;
@@ -27,6 +28,7 @@ struct PrefixHash(u64);
 pub(crate) struct HolderId(u8);
 
 /// What policies read of the index.
+#[async_trait]
 pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// The leading tokens of `tokens` each worker's device cache holds, in the order of
     /// `workers`: by its KV events when they are exact, raised to the prompts routed to it
@@ -38,4 +40,15 @@ pub(crate) trait PrefixMatchProvider: Send + Sync + Debug {
     /// Predicts that `worker` will hold `tokens`, routed to it, without waiting for the
     /// index's writer.
     fn on_routed(&self, _tokens: &[u32], _worker: &dyn Worker) {}
+
+    /// The tokens of `tokens` `worker`'s engine will report cached when its device cache
+    /// holds `device` of them, with what it loads from a store; None when that is unknown.
+    async fn cached_tokens(
+        &self,
+        _worker: &dyn Worker,
+        _tokens: &[u32],
+        device: u32,
+    ) -> Option<u32> {
+        Some(device)
+    }
 }

@@ -321,8 +321,9 @@ impl CacheAwarePolicy {
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, the highest first, then the
     /// lower load. None leaves the request to the tree: it has no tokens, or no candidate
-    /// holds more of them than `cache_threshold`.
-    fn select_by_kv_events(
+    /// holds more of them than `cache_threshold`. The estimate also counts what the
+    /// selected worker's engine will load from a store.
+    async fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
@@ -330,7 +331,8 @@ impl CacheAwarePolicy {
         model_id: &str,
     ) -> Option<(Option<usize>, RouteDecision)> {
         let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
-        let hits = self.kv_events.get()?.match_workers(tokens, workers);
+        let provider = self.kv_events.get()?;
+        let hits = provider.match_workers(tokens, workers);
         let (idx, cached) = healthy_indices
             .iter()
             .filter_map(|&idx| Some((idx, hits[idx]?)))
@@ -347,9 +349,12 @@ impl CacheAwarePolicy {
         }
         self.routed(info, workers[idx].as_ref());
         workers[idx].increment_processed();
+        let cached = provider
+            .cached_tokens(workers[idx].as_ref(), tokens, cached)
+            .await;
         let decision = RouteDecision {
             match_ratio: Some(match_rate),
-            estimated_hit_ratio: Some(match_rate),
+            estimated_hit_ratio: cached.map(|cached| f64::from(cached) / tokens.len() as f64),
             ..RouteDecision::branch("kv_affinity")
         };
         Some((Some(idx), decision))
@@ -410,8 +415,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return (selected, RouteDecision::branch("imbalanced"));
         }
 
-        if let Some(selected) = self.select_by_kv_events(workers, info, &healthy_indices, &model_id)
-        {
+        let by_kv_events = self.select_by_kv_events(workers, info, &healthy_indices, &model_id);
+        if let Some(selected) = by_kv_events.await {
             return selected;
         }
 
@@ -919,6 +924,55 @@ mod tests {
             decide(&cold, &workers, &info).await,
             (2, "affinity", Some(1.0))
         );
+    }
+
+    /// A worker's device hit, and what its engine reports cached once it loads from a
+    /// store: None when the store does not answer.
+    #[derive(Debug)]
+    struct Stored(&'static str, u32, Option<u32>);
+
+    #[async_trait]
+    impl PrefixMatchProvider for Stored {
+        fn match_workers(&self, _tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+            let hit = |worker: &Arc<dyn Worker>| (worker.url() == self.0).then_some(self.1);
+            workers.iter().map(hit).collect()
+        }
+
+        async fn cached_tokens(&self, worker: &dyn Worker, _: &[u32], device: u32) -> Option<u32> {
+            assert_eq!((worker.url(), device), (self.0, self.1));
+            self.2
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kv_estimate_counts_what_the_engine_loads_from_a_store() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .collect();
+        let tokens: Vec<u32> = (0..100).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        for (stored, want) in [
+            (
+                Stored("http://w2:8000", 60, Some(90)),
+                (1, Some(0.6), Some(0.9)),
+            ),
+            (Stored("http://w1:8000", 80, None), (0, Some(0.8), None)),
+        ] {
+            let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                eviction_interval_secs: 0,
+                ..Default::default()
+            });
+            policy.init_workers(&workers);
+            policy.set_kv_events(Arc::new(stored));
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            assert_eq!(decision.branch, "kv_affinity");
+            let got = (decision.match_ratio, decision.estimated_hit_ratio);
+            assert_eq!((selected.unwrap(), got.0, got.1), want);
+        }
     }
 
     #[tokio::test]
