@@ -4653,6 +4653,10 @@ class ModelRunner:
         # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
         self._maybe_calibrate_dspark_sps(full_q_len)
 
+        # The captures and the calibration ran the model for real; take back
+        # what they wrote into the cache before the first request is admitted.
+        self.attn_metadata_builder.reset_cache_after_capture()
+
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).
         _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)

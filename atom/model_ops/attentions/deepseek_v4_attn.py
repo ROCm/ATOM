@@ -1436,6 +1436,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert len(planes) == len(self._plane_row_widths())
         return planes
 
+    def reset_cache_after_capture(self) -> None:
+        """Give back the cache the capture's warmups wrote, as allocation left it.
+
+        `build_for_cudagraph_capture` runs its synthetic batch on real state
+        slots and points every block table at block 0, so each captured bucket
+        writes slots `0..bs-1` and block 0. Nothing owns a slot or a block yet,
+        so every plane goes back to zeros and every state field to its own
+        fill, as if just allocated.
+        """
+        for plane in self._kv_planes():
+            plane.zero_()
+        for pool, _ in self._indexer_page_pools():
+            pool.zero_()
+        self.model_runner.v4_state_arena.refill_live()
+
     def _indexer_page_pools(self) -> list[tuple[torch.Tensor, str]]:
         """Indexer pools and semantic-role prefixes in PAGE stream order.
 
