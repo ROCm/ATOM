@@ -43,6 +43,28 @@ backends:
         policy: random
         prometheus_port: 29100
 
+agentic_1m_aiperf: &agentic_1m_aiperf
+  kind: aiperf_agentic
+  scenario: agentx
+  public_dataset: semianalysis_cc_traces_weka_062126
+  apply_chat_template: true
+  max_context_length: 1048576
+  num_dataset_entries: 393
+  benchmark_duration: 3600
+  warmup_requests_per_lane: 10
+  trace_idle_gap_cap_seconds: 300
+  warmup_grace_period: 1800
+  trajectory_start_min_ratio: 0.25
+  trajectory_start_max_ratio: 0.75
+  failed_request_threshold: 0.10
+  slice_duration: 1.0
+  cancel_drain_timeout: 300
+  http_tcp_user_timeout: 900000
+  dataset_configuration_timeout: 1800
+  service_profile_configure_timeout: 1800
+  wait_server_timeout: 4500
+  wait_router_timeout: 600
+
 models:
   DeepSeek-V4-Pro:
     backend: atom
@@ -238,6 +260,40 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
+        - &dsv4_moriio_agentic_c1
+          name: ds-v4-1p1d-tp8-moriio-agentic-1m-c1
+          router:
+            policy: cache_aware
+          topology: 1p1d_tp8_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [1]
+          server:
+            common_args:
+              block_size: 256
+              enable_prefix_caching: true
+              gpu_memory_utilization: 0.95
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+              max_model_len: 1048576
+              max_num_batched_tokens: 16384
+              state_checkpoint_interval_tokens: 8192
+          decode:
+            cudagraph: "[1,2,3,4]"
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+          benchmark: *agentic_1m_aiperf
+          run_eval: false
+        - <<: *dsv4_moriio_agentic_c1
+          name: ds-v4-2p1d-tp8-moriio-agentic-1m-c1
+          topology: 2p1d_tp8_moriio
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+
     accuracy:
       task: gsm8k
       fewshot: 3
@@ -364,27 +420,7 @@ models:
                 HIP_VISIBLE_DEVICES: "0,1,2,3"
               decode:
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
-            benchmark: &agentic_1m_aiperf
-              kind: aiperf_agentic
-              scenario: agentx
-              public_dataset: semianalysis_cc_traces_weka_062126
-              apply_chat_template: true
-              max_context_length: 1048576
-              num_dataset_entries: 393
-              benchmark_duration: 3600
-              warmup_requests_per_lane: 10
-              trace_idle_gap_cap_seconds: 300
-              warmup_grace_period: 1800
-              trajectory_start_min_ratio: 0.25
-              trajectory_start_max_ratio: 0.75
-              failed_request_threshold: 0.10
-              slice_duration: 1.0
-              cancel_drain_timeout: 300
-              http_tcp_user_timeout: 900000
-              dataset_configuration_timeout: 1800
-              service_profile_configure_timeout: 1800
-              wait_server_timeout: 4500
-              wait_router_timeout: 600
+            benchmark: *agentic_1m_aiperf
             run_eval: false
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c48
           topology: 1p1d_cpp4_dcp4
