@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: MIT
+"""Self-consistency of the probabilistic verification's input variants.
+
+`prob_rejection_sample` can read the target rows of the full logits in place
+(`in_place=True`) instead of a compacted copy of them; on the same inputs it
+must give the same tokens and verdict either way.
+
+Needs a GPU, or TRITON_INTERPRET=1 (then runs on the CPU).
+"""
+
+import os
+
+import pytest
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("triton")
+if torch.cuda.is_available():
+    DEV = "cuda"
+elif os.environ.get("TRITON_INTERPRET") == "1":
+    DEV = "cpu"
+else:
+    pytest.skip("needs a GPU or TRITON_INTERPRET=1", allow_module_level=True)
+
+import atom.model_ops.dspark_prob_sample as dps
+
+V = 20000
+R, N = 4, 3
+PER_ROW_TOP_P = (0.95, 0.5, 1.0, 0.8)
+
+
+def _case(seed, greedy_rows=(), no_q_rows=()):
+    g = torch.Generator().manual_seed(seed)
+    temps = torch.full((R,), 0.8)
+    for i in greedy_rows:
+        temps[i] = 1e-10
+    per = N + 1
+    full = torch.randn(R * per + 3, V, generator=g) * 3.0
+    full[1] *= 0.05  # a flat row: top-p keeps many tokens
+    drafts = torch.randint(0, V, (R, N), generator=g, dtype=torch.int32)
+    q = torch.randn(R, N, V, generator=g) * 3.0
+    for i in range(R):
+        for k in range(0, N, 2):  # some drafts likely under both models
+            full[i * per + k, drafts[i, k]] += 12.0
+            q[i, k, drafts[i, k]] += 12.0
+    input_ids = torch.zeros(R * per, dtype=torch.int32)
+    rows = torch.zeros(R * N, dtype=torch.int32)
+    bonus_rows = torch.zeros(R, dtype=torch.int32)
+    for i in range(R):
+        input_ids[i * per + 1 : (i + 1) * per] = drafts[i]
+        rows[i * N : (i + 1) * N] = torch.arange(N, dtype=torch.int32) + i * per
+        bonus_rows[i] = i * per + N
+    src = torch.arange(R, dtype=torch.int32)
+    src[list(no_q_rows)] = -1
+    to = {"device": DEV}
+    return {
+        "full": full.to(**to),
+        "rows": rows.to(**to),
+        "input_ids": input_ids.to(**to),
+        "cu": (torch.arange(1, R + 1, dtype=torch.int32) * N).to(**to),
+        "bonus": torch.randint(0, V, (R,), generator=g, dtype=torch.int32).to(**to),
+        "bonus_rows": bonus_rows.to(**to),
+        "temps": temps.to(**to),
+        "src": src.to(**to),
+        "q": q.to(**to),
+        "drafts": drafts.to(**to),
+    }
+
+
+def _verify(c, top_p, use_block, in_place=False):
+    state = dps.ProbDraftState(
+        q=c["q"].clone(),
+        ids=c["drafts"].clone(),
+        temps=c["temps"].clone(),
+        seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+    )
+    state.set_layout(0, V, 1)
+    state.verify_step = 12345
+    if torch.is_tensor(top_p):
+        top_p = top_p.to(DEV)
+    logits = c["full"] if in_place else c["full"].index_select(0, c["rows"])
+    out, verdict = dps.prob_rejection_sample(
+        c["input_ids"],
+        c["rows"],
+        N,
+        c["cu"],
+        logits,
+        c["bonus"],
+        c["bonus_rows"],
+        c["temps"],
+        top_p,
+        c["src"],
+        state,
+        use_block=use_block,
+        in_place=in_place,
+    )
+    return out.cpu(), verdict.cpu()
+
+
+CASES = [
+    # seed, top_p, block verification, greedy rows, rows without q
+    (1, None, False, (), ()),
+    (2, 0.9, False, (), ()),
+    (3, 0.9, True, (2,), (1,)),
+    (4, None, True, (), (3,)),
+    (5, torch.tensor(PER_ROW_TOP_P), False, (0,), ()),
+    (6, torch.tensor(PER_ROW_TOP_P), True, (), (2,)),
+]
+
+
+def _assert_same(a, b):
+    assert torch.equal(a[0], b[0]), (a[0], b[0])
+    assert torch.equal(a[1], b[1]), (a[1], b[1])
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)
+def test_rows_read_in_place_match_compacted_rows(seed, top_p, use_block, greedy, no_q):
+    c = _case(seed, greedy, no_q)
+    _assert_same(
+        _verify(c, top_p, use_block, in_place=True), _verify(c, top_p, use_block)
+    )
+
+
+def test_in_place_refuses_a_strided_source():
+    """The kernels step rows by the vocab width, so a strided view of the
+    logits must be refused rather than silently copied back out."""
+    c = _case(1, (), ())
+    strided = torch.cat((c["full"], c["full"]), dim=1)[:, :V]
+    assert not strided.is_contiguous()
+    state = dps.ProbDraftState(
+        q=c["q"].clone(),
+        ids=c["drafts"].clone(),
+        temps=c["temps"].clone(),
+        seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+    )
+    state.set_layout(0, V, 1)
+    with pytest.raises(AssertionError):
+        dps.prob_rejection_sample(
+            c["input_ids"],
+            c["rows"],
+            N,
+            c["cu"],
+            strided,
+            c["bonus"],
+            c["bonus_rows"],
+            c["temps"],
+            None,
+            c["src"],
+            state,
+            in_place=True,
+        )
