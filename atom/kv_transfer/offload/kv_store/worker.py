@@ -25,6 +25,9 @@ Completion protocol, per worker and operation:
   every PP stage reports the same per-chunk set. An exception from the GPU
   copy claims neither: it propagates, and ``_guard`` reports the failure
   without the quiescent claim.
+* A chunk the store already holds when a save reaches its window is neither
+  read nor put: it is source-safe at once and counts as stored, so a save
+  whose every chunk was held ends in a success like any other.
 * A load ends in exactly one of done or failed, all-or-nothing.
 * A slot returns to the pool only once no GPU or store access can still reach
   it. One a store transfer or a GPU copy may still reach is quarantined for
@@ -47,7 +50,7 @@ import logging
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -121,6 +124,23 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
     return [range(low, min(end, low + size)) for low in range(start, end, size)]
 
 
+def _held_runs(window: range, held: list[bool]) -> list[tuple[range, bool]]:
+    """``window`` in maximal runs of chunks alike in ``held``, the highest first.
+
+    ``held[i]`` is chunk ``window[i]``'s.
+    """
+    runs: list[tuple[range, bool]] = []
+    high = window.stop
+    while high > window.start:
+        state = held[high - 1 - window.start]
+        low = high - 1
+        while low > window.start and held[low - 1 - window.start] == state:
+            low -= 1
+        runs.append((range(low, high), state))
+        high = low
+    return runs
+
+
 class KVStoreOffloadConnector(DenseOffloadConnector):
     """Offload worker whose tier is an external KV store, reached directly.
 
@@ -161,6 +181,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         self._next_stats_log_at = 0.0
         self._next_warning_at: dict[str, float] = {}
         self._suppressed_warnings: Counter = Counter()
+        # Per save: the windows looked up, and the chunks put and found held.
+        self._save_counts: Counter = Counter()
         # Why this worker loads nothing from the store any more, once it does
         # not: its own put (`_distrust_store`) or the backend's mark of it.
         self._store_distrusted: str | None = None
@@ -511,6 +533,48 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             window.stop,
         )
 
+    def _save_segments(
+        self,
+        client: KVStoreClient,
+        req: LMCacheReqMeta,
+        windows: list[range],
+    ) -> Iterator[tuple[range, bool, list[str], float | None]]:
+        """``windows`` in runs of chunks the store holds or not, highest first.
+
+        Per run: its chunks, whether the store holds them, their keys and the
+        milliseconds the lookup took, on a window's first run only (None on
+        the rest). One
+        lookup per window, made when the save reaches it. Another request's
+        save often stored a prefix already -- the scheduler's lookup counts
+        only the prefix every rank holds, so a save starts below what this
+        rank has -- and putting it again would pack and send bytes the store
+        then drops. A lookup that fails, or a key it has no answer for, holds
+        nothing: the chunk is put as it would be without a lookup. The client
+        answers one code per key or raises (`KVStoreClient.exists`).
+        """
+        for window in windows:
+            keys = self._window_keys(req, window)
+            t0 = time.perf_counter()
+            try:
+                held = [answer == 1 for answer in client.exists(keys)]
+            except Exception as exc:  # noqa: BLE001  # the window is put whole
+                self._warn_rate_limited(
+                    "save:exists_failed",
+                    "%s: a save's lookup failed (%r), req=%s; its "
+                    "chunks are put without one",
+                    self.LABEL,
+                    exc,
+                    req.req_id,
+                )
+                held = [False] * len(window)
+            lookup_ms = (time.perf_counter() - t0) * 1000
+            with self._stats_lock:
+                self._save_counts["lookups"] += 1
+            for run, run_held in _held_runs(window, held):
+                offset = run.start - window.start
+                yield run, run_held, keys[offset : offset + len(run)], lookup_ms
+                lookup_ms = None
+
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
@@ -527,15 +591,27 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         windows = _tail_first_windows(
             start, end, pool.window("save", self.save_workers)
         )
-        # The lowest chunk handed to the GPU so far; [start, read_from) is unread.
+        # The lowest chunk handed to the GPU or found held so far; [start,
+        # read_from) is unread.
         read_from = end
         failure = detail = None
-        windows_run = stored_bytes = in_place_windows = 0
-        pack_ms = put_ms = 0.0
+        segments_run = put_bytes = in_place_segments = 0
+        windows_reached = put_chunks = held_chunks = 0
+        pack_ms = put_ms = exists_ms = 0.0
         t_store0 = time.perf_counter()
-        for window in windows:
+        for segment, held, keys, lookup_ms in self._save_segments(client, req, windows):
+            if lookup_ms is not None:  # the first segment of a window
+                windows_reached += 1
+                exists_ms += lookup_ms
+            if held:
+                # Already in the store: neither read nor put, and source-safe
+                # at once, highest first like the rest.
+                self._chunks_source_safe(req.save_operation, reversed(segment))
+                read_from = segment.start
+                held_chunks += len(segment)
+                continue
             try:
-                slots = pool.acquire("save", len(window))
+                slots = pool.acquire("save", len(segment))
             except SlotPoolExhausted as exc:
                 failure, detail = "pool_exhausted", str(exc)
                 break
@@ -548,14 +624,14 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                     "the scheduler may reclaim the source blocks"
                 )
                 break
-            windows_run += 1
+            segments_run += 1
             run = pool.contiguous_view(slots) if self._in_place else None
             t_pack0 = time.perf_counter()
             try:
                 if run is not None:
                     self._copy_in_place(
                         run,
-                        window,
+                        segment,
                         req.block_ids,
                         pack=True,
                         producer_event=producer_event,
@@ -564,8 +640,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                     with gpu_connector.track_save_source(req.save_operation):
                         gpu_connector.batched_from_gpu(
                             slots,
-                            [index * chunk for index in window],
-                            [(index + 1) * chunk for index in window],
+                            [index * chunk for index in segment],
+                            [(index + 1) * chunk for index in segment],
                             block_ids=req.block_ids,
                             producer_event=producer_event,
                         )
@@ -574,16 +650,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 raise
             pack_ms += (time.perf_counter() - t_pack0) * 1000
             # Both paths return after their final stream sync: no GPU work of
-            # this window still reads the source or writes the slots.
-            read_from = window.start
+            # this segment still reads the source or writes the slots.
+            read_from = segment.start
             if run is not None:
-                in_place_windows += 1
+                in_place_segments += 1
                 # Highest first, as the block GPU connector reports them.
-                self._chunks_source_safe(req.save_operation, reversed(window))
-            keys = self._window_keys(req, window)
+                self._chunks_source_safe(req.save_operation, reversed(segment))
             t_put0 = time.perf_counter()
             try:
-                answer = self._put_chunks(client, req, window, keys, slots)
+                answer = self._put_chunks(client, req, segment, keys, slots)
             except CallRefused as exc:
                 # Refused before the store had the call: nothing was sent.
                 pool.release(slots)
@@ -595,11 +670,15 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
                 failure, detail = "put_raised", repr(exc)
                 break
             put_ms += (time.perf_counter() - t_put0) * 1000
+            put_chunks += len(slots)
             problem = self._settle_put(pool, slots, answer)
             if problem is not None:
                 failure, detail = "put_failed", problem
                 break
-            stored_bytes += self._chunk_bytes * len(slots)
+            put_bytes += self._chunk_bytes * len(slots)
+        with self._stats_lock:
+            self._save_counts["put_chunks"] += put_chunks
+            self._save_counts["held_chunks"] += held_chunks
         store_ms = (time.perf_counter() - t_store0) * 1000
         if failure is not None:
             self._warn_rate_limited(
@@ -614,17 +693,23 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d chunks=%d "
-                "windows=%d in_place_windows=%d total_bytes=%d producer_fenced=%d "
-                "pack_ms=%.2f put_ms=%.2f store_ms=%.2f total_ms=%.2f status=%s",
+                "held_chunks=%d put_chunks=%d windows=%d segments=%d "
+                "in_place_segments=%d put_bytes=%d producer_fenced=%d "
+                "exists_ms=%.2f pack_ms=%.2f put_ms=%.2f store_ms=%.2f "
+                "total_ms=%.2f status=%s",
                 self._rank,
                 req.req_id,
                 end * chunk,
                 start * chunk,
                 end - start,
-                windows_run,
-                in_place_windows,
-                stored_bytes,
-                int(producer_event is not None and windows_run > 0),
+                held_chunks,
+                put_chunks,
+                windows_reached,
+                segments_run,
+                in_place_segments,
+                put_bytes,
+                int(producer_event is not None and segments_run > 0),
+                exists_ms,
                 pack_ms,
                 put_ms,
                 store_ms,
@@ -948,6 +1033,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             if now < self._next_stats_log_at:
                 return
             self._next_stats_log_at = now + _STATS_LOG_INTERVAL_S
+            save_counts = Counter(self._save_counts)
         stats = client.stats()
         counts = stats["counts"]
         failures = ",".join(
@@ -955,12 +1041,18 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
         )
         logger.info(
             "[OFFLOAD-STORE-STATS] rank=%s puts=%d put_keys=%d put_bytes=%d "
+            "save_exists=%d save_put_chunks=%d save_held_chunks=%d "
+            "save_held_bytes=%d "
             "gets=%d get_keys=%d get_bytes=%d failures=%s "
             "quarantined_slots=save:%d,load:%d",
             self._rank,
             counts.get("put_calls", 0),
             counts.get("put_keys", 0),
             counts.get("put_bytes", 0),
+            save_counts["lookups"],
+            save_counts["put_chunks"],
+            save_counts["held_chunks"],
+            save_counts["held_chunks"] * self._chunk_bytes,
             counts.get("get_calls", 0),
             counts.get("get_keys", 0),
             counts.get("get_bytes", 0),

@@ -38,7 +38,10 @@ class KVStoreClient(Protocol):
         """Release a buffer ``register`` took."""
 
     def exists(self, keys: list[str]) -> list[Any]:
-        """Per key, in order: 1 (or True) when the store holds it."""
+        """Per key, in order: 1 (or True) when the store holds it.
+
+        Raises when the store answers for a different number of keys.
+        """
 
     def put(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> list[Any]:
         """Store each buffer under its key; per key the backend's answer.
