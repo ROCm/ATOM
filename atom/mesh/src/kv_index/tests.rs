@@ -462,19 +462,21 @@ fn bench_memory_1m_blocks() {
 }
 
 /// What `cache_aware` asks, hashing the request included: 16 workers, worker k holding
-/// (k+1)/16 of a 100k-token prompt, in one partition with 1M other entries.
+/// (k+1)/16 of a 100k-token prompt, in one partition with 1M other entries. `filled` reads
+/// the sizes, and `KV_BENCH_SAMPLES` (2000) the samples.
 #[tokio::test]
 #[ignore]
 async fn bench_match_workers_16_workers() {
     let ttl = Duration::from_secs(120);
     let partition = Partition::start(16, ttl, &tokio::runtime::Handle::current());
-    let (_, tokens, prefix) = filled(&partition.index);
+    let (background, tokens, prefix) = filled(&partition.index);
+    let (workers, count) = (background.len(), size("KV_BENCH_SAMPLES", 2000));
     let status = Arc::new(Mutex::new(SourceStatus::default()));
-    let holders: Vec<_> = (0..16)
+    let holders: Vec<_> = (0..workers)
         .map(|_| partition.hold(status.clone()).unwrap())
         .collect();
     for (k, holder) in holders.iter().enumerate() {
-        let held = &prefix[..prefix.len() * (k + 1) / 16];
+        let held = &prefix[..prefix.len() * (k + 1) / workers];
         partition.index.apply(
             holder.lane().1,
             &mut held.iter().copied().map(Op::Store).collect(),
@@ -482,46 +484,48 @@ async fn bench_match_workers_16_workers() {
     }
     let lanes: Vec<_> = holders.iter().map(|holder| Some(holder.lane())).collect();
     // Short of the block of the prompt's last token.
-    let all = Some(100_000 - 16);
-    let samples = (0..2000)
+    let all = Some(((tokens.len() - 1) / 16 * 16) as u32);
+    let samples = (0..count)
         .map(|_| {
             let started = Instant::now();
             let hits = match_holders(&tokens, &lanes);
-            assert_eq!(hits[15], all);
+            assert_eq!(hits[workers - 1], all);
             started.elapsed()
         })
         .collect();
     println!(
-        "match_workers with hashing, 16 workers: {}",
+        "match_workers with hashing, {workers} workers: {}",
         percentiles(samples)
     );
 
     // Every rank's events partial, and each worker predicted to hold its share too.
-    let predictors: Vec<_> = (0..16).map(|_| partition.predict("w").unwrap()).collect();
+    let predictors: Vec<_> = (0..workers)
+        .map(|_| partition.predict("w").unwrap())
+        .collect();
     for (k, predictor) in predictors.iter().enumerate() {
-        let held = &prefix[..prefix.len() * (k + 1) / 16];
+        let held = &prefix[..prefix.len() * (k + 1) / workers];
         partition.predicted.apply(
             predictor.lane().1,
             &mut held.iter().copied().map(Op::Store).collect(),
         );
     }
     let predicted: Vec<_> = predictors.iter().map(|p| Some(p.lane())).collect();
-    let samples = (0..2000)
+    let samples = (0..count)
         .map(|_| {
             let started = Instant::now();
             let hits = match_lanes(&tokens, &lanes, &predicted);
-            assert_eq!(hits[15], all);
+            assert_eq!(hits[workers - 1], all);
             started.elapsed()
         })
         .collect();
     println!(
-        "match_workers with hashing, 16 partial workers with predictions: {}",
+        "match_workers with hashing, {workers} partial workers with predictions: {}",
         percentiles(samples)
     );
 }
 
 /// One routing of a 100k-token prompt, routed again and again, as many times as the writer
-/// queues: the request's hashing, and the writer's time.
+/// queues: the request's hashing, and the writer's time. `KV_BENCH_TOKENS` sizes the prompt.
 #[tokio::test]
 #[ignore]
 async fn bench_predict_100k_tokens() {
@@ -530,7 +534,7 @@ async fn bench_predict_100k_tokens() {
     let partition = Partition::start(16, ttl, &tokio::runtime::Handle::current());
     let predictor = partition.predict("w").unwrap();
     let lanes = [Some(predictor.lane())];
-    let prompt: Vec<u32> = (0..100_000).collect();
+    let prompt: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000) as u32).collect();
     let last: Vec<u32> = (0..17).rev().collect();
     let started = Instant::now();
     for _ in 1..ROUTINGS {
@@ -542,7 +546,8 @@ async fn bench_predict_100k_tokens() {
         tokio::task::yield_now().await;
     }
     println!(
-        "predict, 100k tokens: request {:?}, writer {:?}",
+        "predict, {} tokens: request {:?}, writer {:?}",
+        prompt.len(),
         queued / ROUTINGS,
         (started.elapsed() - queued) / ROUTINGS
     );
