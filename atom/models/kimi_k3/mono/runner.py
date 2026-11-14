@@ -21,11 +21,9 @@ decides which is which; the two paths hand each other the same tensors. A
 full-attention layer still runs K2 for everything after its attention
 (``_pre_o_core``), unless ``bind_model`` left it on the production path.
 
-The block-residual buffer is the one place the mono loop cannot reuse
-``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
-with ``torch.cat``, while the kernels write their block into a slot of a buffer
-sized for the whole stack. ``_fallback`` is that same forward with the ``cat``
-replaced by a slot copy, so a fallback layer's numerics are the original path's.
+The kernels write their block into a slot of a buffer sized for the whole stack,
+as ``AttnRes.maybe_close_block`` does; ``_fallback`` is ``KimiDecoderLayer.forward``
+on that buffer, so a fallback layer's numerics are the original path's.
 
 ATOM carries two pending adds between layers (an MoE layer defers its routed and
 its shared output separately); K2 all-reduces one MoE output, so a mono layer
@@ -45,6 +43,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+from atom.model_ops.kimi_k3.attention_residual import materialize_folded_zeros
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
     Dims,
@@ -512,6 +511,8 @@ class K3MonoDecodeRunner:
                     plan, positions, prefix, blocks, add, add2
                 )
             else:
+                # a row-sharded fallback layer's addends are unwritten folded zeros
+                materialize_folded_zeros(add, add2)
                 delta = add if add2 is None else (add2 if add is None else add + add2)
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
@@ -578,8 +579,7 @@ class K3MonoDecodeRunner:
         self.aux.write(layer_id, tap)
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
-        """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``
-        replaced by a slot copy."""
+        """``KimiDecoderLayer.forward`` rerun from its submodules."""
         layer, normed, prefix, before, write_idx = self._seam(
             plan, prefix, blocks, add, add2
         )
@@ -591,9 +591,7 @@ class K3MonoDecodeRunner:
         else:
             attn_out = layer.self_attn(positions, normed)
         after = before + (write_idx >= 0)
-        normed, prefix = layer.mlp_attn_res(prefix, blocks[:, :after], attn_out)
-        out, shared = layer._ffn(normed)
-        return prefix, out, shared
+        return layer._post_attention(attn_out, prefix, blocks[:, :after])
 
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
         """K1 -> the gated core rows (``o_proj``'s input).

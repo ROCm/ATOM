@@ -112,7 +112,8 @@ class AttnRes(nn.Module):
         self.eps = 1e-6 if norm is None else _rms_eps(norm)
         self.out_eps = 1e-6 if out_norm is None else _rms_eps(out_norm)
         self.score_weight: torch.Tensor | None = None
-        # Set only on the site that closes out blocks (see maybe_close_block).
+        # Set on a site handed the whole bank: it mixes the slots closed before
+        # layer `layer_idx`, which `maybe_close_block` writes.
         self.block_size = block_size
         self.layer_idx = layer_idx
 
@@ -170,6 +171,7 @@ class AttnRes(nn.Module):
         if prefix_sum is None:
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
+        block_residual = self.window(block_residual)
 
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
@@ -193,18 +195,30 @@ class AttnRes(nn.Module):
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
         # what the kernel would otherwise have folded into its load and store.
         if add_hidden is not None:
+            from atom.model_ops.kimi_k3.attention_residual import (
+                materialize_folded_zeros,
+            )
+
+            materialize_folded_zeros(add_hidden, add_hidden2)
             prefix_sum = prefix_sum + add_hidden
             if add_hidden2 is not None:
                 prefix_sum = prefix_sum + add_hidden2
         mixed = prefix_sum if self.out_norm is None else self.out_norm(prefix_sum)
         return mixed, prefix_sum
 
+    def window(self, block_residual: torch.Tensor | None) -> torch.Tensor | None:
+        """The bank's slots this site mixes. Sliced here, not by the caller: in
+        a compiled forward a view must not cross a graph split."""
+        if self.block_size is None or block_residual is None:
+            return block_residual
+        return block_residual[:, : -(-self.layer_idx // self.block_size)]
+
     def maybe_close_block(
         self,
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Append ``prefix_sum`` as a candidate every ``block_size`` layers.
+        """Copy ``prefix_sum`` into its slot of the bank every ``block_size`` layers.
 
         Returns the new ``(block_residual, prefix_sum)``. A closed-out block
         leaves prefix_sum None: the running sum has been banked as a candidate
@@ -216,5 +230,10 @@ class AttnRes(nn.Module):
         if self.layer_idx % self.block_size != 0:
             return block_residual, prefix_sum
         assert block_residual is not None
-        block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+        # as_strided, not select: Inductor reinplaces it even into a bank allocated
+        # in the same graph, where a select's scatter rewrites every slot. The bank
+        # starts its storage (storage_offset() would break the Dynamo graph).
+        row, slot, col = block_residual.stride()
+        start = self.layer_idx // self.block_size * slot
+        block_residual.as_strided(prefix_sum.shape, (row, col), start).copy_(prefix_sum)
         return block_residual, None

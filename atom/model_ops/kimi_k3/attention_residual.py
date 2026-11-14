@@ -34,6 +34,8 @@ Four deliberate divergences from that reference:
 
 from __future__ import annotations
 
+import weakref
+
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
@@ -217,6 +219,68 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
+# The zero addends row-sharded MoE layers handed back, by weak reference.
+_folded_zeros: list[weakref.ref] = []
+
+
+def folded_zero_like(x: torch.Tensor) -> torch.Tensor:
+    """A fresh ``x`` that stands for zero but is never written:
+    ``apply_attn_res`` adds it without loading, and a consumer that adds it
+    in torch zeroes it first (``materialize_folded_zeros``).
+
+    Fresh, not cached: Inductor may write a later kernel into a custom op's
+    output once that output is dead. Held here until an ``apply_attn_res``
+    takes it or it dies, so no other tensor is mistaken for it."""
+    zero = torch.empty_like(x)
+    _folded_zeros.append(weakref.ref(zero))
+    return zero
+
+
+def _is_folded_zero(t: torch.Tensor) -> bool:
+    return any(
+        (z := r()) is not None and z.data_ptr() == t.data_ptr() for r in _folded_zeros
+    )
+
+
+def _take_folded_zero(t: torch.Tensor) -> bool:
+    """Whether ``t`` is a held folded zero; a match releases it, and dead
+    entries go with it."""
+    held = _is_folded_zero(t)
+    _folded_zeros[:] = [
+        r
+        for r in _folded_zeros
+        if (z := r()) is not None and z.data_ptr() != t.data_ptr()
+    ]
+    return held
+
+
+def _materialize_folded_zeros_op(
+    add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
+) -> None:
+    for add in (add_hidden, add_hidden2):
+        if add is not None and _is_folded_zero(add):
+            add.zero_()
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_materialize_folded_zeros",
+    op_func=_materialize_folded_zeros_op,
+    mutates_args=["add_hidden", "add_hidden2"],
+    fake_impl=lambda add_hidden, add_hidden2=None: None,
+    # plain torch: the layer's aux reconstruction also runs on CPU tensors
+    dispatch_key="CompositeExplicitAutograd",
+)
+
+
+def materialize_folded_zeros(
+    add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
+) -> None:
+    """Zero whichever addends are folded zeros, for a consumer that adds them
+    in torch. Opaque, so the check runs at run time; the write orders it
+    before every later reader, ``apply_attn_res`` included."""
+    torch.ops.aiter.kimi_k3_materialize_folded_zeros(add_hidden, add_hidden2)
+
+
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride or copied
@@ -259,6 +323,8 @@ def _apply_attn_res_impl(
     do_add2 = add_hidden2 is not None
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
+    load_add = do_add and not _take_folded_zero(add_hidden)
+    load_add2 = do_add2 and not _take_folded_zero(add_hidden2)
     out_norm = out_norm_weight is not None
     quant = quant_dtype is not None
     if quant and not out_norm:
@@ -287,8 +353,10 @@ def _apply_attn_res_impl(
     # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
     # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
     # WRITE_PREF are False).
-    hs = add_hidden.contiguous() if do_add else ps
-    hs2 = add_hidden2.contiguous() if do_add2 else ps
+    hs = add_hidden.contiguous() if load_add else ps
+    hs2 = add_hidden2.contiguous() if load_add2 else ps
+    # Written whenever an addend was given, loaded or not: the op's outputs
+    # must not alias its inputs.
     pref = torch.empty_like(ps) if do_add else ps
 
     nw, ns, bl = (
@@ -324,8 +392,8 @@ def _apply_attn_res_impl(
         BD=triton.next_power_of_2(H),
         num_stages=ns,
         num_warps=nw,
-        DO_ADD=do_add,
-        DO_ADD2=do_add2,
+        DO_ADD=load_add,
+        DO_ADD2=load_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
         QUANT=quant,
