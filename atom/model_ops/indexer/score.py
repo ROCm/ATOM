@@ -30,6 +30,7 @@ from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
+from atom import plugin_host
 from atom.distributed.dcp_utils import get_dcp_group
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
@@ -217,7 +218,9 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         else:
             # Packed: a row's logits start at its offset; the top-k is told
             # the plane width the rows stand for, so it picks as that would.
-            top_k_per_row_decode(
+            plugin_host.call(
+                "v41.attn.index_topk",
+                top_k_per_row_decode,
                 scores,
                 1,
                 rows.row_ends[span],

@@ -131,6 +131,8 @@ cannot affect a server that does not use the feature.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_PLUGIN_HOST** | bool | 1 (true) | Plugin host (`atom/plugin_host.py`) kill switch: `0` keeps every seam native and hands `aiter.plugin.configure` an empty enable list. It can only disable; plugins are enabled by `--plugin-recipe` / `--plugin-enable` alone. Part of the compile cache key when a plugin plan is set. |
+| **ATOM_PLUGIN_HOST_STRICT** | bool | 0 (false) | Plugin host: `1` asks every owner of a seam (owners are meant for disjoint shapes) and raises when two accept the same call. Off: the first owner that accepts serves. Enables nothing. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
 ## Kernel / backend selection

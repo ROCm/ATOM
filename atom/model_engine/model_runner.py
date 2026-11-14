@@ -30,7 +30,7 @@ from aiter.dist.parallel_state import (
 )
 from torch.profiler import record_function
 
-from atom import structured_output
+from atom import plugin_host, structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.group_agreement import group_min
 from atom.distributed.pcp_utils import (
@@ -911,6 +911,15 @@ class ModelRunner:
             dtype=np.int64,
         )
 
+        # Before the build: seams bind at construction, and capture freezes them.
+        # A hot-plug boot binds every seam (not just the planned owners), so a
+        # later plan can be installed without rebuilding the model.
+        plugin_host.configure(
+            config.plugin_source,
+            arm=config.plugin_arm,
+            config=config,
+            hotplug=getattr(config, "plugin_hotplug", False),
+        )
         self.model = get_model(config, self.device, self._model_loader())
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.

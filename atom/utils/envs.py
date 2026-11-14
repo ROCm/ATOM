@@ -667,6 +667,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
+    # Plugin host kill switch (atom/plugin_host.py): "0" serves every seam
+    # natively and passes AITER an empty enable list. It cannot enable a plugin;
+    # only --plugin-recipe / --plugin-enable do.
+    "ATOM_PLUGIN_HOST": lambda: os.getenv("ATOM_PLUGIN_HOST", "1") != "0",
+    # "1": ask every owner of a seam and raise when two accept one call (their
+    # cells overlap). Off by default; like the switch above it enables nothing.
+    "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

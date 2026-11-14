@@ -686,8 +686,11 @@ class DSparkProposer(Drafter):
         # One block when every tap was relayed from earlier PP stages.
         if len(aux_hidden_states) == 1:
             main_hidden_all = aux_hidden_states[0]
-        else:
+        elif not getattr(self.model, "context_takes_taps", False):
             main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        else:
+            # The model concatenates its taps (a plugin may fuse the cat away).
+            main_hidden_all = aux_hidden_states
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):

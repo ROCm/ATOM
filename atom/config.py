@@ -2206,6 +2206,11 @@ class Config:
 
     # only use for plugin mode
     plugin_config: PluginConfig | None = None
+    # --plugin-recipe / --plugin-enable as plain, picklable data
+    # (atom.plugin_recipe.RecipeSource: the recipes' text and the names); each
+    # process resolves it to the plugin plan. None: native. --plugin-arm.
+    plugin_source: Any = None
+    plugin_arm: str = "plugin"
     # only for quark_online_quantization
     online_quant_config: dict | None = None
     hf_overrides: dict[str, Any] | None = None
@@ -3375,6 +3380,15 @@ class Config:
         factors.append(
             None if spec is None else (spec.method, spec.num_speculative_tokens)
         )
+        # A plugin plan puts opaque ops and AITER providers into the graph. An
+        # empty plan keys nothing, so the native cache keys stay as they were.
+        source = getattr(self, "plugin_source", None)
+        if source is not None and not source.empty:
+            factors.append((source.plan_id, envs.ATOM_PLUGIN_HOST))
+        # A hot-plug boot keeps every seam bound even when the plan is empty, so
+        # the compiled/captured artifact's route topology differs from native.
+        if getattr(self, "plugin_hotplug", False):
+            factors.append(("plugin-hotplug", envs.ATOM_PLUGIN_HOST))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
