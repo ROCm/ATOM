@@ -879,14 +879,9 @@ wait_http() {
   local timeout="$3"
   local pid="${4:-}"
   local deadline=$(( $(date +%s) + timeout ))
-  local peer
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
     exit_if_mooncake_store_died
-    if peer="$(failed_peer_node)"; then
-      echo "[wait][FAIL] ${name}: another node's launcher exited (${peer})" >&2
-      exit 1
-    fi
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -1042,19 +1037,13 @@ purge_lmcache_disk() {
 #    each prefill stage its GPU's NIC and, under one shared master, refuses one
 #    an owner uses: owners and requesters sharing NICs stall concurrent reads.
 #  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
-#  - MOONCAKE_STORE_EVICTION_HIGH_WATERMARK (default 0.90) and
-#    MOONCAKE_STORE_EVICTION_RATIO (default 0.05): a master evicts the ratio
-#    of its pool once the watermark of it is in use, so the Store holds
-#    between their difference and the watermark.
 #  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
 #    the stages' NICs: one master per owner NIC, every owner on exactly one
 #    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
 #  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
 #    starts on its own memory, joining the prefill node's masters
-#    (pd_worker_layout multi_node, one prefill node and one decode node; or
-#    packed_nodes, one prefill worker and one node besides its own, where the
-#    first decode worker there starts them). The prefill workers start once
-#    every pool counts the owners of both nodes.
+#    (pd_worker_layout multi_node, one prefill node and one decode node). The
+#    prefill workers start once every pool counts the owners of both nodes.
 #  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
@@ -1333,7 +1322,6 @@ require_mooncake_store_number() {
     positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
     integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
     positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
-    fraction) [[ "${value}" =~ ^0?[.][0-9]+$ && "${value}" =~ [1-9] ]] && valid=1 ;;
   esac
   if ((!valid)); then
     echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
@@ -1369,20 +1357,9 @@ check_mooncake_store_settings() {
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
   local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
-  local decode_owner_nodes=0 node
-  local -A decode_only_nodes=()
-  case "${layout}" in
-    multi_node) decode_owner_nodes="${num_decode}" ;;
-    packed_nodes)
-      for node in ${decode_nodes[@]+"${decode_nodes[@]}"}; do
-        [[ "${node}" == "${prefill_nodes[0]:-0}" ]] || decode_only_nodes[${node}]=1
-      done
-      decode_owner_nodes="${#decode_only_nodes[@]}"
-      ;;
-  esac
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${num_prefill}" != "1" || "${decode_owner_nodes}" != "1" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node or packed_nodes, here ${layout}), one prefill worker (here ${num_prefill}), whose node's masters they join, and one node with decode workers only (here ${decode_owner_nodes}): the pools count the decode owners once" >&2
+    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
     exit 2
   fi
   # This shell starts one Store, planned for its first prefill worker's GPUs;
@@ -1408,8 +1385,6 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
-  require_mooncake_store_number MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90 fraction
-  require_mooncake_store_number MOONCAKE_STORE_EVICTION_RATIO 0.05 fraction
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1625,40 +1600,18 @@ stop_mooncake_store() {
   [[ -z "${mooncake_store_failed_rc}" ]]
 }
 
-# Prints the rank-rc-* of another node whose launcher exited non-zero
-# (pd_slurm_job.sh publishes one per node as it exits): the servers, router or
-# Store owners that node was to bring never come.
-failed_peer_node() {
-  local f rc
-  for f in "${RUN_DIR}"/rank-rc-*; do
-    [[ -f "${f}" && "${f}" != *.tmp && "${f##*/}" != "rank-rc-${NODE_RANK}" ]] || continue
-    rc="$(cat "${f}" 2>/dev/null)"
-    if [[ -n "${rc}" && "${rc}" != "0" ]]; then
-      echo "${f##*/}=${rc}"
-      return 0
-    fi
-  done
-  return 1
-}
-
 # Fails startup (stopping what it started) unless <condition> holds within
-# <timeout> seconds; a dying Store process, or another node's launcher
-# exiting non-zero, fails it at once.
+# <timeout> seconds; a dying Store process fails it at once.
 wait_for_mooncake_store() {
   local what="$1" timeout="$2"
   shift 2
   local deadline=$(( $(date +%s) + timeout ))
-  local log peer
+  local log
   until "$@"; do
     if ! reap_dead_mooncake_store; then
       echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
       stop_mooncake_store || true
       exit "${mooncake_store_failed_rc}"
-    fi
-    if peer="$(failed_peer_node)"; then
-      echo "[wait][FAIL] mooncake-store ${what}: another node's launcher exited (${peer})" >&2
-      stop_mooncake_store || true
-      exit 1
     fi
     for log in "${mooncake_store_logs[@]}"; do
       if grep -q -E "Failed to setup client|Failed to mount|Check failed|FATAL" "${log}" 2>/dev/null; then
@@ -1878,8 +1831,7 @@ start_mooncake_store() {
       --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
       --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
       --default_kv_lease_ttl=10000
-      --eviction_high_watermark_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90)"
-      --eviction_ratio="$(mooncake_setting MOONCAKE_STORE_EVICTION_RATIO 0.05)"
+      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
       --allocation_strategy=random --memory_allocator=offset --client_ttl=10
     )
     dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
@@ -1926,13 +1878,6 @@ start_mooncake_store() {
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
-  # Packed nodes start decode workers on the prefill's node too, and several
-  # on the other: that node's first one starts the owners.
-  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
-    [[ "${NODE_RANK}" != "${prefill_nodes[0]:-0}" ]] || return 0
-    [[ -z "${mooncake_store_decode_owners_started:-}" ]] || return 0
-    mooncake_store_decode_owners_started=1
-  fi
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
