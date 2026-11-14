@@ -31,7 +31,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
@@ -609,14 +609,9 @@ def _score_tile_keys(
 # because the next shape down (68 blocks) prefers 128 over 64 by 10%, so
 # lowering it is not a one-line change; it is worth ~0.1ms of a prefill step.
 #
-# Decode cannot derive it, because it is captured: the wrapper's Python runs
-# once, at capture, and capture is handed max_seqlen_k = max_model_len so the
-# grid covers every replay. A derived width would therefore be the
-# longest-context one on every replay -- (1024, 8) here, which is 1.4-1.7x off
-# the per-shape best at 64 blocks. So decode takes a constant, chosen by total
-# regret over the deployed shapes. That regret is real and mostly irreducible:
-# the per-shape optima span (64, 1) to (1024, 8), and the best single pair,
-# (256, 4), is only 0.6% better than this one over 16 shapes.
+# Decode can only use the capture-time max-block bound, never the live replay
+# length. Its width is selected from that bound and remains fixed for every
+# replay of the graph.
 #
 # Neither phase may autotune, and not for the usual reason: triton's key here
 # would be BLOCK_SIZE_T == next_pow2(topk) == 16, a constant, so the first shape
@@ -633,6 +628,16 @@ PREFILL_TOPK_MAX_BLOCK_SIZE_K = 1024
 PREFILL_TOPK_NUM_WARPS = 1
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
+
+
+def _decode_topk_block_size_k(arch: str, max_block: int) -> int:
+    if arch != "gfx1250" or max_block <= 512:
+        return DECODE_TOPK_BLOCK_SIZE_K
+    # At 2048+ blocks the production emit path normally selects aiter first.
+    # This tile serves calls without published bounds or shapes aiter declines.
+    if max_block >= 2048:
+        return 2048
+    return 1024
 
 
 @functools.cache
@@ -1500,7 +1505,7 @@ def minimax_m3_index_topk_decode(
         num_idx_heads,
         rows_per_req=max_query_len,
         decode_max_q=max_query_len,
-        block_size_k=DECODE_TOPK_BLOCK_SIZE_K,
+        block_size_k=_decode_topk_block_size_k(get_gfx_runtime(), max_block),
         num_warps=DECODE_TOPK_NUM_WARPS,
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
