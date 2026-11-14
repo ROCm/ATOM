@@ -869,13 +869,13 @@ class KimiFullAttention(nn.Module):
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
-        # (ptpc_fp8) or per-1x128 block.
+        # (ptpc_fp8) or per-1x128 block (FP32 or E8M0 scales).
         o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = (
-            o_dtype == dtypes.fp8
-            and o_type in (QuantType.per_Token, QuantType.per_1x128)
-            and not _is_e8m0_blockscale(quant_config, o_type)
+        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
+            QuantType.per_Token,
+            QuantType.per_1x128,
         )
+        self.o_proj_e8m0_scale = _is_e8m0_blockscale(quant_config, o_type)
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
         self.o_proj_quant_type_value = (
@@ -949,6 +949,7 @@ class KimiFullAttention(nn.Module):
             gate,
             quant=self.fuse_sigmoid_mul_quant,
             quant_type_value=self.o_proj_quant_type_value,
+            e8m0_scale=self.o_proj_e8m0_scale,
         )
         return attn_out, attn_scale
 
