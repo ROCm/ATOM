@@ -6,8 +6,8 @@ preceding layer's K2 (``kernels.stages.mla_prep``), host side.
 
 GPU-free: the flags, the bind-time refusals, which K2 builds carry the stage,
 that a folded layer takes the stage's outputs while replaying the production
-seam's allocations, and sub-mode 3's buffers, arguments and decode entry. Whether the stage is right needs a GPU
-(``ATOM_MONO_MLA_PREP_CHECK``).
+seam's allocations, and sub-mode 3's buffers, arguments and decode entry.
+Whether the stages are right needs a GPU (``test_kimi_k3_mono_mla_prep_gpu.py``).
 """
 
 from types import SimpleNamespace
@@ -31,12 +31,8 @@ def runner_module():
 
 
 def test_flags_default_off(monkeypatch):
-    for name in ("ATOM_MONO_MLA_PREP", "ATOM_MONO_MLA_PREP_LAYERS"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.delenv("ATOM_MONO_MLA_PREP_CHECK", raising=False)
+    monkeypatch.delenv("ATOM_MONO_MLA_PREP", raising=False)
     assert envs.ATOM_MONO_MLA_PREP == "0"
-    assert envs.ATOM_MONO_MLA_PREP_LAYERS == ""
-    assert envs.ATOM_MONO_MLA_PREP_CHECK is False
 
 
 def _runner(runner_module, prep=None):
@@ -108,7 +104,6 @@ def test_a_folded_layer_takes_the_stage_outputs(runner_module):
         self_attention_attn_res=lambda *a: pytest.fail("the seam ran")
     )
     r.inner = SimpleNamespace(layers={3: layer})
-    r.mla_prep_check = False
     pend = {
         "pref": torch.zeros(ROWS, HIDDEN),
         "x8": torch.zeros(ROWS, HIDDEN),
