@@ -11,6 +11,7 @@ for the NIC, so every destination byte is compared, not just the plan.
 """
 
 import ctypes
+import logging
 import threading
 from contextlib import nullcontext
 
@@ -571,6 +572,79 @@ def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small):
     assert new._kv_staging_slots.free == [0]
 
 
+def _per_token_reference(mc, regions):
+    expected = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in regions]
+    old = _producer(mc, regions)
+    assert _run(mc, old, _request(2, 2, 1, 1, expected), range(4), [3, 5], None)
+    return expected
+
+
+def test_a_pool_retired_mid_transfer_sends_the_rest_per_token(monkeypatch, caplog):
+    """Another transfer's uncertain write retires the pool after this one sent a
+    slot: the rest goes per token, staging stays off, and one warning says so."""
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    regions = _source_regions(2, 8)
+    expected = _per_token_reference(mc, regions)
+    new = _producer(mc, regions, pool_size=1, slot_pages=1)
+    write = new._nic.write
+
+    def retire_after_the_first_slot(*args, **kwargs):
+        ok = write(*args, **kwargs)
+        new._retire_kv_staging("other-req")
+        return ok
+
+    new._rdma_write = retire_after_the_first_slot
+    actual = [torch.zeros_like(t) for t in expected]
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
+        again = [torch.zeros_like(t) for t in expected]
+        assert _run(mc, new, _request(2, 2, 1, 1, again), range(4), [3, 5], object())
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+    assert all(torch.equal(a, e) for a, e in zip(again, expected))
+    # One staged slot, then the per-token rest; the next transfer never stages.
+    assert new._nic.labels == ["staged-kv", "block", "block"]
+    assert new._kv_staging_failed
+    off = [r for r in caplog.records if "KV staging and landing are off" in r.message]
+    assert len(off) == 1
+
+
+def test_a_transfer_waiting_on_a_retired_pool_sends_per_token(monkeypatch):
+    """A worker blocked on the only slot is woken by the uncertain write that
+    holds it, and finishes per token instead of failing."""
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    regions = _source_regions(2, 8)
+    expected = _per_token_reference(mc, regions)
+    new = _producer(mc, regions, pool_size=1, slot_pages=4)
+    actual = [torch.zeros_like(t) for t in expected]
+    waiting = []
+    waiter = threading.Thread(
+        target=lambda: waiting.append(
+            _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
+        )
+    )
+
+    def staged_write_is_uncertain(target, src, dst, sizes, req, label, **kwargs):
+        if label != "staged-kv":
+            return new._nic.write(target, src, dst, sizes, req, label, **kwargs)
+        # This transfer holds the only slot while the other one starts waiting.
+        waiter.start()
+        waiter.join(0.2)
+        assert waiter.is_alive() and not new._nic.labels
+        return False
+
+    new._rdma_write = staged_write_is_uncertain
+    first = [torch.zeros_like(t) for t in expected]
+    assert not _run(mc, new, _request(2, 2, 1, 1, first), range(4), [3, 5], object())
+    waiter.join(5)
+    assert waiting == [True]
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+    assert new._nic.labels == ["block"]
+    # The uncertain write's slot is never handed out again.
+    assert new._kv_staging_slots.free == []
+
+
 def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
@@ -645,15 +719,37 @@ def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
     assert conn._kv_staging is None
 
 
-def test_kv_staging_is_disabled_by_env(monkeypatch):
+@pytest.mark.parametrize("enabled", [True, False])
+def test_kv_staging_follows_the_env_through_its_reserve(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    from test_pd_producer_config import _mla_producer_config
+
+    from atom.kv_transfer.disaggregation.staging_config import staging_reserve_bytes
+    from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
     mc = _mooncake()
-    monkeypatch.setenv("ATOM_PD_MLA_STAGING", "0")
+    monkeypatch.setenv("ATOM_PD_MLA_STAGING", "1" if enabled else "0")
+
+    class _DeviceView:
+        # What a GPU PAGE view reports, backed by host memory here.
+        is_cuda = True
+        dtype = torch.uint8
+        device = torch.device("cpu")
+
+        def is_contiguous(self):
+            return True
+
     conn = object.__new__(mc.MooncakeConnector)
-    conn.is_producer = True
-    conn.dcp_size = 1
     conn._has_slot_regions = False
-    assert conn._build_kv_staging(object()) is None
-    assert conn._kv_staging is None
+    conn._num_send_workers = 1
+    # What __init__ sets from the connector's config.
+    conn._kv_staging_reserve = staging_reserve_bytes(_mla_producer_config(1))
+    region = KVTransferRegion(0, 8 * PAGE_BYTES, PAGE_BYTES, semantic_role=MLA_KV_ROLE)
+    tt = SimpleNamespace(block_regions=[region], block_tensor_views=[_DeviceView()])
+    staging = conn._build_kv_staging(tt)
+    assert (staging is not None) is enabled
+    assert (conn._kv_staging is not None) is enabled
 
 
 class _DeviceNic:
