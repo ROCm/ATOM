@@ -127,7 +127,11 @@ def ix_peer_offset(max_rows: int) -> int:
 
 def _next_fold_build(key: "k2.K2Build") -> "k2.K2Build":
     """The build a fold build that needs scratch is rebuilt as: the next of
-    ``k2.FOLD_SCHEDULERS``, then its layer's default build."""
+    ``k2.FOLD_SCHEDULERS``, then its layer's default build. The scheduler
+    steps work around an LLVM bug (an orphaned SGPR spill slot).
+    Tracked in: <LLVM_ISSUE_URL>
+    They can go once the LLVM that FlyDSL ships has the fix; the default build
+    stays the last step."""
     order = ("", *k2.FOLD_SCHEDULERS)
     at = order.index(key.sched)
     if at + 1 < len(order):
