@@ -39,7 +39,7 @@ from atom.models.deepseek_v41.mono.gfx1250.debug import RunnerDebug, timeline
 from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
 from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 from atom.mono.plan.build_key import source_digest
-from atom.mono.runtime.compile import compile_only
+from atom.mono.runtime.compile import compile_only, keep_compiled
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
 from atom.utils.forward_context import get_forward_context
@@ -202,14 +202,18 @@ class SingleStepRunner(StepInputs, RunnerDebug):
             with compile_only():
                 for ln in launch:
                     ln(*self._launch_args(), stream=torch.cuda.current_stream())
+                    keep_compiled(
+                        ln, *self._launch_args(), stream=torch.cuda.current_stream()
+                    )
             torch.distributed.barrier(group=get_tp_group().cpu_group)
             self.builds[rows] = launch
         return True
 
     def _fast_launchers(self, rows):
-        """The width's launchers: each @flyc.jit launcher's first call goes through flyc.compile (which launches it)
-        and the CompiledFunction it returns is called after that -- no per-call signature binding / cache key / globals
-        check (~0.15 ms of host time a launch)."""
+        """The width's launchers: each @flyc.jit launcher's CompiledFunction, called with no per-call signature
+        binding / cache key / globals check (~0.15 ms of host time a launch). The one ``prepare`` kept
+        (``keep_compiled``), else the one the launcher's first call gets from flyc.compile (which launches it).
+        """
         fast = self._fast.get(rows)
         if fast is None:
 
@@ -224,7 +228,10 @@ class SingleStepRunner(StepInputs, RunnerDebug):
 
                 return call
 
-            fast = self._fast[rows] = [first(i) for i in range(len(self.builds[rows]))]
+            fast = self._fast[rows] = [
+                first(i) if getattr(ln, "_cf", None) is None else ln._cf
+                for i, ln in enumerate(self.builds[rows])
+            ]
         return fast
 
     def _launch_args(self) -> tuple:

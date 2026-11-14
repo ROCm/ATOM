@@ -15,11 +15,12 @@ program for another target than the visible GPU's compiles too (no launch, no
 admission query: a GPU cannot load another arch's code object).
 
 A build traces its kernel and holds the trace to the hand-off contract and the memory model (``check``,
-``check_memory``), FlyDSL's disk cache off so that every build traces. Inside ``serving()`` (the engine's builds at
-load) the disk cache is on instead and those checks are left to the CPU checks of the served programs (every one of
-them traced and checked there): a build FlyDSL has cached loads without tracing or compiling, and the ranks of a node
-share one compile of a program (FlyDSL's compile lock). The resource gate and the code's hazard scan read the built
-code object either way.
+``check_memory``). FlyDSL traces a build before it looks it up in its disk cache (its key is the traced module), so a
+cached build is traced too, only not compiled again, and the ranks of a node share one compile of a program
+(FlyDSL's compile lock). Inside ``serving()`` (the engine's builds at load) those checks are left to the CPU checks of
+the served programs (every one of them traced and checked there): the traces record nothing and capture no source
+locations. The resource gate and the code's hazard scan read the built code object either way, and the build's
+callable is kept for the first launch (one trace a program).
 """
 
 import functools
@@ -27,10 +28,11 @@ import hashlib
 import os
 import re
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
 from atom.mono.runtime import srcloc
+from atom.mono.runtime.compile import keep_compiled
 
 from ..plan.check import check, check_memory
 from ..plan.program import Program
@@ -153,27 +155,24 @@ def serving():
 
 def compile_traced(launcher, program: Program):
     """Compile ``launcher`` (no launch) and hold its recorded hand-offs to the program's regions and its memory
-    operations to the memory model (``plan.check.check_memory``; raises ContractError): the body traced, FlyDSL's
-    disk cache off. Inside ``serving()``: the disk cache on (a cached build loads untraced), no checks.
+    operations to the memory model (``plan.check.check_memory``; raises ContractError). Inside ``serving()``: nothing
+    recorded, no source locations and no checks (the CPU checks' part), None. Either way the build's callable is kept for the first launch (``keep_compiled``: not
+    traced again there).
     """
     arch = program.target.mcpu
     serve = _SERVING.get()
-    cache = os.environ.get("FLYDSL_RUNTIME_ENABLE_CACHE", "1") if serve else "0"
     with (
-        recording() as rec,
-        _env(
-            COMPILE_ONLY=1,
-            FLYDSL_RUNTIME_ENABLE_CACHE=cache,
-            ARCH=arch,
-            FLYDSL_GPU_ARCH=arch,
-        ),
-        srcloc.scoped(),  # (the source locations at a fraction of FlyDSL's cost)
+        nullcontext() if serve else recording() as rec,
+        _env(COMPILE_ONLY=1, ARCH=arch, FLYDSL_GPU_ARCH=arch),
+        # (the source locations one frame deep; serving: none)
+        srcloc.unlocated() if serve else srcloc.scoped(),
     ):
         launcher(0, 0, 0, 0, 0)
+    keep_compiled(launcher, 0, 0, 0, 0, 0)
     if serve:
-        return rec
+        return None
     if not rec.stages:
-        raise RuntimeError("nothing traced (a cached build?)")
+        raise RuntimeError("nothing traced")
     return check_record(rec, program)
 
 
@@ -315,7 +314,7 @@ def gate(
     ``occupancy.py``); the toy and layer runs on the device are the rest of the evidence.
     """
     problems = []
-    # a private segment the code never reaches passes: FlyDSL 0.4.0 reserves 36 B in V4.1's 1M-context KV-source
+    # a private segment the code never reaches passes: FlyDSL reserves 36 B in V4.1's 1M-context KV-source
     # layers (an SGPR-spill save slot) with no instruction that can touch it (``scratch_ops`` 0; None or missing:
     # unknown, refused as before)
     if res["scratch"] and res.get("scratch_ops") != 0:

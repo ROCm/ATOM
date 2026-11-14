@@ -2,11 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The hi programs' hand-off contracts and memory model, checked on their builds (compile-only, no GPU needed).
 
-Composed outside ``hi.emit.compile.serving()``, every build of ``hi_compose.HiPrograms`` is traced (FlyDSL's disk
-cache off) and its trace held to the hand-off contract (``hi.plan.check.check``: every poll waits on a region an
-earlier stage or the host puts) and the memory model (``check_memory``), raising ``ContractError`` on a violation.
-The engine's builds at load skip both (``serving``: FlyDSL's disk cache on) and rely on this check of the same
-programs.
+Composed outside ``hi.emit.compile.serving()``, every build of ``hi_compose.HiPrograms`` is traced and its trace
+held to the hand-off contract (``hi.plan.check.check``: every poll waits on a region an earlier stage or the host
+puts) and the memory model (``check_memory``), raising ``ContractError`` on a violation. The engine's builds at load
+skip both (``serving``) and rely on this check of the same programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--fits]
 (``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108

@@ -94,7 +94,9 @@ class WidthBuilds:
         if not group_agree(built is not None, self._group):
             return None, {}
         try:
-            launchers = compile_kernels(kernels)
+            # the rest from the disk cache (this rank's share holds its build: not traced again)
+            compile_kernels([k for k in kernels if getattr(k[0], "_cf", None) is None])
+            launchers = [launcher for launcher, _ in kernels]
             return built, {launcher: scratch_bytes(launcher) for launcher in launchers}
         except Exception:
             logger.exception(

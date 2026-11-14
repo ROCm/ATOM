@@ -48,23 +48,70 @@ def compile_only():
 
 def compile_kernels(kernels) -> list:
     """Each ``(launcher, abi)`` of ``kernels`` compiled without a launch (its
-    arguments ``abi.zeros()``); returns the launchers."""
+    arguments ``abi.zeros()``) and its build kept for the first launch
+    (``keep_compiled``); returns the launchers."""
     with compile_only():
         for launcher, abi in kernels:
             launcher(*abi.zeros())
+            keep_compiled(launcher, *abi.zeros())
     return [launcher for launcher, _ in kernels]
+
+
+def keep_compiled(launcher, *args, **kwargs):
+    """The ``CompiledFunction`` of the build ``launcher(*args, **kwargs)`` just
+    compiled (a compile-only call), kept as ``launcher._cf``; None when there is
+    none to keep (the launcher left as it was).
+
+    FlyDSL traces a ``@flyc.jit`` launcher on every call before it looks for a
+    cached binary, and a compile-only call returns no callable. The first launch
+    (aiter's ``_run_compiled``: ``flyc.compile``, unless the launcher holds
+    ``_cf``) then traced the whole kernel a second time, for the binary already
+    in the launcher's memory cache. This hands it that binary's callable
+    instead, made as ``flyc.compile`` makes it (FlyDSL's
+    ``_make_compiled_function``; a FlyDSL without it: None).
+
+    Kept only when the launch cannot need another build or another argument
+    packing than the compile-only call's: the launcher holds one binary, and
+    every parameter is a runtime argument of a FlyDSL type (its packing from
+    the annotation, not from the compile-only value; ``_runtime_argument``).
+    """
+    make = getattr(launcher, "_make_compiled_function", None)
+    sig = getattr(launcher, "_sig", None)
+    builds = getattr(launcher, "_mem_cache", None)
+    if make is None or sig is None or not builds or len(builds) != 1:
+        return None
+    if not all(_runtime_argument(p.annotation) for p in sig.parameters.values()):
+        return None
+    bound = sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    launcher._resolve_arguments(bound.arguments)
+    launcher._cf = make(next(iter(builds)), bound, None)
+    return launcher._cf
+
+
+def _runtime_argument(annotation) -> bool:
+    """Whether a ``@flyc.jit`` parameter so annotated is a FlyDSL runtime
+    argument (``fx.Int64``, ``fx.Stream``, ...): not a compile-time value
+    (``Constexpr``, a type) and packed by its annotation's type."""
+    from flydsl.compiler.jit_argument import JitArgument, is_type_param_annotation
+    from flydsl.expr.typing import Constexpr
+
+    return (
+        isinstance(annotation, type)
+        and issubclass(annotation, JitArgument)
+        and not Constexpr.is_constexpr_annotation(annotation)
+        and not is_type_param_annotation(annotation)
+    )
 
 
 def trace(launcher, abi) -> Record:
     """``launcher``'s hand-offs, traced compile-only (no launch, no GPU needed
-    with ``ARCH`` set). A build served from FlyDSL's disk cache is not traced,
-    so the caller disables the cache (``FLYDSL_RUNTIME_ENABLE_CACHE=0``)."""
+    with ``ARCH`` set). FlyDSL traces a build before it looks it up, so a
+    build in its disk cache is traced too."""
     with recording() as rec:
         compile_kernels([(launcher, abi)])
     if not rec.stages:
-        raise RuntimeError(
-            "nothing traced: a cached build? set FLYDSL_RUNTIME_ENABLE_CACHE=0"
-        )
+        raise RuntimeError("nothing traced")
     return rec
 
 

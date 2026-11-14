@@ -35,7 +35,12 @@ from atom.models.deepseek_v4.mono.config import (
 from atom.models.deepseek_v4.mono.runtime import require_resident_grid
 from atom.models.deepseek_v4.mono.state import Dsv4Variant
 from atom.models.deepseek_v4.mono.weights import pack_layer_weights
-from atom.mono.runtime.compile import compile_only, kernel_names, launcher_resources
+from atom.mono.runtime.compile import (
+    compile_only,
+    keep_compiled,
+    kernel_names,
+    launcher_resources,
+)
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 
 logger = logging.getLogger("atom")
@@ -259,13 +264,15 @@ class V4MonoDecodeRunner:
 
     @staticmethod
     def _compile(launch):
-        """Compile before allocating peers; all ranks vote before any launch."""
+        """Compile before allocating peers; all ranks vote before any launch. The build is kept for the first
+        launch (``keep_compiled``: not traced again there)."""
         n = sum(
             name != "stream"
             for name in inspect.signature(launch._original_func).parameters
         )
         with compile_only():
             launch(*([0] * n))
+            keep_compiled(launch, *([0] * n))
         return launcher_resources(launch)
 
     def prepare(self, rows: int, *, tokens_per_seq: int = 1, lanes: int = 1) -> bool:
