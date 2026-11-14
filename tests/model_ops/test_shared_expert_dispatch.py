@@ -105,7 +105,8 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         layer, weights, ids
     )
 
-    method = object()
+    method = object.__new__(Mxfp4MoEMethod)
+    method.use_flydsl_herd = False
     weights, ids = Mxfp4MoEMethod.select_experts(
         method, layer, torch.empty(1, 4), torch.empty(1, 8)
     )
@@ -145,7 +146,8 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
 
-    method = object()
+    method = object.__new__(Mxfp4MoEMethod)
+    method.use_flydsl_herd = False
     weights, ids = Mxfp4MoEMethod.select_experts(
         method, layer, torch.empty(2, 4), torch.empty(2, 8)
     )

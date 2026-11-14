@@ -333,6 +333,7 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
     method.hidden_pad = 0
     method.intermediate_pad = 0
     method.fused_experts = None
+    method.use_flydsl_herd = False
     method.triton_identity_expert_map = "identity_map"
     method._triton_views_of_flydsl_weights = lambda _layer: (
         "w13_view",
