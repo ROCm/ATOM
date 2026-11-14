@@ -37,7 +37,7 @@ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
 from atom.models.minimax_m3.mono.config import HIDDEN
 from atom.models.minimax_m3.mono.layout import N_SPLIT
-from atom.models.minimax_m3.mono.policy import HYBRID_MAX_ROWS
+from atom.models.minimax_m3.mono.policy import HYBRID_MAX_ROWS, O_FLAG_WIDTHS
 from atom.models.minimax_m3.mono.runner import (
     K4_ABI,
     N_DENSE,
@@ -89,13 +89,14 @@ class ProductionFront:
         return res_mid, x_moe, entering
 
 
-def front_options(r, n: int) -> dict:
+def front_options(r, n: int, whole: bool = False) -> dict:
     """The build options of an n-row front half, as ``Front64._build`` picks them (measured per size:
-    32 rows keep 8 split tasks a token, wider 4; the group pipeline and 13 copy rounds in flight everywhere).
+    32 rows keep 8 split tasks a token, wider 4; the group pipeline and 13 copy rounds in flight everywhere;
+    the whole layer's tag-free o all-reduce at the widths of ``policy.O_FLAG_WIDTHS``).
     """
     return {
         "pipe": r.attn_mxfp8, "copy_batch": 13, "n_split": 4 if n > 32 and r.nvfp4 else 8,
-        **r.cp.options(n),
+        **r.cp.options(n), **({"o_flag": 1} if whole and n in O_FLAG_WIDTHS else {}),
     }  # fmt: skip
 
 
@@ -103,11 +104,12 @@ def symbol_tokens(r, n: int, whole: bool) -> set[str]:
     """What the n-row kernel's symbol must spell (``post_attn.py``: ``sym_extra``; a default is not spelled):
     the same build options as the front half, ``mb1`` for the whole layer, ``fr1`` for a front-only build.
     """
-    o = front_options(r, n)
+    o = front_options(r, n, whole)
     want = {f"s{n}", "mb1" if whole else "fr1"}
     want |= {"pp1"} if o["pipe"] else set()
     want |= {f"cb{o['copy_batch']}"} if o["copy_batch"] != 8 else set()
     want |= {f"ns{o['n_split']}"} if o["n_split"] != N_SPLIT else set()
+    want |= {"of1"} if o.get("o_flag") else set()
     want |= {"cp1"} if o.get("index_cp") else set()
     want |= {f"cm{o['cp_min_blocks']}"} if o.get("cp_min_blocks") else set()
     want |= {f"cn{o['cp_min_batch']}"} if o.get("cp_min_batch", 1) != 1 else set()
@@ -229,7 +231,7 @@ class MonoFull(MonoFront):
                     index_topk=True,
                     moe_back=True,
                     moe_a4w4=True,
-                    **front_options(self.runner, n),
+                    **front_options(self.runner, n, True),
                 )
 
             def run_layer(self, i, lw, fwd, positions, res, rows, hidden, ar_out):

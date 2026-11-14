@@ -49,6 +49,10 @@ HYBRID_MAX_ROWS = 64
 # (TP4, 33/40/48 live rows) per wholly dead group, so the builds sit on the group boundaries
 # (32, 48, 64) and 24 / 40 / 56 are not built. Re-measure when the kernels change;
 # ATOM_MONO_WIDTHS overrides per run.
+# Widths whose whole-layer build all-reduces o_proj tag-free (``o_flag``: plain bf16 payload + flag pairs, bit-equal to the tagged form;
+# task-mono-wide-r4/RESULTS.md, TP4, ctx 2K, q4, in-process A/B, 4 passes, A/A control +-0.3 us): the wide o stage ends
+# 2.0-2.3 us earlier at 64 rows (E 60 / 97 / 110), 1.8-2.0 at 48 (not under the 2 us rule at every E), 0.4-0.5 at 32 (no gain).
+O_FLAG_WIDTHS: tuple[int, ...] = (64,)
 MEASURED_HYBRID: str | None = None
 MEASURED_WIDE: str | None = "32:mono,48:mono,64:mono"
 

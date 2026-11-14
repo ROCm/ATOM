@@ -264,7 +264,8 @@ def test_the_kernel_symbol_must_spell_the_measured_front_options(monkeypatch):
     import types
 
     r = SimpleNamespace(attn_mxfp8=True, nvfp4=True, cp=IndexerCp())
-    assert hybrid.symbol_tokens(r, 64, True) == {"s64", "mb1", "pp1", "cb13", "ns4"}
+    assert hybrid.symbol_tokens(r, 64, True) == {"s64", "mb1", "pp1", "cb13", "ns4", "of1"}  # the tag-free o all-reduce at 64 rows
+    assert hybrid.symbol_tokens(r, 48, True) == {"s48", "mb1", "pp1", "cb13", "ns4"}
     assert hybrid.symbol_tokens(r, 32, False) == {
         "s32",
         "fr1",
@@ -288,6 +289,7 @@ def test_the_kernel_symbol_must_spell_the_measured_front_options(monkeypatch):
         "pp1",
         "cb13",
         "ns4",
+        "of1",
         "cp1",
         "cm5000",
         "cn16",
