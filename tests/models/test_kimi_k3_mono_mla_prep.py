@@ -146,6 +146,88 @@ def test_an_unfolded_layer_runs_its_seam(runner_module):
     assert out == ("layer", "normed", "prefix", None, None) and calls["seam"]
 
 
+class _NoKernel:
+    def __getitem__(self, grid):
+        return lambda *args, **kwargs: None
+
+
+def _pool_trace(monkeypatch):
+    """Every explicit allocation from here on, as ``(bytes, weakref)`` in
+    order (``torch.empty`` & co, and a ``contiguous`` that copies)."""
+    import weakref
+
+    trace = []
+
+    def note(t):
+        trace.append((t.numel() * t.element_size(), weakref.ref(t)))
+        return t
+
+    def wrap(fn):
+        return lambda *a, **k: note(fn(*a, **k))
+
+    for name in ("empty", "empty_like", "zeros"):
+        monkeypatch.setattr(torch, name, wrap(getattr(torch, name)))
+    new_empty, contiguous = torch.Tensor.new_empty, torch.Tensor.contiguous
+    monkeypatch.setattr(torch.Tensor, "new_empty", wrap(new_empty))
+    monkeypatch.setattr(
+        torch.Tensor,
+        "contiguous",
+        lambda t, *a, **k: t if t.is_contiguous() else note(contiguous(t, *a, **k)),
+    )
+    return trace
+
+
+def _alive(trace):
+    import gc
+
+    gc.collect()
+    return [(n, ref() is not None) for n, ref in trace]
+
+
+@pytest.mark.parametrize("bank", ["slice", "strided"])
+@pytest.mark.parametrize("add2", [False, True])
+def test_seam_mirror_allocates_as_the_production_seam(
+    runner_module, monkeypatch, bank, add2
+):
+    """``_seam_mirror`` replays ``_apply_attn_res_impl``'s allocations (its
+    kernel stubbed): the same sizes in the same order, the same ones held
+    while the caller keeps the seam's outputs. A change to either side fails
+    here before it moves a CUDA graph's pool layout."""
+    from atom.model_ops.kimi_k3 import attention_residual as ar
+
+    monkeypatch.setattr(ar, "_attn_res_fused_kernel", _NoKernel())
+    monkeypatch.setattr(
+        ar,
+        "triton",
+        SimpleNamespace(next_power_of_2=lambda n: 1 << (int(n) - 1).bit_length()),
+        raising=False,
+    )
+    prefix = torch.ones(ROWS, HIDDEN, dtype=torch.bfloat16)
+    if bank == "slice":
+        # ``_prepped_seam``'s ``blocks[:, :before]``: H unit-stride
+        br = torch.zeros(ROWS, 4, HIDDEN, dtype=torch.bfloat16)[:, :2]
+    else:
+        br = torch.zeros(ROWS, HIDDEN, 2, dtype=torch.bfloat16).transpose(1, 2)
+    add = torch.ones(ROWS, HIDDEN, dtype=torch.bfloat16)
+    second = add.clone() if add2 else None
+    w = torch.ones(HIDDEN, dtype=torch.bfloat16)
+
+    trace = _pool_trace(monkeypatch)
+    held = ar._apply_attn_res_impl(
+        prefix, br, w, 1e-6, add, out_norm_weight=w, add_hidden2=second,
+        quant_dtype=FP8,
+    )  # fmt: skip
+    production = _alive(trace)
+    del held
+    trace.clear()
+    r = _runner(runner_module)
+    held = (r._seam_mirror(prefix, br, add, second), r._pref_hold_next)
+    assert _alive(trace) == production
+    del held
+    # y, y_scale, pref (and the strided bank's copy)
+    assert len(production) == 3 + (bank == "strided")
+
+
 def test_bind_refuses_before_reading_the_seam():
     from atom.models.kimi_k3.mono import weights
     from atom.mono.runtime.consensus import MonoUnsupported

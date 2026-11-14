@@ -837,17 +837,19 @@ class K3MonoDecodeRunner:
         self, prefix: torch.Tensor, block_residual: torch.Tensor, add=None, add2=None
     ) -> tuple:
         """The production attention seam's pool allocations, in its order and
-        sizes (``attention_residual._apply_attn_res_impl``: ``br``, ``y``,
-        ``y_scale``, the addends' copies, ``pref``; ``br`` and the copies
+        sizes (``attention_residual._apply_attn_res_impl``: ``br`` -- only for a
+        block bank strided along H; a slice of the bank is read in place --,
+        ``y``, ``y_scale``, the addends' copies, ``pref``; ``br`` and the copies
         released when it returns), with no kernel. Returns ``(y, y_scale)`` for
         the caller to keep alive as long as the production ``normed``; ``pref``
         waits in ``_pref_hold_next`` for the forward loop to keep as long as the
         production prefix. A change to that function's allocations must change
-        this one with it."""
+        this one with it (``test_seam_mirror_allocates_as_the_production_seam``
+        fails otherwise)."""
         dev = prefix.device
         rows = prefix.size(0)
         br = None
-        if not block_residual.is_contiguous():
+        if block_residual.stride(-1) != 1:
             br = torch.empty(
                 block_residual.shape, dtype=block_residual.dtype, device=dev
             )
