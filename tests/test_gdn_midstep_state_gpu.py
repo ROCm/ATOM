@@ -99,6 +99,38 @@ def test_every_interior_boundary_matches_a_shortened_forward():
         ), f"boundary at token {j * CHUNK} differs from a forward ending there"
 
 
+def test_snapshots_hold_the_unnarrowed_state_and_leave_the_forward_alone():
+    """An fp32 pool's checkpoint is the fp32 state, not bf16 `h` widened.
+
+    The snapshot at boundary `j` must equal, bit for bit, the fp32 final state
+    of a forward stopped there; asking for snapshots must not move `h` or the
+    output.
+    """
+    inp = _inputs()
+    cu = torch.tensor([0, inp["q"].shape[1]], dtype=torch.int32, device=DEV)
+    snap_idx = torch.arange(-1, NUM_CHUNKS - 1, dtype=torch.int32, device=DEV)
+    h_snap = torch.empty(NUM_CHUNKS - 1, H, K, V, dtype=torch.float32, device=DEV)
+    outs, hs = [], []
+    for snapshots in (None, (snap_idx, h_snap)):
+        o, _ = chunk_gated_delta_rule(
+            **inp,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            keep_intermediate_states=True,
+            state_snapshots=snapshots,
+        )
+        outs.append(o)
+        hs.append(pop_last_intermediate_states())
+    assert torch.equal(outs[0], outs[1])
+    assert torch.equal(hs[0], hs[1])
+    for j in range(1, NUM_CHUNKS):
+        cut = _forward(inp, upto=j * CHUNK)
+        assert torch.equal(h_snap[j - 1], cut.reshape(h_snap[j - 1].shape))
+
+
 def test_popping_consumes_the_reference():
     """A second pop must come back empty.
 
@@ -153,7 +185,7 @@ def _cu(lens):
     return torch.tensor(out, dtype=torch.int32, device=DEV)
 
 
-def _run(inp, cu, init, keep=False):
+def _run(inp, cu, init, keep=False, snapshots=None):
     _, final = chunk_gated_delta_rule(
         q=inp["q"],
         k=inp["k"],
@@ -166,61 +198,86 @@ def _run(inp, cu, init, keep=False):
         head_first=False,
         use_qk_l2norm_in_kernel=True,
         keep_intermediate_states=keep,
+        state_snapshots=snapshots,
     )
     return final
 
 
-def test_varlen_resumed_rows_match_a_forward_stopped_there():
+@pytest.mark.parametrize("pool_dtype", [torch.bfloat16, torch.float32])
+def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
     """Three resumed prefills of uneven length, every readable position.
 
     Each row starts from its own initial state, as a request resuming from a
     checkpoint does, so a position is an offset from the row's start -- the
     frame `_checkpoint_targets` hands the kernel. The reference for each target
     is that row alone, from the same state, stopped there.
+
+    Run at both pool dtypes, as the layer runs them: a bf16 pool reads `h`,
+    an fp32 one (Qwen4Exp) reads the chunk kernel's unnarrowed snapshots.
     """
     from atom.model_ops.fla_ops.index import prepare_chunk_offsets
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+    from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
 
     lens = [200, 77, 333]
     inp = _varlen(lens, seed=1)
     cu = _cu(lens)
-    init = torch.randn(len(lens), H, K, V, dtype=DTYPE, device=DEV) * 0.1
-    final = _run(inp, cu, init.clone(), keep=True)
+    chunk_offsets = prepare_chunk_offsets(cu, CHUNK)
+    init = torch.randn(len(lens), H, K, V, dtype=pool_dtype, device=DEV) * 0.1
+
+    def ix(vals):
+        return torch.tensor(vals, dtype=torch.int32, device=DEV)
+
+    targets = []  # (row, off, is_end)
+    for r, n in enumerate(lens):
+        targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
+        targets.append((r, n, 1))
+    rows, offs = ix([r for r, _o, _e in targets]), ix([o for _r, o, _e in targets])
+    # As the layer does: a pool wider than `h` reads interior targets from
+    # snapshots, a pool of `h`'s dtype reads `h` itself.
+    snap = {}
+    snapshots = None
+    if pool_dtype != DTYPE:
+        snap_idx, h_rows, n_snaps = interior_state_snapshots(
+            rows,
+            offs,
+            [not e for _r, _o, e in targets],
+            chunk_offsets,
+            sum(lens) // CHUNK + len(lens) + 1,
+            CHUNK,
+        )
+        h_snap = torch.empty(n_snaps, H, K, V, dtype=pool_dtype, device=DEV)
+        snapshots, snap = (snap_idx, h_snap), {"h_rows": h_rows}
+    final = _run(inp, cu, init.clone(), keep=True, snapshots=snapshots)
     h = pop_last_intermediate_states()
     assert h is not None
 
     # Runtime slots 0..2 hold each row's final state, as the scatter after the
     # chunk kernel leaves them; checkpoint slots follow.
-    targets = []  # (row, off, is_end)
-    for r, n in enumerate(lens):
-        targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
-        targets.append((r, n, 1))
     pool = torch.zeros(
-        len(lens) + len(targets), *final.shape[1:], dtype=DTYPE, device=DEV
+        len(lens) + len(targets), *final.shape[1:], dtype=pool_dtype, device=DEV
     )
-    pool[: len(lens)] = final.to(DTYPE)
+    pool[: len(lens)] = final.to(pool_dtype)
     D = 8
     x = torch.randn(sum(lens), D, dtype=DTYPE, device=DEV)
     conv = torch.zeros(pool.shape[0], D, 6, dtype=DTYPE, device=DEV)
 
-    def ix(vals):
-        return torch.tensor(vals, dtype=torch.int32, device=DEV)
-
     slots = list(range(len(lens), len(lens) + len(targets)))
     write_state_checkpoints(
-        h,
+        snapshots[1] if snapshots else h,
         pool,
         x,
         conv,
-        ix([r for r, _o, _e in targets]),
+        rows,
         ix(slots),
-        ix([o for _r, o, _e in targets]),
+        offs,
         ix([e for _r, _o, e in targets]),
-        ix([r for r, _o, _e in targets]),
-        prepare_chunk_offsets(cu, CHUNK),
+        rows,
+        chunk_offsets,
         cu,
         CHUNK,
         3,
+        **snap,
     )
 
     starts = cu.tolist()
@@ -229,7 +286,7 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there():
         alone = {key: t[:, sl] for key, t in inp.items()}
         ref = _run(alone, _cu([off]), init[r : r + 1].clone())
         assert torch.equal(
-            pool[slot], ref[0].to(DTYPE)
+            pool[slot], ref[0].to(pool_dtype)
         ), f"row {r} at offset {off} differs from a forward stopped there"
 
 

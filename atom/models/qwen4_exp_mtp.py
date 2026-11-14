@@ -7,6 +7,7 @@ import json
 import os
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import Config
@@ -42,6 +43,16 @@ def _mtp_weights_quantized(model: str) -> bool:
         return True
     mtp = [n for n in names if n.startswith("mtp.")]
     return not mtp or any("_scale" in n.rsplit(".", 1)[-1] for n in mtp)
+
+
+def _moe_needs_quantized_weights() -> bool:
+    """Whether this GPU has no unquantized (BF16) fused MoE kernel.
+
+    aiter's gfx1250 MoE kernels are MXFP4 only (grouped a4w4/a8w4 and mega
+    MoE). A BF16 expert falls back to the CK 2-stage kernel, which does not
+    build for gfx1250, so a BF16 MTP head is quantized online to MXFP4 there.
+    """
+    return get_gfx_runtime() == "gfx1250"
 
 
 class _UnquantizedMTPQuantizationConfig(_Qwen4ExpQuantizationConfig):
@@ -83,9 +94,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        quantized_mtp = _moe_needs_quantized_weights() or _mtp_weights_quantized(
+            atom_config.model
+        )
         quant_cls = (
             _Qwen4ExpQuantizationConfig
-            if _mtp_weights_quantized(atom_config.model)
+            if quantized_mtp
             else _UnquantizedMTPQuantizationConfig
         )
         quant_config = quant_cls(atom_config.quant_config)

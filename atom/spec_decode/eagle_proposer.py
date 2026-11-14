@@ -869,6 +869,9 @@ class EagleProposer(Drafter):
                             num_reject_tokens,
                         )
                         # From here the loop owns the pass's positions buffer.
+                        # `prepare_mtp_decode` derives each step's SWA extents
+                        # from it, so it must be `running_bs` wide before the
+                        # metadata advance; padding only before forward is late.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

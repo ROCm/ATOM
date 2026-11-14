@@ -22,6 +22,7 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
+from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,
@@ -412,14 +413,32 @@ class GDNStateMixin(PoolRowsMixin):
             batch, attn_metadata, is_prefill=True, prepare_block_tables=False
         )
 
-        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        gdn_metadata.ssm_checkpoints = ckpt = self._checkpoint_targets(batch)
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if gdn_metadata.ssm_checkpoints is not None:
+        if ckpt is not None:
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
                 gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
             )
+            # `h` holds the state narrowed to the activation dtype. A wider
+            # pool (Qwen4Exp's fp32) takes its interior targets from snapshots
+            # the chunk kernel stores unnarrowed.
+            if (
+                ckpt["interior"]
+                and self._state_dtypes()[1] != self.model_runner.config.torch_dtype
+            ):
+                lens = batch.num_scheduled_tokens
+                ckpt["snap_idx"], ckpt["h_rows"], ckpt["num_snaps"] = (
+                    interior_state_snapshots(
+                        ckpt["rows"],
+                        ckpt["offs"],
+                        ckpt["interior_host"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        int(sum(lens)) // CHUNK_SIZE + len(lens) + 1,
+                        CHUNK_SIZE,
+                    )
+                )
 
         attn_metadata.gdn_metadata = gdn_metadata
 
@@ -599,33 +618,43 @@ class GDNStateMixin(PoolRowsMixin):
         rather than one contiguous entry, so there is no single range to
         duplicate — and at one token the fork binds almost nothing anyway.
 
-        NOT midstep-readable, though the machinery for it is present and its
-        numerical claim holds. The chunk kernel materializes the recurrent
-        state at every 64-token boundary, `write_state_checkpoints` copies
-        those out, and `tests/test_gdn_midstep_state_gpu.py` shows a slice of
-        `h` is bit-exact against a forward stopped there. What is missing is
-        everything between: the write path declines on six conditions that
-        `commit_midstep` cannot see, its row index spans three differently
-        scoped sequence lists, and its SSM read floors to a 64 grid that
-        `midstep_positions` does not enforce (`hash_block_size` defaults to
-        16). Each of those stores a findable image holding the wrong state,
-        which is worse than storing nothing.
+        Midstep-readable under `ATOM_GDN_STATE_MIDSTEP=1`, through the same
+        write path as the PAGE transfer below. The chunk kernel materializes
+        the recurrent state at every 64-token boundary of a forward, and
+        `write_state_checkpoints` copies each reserved position out of it into
+        an ordinary pool slot that `StateSlotPool.publish_midstep` files after
+        the forward. What once kept this off is shared with the PAGE path and
+        fixed there:
+          * the scheduler and the runner agree on what is writable through
+            `midstep_target_ok`, and a reservation the forward cannot write
+            raises instead of publishing a hash over unwritten bytes;
+          * rows go through `ScheduledBatch.state_rows`, not one index over
+            three differently scoped lists;
+          * positions are snapped onto the forward's own 64-token grid, and
+            non-final chunks end on a hash block so the next grid stays on it;
+          * the conv checkpoint is the `conv_kernel - 1` window the prefill
+            conv kernel resumes from.
+        `tests/test_gdn_midstep_checkpoints.py` covers the scheduler side on
+        this fork transfer; `tests/test_gdn_midstep_state_gpu.py` shows a slice
+        of `h` is bit-exact against a forward stopped there.
 
-        None of it has ever run under a server: Kimi-K3 takes the PAGE path and
-        cannot reach this one, so every measurement in this area is of the
-        other mechanism. Declaring `False` costs a shortened prefill chunk per
-        placement — the cost every backend paid before — and is what the
-        evidence supports. Flip it back with the fixes and an end-to-end run,
-        not before.
-
-        Exact, not approximate, when it is turned back on: `h` is `k.new_empty`
-        and `_state_dtypes` returns `config.torch_dtype`, so slicing `h` rounds
-        exactly where a shortened forward would. That rests on the two dtypes
-        agreeing; kimi_linear's temporal side is `ATOM_GDN_SSM_DTYPE` and need
-        not, so it overrides unconditionally
-        (`_KimiMLAGDNCommon.state_transfer`).
+        Exact at any state dtype. The recurrence runs in fp32 and `h` narrows
+        it to the activation dtype, which is exact for a pool of that dtype.
+        A wider pool -- Qwen4Exp keeps its state in fp32 (`mamba_ssm_dtype`)
+        -- has the chunk kernel store each interior target's boundary
+        unnarrowed into a snapshot (`interior_state_snapshots`), so the
+        checkpoint is the value a forward ending there would store. FlyDSL
+        prefill, which takes no snapshots, steps aside for such a forward.
         """
-        return StateTransfer.fork(1, readable_midstep=False)
+        if not envs.ATOM_GDN_STATE_MIDSTEP:
+            return StateTransfer.fork(1, readable_midstep=False)
+
+        return StateTransfer.fork(
+            1,
+            readable_midstep=True,
+            midstep_grid=CHUNK_SIZE,
+            midstep_min_offset=self._conv_state_len(),
+        )
 
     def num_state_layers(self) -> int:
         """Layers holding a recurrent state, one slot each.
@@ -1272,6 +1301,9 @@ class GDNStateMixin(PoolRowsMixin):
             "offs": mk(offs),
             "is_end": mk(is_end),
             "runtime": mk(runtime),
+            # Host-side, so nothing downstream waits on the device for them.
+            "interior": not all(is_end),
+            "interior_host": [not e for e in is_end],
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):

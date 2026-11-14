@@ -114,6 +114,29 @@ class TestTheLayoutId:
         assert _layout(monkeypatch) != _layout(monkeypatch, layers=44)
 
 
+def _fork_transfer(monkeypatch, *, midstep):
+    _builder_cls()
+    from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+
+    monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if midstep else "0")
+    builder = SimpleNamespace(_conv_state_len=lambda: 3)
+    return GDNStateMixin.state_transfer(builder)
+
+
+class TestForkMidstep:
+    def test_off_unless_asked_for(self, monkeypatch):
+        transfer = _fork_transfer(monkeypatch, midstep=False)
+        assert transfer.forks and not transfer.readable_midstep
+
+    def test_on_reads_the_chunk_grid_and_the_conv_window(self, monkeypatch):
+        transfer = _fork_transfer(monkeypatch, midstep=True)
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        assert transfer.forks and transfer.readable_midstep
+        assert transfer.midstep_grid == CHUNK_SIZE
+        assert transfer.midstep_min_offset == 3
+
+
 def _pool(*, kv_dtype, layers=15, block_size=16):
     pool = MhaKvPool(
         layers=layers,

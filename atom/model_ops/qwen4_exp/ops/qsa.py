@@ -23,14 +23,21 @@ Source provenance:
   without changing the other model's implementation.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.mqa_logits import qsa_flydsl_layout
 from aiter.ops.topk import top_k_per_row_prefill
 
+from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
+    qsa_gfx1250_supports,
+    qsa_sparse_paged_gqa_gfx1250,
+)
+from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 from atom.utils import envs
 
 # Quantized cache rows. FP8 rows carry one FP32 scale (row amax / FP8 max), so
@@ -335,6 +342,11 @@ def qsa_store_quantized_rows(
         GROUP=FP4_GROUP,
         num_warps=1,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    return get_gfx_runtime() == "gfx1250"
 
 
 def _prev_pow2(n: int) -> int:
@@ -1612,6 +1624,19 @@ _STACKED_DECODE_TILES = {
     _FMT_FP8: (4, 64, 4, 256),
     _FMT_FP4: (4, 64, 4, 256),
 }
+# gfx1250 BF16 keys: 64-column tiles and about 8 programs per CU split over the
+# row programs (None). Qwen3.8 MTP verify, ~98K-token context, 12 caches
+# rotated in one CUDA graph, us per call: bs1 4.73 -> 3.25, bs4 7.17 -> 5.09,
+# bs16 14.85 -> 11.66, bs64 45.82 -> 38.86.
+_STACKED_DECODE_TILES_GFX1250 = {_FMT_BF16: (4, 64, 2, None)}
+_STACKED_DECODE_PROGRAMS_PER_CU = 8
+
+
+def _stacked_decode_tiles(key_fmt: int) -> tuple[int, int, int, int | None]:
+    """(rows per program, column tile, warps, column programs or None)."""
+    if _is_gfx1250() and key_fmt in _STACKED_DECODE_TILES_GFX1250:
+        return _STACKED_DECODE_TILES_GFX1250[key_fmt]
+    return _STACKED_DECODE_TILES[key_fmt]
 
 
 # Cap on the FP32 logits buffer; scoring is chunked over query rows to respect
@@ -1723,12 +1748,25 @@ def qsa_paged_mqa_logits(
         and page_table.stride(1) == 1
     )
     heads, head_dim = q.shape[1], q.shape[2]
-    bmt, bn, warps, column_programs = _STACKED_DECODE_TILES[key_fmt]
+    bmt, bn, warps, column_programs = _stacked_decode_tiles(key_fmt)
+    row_programs = triton.cdiv(q.shape[0], bmt)
+    if column_programs is None:
+        column_programs = max(
+            1, _STACKED_DECODE_PROGRAMS_PER_CU * get_cu_num() // row_programs
+        )
     # Decode-sized batches stack each row's heads into the MFMA M dimension,
     # so a few rows per request still fill it and a request's keys are read
-    # once rather than once per row.
+    # once rather than once per row. With gfx1250 tiles an MTP verify batch
+    # (bmt rows per request) stays stacked past 256 rows.
     if (
-        q.shape[0] <= 256
+        (
+            q.shape[0] <= 256
+            or (
+                key_fmt in _STACKED_DECODE_TILES_GFX1250
+                and _is_gfx1250()
+                and q.shape[0] == bmt * page_table.shape[0]
+            )
+        )
         and envs.ATOM_QSA_STACKED_DECODE_SCORER
         and contiguous
         and heads & (heads - 1) == 0
@@ -1737,10 +1775,7 @@ def qsa_paged_mqa_logits(
         and head_dim >= 16
     ):
         _qsa_paged_mqa_logits_stacked_kernel[
-            (
-                triton.cdiv(q.shape[0], bmt),
-                min(triton.cdiv(columns, bn), column_programs),
-            )
+            (row_programs, min(triton.cdiv(columns, bn), column_programs))
         ](
             q,
             compressed_k_cache,
@@ -2411,6 +2446,28 @@ def qsa_sparse_paged_gqa(
         raise ValueError("token_to_request must be contiguous int32/int64 [tokens]")
 
     scale = q.shape[2] ** -0.5 if softmax_scale is None else softmax_scale
+    if (
+        kv_splits is None
+        and q.shape[0] > 0
+        and logical_indices.shape[1] > 0
+        and logical_indices.stride(1) == 1
+        and block_table.stride(1) == 1
+        and _is_gfx1250()
+        and qsa_gfx1250_supports(q, k_cache, v_cache, k_scale, v_scale)
+    ):
+        return qsa_sparse_paged_gqa_gfx1250(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_request,
+            scale,
+            _table_width_bucket(block_table.shape[1]),
+            get_cu_num(),
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
     # Split-K reduction requires contiguous output head dimensions.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if q.shape[0] == 0:
@@ -2438,15 +2495,7 @@ def qsa_sparse_paged_gqa(
     if logical_indices.shape[1] == 0:
         # Empty selections produce zero attention output; skip split reduction.
         return out.zero_()
-    target = out
-    partial_max = partial_sum = out
-    widths = None
-    if kv_splits > 1:
-        shape = (q.shape[0], q.shape[1], kv_splits)
-        partial_max = torch.empty(shape, device=q.device, dtype=torch.float32)
-        partial_sum = torch.empty_like(partial_max)
-        target = torch.empty((*shape, q.shape[2]), device=q.device, dtype=torch.float32)
-        widths = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
     grid_y = k_cache.shape[2] * num_head_groups
     _qsa_sparse_paged_gqa_kernel[(q.shape[0], grid_y, kv_splits)](
         q,
@@ -2500,30 +2549,5 @@ def qsa_sparse_paged_gqa(
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
     )
-    if kv_splits > 1:
-        from aiter.ops.triton._triton_kernels.attention.mla import (
-            _mla_decode_fwd_reduce_kernel,
-        )
-
-        _mla_decode_fwd_reduce_kernel[(q.shape[0], q.shape[1])](
-            out,
-            target,
-            partial_max,
-            partial_sum,
-            widths,
-            None,
-            q.shape[0],
-            q.shape[1],
-            out.stride(0),
-            out.stride(1),
-            1,
-            1,
-            q.shape[0],
-            TILE_SIZE=block_n,
-            KV_LORA_RANK=q.shape[2],
-            query_start_len_ptr=None,
-            BLOCK_Q=1,
-            NUM_SEGMENTS_PER_SEQ=kv_splits,
-            ALL_DECODE=True,
-        )
+    reduce_split_k(out, target, partial_max, partial_sum, widths, kv_splits, block_n)
     return out
