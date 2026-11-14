@@ -258,7 +258,8 @@
     "accuracy_timeout_minutes": 45,
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "moonshotai/Kimi-K3 + RadixArk/Kimi-K3-DSpark",
-    "_baseline_note": "Kimi-K3 with the RadixArk/Kimi-K3-DSpark draft (#2581): the only DSpark draft with a GQA backbone, so the only case that runs a draft-owned KV pool and the draft block read through aiter unified_attention. TP8 + DCP8 with an fp8 KV cache is its production shape: the pool sits outside the DCP group, and an fp8 pool takes the Gluon-gate path. Spec-decode is lossless w.r.t. the target, so baseline and threshold are the Kimi-K3 target's."
+    "mtp_accept_threshold": 0.40,
+    "_baseline_note": "Kimi-K3 with the RadixArk/Kimi-K3-DSpark draft (#2581): the only DSpark draft with a GQA backbone, so the only case that runs a draft-owned KV pool and the draft block read through aiter unified_attention. TP8 + DCP8 with an fp8 KV cache is its production shape: the pool sits outside the DCP group, and an fp8 pool takes the Gluon-gate path. Spec-decode is lossless w.r.t. the target, so baseline and threshold are the Kimi-K3 target's. Measured with these flags and the CI lm_eval command on MI355X: GSM8K 3-shot 0.9659, acceptance 49.5% (4.47 tokens a forward); mtp_accept_threshold 0.40 catches a broken draft, which GSM8K alone cannot."
   },
   {
     "model_name": "Kimi-K3 DSpark PP2",
