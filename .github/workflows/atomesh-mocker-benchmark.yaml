@@ -108,6 +108,23 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib routers::http_pd_router
 
+      # KV events: following the engines' streams, the prefix index, the shared-store
+      # lookups, and the routing and observability code they feed.
+      - name: Test KV events
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --lib -- \
+            kv_events:: kv_index:: kv_storage:: \
+            policies::cache_aware policies::registry observability:: routers::prepare
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --test api_tests --test routing_tests -- \
+            kv_events_test ingress_tests
+
       # The mocker is its own cargo root: atom/mesh's profiles, ci included,
       # do not apply, and its release profile is cargo's default (no fat LTO).
       - name: Run Atomesh test harness
