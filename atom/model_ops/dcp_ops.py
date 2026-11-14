@@ -27,6 +27,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_owner_rank,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.utils import envs
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
@@ -77,6 +78,70 @@ def dcp_all_gather(cp_group, x: torch.Tensor, dim: int) -> torch.Tensor:
     # Viewing narrows the trailing dim, so only a last-dim gather sees a
     # different split; both land on the same byte layout after the view back.
     return device_comm.all_gather(x.view(view_dtype), dim).view(x.dtype)
+
+
+def dcp_all_gather_ready(cp_group) -> "torch.cuda.Event | None":
+    """Mark "everything queued so far is done" for side-stream gathers, or None.
+
+    The point at which a gather may start; it is taken before the work the gather
+    should hide behind is queued, and passed to ``DcpAllGatherHandle`` after, so
+    the gather depends on the former and not on the latter. None (overlap off)
+    unless ``ATOM_DCP_PREFILL_KV_AG_OVERLAP`` is set. Also None when the group
+    borrows another group's communicators (``AITER_REUSE_IDENTICAL_COMM_GROUPS``
+    with ``tp == dcp``): the custom collective's input pool and signal state
+    belong to the communicator, so a side-stream gather would race the TP
+    all-reduce on the same pool. And None while a CUDA graph is being captured,
+    where a second stream is a fork/join problem of its own.
+    """
+    if (
+        not envs.ATOM_DCP_PREFILL_KV_AG_OVERLAP
+        or getattr(cp_group, "reuse_from", None) is not None
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream())
+    return ready
+
+
+_side_stream: torch.cuda.Stream | None = None
+
+
+class DcpAllGatherHandle:
+    """A DCP all-gather in flight on the side stream; ``wait()`` joins it.
+
+    Every handle shares ONE side stream, so the gathers of a rank run in the
+    order they were started, and that order is the program order every rank
+    follows -- the custom collective needs all ranks to enter the same gather
+    together, and one stream per communicator keeps it so. ``produce`` (the
+    input's own gather kernel) runs there too, so none of it queues ahead of
+    the caller's compute.
+
+    The handle owns the cross-stream bookkeeping: the side stream starts after
+    ``ready`` (so the cache and metadata ``produce`` reads are ready), and
+    ``wait()`` makes the caller's stream follow the gather and marks the result
+    as used there, so the allocator does not recycle it for the side stream
+    while the caller still reads it.
+    """
+
+    def __init__(self, cp_group, produce, dim: int, ready: "torch.cuda.Event"):
+        global _side_stream
+        if _side_stream is None:
+            # High priority: HIP maps streams onto a few HW queues by creation
+            # order, and a normal-priority side stream can land on the main
+            # stream's queue, where nothing runs beside the flash kernels.
+            _side_stream = torch.cuda.Stream(priority=-1)
+        _side_stream.wait_event(ready)
+        with torch.cuda.stream(_side_stream):
+            self._out = dcp_all_gather(cp_group, produce(), dim)
+            self._done = torch.cuda.Event()
+            self._done.record(_side_stream)
+
+    def wait(self) -> torch.Tensor:
+        stream = torch.cuda.current_stream()
+        stream.wait_event(self._done)
+        self._out.record_stream(stream)
+        return self._out
 
 
 def dcp_all_gather_query_heads(cp_group, q: torch.Tensor) -> torch.Tensor:
