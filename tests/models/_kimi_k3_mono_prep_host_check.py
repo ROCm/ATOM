@@ -3,8 +3,8 @@
 ``torch.empty`` and friends to trace the step's pool allocations).
 
 The REAL ``K3MonoDecodeRunner.forward`` (``_layer``, ``_k2``, ``_pre_o_core``,
-``_post_core``, ``_prep_args``, ``_prepped_seam``, ``_seam_mirror``,
-``_write_aux``) over the full 93-layer Kimi-K3 stack: ``ATOM_MONO_MLA_POST``
+``_write_aux``, and ``folds.MlaFolds``' ``_post_core``, ``_prep_args``,
+``_prepped_seam``, ``_seam_mirror``) over the full 93-layer Kimi-K3 stack: ``ATOM_MONO_MLA_POST``
 off / on against ``ATOM_MONO_MLA_PREP`` off / on, and on with only a subset
 of the MLA layers folded (gaps between folded layers, 92 unfolded); three
 decode steps, one of them past the folds' 16-row width (the unfused path).
@@ -42,6 +42,7 @@ os.environ["ARCH"] = "gfx950"
 import torch
 
 from atom.model_ops.kimi_k3 import attention_residual as AR
+from atom.models.kimi_k3.mono import folds as F
 from atom.models.kimi_k3.mono import runner as R
 from atom.models.kimi_k3.mono.config import layer_block, num_blocks
 from atom.models.kimi_k3.mono.kernels import layer as k2
@@ -292,7 +293,7 @@ class Ctx:
 
 
 FC = NS(attn_metadata=None, kv_cache_data={}, context=NS(is_dummy_run=False))
-R.get_forward_context = lambda: FC
+R.get_forward_context = F.get_forward_context = lambda: FC
 R.kda_metadata = lambda fc: NS(spec_state_indices_tensor=None, num_accepted_tokens=None)
 
 
