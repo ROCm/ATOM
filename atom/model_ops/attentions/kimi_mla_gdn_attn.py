@@ -245,13 +245,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         refuses it. ReplaySSM's cursor, the last region, is the same on every
         rank; `slot_region_tp_replicated` says so.
 
-        Units are read off the cache shapes, not a slot: a PP stage that holds
-        no KDA layer has caches with a zero layer axis.
+        Units are read off the shapes of `slot_indexed_caches`, the caches
+        `state_slot_regions` publishes, not a slot: a PP stage that holds no
+        KDA layer has caches with a zero layer axis.
         """
         runner = self.model_runner
         hf = runner.config.hf_config
         segments: list = [None] * num_regions
-        conv_cache = runner.mamba_k_cache
+        caches = slot_indexed_caches(runner, self.replayssm)
+        conv_cache = caches[0]
         n_kda = conv_cache.shape[0]
         width, channels = conv_cache.shape[2:]
         # As `_state_shape_for_runner` sized it: from the runner's count, which
@@ -266,21 +268,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             run_bytes = run * conv_cache.element_size()
             for i in range(min(n_kda, num_regions)):
                 segments[i] = (run_bytes,) * (3 * width)
-        ssm_bytes = math.prod(runner.mamba_v_cache.shape[2:]) * (
-            runner.mamba_v_cache.element_size()
-        )
-        for i in range(n_kda, min(2 * n_kda, num_regions)):
-            segments[i] = (ssm_bytes,)
-        if self.replayssm:
-            records = (
-                runner.replayssm_buf_k,
-                runner.replayssm_buf_u,
-                runner.replayssm_buf_g,
-            )
-            for group, buf in enumerate(records, start=2):
-                unit = math.prod(buf.shape[2:]) * buf.element_size()
-                for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
-                    segments[i] = (unit,)
+        for group, cache in enumerate(caches[1:], start=1):
+            unit = math.prod(cache.shape[2:]) * cache.element_size()
+            for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
+                segments[i] = (unit,)
         return segments
 
     def _pp_consumer_region_indices(

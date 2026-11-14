@@ -1168,6 +1168,22 @@ def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invali
     assert "missing the producer's final source slot" in caplog.text
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_pp_stage_drops_its_producer_entry_once_its_consumers_are_served(pp_rank):
+    captured = []
+    conn = _make_transfer_connector({}, captured)
+    conn.pp_size = 2
+    conn.pp_rank = pp_rank
+    conn._completed_prefills["prefill-1"] = {"block_ids": [3], "slot_index": 7}
+
+    conn._execute_transfer(_stateful_write_request(src_block_ids=[3]))
+
+    assert len(captured) == 1
+    # Stage 0 keeps its entry for the release, which only it receives.
+    assert ("prefill-1" in conn._completed_prefills) == (pp_rank == 0)
+    assert conn.done_sending == set()
+
+
 def test_write_done_correct_nonce_accepted():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
