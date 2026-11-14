@@ -93,8 +93,7 @@ pub struct SourceStatus {
     pub stored_blocks: u64,
     pub removed_blocks: u64,
     pub clears: u64,
-    /// Batches admitted as `ClearAndApply`: after lost batches, a lost connection or an
-    /// engine restart.
+    /// Holder clears after lost batches, a lost connection or an engine restart.
     pub resets: u64,
     pub dropped_events: BTreeMap<DropReason, u64>,
     /// Messages dropped whole: not `[topic, seq, payload]`, a seq that is not 8 bytes, a
