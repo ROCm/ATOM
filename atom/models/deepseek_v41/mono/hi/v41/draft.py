@@ -655,7 +655,9 @@ def DRAFT_KPARTS(rows: int) -> int:
 # one-request draft head (``head_program``): TP8's 1010 row groups in 253 tasks of 4 (64 ids a CTA) instead of 127 of
 # 8, the 165 MB a rank streamed by almost every CU instead of half of them. Env ATOM_DSV41_MONO_HI_MK_SPREAD (an int
 # 1-8, any TP; every rank the same) overrides it.
-MK_SPREAD_TP = {8: 4}
+# Measured at TP8 c1 (step bench, fp8 KV): 4 row groups made the draft head slower (93 vs ~77 us; the step +0.9 %),
+# so no TP spreads its Markov dot by default yet
+MK_SPREAD_TP: dict = {}
 MK_SPREAD_ENV = "ATOM_DSV41_MONO_HI_MK_SPREAD"
 
 
