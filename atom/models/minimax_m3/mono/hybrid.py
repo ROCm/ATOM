@@ -37,7 +37,7 @@ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
 from atom.models.minimax_m3.mono.config import HIDDEN
 from atom.models.minimax_m3.mono.layout import N_SPLIT
-from atom.models.minimax_m3.mono.policy import HYBRID_MAX_ROWS, O_FLAG_WIDTHS
+from atom.models.minimax_m3.mono.policy import BACK_OPTIONS, HYBRID_MAX_ROWS, O_FLAG_WIDTHS
 from atom.models.minimax_m3.mono.runner import (
     K4_ABI,
     N_DENSE,
@@ -100,6 +100,11 @@ def front_options(r, n: int, whole: bool = False) -> dict:
     }  # fmt: skip
 
 
+def back_options(n: int) -> dict:
+    """The whole-layer build's back-half options for n rows (``policy.BACK_OPTIONS``)."""
+    return dict(BACK_OPTIONS.get(n, {}))
+
+
 def symbol_tokens(r, n: int, whole: bool) -> set[str]:
     """What the n-row kernel's symbol must spell (``post_attn.py``: ``sym_extra``; a default is not spelled):
     the same build options as the front half, ``mb1`` for the whole layer, ``fr1`` for a front-only build.
@@ -110,6 +115,10 @@ def symbol_tokens(r, n: int, whole: bool) -> set[str]:
     want |= {f"cb{o['copy_batch']}"} if o["copy_batch"] != 8 else set()
     want |= {f"ns{o['n_split']}"} if o["n_split"] != N_SPLIT else set()
     want |= {"of1"} if o.get("o_flag") else set()
+    if whole:
+        b = back_options(n)
+        want |= {f"af{b['ar_flag']}"} if b.get("ar_flag") else set()
+        want |= {f"bnr{b['back_sh_noroute']}"} if b.get("back_sh_noroute") else set()
     want |= {"cp1"} if o.get("index_cp") else set()
     want |= {f"cm{o['cp_min_blocks']}"} if o.get("cp_min_blocks") else set()
     want |= {f"cn{o['cp_min_batch']}"} if o.get("cp_min_batch", 1) != 1 else set()
@@ -232,6 +241,7 @@ class MonoFull(MonoFront):
                     moe_back=True,
                     moe_a4w4=True,
                     **front_options(self.runner, n, True),
+                    **back_options(n),
                 )
 
             def run_layer(self, i, lw, fwd, positions, res, rows, hidden, ar_out):
