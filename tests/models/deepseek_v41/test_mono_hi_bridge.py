@@ -157,9 +157,8 @@ def _atom_dequantize_rows():
         )
 
         return dequantize_rows
-    except (
-        Exception
-    ):  # noqa: BLE001 - its module needs AITER's attention (and what it imports)
+    # its module needs AITER's attention (and what it imports)
+    except Exception:  # noqa: BLE001
 
         def dequantize_rows(values, scales):
             groups = values.float().unflatten(-1, (-1, 32))

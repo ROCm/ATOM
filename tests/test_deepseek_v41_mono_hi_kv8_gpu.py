@@ -25,29 +25,29 @@ import pytest
 pytest.importorskip("flydsl")
 pytest.importorskip("aiter")
 
-import flydsl.expr as fx  # noqa: E402
-import torch  # noqa: E402
-from flydsl.expr.typing import T  # noqa: E402
+import flydsl.expr as fx
+import torch
+from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono.hi.blocks.gfx950 import compressor  # noqa: E402
+from atom.models.deepseek_v41.mono.hi.blocks.gfx950 import compressor
 from atom.models.deepseek_v41.mono.hi.blocks.gfx950.attention import (
     mla_sparse,
-)  # noqa: E402
+)
 from atom.models.deepseek_v41.mono.hi.device.gfx950 import (
     buffer_ops as bo,
-)  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.device.gfx950 import paged  # noqa: E402
+)
+from atom.models.deepseek_v41.mono.hi.device.gfx950 import paged
 from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import (
     ld_i32,
     rsrc,
     traced,
-)  # noqa: E402
+)
 from atom.models.deepseek_v41.mono.hi.plan.program import (
     Program,
     Scenario,
     Stage,
-)  # noqa: E402
-from atom.models.deepseek_v41.mono.hi.v41 import draft  # noqa: E402
+)
+from atom.models.deepseek_v41.mono.hi.v41 import draft
 
 ROWS, HD, ROW8 = 64, 512, 528
 

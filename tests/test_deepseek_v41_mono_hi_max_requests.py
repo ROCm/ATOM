@@ -6,8 +6,8 @@ import pytest
 
 pytest.importorskip("triton")
 
-from atom.models.deepseek_v41.mono.hi_compose import ROWS  # noqa: E402
-from atom.models.deepseek_v41.mono.hi_runner import served_rows  # noqa: E402
+from atom.models.deepseek_v41.mono.hi_compose import ROWS
+from atom.models.deepseek_v41.mono.hi_runner import served_rows
 
 
 def test_default_serves_every_width():
