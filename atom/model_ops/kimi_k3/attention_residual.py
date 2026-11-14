@@ -86,6 +86,17 @@ if _HAS_TRITON:
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
         QUANT: tl.constexpr,  # fold the consumer's per-token quant into the store
+        share_ptr=None,
+        scratch_ptr=None,
+        peers_ptr=None,
+        epochs_ptr=None,
+        rank=0,
+        stride_share_t=0,
+        PEERS: tl.constexpr = 1,
+        COLS: tl.constexpr = 2,
+        ROWS: tl.constexpr = 1,
+        BW: tl.constexpr = 1,
+        GATHER: tl.constexpr = False,  # see PeerColumnGather.kernel_args
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -123,9 +134,40 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
+        #
+        # GATHER: add_hidden is the all-gather of every rank's share of it,
+        # exchanged here (see PeerColumnGather). The push goes first and the
+        # poll right after the prefix load. Polling after the bank rows' tiles
+        # would hide more of the exchange, but splitting the loop changes how
+        # the compiler fuses the mix's multiply-adds, and y with it.
         t = tl.program_id(0)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
+        if GATHER:
+            # Row t of this rank's share goes to slot (parity, rank, t) of
+            # every rank's scratch as int64 words, two columns under the row's
+            # epoch, so a reader that sees the epoch sees the data. One load of
+            # every address, one unbranched store to every rank (this one
+            # included): a branch per peer waits on the stores before it.
+            W: tl.constexpr = COLS // 2
+            flag = tl.load(epochs_ptr + t) + 1
+            o_w = tl.arange(0, BW)
+            o_p = tl.arange(0, PEERS)
+            data = tl.load(
+                share_ptr.to(tl.pointer_type(tl.int32))
+                + t * (stride_share_t // 2)
+                + o_w,
+                mask=o_w < W,
+                other=0,
+            )
+            word = (flag.to(tl.int64) << 32) | (data.to(tl.int64) & 0xFFFFFFFF)
+            slot = (((flag & 1) * PEERS + rank) * ROWS + t) * W + o_w
+            peers = tl.load(peers_ptr + o_p).to(tl.pointer_type(tl.int64))
+            tl.store(
+                peers[:, None] + slot[None, :],
+                word[None, :],
+                mask=(o_p < PEERS)[:, None] & (o_w < W)[None, :],
+            )
         sw = tl.load(sw_ptr + o_d, mask=m_d, other=0.0).to(tl.float32)
 
         # prefix (the last candidate) is loaded once and reused across tiles;
@@ -135,6 +177,30 @@ if _HAS_TRITON:
             ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
             )
+        if GATHER:
+            # This rank's columns from its share, the others' from the scratch
+            # once their words carry the epoch. .cv reads past the caches,
+            # where a stale line would hide the peer's store.
+            src = o_d // COLS
+            col = o_d % COLS
+            words = scratch_ptr + (((flag & 1) * PEERS + src) * ROWS + t) * W + col // 2
+            remote = m_d & (src != rank)
+            ready = flag.to(tl.int64) << 32
+            w = tl.load(
+                words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+            )
+            while tl.min(((w >> 32).to(tl.int32) == flag).to(tl.int32), axis=0) == 0:
+                w = tl.load(
+                    words, mask=remote, other=ready, volatile=True, cache_modifier=".cv"
+                )
+            bits = ((w >> ((col % 2) * 16).to(tl.int64)) & 0xFFFF).to(tl.int32)
+            mine = tl.load(
+                share_ptr + t * stride_share_t + o_d - rank * COLS,
+                mask=m_d & (src == rank),
+                other=0.0,
+            ).to(tl.float32)
+            ps += tl.where(src == rank, mine, (bits << 16).to(tl.float32, bitcast=True))
+            tl.store(epochs_ptr + t, flag)
         if DO_ADD2:
             ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
@@ -254,12 +320,97 @@ def _take_folded_zero(t: torch.Tensor) -> bool:
     return held
 
 
+class PeerColumnGather:
+    """The all-gather of each TP rank's columns of a [T, H] BF16 sum, run
+    inside the next ``apply_attn_res`` instead of on its own (``defer``).
+
+    That kernel pushes row t of this rank's share into slot (parity, rank, t)
+    of every rank's scratch and polls its own scratch for the other ranks'.
+    The scratch is [2 parities][world][rows][H / world / 2] int64 words in a
+    symmetric peer buffer. ``epochs`` counts each row's gathers on this rank,
+    alike on every rank because every rank gathers the same rows. A slot is
+    rewritten two epochs later, by a rank that has by then read this rank's
+    next push, which this rank issued after reading the slot."""
+
+    def __init__(self, hidden: int, rows: int, rank: int, world: int, group) -> None:
+        from atom.mono.runtime import peer_memory
+
+        self.rank, self.world, self.rows = rank, world, rows
+        self.cols = hidden // world
+        words = 2 * world * rows * (self.cols // 2)
+        # Raises MonoUnsupported on every rank alike when the exchange fails.
+        self.buffer = peer_memory.SymmetricPeerBuffer(8 * words, rank, world, group)
+        self.scratch = self.buffer.storage.view(torch.int64)
+        self.epochs = torch.zeros(rows, dtype=torch.int32, device=self.scratch.device)
+
+    @staticmethod
+    def fits(hidden: int, world: int) -> bool:
+        """Whether the kernel takes this split: a power-of-two world of
+        column pairs."""
+        return world & (world - 1) == 0 and hidden % (2 * world) == 0
+
+    def defer(self, share: torch.Tensor) -> torch.Tensor:
+        """A fresh, unwritten [T, H] that stands for the all-gather of this
+        rank's [T, H / world] ``share``: ``apply_attn_res`` gathers it on load,
+        and a consumer that adds it in torch all-gathers it first
+        (``materialize_folded_zeros``). Held as folded zeros are."""
+        if not 0 < share.shape[0] <= self.rows or share.shape[1] != self.cols:
+            raise ValueError(f"share {tuple(share.shape)} exceeds the scratch")
+        _deferred_gathers[:] = [d for d in _deferred_gathers if d[0]() is not None]
+        gathered = share.new_empty(share.shape[0], self.world * self.cols)
+        _deferred_gathers.append((weakref.ref(gathered), share.contiguous(), self))
+        return gathered
+
+    def kernel_args(self, share: torch.Tensor) -> dict:
+        return {
+            "share_ptr": share,
+            "scratch_ptr": self.scratch,
+            "peers_ptr": self.buffer.addresses,
+            "epochs_ptr": self.epochs,
+            "rank": self.rank,
+            "stride_share_t": share.stride(0),
+            "PEERS": self.world,
+            "COLS": self.cols,
+            "ROWS": self.rows,
+            "BW": triton.next_power_of_2(self.cols // 2),
+            "GATHER": True,
+        }
+
+
+# Deferred all-gathers by weak reference to their stand-in, each with the
+# share it gathers and its PeerColumnGather.
+_deferred_gathers: list[tuple[weakref.ref, torch.Tensor, PeerColumnGather]] = []
+
+
+def _take_deferred_gather(t: torch.Tensor):
+    """``(share, gather)`` when ``t`` stands for a deferred all-gather, which
+    a match releases; dead entries go with it."""
+    found, held = None, []
+    for entry in _deferred_gathers:
+        if (stand_in := entry[0]()) is None:
+            continue
+        if found is None and stand_in.data_ptr() == t.data_ptr():
+            found = entry[1:]
+        else:
+            held.append(entry)
+    _deferred_gathers[:] = held
+    return found
+
+
 def _materialize_folded_zeros_op(
     add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
 ) -> None:
     for add in (add_hidden, add_hidden2):
-        if add is not None and _is_folded_zero(add):
+        if add is None:
+            continue
+        if _is_folded_zero(add):
             add.zero_()
+        elif (deferred := _take_deferred_gather(add)) is not None:
+            from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+            add.copy_(
+                tensor_model_parallel_all_gather(deferred[0], use_custom=True, dim=-1)
+            )
 
 
 direct_register_custom_op(
@@ -275,9 +426,11 @@ direct_register_custom_op(
 def materialize_folded_zeros(
     add_hidden: torch.Tensor | None, add_hidden2: torch.Tensor | None = None
 ) -> None:
-    """Zero whichever addends are folded zeros, for a consumer that adds them
-    in torch. Opaque, so the check runs at run time; the write orders it
-    before every later reader, ``apply_attn_res`` included."""
+    """Write whichever addends were handed back unwritten, for a consumer that
+    adds them in torch: a folded zero as zero, a deferred all-gather
+    (``PeerColumnGather.defer``) as that all-gather. Opaque, so the check runs
+    at run time; the write orders it before every later reader,
+    ``apply_attn_res`` included, which then loads it."""
     torch.ops.aiter.kimi_k3_materialize_folded_zeros(add_hidden, add_hidden2)
 
 
@@ -323,7 +476,8 @@ def _apply_attn_res_impl(
     do_add2 = add_hidden2 is not None
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
-    load_add = do_add and not _take_folded_zero(add_hidden)
+    deferred = _take_deferred_gather(add_hidden) if do_add else None
+    load_add = do_add and deferred is None and not _take_folded_zero(add_hidden)
     load_add2 = do_add2 and not _take_folded_zero(add_hidden2)
     out_norm = out_norm_weight is not None
     quant = quant_dtype is not None
@@ -397,6 +551,7 @@ def _apply_attn_res_impl(
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
         QUANT=quant,
+        **(deferred[1].kernel_args(deferred[0]) if deferred else {}),
     )
     prefix_out = pref if do_add else prefix_sum
     if quant:
