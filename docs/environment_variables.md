@@ -673,7 +673,8 @@ rank configuration, deployment requirements, and registration lifetime.
 
 A staged RDMA write whose completion is uncertain (an error or exception after
 submission) keeps its staging slot until connector teardown and turns staging
-off on that connector; later requests use the direct path. A write that
+off on that connector, with one warning in the log. Transfers waiting for a
+staging slot then, and all later ones, use the direct path. A write that
 finishes, or stops before submission, returns its slot.
 
 ## Mooncake PD MLA landing
