@@ -65,14 +65,21 @@ class _ThreadTransferState:
         self,
         device: torch.device,
         use_cuda: bool,
+        priority: int | None = None,
     ) -> None:
+        """One copy thread's pack and copy streams, and its staging buffer.
+
+        ``priority`` is the streams' priority (``torch.cuda.Stream``); None
+        keeps the default.
+        """
         self.device = device
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
+            kwargs = {} if priority is None else {"priority": int(priority)}
             with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream()
-                self.copy_stream = torch.cuda.Stream()
+                self.pack_stream = torch.cuda.Stream(**kwargs)
+                self.copy_stream = torch.cuda.Stream(**kwargs)
         self.staging_buffer = _StagingBuffer(use_cuda)
 
     def stream_ctx(self, stream):

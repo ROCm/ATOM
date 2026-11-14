@@ -130,3 +130,37 @@ def test_transfer_evidence_is_thread_local_and_returned_as_a_snapshot(monkeypatc
     assert results == [0, -1]
     assert connector.last_transfer_stats()["chunks"] == 0
     assert connector.last_transfer_stats()["stats_available"] == 1
+
+
+@pytest.mark.parametrize("priority", [None, -1])
+def test_copy_thread_streams_take_the_connector_priority(monkeypatch, priority):
+    from atom.kv_transfer.offload import _block_gpu_connector as connector_mod
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    made = []
+
+    class FakeStream:
+        def __init__(self, **kwargs):
+            made.append(kwargs)
+
+    @contextmanager
+    def fake_device(_device):
+        yield
+
+    monkeypatch.setattr(staging.torch.cuda, "Stream", FakeStream)
+    monkeypatch.setattr(staging.torch.cuda, "device", fake_device)
+    monkeypatch.setattr(staging, "_StagingBuffer", lambda use_cuda: None)
+    monkeypatch.setattr(
+        connector_mod, "_ThreadTransferState", staging._ThreadTransferState
+    )
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=3)
+    kwargs = {} if priority is None else {"stream_priority": priority}
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=8, **kwargs)
+    monkeypatch.setattr(connector, "_use_cuda", lambda: True)
+
+    state = connector._thread_state()
+    assert connector._thread_state() is state  # one per thread
+    # Pack and copy stream alike; the default keeps torch's default priority.
+    expected = {} if priority is None else {"priority": priority}
+    assert made == [expected, expected]

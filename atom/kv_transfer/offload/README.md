@@ -705,6 +705,32 @@ this worker config.
 - Sharing the P/D transfer engine: the Store client opens its own, on its own
   NIC.
 
+## Mori UMBP offload (`umbp_store`)
+
+`umbp_store` is the Mooncake Store offload's data path pointed at a Mori UMBP
+standalone server (one per node, started outside ATOM) instead of a Mooncake
+Store. The package is a copy of `mooncake_store` adapted to UMBP; a shared
+store layer for both is planned. It keeps `ChunkedOffloadSchedulerBase`, the
+`DenseOffloadConnector` worker plumbing, the chunk hash chain keys, the HBM
+staging pools and the dense or M3 PAGE codecs. What differs:
+
+- One server per node over a unix socket; no master, NIC selection or RDMA
+  setup. The server reads and writes the registered staging pools through
+  HIP IPC.
+- The client uses UMBP's per-key `bool` results. There is no per-key remove,
+  no read lease and no eviction groups; the taint mark is kept in-process.
+- Keys use the `atomumbp1-` namespace prefix, so they never collide with
+  Mooncake Store objects.
+
+Select it with
+`{"kv_connector": "umbp_store", "kv_role": "offload", "kv_connector_extra_config": {"umbp_store.address": "unix:///tmp/umbp/server.sock"}}`,
+alone or beside a P/D producer under `multi`. How to install, start and check UMBP, with the settings table, is in
+[`recipes/UMBP-KV-Offload.md`](../../../recipes/UMBP-KV-Offload.md). MiniMax-M3
+walkthroughs: aggregated TP4 in
+[`recipes/MiniMax-M3-UMBP.md`](../../../recipes/MiniMax-M3-UMBP.md); PD 1P1D (not
+supported yet, planned setup only) in
+[`recipes/mesh/Agentic-MiniMax-M3-UMBP.md`](../../../recipes/mesh/Agentic-MiniMax-M3-UMBP.md).
+
 ## In-process `lmcache_offload` Architecture
 
 The connector is split across two processes, mirroring ATOM's P/D split:
