@@ -800,9 +800,13 @@ impl IngressRouting {
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            let routed = super::prepare::inference::with_media_digests(chat);
+            super::prepare::chat_template::process_chat_messages(
+                routed.as_ref().unwrap_or(chat),
+                &*entry.tokenizer,
+            )
+            .map_err(IngressError::invalid)?
+            .text
         } else {
             metadata.text.clone()
         };
