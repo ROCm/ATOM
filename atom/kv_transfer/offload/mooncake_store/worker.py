@@ -26,6 +26,12 @@ Mooncake Store's own part:
   worker loads nothing from the Store, and marks it tainted so that no client
   of it does (``_distrust_store``, :mod:`.taint`). Before every get, and
   after a load's last one, it looks for that mark (``_load_refusal``);
+* a save asks the Store which of its chunks it already holds, one master
+  RPC per window (``KVStoreOffloadConnector._save_segments``). The master
+  grants each key it finds a read lease, as a scheduler lookup does: only
+  chunks already held, for a few seconds, which keeps them from eviction that
+  long and never stops a new chunk's put, since a put of a missing key takes
+  no lease;
 * the startup probe removes its object again.
 """
 

@@ -587,7 +587,15 @@ a copy into each slot (and the reverse).
   scheduler and the workers refuse to start where the kernel's boot ID
   (`/proc/sys/kernel/random/boot_id`) cannot be read, since every save would
   then read nothing.
-- A put of a key that already exists succeeds (Mooncake reports 0).
+- A put of a key that already exists succeeds (Mooncake reports 0). Before
+  it packs a window, a save asks the Store which of the window's chunks it
+  holds (one `batch_is_exist`, the shared `kv_store` worker's) and neither
+  reads nor puts those: they are source-safe at once and count as stored. The
+  scheduler's lookup counts only the prefix every rank holds, so a save often
+  starts below what this rank has stored. The lookup grants the chunks it finds
+  a read lease, as a scheduler lookup does; it covers only chunks already held
+  and never stops a new chunk's put. A failed lookup, or a key it answers with
+  an error, puts the chunk as before.
 - After a failed save that the base retries, no save is emitted for 1 s,
   doubled for each further such failure in a row up to 30 s. A stored save
   ends the pause and starts the doubling over, also when it reports after a
@@ -682,11 +690,17 @@ this worker config.
   path, or any other setting that rearranges the KV bytes without being named
   above. A Store whose log or workers report the taint marker needs a
   restart, not `remove_all` (see above).
-- **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
+- **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`held_chunks` and
+  `put_chunks`; `windows`, the windows the save reached, each looked up once,
+  and `segments`, the runs of missing chunks it packed and put, of which
+  `in_place_segments` in place; `put_bytes`, the bytes of the chunks it
+  put, held chunks not included; `exists_ms`, `pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with `status=ok` or the failure that ended
   it, whose rate-limited warning names the first Mooncake result code.
-  Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
+  Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, the saves'
+  lookups and the chunks they put or found held (`save_exists`,
+  `save_put_chunks`, `save_held_chunks`, `save_held_bytes`), failures by
   code, quarantined slots) at most once a minute while it transfers;
   `put_bytes` counts every chunk a put left in the Store, those it already
   held included, since Mooncake answers both alike. The
