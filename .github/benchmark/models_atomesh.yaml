@@ -17035,6 +17035,30 @@ models:
               <<: *m31_m75_c80_env
               ATOMESH_M31_VLLM_REPO: https://github.com/whx-sjtu/vllm.git
               ATOMESH_M31_VLLM_SHA: 8c7e9724ea67ba7c116c9c623798670ff7552fc1
+        # Above C80 on the same image (C80 kept TTFT p90 at 1.8 s): half the sessions per D, 1,499 GB
+        # eager host KV, 4096-token prefill chunks.
+        - <<: *m31_moriio_1p2d_m75_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75-c96-dcap24-cpu15-lpt4k
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_m75_c80_env
+              ATOMESH_M31_D_MAX_SEQS: "24"
+        - <<: *m31_moriio_1p2d_m75_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75-c112-dcap28-cpu15-lpt4k
+          concurrency: [112]
+          env:
+            common:
+              <<: *m31_m75_c80_env
+              ATOMESH_M31_D_MAX_SEQS: "28"
+        # C80 with D graphs as the #5035 lane captures them (breakable, up to 2048 tokens) instead of FULL
+        # graphs at 8-token steps up to 8 x the D batch cap.
+        - <<: *m31_moriio_1p2d_m75_c80_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-m75-c80-dcap20-cpu15-lpt4k-dg2048
+          env:
+            common:
+              <<: *m31_m75_c80_env
+              ATOMESH_M31_D_COMPILATION_CONFIG: '{"max_cudagraph_capture_size":2048}'
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

@@ -142,9 +142,11 @@ start_vllm_server() {
     # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..max-num-seqs requests x 8
     # tokens. ATOMESH_M31_D_MAX_SEQS caps each D's decode batch (default CONC: no cap).
     local d_seqs="${ATOMESH_M31_D_MAX_SEQS:-${m31_conc}}"
+    # ATOMESH_M31_D_COMPILATION_CONFIG replaces these graph sizes.
+    local d_graphs="{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * d_seqs)))],\"max_cudagraph_capture_size\":$((8 * d_seqs))}"
     role_args=(--tensor-parallel-size "${DECODE_TP_SIZE}" --max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 8192
-      --compilation-config "{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * d_seqs)))],\"max_cudagraph_capture_size\":$((8 * d_seqs))}"
+      --compilation-config "${ATOMESH_M31_D_COMPILATION_CONFIG:-${d_graphs}}"
       --kv-transfer-config "${xfer}")
   fi
   # GPUs 0-3 sit on NUMA node 0, GPUs 4-7 on node 1; a server spanning both (TP8) runs unpinned.
