@@ -241,11 +241,10 @@ def test_attention_hooks_exist():
 
 # ---------------------------------------------------------------------- the flags
 def test_flags_default_off(monkeypatch):
-    for name in ("ATOM_MONO_MLA_POST", "ATOM_MONO_MLA_POST_CHECK"):
-        monkeypatch.delenv(name, raising=False)
-        assert getattr(envs, name) is False
-        monkeypatch.setenv(name, "1")
-        assert getattr(envs, name) is True
+    monkeypatch.delenv("ATOM_MONO_MLA_POST", raising=False)
+    assert envs.ATOM_MONO_MLA_POST is False
+    monkeypatch.setenv("ATOM_MONO_MLA_POST", "1")
+    assert envs.ATOM_MONO_MLA_POST is True
 
 
 # ------------------------------------------------------- the FP8 weight layout

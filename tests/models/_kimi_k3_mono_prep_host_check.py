@@ -5,9 +5,8 @@
 The REAL ``K3MonoDecodeRunner.forward`` (``_layer``, ``_k2``, ``_pre_o_core``,
 ``_post_core``, ``_prep_args``, ``_prepped_seam``, ``_seam_mirror``,
 ``_write_aux``) over the full 93-layer Kimi-K3 stack: ``ATOM_MONO_MLA_POST``
-off / on against ``ATOM_MONO_MLA_PREP`` 0 / 1 / 2 / 3, and 1 / 3 over an
-``ATOM_MONO_MLA_PREP_LAYERS`` subset (gaps between folded layers, 92
-unfolded); three decode steps, one of them past the folds' 16-row width (the
+off / on against ``ATOM_MONO_MLA_PREP`` 0 / 1 / 2 / 3, and 1 / 3 with only a
+subset of the MLA layers folded (gaps between folded layers, 92 unfolded); three decode steps, one of them past the folds' 16-row width (the
 unfused path).
 
 The attention seam is the tree's own ``_apply_attn_res_impl`` (its
@@ -604,15 +603,13 @@ def run(mode, post, rows_steps, only=None):
             )
             for m in MLA
         }
-    r.mla_post_check = r.mla_prep_check = False
-    r._mla_post_pending = None
     r.mla_prep, r.mla_prep_prev = {}, {}
     r._prep_pending, r._pref_hold_next = {}, None
     r.max_rows, r.device = 48, "cpu"
     r._k1 = k1_stub.__get__(r)
     if mode:
-        # every M - 1 is a K2 layer (91 -> 92 included); ``only``:
-        # ATOM_MONO_MLA_PREP_LAYERS
+        # every M - 1 is a K2 layer (91 -> 92 included); ``only``: the MLA
+        # layers folded
         for m in sorted(MLA if only is None else MLA & only):
             r.mla_prep[m] = mla_for(m, mode)
             r.mla_prep_prev[m - 1] = m
