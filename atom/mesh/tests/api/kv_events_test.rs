@@ -9,7 +9,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -104,12 +104,15 @@ async fn storage_once(app: &Router, done: impl Fn(&Value) -> bool) -> Value {
     panic!("timed out at /kv_storage/sources");
 }
 
-/// A Mooncake master's admin service, its port, holding the taint key when `tainted`.
-async fn mooncake_admin(tainted: Arc<AtomicBool>) -> u16 {
+/// A Mooncake master's admin service, its port, holding every key but the taint key,
+/// which it holds when `tainted`, and keeping the keys of each request in `asked`.
+async fn mooncake_admin(tainted: Arc<AtomicBool>, asked: Arc<Mutex<Vec<String>>>) -> u16 {
     let answer = move |Query(query): Query<HashMap<String, String>>| {
         let tainted = tainted.load(Ordering::Relaxed);
+        asked.lock().unwrap().push(query["keys"].clone());
         async move {
-            let state = |key: &str| match key == "atomkv/store-tainted" && tainted {
+            let held = |key: &str| key != "atomkv/store-tainted" || tainted;
+            let state = |key: &str| match held(key) {
                 true => json!({"ok": true, "values": [{"size_": 4096}]}),
                 false => json!({"ok": false, "error": "OBJECT_NOT_FOUND", "values": null}),
             };
@@ -176,7 +179,7 @@ async fn a_registered_worker_is_followed_until_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed() {
     let tainted = Arc::new(AtomicBool::new(false));
-    let admin_port = mooncake_admin(tainted.clone()).await;
+    let admin_port = mooncake_admin(tainted.clone(), Arc::default()).await;
     let mut publishers = Vec::new();
     let mut ports = Vec::new();
     for _ in 0..2 {
@@ -318,12 +321,21 @@ fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
 /// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
 /// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
 /// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
+/// What the engine will load of the request from the store the worker reads is asked of
+/// the store by ATOM's keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_aware_places_requests_by_the_kv_event_index() {
     let mut publisher = PubSocket::new();
     let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
     let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
-    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let admin_port = mooncake_admin(Arc::default(), asked.clone()).await;
+    // ATOM's chain_check of chunks of 2 tokens.
+    let offload = json!({"backend": "mooncake_store", "masters": ["127.0.0.1:50051"],
+        "namespace": "atomkv1-0123456789abcdef01234567", "chunk_tokens": 2, "world": 1,
+        "min_load_tokens": 2, "chain_check": "d68e6ab9e85080fefe04ef8bdde3032f"});
+    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4,
+        "offload": offload});
     let mut workers = Vec::new();
     for sources in [json!({"0": source}), json!({})] {
         let mut worker = MockWorker::new(MockWorkerConfig {
@@ -340,6 +352,8 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     }
     let mut config = TestRouterConfig::cache_aware(3991);
     config.kv_events = true;
+    config.mooncake_admin_port = admin_port;
+    config.kv_storage_deadline_ms = 1000;
     let ctx = AppTestContext::new_with_config(config, vec![]).await;
     let dir = tempfile::tempdir().unwrap();
     let tokenizer = bos_tokenizer(dir.path());
@@ -382,6 +396,26 @@ async fn cache_aware_places_requests_by_the_kv_event_index() {
     for _ in 0..4 {
         assert_eq!(served_by(&app, "/generate", &request).await, workers[0].2);
     }
+    // The store may hold the rest, but for the last token: ATOM's keys of the request's
+    // 6 chunks at rank 0, from its keys.py, and the taint key.
+    let keys = [
+        "27fbf4f34f6a83d0823cd5a524cc26b6",
+        "860ba8237adce06b477e78dfcfbe4447",
+        "a9c694a6f9bf83bb6f8c266825c47f11",
+        "efc6ab4b75dd5218bf3cf487ceda7892",
+        "1a78819b1adf2af3bfee604892da6a74",
+        "ca1e63585d9dcb9c4a86979ef86a8d7a",
+    ]
+    .map(|digest| format!("atomkv1-0123456789abcdef01234567/w0of1/{digest}"));
+    let keys = format!("{},atomkv/store-tainted", keys.join(","));
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        !asked.is_empty() && asked.iter().all(|asked| *asked == keys),
+        "{asked:?}"
+    );
+    let (_, stores) = call(&app, "GET", "/kv_storage/sources", None).await;
+    assert!(stores[0]["last_lookup_us"].is_u64(), "{stores}");
+    assert_eq!(stores[0]["breaker_open"], false);
     // `<s>` and a to g: two of the text's three blocks, as ATOM encodes it.
     publish(
         &mut publisher,

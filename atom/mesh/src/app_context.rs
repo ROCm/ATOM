@@ -269,17 +269,24 @@ impl AppContextBuilder {
         let policy_registry = self
             .policy_registry
             .ok_or(AppContextBuildError("policy_registry"))?;
+        let client = self.client.ok_or(AppContextBuildError("client"))?;
+        let kv_storage = (router_config.kv_events).then(|| {
+            let deadline = Duration::from_millis(router_config.kv_storage_deadline_ms);
+            let port = router_config.mooncake_admin_port;
+            Arc::new(StorageSources::new(port, deadline, client.clone()))
+        });
         if let Some(monitor) = &kv_event_monitor {
+            if let Some(storage) = &kv_storage {
+                monitor.read_stores(storage.clone());
+            }
             policy_registry.set_kv_events(monitor.clone());
         }
-        let kv_storage = (router_config.kv_events)
-            .then(|| Arc::new(StorageSources::new(router_config.mooncake_admin_port)));
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
                 .ok_or(AppContextBuildError("prepare_pool"))?,
             admission,
-            client: self.client.ok_or(AppContextBuildError("client"))?,
+            client,
             router_config,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self

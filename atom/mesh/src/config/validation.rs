@@ -213,6 +213,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.kv_storage_deadline_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "kv_storage_deadline_ms".to_string(),
+                value: config.kv_storage_deadline_ms.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -427,6 +435,19 @@ mod tests {
             assert!(error.to_string().contains("prepare_pool."), "{error}");
         }
         RouterConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn kv_storage_deadline_must_be_positive() {
+        let config = RouterConfig {
+            kv_storage_deadline_ms: 0,
+            ..Default::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("kv_storage_deadline_ms"),
+            "{error}"
+        );
     }
 
     #[test]
