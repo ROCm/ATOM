@@ -268,6 +268,93 @@ jobs:
         run: |
           docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
 
+  gpu-unit-tests:
+    # The unit-test job in pre-checks.yaml runs on a CPU runner with no aiter,
+    # so every test that needs aiter or a GPU skips there: most of the
+    # speculative-decoding draft tests, and every kernel check behind them
+    # (e.g. 30 of the 39 Kimi-K3 DSpark GQA draft tests). This runs those
+    # suites on one GPU against the same aiter wheel the accuracy matrix
+    # installs, so a change to a private aiter API the drafts call fails here
+    # rather than at server startup. Behind the same approval/label gate as
+    # the accuracy matrix, which shares the wheel.
+    needs: [ci-gate, download_aiter_wheel]
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' }}
+    name: GPU unit tests (speculative decoding)
+    runs-on: linux-atom-mi35x-1
+    timeout-minutes: 45
+    # The aiter wheel is another job's artifact: listing and downloading it
+    # needs actions: read, as the accuracy job has.
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CONTAINER_NAME: atom_gpu_unit_tests
+      GPU_UNIT_TESTS: >-
+        tests/test_kimi_k3_dspark_gqa.py
+        tests/test_dspark_draft.py
+        tests/test_dspark.py
+        tests/test_draft_kv_builder.py
+        tests/test_kv_pool_contract.py
+        tests/test_spec_lossless_staging.py
+    steps:
+      - name: Kill stale containers
+        run: |
+          docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Docker Login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Download aiter wheel
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+          AITER_WHEEL_OUTPUT_DIR: /tmp/aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
+
+      - name: Start CI container
+        uses: ./.github/actions/setup-gpu-container
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: ${{ env.ATOM_BASE_IMAGE }}
+          runner: linux-atom-mi35x-1
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
+
+      - name: Install aiter from wheel
+        run: bash .github/scripts/install_aiter_wheel.sh
+
+      - name: Install ATOM
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            cd /workspace
+            git config --global --add safe.directory /workspace
+            pip install --timeout 60 --retries 10 -e . pytest
+          "
+
+      - name: Run GPU unit tests
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          docker exec "$CONTAINER_NAME" bash -lc "
+            set -euo pipefail
+            cd /workspace
+            python3 -m pytest -q -rs ${GPU_UNIT_TESTS}
+          "
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
+
   atom-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
     name: Accuracy

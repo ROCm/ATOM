@@ -248,6 +248,20 @@
     "_baseline_note": "Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured."
   },
   {
+    "model_name": "Kimi-K3 DSpark GQA",
+    "model_path": "moonshotai/Kimi-K3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --decode-context-parallel-size 8 --trust-remote-code --gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching --method dspark --draft-model RadixArk/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64",
+    "env_vars": "",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_timeout_minutes": 45,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "moonshotai/Kimi-K3 + RadixArk/Kimi-K3-DSpark",
+    "mtp_accept_threshold": 0.40,
+    "_baseline_note": "Kimi-K3 with the RadixArk/Kimi-K3-DSpark draft (#2581): the only DSpark draft with a GQA backbone, so the only case that runs a draft-owned KV pool and the draft block read through aiter unified_attention. TP8 + DCP8 with an fp8 KV cache is its production shape: the pool sits outside the DCP group, and an fp8 pool takes the Gluon-gate path. Spec-decode is lossless w.r.t. the target, so baseline and threshold are the Kimi-K3 target's. Measured with these flags and the CI lm_eval command on MI355X: GSM8K 3-shot 0.9659, acceptance 49.5% (4.47 tokens a forward); mtp_accept_threshold 0.40 catches a broken draft, which GSM8K alone cannot."
+  },
+  {
     "model_name": "Kimi-K3 DSpark PP2",
     "model_path": "moonshotai/Kimi-K3",
     "extraArgs": "--kv_cache_dtype fp8 -tp 4 --pipeline-parallel-size 2 --enforce-eager --trust-remote-code --gpu-memory-utilization 0.9 --block-size 128 --enable_prefix_caching --method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64 --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*self_attn.[qkv]_conv1d*\", \"*block_sparse_moe.experts*\", \"*block_sparse_moe.routed_expert_*\", \"*vision_tower*\", \"*mm_projector*\", \"context_proj\", \"layers\"]}'",
