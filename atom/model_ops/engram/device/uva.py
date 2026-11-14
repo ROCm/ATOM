@@ -100,9 +100,19 @@ def uva_gather_into(
             f"{(tokens, local_heads, table.head_dim)}"
         )
     weight, scales, row_start, row_end = table.registered_shard()
-    num_sms = torch.cuda.get_device_properties(out.device).multi_processor_count
-    block = 16
-    grid = min(-(-num_rows // block), num_sms)
+    props = torch.cuda.get_device_properties(out.device)
+    num_sms = props.multi_processor_count
+    # Real-table graph timings on gfx1250 favor less per-thread gather state
+    # and a wider persistent grid for the quantized 256-wide Engram rows.
+    tuned = (
+        getattr(props, "gcnArchName", "").startswith("gfx1250")
+        and weight.dtype == torch.float8_e4m3fn
+        and table.head_dim == 256
+        and table.block_size == 32
+        and table.quantized
+    )
+    block = 1 if tuned else 16
+    grid = min(-(-num_rows // block), num_sms * (4 if tuned else 1))
     _uva_lookup_kernel[(grid,)](
         weight,
         scales,
