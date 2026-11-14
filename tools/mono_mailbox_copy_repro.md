@@ -4,8 +4,12 @@ This tool exercises the production V4.1 K1/StepMailboxes code, not a replacement
 spin loop. It uses synthetic nonzero FP8 weights, 6 token rows, projection TP4
 with a single local peer, a noncooperative 256-CTA x 512-thread K1 launch, and
 32 captured K1 launches replayed 32 times per sample. A second full-256-CU HIP
-mask stream (both flags0) runs native KV unpack with 362 chunks / 724 blocks /
-267,822,080 useful bytes. No model checkpoint or running Store service is needed.
+mask stream (both flags0) runs native KV unpack with 724 blocks / 267,822,080 useful bytes. The current public
+TransferSlotPool supplies one window-sized contiguous Slot.tensor; registration
+is an explicit offline no-op, so this is not an RDMA/MR test. This differs from
+the historical diagnostic 362 padded-slot/strided-unpack fixture. It does not
+restore removed APIs or claim historical results for this new layout.
+No model checkpoint or running Store service is needed.
 It checks full restored KV bytes and the K1 Q/ring output against its initial
 complete control run. This is a mailbox/copy liveness probe, not precision or
 service performance validation, and events do not prove physical CU overlap.
@@ -16,6 +20,8 @@ MI355X. Do not run on a device with an existing service or after a timeout until
 its prior process/KFD ownership has actually gone away.
 
 ```
+# First validate the actual pool allocation, prepared ID upload and GPU pack/unpack:
+PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py --setup-only
 # Install/run from a full checkout so Python imports its atom package.
 # Use PYTHONPATH only for this checkout; the tool asserts module path ownership.
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode side --repeats 128

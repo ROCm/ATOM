@@ -4,7 +4,9 @@
 
 One visible MI355X, two HIP full-CU mask streams (flags0), production K1
 256-CTA/512-thread noncooperative launch with synthetic nonzero FP8 weights,
-real StepMailboxes, and 267822080 bytes of native KV unpack. No model checkpoint,
+real StepMailboxes, and 267822080 bytes of contiguous native KV unpack from
+one actual Slot.tensor (offline registration no-op). This differs from the
+historical padded-slot diagnostic. No model checkpoint,
 Store service, profiler, sampling change, or synthetic mailbox replacement.
 
 Run from the checkout with matching ROCm PyTorch/FlyDSL/AITER dependencies:
@@ -31,6 +33,11 @@ parser.add_argument(
     "--mode", choices=("side", "mono-alone", "copy-alone"), default="side"
 )
 parser.add_argument("--deadline", type=float, default=15)
+parser.add_argument(
+    "--setup-only",
+    action="store_true",
+    help="Run real pool/codec allocation, pack/unpack and byte validation without K1",
+)
 args = parser.parse_args()
 if not 1 <= args.repeats <= 1024 or args.deadline <= 0:
     parser.error("invalid repeats/deadline")
@@ -42,6 +49,7 @@ def run_fixture(args):
     from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
     from atom.kv_transfer.offload.mooncake_store.pool import TransferSlotPool
     from types import SimpleNamespace
+    from atom.mono.device import sync
 
     def emit(value):
         print(json.dumps(value), flush=True)
@@ -111,20 +119,47 @@ def run_fixture(args):
     )
     pool = TransferSlotPool(
         device=device,
-        chunk_bytes=739840,
-        save_bytes=362 * 741376,
-        load_bytes=362 * 741376,
+        chunk_bytes=362 * 739840,
+        save_bytes=362 * 739840 + 4096,
+        load_bytes=362 * 739840 + 4096,
         client=SimpleNamespace(register=lambda *a: None, unregister=lambda *a: None),
     )
-    slots = pool.acquire("load", 362)
-    padded = pool.strided_view(slots)
-    contig = torch.empty(362 * 739840, dtype=torch.uint8, device=device)
+    # A single window-sized Slot.tensor is the current pool's public contiguous
+    # byte view. This offline probe does not pretend to have the old diagnostic
+    # strided_view API or an actual NIC registration.
+    slots = pool.acquire("load", 1)
+    contig = slots[0].tensor
+    assert contig.is_contiguous() and contig.numel() == 267822080
     srcids = list(range(724))
     dstids = list(range(724, 1448))
     codec.gpu_to_chunk_major_device_buffer(contig, srcids, stream=compute)
-    for i, s in enumerate(slots):
-        s.tensor.copy_(contig[i * 739840 : (i + 1) * 739840])
     torch.cuda.synchronize()
+    if args.setup_only:
+        owner = codec.prepare_block_id_groups([dstids], device=device, stream=restore)
+        codec.chunk_major_device_buffer_to_gpu_prepared(
+            contig, owner, 0, stream=restore
+        )
+        restore.synchronize()
+        assert all(
+            torch.equal(v[: 724 * u], v[724 * u : 1448 * u])
+            for v, u in zip(regions, units)
+        ), "setup byte validation failed"
+        emit(
+            {
+                "stage": "setup_complete",
+                "actual_pool": str(type(pool)),
+                "actual_codec": str(type(codec)),
+                "bytes_checked": 267822080,
+                "prepared_groups": owner.group_count,
+                "real_GPU_pack_unpack": True,
+                "NIC_registration_tested": False,
+            }
+        )
+        torch.cuda.synchronize()
+        pool.release(slots)
+        pool.close()
+        torch.cuda.set_stream(original_stream)
+        return list(owners), hip
     keepers = []
     tag = 10
     from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
@@ -133,13 +168,26 @@ def run_fixture(args):
     from atom.mono.runtime.mailboxes import StepMailboxes
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+    assert pathlib.Path(k1.__file__).resolve().is_relative_to(root)
+    assert pathlib.Path(sync.__file__).resolve().is_relative_to(root)
+    emit(
+        {
+            "stage": "code_identity_before_K1",
+            "k1": k1.__file__,
+            "sync": sync.__file__,
+            "sync_sha256": hashlib.sha256(
+                pathlib.Path(sync.__file__).read_bytes()
+            ).hexdigest(),
+        }
+    )
     key = k1.AttnPreBuild(tokens=6, fold=False, tp=4, feeds_index=False)
-    launch = k1.build_attn_pre(key, cooperative=False)
+    inspect.signature(k1.build_attn_pre).bind(key)
+    launch = k1.build_attn_pre(key)
     emit(
         {
             "stage": "actual_native_factory",
-            "cooperative": False,
-            "manager_key": launch.manager_key,
+            "launch_api": "ordinary production factory",
+            "actual_factory": str(inspect.signature(k1.build_attn_pre)),
             "StepBegin": "ordinary actual StepMailboxes.begin_step",
             "real_tensor_shim_run_compiled": True,
         }
@@ -288,7 +336,6 @@ def run_fixture(args):
     )
 
     assert pathlib.Path(k1.__file__).resolve().is_relative_to(root)
-    from atom.mono.device import sync
 
     emit(
         {
@@ -330,13 +377,8 @@ def run_fixture(args):
         busy_samples += int(bool(busy))
         if copy:
             cb.record(restore)
-            codec.chunk_major_strided_buffer_to_gpu_prepared(
-                padded,
-                owner,
-                0,
-                items_per_chunk=2,
-                chunk_stride_bytes=741376,
-                stream=restore,
+            codec.chunk_major_device_buffer_to_gpu_prepared(
+                contig, owner, 0, stream=restore
             )
             ce.record(restore)
         emit(
@@ -402,8 +444,8 @@ def run_fixture(args):
             "event_window_not_physical_CU_overlap": True,
         }
     )
-    codec.record_prepared_block_id_completion(owner)
-    codec.finish_prepared_block_id_groups(owner, safe=True)
+    # The current prepared owner is caller-retained; completion is the GPU
+    # fence, not a diagnostic retirement method. Keep it live through the sync.
     torch.cuda.synchronize()
     pool.release(slots)
     pool.close()
