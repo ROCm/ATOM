@@ -268,8 +268,9 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
 
-    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM);
-    /// /kv_events/sources shows every subscription
+    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM),
+    /// replaying missed batches from engines that keep them
+    /// (ATOM_KV_EVENTS_REPLAY_ENDPOINT); /kv_events/sources shows every subscription
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub kv_events: bool,
 

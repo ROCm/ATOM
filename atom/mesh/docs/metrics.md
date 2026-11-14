@@ -68,12 +68,17 @@ skipped after a failed prefill adds none.
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
+| `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
+| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
+| `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
 Histogram buckets:
 
 - prefix match ratio: 0, 0.1, 0.2, ..., 0.9, 0.95, 1;
-- selected worker's active requests: 0, 1, 2, 4, ..., 4096.
+- selected worker's active requests: 0, 1, 2, 4, ..., 4096;
+- estimate error ratio: -1, -0.5, -0.25, -0.1, -0.05, -0.01, 0, 0.01, 0.05,
+  0.1, 0.25, 0.5, 1.
 
 ## Branches
 
@@ -171,6 +176,38 @@ maps the selection to a DP rank. `worker` is the base URL, which ranks behind
 one endpoint share; `dp_rank` is `none` for workers without ranks. Uneven
 counts across ranks of one endpoint show rank skew.
 
+### Router estimate and engine-reported cached tokens
+
+`kind="cached"` is the engine's own count, read from the response usage
+(`usage.prompt_tokens_details.cached_tokens`,
+`usage.input_tokens_details.cached_tokens`, `usage.cache_read_input_tokens`, or
+`meta_info.cached_tokens` from `/generate`).
+A streaming response carries usage only if the client asks for it, for example
+`stream_options.include_usage`; requests without a cached count are not
+recorded. Each request is recorded once, after its last attempt, on the pool
+that ran the prompt: `regular`, or `prefill` in PD. A PD response comes from
+decode, but its cached count is prefill's: in a Kimi-K3 1P1D run, every one of
+226 responses matched the tokens prefill had cached, while decode's own prefix
+cache hit rate stayed at 0 ([#3142](https://github.com/ROCm/ATOM/pull/3142)).
+
+`kind="estimated"` is the router's guess at selection time:
+round(estimated hit ratio x prompt tokens). `cache_aware` estimates its prefix
+match ratio only when it picked the worker holding the best match, which covers
+every `affinity` decision and any `relocate` that happened to pick it. With
+`--kv-events`, its `kv_affinity` decisions estimate the selection from the KV
+event index, short of the block of the prompt's last token, which the engine
+always computes. The
+router drops the estimate when it sends the prompt to a different worker than
+the policy chose, such as another DP rank under
+`--atom-pd-rank-mapping-policy idx2idx`, because ranks keep separate KV caches.
+`kind="actual"` repeats the engine count for exactly those requests, so
+`estimated` and `actual` compare like for like.
+
+The two differ because the ratio counts characters while the engine counts
+tokens in blocks, and the tree does not see engine eviction, chat templates or
+KV offload. A positive error means the router overestimated; a negative one
+means the engine reused more than predicted.
+
 ## Example queries
 
 Branch share per policy and pool:
@@ -195,6 +232,17 @@ Session worker changes per session request:
 sum by (pool, reason) (rate(mesh_session_worker_change_total[5m]))
   / ignoring (reason) group_left
     sum by (pool) (rate(mesh_route_branch_total{policy="dp_sticky",branch=~"hit|new|rebind|expired"}[5m]))
+```
+
+Engine-reported cache hit rate, and the router's estimate bias:
+
+```promql
+sum by (pool) (rate(mesh_route_cache_tokens_total{kind="cached"}[5m]))
+  / sum by (pool) (rate(mesh_route_cache_tokens_total{kind="prompt"}[5m]))
+
+(sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="estimated"}[5m]))
+  - sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="actual"}[5m])))
+  / sum by (pool) (rate(mesh_route_cache_estimate_tokens_total{kind="prompt"}[5m]))
 ```
 
 Median prefix match ratio:
