@@ -55,14 +55,13 @@ def require_chunk_matches_server(adapter: Any, config: Any) -> None:
     so other strategies and runs with only one routable engine are not
     checked. Called by both worker registrations (PAGE-only and native-state).
     """
-    policy = getattr(config, "dp_load_balance", None)
     if not shared_prefix_routing_enabled(config):
         return
     configured = offcfg.lmcache_chunk_tokens(_storage_kv_transfer_config(config))
     server = int(adapter.lmcache_tokens_per_chunk)
     if configured != server:
         raise ValueError(
-            f"--dp-load-balance {policy} with LMCache MP needs the "
+            f"--dp-load-balance {config.dp_load_balance} with LMCache MP needs the "
             f"configured chunk to match the server: configured {configured} "
             f"(lmcache.chunk_size or LMCACHE_CHUNK_SIZE), server {server}"
         )

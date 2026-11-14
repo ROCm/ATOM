@@ -9,6 +9,7 @@ for its turn and for a FIRE.
 """
 
 import logging
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -197,7 +198,7 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [a, b]  # a parked-and-loaded old-path request
     # would have moved up; an early-loaded one keeps its place
@@ -207,11 +208,14 @@ def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id, b.id}
     sched.schedule()
-    # b parked by the admission pass, not by the early load.
+    # b parked by the admission pass, not by the early load; the real
+    # admission owns its block table before it can park for a tier load.
+    sched.block_manager.allocate(b)
+    assert b.block_table
     b.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [b, a]
 
@@ -223,7 +227,9 @@ def test_loaded_request_prefills_only_on_a_fire(setup):
 
     batch, _ = sched.schedule()  # still HOLD
     assert batch.total_seqs_num_prefill == 0
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    # Completion resolves before the delayer sizes the work, but HOLD still
+    # launches no prefill and preserves the reserved resources.
+    assert seq.status == SequenceStatus.WAITING
 
     delayer.allow = True
     batch, scheduled = sched.schedule()  # FIRE: resumes as an offload prefill
@@ -635,7 +641,7 @@ def test_early_loads_in_flight_do_not_use_up_the_probe_budget(monkeypatch, seq_f
     assert sched._can_admit_head_prefill()
 
 
-# -- slots, age and failed loads (review of #3097) -------------------------------------
+# -- slots, age and failed loads -------------------------------------
 
 
 def _parked(sched, seq_factory, n, *, early=True):
@@ -657,10 +663,12 @@ def test_finished_early_loads_are_promoted_when_the_head_has_no_slot(
     sched = _sched(monkeypatch)
     head = seq_factory(list(range(16)))
     parked = _parked(sched, seq_factory, sched.max_num_seqs)
+    for seq in parked:
+        sched.block_manager.allocate(seq)
     sched.waiting.extend([head, *parked])
     sched._num_parked_remote_kv = sched.max_num_seqs
     sched.finished_recving_kv_req_ids = [seq.id for seq in parked]
-    sched._promote_ready_remote_kv_requests()
+    sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting)[: len(parked)] == parked
     assert sched.waiting[-1] is head
 
@@ -751,6 +759,38 @@ def test_settled_early_owner_keeps_fifo_until_the_head_cannot_allocate(
     sched._prioritize_ready_remote_kv_requests()
     assert list(sched.waiting) == [owner, head]
     assert owner.block_table
+
+
+def test_a_settled_early_owner_behind_a_runnable_head_does_not_rebuild_waiting(
+    monkeypatch, seq_factory
+):
+    class Counting(deque):
+        clears = 0
+
+        def clear(self):
+            Counting.clears += 1
+            super().clear()
+
+    sched, _, (head, owner) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {head.id}
+    sched.schedule()
+    sched.finished_recving_kv_req_ids.append(owner.id)
+    sched.schedule()  # consumes the completion event
+    sched.waiting = Counting(sched.waiting)
+    for _ in range(3):
+        sched._prioritize_ready_remote_kv_requests()
+    assert Counting.clears == 0
+    assert list(sched.waiting) == [head, owner]
+    # The same queue is rebuilt once the head cannot allocate.
+    original = sched.block_manager.can_allocate_memoized
+    monkeypatch.setattr(
+        sched.block_manager,
+        "can_allocate_memoized",
+        lambda seq: -1 if seq is head else original(seq),
+    )
+    sched._prioritize_ready_remote_kv_requests()
+    assert Counting.clears == 1
+    assert list(sched.waiting) == [owner, head]
 
 
 def test_a_load_in_flight_ahead_of_the_blocked_head_does_not_hide_it(

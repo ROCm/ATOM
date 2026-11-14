@@ -86,6 +86,7 @@ def _seq(seq_id=7, **params):
         output_tokens=[42],
         spec_token_ids=None,
         prefix_cache_hit_tokens=0,
+        state_slot=-1,
     )
 
 
@@ -241,13 +242,15 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
-    from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
-        MooncakeConnector,
-    )
+    with stubbed_aiter():
+        from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
+            MooncakeConnector,
+        )
 
     sched = _mooncake()
     seq = _seq(do_remote_decode=True)
     seq.output_tokens = []
+    seq.state_slot = 5
     sched.update_state_after_alloc(seq)
     worker = MooncakeConnector.__new__(MooncakeConnector)
     worker.is_producer = True
@@ -272,7 +275,6 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
         seq.output_tokens = [42]
         seq.leave_reason = "stop_sequence"
         seq.block_table = [10, 11]
-        seq.state_slot = 5
         sched.request_finished(seq)
         # Last request publication must reach D through the real idle engine.
         with stubbed_aiter():
