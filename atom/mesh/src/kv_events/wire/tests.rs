@@ -167,3 +167,51 @@ fn malformed_input_fails_the_batch_or_drops_the_event() {
     let decode = ["drop decode"; 6].join("; ");
     assert_eq!(render(&batch.unwrap()), format!("rank -: {decode}"));
 }
+
+/// Decoding the batches ATOM publishes: a decode step's, one block of 16 tokens an event,
+/// and a prefill step's, one event of many blocks. `KV_BENCH_EVENTS` (96) and
+/// `KV_BENCH_BLOCKS` (512) size them.
+/// `cargo test --release --lib kv_events::wire::tests::bench -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_decode() {
+    let size = |name: &str, default: usize| {
+        std::env::var(name).map_or(default, |value| value.parse().unwrap())
+    };
+    let stored = |first: u64, blocks: u64| {
+        let hashes: Vec<String> = (first..first + blocks)
+            .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_string())
+            .collect();
+        let tokens: Vec<String> = (first * 16..(first + blocks) * 16)
+            .map(|token| (token % 150_000).to_string())
+            .collect();
+        format!(
+            r#"{{"type": "BlockStored", "block_hashes": [{}], "parent_block_hash": {first}, "token_ids": [{}], "block_size": 16, "lora_id": null, "medium": "GPU", "lora_name": null, "token_offset": 0}}"#,
+            hashes.join(", "),
+            tokens.join(", ")
+        )
+    };
+    for (step, events, blocks) in [
+        ("decode", size("KV_BENCH_EVENTS", 96), 1),
+        ("prefill", 1, size("KV_BENCH_BLOCKS", 512)),
+    ] {
+        let batch: Vec<String> = (0..events as u64)
+            .map(|event| stored(event * blocks as u64, blocks as u64))
+            .collect();
+        let payload = encode(&format!("[1.0, [{}], 0]", batch.join(", ")));
+        let mut samples: Vec<_> = (0..2000)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                assert_eq!(decode(&payload, 16).unwrap().events.len(), events);
+                started.elapsed()
+            })
+            .collect();
+        samples.sort();
+        let (p50, p99) = (samples[1000], samples[1980]);
+        println!(
+            "{step} step, {events} events of {blocks} blocks, {} bytes: p50 {p50:?}, p99 {p99:?}; {:?} an event",
+            payload.len(),
+            p50 / events as u32
+        );
+    }
+}
