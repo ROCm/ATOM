@@ -3,7 +3,7 @@
 
 """Admission and memory budgets for validated staging/landing configurations.
 
-The MLA switches gate supported recipes here, not transport algorithms.
+The MLA and MHA switches gate supported recipes here, not transport algorithms.
 Runtime plans select ownership using peer topology and declared region layouts.
 """
 
@@ -17,9 +17,13 @@ from atom.kv_transfer.disaggregation.mooncake.landing import (
 from atom.kv_transfer.disaggregation.pd_producer import (
     mla_staging_reserve_bytes,
     plain_mla_model,
+    send_worker_count,
+    staging_pool_bytes,
 )
-from atom.kv_transfer.disaggregation.transfer_plan import TOKEN_UNITS
+from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS, TOKEN_UNITS
 from atom.utils import envs, get_hf_text_config
+
+MHA_SCATTER_SEGMENTS = 4096
 
 
 def mla_landing_configured(config) -> bool:
@@ -55,25 +59,57 @@ def mla_landing_table_segments(config) -> int:
     return segment_table_capacity(LANDING_POOL_SLOTS * (pages_per_slot + 64))
 
 
+def mha_landing_model(config) -> bool:
+    from atom.config import _is_minimax_m3_config
+
+    return bool(
+        envs.ATOM_PD_MHA_LANDING
+        and getattr(config, "decode_context_parallel_size", 1) == 1
+        and _is_minimax_m3_config(getattr(config, "hf_config", None))
+    )
+
+
+def mha_staging_reserve_bytes(config) -> int:
+    if (
+        not mha_landing_model(config)
+        or getattr(config, "tensor_parallel_size", 1) != 1
+        or config.kv_transfer_config.get("kv_role") not in ("kv_producer", "kv_both")
+    ):
+        return 0
+    return staging_pool_bytes(send_worker_count(config.kv_transfer_config))
+
+
+def mha_landing_configured(config) -> bool:
+    return bool(
+        mha_landing_model(config)
+        and getattr(config, "tensor_parallel_size", 1) > 1
+        and config.kv_transfer_config.get("kv_role") == "kv_consumer"
+    )
+
+
 @dataclass(frozen=True)
 class LandingSpec:
     units_per_page: int
     table_segments: int
     wire_layout: str
+    supports_chunks: bool = False
 
 
 def landing_spec(config):
+    # MLA lands only with DCP and MHA only without it, so at most one applies.
     if mla_landing_configured(config):
         return LandingSpec(
             config.kv_cache_block_size,
             mla_landing_table_segments(config),
             TOKEN_UNITS,
         )
+    if mha_landing_configured(config):
+        return LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, supports_chunks=True)
     return None
 
 
 def staging_reserve_bytes(config):
-    return mla_staging_reserve_bytes(config)
+    return mla_staging_reserve_bytes(config) + mha_staging_reserve_bytes(config)
 
 
 def landing_reserve_bytes(config):

@@ -7,8 +7,9 @@ from dataclasses import replace
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.gather import GatherLayout, gather_units
+from atom.kv_transfer.disaggregation.gather import gather_units
 from atom.kv_transfer.disaggregation.transfer_plan import (
+    PAGE_UNITS,
     TOKEN_UNITS,
     RegionLayout,
     TransferTopology,
@@ -67,6 +68,33 @@ def test_dcp_rank_owns_its_interleaved_token_rows(rank):
     assert plan.regions[0].target_region == 7  # explicit PP region mapping
 
 
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("heads", [4, 2])
+def test_tp_rank_owns_its_heads_of_each_page(rank, heads):
+    # TP4 splits four KV heads or replicates two. No attention-family input.
+    source = (
+        torch.arange(4 * 8 * heads * 4, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .view(4, 8, heads, 4)
+    )
+    ids = [3, 0, 2]
+    destination = torch.zeros(5, 8, 1, 4, dtype=torch.uint8)
+    dst_ids = [4, 1, 3]
+    layout = RegionLayout(
+        0, 7, destination.data_ptr(), 32 * heads, 32, True, (8, heads), (8, 1)
+    )
+    plan = build_transfer_plan(
+        TransferTopology(target_tp=4, target_tp_rank=rank), [layout], ids, dst_ids, 8
+    )
+    assert plan.wire_layout == PAGE_UNITS
+    execute_plan(plan, source, destination)
+    head = rank * heads // 4
+    assert torch.equal(destination[dst_ids], source[ids, :, head : head + 1, :])
+    assert not destination[list(set(range(5)) - set(dst_ids))].any()
+    assert plan.regions[0].target_region == 7  # explicit PP region mapping
+
+
 @pytest.mark.parametrize("source_tp", [1, 2, 4])
 @pytest.mark.parametrize("rank", range(4))
 def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
@@ -109,23 +137,19 @@ def test_unknown_token_layout_and_unsupported_topologies_are_rejected():
         )
     with pytest.raises(ValueError, match="non-DCP producer"):
         build_transfer_plan(replace(dcp, source_dcp=4), [layout], [0], [0], 8)
-    with pytest.raises(ValueError, match="PAGE adapter"):
-        build_transfer_plan(TransferTopology(target_tp=4), [layout], [0], [0], 8)
-
-
-def test_gather_refuses_strided_slices():
-    source = torch.zeros(4, 32, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="layout adapter"):
-        gather_units(
-            source,
-            torch.tensor([0, 1]),
-            torch.empty(2 * 8, dtype=torch.uint8),
-            GatherLayout(32, 8, 0, 16, 4),
+    heads = replace(layout, token_contiguous=True, source_head_runs=(8, 4))
+    with pytest.raises(ValueError, match="Combined token/head"):
+        build_transfer_plan(replace(dcp, target_tp=4), [heads], [0], [0], 8)
+    page = RegionLayout(0, 0, 0, 128, 32, False, (8, 4), (8, 1))
+    with pytest.raises(ValueError, match="TP1 producer"):
+        build_transfer_plan(
+            TransferTopology(source_tp=2, target_tp=4), [page], [0], [0], 8
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU buffer allocation")
-def test_shared_buffer_builders_respect_reserved_memory():
+@pytest.mark.parametrize("page_units", [False, True])
+def test_shared_buffer_builders_respect_reserved_memory(page_units):
     from types import SimpleNamespace
 
     from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
@@ -135,12 +159,14 @@ def test_shared_buffer_builders_respect_reserved_memory():
     from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE, KVTransferRegion
 
     source = torch.empty((4, 128), dtype=torch.uint8, device="cuda")
+    role = "target.kv" if page_units else MLA_KV_ROLE
     c = object.__new__(MooncakeConnector)
     c._kv_staging_reserve = 8 << 20
     c._num_send_workers = 4  # Must share the single reserved source slot.
+    c._page_staging_enabled = page_units
     c._has_slot_regions = False
     region = KVTransferRegion(
-        source.data_ptr(), source.numel(), 128, semantic_role=MLA_KV_ROLE
+        source.data_ptr(), source.numel(), 128, semantic_role=role
     )
     staging = c._build_kv_staging(
         SimpleNamespace(block_regions=[region], block_tensor_views=[source])
@@ -148,8 +174,13 @@ def test_shared_buffer_builders_respect_reserved_memory():
     assert staging.total_bytes == c._kv_staging_reserve
     assert c._kv_staging_slots.size == 1
     assert staging.base_addr == c._kv_staging.data_ptr()
-    c._landing_spec = LandingSpec(8, 16, TOKEN_UNITS)
-    c._block_region_roles = [MLA_KV_ROLE]
+    c._landing_spec = LandingSpec(
+        1 if page_units else 8,
+        16,
+        PAGE_UNITS if page_units else TOKEN_UNITS,
+        page_units,
+    )
+    c._block_region_roles = [role]
     c._per_block_bytes_list = [128]
     c.kv_caches_base_addr = [source.data_ptr()]
     c._cuda_device = torch.cuda.current_device()

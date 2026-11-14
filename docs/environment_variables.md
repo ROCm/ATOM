@@ -672,6 +672,16 @@ Set on the decode side; the prefill side follows what each write request offers 
 |----------|------|---------|-------------|
 | **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1, a plain MLA model) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank; it and the scatter's segment table (about 12 MiB at block size 1, less for larger blocks) are held back from the KV cache budget. Only a non-DCP MLA prefill with `ATOM_PD_MLA_STAGING=1` lands, so set 0 where none does (for example symmetric DCP P/D) to give the pool back to the KV cache. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A stage that reports it cannot land returns its partition at its first write-done and is not offered slots again. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |
 
+## Mooncake PD MiniMax PP-to-TP landing
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MHA_LANDING** | bool | 0 | Set on both prefill and decode. MiniMax-M3 only, TP1 (PP) prefill to a TP-sharded decode without DCP. The prefill gathers each decode rank's heads of every PAGE into a staging slot, byte for byte; the decode lands the slot in a GPU pool and scatters it into its paged KV cache. Works with and without `enable_chunked_transfer`. The prefill holds one 8 MiB staging slot per send worker, capped at 256 MiB per GPU; each decode GPU holds a 256 MiB landing pool and a 96 KiB scatter table; both come out of the KV cache budget. A transfer needing fewer than 2 landing slots, or the rest of one after waiting 10 ms for a free slot, is written from the staging slot straight to the decode's pages. Other models, DCP, and state-slot layouts are unaffected. |
+
+MLA and MiniMax share the staging pool lifecycle, landing receiver and failure
+handling described above; the peer topology selects ownership and the region
+layout selects bytes.
+
 ## MoRIIO PD
 
 | Variable | Type | Default | Description |
