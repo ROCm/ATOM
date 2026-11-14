@@ -6,7 +6,9 @@
 With the stages' `wkv` GEMMs fused, `write_context_kv` used to normalize the
 projected context with `main_norm` to bf16 and let `native_quant_linear`
 quantize that with `quantize_fp8`. `project_context_quant` emits the GEMM's
-`(x, x_scale)` from the norm instead.
+`(x, x_scale)` from the norm instead. Both take the target's taps, as
+`write_context_kv` does, and project them through one shared helper; joined
+into one block first, the taps give the same bytes.
 
 That is not bit-exact: the fused kernel quantizes the fp32 normalized value,
 the chain the bf16-rounded one. So, as in the draft-KV tail's test, the claim
@@ -40,6 +42,7 @@ DEV = "cuda"
 HIDDEN = 5120  # config.hidden_size
 KV_WIDTH = 3 * 512  # num_nextn_predict_layers x head_dim, the fused wkv rows
 EPS = 1e-20  # config.rms_norm_eps
+TAPS = 3  # dspark_target_layer_ids
 
 
 class _Draft:
@@ -47,11 +50,20 @@ class _Draft:
 
     project_context = DeepseekV41DSpark.project_context
     project_context_quant = DeepseekV41DSpark.project_context_quant
+    _project_taps = DeepseekV41DSpark._project_taps
     _main_norm_quant = DeepseekV41DSpark._main_norm_quant
 
     def __init__(self, norm):
-        self.mtp = [SimpleNamespace(main_proj=lambda x: x, main_norm=norm)]
+        self.mtp = [SimpleNamespace(main_proj=_main_proj, main_norm=norm)]
         DeepseekV41DSpark._build_main_norm_quant(self)
+
+
+def _main_proj(x, x_scale):
+    """Stands in for `main_proj`: takes the fp8 input and its scales, as the
+    real one is handed them, and sums the taps' dequantized slices, so the
+    context keeps the per-group gains every tap carries."""
+    values = _dequant(x, x_scale).unflatten(-1, (TAPS, HIDDEN))
+    return values.sum(-2).to(torch.bfloat16)
 
 
 def _draft(seed):
@@ -64,16 +76,19 @@ def _draft(seed):
     return _Draft(norm), gen
 
 
-def _context(width, gen):
+def _taps(width, gen):
     # A power of two per 32-column group, so groups pick different scales and
     # a scale read for the wrong group is far off rather than coincidentally
     # equal.
     group_gain = 2.0 ** torch.randint(
         -4, 5, (HIDDEN // 32,), generator=gen, device=DEV
     ).repeat_interleave(32)
-    return (torch.randn(1, width, HIDDEN, generator=gen, device=DEV) * group_gain).to(
-        torch.bfloat16
-    )
+    return [
+        (torch.randn(width, HIDDEN, generator=gen, device=DEV) * group_gain).to(
+            torch.bfloat16
+        )
+        for _ in range(TAPS)
+    ]
 
 
 def _reference(ctx, weight):
@@ -107,12 +122,12 @@ def _quantize_32x32(weight):
 @pytest.mark.parametrize("width", [1, 37, 384])
 def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
     draft, gen = _draft(seed=width)
-    ctx = _context(width, gen)
-    reference = _reference(ctx, draft.mtp[0].main_norm.weight)
+    taps = _taps(width, gen)
 
     with torch.inference_mode():
-        values, scales = draft.project_context_quant(ctx)
-        chain = _dequant(*quantize_fp8(draft.project_context(ctx)))
+        reference = _reference(draft._project_taps(taps), draft.mtp[0].main_norm.weight)
+        values, scales = draft.project_context_quant(taps)
+        chain = _dequant(*quantize_fp8(draft.project_context(taps)))
     assert values.shape == (1, width, HIDDEN)
     assert values.dtype == torch.float8_e4m3fn
     assert scales.shape == (1, width, HIDDEN // 32)
@@ -149,13 +164,15 @@ def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
 @pytest.mark.parametrize("width", [1, 37, 384])
 def test_context_norm_quant_scale_layout_feeds_the_gemm(single_rank, width):
     draft, gen = _draft(seed=100 + width)
-    ctx = _context(width, gen)
+    taps = _taps(width, gen)
+    with torch.inference_mode():
+        hidden = draft._project_taps(taps)
     weight = (
         torch.randn(KV_WIDTH, HIDDEN, generator=gen, device=DEV, dtype=torch.float32)
         * 0.02
     ).to(torch.bfloat16)
     weight_q, weight_scale = _quantize_32x32(weight)
-    expected = _reference(ctx, draft.mtp[0].main_norm.weight) @ (
+    expected = _reference(hidden, draft.mtp[0].main_norm.weight) @ (
         _dequant(weight_q, weight_scale, rows=32).T
     )
     # Stored the way the loader stores `wkv` on this GPU.
@@ -171,7 +188,7 @@ def test_context_norm_quant_scale_layout_feeds_the_gemm(single_rank, width):
         ).mean().sqrt()
 
     with torch.inference_mode():
-        values, scales = draft.project_context_quant(ctx)
+        values, scales = draft.project_context_quant(taps)
 
         def _gemm(x, x_scale):
             return native_quant_linear(
@@ -184,7 +201,7 @@ def test_context_norm_quant_scale_layout_feeds_the_gemm(single_rank, width):
             )
 
         fused = _gemm(values, scales)
-        chain = _gemm(draft.project_context(ctx), None)
+        chain = _gemm(draft.project_context(taps), None)
         # The same bytes read as if the groups were laid out the other way
         # round: what a transposed or column-major scale view would do.
         flipped = scales.flip(-1)
@@ -206,10 +223,28 @@ def test_main_norm_quant_shares_the_main_norm_weight(single_rank):
     assert draft._main_norm_quant() is fused_norm
     # In place, the way a weight load or sync writes it.
     draft.mtp[0].main_norm.weight.data.mul_(2)
-    ctx = _context(5, gen)
+    taps = _taps(5, gen)
     with torch.inference_mode():
-        values, scales = draft.project_context_quant(ctx)
-    reference = _reference(ctx, draft.mtp[0].main_norm.weight)
+        values, scales = draft.project_context_quant(taps)
+        reference = _reference(draft._project_taps(taps), draft.mtp[0].main_norm.weight)
     assert (_dequant(values, scales) - reference).abs().max() < (
         reference.abs().max() * 2.0**-3
     )
+
+
+@pytest.mark.parametrize("width", [1, 37, 384])
+def test_context_projection_takes_taps_as_the_joined_block(single_rank, width):
+    """The taps, quantized where they lie, against the same rows joined into
+    one block (a PP relay, which `quantize_fp8_taps` quantizes as it is):
+    both projections come out byte for byte the same."""
+    draft, gen = _draft(seed=200 + width)
+    taps = _taps(width, gen)
+    joined = [torch.cat(taps, dim=-1)]
+    with torch.inference_mode():
+        values, scales = draft.project_context_quant(taps)
+        joined_values, joined_scales = draft.project_context_quant(joined)
+        hidden = draft.project_context(taps)
+        joined_hidden = draft.project_context(joined)
+    assert torch.equal(values.view(torch.uint8), joined_values.view(torch.uint8))
+    assert torch.equal(scales.view(torch.uint8), joined_scales.view(torch.uint8))
+    assert torch.equal(hidden, joined_hidden)

@@ -32,7 +32,9 @@ def _context(monkeypatch, module, service):
 def _proposer(module, writes):
     p = module.DSparkProposer.__new__(module.DSparkProposer)
     p.model = SimpleNamespace(
-        write_context_kv=lambda hidden, positions, slots: writes.append(hidden.shape),
+        write_context_kv=lambda taps, positions, slots: writes.append(
+            torch.cat(taps, dim=-1).shape
+        ),
         kv_pool_spec=None,
         vocab_size=100,
     )

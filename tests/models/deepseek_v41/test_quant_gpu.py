@@ -38,6 +38,82 @@ def test_fp8_quantization_bytes_and_qat(shape):
 
 
 @pytest.mark.parametrize(
+    "count,tokens,width,pad,rows,alias",
+    [
+        (3, 17, 1024, 0, None, False),
+        # One tensor passed for every tap.
+        (3, 6, 1024, 0, None, True),
+        # Rows strided past the tap's width.
+        (3, 5, 2048, 96, None, False),
+        # Fewer rows than the taps hold (the caller's row cut), and none.
+        (3, 9, 1024, 32, 4, False),
+        (3, 9, 1024, 0, 0, False),
+        # Shapes the kernel does not take go through the concatenation.
+        (3, 7, 288, 0, None, False),
+        (1, 7, 1024, 0, None, False),
+        (2, 5, 2048, 96, None, False),
+        (4, 9, 1024, 32, 4, False),
+    ],
+)
+def test_fp8_taps_quantization_matches_the_concatenation(
+    count, tokens, width, pad, rows, alias
+):
+    from atom.model_ops.blockscale import quantize_fp8, quantize_fp8_taps
+
+    torch.manual_seed(97)
+    base = 4 * torch.randn((count, tokens, width + pad), dtype=torch.bfloat16)
+    base[0, 0, :32] = 0
+    base = base.cuda()
+    taps = [base[0 if alias else i, :rows, :width] for i in range(count)]
+    q, s = quantize_fp8_taps(taps)
+    ref_q, ref_s = quantize_fp8(torch.cat(taps, -1))
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.uint8), ref_s.view(torch.uint8))
+
+
+def test_fp8_taps_quantization_mixed_dtypes_fall_back():
+    from atom.model_ops.blockscale import quantize_fp8, quantize_fp8_taps
+
+    torch.manual_seed(98)
+    taps = [
+        torch.randn((5, 1024), dtype=torch.bfloat16, device="cuda"),
+        torch.randn((5, 1024), dtype=torch.float32, device="cuda"),
+        torch.randn((5, 1024), dtype=torch.bfloat16, device="cuda"),
+    ]
+    q, s = quantize_fp8_taps(taps)
+    ref_q, ref_s = quantize_fp8(torch.cat(taps, -1))
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.uint8), ref_s.view(torch.uint8))
+
+
+def test_v41_context_projection_takes_taps_or_a_joined_block():
+    # The proposer hands V4.1 the taps (or, under PP, a block already joined);
+    # `main_proj` must see the same fp8 rows and scales either way.
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+
+    draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    nn.Module.__init__(draft)
+    draft.mtp = [
+        SimpleNamespace(
+            main_proj=lambda x, x_scale: (x, x_scale), main_norm=lambda y: y
+        )
+    ]
+    torch.manual_seed(99)
+    taps = [
+        torch.randn((7, 1024), dtype=torch.bfloat16, device="cuda") for _ in range(3)
+    ]
+    q, s = draft.project_context(taps)
+    ref_q, ref_s = draft.project_context([torch.cat(taps, -1)])
+    assert q.shape == (1, 7, 3072)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(s.view(torch.uint8), ref_s.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
     "scale_dtype,group", [(torch.float8_e8m0fnu, 32), (torch.float8_e4m3fn, 16)]
 )
 def test_fp4_quantization_bytes_midpoints_and_qat(scale_dtype, group):
