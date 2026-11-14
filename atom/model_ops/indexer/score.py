@@ -58,7 +58,6 @@ def score_topk(
     stable: bool = False,
     on_band=None,
     out: torch.Tensor | None = None,
-    keys=None,
     request_local: bool = True,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
@@ -73,30 +72,35 @@ def score_topk(
 
     `on_band(scores, span)`, when given, sees each band's logits before its
     top-k: a scorer that reads more than the top-k off them (a layer picking
-    its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
-    `(values, scales)` already gathered end to end (DCP's all-gathered
-    shards); gathered here from `cache` otherwise.
+    its successors' candidate blocks) does it there. FP8 concat rows' keys
+    are gathered here, packed ones pass by pass (`rows.passes`), every rank
+    its share of each pass.
 
     A striped split (`RowSplit.striped`) scores this rank's rows of `query`
     and `weights` into its slot and returns the gathered slots rank-major:
     slot r holds rows r, r + world, ..., so row i sits at
     `(i % world) * stride + i // world` (`csa_translate_pack` reads it
-    there). `out`, `on_band`, `keys` and `request_local=False`, which assume
-    rows in order, do not apply."""
+    there). `out`, `on_band` and `request_local=False`, which assume rows in
+    order, do not apply."""
     split = rows.split
     if split.stripe:
-        if not (out is None and on_band is None and keys is None and request_local):
+        if not (out is None and on_band is None and request_local):
             raise ValueError(
                 "a striped split returns its rows rank-major, not in place"
             )
         query, weights = _stripe_rows(query, weights, cache, split)
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
+    if rows.passes is not None:
+        _score_concat_passes(query, weights, cache, rows, topk, stable, out)
+        if not request_local:  # places in the step's gathered run
+            n = rows.row_ends.shape[0]
+            picked, starts = out[:n], rows.concat.row_starts[:n].unsqueeze(1)
+            torch.where(picked < 0, picked, picked + starts, out=picked)
+        return out
     mine = out[split.slot : split.slot + split.stride] if split.stripe else out
     if rows.concat is not None:
-        _score_concat(
-            query, weights, cache, rows, topk, stable, mine, keys, request_local
-        )
+        _score_concat(query, weights, cache, rows, topk, stable, mine, request_local)
     else:
         _score_paged(
             query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
@@ -132,12 +136,16 @@ def _gather_split(out, split):
     (`IndexRows.out_rows`). A world of one already holds them all."""
     if split.world == 1:
         return
-    region = out[: split.stride * split.world]
     group = get_tp_group() if split.group == "tp" else get_dcp_group()
+    _all_gather_slot(out, split.stride, split.rank, split.world, group)
+
+
+def _all_gather_slot(buffer, stride, rank, world, group):
+    """The `world` slots of `stride` rows at the front of `buffer`, gathered
+    in place from this rank's own slot."""
+    region = buffer[: stride * world]
     torch.distributed.all_gather_into_tensor(
-        region,
-        region[split.slot : split.slot + split.stride],
-        group=group.device_group,
+        region, region[rank * stride : (rank + 1) * stride], group=group.device_group
     )
 
 
@@ -232,6 +240,83 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
             )
 
 
+def _score_concat_passes(query, weights, cache, rows, topk, stable, out):
+    """Packed FP8 prefill rows a pass at a time: keys gathered, this rank's rows
+    scored band by band, selections all-gathered. Ids are request-local."""
+    keys, scores = rows.concat, rows.workspace.packed_logits()
+    for p in rows.passes:
+        lo, hi = p.lo, p.hi
+        if not p.stride:
+            continue  # no rows in the pass, alike on every DCP rank
+        k_fp8, k_scale = _gather_pass_keys(cache, keys, p)
+        # Each row's key range within the pass; PCP padding (start 0, no
+        # keys) stays empty.
+        starts = (keys.row_starts[lo:hi] - p.key_base).clamp_min_(0)
+        ends = starts + rows.row_ends[lo:hi]
+        for first, end in p.bands:
+            span, local = slice(first, end), slice(first - lo, end - lo)
+            offsets = rows.packed_offsets[span]
+            fp8_mqa_logits(
+                Q=query[span],
+                KV=k_fp8,
+                kv_scales=k_scale,
+                weights=weights[span],
+                cu_starts=starts[local],
+                cu_ends=ends[local],
+                clean_logits=False,
+                out=scores,
+                out_offsets=offsets,
+            )
+            # V4.1's packed consumer: a row's ids local to its offset.
+            top_k_per_row_decode(
+                scores,
+                1,
+                rows.row_ends[span],
+                out[span],
+                end - first,
+                0,
+                1,
+                k=topk,
+                stable=stable,
+                row_starts=offsets,
+                plane_width=rows.width,
+            )
+        if p.world > 1:
+            _all_gather_slot(
+                out[p.row_base :], p.stride, p.rank, p.world, get_dcp_group()
+            )
+
+
+def _gather_pass_keys(cache, keys, p):
+    """Pass `p`'s keys into the key workspace; under DCP each rank's shard via
+    its slot, all-gathered in place and put back in key order."""
+    workspace, tables = keys.workspace, keys.block_tables[p.first : p.end]
+    k_fp8, k_scale = workspace.keys(p.keys)
+    if p.dcp is None:
+        dst, dst_scales = k_fp8, k_scale
+        cu = keys.cu_committed[p.first : p.end + 1]
+        cu = cu - p.key_base if p.key_base else cu
+    else:
+        local_total, gather_index = p.dcp.local_total, p.dcp.gather_index
+        group = get_dcp_group()
+        rank, world = group.rank_in_group, group.world_size
+        shards, shard_scales = workspace.gathered(world * local_total)
+        slot = slice(rank * local_total, (rank + 1) * local_total)
+        dst, dst_scales, cu = shards[slot], shard_scales[slot], p.dcp.local_cu
+    cp_gather_indexer_k_quant_cache(
+        cache.values, dst, dst_scales.view(dtypes.fp8), tables, cu, preshuffle=True
+    )
+    if p.dcp is None:
+        return k_fp8, k_scale
+    # fp8 has no collective support; the keys move as bytes.
+    shard_bytes = shards.view(torch.uint8)
+    _all_gather_slot(shard_bytes, local_total, rank, world, group)
+    _all_gather_slot(shard_scales, local_total, rank, world, group)
+    torch.index_select(shard_bytes, 0, gather_index, out=k_fp8.view(torch.uint8))
+    torch.index_select(shard_scales, 0, gather_index, out=k_scale)
+    return k_fp8, k_scale
+
+
 def _gather_concat(query, cache, keys):
     """The step's requests' committed keys, end to end."""
     k_fp8 = torch.empty(
@@ -249,15 +334,11 @@ def _gather_concat(query, cache, keys):
     return k_fp8, k_scale
 
 
-def _score_concat(
-    query, weights, cache, rows, topk, stable, out, gathered, request_local
-):
+def _score_concat(query, weights, cache, rows, topk, stable, out, request_local):
     """FP8 prefill against the gathered keys. The top-k reports a key's place
     in the gathered run; less its request's start it is the request's own."""
     keys = rows.concat
-    k_fp8, k_scale = (
-        _gather_concat(query, cache, keys) if gathered is None else gathered
-    )
+    k_fp8, k_scale = _gather_concat(query, cache, keys)
     ends = keys.row_starts + rows.row_ends
     for first, end in rows.bands:
         span = slice(first, end)

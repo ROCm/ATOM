@@ -1331,10 +1331,12 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
 @needs_gpu
 @pytest.mark.parametrize("lengths", [(45, 17), (1,), (13, 17, 3)])
 def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengths):
-    """The local cu-seqlens, not running_bs, bound the native gather's rows."""
-    from aiter import indexer_k_quant_and_cache
+    """A pass reads its own requests' table rows, not running_bs padding."""
+    from aiter import dtypes, indexer_k_quant_and_cache
 
-    from atom.model_ops.indexer import indexer_forward
+    from atom.model_ops.indexer import score
+    from atom.model_ops.indexer import workspace as ws
+    from atom.model_ops.indexer.rows import ConcatKeys, IndexCache
 
     total = sum(lengths)
     keys = torch.ones(total, 128, dtype=torch.bfloat16, device=DEV)
@@ -1360,20 +1362,14 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
     backing = torch.tensor(
         cums + [0, total, total, total], dtype=torch.int32, device=DEV
     )
-    md = SimpleNamespace(
-        dcp_indexer_local_total=total,
-        dcp_indexer_local_cu_seqlens=backing[: len(cums)],
-        dcp_indexer_gather_index=torch.arange(total, device=DEV),
-        block_tables=table,
-    )
-    monkeypatch.setattr(
-        indexer_forward,
-        "get_dcp_group",
-        lambda: SimpleNamespace(all_gather=lambda x, dim: x),
-    )
-    values, scales = indexer_forward._dcp_gather_indexer_k_prefill(
-        cache, md, 128, keys.device
-    )
+    gather = ws.DcpGather(total, backing[: len(cums)], torch.arange(total, device=DEV))
+    workspace = ws.ConcatKeyWorkspace(total, 128, dtypes.fp8, DEV, total)
+    step = ConcatKeys(table, None, total, None, workspace)
+    whole = ws.ConcatPass(0, len(lengths), 0, total, 0, 0, 0, 1, 0, 0, (), gather)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    monkeypatch.setattr(score, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(score, "_all_gather_slot", lambda *args: None)
+    values, scales = score._gather_pass_keys(IndexCache(cache, None, 128), step, whole)
     torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
 
 

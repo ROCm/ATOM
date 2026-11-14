@@ -11,7 +11,7 @@ projections and calls this op.
 """
 
 import torch
-from aiter import cp_gather_indexer_k_quant_cache, dtypes, indexer_k_quant_and_cache
+from aiter import dtypes, indexer_k_quant_and_cache
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_rank, get_dcp_world_size
@@ -35,50 +35,6 @@ from .rows import IndexCache
 from .score import score_topk
 
 
-def _dcp_gather_indexer_k_prefill(
-    kv_cache: torch.Tensor,
-    prefill_metadata,
-    head_dim: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather the full-sequence indexer K under DCP for prefill top-k.
-
-    The index cache holds only this rank's round-robin 1/W, so a plain gather
-    would return a 1/W-long prefix of garbage. Gather the local shard with LOCAL
-    cu_seqlens (the gather's own slot formula, block_table[j//bs]*bs + j%bs, is
-    exactly the round-robin write layout), all-gather it, then de-interleave back
-    to global order -- the same local-shard + all-gather the decode path uses, on
-    k rather than logits. Returns (k_fp8, k_scale) in global order.
-    """
-    local_total = prefill_metadata.dcp_indexer_local_total
-    local_cu_seqlens = prefill_metadata.dcp_indexer_local_cu_seqlens
-    # Cached prefill pads block tables to running_bs for later consumers,
-    # while these local cums contain only the scheduled requests. AITER takes
-    # its request count from the table height: passing the padded rows would
-    # read beyond local_cu_seqlens and can gather another request's keys.
-    block_tables = prefill_metadata.block_tables[: local_cu_seqlens.numel() - 1]
-    k_fp8_local = torch.empty([local_total, head_dim], device=device, dtype=dtypes.fp8)
-    k_scale_local = torch.empty([local_total, 1], device=device, dtype=torch.float32)
-    cp_gather_indexer_k_quant_cache(
-        kv_cache,
-        k_fp8_local,
-        k_scale_local.view(dtypes.fp8),
-        block_tables,
-        local_cu_seqlens,
-        preshuffle=True,
-    )
-    dcp_group = get_dcp_group()
-    # fp8 has no collective support; move the bytes as uint8.
-    gathered_k = dcp_group.all_gather(k_fp8_local.view(torch.uint8), dim=0).view(
-        dtypes.fp8
-    )
-    gathered_scale = dcp_group.all_gather(k_scale_local, dim=0)
-    gather_index = prefill_metadata.dcp_indexer_gather_index
-    k_fp8 = gathered_k.index_select(0, gather_index)
-    k_scale = gathered_scale.index_select(0, gather_index)
-    return k_fp8, k_scale
-
-
 def _dcp_stage_indexer_fp4_prefill(
     kv_cache: torch.Tensor,
     kv_cache_scale: torch.Tensor,
@@ -86,7 +42,7 @@ def _dcp_stage_indexer_fp4_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Stage the whole key set's FP4 index planes into pages of this rank's own.
 
-    Same three steps as `_dcp_gather_indexer_k_prefill` -- read the local shard,
+    Same three steps as `score._gather_pass_keys` -- read the local shard,
     all-gather it, de-interleave back to global order -- on the two E2M1/e8m0
     planes instead of the one FP8 one. It ends in pages rather than a flat
     buffer because every FP4 mqa-logits kernel is paged: each request's keys
@@ -330,13 +286,6 @@ def sparse_attn_indexer(
         weight_scale=weights_scale,
         stable=stable_topk,
         out=topk_indices[: rows.out_rows],
-        keys=(
-            _dcp_gather_indexer_k_prefill(kv_cache, attn_metadata, head_dim, k.device)
-            if rows.concat is not None
-            and rows.split.world > 1
-            and rows.split.group == "dcp"
-            else None
-        ),
         request_local=not single_rank_prefill,
     )
     if not context.is_prefill:

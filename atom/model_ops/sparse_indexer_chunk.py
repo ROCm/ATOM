@@ -82,6 +82,12 @@ def logits_rows(rows, width):
     )
 
 
+def plane_capacity(rows, width):
+    """fp32 elements of one `width`-column band: up to `rows` query rows, as
+    many as the logits budget allows. Scoring runs in bands of it."""
+    return logits_rows(rows, width) * width
+
+
 def capped_logits_rows(rows, width, capacity, min_rows=1):
     """`logits_rows` within a workspace of `capacity` rows of `width`; fails
     when it cannot hold `min_rows`."""
@@ -215,9 +221,9 @@ class LogitsWorkspace:
 
     @classmethod
     def for_rows(cls, rows: int, width: int, device) -> "LogitsWorkspace":
-        """A plane for `rows` query rows of `width` columns, in as many bands
-        as the logits budget asks."""
-        return cls(logits_rows(rows, width) * width, device)
+        """A plane of `plane_capacity(rows, width)`: one band of up to `rows`
+        query rows, as many as the logits budget allows."""
+        return cls(plane_capacity(rows, width), device)
 
     @property
     def nbytes(self) -> int:
@@ -231,3 +237,7 @@ class LogitsWorkspace:
     def logits(self, rows: int, width: int) -> torch.Tensor:
         """`[rows, width]` fp32, one band of the plane; fails past it."""
         return flat_view(self._logits, rows, width)
+
+    def packed_logits(self) -> torch.Tensor:
+        """The flat plane, a packed row at its band-local offset."""
+        return self._logits
