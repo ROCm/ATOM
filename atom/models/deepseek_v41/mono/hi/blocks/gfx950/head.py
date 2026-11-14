@@ -192,6 +192,7 @@ class _Plan:
     balance: int = (
         0  # K parts a row group (``balance``: balanced tasks, module docstring); 0: a task 8 row groups
     )
+    wcm: int = CM_NT  # the weight loads' cache policy (``temporal``: 0, cacheable; else nontemporal)
     g: int = WAVES  # row groups a task (``spread``: the module docstring's "Spread tasks"); WAVES: one a wave
 
     probe = False  # ``linear._land_batch``'s probe build: off
@@ -342,7 +343,7 @@ class ArgmaxHead(Block):
                  prefetch: int = 16, vals: bool = True, out: Channel | None = None, lead: int = 4,
                  late: bool = False, sample: bool = False, weight_format: str = "bf16",
                  race: bool | str = False, balance: int = 0, kparts: int = 0,
-                 spread: int = 0):  # fmt: skip
+                 spread: int = 0, temporal: bool = False):  # fmt: skip
         if weight_format not in WFMTS:
             raise ValueError(f"ArgmaxHead {name}: weight_format in {WFMTS}")
         mx = weight_format == "mxfp4"
@@ -413,12 +414,16 @@ class ArgmaxHead(Block):
             raise ValueError(f"ArgmaxHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} with bf16 "
                              f"weights in layout 'wave', not balanced")  # fmt: skip
         self.spread = spread
+        # the weight loads temporal (cacheable) instead of nontemporal: the same bytes, another cache policy (a
+        # head weight read again soon, e.g. the draft head's dot after the verify head's on the same tensor)
+        self.temporal = bool(temporal)
 
     def plan(self, sc: Scenario) -> _Plan:
         p = _Plan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, self.key, self.layout,
                   self.prefetch, self.vals, self.out.name if self.out is not None else "", self.lead,
                   self.late, self.sample, self.weight_format, race=bool(self.race),
-                  race_lg=self.race == "check", race_only=self.race == "only", balance=self.balance, g=self.spread)  # fmt: skip
+                  race_lg=self.race == "check", race_only=self.race == "only", balance=self.balance, g=self.spread,
+                  wcm=0 if self.temporal else CM_NT)  # fmt: skip
         if (
             not p.mx
         ):  # x in K slices where it does not fit whole (the bf16 weights' path), ``kparts`` at least
@@ -566,13 +571,13 @@ def _key(p, v):
 
 
 def _issue(p, r_w, t, wave, rg, lane, valid, i):
-    """Lane ``lane``'s 16 B of the wave's unit at K step ``i``, nontemporal (a row group past n: read as 0, no
-    memory touched)."""
+    """Lane ``lane``'s 16 B of the wave's unit at K step ``i``, nontemporal (``wcm``; ``temporal``: cacheable) (a row
+    group past n: read as 0, no memory touched)."""
     if p.layout == "wave":  # (row group rg = t g + wave: its units contiguous at rg x steps)
         off = (rg * p.steps + i) * UNIT_WORDS + lane * 4
     off = valid.select(off, fx.Int32(OOB // 4))
     return fx.Vector(
-        bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+        bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=p.wcm)
     )
 
 

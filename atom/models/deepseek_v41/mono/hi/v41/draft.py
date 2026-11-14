@@ -676,6 +676,7 @@ def head_blocks(
     prefetch: int | None = None,
     kparts: int | None = None,
     spread: int = 0,
+    temporal: bool = False,
 ) -> list[Block]:
     """The draft's head after stage 2 (chained: its fold sums stage 2's pushed MoE partials): the fold and the
     collapse (``head.head_blocks``' seam), the last stage's ``norm`` (arg ``norm.g``: ``mtp.2.norm``), then
@@ -706,6 +707,7 @@ def head_blocks(
             lead=H.LEAD,
             kparts=kp,
             spread=spread,
+            temporal=temporal,
         )
     ]
 
@@ -717,7 +719,7 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
     from .recipe import CHAIN_PEER
     from .schedules import KEY_TP
 
-    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc))
+    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc), temporal=H.temporal("draft"))
     stages = [st for b in blocks for st in b.stages(sc)]
     # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
     program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)

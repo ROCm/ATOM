@@ -129,11 +129,33 @@ def dot_spread(sc, ctx: bool = False) -> int:
     return (SPREAD_CTX_TP if ctx else SPREAD_TP).get(sc.tp, 8)
 
 
+# The LM-head weight loads (``ArgmaxHead`` / ``MarkovHead(temporal=)``): nontemporal (as every weight stream) or
+# temporal, so the rank's 165 MB (TP8) shard may stay in the 256 MB MALL from the verify head to the draft head on the
+# same tensor (an experiment: whether NT loads allocate in the MALL on MI355X is not known here). "" / "0": both NT;
+# "verify", "draft" or "both" / "1": those heads' loads temporal. Env ATOM_DSV41_MONO_HI_HEAD_TEMPORAL overrides it.
+# The same bytes and arithmetic: only the cache policy bits differ
+HEAD_TEMPORAL = ""
+TEMPORAL_ENV = "ATOM_DSV41_MONO_HI_HEAD_TEMPORAL"
+
+
+def temporal(head: str) -> bool:
+    """Whether ``head`` ("verify" / "draft")'s weight loads are temporal (``HEAD_TEMPORAL``, the env's)."""
+    raw = os.environ.get(TEMPORAL_ENV, "").strip().lower() or HEAD_TEMPORAL
+    if raw in ("", "0", "off", "none"):
+        return False
+    if raw in ("1", "on", "both", "all"):
+        return True
+    if raw not in ("verify", "draft"):
+        raise ValueError(f"{TEMPORAL_ENV}={raw!r}: 0, verify, draft or both")
+    return raw == head
+
+
 def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout: str | None = None,
                 prefetch: int | None = None, lead: int | None = None, late: bool | None = None,
                 src: str | None = None, res_out: str | None = None,
                 rows: int | None = None, sample: bool = False, knobs: dict | None = None,
-                race: bool | str = False, kparts: int | None = None, spread: int = 0) -> list[Block]:  # fmt: skip
+                race: bool | str = False, kparts: int | None = None, spread: int = 0,
+                temporal: bool = False) -> list[Block]:  # fmt: skip
     """The head program's blocks for a TP-``tp`` rank. Where the fold's inputs come from (``src``): "plain" (args
     ``r_f``, ``gate_f``, ``ffn_out``: a chain tail's), "chain" (``chain=True``: the fold sums the previous launch's
     MoE partials, the last layer launched with ``push_moe``; the program needs ``peer_first=CHAIN_PEER``) or "fused"
@@ -206,6 +228,7 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
             race=race,
             kparts=_kparts(kparts, rows),
             spread=spread,
+            temporal=temporal,
         ),
     ]
 
@@ -306,7 +329,7 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
         [
             st
             for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, spread=0 if dyn else dot_spread(sc, ctx),
-                                 **knobs)
+                                 temporal=temporal("verify"), **knobs)
             for st in b.stages(sc)
         ]
     )

@@ -171,7 +171,7 @@ class MarkovHead(Block):
 
     def __init__(self, name: str, x: Channel, n: int, layout: str = "packed", prefetch: int = 16, lead: int = 4,
                  rank_r: int = 256, logits: Channel | None = None, kparts: int = 0,
-                 blocks: int | None = None, spread: int = 0):  # fmt: skip
+                 blocks: int | None = None, spread: int = 0, temporal: bool = False):  # fmt: skip
         # blocks: 128-id blocks a task; None: 1 while a rank's blocks fit one a CU, else 2 (V4.1 at TP2: 505 blocks of
         # its 64,640 ids, 253 tasks of 2)
         if blocks not in (None, 1, 2) or (blocks == 2 and logits is not None):
@@ -220,10 +220,12 @@ class MarkovHead(Block):
             raise ValueError(f"MarkovHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} in layout "
                              f"'wave', one block a task, the head's own dot")  # fmt: skip
         self.spread = spread
+        self.temporal = bool(temporal)  # the weight loads cacheable (``ArgmaxHead(temporal=)``)
 
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
-                   False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch, g=self.spread)  # fmt: skip
+                   False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch, g=self.spread,
+                   wcm=0 if self.temporal else ah.CM_NT)  # fmt: skip
         if (
             sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
         ):  # x in K slices where it does not fit whole
