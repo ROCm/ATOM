@@ -148,6 +148,11 @@ class _Engine:
     def _advance_idle_kv_transfer(self):
         raise AssertionError("no KV work was scripted")
 
+    def _wait_for_work(self):
+        # The base loop blocks here on an idle pass; the schedule advances
+        # time itself.
+        pass
+
     def _drain_kv_work_at_exit(self):
         return None
 
