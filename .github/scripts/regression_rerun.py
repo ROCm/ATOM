@@ -36,8 +36,8 @@ def _normalize_model_path(path):
     return path.removeprefix("/models/").rstrip("/")
 
 
-def _find_model_config(regression_entry, models):
-    """Match a regression entry to one load_variants() record.
+def _find_model_configs(regression_entry, models):
+    """Find every load_variants() record a regression entry could mean.
 
     summarize.py reports a result's benchmark_model_name, which is the catalog
     display of the variant (e.g. "DeepSeek-V4-Pro DPA DSpark"), as "model", and
@@ -45,7 +45,8 @@ def _find_model_config(regression_entry, models):
     a variant-level path) as "model_id". Results without benchmark_model_name
     are reported as "<checkpoint basename>[-mtp<N>]"; those match basename +
     suffix. Variants sharing a display are told apart by their concurrency
-    band. Returns None unless exactly one record matches.
+    band. Returns zero (unmapped), one (resolved) or several (ambiguous)
+    records; the caller reports the last two cases differently.
     """
     model_id = regression_entry.get("model_id", "")
     display = regression_entry.get("model", "")
@@ -66,7 +67,7 @@ def _find_model_config(regression_entry, models):
     conc = regression_entry.get("conc")
     if len(matches) > 1 and conc is not None:
         matches = [m for m in matches if m["conc_min"] <= conc <= m["conc_max"]]
-    return matches[0] if len(matches) == 1 else None
+    return matches
 
 
 def _regression_severity(r):
@@ -93,15 +94,33 @@ def generate_configs(report_path, models_path, top_n=3):
 
     configs = []
     for r in regressions:
-        model_cfg = _find_model_config(r, models)
-        if model_cfg is None:
-            print(
-                f"WARNING: No model config found for {r.get('model', '?')}, skipping",
-                file=sys.stderr,
-            )
+        isl, osl, conc = r.get("isl"), r.get("osl"), r.get("conc")
+        matches = _find_model_configs(r, models)
+        if len(matches) != 1:
+            if matches:
+                # Several variants share the display and their concurrency
+                # bands both contain the entry's concurrency (or the entry has
+                # no concurrency): a catalog error, not an unknown model.
+                candidates = "; ".join(
+                    f"{m['path']}{m.get('suffix', '')} "
+                    f"conc {m['conc_min']}-{m['conc_max']}"
+                    for m in matches
+                )
+                print(
+                    f"WARNING: ambiguous model config for {r.get('model', '?')} "
+                    f"at conc {conc if conc is not None else '?'}: "
+                    f"{len(matches)} candidates ({candidates}), skipping",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"WARNING: No model config found for {r.get('model', '?')}, "
+                    "skipping",
+                    file=sys.stderr,
+                )
             continue
 
-        isl, osl, conc = r.get("isl"), r.get("osl"), r.get("conc")
+        model_cfg = matches[0]
         if None in (isl, osl, conc):
             print(
                 f"WARNING: skipping {r.get('model', '?')} — missing isl/osl/conc",

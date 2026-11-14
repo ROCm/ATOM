@@ -5,8 +5,8 @@ The regression report's "model" is the catalog display name of the variant
 (benchmark-tmpl.yml stores it as benchmark_model_name), e.g.
 "DeepSeek-V4-Pro DPA DSpark", and "model_id" is the served checkpoint dir
 (e.g. "/models/deepseek-ai/DeepSeek-V4-Pro-DSpark"). The fixture entries below
-use catalog identities and workload shapes from the historical report;
-severity values are synthetic test data.
+use catalog identities and workload shapes modelled on the historical report;
+variant arguments are trimmed and the severity values are synthetic test data.
 """
 
 import json
@@ -27,9 +27,13 @@ import regression_rerun
 V4_SERVER = {"tp": 8, "kv_cache_dtype": "fp8"}
 EPLB_CFG = "--eplb-config '{\"num_redundant_experts\": 0}'"
 
-# Shapes copied from .github/benchmark/models.json: labels with spaces, a
-# variant-level "path" override (DSpark draft checkpoint), and two variants
-# that share a display name and suffix and differ only by concurrency band.
+# Shapes modelled on .github/benchmark/models.json, not copied from it: labels
+# with spaces, a variant-level "path" override (DSpark draft checkpoint), and
+# two variants that share a display name and suffix, differing by concurrency
+# band and args, are real catalog shapes. The fixture is partly synthetic:
+# it keeps a "DPA MTP3" V4-Pro variant that the current catalog no longer has
+# (V4-Pro ships "", -tbo, -dpa, -dpa-tbo and -dpa-dspark), and its model
+# config, extra_args and env_vars are trimmed to what these tests exercise.
 MODELS = {
     "default_scenarios": [],
     "models": [
@@ -203,29 +207,80 @@ def _record(models_path, suffix, path, conc):
 )
 def test_report_entries_resolve_to_their_variant(models_path, entry, suffix, path):
     models = catalog.load_variants(models_path)
-    found = regression_rerun._find_model_config(entry, models)
-    assert found is not None, entry["model"]
-    assert found == _record(models_path, suffix, path, entry["conc"])
+    matches = regression_rerun._find_model_configs(entry, models)
+    assert matches == [_record(models_path, suffix, path, entry["conc"])]
 
 
 def test_shared_display_name_resolves_by_concurrency_band(models_path):
     models = catalog.load_variants(models_path)
     for conc, extra in ((512, ""), (4096, " --gpu-memory-utilization 0.85")):
         entry = _reg(EPLB, V4, conc, -9.0, 9.0)
-        found = regression_rerun._find_model_config(entry, models)
-        assert found is not None
-        assert found["args"].endswith(EPLB_CFG + extra)
-    # Outside both bands, or without a concurrency, there is nothing to pick
-    # between two different recipes.
-    assert (
-        regression_rerun._find_model_config(_reg(EPLB, V4, 64, -9, 9), models) is None
-    )
+        matches = regression_rerun._find_model_configs(entry, models)
+        assert len(matches) == 1
+        assert matches[0]["args"].endswith(EPLB_CFG + extra)
+    # Outside both bands there is no candidate; without a concurrency there is
+    # nothing to pick between two different recipes.
+    assert regression_rerun._find_model_configs(_reg(EPLB, V4, 64, -9, 9), models) == []
     no_conc = {"model": EPLB, "model_id": V4}
-    assert regression_rerun._find_model_config(no_conc, models) is None
+    assert len(regression_rerun._find_model_configs(no_conc, models)) == 2
+
+
+def test_ambiguous_match_is_reported_separately_from_no_match(tmp_path, capsys):
+    # Two variants of one display whose concurrency bands overlap: no single
+    # record can be picked, which is a catalog error, not an unknown model.
+    models = {
+        "default_scenarios": [],
+        "models": [
+            {
+                "display": "Band-Model",
+                "path": "org/Band-Model",
+                "prefix": "band",
+                "runner": "cpu",
+                "variants": [
+                    {
+                        "label": "DPA",
+                        "suffix": "-dpa",
+                        "extra_args": "--first-band",
+                        "conc_min": 64,
+                        "conc_max": 512,
+                    },
+                    {
+                        "label": "DPA",
+                        "suffix": "-dpa",
+                        "extra_args": "--second-band",
+                        "conc_min": 256,
+                        "conc_max": 1024,
+                    },
+                ],
+            }
+        ],
+    }
+    models_path = tmp_path / "models.json"
+    models_path.write_text(json.dumps(models), encoding="utf-8")
+    report = _report(
+        tmp_path,
+        [
+            _reg("Band-Model DPA", "/models/org/Band-Model", 256, -9.0, 9.0),
+            _reg("Missing-Model", "/models/org/Missing-Model", 64, -8.0, 8.0),
+        ],
+    )
+
+    assert regression_rerun.generate_configs(report, str(models_path)) == []
+
+    err = capsys.readouterr().err
+    assert "ambiguous model config for Band-Model DPA at conc 256: 2 candidates" in err
+    # The candidates are named by checkpoint, suffix and band, so the
+    # overlapping catalog entries can be located and fixed.
+    assert "org/Band-Model-dpa conc 64-512" in err
+    assert "org/Band-Model-dpa conc 256-1024" in err
+    assert "No model config found for Missing-Model" in err
+    assert "No model config found for Band-Model DPA" not in err
 
 
 def test_9a0a5202_report_yields_rerun_cells(tmp_path, models_path):
-    # The nightly ran this with the default --top-n 3 and wrote 0 matrix cells.
+    # With the default --top-n 3, a report of this shape made the pre-fix
+    # resolver write 0 matrix cells: the synthetic severities put unmappable
+    # entries first, and the old code took top-N before resolution.
     report = _report(tmp_path, REGRESSIONS_9A0A5202)
     matrix = regression_rerun.generate_matrix(report, models_path, top_n=3)
 
@@ -275,16 +330,16 @@ def test_unusable_regressions_do_not_use_up_top_n(tmp_path, models_path, capsys)
 def test_unknown_or_mismatched_identity_is_not_mapped(models_path, display, model_id):
     models = catalog.load_variants(models_path)
     entry = _reg(display, model_id, 128, -10.0, 10.0)
-    assert regression_rerun._find_model_config(entry, models) is None
+    assert regression_rerun._find_model_configs(entry, models) == []
 
 
 @pytest.mark.parametrize("model_id", [V4_ID, V4, V4 + "/"])
 def test_hf_and_mounted_model_ids_match(models_path, model_id):
     models = catalog.load_variants(models_path)
     entry = _reg("DeepSeek-V4-Pro DPA", model_id, 128, -10.0, 10.0)
-    found = regression_rerun._find_model_config(entry, models)
-    assert found is not None
-    assert (found["path"], found["suffix"]) == (V4_ID, "-dpa")
+    matches = regression_rerun._find_model_configs(entry, models)
+    assert len(matches) == 1
+    assert (matches[0]["path"], matches[0]["suffix"]) == (V4_ID, "-dpa")
 
 
 @pytest.mark.parametrize(
@@ -301,10 +356,10 @@ def test_legacy_display_names_still_resolve(models_path, display, model_id, suff
     # "<path basename>[-mtp<N>]" (summarize._display_model).
     models = catalog.load_variants(models_path)
     entry = _reg(display, model_id, 4, -10.0, 10.0)
-    found = regression_rerun._find_model_config(entry, models)
-    assert found is not None
-    assert found["suffix"] == suffix
-    assert found["path"] == R1_ID
+    matches = regression_rerun._find_model_configs(entry, models)
+    assert len(matches) == 1
+    assert matches[0]["suffix"] == suffix
+    assert matches[0]["path"] == R1_ID
 
 
 def test_cells_sharing_prefix_and_suffix_get_distinct_prefixes(tmp_path, models_path):
@@ -368,9 +423,9 @@ def test_every_real_catalog_variant_resolves_to_itself():
     models = catalog.load_variants(CATALOG)
     for v in models:
         entry = _reg(v["display"], "/models/" + v["path"], v["conc_max"], -10.0, 10.0)
-        found = regression_rerun._find_model_config(entry, models)
-        assert found is not None, v["display"]
-        assert (found["path"], found["suffix"], found["args"]) == (
+        matches = regression_rerun._find_model_configs(entry, models)
+        assert len(matches) == 1, v["display"]
+        assert (matches[0]["path"], matches[0]["suffix"], matches[0]["args"]) == (
             v["path"],
             v["suffix"],
             v["args"],
