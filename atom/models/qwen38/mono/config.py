@@ -134,7 +134,7 @@ def _quark_mxfp4(atom_config) -> bool:
 
 
 def _cache_formats(atom_config) -> tuple[str, str]:
-    """(K / V, index) cache formats as ATOM's QSA resolves them (``qwen4_exp.ops.qsa.qsa_cache_formats``)."""
+    """(K / V, index) cache formats as ATOM's QSA resolves them (``qwen4_exp.qsa_cache_rules.qsa_cache_formats``)."""
     kv = getattr(atom_config, "kv_cache_dtype", "bf16") or "bf16"
     kv = "bf16" if kv in ("auto", "bfloat16") else kv
     index = getattr(atom_config, "index_cache_dtype", None) or kv

@@ -54,7 +54,6 @@ from atom.model_ops.qwen4_exp.ops.gated import (
 )
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
-    qsa_cache_formats,
     qsa_cache_row_layout,
     qsa_compress_groups,
     qsa_expand_block_indices,
@@ -63,6 +62,12 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
     qsa_store_rows,
+)
+from atom.model_ops.qwen4_exp.qsa_cache_rules import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    qsa_cache_formats,
+    qsa_row_space,
 )
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
@@ -397,14 +402,13 @@ class Qwen4ExpAttention(nn.Module):
         # The MTP draft layer sits past the target stack. It keeps BF16 caches
         # under quantized target caches, in a row space of its own: an FP8
         # draft KV costs ~3.5% of the real acceptance length, a BF16 one none.
-        self.qsa_row_space = "qsa"
-        if (
-            layer_num >= int(config.num_hidden_layers)
-            and envs.ATOM_QSA_DRAFT_KV_BF16
-            and (self.kv_format, self.index_format) != ("bf16", "bf16")
-        ):
+        self.qsa_row_space = (
+            QSA_ROWS
+            if is_plugin_mode()
+            else qsa_row_space(atom_config, layer_num, int(config.num_hidden_layers))
+        )
+        if self.qsa_row_space == QSA_DRAFT_ROWS:
             self.kv_format = self.index_format = "bf16"
-            self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
 
     def bind_caches(

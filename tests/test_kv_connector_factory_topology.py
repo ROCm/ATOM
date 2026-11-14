@@ -68,6 +68,16 @@ def test_names_resolve_through_aliases():
     ]
 
 
+def test_the_lmcache_tiers_alone_read_page_images(pool_backend):
+    for spelling in ("LMCacheConnectorV1", " LMCache_MP", "LMCacheMPConnector"):
+        name = KVConnectorFactory.canonical_name(spelling)
+        assert KVConnectorFactory.reads_page_images(name)
+    # An offload tier, but not one that carries the image.
+    assert KVConnectorFactory.is_offload_backend("mooncake_store")
+    assert not KVConnectorFactory.reads_page_images("mooncake_store")
+    assert not KVConnectorFactory.reads_page_images("pool_probe")  # undeclared
+
+
 def test_multi_expands_into_its_subs_each_seeing_its_own_config():
     mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
     pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}

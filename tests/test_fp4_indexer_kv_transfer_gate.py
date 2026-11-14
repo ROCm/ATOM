@@ -235,6 +235,7 @@ def test_region_map_verdict_comes_from_the_registration():
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
             KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+            KVConnectorFactory._reads_page_images.pop(name, None)
 
 
 def test_fp4_service_comes_from_the_registration_not_the_name():
@@ -293,6 +294,7 @@ def test_fp4_service_comes_from_the_registration_not_the_name():
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
             KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+            KVConnectorFactory._reads_page_images.pop(name, None)
 
 
 def test_fp4_gate_reads_the_shared_connector_predicate():

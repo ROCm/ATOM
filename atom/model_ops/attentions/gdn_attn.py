@@ -39,6 +39,14 @@ from .aiter_attention import (
     _mtp_prepare_decode_metadata_kernel,
     kv_indices_generate_triton,
 )
+from .pool_layout.entry_arena import published_bytes_for
+from .pool_layout.layer_major_page_unit_geometry import (
+    layer_major_page_unit_bases,
+    layer_major_page_unit_regions,
+    layer_major_page_unit_segments,
+    layer_major_page_unit_stream_sizes,
+    layer_major_page_unit_views,
+)
 from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
@@ -1693,9 +1701,8 @@ class GDNStateMixin(PoolRowsMixin):
 
 # ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
 # Turning PAGE copies on for every subclass would aim the image at MHA
-# regions. Qwen4Exp inherits the builder and keeps its state on a QSA pool,
-# which this geometry does not address. The set is only the hybrids whose
-# full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+# regions. Subclasses answer `_wants_paged_checkpoints` themselves. The set is
+# only the hybrids whose full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
 #
 # These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
 # ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
@@ -1704,6 +1711,15 @@ class GDNStateMixin(PoolRowsMixin):
 GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
+
+
+def paged_checkpoints_deployable(config) -> bool:
+    """False under pipeline parallelism or RapidServe (`_uses_paged_checkpoints`)."""
+
+    return not (
+        int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1
+        or getattr(config, "enable_rapidserve", False)
+    )
 
 
 def draft_kv_write_slots(
@@ -1771,10 +1787,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """
 
         config = self.model_runner.config
-        if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1 or getattr(
-            config, "enable_rapidserve", False
-        ):
+        if not paged_checkpoints_deployable(config):
             return False
+        return self._wants_paged_checkpoints(config)
+
+    def _wants_paged_checkpoints(self, config) -> bool:
         from atom.utils import get_hf_text_config
 
         text = get_hf_text_config(config.hf_config)
@@ -1783,8 +1800,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def state_transfer(self) -> StateTransfer:
         """PAGE image for Qwen GDN hybrids; fork for everyone else.
 
-        Qwen4Exp inherits this builder and stays on fork: its model type is
-        not in the set, and its QSA pool is not the MHA destination below.
         Pipeline parallelism and RapidServe stay on fork so sizing does not
         refuse to start.
         """
@@ -1823,7 +1838,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:
-        """Bytes of one MHA page that a transfer actually publishes.
+        """Bytes of one PAGE block that a transfer actually publishes.
 
         ``ModelRunner`` sizes the checkpoint unit from this builder's own PAGE
         ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
@@ -1848,99 +1863,88 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         if not self._uses_paged_checkpoints():
             return None
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_published_page_bytes,
-        )
-
-        published = mha_published_page_bytes(self._declare_kv_pools().values())
+        published = self._published_page_unit_bytes()
         if published <= 0:
-            raise RuntimeError("GDN PAGE checkpoint has no published MHA bytes")
+            raise RuntimeError("GDN PAGE checkpoint has no published PAGE bytes")
         return published
 
+    def _published_page_unit_bytes(self) -> int:
+        """Bytes one block publishes; asked at sizing, before any pool exists."""
+        return sum(
+            published_bytes_for(group)
+            for pool in self._declare_kv_pools().values()
+            for group in pool.field_groups
+        )
+
+    def _page_unit_pools(self) -> list:
+        """Pools holding the PAGE image, in published order. A builder that
+        keeps its pages elsewhere overrides this and
+        ``_published_page_unit_bytes``."""
+        return list(self.kv_pools.values())
+
+    def release_kv_pools(self) -> None:
+        # The region cache is keyed on the pool objects.
+        self._page_unit_region_cache = None
+        super().release_kv_pools()
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Where a scheduler block sits in the MHA pool.
+        """Where a scheduler block sits in the pools `_page_unit_pools` names.
 
         The mixin raises: it knows the state planes, not this pool. The
         addresses have to match ``get_kv_transfer_tensors`` or the copy and
         ``lmcache_mp`` would name different bytes.
         """
-
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_regions,
-        )
-
-        pools = list(self.kv_pools.values())
-        key = tuple(
-            (
-                tensor.data_ptr(),
-                tuple(tensor.shape),
-                tuple(tensor.stride()),
-                tensor.element_size(),
-            )
-            for pool in pools
-            for _, tensor in pool.region_tensors()
-        )
+        pools = self._page_unit_pools()
+        # Keyed on the pool objects, whose regions do not move while they are
+        # allocated (`release_kv_pools` drops it).
         cached = getattr(self, "_page_unit_region_cache", None)
-        if cached is not None and cached[0] == key:
+        if (
+            cached is not None
+            and len(cached[0]) == len(pools)
+            and all(a is b for a, b in zip(cached[0], pools))
+        ):
             return cached[1]
-        regions = mha_page_unit_regions(pools)
+        key = tuple(pools)
+        regions = layer_major_page_unit_regions(pools)
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
         owned = int(regions[1].sum())
         if spec is not None and owned != spec.page_unit_bytes:
             raise RuntimeError(
-                f"a PAGE unit is {spec.page_unit_bytes} B but the MHA regions "
+                f"a PAGE unit is {spec.page_unit_bytes} B but the published regions "
                 f"cover {owned} B"
             )
         self._page_unit_region_cache = (key, regions)
         return regions
 
     def _page_unit_bases(self, unit_ids):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_bases,
-        )
-
-        return mha_page_unit_bases(self._page_unit_regions(), unit_ids)
+        return layer_major_page_unit_bases(self._page_unit_regions(), unit_ids)
 
     def _page_unit_stream_sizes(self, units: int):
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_stream_sizes,
-        )
-
-        return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
+        return layer_major_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def page_unit_views(self, unit_ids):
-        """MHA views of one checkpoint image, for the in-process state tier.
+        """Views of one checkpoint image, for the in-process state tier.
 
         The tier packs these bytes and unpacks them into ``state_entry_views``.
         The copy plan already wrote the slot stream across these regions, so
         the two orders are the same byte sequence once the tail is trimmed to
         ``image_bytes``.
         """
-
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_views,
-        )
-
         self._page_unit_regions()
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
         image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
-        return mha_page_unit_views(
-            self.kv_pools.values(), unit_ids, image_bytes=image_bytes
+        return layer_major_page_unit_views(
+            self._page_unit_pools(), unit_ids, image_bytes=image_bytes
         )
 
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
-
-        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
-            mha_page_unit_segments,
-        )
-
         regions = self._page_unit_regions()
         spec = self.model_runner.state_runtime.checkpoint_spec
-        first_region = next(iter(self.kv_pools.values())).region_tensors()[0][1]
-        return mha_page_unit_segments(
+        first_region = self._page_unit_pools()[0].region_tensors()[0][1]
+        return layer_major_page_unit_segments(
             regions,
             unit_ids,
             entries=int(first_region.shape[0]),
@@ -1950,19 +1954,30 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def get_kv_transfer_tensors(self):
         """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
 
-        transfer = super().get_kv_transfer_tensors()
+        return self._with_paged_state_contract(super().get_kv_transfer_tensors())
+
+    def _with_paged_state_contract(self, transfer):
+        """Attach the checkpoint contract to `transfer`'s PAGE regions, checked
+        against the pools' declared offsets (``region_layout``): the published
+        views and ``_page_unit_regions`` would move together."""
+
         if transfer is None or not self._uses_paged_checkpoints():
             return transfer
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
             return transfer
-        bases, sizes = self._page_unit_regions()
+        bases, _ = self._page_unit_regions()
         count = len(bases)
         published = [
             (page.region.base_addr, page.region.unit_bytes)
             for page in transfer.pages[:count]
         ]
-        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+        expected = [
+            region
+            for pool in self._page_unit_pools()
+            for region in pool.region_layout()
+        ]
+        if published != expected:
             raise RuntimeError(
                 "GDN transfer regions do not match its checkpoint PAGE unit: "
                 f"{len(transfer.pages)} published, {count} in a unit"

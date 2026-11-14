@@ -24,7 +24,9 @@ from typing import Any
 
 import torch
 
-from atom.utils import envs
+from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_page_segments
+from atom.utils import envs, get_hf_text_config
+from atom.utils.selector import Family, attn_family
 
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
@@ -65,7 +67,7 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
 # `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
-# `Family.GDN`, but note the attribute skew: the guard below reads
+# `Family.GDN` or `Family.QSA_GDN`, but note the attribute skew: the guard below reads
 # `hf_config.model_type` while `attn_family` reads the text config. On the
 # native path they agree only because `get_hf_config` flattens the text type
 # up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
@@ -79,7 +81,13 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 # delivered only through transfer_tensors.block_regions, so the dense codec --
 # which builds from per-layer KVCacheTensor K/V -- would silently drop it.
 _GDN_LINEAR_MODEL_TYPES = frozenset(
-    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+    {
+        "qwen3_next",
+        "qwen3_next_mtp",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "qwen4_exp_text",
+    }
 )
 
 # Layouts that own a tier for a model's per-request *recurrent* state.
@@ -422,6 +430,8 @@ def build_page_namespace(
     index_layout = getattr(config, "index_cache_layout", None)
     if index_layout is not None:
         document["index_cache_layout"] = index_layout
+    if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
+        document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,
         sort_keys=True,

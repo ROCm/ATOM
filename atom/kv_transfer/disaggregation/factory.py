@@ -97,6 +97,10 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # Whether a backend stores and restores a PAGE checkpoint image, the
+    # per-request state behind a hybrid's pages. Absent means no: a model
+    # whose state rides that image refuses it.
+    _reads_page_images: ClassVar[dict[str, bool]] = {}
     # Whether a backend's tier is one store every DP rank reads (an LMCache MP
     # server, Mooncake Store), not one per rank. Absent means per rank.
     _shared_tier: ClassVar[dict[str, bool]] = {}
@@ -118,6 +122,7 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        reads_page_images: bool = False,
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
     ) -> None:
@@ -131,6 +136,8 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            reads_page_images: The backend carries PAGE checkpoint images
+                (`reads_page_images`).
             reads_block_regions: Whether this backend reads the PAGE region
                 map. A predicate of the engine config is asked when the answer
                 depends on the model. The default is True.
@@ -168,6 +175,7 @@ class KVConnectorFactory:
             )
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._reads_page_images[name] = bool(reads_page_images)
         cls._shared_tier[name] = bool(shared_tier)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
@@ -197,6 +205,13 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def reads_page_images(cls, name: str) -> bool:
+        """Whether the registered backend ``name`` (canonical) carries PAGE
+        checkpoint images."""
+
+        return cls._reads_page_images.get(name, False)
 
     @classmethod
     def offload_tier(cls, config: Any) -> OffloadTierProfile:

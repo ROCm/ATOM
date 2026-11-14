@@ -1207,6 +1207,26 @@ def test_dense_codec_fp8_indexer_layout_is_unchanged():
     )
 
 
+def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.config import KVCacheTensor
+
+    blocks = 4
+    k = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
+    comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
+    qsa = KVCacheTensor(layer_num=0, k_cache=k, v_cache=v, extra_planes=(raw, comp))
+    plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
+    qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
+    plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
+    assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
+    assert plain_codec.bytes_per_block == (8 + 8) * 2
+
+
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     import torch
 

@@ -196,6 +196,28 @@ def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
+def _qwen38_config(*, image_input: bool):
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen4_exp"
+    config.hf_config.text_config = SimpleNamespace(
+        model_type="qwen4_exp_text", num_attention_heads=32
+    )
+    config.multimodal_config = SimpleNamespace() if image_input else None
+    return config
+
+
+def test_qwen38_offload_uses_the_qwen_tier():
+    # Text config, not the wrapper name: `get_hf_text_config` peels it.
+    # `dense` must still be refused, or QSA KV comes back over a stale slot.
+    config = _qwen38_config(image_input=False)
+
+    assert offcfg.select_offload_layout(config) == "qwen"
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+
+
 def test_qwen_offload_classes_inherit_the_k3_tier():
     from atom.kv_transfer.offload._offload_common import StateOffloadFace
     from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
@@ -229,6 +251,60 @@ def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
     config.kv_transfer_config = {"offload_layout": "dense"}
     with pytest.raises(ValueError, match="owns no tier"):
         offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+def test_qwen38_page_namespace_separates_image_input():
+    """With image input Qwen3.8 caches `rope_positions` too, so one checkpoint
+    stores two byte layouts; a shared tier must not read one as the other."""
+    text_only = offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+    images = offcfg.build_page_namespace(
+        _qwen38_config(image_input=True), _lmcache_config(), 1
+    )
+    assert text_only != images
+    assert text_only == offcfg.build_page_namespace(
+        _qwen38_config(image_input=False), _lmcache_config(), 1
+    )
+
+
+def test_qwen38_page_namespace_separates_the_draft_cache_format(monkeypatch):
+    """BF16 draft rows under FP8 target rows add `*_draft` PAGE fields; a
+    restart that flips the draft format must not read the other block size."""
+    config = _qwen38_config(image_input=False)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    bf16_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    target_draft = offcfg.build_page_namespace(config, _lmcache_config(), 1)
+    assert bf16_draft != target_draft
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_draft_cache_format_leaves_other_page_namespaces_unchanged(
+    monkeypatch, model_type
+):
+    config = _config()
+    if model_type is not None:
+        config.hf_config.compress_ratios = None
+        config.hf_config.model_type = model_type
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "1")
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", "0")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe_text"])
+def test_image_input_leaves_other_page_namespaces_unchanged(model_type):
+    # Their segment set does not depend on it: keying it would only split a
+    # tier that text-only and image servers can share, and orphan what is
+    # already stored.
+    config = _config()
+    if model_type is not None:
+        config.hf_config.compress_ratios = None
+        config.hf_config.model_type = model_type
+    before = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.multimodal_config = SimpleNamespace()
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == before
 
 
 @pytest.mark.parametrize(

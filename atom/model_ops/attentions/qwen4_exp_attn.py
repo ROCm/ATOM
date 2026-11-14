@@ -23,22 +23,47 @@ The physical block size matches the scheduler's (`block_ratio == 1`), so each
 block table entry directly addresses a page in both main and index-key caches.
 """
 
+import logging
+import math
 from dataclasses import dataclass, replace
+from functools import cached_property
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
+from atom.kv_transfer.disaggregation.page_region import page_region
+from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_ops.fla_ops.gdn_flydsl import select_policy
 from atom.model_ops.qwen4_exp.ops.qsa import (
-    qsa_cache_formats,
     qsa_cache_row_layout,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
 )
-from atom.utils import CpuGpuBuffer
+from atom.model_ops.qwen4_exp.qsa_cache_rules import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    check_kv_transfer,
+    kv_transfer_leaves,
+    qsa_cache_formats,
+    qsa_caches_rope_positions,
+    qsa_paged_layout_id,
+)
+from atom.utils import CpuGpuBuffer, envs
 
-from .gdn_attn import GDNAttentionBackend, GDNAttentionMetadataBuilder
-from .pool_layout.entry_arena import EntryField, LayerMajorArena, entry_bytes_for
+from .gdn_attn import (
+    LINEAR_STATE_ROWS,
+    GDNAttentionBackend,
+    GDNAttentionMetadataBuilder,
+    paged_checkpoints_deployable,
+)
+from .pool_layout.entry_arena import (
+    EntryField,
+    LayerMajorArena,
+    entry_bytes_for,
+    published_bytes_for,
+)
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .token_layout.batch_ids import build_batch_ids
 
@@ -46,14 +71,21 @@ from .token_layout.batch_ids import build_batch_ids
 # recurrent state's lifetime and multiplicity, so it shares its index space.
 PLE_STATE_SLOT_CLASS = STATE_SLOT_CLASS
 
-# The QSA layers' row space. Named rather than derived from
-# `layer_id // full_attention_interval`, because the row a layer holds is the
-# order it was bound in: on a non-first PP stage the global layer numbers do
-# not start at zero, and that arithmetic would index past the pool.
-QSA_ROWS = "qsa"
-# MTP draft QSA layers that keep BF16 caches while the target's are quantized
-# (`ATOM_QSA_DRAFT_KV_BF16=1`): their own rows, their own `*_draft` fields.
-QSA_DRAFT_ROWS = "qsa_draft"
+logger = logging.getLogger("atom")
+
+
+class _PlePlane(NamedTuple):
+    """One PLE state tensor: `shape` is a single slot's, without the slot dim."""
+
+    name: str
+    tag: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    fill: int
+
+    @property
+    def slot_bytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
 
 
 @dataclass
@@ -123,9 +155,12 @@ class Qwen4ExpBackend(GDNAttentionBackend):
         if config.enable_tbo or config.enable_tbo_decode:
             # QSA/PLE metadata are not sliced by the shared ubatch dispatcher.
             raise ValueError("Qwen QSA/PLE metadata do not support TBO slicing")
-        if config.kv_transfer_config:
+        check_kv_transfer(config)
+        if config.kv_transfer_config and not paged_checkpoints_deployable(config):
+            # Restoring QSA pages from fork slots would leave GDN and PLE stale.
             raise ValueError(
-                "Qwen KV transfer/offload requires QSA side caches and PLE state"
+                "Qwen3.8 offload needs PAGE checkpoints; pipeline parallelism "
+                "and RapidServe stay on fork slots"
             )
         if len(set(config.hf_config.ple_layer_ids or [])) > 1:
             raise ValueError("Qwen backend currently allocates state for one PLE layer")
@@ -156,20 +191,48 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     BACKEND = Qwen4ExpBackend
 
+    def _gdn_flydsl_policy(self, module, state):
+        attention = module.impl
+        return select_policy(
+            allowed=attention.allow_aiter_flydsl,
+            replayssm=self.replayssm,
+            lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
+            state=state,
+            activation_dtype=attention.dt_bias.dtype,
+        )
+
+    @cached_property
+    def _ssm_storage(self) -> str:
+        """`vk` when FlyDSL decode keeps the SSM state transposed, else `kv`.
+
+        Asked of a one-slot probe: the layout id is spelled before any state
+        is allocated.
+        """
+        _, shape_v = self._state_shape_for_runner()
+        _, dtype_v = self._state_dtypes()
+        probe = torch.empty((1, *shape_v), dtype=dtype_v, device=self.device)
+        transposed = {
+            self._gdn_flydsl_policy(module, probe).decode
+            for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
+            if hasattr(module, "base_linear_attention")
+        }
+        if len(transposed) > 1:
+            raise RuntimeError("GDN layers disagree on the SSM storage order")
+        return "vk" if True in transposed else "kv"
+
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
         if hasattr(module, "base_linear_attention"):
-            from atom.model_ops.fla_ops.gdn_flydsl import select_policy
-            from atom.utils import envs
-
             attention = module.impl
-            policy = select_policy(
-                allowed=attention.allow_aiter_flydsl,
-                replayssm=self.replayssm,
-                lossy_decode=envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST,
-                state=cache.v_cache,
-                activation_dtype=attention.dt_bias.dtype,
-            )
+            policy = self._gdn_flydsl_policy(module, cache.v_cache)
+            if self._uses_paged_checkpoints() and policy.decode != (
+                self._ssm_storage == "vk"
+            ):
+                raise RuntimeError(
+                    "GDN SSM state is bound "
+                    f"{'VK' if policy.decode else 'KV'} but the checkpoint "
+                    f"layout id says ssm_storage={self._ssm_storage}"
+                )
             attention.gdn_flydsl_policy = policy
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
@@ -184,13 +247,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
         hf = model_runner.config.hf_config
-        # Image/video requests give mRoPE three genuinely different position
-        # rows, and then a compressed key's group position cannot be recomputed
-        # arithmetically. Cache the per-token axes only when the engine can
-        # actually be handed an image -- it costs ~1.4 GB of the paged budget.
-        self.cache_rope_positions = (
-            getattr(model_runner.config, "multimodal_config", None) is not None
-        )
+        self.cache_rope_positions = qsa_caches_rope_positions(model_runner.config)
         self.ngram_context_len = int(hf.ngram_size) - 1 if hf.ple_layer_ids else 0
         eos = hf.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
@@ -260,13 +317,32 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def _compress_ratio(self) -> int:
         return int(self.model_runner.config.hf_config.indexer_compress_ratio)
 
-    def _ple_state_shape(self) -> tuple[int, int]:
+    @cached_property
+    def _ple_planes(self) -> list[_PlePlane]:
+        """One PLE slot's tensors, in checkpoint order; empty without PLE."""
         hf = self.model_runner.config.hf_config
+        if not getattr(hf, "ple_layer_ids", None):
+            return []
         state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
         channels = int(hf.hidden_size) * int(hf.hc_count)
         # The PLE convolution is NOT tensor-parallel: every rank runs the full
         # hc_count * hidden width, matching the reference's tp_world_size=1.
-        return state_len + self.num_spec, channels
+        return [
+            _PlePlane(
+                "ple_conv_state",
+                "conv",
+                (channels, state_len + self.num_spec),
+                self.model_runner.config.torch_dtype,
+                0,
+            ),
+            _PlePlane(
+                "ple_ngram_state",
+                "ngram",
+                (self.ngram_context_len + self.num_spec,),
+                torch.int64,
+                self.eos_token_id,
+            ),
+        ]
 
     # ------------------------------------------------------------------ #
     # Pool sizing and allocation                                          #
@@ -352,14 +428,13 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
     def _ple_state_spec(self) -> SubPoolSpec | None:
         """Both PLE windows share one state slot; absent when there is no PLE."""
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
+        planes = self._ple_planes
+        if not planes:
             return None
-        state_len, channels = self._ple_state_shape()
-        entry = state_len * channels * self.model_runner.config.torch_dtype.itemsize
-        entry += (int(hf.ngram_size) - 1 + self.num_spec) * torch.int64.itemsize
         return state_pool(
-            PLE_STATE_SLOT_CLASS, entry, entries_per_req=self.slots_per_req()
+            PLE_STATE_SLOT_CLASS,
+            sum(plane.slot_bytes for plane in planes),
+            entries_per_req=self.slots_per_req(),
         )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -370,6 +445,70 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         if ple_spec is not None:
             specs.append(ple_spec)
         return specs
+
+    def _wants_paged_checkpoints(self, config) -> bool:
+        # No model-type test: only `Qwen4ExpBackend` builds this class, and
+        # its `validate_config` admits only tiers that read PAGE images.
+        return bool(kv_transfer_leaves(config))
+
+    def state_transfer(self):
+        transfer = super().state_transfer()
+        if not transfer.copies:
+            return transfer
+        # What the parent's id cannot see: the PAGE fields, the SSM's physical
+        # order and the PLE planes.
+        planes = self._ple_planes
+        layout_id = qsa_paged_layout_id(
+            transfer.paged_layout_id,
+            self._ssm_storage,
+            [(f.name, f.shape, f.dtype) for f in self._qsa_fields()],
+            [(p.tag, p.shape, p.dtype) for p in planes],
+        )
+        if planes and transfer.readable_midstep:
+            # Nothing snapshots the PLE windows inside a forward, so prefill
+            # stays cut onto rungs.
+            logger.warning(
+                "ATOM_GDN_STATE_MIDSTEP=1 does not apply to Qwen3.8: its PLE "
+                "windows are checkpointed only where a forward ends"
+            )
+            transfer = replace(
+                transfer, readable_midstep=False, midstep_grid=0, midstep_min_offset=0
+            )
+        return replace(transfer, paged_layout_id=layout_id)
+
+    def _checkpoint_plane_shapes(self) -> list[tuple[int, int]]:
+        return super()._checkpoint_plane_shapes() + [
+            (plane.slot_bytes, 1) for plane in self._ple_planes
+        ]
+
+    def _ple_tensors(self) -> list[torch.Tensor]:
+        """The runner's PLE tensors in `_ple_planes` order; empty before allocation."""
+        states = [getattr(self.model_runner, p.name, None) for p in self._ple_planes]
+        return [] if all(state is None for state in states) else states
+
+    def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
+        # GDN planes are `(layers, slots, ...)`. PLE is allocated `(slots, ...)`.
+        return super()._checkpoint_plane_tensors() + [
+            state.unsqueeze(0) for state in self._ple_tensors()
+        ]
+
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        # The parent range-checks `slot`; PLE shares its slot class.
+        return super().state_entry_views(slot) + [
+            state[slot : slot + 1] for state in self._ple_tensors()
+        ]
+
+    # The parent's PAGE contract reads the image through these two hooks.
+
+    def _published_page_unit_bytes(self) -> int:
+        # Asked at sizing, before the arena exists.
+        return published_bytes_for(self._qsa_fields())
+
+    def _page_unit_pools(self) -> list:
+        arena = getattr(self, "qsa_arena", None)
+        if arena is None:
+            raise RuntimeError("Qwen3.8 PAGE checkpoint has no QSA arena")
+        return [arena]
 
     def allocate_kv_cache_tensors(self, *, blocks: int, buf) -> dict:
         """Back every paged field with the runner's shared allocation."""
@@ -387,83 +526,35 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         super().release_kv_pools()
 
     def get_kv_transfer_tensors(self):
-        # Expose all regions for diagnostics/lifecycle consumers. External
-        # transfer is rejected by config until the connector owns this layout.
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferRegion,
-            KVTransferTensors,
-            PageRegion,
-        )
-
+        """QSA PAGE regions; GDN and PLE ride the checkpoint image."""
         arena = getattr(self, "qsa_arena", None)
         if arena is None:
             return None
-
-        def region(tensor, role):
-            return KVTransferRegion(
-                base_addr=tensor.data_ptr(),
-                total_bytes=tensor.numel() * tensor.element_size(),
-                unit_bytes=tensor.stride(0) * tensor.element_size(),
-                semantic_role=role,
-            )
-
-        blocks = [
-            region(tensor, f"qsa.{field.name}.{layer}")
-            for field in arena.fields
-            for layer, tensor in enumerate(arena.view(field.name))
-        ]
-        runner = self.model_runner
-        slots = [
-            region(tensor, f"gdn.{name}.{layer}")
-            for name in ("mamba_k_cache", "mamba_v_cache")
-            for layer, tensor in enumerate(getattr(runner, name, ()))
-        ]
-        for name, role in (
-            ("ple_conv_state", "ple.conv"),
-            ("ple_ngram_state", "ple.ngram"),
-        ):
-            ple = getattr(runner, name, None)
-            if ple is not None:
-                slots.append(region(ple, role))
-        # Addresses only: no byte views, so LMCache MP refuses this layout.
-        return KVTransferTensors(
-            pages=[PageRegion(block) for block in blocks], slot_regions=slots
+        transfer = KVTransferTensors(
+            pages=[
+                page_region(tensor, semantic_role=role)
+                for role, tensor in arena.region_tensors()
+            ],
         )
+        return self._with_paged_state_contract(transfer)
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         caches = super().allocate_per_req_cache(entries)
-        hf = self.model_runner.config.hf_config
-        if not getattr(hf, "ple_layer_ids", None):
-            return caches
-        state_len, channels = self._ple_state_shape()
-        caches["ple_conv_state"] = torch.zeros(
-            entries.get(PLE_STATE_SLOT_CLASS, 0),
-            channels,
-            state_len,
-            dtype=self.model_runner.config.torch_dtype,
-            device="cuda",
-        )
-        caches["ple_ngram_state"] = torch.full(
-            (
-                entries.get(PLE_STATE_SLOT_CLASS, 0),
-                self.ngram_context_len + self.num_spec,
-            ),
-            self.eos_token_id,
-            dtype=torch.int64,
-            device="cuda",
-        )
+        slots = entries.get(PLE_STATE_SLOT_CLASS, 0)
+        for plane in self._ple_planes:
+            caches[plane.name] = torch.full(
+                (slots, *plane.shape), plane.fill, dtype=plane.dtype, device="cuda"
+            )
         return caches
 
     def relocate_state_slots(self, pairs) -> None:
         super().relocate_state_slots(pairs)
         destinations, sources = [], []
         # The shared pool relocates individual slots, never request groups.
-        for name in ("ple_conv_state", "ple_ngram_state"):
-            state = getattr(self.model_runner, name, None)
-            if state is not None:
-                for src, dst in pairs:
-                    destinations.append(state[dst : dst + 1])
-                    sources.append(state[src : src + 1])
+        for state in self._ple_tensors():
+            for src, dst in pairs:
+                destinations.append(state[dst : dst + 1])
+                sources.append(state[src : src + 1])
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
@@ -485,22 +576,31 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return arena.view(name)[row] if name in names else None
 
         key, value = optional("k"), optional("v")
+        k_scale, v_scale = optional("k_scale"), optional("v_scale")
+        raw, compressed = optional("index_raw"), optional("index_compressed")
+        rope = optional("rope_positions")
+        compressed_scale = optional("index_compressed_scale")
         module.bind_caches(
             key,
             value,
-            optional("index_raw"),
-            optional("index_compressed"),
-            optional("rope_positions"),
-            k_scale_cache=optional("k_scale"),
-            v_scale_cache=optional("v_scale"),
-            compressed_key_scale=optional("index_compressed_scale"),
+            raw,
+            compressed,
+            rope,
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=None,
-            v_scale=None,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            extra_planes=tuple(
+                plane
+                for plane in (raw, compressed, rope, compressed_scale)
+                if plane is not None
+            ),
         )
 
     # ------------------------------------------------------------------ #

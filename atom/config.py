@@ -70,6 +70,9 @@ class KVCacheTensor:
     # without their exponents, and every index it computes stays in bounds while
     # doing it. Whatever moves one must move the other.
     index_scale: torch.Tensor | None = None
+    # Per-block planes a layer's pages carry beyond the fields above, in stored
+    # byte order.
+    extra_planes: tuple[torch.Tensor, ...] = ()
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in
