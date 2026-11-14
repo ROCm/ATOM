@@ -17,7 +17,11 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
-from atom.utils.region_graph import eager_region
+from atom.utils.region_graph import (
+    eager_region,
+    on_scheduled_rows,
+    padded_prefill_rows,
+)
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -1005,8 +1009,30 @@ def fake_(
 # This way, although attention operation is complicated,
 # we can still capture the model's computation graph as a full-graph
 @mark_spliting_op(is_custom=True, gen_fake=fake_, mutates_args=[])
-@eager_region()
 def unified_attention_with_output_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    """The attention as one TR-graph break, or an MLA layer's recorded prefill
+    split (`MLAAttention.records_prefill_split`)."""
+    if use_mla:
+        atom_config = get_current_atom_config()
+        bound = atom_config.compilation_config.static_forward_context[layer_name]
+        impl = getattr(bound, "impl", bound)
+        records_split = getattr(impl, "records_prefill_split", None)
+        if records_split is not None and records_split():
+            return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
+    return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
+
+
+@eager_region()
+def _attention_region(
     q: torch.Tensor,
     q_scale: torch.Tensor | None,
     k: torch.Tensor,
@@ -1018,20 +1044,25 @@ def unified_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    if use_mla:
-        return self.impl.forward(
-            query=q,
-            k_nope=k,
-            k_rope=v,
-            positions=positions,
-            q_scale=q_scale,
-        )
-    elif getattr(self, "sp_columns", None) is not None:
+    if not use_mla and getattr(self, "sp_columns", None) is not None:
         # Ulysses: trade this rank's token chunk for its head slice around the
         # unchanged impl. Inside the custom op, so the collectives stay opaque.
-        out, rows = ulysses_attention(self, q, k, v, positions, q_scale, qkv)
-        return gather_heads(out, rows, self.sp_head_exchange)
-    else:
+        out, sp_rows = ulysses_attention(self, q, k, v, positions, q_scale, qkv)
+        return gather_heads(out, sp_rows, self.sp_head_exchange)
+    rows = padded_prefill_rows(q.shape[0])
+    if rows is not None:
+        # Rows are positions' last dim (an mrope table leads with its axes).
+        positions = positions[..., :rows]
+
+    def attend(q, q_scale, k, v, qkv):
+        if use_mla:
+            return self.impl.forward(
+                query=q,
+                k_nope=k,
+                k_rope=v,
+                positions=positions,
+                q_scale=q_scale,
+            )
         return self.impl.forward(
             query=q,
             key=k,
@@ -1040,6 +1071,8 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+    return on_scheduled_rows(attend, rows, q, q_scale, k, v, qkv)
 
 
 def linear_attention_with_output_base_fake(

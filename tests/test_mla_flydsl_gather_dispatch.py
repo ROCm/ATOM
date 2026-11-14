@@ -143,6 +143,9 @@ def _prefill_impl(**over):
         "_prepare_prefill_k",
         "_drop_rope_pad",
         "_flash_attn_prefill",
+        "_new_token_kv",
+        "_quantize_new_tokens",
+        "_chunked_prefill_attention",
     ):
         setattr(impl, name, MethodType(getattr(mla.MLAAttention, name), impl))
     impl.__dict__.update(over)

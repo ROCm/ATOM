@@ -17,6 +17,7 @@ from atom.model_ops.glm5_next.geometry import (
     speculative_kpool_history_size,
 )
 from atom.utils import CpuGpuBuffer, envs
+from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -549,6 +550,41 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         _, lengths, _ = self.decode_spans(batch)
         self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         return built
+
+    @property
+    def supports_token_graph(self) -> bool:
+        """Every launch outside the model's eager regions -- the KDA recurrence
+        and MLA attention -- is sized by the token count alone, so a prefill
+        may pad to a recorded token-graph bucket; the regions run its scheduled
+        rows (`region_graph.padded_prefill_rows`).
+
+        Not under DP: a decoding or idle rank would replay the prefill
+        recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
+        prefill alone."""
+        config = getattr(self.model_runner, "config", None)
+        return config is not None and config.parallel_config.data_parallel_size == 1
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: its regions hand back their output
+        shape and touch no KV or state -- a replay runs them on the live step
+        -- and the segments need only its shape."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     def _stage_draft_ctx_slots(
         self, batch, seqlens_q: np.ndarray, rows: int, group
