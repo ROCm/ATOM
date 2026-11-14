@@ -234,6 +234,12 @@ logger = logging.getLogger("atom")
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 # The one width below 16 aiter's MLA decode dispatches; see mla_decode_min_heads.
 _MLA_NARROW_MIN_HEADS = 12
+# Verify widths at which ATOM takes it (mla_dense_min_query_heads). Below 5, 16
+# heads have their own qh16 kernels, which beat 12 heads on the gqa=32
+# qseqlen=4 tile by 6-66%; from 5 to 8 both widths run that tile and 12 is
+# 0-10% faster with bit-identical output; past 8, 16 heads overflow the tile
+# and 12 wins or loses by batch size. Measured on MI350X (aiter 0dd2716).
+_MLA_NARROW_QLENS = range(5, 9)
 _MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
@@ -280,8 +286,11 @@ def mla_dense_min_query_heads(atom_config, num_heads: int) -> int:
     The one model-level value MLAAttention pads a non-sparse layer with
     ``num_heads`` heads a rank to and AiterMLAMetadataBuilder plans that
     layer's work for, so the two cannot disagree. 12 only for a rank with
-    exactly 12 heads (Kimi-K3 at tp8), where it drops the padding altogether;
-    fewer heads keep 16 rather than move onto a different kernel unmeasured.
+    exactly 12 heads (Kimi-K3 at tp8), where it drops the padding altogether,
+    and only where aiter serves 12 and it is the faster width: a speculative
+    verify of 5 to 8 tokens (``_MLA_NARROW_QLENS``; Kimi-K3's interactive
+    band verifies 8). Fewer heads keep 16 rather than move onto a different
+    kernel unmeasured.
     Sparse (DSA) layers keep 16: their plans and prefill kernels are sized for
     it. Plugin mode keeps 16 too -- vLLM, SGLang and RTP-LLM plan the decode in
     their own builders, which plan one width, and vLLM runs it non-persistent
@@ -295,6 +304,8 @@ def mla_dense_min_query_heads(atom_config, num_heads: int) -> int:
         return _MLA_MIN_HEADS
     spec = atom_config.speculative_config
     max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
+    if max_seqlen_q not in _MLA_NARROW_QLENS:
+        return _MLA_MIN_HEADS
     # The decode runs aiter's persistent kernel over the builder's plan only on
     # the plain page_size=1 asm path (see MLAAttention.decode_is_persistent).
     persistent = (

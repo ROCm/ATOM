@@ -38,11 +38,12 @@ MLAAttention = attention_mla.MLAAttention
 
 @pytest.fixture
 def native(monkeypatch):
-    """Native ATOM on a gfx950 rank with an fp8 KV cache and no DCP: the
-    configuration the 12-head decode is for. Tests change one thing each."""
+    """Native ATOM on a gfx950 rank with an fp8 KV cache, no DCP and the
+    Kimi-K3 interactive band's DSpark 7 (an 8-token verify): the configuration
+    the 12-head decode is for. Tests change one thing each."""
     cfg = SimpleNamespace(
         kv_cache_dtype="fp8",
-        speculative_config=None,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
         decode_context_parallel_size=1,
         kv_cache_block_size=1,
         hf_config=SimpleNamespace(),
@@ -210,10 +211,11 @@ def _set(monkeypatch, cfg, change):
         cfg.kv_cache_dtype = "bf16"
     elif change == "non-persistent":
         monkeypatch.setenv("ATOM_USE_TRITON_MLA", "1")
-    elif change == "qlen 11":
-        cfg.speculative_config = SimpleNamespace(num_speculative_tokens=10)
-    elif change == "qlen 10":
-        cfg.speculative_config = SimpleNamespace(num_speculative_tokens=9)
+    elif change.startswith("qlen "):
+        qlen = int(change.split()[1])
+        cfg.speculative_config = (
+            SimpleNamespace(num_speculative_tokens=qlen - 1) if qlen > 1 else None
+        )
     elif change == "vllm":
         monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
     else:
@@ -226,8 +228,14 @@ def _set(monkeypatch, cfg, change):
         ("gfx942", 16),
         ("bf16 kv", 16),
         ("non-persistent", 16),
+        # aiter serves 12 up to qlen 10; ATOM takes it where it is faster.
+        ("qlen 1", 16),
+        ("qlen 4", 16),
+        ("qlen 5", 12),
+        ("qlen 6", 12),
+        ("qlen 9", 16),
+        ("qlen 10", 16),
         ("qlen 11", 16),
-        ("qlen 10", 12),
         ("vllm", 16),
     ],
 )
