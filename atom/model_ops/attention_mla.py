@@ -237,8 +237,9 @@ _MLA_NARROW_MIN_HEADS = 12
 # Verify widths at which ATOM takes it (mla_dense_min_query_heads). Below 5, 16
 # heads have their own qh16 kernels, which beat 12 heads on the gqa=32
 # qseqlen=4 tile by 6-66%; from 5 to 8 both widths run that tile and 12 is
-# 0-10% faster with bit-identical output; past 8, 16 heads overflow the tile
-# and 12 wins or loses by batch size. Measured on MI350X (aiter 0dd2716).
+# 1-3% faster at the median (10% faster to 2% slower) with bit-identical
+# output; past 8, 16 heads overflow the tile and 12 wins or loses by batch
+# size. Measured on MI350X (aiter 0dd2716).
 _MLA_NARROW_QLENS = range(5, 9)
 _MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
