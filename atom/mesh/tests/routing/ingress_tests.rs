@@ -1097,6 +1097,76 @@ async fn wanted_tokens_fall_back_to_the_text() {
     }
 }
 
+/// A P/D pair's policies share the request's tokens. With `--kv-events`, they carry the
+/// special tokens, as ATOM stores the blocks `cache_aware` matches, even with `prefix_hash`
+/// the other, which needs them.
+#[tokio::test]
+async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
+    use crate::policies::{CacheAwarePolicy, LoadBalancingPolicy, PrefixHashPolicy};
+    let prefix_hash =
+        || -> Arc<dyn LoadBalancingPolicy> { Arc::new(PrefixHashPolicy::new(Default::default())) };
+    let cache_aware = || -> Arc<dyn LoadBalancingPolicy> { Arc::new(CacheAwarePolicy::new()) };
+    // A tokenizer that, as Llama's, puts `<s>`, id 0, before the words.
+    let dir = tempfile::tempdir().unwrap();
+    let special = |id: u32, content: &str| {
+        json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true})
+    };
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [special(0, "<s>"), special(1, "<unk>")], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>",
+            "vocab": {"<s>": 0, "<unk>": 1, "a": 2, "b": 3}}});
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let config = json!({"add_bos_token": true, "bos_token": "<s>"});
+    std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+    for (kv_events, prefill, decode, want) in [
+        (true, prefix_hash(), cache_aware(), &[0, 2, 3][..]),
+        (true, cache_aware(), prefix_hash(), &[0, 2, 3]),
+        (false, prefix_hash(), cache_aware(), &[2, 3]),
+    ] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            kv_events,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        app.policy_registry.set_prefill_policy(prefill);
+        app.policy_registry.set_decode_policy(decode);
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(
+            crate::tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap(),
+        );
+        app.tokenizer_registry
+            .load("bos-id", "m", "bos", || async { Ok(tokenizer) })
+            .await
+            .unwrap();
+        let body = br#"{"model": "m", "text": "a b"}"#;
+        let parsed = ParsedInference::parse("/generate", body).unwrap();
+        let routing = IngressRouting::new(&app);
+        let (_, tokens) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
+    }
+}
+
 /// The template and encode stages `--kv-events` adds to a chat request `cache_aware`
 /// places, with the tokenizer.json at `MESH_BENCH_TOKENIZER`.
 #[test]
