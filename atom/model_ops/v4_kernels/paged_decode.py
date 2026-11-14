@@ -645,6 +645,7 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int | None = None,
     kv_splits: int | None = None,
     block_k: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
     exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
@@ -693,7 +694,8 @@ def _sparse_attn_v4_paged_decode_triton(
             )
 
     T, H, D = q.shape
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
 
     if block_h is None:
         block_h = triton.next_power_of_2(min(H, 64))
@@ -952,6 +954,7 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
     unified_kv_rope: torch.Tensor,
     q_packed_in: torch.Tensor,
     q_rope_in: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run H=128 fp8 decode through the sparse-prefill ASM kernel.
 
@@ -971,6 +974,7 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
         )
 
     return mla_sparse_prefill_fp8_asm(
+        out=out,
         q_nope=q_packed_in,
         q_rope=q_rope_in,
         unified_kv_nope=unified_kv,
@@ -1039,6 +1043,7 @@ def _sparse_attn_v4_paged_decode_asm(
     kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
     num_kv_splits: int | None = None,
     split_indptr: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
     ``mla_decode_fwd_v4_nm`` (ROCm/aiter#3112, mi350/gfx950).
@@ -1144,8 +1149,12 @@ def _sparse_attn_v4_paged_decode_asm(
     kv_page_indices_i32 = kv_indices.contiguous()
     max_seqlen_q = 1
 
-    output = torch.empty(
-        (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
+    output = (
+        out
+        if out is not None and H == H_real
+        else torch.empty(
+            (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
+        )
     )
 
     # A uniform split plan's prefix is itself a valid plan, so it trims like
@@ -1169,6 +1178,10 @@ def _sparse_attn_v4_paged_decode_asm(
     )
     # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
     # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
+    if out is not None:
+        if output is not out:
+            out.copy_(output[:, :H_real])
+        return out
     return output[:, :H_real].contiguous() if H_real != H else output
 
 
@@ -1190,6 +1203,7 @@ def sparse_attn_v4_paged_decode(
     prefix: str = "",
     split_plan: tuple[int, torch.Tensor] | None = None,
     compress_ratio: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1212,7 +1226,12 @@ def sparse_attn_v4_paged_decode(
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
     in-kernel using 1xGROUP_SIZE (default 64) block scales (legacy 1buff,
     unreachable from the model).
+
+    ``out`` optionally supplies a contiguous destination with matching rows,
+    heads, dtype and device. FP8 ASM copies back only when it must pad heads.
     """
+    if out is not None and not out.is_contiguous():
+        raise ValueError("decode output must be contiguous")
     if unified_kv_rope is not None:
         if (
             envs.ATOM_USE_V4_PREFILL_ASM_FOR_DECODE
@@ -1231,6 +1250,7 @@ def sparse_attn_v4_paged_decode(
                 unified_kv_rope,
                 q_packed_in,
                 q_rope_in,
+                out=out,
             )
         if (
             q_packed_in is not None
@@ -1251,6 +1271,7 @@ def sparse_attn_v4_paged_decode(
                 unified_kv_rope,
                 q_packed_in,
                 q_rope_in,
+                out=out,
             )
         num_kv_splits, split_indptr = split_plan or (None, None)
         return _sparse_attn_v4_paged_decode_asm(
@@ -1266,6 +1287,7 @@ def sparse_attn_v4_paged_decode(
             kv_last_page_lens=kv_last_page_lens,
             num_kv_splits=num_kv_splits,
             split_indptr=split_indptr,
+            out=out,
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):
@@ -1276,6 +1298,7 @@ def sparse_attn_v4_paged_decode(
             kv_indptr,
             attn_sink,
             softmax_scale,
+            out=out,
             has_invalid=False,
             kv_scales=kv_scales,
         )
@@ -1288,8 +1311,9 @@ def sparse_attn_v4_paged_decode(
             attn_sink,
             softmax_scale,
             kv_scales=kv_scales,
+            out=out,
         )
-    return sparse_attn_v4_paged_decode_reference(
+    result = sparse_attn_v4_paged_decode_reference(
         q,
         unified_kv,
         kv_indices,
@@ -1298,3 +1322,4 @@ def sparse_attn_v4_paged_decode(
         softmax_scale,
         kv_scales=kv_scales,
     )
+    return result if out is None else out.copy_(result)

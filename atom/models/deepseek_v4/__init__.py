@@ -2409,9 +2409,14 @@ class DeepseekV4Attention(nn.Module):
         x: torch.Tensor | None = None,  # FULL only: inline `forward_batched`
         qr: torch.Tensor | None = None,  # FULL only, same
         qr_scale: torch.Tensor | None = None,  # FULL only, same
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The TOKEN-shaped tail: indexer top-k, CSA pack, the paged attention, and
         prefill's SWA write.
+
+        ``out`` optionally supplies a contiguous token-row slice of shape
+        ``[num_tokens, n_local_heads, head_dim]``. Prefill and decode can write
+        disjoint slices of one allocation without concatenating their results.
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP8
@@ -2438,6 +2443,8 @@ class DeepseekV4Attention(nn.Module):
             # warmup runs before allocate_kv_cache: `unified_kv` is unbound and
             # the paged kernels would read OOB. Same guard the core has always
             # carried; this half now runs outside it. See `_qk_norm_rope`.
+            if out is not None:
+                return out.zero_().reshape(num_tokens, -1)
             return q_rows.new_zeros(
                 (num_tokens, self.n_local_heads * self.head_dim),
                 dtype=torch.bfloat16,
@@ -2503,6 +2510,7 @@ class DeepseekV4Attention(nn.Module):
                 prefix=f"{self.layer_name}.sparse_attn_decode",
                 split_plan=split_plan,
                 compress_ratio=ratio,
+                out=out,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio
@@ -2579,9 +2587,8 @@ class DeepseekV4Attention(nn.Module):
             # quant; bf16 → OPUS / Triton over q_sa and the bf16 extend kv_full.
             # Under PCP the extend K is the PCP all-gathered full sequence
             # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
-            # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
-            # attention output buffer (q_sa is not needed after this call →
-            # avoids an extra empty_like); fp8 ignores both q_sa and out.
+            # tensor unchanged. Without a caller's output, BF16 reuses q_sa
+            # (not needed after this call), while FP8 allocates a BF16 buffer.
             o = sparse_attn_v4_paged_2src(
                 qkn.q_sa,
                 self.unified_kv,
@@ -2592,9 +2599,7 @@ class DeepseekV4Attention(nn.Module):
                 attn_md.kv_indptr_extend,
                 self.attn_sink,
                 self.softmax_scale,
-                # Reuse q_sa as the attention output buffer; q_sa is not needed
-                # after this call and this avoids an extra empty_like allocation.
-                out=qkn.q_sa,
+                out=qkn.q_sa if out is None else out,
                 unified_kv_rope=self.unified_kv_rope,
                 q_packed=qkn.q_packed,
                 q_rope=qkn.q_rope,
