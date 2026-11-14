@@ -3348,14 +3348,19 @@ class MooncakeConnector(KVConnectorBase):
                 list(range(num_regions)),
             )
             if staging_plan.minimum_slot_bytes <= self._kv_staging.shape[1]:
-                return self._execute_staged_transfer(
-                    request_data,
-                    target,
-                    staging_plan,
-                    req_id,
-                    kv_cache_ready_event,
-                    engine=engine,
-                )
+                try:
+                    return self._execute_staged_transfer(
+                        request_data,
+                        target,
+                        staging_plan,
+                        req_id,
+                        kv_cache_ready_event,
+                        engine=engine,
+                    )
+                except _StagingRetired:
+                    # The direct descriptors below write every head slice;
+                    # units already landed get the same bytes again.
+                    pass
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
