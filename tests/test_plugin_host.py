@@ -1012,3 +1012,286 @@ def test_model_runner_configures_the_host_before_building():
     assert source.index("config.plugin_source, arm=config.plugin_arm", configure) < (
         source.index("self._build_and_load_model(model_class)")
     )
+
+
+# -- V4.1 seams --------------------------------------------------------------------
+
+
+def _seam_uses(path):
+    """(form, seam) of each plugin_host.bind/call/site/span_op naming a seam."""
+    import ast
+
+    uses = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "plugin_host"
+            and node.func.attr in ("bind", "call", "site", "span_op")
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            uses.append((node.func.attr, node.args[0].value))
+    return uses
+
+
+def test_every_seam_is_reached_exactly_once_from_its_target():
+    found = {}
+    for path in (REPO_ROOT / "atom").rglob("*.py"):
+        for form, seam in _seam_uses(path):
+            if form != "span_op":
+                where = path.relative_to(REPO_ROOT).as_posix()
+                found.setdefault(seam, []).append((form, where))
+    expected = {
+        name: [
+            ("site" if s.form == "call" and s.name in _DECORATED else s.form, s.target)
+        ]
+        for name, s in host.SEAMS.items()
+    }
+    assert found == expected
+
+
+_DECORATED = {"v41.op.quant_fp8_g32", "v41.attn.attend"}
+
+
+def test_only_the_shared_act_seam_builds_its_own_span():
+    spans = [
+        (seam, path.relative_to(REPO_ROOT).as_posix())
+        for path in (REPO_ROOT / "atom").rglob("*.py")
+        for form, seam in _seam_uses(path)
+        if form == "span_op"
+    ]
+    assert spans == [(ACT, "atom/models/deepseek_v4/__init__.py")]
+
+
+def test_seam_specs_are_self_consistent():
+    for name, spec in host.SEAMS.items():
+        assert spec.name == name and spec.contract >= 1
+        assert spec.kind in ("op", "region") and spec.form in ("bind", "call")
+        assert spec.graph in ("eager", "capture_safe", "opaque_op")
+        assert set(spec.key) <= set(spec.inputs)
+        assert spec.parent is None or host.SEAMS[spec.parent].kind == "region"
+        assert (REPO_ROOT / spec.target).is_file()
+
+
+def _attention_module():
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+        return load("atom.models.deepseek_v41.attention")
+
+
+def _project_out(module, fused, groups=2, rank=64, k=128, rows=3, heads=4):
+    """`Attention._project_out` on a stand-in layer; wo_b's (y, x_scale)."""
+    from functools import partial
+
+    x_fp8 = torch.randn(rows, groups, k)
+    x_scale = torch.randn(rows, groups, k // 32)
+    module.inverse_rope_group_quant = lambda *a, **kw: (x_fp8, x_scale)
+    module.batched_gemm_a8w8_mxscale_bpreshuffle = lambda x, w, xs, ws, dtype: (
+        torch.full((rows, groups, rank), 1.0)
+    )
+    module.batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant = lambda x, w, xs, ws: (
+        torch.full((rows, groups, rank), 2.0),
+        torch.full((rows, groups, rank // 32), 3.0),
+    )
+    wo_b = []
+    layer = types.SimpleNamespace(
+        heads=heads,
+        head_dim=groups * k // heads,
+        groups=groups,
+        o_rank=rank,
+        _fuse_woa_quant=fused,
+        wo_a=types.SimpleNamespace(
+            weight=torch.zeros(groups * rank, k),
+            weight_scale=torch.zeros(groups * rank // 32, k // 32),
+        ),
+        wo_b=lambda y, x_scale=None: wo_b.append((y, x_scale)) or "out",
+    )
+    native = partial(module.Attention._wo_a, layer)
+    capability = partial(module.Attention._wo_a_capability, layer)
+    layer._wo_a_seam = host.bind(OUT, native, capability=capability)
+    output = torch.zeros(1, rows, heads, groups * k // heads)
+    rope = types.SimpleNamespace(cos_cache=None, sin_cache=None)
+    module.Attention._project_out(layer, output, rope, torch.zeros(1, rows))
+    return layer, native, wo_b[0]
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_attn_out_native_feeds_wo_b_as_before(fused):
+    host.configure(None)
+    layer, native, (y, y_scale) = _project_out(_attention_module(), fused)
+    assert layer._wo_a_seam is native
+    if fused:
+        assert torch.equal(y, torch.full((1, 3, 128), 2.0))
+        assert torch.equal(y_scale, torch.full((1, 3, 4), 3.0))
+    else:
+        assert y_scale is None and torch.equal(y, torch.ones(1, 3, 128))
+
+
+def test_attn_out_plugin_pair_reaches_wo_b(monkeypatch):
+    got = {}
+
+    def bmm(x_fp8, x_scale, w, ws, *, dtype, capability, valid_rows):
+        got.update(shapes=(w.shape, ws.shape), cap=capability, dtype=dtype)
+        return torch.full((3, 2, 64), 7.0), torch.full((3, 2, 2), 8.0)
+
+    _plugins(monkeypatch, bmm=_offer(OUT, "bmm", impl=bmm))
+    host.configure(["bmm"], kill_switch=False)
+    _, _, (y, y_scale) = _project_out(_attention_module(), fused=False)
+    assert got["shapes"] == ((2, 64, 128), (2, 2, 4))
+    assert got["cap"].quant == host.MX and got["cap"].rows == 3
+    assert dict(got["cap"].flags) == {
+        "native_fused_epilogue": False,
+        "groups": 2,
+        "o_rank": 64,
+        "wo_a_preshuffled": True,
+    }
+    assert torch.equal(y, torch.full((1, 3, 128), 7.0))
+    assert torch.equal(y_scale, torch.full((1, 3, 4), 8.0))
+
+
+DIM = 8
+
+
+def _shared_expert(name, fused=False):
+    """deepseek_v4 `Expert`, built (bind/span_op) on a stand-in layer after
+    `configure`: (forward, w2's calls)."""
+    from functools import partial
+
+    from aiter_stub import atom_under_stubs
+
+    with atom_under_stubs() as load:
+        module = load("atom.models.deepseek_v4")
+    module.aiter_silu_and_mul = lambda out, combined, limit: out.copy_(
+        combined[:, : out.shape[1]].clamp(max=limit)
+    )
+    w2 = []
+
+    class W2:
+        native_a8_group_rows = 32
+        output_size = DIM
+
+        def __call__(self, x, x_scale=None):
+            w2.append((x, x_scale))
+            return x.new_ones(x.shape[0], DIM, dtype=torch.bfloat16)
+
+    layer = types.SimpleNamespace(
+        gate_up_proj=lambda x: torch.cat([x, x], dim=-1),
+        use_fused_clamp_act_mul=fused,
+        swiglu_limit=10.0,
+        w2=W2(),
+    )
+    for method in ("_act", "_act_down", "_act_down_fake", "_act_capability"):
+        setattr(layer, method, partial(getattr(module.Expert, method), layer))
+    layer._act_seam = host.bind(ACT, layer._act, capability=layer._act_capability)
+    layer.act_down = host.span_op(ACT, name, layer._act_down, layer._act_down_fake)
+    return layer, partial(module.Expert.forward, layer), w2
+
+
+def test_shared_act_without_a_plugin_stays_inline():
+    host.configure(None)
+    layer, forward, w2 = _shared_expert("layers.0.ffn.shared_experts")
+    assert layer.act_down == layer._act_down and layer._act_seam == layer._act
+    x = torch.arange(6.0).reshape(2, 3) * 5
+    assert forward(x).shape == (2, DIM)
+    act, scale = w2[0]
+    assert scale is None and torch.equal(act, x.clamp(max=10.0))
+
+
+def test_shared_act_plugin_runs_inside_one_opaque_op(monkeypatch):
+    seen = []
+
+    def silu(combined, weights, *, capability, valid_rows):
+        seen.append((combined.shape[0], capability.quant, dict(capability.flags)))
+        return torch.zeros(combined.shape[0], 3), torch.ones(combined.shape[0], 1)
+
+    _plugins(
+        monkeypatch,
+        silu=_offer(ACT, "silu", impl=silu, select=lambda cap, c, w: c.shape[0] > 2),
+    )
+    host.configure(["silu"], kill_switch=False)
+    layer, forward, w2 = _shared_expert("layers.1.ffn.shared_experts")
+    assert layer.act_down != layer._act_down
+    forward(torch.ones(4, 3))
+    forward(torch.ones(2, 3))
+    assert seen == [(4, host.MX, {"swiglu_limit": 10.0, "native_fused_act": False})]
+    assert torch.equal(w2[0][1], torch.ones(4, 1)) and w2[1][1] is None
+    meta = layer.act_down(torch.empty(5, 6, device="meta"), None)
+    assert (meta.shape, meta.dtype) == ((5, DIM), torch.bfloat16)
+
+
+def test_draft_ctx_native_is_the_old_cat_and_slice():
+    import ast
+
+    tree = ast.parse(
+        (REPO_ROOT / "atom/models/deepseek_v41/dspark.py").read_text(encoding="utf-8")
+    )
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "DeepseekV41DSpark"
+    )
+    node = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_concat_taps"
+    )
+    node.decorator_list = []
+    namespace = {"torch": torch}
+    code = compile(ast.Module([node], []), "dspark.py", "exec")
+    exec(code, namespace)  # noqa: S102 -- ATOM's own source, one function
+    concat = namespace["_concat_taps"]
+    taps = [torch.randn(8, 4) for _ in range(3)]
+    rows = torch.tensor([1, 3, 5, 7])
+    old = torch.cat(taps, dim=-1)
+    assert torch.equal(concat(taps, None, 6)[0], old[:6])
+    assert torch.equal(concat(taps, rows, 3)[0], old[rows][:3])
+    assert torch.equal(concat(old, rows, 3)[0], old[rows][:3])
+    assert concat(taps, None, 6)[1] is None
+
+
+def test_draft_ctx_and_ffn_call_sites():
+    dspark = (REPO_ROOT / "atom/models/deepseek_v41/dspark.py").read_text(
+        encoding="utf-8"
+    )
+    assert dspark.count("main_proj(aux_concat, x_scale=aux_scale)") == 2
+    assert "self._ctx_seam(aux_concat, rows, step.running_tokens)" in dspark
+    proposer = (REPO_ROOT / "atom/spec_decode/dspark_proposer.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'getattr(self.model, "context_takes_taps", False)' in proposer
+    model = (REPO_ROOT / "atom/models/deepseek_v41/model.py").read_text(
+        encoding="utf-8"
+    )
+    assert "self.finish_ffn(self._ffn(normed), residual, pre, post, comb)" in model
+    assert "self.ffn.__call__," in model
+
+
+@pytest.mark.skipif(
+    not torch._dynamo.is_dynamo_supported(), reason="Dynamo unsupported here"
+)
+def test_a_bound_module_call_traces_like_the_module():
+    """No owner: Block keeps `self.ffn.__call__`, which must trace as the module."""
+    torch._dynamo.reset()
+    host.configure(None)
+
+    class Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ffn = torch.nn.Linear(4, 4)
+            self._ffn = host.bind(
+                FFN, self.ffn.__call__, layer="toy", fake=torch.empty_like
+            )
+
+        def forward(self, x):
+            return self._ffn(x)
+
+    toy = Toy()
+    assert toy._ffn == toy.ffn.__call__
+    assert [n for n, _ in toy.named_modules()] == ["", "ffn"]
+    x = torch.randn(2, 4)
+    compiled = torch.compile(toy, backend="eager", fullgraph=True)
+    assert torch.allclose(compiled(x), toy.ffn(x))
+    torch._dynamo.reset()

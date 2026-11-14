@@ -21,6 +21,7 @@ except ImportError:
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
+from atom import plugin_host
 from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
     supports_a8w4_attention,
 )
@@ -322,6 +323,9 @@ class Attention(nn.Module):
         # Set in `process_weights_after_loading`, once wo_a's shape is known.
         # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
         self._fuse_woa_quant = False
+        self._wo_a_seam = plugin_host.bind(
+            "v41.attn.out", self._wo_a, capability=self._wo_a_capability
+        )
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -420,24 +424,42 @@ class Attention(nn.Module):
         )
         wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        y, y_scale = self._wo_a_seam(
+            x_fp8, x_scale, wo_a_w, wo_a_ws, dtype=output.dtype
+        )
+        lead = output.shape[:-2]
+        if y_scale is not None:
+            y_scale = y_scale.view(*lead, -1)
+        return self.wo_b(y.view(*lead, -1), x_scale=y_scale)
+
+    def _wo_a(self, x_fp8, x_scale, wo_a_w, wo_a_ws, *, dtype):
+        """wo_b's input: the (e4m3, e8m0) pair, or bf16 with no scale."""
         if self._fuse_woa_quant:
             # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
             # standalone quantize_fp8 between wo_a and wo_b is removed.
-            y8, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
+            return batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
                 x_fp8, wo_a_w, x_scale, wo_a_ws
-            )
-            return self.wo_b(
-                y8.view(*output.shape[:-2], -1),
-                x_scale=y_scale.view(*output.shape[:-2], -1),
             )
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
             wo_a_w,
             x_scale,
             wo_a_ws,
-            dtype=output.dtype,
+            dtype=dtype,
         )
-        return self.wo_b(y.view(*output.shape[:-2], -1))
+        return y, None
+
+    def _wo_a_capability(self, *inputs, **kwargs):
+        """What a `v41.attn.out` plugin may rely on, read after the load."""
+        return {
+            "quant": plugin_host.MX,
+            "flags": {
+                "native_fused_epilogue": self._fuse_woa_quant,
+                "groups": self.groups,
+                "o_rank": self.o_rank,
+                "wo_a_preshuffled": True,
+            },
+        }
 
     def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""

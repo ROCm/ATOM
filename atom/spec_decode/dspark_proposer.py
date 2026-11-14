@@ -751,7 +751,11 @@ class DSparkProposer(Drafter):
         if aux is None:
             return
         # One block when every tap was relayed from earlier PP stages.
-        aux = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
+        if len(aux) == 1:
+            aux = aux[0]
+        elif not getattr(self.model, "context_takes_taps", False):
+            aux = torch.cat(aux, dim=-1)
+        # else: the model concatenates its taps (a plugin may fuse the cat away)
         spec = self.model.kv_pool_spec
         if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
