@@ -285,6 +285,7 @@ def _fc(slots, dtype_q=FP8, cache=None, dummy=False):
 
 
 def test_prep_args(runner_module, monkeypatch):
+    from atom.models.kimi_k3.mono import folds
     from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
 
     prep = _prep()
@@ -293,7 +294,7 @@ def test_prep_args(runner_module, monkeypatch):
     # a slot mapping longer than the step (the tokens' own are read)
     slots = torch.tensor([5, -1, 9, 2, 7, 7], dtype=torch.int64)
     fc = _fc(slots)
-    monkeypatch.setattr(runner_module, "get_forward_context", lambda: fc)
+    monkeypatch.setattr(folds, "get_forward_context", lambda: fc)
     args = r._prep_args(2, prefix)
     assert set(args) == set(k2pr.ARGS)
     cache = fc.kv_cache_data["layer_3"].k_cache
@@ -312,9 +313,7 @@ def test_prep_args(runner_module, monkeypatch):
     assert args["pref"] == pend["pref"].data_ptr()
 
     # a dummy run writes no KV-cache row
-    monkeypatch.setattr(
-        runner_module, "get_forward_context", lambda: _fc(slots, dummy=True)
-    )
+    monkeypatch.setattr(folds, "get_forward_context", lambda: _fc(slots, dummy=True))
     args = r._prep_args(2, prefix)
     assert args["slots"] == r._neg_slots.data_ptr()
 
@@ -336,12 +335,13 @@ def test_prep_args(runner_module, monkeypatch):
     ],
 )
 def test_prep_args_refusals(runner_module, monkeypatch, fc, why):
+    from atom.models.kimi_k3.mono import folds
     from atom.mono.runtime.consensus import MonoUnsupported
 
     r = _runner_bufs(runner_module, _prep())
     slots = torch.arange(ROWS, dtype=torch.int64)
     ctx = fc(slots)
-    monkeypatch.setattr(runner_module, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(folds, "get_forward_context", lambda: ctx)
     with pytest.raises(MonoUnsupported, match=why):
         r._prep_args(2, torch.zeros(ROWS, HIDDEN))
 
