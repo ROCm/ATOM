@@ -19,6 +19,7 @@ from __future__ import annotations
 import torch
 
 from atom.mono.runtime.hip_ipc import allocate_fine_grained, allocate_uncached
+from atom.utils.device_bytes import DeviceBytes
 
 
 def ipc_heap():
@@ -29,19 +30,6 @@ def ipc_heap():
     from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
 
     return UncachedIpcHeap
-
-
-class DeviceBytes:
-    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address, for a
-    non-owning torch view."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "version": 3,
-        }
 
 
 def alloc_uncached(nbytes: int) -> int:

@@ -7,7 +7,8 @@ import torch
 from atom.distributed.group_agreement import group_agree
 from atom.mono.runtime.compile import _SYMBOL_KEY, _code_object
 from atom.mono.runtime.consensus import MonoUnsupported
-from atom.mono.runtime.uncached import DeviceBytes, alloc_uncached, ipc_heap
+from atom.mono.runtime.uncached import alloc_uncached, ipc_heap
+from atom.utils.device_bytes import DeviceBytes
 
 
 def _entry_symbol(elf: bytes) -> str:

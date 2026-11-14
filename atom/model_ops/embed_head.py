@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -19,6 +21,8 @@ from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
+
+logger = logging.getLogger("atom")
 
 
 @triton.jit
@@ -350,14 +354,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         return out.copy_(token)
 
     def _vocab_shard_logits(
-        self, x: torch.Tensor, rank: int, world: int
+        self,
+        x: torch.Tensor,
+        rank: int,
+        world: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``x``'s logits over the ``rank``-th of ``world`` equal vocab slices of
-        a replicated head."""
+        a replicated head, written into ``out`` when given."""
         vshard = self.num_embeddings // world
         vocab = slice(rank * vshard, (rank + 1) * vshard)
         bias = None if self.bias is None else self.bias[vocab]
-        return tgemm.mm(x, self.weight[vocab], bias)
+        return tgemm.mm(x, self.weight[vocab], bias, out=out)
 
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
@@ -411,6 +419,71 @@ class ParallelLMHead(VocabParallelEmbedding):
             return False
         return get_forward_context().dp_metadata is not None
 
+    def prepare_dp_logits_exchange(self, row_sizes: list[int], namespace: str):
+        """Allocate the fixed peer pool before any request graph is captured."""
+        dp = get_dp_group()
+        comm = getattr(dp.device_communicator, "ca_comm", None)
+        if (
+            envs.ATOM_DP_LM_HEAD_MODE != "allgather"
+            or self.tp_size != 1
+            or dp.world_size != 4
+            or self.weight.dtype != torch.bfloat16
+            or self.num_embeddings % (4 * 32)
+            or comm is None
+            or comm.disabled
+            or not comm._is_gfx1250
+            or not comm._same_node
+        ):
+            logger.warning(
+                "DP logits peer exchange unavailable: mode=%s tp=%d dp=%d "
+                "dtype=%s vocab=%d communicator=%s; retaining native head",
+                envs.ATOM_DP_LM_HEAD_MODE,
+                self.tp_size,
+                dp.world_size,
+                self.weight.dtype,
+                self.num_embeddings,
+                (
+                    None
+                    if comm is None
+                    else {
+                        key: getattr(comm, key, None)
+                        for key in ("disabled", "_is_gfx1250", "_same_node")
+                    }
+                ),
+            )
+            return
+        if self.__dict__.get("_dp_logits_exchange") is not None:
+            raise RuntimeError("DP logits peer pool is already initialized")
+        from atom.distributed.dp_logits_exchange import PeerLogitsExchange
+
+        # The exchange owns its VMM allocation. The reused communicator only
+        # supplies barriers, and may itself use either IPC or VMM transport.
+        max_rows = max(row_sizes)
+        self._dp_logits_exchange = PeerLogitsExchange(
+            dp.cpu_group,
+            self.weight.device,
+            max_rows,
+            self.num_embeddings // dp.world_size,
+            dtype=self.weight.dtype,
+            barrier_communicator=comm,
+            namespace=namespace,
+        )
+        # Compile reachable row buckets at startup, before benchmark requests.
+        # Transport only: nothing is written into the pool, and no model or
+        # request state is changed.
+        for rows in sorted(set(row_sizes), reverse=True):
+            self._dp_logits_exchange.produce(lambda dst: None, rows, rows)
+        torch.cuda.synchronize()
+        logger.info(
+            "DP logits peer exchange ready: rank=%d max_rows=%d vocab=%d "
+            "barrier_transport=%s source=%s",
+            dp.rank_in_group,
+            max_rows,
+            self.num_embeddings,
+            "VMM" if comm._use_vmm else "IPC",
+            __file__,
+        )
+
     def _dp_sharded_logits(self, x: torch.Tensor, mode: str) -> torch.Tensor:
         """This rank's own rows out of a DP-vocab-sharded lm_head.
 
@@ -443,6 +516,25 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
+        peer = self.__dict__.get("_dp_logits_exchange")
+        if mode == "allgather" and peer is not None and max_rows <= peer.max_rows:
+            if not self.__dict__.get("_dp_logits_peer_logged", False):
+                logger.info(
+                    "DP logits peer exchange active: rank=%d padded_rows=%d local_rows=%d",
+                    dp_rank,
+                    max_rows,
+                    local_rows,
+                )
+                self._dp_logits_peer_logged = True
+            # The GEMM writes this rank's shard straight into the peer pool.
+            return peer.produce(
+                lambda dst: self._vocab_shard_logits(
+                    gathered, dp_rank, dp_size, out=dst
+                ),
+                max_rows,
+                local_rows,
+            )
+
         # [dp_size * max_rows, V/dp]
         logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
         start = dp_rank * max_rows
