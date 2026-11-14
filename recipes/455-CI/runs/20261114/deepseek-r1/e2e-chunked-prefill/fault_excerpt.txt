@@ -1,0 +1,19 @@
+[atom 04:52:42] Engine Core Mgr: add rank1: 1 req / 26635 tok | in-flight reqs=[16, 16, 16, 16] queued_prefill_tokens=[299217, 400177, 349058, 324362]
+INFO:     127.0.0.1:50158 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[atom 04:52:42] Scheduled prefill batch: 1 reqs, 16384 new tokens (done: [4032], new: [16384]), req_ids: (1545,)
+[atom 04:52:42] Scheduled prefill batch: 1 reqs, 16384 new tokens (done: [5056], new: [16384]), req_ids: (1546,)
+[atom 04:52:42] Scheduled prefill batch: 1 reqs, 16384 new tokens (done: [5184], new: [16384]), req_ids: (1543,)
+[atom 04:52:42] Scheduled prefill batch: 1 reqs, 16384 new tokens (done: [3840], new: [16384]), req_ids: (1547,)
+Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+VGPU(0x17e5e210) hang analysis:
+SWq=0x6fffd3c46000, HWq=0x6fbe86a00000, id=2, priority=1, Dispatch Header = 0xb00 (type=0, barrier=1, acquire=1, release=1), setup=3, cluster_count=[384, 1, 1], cluster_size=[1, 1, 1], workgroup=[128, 1, 1], private_seg_size=3028, group_seg_size=73728, kernel_
+SWq=0x6fffd3c46000, HWq=0x6fbe86a00000, id=2, Metadata Packet [wptr=16203404]: header=[0x0, 0x0, 0x0, 0x0], event_id=0x0, kernel_code_entry_byte_offset=0x1080, compute_pgm_rsrc1=0xc00f003f, compute_pgm_rsrc2=0x3b5, compute_pgm_rsrc3=0xff0, kernel_code_properti
+:0:rocdevice.cpp            :3896: 148722891157 us:  Memory Fault Error [host: ctheliosr-rck-g02-e15-06, GPU index: 2, faulting addr: 0x6fcf17598000, kernel: _triton_gather_kv_b_proj]
+Memory access fault by GPU node-4 (Agent handle: 0x139b3a20) on address 0x6fcf17598000. Reason: Page not present or supervisor privilege.
+[atom 04:52:43] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] proc died unexpectedly (exitcode=-6), shutting down.
+[atom 04:52:43] AsyncIOProcManager(ModelRunner): shutdown all runners...
+[atom 04:52:44] AsyncIOProcManager(ModelRunner): All runners are shutdown.
+[atom 04:52:44] [gc] unfroze 971772 objects
+/results/server_cmd.sh: line 18:    20 Killed                  env ATOM_MLA_ABSORB_BF16_FUSE_QOUT=1 ATOM_MLA_KV_SHUFFLED=1 ATOM_MEGA_MASK_PAD_ROWS=1 MEGA_COMBINE_WIRE=bf16 AITER_DISABLE_KERNARG_PRELOAD=1 HSA_ENABLE_SDMA=1 HSA_USE_SVM=1 HSA_XNACK=1 ATOM_DP_LM_H
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 16 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

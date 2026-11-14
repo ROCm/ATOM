@@ -29,8 +29,8 @@
 - Reproduced 1 of 1 runs. The node was healthy afterwards (4 GPUs, no KFD processes left, no MES errors in dmesg).
 
 ## Logs
-- [`fault_excerpt.log`](fault_excerpt.log): the fault and the hang analysis (dispatch: workgroup 128, grid 384x1x1).
-- [`server_log_before_fault.log`](server_log_before_fault.log): the 60 server log lines before the fault, with the prefill batches the scheduler issued.
+- [`fault_excerpt.txt`](fault_excerpt.txt): the fault and the hang analysis (dispatch: workgroup 128, grid 384x1x1).
+- [`server_log_before_fault.txt`](server_log_before_fault.txt): the 60 server log lines before the fault, with the prefill batches the scheduler issued.
 
 ## What we checked
 - PRs searched: `gather_kv_b_proj`, `shuffle_kv_block`, `kv_shuffled chunked prefill`, `MLA chunked prefill memory fault` in ROCm/ATOM and ROCm/aiter. None is about this. ROCm/aiter#7952 (open) fixes 32-bit offset overflow in a different MLA kernel (`fused_qk_rope_cat_and_cache_mla`).
