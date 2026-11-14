@@ -70,7 +70,7 @@ Enable it from **CONC ≥ 15** by adding one line to the server's `env \` block:
   ATOM_M3_INDEXER_CP=1 \
 ```
 
-Requires `--tensor-parallel-size 4` (ATOM asserts `tp_size == sparse_num_index_heads`, 4 for M3) and `decode_context_parallel_size == 1`. It runs on the MXFP4 index cache too (`--index-cache-dtype fp4`, with or without `--kv-cache-dtype fp4`): each rank's decode scorer is then aiter's FlyDSL MXFP4 scorer over its shard, and `tests/test_minimax_m3_mxfp4_indexer_cp.py` pins the merged selection to the TP path's. Measured, same-commit A/B, 1800 s per arm:
+Requires `--tensor-parallel-size 4` (ATOM asserts `tp_size == sparse_num_index_heads`, 4 for M3) and `decode_context_parallel_size == 1`. Measured, same-commit A/B, 1800 s per arm:
 
 | CONC | interactivity p90 | ISL-normalised throughput | prefix hit, TP vs CP |
 | ---: | ---: | ---: | --- |
@@ -79,6 +79,8 @@ Requires `--tensor-parallel-size 4` (ATOM asserts `tp_size == sparse_num_index_h
 | 28 | **+16.7%** | +2.7% | 97.2% / 97.3% |
 
 Monotone and never negative: throughput is neutral everywhere while interactivity rises with the running batch, which is what CP actually shortens. Identical prefix-hit rates within each pair are the control — CP changes the indexer's parallel axis and nothing in the KV pool. Below CONC 15 the exchange+merge tail — a fixed 10–14 µs per sparse layer, independent of batch and context — is not amortised, and at batch ≈ 2 the kernel chain measures 1.55× slower than the TP path.
+
+**MXFP4 index cache.** Indexer CP also runs on `--index-cache-dtype fp4` (with or without `--kv-cache-dtype fp4`): each rank's decode scorer is then aiter's FlyDSL MXFP4 scorer over its shard, and `tests/test_minimax_m3_mxfp4_indexer_cp.py` pins the merged selection to the TP path's. The table above, measured with the server command above (`--kv_cache_dtype fp8`), does not carry over. On one aggregated TP4 server with both MXFP4 caches (`benchmark_serving`, fixed-length random prompts, DSpark7 at a forced acceptance length of 4.04), CP lowered tok/s/GPU by 0.4–2.9% in all six cells measured: 32K/2K at CONC 32, 64 and 128, and 128K/4K at CONC 16, 32 and 64. Median ITL rose 5.1% at 32K and CONC 32, and fell 4.7% at 128K and CONC 64, the only gain. The throughput gain on MXFP4 (+3.2% tok/s/GPU at CONC 220, on the experiment branch) was measured only on the decode nodes of a 1P2D deployment, which needs MXFP4 KV under P/D and is not on `main` yet. Leave indexer CP off on an aggregated MXFP4 server.
 
 > Arm verification does **not** use the `Engine kwargs` line — it prints the pre-override value and shows `indexer_dcp_only=False` on both arms. Use the `dcp_config.indexer_dcp_only enabled` startup line, the absence of a `disabled` line, and a `peak_torch` delta of ~0.13 GB (the widened `index_q` projection).
 
