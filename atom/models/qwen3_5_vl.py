@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+from atom.multimodal.processing import media_token_spans
+
 
 class Qwen3VisionPatchEmbed(nn.Module):
     def __init__(
@@ -415,14 +418,15 @@ def _images_before_text(messages: list[dict]) -> list[dict]:
 
 # Qwen3.5 multimodal checkpoints: the model types whose image prompts carry
 # explicit embedding spans here and whose MRoPE positions `qwen3_5.py` builds.
-# Kept in this module, which the API server imports, rather than in
-# `qwen3_5.py`, which imports AITER.
+# Defined here rather than in `qwen3_5.py`, which imports AITER: the input
+# builder below is resolved for image requests, so this module must stay free
+# of AITER imports.
 QWEN3_5_MULTIMODAL_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
 
 
 def qwen3_5_image_spans(
     input_ids: list[int],
-    image_grid_thw,
+    image_grid_thw: torch.Tensor,
     image_token_id: int,
     spatial_merge_size: int,
 ) -> tuple[tuple[int, int], ...]:
@@ -432,13 +436,8 @@ def qwen3_5_image_spans(
     ``t * h * w / spatial_merge_size**2`` image tokens, one per row the vision
     tower returns for that grid.
     """
-    from atom.multimodal.processing import media_token_spans
-
-    grids = (
-        image_grid_thw.tolist() if hasattr(image_grid_thw, "tolist") else image_grid_thw
-    )
-    merge_unit = int(spatial_merge_size) ** 2
-    counts = [int(t) * int(h) * int(w) // merge_unit for t, h, w in grids]
+    merge_unit = spatial_merge_size**2
+    counts = [t * h * w // merge_unit for t, h, w in image_grid_thw.tolist()]
     return media_token_spans(input_ids, counts, image_token_id)
 
 
@@ -482,16 +481,15 @@ def build_qwen_vl_inputs(
         "pixel_values": processed["pixel_values"],
         "image_grid_thw": processed["image_grid_thw"],
     }
-    multimodal_config = getattr(atom_config, "multimodal_config", None)
-    if getattr(multimodal_config, "model_type", None) in QWEN3_5_MULTIMODAL_MODEL_TYPES:
-        from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
-        vision_config = getattr(multimodal_config, "vision_config", None)
+    multimodal_config = atom_config.multimodal_config
+    if multimodal_config is None:
+        raise ValueError("This model has no multimodal config, so it takes no images")
+    if multimodal_config.model_type in QWEN3_5_MULTIMODAL_MODEL_TYPES:
         multimodal_data["embedding_spans"] = qwen3_5_image_spans(
             input_ids,
             multimodal_data["image_grid_thw"],
-            image_token_id=getattr(multimodal_config, "image_token_id", 248056),
-            spatial_merge_size=getattr(vision_config, "spatial_merge_size", 2),
+            image_token_id=multimodal_config.image_token_id,
+            spatial_merge_size=multimodal_config.vision_config.spatial_merge_size,
         )
         multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
     return input_ids, multimodal_data
