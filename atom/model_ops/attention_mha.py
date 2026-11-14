@@ -1805,10 +1805,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         Only the shard's own top-k crosses the wire, so the payload is
         world*topk keys per token at any context length.
         """
-        from atom.distributed.indexer_cp import exchange_candidates
+        from atom.distributed.indexer_cp import (
+            candidate_mailbox,
+            exchange_candidates,
+        )
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
             local_candidate_keys,
             merge_candidate_keys,
+            select_exchanged_candidates,
         )
         from atom.model_ops.minimax_m3.indexer_context_parallel import (
             indexer_context_scores,
@@ -1826,6 +1830,23 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             max_query_len,
             self.scale,
         )
+        # The shape decides the path, so every rank takes the same one.
+        mailbox = candidate_mailbox()
+        if mailbox is not None and mailbox.fits(
+            scores.shape[0], scores.shape[1], self.topk
+        ):
+            return select_exchanged_candidates(
+                scores,
+                seq_lens,
+                block_table,
+                self.topk,
+                self.indexer_cp_rank,
+                self.indexer_cp_world,
+                max_query_len,
+                self.init_blocks,
+                self.local_blocks,
+                mailbox,
+            )
         # Forced blocks are pinned in BOTH passes on purpose: one that lost its
         # owner shard's top-k would never arrive at the merge to be pinned.
         keys = local_candidate_keys(

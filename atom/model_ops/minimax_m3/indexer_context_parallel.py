@@ -1,21 +1,46 @@
 """Opt-in M3 compute-only index context partitioning, independent of global DCP."""
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
     PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
-    _decode_score_chunks,
     _launch_select,
     _require_packable,
 )
 
+# A decode graph is captured for max_model_len, so a grid sized by the launch
+# width is mostly programs past every request. The grid is sized by the batch
+# instead, and each request's live blocks are split over its programs.
+CP_SCORE_PROGRAMS = 1024
+CP_SCORE_MIN_SPAN = 2  # blocks a program scores at least
 
-@triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS", "CHUNK"])
+
+@functools.cache
+def _transposed_score() -> bool:
+    # On gfx1250, use Q as WMMA's M operand and converted K as N. Same bits.
+    # The architecture-specific K load policy is documented at the load.
+    return get_gfx_runtime() == "gfx1250"
+
+
+def _context_score_programs(batch: int, local_blocks: int) -> int:
+    return max(
+        1,
+        min(
+            CP_SCORE_PROGRAMS // max(1, batch),
+            triton.cdiv(local_blocks, CP_SCORE_MIN_SPAN),
+        ),
+    )
+
+
+@triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS"])
 def _context_score(
     Q,
     Cache,
@@ -31,43 +56,59 @@ def _context_score(
     GLOBAL_BLOCKS,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
-    CHUNK,
+    MIN_SPAN: tl.constexpr,
     N: tl.constexpr,
     SCALE: tl.constexpr,
+    TRANSPOSED: tl.constexpr,
 ):
     request = tl.program_id(0)
     tokens = tl.num_programs(0) * QUERY_LEN
-    chunk = tl.program_id(1)
+    program = tl.program_id(1)
+    programs = tl.num_programs(1)
     n = tl.arange(0, N)
     token, head = n // HEADS, n % HEADS
     row = request * QUERY_LEN + token
-    d = tl.arange(0, 128)
-    q = tl.load(
-        Q + row[None, :] * Q_TOKEN_STRIDE + head[None, :] * Q_HEAD_STRIDE + d[:, None],
-        mask=n[None, :] < HEADS * QUERY_LEN,
-        other=0,
-    )
+    live = n < HEADS * QUERY_LEN
     length = tl.load(Lengths + request)
     cutoff = length - QUERY_LEN + token + 1
-    pos = tl.arange(0, 128)
-    for local in range(chunk * CHUNK, tl.minimum((chunk + 1) * CHUNK, LOCAL_BLOCKS)):
-        block = local * WORLD + RANK
-        valid = (block < GLOBAL_BLOCKS) & (block * 128 < length)
-        # Every output slot is overwritten, including empty shards and replay padding.
-        score = tl.full((N,), float("-inf"), tl.float32)
-        if valid:
+    s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
+    # This rank's blocks of the request are local < live_end.
+    request_blocks = tl.minimum(GLOBAL_BLOCKS, (length + 127) // 128)
+    live_end = tl.minimum(
+        LOCAL_BLOCKS, tl.maximum(0, (request_blocks - RANK + WORLD - 1) // WORLD)
+    )
+    span = tl.maximum(MIN_SPAN, (live_end + programs - 1) // programs)
+    start = program * span
+    end = tl.minimum(start + span, live_end)
+    if start < end:
+        d = tl.arange(0, 128)
+        pos = tl.arange(0, 128)
+        q_rows = Q + row * Q_TOKEN_STRIDE + head * Q_HEAD_STRIDE
+        if TRANSPOSED:
+            q = tl.load(q_rows[:, None] + d[None, :], mask=live[:, None], other=0)
+        else:
+            q = tl.load(q_rows[None, :] + d[:, None], mask=live[None, :], other=0)
+        for local in tl.range(start, end):
+            block = local * WORLD + RANK
             page = tl.load(Table + request * TABLE_STRIDE + block).to(tl.int64)
-            k = tl.load(Cache + page * 128 * 128 + pos[:, None] * 128 + d[None, :])
-            dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
-            dot = tl.where(
-                block * 128 + pos[:, None] < cutoff[None, :], dot, float("-inf")
-            )
-            score = tl.max(dot, 0)
-        tl.store(
-            Scores + (head * tokens + row) * LOCAL_BLOCKS + local,
-            score,
-            mask=n < HEADS * QUERY_LEN,
-        )
+            k_page = Cache + page * 128 * 128
+            if TRANSPOSED:
+                # On CDNA5 `.cv` is a system-scoped volatile/last-use load, not
+                # a streaming (`.cs`) policy. It is safe here because earlier
+                # kernels finished producing K and no writer races this launch;
+                # `.cs` has not been substituted without a separate benchmark.
+                k = tl.load(
+                    k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
+                )
+                dot = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * SCALE
+                in_ctx = block * 128 + pos[None, :] < cutoff[:, None]
+                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 1)
+            else:
+                k = tl.load(k_page + pos[:, None] * 128 + d[None, :])
+                dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
+                in_ctx = block * 128 + pos[:, None] < cutoff[None, :]
+                score = tl.max(tl.where(in_ctx, dot, float("-inf")), 0)
+            tl.store(s_row + local, score, mask=live)
 
 
 def indexer_context_scores(
@@ -85,6 +126,8 @@ def indexer_context_scores(
 
     Index cache remains replicated. Caller supplies valid live lengths no greater
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
+    Only each row's live shard prefix is initialized; selection masks the tail
+    from ``seq_lens`` rather than reading replay leftovers.
     """
     if (
         world_size < 1
@@ -141,8 +184,8 @@ def indexer_context_scores(
         (heads, tokens, local), dtype=torch.float32, device=idx_q.device
     )
     if tokens:
-        chunks = min(local, _decode_score_chunks(seq_lens.numel(), local))
-        _context_score[(seq_lens.numel(), chunks)](
+        programs = _context_score_programs(seq_lens.numel(), local)
+        _context_score[(seq_lens.numel(), programs)](
             idx_q,
             index_cache,
             block_table,
@@ -157,9 +200,10 @@ def indexer_context_scores(
             GLOBAL_BLOCKS=blocks,
             RANK=rank,
             WORLD=world_size,
-            CHUNK=triton.cdiv(local, chunks),
+            MIN_SPAN=CP_SCORE_MIN_SPAN,
             N=max(16, triton.next_power_of_2(heads * max_query_len)),
             SCALE=sm_scale * 1.4426950409,
+            TRANSPOSED=_transposed_score(),
             num_stages=3,
         )
     return scores

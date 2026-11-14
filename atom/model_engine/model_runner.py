@@ -4342,7 +4342,8 @@ class ModelRunner:
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
 
-        warmup_exchange(self.device)
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        warmup_exchange(self.device, self.config.max_num_seqs * full_q_len)
 
         tr_hybrid = self._tr_hybrid_active()
         if tr_hybrid:
@@ -4376,7 +4377,6 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
         max_bs = max_schedulable_decode_bs(

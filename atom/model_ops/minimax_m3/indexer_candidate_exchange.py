@@ -19,11 +19,32 @@ import triton.language as tl
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_NUM_WARPS,
+    PAGES_PER_SPARSE_BLOCK,
+    SCORE_KEY_BITS,
     _alloc_emit,
     _emit_sparse_block_table_row,
     _pack_score_key,
     _require_packable,
 )
+
+# Live blocks one _local_topk tile selects from; longer rows stream more tiles.
+LOCAL_TOPK_TILE = 512
+
+
+def _topk_block_t(topk: int) -> int:
+    """Power-of-two selection width required by tl.topk and fused emission."""
+    return triton.next_power_of_2(topk)
+
+
+def _topk_tiles(topk: int, local_blocks: int) -> tuple[int, int]:
+    """The score tile and selection widths shared by both local-top-k paths."""
+    block_t = _topk_block_t(topk)
+    block_k = max(
+        16,
+        block_t,
+        min(triton.next_power_of_2(local_blocks), LOCAL_TOPK_TILE),
+    )
+    return block_k, block_t
 
 
 @triton.jit
@@ -35,6 +56,59 @@ def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
     """
     score = tl.where(valid & (block < INIT_BLOCKS), 1e30, score)
     return tl.where(valid & (block >= local_start), 1e29, score)
+
+
+@triton.jit
+def _shard_winners(
+    Scores,
+    Lengths,
+    row,
+    head,
+    tokens,
+    QUERY_LEN: tl.constexpr,
+    LOCAL_BLOCKS,
+    GLOBAL_BLOCKS,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    LOCAL_KEEP: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """This shard's top-BLOCK_SIZE_T packed keys for one (head, query row)."""
+    request = row // QUERY_LEN
+    token = row % QUERY_LEN
+    length = tl.load(Lengths + request)
+    # Blocks this query token may attend, in global numbering.
+    causal_blocks = (length - QUERY_LEN + token + 128) // 128
+    local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
+    s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
+    # Lanes past this rank's blocks the token may attend key to zero, so tiles
+    # stop there rather than at the launch width.
+    live_end = tl.minimum(
+        LOCAL_BLOCKS,
+        tl.maximum(
+            0, (tl.minimum(GLOBAL_BLOCKS, causal_blocks) - RANK + WORLD - 1) // WORLD
+        ),
+    )
+
+    off = tl.arange(0, BLOCK_SIZE_K)
+    local_valid = off < live_end
+    block = off * WORLD + RANK
+    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+    score = _force(score, block, valid, local_start, INIT_BLOCKS)
+    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+    for start in tl.range(BLOCK_SIZE_K, live_end, BLOCK_SIZE_K):
+        off = start + tl.arange(0, BLOCK_SIZE_K)
+        local_valid = off < live_end
+        block = off * WORLD + RANK
+        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+        score = _force(score, block, valid, local_start, INIT_BLOCKS)
+        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    return winners
 
 
 # Retain bounded alignment specialization for the score row stride.
@@ -68,30 +142,22 @@ def _local_topk(
     row = tl.program_id(0)
     head = tl.program_id(1)
     tokens = tl.num_programs(0)
-    request = row // QUERY_LEN
-    token = row % QUERY_LEN
-    length = tl.load(Lengths + request)
-    # Blocks this query token may attend, in global numbering.
-    causal_blocks = (length - QUERY_LEN + token + 128) // 128
-    local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
-    s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
-
-    off = tl.arange(0, BLOCK_SIZE_K)
-    local_valid = off < LOCAL_BLOCKS
-    block = off * WORLD + RANK
-    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-    score = _force(score, block, valid, local_start, INIT_BLOCKS)
-    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-    for start in tl.range(BLOCK_SIZE_K, LOCAL_BLOCKS, BLOCK_SIZE_K):
-        off = start + tl.arange(0, BLOCK_SIZE_K)
-        local_valid = off < LOCAL_BLOCKS
-        block = off * WORLD + RANK
-        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-        score = _force(score, block, valid, local_start, INIT_BLOCKS)
-        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    winners = _shard_winners(
+        Scores,
+        Lengths,
+        row,
+        head,
+        tokens,
+        QUERY_LEN=QUERY_LEN,
+        LOCAL_BLOCKS=LOCAL_BLOCKS,
+        GLOBAL_BLOCKS=GLOBAL_BLOCKS,
+        RANK=RANK,
+        WORLD=WORLD,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+    )
     off_t = tl.arange(0, BLOCK_SIZE_T)
     tl.store(
         Keys + (head * tokens + row) * TOPK + off_t,
@@ -100,9 +166,10 @@ def _local_topk(
     )
 
 
-@triton.jit(do_not_specialize=["SRC_STRIDE"])
-def _merge_topk(
-    Keys,
+@triton.jit
+def _merge_winners(
+    key,
+    row,
     Indices,
     Lengths,
     Table,
@@ -116,22 +183,11 @@ def _merge_topk(
     LOCAL_KEEP: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
-    KEYS_PER_SHARD: tl.constexpr,
-    SRC_STRIDE,
-    ROW_STRIDE: tl.constexpr,
-    REAL_CANDIDATES: tl.constexpr,
-    CANDIDATES: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     EMIT: tl.constexpr,
 ):
-    """Merge WORLD*TOPK gathered candidates into the global top-k for one head.
-
-    Forced blocks are re-pinned here even though the shard pass already pinned
-    them, because the pin has to survive the score round trip: this is what
-    keeps a forced block ahead of a real block that happens to score above
-    1e29. It is not what makes forced blocks arrive -- see ``_local_topk``.
-    """
-    row = tl.program_id(0)
+    """The global top-k of one query row's gathered keys (0 for an empty slot),
+    stored as block indices and, with EMIT, as its sparse block-table row."""
     request = row // QUERY_LEN
     token = row % QUERY_LEN
     length = tl.load(Lengths + request)
@@ -139,15 +195,6 @@ def _merge_topk(
     valid_blocks = (causal_len + 127) // 128
     local_start = tl.maximum(0, valid_blocks - LOCAL_KEEP)
 
-    off = tl.arange(0, CANDIDATES)
-    # The all-to-all delivers [shard, token, topk]; reading it with a stride
-    # costs two integer ops and saves the contiguous() copy that flattening the
-    # shard axis into the token axis would otherwise need.
-    # CANDIDATES is rounded up to a power of two; the pad lanes must read 0,
-    # the same key an empty shard slot carries, so _pack_score_key ranks them
-    # below every real candidate.
-    src = (off // KEYS_PER_SHARD) * SRC_STRIDE + row * ROW_STRIDE + off % KEYS_PER_SHARD
-    key = tl.load(Keys + src, mask=off < REAL_CANDIDATES, other=0)
     # Unpack the id, re-pin forced blocks, repack. Padding lanes carry key 0.
     block = (key & 0xFFFF).to(tl.int32) - 1
     real = key != 0
@@ -184,6 +231,138 @@ def _merge_topk(
         )
 
 
+@triton.jit(do_not_specialize=["SRC_STRIDE"])
+def _merge_topk(
+    Keys,
+    Indices,
+    Lengths,
+    Table,
+    SparseBt,
+    SparseCtx,
+    TABLE_STRIDE: tl.constexpr,
+    SBT_STRIDE: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
+    TOPK: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    LOCAL_KEEP: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+    KEYS_PER_SHARD: tl.constexpr,
+    SRC_STRIDE,
+    ROW_STRIDE: tl.constexpr,
+    REAL_CANDIDATES: tl.constexpr,
+    CANDIDATES: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    EMIT: tl.constexpr,
+):
+    """Merge WORLD*TOPK gathered candidates into the global top-k for one head.
+
+    Forced blocks are re-pinned here even though the shard pass already pinned
+    them, because the pin has to survive the score round trip: this is what
+    keeps a forced block ahead of a real block that happens to score above
+    1e29. It is not what makes forced blocks arrive -- see ``_local_topk``.
+    """
+    row = tl.program_id(0)
+    off = tl.arange(0, CANDIDATES)
+    # The all-to-all delivers [shard, token, topk]; reading it with a stride
+    # costs two integer ops and saves the contiguous() copy that flattening the
+    # shard axis into the token axis would otherwise need.
+    # CANDIDATES is rounded up to a power of two; the pad lanes must read 0,
+    # the same key an empty shard slot carries, so _pack_score_key ranks them
+    # below every real candidate.
+    src = (off // KEYS_PER_SHARD) * SRC_STRIDE + row * ROW_STRIDE + off % KEYS_PER_SHARD
+    key = tl.load(Keys + src, mask=off < REAL_CANDIDATES, other=0)
+    _merge_winners(
+        key,
+        row,
+        Indices,
+        Lengths,
+        Table,
+        SparseBt,
+        SparseCtx,
+        TABLE_STRIDE=TABLE_STRIDE,
+        SBT_STRIDE=SBT_STRIDE,
+        QUERY_LEN=QUERY_LEN,
+        TOPK=TOPK,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        PAGES_PER_BLOCK=PAGES_PER_BLOCK,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+        EMIT=EMIT,
+    )
+
+
+def _validate_local_candidate_inputs(
+    scores,
+    seq_lens,
+    topk,
+    rank,
+    world_size,
+    max_query_len,
+    global_blocks,
+    init_blocks,
+    local_blocks,
+):
+    """Validate the score/local-selection inputs shared by both paths."""
+    if scores.ndim != 3 or scores.dtype != torch.float32:
+        raise ValueError("scores must be FP32 [heads,tokens,local_blocks]")
+    heads, tokens, local = scores.shape
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("invalid context partition")
+    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
+        raise ValueError("score rows must equal batch * max_query_len")
+    if topk < 1 or topk > 512:
+        raise ValueError("unsupported top-k")
+    if min(init_blocks, local_blocks) < 0:
+        raise ValueError("forced-block counts must be non-negative")
+    _require_packable(global_blocks)
+    if (
+        not scores.is_contiguous()
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or not scores.is_cuda
+        or not seq_lens.is_cuda
+        or seq_lens.device != scores.device
+    ):
+        raise ValueError("scores and lengths must be contiguous FP32/int32 on one GPU")
+    return heads, tokens, local
+
+
+def _validate_merge_metadata(
+    block_table,
+    seq_lens,
+    tokens,
+    candidates,
+    topk,
+    init_blocks,
+    local_blocks,
+    max_query_len,
+    device,
+):
+    """Validate the table/length metadata shared by merge and fused paths."""
+    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
+        raise ValueError("key rows must equal batch * max_query_len")
+    if topk < 1 or topk > candidates:
+        raise ValueError("top-k must not exceed the gathered candidate count")
+    if min(init_blocks, local_blocks) < 0:
+        raise ValueError("forced-block counts must be non-negative")
+    if block_table.ndim != 2 or block_table.shape[0] != seq_lens.numel():
+        raise ValueError("block table must have one row per request")
+    if (
+        block_table.dtype != torch.int32
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or block_table.stride(1) != 1
+    ):
+        raise ValueError("metadata must be int32 with contiguous inner dimensions")
+    if any(
+        not tensor.is_cuda or tensor.device != device
+        for tensor in (block_table, seq_lens)
+    ):
+        raise ValueError("selection metadata must share the input GPU")
+
+
 def local_candidate_keys(
     scores,
     seq_lens,
@@ -203,20 +382,17 @@ def local_candidate_keys(
     block has to be pinned on the rank that owns it or it never reaches the
     merge to be pinned there.
     """
-    if scores.ndim != 3 or scores.dtype != torch.float32:
-        raise ValueError("scores must be FP32 [heads,tokens,local_blocks]")
-    heads, tokens, local = scores.shape
-    if world_size < 1 or not 0 <= rank < world_size:
-        raise ValueError("invalid context partition")
-    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
-        raise ValueError("score rows must equal batch * max_query_len")
-    if topk < 1 or topk > 512:
-        raise ValueError("unsupported top-k")
-    if min(init_blocks, local_blocks) < 0:
-        raise ValueError("forced-block counts must be non-negative")
-    _require_packable(global_blocks)
-    if not scores.is_contiguous() or seq_lens.dtype != torch.int32:
-        raise ValueError("scores must be contiguous and lengths int32")
+    heads, tokens, local = _validate_local_candidate_inputs(
+        scores,
+        seq_lens,
+        topk,
+        rank,
+        world_size,
+        max_query_len,
+        global_blocks,
+        init_blocks,
+        local_blocks,
+    )
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
         # The tile must be at least as wide as the top-k it selects: the
@@ -228,11 +404,7 @@ def local_candidate_keys(
         # shipped config and costs it exactly nothing; it is here so the
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
-        width = max(16, triton.next_power_of_2(local), triton.next_power_of_2(topk))
-        # Select medium rows in one tile; smaller streaming tiles avoid
-        # excessive padding work when a longer row crosses a tile boundary.
-        if width > 2048:
-            width = 1024
+        block_k, block_t = _topk_tiles(topk, local)
         _local_topk[(tokens, heads)](
             scores,
             keys,
@@ -245,8 +417,8 @@ def local_candidate_keys(
             TOPK=topk,
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
-            BLOCK_SIZE_K=width,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_T=block_t,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
     return keys
@@ -276,28 +448,23 @@ def merge_candidate_keys(
         row_stride, key_stride = keys.stride()
     if key_stride != 1:
         raise ValueError("the candidate axis must be contiguous")
-    if max_query_len < 1 or tokens != seq_lens.numel() * max_query_len:
-        raise ValueError("key rows must equal batch * max_query_len")
-    if topk < 1 or topk > candidates:
-        raise ValueError("top-k must not exceed the gathered candidate count")
-    if min(init_blocks, local_blocks) < 0:
-        raise ValueError("forced-block counts must be non-negative")
-    if block_table.ndim != 2 or block_table.shape[0] != seq_lens.numel():
-        raise ValueError("block table must have one row per request")
-    if (
-        block_table.dtype != torch.int32
-        or seq_lens.dtype != torch.int32
-        or not seq_lens.is_contiguous()
-        or block_table.stride(1) != 1
-    ):
-        raise ValueError("metadata must be int32 with contiguous inner dimensions")
-    if any(
-        not x.is_cuda or x.device != keys.device for x in (keys, block_table, seq_lens)
-    ):
-        raise ValueError("merge inputs must share a GPU")
+    if not keys.is_cuda:
+        raise ValueError("candidate keys must be on a GPU")
+    _validate_merge_metadata(
+        block_table,
+        seq_lens,
+        tokens,
+        candidates,
+        topk,
+        init_blocks,
+        local_blocks,
+        max_query_len,
+        keys.device,
+    )
     indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=keys.device)
     output, _ = _alloc_emit(tokens, 1, topk, block_table, True, keys.device)
     if tokens:
+        block_t = _topk_block_t(topk)
         _merge_topk[(tokens,)](
             keys,
             indices,
@@ -312,7 +479,7 @@ def merge_candidate_keys(
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             NUM_KV_HEADS=1,
-            PAGES_PER_BLOCK=8,
+            PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
             KEYS_PER_SHARD=per_shard,
             SRC_STRIDE=src_stride,
             ROW_STRIDE=row_stride,
@@ -322,8 +489,226 @@ def merge_candidate_keys(
             # emit's zero-fill spans BLOCK_SIZE_T*pages_per_block unmasked, and
             # the sparse_bt row is only topk*pages_per_block wide. A padded
             # BLOCK_SIZE_T writes past the row into the next allocation.
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
+            BLOCK_SIZE_T=block_t,
             EMIT=True,
+            num_warps=DECODE_TOPK_NUM_WARPS,
+        )
+    return indices, *output
+
+
+# A mailbox word carries its tag above the packed score key. The tag is never
+# zero, which is the value of an empty mailbox word.
+_TAG_SHIFT = tl.constexpr(SCORE_KEY_BITS)
+_TAG_MASK = tl.constexpr((1 << (64 - SCORE_KEY_BITS)) - 1)
+# Divisible by both banks, so bank alternation survives the counter wrap.
+_CALL_PERIOD = tl.constexpr(1 << 30)
+
+
+@triton.jit
+def _next_call(counter, BANKS: tl.constexpr):
+    """Return the next counter value and its mailbox bank/tag."""
+    tl.static_assert(_CALL_PERIOD % BANKS == 0)
+    call = tl.load(counter) % _CALL_PERIOD + 1
+    return call, call % BANKS, (call % _TAG_MASK + 1).to(tl.int64)
+
+
+@triton.jit(do_not_specialize=["GLOBAL_BLOCKS"])
+def _select_exchange_merge(
+    Scores,
+    Lengths,
+    Peers,
+    SendCalls,
+    RecvCalls,
+    Indices,
+    Table,
+    SparseBt,
+    SparseCtx,
+    QUERY_LEN: tl.constexpr,
+    LOCAL_BLOCKS,
+    GLOBAL_BLOCKS,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    BANKS: tl.constexpr,
+    TOPK: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    LOCAL_KEEP: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    CANDIDATES: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+    SLOT_KEYS: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    SBT_STRIDE: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+):
+    """_local_topk, the exchange and _merge_topk in one launch.
+
+    A program selects one (head, row)'s shard top-k and stores it, tagged with
+    its call, in the mailbox of the rank that owns the head. The programs of
+    this rank's own head then wait until every shard's keys for their row carry
+    the call's tag, and merge them. They come last in the grid, so a program
+    that waits never holds a slot a sender of this GPU still needs. Even and odd
+    calls use 2 banks: a rank can be one call ahead of a peer.
+    """
+    tokens = tl.num_programs(0) // WORLD
+    pid = tl.program_id(0)
+    row = pid % tokens
+    head = (RANK + 1 + pid // tokens) % WORLD
+    counter = SendCalls + head * MAX_ROWS + row
+    call, bank, tag = _next_call(counter, BANKS)
+    peer = tl.load(Peers + head).to(tl.pointer_type(tl.int64))
+    winners = _shard_winners(
+        Scores,
+        Lengths,
+        row,
+        head,
+        tokens,
+        QUERY_LEN=QUERY_LEN,
+        LOCAL_BLOCKS=LOCAL_BLOCKS,
+        GLOBAL_BLOCKS=GLOBAL_BLOCKS,
+        RANK=RANK,
+        WORLD=WORLD,
+        INIT_BLOCKS=INIT_BLOCKS,
+        LOCAL_KEEP=LOCAL_KEEP,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
+    )
+    tl.debug_barrier()  # every wave has read the old call
+    tl.store(counter, call)
+    off_t = tl.arange(0, BLOCK_SIZE_T)
+    slot = (bank * WORLD + RANK) * MAX_ROWS + row
+    tl.store(
+        peer + slot * SLOT_KEYS + off_t,
+        winners | (tag << _TAG_SHIFT),
+        mask=off_t < TOPK,
+        cache_modifier=".wt",
+    )
+    if head == RANK:
+        counter = RecvCalls + row
+        call, bank, tag = _next_call(counter, BANKS)
+        off = tl.arange(0, CANDIDATES)
+        bank_offset = bank * WORLD * MAX_ROWS
+        src = peer + (
+            (bank_offset + (off // TOPK) * MAX_ROWS + row) * SLOT_KEYS + off % TOPK
+        )
+        # The pad lanes of a power-of-two CANDIDATES read as an empty slot that arrived.
+        real = off < WORLD * TOPK
+        empty = tag << _TAG_SHIFT
+        late = 1
+        # Match the collective this replaces: a delayed peer may stall the
+        # group, but must never turn stale mailbox words into a wrong top-k.
+        while late > 0:
+            seen = tl.load(
+                src, mask=real, other=empty, cache_modifier=".cv", volatile=True
+            )
+            late = tl.sum(
+                (((seen >> _TAG_SHIFT) & _TAG_MASK) != tag).to(tl.int32), axis=0
+            )
+        tl.debug_barrier()
+        tl.store(counter, call)
+        # The poll checked one copy of each key; the waves holding the others
+        # may have read them before they arrived, so every copy reads them now.
+        word = tl.load(src, mask=real, other=empty, cache_modifier=".cv", volatile=True)
+        _merge_winners(
+            word & ((1 << _TAG_SHIFT) - 1),
+            row,
+            Indices,
+            Lengths,
+            Table,
+            SparseBt,
+            SparseCtx,
+            TABLE_STRIDE=TABLE_STRIDE,
+            SBT_STRIDE=SBT_STRIDE,
+            QUERY_LEN=QUERY_LEN,
+            TOPK=TOPK,
+            INIT_BLOCKS=INIT_BLOCKS,
+            LOCAL_KEEP=LOCAL_KEEP,
+            NUM_KV_HEADS=1,
+            PAGES_PER_BLOCK=PAGES_PER_BLOCK,
+            BLOCK_SIZE_T=BLOCK_SIZE_T,
+            EMIT=True,
+        )
+
+
+def select_exchanged_candidates(
+    scores,
+    seq_lens,
+    block_table,
+    topk,
+    rank,
+    world_size,
+    max_query_len,
+    init_blocks,
+    local_blocks,
+    mailbox,
+):
+    """``local_candidate_keys``, the exchange and ``merge_candidate_keys`` in one
+    launch, through ``mailbox`` (an ``indexer_cp.CandidateMailbox`` that
+    ``fits`` this call). Returns what ``merge_candidate_keys`` returns, bit for bit.
+
+    Every rank of the group must make the same calls in the same order, as for
+    any collective.
+    """
+    if block_table.ndim != 2:
+        raise ValueError("block table must have one row per request")
+    global_blocks = block_table.shape[1]
+    heads, tokens, local = _validate_local_candidate_inputs(
+        scores,
+        seq_lens,
+        topk,
+        rank,
+        world_size,
+        max_query_len,
+        global_blocks,
+        init_blocks,
+        local_blocks,
+    )
+    _validate_merge_metadata(
+        block_table,
+        seq_lens,
+        tokens,
+        world_size * topk,
+        topk,
+        init_blocks,
+        local_blocks,
+        max_query_len,
+        scores.device,
+    )
+    if world_size != mailbox.world or not mailbox.fits(heads, tokens, topk):
+        raise ValueError(
+            "the mailbox exchange needs one head a rank and room for the call"
+        )
+    indices = torch.empty((1, tokens, topk), dtype=torch.int32, device=scores.device)
+    output, _ = _alloc_emit(tokens, 1, topk, block_table, True, scores.device)
+    if tokens:
+        block_k, block_t = _topk_tiles(topk, local)
+        _select_exchange_merge[(tokens * heads,)](
+            scores,
+            seq_lens,
+            mailbox.peers,
+            mailbox.send_calls,
+            mailbox.recv_calls,
+            indices,
+            block_table,
+            output[0],
+            output[1],
+            QUERY_LEN=max_query_len,
+            LOCAL_BLOCKS=local,
+            GLOBAL_BLOCKS=global_blocks,
+            RANK=rank,
+            WORLD=world_size,
+            BANKS=mailbox.BANKS,
+            TOPK=topk,
+            INIT_BLOCKS=init_blocks,
+            LOCAL_KEEP=local_blocks,
+            BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_T=block_t,
+            CANDIDATES=triton.next_power_of_2(world_size * topk),
+            MAX_ROWS=mailbox.max_rows,
+            SLOT_KEYS=mailbox.MAX_TOPK,
+            TABLE_STRIDE=block_table.stride(0),
+            SBT_STRIDE=output[0].stride(0),
+            PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
     return indices, *output
