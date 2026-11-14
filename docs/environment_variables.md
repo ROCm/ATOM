@@ -164,6 +164,14 @@ cannot affect a server that does not use the feature.
 | **ATOM_QSA_FLYDSL_ATTN** | bool | 1 (true) | `0` / `false` / `off` disables. Run the QSA sparse attention of SGLang-ATOM eager prefill (target prefill and the MTP drafter's prefill extend) with aiter's FlyDSL kernel instead of `qsa_sparse_paged_gqa`. Prefixed chunks gather their requests' full-context K/V from the paged cache once per layer. Falls back to the native kernel outside eager unpacked extends, under graph capture, on non-gfx942 GPUs, with an FP8 KV cache, for budgets other than 1024 / 2048 / 3072 / 4096 or a compression ratio other than 4, for shapes other than BF16 D256 with one KV head and 12, 6 or 3 query heads per rank, and when the padded selection would span 2**31 bytes or more. The first FlyDSL call logs an INFO line and each distinct fallback reason a WARNING, once per process. **Needs aiter with ROCm/aiter#6576.** |
 | **ATOM_QWEN4_EXP_SP_MIN_TOKENS** | int | 1024 | Under TP, eager forwards with at least this many tokens keep the hyper-connection residual streams token-sharded across the TP ranks, so the replicated per-token HC work (norm, low-rank GEMMs, gated mean) and the QSA index selection are split TP ways. Sub-layer inputs are all-gathered and their partial sums reduce-scattered, which moves the same bytes as the all-reduce they replace. The target model never shards forwards of at most 1024 tokens (`HC_QUANT_ROWS_MAX`), so they keep the fused HC FP8 activation quant whatever this value. The MTP drafter's prefill extend follows this value alone. Graph-captured steps never shard. `0` disables; a malformed or negative value logs a warning and keeps the default. |
 
+#### aiter kernel providers (`aiter.plugin`)
+
+The contract is the `--aiter-provider-enable` flag (`Config.aiter_provider_enable`, keyed into `Config.compute_hash()`); the variable below is only an operator override for deployments that cannot change the launch command. It is read once, when `EngineArgs` builds the `Config`, and only when the flag is absent; a worker never reads it.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_AITER_PROVIDER_ENABLE** | str | "" (off) | Comma-separated aiter kernel providers to enable (e.g. `qsa-index-scorer-provider`) when `--aiter-provider-enable` is not given. Empty enables nothing and imports nothing of `aiter.plugin`. aiter's own `AITER_PLUGINS=0` (kill switch: every routed op native) is read by aiter, never set by ATOM; no aiter variable can enable a provider. |
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |

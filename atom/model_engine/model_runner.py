@@ -32,6 +32,7 @@ from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
 from atom import structured_output
+from atom.aiter_fused_ops import configure_aiter_fused_ops, prewarm_aiter_fused_ops
 from atom.config import Config, local_device_index, set_current_atom_config
 from atom.distributed.group_agreement import agree_kv_budget, group_min
 from atom.distributed.pcp_utils import (
@@ -862,6 +863,13 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        # Opt-in aiter in-tree ops (default off: nothing imported): hand the
+        # policy to aiter once per worker process (`aiter.ops.<op>.configure`),
+        # before the model is built and long before warm-up / KV allocation /
+        # CUDA-graph capture.
+        self.aiter_fused_ops = configure_aiter_fused_ops(
+            config, rank_name=self.rank_name
+        )
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
@@ -2372,6 +2380,15 @@ class ModelRunner:
             )
         return pool
 
+    def _prewarm_aiter_fused_ops(self, models_to_bind) -> None:
+        """Prewarm opt-in aiter ops over the just-bound caches (default off:
+        a no-op that imports nothing). Runs before CUDA-graph capture."""
+        self.aiter_fused_ops_prewarm = prewarm_aiter_fused_ops(
+            self.config,
+            [model for _, model in models_to_bind],
+            rank_name=self.rank_name,
+        )
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -2503,6 +2520,10 @@ class ModelRunner:
                     f"actual={actual_kv_bytes / (1 << 30):.3f}GB, "
                     f"diff={diff_pct:.1%}"
                 )
+        # After the size check (prewarm's transient scratch is not KV) and
+        # before CUDA-graph capture: aiter builds the variants of its opt-in
+        # ops that the bound caches can select.
+        self._prewarm_aiter_fused_ops(models_to_bind)
 
         # Skip on single-rank: a world_size==1 barrier is a no-op but still
         # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
@@ -5241,6 +5262,7 @@ class RapidServeModelRunner(ModelRunner):
         from atom.utils.forward_context import set_kv_cache_data
 
         set_kv_cache_data(kv_cache_data)
+        self._prewarm_aiter_fused_ops(models_to_bind)
 
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward

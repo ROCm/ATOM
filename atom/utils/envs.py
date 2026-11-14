@@ -991,6 +991,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # aiter kernel providers: operator override for --aiter-provider-enable
+    # (comma-separated names). Read once when EngineArgs builds the Config,
+    # only when the flag is absent; the Config field is the contract.
+    # Empty (default) = OFF.
+    "ATOM_AITER_PROVIDER_ENABLE": lambda: os.getenv(
+        "ATOM_AITER_PROVIDER_ENABLE", ""
+    ).strip(),
     # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
     # (eager prefill) keep the hyper-connection residual streams token-sharded
     # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
@@ -1479,6 +1486,12 @@ def __getattr__(name: str):
 # MASTER_ADDR, MASTER_PORT        — PyTorch distributed; set in model_runner.py
 # AITER_LOG_LEVEL                 — AITER library log verbosity
 # AITER_QUICK_REDUCE_QUANTIZATION — AITER; set conditionally in model_runner.py
+# AITER_PLUGINS                   — aiter.plugin kill switch (AITER_PLUGINS=0:
+#                                   every routed op native, nothing recorded);
+#                                   read by aiter, never set by ATOM. It cannot
+#                                   enable a provider (ATOM's
+#                                   --aiter-provider-enable does, through
+#                                   aiter.plugin.configure)
 # TORCHINDUCTOR_CACHE_DIR         — PyTorch Inductor; set in compiler_inferface.py
 # TRITON_CACHE_DIR                — Triton compiler; set in compiler_inferface.py
 # HF_TOKEN                        — HuggingFace Hub auth token

@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, fields
 
 from atom import LLMEngine
+from atom.aiter_provider import normalize_provider_names
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
@@ -14,6 +15,7 @@ from atom.config import (
     DSparkConfig,
     EPLBConfig,
     ParallelConfig,
+    QSAIndexScorerConfig,
     SpeculativeConfig,
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -189,6 +191,8 @@ class EngineArgs:
     eplb_enable: bool = False
     eplb_config: dict | None = None
     dcp_config: dict | None = None
+    aiter_provider_enable: str = ""
+    qsa_index_scorer_capture: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -881,6 +885,37 @@ class EngineArgs:
                 """"biased"}'"""
             ),
         )
+        provider_group = parser.add_argument_group("aiter kernel providers")
+        provider_group.add_argument(
+            "--aiter-provider-enable",
+            type=str,
+            default="",
+            help=(
+                "Comma-separated out-of-tree aiter kernel providers to enable "
+                "(aiter.plugin.configure(enable=[...]), preference order), e.g. "
+                "qsa-index-scorer-provider. Default empty = OFF (nothing "
+                "imported; aiter's routed ops run native). When absent, "
+                "$ATOM_AITER_PROVIDER_ENABLE is used. A provider declaring "
+                "qsa_paged_mqa_logits also moves the Qwen QSA indexer onto "
+                "aiter.ops.qsa.qsa_paged_mqa_logits. See docs/qsa_index_scorer.md."
+            ),
+        )
+        qsa_group = parser.add_argument_group("QSA index scorer options")
+        qsa_group.add_argument(
+            "--qsa-index-scorer-capture",
+            type=str,
+            default="",
+            help=(
+                "Debug/coverage: write every QSA index scorer call class "
+                "(shapes, dtypes, strides, buckets, cache layouts, rank, and "
+                "aiter.ops.qsa.explain()'s path) to this JSON path "
+                "({rank}/{pid} placeholders allowed) for the coverage matrix "
+                "and aiter gen_profile --plan-file, and log per-path call "
+                "counts at exit. Off by default (no wrapper installed). "
+                "Without an enabled provider for qsa_paged_mqa_logits it "
+                "observes ATOM's own scorer."
+            ),
+        )
 
         return parser
 
@@ -979,6 +1014,17 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+        # --qsa-index-scorer-capture → QSAIndexScorerConfig (default OFF).
+        kwargs["qsa_index_scorer"] = QSAIndexScorerConfig.from_dict(
+            {"capture": kwargs.pop("qsa_index_scorer_capture", "")}
+        )
+        # --aiter-provider-enable → Config.aiter_provider_enable (tuple, default
+        # OFF). An absent flag takes the operator override
+        # ATOM_AITER_PROVIDER_ENABLE, read once here.
+        providers = (kwargs.pop("aiter_provider_enable", "") or "").strip()
+        kwargs["aiter_provider_enable"] = normalize_provider_names(
+            providers or envs.ATOM_AITER_PROVIDER_ENABLE
+        )
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
