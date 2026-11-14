@@ -476,6 +476,12 @@ def build_post_attn_kernel(
         sym_extra["cb"] = copy_batch
     if o_flag:
         sym_extra["of"] = o_flag
+    for tok, v, dflt in (  # the whole-layer back half's options, named when not the default
+        ("bsu", back_sh_units, 8), ("bds", back_dn_split, 0), ("bdb", back_dn_bdepth, 1),
+        ("bst", back_steal, 0), ("bdd", back_dn_depth, 3),
+    ):  # fmt: skip
+        if moe_back and v != dflt:
+            sym_extra[tok] = v
     if index_cp:
         sym_extra["cp"] = 1
         if cp_min_blocks:
