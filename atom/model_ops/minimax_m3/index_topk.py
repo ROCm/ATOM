@@ -35,6 +35,7 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
+from atom.model_ops.minimax_m3.nvfp4_pages import index_page_views as nvfp4_page_views
 
 
 @functools.cache
@@ -44,6 +45,23 @@ def flydsl_ops():
     from aiter.ops import flydsl
 
     return flydsl
+
+
+def _fp4_index_ops(index_scorer):
+    """The page views, prefill scorer and decode scorer of the FP4 index cache an
+    `IndexScoreBuffers` record is for: MXFP4, or NVFP4 when ``index_scorer.nvfp4``."""
+    ops = flydsl_ops()
+    if index_scorer.nvfp4:
+        return (
+            nvfp4_page_views,
+            ops.minimax_m3_index_score_prefill_nvfp4_flydsl,
+            ops.minimax_m3_index_score_nvfp4_flydsl,
+        )
+    return (
+        page_views,
+        ops.minimax_m3_index_score_prefill_fp4_flydsl,
+        ops.minimax_m3_index_score_fp4_flydsl,
+    )
 
 
 @functools.cache
@@ -1159,13 +1177,14 @@ def minimax_m3_index_topk(
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
 
-    With an ``index_scorer`` (an `IndexScoreBuffers`, MXFP4 index cache only)
-    ``index_kv_cache`` is the uint8 ``[num_blocks, 8704]`` page cache and aiter's
-    FlyDSL prefill scorer writes the scores into ``index_scorer.scores`` (shared by
+    With an ``index_scorer`` (an `IndexScoreBuffers`, an FP4 index cache only)
+    ``index_kv_cache`` is the uint8 page cache (``[num_blocks, 8704]`` MXFP4,
+    ``[num_blocks, 9216]`` NVFP4 as ``index_scorer.nvfp4`` says) and aiter's FlyDSL
+    prefill scorer writes the scores into ``index_scorer.scores`` (shared by
     every layer, never filled: the selection reads a row only up to its valid
     blocks). Without one the Triton scorer runs. ``pages_per_block`` /
     ``block_page_stride`` describe the emitted block table: 8 / 8 page-16 SHUFFLE,
-    1 / 1 MXFP4 KV.
+    1 / 1 MXFP4 KV (the NVFP4 KV takes the logical block ids, no emitted table).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1198,8 +1217,9 @@ def minimax_m3_index_topk(
     _require_packable(max_block)
 
     if index_scorer is not None:
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_prefill_fp4_flydsl(
+        views, score_prefill, _ = _fp4_index_ops(index_scorer)
+        k_data, k_scale = views(index_kv_cache)
+        score = score_prefill(
             idx_q,
             k_data,
             k_scale,
@@ -1389,8 +1409,9 @@ def minimax_m3_index_topk_decode(
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
     ``index_scorer`` (here with the step's work map) and ``pages_per_block`` as in
-    :func:`minimax_m3_index_topk`. The MXFP4 scorer takes an e4m3 query; the record's
-    ``max_block`` must not move between graph replays (the map's rows are its grid).
+    :func:`minimax_m3_index_topk`. The FP4 scorers take an e4m3 query (the NVFP4 one
+    widens it to bf16); the record's ``max_block`` must not move between graph replays
+    (the map's rows are its grid).
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1445,9 +1466,10 @@ def minimax_m3_index_topk_decode(
     )
 
     if index_scorer is not None:
+        views, _, score_decode = _fp4_index_ops(index_scorer)
         if index_scorer.work_map is None:
             raise ValueError(
-                "the MXFP4 index decode needs the step's index_scorer "
+                "the FP4 index decode needs the step's index_scorer "
                 "(a work map and the score workspace)"
             )
         score_max_block = index_scorer.max_block
@@ -1461,8 +1483,8 @@ def minimax_m3_index_topk_decode(
         score_out = index_scorer.scores.logits(
             num_idx_heads * total_q, score_max_block
         ).view(num_idx_heads, total_q, score_max_block)
-        k_data, k_scale = page_views(index_kv_cache)
-        score = flydsl_ops().minimax_m3_index_score_fp4_flydsl(
+        k_data, k_scale = views(index_kv_cache)
+        score = score_decode(
             idx_q,
             k_data,
             k_scale,

@@ -507,9 +507,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the one geometry check of an MXFP4 page, as the K / V layout makes it
             Mxfp4KvLayout().check(self.block_size, dim, entry_tokens // self.block_size)
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
+        if index_dtype == "nvfp4":
+            from atom.model_ops.minimax_m3.nvfp4_pages import (
+                HEAD_DIM,
+                INDEX_PAGE_BYTES,
+            )
+
+            if dim != HEAD_DIM or entry_tokens != self.block_size:
+                raise ValueError(
+                    "the NVFP4 index cache is 128-wide keys, one block an entry; "
+                    f"got dim {dim}, {entry_tokens} tokens an entry"
+                )
+            return _IndexCacheSpec(
+                rows, (INDEX_PAGE_BYTES,), torch.uint8, (-1, INDEX_PAGE_BYTES)
+            )
         if index_dtype not in ("bf16", "fp8"):
             raise ValueError(
-                f"index_cache_dtype must be 'bf16', 'fp8' or 'fp4', got {index_dtype!r}"
+                "index_cache_dtype must be 'bf16', 'fp8', 'fp4' or 'nvfp4', got "
+                f"{index_dtype!r}"
             )
         dtype = dtypes.d_dtypes[index_dtype]
         return _IndexCacheSpec(
@@ -627,6 +642,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # them, mxfp4_pages.page_views).
         if pool.scale_fields:
             module.k_scale, module.v_scale = pool.scale_views(row)
+
+        if config.kv_cache_dtype == "nvfp4" and _is_indexed_sparse_attention(module):
+            # The layer's fp32 global K / V scale, one element each, outside the
+            # page. 1.0: the M3.1 checkpoint carries no k_scale / v_scale and vLLM's
+            # default is the same; the kernels take whatever value is here.
+            module.impl.nvfp4_k_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
+            module.impl.nvfp4_v_scale = torch.ones(
+                1, dtype=torch.float32, device=k_cache.device
+            )
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache
