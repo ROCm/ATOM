@@ -137,6 +137,30 @@ def test_the_gate_reads_the_values_atom_settled_on(served):
     assert served.max_model_len <= hi_gate.MAX_CTX and not served.kv_transfer_config
 
 
+@pytest.mark.parametrize("kv", hi_gate.KV_DTYPES)
+def test_both_kv_formats_are_served(mi355x, kv):
+    """ATOM's bf16 pool, or its MXFP8 one (``--kv_cache_dtype fp8``: the programs dequantize on load and quantize on
+    store), from the served command line's ``Config``."""
+    cfg = _atom_config(
+        SERVED_ARGS.replace("--kv_cache_dtype bf16", f"--kv_cache_dtype {kv}")
+    )
+    assert cfg.kv_cache_dtype == kv
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
+
+
+def test_auto_serves_fp8_kv_only_when_asked(mi355x, served, monkeypatch, caplog):
+    """The fp8 pool is opt-in (``AUTO_KV_DTYPES``: measured on MI350X, not yet on MI355X): "auto" keeps ATOM's mono
+    path with one info line naming the opt-in; "1" serves it."""
+    cfg = _config(served, kv_cache_dtype="fp8")
+    assert hi_gate.refusal(cfg, _drafter(), _builder(), 0) == ""
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert hi_gate.decide(cfg, _drafter(), _builder(), 0) is False
+    line = "V4.1 mono hi off: --kv_cache_dtype fp8 (served with ATOM_DSV41_MONO_HI=1 only); ATOM's mono path"
+    assert [r.getMessage() for r in caplog.records] == [line]
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
+    assert hi_gate.decide(cfg, _drafter(), _builder(), 0) is True
+
+
 @pytest.mark.parametrize("block", [1, 16, 64, 256])
 def test_any_block_size_flag_takes_atoms_v41_page(mi355x, block):
     """ATOM lays V4.1's KV out in 128-token pages whatever ``--block-size`` asks: served either way."""
@@ -150,7 +174,7 @@ UNSUPPORTED = {
     "TP2": ({"tensor_parallel_size": 2}, {}, "TP2"),
     "TP8": ({"tensor_parallel_size": 8}, {}, "TP8"),
     "DP attention": ({}, {"dp_ranks": 2}, "DP attention"),
-    "fp8 KV": ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype fp8"),
+    "fp4 KV": ({"kv_cache_dtype": "fp4"}, {}, "kv_cache_dtype fp4"),
     "fp8 index cache": ({"index_cache_dtype": "fp8"}, {}, "index-cache-dtype fp8"),
     "gfx1250's FP4 index layout": (
         {"index_cache_layout": "natural"},

@@ -27,9 +27,12 @@ class WidthBuilds:
     needs every CTA resident at once, and one whose waves need scratch can be
     dispatched only in part (the scratch the runtime holds for the grid), its
     resident CTAs then waiting for ever on the rest. ``lean(built, spilled)``,
-    when given, first rebuilds the kernels whose launchers spilled with fewer
-    registers (a build returned with those swapped, or None when it has none
-    leaner), every rank together: the width is refused only if those spill too."""
+    when given, first offers a leaner build of the width, every rank together:
+    the width is refused only if that spills too. What "leaner" means is the
+    runner's answer, and the whole build is replaced, not only the launchers
+    named -- Kimi-K3 restages a spilling K1's GEMV at one column group a unit,
+    V4.1's decode drops a spilling K2's index stage and runs that indexer
+    outside the kernels. None: this runner has nothing leaner for that spill."""
 
     def __init__(self, build, kernels, group, what: str, lean=None) -> None:
         self._build, self._kernels, self._lean = build, kernels, lean

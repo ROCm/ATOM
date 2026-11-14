@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""What a V4.1 mono width was built as, fused or unfused.
+
+One record a width (``WidthBuilds``, keyed by the step's row count), holding
+the launchers and -- the reason it is a record and not a row count -- the K2
+build key they came from. A step's shape is not a function of its rows alone,
+so ``runner`` reads it off the build in hand rather than deriving it again.
+
+A width is normally built *fused*: K2 carries the indexer, so a selecting
+layer's scoring, its top-k and the pool rows the attention reads all happen
+inside the one launch (``kernels.index_score``). At some widths that build
+needs a byte of scratch a lane -- at TP 4 a 32- or 48-row K2 on the MFMA FP4
+index layout comes out at 256 VGPRs instead of 255 -- and a persistent kernel
+whose waves need scratch cannot be dispatched whole, so ``WidthBuilds`` refuses
+the width and its steps take the original model's path.
+
+The unfused variant is what ``WidthBuilds``' ``lean`` seam rebuilds such a
+width as: K2 without its index stage (``index_bound_max`` 0, the shape the
+DSpark draft already builds), with ATOM's own indexer run between K1 and K2
+and its selection published into the buffers K2 would otherwise have filled
+itself (``runner.V41MonoDecodeRunner._publish_selection``,
+``write_selection_rows``). The same configuration, on kernels byte-identical
+to these, is what the out-of-tree AITER provider drives, so this is a build
+choice, not a new kernel.
+"""
+
+from dataclasses import dataclass, replace
+
+import torch
+
+
+@dataclass(frozen=True)
+class RowsBuild:
+    """The kernels of an S-row step: K1's build a layer and their launchers,
+    and K2 (or, with ``check``, K2a and K2b apart).
+
+    ``post_key`` is the K2 build key the launchers came from: the one place a
+    step's ``tok_par`` and its K2 scratch layout are recorded, so the forward
+    and the debug paths ask the build what it is instead of recomputing it
+    from the row count and hoping the two answers agree. ``unfused``: K2 was
+    built without its indexer and the runner scores between K1 and K2."""
+
+    keys: list
+    launchers: dict
+    layer_post: object = None
+    attn_post: object = None
+    moe: object = None
+    post_key: object = None
+    unfused: bool = False
+
+    @property
+    def tok_par(self) -> bool:
+        """Whether this build's kernels run token parallel. Read it off the
+        build, never off the row count: the unfused variant of a width that
+        would run token parallel does not."""
+        return bool(self.post_key is not None and self.post_key.tok_par)
+
+
+def unfused_post_key(key):
+    """``key`` with K2's index stage out.
+
+    ``index_bound_max`` 0 builds the K2 that reads a selection instead of
+    making one; ``tok_par`` off because the indexer is what a token-parallel
+    step splits (each rank selects its own rows and writes every rank's copy,
+    ``index_score._st_out``) -- without it in the kernel every rank scores
+    every row on the host side and keeps its own copy.
+    """
+    return replace(key, index_bound_max=0, tok_par=False)
+
+
+def unfused_keys(keys: list, post_key):
+    """A width's (K1 build keys, K2 build key), unfused.
+
+    K1 loses token parallel with K2: a token-parallel K1 writes only its own
+    rank's rows (``token_par.own_rows``), which is whose selection that rank's
+    K2 indexer would have made. Nothing else about K1 changes -- it still
+    projects the indexer query, which the host-side scorer's FP8 form reads.
+    """
+    key = unfused_post_key(post_key)
+    return [replace(k, tok_par=key.tok_par) for k in keys], key
+
+
+def lean_width(built: RowsBuild, spilled: list, rebuild):
+    """``built`` rebuilt unfused when one of its K2 launchers needs scratch,
+    else None (``WidthBuilds``: nothing leaner, so the width is refused).
+
+    ``rebuild()``: the same width's unfused build. Only a fused build has a
+    leaner form, and only a K2 spill is what the unfused form fixes -- a K1
+    that spills on its own is rebuilt by nothing here, nor is a K2b, which the
+    unfused key does not change (``LayerPostBuild.halves``), nor a build whose
+    K2 has no index stage to drop (one already unfused, or the DSpark draft's).
+    """
+    key = built.post_key
+    if built.unfused or key is None or key.index_bound_max == 0:
+        return None
+    k2 = [f for f in (built.layer_post, built.attn_post) if f is not None]
+    if not any(f in spilled for f in k2):
+        return None
+    return rebuild()
+
+
+def write_selection_rows(
+    out, selected, batch_ids, block_tables, rows_per_page, page_rows, main_off
+) -> None:
+    """An unfused width's selection as K2's attention reads it (``out`` [S, K]
+    int32: the pool rows of a selection's columns, valid ones packed first).
+
+    ``selected`` [S, K] int32: the scorer's compressed-key columns, -1 where
+    there is none (a REINDEX layer's already lifted back to the row it stands
+    for, which is what ``step.selected`` holds either way). A column's pool row
+    is its request's PAGE (``block_tables[batch, col // rows_per_page]``) times
+    ``page_rows``, plus the KV owner's ``main_off`` and ``col % rows_per_page``
+    -- ``index_score._selected_rows``' arithmetic, which a fused K2 does in
+    the launch, and ``indices._indices``' addressing. A pad row (batch id -1)
+    selects nothing.
+
+    The attention takes the valid count off the bound, not off this
+    (``index_plan.selected`` of ``sbound``), so the valid entries have to be
+    packed first in their order: the top-k's own rank, which ``cumsum`` gives.
+    """
+    k = selected.shape[1]
+    s = out.shape[0]
+    assert out.shape == (s, k), (out.shape, selected.shape)
+    sel = selected[:s].to(torch.int64)
+    live = batch_ids[:s] >= 0
+    valid = (sel >= 0) & live.unsqueeze(1)
+    cols = sel.clamp_min(0)
+    batch = batch_ids[:s].to(torch.int64).clamp_min(0).unsqueeze(1)
+    pages = block_tables[batch, cols // rows_per_page].to(torch.int64)
+    rows = pages * page_rows + main_off + cols % rows_per_page
+    # a valid entry's slot is how many valid entries precede it; the rest go to
+    # a scratch column the copy below drops
+    dest = torch.where(valid, valid.to(torch.int64).cumsum(1) - 1, k)
+    packed = torch.zeros(s, k + 1, dtype=torch.int64, device=sel.device)
+    packed.scatter_(1, dest, torch.where(valid, rows, 0))
+    out.copy_(packed[:, :k])

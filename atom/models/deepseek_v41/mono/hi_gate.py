@@ -3,11 +3,12 @@
 """Whether DeepSeek-V4.1's high-interactivity (hi) monokernels serve this deployment (``ATOM_DSV41_MONO_HI``).
 
 - "auto" (the default): on for exactly the deployment they are built for, gfx950 (MI355X, every CU) at TP4 without
-  DP attention, a bf16 KV cache with the FP4 index cache (either gfx950 layout, ``INDEX_LAYOUTS``), ATOM's 128-token
-  V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA lookup with overlap staging, no KV
-  transfer, a context up to ``MAX_CTX`` (the programs' context bucket), DeepSeek-V4.1-Flash's geometry and FlyDSL
-  installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
-- "1": the same, but a deployment they do not serve is an error (raised, naming why).
+  DP attention, a bf16 KV cache (``AUTO_KV_DTYPES``) with the FP4 index cache (either gfx950 layout,
+  ``INDEX_LAYOUTS``), ATOM's 128-token V4.1 pages, the DSpark draft with its 5 drafts, ATOM's Engram runtime on its UVA
+  lookup with overlap staging, no KV transfer, a context up to ``MAX_CTX`` (the programs' context bucket),
+  DeepSeek-V4.1-Flash's geometry and FlyDSL installed. Any other deployment keeps ATOM's own mono decode, unchanged, with one info line saying why.
+- "1": the same, and an fp8 KV cache as well (``KV_DTYPES``: opt-in, measured on MI350X, not yet on MI355X); a
+  deployment they do not serve is an error (raised, naming why).
 - "0": never.
 
 Decided once, at ``install_mono_decode`` (after ATOM's own mono refusals, ``config.config_refusal``), before anything
@@ -41,6 +42,12 @@ CUS = 256  # MI355X's CUs (one CTA a CU: a compute partition has fewer)
 # ATOM's FP4 index plane layouts the hi programs read and write in place (``Config.index_cache_layout`` on gfx950:
 # "mfma" with ``ATOM_V4_UNIFIED_MQA=opus``, the default, "preshuffle" with ``flydsl``; ``hi.device.gfx950.paged``)
 INDEX_LAYOUTS = ("preshuffle", "mfma")
+# ATOM's KV pool formats (``--kv_cache_dtype``) the hi programs read and write in place: bf16 rows, or MXFP8 rows
+# (512 E4M3 + 16 E8M0 group-32 scales, 528 B: dequantized on load, quantized on store, the math bf16 either way)
+KV_DTYPES = ("bf16", "fp8")
+# the KV pool formats "auto" turns the hi path on for: the fp8 pool is opt-in ("1") until the hi path on it is
+# measured on MI355X (its numbers so far are MI350X ones)
+AUTO_KV_DTYPES = ("bf16",)
 ARCH = "gfx950"
 # DeepSeek-V4.1-Flash: the geometry the hi programs are composed for (``hi.v41.config.Geometry``, the verify head's
 # vocabulary, the draft's taps and stages, the Engram's n-grams and heads)
@@ -109,8 +116,8 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     if cus is not None and cus != CUS:
         return f"{cus} CUs (the hi path serves a whole MI355X, {CUS})"
     kv = getattr(cfg, "kv_cache_dtype", None)
-    if kv != "bf16":
-        return f"--kv_cache_dtype {kv} (the hi path serves bf16)"
+    if kv not in KV_DTYPES:
+        return f"--kv_cache_dtype {kv} (the hi path serves {', '.join(KV_DTYPES)})"
     index = getattr(cfg, "index_cache_dtype", None)
     if index != "fp4":
         return f"--index-cache-dtype {index} (the hi path serves fp4)"
@@ -158,6 +165,15 @@ def refusal(atom_config, drafter, metadata_builder, dp_ranks: int) -> str:
     return ""
 
 
+def auto_refusal(atom_config) -> str:
+    """Why "auto" leaves a deployment the hi path serves on ATOM's mono path ("" when it does not): a KV format it
+    serves only on request (``KV_DTYPES`` past ``AUTO_KV_DTYPES``)."""
+    kv = getattr(atom_config, "kv_cache_dtype", None)
+    if kv not in AUTO_KV_DTYPES:
+        return f"--kv_cache_dtype {kv} (served with ATOM_DSV41_MONO_HI=1 only)"
+    return ""
+
+
 def _plain(value):
     """A configuration value as ``GEOMETRY`` spells it (a tuple of ids as a list)."""
     return list(value) if isinstance(value, tuple) else value
@@ -171,6 +187,8 @@ def decide(atom_config, drafter, metadata_builder, dp_ranks: int) -> bool:
         log_once(logging.INFO, "V4.1 mono hi off: ATOM_DSV41_MONO_HI=0")
         return False
     why = refusal(atom_config, drafter, metadata_builder, dp_ranks)
+    if not why and m == "auto":
+        why = auto_refusal(atom_config)
     if not why:
         return True
     if m == "1":

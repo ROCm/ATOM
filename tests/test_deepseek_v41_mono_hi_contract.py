@@ -31,3 +31,20 @@ def test_the_one_request_programs_hold(monkeypatch, tmp_path):
     )
     # the Linear fits derived again (``check`` raises where one differs from the frozen table), every one in it
     assert hi_contract.missing_fits() == {}
+
+
+def test_the_one_request_kv8_programs_hold(monkeypatch, tmp_path):
+    """On ATOM's fp8 KV pool (``--kv_cache_dtype fp8``): the KV programs' own builds ("_kv8": the compressed layers'
+    MXFP8 stores and dequantizing loads, the DSpark context write's quantized ring store, the draft stages' ring
+    reads) build for gfx950 and hold the contract, without scratch."""
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "flydsl"))
+    progs = hi_contract.check(hi_contract.config(str(CONFIG)), [6], kv_dtype="fp8")
+    kv8 = {
+        k.program.name: k.resources
+        for k in progs.kernels().values()
+        if "_kv8" in k.program.name
+    }
+    assert any(n.startswith("atom_v41_ctx_kv8") for n in kv8), sorted(kv8)
+    assert any(n.startswith("atom_v41_draft") for n in kv8), sorted(kv8)
+    assert any(n.startswith("atom_v41_consumer") for n in kv8), sorted(kv8)
+    assert not [n for n, r in kv8.items() if r["scratch"] or r.get("vgpr_spill")], kv8

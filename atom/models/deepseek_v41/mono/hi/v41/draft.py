@@ -61,7 +61,17 @@ from ..blocks.gfx950.norm import (
 )
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
-from ..device.gfx950.ops import ld_i32, rsrc, traced, uniform
+from ..device.gfx950 import paged
+from ..device.gfx950.ops import (
+    bf2_f32,
+    butterfly,
+    fp8_pack4,
+    ld_i32,
+    rsrc,
+    traced,
+    uniform,
+    xshfl,
+)
 from ..device.gfx950.peer import from_rank, to_rank
 from ..plan.program import Program, Region, Scenario, Stage
 from ..plan.trace import Space
@@ -251,6 +261,9 @@ class _SPlan:
     spec: int = (
         0  # B > 1 requests (``Scenario(B, spec)``): rows a request; 0: one request (the original build)
     )
+    kv8: bool = (
+        False  # the ring is in ATOM's fp8 pool: the row stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
+    )
 
 
 @traced
@@ -279,21 +292,43 @@ def _ring_store(k, r, p: _SPlan):
     row = fx.max(slot, fx.Int32(0)) * slot_rows + (q // stride) * run + q % stride
     if k.tid < KVD // 2:
         w = mb.poll([(k.mb[p.kvn], (r * KVD) // 2 + k.tid, 1)], k.tag)[0][0]
-        if live:
-            bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
+        if const_expr(p.kv8):
+            _ring_store8(k, p, row, w, live)
+        if const_expr(not p.kv8):  # noqa: SIM102 (traced)
+            if live:
+                bo.buffer_store(w, rsrc(k.args[p.ring]), row * (KVD // 2) + k.tid)
+
+
+@traced
+def _ring_store8(k, p: _SPlan, row, w, live):
+    """``_ring_store``'s row into ATOM's fp8 pool: thread tid's pair (dims 2 tid, + 1; 16 threads a 32-dim group) as
+    ATOM's writer quantizes it (``paged.kv8_code``; the key is QAT'd already, ``KVPrep(kv8=True)``: the same values),
+    an even thread storing its pair and its neighbour's as one word, a group's first thread its code.
+    """
+    v0, v1 = bf2_f32(w)
+    amax = butterfly(fx.max(fx.max(v0, -v0), fx.max(v1, -v1)), (1, 2, 4, 8), fx.max)
+    code = paged.kv8_code(amax)
+    s0, s1 = paged.kv8_scaled(v0, code), paged.kv8_scaled(v1, code)
+    word = fp8_pack4(s0, s1, xshfl(s0, 1), xshfl(s1, 1))
+    base = fx.Int64(k.args[p.ring]) + fx.Int64(row) * paged.KV8_ROW_BYTES
+    if live & ((k.tid % 2) == 0):
+        paged.global_store(base + fx.Int64(k.tid * 2), word)
+    if live & ((k.tid % 16) == 0):
+        paged.global_store(base + fx.Int64(KVD + k.tid // 16), code, 1)
 
 
 class RingStore(Block):
     """Row r of ``kvn`` (a key, bf16 [KVD]) into an engine-owned window ring (module docstring: the address, the
     slot and the liveness), one task a row. Rows that are not the step's request's (padding, a dummy step) store
-    nothing; nothing else of the ring is written."""
+    nothing; nothing else of the ring is written. ``kv8``: the ring is in ATOM's fp8 pool (MXFP8 rows).
+    """
 
     def __init__(self, name: str, kvn: Channel, ring: str, geo: str, stage: int, pos: str = "pos",
-                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = ""):  # fmt: skip
+                 bids: str = "cx.bids", slots: str = "cx.slots", meta: str = "", kv8: bool = False):  # fmt: skip
         if kvn.fmt is not Fmt.BF16 or kvn.width != KVD or kvn.flagged:
             raise ValueError(f"RingStore {name}: a tagged BF16 channel of width {KVD}")
         self.p = _SPlan(name, kvn.name, ring, geo, stage, pos, bids if not meta else "", slots if not meta else "",
-                        meta)  # fmt: skip
+                        meta, kv8=kv8)  # fmt: skip
         self.name = name
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -325,8 +360,9 @@ def channels(tp: int, cols: str = "shard"):
 
 
 # the Linears' K slices (None: the plan's choice). main_proj in 3 (240 tasks; the plan's 2: 160): 20.8 vs 22.1 µs a
-# launch, 4: 21.1; wkv in 2: 23.0 (TP4, 6 rows, CUDA-graph timing; bit-exact vs the reference in every variant)
-KNOBS = {"PROJ_KSPLIT": 3, "WKV_KSPLIT": None}
+# launch, 4: 21.1; wkv in 2: 23.0 (TP4, 6 rows, CUDA-graph timing; bit-exact vs the reference in every variant).
+# KV_FMT: ATOM's draft rings' rows (``schedules.DEFAULT``'s: the deployment's KV pool), "bf16" or "fp8" (MXFP8)
+KNOBS = {"PROJ_KSPLIT": 3, "WKV_KSPLIT": None, "KV_FMT": "bf16"}
 # by rows (``context_program``): main_proj in 6 K slices over 18 rows (3 leaves no task shape at 24 rows, 4 / 5 spill
 # SGPRs)
 KNOBS_ROWS = {r: {"PROJ_KSPLIT": 6} for r in range(19, 25)}
@@ -342,6 +378,8 @@ def context_blocks(
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
     kn = {**KNOBS, **(knobs or {})}
+    # ATOM's draft rings in its fp8 pool: the keys QAT'd by its writer's code, stored as its MXFP8 rows
+    kv8 = kn["KV_FMT"] == "fp8"
     C = channels(tp, cols)
     shard = tp > 1 and cols == "shard"
     w8 = {"weight_format": "mxfp8"}
@@ -376,7 +414,9 @@ def context_blocks(
         blocks.append(NormQuant(f"cx_kvn{s}", C["kv"][s], C["kvq"][s], f"cx.kv_norm{s}.g", bf16_out=C["kvb"][s],
                                 spec=_nspec(KVD, 64, 4)))  # fmt: skip
     for s in range(STAGES):
-        blocks.append(KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope"))
+        blocks.append(
+            KVPrep(f"cx_kvp{s}", C["kvb"][s], C["kvn"][s], "pos", "rope", kv8=kv8)
+        )
     for s in range(STAGES):
         blocks.append(
             RingStore(
@@ -386,6 +426,7 @@ def context_blocks(
                 "cx.geo",
                 s,
                 meta="cx.meta" if meta else "",
+                kv8=kv8,
             )
         )
     return blocks
@@ -484,6 +525,8 @@ def stage_blocks(
     from .recipe import window_layer_blocks
 
     first, push, prev = STAGE_ROLES[stage]
+    # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
+    kv8 = (knobs or {}).get("KV_FMT", "bf16") == "fp8"
     # (the draft's own chain keeps its residual replicated and its rs partials as pairs: the target's ``RESIDUAL`` /
     # ``RS_PACK`` are the target layers')
     knobs = {**(knobs or {}), "RESIDUAL": "replicated", "RS_PACK": "pair"}
@@ -497,7 +540,7 @@ def stage_blocks(
             b.name == "attn"
         ):  # (its output's inverse RoPE as the window attention's: ATTN_OUT_F32_ROPE)
             b = MLABlockAttn("attn", b.q, b.kvn, b.out, b.pos, b.rope, b.sink, "dr.ring", "dr.geo", "dr.slot",
-                             heads=b.heads, unrope_f32=b.unrope_f32)  # fmt: skip
+                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8)  # fmt: skip
         out.append(b)
     return out
 

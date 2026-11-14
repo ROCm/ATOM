@@ -38,7 +38,8 @@ earlier position still needs: a verify step whose later rows are rejected leaves
 Outputs:
 
 - ``cache`` (ATOM's pool in place: the owner's main rows, ``device.gfx950.paged``): entry ``P // ratio`` := the
-  QAT'd (``qat``), rotated latent, for every emitting row of a live request (later launches read it);
+  QAT'd (``qat``), rotated latent, for every emitting row of a live request (later launches read it); ``kv8``: ATOM's
+  fp8 pool, the entry quantized to its MXFP8 row (``paged.KV8_ROW_BYTES``) as ATOM's writer does;
 - ``out`` (a tagged BF16 channel, 512): the same entry, row r (zeros on a row that does not emit): the in-launch
   hand-off for this layer's attention / indexer (plain stores are not visible to another XCD within a launch);
 - ``latent`` (optional tagged BF16 channel, 512): the normed latent before RoPE (what the indexer's ``wk``
@@ -69,6 +70,7 @@ from ...device.gfx950.ops import (
     bf16_pair,
     bf16_round,
     butterfly,
+    fp8_pack4,
     hw_exp2,
     hw_rsq,
     ld_i32,
@@ -125,6 +127,9 @@ class _Plan:
     flag: bool  # some row overwrites the slot the step's first row reads: the .rd hand-off
     qat: bool = (
         True  # the cache entry's FP4 QAT (False: the rotated bf16 latent, unquantized)
+    )
+    kv8: bool = (
+        False  # the cache is ATOM's fp8 pool: the entry stored as its MXFP8 row (``paged.KV8_ROW_BYTES``)
     )
 
     @property
@@ -273,9 +278,34 @@ def _put_pair(k, a, e, v0, v1, ok):
 
 
 @traced
-def _store_entry(addr, w, ok):
+def _store_entry(addr, w, ok, nbytes=4):
     if ok:
-        paged.global_store(addr, w)
+        paged.global_store(addr, w, nbytes)
+
+
+def _kv8_entry(k, p: _Plan, b, pos, c, entry, ok):
+    """Channel c's ``entry`` (bf16) into entry pos // ratio's MXFP8 row of ATOM's fp8 pool where ``ok``, as ATOM's
+    writer stores it (``paged.kv8_code``: its group the 32 channels of a half wave); -> the value the row holds
+    (QAT: what ATOM's readers take). A lane c % 4 == 0 stores channels c .. c + 3 (a word), lane c % 32 == 0 the
+    group's code."""
+    amax = butterfly(fx.Float32(fx.max(entry, -entry)), (1, 2, 4, 8, 16), fx.max)
+    code = paged.kv8_code(amax)
+    scaled = paged.kv8_scaled(entry, code)
+    n1 = xshfl(scaled, 1)
+    word = fp8_pack4(
+        scaled, n1, xshfl(scaled, 2), xshfl(n1, 2)
+    )  # (lane c ^ 2's neighbour: c + 3)
+    row = paged.row_addr(
+        k, p.cache, b, pos // p.ratio, p.ratio, row_bytes=paged.KV8_ROW_BYTES
+    )
+    _store_entry(row + fx.Int64(c), word, ok & ((c % 4) == 0))
+    _store_entry(
+        row + fx.Int64(HD + c // paged.KV8_GROUP),
+        code,
+        ok & ((c % paged.KV8_GROUP) == 0),
+        1,
+    )
+    return paged.kv8_value(scaled, code)
 
 
 def _state_at(k, p: _Plan, b, slot):
@@ -375,18 +405,25 @@ def _pool(k, t, p: _Plan):
         zero = fx.Float32(0.0)
         entry = emits.select(entry, zero)
         lat = emits.select(lat, zero)
+    if const_expr(p.kv8):
+        # ATOM's fp8 pool: the entry as its writer quantizes the bf16 row (``fused_compress``'s ``fp8_groups``), a
+        # group of 32 channels a half wave; this launch's readers (``out``) take the values the row holds
+        entry = _kv8_entry(
+            k, p, b, pos, c, entry, live if emits is None else live & emits
+        )
     # outputs: a pair a even thread
     nxt = xshfl(entry, 1)
     even = (c & 1) == 0
     _put_pair(k, k.mb[p.out], t * HD + c, entry, nxt, even)
-    # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
-    addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
-    ok = even & live
-    _store_entry(
-        addr,
-        bf16_pair(entry, nxt).bitcast(fx.Int32),
-        ok if emits is None else ok & emits,
-    )
+    if const_expr(not p.kv8):
+        # the entry into ATOM's pool, in place: the owner's main row of entry pos // ratio (``paged``)
+        addr = paged.row_addr(k, p.cache, b, pos // p.ratio, p.ratio) + fx.Int64(c * 2)
+        ok = even & live
+        _store_entry(
+            addr,
+            bf16_pair(entry, nxt).bitcast(fx.Int32),
+            ok if emits is None else ok & emits,
+        )
     if p.index_out:
         _index_key(k, t, p, c, b, pos, iload, lat, emits)
     gpu.barrier()  # the next task reuses the LDS
@@ -402,7 +439,8 @@ class Compressor(Block):
     def __init__(self, name: str, x: Channel, ratio: int, out: Channel, pos: str, rope: str, cache: str,
                  cache_len: int, latent: Channel | None = None, kv_state: str = "", score_state: str = "",
                  slots: int = 0, index_out: Channel | None = None, kslices: int = 4,
-                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True):  # fmt: skip
+                 tiles: int = 1, poll_batch: int = 0, eps: float = 1e-20, qat: bool = True,
+                 kv8: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(
                 f"Compressor {name}: ratio 1 or 2 (DeepSeek-V4.1's), got {ratio}"
@@ -454,6 +492,8 @@ class Compressor(Block):
         # the cache entry's FP4 QAT (the official model's); False: the rotated bf16 latent as is (an engine's bf16
         # cache without the QAT, ATOM's). A numerics choice, not a schedule knob
         self.qat = qat
+        # the cache's rows: ATOM's fp8 pool (MXFP8, ``_Plan.kv8``) or its bf16 one; the deployment's
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _Plan:
         spec = sc.spec
@@ -464,7 +504,7 @@ class Compressor(Block):
                      self.dots[0].part.name, self.dots[1].part.name if self.ratio == 2 else "", self.pos, self.rope,
                      self.aux, self.cache, self.cache_len, self.kv_state, self.score_state, self.out.name,
                      self.latent.name if self.latent else "", self.eps, self.poll_batch,
-                     self.index_out.name if self.index_out else "", flag, self.qat)  # fmt: skip
+                     self.index_out.name if self.index_out else "", flag, self.qat, kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

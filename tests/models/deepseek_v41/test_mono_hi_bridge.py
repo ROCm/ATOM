@@ -5,11 +5,16 @@ interpreter, no GPU.
 
 - [2] / [3] / [4]: each bridge body as a kernel of its own (``mono_hi_bridge_ref``) against a torch model of ATOM's
   pool: the rings' import / export, the request words of the in-place programs, the mHC hand-off, the DSpark tap;
-- [5]: the fused begin-step / end-step launches == those separate launches (and the Engram segments);
+- [2k] / [2kr]: ATOM's fp8 pool (``KV8``): its MXFP8 rows decoded and encoded as ATOM's reader / writer do
+  (``dequantize_rows`` / ``fp8_groups``, torch models of them here: the interpreter's fp8 conversion rounds ties away
+  and drops subnormals, which is why the bridge encodes in integer arithmetic), and the rings' import / export over it;
+- [5]: the fused begin-step / end-step launches == those separate launches (and the Engram segments; on the fp8
+  pool);
 - [8]: the incremental ring import == the full import over a scripted run;
 - [10]: the bridge at B requests a step and on the batch bands' slots, the block draft's begin kernel;
-- [ef] / [vf] / [pv] / [gf]: the Engram fold, the verdict reference, the in-graph post-verify (the forward's head
-  output) and the glue folds against ATOM's own launches (these need AITER: they skip without it).
+- [ef] / [vf] / [pv] / [gf] / [2ka]: the Engram fold, the verdict reference, the in-graph post-verify (the forward's
+  head output), the glue folds and the fp8 rows' export / import against ATOM's own launches (these need AITER and a
+  GPU: they skip without them).
 
 The interpreter's sections need Triton's interpreter from the start (minutes):
 
@@ -41,6 +46,8 @@ MONO = ROOT / "atom/models/deepseek_v41/mono"
 HELPERS = (
     "_ring_in",
     "_ring_out",
+    "_kv8_load",
+    "_kv8_store",
     "_req_words",
     "_dead_words",
     "_eng_fold",
@@ -104,6 +111,117 @@ ml = _Ml()
 _FAILS: list = []
 
 
+def _interpreter_bool_masks():
+    """Triton's interpreter (3.8) builds the mask of a scalar condition and a vector one (``ok & (d < DIM)``) as
+    int32, which its load / store refuse ("mask has unsupported dtype"); a compiled kernel takes it as is. Its loads
+    and stores here take any mask as bool, so the bridge's bodies run unchanged."""
+    from triton.runtime import interpreter
+
+    native = interpreter._interpreter
+    if getattr(native, "_bool_masks", False):
+        return
+    load, store = native.load, native.store
+
+    class Native:
+        _bool_masks = True
+
+        def __getattr__(self, name):
+            return getattr(native, name)
+
+        @staticmethod
+        def load(ptrs, mask, other, dtype):
+            return load(ptrs, mask.astype(bool, copy=False), other, dtype)
+
+        @staticmethod
+        def store(ptrs, value, mask):
+            return store(ptrs, value, mask.astype(bool, copy=False))
+
+    interpreter._interpreter = Native()
+
+
+if INTERPRET:
+    _interpreter_bool_masks()
+
+
+# ---------------------------------------------------------------- ATOM's fp8 pool rows (torch models)
+#
+# A row: 512 E4M3 bytes, then 16 E8M0 group-32 codes (``V41PoolGeometry.row_bytes``: 528). ATOM's reader
+# (``fp8_attention.dequantize_rows``) when it imports here, else the same torch body; its writer (``fp8_groups``,
+# Triton) as torch: f32 arithmetic and torch's fp8 conversion, which rounds to nearest even.
+
+
+def _atom_dequantize_rows():
+    try:
+        from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+            dequantize_rows,
+        )
+
+        return dequantize_rows
+    # its module needs AITER's attention (and what it imports)
+    except Exception:  # noqa: BLE001
+
+        def dequantize_rows(values, scales):
+            groups = values.float().unflatten(-1, (-1, 32))
+            steps = torch.exp2(scales.view(torch.uint8).float() - 127)
+            return (groups * steps[..., None]).flatten(-2)
+
+        return dequantize_rows
+
+
+def kv8_decode(rows: torch.Tensor) -> torch.Tensor:
+    """ATOM's fp8 pool rows (uint8 [n, 528]) as ATOM's reader takes them: f32 [n, 512]."""
+    values = rows[:, :512].contiguous().view(torch.float8_e4m3fn)
+    scales = rows[:, 512:].contiguous().view(torch.float8_e8m0fnu)
+    return _atom_dequantize_rows()(values, scales)
+
+
+def kv8_encode(x: torch.Tensor) -> torch.Tensor:
+    """``x`` [n, 512] as ATOM's writer stores it (``fp8_groups``): uint8 [n, 528]. A group's amax floored at 1e-10,
+    code = the smallest power of two >= amax x fp32(1 / 448) (``ceil_pow2_code``), the values times the scale's exact
+    reciprocal (``pow2_reciprocal``), clamped to +-448, E4M3 rounded to nearest even."""
+    n = x.shape[0]
+    g = x.float().reshape(n, 16, 32)
+    amax = torch.maximum(
+        g.abs().amax(-1), torch.tensor(1e-10, dtype=torch.float32, device=x.device)
+    )
+    t = (amax * torch.tensor(1 / 448, dtype=torch.float32, device=x.device)).view(
+        torch.int32
+    )
+    code = (t >> 23) + ((t & 0x7FFFFF) != 0).int()
+    rcp = ((254 - code).clamp_min(0) << 23).view(torch.float32)
+    q = (g * rcp[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return torch.cat([q.view(torch.uint8).reshape(n, 512), code.to(torch.uint8)], -1)
+
+
+def kv8_rows(n: int, seed: int = 0) -> torch.Tensor:
+    """``_kv8_rows`` built on the host whatever the default device (a GPU run sets cuda)."""
+    with torch.device("cpu"):
+        return _kv8_rows(n, seed)
+
+
+def _kv8_rows(n: int, seed: int = 0) -> torch.Tensor:
+    """n bf16 rows [n, 512] that reach every case of the encoding: groups from 2^-40 to 2^20 in scale, an all-zero
+    group (the amax floor), +-0, exact powers of two at the clamp, values at the E4M3 midpoints (normal and
+    subnormal: the rounding's ties), values below the smallest subnormal."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, 16, 32, generator=g)
+    x *= torch.exp2(torch.randint(-40, 21, (n, 16, 1), generator=g).float())
+    x[0, 0] = 0.0
+    x[0, 1, ::2] = -0.0
+    # amax 448 x 2^k (code 127 + k exactly), then the midpoints between E4M3 neighbours (scaled by 2^k): normal
+    # (2.125: 2 | 2.25, 1.0625 x 2^5, 3.5 x 2^-7 ..) and subnormal (k units of 2^-9 plus half a unit), and 2^-11
+    ties = torch.tensor([2.125, 2.375, 1.1875, 1.0625 * 32, 3.5 * 2**-7, 0.5 * 2**-9, 1.5 * 2**-9, 2.5 * 2**-9,
+                         7.5 * 2**-9, 2**-11, 15.5 * 2**-7, 240.0, 232.0, 0.0])  # fmt: skip
+    for r in range(min(n, 8)):
+        k = r * 3 - 9
+        row = x[r, 2 + r % 14]
+        row[:] = 0.0
+        row[0] = 448.0 * 2.0**k
+        row[1 : 1 + len(ties)] = ties * 2.0**k
+        row[1 + len(ties) : 1 + 2 * len(ties)] = -ties * 2.0**k
+    return x.reshape(n, 512).bfloat16()
+
+
 def report(name, ok, extra=""):
     if not ok:
         _FAILS.append(f"{name} {extra}")
@@ -116,7 +234,7 @@ def _run(check, *args):
     assert not _FAILS, _FAILS
 
 
-def ring_world(seed=0):
+def ring_world(seed=0, kv8=False):
     torch.manual_seed(seed)
     w = SimpleNamespace(
         dim=512,
@@ -129,15 +247,20 @@ def ring_world(seed=0):
     w.pool = torch.randn(
         w.ring_start0 + w.num_slots * w.slot_rows + 8, w.dim
     ).bfloat16()
+    if kv8:  # ATOM's fp8 pool: its writer's rows of the same keys
+        w.pool = kv8_encode(w.pool)
     return w
 
 
-def check_rings():
+def check_rings(kv8=False):
+    """[2] (``kv8`` [2kr]: on ATOM's fp8 pool, its rows decoded on import and the step's rows encoded on export)."""
+    kv = {"KV8": 1} if kv8 else {}
+    tag = "[2kr] fp8 rings" if kv8 else "[2] rings"
     mf = [0, 2, 3, 20, 39]
     ids = torch.tensor(mf, dtype=torch.int32)
     for ctx, rows, slot, pad in ((5, 6, 1, False), (127, 6, 2, False), (1000, 6, 2, False), (1131, 6, 1, False),
                                  (300, 6, 1, True)):  # fmt: skip
-        w = ring_world(ctx)
+        w = ring_world(ctx, kv8)
         positions = torch.arange(ctx, ctx + rows, dtype=torch.int64)
         batch = torch.full((rows,), -1 if pad else 0, dtype=torch.int32)
         slots = torch.tensor([slot, 0, 0], dtype=torch.int32)
@@ -148,7 +271,7 @@ def check_rings():
         geo = (w.ring_start0, w.slot_rows, w.ring_slots, w.num_slots, 1 << 20)
         before = w.pool.clone()
         ml._import_rings_kernel[(len(mf), 128)](w.pool, positions, batch, slots, rings, ids, pos, bounds, *geo, rows,
-                                                WIN=128, DIM=w.dim, RB=8)  # fmt: skip
+                                                WIN=128, DIM=w.dim, RB=8, **kv)  # fmt: skip
         ok = int(pos) == ctx
         for m, layer in enumerate(mf):
             want = torch.zeros(128, w.dim).bfloat16()
@@ -156,12 +279,13 @@ def check_rings():
                 for s in range(128):
                     q = ctx - 128 + (s - ctx % 128 + 128) % 128
                     if q >= 0:
-                        want[s] = before[
+                        i = (
                             w.ring_start0
                             + layer * w.ring_slots
                             + slot * w.slot_rows
                             + q % w.ring_slots
-                        ]
+                        )
+                        want[s] = kv8_decode(before[i : i + 1])[0] if kv8 else before[i]
             ok &= torch.equal(rings[m, 0], want)
         j = torch.arange(rows)
         ok &= torch.equal(bounds[0, :rows], ((ctx + j + 1) // 2).int()) and torch.equal(
@@ -173,7 +297,7 @@ def check_rings():
             for r in range(rows):
                 rings[m, 0, (ctx + r) % 128] = new[m, r]
         ml._export_rings_kernel[(len(mf), rows)](
-            w.pool, positions, batch, slots, rings, ids, *geo, WIN=128, DIM=w.dim
+            w.pool, positions, batch, slots, rings, ids, *geo, WIN=128, DIM=w.dim, **kv
         )
         want_pool = before.clone()
         if not pad:
@@ -184,9 +308,49 @@ def check_rings():
                         + layer * w.ring_slots
                         + slot * w.slot_rows
                         + (ctx + r) % w.ring_slots
-                    ] = new[m, r]
+                    ] = (kv8_encode(new[m, r][None])[0] if kv8 else new[m, r])
         ok &= torch.equal(w.pool, want_pool)
-        report(f"[2] rings ctx {ctx} rows {rows} slot {slot} pad {pad}", ok)
+        report(f"{tag} ctx {ctx} rows {rows} slot {slot} pad {pad}", ok)
+
+
+def check_kv8_codec():
+    """[2k] ATOM's fp8 pool rows (``_kv8_store`` / ``_kv8_load``, the bridge's export and import of a row): the bytes
+    ATOM's writer stores for a bf16 row (``kv8_encode``: every case ``kv8_rows`` reaches), decoded as ATOM's reader
+    does, exactly in bf16; and ATOM's rows of any codes it writes decoded alike."""
+    n, dim = 64, 512
+    x = kv8_rows(n)
+    got = torch.zeros(n, ml.KV8_ROW_BYTES, dtype=torch.uint8)
+    ml._kv8_store_kernel[(n,)](x, got, DIM=dim)
+    want = kv8_encode(x)
+    bad = (got != want).any(-1).nonzero().flatten().tolist()
+    report("[2k] export: ATOM's writer's bytes", not bad,
+           f"(rows {bad[:8]}; values {int((got[:, :dim] != want[:, :dim]).sum())} differ, codes "
+           f"{int((got[:, dim:] != want[:, dim:]).sum())})")  # fmt: skip
+    back = torch.zeros(n, dim).bfloat16()
+    ml._kv8_load_kernel[(n,)](want, back, DIM=dim)
+    ref = kv8_decode(want)
+    report("[2k] import: ATOM's reader's values, exact in bf16",
+           torch.equal(back.float(), ref) and torch.equal(ref.bfloat16().float(), ref))  # fmt: skip
+    # ATOM's rows of random value bytes (no NaN: 0x7f / 0xff are its clamp's) and codes 85 .. 200 (the amax floor's
+    # code is 85)
+    g = torch.Generator().manual_seed(1)
+    rows = torch.randint(
+        0, 256, (n, ml.KV8_ROW_BYTES), generator=g, dtype=torch.int32
+    ).to(torch.uint8)
+    rows[:, :dim][(rows[:, :dim] & 0x7F) == 0x7F] = 0x7E
+    rows[:, dim:] = torch.randint(
+        85, 201, (n, dim // 32), generator=g, dtype=torch.int32
+    ).to(torch.uint8)
+    ml._kv8_load_kernel[(n,)](rows, back, DIM=dim)
+    report("[2k] import: random ATOM rows", torch.equal(back.float(), kv8_decode(rows)))
+    # a row the hi path re-exports after importing it decodes to the same values (its bytes may differ: a group whose
+    # largest value rounded down to 224 x scale re-encodes at half the scale, every value doubled)
+    again = torch.zeros_like(got)
+    ml._kv8_store_kernel[(n,)](back, again, DIM=dim)
+    report(
+        "[2k] export after import: the same values",
+        torch.equal(kv8_decode(again), kv8_decode(rows)),
+    )
 
 
 def check_req_words():
@@ -308,14 +472,14 @@ def check_hc():
     )
 
 
-def check_fused(engram: bool = False):
+def check_fused(engram: bool = False, kv8: bool = False):
     """[5] The fused bridge (``_begin_step_kernel`` / ``_end_step_kernel``, the hook's default) writes the same bytes
     as the separate kernels it replaces ([2]-[4] check those against the reference model): one world, the rings, the
     request words, three taps, the gates; random state everywhere so an unwritten or misrouted byte shows; the hi
     side's writes between import and export are the same random values for both. ``engram`` ([5e]): the begin-step's
     Engram segments too, against ``_engram_rows_kernel`` / ``_engram_hist_kernel``: ATOM's staged rows of two layers
     (a strided view, as a wider staging buffer gives) into the kv launch's ``eng<L>.rows``, and (the table lookup)
-    the history from ATOM's cursor."""
+    the history from ATOM's cursor. ``kv8`` ([5k]): on ATOM's fp8 pool (``KV8``)."""
     torch.manual_seed(5)
     dim, rows, win, hid = 512, 6, 128, 2048
     mf = [0, 2, 3, 20, 39]
@@ -329,6 +493,12 @@ def check_fused(engram: bool = False):
         "pre": torch.zeros(rows, 4), "post": torch.zeros(rows, 4), "comb": torch.zeros(rows, 16),
         "req": torch.randint(-9, 9, (ml.REQ_WORDS,), dtype=torch.int32),
     }  # fmt: skip
+    kv = {"KV8": 1} if kv8 else {}
+    if kv8:  # ATOM's writer's rows of keys over many scales
+        base["pool"] = kv8_encode(
+            base["pool"].float()
+            * torch.exp2(torch.randint(-30, 20, (len(base["pool"]), 1)))
+        )
     if (
         engram
     ):  # ATOM's staged rows (views of a wider buffer), the kv launch's row buffers, the cursor, hist
@@ -370,7 +540,7 @@ def check_fused(engram: bool = False):
         w["step"].add_(1)
         w["h_in"][:rows].copy_(w["hidden"].view(rows, 1, -1).expand(rows, 4, hid))
         ml._import_rings_kernel[(len(mf), win)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"],
-                                                w["bounds"], *geo, rows, WIN=win, DIM=dim, RB=8)  # fmt: skip
+                                                w["bounds"], *geo, rows, WIN=win, DIM=dim, RB=8, **kv)  # fmt: skip
         ml._req_words_kernel[(1,)](positions, batch, slot_map, num_slots, 1 << 20, w["req"], w["pos"], rows, NB=1, BM=1,
                                    RQP=8)  # fmt: skip
         hi_writes(w)
@@ -378,7 +548,7 @@ def check_fused(engram: bool = False):
             w["gate"], w["pre"], w["post"], w["comb"], NMIX=24, NHC=4
         )
         ml._export_rings_kernel[(len(mf), rows)](w["pool"], positions, batch, slot_map, w["rings"], ids, *geo, WIN=win,
-                                                 DIM=dim)  # fmt: skip
+                                                 DIM=dim, **kv)  # fmt: skip
         for t in range(3):
             ml._aux_tap_kernel[(rows,)](
                 w[f"r_a{t}"], w[f"aux{t}"], HIDDEN=hid, BLOCK=1024, NHC=4
@@ -413,13 +583,13 @@ def check_fused(engram: bool = False):
         ml._begin_step_kernel[(grid,)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *geo,
                                        rows, w["hidden"], w["hidden"].stride(0), w["h_in"], w["step"],
                                        w["req"], *eflat, w["pos"], NMF=len(mf), WIN=win, DIM=dim, RB=8,
-                                       HIDDEN=hid, BLOCK=1024, NHC=4, **ek, RQP=8)  # fmt: skip
+                                       HIDDEN=hid, BLOCK=1024, NHC=4, **ek, RQP=8, **kv)  # fmt: skip
         hi_writes(w)
         taps = [w[f"{k}{t}"] for t in range(3) for k in ("r_a", "aux")]
         ml._end_step_kernel[((len(mf) + 3 + 1) * rows,)](
             w["pool"], positions, batch, slot_map, w["rings"], ids, *geo, rows, *taps, w["gate"], w["pre"], w["post"],
             w["comb"], w["pos"], NMF=len(mf), WIN=win, DIM=dim, HIDDEN=hid, BLOCK=1024, NHC=4, NMIX=24, NTAPS=3,
-            PLANAR=True,
+            PLANAR=True, **kv,
         )  # fmt: skip
         a, bw = worlds
         diff = [k for k in base if not torch.equal(a[k], bw[k])]
@@ -431,6 +601,9 @@ def check_fused(engram: bool = False):
             )
             diff += [] if ok_rows else ["eng_rows (vs the staged rows)"]
         tag = "[5e] fused bridge + Engram segments," if engram else "[5] fused bridge,"
+        tag = tag.replace("bridge", "bridge (fp8 pool)").replace(
+            "[5", "[5k" if kv8 else "[5"
+        )
         report(f"{tag} == separate kernels, ctx {ctx} request {b} pad {pad}", not diff,
                f"({len(base) - len(diff)} / {len(base)} tensors equal; {len(changed)} written"
                + (f"; DIFF {diff}" if diff else "") + ")")  # fmt: skip
@@ -1589,12 +1762,44 @@ def check_glue_folds():
                               f"{int((fused != ref).any(-1).sum())} of {rows} rows)")  # fmt: skip
 
 
+def check_kv8_atom():
+    """[2ka] The bridge's fp8 row export / import, compiled, against ATOM's own launches on the same bf16 rows:
+    ``quantize_fp8`` (``fp8_groups``: the bytes ATOM's writers store) and ``dequantize_rows`` (its reader).
+    """
+    from atom.model_ops.blockscale import quantize_fp8
+
+    n, dim = 64, 512
+    x = kv8_rows(n).to(torch.get_default_device())
+    got = torch.zeros(n, ml.KV8_ROW_BYTES, dtype=torch.uint8)
+    ml._kv8_store_kernel[(n,)](x, got, DIM=dim)
+    values, scales = quantize_fp8(x)
+    want = torch.cat([values.view(torch.uint8), scales.view(torch.uint8)], -1)
+    report("[2ka] export == ATOM's quantize_fp8 bytes", torch.equal(got, want),
+           f"({int((got != want).sum())} bytes differ)")  # fmt: skip
+    report(
+        "[2ka] the torch model == ATOM's quantize_fp8 bytes",
+        torch.equal(kv8_encode(x.cpu()), want.cpu()),
+    )
+    back = torch.zeros(n, dim, dtype=torch.bfloat16)
+    ml._kv8_load_kernel[(n,)](want, back, DIM=dim)
+    report(
+        "[2ka] import == ATOM's dequantize_rows",
+        torch.equal(back.float(), kv8_decode(want)),
+    )
+
+
 # ---------------------------------------------------------------- the tests
 
 
 @interpreted
-def test_rings():
-    _run(check_rings)
+@pytest.mark.parametrize("kv8", [False, True])
+def test_rings(kv8):
+    _run(check_rings, kv8)
+
+
+@interpreted
+def test_kv8_codec():
+    _run(check_kv8_codec)
 
 
 @interpreted
@@ -1616,6 +1821,11 @@ def test_engram_hist():
 @pytest.mark.parametrize("engram", [False, True])
 def test_fused(engram):
     _run(check_fused, engram)
+
+
+@interpreted
+def test_fused_kv8():
+    _run(check_fused, False, True)
 
 
 @interpreted
@@ -1681,3 +1891,7 @@ def test_post_verify(on_gpu):
 
 def test_glue_folds(on_gpu):
     _run(check_glue_folds)
+
+
+def test_kv8_atom(on_gpu):
+    _run(check_kv8_atom)

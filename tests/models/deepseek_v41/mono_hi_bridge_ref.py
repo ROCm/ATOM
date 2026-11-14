@@ -16,23 +16,42 @@ def _import_rings_kernel(
     pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos, rows,
     WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, NB: tl.constexpr = 1, BM: tl.constexpr = 1,
+    KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """Program (m, s, b): ``_ring_in`` (grid (NMF, WIN, NB); ``rows`` = NB requests' rows)."""
     _ring_in(tl.program_id(0), tl.program_id(2), tl.program_id(1), rows // NB, pool, positions, batch_ids, slots,
              rings, layer_ids, pos_out, bounds_out, ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM,
-             RB, BM)  # fmt: skip
+             RB, BM, KV8)  # fmt: skip
 
 
 @triton.jit
 def _export_rings_kernel(
     pool, positions, batch_ids, slots, rings, layer_ids,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos,
-    WIN: tl.constexpr, DIM: tl.constexpr, RQ: tl.constexpr = 0, BM: tl.constexpr = 1,
+    WIN: tl.constexpr, DIM: tl.constexpr, RQ: tl.constexpr = 0, BM: tl.constexpr = 1, KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """Program (m, j): ``_ring_out`` (``RQ``: rows a request; 0: one request, the grid's rows)."""
     rq = tl.num_programs(1) if RQ == 0 else RQ
     _ring_out(tl.program_id(0), tl.program_id(1), rq, pool, positions, batch_ids, slots, rings, layer_ids, ring_start0,
-              slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, BM)  # fmt: skip
+              slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, BM, KV8)  # fmt: skip
+
+
+@triton.jit
+def _kv8_store_kernel(src, pool, DIM: tl.constexpr):
+    """Program r: bf16 row r of ``src`` [rows, DIM] -> ATOM's MXFP8 row r of ``pool`` (``_kv8_store``)."""
+    r = tl.program_id(0)
+    v = tl.load(src + r.to(tl.int64) * DIM + tl.arange(0, DIM))
+    _kv8_store(pool, r.to(tl.int64), v, r >= 0, DIM)
+
+
+@triton.jit
+def _kv8_load_kernel(pool, dst, DIM: tl.constexpr):
+    """Program r: ATOM's MXFP8 row r of ``pool`` -> bf16 row r of ``dst`` [rows, DIM] (``_kv8_load``)."""
+    r = tl.program_id(0)
+    tl.store(
+        dst + r.to(tl.int64) * DIM + tl.arange(0, DIM),
+        _kv8_load(pool, r.to(tl.int64), r >= 0, DIM),
+    )
 
 
 @triton.jit

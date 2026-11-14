@@ -16,7 +16,6 @@ kernels the original modules still run the compressor and Engram.
 
 import logging
 import struct
-from dataclasses import dataclass
 
 import torch
 from aiter.dist.parallel_state import (
@@ -35,6 +34,12 @@ from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.builds import (
+    RowsBuild,
+    lean_width,
+    unfused_keys,
+    write_selection_rows,
+)
 from atom.models.deepseek_v41.mono.check import (
     check_front,
     check_moe,
@@ -106,18 +111,6 @@ def _rows(x, dim, s):
     return x.narrow(dim, 0, s)
 
 
-@dataclass(frozen=True)
-class RowsBuild:
-    """The kernels of an S-row step: K1's build a layer and their launchers,
-    and K2 (or, with ``check``, K2a and K2b apart)."""
-
-    keys: list
-    launchers: dict
-    layer_post: object = None
-    attn_post: object = None
-    moe: object = None
-
-
 # the layers whose attention norm has other readers (the compressor, the indexer)
 _FEEDS_INDEX = (AttentionMode.FULL, AttentionMode.REINDEX)
 
@@ -180,7 +173,11 @@ class V41MonoDecodeRunner:
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
         self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
         self.widths = WidthBuilds(
-            self._rows_build, self._row_kernels, group, "V4.1 mono"
+            self._rows_build,
+            self._row_kernels,
+            group,
+            "V4.1 mono",
+            lean=self._lean_width,
         )
 
     def _place_index_outputs(self, plain: dict) -> None:
@@ -351,9 +348,10 @@ class V41MonoDecodeRunner:
         )
 
     def _own_rows(self, s: int) -> tuple[int, int]:
-        """(first row, rows) of an s-row step this rank's indexer selects
-        (``index_score._own_rows``)."""
-        return own_rows(s, self.tp, self.rank) if self._tok_par(s) else (0, s)
+        """(first row, rows) of this step's rows this rank's indexer selects
+        (``index_score._own_rows``), off the build in hand rather than off
+        ``s``: a width's shape is the build's answer, not the row count's."""
+        return own_rows(s, self.tp, self.rank) if self.build.tok_par else (0, s)
 
     def _layer_keys(self, s: int) -> list:
         """K1's build of every layer for an s-row step."""
@@ -394,11 +392,16 @@ class V41MonoDecodeRunner:
             kv_fp8=self.kv_fp8,
         )
 
-    def _rows_build(self, s: int) -> RowsBuild:
-        """The s-row step's kernels."""
-        keys = self._layer_keys(s)
-        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+    def _rows_build(self, s: int, *, unfused: bool = False) -> RowsBuild:
+        """The s-row step's kernels, fused or (``unfused``) with K2's indexer
+        out and token parallel off (``builds.unfused_post_key``): the runner
+        then scores between K1 and K2 (``_score``, ``_publish_selection``)."""
         post_key = self._post_key(s)
+        keys = self._layer_keys(s)
+        if unfused:
+            keys, post_key = unfused_keys(keys, post_key)
+        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+        rest = {"post_key": post_key, "unfused": unfused}
         if self.split_k2:
             key_a, key_b = post_key.halves()
             return RowsBuild(
@@ -406,8 +409,21 @@ class V41MonoDecodeRunner:
                 launchers,
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
+                **rest,
             )
-        return RowsBuild(keys, launchers, layer_post=k2.build_layer_post(post_key))
+        return RowsBuild(
+            keys, launchers, layer_post=k2.build_layer_post(post_key), **rest
+        )
+
+    def _lean_width(self, built: RowsBuild, spilled: list) -> RowsBuild | None:
+        """``WidthBuilds``' lean seam: a width whose K2 needs scratch rebuilt
+        unfused, which has no index stage to spill on. Anything else has
+        nothing leaner and the width is refused as before."""
+        return lean_width(
+            built,
+            spilled,
+            lambda: self._rows_build(built.post_key.tokens, unfused=True),
+        )
 
     @staticmethod
     def _row_kernels(build: RowsBuild) -> list:
@@ -539,7 +555,8 @@ class V41MonoDecodeRunner:
             cache.geometry.window(0, cache.num_pages),
             self.ring_rel,
             self.key_meta,
-            self.walk_plans,
+            # an unfused width's scorer is ATOM's own, which plans its own work
+            {} if self.build.unfused else self.walk_plans,
             # a token-parallel step's indexer scores this rank's rows alone
             self._own_rows(rows),
         )
@@ -570,7 +587,12 @@ class V41MonoDecodeRunner:
                 )
             if block.attn.indexer is not None:
                 block.attn._compress_batch(self.normed, cache, step, rope)
-                if self.check:
+                if self.build.unfused:
+                    # this width's K2 has no index stage: ATOM's own indexer
+                    # makes the selection and K2 reads it
+                    self._score(block, cache, step, rope)
+                    self._publish_selection(spec, cache, step)
+                elif self.check:
                     # the original scorer, the reference the selection is held to
                     block.attn.indexer.score_quantized(
                         self.index_query(), self.iw, cache, step
@@ -593,7 +615,9 @@ class V41MonoDecodeRunner:
                     rows_per_block=ip.BLOCK_ROWS,
                 )
             if self.check:
-                if block.attn.indexer is not None:
+                # an unfused width makes no selection of its own to hold to the
+                # original scorer: the one K2 read is already that scorer's
+                if block.attn.indexer is not None and not self.build.unfused:
                     check_selection(self, spec, step)
                 # the original index build, for the reference attention alone
                 keys = decode_keys(cache, spec, step)
@@ -603,7 +627,7 @@ class V41MonoDecodeRunner:
             pre, post, comb = self.gates_ffn
             state = SinglePassHCState(self.res_ffn, pre, self.ffn_out, post, comb)
         hidden = state.collapse()
-        if self._tok_par(rows):
+        if self.build.tok_par:
             hidden = self._gather_rows(hidden, rows)
         model.end_forward(hidden, None)
         self._raise_on_given_up_waits(rows)
@@ -623,6 +647,43 @@ class V41MonoDecodeRunner:
         for k, buf in enumerate(self.aux.buffers):
             buf[:rows].copy_(every[:, k + 1])
         return every[:, 0].contiguous().unsqueeze(0)
+
+    def _score(self, block, cache, step, rope) -> None:
+        """An unfused width's indexer, run between K1 and K2: this layer's
+        top-k (and a candidate producer's blocks) into ``step``, on K1's
+        outputs, as the AITER provider drives these same kernels."""
+        indexer = block.attn.indexer
+        if self.index_fp4:
+            # K1's FP4 query is laid out for K2's scorer, not this one: the
+            # original projection off K1's normed row and q latent instead
+            query, weights = indexer.project(
+                self.normed, self.qr, self.qr_scale, cache, step, rope
+            )
+            indexer.score(query, weights, cache, step)
+        else:
+            # K1's per-(row, head) FP8 query and its scale-folded head weights,
+            # as check mode scores them
+            indexer.score_quantized(self.iq, self.iw, cache, step)
+
+    def _publish_selection(self, spec, cache, step) -> None:
+        """An unfused width's selection where K2 reads it: owner
+        ``spec.layer_id``'s pool rows in ``irow`` and, on a candidate producer,
+        its blocks in ``icand`` -- what a fused build's K2 writes itself
+        (``index_score._final``)."""
+        owner = spec.layer_id
+        geometry = cache.geometry
+        write_selection_rows(
+            self.irow[owner],
+            step.selected[owner][0],
+            step.batch_ids,
+            step.block_tables,
+            geometry.rows_per_page(spec.ratio),
+            geometry.page_bytes // geometry.row_bytes,
+            geometry.main_offset(spec.kv_owner),
+        )
+        if spec.produces_candidates:
+            # the REINDEX layers read them through ``candidate_block_table``
+            self.icand.copy_(step.candidates[owner])
 
     def _front(self, layer_id, key, weights, state, cache, step, rope):
         """K1 -> (the residual after the owed post, the seam's (pre, post, comb));
@@ -755,7 +816,7 @@ class V41MonoDecodeRunner:
     def _moe(self, layer_id, weights) -> None:
         """K2b: router, routed and shared experts and their all-reduce ->
         ``ffn_out``."""
-        key_a, _ = self._post_key(self.ffn_normed.shape[1]).halves()
+        key_a, _ = self.build.post_key.halves()
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
@@ -790,7 +851,7 @@ class V41MonoDecodeRunner:
             return
         regions = {
             *k1.scratch_layout(rows),
-            *k2.scratch_layout(self._post_key(rows)),
+            *k2.scratch_layout(self.build.post_key),
         }
         diag = self.scratch[self.diag_off : self.diag_off + DIAG_BYTES]
         waits = given_up_waits(diag, kernel_debug.region_names(regions))

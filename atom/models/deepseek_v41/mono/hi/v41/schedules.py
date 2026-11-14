@@ -36,6 +36,10 @@ DEFAULT: dict = {
     # the FP4 index plane's layout in ATOM's storage (``config.index_cache_layout``): "preshuffle" or "mfma"
     # (``device.gfx950.paged``); the deployment's, never a (kind, rows) entry
     "INDEX_KLAYOUT": "preshuffle",
+    # ATOM's KV pool's rows (``--kv_cache_dtype``) the compressed layers read and the KV sources write in place: "bf16"
+    # or "fp8" (MXFP8 rows, ``device.gfx950.paged.KV8_ROW_BYTES``: dequantized on load, quantized on store); the
+    # deployment's, never a (kind, rows) entry
+    "KV_FMT": "bf16",
     "XA_PROTO": "flag",  # attn_norm -> wq_a / wkv: "tagged" pairs or "flag" (dense words + a flag a norm task)
     "Q_NORM": "stage",  # q_norm: "stage" or "wq_b" (wq_b's NormIn prologue normalizes the qr rows)
     # the seams (HCSeam)
@@ -409,6 +413,9 @@ CHAIN_KNOBS = ("RS_PACK", "RS_PACK_ROWS")
 # the precision knobs: a deployment's numerics contract (the official model's or ATOM's), one value a process
 # (live / pinned), never a (kind, rows) entry (``knobs`` refuses one)
 PRECISION_KNOBS = ("COMPRESS_QAT", "IDX_SCORE_F32", "ATTN_OUT_F32_ROPE")
+# the knobs of ATOM's storage the programs address in place: the deployment's (its cache's layout and format), never
+# a (kind, rows) entry (``knobs`` refuses one)
+STORAGE_KNOBS = ("INDEX_KLAYOUT", "KV_FMT")
 
 
 def _entry(table: dict, kind: str, rows: int | None) -> dict:
@@ -455,12 +462,15 @@ def knobs(
 
 
 def _check_entries() -> None:
-    """No (kind, rows) entry sets a step's knob (``CHAIN_KNOBS``) or a process's numerics (``PRECISION_KNOBS``)."""
+    """No (kind, rows) entry sets a step's knob (``CHAIN_KNOBS``), a process's numerics (``PRECISION_KNOBS``) or
+    the deployment's storage (``STORAGE_KNOBS``)."""
     for key, entry in SCHEDULES.items():
-        bad = [n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS) if n in entry]
+        bad = [
+            n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS, *STORAGE_KNOBS) if n in entry
+        ]
         if bad:
             raise ValueError(
-                f"V4.1 schedule entry {key}: {bad} are a step's or a process's, not a kind's"
+                f"V4.1 schedule entry {key}: {bad} are a step's, a process's or a deployment's, not a kind's"
             )
 
 

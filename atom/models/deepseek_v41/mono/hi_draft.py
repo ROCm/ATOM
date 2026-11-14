@@ -28,6 +28,19 @@ CTX_LAUNCH = 42  # the DSpark context write's launch id (40: the head, 41: the E
 # ---- shared with the runner (``hi_runner``)
 
 
+def _fp8_pool(pool: torch.Tensor, row_bytes: int) -> bool:
+    """Whether ``pool`` is ATOM's fp8 pool as the programs address it (``KV_FMT`` "fp8"): its rows of MXFP8 bytes,
+    ``hi_bridge.KV8_ROW_BYTES`` each (512 E4M3 values, then their 16 E8M0 group-32 scales), a contiguous uint8
+    [rows, 528] view whose geometry counts rows of those bytes (``row_bytes``)."""
+    return (
+        pool.dim() == 2
+        and pool.dtype == torch.uint8
+        and pool.shape[-1] == ml.KV8_ROW_BYTES
+        and pool.is_contiguous()
+        and row_bytes == ml.KV8_ROW_BYTES
+    )
+
+
 class _Arena:
     """One scratch arena the programs of a step counter share (``emit.kernel``'s kernel ABI): every launch's tags are
     new and the programs run one after another on one stream, so each sees only other launches' stale pairs, which
@@ -142,7 +155,13 @@ class HiDraft:
         if self.cx_layers is None:
             raise RuntimeError("V4.1 mono hi draft: no DSpark draft bound (bind_draft)")
         pool = cache.pool
-        if (
+        if self.kv_fp8:
+            # ATOM's fp8 pool: the draft rings' rows MXFP8 (the context write's and the stages' ``KV_FMT`` "fp8")
+            if not _fp8_pool(pool, cache.geometry.row_bytes):
+                raise RuntimeError(
+                    f"pool {tuple(pool.shape)} {pool.dtype}: not the fp8 [rows, {ml.KV8_ROW_BYTES}] uint8 view"
+                )
+        elif (
             pool.dim() != 2
             or pool.shape[-1] != HEAD_DIM
             or not pool.is_contiguous()

@@ -18,6 +18,12 @@ liveness, a row's). Only the window rings are imported and exported:
 |---|---|---|---|---|
 | window ring, every hi layer | bf16 rows ``ring_start(l) + slot * slot_rows + p % ring_slots`` (ring_slots = 128 + drafts) | bf16 [1, 128, 512], slot ``p % 128`` | the 128 positions before the step | the step's rows |
 
+On ATOM's fp8 pool (``--kv_cache_dtype fp8``, ``KV8``) its rows are MXFP8, ``KV8_ROW_BYTES`` each (512 E4M3 values,
+then their 16 E8M0 group-32 scale codes) at the same row indices; the hi rings stay bf16. The import dequantizes
+(value x 2^(code - 127): exact in bf16), the export quantizes as ATOM's writer does (``fp8_groups``,
+``atom/model_ops/blockscale_kernels/quantization.py``: ``_kv8_store``), so a row the hi path exports is the bytes
+ATOM's own decode would have written from the same bf16 key.
+
 So a rejected draft row never corrupts the next step: ATOM's ring is
 position-addressed with draft slack, and the next import rebuilds the hi
 runtime's 128-slot ring from it (its own 128-slot layout would lose the accepted
@@ -39,6 +45,9 @@ HC = 4
 MIX = HC * (HC + 2)
 WINDOW = 128
 HEAD_DIM = 512
+# a row of ATOM's fp8 pool (``--kv_cache_dtype fp8``): MXFP8, HEAD_DIM E4M3 values then their HEAD_DIM / 32 E8M0
+# group scales (``hi.device.gfx950.paged.KV8_ROW_BYTES``)
+KV8_ROW_BYTES = HEAD_DIM + HEAD_DIM // 32
 FP4_PAGE = 8  # ATOM's FP4 index plane: keys a unit (``FP4_INDEX_PAGE_ROWS``)
 IDX_DIM = 128
 
@@ -106,7 +115,7 @@ def _dead_words(req, pos_out, rows, NB: tl.constexpr, BM: tl.constexpr):
 def _ring_in(
     m, b, s, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos,
-    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, BM: tl.constexpr,
+    WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, BM: tl.constexpr, KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """The hi runtime layer m's ring slot s of request b <- ATOM's ring row of the
     position q in [ctx - WIN, ctx) with q % WIN == s (zeros below position 0 or
@@ -117,7 +126,7 @@ def _ring_in(
         b, rq, positions, batch_ids, slots, num_slots, max_pos
     )
     _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
-              BM)  # fmt: skip
+              BM, KV8)  # fmt: skip
     if (m == 0) & (s == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -125,10 +134,11 @@ def _ring_in(
 @triton.jit
 def _ring_row(
     m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots,
-    WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr,
+    WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr, KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """``_ring_in``'s copy: hi layer m's ring slot s of request b <- ATOM's ring row of position q in
-    [ctx - WIN, ctx), q % WIN == s (zeros below 0 / on a pad request).
+    [ctx - WIN, ctx), q % WIN == s (zeros below 0 / on a pad request); ``KV8``: ATOM's MXFP8 row dequantized
+    (``_kv8_load``).
     """
     layer = tl.load(layer_ids + m).to(tl.int64)
     slot = tl.where(live, slot, 0)
@@ -141,9 +151,68 @@ def _ring_row(
         + tl.maximum(q, 0) % ring_slots
     )
     d = tl.arange(0, DIM)
-    v = tl.load(pool + row * DIM + d, mask=ok & (d < DIM), other=0.0)
+    if KV8:
+        v = _kv8_load(pool, row, ok, DIM)
+    else:
+        v = tl.load(pool + row * DIM + d, mask=ok & (d < DIM), other=0.0)
     at = ((m * BM + b) * WIN + s).to(tl.int64)
     tl.store(rings + at * DIM + d, v)
+
+
+# ---------------------------------------------------------------- ATOM's fp8 pool rows (``KV8``)
+#
+# A row: DIM E4M3 bytes, then DIM / 32 E8M0 codes (group g's scale 2^(code - 127)); row r at byte r * (DIM + DIM / 32)
+# of the pool (``KV8_ROW_BYTES``). ATOM writes codes of 85 and up only (its amax floor, ``_kv8_store``; 255 only for a
+# non-finite row) and no NaN value byte (its clamp).
+
+
+@triton.jit
+def _kv8_load(pool, row, ok, DIM: tl.constexpr):
+    """ATOM's MXFP8 row ``row`` of ``pool`` (uint8) as bf16 [DIM]: each E4M3 value x 2^(code - 127), exact (a 4-bit
+    significand by a power of two, in bf16's range for every code ATOM writes); zeros where not ``ok``.
+    """
+    base = pool + row * (DIM + DIM // 32)
+    g = tl.arange(0, DIM // 32)
+    e = tl.arange(0, 32)
+    q = tl.load(base + g[:, None] * 32 + e[None, :], mask=ok, other=0)
+    code = tl.load(base + DIM + g, mask=ok, other=127).to(tl.int32)
+    scale = (code << 23).to(tl.float32, bitcast=True)  # 2^(code - 127)
+    v = q.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale[:, None]
+    return tl.reshape(v, (DIM,)).to(tl.bfloat16)
+
+
+@triton.jit
+def _e4m3_rne(y):
+    """f32 ``y`` (|y| <= 448, finite) as E4M3 bytes (uint8, OCP: bias 7, no infinities), rounded to nearest even
+    as the hardware conversion ATOM's writer uses: integer arithmetic, so the same bytes in the Triton interpreter
+    (whose fp8 conversion rounds ties away and drops the subnormals). Normal (|y| >= 2^-6): the f32 significand
+    rounded to 3 bits, rebiased; subnormal: |y| / 2^-9 rounded to an integer 0 .. 8 (8: 2^-6, the first normal's
+    byte) by the f32 addition of 2^23."""
+    b = y.to(tl.uint32, bitcast=True)
+    a = b & 0x7FFFFFFF
+    normal = ((a + 0x7FFFF + ((a >> 20) & 1)) >> 20) - (120 << 3)
+    sub = (tl.abs(y) * 512.0 + 8388608.0).to(tl.uint32, bitcast=True) - 0x4B000000
+    m = tl.where(a >= (121 << 23), normal, sub)
+    return (m | ((b >> 24) & 0x80)).to(tl.uint8)
+
+
+@triton.jit
+def _kv8_store(pool, row, v, ok, DIM: tl.constexpr):
+    """bf16 ``v`` [DIM] into ATOM's MXFP8 row ``row`` of ``pool`` (uint8) where ``ok``, the bytes ATOM's writer
+    stores for it (``fp8_groups``): a group's amax floored at 1e-10, its code the smallest power of two at least
+    amax x fp32(1 / 448) (``ceil_pow2_code``), each value times the scale's exact reciprocal, clamped to +-448, E4M3
+    rounded to nearest even (``_e4m3_rne``)."""
+    base = pool + row * (DIM + DIM // 32)
+    g = tl.arange(0, DIM // 32)
+    e = tl.arange(0, 32)
+    x = tl.reshape(v.to(tl.float32), (DIM // 32, 32))
+    amax = tl.maximum(tl.max(tl.abs(x), 1), 1e-10)
+    t = (amax * (1.0 / 448.0)).to(tl.uint32, bitcast=True)
+    code = (t >> 23) + ((t & 0x7FFFFF) != 0).to(tl.uint32)
+    rcp = (tl.maximum(254 - code.to(tl.int32), 0) << 23).to(tl.float32, bitcast=True)
+    y = tl.minimum(tl.maximum(x * rcp[:, None], -448.0), 448.0)
+    tl.store(base + g[:, None] * 32 + e[None, :], _e4m3_rne(y), mask=ok)
+    tl.store(base + DIM + g, code.to(tl.uint8), mask=ok)
 
 
 @triton.jit
@@ -163,11 +232,12 @@ def _step_bounds(ctx, pos_out, bounds_out, rows, RB: tl.constexpr):
 def _ring_out(
     m, j, rq, pool, positions, batch_ids, slots, rings, layer_ids,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos,
-    WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr,
+    WIN: tl.constexpr, DIM: tl.constexpr, BM: tl.constexpr, KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """The hi runtime layer m's key row of step row j (request b = j // rq, its ring
     slot (ctx_b + j - b rq) % WIN) -> ATOM's ring at that position (the
-    request's own rows only)."""
+    request's own rows only); ``KV8``: quantized to ATOM's MXFP8 row (``_kv8_store``).
+    """
     layer = tl.load(layer_ids + m).to(tl.int64)
     b = j // rq
     b0, slot, live, ctx = _request(
@@ -180,7 +250,10 @@ def _ring_out(
     d = tl.arange(0, DIM)
     v = tl.load(rings + ((m * BM + b) * WIN + p % WIN).to(tl.int64) * DIM + d)
     row = ring_start0 + layer * ring_slots + slot * slot_rows + p % ring_slots
-    tl.store(pool + row * DIM + d, v, mask=live & (d < DIM))
+    if KV8:
+        _kv8_store(pool, row, v, live, DIM)
+    else:
+        tl.store(pool + row * DIM + d, v, mask=live & (d < DIM))
 
 
 # ---------------------------------------------------------------- Engram inputs
@@ -403,6 +476,7 @@ def _ring_in_incr(
     m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
     ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp,
     WIN: tl.constexpr, DIM: tl.constexpr, RB: tl.constexpr, RP: tl.constexpr, BM: tl.constexpr,
+    KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """Program (m, b, r) of the incremental ring import: layer m's slots r, r + RP, .. of request b that the last
     served step's rows wrote (all of them unless ``incr``), each ``_ring_row``; (0, b, 0) also pos / bounds.
@@ -413,7 +487,7 @@ def _ring_in_incr(
     for s in range(r, WIN, RP):
         if (~incr) | (((s - pctx % WIN + WIN) % WIN) < prow):
             _ring_row(m, b, s, ctx, slot, live, pool, rings, layer_ids, ring_start0, slot_rows, ring_slots, WIN, DIM,
-                      BM)  # fmt: skip
+                      BM, KV8)  # fmt: skip
     if (m == 0) & (r == 0):
         _step_bounds(ctx, pos_out + b, bounds_out + b * rq, rq, RB)
 
@@ -431,6 +505,7 @@ def _begin_step_kernel(
     NB: tl.constexpr = 1, BM: tl.constexpr = 1, RQP: tl.constexpr = 1,
     fold_ids=None, fold_dst=None, fold_tmap=None, fold_dead=None, fold_cand=None, fold_cand_stride=0,
     fold_live=None, hist_stride=0, fold_cand_req_stride=0, EFOLD: tl.constexpr = 0, RPOW: tl.constexpr = 16,
+    KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """Grid NMF * NB * RP + rows + NE0 + NE1 + EHIST:
     the ring import of each of the step's ``NB`` requests (and its pos /
@@ -450,7 +525,8 @@ def _begin_step_kernel(
     The full import (``INCR`` = 0): a program a ring slot (RP = WIN). The incremental import (``INCR`` = 1, the hook's
     served path): RP programs a layer loop over only what changed since ``imp[b]`` (the request slot's last served
     step, ``_end_step_kernel``'s ``TRACK``), or over everything when the request does not continue it
-    (``_import_state``)."""
+    (``_import_state``). ``KV8``: ATOM's pool is its fp8 one (``pool`` its uint8 rows, ``KV8_ROW_BYTES``).
+    """
     pid = tl.program_id(0)
     rq = rows // NB
     n0 = NMF * NB * RP
@@ -462,10 +538,10 @@ def _begin_step_kernel(
         if INCR:
             _ring_in_incr(m, b, r, rq, positions, pool, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
                           ring_start0, slot_rows, ring_slots, num_slots, max_pos, imp, WIN, DIM, RB, RP,
-                          BM)  # fmt: skip
+                          BM, KV8)  # fmt: skip
         else:
             _ring_in(m, b, r, rq, pool, positions, batch_ids, slots, rings, layer_ids, pos_out, bounds_out,
-                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, RB, BM)  # fmt: skip
+                     ring_start0, slot_rows, ring_slots, num_slots, max_pos, WIN, DIM, RB, BM, KV8)  # fmt: skip
         if (m == 0) & (r == 0):
             _req_words(b, rq, positions, batch_ids, slots, num_slots, max_pos, req, RQP)
         if pid == 0:
@@ -503,7 +579,7 @@ def _end_step_kernel(
     HIDDEN: tl.constexpr, BLOCK: tl.constexpr, NHC: tl.constexpr, NMIX: tl.constexpr,
     NTAPS: tl.constexpr, PLANAR: tl.constexpr, TRACK: tl.constexpr = 0,
     NB: tl.constexpr = 1, BM: tl.constexpr = 1,
-    col_res=None, col_out=None, COLLAPSE: tl.constexpr = 0,
+    col_res=None, col_out=None, COLLAPSE: tl.constexpr = 0, KV8: tl.constexpr = 0,
 ):  # fmt: skip
     """Grid (NMF + NTAPS + PLANAR (+ HIDDEN / BLOCK with COLLAPSE)) * rows, ``rows`` programs a
     segment: the ring export, the DSpark taps, and (PLANAR) the last
@@ -513,7 +589,8 @@ def _end_step_kernel(
     j // (rows / NB) (``_ring_out``). ``TRACK`` (the
     incremental import): program b < NB records request b's step in ``imp[b]``
     (int32 [slot, ctx, rows a request]; slot -1 on a pad request) for the next
-    step's import (``_begin_step_kernel``'s ``INCR``)."""
+    step's import (``_begin_step_kernel``'s ``INCR``). ``KV8``: ATOM's pool is its fp8 one (``_ring_out``).
+    """
     pid = tl.program_id(0)
     seg = pid // rows
     j = pid % rows
@@ -528,7 +605,7 @@ def _end_step_kernel(
             tl.store(imp + pid * 4 + 2, rq)
     if seg < NMF:
         _ring_out(seg, j, rq, pool, positions, batch_ids, slots, rings, layer_ids, ring_start0, slot_rows, ring_slots,
-                  num_slots, max_pos, WIN, DIM, BM)  # fmt: skip
+                  num_slots, max_pos, WIN, DIM, BM, KV8)  # fmt: skip
     else:
         t = seg - NMF
         if t < NTAPS:

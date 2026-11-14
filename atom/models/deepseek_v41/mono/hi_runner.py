@@ -121,6 +121,7 @@ from atom.models.deepseek_v41.mono.hi_draft import (
     _Arena,
     _buffers,
     _end_step,
+    _fp8_pool,
     _Streams,
 )
 from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
@@ -130,6 +131,7 @@ from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-e
     log_once,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -168,7 +170,8 @@ class HiLayers(HiDraft, HiPrograms):
         # the programs (``hi_compose``: the plan, the widths, every program built)
         self._cpu_group = get_tp_group().cpu_group
         HiPrograms.__init__(self, cfg, model.topology, widths, max_ctx, self.tp, self._cpu_group,
-                            index_layout=atom_config.index_cache_layout)  # fmt: skip
+                            index_layout=atom_config.index_cache_layout,
+                            kv_dtype=atom_config.kv_cache_dtype)  # fmt: skip
         # lean host prep (``lean_host``) with every layer on the hi path; ``served_widths``: the widths a forward took this
         # hook's path at (a capture's included), the builder's lean-step test
         self.runs_every_layer = True
@@ -234,6 +237,10 @@ class HiLayers(HiDraft, HiPrograms):
         ):
             raise RuntimeError(
                 "V4.1 mono hi: the request words' layout differs between the bridge and the programs"
+            )
+        if paged.KV8_ROW_BYTES != ml.KV8_ROW_BYTES:
+            raise RuntimeError(
+                "V4.1 mono hi: the fp8 pool's row differs between the bridge and the programs"
             )
         self.req = z(ml.REQ_WORDS, dt=i32)
         self.req[ml.REQ_BID : ml.REQ_SLOT].fill_(-1)
@@ -667,7 +674,14 @@ class HiLayers(HiDraft, HiPrograms):
         if key == self._bound:
             return
         g = cache.geometry
-        if (
+        if self.kv_fp8:
+            # ATOM's fp8 pool: MXFP8 rows (``hi_bridge.KV8_ROW_BYTES``) as bytes, the programs' ``KV_FMT`` "fp8"
+            if not _fp8_pool(cache.pool, g.row_bytes):
+                raise RuntimeError(
+                    f"pool {tuple(cache.pool.shape)} {cache.pool.dtype}: not the fp8 [rows, "
+                    f"{ml.KV8_ROW_BYTES}] uint8 view"
+                )
+        elif (
             cache.pool.shape[-1] != HEAD_DIM
             or not cache.pool.is_contiguous()
             or g.row_bytes != 2 * HEAD_DIM
@@ -768,7 +782,7 @@ class HiLayers(HiDraft, HiPrograms):
             self.bounds, *self._geo(cache), rows, hidden, hidden.stride(0), self.h_in0,
             self.step, self.req, *eflat, self.imp, NMF=len(self.mf), WIN=WINDOW, DIM=HEAD_DIM,
             RB=self.RB, HIDDEN=hidden.shape[-1], BLOCK=1024, NHC=HC, **ke, INCR=1, RP=rp, NB=nb, BM=self.bmax,
-            RQP=triton.next_power_of_2(rows // nb),
+            RQP=triton.next_power_of_2(rows // nb), KV8=int(self.kv_fp8),
         )  # fmt: skip
         if rows in self.band_of:
             self._band_step(rows)
@@ -925,7 +939,7 @@ class HiLayers(HiDraft, HiPrograms):
             cache.pool, step.positions, step.batch_ids, step.slots, self.rings, self.ring_layers,
             *self._geo(cache), rows, *tp, last.gate_f, self.pre, self.post, self.comb, self.imp, NMF=len(self.mf),
             WIN=WINDOW, DIM=HEAD_DIM, HIDDEN=hidden, BLOCK=1024, NHC=HC, NMIX=MIX, **ke, NTAPS=len(taps),
-            PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax,
+            PLANAR=self.planar_at_end, TRACK=1, NB=self.split[rows][0], BM=self.bmax, KV8=int(self.kv_fp8),
         )  # fmt: skip
 
 
@@ -1050,12 +1064,22 @@ def host_shard(host, consts: dict, layer: int, tp: int, rank: int) -> tuple:
     )
 
 
+def served_rows(max_requests: int) -> list[int]:
+    """The step widths of ``ROWS`` the hook serves under ``ATOM_DSV41_MONO_HI_MAX_REQUESTS``: those of at most
+    ``max_requests`` requests (a wider step runs ATOM's mono path)."""
+    if not 1 <= max_requests <= len(ROWS):
+        raise ValueError(
+            f"ATOM_DSV41_MONO_HI_MAX_REQUESTS={max_requests}: one of 1..{len(ROWS)}"
+        )
+    return list(ROWS[:max_requests])
+
+
 def install(model, atom_config, engram_mapping, draft) -> HiLayers | None:
     """The hook for this rank (the deployment is one the hi path serves: ``hi_gate.decide``). ``engram_mapping``:
     ATOM's Engram hash mapping (its runtime's), the source of the table lookup's hash constants (``engram_consts``);
     ``draft``: ATOM's DSpark draft model (loaded: the draft's weights are packed from its tensors). Collective (the
     peer groups): every rank calls it at the same point."""
-    widths = list(ROWS)
+    widths = served_rows(envs.ATOM_DSV41_MONO_HI_MAX_REQUESTS)
     max_ctx = MAX_CTX
     for p in hi_plan.plan_layers(
         model.topology, model.config.engram_layer_ids, engram_on=True

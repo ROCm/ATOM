@@ -6,7 +6,8 @@ A KV owner (a compressing layer) keeps its compressed entries in ATOM's pool, a 
 ``rpp = PAGE / ratio`` rows of the owner, and its FP4 index keys in a plane of its own, dense in 8-key units:
 
 - entry ``e`` of the request with batch id ``bid``: page ``ptab[bid * stride + e // rpp]``, main row ``page *
-  page_rows + e % rpp`` (bf16 [512], 1 KiB) from the owner's base (the pool + its main offset rows);
+  page_rows + e % rpp`` (bf16 [512], 1 KiB; in ATOM's fp8 pool MXFP8, ``KV8_ROW_BYTES``) from the owner's base
+  (the pool + its main offset rows);
 - its index key: unit ``u = (page * rpp + e % rpp) // 8``, lane ``t`` the remainder; the 16 B of 32-element group
   ``c`` at ``u * 512 + (t % 4) * 128 + c * 32 + (t // 4) * 16`` of the values plane, its E8M0 byte at ``u * 32 + c *
   8 + t`` of the scales plane (ATOM's FP4 ``preshuffle`` layout). In ATOM's ``mfma`` layout (gfx950's OPUS scorer,
@@ -27,7 +28,11 @@ from __future__ import annotations
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith, llvm
-from flydsl.expr.typing import as_ir_value
+from flydsl.expr import rocdl
+from flydsl.expr.typing import T, as_ir_value
+
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2, rcp_pow2
+from atom.mono.device.ops import mxfp8_to_bf16x8
 
 from ...plan import trace
 from . import dual
@@ -35,6 +40,12 @@ from .ops import ld_i32, uniform
 
 PAGE = 128  # ATOM's V4.1 page in positions (``hi_gate.BLOCK_SIZE``)
 ROW_BYTES = 1024  # a main row: bf16 [512]
+# a main row of ATOM's fp8 pool (``--kv_cache_dtype fp8``): MXFP8, 512 E4M3 values then their 16 E8M0 group-32 scales
+KV8_ROW_BYTES = 528
+KV8_GROUP = 32  # the values an E8M0 code of such a row scales
+# ATOM's FP8 activations' amax floor (``blockscale_kernels.quantization.AMAX_FLOOR``): its writers' code of an all-zero
+# (or tinier) group is the floor's
+AMAX_FLOOR = 1e-10
 REQ = ("req", "ptab")  # the args every in-place block takes
 MAX_REQ, MAX_ROWS = (
     8,
@@ -73,9 +84,10 @@ def main_row(k, b, e, ratio: int, uni: bool = True):
     return fx.Int64(page) * fx.Int64(page_rows) + fx.Int64(e % rpp(ratio))
 
 
-def row_addr(k, base_arg: str, b, e, ratio: int, uni: bool = True):
-    """Entry ``e``'s main row address (64-bit) in the owner's rows at ``k.args[base_arg]``."""
-    return fx.Int64(k.args[base_arg]) + main_row(k, b, e, ratio, uni) * ROW_BYTES
+def row_addr(k, base_arg: str, b, e, ratio: int, uni: bool = True, row_bytes: int = ROW_BYTES):  # fmt: skip
+    """Entry ``e``'s main row address (64-bit) in the owner's rows at ``k.args[base_arg]`` (``row_bytes``: the
+    pool's row, ``ROW_BYTES`` or ``KV8_ROW_BYTES``)."""
+    return fx.Int64(k.args[base_arg]) + main_row(k, b, e, ratio, uni) * row_bytes
 
 
 def key_unit(k, b, e, ratio: int, uni: bool = True):
@@ -141,3 +153,40 @@ def global_store(addr, value, nbytes: int = 4):
     if nbytes == 1:
         v = arith.TruncIOp(ir.IntegerType.get_signless(8), v).result
     llvm.StoreOp(v, ptr, alignment=nbytes)
+
+
+# ------------------------------------------------------------------ ATOM's fp8 pool rows (MXFP8)
+#
+# A row: 512 E4M3 values (byte d: dim d), then the 16 E8M0 codes of its 32-dim groups (byte 512 + g). ATOM's writers
+# (``fp8_groups``: the compressor's ``fused_compress``, the window's ``rope_window``, ``quantize_fp8``) quantize a bf16
+# row group by group: the code of the smallest power of two >= max(amax, AMAX_FLOOR) x fp32(1 / 448), the values times
+# its exact reciprocal, clamped to +-448, E4M3 rounded to nearest even (the hardware conversion). Its readers take
+# value x 2^(code - 127): exact in bf16 (a 4-bit significand by a power of two).
+
+
+def kv8_code(amax):
+    """ATOM's writer's E8M0 code of a group whose largest |value| is ``amax`` (f32, >= 0)."""
+    return code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
+
+
+def kv8_scaled(v, code):
+    """``v`` (f32) of a group of code ``code`` divided by its scale (exactly) and clamped: what the E4M3 byte rounds."""
+    return clamp_fp8(v * rcp_pow2(code))
+
+
+def kv8_value(scaled, code):
+    """The value the row holds for ``kv8_scaled``'s ``scaled``: E4M3 (RNE) times the scale, f32 (a bf16 exactly)."""
+    w = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, scaled, scaled, fx.Int32(0), False))
+    return fx.Float32(rocdl.cvt_f32_fp8(T.f32, w.ir_value(), 0)) * pow2(code)
+
+
+def kv8_code_of(word, group):
+    """Group ``group``'s code from the code word holding it (the row's code bytes 4 (group // 4) .. + 4), Int32."""
+    return (fx.Int32(word) >> ((group % 4) * 8)) & 0xFF
+
+
+def kv8_words(w0, w1, code):
+    """Eight E4M3 values (two words, dims in byte order) of a group of code ``code`` as four bf16-pair words: the
+    words a bf16 row holds there (exact)."""
+    v = mxfp8_to_bf16x8(w0, w1, pow2(code)).bitcast(fx.Int32)
+    return [v[e] for e in range(4)]

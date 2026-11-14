@@ -38,6 +38,7 @@ from ..blocks.base import Block, Channel, Fmt
 from ..blocks.gfx950.attention import mla_window as mw
 from ..device.gfx950 import buffer_ops as bo
 from ..device.gfx950 import mailbox as mb
+from ..device.gfx950 import paged
 from ..device.gfx950.ops import (
     bf2_f32,
     bf16_round,
@@ -60,6 +61,9 @@ class _BPlan(mw._APlan):
     ring_arg: str = ""
     geo: str = ""
     slot: str = ""
+    kv8: bool = (
+        False  # the ring is in ATOM's fp8 pool: MXFP8 rows (``paged.KV8_ROW_BYTES``) dequantized on load
+    )
 
     @property
     def a_b(self):  # the block's key rows [spec][PITCH]
@@ -96,6 +100,19 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
         kp = pos_w - (WINDOW - 1) + k.wave * (WINDOW // WAVES) + i
         q = ((kp % ring_slots) + ring_slots) % ring_slots
         row = slot * slot_rows + (q // stride) * run + q % stride
+        if (
+            p.kv8
+        ):  # ATOM's fp8 pool: the lane's 8 E4M3 (dims 8 lane ..) and its group's code, as bf16 pairs
+            at = row * (paged.KV8_ROW_BYTES // 4)
+            v = fx.Vector(
+                bo.buffer_load(r_ring, at + k.lane * 2, vec_width=2, dtype=T.i32)
+            )
+            cw = bo.buffer_load(
+                r_ring, at + HD // 4 + k.lane // 16, vec_width=1, dtype=T.i32
+            )
+            words = paged.kv8_words(v[0], v[1], paged.kv8_code_of(cw, k.lane // 4))
+            out.append(fx.Vector.from_elements(words, fx.Int32))
+            continue
         out.append(
             fx.Vector(
                 bo.buffer_load(
@@ -250,7 +267,8 @@ class MLABlockAttn(Block):
     ``MLAWindowAttn``'s: 8 a rank at TP8)."""
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, pos: str, rope: str, sink: str, ring: str,
-                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False):  # fmt: skip
+                 geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False,
+                 kv8: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -277,6 +295,8 @@ class MLABlockAttn(Block):
         # the output's inverse RoPE quantized from f32 (``MLAWindowAttn(unrope_f32=)``: ATOM's order, the draft's K2a
         # irq path); False: bf16-rounded first (the official order). A numerics choice, not a schedule knob
         self.unrope_f32 = unrope_f32
+        # the ring's rows: ATOM's fp8 pool (MXFP8, ``_BPlan.kv8``) or its bf16 one; the deployment's
+        self.kv8 = kv8
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
@@ -285,7 +305,8 @@ class MLABlockAttn(Block):
             )
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
                       self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
-                      unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot)  # fmt: skip
+                      unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot,
+                      kv8=self.kv8)  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
         p = self.plan(sc)

@@ -36,9 +36,9 @@ def config(path: str) -> SimpleNamespace:
     return SimpleNamespace(**raw.get("text_config", raw))
 
 
-def check(cfg, widths=None, tp: int = TP, fits: bool = True) -> hi_compose.HiPrograms:
+def check(cfg, widths=None, tp: int = TP, fits: bool = True, kv_dtype: str = "bf16") -> hi_compose.HiPrograms:  # fmt: skip
     """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` built for gfx950 compile-only, its trace
-    checked (module docstring); -> the composition. Raises ``ContractError`` on a violation. ``fits``: the Linear
+    checked (module docstring), on ATOM's KV pool of ``kv_dtype``; -> the composition. Raises ``ContractError`` on a violation. ``fits``: the Linear
     prefetch fits derived by their probes, not read from the frozen table (``linear_fits``), and each held to the
     table's (``ContractError`` on a difference; a plan the table lacks: ``missing_fits``).
     """
@@ -50,7 +50,9 @@ def check(cfg, widths=None, tp: int = TP, fits: bool = True) -> hi_compose.HiPro
     widths = list(hi_compose.ROWS) if widths is None else list(widths)
     frozen, linear.FROZEN = linear.FROZEN, not fits
     try:
-        progs = hi_compose.HiPrograms(cfg, topology, widths, MAX_CTX, tp)
+        progs = hi_compose.HiPrograms(
+            cfg, topology, widths, MAX_CTX, tp, kv_dtype=kv_dtype
+        )
     finally:
         linear.FROZEN = frozen
     if fits:

@@ -654,8 +654,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
     # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
-    # on, or an error naming why not; "0": off.
+    # on, or an error naming why not, and on an FP8 KV cache too (opt-in until
+    # measured on MI355X); "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # The most requests a decode step the hi monokernels serve (1..8; 8: every
+    # width `hi_compose.ROWS` lists); a wider step runs ATOM's mono path.
+    # Default 5: on MI350X a hi step of 6 or more requests hangs (cause not
+    # found yet; main's hi on a bf16 KV cache does the same).
+    "ATOM_DSV41_MONO_HI_MAX_REQUESTS": lambda: int(
+        os.getenv("ATOM_DSV41_MONO_HI_MAX_REQUESTS", "5")
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
