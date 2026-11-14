@@ -45,7 +45,7 @@ copy. A shared program adds its group's step phase to its tag's parity (the peer
 which ``PeerGroup.end_step`` after a step's last launch flips when the step's launch count was odd: consecutive
 launches alternate across steps of any widths.
 
-**The fast entry** (``FAST_ENTRY_ENV``, off by default): every TP program takes ``Program.fast_entry`` and a shared
+**The fast entry** (``FAST_ENTRY_ENV``, on by default): every TP program takes ``Program.fast_entry`` and a shared
 program reads its group's step phase next to the step counter (``Program.phase_slot``: the int64 word at int32 word
 ``phase_word(slot)`` of the step tensor, the kernel's ``step`` argument) instead of the peer table's entry ``tp``.
 The phase load is then a scalar load off a kernel argument, issued with the table's: two dependent memory round trips
@@ -109,8 +109,9 @@ def share_peer_groups(on: bool = True) -> None:
 
 
 def fast_entry_on() -> bool:
-    """Whether the fast entry (module docstring) is on: ``FAST_ENTRY_ENV`` = 1."""
-    return os.environ.get(FAST_ENTRY_ENV, "0").strip() == "1"
+    """Whether the fast entry (module docstring) is on: by default (TP8 c1 fp8 step bench -1.0 %, 2 pairs; the TP4
+    builds pass the contract check, not measured on GPU); ``FAST_ENTRY_ENV`` = 0 turns it off."""
+    return os.environ.get(FAST_ENTRY_ENV, "1").strip() != "0"
 
 
 def phase_word(slot: int) -> int:
