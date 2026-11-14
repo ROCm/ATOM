@@ -467,7 +467,7 @@ def _pipeline(sched, *, stage_runs=True):
     stage = _engine(_running(0)[0], PPEngineCoreProc)
     for engine, is_head in ((head, True), (stage, False)):
         engine.is_head, engine.is_last = is_head, not is_head
-        engine.pp_size = 2
+        engine.pp_size = engine.pp_max_inflight = 2
         engine.pp_transport = wire
         engine._pp_kv_aggregator = None
         engine._has_pending_utility = False

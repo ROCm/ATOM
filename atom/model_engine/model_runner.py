@@ -1580,17 +1580,18 @@ class ModelRunner:
             )
 
     def _init_forward_vars_ring(self):
-        """Build a ring of independent ``forward_vars`` copies, one per possible
-        in-flight pipeline microbatch.
+        """Build a ring of ``pp_size`` independent ``forward_vars`` copies.
 
-        The head launches up to ``pp_size`` forwards back-to-back without a GPU
-        sync, so a single reused ``forward_vars`` set would let microbatch N+1's
-        ``prepare_inputs`` overwrite staging buffers microbatch N's kernels are
-        still reading. Each in-flight slot gets its own buffer set; reuse of a
-        slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
-        ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head runs middle-chunk or DP-sync dummy batches
-        without a GPU sync.
+        The head launches up to ``pp_max_inflight`` forwards back-to-back
+        without a GPU sync (``pp_size`` unless ATOM_PP_MAX_INFLIGHT says
+        otherwise), so a single reused ``forward_vars`` set would let
+        microbatch N+1's ``prepare_inputs`` overwrite staging buffers
+        microbatch N's kernels are still reading. Each slot gets its own buffer
+        set; reuse of a slot is gated by a per-slot CUDA event (see
+        ``_advance_forward_vars`` / ``_record_forward_vars_event``), bounding
+        the CPU's GPU lead to the ring size even when more forwards are in
+        flight, or the head runs middle-chunk or DP-sync dummy batches without
+        a GPU sync.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.

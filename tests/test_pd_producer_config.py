@@ -159,6 +159,11 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
     monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
     assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
     assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
+    # An MLA hybrid stages its MLA pages beside the state it sends whole.
+    kimi = SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512)
+    assert mla_staging_reserve_bytes(_mla_producer_config(16, hf_config=kimi)) == (
+        128 << 20
+    )
     # The connector rounds a slot down to whole pages, so the reserve bounds
     # what it allocates for any worker count.
     for page in (16 * 576, 12 << 20):
@@ -174,7 +179,7 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
     [
         ({"hf_config": SimpleNamespace()}, {}),
         # DeepSeek-V4 loads through the V3 schema, which defaults kv_lora_rank,
-        # and Kimi's MLA hybrid has slot regions: neither stages MLA rows.
+        # but stages no MLA rows.
         (
             {
                 "hf_config": SimpleNamespace(
@@ -185,8 +190,14 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
             },
             {},
         ),
+        # A sparse MLA hybrid: a DCP consumer cannot take its indexer region
+        # per token, so it never stages.
         (
-            {"hf_config": SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512)},
+            {
+                "hf_config": SimpleNamespace(
+                    model_type="glm5_next_text", kv_lora_rank=512, index_topk=2048
+                )
+            },
             {},
         ),
         ({"decode_context_parallel_size": 4}, {}),

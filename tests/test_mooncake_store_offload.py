@@ -2913,6 +2913,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
     head_rpcs, sent, acks = [], [], deque()
     head = SimpleNamespace(
         pp_size=4,
+        pp_max_inflight=4,
         scheduler=engine,
         kv_transfer_enabled=True,
         _in_flight=deque(),

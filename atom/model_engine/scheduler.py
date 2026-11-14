@@ -874,7 +874,7 @@ class Scheduler:
 
         self._num_parked_remote_kv: int = 0
 
-        # Under PP the head keeps pp_size batches in flight, so schedule() must
+        # Under PP the head keeps several batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
         # postprocess, else back-to-back schedules re-issue the same chunk.
         self.advance_on_schedule: bool = (

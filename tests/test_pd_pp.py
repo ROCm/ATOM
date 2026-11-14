@@ -1109,8 +1109,8 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id, engine)
+        lambda request, target, src, dst, data, req_id, _ready=None, *, engine=None: (
+            captured.append((request, target, src, dst, data, req_id, engine))
         )
         or True
     )
@@ -1524,13 +1524,14 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, *, launches=1, pp_size=4, pp_max_inflight=4):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
         _in_flight=deque(),
         _defer_prefix_hash=False,
-        pp_size=4,
+        pp_size=pp_size,
+        pp_max_inflight=pp_max_inflight,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1543,7 +1544,7 @@ def _fake_head(batch):
         # never sleeps, so it must go through `_advance_idle_kv_transfer`.
         _next_idle_kv_drain=0.0,
     )
-    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.schedule.side_effect = [(batch, {})] * launches + [None]
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = False
     head.pp_transport.recv_completion.return_value = None
@@ -1569,6 +1570,28 @@ def _dispatched_metas(head):
         for c in head.runner_mgr.call_func.call_args_list
         if c.args and c.args[0] == "process_kvconnector_output"
     ]
+
+
+def test_the_head_fills_its_inflight_cap_past_the_stage_count():
+    """Middle chunks count against the cap as output batches do, and a cap
+    above the stage count keeps the head issuing until it is reached."""
+    chunk = SimpleNamespace(
+        req_ids=["r1"], connector_meta_output=None, produces_output=lambda: False
+    )
+    head = _fake_head(chunk, launches=8, pp_size=2, pp_max_inflight=4)
+    assert len(head._in_flight) == 4
+    assert head.scheduler.schedule.call_count == 4
+
+
+@pytest.mark.parametrize("env, cap", [("0", 2), ("16", 16), ("-1", None)])
+def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch, env, cap):
+    pp_engine_core = sys.modules[_pp_engine_core_cls().__module__]
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", env)
+    if cap is None:
+        with pytest.raises(ValueError, match="non-negative"):
+            pp_engine_core.pp_max_inflight(2)
+    else:
+        assert pp_engine_core.pp_max_inflight(2) == cap
 
 
 def test_pp_head_dispatches_meta_of_request_less_batch():
@@ -1753,6 +1776,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1955,6 +1979,7 @@ def _pp_stage_connector(mc, nic, *, tp_size=1, tp_rank=0, ssm_segments=True):
     ]
     connector._slot_region_tp_replicated = [False, False, True]
     connector._gather_slot = None
+    connector._mla_staging = None
     connector._rdma_write = nic.write
     return connector
 
@@ -1979,7 +2004,7 @@ def _dcp_tp_request(consumer_tp_size=2, consumer_tp_rank=1, ratio=2):
     }
 
 
-def _run_slot_transfer(mc, connector, request_data):
+def _run_slot_transfer(mc, connector, request_data, ready_event=None):
     return mc.MooncakeConnector._execute_block_slot_transfer(
         connector,
         request_data,
@@ -1988,10 +2013,12 @@ def _run_slot_transfer(mc, connector, request_data):
         [1, 2],
         {"slot_index": 5},
         "req-1",
+        ready_event,
     )
 
 
-def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
+@pytest.mark.parametrize("staged", [False, True], ids=["per-token", "staged-mla"])
+def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer(staged):
     np = pytest.importorskip("numpy")
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
@@ -2005,8 +2032,17 @@ def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
         _CURSOR_SRC + _SRC_SLOTS * _CURSOR_BPS - _CONV_SRC, dtype=np.uint8
     )
     before = nic.mem.copy()
+    connector = _pp_stage_connector(mc, nic)
+    staged_regions = []
+    if staged:
+        # The MLA pages take the staging path; the state is still written here.
+        connector._mla_staging = object()
+        connector._mla_token_views = {0: None}
+        connector._execute_mla_regions = lambda *args, **_kw: (
+            staged_regions.append(args[4]) or True
+        )
 
-    assert _run_slot_transfer(mc, _pp_stage_connector(mc, nic), _dcp_tp_request())
+    assert _run_slot_transfer(mc, connector, _dcp_tp_request(), object())
 
     conv = before[_CONV_SRC + 5 * _CONV_BPS : _CONV_SRC + 6 * _CONV_BPS]
     ssm = before[_SSM_SRC + 5 * _SSM_BPS : _SSM_SRC + 6 * _SSM_BPS]
@@ -2027,6 +2063,9 @@ def test_pp_stage_relayouts_kv_and_splits_kda_state_for_a_dcp_tp_consumer():
         (_DST_SLOT[5] + 3 * (_SSM_BPS // 2), ssm[_SSM_BPS // 2 :]),
         (_DST_SLOT[6] + 3 * _CURSOR_BPS, cursor),
     ]
+    if staged:
+        assert staged_regions == [[(0, _DST_MLA[1], _BPB)]]
+        landed = landed[1:]
     written = np.zeros_like(nic.mem, dtype=bool)
     for dst, want in landed:
         assert (nic.mem[dst : dst + want.size] == want).all()
@@ -2062,6 +2101,65 @@ def test_a_tp_split_the_state_cannot_take_is_refused(
         _run_slot_transfer(mc, connector, request)
     # Refused before Phase 1: no MLA page reached the peer.
     assert not nic.mem[_DST_MLA[0] : _DST_SLOT[0]].any()
+
+
+def test_pp_stage_stages_its_mla_pages_like_a_block_only_producer(monkeypatch):
+    """With the producer's MLA staging pool and the request's ready event, the
+    stateful path sends its MLA pages as `_execute_block_transfer` does:
+    gathered into destination pages, the bytes the per-token path writes."""
+    import ctypes
+    from contextlib import nullcontext
+
+    torch = pytest.importorskip("torch")
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    src = torch.arange(4 * _BPB, dtype=torch.uint8).view(4, _BPB)
+    stream = SimpleNamespace(wait_event=lambda _e: None, synchronize=lambda: None)
+    landed = []
+    for staged in (False, True):
+        dst = torch.zeros((2, 4, _BPB), dtype=torch.uint8)
+        labels = []
+
+        def write(_t, srcs, dsts, sizes, _r, label, *, labels=labels, **_kw):
+            for s, d, n in zip(srcs, dsts, sizes):
+                ctypes.memmove(int(d), int(s), int(n))
+            labels.append(label)
+            return True
+
+        conn = _pp_stage_connector(mc, SimpleNamespace(write=write))
+        conn._block_regions = [(src.data_ptr(), _BPB)]
+        conn._slot_regions = []
+        conn._slot_region_consumer_indices = None
+        conn._slot_region_tp_segments = None
+        conn._slot_region_tp_replicated = None
+        if staged:
+            conn._mla_staging = torch.empty((1, 2 * _BPB), dtype=torch.uint8)
+            conn._mla_staging_slots = mc.SlotPool(1)
+            conn._send_worker_stream = lambda: stream
+            conn._mla_token_views = {0: src.view(-1, _TOKEN_BYTES)}
+        request = _dcp_tp_request()
+        request.update(
+            consumer_block_base_addrs=[dst[0].data_ptr(), dst[1].data_ptr()],
+            consumer_slot_base_addrs=[],
+            consumer_slot_bps=[],
+            dst_slot_index=-1,
+        )
+        assert mc.MooncakeConnector._execute_block_slot_transfer(
+            conn,
+            request,
+            "consumer:1",
+            [0, 1, 2, 3],
+            [1, 2],
+            {"slot_index": -1},
+            "req-1",
+            object(),
+        )
+        landed.append(dst)
+        assert ("staged-mla" in labels) is staged
+    assert landed[0].any()
+    assert torch.equal(landed[0], landed[1])
 
 
 def test_dcp_index_staging_waits_for_request_ready_event():

@@ -176,38 +176,64 @@ def mla_staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
     return min(num_send_workers, mla_staging_pool_bytes(num_send_workers) // slot_bytes)
 
 
-def plain_mla_model(config) -> bool:
-    """Whether ``config``'s model keeps plain MLA KV, all MLA staging handles.
-
-    One latent row per token and no per-request state (``Family.MLA``), which
-    is what the producer stages and a DCP consumer lands. DeepSeek-V4 carries
-    a ``kv_lora_rank`` too (its V3 schema defaults one) but is its own family,
-    and the MLA hybrids register slot regions, which both paths skip, so
-    reserving for either would hold back HBM nothing uses.
-    """
+def _attn_family(config):
+    """``config``'s ``selector.Family``, or None without an HF config."""
 
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
-        return False
+        return None
     # Local import: config-time callers must not import transformers early.
     from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
+    from atom.utils.selector import attn_family
 
-    return attn_family(get_hf_text_config(hf_config)) == Family.MLA
+    return attn_family(get_hf_text_config(hf_config))
+
+
+def plain_mla_model(config) -> bool:
+    """Whether ``config``'s model keeps plain MLA KV, which a DCP consumer lands.
+
+    One latent row per token and no per-request state (``Family.MLA``).
+    DeepSeek-V4 carries a ``kv_lora_rank`` too (its V3 schema defaults one) but
+    is its own family, and the MLA hybrids register slot regions, which landing
+    skips, so reserving for either would hold back HBM nothing uses.
+    """
+
+    from atom.utils.selector import Family
+
+    return _attn_family(config) == Family.MLA
+
+
+def mla_staging_model(config) -> bool:
+    """Whether a producer stages ``config``'s MLA KV for a DCP consumer.
+
+    Plain MLA, and the MLA hybrids without a sparse indexer such as Kimi-K3,
+    whose MLA pages are staged while their slot regions go whole. Not a sparse
+    hybrid such as GLM-5.3-Flash, whose indexer region a DCP consumer cannot
+    take per token, nor DeepSeek-V4, its own family.
+    """
+
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, has_mla_indexer
+
+    family = _attn_family(config)
+    if family == Family.KIMI_MLA:
+        return not has_mla_indexer(get_hf_text_config(config.hf_config))
+    return family == Family.MLA
 
 
 def mla_staging_reserve_bytes(config) -> int:
     """HBM to hold back from the KV budget for Mooncake MLA staging pools.
 
     An upper bound of what ``MooncakeConnector`` allocates after the KV cache
-    is sized: every Mooncake producer entry on a plain MLA model without
-    producer DCP gets ``mla_staging_pool_bytes``, which its slots fit into.
+    is sized: every Mooncake producer entry on an MLA model
+    (``mla_staging_model``) without producer DCP gets
+    ``mla_staging_pool_bytes``, which its slots fit into.
     """
 
     if (
         not envs.ATOM_PD_MLA_STAGING
         or getattr(config, "decode_context_parallel_size", 1) > 1
-        or not plain_mla_model(config)
+        or not mla_staging_model(config)
     ):
         return 0
     return sum(
