@@ -323,7 +323,10 @@ async fn follow(
             message = socket.recv() => message,
         };
         let message = match message {
-            Ok(message) => message,
+            Ok(message) => {
+                recv_failed = false;
+                message
+            }
             // The socket reconnects by itself.
             Err(e) => {
                 if !std::mem::replace(&mut recv_failed, true) {
