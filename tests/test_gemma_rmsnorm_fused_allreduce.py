@@ -123,6 +123,7 @@ def test_a_rollout_sync_reaches_the_next_forward(calls, quant):
             pass
 
     runner = _Runner()
+    runner._init_weight_updater()
     runner.model = model
     new = torch.randn(HIDDEN)
     assert runner.update_weights([("norm.weight", new)]) == 1

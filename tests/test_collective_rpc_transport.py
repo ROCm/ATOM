@@ -28,7 +28,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_METHODS,
+    WeightReloadRefused,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
@@ -291,6 +294,34 @@ def test_a_return_that_is_not_plain_data_is_refused_on_the_worker(value):
     )
     assert not out.ok
     assert "not plain data" in out.error
+
+
+class _NotWritten(WeightReloadRefused):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("exc", "refused"),
+    [
+        (WeightReloadRefused("MLA"), True),
+        (_NotWritten("a subclass"), True),
+        (RuntimeError("WeightReloadRefused: only the text"), False),
+    ],
+    ids=["refusal", "subclass", "lookalike-text"],
+)
+def test_a_refusal_before_writing_is_marked_on_the_reply(exc, refused):
+    """The engine read the refusal off the error text, which a subclass's
+    name changes and any message could imitate."""
+
+    def raise_it():
+        raise exc
+
+    runner = SimpleNamespace(raise_it=raise_it)
+    out = _proc(runners=[runner])._run_generic_rpc(
+        runner, "raise_it", (), {}, RpcPayload("refused")
+    )
+    assert not out.ok
+    assert out.refused_before_writing is refused
 
 
 @pytest.mark.parametrize(
@@ -728,6 +759,23 @@ def test_a_dead_rank_breaks_the_barrier_so_the_survivors_answer():
     assert mgr.all_ranks_barrier.broken
     assert results[0].error == "barrier broke"
     assert "died" in results[1].error
+
+
+@pytest.mark.parametrize("unsent", ["past its deadline", "broken barrier"])
+def test_a_call_that_was_never_sent_wrote_nothing(unsent):
+    """A sync's first update that waited in the engine's queue past its
+    deadline ran on no rank, yet its replies read as written, and a healthy
+    engine was marked not whole."""
+    mgr = _mgr(2)
+    if unsent == "broken barrier":
+        mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+        mgr.all_ranks_barrier.broken = True
+        results = mgr.collective_rpc("m", RpcPayload("u1", barrier=True), timeout=5)
+    else:
+        results = mgr.collective_rpc("m", RpcPayload("u2"), timeout=0)
+
+    assert mgr.rpc_broadcast_mq.sent == []
+    assert all(not r.ok and r.refused_before_writing for r in results)
 
 
 def test_a_slow_rank_does_not_break_the_barrier():

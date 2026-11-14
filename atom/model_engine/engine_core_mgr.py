@@ -49,6 +49,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
     PAUSE_GENERATION_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
     kv_change,
@@ -2212,6 +2213,15 @@ class CoreManager:
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
         missing = sorted(set(sent) - set(by_dp_rank))
+        if missing and cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+            # Still being received: an engine waits for its runners to decide
+            # the stream, and a discard would fence it over what they wrote.
+            raise TimeoutError(
+                f"{self.label}: DP rank(s) {missing} did not answer {cmd!r} "
+                f"within {timeout}s, so whether they wrote the stream is "
+                f"unknown; they stay fenced until a later sync rewrites every "
+                f"parameter"
+            )
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)

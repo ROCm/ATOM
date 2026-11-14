@@ -41,6 +41,7 @@ from atom.model_engine.collective_rpc import (
     UTILITY_MANAGED_RUNNER_METHODS,
     RpcPayload,
     RpcResult,
+    WeightReloadRefused,
     checked_timeout,
     is_plain_rpc_value,
 )
@@ -393,7 +394,12 @@ class AsyncIOProc:
         try:
             value = func(*call_args, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
-            return self._failure(payload, f"{type(exc).__name__}: {exc}")
+            return RpcResult(
+                payload.request_id,
+                self.rank,
+                error=f"{type(exc).__name__}: {exc}",
+                refused_before_writing=isinstance(exc, WeightReloadRefused),
+            )
         if not is_plain_rpc_value(value):
             return self._failure(
                 payload,
@@ -755,7 +761,9 @@ class AsyncIOProcManager:
                 f"so no TP rank ran it"
             )
             return [
-                RpcResult(payload.request_id, rank, error=error)
+                RpcResult(
+                    payload.request_id, rank, error=error, refused_before_writing=True
+                )
                 for rank in range(self.proc_num)
             ]
 
@@ -770,7 +778,12 @@ class AsyncIOProcManager:
                     f"broken; restart the runner manager"
                 )
                 return [
-                    RpcResult(payload.request_id, rank, error=error)
+                    RpcResult(
+                        payload.request_id,
+                        rank,
+                        error=error,
+                        refused_before_writing=True,
+                    )
                     for rank in range(self.proc_num)
                 ]
             self.rpc_broadcast_mq.enqueue((func_name, payload))
