@@ -651,18 +651,38 @@ def DRAFT_KPARTS(rows: int) -> int:
     return 10 if rows > 20 else 0
 
 
+# The Markov head's dot row groups a task (``MarkovHead(spread=)``, "Spread tasks": the same ids), by TP, for the
+# one-request draft head (``head_program``): TP8's 1010 row groups in 253 tasks of 4 (64 ids a CTA) instead of 127 of
+# 8, the 165 MB a rank streamed by almost every CU instead of half of them. Env ATOM_DSV41_MONO_HI_MK_SPREAD (an int
+# 1-8, any TP; every rank the same) overrides it.
+MK_SPREAD_TP = {8: 4}
+MK_SPREAD_ENV = "ATOM_DSV41_MONO_HI_MK_SPREAD"
+
+
+def mk_spread(sc: Scenario) -> int:
+    """``head_program``'s Markov dot row groups a task at ``sc`` (one request, else 8)."""
+    from .head import env_int
+
+    if sc.batch != 1:
+        return 8
+    env = env_int(MK_SPREAD_ENV, 1, 8)
+    return env if env is not None else MK_SPREAD_TP.get(sc.tp, 8)
+
+
 def head_blocks(
     tp: int = 4,
     rows: int = 5,
     res_out: str | None = None,
     prefetch: int | None = None,
     kparts: int | None = None,
+    spread: int = 0,
 ) -> list[Block]:
     """The draft's head after stage 2 (chained: its fold sums stage 2's pushed MoE partials): the fold and the
     collapse (``head.head_blocks``' seam), the last stage's ``norm`` (arg ``norm.g``: ``mtp.2.norm``), then
     ``MarkovHead`` on the target's LM head (arg ``mk.w``: the verify head's packed ``head.w``, the same tensor) and
     the Markov tables (``mk.w1`` / ``mk.w2``: ``mtp.2.markov_head.{embed,head}``), x_{-1} = ``mk.anchor``, the ids
-    into ``mk.ids``. ``res_out``: the fold's R (stage 2's output streams) also into that plain arg.
+    into ``mk.ids``. ``res_out``: the fold's R (stage 2's output streams) also into that plain arg. ``spread``: the
+    dot's row groups a task (``MarkovHead``; 0: 8).
     """
     from ..blocks.gfx950.markov import MarkovHead
     from . import head as H
@@ -685,6 +705,7 @@ def head_blocks(
             prefetch=pf,
             lead=H.LEAD,
             kparts=kp,
+            spread=spread,
         )
     ]
 
@@ -696,7 +717,7 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
     from .recipe import CHAIN_PEER
     from .schedules import KEY_TP
 
-    blocks = head_blocks(sc.tp, sc.rows, res_out)
+    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc))
     stages = [st for b in blocks for st in b.stages(sc)]
     # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
     program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)

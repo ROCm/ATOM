@@ -27,6 +27,12 @@ request b's position j). The dot runs once for every row (``ArgmaxHead``'s 16-ro
 fit the LDS, its K slices); then per position j the B requests' steps run side by side: their B ``W1`` rows, B biases
 a thread, B task bests pushed and polled in one round trip, B picks. A request's ids are the bits of its block alone.
 
+**Spread tasks** (``spread`` G < 8, one request, x whole, one block a task): a task G row groups (16 G ids: TP8's
+16160 ids in 253 tasks of 64 instead of 127 of 128, the dot's bytes over almost every CU), waves 0 .. G - 1 stream
+one each (``ArgmaxHead``'s "Spread tasks": every base logit the same bits); the task's ``W2`` rows are its 16 G; in a
+position the threads of ids past 16 G hold no candidate. Every bias is the same 4 lanes' sums in the same order, and
+the picks reduce the same (value, id) set under a total order: the same ids, ``tp x tasks`` entries a position.
+
 Args: ``<name>.w`` (``ArgmaxHead.pack``), ``<name>.w1`` / ``<name>.w2`` (bf16 [V, r] tables), ``<name>.anchor``
 (int32 [B]: each request's x_{-1}), ``<name>.ids`` (int32 [rows]: out).
 """
@@ -45,6 +51,7 @@ from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
     bf2_f32,
     bf16_round,
+    fresh_after,
     ld_i32,
     mfma_bf16,
     rsrc,
@@ -87,8 +94,8 @@ class _MPlan(ah._Plan):
         # (or a task of several blocks: their W2 rows over x)
 
     @property
-    def vt(self) -> int:  # ids a task: VT a block
-        return VT * self.blocks
+    def vt(self) -> int:  # ids a task: VT a block (``spread``: 16 g)
+        return VT * self.blocks if self.g == WAVES else ah.RG * self.g
 
     @property
     def mtasks(
@@ -164,7 +171,7 @@ class MarkovHead(Block):
 
     def __init__(self, name: str, x: Channel, n: int, layout: str = "packed", prefetch: int = 16, lead: int = 4,
                  rank_r: int = 256, logits: Channel | None = None, kparts: int = 0,
-                 blocks: int | None = None):  # fmt: skip
+                 blocks: int | None = None, spread: int = 0):  # fmt: skip
         # blocks: 128-id blocks a task; None: 1 while a rank's blocks fit one a CU, else 2 (V4.1 at TP2: 505 blocks of
         # its 64,640 ids, 253 tasks of 2)
         if blocks not in (None, 1, 2) or (blocks == 2 and logits is not None):
@@ -207,10 +214,16 @@ class MarkovHead(Block):
         if kparts < 0:
             raise ValueError(f"MarkovHead {name}: kparts >= 0")
         self.kparts = kparts
+        # row groups a task (0 / 8: one a wave; module docstring, "Spread tasks")
+        spread = spread or WAVES
+        if not 1 <= spread <= WAVES or (spread < WAVES and (layout != "wave" or logits is not None or blocks == 2)):
+            raise ValueError(f"MarkovHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} in layout "
+                             f"'wave', one block a task, the head's own dot")  # fmt: skip
+        self.spread = spread
 
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
-                   False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch)  # fmt: skip
+                   False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch, g=self.spread)  # fmt: skip
         if (
             sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
         ):  # x in K slices where it does not fit whole
@@ -237,6 +250,10 @@ class MarkovHead(Block):
         if p.mtasks > MI355X.cus:
             raise ValueError(
                 f"MarkovHead {self.name}: {p.mtasks} tasks, more than one a CTA"
+            )
+        if p.g < WAVES and not p.single:
+            raise ValueError(
+                f"MarkovHead {self.name}: spread: one request, x whole in the LDS, one block a task"
             )
         if p.single and sc.rows > 16:
             raise ValueError(
@@ -268,8 +285,11 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
     tb = (
         t * p.blocks if p.blocks > 1 else t
     )  # the task's first 128-id block in the weight's packing
-    rg = tb * WAVES + wave
-    issue = partial(ah._issue, p, r_w, tb, wave, rg, lane, rg < p.n_rg)
+    rg = tb * p.g + wave
+    valid = rg < p.n_rg
+    if const_expr(p.g < WAVES):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
+        valid = valid & (wave < p.g)
+    issue = partial(ah._issue, p, r_w, tb, wave, rg, lane, valid)
     n_pre = min(p.prefetch, p.steps)
     lead = min(p.lead, n_pre)
     q = [issue(i) for i in range(lead)]
@@ -296,7 +316,10 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
     gpu.barrier()
     first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
     if const_expr(p.single):
-        _stream(k, p, lane, issue, q)
+        if const_expr(p.g < WAVES):
+            _stream_some(k, p, lane, issue, q)
+        else:
+            _stream(k, p, lane, issue, q)
         _w2_tile(k, p, t, first)
         gpu.barrier()
         xp = uniform(ld_i32(k.args[f"{p.name}.anchor"], 0))
@@ -311,6 +334,14 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
         )  # x_{-1} of every request into LDS (where each position leaves its x_j)
         gpu.barrier()
         _position_loop(k, p, t, first)
+
+
+@traced
+def _stream_some(k, p: _MPlan, lane, issue, q):
+    """``spread``: the stream on waves 0 .. g - 1 only (a wave-uniform branch, no barrier inside); the other waves'
+    base logit slots are never read (``_position``: ids past ``vt`` hold no candidate)."""
+    if k.wave < p.g:
+        _stream(k, p, lane, issue, q)
 
 
 def _stream(k, p: _MPlan, lane, issue, q):
@@ -328,7 +359,11 @@ def _stream(k, p: _MPlan, lane, issue, q):
         )
         acc = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), acc)
     rocdl.sched_barrier(0)
-    _base_put(k, p, lane, [bf16_round(acc[e]) for e in range(4)])
+    vals = [bf16_round(acc[e]) for e in range(4)]
+    if const_expr(p.g < WAVES):  # (spread: the store's lane from the thread id after the sums, not held across the
+        # stream: TP8's 253 tasks of 4 spilled it, one VGPR)
+        lane = fresh_after(k.tid, vals[:1]) % 64
+    _base_put(k, p, lane, vals)
 
 
 @traced
@@ -416,8 +451,10 @@ def _position(k, p: _MPlan, t, j, xp, first):
     acc = acc + xshfl(acc, 1)
     acc = acc + xshfl(acc, 2)
     val = fx.ptr_load(k.ldsf + (p.a_base + j * VT + v)) + acc
-    lid = t * VT + v
+    lid = t * p.vt + v
     ok = (part == 0) & (lid < p.n)
+    if const_expr(p.vt < VT):  # (spread: the task's ids are its first vt; v past them reads unset LDS)
+        ok = ok & (v < p.vt)
     bits = val.bitcast(fx.Int32)
     bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0
     kk = ok.select(order_key(bits), fx.Int32(0))

@@ -97,7 +97,15 @@ w + 8, .. of the CTA over their parts in part order and takes their top-1 (the s
 G / 8 row groups of a rank do not fill whole rounds of the grid (e.g. 3126 over 256 CTAs, 1.53 tasks a CTA
 with whole row groups a wave) a wave's work is at most ceil(ceil(G / tasks) S / 8) parts instead of two tasks. The
 logits are the same products summed in another order (S partial sums added in order): another rounding than the
-unbalanced head's (a bf16 key can differ on a near-tie)."""
+unbalanced head's (a bf16 key can differ on a near-tie).
+
+**Spread tasks** (``spread`` G < 8; layout "wave", bf16, rows <= 16, x whole in the LDS, not ``balance``): a task G
+row groups (waves 0 .. G - 1 stream one each, the CTA's other waves skip the stream), ``ceil(n / 16 G)`` tasks: e.g.
+TP8's 1010 row groups in 253 tasks of 4 instead of 127 of 8, the dot's bytes over (almost) every CU instead of half
+of them. Each row group's logits are the same wave's MFMAs over K in the same order (``_issue`` addresses a row
+group's units alike), so every logit, race score and ``<name>.lg`` pair is the same bits; the task's best and the
+pick's are of the same (key, id) set under a total order: the same ids and ``vals``. Only ``<name>.top``'s entries
+(tp x tasks a row) and the pick's poll grow."""
 
 from __future__ import annotations
 
@@ -184,6 +192,7 @@ class _Plan:
     balance: int = (
         0  # K parts a row group (``balance``: balanced tasks, module docstring); 0: a task 8 row groups
     )
+    g: int = WAVES  # row groups a task (``spread``: the module docstring's "Spread tasks"); WAVES: one a wave
 
     probe = False  # ``linear._land_batch``'s probe build: off
 
@@ -197,7 +206,7 @@ class _Plan:
 
     @property
     def tasks(self) -> int:
-        return min(MI355X.cus, self.n_rg) if self.balance else -(-self.n_rg // WAVES)
+        return min(MI355X.cus, self.n_rg) if self.balance else -(-self.n_rg // self.g)
 
     @property
     def bal_g(self) -> int:  # ``balance``: the most row groups a CTA
@@ -332,7 +341,8 @@ class ArgmaxHead(Block):
     def __init__(self, name: str, x: Channel, n: int, key: str = "bf16", layout: str = "packed",
                  prefetch: int = 16, vals: bool = True, out: Channel | None = None, lead: int = 4,
                  late: bool = False, sample: bool = False, weight_format: str = "bf16",
-                 race: bool | str = False, balance: int = 0, kparts: int = 0):  # fmt: skip
+                 race: bool | str = False, balance: int = 0, kparts: int = 0,
+                 spread: int = 0):  # fmt: skip
         if weight_format not in WFMTS:
             raise ValueError(f"ArgmaxHead {name}: weight_format in {WFMTS}")
         mx = weight_format == "mxfp4"
@@ -397,12 +407,18 @@ class ArgmaxHead(Block):
         if kparts < 0 or (kparts and mx):
             raise ValueError(f"ArgmaxHead {name}: kparts >= 0, bf16 weights only")
         self.kparts = kparts
+        # row groups a task (0 / 8: one a wave; module docstring, "Spread tasks")
+        spread = spread or WAVES
+        if not 1 <= spread <= WAVES or (spread < WAVES and (mx or layout != "wave" or balance)):
+            raise ValueError(f"ArgmaxHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} with bf16 "
+                             f"weights in layout 'wave', not balanced")  # fmt: skip
+        self.spread = spread
 
     def plan(self, sc: Scenario) -> _Plan:
         p = _Plan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, self.key, self.layout,
                   self.prefetch, self.vals, self.out.name if self.out is not None else "", self.lead,
                   self.late, self.sample, self.weight_format, race=bool(self.race),
-                  race_lg=self.race == "check", race_only=self.race == "only", balance=self.balance)  # fmt: skip
+                  race_lg=self.race == "check", race_only=self.race == "only", balance=self.balance, g=self.spread)  # fmt: skip
         if (
             not p.mx
         ):  # x in K slices where it does not fit whole (the bf16 weights' path), ``kparts`` at least
@@ -416,6 +432,10 @@ class ArgmaxHead(Block):
                 if p.lds_words * 4 <= MI355X.lds_bytes:
                     break
                 p = replace(p, kparts=kp)
+        if p.g < WAVES and (p.kparts > 1 or p.rc > 1):
+            raise ValueError(
+                f"ArgmaxHead {self.name}: spread: x of {sc.rows} rows whole in the LDS, at most 16 rows"
+            )
         if p.balance and (p.kparts > 1 or p.rc > 1):
             raise ValueError(
                 f"ArgmaxHead {self.name}: balance: x of {sc.rows} rows whole in the LDS, at most 16 rows"
@@ -548,8 +568,8 @@ def _key(p, v):
 def _issue(p, r_w, t, wave, rg, lane, valid, i):
     """Lane ``lane``'s 16 B of the wave's unit at K step ``i``, nontemporal (a row group past n: read as 0, no
     memory touched)."""
-    if p.layout == "wave":
-        off = ((t * WAVES + wave) * p.steps + i) * UNIT_WORDS + lane * 4
+    if p.layout == "wave":  # (row group rg = t g + wave: its units contiguous at rg x steps)
+        off = (rg * p.steps + i) * UNIT_WORDS + lane * 4
     off = valid.select(off, fx.Int32(OOB // 4))
     return fx.Vector(
         bo.buffer_load(r_w, off, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
@@ -587,8 +607,10 @@ def _x_batches(k, p, tid, threads, part: int = 0):
 
 def _dot(k, t, p):
     lane, wave = k.lane, k.wave
-    rg = t * WAVES + wave
+    rg = t * p.g + wave
     valid = rg < p.n_rg
+    if const_expr(p.g < WAVES):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
+        valid = valid & (wave < p.g)
     r_w = rsrc(k.args[f"{p.name}.w"], p.w_bytes)
     issue = partial(_issue, p, r_w, t, wave, rg, lane, valid)
     n_pre = min(p.prefetch, p.steps)
@@ -622,10 +644,21 @@ def _dot(k, t, p):
         rocdl.sched_barrier(0)
         q += [issue(i) for i in range(lead, n_pre)]
     gpu.barrier()
-    _stream(k, p, t, rg, lane, valid, issue, q)
+    if const_expr(p.g < WAVES):
+        _stream_some(k, p, t, rg, lane, valid, issue, q)
+    else:
+        _stream(k, p, t, rg, lane, valid, issue, q)
     gpu.barrier()
     _task_put(k, p, t, k.rank * p.n if p.tp > 1 else fx.Int32(0))
     gpu.barrier()  # the next task reuses the LDS
+
+
+@traced
+def _stream_some(k, p, t, rg, lane, valid, issue, q):
+    """``spread``: the stream on waves 0 .. g - 1 only (a wave-uniform branch; the stream has no barrier at one
+    16-row chunk and x whole, ``plan``); the other waves' (key, id) slots are never read (``_task_put``)."""
+    if k.wave < p.g:
+        _stream(k, p, t, rg, lane, valid, issue, q)
 
 
 def _stream(k, p, t, rg, lane, valid, issue, q):
@@ -750,7 +783,7 @@ def _task_put(k, p, t, first):
         r = k.tid
         kk = fx.Int32(fx.ptr_load(k.lds + (p.red + r * 2)))
         ii = fx.Int32(fx.ptr_load(k.lds + (p.red + r * 2 + 1)))
-        for w in range_constexpr(1, WAVES):
+        for w in range_constexpr(1, p.g):  # (the waves that streamed)
             kw = fx.Int32(fx.ptr_load(k.lds + (p.red + (w * p.rows + r) * 2)))
             iw = fx.Int32(fx.ptr_load(k.lds + (p.red + (w * p.rows + r) * 2 + 1)))
             kk, ii = _take(kk, ii, kw, iw)

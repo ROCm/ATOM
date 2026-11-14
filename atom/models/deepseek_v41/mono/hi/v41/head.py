@@ -32,6 +32,8 @@ fallback head on the same step; ATOM's ``collapse`` of a settled state is one la
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from ..blocks.base import Block, Channel, Fmt
@@ -93,11 +95,45 @@ def _late(late, rows: int | None) -> bool:
     )
 
 
+# The dot's row groups a task (``ArgmaxHead(spread=)``, "Spread tasks": the same bits), by TP, for a one-request head
+# of at most 16 rows (``head_program``): a rank's 16-row groups ceil(V / 16 tp) in tasks of G, one a CTA. 8 (the
+# head's own): TP8's 1010 row groups in 127 tasks, the dot's 165 MB a rank streamed by 127 of the 256 CUs (TP4: 253
+# tasks of 8 already). TP8 4: 253 tasks of 4 (4 streaming waves a CU). With the context write merged
+# (``head_program(ctx=True)``) ``SPREAD_CTX_TP``: the dot's tasks take the CUs the context write ran on, so it stays
+# 8 unless asked (``CTX_AT`` "split" gives the context write's late stages the CUs left: e.g. 5 -> 202 tasks, 48
+# free CTAs). Env ATOM_DSV41_MONO_HI_HEAD_SPREAD (an int 1-8, any TP; every rank the same) overrides both.
+SPREAD_TP = {8: 4}
+SPREAD_CTX_TP: dict[int, int] = {}
+SPREAD_ENV = "ATOM_DSV41_MONO_HI_HEAD_SPREAD"
+
+
+def env_int(name: str, lo: int, hi: int) -> int | None:
+    """An int env override in ``lo .. hi`` (None: unset / "auto")."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("", "auto"):
+        return None
+    v = int(raw)
+    if not lo <= v <= hi:
+        raise ValueError(f"{name}={raw!r}: {lo} .. {hi}")
+    return v
+
+
+def dot_spread(sc, ctx: bool = False) -> int:
+    """``head_program``'s dot row groups a task at ``sc`` (``SPREAD_TP`` / ``SPREAD_CTX_TP``, the env's): a one-request
+    head of at most 16 rows, else 8."""
+    if sc.batch != 1 or sc.rows > 16:
+        return 8
+    env = env_int(SPREAD_ENV, 1, 8)
+    if env is not None:
+        return env
+    return (SPREAD_CTX_TP if ctx else SPREAD_TP).get(sc.tp, 8)
+
+
 def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout: str | None = None,
                 prefetch: int | None = None, lead: int | None = None, late: bool | None = None,
                 src: str | None = None, res_out: str | None = None,
                 rows: int | None = None, sample: bool = False, knobs: dict | None = None,
-                race: bool | str = False, kparts: int | None = None) -> list[Block]:  # fmt: skip
+                race: bool | str = False, kparts: int | None = None, spread: int = 0) -> list[Block]:  # fmt: skip
     """The head program's blocks for a TP-``tp`` rank. Where the fold's inputs come from (``src``): "plain" (args
     ``r_f``, ``gate_f``, ``ffn_out``: a chain tail's), "chain" (``chain=True``: the fold sums the previous launch's
     MoE partials, the last layer launched with ``push_moe``; the program needs ``peer_first=CHAIN_PEER``) or "fused"
@@ -107,7 +143,8 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
     bf16 sums ``moe.part.dag``, else the pushed partials ``moe.part``). ``knobs``: the layer knobs the fold's layout
     follows (``layer.residual_layout`` / ``chain_pend``; default the live ones), e.g. the draft's replicated chain.
     ``sample``: the head's sampling mode (``ArgmaxHead``); ``race``: with it, rows with T > 0 and top_p >= 1 drawn in
-    the dot's epilogue (the hook's served head; "check": every row's logits kept)."""
+    the dot's epilogue (the hook's served head; "check": every row's logits kept). ``spread``: the dot's row groups
+    a task (``ArgmaxHead``; 0: 8)."""
     lin, xq, xb = (
         Channel("lin_h", HIDDEN, Fmt.BF16),
         Channel("xh", HIDDEN, Fmt.MXFP8),
@@ -168,6 +205,7 @@ def head_blocks(tp: int = 1, chain: bool = False, key: str | None = None, layout
             sample=sample,
             race=race,
             kparts=_kparts(kparts, rows),
+            spread=spread,
         ),
     ]
 
@@ -207,6 +245,47 @@ def place(stages, cus: int = 256):
 # ``head_program(ctx=True)``: the head's stages the merged context write keeps off (the dot and the pick: a context
 # task queued behind one of them on its CTA would start when it ends)
 CTX_AVOID = ("head", "head.pick")
+# where the merged context write's stages go: "after" (every one after the head's stages, on the CTAs the dot and the
+# pick leave idle: ``place_after``) or "split" (its early stages, ``CTX_EARLY``: the taps' quantize and main_proj, whose
+# inputs are all there at the launch's start, in front of the dot in program order on the least loaded CTAs, where
+# they run while the dot's x is still being folded and normed; the rest, from the cross-GPU gather on, after the head's
+# stages on the CTAs the dot and the pick leave idle, as "after"). Env ATOM_DSV41_MONO_HI_CTX_AT overrides it (every
+# rank the same)
+CTX_AT = "after"
+CTX_AT_ENV = "ATOM_DSV41_MONO_HI_CTX_AT"
+CTX_EARLY = ("cx_q0", "cx_q1", "cx_q2", "cx_proj")
+CTX_DOT_LOAD = 4  # ``place_front``: a dot task's weight in the CTAs' loads (a context task in front of it delays it)
+
+
+def ctx_at() -> str:
+    at = os.environ.get(CTX_AT_ENV, "").strip().lower() or CTX_AT
+    if at not in ("after", "split"):
+        raise ValueError(f"{CTX_AT_ENV}={at!r}: 'after' or 'split'")
+    return at
+
+
+def place_front(stages, front, before: str, heavy: tuple = ("head",), cus: int = 256):
+    """``stages`` with ``front`` inserted before stage ``before`` in program order, each front stage on the least
+    loaded cyclic run of CTAs (the load: the tasks of ``stages`` before ``before`` and of the front stages placed so
+    far, a ``heavy`` stage's task ``CTX_DOT_LOAD``). Every ``stages`` base is frozen at ``plan``'s placement first, so
+    the host program's own placement is unchanged; the front stages poll only each other (earlier in program order)."""
+    from .recipe import plan_bases
+
+    for st, base in zip(stages, plan_bases(stages, cus), strict=True):
+        st.base = base
+    at = next(i for i, st in enumerate(stages) if st.name == before)
+    load = [0] * cus
+    for st in stages:
+        w = CTX_DOT_LOAD if st.name in heavy else 1 if stages.index(st) < at else 0
+        for t in range(st.tasks):
+            load[(st.base + t) % cus] += w
+    for st in front:
+        n = min(st.tasks, cus)
+        at0 = min(range(cus), key=lambda a: (sum(load[(a + t) % cus] for t in range(n)), a))
+        for t in range(st.tasks):
+            load[(at0 + t) % cus] += 1
+        st.base = at0
+    return stages[:at] + list(front) + stages[at:]
 
 
 def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: bool = False,
@@ -226,7 +305,8 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
     stages = place(
         [
             st
-            for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, **knobs)
+            for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, spread=0 if dyn else dot_spread(sc, ctx),
+                                 **knobs)
             for st in b.stages(sc)
         ]
     )
@@ -236,7 +316,12 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
         if sc.batch != 1 or dyn:
             raise ValueError(f"{name}: the context write merges into a one-request head")
         cx = [st for b in context_blocks_at(sc, "shard", False, ctx_knobs, taps="streams") for st in b.stages(sc)]
-        stages = place_after(stages, cx, CTX_AVOID)
+        if ctx_at() == "split":
+            early = [st for st in cx if st.name in CTX_EARLY]
+            late = [st for st in cx if st.name not in CTX_EARLY]
+            stages = place_after(place_front(stages, early, "head"), late, CTX_AVOID)
+        else:
+            stages = place_after(stages, cx, CTX_AVOID)
     wide = (
         sc.tp > KEY_TP
     )  # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: up to 12)
