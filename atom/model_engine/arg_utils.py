@@ -873,9 +873,11 @@ class EngineArgs:
                 "aggregation used by the EPLB balancedness gate.\n"
                 '  - "p2p_batch_chunk_size": int, P2P batch chunk size used '
                 "while migrating expert weights.\n"
-                '  - "placement_policy": "naive"|"biased", how to spend the '
-                "redundant budget: 'naive' (spread) or 'biased' (fully "
-                "replicate top-K hottest experts to all GPUs).\n"
+                '  - "placement_policy": "naive"|"biased"|"step_peak", how to '
+                "spend the redundant budget: 'naive' (spread), 'biased' (fully "
+                "replicate top-K hottest experts to all GPUs) or 'step_peak' "
+                "(replicate and pack against the per-step busiest GPU over the "
+                "window; flat placement only).\n"
                 "Example:\n"
                 """  '{"num_redundant_experts": 8, "placement_policy": """
                 """"biased"}'"""
