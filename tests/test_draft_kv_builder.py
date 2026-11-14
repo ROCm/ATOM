@@ -489,6 +489,69 @@ def test_a_per_tensor_scale_stays_off_the_blockwise_kv_cache_data():
     assert codec.bytes_per_block > 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused GPU staging")
+def test_an_offload_round_trip_restores_the_draft_rows_at_new_block_ids():
+    """What an LMCache tier save and a later tier load do to the draft's pool:
+    the codec gathers some blocks into a staging buffer and scatters it back
+    into other block ids. The draft's K/V rows come back byte for byte, beside
+    a target-like block-major cache, and nothing else is written."""
+    pytest.importorskip("triton")
+    from atom.config import KVCacheTensor
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+
+    blocks = 6
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        flash_layout=True,
+    )
+    pool.allocate(blocks, "cuda")
+    runner = _runner(draft_layers=2)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(
+        runner, lambda **_: pool, kv_scale=DraftKvPoolSpec().kv_scale
+    )
+    builder._kv_pool = pool
+    layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    entries = {
+        # A target layer's block-major cache, as the target builder publishes it.
+        "layer_0": KVCacheTensor(
+            layer_num=0, k_cache=torch.empty(blocks, 128, 576, device="cuda")
+        )
+    }
+    for i, m in enumerate(layers, start=1):
+        m.layer_num = i
+        entries[f"layer_{i}"] = builder.build_kv_cache_tensor(m)
+    caches = [
+        t
+        for e in entries.values()
+        for t in (e.k_cache, e.v_cache)
+        if t is not None and t.numel()
+    ]
+    for t in caches:
+        t.copy_(torch.randn(t.shape, device="cuda").to(t.dtype))
+    before = [t.clone() for t in caches]
+
+    codec = DenseKVByteCodec(entries, num_blocks=blocks)
+    saved, restored = [1, 4], [0, 3]
+    buf = torch.empty(
+        len(saved) * codec.bytes_per_block, dtype=torch.uint8, device="cuda"
+    )
+    codec.gpu_to_chunk_major_device_buffer(buf, [saved])
+    for t in caches:
+        t.zero_()
+    codec.chunk_major_device_buffer_to_gpu(buf, [restored])
+    torch.cuda.synchronize()
+
+    for t, ref in zip(caches, before):
+        assert torch.equal(t[restored], ref[saved])
+        untouched = [b for b in range(blocks) if b not in restored]
+        assert not t[untouched].any()
+
+
 def _bind_first_layer(pool, kv_cache_dtype, kv_scale=None):
     """Bind one paged layer through the builder; return the module."""
     pool.allocate(2, "cpu")
