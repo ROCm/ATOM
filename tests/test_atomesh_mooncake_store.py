@@ -769,7 +769,8 @@ stop_mooncake_store
     def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
         # The decode node's owners failed to mount and its launcher exited 1:
         # the prefill node fails within seconds rather than when its wait times
-        # out, and a node that exited 0, or its own rank's file, does not stop it.
+        # out. A node that exited 0, its own rank's file, and an rc still being
+        # written (rank-rc-1.tmp, there across two polls) do not stop it.
         run_dir = self.root / "run"
         run_dir.mkdir()
         (run_dir / "rank-rc-0").write_text("1\n")
@@ -783,6 +784,7 @@ stop_mooncake_store
   done
   sleep 2
   echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  sleep 5
   mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
 ) >/dev/null 2>&1 &
 start_mooncake_store
@@ -796,6 +798,7 @@ start_mooncake_store
         )
         self.assertLess(time.monotonic() - started, 30)
         self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
+        self.assertNotIn("rank-rc-1.tmp", result.stderr)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
