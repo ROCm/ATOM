@@ -1772,7 +1772,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             assert use_persistent_metadata and dcp_tot_seq_lens_device is not None, (
                 f"causal decode of query length {max_qo_len} under DCP"
                 f"{self.dcp_world_size} needs the persistent round-robin kernel, "
-                "which is unavailable here (non-gfx950, or DP > 1)"
+                "which aiter does not run at this width here, or DP > 1"
             )
             g_kv_indptr = self._g_kv_indptr_buf[: num_reqs + 1]
             # [0] stays 0 (zero-init, never written). cumsum promotes to int64,

@@ -231,13 +231,13 @@ def serve_remote_tp_ranks(engine_args) -> int:
         proc.start()
         procs.append(proc)
     logger.info("TP ranks %d-%d started for the engine at %s", start, ranks[-1], ip)
-    return _supervise(procs, store, ip, port, engine_id)
+    return _supervise(procs, ip, port, engine_id)
 
 
-def _supervise(procs, store, ip: str, port: int, engine_id: str) -> int:
+def _supervise(procs, ip: str, port: int, engine_id: str) -> int:
     """Wait for the workers. The engine stopping, losing its store (it lives in
     the engine node's server process), a worker failing or a signal stops all
-    of them; the last two are reported to the engine, which then stops too."""
+    of them; the last three are reported to the engine, which then stops too."""
     stopping = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda signum, frame: stopping.append(signum))
@@ -264,6 +264,9 @@ def _supervise(procs, store, ip: str, port: int, engine_id: str) -> int:
             watchdog, misses = None, misses + 1
             logger.warning("Engine store at %s:%d unreachable: %s", ip, port, e)
             if misses >= _WATCHDOG_MISSES:
+                # Reported in case the store comes back: the engine's ranks
+                # would otherwise wait in collectives until the group timeout.
+                failure = "a node of TP ranks lost the engine's store"
                 logger.error("Lost the engine; stopping this node's TP ranks")
                 break
         else:
@@ -277,7 +280,10 @@ def _supervise(procs, store, ip: str, port: int, engine_id: str) -> int:
         logger.info("Signal %d: stopping this node's TP ranks", stopping[0])
     if failure:
         try:
-            store.set(_engine_key(engine_id, "failed"), failure)
+            # A short-timeout client: the engine may be gone already.
+            _store(ip, port, _WATCHDOG_TIMEOUT_S).set(
+                _engine_key(engine_id, "failed"), failure
+            )
         except Exception as e:  # noqa: BLE001 - the engine may be gone already
             logger.warning("Cannot report to the engine: %s", e)
     shutdown_all_processes(procs, allowed_seconds=5)

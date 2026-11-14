@@ -999,8 +999,6 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_prefill_num_heads = self.num_heads
         self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
                 self.dcp_persistent_supported,
@@ -1020,7 +1018,6 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
-                get_gfx_runtime() == "gfx950",
                 get_current_atom_config().max_num_batched_tokens,
             )
             (

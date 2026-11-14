@@ -972,15 +972,39 @@ def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
 def test_sparse_prefill_nonps_gate(
     monkeypatch, env, dcp, heads, fp8, gfx950, page, mbt, expected
 ):
+    from atom.distributed import dcp_utils
+
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
-    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: gfx950)
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, mbt) is expected
+
+
+@pytest.mark.parametrize("arch,expected", [("gfx950", True), ("gfx1250", False)])
+def test_sparse_prefill_nonps_asks_the_gpu_it_runs_on(monkeypatch, arch, expected):
+    """Not whether DCP decode runs persistent: gfx1250 PS1 does, and its
+    non-persistent kernel takes 64-token pages only."""
+    import sys
+    import types
+
+    for parent in ("aiter", "aiter.jit", "aiter.jit.utils"):
+        if parent not in sys.modules:  # CPU runner: no aiter
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: arch
+    monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1")
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384) is expected
 
 
 def test_sparse_prefill_nonps_is_on_by_default(monkeypatch):
+    from atom.distributed import dcp_utils
+
     monkeypatch.delenv("ATOM_DCP_SPARSE_PREFILL_NONPS", raising=False)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
-    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, True, 16384)
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: True)
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384)
 
 
 @pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])

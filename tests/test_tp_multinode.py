@@ -262,8 +262,7 @@ def _supervise(config, remote, procs, monkeypatch):
     )
     pc = config.parallel_config
     ip, port = pc.data_parallel_master_ip, pc.data_parallel_base_port
-    store = tp_multinode._store(ip, port, 5)
-    status = tp_multinode._supervise(procs, store, ip, port, remote.engine_id)
+    status = tp_multinode._supervise(procs, ip, port, remote.engine_id)
     assert stopped == procs
     return status
 
@@ -274,6 +273,25 @@ def test_a_failed_worker_is_reported_to_the_engine(monkeypatch, engine_store):
     procs = [_Proc("ModelRunner4/8"), _Proc("ModelRunner5/8", exitcode=-9)]
     assert _supervise(engine_store, remote, procs, monkeypatch) == 1
     assert remote.failure() == "ModelRunner5/8 exited with -9"
+
+
+def test_a_lost_engine_store_is_reported_if_it_comes_back(monkeypatch, engine_store):
+    """A blip, not engine death: the engine's ranks must not wait in collectives
+    until the group timeout."""
+    remote = _remote_ranks(engine_store, monkeypatch)
+    real_store, calls = tp_multinode._store, []
+
+    def store(ip, port, timeout_s):
+        calls.append(timeout_s)
+        if len(calls) <= tp_multinode._WATCHDOG_MISSES:
+            raise TimeoutError("unreachable")
+        return real_store(ip, port, timeout_s)
+
+    monkeypatch.setattr(tp_multinode, "_store", store)
+    assert _supervise(engine_store, remote, [_Proc("ModelRunner4/8")], monkeypatch) == 1
+    assert remote.failure() == "a node of TP ranks lost the engine's store"
+    # The report does not wait as long as startup does.
+    assert calls[-1] == tp_multinode._WATCHDOG_TIMEOUT_S
 
 
 def test_the_engine_stopping_stops_the_worker_node(monkeypatch, engine_store):

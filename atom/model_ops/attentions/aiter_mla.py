@@ -607,13 +607,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
 
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
         nonps_args = (
             self.dcp_world_size,
             self.num_attention_heads * self.dcp_world_size,
             self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
-            get_gfx_runtime() == "gfx950",
         )
         self.dcp_sparse_prefill_nonps = self.is_sparse and (
             mla_dcp_sparse_prefill_uses_nonps(

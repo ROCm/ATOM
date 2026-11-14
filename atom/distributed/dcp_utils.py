@@ -162,7 +162,6 @@ def mla_dcp_sparse_prefill_uses_nonps(
     dcp_world_size: int,
     gathered_heads: int,
     fp8_qkv: bool,
-    is_gfx950: bool,
     max_num_batched_tokens: int,
 ) -> bool:
     """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
@@ -178,10 +177,18 @@ def mla_dcp_sparse_prefill_uses_nonps(
         and dcp_world_size > 1
         and gathered_heads == 64
         and fp8_qkv
-        and is_gfx950
         and envs.ATOM_MLA_PAGE_SIZE <= 1
         and max_num_batched_tokens <= NONPS_MAX_Q_ROWS
+        and _runs_on_gfx950()
     )
+
+
+def _runs_on_gfx950() -> bool:
+    """The GPU this process runs on, not ``dcp_persistent_supported``: that is
+    also true on gfx1250, where the non-persistent kernel takes 64-token pages."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx950"
 
 
 def mla_dcp_sparse_prefill_mode(
