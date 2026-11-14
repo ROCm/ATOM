@@ -11,9 +11,12 @@ when state reaches that cap, approximately 96 GiB of the pool remains for KV.
 Behind a PP prefill the stages pool that cap instead: every stage keeps the
 same number of state images, so a stage whose layers hold more state than the
 average stage retains more than 128 GiB, while its CPU pool is its layer share
-of `LMCACHE_MAX_LOCAL_CPU_SIZE`. At PP8 that is stage 0, with 9 of the 69 KDA
-layers in 11 of the 93 layers: it keeps about 134 GiB of state, so size
-`LMCACHE_MAX_LOCAL_CPU_SIZE` for stage 0's share to leave room for its KV.
+of `pp_size × LMCACHE_MAX_LOCAL_CPU_SIZE`, with the DSpark layer counted on the
+last stage. At PP8 with the default layer split that is stage 0, with 9 of the
+69 KDA layers in 11 of the 94 layers. Its pool is 8 × 11/94 ≈ 0.94× the
+setting, about 210 GiB at 224. When state reaches the cap it keeps about
+134 GiB, which leaves about 76 GiB for KV. Size `LMCACHE_MAX_LOCAL_CPU_SIZE` so
+that 0.94× the setting covers stage 0's state and its KV.
 This is a shared allocator, not two separately reserved pools. Plan for
 **1.75 TiB of CPU cache capacity across the eight prefill ranks**, plus process
 and model-loading memory.
