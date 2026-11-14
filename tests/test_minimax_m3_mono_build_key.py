@@ -42,7 +42,7 @@ OTHER = {
     "moe_back": True, "back_dn_depth": 2, "back_sh_units": 4, "back_steal": 1,
     "back_dn_split": 1, "back_dn_bdepth": 2, "n_split": 4, "pipe": True,
     "score_sleep": 2, "copy_batch": 4, "index_cp": True, "cp_min_blocks": 5,
-    "cp_min_batch": 2, "o_flag": 1,
+    "cp_min_batch": 2, "o_flag": 1, "ar_flag": 1,
 }  # fmt: skip
 # a field whose other value is a valid build only beside other settings: both builds take them
 BESIDE = {
@@ -62,7 +62,7 @@ WIDE = {
 WIDE_FIELDS = (
     "front", "moe_back", "back_dn_depth", "back_sh_units", "back_steal",
     "back_dn_split", "back_dn_bdepth", "n_split", "pipe", "score_sleep", "copy_batch",
-    "index_cp", "cp_min_blocks", "cp_min_batch", "o_flag",
+    "index_cp", "cp_min_blocks", "cp_min_batch", "o_flag", "ar_flag",
 )  # fmt: skip
 
 
@@ -75,7 +75,7 @@ def _pair(name: str) -> tuple[K4Build, K4Build]:
             return whole, dataclasses.replace(whole, moe_back=False, front=True)
         if name == "moe_back":
             return front, whole
-        base = whole if name.startswith("back_") else front  # the back half's knobs
+        base = whole if name.startswith("back_") or name == "ar_flag" else front  # the back half's knobs
         if name.startswith("cp_min"):  # the thresholds exist beside indexer CP only
             base = dataclasses.replace(base, index_cp=True, index_heads=4)
         elif (
@@ -103,7 +103,7 @@ def _compile(key: K4Build) -> None:
         back_dn_bdepth=key.back_dn_bdepth, n_split=key.n_split, pipe=key.pipe,
         score_sleep=key.score_sleep, copy_batch=key.copy_batch,
         index_cp=key.index_cp, cp_min_blocks=key.cp_min_blocks,
-        cp_min_batch=key.cp_min_batch, o_flag=key.o_flag,
+        cp_min_batch=key.cp_min_batch, o_flag=key.o_flag, ar_flag=key.ar_flag,
     )  # fmt: skip
     with compile_only():
         launch(*K4_ABI.zeros())
