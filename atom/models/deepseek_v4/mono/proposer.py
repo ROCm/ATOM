@@ -126,9 +126,8 @@ class MonoDSparkProposer(DSparkProposer):
                 raise RuntimeError(
                     "DSpark mono context requires target auxiliary states"
                 )
-            hidden = torch.cat(aux, dim=-1)
-            with record_function(f"draft_kv[bs={bs} tok={hidden.shape[0]}]"):
-                self.model.write_context_kv(hidden, positions)
+            with record_function(f"draft_kv[bs={bs} tok={aux[0].shape[0]}]"):
+                self.model.write_context_kv(aux, positions)
 
         self._mono_session.write_draft_context(
             produce,

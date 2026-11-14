@@ -30,6 +30,7 @@ The standalone GQA drafts (Kimi-K3 DSpark GQA, MiniMax-M3.1) also share one laye
 forward, ``DSparkGQADecoderLayer``.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -528,11 +529,16 @@ class DSparkDraftModel(nn.Module):
 
     def write_context_kv(
         self,
-        aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
+        taps: Sequence[torch.Tensor],  # per tap [N, target_hidden]
         positions: torch.Tensor,  # [N] absolute positions
         slot_mapping: torch.Tensor | None = None,  # [N] paged-pool slots
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
+
+        ``taps`` are the target's aux hidden states in tap order, as
+        ``Drafter.aux_for`` serves them; under PP the leading entry may be
+        several taps already joined, relayed from earlier stages. Joining
+        them is the model's business, in ``project_context``.
 
         Where those rows land -- a private rolling window, a paged pool -- is
         the layer's business, not this method's. A paged layer writes at
@@ -542,7 +548,7 @@ class DSparkDraftModel(nn.Module):
 
         That makes the call site load-bearing: this must run while
         ``attn_metadata`` still describes the TARGET forward that produced
-        ``aux_concat``. A drafter that has already retargeted the metadata to
+        ``taps``. A drafter that has already retargeted the metadata to
         its own block pass (see ``DSparkProposer._propose_with_draft``) is
         past the point where these rows can be placed.
         """
@@ -556,18 +562,24 @@ class DSparkDraftModel(nn.Module):
         # the memory-profiling pass, so it must still run.
         if get_forward_context().context.is_dummy_run:
             return
-        ctx_hidden = self.project_context(aux_concat)
+        ctx_hidden = self.project_context(taps)
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions, slot_mapping)
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """Fuse the concatenated target aux hidden states into one [N, hidden]
-        context tensor, shared by every layer: ``hidden_norm(fc(aux))``.
+    @staticmethod
+    def concat_taps(taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """The taps as one ``[N, target_hidden * num_taps]`` tensor, for a
+        projection that wants it; no copy when they arrive already joined."""
+        return taps[0] if len(taps) == 1 else torch.cat(tuple(taps), dim=-1)
+
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Fuse the target aux taps into one [N, hidden] context tensor,
+        shared by every layer: ``hidden_norm(fc(concat(taps)))``.
 
         A target layer id is that layer's output, the residual stream before
         any final norm, which is what the standalone drafts are trained on.
         """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
+        return self.hidden_norm(linear_out(self.fc(self.concat_taps(taps))))
 
     @property
     def context_layers(self):

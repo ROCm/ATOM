@@ -41,6 +41,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   (embed + lm_head are shared with the target via share_with_target)
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -1018,15 +1019,15 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``main_norm(main_proj(concat(aux)))`` -- the shared context.
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``main_norm(main_proj(concat(taps)))`` -- the shared context.
 
         Stage 0 owns main_proj/main_norm; the projection runs once and every
         stage then writes its own rolling-KV rows from it (each stage has its
         own kv cache and attention linears).
         """
         stage0 = self.model.mtp[0]
-        return stage0.main_norm(linear_out(stage0.main_proj(aux_concat)))
+        return stage0.main_norm(linear_out(stage0.main_proj(self.concat_taps(taps))))
 
     @property
     def context_layers(self):

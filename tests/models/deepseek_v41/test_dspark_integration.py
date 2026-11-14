@@ -131,14 +131,15 @@ def test_draft_context_write_spans_the_forwards_width_not_its_tokens(monkeypatch
     draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     nn.Module.__init__(draft)
     draft.rope = object()
-    draft.project_context = lambda rows: rows
+    draft.project_context = lambda taps: torch.cat(taps, -1).unsqueeze(0)
     attention = SimpleNamespace(
         spec=SimpleNamespace(layer_id=0),
         project_context=lambda hidden, positions, rope, packed: (hidden, positions),
     )
     draft.mtp = [SimpleNamespace(attn=attention)]
     aux = torch.arange(4 * 8, dtype=torch.float32).view(4, 8)
-    draft.write_context_kv(aux, torch.arange(4))
+    # Three taps, as the proposer hands them; the rows are cut per tap.
+    draft.write_context_kv(aux.split([2, 4, 2], -1), torch.arange(4))
     layer, (hidden, positions), taken = written.pop()
     assert not written and layer == 0 and taken is step
     torch.testing.assert_close(hidden, aux[: step.running_tokens].unsqueeze(0))
@@ -165,7 +166,7 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     draft = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     nn.Module.__init__(draft)
     draft.rope = object()
-    draft.project_context = lambda rows: rows
+    draft.project_context = lambda taps: torch.cat(taps, -1).unsqueeze(0)
     draft.mtp = [
         SimpleNamespace(
             attn=SimpleNamespace(
@@ -180,11 +181,11 @@ def test_draft_context_write_follows_a_replayed_decoder(monkeypatch):
     aux = torch.arange(6 * 2, dtype=torch.float32).view(6, 2)
     # a middle chunk: its tail holds no request, the decoder ran on none
     outer.replay = SimpleNamespace(tail=SimpleNamespace(requests=()))
-    draft.write_context_kv(aux, torch.arange(6))
+    draft.write_context_kv(aux.split(1, -1), torch.arange(6))
     assert not written
     tail = SimpleNamespace(running_tokens=2, requests=(object(),))
     outer.replay = SimpleNamespace(tail=tail, tail_rows=torch.tensor([3, 5]))
-    draft.write_context_kv(aux, torch.arange(10, 16))
+    draft.write_context_kv(aux.split(1, -1), torch.arange(10, 16))
     (hidden, positions), taken = written.pop()
     assert taken is tail
     torch.testing.assert_close(hidden, aux[[3, 5]].unsqueeze(0))
