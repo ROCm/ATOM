@@ -657,3 +657,56 @@ python atom/benchmarks/internode_dp_ep_smoke.py \
 
 Expect both nodes to report an EP group spanning all global ranks and an
 `ep_all_reduce_sum` equal to the sum of those ranks.
+
+## 10. Tensor parallelism across nodes
+
+One TP group may span nodes, for a model too large for one node's GPUs at the
+TP size it needs. The node that runs TP rank 0 runs the engine, the API server
+and its own ranks' workers; every other node runs only its workers
+(`atom/model_engine/tp_multinode.py`). The engine reaches them through the same
+broadcast queue and reply channels as local ranks, over TCP, and finds them
+through the model-runner TCPStore on `--data-parallel-master-ip` /
+`--data-parallel-base-port`.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--tensor-parallel-size-local` | TP ranks on **this** node (default: `-tp`) |
+| `--tensor-parallel-rank` | First TP rank this node owns; a multiple of the local size |
+| `--data-parallel-master-ip` | Address of the node that runs TP rank 0 |
+| `--data-parallel-base-port` | Model-runner rendezvous port, the same nonzero value on every node |
+
+### Example — TP8 over 2 nodes of 4 GPUs
+
+```bash
+# Node 0 (10.0.0.1): engine, API server, TP ranks 0-3
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 0 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+
+# Node 1: TP ranks 4-7 only
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 4 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+```
+
+Start the nodes in either order. Every node must set `AITER_MLA_DECODE_PS1_FLYDSL`
+alike; a worker node refuses a mismatch. A failed worker on either side stops
+the whole group.
+
+### Timeouts
+
+- `ATOM_MULTINODE_TP_TIMEOUT_S` (1800): startup waits, e.g. a worker node for
+  the engine's endpoints and the engine for every remote rank to subscribe.
+- `ATOM_MULTINODE_PG_TIMEOUT_S` (7200): floor for the process groups' gloo and
+  NCCL timeouts, so a slow node's weight load does not time them out.
+
+### Restrictions
+
+- Rejected with a `ValueError`: DP, `--enable-dp-attention`, PP, prefill
+  context parallelism, `--fake-eplb`, RapidServe.
+- Mono decode is refused (its peer memory is HIP IPC, which cannot reach another
+  node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
+- The custom all-reduce is node-local, so collectives between nodes go through
+  RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.

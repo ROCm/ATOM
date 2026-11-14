@@ -18,7 +18,6 @@ from aiter import (
 
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
-    dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
@@ -49,6 +48,7 @@ from atom.model_ops.attention_mla import (
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_kernel_num_heads,
+    mla_dcp_persistent_width,
     mla_dcp_sparse_prefill_num_heads,
     mla_kernel_num_heads,
 )
@@ -573,10 +573,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # gathered width, not the per-rank one. Pad it the same way the module
         # does (mla_dcp_decode_is_persistent picks the width set), so these
         # descriptors always describe the kernel that will actually run.
-        # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
-        # kernel and stays non-persistent, where this metadata is unused); scale
-        # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        dcp_persistent = dcp_persistent_supported()
+        # Only where aiter runs DCP decode persistent (gfx942 lacks the lse
+        # persistent kernel and stays non-persistent, where this metadata is
+        # unused) does it scale by dcp; elsewhere it keeps the per-rank sizing.
+        # Target layers only: min_query_heads is the DSpark draft's, and the
+        # draft plans its own descriptors (DSparkProposer).
+        dcp_persistent = (
+            mla_dcp_persistent_width(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+            )
+            is not None
+        )
         self.sparse_dcp_metadata_rebuild = (
             self.is_sparse
             and self.dcp_world_size > 1
@@ -602,7 +611,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dcp_world_size,
             self.num_attention_heads * self.dcp_world_size,
             self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
-            dcp_persistent,
         )
         self.dcp_sparse_prefill_nonps = self.is_sparse and (
             mla_dcp_sparse_prefill_uses_nonps(

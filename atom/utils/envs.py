@@ -196,8 +196,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
-    # Floor for the timeout of groups a multi-node DP rank creates without one
-    # (aiter's gloo groups; torch's own default is 30 minutes), in seconds.
+    # Floor for the gloo and NCCL timeouts of groups a rank creates without one
+    # (aiter's groups; torch's own defaults are 30 and 10 minutes) when its DP
+    # or TP group spans nodes, in seconds.
     "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
         os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
     ),
@@ -810,6 +811,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
+    # How long the nodes of a TP group that spans nodes wait for each other at
+    # startup: a remote node for the engine's endpoints, the engine for every
+    # remote rank to subscribe to its broadcast queue, a rank on the
+    # model-runner store. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
+    "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(

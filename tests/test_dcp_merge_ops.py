@@ -972,15 +972,39 @@ def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
 def test_sparse_prefill_nonps_gate(
     monkeypatch, env, dcp, heads, fp8, gfx950, page, mbt, expected
 ):
+    from atom.distributed import dcp_utils
+
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
-    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: gfx950)
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, mbt) is expected
+
+
+@pytest.mark.parametrize("arch,expected", [("gfx950", True), ("gfx1250", False)])
+def test_sparse_prefill_nonps_asks_the_gpu_it_runs_on(monkeypatch, arch, expected):
+    """Not whether DCP decode runs persistent: gfx1250 PS1 does, and its
+    non-persistent kernel takes 64-token pages only."""
+    import sys
+    import types
+
+    for parent in ("aiter", "aiter.jit", "aiter.jit.utils"):
+        if parent not in sys.modules:  # CPU runner: no aiter
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx_runtime = lambda: arch
+    monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1")
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384) is expected
 
 
 def test_sparse_prefill_nonps_is_on_by_default(monkeypatch):
+    from atom.distributed import dcp_utils
+
     monkeypatch.delenv("ATOM_DCP_SPARSE_PREFILL_NONPS", raising=False)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
-    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, True, 16384)
+    monkeypatch.setattr(dcp_utils, "_runs_on_gfx950", lambda: True)
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, 16384)
 
 
 @pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
@@ -1270,7 +1294,9 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
     for module in (backends, aiter_mla):
         monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
         monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
-    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda: True)
+    from atom.model_ops import attention_mla
+
+    monkeypatch.setattr(attention_mla, "dcp_persistent_supported", lambda *_: True)
     cfg = SimpleNamespace(
         hf_config=SimpleNamespace(
             num_attention_heads=96,
@@ -1975,6 +2001,85 @@ def test_sparse_prefill_persistence_does_not_look_at_dtype():
         "the DCP sparse-prefill persistence predicate must not key off KV "
         f"cache dtype; got parameters {list(params)}"
     )
+
+
+@pytest.mark.parametrize(
+    "dcp,q,causal,cp_world_size",
+    [(8, 1, True, 1), (8, 8, True, 8), (8, 8, False, 1), (1, 8, True, 1)],
+    ids=["one_row", "causal_verify", "draft_block", "no_dcp"],
+)
+def test_dcp_decode_call_is_the_one_forward_makes(dcp, q, causal, cp_world_size):
+    """Only a causal multi-row decode takes the round-robin kernel; aiter routes
+    gfx1250 to the asm table (no kernel) for cp_world_size > 1 without it."""
+    from atom.distributed.dcp_utils import mla_dcp_decode_call
+
+    call = mla_dcp_decode_call(dcp, q, causal)
+    assert call["cp_world_size"] == cp_world_size
+    assert call["cp_round_robin"] is (cp_world_size > 1)
+    assert call["causal"] is causal and call["return_lse"] is True
+
+
+@pytest.mark.parametrize(
+    "supported,backend,expected",
+    [
+        (True, "asm", True),
+        (False, "asm", False),
+        (None, "flydsl_ps1", True),
+        # A failed asm query is not a yes.
+        (None, "asm", False),
+    ],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
+def test_dcp_persistent_supported_reads_aiters_answer(
+    monkeypatch, supported, backend, expected, kv_cache_dtype
+):
+    import enum
+    import sys
+    import types
+
+    from atom.distributed.dcp_utils import dcp_persistent_supported
+
+    class MlaBackend(str, enum.Enum):
+        ASM = "asm"
+        FLYDSL_PS1 = "flydsl_ps1"
+
+    calls = []
+
+    def get_mla_decode_shape_support(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(supported=supported, backend=MlaBackend(backend))
+
+    fp8 = object()
+    aiter = types.ModuleType("aiter")
+    aiter.dtypes = SimpleNamespace(fp8=fp8)
+    ops = types.ModuleType("aiter.ops")
+    attention = types.ModuleType("aiter.ops.attention")
+    attention.MlaBackend = MlaBackend
+    attention.get_mla_decode_shape_support = get_mla_decode_shape_support
+    for name, module in (
+        ("aiter", aiter),
+        ("aiter.ops", ops),
+        ("aiter.ops.attention", attention),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+
+    assert dcp_persistent_supported(64, kv_cache_dtype, 8) is expected
+    dtype = fp8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    assert calls == [
+        (
+            (64, 1, dtype, dtype),
+            {
+                "persistent": True,
+                "page_size": 1,
+                # A one-row decode passes no round-robin arguments.
+                "return_lse": True,
+                "causal": True,
+                "cp_world_size": 1,
+                "cp_round_robin": False,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("dcp_world_size", [1, 2, 8])

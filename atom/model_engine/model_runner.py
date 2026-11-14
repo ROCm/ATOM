@@ -90,6 +90,7 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -131,7 +132,11 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
-from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+from atom.utils.distributed.utils import (
+    kv_blocks_differ_across_ranks,
+    raise_timeout_if_dp_spans_nodes,
+    raise_timeout_if_tp_spans_nodes,
+)
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -1151,19 +1156,17 @@ class ModelRunner:
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
         raise_timeout_if_dp_spans_nodes(config.parallel_config)
+        raise_timeout_if_tp_spans_nodes(config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()
         ):
             # Preserve AITER's environment setup when preinitializing its group.
+            visible = config.tp_size_local if config.is_multinode_tp else world_size
             os.environ.setdefault(
-                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible)))
             )
-            store = torch.distributed.TCPStore(
-                config.parallel_config.data_parallel_master_ip,
-                config.parallel_config.data_parallel_base_port,
-                is_master=False,
-            )
+            store = managed_store_client(config)
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=global_rank, world_size=world_size
             )
@@ -2132,13 +2135,14 @@ class ModelRunner:
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
-        # PP stages compute different block counts; block ids must be valid on
-        # every stage's KV tensor, so reduce to the global minimum. Fold the
+        # PP stages, and TP ranks on another node, compute different block
+        # counts; block ids must be valid on every rank's KV tensor, so reduce
+        # to the global minimum (kv_blocks_differ_across_ranks). Fold the
         # result back into the plan before publishing anything: the plan is the
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        if kv_blocks_differ_across_ranks(config) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )

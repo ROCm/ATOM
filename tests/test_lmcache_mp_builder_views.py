@@ -131,7 +131,6 @@ def mla_builder_cls():
         "atom.distributed.dcp_utils": _module(
             "atom.distributed.dcp_utils",
             NONPS_MAX_Q_ROWS=32768,
-            dcp_persistent_supported=noop,
             get_dcp_rank=lambda: 0,
             get_dcp_world_size=lambda: 1,
             mla_dcp_decode_is_persistent=lambda *args, **kwargs: False,
@@ -157,6 +156,7 @@ def mla_builder_cls():
             _MLA_SPLIT_BUDGET_AUTO=-1,
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_kernel_num_heads=noop,
+            mla_dcp_persistent_width=lambda *args, **kwargs: None,
             mla_dcp_sparse_prefill_num_heads=noop,
             mla_kernel_num_heads=lambda heads: max(16, -(-heads // 16) * 16),
         ),

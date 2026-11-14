@@ -28,7 +28,7 @@ limitations](observability/README.md).
 | **ATOM_DP_SIZE** | int | 1 | Total number of data parallel ranks. |
 | **ATOM_DP_MASTER_IP** | str | 127.0.0.1 | Master IP address for DP ranks coordination. |
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
-| **ATOM_MULTINODE_PG_TIMEOUT_S** | int | 7200 | When the DP group has ranks on other nodes (`data_parallel_size_local < data_parallel_size`), the floor, in seconds, for the timeout of process groups created without one, such as aiter's gloo groups (torch's own default is 30 minutes). It raises the default and never lowers it. |
+| **ATOM_MULTINODE_PG_TIMEOUT_S** | int | 7200 | When the DP group (`data_parallel_size_local < data_parallel_size`) or the TP group (`--tensor-parallel-size-local`) has ranks on other nodes, the floor, in seconds, for the timeout of process groups created without one, such as the default group and aiter's gloo and NCCL groups (torch's own defaults are 30 minutes for gloo, 10 for NCCL). It raises the defaults and never lowers them. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_DISPATCH_DEPTH** | int | 0 | Per-rank cap on in-flight load-balanced requests for an offline batch (`LLMEngine.generate` / `generate_multimodal`). `0` sprays that batch up front. `>0` holds the rest and refills a rank as it finishes, so ranks finish prefilling together and the tail stays all-decode on the CUDA graph. A prefill on any rank is what leaves the graph; an idle rank's dummy batch does not. Online API requests are dispatched immediately even when this is set. While set, offline dispatch balances on in-flight request count and ignores `--dp-load-balance` (`round_robin` and `least_tokens`); init warns when the configured strategy is not `least_requests`. Under `prefix_spread` the depth itself is ignored: that strategy places every request, and offline batches are sent at once (init warns). A failed send puts the requests back on the pending pool instead of dropping them. `abort_request` removes a request that is still pending. Keep it `>= max_num_seqs` (about 1.2–1.5× is a starting point). A non-integer or negative value warns and disables the feature. A positive value below `max_num_seqs` warns and still caps every rank's running batch. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, then `X-Session-ID` (MLPerf Endpoints client), then `X-Correlation-ID`. |
@@ -36,6 +36,18 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 360000 | DP prefill cost balancing (always on under DP attention with more than one rank; needs the prefill delayer): each lockstep prefill step aims at min(costliest, mean x (1 + slack)) of the ranks' estimated chunk costs, and a costlier rank takes fewer tokens. This is the per-token term of the chunk cost, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
+
+## Tensor parallelism across nodes
+
+One TP group over several nodes (`--tensor-parallel-size-local`, `--tensor-parallel-rank`): the node that runs TP rank 0 runs the engine and the API server, the others only their workers.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | How many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, the engine waits this long for every remote rank to subscribe to its broadcast queue, and a rank waits this long on the model-runner store (for the NCCL id of a communicator created on first use). The process groups' own timeout is `ATOM_MULTINODE_PG_TIMEOUT_S`. A value that is not a finite positive number is warned about and replaced by the default. |
+
+Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. A worker node refuses to start when one it knows of differs from the engine node's: `AITER_MLA_DECODE_PS1_FLYDSL`, which decides whether DCP decode runs persistent on gfx1250.
+
+The nodes trust each other: the engine's store and the workers' reply channels are unauthenticated TCP on `--data-parallel-master-ip` and carry pickled objects, so that address must be on a network only the nodes can reach.
 
 ## Prefill delayer (TP/DCP and DP attention)
 

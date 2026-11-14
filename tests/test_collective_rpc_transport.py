@@ -64,7 +64,9 @@ def test_worker_death_reports_failure_before_blocking_cleanup(monkeypatch):
         lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
     )
     monkeypatch.setattr(
-        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
     )
     mgr.monitor_procs()
     targets[0]()
@@ -83,7 +85,9 @@ def test_expected_worker_shutdown_does_not_report_failure(monkeypatch):
         lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
     )
     monkeypatch.setattr(
-        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+        async_proc_module.multiprocessing.connection,
+        "wait",
+        lambda sentinels, timeout=None: [17],
     )
     mgr.monitor_procs()
     mgr.keep_monitoring = False
@@ -436,7 +440,7 @@ def _mgr(proc_num=4, *, procs=None):
     """
     mgr = object.__new__(AsyncIOProcManager)
     mgr.label = "test-mgr"
-    mgr.proc_num = proc_num
+    mgr.proc_num = mgr.local_proc_num = proc_num
     # The transport tests drive stand-in method names.
     mgr._PUBLIC_RPC_METHODS = COLLECTIVE_RPC_METHODS | _STAND_IN_METHODS
     mgr.rpc_broadcast_mq = _Mq()
@@ -578,6 +582,16 @@ def test_a_broken_barrier_is_not_reused_or_unsafely_reset():
     results = mgr.collective_rpc("m", RpcPayload("br", barrier=True), timeout=5)
 
     assert all("restart the runner manager" in r.error for r in results)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+def test_a_barrier_call_is_refused_when_ranks_run_on_other_nodes():
+    mgr = _mgr(8)
+    mgr.local_proc_num = 4
+
+    results = mgr.collective_rpc("m", RpcPayload("mn", barrier=True), timeout=5)
+
+    assert all("share no barrier" in r.error for r in results)
     assert mgr.rpc_broadcast_mq.sent == []
 
 

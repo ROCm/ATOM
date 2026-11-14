@@ -139,6 +139,7 @@ class EngineCore:
                 config.tp_world_size * config.pcp_group_size,
                 config.runner_qualname,
                 config,
+                local_proc_num=config.tp_size_local if config.is_multinode_tp else None,
                 on_worker_failure=self._send_engine_dead,
                 kv_progress_event=self._kv_progress_event,
             )

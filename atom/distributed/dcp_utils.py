@@ -7,7 +7,7 @@ state), mirroring ``pcp_utils.py``.
 
 Scope: the world-size / group wrappers are ATOM native (server) mode only —
 the vLLM plugin resolves those from ``vllm.distributed`` instead.
-``dcp_persistent_supported()`` is the one exception (arch-based, shared by
+``dcp_persistent_supported`` is the one exception (an aiter query, shared by
 both). DCP compute / communication primitives live in ``atom.model_ops.dcp_ops``;
 this module is only the distributed-access layer.
 """
@@ -54,17 +54,53 @@ def get_dcp_rank() -> int:
     return get_dcp_group().rank_in_group if dcp_is_enabled() else 0
 
 
-def dcp_persistent_supported() -> bool:
-    """Whether DCP decode can run in *persistent* mode on this GPU.
+def mla_dcp_decode_call(
+    dcp_world_size: int, max_seqlen_q: int = 1, causal: bool = True
+) -> dict:
+    """How a DCP decode calls ``mla_decode_fwd``, as aiter's shape queries take
+    it. Mirrors ``MLAAttention._forward_decode``: only a causal decode of more
+    than one row masks on global positions, through the round-robin
+    (``g_kv_indptr``) kernel; every other decode runs as if DCP were off."""
+    round_robin = dcp_world_size > 1 and max_seqlen_q > 1 and causal
+    return {
+        "return_lse": True,
+        "causal": causal,
+        "cp_world_size": dcp_world_size if round_robin else 1,
+        "cp_round_robin": round_robin,
+    }
 
-    Needs an lse-emitting ASM decode kernel; only gfx950 ships one (gfx942
-    falls back to the triton stage2 reduce instead). Cache the result once
-    per ``__init__`` — calling this per-forward would graph-break on
-    ``get_gfx()``.
+
+def dcp_persistent_supported(
+    num_heads: int, kv_cache_dtype: str, dcp_world_size: int
+) -> bool:
+    """Whether DCP decode can run in *persistent* mode at ``num_heads`` gathered
+    query heads.
+
+    Asks aiter whether mla_decode_fwd has a persistent decode that returns the
+    lse DCP's merge needs, for this call: gfx950's ASM kernels, and gfx1250's
+    PS1 ones when AITER_MLA_DECODE_PS1_FLYDSL=1 selects them. gfx942 has none
+    and falls back to the triton stage2 reduce. Cache the result once per
+    ``__init__``; it is not for the forward pass.
     """
-    from aiter.jit.utils.chip_info import get_gfx
+    import torch
+    from aiter import dtypes
+    from aiter.ops.attention import MlaBackend, get_mla_decode_shape_support
 
-    return get_gfx() == "gfx950"
+    dtype = dtypes.fp8 if kv_cache_dtype.startswith("fp8") else torch.bfloat16
+    support = get_mla_decode_shape_support(
+        num_heads,
+        1,
+        dtype,
+        dtype,
+        persistent=True,
+        page_size=max(envs.ATOM_MLA_PAGE_SIZE, 1),
+        **mla_dcp_decode_call(dcp_world_size),
+    )
+    # aiter has no table for the FlyDSL PS1 route and answers None there; a
+    # None from any other route is a failed query, not a yes.
+    return bool(support.supported) or (
+        support.supported is None and support.backend is MlaBackend.FLYDSL_PS1
+    )
 
 
 def mla_dcp_decode_is_persistent(
@@ -79,7 +115,8 @@ def mla_dcp_decode_is_persistent(
     Settled at construction time (mirrors the live per-step decision in
     ``_forward_decode``) because the gathered head width must be fixed before
     forward. Sparse MLA needs the caller to rebuild work/reduce metadata per
-    full indexer layer first; only gfx950 supports persistent mode at all.
+    full indexer layer first; ``dcp_persistent_supported`` says where aiter has a
+    persistent kernel at all.
 
     Lives here, not in ``atom.model_ops.attention_mla``: dependency-free, so
     it stays importable without triton/aiter, and
@@ -125,12 +162,12 @@ def mla_dcp_sparse_prefill_uses_nonps(
     dcp_world_size: int,
     gathered_heads: int,
     fp8_qkv: bool,
-    is_gfx950: bool,
     max_num_batched_tokens: int,
 ) -> bool:
     """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
 
-    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
+    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1 (gfx1250's
+    non-persistent decode takes only 64-token pages). It needs
     no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
     Every prefill token of a step is one q row, so a step budget above
     NONPS_MAX_Q_ROWS stays on the persistent path.
@@ -140,10 +177,18 @@ def mla_dcp_sparse_prefill_uses_nonps(
         and dcp_world_size > 1
         and gathered_heads == 64
         and fp8_qkv
-        and is_gfx950
         and envs.ATOM_MLA_PAGE_SIZE <= 1
         and max_num_batched_tokens <= NONPS_MAX_Q_ROWS
+        and _runs_on_gfx950()
     )
+
+
+def _runs_on_gfx950() -> bool:
+    """The GPU this process runs on, not ``dcp_persistent_supported``: that is
+    also true on gfx1250, where the non-persistent kernel takes 64-token pages."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx950"
 
 
 def mla_dcp_sparse_prefill_mode(
