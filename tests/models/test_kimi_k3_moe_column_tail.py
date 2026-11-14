@@ -69,8 +69,9 @@ def _attn_res(prefix, bank, score_weight, eps, add, norm_weight, out_eps, add2, 
 
 @pytest.fixture(autouse=True)
 def tail_calls(monkeypatch, ranks, split_op_on_cpu):  # noqa: F811
-    """Stub sub-modules at TP8 with dual-stream off, as recipe F8 runs;
-    `latent_tail` in torch, logging each call's rank and operands."""
+    """Stub sub-modules at TP8 with dual-stream off
+    (ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0); `latent_tail` in torch, logging
+    each call's rank and operands."""
     for name in ("ReplicatedLinear", "FusedMoE", "KimiMLP", "RMSNorm"):
         monkeypatch.setattr(kimi, name, _Stub)
     monkeypatch.setattr(kimi, "MergedBF16Linears", _Stub)
