@@ -1553,8 +1553,17 @@ class GDNStateMixin(PoolRowsMixin):
             # leave stale tail entries in the slice -- and a stale tail from a
             # decode step is PAD_SLOT_ID. index_fill_ would read that as "from
             # the end" and park a live, unrelated slot's cursor.
-            live = slot_idx[slot_idx >= 0].to(torch.int64)
-            write_pos.index_fill_(0, live, -1)
+            # Filter on the host mirror `stage_prefill` has just published the
+            # slots from: masking the device tensor is a nonzero, a device sync
+            # that waits for every queued kernel, once per prefill step. Pinned:
+            # a pageable H2D syncs the stream.
+            host = self.non_spec_state_indices_tensor.np[:num_reqs]
+            live = host[host >= 0]
+            if live.size:
+                live = torch.from_numpy(live.astype(np.int64)).pin_memory()
+                write_pos.index_fill_(
+                    0, live.to(write_pos.device, non_blocking=True), -1
+                )
             return
 
         if self._fork_slots:
