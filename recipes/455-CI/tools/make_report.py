@@ -25,7 +25,7 @@ import io
 import json
 import os
 
-from ci455_data import MODELS, acc_cell, perf_cells, read_csv
+from ci455_data import FOLLOWUP_COLUMNS, MODELS, acc_cell, perf_cells, read_csv
 from ci455_report import (
     ModelResult,
     highlights,
@@ -48,6 +48,25 @@ def _read(path):
         return f.read()
 
 
+CMD_ORDER = ("server", "gsm8k", "bench")
+
+
+def commands(model_dir):
+    """(file name, text) of a model's recorded commands, *_cmd*.sh in its run
+    dir: the servers first, then GSM8K, then the bench (guide §3.1)."""
+    if not os.path.isdir(model_dir):
+        return []
+    names = [n for n in os.listdir(model_dir) if n.endswith(".sh") and "_cmd" in n]
+    rank = {
+        n: next((i for i, k in enumerate(CMD_ORDER) if n.startswith(k)), len(CMD_ORDER))
+        for n in names
+    }
+    return [
+        (n, _read(os.path.join(model_dir, n)))
+        for n in sorted(names, key=lambda n: (rank[n], n))
+    ]
+
+
 def environment(data_dir, rows):
     """The session's image: its image.json, filled in from the CSV rows."""
     env = {}
@@ -60,6 +79,9 @@ def environment(data_dir, rows):
         env.setdefault("image", r.get("image"))
         env.setdefault("atom", {"commit": r.get("atom_commit")})
         env.setdefault("aiter", {"commit": r.get("aiter_commit")})
+        for repo in ("atom", "aiter"):
+            if r.get(f"{repo}_branch"):
+                env[repo].setdefault("branch", r[f"{repo}_branch"])
     return env
 
 
@@ -102,6 +124,7 @@ def main(argv=None):
             perf_cells(perf, s, slug, day),
             acc_cell(acc, s, slug, day),
             _read(os.path.join(run_dir, slug, "error.log")),
+            commands(os.path.join(run_dir, slug)),
         )
         for s in scenarios
         for slug, name in MODELS[s]
@@ -150,8 +173,14 @@ def main(argv=None):
         prs = pending.get(slug[name])
         if prs:
             row = io.StringIO()
+            fields = {
+                "test_date": day,
+                "model": slug[name],
+                "action": "open_pr",
+                "link": " ".join(prs),
+            }
             csv.writer(row, lineterminator="").writerow(
-                [day, slug[name], "open_pr", " ".join(prs), "", ""]
+                [fields.get(c, "") for c in FOLLOWUP_COLUMNS]
             )
             print(
                 f"  Known unmerged fix in pending_fixes.csv: {' + '.join(map(pr_label, prs))}. If it is still open and fixes this, add to followups.csv:\n  {row.getvalue()}"

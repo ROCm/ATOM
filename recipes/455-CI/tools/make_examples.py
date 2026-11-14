@@ -87,6 +87,7 @@ FOLLOWUPS = [
         "model": "qwen-35b-a3b",
         "action": "repro",
         "link": f"runs/{NEWEST.replace('-', '')}/qwen-35b-a3b/repro.md",
+        "problem": "(mock) out of memory capturing CUDA graphs",
         "note": "(mock) OOM while capturing CUDA graphs, at c64 only",
     },
     {
@@ -94,6 +95,7 @@ FOLLOWUPS = [
         "model": "deepseek-r1",
         "action": "our_pr",
         "link": "https://github.com/ROCm/ATOM/pull/99901",
+        "problem": "(mock) a new MoE dispatch default",
         "note": "(mock) verified on 455: c64 back to 1,560 tok/s/GPU",
     },
     {
@@ -101,6 +103,7 @@ FOLLOWUPS = [
         "model": "deepseek-v4.1-flash",
         "action": "open_pr",
         "link": "https://github.com/ROCm/aiter/pull/99902",
+        "problem": "(mock) MoE scale rounding",
         "note": "(mock) the open aiter PR fixes the MoE scale rounding",
     },
 ]
@@ -151,6 +154,19 @@ REPRO = """\
 - Not tried yet: a lower `--gpu-memory-utilization`.
 """
 ERROR = "RuntimeError: HIP error: out of memory (mock)"
+# The failed example's recorded commands (guide §3.1), shown under "Reproduce".
+COMMANDS = {
+    "server_cmd.sh": (
+        "# (mock) 455-CI recipe, Qwen-35B-A3B server\n"
+        "HIP_VISIBLE_DEVICES=0 python3 -m atom.entrypoints.openai_server \\\n"
+        "  --model /models/Qwen3.5-35B-A3B-MXFP4 --tensor-parallel-size 1 --server-port 8000\n"
+    ),
+    "bench_cmd.sh": (
+        "SERVED_NAME='/models/Qwen3.5-35B-A3B-MXFP4'; SERVER='127.0.0.1:8000'  # (mock)\n"
+        "# point_yaml <name> <concurrency> <trajectories> <warmup|run> <report_dir>\n"
+        "point_yaml() { echo '(mock) the shared MLPerf Endpoint client config'; }\n"
+    ),
+}
 ERROR_LOG = """\
 (mock) INFO  [model_runner] capturing CUDA graphs for batch sizes 1..64
 (mock) Traceback (most recent call last):
@@ -263,6 +279,9 @@ def main():
         os.path.join(run, "qwen-35b-a3b", "error.log"), "w", encoding="utf-8"
     ) as f:
         f.write(ERROR_LOG)
+    for name, text in COMMANDS.items():
+        with open(os.path.join(run, "qwen-35b-a3b", name), "w", encoding="utf-8") as f:
+            f.write(text)
     with open(os.path.join(OUT, FOLLOWUPS[0]["link"]), "w", encoding="utf-8") as f:
         f.write(REPRO)
     with open(os.path.join(run, "findings.md"), "w", encoding="utf-8") as f:

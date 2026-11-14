@@ -295,7 +295,9 @@ def test_the_known_fix_is_not_suggested_once_a_follow_up_is_recorded(ci, capsys)
     out = capsys.readouterr().out
     assert "pending_fixes.csv" not in out and "no follow-up" not in out
     report = result(ci, "20261118").read_text()
-    assert "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)." in report
+    assert (
+        "+ [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)." in report
+    )
 
 
 def test_the_findings_of_the_session_sit_between_the_summary_and_the_details(ci):
@@ -323,3 +325,30 @@ def test_out_writes_the_result_elsewhere_with_links_from_there(ci):
     main(["--date", "2026-11-14", "--data-dir", str(ci), "--out", str(out)])
     assert "../455-CI/runs/20261114/charts/perf-endpoint.png" in out.read_text()
     assert not (ci.parent / "result").exists()
+
+
+def test_a_failure_lists_its_recorded_commands_servers_first_then_gsm8k_then_bench(ci):
+    write_csv(
+        ci / "perf.csv",
+        PERF_COLUMNS,
+        [perf("2026-11-14", 64, "", status="fail", error="RuntimeError: x")],
+    )
+    k3 = ci / "runs" / "20261114" / "kimi-k3"
+    k3.mkdir(parents=True)
+    for name in (
+        "bench_cmd.sh",
+        "server_cmd_node1.sh",
+        "gsm8k_cmd.sh",
+        "server_cmd_node0.sh",
+        "notes.sh",
+    ):
+        (k3 / name).write_text(f"echo {name}\n")
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    failures = result(ci, "20261114").read_text().split("\n### Failures\n")[1]
+    shown = re.findall(r"^`([\w.]+\.sh)`:$", failures, re.MULTILINE)
+    assert shown == [
+        "server_cmd_node0.sh",
+        "server_cmd_node1.sh",
+        "gsm8k_cmd.sh",
+        "bench_cmd.sh",
+    ]

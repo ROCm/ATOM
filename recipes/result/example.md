@@ -2,15 +2,17 @@
 
 > ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; they are not real test results.
 
-Image `gfx1250-atom-ci455-20261114` · ATOM `main@000000000` · aiter `main@111111111`
+- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
+- ATOM: `main` @ `0000000000000000000000000000000000000000` (2026-11-14)
+- aiter: `main` @ `1111111111111111111111111111111111111111` (2026-11-14)
 
 ## Summary
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory (mock)). No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md).
-- ⚠️ DeepSeek R1: throughput down 4.5%. Fixed by us in [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901), verified.
-- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Fix in progress: [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902).
+- ❌ Qwen-35B-A3B: c64 failed — (mock) out of memory capturing CUDA graphs. No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md).
+- ⚠️ DeepSeek R1: throughput down 4.5%. Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified).
+- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open).
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
 - ✅ Kimi-K3: recovered from the previous failure.
 
@@ -39,8 +41,8 @@ Image `gfx1250-atom-ci455-20261114` · ATOM `main@000000000` · aiter `main@1111
 | Item | Value |
 |---|---|
 | Test image | `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114` (digest `sha256:0000mock`) |
-| ATOM | `main` @ [`000000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000), 2026-11-14 (mock) ATOM main head |
-| aiter | `main` @ [`111111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111), 2026-11-14 (mock) aiter main head |
+| ATOM | `main` @ [`0000000000000000000000000000000000000000`](https://github.com/ROCm/ATOM/commit/0000000000000000000000000000000000000000), 2026-11-14 (mock) ATOM main head |
+| aiter | `main` @ [`1111111111111111111111111111111111111111`](https://github.com/ROCm/aiter/commit/1111111111111111111111111111111111111111), 2026-11-14 (mock) aiter main head |
 | Test date | 2026-11-14 |
 
 ### Performance · MLPerf Endpoint
@@ -73,11 +75,11 @@ Image `gfx1250-atom-ci455-20261114` · ATOM `main@000000000` · aiter `main@1111
 
 ### Follow-ups
 
-| Model | Next step | Note |
-|---|---|---|
-| DeepSeek R1 | Fixed by us in [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901), verified. | (mock) verified on 455: c64 back to 1,560 tok/s/GPU |
-| DeepSeek-V4.1-Flash | Fix in progress: [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902). | (mock) the open aiter PR fixes the MoE scale rounding |
-| Qwen-35B-A3B | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md). | (mock) OOM while capturing CUDA graphs, at c64 only |
+| Model | Problem | Next step | Note |
+|---|---|---|---|
+| DeepSeek R1 | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified). | (mock) verified on 455: c64 back to 1,560 tok/s/GPU |
+| DeepSeek-V4.1-Flash | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open). | (mock) the open aiter PR fixes the MoE scale rounding |
+| Qwen-35B-A3B | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md). | (mock) OOM while capturing CUDA graphs, at c64 only |
 
 ### Failures
 
@@ -98,4 +100,38 @@ Core error log:
 (mock) RuntimeError: HIP error: out of memory (mock)
 ----- last 30 lines -----
 (mock) ERROR [engine_core] EngineCore_DP0 died, shutting down the server
+```
+
+Reproduce:
+
+```bash
+# the test container (455-CI-recipe.md); the server and GSM8K commands below run inside it
+docker run -d --name ci455-qwen-35b-a3b --network host --ipc host --shm-size 128g \
+  --device /dev/kfd --device /dev/dri --group-add video --cap-add SYS_PTRACE \
+  --security-opt seccomp=unconfined -v <weights dir>:/models/<model dir>:ro -v <results dir>:/results \
+  rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114
+```
+
+`server_cmd.sh`:
+
+```bash
+# (mock) 455-CI recipe, Qwen-35B-A3B server
+HIP_VISIBLE_DEVICES=0 python3 -m atom.entrypoints.openai_server \
+  --model /models/Qwen3.5-35B-A3B-MXFP4 --tensor-parallel-size 1 --server-port 8000
+```
+
+`bench_cmd.sh`:
+
+```bash
+SERVED_NAME='/models/Qwen3.5-35B-A3B-MXFP4'; SERVER='127.0.0.1:8000'  # (mock)
+# ...then the shared client below
+```
+
+#### Shared MLPerf Endpoint client
+
+Each bench command above sets its model's variables and then runs this, on the host (455-CI-recipe.md):
+
+```bash
+# point_yaml <name> <concurrency> <trajectories> <warmup|run> <report_dir>
+point_yaml() { echo '(mock) the shared MLPerf Endpoint client config'; }
 ```

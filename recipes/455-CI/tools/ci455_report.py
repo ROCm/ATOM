@@ -4,7 +4,7 @@ details (environment, every number, trend charts, follow-ups and each failure's
 core error log) (455-CI-guide.md §5)."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ci455_data import LABEL
 
@@ -33,6 +33,8 @@ class ModelResult:
     perf: list  # PerfCell per concurrency
     acc: object  # AccCell
     error_log: str = ""  # runs/<YYYYMMDD>/<slug>/error.log
+    # (file name, text) of the commands run, runs/<YYYYMMDD>/<slug>/*_cmd*.sh
+    commands: list = field(default_factory=list)
 
 
 def pct(x):
@@ -124,9 +126,11 @@ def _phrase(cells, top, key, template, flag=perf_flag):
 
 
 def _news(results):
-    """(category, slug, line) per piece of news, most important first:
+    """(category, slug, line, err) per piece of news, most important first:
     failures, severe and plain regressions (throughput, then GSM8K),
-    progress, recoveries. Everything is against the previous success."""
+    progress, recoveries. Everything is against the previous success. A
+    failure's line stops after what failed, and `err` is its short error (the
+    highlight adds the cause); other news has a whole line and `err` None."""
     items = []
     for r in results:
         who, top = short_name(r.name), headline(r)
@@ -138,13 +142,7 @@ def _news(results):
             )
             err = _short(errors[0]) if errors else ""
             what = "all runs failed" if everything else f"{' and '.join(parts)} failed"
-            items.append(
-                (
-                    0,
-                    r.slug,
-                    f"❌ {who}: {what}" + (f" ({err})" if err else "") + ".",
-                )
-            )
+            items.append((0, r.slug, f"❌ {who}: {what}", err))
             continue
         down = [c for c in r.perf if perf_flag(c.delta) in ("⚠️", "🔴")]
         if down:
@@ -154,6 +152,7 @@ def _news(results):
                     1 if icon == "🔴" else 2,
                     r.slug,
                     f"{icon} {who}: {_phrase(down, top, lambda c: c.delta, '{subject} down {pct}')}.",
+                    None,
                 )
             )
         flag = acc_flag(r.acc.delta)
@@ -163,6 +162,7 @@ def _news(results):
                     1 if flag == "🔴" else 2,
                     r.slug,
                     f"{flag} {who}: GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}.",
+                    None,
                 )
             )
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
@@ -172,6 +172,7 @@ def _news(results):
                     4,
                     r.slug,
                     f"🟢 {who}: {_phrase(up, top, lambda c: c.delta, '{subject} up {pct}')}.",
+                    None,
                 )
             )
         # Only what ran this session can have recovered: a model left untested
@@ -179,7 +180,9 @@ def _news(results):
         ran = [c for c in r.perf if c.status == "ok"]
         ran += [r.acc] if r.acc.status == "ok" else []
         if any(c.prev_failed for c in ran):
-            items.append((5, r.slug, f"✅ {who}: recovered from the previous failure."))
+            items.append(
+                (5, r.slug, f"✅ {who}: recovered from the previous failure.", None)
+            )
     return sorted(
         items, key=lambda item: item[0]
     )  # stable: model order within a category
@@ -188,7 +191,10 @@ def _news(results):
 # Highlight categories of _news that are problems (failures, severe and plain
 # regressions). Each needs a follow-up in followups.csv (455-CI-guide.md §3.7).
 PROBLEM = (0, 1, 2)
-ACTIONS = ("open_pr", "our_pr", "repro")
+# open_pr: someone's open PR fixes it; our_pr: we fixed and verified it (the
+# links may include others' PRs it needs); merged_pr: the fix reached main after
+# the image was built; repro: no fix yet, a repro doc (455-CI-guide.md §3.7).
+ACTIONS = ("open_pr", "our_pr", "merged_pr", "repro")
 PR_URL = re.compile(r"https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 
@@ -200,40 +206,55 @@ def pr_label(url):
 
 def _prs(links):
     """Space-separated PR links (a fix may take several, e.g. an ATOM PR and
-    an aiter PR together), each shown as "ROCm/ATOM#123", joined by "+"."""
-    shown = [
-        f"[{pr_label(u)}]({u})" if PR_URL.match(u) else f"<{u}>" for u in links.split()
-    ]
+    an aiter PR together), joined by "+". The first PR of a repo is shown as
+    "ROCm/ATOM#123", the next ones of the same repo as "#124"."""
+    shown, seen = [], set()
+    for u in links.split():
+        m = PR_URL.match(u)
+        if not m:
+            shown.append(f"<{u}>")
+            continue
+        label = f"#{m.group(2)}" if m.group(1) in seen else pr_label(u)
+        seen.add(m.group(1))
+        shown.append(f"[{label}]({u})")
     return " + ".join(shown) or "(no link)"
 
 
 def _follow_text(f):
-    """A problem's next step, from its followups.csv row."""
+    """A problem's next step, from its followups.csv row: short, because the
+    highlights go to the boss as they are."""
     action, link = (f or {}).get("action"), ((f or {}).get("link") or "").strip()
     if action == "open_pr":
-        return f"Fix in progress: {_prs(link)}."
+        return f"Needs {_prs(link)} (open)."
     if action == "our_pr":
-        return f"Fixed by us in {_prs(link)}, verified."
+        return f"Passes with {_prs(link)} (verified)."
+    if action == "merged_pr":
+        return f"Fixed on main by {_prs(link)} (merged after the image was built)."
     if action == "repro":
         return f"No fix yet; [repro]({link})."
     return ""
 
 
 def highlights(results, followups=None):
-    """One short line per piece of news, "<flag> <model>: <what happened>". A
-    problem (❌ 🔴 ⚠️) goes on with its next step from followups.csv. Flat
-    models and first results are not news; with no news the list says so."""
+    """One short line per piece of news: "<flag> <model>: <what happened>". A
+    failure says what failed and why (followups.csv's `problem`, else the
+    error), and every problem (❌ 🔴 ⚠️) ends with its next step. Flat models
+    and first results are not news; with no news the list says so."""
     lines = []
-    for category, slug, line in _news(results):
-        step = _follow_text((followups or {}).get(slug)) if category in PROBLEM else ""
+    for category, slug, line, err in _news(results):
+        f = (followups or {}).get(slug) or {}
+        if err is not None:
+            why = (f.get("problem") or "").strip()
+            line += (f" — {why}" if why else (f" ({err})" if err else "")) + "."
+        step = _follow_text(f) if category in PROBLEM else ""
         lines.append(" ".join(x for x in (line, step) if x))
     return lines or [NONE]
 
 
 def missing_followups(results, followups):
     """Models with a problem in the highlights but no usable follow-up: one of
-    open_pr, our_pr or repro, with a link (455-CI-guide.md §3.7)."""
-    problems = {slug for category, slug, _ in _news(results) if category in PROBLEM}
+    the ACTIONS, with a link (455-CI-guide.md §3.7)."""
+    problems = {slug for category, slug, *_ in _news(results) if category in PROBLEM}
     missing = []
     for r in results:
         f = (followups or {}).get(r.slug) or {}
@@ -320,12 +341,14 @@ def _acc_delta(a):
     return f"{acc_flag(a.delta)} {pts(a.delta)}".strip()
 
 
-def _sha(env, repo):
-    return ((env.get(repo) or {}).get("commit") or "")[:9] or "—"
-
-
-def _image_short(image):
-    return (image or "—").split(":")[-1]
+def _branch_commit(env, repo):
+    """`main` @ `<full sha>` (<commit date>): what the result's first lines say."""
+    c = env.get(repo) or {}
+    sha = c.get("commit") or ""
+    if not sha:
+        return "—"
+    date = f" ({c['date']})" if c.get("date") else ""
+    return f"`{c.get('branch') or 'main'}` @ `{sha}`{date}"
 
 
 def _labels(results):
@@ -362,7 +385,8 @@ def _env_rows(env, date):
         if not sha:
             return "—"
         tail = " ".join(x for x in (c.get("date"), c.get("title")) if x)
-        return f"`main` @ [`{sha[:9]}`](https://github.com/{url}/commit/{sha})" + (
+        branch = c.get("branch") or "main"
+        return f"`{branch}` @ [`{sha}`](https://github.com/{url}/commit/{sha})" + (
             f", {tail}" if tail else ""
         )
 
@@ -457,15 +481,15 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
             "",
             f"![{label} GSM8K]({charts_dir}/accuracy-{scenario}.png)",
         ]
-    problems = {slug for category, slug, _ in _news(results) if category in PROBLEM}
+    problems = {slug for category, slug, *_ in _news(results) if category in PROBLEM}
     if problems:
         missing = set(missing_followups(results, followups))
         out += [
             "",
             "### Follow-ups",
             "",
-            "| Model | Next step | Note |",
-            "|---|---|---|",
+            "| Model | Problem | Next step | Note |",
+            "|---|---|---|---|",
         ]
         for r in results:
             if r.slug not in problems:
@@ -475,8 +499,10 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
                 "Missing: needs a follow-up" if r.name in missing else _follow_text(f)
             )
             note = (f.get("note") or "").strip().replace("|", "\\|") or "—"
-            out.append(f"| {r.name} | {step} | {note} |")
+            why = (f.get("problem") or "").strip().replace("|", "\\|") or "—"
+            out.append(f"| {r.name} | {why} | {step} | {note} |")
     out += ["", "### Failures", ""]
+    shared = {}  # scenario -> the MLPerf Endpoint client its bench commands share
     broken = [r for r in results if _failed_parts(r)]
     if not broken:
         out.append("No failures.")
@@ -509,6 +535,60 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
             ]
         else:
             out += ["No error.log found; add one as in the guide's §3.4.", ""]
+        out += _repro(r, env, shared)
+    for scenario, client in shared.items():
+        out += [
+            f"#### Shared {LABEL[scenario]} client",
+            "",
+            "Each bench command above sets its model's variables and then runs this, on the host (455-CI-recipe.md):",
+            "",
+            "```bash",
+            client,
+            "```",
+            "",
+        ]
+    return out
+
+
+def _split_client(text):
+    """An MLPerf Endpoint bench_cmd.sh: (its model's own lines, the shared client
+    from the recipe that follows them), or (the whole text, "") for any other."""
+    lines = text.rstrip("\n").splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(("# point_yaml", "point_yaml() {")):
+            return "\n".join(lines[:i]).rstrip(), "\n".join(lines[i:])
+    return text.rstrip("\n"), ""
+
+
+def _repro(r, env, shared):
+    """How to reproduce a failure: the test container, then the commands as
+    run (runs/<YYYYMMDD>/<slug>/*_cmd*.sh, internal addresses replaced). The
+    MLPerf Endpoint client they share is shown once, after all failures."""
+    if not r.commands:
+        return [
+            "No commands recorded (runs/<YYYYMMDD>/<slug>/*_cmd*.sh, guide §3.1).",
+            "",
+        ]
+    out = [
+        "Reproduce:",
+        "",
+        "```bash",
+        "# the test container (455-CI-recipe.md); the server and GSM8K commands below run inside it",
+        f"docker run -d --name ci455-{r.slug} --network host --ipc host --shm-size 128g \\",
+        "  --device /dev/kfd --device /dev/dri --group-add video --cap-add SYS_PTRACE \\",
+        "  --security-opt seccomp=unconfined -v <weights dir>:/models/<model dir>:ro -v <results dir>:/results \\",
+        f"  {env.get('image') or '<image>'}",
+        "```",
+        "",
+    ]
+    for name, text in r.commands:
+        own, client = (
+            _split_client(text) if name.startswith("bench") else (text.rstrip("\n"), "")
+        )
+        if client:
+            shared.setdefault(r.scenario, client)
+            own += "\n# ...then the shared client below"
+        out += [f"`{name}`:", "", "```bash", own, "```", ""]
     return out
 
 
@@ -530,10 +610,9 @@ def report_md(
         + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
-        (
-            f"Image `{_image_short(env.get('image'))}` · ATOM `main@{_sha(env, 'atom')}`"
-            f" · aiter `main@{_sha(env, 'aiter')}`"
-        ),
+        f"- Image: `{env.get('image') or '—'}`",
+        f"- ATOM: {_branch_commit(env, 'atom')}",
+        f"- aiter: {_branch_commit(env, 'aiter')}",
         "",
         *_summary(date, results, followups),
         "",

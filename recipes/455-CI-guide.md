@@ -430,7 +430,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
    done
    ```
 
-   找到了，说法就是 `open_pr`，链接写这个 PR；要一起合入的一组 PR 都写上，空格隔开。
+   找到了，说法就是 `open_pr`（PR 还开着）或 `merged_pr`（镜像构建之后已经合进 main），链接写这个 PR；要一起合入的一组 PR 都写上，空格隔开。
 
 2. **没人在修，就评估好不好修**：根因清楚、改动小、能在 455 机器上验证，就算好修。回退先看上一场和这一场之间 ATOM、aiter 的 commit（两场的 sha 在报告的 Environment 和 `perf.csv` 里），能定位到具体 commit 的通常好修。好修就自己修：
    - 从对应仓库的 main 拉分支，改动尽量小，按那个仓库的规矩跑测试和 lint（ATOM 见 `/ci-pr-guide`，commit 不加 `Co-Authored-By`）。
@@ -472,8 +472,9 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 |---|---|
 | `test_date` | 场次日期，`YYYY-MM-DD` |
 | `model` | §1 的 slug |
-| `action` | `open_pr`、`our_pr` 或 `repro`，对应上面三步 |
+| `action` | `open_pr`、`merged_pr`、`our_pr` 或 `repro`，对应上面三步。我们的修复还要配合别人开着的 PR 才能跑通时，记 `our_pr`，`link` 把那些 PR 也写上 |
 | `link` | PR 的链接，多个用空格隔开；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
+| `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。Highlights 用它说原因；不填就用一句话报错 |
 | `note` | 英文一句话：验证结果、怀疑的方向等 |
 
 `make_report.py` 把说法接在 Highlights 那一条后面，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
@@ -614,17 +615,22 @@ recipes/
 | 发现（`## Findings`） | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | 详细 summary（`## Details`） | 要看细节的人 | 测试镜像和环境、全部数字、趋势图、说法、跑挂 case 的核心 error log（§5.3、§5.4） |
 
+这个文件会原样贴到 Teams 发给老板们，所以：开头写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Highlights 要短（§5.1）；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
+
 结果和图都用 §5.5 的脚本从 CSV 生成，不手填数字。唯一手写的是发现：写进 `runs/<YYYYMMDD>/findings.md`，英文，每条以 `- ` 开头，链接用完整 URL；脚本原样放进 Findings，没有这个文件就显示 `None recorded.`。跑挂或回退的线索、绕过的办法、异常的耗时（例如 server 启动特别慢）、和 recipe 对不上的地方，都算发现。样例见 [`result/example.md`](result/example.md)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
 ### 5.1 Highlights
 
-大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行：`<标记> <模型>: <发生了什么>`。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Qwen-35B-A3B: c64 failed (RuntimeError: …).`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
+大老板只看 Highlights，所以只写本次出了大事或跑挂的模型，每个一行，写清是什么模型、发生了什么（跑挂、性能升降多少）、需要什么 PR：`<标记> <模型>: <什么挂了或变了>[ — <原因>]. <说法>`。原因取自 `followups.csv` 的 `problem`（§3.7），没有就用一句话报错。不写场景，只给一个关键数字，例如 `⚠️ GLM-5.2: throughput down 4.2%.`、`❌ Kimi-K3: all runs failed — no cross-node TP on main.`。持平、变化不大或第一次有数据的模型都不提；一个都没有时只写 `No failures or major changes.`。
 
 ❌、🔴、⚠️ 这几条后面要接上说法（§3.7），不能只报问题。例如：
 
-- `❌ Qwen-35B-A3B: c64 failed (…). No fix yet; [repro](…).`
-- `⚠️ GLM-5.2: throughput down 4.2%. Fixed by us in [ROCm/ATOM#…](…), verified.`
-- `⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%. Fix in progress: [ROCm/aiter#…](…).`
+- `❌ Kimi-K3: all runs failed — no cross-node TP on main. Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified).`（`our_pr`）
+- `❌ Qwen-35B-A3B: all runs failed — gfx1250 fused-MoE layout check. Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built).`（`merged_pr`）
+- `⚠️ MiniMax-M3: GSM8K down 4.6 points to 88.1%. Needs [ROCm/aiter#…](…) (open).`（`open_pr`）
+- `❌ GLM-5.2: c64 failed — out of memory capturing CUDA graphs. No fix yet; [repro](…).`（`repro`）
+
+同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。
 
 结果里不 @ 任何人：负责人由 user 把 Highlights 贴到 Teams 给老板汇报时自己加上。
 
@@ -634,7 +640,7 @@ recipes/
 
 | 标记 | 什么时候算 | 写法 |
 |---|---|---|
-| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed (<一句话报错>)`、`all runs failed (…)` |
+| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed — <problem>`、`all runs failed — <problem>` |
 | 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
 | ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
 | 🟢 | 吞吐比上一场高 3% 及以上 | `throughput up 6.9%` |
@@ -651,15 +657,17 @@ recipes/
 ```markdown
 # 455-CI result · <YYYY-MM-DD> · MLPerf Endpoint
 
-Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `main@<sha 前 9 位>`
+- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`
+- ATOM: `main` @ `<完整 commit>` (<commit 日期>)
+- aiter: `main` @ `<完整 commit>` (<commit 日期>)
 
 ## Summary
 
 ### Highlights
 
-- ❌ Qwen-35B-A3B: c64 failed (RuntimeError: HIP error: out of memory). No fix yet; [repro](…).
-- ⚠️ DeepSeek R1: throughput down 4.5%. Fixed by us in [ROCm/ATOM#…](…), verified.
-- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Fix in progress: [ROCm/aiter#…](…).
+- ❌ Qwen-35B-A3B: c64 failed — out of memory capturing CUDA graphs. No fix yet; [repro](…).
+- ⚠️ DeepSeek R1: throughput down 4.5%. Passes with [ROCm/ATOM#…](…) (verified).
+- ⚠️ DeepSeek-V4.1-Flash: GSM8K down 5.2 points to 88.9%. Needs [ROCm/aiter#…](…) (open).
 - 🟢 DeepSeek-V4.1-Flash: throughput up 6.9%.
 - ✅ Kimi-K3: recovered from the previous failure.
 
@@ -690,12 +698,12 @@ Image `gfx1250-atom-ci455-<YYYYMMDD>` · ATOM `main@<sha 前 9 位>` · aiter `m
 
 在 Findings 后面，`## Details` 下依次是以下几节，全部英文：
 
-1. **Environment**：测试 image 和 digest、ATOM 和 aiter 的 branch 与 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
+1. **Environment**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与完整 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。
-5. **Follow-ups**：每个问题模型一行，写说法和 note（§3.7）。
-6. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接，以及核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份）。
+5. **Follow-ups**：每个问题模型一行，写问题（`problem`）、说法和 note（§3.7）。验证用的数字写在 note 里。
+6. **Failures**：每个跑挂的 case 一小节，写一句话报错、`error.log` 的链接、核心 error log 段落（`error.log` 的前 60 行，§3.4 摘出来的那份），以及复现命令：测试容器的 `docker run`（镜像全名）和实际执行的命令（`runs/<YYYYMMDD>/<slug>/*_cmd*.sh`，§3.1，server、GSM8K、bench 依次排）。MLPerf Endpoint 各模型共用的 client 只在最后贴一次。
 
 ### 5.4 趋势图
 

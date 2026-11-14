@@ -434,7 +434,7 @@ def test_a_failure_carries_the_open_pr_that_fixes_it():
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
     assert line.startswith("❌ Bravo: c64 failed")
-    assert line.endswith(f"Fix in progress: [ROCm/aiter#1234]({PR_OPEN}).")
+    assert line.endswith(f"Needs [ROCm/aiter#1234]({PR_OPEN}) (open).")
 
 
 def test_a_regression_we_fixed_links_our_verified_pr():
@@ -443,7 +443,7 @@ def test_a_regression_we_fixed_links_our_verified_pr():
         followups={"alpha": follow("our_pr", PR_OURS)},
     )
     assert line.startswith("⚠️ Alpha: throughput down 5.0%.")
-    assert line.endswith(f"Fixed by us in [ROCm/ATOM#2601]({PR_OURS}), verified.")
+    assert line.endswith(f"Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified).")
 
 
 def test_a_problem_with_only_a_repro_links_it():
@@ -493,10 +493,10 @@ def test_the_details_list_each_problem_with_its_next_step_and_note():
     details = text.split("\n## Details\n")[1]
     table = details.split("\n### Follow-ups\n")[1].split("\n### ")[0]
     assert (
-        f"| Bravo | Fixed by us in [ROCm/ATOM#2601]({PR_OURS}), verified. | c64 905 tok/s/GPU on 455 |"
+        f"| Bravo | — | Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified). | c64 905 tok/s/GPU on 455 |"
         in table
     )
-    assert "| Charlie | Missing: needs a follow-up | — |" in table
+    assert "| Charlie | — | Missing: needs a follow-up | — |" in table
     assert "Alpha" not in table
 
 
@@ -507,7 +507,7 @@ def test_a_fix_that_takes_two_prs_links_both():
     (line,) = highlights(
         [model("Bravo", **FAILING)], followups={"bravo": follow("open_pr", links)}
     )
-    want = "Fix in progress: [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847)."
+    want = "Needs [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)."
     assert line.endswith(want)
 
 
@@ -517,3 +517,104 @@ def test_the_findings_text_goes_into_its_own_section():
     )
     assert "\n## Findings\n\n- Note one.\n\n## Details\n" in text
     assert text.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")
+
+
+def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
+    (line,) = highlights(
+        [model("Bravo", **FAILING)],
+        followups={
+            "bravo": {
+                "action": "open_pr",
+                "link": PR_OPEN,
+                "problem": "no cross-node TP on main",
+            }
+        },
+    )
+    assert line == (
+        f"❌ Bravo: c64 failed — no cross-node TP on main. Needs [ROCm/aiter#1234]({PR_OPEN}) (open)."
+    )
+
+
+def test_a_fix_merged_after_the_image_was_built_says_main_has_it():
+    (line,) = highlights(
+        [model("Bravo", **FAILING)], followups={"bravo": follow("merged_pr", PR_OURS)}
+    )
+    assert line.endswith(
+        f"Fixed on main by [ROCm/ATOM#2601]({PR_OURS}) (merged after the image was built)."
+    )
+    assert (
+        missing_followups(
+            [model("Bravo", **FAILING)], {"bravo": follow("merged_pr", PR_OURS)}
+        )
+        == []
+    )
+
+
+def test_prs_of_one_repo_name_the_repo_once():
+    a1, a2 = (
+        "https://github.com/ROCm/ATOM/pull/2647",
+        "https://github.com/ROCm/ATOM/pull/2760",
+    )
+    b1 = "https://github.com/ROCm/aiter/pull/7913"
+    (line,) = highlights(
+        [model("Bravo", **FAILING)],
+        followups={"bravo": follow("our_pr", f"{a1} {a2} {b1}")},
+    )
+    assert line.endswith(
+        f"Passes with [ROCm/ATOM#2647]({a1}) + [#2760]({a2}) + [ROCm/aiter#7913]({b1}) (verified)."
+    )
+
+
+ENV = {
+    "image": "rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114",
+    "atom": {
+        "commit": "9fec99786b088168aec7729858c1176e99d818e6",
+        "date": "2026-11-13",
+        "branch": "main",
+    },
+    "aiter": {
+        "commit": "b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47",
+        "date": "2026-11-13",
+    },
+}
+
+
+def test_the_result_opens_with_the_full_image_and_each_repo_branch_commit_and_date():
+    head = report_md("2026-11-14", ENV, [model("Alpha", **FLAT)], "c", "r").split(
+        "## Summary"
+    )[0]
+    assert "- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`" in head
+    assert (
+        "- ATOM: `main` @ `9fec99786b088168aec7729858c1176e99d818e6` (2026-11-13)"
+        in head
+    )
+    assert (
+        "- aiter: `main` @ `b6f1ff6b7f3754aca8cc8c403b5fcd7a258eba47` (2026-11-13)"
+        in head
+    )
+
+
+def test_a_failure_shows_how_to_reproduce_it_and_the_shared_client_once():
+    bench = "SERVED_NAME='/models/x'; SERVER='127.0.0.1:8000'\n# point_yaml <name>\npoint_yaml() {\n  echo yaml\n}\n"
+    broken = []
+    for name in ("Bravo", "Charlie"):
+        r = model(name, **FAILING)
+        r.commands = [
+            (
+                "server_cmd.sh",
+                "python3 -m atom.entrypoints.openai_server --model /models/x\n",
+            ),
+            ("bench_cmd.sh", bench),
+        ]
+        broken.append(r)
+    text = report_md("2026-11-14", ENV, broken, "c", "r")
+    failures = text.split("\n### Failures\n")[1]
+    assert failures.count("Reproduce:") == 2
+    assert "  rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114" in failures
+    assert "python3 -m atom.entrypoints.openai_server --model /models/x" in failures
+    assert (
+        failures.count("point_yaml() {") == 1
+    )  # the shared client, shown once at the end
+    assert failures.index("#### Shared MLPerf Endpoint client") > failures.rindex(
+        "Reproduce:"
+    )
