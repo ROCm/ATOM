@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The width guard (``WidthBuilds``: no kernel with scratch) on the K2 builds a
-TP8 Kimi-K3 server makes with ``ATOM_MONO_MLA_POST=1 ATOM_MONO_MLA_PREP=3``.
+TP8 Kimi-K3 server makes with the MLA folds on (``ATOM_MONO_MLA_POST`` and
+``ATOM_MONO_MLA_PREP``, the default).
 
 K2 sits at its 256-VGPR limit with 100+ SGPRs spilled to VGPR lanes. Some fold
 builds (post and / or prep) then come out of the backend with a private segment
@@ -46,8 +47,8 @@ def test_folds_stop_at_16_rows():
 
 def server_k2_keys(rows: int) -> dict:
     """``K3MonoDecodeRunner._k2_keys`` at ``rows`` with every MLA layer's post
-    and sub-mode 3 prep (the build-key fields that shape the code; the model's
-    eps values only change constants)."""
+    and prep (the build-key fields that shape the code; the model's eps values
+    only change constants)."""
     from atom.models.kimi_k3.mono.config import layer_block
     from atom.models.kimi_k3.mono.kernels import layer as k2
     from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
@@ -58,7 +59,7 @@ def server_k2_keys(rows: int) -> dict:
         kw = {"mla_post": layer in MLA and rows <= 16}
         prep_blocks = layer_block(layer + 1)[0]
         if layer + 1 in MLA and rows <= 16 and k2pr.red_fits(rows, prep_blocks + 1):
-            kw.update(mla_prep=3, prep_nblocks=prep_blocks)
+            kw.update(mla_prep=True, prep_nblocks=prep_blocks)
         keys[layer] = k2.K2Build(tokens=rows, nblocks=blocks + (write_idx >= 0), **kw)
     return keys
 

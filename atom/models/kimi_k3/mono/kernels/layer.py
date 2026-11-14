@@ -109,17 +109,17 @@ class K2Build:
     # set, so the default build's symbol is unchanged
     mla_post: bool = False
     # ``ATOM_MONO_MLA_PREP``: the NEXT (MLA) layer's prep as this launch's tail
-    # stages (``stages.mla_prep``; 1: its attention seam, P0; 2: also the q_a /
-    # kv_a GEMV and RMSNorms, P1 / P2; 3: also q_b, the absorb, rope and the
-    # FP8 KV-cache write, P3 .. P5), on a seam of
-    # ``prep_nblocks`` blocks; in the symbol only when set
-    mla_prep: int = 0
+    # stages (``stages.mla_prep``: its attention seam, P0; the q_a / kv_a GEMV
+    # and RMSNorms, P1 / P2; q_b, the absorb, rope and the FP8 KV-cache write,
+    # P3 .. P5), on a seam of ``prep_nblocks`` blocks; in the symbol only when
+    # set
+    mla_prep: bool = False
     prep_nblocks: int = 0
     prep_eps: float = 1e-6
     prep_out_eps: float = 1e-6
-    qa_eps: float = 1e-6  # mode 2: q_a_layernorm
-    kva_eps: float = 1e-6  # mode 2: kv_a_layernorm
-    # mode 3: the MLA layer's rotary module (neox style; cos / sin rows)
+    qa_eps: float = 1e-6  # q_a_layernorm
+    kva_eps: float = 1e-6  # kv_a_layernorm
+    # the MLA layer's rotary module (neox style; cos / sin rows)
     rope_neox: bool = True
     rope_maxpos: int = 1
     # a fold build's LLVM machine scheduler (``amdgpu-sched-strategy``, one of
@@ -515,15 +515,13 @@ def _body(
     if const_expr(key.mla_prep):
         for region in pr.REGIONS:
             c[region] = sreg(scratch, lay[region][0], region)
-        if const_expr(key.mla_prep >= 2):
-            # P1 stages x8 where the post stage stages g_proj's x
-            c["prep_xl"] = st.post.peek().xq.ptr
-            c["prep_slabs"] = post_slabs
-            c["qa_eps"] = key.qa_eps
-            c["kva_eps"] = key.kva_eps
-            c["prep_mode"] = key.mla_prep
-            c["rope_neox"] = key.rope_neox
-            c["rope_maxpos"] = key.rope_maxpos
+        # P1 stages x8 where the post stage stages g_proj's x
+        c["prep_xl"] = st.post.peek().xq.ptr
+        c["prep_slabs"] = post_slabs
+        c["qa_eps"] = key.qa_eps
+        c["kva_eps"] = key.kva_eps
+        c["rope_neox"] = key.rope_neox
+        c["rope_maxpos"] = key.rope_maxpos
     on, tls = key.timeline, lds.tls.ptr
     stamp_begin(on, tls, tid, TL_POINTS)
     # ---- o_proj on every CTA (``o_slot``)
@@ -606,19 +604,17 @@ def _body(
         cp = pr.prep_context(c, key.prep_nblocks + 1, key.prep_eps, key.prep_out_eps)
         if bid < NA:
             pr.p0_seam(cp, bid)
-        if const_expr(key.mla_prep >= 2):
-            # P1 past the lnorm CTAs, after their own work; P2 on P0's first
-            # 2 S CTAs, after it (it waits on P1, P1 on P0)
-            if (bid >= pr.P1_CTA0) & (bid < pr.P1_CTA0 + pr.P1_TASKS):
-                pr.p1_task(c, bid - pr.P1_CTA0)
-            if bid < 2 * s:
-                pr.p2_norm(c, bid)
-        if const_expr(key.mla_prep >= 3):
-            # P3 on the lnorm CTAs and P1's (after it), P4 past them
-            if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
-                pr.p3_task(c, bid - pr.P3_CTA0)
-            if bid >= pr.P4_CTA0:
-                pr.p4_task(c, bid - pr.P4_CTA0)
+        # P1 past the lnorm CTAs, after their own work; P2 on P0's first 2 S
+        # CTAs, after it (it waits on P1, P1 on P0)
+        if (bid >= pr.P1_CTA0) & (bid < pr.P1_CTA0 + pr.P1_TASKS):
+            pr.p1_task(c, bid - pr.P1_CTA0)
+        if bid < 2 * s:
+            pr.p2_norm(c, bid)
+        # P3 on the lnorm CTAs and P1's (after it), P4 past them
+        if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
+            pr.p3_task(c, bid - pr.P3_CTA0)
+        if bid >= pr.P4_CTA0:
+            pr.p4_task(c, bid - pr.P4_CTA0)
     stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
@@ -670,19 +666,18 @@ def build(key: K2Build):
 
     assert not key.sched or key.mla_post or key.mla_prep, "sched is a fold build's"
     if key.mla_prep:
-        assert key.mla_prep in (1, 2, 3), f"MLA prep mode {key.mla_prep}"
         # P2 on P0's first 2 S CTAs
         assert 2 * s <= NA
         assert s <= pr.MAX_ROWS, f"MLA prep: {s} rows past {pr.MAX_ROWS}"
         # P0 stages layer M's sources in this build's ``vals``
         assert 1 <= key.prep_nblocks < ns, (key.prep_nblocks, ns)
         assert pr.red_fits(s, key.prep_nblocks + 1)
-    if key.mla_post or key.mla_prep >= 2:
+    if key.mla_post or key.mla_prep:
         assert s <= mp.MAX_ROWS, f"MLA post: {s} rows past {mp.MAX_ROWS}"
         # the post stage stages x in whatever LDS is left past the fixed parts
         budget = (LDS_LIMIT - lds_bytes(Smem) - lds_bytes(RouteLds) - 256) // 16 * 16
         post_slabs = tuple(mp.slabs(s, budget))
-        if key.mla_prep >= 3:
+        if key.mla_prep:
             # P3 stages all of q8 (K 1536) at once
             assert mp.lds_words(s, budget) * 4 >= s * (pr.QB_K + mp.XPAD)
 
@@ -715,7 +710,7 @@ def build(key: K2Build):
     keyed = key_tuple(key, _SOURCES)
     ext_sym = {"mp": 1} if key.mla_post else {}
     if key.mla_prep:
-        ext_sym["pp"] = key.mla_prep
+        ext_sym["pp"] = 1
     if key.sched:
         ext_sym["ss"] = key.sched.removeprefix("iterative-")
     name = kernel_symbol("k3_mono_k2", **symbol_params(key), **ext_sym)

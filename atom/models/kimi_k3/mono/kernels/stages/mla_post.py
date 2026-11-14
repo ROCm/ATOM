@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Megakernel M2a (``ATOM_MONO_MLA_POST=1``): an MLA layer's attention tail as
+"""Megakernel M2a (``ATOM_MONO_MLA_POST``): an MLA layer's attention tail as
 the first stage of its own mono K2 launch -- no new launch, no grid barrier.
 
 Without it, between ``kn_mla_reduce`` and the MLA layer's K2, four kernels run:

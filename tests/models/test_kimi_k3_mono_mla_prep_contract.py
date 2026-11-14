@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""K2's MLA prep build (``ATOM_MONO_MLA_PREP``, P0), traced compile-only: no
-GPU, but FlyDSL and ``ARCH`` (``compile.trace``).
+"""K2's MLA prep build (``ATOM_MONO_MLA_PREP``, P0 .. P5), traced compile-only:
+no GPU, but FlyDSL and ``ARCH`` (``compile.trace``).
 
 The prep build hands off exactly what the default build does before its tail;
 the tail (``k2.mlaprep``) reads layer M-1's output from FING, which ``k2.up``
-filled, exchanges its own seam's pairs and publishes PXRDY for the next stage.
+filled, exchanges its own seam's pairs and hands each stage's output to the
+next through its pairs.
 """
 
 import os
@@ -30,20 +31,9 @@ def _no_disk_cache(monkeypatch):
     monkeypatch.setattr(k2, "_BUILDS", {})
 
 
-P0_REGIONS = {"ppart", "pwgt", "pmsq", "pamx", "pxrdy"}
-
-
-REGIONS_OF = {
-    1: P0_REGIONS,
-    2: P0_REGIONS | {"p1done", "p2done"},
-    3: P0_REGIONS | {"p1done", "p2done", "p3done"},
-}
-
-
-@pytest.mark.parametrize("mode", [1, 2, 3])
-def test_prep_build_adds_only_its_tail(mode):
+def test_prep_build_adds_only_its_tail():
     base_key = k2.K2Build(tokens=1, nblocks=2)
-    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=mode, prep_nblocks=2)
+    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=True, prep_nblocks=2)
     base = trace(k2.build(base_key), k2.abi_for(base_key))
     rec = trace(k2.build(key), k2.abi_for(key))
     assert not rec.unnamed
@@ -51,9 +41,7 @@ def test_prep_build_adds_only_its_tail(mode):
     before = [(a.region, a.kind) for a in rec.accesses if a.stage != "k2.mlaprep"]
     assert before == [(a.region, a.kind) for a in base.accesses]
     tail = [a for a in rec.accesses if a.stage == "k2.mlaprep"]
-    regions = REGIONS_OF[mode]
-    assert regions <= set(pr.REGIONS)
-    assert {a.region for a in tail} == regions | {"fing"}
+    assert {a.region for a in tail} == set(pr.REGIONS) | {"fing"}
     for a in tail:
         if a.region == "fing":
             assert a.kind == "poll" and a.space is Space.PEER
@@ -63,17 +51,10 @@ def test_prep_build_adds_only_its_tail(mode):
     assert {
         a.stage for a in base.accesses if a.region == "fing" and a.kind == "put"
     } == {"k2.up"}
-    # PXRDY is P1's (mode 2): put by P0, then polled; mode 1 has no reader
-    pxrdy = [a.kind for a in tail if a.region == "pxrdy"]
-    assert pxrdy == (["put", "poll"] if mode >= 2 else ["put"])
-    if mode >= 2:
-        # P2 waits on P1's pairs; P2DONE is P3's (mode 3), else nobody's
-        assert [a.kind for a in tail if a.region == "p1done"] == ["put", "poll"]
-        p2 = [a.kind for a in tail if a.region == "p2done"]
-        assert p2 == (["put", "poll"] if mode >= 3 else ["put"])
-    if mode >= 3:
-        # P4 waits on its head's P3 tasks
-        assert [a.kind for a in tail if a.region == "p3done"] == ["put", "poll"]
+    # each hand-off is put by its stage, then polled by the next: PXRDY (P0 ->
+    # P1), P1DONE (P1 -> P2), P2DONE (P2 -> P3), P3DONE (P3 -> P4)
+    for r in ("pxrdy", "p1done", "p2done", "p3done"):
+        assert [a.kind for a in tail if a.region == r] == ["put", "poll"], r
     # every other region of the tail is put before it is polled
     for r in ("ppart", "pwgt", "pmsq", "pamx"):
         kinds = [a.kind for a in tail if a.region == r]
@@ -81,10 +62,10 @@ def test_prep_build_adds_only_its_tail(mode):
 
 
 def test_prep_symbol_and_abi():
-    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=1, prep_nblocks=2)
+    key = k2.K2Build(tokens=1, nblocks=2, mla_prep=True, prep_nblocks=2)
     assert k2.abi_for(key).names[-len(pr.ARGS) :] == pr.ARGS
     assert k2.abi_for(k2.K2Build(tokens=1, nblocks=2)) is k2.ABI
     with pytest.raises(AssertionError):
-        k2.build(k2.K2Build(tokens=17, nblocks=2, mla_prep=1, prep_nblocks=2))
+        k2.build(k2.K2Build(tokens=17, nblocks=2, mla_prep=True, prep_nblocks=2))
     with pytest.raises(AssertionError):
-        k2.build(k2.K2Build(tokens=1, nblocks=2, mla_prep=1, prep_nblocks=3))
+        k2.build(k2.K2Build(tokens=1, nblocks=2, mla_prep=True, prep_nblocks=3))

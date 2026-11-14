@@ -3394,7 +3394,7 @@ class MLAAttention(nn.Module):
     def forward_decode_prebuilt(
         self, q_out: torch.Tensor, latent_out: bool = False
     ) -> torch.Tensor:
-        """K3 mono decode, ``ATOM_MONO_MLA_PREP=3``: ``forward_impl``'s plain DCP-1
+        """K3 mono decode, ``ATOM_MONO_MLA_PREP``: ``forward_impl``'s plain DCP-1
         decode branch from the ``q_out`` the preceding K2 launch wrote, together
         with this step's KV-cache rows (the work of ``q_proj``, the absorb BMM and
         ``fused_qk_rope_concat_and_cache_mla``)."""

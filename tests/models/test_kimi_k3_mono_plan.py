@@ -452,10 +452,10 @@ def test_a_lean_width_unfolds_only_the_spilled_mla_fold_k2_builds(monkeypatch):
     last = k2.FOLD_SCHEDULERS[-1]
     plain8 = k2.K2Build(tokens=6, nblocks=8)
     both = replace(
-        plain8, mla_post=True, mla_prep=3, prep_nblocks=8, rope_maxpos=64, sched=last
+        plain8, mla_post=True, mla_prep=True, prep_nblocks=8, rope_maxpos=64, sched=last
     )
     prep2 = k2.K2Build(
-        tokens=6, nblocks=2, mla_prep=3, prep_nblocks=2, qa_eps=1e-5, sched=last
+        tokens=6, nblocks=2, mla_prep=True, prep_nblocks=2, qa_eps=1e-5, sched=last
     )
     post2 = k2.K2Build(tokens=6, nblocks=2, mla_post=True)
     built = runner.WidthBuild(
@@ -484,7 +484,7 @@ def test_a_spilled_fold_build_tries_each_scheduler_before_unfolding(monkeypatch)
     from atom.models.kimi_k3.mono.kernels import layer as k2
 
     monkeypatch.setattr(k2, "build", lambda key: ("built", key.sched))
-    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=2, prep_nblocks=2)
+    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=True, prep_nblocks=2)
     built = runner.WidthBuild(
         k1_keys={}, k1_launchers={}, k2_keys={6: fold}, k2_launchers={fold: "s0"}
     )
@@ -505,6 +505,6 @@ def test_unfolding_drops_the_scheduler():
     pytest.importorskip("flydsl", reason="K2 builds need FlyDSL")
     from atom.models.kimi_k3.mono.kernels import layer as k2
 
-    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=2, prep_nblocks=2)
+    fold = k2.K2Build(tokens=8, nblocks=2, mla_prep=True, prep_nblocks=2)
     assert k2.unfolded(replace(fold, sched="iterative-ilp")) == k2.unfolded(fold)
     assert "sched" in k2.FOLD_FIELDS
