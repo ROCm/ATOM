@@ -81,6 +81,7 @@ class _MPlan(ah._Plan):
     blocks: int = (
         1  # 128-id blocks a task (``MarkovHead(blocks=)``: a rank's vocab past one block a CU)
     )
+    w2_early: bool = False  # ``MarkovHead(w2_early=)``: the W2 tile issued before the dot (one request)
 
     @property
     def single(
@@ -171,7 +172,8 @@ class MarkovHead(Block):
 
     def __init__(self, name: str, x: Channel, n: int, layout: str = "packed", prefetch: int = 16, lead: int = 4,
                  rank_r: int = 256, logits: Channel | None = None, kparts: int = 0,
-                 blocks: int | None = None, spread: int = 0, temporal: bool = False):  # fmt: skip
+                 blocks: int | None = None, spread: int = 0, temporal: bool = False,
+                 w2_early: bool = False):  # fmt: skip
         # blocks: 128-id blocks a task; None: 1 while a rank's blocks fit one a CU, else 2 (V4.1 at TP2: 505 blocks of
         # its 64,640 ids, 253 tasks of 2)
         if blocks not in (None, 1, 2) or (blocks == 2 and logits is not None):
@@ -221,11 +223,16 @@ class MarkovHead(Block):
                              f"'wave', one block a task, the head's own dot")  # fmt: skip
         self.spread = spread
         self.temporal = bool(temporal)  # the weight loads cacheable (``ArgmaxHead(temporal=)``)
+        # one request: the task's W2 rows loaded first (before the dot's lead units, stored to the LDS once x's attempt
+        # is issued, before the rest of the prefetch), not after the dot: their latency under x's wait, not between
+        # the dot and the first position. The same rows into the same LDS words (``a_w2``: past x and the base
+        # logits): the same bits
+        self.w2_early = bool(w2_early)
 
     def plan(self, sc: Scenario) -> _MPlan:
         p = _MPlan(self.name, sc.rows, self.x.width, self.n, sc.tp, self.x.name, "bf16", self.layout, self.prefetch,
                    False, "", self.lead, False, rank_r=self.rank_r, batch=sc.batch, g=self.spread,
-                   wcm=0 if self.temporal else ah.CM_NT)  # fmt: skip
+                   wcm=0 if self.temporal else ah.CM_NT, w2_early=self.w2_early)  # fmt: skip
         if (
             sc.batch > 1 or p.lds_words * 4 > MI355X.lds_bytes
         ):  # x in K slices where it does not fit whole
@@ -294,12 +301,20 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
     issue = partial(ah._issue, p, r_w, tb, wave, rg, lane, valid)
     n_pre = min(p.prefetch, p.steps)
     lead = min(p.lead, n_pre)
+    first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
+    early = p.w2_early and p.single
+    if const_expr(early):  # (W2 first: vmcnt is in order, so its stores below wait for it alone)
+        w2 = _w2_issue(k, p, t, first)
+        rocdl.sched_barrier(0)
     q = [issue(i) for i in range(lead)]
     if const_expr(p.single):
         batches = ah._x_batches(k, p, k.tid, THREADS)
         rocdl.sched_barrier(0)
         tries = [_try_batch(specs) for specs, _ in batches]
         rocdl.sched_barrier(0)
+        if const_expr(early):  # (its registers free before the prefetch's)
+            _w2_store(k, p, w2)
+            rocdl.sched_barrier(0)
         q += [issue(i) for i in range(lead, n_pre)]
         rocdl.sched_barrier(0)
         for (specs, dests), words in zip(batches, tries, strict=True):
@@ -316,13 +331,13 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
         rocdl.sched_barrier(0)
         q += [issue(i) for i in range(lead, n_pre)]
     gpu.barrier()
-    first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
     if const_expr(p.single):
         if const_expr(p.g < WAVES):
             _stream_some(k, p, lane, issue, q)
         else:
             _stream(k, p, lane, issue, q)
-        _w2_tile(k, p, t, first)
+        if const_expr(not early):
+            _w2_tile(k, p, t, first)
         gpu.barrier()
         xp = uniform(ld_i32(k.args[f"{p.name}.anchor"], 0))
         for j in range_constexpr(p.rows):
@@ -435,6 +450,26 @@ def _w2_tile(k, p: _MPlan, t, first):
         fx.ptr_store(
             got.bitcast(fx.Float32), k.ldsf + (p.a_w2 + v * p.w2pitch + w4 * 4)
         )
+
+
+def _w2_issue(k, p: _MPlan, t, first):
+    """``w2_early``: ``_w2_tile``'s loads, every one issued first: [(16 B, LDS word)] (``_w2_store``)."""
+    r_w2 = rsrc(k.args[f"{p.name}.w2"])
+    per = p.rw // 4  # 16 B loads a row
+    total = p.vt * per
+    out = []
+    for c in range(-(-total // THREADS)):
+        i = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(total - 1))
+        v, w4 = i // per, i % per
+        gid = first + fx.min(t * p.vt + v, fx.Int32(p.n - 1))
+        got = fx.Vector(bo.buffer_load(r_w2, gid * p.rw + w4 * 4, vec_width=4, dtype=T.i32))
+        out.append((got, p.a_w2 + v * p.w2pitch + w4 * 4))
+    return out
+
+
+def _w2_store(k, p: _MPlan, items):
+    for got, at in items:
+        fx.ptr_store(got.bitcast(fx.Float32), k.ldsf + at)
 
 
 def _position(k, p: _MPlan, t, j, xp, first):

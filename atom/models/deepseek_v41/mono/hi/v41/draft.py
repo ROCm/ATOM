@@ -659,6 +659,19 @@ MK_SPREAD_TP = {8: 4}
 MK_SPREAD_ENV = "ATOM_DSV41_MONO_HI_MK_SPREAD"
 
 
+# The Markov head's W2 tile issued before the dot (``MarkovHead(w2_early=)``: the same bits), by TP, one request.
+# Env ATOM_DSV41_MONO_HI_MK_W2_EARLY (0 / 1, any TP; every rank the same) overrides it.
+MK_W2_EARLY_TP = (8,)
+MK_W2_EARLY_ENV = "ATOM_DSV41_MONO_HI_MK_W2_EARLY"
+
+
+def mk_w2_early(sc: Scenario) -> bool:
+    from .head import env_int
+
+    env = env_int(MK_W2_EARLY_ENV, 0, 1)
+    return sc.batch == 1 and (bool(env) if env is not None else sc.tp in MK_W2_EARLY_TP)
+
+
 def mk_spread(sc: Scenario) -> int:
     """``head_program``'s Markov dot row groups a task at ``sc`` (one request, else 8)."""
     from .head import env_int
@@ -677,6 +690,7 @@ def head_blocks(
     kparts: int | None = None,
     spread: int = 0,
     temporal: bool = False,
+    w2_early: bool = False,
 ) -> list[Block]:
     """The draft's head after stage 2 (chained: its fold sums stage 2's pushed MoE partials): the fold and the
     collapse (``head.head_blocks``' seam), the last stage's ``norm`` (arg ``norm.g``: ``mtp.2.norm``), then
@@ -708,6 +722,7 @@ def head_blocks(
             kparts=kp,
             spread=spread,
             temporal=temporal,
+            w2_early=w2_early,
         )
     ]
 
@@ -719,7 +734,8 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
     from .recipe import CHAIN_PEER
     from .schedules import KEY_TP
 
-    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc), temporal=H.temporal("draft"))
+    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc), temporal=H.temporal("draft"),
+                         w2_early=mk_w2_early(sc))
     stages = [st for b in blocks for st in b.stages(sc)]
     # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
     program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)
