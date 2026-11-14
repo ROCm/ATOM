@@ -514,3 +514,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         return (
             dp_group.world_size > 1 and self.num_embeddings % dp_group.world_size == 0
         )
+
+    def dp_argmax_token(self, x: torch.Tensor) -> torch.Tensor | None:
+        """``x``'s greedy ids, fp32 ``[rows]``, on a step that runs the
+        DP-sharded head (same GEMM, lowest id on ties); else None."""
+        if is_plugin_mode() or not self._can_use_dp_sharded_head(
+            get_forward_context().context
+        ):
+            return None
+        return self._dp_sharded_logits(x, "argmax")
+
+    def local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits off this TP-1 rank's own weight, no collective."""
+        return tgemm.mm(x, self.weight, self.bias)
