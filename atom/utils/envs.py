@@ -596,6 +596,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
+    # MiniMax-M3.1 on gfx950: for steps of at most 16 rows, run the router
+    # GEMV, sigmoid top-4 gate and the MoE sort as one kernel that hands its sort
+    # to aiter's fused_moe (atom/model_ops/minimax_m3/router). 0 disables it.
+    "ATOM_M3_FUSED_ROUTER": lambda: os.getenv("ATOM_M3_FUSED_ROUTER", "1") == "1",
     # Fused decode for measured model/deployment/step geometries. Unsupported
     # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",

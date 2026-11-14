@@ -42,6 +42,7 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "model_ops/minimax_m3/router/*.hip",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
