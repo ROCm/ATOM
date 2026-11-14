@@ -21,11 +21,14 @@ XPAD = 16  # bytes a padded fp8 x row
 MAX_ROWS = 16  # the widest step built with the stage (wider: the unfused path)
 
 # Every K2 CTA runs o_proj, which reads every core column, so the 96 tasks gate
-# all of it; they sit where the least other work is queued behind them: the
-# 64 CTAs with one o_proj task (the AttnRes CTAs 0 .. 55 and 248 .. 255), the
-# two-task CTAs with no early GEMV (152 .. 159, 244 .. 247) and the last 20
-# latent parts (224 .. 243), whose weights are issued after their o_proj.
-# ``(first CTA, first task, count)`` a range.
+# all of it; one task a CTA, where the least other work is queued behind it.
+# ``(first CTA, first task, count)`` a range:
+#   CTAs   0 .. 55   tasks  0 .. 55: the AttnRes CTAs (one o_proj task each);
+#   CTAs 152 .. 159  tasks 56 .. 63: two o_proj tasks, no early GEMV;
+#   CTAs 224 .. 255  tasks 64 .. 95: the last 20 latent parts (224 .. 243,
+#                    their weights issued after their o_proj), then two o_proj
+#                    tasks and no early GEMV (244 .. 247), then one o_proj task
+#                    (248 .. 255).
 CTA_RANGES = ((0, 0, 56), (152, 56, 8), (224, 64, 32))
 
 
