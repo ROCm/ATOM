@@ -546,6 +546,7 @@ def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
     monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
     engine = object.__new__(core.EngineCore)
     engine._kv_progress_event = threading.Event()
+    engine._work_arrived = threading.Event()
     engine.label, engine.input_queue = "test", queue.Queue()
     engine.process_input_sockets("input", "control")
     want = reference_chain(tokens, BLOCK, -1, 10)

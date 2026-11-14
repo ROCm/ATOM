@@ -58,6 +58,19 @@ logger = logging.getLogger("atom")
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # How long a busy loop that finds its engine held sleeps before it looks again.
 HELD_POLL_S = 0.01
+# Longest an idle busy loop blocks before it looks again. Arrivals on the input
+# and control sockets wake it at once (`_work_arrived`); the bound only paces
+# what nothing signals: the metrics push, the throughput heartbeat, the idle KV
+# drain (same 1ms as `KV_IDLE_DRAIN_INTERVAL_S`), a disagg peer's socket.
+#
+# Blocking, not spinning, is the point. The output and input socket threads
+# need the GIL to pickle and send, and a loop spinning in Python hands it over
+# only when forced, once per `sys.getswitchinterval()` (5ms). The step that
+# finishes a request is the one after which the loop goes idle, so its output
+# -- the last token chunk and the finish -- sat in `output_queue` ~5ms (c1
+# DSv4.1 TP8: last chunk gap 7.8ms against 2.7ms per step), and a request
+# arriving at an idle engine waited as long on the input side.
+IDLE_WAIT_S = 0.001
 
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
@@ -78,6 +91,9 @@ class EngineCore:
         # reference, and the workers own their own copies.
         self.config = config
         self._kv_progress_event = threading.Event()
+        # Set by the input thread on every request, utility command and
+        # shutdown; an idle busy loop blocks on it (`_wait_for_work`).
+        self._work_arrived = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
@@ -537,6 +553,7 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    self._wait_for_work()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -550,6 +567,19 @@ class EngineCore:
                 self.scheduler.shutdown_kv_events()
             finally:
                 tracing.shutdown()
+
+    def _wait_for_work(self, timeout: float = IDLE_WAIT_S) -> None:
+        """Block an idle busy loop, GIL released, until input arrives or
+        ``timeout`` passes. See `IDLE_WAIT_S` for why it must not spin.
+
+        Cleared before the queues are read, so a request enqueued after the
+        check sets the event again and the wait returns at once; one enqueued
+        before it is seen in the queue and there is no wait at all.
+        """
+        self._work_arrived.clear()
+        if not self.input_queue.empty() or not self.utility_queue.empty():
+            return
+        self._work_arrived.wait(timeout)
 
     def _process_engine_step(self):
         try:
@@ -920,6 +950,7 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                         self._kv_progress_event.set()
+                        self._work_arrived.set()
                         self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
@@ -927,10 +958,12 @@ class EngineCore:
                         self.utility_queue.put_nowait((cmd, reqs))
                         self._has_pending_utility = True
                         self._kv_progress_event.set()
+                        self._work_arrived.set()
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])
                         self._kv_progress_event.set()
+                        self._work_arrived.set()
                         alive = False
                         reason = request_type
             logger.debug(f"{self.label}: input thread exit due to {reason}")
