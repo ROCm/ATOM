@@ -47,10 +47,12 @@ impl RankState {
     }
 
     /// The socket lost its connection: an engine that restarted meanwhile may go on at the
-    /// very seq that would follow, so the next batch starts the holder over.
+    /// very seq that would follow, so the next batch starts the holder over, and batches
+    /// may be lost until then.
     pub fn disconnected(&mut self) {
         if self.next.take().is_some() {
             self.stale = true;
+            self.trust = Trust::Partial;
         }
     }
 
@@ -138,6 +140,7 @@ mod tests {
         restart, startup clear missed    | 0 apply, 1 apply, 2 apply, 1@3 clear     | exact
         restart, more missed             | 0 apply, 5 missing 1 clear, 6 apply, 3@7 missing 0 clear | partial
         restart, replayed from 0         | 0 apply, 1 apply, 2 apply, 3 apply, 2@12 missing 0, 0C@10 clear, 1@11 apply, 2@12 apply, 2@12 dup | exact
+        connection lost                  | 0 apply, 1 apply, D                      | partial
         restart at the seq that follows  | 0 apply, 1 apply, 2 apply, D, 3 missing 0 clear | partial
         the same, replayed from 0        | 0 apply, 1 apply, 2 apply, D, 3@10 missing 0, 0C@7 clear, 1@8 apply, 2@9 apply, 3@10 apply | exact
         restart seen at its first batch  | 0 apply, 1 apply, D, 1 clear             | exact

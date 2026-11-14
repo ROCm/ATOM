@@ -108,8 +108,8 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib routers::http_pd_router
 
-      # KV events: following the engines' streams, the prefix index, the shared-store
-      # lookups, and the routing and observability code they feed.
+      # KV events: following the engines' streams, the prefix index, the shared store, and
+      # the routing and observability code they feed.
       - name: Test KV events
         run: |
           set -euo pipefail
