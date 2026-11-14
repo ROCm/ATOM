@@ -282,6 +282,11 @@ jobs:
     name: GPU unit tests (speculative decoding)
     runs-on: linux-atom-mi35x-1
     timeout-minutes: 45
+    # The aiter wheel is another job's artifact: listing and downloading it
+    # needs actions: read, as the accuracy job has.
+    permissions:
+      actions: read
+      contents: read
     env:
       CONTAINER_NAME: atom_gpu_unit_tests
       GPU_UNIT_TESTS: >-
