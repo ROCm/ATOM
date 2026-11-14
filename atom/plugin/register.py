@@ -138,10 +138,34 @@ def _register_custom_attention_to_sglang() -> None:
         )
         return backend_cls(runner)
 
+    def _is_native_dspark_draft(runner) -> bool:
+        """SGLang's DSpark draft owns its attention and native KV pool."""
+        if not bool(getattr(runner, "is_draft_worker", False)):
+            return False
+        spec = getattr(runner, "spec_algorithm", None)
+        if spec is not None and bool(getattr(spec, "is_dspark", lambda: False)()):
+            return True
+        arches = (
+            getattr(
+                getattr(getattr(runner, "model_config", None), "hf_config", None),
+                "architectures",
+                None,
+            )
+            or []
+        )
+        return any("DSpark" in str(arch) for arch in arches)
+
     @register_attention_backend("aiter")
     def create_atom_backend(runner):
         hf_config = runner.model_config.hf_config
         arches = getattr(hf_config, "architectures", None) or []
+        if _is_native_dspark_draft(runner):
+            from sglang.srt.layers.attention.attention_registry import (
+                create_dsv4_backend as create_native_dsv4_backend,
+            )
+
+            logger.info("Use native SGLang DSV4 attention for the DSpark draft")
+            return create_native_dsv4_backend(runner)
         if any("DeepseekV4" in str(arch) for arch in arches):
             logger.info(
                 "Use ATOMDeepseekV4BackendForSgl for DeepSeek-V4 through SGLang aiter backend choice"
@@ -158,6 +182,13 @@ def _register_custom_attention_to_sglang() -> None:
 
     @register_attention_backend("dsv4")
     def create_dsv4_backend(runner):
+        if _is_native_dspark_draft(runner):
+            from sglang.srt.layers.attention.attention_registry import (
+                create_dsv4_backend as create_native_dsv4_backend,
+            )
+
+            logger.info("Use native SGLang DSV4 attention for the DSpark draft")
+            return create_native_dsv4_backend(runner)
         logger.info(
             "Create ATOMDeepseekV4BackendForSgl through SGLang dsv4 backend choice"
         )

@@ -353,11 +353,15 @@ def _write_dense_only_prefill_indices(
 
 try:
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4TokenToKVPool as _SGLangDeepSeekV4TokenToKVPool,
+    )
 except Exception:  # noqa: BLE001  # pragma: no cover - SGLang import-time fallback
     BaseSWAKVPool = object
+    _SGLangDeepSeekV4TokenToKVPool = object
 
 
-class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
+class ATOMDeepSeekV4ProxyKVPool(_SGLangDeepSeekV4TokenToKVPool):
     """SGLang-visible proxy KV pool whose bytes are owned by ATOM V4.
 
     SGLang still allocates full/SWA token indices through its regular SWA
@@ -466,8 +470,10 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # paged SWA bookkeeping path, so the flag stays on.
         self.needs_paged_swa_allocator = True
         # Encoder-replay pools own a RequestWindow. ATOM stays on the paged
-        # SWA map, which 0.5.22 selects when this is None.
+        # SWA map, which 0.5.22 selects when this is None. The row reset
+        # checks the memory object itself, so that stays unset too.
         self.request_window = None
+        self.request_window_memory = None
         self.unified_kv_pool = None
         self.c4_kv_pool = None
         self.c128_kv_pool = None
@@ -887,31 +893,49 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
 
 
 def install_deepseek_v4_proxy_pool_patch() -> None:
-    """Patch SGLang's DSV4 pool constructor before ModelRunner._init_pools().
+    """Allocate the ATOM proxy for the target and the native pool for DSpark.
 
-    This makes SGLang allocate the ATOM proxy pool instead of the stock DSV4 KV
-    pool, while leaving SGLang's scheduler/radix-cache code unchanged.  The proxy
-    still satisfies SGLang's TokenToKVPool contract but exposes ATOM V4's SWA,
-    CSA, HCA, and indexer views to the model.
+    The target model reads ATOM's SWA, CSA, HCA, and indexer views. The DSpark
+    draft is SGLang's own DeepseekV4ForCausalLMDSpark, and its attention writes
+    SWA keys through the native pool. Replacing DeepSeekV4TokenToKVPool globally
+    would hand that draft the proxy, which does not implement those writes.
+    The proxy subclasses the native pool so existing isinstance checks accept
+    both.
     """
 
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
+    import sglang.srt.mem_cache.kv_cache_configurator as kv_configurator
 
     original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
     if original_pool_cls is None:
         raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
     if original_pool_cls is ATOMDeepSeekV4ProxyKVPool:
-        return
-
-    dsv4_pool.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
+        raise RuntimeError(
+            "DeepSeekV4TokenToKVPool was already replaced, so the DSpark draft "
+            "cannot recover the native KV pool."
+        )
     dsv4_pool.ATOMDeepSeekV4ProxyKVPool = ATOMDeepSeekV4ProxyKVPool
 
-    # SGLang 0.5.17 moved pool construction into mem_cache.kv_cache_configurator,
-    # which imports DeepSeekV4TokenToKVPool as a module-local symbol. Patch any
-    # already-loaded local aliases that still point at the original class.
-    for module in list(sys.modules.values()):
-        if getattr(module, "DeepSeekV4TokenToKVPool", None) is original_pool_cls:
-            module.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
+    builder = kv_configurator.KVCacheConfigurator._build_dsv4_kv_pool
+    if getattr(builder, "_atom_dsv4_pool_dispatch", False):
+        return
+
+    def _build_dsv4_kv_pool(self, *args, **kwargs):
+        # Only the DSpark draft needs SGLang's native pool: its attention writes
+        # SWA keys through set_swa_key_buffer_radix. EAGLE/MTP drafts are ATOM
+        # models that read the proxy's carved views, so they keep the proxy.
+        use_native_pool = self.is_draft_worker and self.spec_algorithm.is_dspark()
+        saved = kv_configurator.DeepSeekV4TokenToKVPool
+        kv_configurator.DeepSeekV4TokenToKVPool = (
+            original_pool_cls if use_native_pool else ATOMDeepSeekV4ProxyKVPool
+        )
+        try:
+            return builder(self, *args, **kwargs)
+        finally:
+            kv_configurator.DeepSeekV4TokenToKVPool = saved
+
+    _build_dsv4_kv_pool._atom_dsv4_pool_dispatch = True
+    kv_configurator.KVCacheConfigurator._build_dsv4_kv_pool = _build_dsv4_kv_pool
 
 
 def _bind_compressor_state(

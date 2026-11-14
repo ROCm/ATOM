@@ -661,7 +661,11 @@ def fused_compress_attn(
             cache_scale=cache_scale,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle and not main_2buff_fp8,
-            quant_mode="fp8_group" if main_2buff_fp8 else _mode,
+            # This aiter build names the 2-buffer group scale "group_fp8".
+            quant_mode={
+                "fp8_group": "group_fp8",
+                "fp8_per_row": "per_row_fp8",
+            }.get("fp8_group" if main_2buff_fp8 else _mode, _mode),
             k_rope_cache=kv_cache_rope if main_2buff_fp8 else None,
         )
         return
