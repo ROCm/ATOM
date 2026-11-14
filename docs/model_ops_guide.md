@@ -605,6 +605,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | SiLU + mul + MXFP4 quant | SiLU activation, multiply, MXFP4 quant | `SiluAndMul(fused_quant=True)` + `QuantType.per_1x32` | `fused_reduce_act_mul_and_mxfp4_quant` |
 | QK norm + RoPE + cache + quant | Q/K norm, RoPE, KV cache write, optional FP8 quant, weight shuffle | `q_norm` + `k_norm` + `rotary_emb` all present | `fused_qk_norm_rope_cache_quant_shuffle` |
 | RoPE + reshape + cache | RoPE, K reshape, KV cache write | Triton attention path | `fused_qk_rope_reshape_and_cache` |
+| QK norm + RoPE + cache (DSpark GQA draft) | Per-head Q/K RMSNorm, neox RoPE, FLASH-layout paged K/V write, optional saturating FP8 quant | `ATOM_K3_DRAFT_QKROPE` (default on) | `fused_qk_rope_reshape_and_cache` (`k_norm_weight` / `q_norm_weight`) |
 | QK RoPE + MLA cache | Q RoPE, KV concat, MLA cache write, FP8 quant | MLA decode path | `fused_qk_rope_concat_and_cache_mla` |
 | GEMM + split + cat (FP4) | KV_b_proj GEMM, split K_nope/V, cat K_rope | `ATOM_USE_TRITON_GEMM=True` + FP4 weights | `fused_gemm_afp4wfp4_preshuffle_split_cat` |
 | GEMM + split + cat (FP8) | KV_b_proj GEMM, split K_nope/V, cat K_rope | `ATOM_USE_TRITON_GEMM=True` + FP8 weights | `fused_gemm_a8w8_blockscale_preshuffle_split_cat` |
