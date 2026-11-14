@@ -1537,7 +1537,6 @@ Connector-specific tuning (env):
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — (48 MiB for `mooncake_store`) | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
-| `OFFLOAD_COPY_HIGH_PRIORITY` | 0 | `mooncake_store` only: run the in-place pack and unpack copies on a high-priority stream (priority -1). At the default priority a copy waits behind the compute already queued on the device, so a load can be held up for as long as that compute runs. |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |
 | `OFFLOAD_PUBLICATION_POLL_INTERVAL_S` | 0.01 | Finite, positive sleep interval between visibility probes; prevents busy-spinning. |

@@ -877,10 +877,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """This copy thread's stream for in-place packs and unpacks."""
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
-            # At the default priority a copy waits behind the compute already
-            # queued on the device, however long that runs.
-            priority = -1 if envs.OFFLOAD_COPY_HIGH_PRIORITY else 0
-            stream = torch.cuda.Stream(device=self._codec.device, priority=priority)
+            stream = torch.cuda.Stream(device=self._codec.device)
             self._in_place_tls.stream = stream
         return stream
 
