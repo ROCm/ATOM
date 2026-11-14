@@ -120,14 +120,19 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | The PAGE-backed native-state layout and `stores_state_images`, scheduler leases, and the worker's restore into an Active SLOT. Its registration and block-id validation are `mp/worker.py`'s (shared with the plugin), and `require_native_state_server` is `mp/deployment.py`'s. |
+| `kv_store/client.py` | The store client protocol every KV-store backend implements (register/unregister/exists/put/get/close/stats), and `CallRefused`. |
+| `kv_store/keys.py` | Layout namespace (with each backend's own prefix), the prompt's 16-byte chunk hash chain, and object key spelling. |
+| `kv_store/layouts.py` | The layouts a KV store moves (dense, M3 PAGE, V4.1 replay PAGE) and the codec for each; a backend names the subset it moves. |
+| `kv_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `kv_store/scheduler.py`, `kv_store/worker.py` | The scheduler (digest-carrying requests, paced save retries, lookup helpers) and worker (windowed put/get through the pool, completion protocol) every KV-store backend extends. |
 | `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
-| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE), and the codec for each. |
-| `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
+| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE). |
+| `mooncake_store/keys.py` | The `atomkv1-` namespace prefix, Mooncake groups, and the taint marker key. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
-| `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `mooncake_store/pool.py` | `TransferSlotPool` named for the Mooncake Store. |
 | `mooncake_store/taint.py` | The Store's taint marker, placed after a put Mooncake gave up on, which every client of the Store checks before it loads. |
-| `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
+| `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (lookups across the Store pools, the taint marker, read-lease renewal) and worker (NIC selection, Mooncake groups, RDMA-aware slot settlement, the taint marker, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
 `atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the

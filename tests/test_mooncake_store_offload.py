@@ -52,6 +52,9 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.kv_store import pool as pool_mod
+from atom.kv_transfer.offload.kv_store import scheduler as store_scheduler_mod
+from atom.kv_transfer.offload.kv_store import worker as store_worker_mod
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -60,7 +63,6 @@ from atom.kv_transfer.offload.metadata import (
 )
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store import keys, nic
-from atom.kv_transfer.offload.mooncake_store import pool as pool_mod
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
 from atom.kv_transfer.offload.mooncake_store import taint as taint_mod
 from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
@@ -570,11 +572,14 @@ def scheduler_clock(monkeypatch):
     dispatch stamp with their own ``time.monotonic()``.
     """
     clock = SimpleNamespace(now=time.monotonic())
-    monkeypatch.setattr(
-        scheduler_mod,
-        "time",
-        SimpleNamespace(monotonic=lambda: clock.now, perf_counter=time.perf_counter),
-    )
+    for module in (scheduler_mod, store_scheduler_mod):
+        monkeypatch.setattr(
+            module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock.now, perf_counter=time.perf_counter
+            ),
+        )
     return clock
 
 
@@ -1706,8 +1711,8 @@ def test_lookup_hashes_a_sequence_prompt_once(cluster):
     seq.token_ids.extend([999] * 5)  # generated tokens are not prompt
     assert scheduler._lookup_token_ids(seq) is seq
     assert scheduler._lookup_client.lookup(seq) == 0
-    assert seq._mooncake_store_chunk_hashes == _hashes(16)
-    seq._mooncake_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
+    assert seq._kv_store_chunk_hashes == _hashes(16)
+    seq._kv_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
     assert prompt_chunk_hashes(seq, CHUNK) == b"\x01" * 32
     media = _seq(5, 20, cache_seed=77)
     assert prompt_chunk_hashes(media, CHUNK) != _hashes(16)
@@ -2486,7 +2491,7 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
     def no_fence(_device):
         raise RuntimeError("sticky HIP error")
 
-    monkeypatch.setattr(worker_mod, "_synchronize", no_fence)
+    monkeypatch.setattr(store_worker_mod, "_synchronize", no_fence)
     worker._guard("save", worker._do_save_req, _save_req(21, 16))
     # A copy that may still run has no time bound: out of use for good.
     assert worker._pool.quarantined("save") == 2
@@ -2495,7 +2500,7 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
 def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
     worker, gpu = make_worker()
     request = _save_req(22, 24)
-    request._mooncake_store_dispatched_at = time.monotonic() - 10_000
+    request._kv_store_dispatched_at = time.monotonic() - 10_000
     worker._do_save_req(request)
     assert gpu.calls == []
     assert cluster.objects.get(MASTER, {}) == {}
@@ -2516,7 +2521,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     clock = SimpleNamespace(monotonic=5000.0)
     # No wall clock: the worker reads none, so no step of it moves a deadline.
     monkeypatch.setattr(
-        worker_mod,
+        store_worker_mod,
         "time",
         SimpleNamespace(
             monotonic=lambda: clock.monotonic, perf_counter=time.perf_counter
@@ -2537,7 +2542,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     metadata = LMCacheOffloadMetadata()
     metadata.add_request(request)
     worker.start_load_kv(metadata)
-    assert request._mooncake_store_dispatched_at == clock.monotonic - 3.0
+    assert request._kv_store_dispatched_at == clock.monotonic - 3.0
     clock.monotonic += runs_after_s - 3.0
     worker._do_save_req(request)
     operation = request.save_operation
@@ -2565,7 +2570,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
 def test_a_save_stamped_on_a_clock_the_worker_cannot_place_reads_nothing(
     cluster, make_worker, monkeypatch, dispatch_clock, own_clock
 ):
-    monkeypatch.setattr(worker_mod, "monotonic_clock_id", lambda: own_clock)
+    monkeypatch.setattr(store_worker_mod, "monotonic_clock_id", lambda: own_clock)
     # Enqueue nothing: the test runs the save when its thread would get to it.
     monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda *_: None)
     worker, gpu = make_worker()
@@ -2592,7 +2597,7 @@ def test_neither_side_starts_where_the_boot_is_unnamed(
 ):
     # A save's stamp is read on the clock it names: without a boot ID every
     # save would read nothing, so neither half starts.
-    monkeypatch.setattr(scheduler_mod, "_BOOT_ID_PATH", str(tmp_path / "missing"))
+    monkeypatch.setattr(store_scheduler_mod, "_BOOT_ID_PATH", str(tmp_path / "missing"))
     scheduler_mod.monotonic_clock_id.cache_clear()
     try:
         build = (
@@ -2652,7 +2657,7 @@ def test_start_load_kv_stamps_saves_and_shares_one_fence(
     worker.start_load_kv(metadata)
     worker._save_executor.shutdown(wait=True)
     # No dispatch time: the deadline counts from receipt.
-    assert all(r._mooncake_store_dispatched_at >= before for r in metadata.requests)
+    assert all(r._kv_store_dispatched_at >= before for r in metadata.requests)
     assert len(events) == 1 and gpu.events == [events[0], events[0]]
     output = worker.get_finished()
     assert output.finished_saving == {r.save_operation for r in metadata.requests}
@@ -3141,7 +3146,7 @@ def _kv_caches(num_blocks=8):
 @pytest.fixture
 def one_rank(monkeypatch):
     monkeypatch.setattr(
-        worker_mod,
+        store_worker_mod,
         "_tp_group",
         lambda: SimpleNamespace(world_size=1, rank_in_group=0),
     )
@@ -3950,7 +3955,7 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
 @pytest.mark.parametrize("layout", ["dense", "m3"])
 def test_store_codec_version_changes_only_its_own_namespace(monkeypatch, layout):
     from atom.kv_transfer.offload.hybrid.m3 import codec as m3_codec
-    from atom.kv_transfer.offload.mooncake_store import layouts
+    from atom.kv_transfer.offload.kv_store import layouts
 
     config = _config()
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: layout)
