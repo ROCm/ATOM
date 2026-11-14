@@ -28,12 +28,14 @@ def chat(*parts):
     return [{"role": "user", "content": list(parts)}]
 
 
-def config(architecture="Qwen3_5ForConditionalGeneration"):
+def config(architecture="Qwen3_5ForConditionalGeneration", model_type="qwen3_5"):
     return SimpleNamespace(
         hf_config=SimpleNamespace(architectures=[architecture]),
         multimodal_config=SimpleNamespace(
+            model_type=model_type,
+            image_token_id=42,
             media_placeholder_token_id=42,
-            vision_config=SimpleNamespace(merge_kernel_size=2),
+            vision_config=SimpleNamespace(merge_kernel_size=2, spatial_merge_size=2),
         ),
     )
 
@@ -256,8 +258,10 @@ def test_qwen_preparation_preserves_template_options_and_hf_tokens_and_tensors(
     first = image_module.new("RGB", (2, 2), "red")
     second = image_module.new("RGB", (2, 2), "blue")
     hf_output = {
-        "input_ids": np.array([[1, 2, 3]]),
-        "pixel_values": np.ones((4, 3)),
+        # One image token per 2x2 grid after the 2x2 merge, as the processor
+        # expands each <|image_pad|>.
+        "input_ids": np.array([[1, 42, 42, 3]]),
+        "pixel_values": np.ones((8, 3)),
         "image_grid_thw": np.array([[1, 2, 2], [1, 2, 2]]),
     }
     seen = {}
@@ -286,7 +290,7 @@ def test_qwen_preparation_preserves_template_options_and_hf_tokens_and_tensors(
     token_ids, model_inputs = prepare_multimodal_inputs(
         config(), Processor(), messages, {"image": [first, second]}, kwargs
     )
-    assert token_ids == [1, 2, 3]
+    assert token_ids == [1, 42, 42, 3]
     assert model_inputs["pixel_values"] is hf_output["pixel_values"]
     assert model_inputs["image_grid_thw"] is hf_output["image_grid_thw"]
     assert seen["messages"][0]["name"] == "user_1"

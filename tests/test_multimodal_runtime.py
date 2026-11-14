@@ -262,7 +262,7 @@ def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
 def qwen3_5_payload(token_ids, image_grid_thw, seed=21):
     from atom.models.qwen3_5_vl import qwen3_5_image_spans
 
-    spans = qwen3_5_image_spans(token_ids, image_grid_thw, 42, 2)
+    spans = qwen3_5_image_spans(token_ids, torch.tensor(image_grid_thw), 42, 2)
     rows = sum(count for _, count in spans)
     return {
         "cache_seed": seed,
@@ -385,11 +385,11 @@ def test_qwen3_5_real_processor_spans_survive_every_prefix_hit():
     # of different sizes back to back, then text. For a prefix hit ending
     # before, inside, between, at the end of and past the images, the forward
     # must get exactly the image rows it still holds.
+    processor = _cached_qwen3_5_processor()  # skips without its dependencies
     from PIL import Image
 
     from atom.models.qwen3_5_vl import build_qwen_vl_inputs
 
-    processor = _cached_qwen3_5_processor()
     atom_config = SimpleNamespace(
         multimodal_config=SimpleNamespace(
             model_type="qwen3_5",
