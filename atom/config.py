@@ -2076,103 +2076,87 @@ _HF_SCALAR_TYPES = (bool, int, float, str, type(None))
 _HF_UNKEYED = object()
 
 
-def _hf_keyable(value, depth: int = 0):
-    """``value``'s deterministic cache-key form, or ``_HF_UNKEYED``.
+def _hf_keyable(value):
+    """``value``'s cache-key form, or ``_HF_UNKEYED`` if it does not key.
 
-    Scalars key by value, and flat lists / tuples of scalars by their ordered
-    contents. A dict keys one level deep, by sorted key, through this same
-    rule: ``rope_parameters`` / ``rope_scaling`` holds the YaRN ``factor`` and
-    ``mscale_all_dim`` that ``deepseek_v2`` folds into ``self.scaling``, a
-    Python float the traced graph bakes in as a constant, so two checkpoints
-    that differ only there must not share an artifact. Values nested deeper
-    than one dict (a dict or a list of non-scalars inside one) key nothing.
+    A scalar keys by value, and a flat list / tuple of scalars by its ordered
+    contents. Anything else -- a nested object, a dict, a list of non-scalars
+    -- keys nothing on its own.
     """
     if isinstance(value, _HF_SCALAR_TYPES):
         return value
-    if isinstance(value, (list, tuple)):
-        if all(isinstance(item, _HF_SCALAR_TYPES) for item in value):
-            return tuple(value)
-        return _HF_UNKEYED
-    if depth == 0 and isinstance(value, Mapping):
-        entries = []
-        for key, item in sorted(value.items(), key=lambda kv: str(kv[0])):
-            keyed = _hf_keyable(item, depth=depth + 1)
-            if keyed is not _HF_UNKEYED:
-                entries.append((str(key), keyed))
-        return tuple(entries)
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, _HF_SCALAR_TYPES) for item in value
+    ):
+        return tuple(value)
     return _HF_UNKEYED
 
 
-def _hf_config_fields(config, label: str) -> tuple:
+def _hf_dict_entries(mapping) -> tuple:
+    """A dict-valued config field's sorted scalar entries, one level deep.
+
+    ``rope_parameters`` / ``rope_scaling`` is what this is for: it holds the
+    YaRN ``factor`` and ``mscale_all_dim`` that ``deepseek_v2`` folds into
+    ``self.scaling``, a Python float the traced graph bakes in as a constant,
+    so two checkpoints that differ only there must not share an artifact.
+    Entries whose value is itself a dict or a list of non-scalars key nothing,
+    and sorting by key keeps the factor independent of insertion order.
+    """
+    return tuple(
+        (str(key), keyed)
+        for key, item in sorted(mapping.items(), key=lambda kv: str(kv[0]))
+        if (keyed := _hf_keyable(item)) is not _HF_UNKEYED
+    )
+
+
+def _hf_config_fields(config) -> tuple:
     """A config's public keyable fields, sorted by name.
 
-    ``config`` is a config object, or a plain mapping: ``get_hf_config``
-    normalizes ``text_config`` into a config object on the transformers 5
-    path, but a config built by ``PretrainedConfig.from_dict`` can carry a
-    nested mapping there verbatim. Warn about anything else rather than
-    silently returning nothing for that half of the factor.
+    ``config`` is a config object, or a plain mapping: ``PretrainedConfig.from_dict``
+    can leave ``text_config`` as the raw mapping, which
+    ``_normalize_minimax_m3_text_config`` converts only for the MiniMax-M3
+    exports. Any other type raises through ``vars`` rather than silently
+    keying nothing.
     """
-    if isinstance(config, Mapping):
-        items = config.items()
-    else:
-        namespace = getattr(config, "__dict__", None)
-        if namespace is None:
-            logger.warning(
-                "hf_architecture_factor: %s has type %s, which is neither a "
-                "config object nor a mapping; its fields do not key the "
-                "compile cache",
-                label,
-                type(config).__name__,
-            )
-            return ()
-        items = namespace.items()
+    items = config.items() if isinstance(config, Mapping) else vars(config).items()
     out = []
     for name, value in sorted(items, key=lambda kv: str(kv[0])):
         name = str(name)
         if name.startswith("_"):
             continue
-        keyed = _hf_keyable(value)
-        if keyed is not _HF_UNKEYED:
-            out.append((name, keyed))
+        if isinstance(value, Mapping):
+            out.append((name, _hf_dict_entries(value)))
+        else:
+            keyed = _hf_keyable(value)
+            if keyed is not _HF_UNKEYED:
+                out.append((name, keyed))
     return tuple(out)
 
 
 def hf_architecture_factor(hf_config) -> tuple:
     """The HF model-config values that key the compile cache.
 
-    Every public scalar (and flat list/tuple of scalars) on the backbone's
-    text config, plus the top-level config when it is a different object.
-    Those values -- ``num_hidden_layers``, widths, head and expert counts,
-    per-layer patterns -- decide how many weights the traced graph takes and
-    their shapes, and scalars such as norm eps or routing scale are baked into
-    it as constants. Two checkpoints of one architecture run the same model
-    code, so without them two that differ only in such values (e.g. the layer
-    count) can hash identically.
+    Every public scalar (and flat list / tuple of scalars, and the scalar
+    entries of dict-valued fields) of the backbone's text config, plus the
+    top-level config when that is a separate object. ``num_hidden_layers``,
+    widths, head and expert counts and per-layer patterns decide how many
+    weights the traced graph takes and their shapes; scalars such as the norm
+    eps or the routing scale are baked into it as constants. Two checkpoints of
+    one architecture run the same model code, so without them two that differ
+    only in such values (e.g. the layer count) can hash identically.
 
-    Dict-valued fields key one level deep, through their scalar entries:
-    ``rope_parameters`` (or ``rope_scaling``) holds the YaRN ``factor`` and
-    ``mscale_all_dim`` that the model folds into a Python-float scaling the
-    graph bakes in, so two checkpoints that differ only there must not share
-    an artifact. A value held deeper than that keys nothing.
-
-    ``text_config`` is read whether it is a config object or a plain mapping;
-    anything else is warned about and contributes nothing.
-
-    Private attributes (``_name_or_path``, ``_commit_hash``) are skipped so the
-    key does not move with where the checkpoint is mounted, as are nested
-    objects (sub-configs, dtypes); ``quantization_config`` is keyed by
-    ``quant_config.compute_hash()`` and, as a dict on the HF config, by the
-    one-level rule above as well.
+    The rule is deliberately conservative: metadata such as
+    ``transformers_version`` keys too, which costs at most a cold compile when
+    it changes. Private attributes (``_name_or_path``, ``_commit_hash``) are
+    skipped so the key does not move with where the checkpoint is mounted, as
+    are nested objects (sub-configs, dtypes); ``quantization_config`` is keyed
+    by ``quant_config.compute_hash()`` and, as a dict on the HF config, by the
+    one-level rule as well.
     """
     text_config = getattr(hf_config, "text_config", None)
-    if text_config is None:
-        text_config = hf_config
-    if text_config is hf_config:
-        return (_hf_config_fields(hf_config, "hf_config"),)
-    return (
-        _hf_config_fields(hf_config, "hf_config"),
-        _hf_config_fields(text_config, "text_config"),
-    )
+    if text_config is None or text_config is hf_config:
+        return (_hf_config_fields(hf_config),)
+    return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
 @dataclass
@@ -3508,31 +3492,10 @@ class Config:
         # writes in both V4 and V4.1. Hash the same snapshot their caches use.
         if self.index_cache_layout is not None:
             factors.append(("index_cache_layout", self.index_cache_layout))
-        text_config = getattr(self.hf_config, "text_config", self.hf_config)
-        factors.append(
-            (
-                getattr(
-                    text_config,
-                    "use_index_cache",
-                    getattr(self.hf_config, "use_index_cache", False),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_freq",
-                    getattr(self.hf_config, "index_topk_freq", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_pattern",
-                    getattr(self.hf_config, "index_topk_pattern", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_skip_topk_offset",
-                    getattr(self.hf_config, "index_skip_topk_offset", None),
-                ),
-            )
-        )
+        # The four index-cache fields (use_index_cache, index_topk_freq,
+        # index_topk_pattern, index_skip_topk_offset) used to be hashed here;
+        # ``hf_architecture_factor`` below keys them, reading both hf_config
+        # and a separate text_config.
         # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
         # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
         # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
@@ -3578,19 +3541,17 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
-        # The factors above have no general architecture input: the checkpoint
-        # config reaches them only through the index-cache fields, the
-        # quantization settings and flags derived from it (e.g. indexer CP). Two
-        # checkpoints of one architecture share their traced code, so a 4-layer
-        # and a 61-layer DeepSeek-V4 config hashed identically and the second
-        # loaded the first's artifact ("too many values to unpack (expected 9)").
+        # The factors above read the checkpoint config only through the
+        # quantization settings and the flags derived from it (e.g. indexer
+        # CP), so without this there is no general architecture input: two
+        # checkpoints of one architecture that differ only in a scalar field
+        # (the layer count, a width) would share one artifact.
         architecture_factor = hf_architecture_factor(self.hf_config)
         factors.append(architecture_factor)
-        # This factor now moves whenever any public scalar (or one-level dict
-        # entry) of hf_config changes, including values ATOM writes there
-        # itself (rope_parameters, dspark_*, an expert_dtype probed from disk).
-        # A field that varied per run would otherwise show up only as a cold
-        # compile, with no error; logged at debug so two runs can be diffed.
+        # hf_config also carries values ATOM writes itself (rope_parameters,
+        # dspark_*, an expert_dtype probed from disk), so a value that moved
+        # between runs would otherwise show up only as a cold compile, with no
+        # error; logged at debug so two runs can be diffed.
         logger.debug("Compile cache HF architecture factor: %s", architecture_factor)
 
         hash_str = hashlib.md5(

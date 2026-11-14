@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""The compile cache key must change with the HF architecture, not just its shape."""
+
 import logging
 from types import SimpleNamespace
 
@@ -33,9 +35,16 @@ def _self_ref(cfg):
     return cfg
 
 
+def _text_config(**fields):
+    # A separate text_config, as a multimodal checkpoint's config carries it.
+    return SimpleNamespace(
+        architectures=["SomeVLM"], text_config=PretrainedConfig(**fields)
+    )
+
+
 def test_layer_count_keys_the_compile_cache():
-    # A 61-layer config started over the cache a 4-layer slice of it had just
-    # written unpacked the wrong number of graph inputs and crashed.
+    # The reported case: a 61-layer config started over the cache a 4-layer
+    # slice of it had just written.
     assert _hash(_hf(num_hidden_layers=4)) != _hash(_hf(num_hidden_layers=61))
     assert _hash(_self_ref(_hf(num_hidden_layers=4))) != _hash(
         _self_ref(_hf(num_hidden_layers=61))
@@ -60,15 +69,31 @@ def test_widths_patterns_and_constants_key_the_compile_cache():
     )
 
 
+def test_index_cache_fields_key_the_compile_cache():
+    # compute_hash hashed these four explicitly until hf_architecture_factor
+    # covered them; key them from hf_config and from a separate text_config,
+    # where a multimodal checkpoint carries them.
+    variants = {
+        "use_index_cache": (False, True),
+        "index_topk_freq": (1, 4),
+        "index_topk_pattern": (["S", "D"], ["D", "S"]),
+        "index_skip_topk_offset": (1, 2),
+    }
+    for name, (left, right) in variants.items():
+        assert _hash(_hf(**{name: left})) != _hash(_hf(**{name: right})), name
+        assert _hash(_text_config(**{name: left})) != _hash(
+            _text_config(**{name: right})
+        ), name
+
+
 def _yarn(factor=32.0, mscale_all_dim=0):
-    # transformers 5 validates YaRN and derives the implicit factor from
-    # max_position_embeddings / original_max_position_embeddings; keep the two
-    # consistent so the config builds quietly. It also normalizes the
-    # ``rope_scaling`` keyword into the ``rope_parameters`` dict ATOM reads.
+    # transformers 5 validates YaRN and needs original_max_position_embeddings
+    # inside the dict; keep it consistent with max_position_embeddings so the
+    # config builds quietly.
     return _hf(
         max_position_embeddings=8192,
-        rope_scaling={
-            "type": "yarn",
+        rope_parameters={
+            "rope_type": "yarn",
             "factor": float(factor),
             "mscale_all_dim": mscale_all_dim,
             "original_max_position_embeddings": int(8192 / factor),
@@ -77,11 +102,9 @@ def _yarn(factor=32.0, mscale_all_dim=0):
 
 
 def test_rope_dict_keys_the_compile_cache():
-    # deepseek_v2 folds the mscale derived from rope_parameters into
-    # ``self.scaling``, a Python float the graph bakes in as a constant. A key
-    # that missed the dict would run the other checkpoint's attention scale to
-    # completion -- silent wrong numerics, not the crash the layer-count case
-    # gives.
+    # The mscale becomes a graph constant (see _hf_dict_entries); a key that
+    # missed the dict ran the other checkpoint's attention scale to
+    # completion, with no error.
     assert _hash(_yarn(factor=32.0)) != _hash(_yarn(factor=16.0))
     assert _hash(_yarn(mscale_all_dim=0)) != _hash(_yarn(mscale_all_dim=1))
     # Same values, same key: keying a dict must not make the factor unstable.
@@ -97,6 +120,21 @@ def test_rope_dict_keys_the_compile_cache():
     assert _hash(a) == _hash(c)
 
 
+def test_quantization_config_keys_the_compile_cache():
+    # The stub leaves quant_config unset, so this keys through the one-level
+    # dict rule; in production quant_config.compute_hash() covers it as well.
+    base = {"quant_method": "fp8", "fmt": "e4m3"}
+    assert _hash(_hf(quantization_config=base)) != _hash(
+        _hf(quantization_config={"quant_method": "fp8", "fmt": "e5m2"})
+    )
+    assert _hash(_hf(quantization_config=base)) != _hash(
+        _hf(quantization_config={"quant_method": "mxfp4"})
+    )
+    assert _hash(_hf(quantization_config=base)) == _hash(
+        _hf(quantization_config=dict(base))
+    )
+
+
 def test_plain_dict_text_config_keys_the_compile_cache():
     # PretrainedConfig.from_dict leaves a nested ``text_config`` mapping as a
     # dict; it must be read like a config object, not silently skipped.
@@ -108,17 +146,6 @@ def test_plain_dict_text_config_keys_the_compile_cache():
         mm(rope_parameters={"factor": 16.0})
     )
     assert _hash(mm(num_hidden_layers=61)) == _hash(mm(num_hidden_layers=61))
-
-
-def test_unexpected_text_config_warns(caplog):
-    # The helper must not fall back to an empty half without saying so.
-    hf_config = SimpleNamespace(architectures=["SomeVLM"], text_config=object())
-    with caplog.at_level(logging.WARNING, logger="atom"):
-        _hash(hf_config)
-    assert any(
-        "text_config" in record.getMessage() and "object" in record.getMessage()
-        for record in caplog.records
-    )
 
 
 def test_architecture_factor_is_logged_at_debug(caplog):
