@@ -958,14 +958,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
-    # Directory rank 0 writes the online_quant_info_*.json dump to. Its own
-    # knob so that a launcher collecting the dump no longer has to hand the
-    # engine a profiler directory to get it: unset (or empty) falls back to
-    # ATOM_TORCH_PROFILER_DIR, the dump's only home before this one existed.
-    # The caller falls back to the working directory from there.
-    "ATOM_ONLINE_QUANT_INFO_DIR": lambda: (
-        _optional_path_env("ATOM_ONLINE_QUANT_INFO_DIR")
-        or _optional_path_env("ATOM_TORCH_PROFILER_DIR")
+    # Directory rank 0 writes the online_quant_info_*.json dump to, when set.
+    # Its own knob so that a launcher collecting the dump no longer has to
+    # hand the engine a profiler directory to get it.
+    "ATOM_ONLINE_QUANT_INFO_DIR": lambda: _optional_path_env(
+        "ATOM_ONLINE_QUANT_INFO_DIR"
     ),
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
@@ -1043,7 +1040,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vLLM plugin, DeepSeek-V4: directory for per-process cudagraph dispatch
     # counters (modes, overridden steps, guard trips), one JSON file per
     # process, rewritten every step. Unset: off.
-    "ATOM_V4_CG_INSTR_DIR": lambda: _optional_path_env("ATOM_V4_CG_INSTR_DIR"),
+    "ATOM_V4_CG_INSTR_DIR": lambda: os.getenv("ATOM_V4_CG_INSTR_DIR") or None,
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),

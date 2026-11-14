@@ -216,21 +216,15 @@ class TestEnvsOverrides:
         assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/oq"
 
     @pytest.mark.parametrize("value", [None, ""])
-    def test_online_quant_info_dir_falls_back_to_profiler_dir(self, monkeypatch, value):
-        # The dump lived under ATOM_TORCH_PROFILER_DIR before it had a knob of
-        # its own; unset or empty keeps landing there.
+    def test_online_quant_info_dir_reads_only_its_own_variable(
+        self, monkeypatch, value
+    ):
+        # The knob reports its own variable and nothing else; the fallback to
+        # ATOM_TORCH_PROFILER_DIR lives at the loader's one call site
+        # (tests/test_online_quant_info_dir.py pins the effective directory).
         if value is not None:
             monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", value)
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
-        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/prof"
-
-    def test_online_quant_info_dir_beats_profiler_dir(self, monkeypatch):
-        monkeypatch.setenv("ATOM_ONLINE_QUANT_INFO_DIR", "/tmp/oq")
-        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
-        assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR == "/tmp/oq"
-
-    def test_online_quant_info_dir_ignores_empty_profiler_dir(self, monkeypatch):
-        monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "")
         assert _get_envs().ATOM_ONLINE_QUANT_INFO_DIR is None
 
     def test_engram_cache_dir_override(self, monkeypatch):

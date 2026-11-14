@@ -45,36 +45,16 @@ parser.add_argument(
 )
 
 
-def resolve_profiler_dir(cli_value: str | None) -> tuple[str, str | None]:
-    """Resolve the trace directory, and the notice to print when it was not given.
-
-    The precedence is the one every other entry point uses: an explicit value,
-    then ``ATOM_TORCH_PROFILER_DIR`` (where empty reads as unset), then this
-    example's own ``./profiler_traces``. It ends with a directory rather than
-    ``None`` because the example always profiles; an empty
-    ``--torch-profiler-dir`` counts as not given, like an empty environment
-    value.
-    """
-    if cli_value:
-        return cli_value, None
-    env_dir = envs.ATOM_TORCH_PROFILER_DIR
-    if env_dir is not None:
-        return env_dir, (
-            "Warning: --torch-profiler-dir not specified, using "
-            f"ATOM_TORCH_PROFILER_DIR: {env_dir}"
-        )
-    return DEFAULT_PROFILER_DIR, (
-        "Warning: --torch-profiler-dir not specified and "
-        f"ATOM_TORCH_PROFILER_DIR unset, using default: {DEFAULT_PROFILER_DIR}"
-    )
-
-
 def main():
     args = parser.parse_args()
 
-    args.torch_profiler_dir, notice = resolve_profiler_dir(args.torch_profiler_dir)
-    if notice is not None:
-        print(notice)
+    # Flag, then the environment, then this example's own directory, the order
+    # the engine uses. An empty flag counts as unset only here; EngineArgs
+    # forwards "" to Config, which aborts on os.makedirs("").
+    args.torch_profiler_dir = (
+        args.torch_profiler_dir or envs.ATOM_TORCH_PROFILER_DIR or DEFAULT_PROFILER_DIR
+    )
+    print(f"Writing profiler traces to {args.torch_profiler_dir}")
 
     print("\nInitializing LLM engine...")
     engine_args = EngineArgs.from_cli_args(args)
