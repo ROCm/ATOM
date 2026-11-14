@@ -2389,6 +2389,8 @@ def _paged_proposer(
             kv_cache_dtype="bf16",
             decode_context_parallel_size=dcp,
             kv_cache_block_size=block_size,
+            # The draft pool's dtype, as `Config` settles it (#2962).
+            speculative_config=types.SimpleNamespace(draft_kv_dtype="bf16"),
         ),
         drafter=p,
         forward_vars={
