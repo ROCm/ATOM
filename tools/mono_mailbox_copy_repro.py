@@ -16,6 +16,7 @@ revert; do not monkeypatch `_spin` or free owners after a pending GPU operation.
 A hang is probabilistic: one completed run is not proof that it cannot recur.
 On deadline this tool retains owners and waits for the external watchdog.
 """
+
 import argparse
 import ctypes
 import gc
@@ -23,8 +24,8 @@ import hashlib
 import inspect
 import json
 import pathlib
-import time
 import sys
+import time
 import traceback
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -44,11 +45,13 @@ if not 1 <= args.repeats <= 1024 or args.deadline <= 0:
 
 
 def run_fixture(args):
+    from types import SimpleNamespace
+
     import torch
+
     from atom.kv_transfer.disaggregation.types import KVTransferRegion
     from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
     from atom.kv_transfer.offload.mooncake_store.pool import TransferSlotPool
-    from types import SimpleNamespace
     from atom.mono.device import sync
 
     def emit(value):
@@ -162,11 +165,12 @@ def run_fixture(args):
         return list(owners), hip
     keepers = []
     tag = 10
-    from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-    from atom.mono.runtime.uncached import uncached_bytes
-    from atom.mono.runtime.peer_memory import PeerBuffer
-    from atom.mono.runtime.mailboxes import StepMailboxes
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
+    from atom.mono.runtime.mailboxes import StepMailboxes
+    from atom.mono.runtime.peer_memory import PeerBuffer
+    from atom.mono.runtime.uncached import uncached_bytes
 
     assert pathlib.Path(k1.__file__).resolve().is_relative_to(root)
     assert pathlib.Path(sync.__file__).resolve().is_relative_to(root)
@@ -464,7 +468,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         for handle in handles:
             assert hip_owner.hipStreamDestroy(handle) == 0
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - retain owners even on interrupts
         # The traceback keeps run_fixture's frames (and all in-flight owners)
         # alive. No manual cleanup or successful completion on this path.
         failure = sys.exc_info()

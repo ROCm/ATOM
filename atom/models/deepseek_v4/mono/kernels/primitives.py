@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-from atom.mono.polling import POLL_SLEEP_UNITS
-
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import range_constexpr, rocdl
@@ -15,6 +13,7 @@ from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.dpp_utils import update_dpp_i32
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 _UMAX_DPP_ASM = "\n".join(
     [

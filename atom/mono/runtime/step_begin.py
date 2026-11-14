@@ -35,9 +35,9 @@ from atom.mono.device.ops import (
     traced,
 )
 from atom.mono.device.sync import DIAG_TICKS
-from atom.mono.polling import POLL_SLEEP_UNITS
 from atom.mono.plan.build_key import key_tuple, source_digest
 from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 _CURRENT_STREAM = fx.Stream(None)
 

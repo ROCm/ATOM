@@ -14,9 +14,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
-from atom.mono.polling import POLL_SLEEP_UNITS
 from atom.mono.plan.layout import DIAG_WORDS
 from atom.mono.plan.trace import Space, note
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 

@@ -22,8 +22,6 @@ from __future__ import annotations
 
 import re
 
-from atom.mono.polling import POLL_SLEEP_UNITS
-
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
@@ -51,6 +49,7 @@ from atom.mono.device.ops import (  # noqa: F401 - re-exported: the blocks impor
     traced,
     uniform,
 )
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 from ...plan import trace
 from ...target import MI355X

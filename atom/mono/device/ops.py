@@ -25,8 +25,6 @@ from __future__ import annotations
 import re
 
 import flydsl.compiler as flyc
-from atom.mono.polling import POLL_SLEEP_UNITS
-
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
@@ -39,6 +37,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.plan.execution import THREADS, WAVES
+from atom.mono.polling import POLL_SLEEP_UNITS
 
 # gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
 # scope (past the per-XCD caches); SC0 | SC1 is system scope (peers over XGMI).
