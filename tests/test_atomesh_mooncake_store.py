@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -764,6 +765,97 @@ stop_mooncake_store
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_the_prefill_node_stops_waiting_once_the_decode_node_failed(self):
+        # The decode node's owners failed to mount and its launcher exited 1:
+        # the prefill node fails within seconds rather than when its wait times
+        # out. A node that exited 0, its own rank's file, and an rc still being
+        # written (rank-rc-1.tmp, there across two polls) do not stop it.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        (run_dir / "rank-rc-2").write_text("0\n")
+        started = time.monotonic()
+        result = self.run_shell(
+            """
+(
+  for _ in $(seq 150); do
+    [[ "$(wc -l < "${STUB_DIR}/segments" 2>/dev/null)" -ge 1 ]] && break
+    sleep 0.2
+  done
+  sleep 2
+  echo 1 > "${RUN_DIR}/rank-rc-1.tmp"
+  sleep 5
+  mv "${RUN_DIR}/rank-rc-1.tmp" "${RUN_DIR}/rank-rc-1"
+) >/dev/null 2>&1 &
+start_mooncake_store
+""",
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            MOONCAKE_STORE_OWNERS="0:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="30",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="30",
+        )
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("another node's launcher exited (rank-rc-1=1)", result.stderr)
+        self.assertNotIn("rank-rc-1.tmp", result.stderr)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_a_wait_for_a_server_stops_once_another_node_failed(self):
+        # A decode node waits up to WAIT_SERVER_TIMEOUT for the router of a
+        # prefill node whose Store failed to start.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http + '\n}\nwait_http "http://127.0.0.1:9/health" router 600\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn(
+            "router: another node's launcher exited (rank-rc-0=1)", result.stderr
+        )
+
+    def test_a_wait_for_a_server_reports_its_own_failure_first(self):
+        # This node's server exited 7 and another node's launcher 1: the wait
+        # exits with the server's rc, not on the peer's.
+        source = SERVER_SCRIPT.read_text()
+        wait_http = "wait_http() {" + source.split("wait_http() {")[1].split("\n}\n")[0]
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-0").write_text("1\n")
+        result = self.run_shell(
+            wait_http
+            + "\n}\n(exit 7) &\npid=$!\nsleep 1\n"
+            + 'wait_http "http://127.0.0.1:9/health" server 600 "${pid}"\n',
+            expect_rc=7,
+            RUN_DIR=str(run_dir),
+            NODE_RANK="1",
+        )
+        self.assertIn("server process exited before becoming ready rc=7", result.stderr)
+        self.assertNotIn("another node's launcher exited", result.stderr)
+
+    def test_the_store_wait_reports_its_own_failure_first(self):
+        # An owner of this node failed to mount and another node's launcher
+        # exited 1: the wait shows the owner's log, not the peer's rc.
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        (run_dir / "rank-rc-1").write_text("1\n")
+        log = self.root / "logs" / "owner.log"
+        log.write_text("E1114 Failed to mount segment\n")
+        result = self.run_shell(
+            f'mooncake_store_logs=("{log}")\nwait_for_mooncake_store owners 30 false\n',
+            expect_rc=1,
+            RUN_DIR=str(run_dir),
+        )
+        self.assertIn("E1114 Failed to mount segment", result.stderr)
+        self.assertIn(f"mooncake-store owners: see {log}", result.stderr)
+        self.assertNotIn("another node's launcher exited", result.stderr)
 
     def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
         # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900
