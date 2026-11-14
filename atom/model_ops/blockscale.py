@@ -10,6 +10,7 @@ and spreads the reduction over every workgroup.
 import functools
 
 import torch
+import torch.nn.functional as F
 import triton
 
 from .blockscale_kernels.blockscale_gemm import (
@@ -147,6 +148,25 @@ def _fp4_split_k(m: int, n: int, k: int, device) -> int:
     return max(1, min(16, k // 1024, -(-units // blocks)))
 
 
+# AITER's gfx950 preshuffled group32 FP8 GEMM steps K in half MFMAs, K % 64 == 0
+# (``bmm_a8w8_mxscale_gfx950.check_bmm_config``). A K it cannot step (DeepSeek-V4.1's
+# shared-expert down projection at TP8: 2304 / 8 = 288) runs on a copy of the
+# weight padded with zero columns to the next multiple (``LinearBase``).
+GROUP32_K_STEP = 64
+
+
+def pad_group32_k(codes, scales, k):
+    """E4M3 ``codes`` [..., K] and their group32 E8M0 ``scales`` [..., K / 32]
+    padded in K to ``k``: zero codes under unit scales. Every padded product is
+    an exact zero, so a GEMM over the padded K sums what it sums over K."""
+    pad = k - codes.shape[-1]
+    if pad == 0:
+        return codes, scales
+    codes = F.pad(codes.view(torch.uint8), (0, pad)).view(codes.dtype)
+    scales = F.pad(scales.view(torch.uint8), (0, pad // 32), value=127)
+    return codes, scales.view(torch.float8_e8m0fnu)
+
+
 def native_quant_linear(
     x,
     weight,
@@ -181,10 +201,21 @@ def native_quant_linear(
         raise ValueError("FP4 requires row/group32 scales; FP8 accepts 1x32 or 32x32")
     n, stored_k = weight.shape
     k = stored_k * (2 if fp4 else 1)
-    if k <= 0 or k % 32 or x.shape[-1] != k or n <= 0:
+    live_k = x.shape[-1]
+    # A weight padded in K (``GROUP32_K_STEP``) takes the activations of its
+    # live K, padded here the same way: only a live K the GEMM cannot step,
+    # against a weight padded to exactly the next step.
+    padded = (
+        not fp4
+        and live_k % GROUP32_K_STEP != 0
+        and k == -(-live_k // GROUP32_K_STEP) * GROUP32_K_STEP
+    )
+    if k <= 0 or k % 32 or live_k % 32 or (live_k != k and not padded) or n <= 0:
         raise ValueError("Invalid matrix dimensions for group32 GEMM")
     if x_scale is None:
         x, x_scale = quantize_fp8(x)
+    if padded:
+        x, x_scale = pad_group32_k(x, x_scale, k)
     m = x.numel() // k
     if split_k is not None and (not isinstance(split_k, int) or split_k < 1):
         raise ValueError("split_k must be a positive integer")

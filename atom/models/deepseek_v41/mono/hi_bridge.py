@@ -88,10 +88,15 @@ def _req_words(
 
 
 @triton.jit
-def _dead_words(req, pos_out, rows, NB: tl.constexpr, BM: tl.constexpr):
+def _dead_words(
+    req, pos_out, bounds_out, rows, NB: tl.constexpr, BM: tl.constexpr, RB: tl.constexpr
+):
     """The words of the batch slots past the step's ``NB`` requests up to ``BM`` (a band's dead ones: batch id -1, not
-    live; first position 0, so their rows' reads of ATOM's RoPE caches stay in the table) and of the rows past its
-    ``rows``: not live (none of their stores reach ATOM's storage)."""
+    live; first position 0, so their rows' reads of ATOM's RoPE caches stay in the table, and bounds 0 [3, RB], as the
+    buffer starts) and of the rows past its ``rows``: not live (none of their stores reach ATOM's storage). A dead
+    request's Indexer scores the tiles its first position reaches and its TopKs rank its rows up to their bounds: an
+    earlier step's bounds left there (a request that has finished) have them poll scores no task of the launch puts,
+    a hang once they pass the first tile."""
     b = tl.arange(0, 8)
     dead = (b >= NB) & (b < BM)
     tl.store(pos_out + b, tl.zeros((8,), tl.int32), mask=dead)
@@ -100,6 +105,11 @@ def _dead_words(req, pos_out, rows, NB: tl.constexpr, BM: tl.constexpr):
     tl.store(req + 20 + b, tl.zeros((8,), tl.int32), mask=dead)
     j = tl.arange(0, 64)
     tl.store(req + 28 + j, tl.zeros((64,), tl.int32), mask=j >= rows)
+    # the dead requests' rows (the batch slots' rows up to BM's: rows a request x BM, at most RB)
+    r = tl.arange(0, RB)
+    dr = (r >= rows) & (r < BM * (rows // NB))
+    for p in tl.static_range(3):
+        tl.store(bounds_out + p * RB + r, tl.zeros((RB,), tl.int32), mask=dr)
 
 
 @triton.jit
@@ -470,7 +480,7 @@ def _begin_step_kernel(
             _req_words(b, rq, positions, batch_ids, slots, num_slots, max_pos, req, RQP)
         if pid == 0:
             tl.store(step, tl.load(step) + 1)
-            _dead_words(req, pos_out, rows, NB, BM)
+            _dead_words(req, pos_out, bounds_out, rows, NB, BM, RB)
     elif pid < n5:
         _expand_row(
             (pid - n0).to(tl.int64), hidden, hidden_stride, h_in, HIDDEN, BLOCK, NHC

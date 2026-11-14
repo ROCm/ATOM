@@ -1325,6 +1325,33 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
+    def _pad_group32_k(self):
+        """``weight_kpad`` / ``weight_scale_kpad``: a copy of this group32 FP8
+        weight padded with zero columns, preshuffled, when AITER's gfx950
+        preshuffled GEMM cannot step its K (``blockscale.GROUP32_K_STEP``).
+        ``weight`` itself stays as loaded for the readers that bind it by shape
+        (the DeepSeek-V4.1 mono kernels); a K the GEMM steps adds nothing."""
+        from aiter.jit.utils.chip_info import get_gfx
+
+        from atom.model_ops.blockscale import GROUP32_K_STEP, pad_group32_k
+
+        k = self.weight.shape[1]
+        if (
+            self.weight.dtype != dtypes.fp8
+            or k % GROUP32_K_STEP == 0
+            or get_gfx() != "gfx950"
+        ):
+            return
+        weight, scale = pad_group32_k(
+            self.weight.data,
+            self.weight_scale.data,
+            -(-k // GROUP32_K_STEP) * GROUP32_K_STEP,
+        )
+        weight = nn.Parameter(weight, requires_grad=False)
+        shuffle_weights(weight)
+        self.register_buffer("weight_kpad", weight.data, persistent=False)
+        self.register_buffer("weight_scale_kpad", scale, persistent=False)
+
     def process_weights_after_loading(self):
         """Settle the layout this weight is stored in, once.
 
@@ -1349,6 +1376,7 @@ class LinearBase(nn.Module):
                 ),
                 native_group_rows=self.native_a8_group_rows,
             ):
+                self._pad_group32_k()
                 shuffle_weights(self.weight)
             return
         if self.weight.numel() == 0:
@@ -1604,10 +1632,12 @@ class LinearBase(nn.Module):
         if self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
+            # A K the GEMM cannot step runs on the zero-padded copy.
+            weight_kpad = getattr(self, "weight_kpad", None)
             y = native_quant_linear(
                 x,
-                self.weight,
-                self.weight_scale,
+                self.weight if weight_kpad is None else weight_kpad,
+                self.weight_scale if weight_kpad is None else self.weight_scale_kpad,
                 x_scale=x_scale,
                 weight_group_rows=self.native_a8_group_rows,
                 weight_preshuffled=getattr(self.weight, "is_shuffled", False),

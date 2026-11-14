@@ -120,9 +120,10 @@ def test_the_hook_and_its_entry_modules_import():
         importlib.import_module(f"{PKG}.{entry}")
 
 
-def test_the_served_schedules_build_dual_copy_mailboxes():
-    """V4.1's schedules (MI355X, TP4) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2" regions): the
-    served programs need the run-time half of the dual-copy scratch (``runtime.dual``).
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_the_served_schedules_build_dual_copy_mailboxes(tp):
+    """V4.1's schedules (MI355X, TP2, TP4 and TP8) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2"
+    regions): the served programs need the run-time half of the dual-copy scratch (``runtime.dual``).
     """
     pytest.importorskip("flydsl")
     pytest.importorskip(
@@ -132,7 +133,7 @@ def test_the_served_schedules_build_dual_copy_mailboxes():
 
     for kind in schedules.KINDS:
         for rows in (6, 12, 24):
-            assert schedules.knobs(kind, rows)["NUMA_DUAL"] > 0, (
+            assert schedules.knobs(kind, rows, tp=tp)["NUMA_DUAL"] > 0, (
                 kind,
                 rows,
             )

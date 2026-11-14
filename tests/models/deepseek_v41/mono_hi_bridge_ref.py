@@ -37,15 +37,15 @@ def _export_rings_kernel(
 
 @triton.jit
 def _req_words_kernel(
-    positions, batch_ids, slots, num_slots, max_pos, req, pos_out, rows,
-    NB: tl.constexpr, BM: tl.constexpr, RQP: tl.constexpr,
+    positions, batch_ids, slots, num_slots, max_pos, req, pos_out, bounds_out, rows,
+    NB: tl.constexpr, BM: tl.constexpr, RQP: tl.constexpr, RB: tl.constexpr,
 ):  # fmt: skip
     """Program b: ``_req_words`` of request b (grid (NB,); ``rows`` = NB requests' rows); program 0 also
     ``_dead_words``."""
     b = tl.program_id(0)
     _req_words(b, rows // NB, positions, batch_ids, slots, num_slots, max_pos, req, RQP)
     if b == 0:
-        _dead_words(req, pos_out, rows, NB, BM)
+        _dead_words(req, pos_out, bounds_out, rows, NB, BM, RB)
 
 
 @triton.jit

@@ -1080,6 +1080,10 @@ def _sample_row(k, p, r, t):
     specs, oks = _lg_specs(k, p, r)
     copy = S_H1C // 2 + (lane % COPIES) * 256
     for s in range_constexpr(p.scan_slices):
+        if const_expr(
+            s > 0
+        ):  # (one slice: the specs above, held for level 2 as before)
+            specs, oks = _lg_specs(k, p, r, s)
         for ci in range_constexpr(len(specs)):
             if const_expr(
                 ci % SCAN_BATCH == 0
@@ -1109,6 +1113,8 @@ def _sample_row(k, p, r, t):
     # 2. level 2: the rank's masses and bests of bin B1's keys, its best above B1
     best = _i64(0, I64_MIN_HI)
     for s in range_constexpr(p.scan_slices):
+        if const_expr(p.scan_slices > 1):  # each slice's specs again, where polled
+            specs, oks = _lg_specs(k, p, r, s)
         for ci in range_constexpr(len(specs)):
             if const_expr(ci % SCAN_BATCH == 0):
                 got = mb.poll(specs[ci : ci + SCAN_BATCH], k.tag)
