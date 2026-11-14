@@ -31,7 +31,12 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
+
+from .decode_score_policy import (
+    decode_score_num_warps,
+    use_transposed_decode_score,
+)
 
 from atom.model_ops.minimax_m3.geometry import SPARSE_BLOCK_SIZE
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
@@ -665,8 +670,10 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     A count, not a size: the grid is (request, chunk), so this IS the second
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
-    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
-    is what bounds the split, and TARGET_GRID still caps the largest batches.
+    CTAs. This shared legacy policy uses DECODE_SCORE_MIN_BLOCKS to amortize
+    query loads, while TARGET_GRID caps large batches. Native gfx1250 decode
+    has a separately measured finer-split exception in _native_decode_score_chunks;
+    CP continues to use this shared policy.
 
     The round trip through the size is not redundant. The caller turns this
     count back into a size with the same cdiv, and a count that does not divide
@@ -684,11 +691,28 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
         # wait in the collective that follows.
         return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
-    # Floor the blocks one chunk walks. The query tile is loaded once outside
-    # the block loop, so at one block per chunk that fixed cost is the whole
-    # cost -- every measured regression was a chunk down to a single block.
+    # Shared legacy floor: amortize the query-tile load across several blocks.
+    # This is not a universal minimum; _native_decode_score_chunks below uses
+    # a measured one/two-block exception for small native gfx1250 grids.
     chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
+
+
+def _native_decode_score_chunks(batch: int, max_block: int) -> int:
+    """Measured native decode policy; CP keeps the shared legacy policy.
+
+    The native tiled scorer was measured on gfx1250 batch1/2. The CP scorer
+    has a different kernel and local-page traversal, so it must not inherit
+    this launch tuning without its own validation.
+    """
+    if (
+        0 < batch <= 2
+        and 0 < max_block
+        and batch * max_block <= 1024
+        and get_gfx() == "gfx1250"
+    ):
+        return max_block if batch * max_block <= 256 else triton.cdiv(max_block, 2)
+    return _decode_score_chunks(batch, max_block)
 
 
 def _require_packable(max_block: int) -> None:
@@ -1133,6 +1157,97 @@ def _decode_index_score_tiled_kernel(
         )
 
 
+# Wide-grid gfx1250 variant. It is separate so launch-limited fallback shapes
+# retain the exact original compiled kernel.
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_N": lambda args: max(
+            16, triton.next_power_of_2(args["NUM_IDX_HEADS"] * args["MAX_Q"])
+        ),
+    }
+)
+@triton.jit
+def _decode_index_score_transposed_kernel(
+    q_ptr,
+    ik_cache_ptr,
+    score_ptr,
+    block_table_ptr,
+    seq_lens,
+    head_dim,
+    sm_scale,
+    chunk_blocks,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_b,
+    stride_s_k,
+    stride_bt_b,
+    NUM_IDX_HEADS: tl.constexpr,
+    MAX_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_chunk = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens + pid_b)
+    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    chunk_start = pid_chunk * chunk_blocks
+    chunk_end = tl.minimum(chunk_start + chunk_blocks, num_blocks)
+    if chunk_start >= chunk_end:
+        return
+
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+    tok = off_n // NUM_IDX_HEADS
+    head = off_n - tok * NUM_IDX_HEADS
+    n_valid = off_n < NUM_IDX_HEADS * MAX_Q
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    d_mask = off_d < head_dim
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    row = pid_b * MAX_Q + tok
+
+    # Exchange the two non-reduction axes so converted BF16 K is WMMA's N
+    # operand. The D reduction order and FP32 accumulation stay unchanged.
+    q = tl.load(
+        q_ptr
+        + row[:, None] * stride_q_n
+        + head[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=n_valid[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    causal_len = seq_len - MAX_Q + tok + 1
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    sm_scale_log2e = sm_scale * 1.4426950409
+
+    for blk in tl.range(chunk_start, chunk_end):
+        page = tl.load(bt_row + blk).to(tl.int64)
+        k = tl.load(
+            ik_cache_ptr
+            + page * stride_ik_blk
+            + off_k[None, :] * stride_ik_pos
+            + off_d[:, None] * stride_ik_d,
+            mask=d_mask[:, None],
+            other=0.0,
+            cache_modifier=".cv",
+        )
+        qk = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * sm_scale_log2e
+        pos = blk * BLOCK_SIZE_K + off_k
+        qk = tl.where(pos[None, :] < causal_len[:, None], qk, float("-inf"))
+        score = tl.max(qk, axis=1)
+        tl.store(
+            score_ptr + head * stride_s_h + row * stride_s_b + blk * stride_s_k,
+            score,
+            mask=n_valid,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
@@ -1339,8 +1454,14 @@ def _triton_decode_score(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    num_score_chunks = _decode_score_chunks(batch, max_block)
-    _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
+    num_score_chunks = _native_decode_score_chunks(batch, max_block)
+    arch = get_gfx_runtime()
+    score_kernel = (
+        _decode_index_score_transposed_kernel
+        if use_transposed_decode_score(arch, batch, max_block, max_query_len)
+        else _decode_index_score_tiled_kernel
+    )
+    score_kernel[(batch, num_score_chunks)](
         idx_q,
         index_kv_cache,
         score,
@@ -1362,6 +1483,7 @@ def _triton_decode_score(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        num_warps=decode_score_num_warps(arch, batch, max_block, max_query_len),
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
     return score
