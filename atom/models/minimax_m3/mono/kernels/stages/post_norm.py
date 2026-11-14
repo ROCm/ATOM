@@ -65,7 +65,7 @@ def post_norm_defs(k4ctx):
     wave = k4ctx["wave"]
     front = k4ctx["front"]
     assert k4ctx["AG_RS"]
-    O_FLAG = k4ctx["o_flag"]
+    O_FLAG = k4ctx.get("o_flag", 0)
     assert not O_FLAG or N_O % 64 == 0
 
     def stage_post_norm():

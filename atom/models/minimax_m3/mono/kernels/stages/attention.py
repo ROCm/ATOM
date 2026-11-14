@@ -599,7 +599,7 @@ def o_defs(k4ctx):
     ROWS = k4ctx["ROWS"]
     SCR = k4ctx["SCR"]
     PIPE = k4ctx["pipe"]
-    O_FLAG = k4ctx["o_flag"]
+    O_FLAG = k4ctx.get("o_flag", 0)  # (the dense layer kernel shares ``o_defs``: no such build field)
     rank = k4ctx["rank"]
 
     # ================================================ 3. o_proj + attn reduce
