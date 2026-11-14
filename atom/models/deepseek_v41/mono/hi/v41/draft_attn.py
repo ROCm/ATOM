@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from functools import partial
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -313,9 +313,18 @@ def _attn(k, t, p: _BPlan):
     slot = ((slot >= 0) & (slot < nslots)).select(slot, fx.Int32(0))
     sinks = mw._sink_issue(k, p, ht)
     rcs = mw._rope_issue(k, p, pos)
-    mw._q_tile(k, p, r, ht, pos)
-    mw._rope_land(k, p, rcs)
-    _ring_land(k, p, pos_w, _ring_issue(k, p, slot, pos_w), base)
+    if p.ring_first:
+        # the window's rows need nothing of this launch (an earlier launch's context write left them): in LDS before
+        # the q poll, which would otherwise wait behind them (vector memory returns in order), so their round trip
+        # overlaps the wait for wq_b (``mla_window._ring_then_q``)
+        _ring_land(k, p, pos_w, _ring_issue(k, p, slot, pos_w), base)
+        rocdl.sched_barrier(0)  # keep the q poll after the ring's landing
+        mw._q_tile(k, p, r, ht, pos)
+        mw._rope_land(k, p, rcs)
+    else:
+        mw._q_tile(k, p, r, ht, pos)
+        mw._rope_land(k, p, rcs)
+        _ring_land(k, p, pos_w, _ring_issue(k, p, slot, pos_w), base)
     _block_keys(k, p, b)
     gpu.barrier()
     _scores_block(k, p)
@@ -340,7 +349,7 @@ class MLABlockAttn(Block):
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, pos: str, rope: str, sink: str, ring: str,
                  geo: str, slot: str, heads: int = mw.HEADS, unrope_f32: bool = False,
-                 kv8: bool = False, pipe: bool = False):  # fmt: skip
+                 kv8: bool = False, pipe: bool = False, ring_first: bool = False):  # fmt: skip
         if heads < 1:
             raise ValueError(f"MLABlockAttn {name}: heads {heads}")
         if q.fmt is not Fmt.BF16 or q.width != heads * HD or q.flagged:
@@ -371,6 +380,8 @@ class MLABlockAttn(Block):
         self.kv8 = kv8
         # the ring loads all in flight before they land (``_BPlan.pipe``: the same bits; a schedule choice)
         self.pipe = pipe
+        # the ring rows landed before the q poll (``_APlan.ring_first``: the same bits; a schedule choice)
+        self.ring_first = ring_first
 
     def plan(self, sc: Scenario) -> _BPlan:
         if not 1 <= sc.spec <= BKEYS:
@@ -378,7 +389,7 @@ class MLABlockAttn(Block):
                 f"MLABlockAttn {self.name}: a block of 1 .. {BKEYS} rows, got {sc.spec}"
             )
         return _BPlan(self.name, sc.rows, sc.spec, self.q.name, self.kvn.name, self.ring, self.pos, self.rope,
-                      self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, False, 1,
+                      self.sink, self.out.name, f"{self.name}.done", self.heads, WINDOW, self.ring_first, 1,
                       unrope_f32=self.unrope_f32, ring_arg=self.ring, geo=self.geo, slot=self.slot,
                       kv8=self.kv8, pipe=self.pipe)  # fmt: skip
 

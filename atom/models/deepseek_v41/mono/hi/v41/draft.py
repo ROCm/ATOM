@@ -585,6 +585,12 @@ STAGE_ROLES = {
 # Env ATOM_DSV41_MONO_HI_DR_RING_PIPE (0 / 1; every rank the same), off by default until a GPU A/B
 DR_RING_PIPE_ENV = "ATOM_DSV41_MONO_HI_DR_RING_PIPE"
 
+# The block attention's window rows landed in LDS before its q poll (``MLABlockAttn(ring_first=)``, the target window
+# layers' RING_FIRST: the same bits): the ring needs nothing of the stage's launch, so its round trip overlaps the
+# wait for wq_b instead of following it. Env ATOM_DSV41_MONO_HI_DR_RING_FIRST (0 / 1; every rank the same), off by
+# default until a GPU A/B
+DR_RING_FIRST_ENV = "ATOM_DSV41_MONO_HI_DR_RING_FIRST"
+
 
 def stage_blocks(
     stage: int, tp: int = 4, rows: int = 5, knobs: dict | None = None
@@ -600,6 +606,7 @@ def stage_blocks(
     # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
     kv8 = (knobs or {}).get("KV_FMT", "bf16") == "fp8"
     pipe = bool(env_int(DR_RING_PIPE_ENV, 0, 1) or 0)
+    ring_first = bool(env_int(DR_RING_FIRST_ENV, 0, 1) or 0)
     # (the draft's own chain keeps its residual replicated and its rs partials as pairs: the target's ``RESIDUAL`` /
     # ``RS_PACK`` are the target layers')
     knobs = {**(knobs or {}), "RESIDUAL": "replicated", "RS_PACK": "pair"}
@@ -613,7 +620,8 @@ def stage_blocks(
             b.name == "attn"
         ):  # (its output's inverse RoPE as the window attention's: ATTN_OUT_F32_ROPE)
             b = MLABlockAttn("attn", b.q, b.kvn, b.out, b.pos, b.rope, b.sink, "dr.ring", "dr.geo", "dr.slot",
-                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8, pipe=pipe)  # fmt: skip
+                             heads=b.heads, unrope_f32=b.unrope_f32, kv8=kv8, pipe=pipe,
+                             ring_first=ring_first)  # fmt: skip
         out.append(b)
     return out
 
