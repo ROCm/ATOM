@@ -560,6 +560,91 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+@triton.jit
+def _prefill_k_cat_kernel(
+    k_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    k_stride_t,
+    k_stride_h,
+    nope_stride_t,
+    nope_stride_h,
+    rope_stride_t,
+    num_heads,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1) * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)[:, None]
+    mask = h < num_heads
+    d_nope = tl.arange(0, NOPE_DIM)[None, :]
+    d_rope = tl.arange(0, ROPE_DIM)[None, :]
+    nope = tl.load(
+        k_nope_ptr + t * nope_stride_t + h * nope_stride_h + d_nope, mask=mask
+    )
+    rope = tl.load(k_rope_ptr + t * rope_stride_t + d_rope)
+    out = k_ptr + t * k_stride_t + h * k_stride_h
+    tl.store(out + d_nope, nope, mask=mask)
+    tl.store(
+        out + NOPE_DIM + d_rope,
+        tl.broadcast_to(rope, (HEAD_BLOCK, ROPE_DIM)),
+        mask=mask,
+    )
+
+
+_PREFILL_K_CAT_HEAD_BLOCK = 16
+
+
+def _prefill_k_cat_supported(k_nope: torch.Tensor, k_rope: torch.Tensor) -> bool:
+    return (
+        k_nope.is_cuda
+        and k_nope.dim() == 3
+        and k_rope.dim() == 3
+        and k_nope.shape[0] >= 1024
+        and k_rope.shape[:2] == (k_nope.shape[0], 1)
+        and k_rope.dtype == k_nope.dtype
+        and k_rope.device == k_nope.device
+        and k_nope.stride(-1) == 1
+        and k_rope.stride(-1) == 1
+        and triton.next_power_of_2(k_nope.shape[-1]) == k_nope.shape[-1]
+        and triton.next_power_of_2(k_rope.shape[-1]) == k_rope.shape[-1]
+    )
+
+
+def _cat_prefill_k(k_nope: torch.Tensor, k_rope: torch.Tensor) -> torch.Tensor:
+    """``torch.cat((k_nope, k_rope.expand(...)), -1)`` as one vectorized copy.
+
+    Same bytes and the same single [T, H, nope + rope] allocation; the generic
+    CatArrayBatchedCopy is several times off bandwidth on the strided kv_b_proj
+    slice.
+    """
+    if not _prefill_k_cat_supported(k_nope, k_rope):
+        return torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1)
+    tokens, heads, nope_dim = k_nope.shape
+    rope_dim = k_rope.shape[-1]
+    k = torch.empty(
+        (tokens, heads, nope_dim + rope_dim), dtype=k_nope.dtype, device=k_nope.device
+    )
+    head_block = min(_PREFILL_K_CAT_HEAD_BLOCK, triton.next_power_of_2(heads))
+    _prefill_k_cat_kernel[(tokens, triton.cdiv(heads, head_block))](
+        k,
+        k_nope,
+        k_rope,
+        k.stride(0),
+        k.stride(1),
+        k_nope.stride(0),
+        k_nope.stride(1),
+        k_rope.stride(0),
+        heads,
+        NOPE_DIM=nope_dim,
+        ROPE_DIM=rope_dim,
+        HEAD_BLOCK=head_block,
+        num_warps=1,
+    )
+    return k
+
+
 def supports_dpa_persistent_mode(
     atom_config,
     mla_modules: MLAModules,
@@ -1124,10 +1209,7 @@ class MLAAttention(nn.Module):
         """Keep K split for FP8 quantization; materialize it for BF16 attention."""
         if self._flydsl_fp8_mha_ok:
             return k_nope, None if self.rope_is_zero_pad else k_rope
-        return (
-            torch.cat((k_nope, k_rope.expand((*k_nope.shape[:-1], -1))), dim=-1),
-            None,
-        )
+        return _cat_prefill_k(k_nope, k_rope), None
 
     def _flash_attn_prefill(
         self,
