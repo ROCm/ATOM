@@ -216,8 +216,8 @@ tokenizer: AutoTokenizer | None = None
 # delivered as plain text -- said out loud at startup, never discovered here.
 tool_call_parser_cls: type | None = None
 # Whether history tool-call argument strings reach the template as sent. Read
-# off the chat template at startup (Kimi-K3 renders them verbatim), not off
-# --tool-call-parser.
+# off the chat template at startup (Kimi-K3 renders them verbatim; DeepSeek-R1/V3
+# concatenate them), not off --tool-call-parser.
 preserve_tool_call_arguments: bool = False
 # The channel `tool_choice="required"` holds output to in that format, derived
 # with it at startup; None where the format defines none (all but Kimi-K3).
@@ -3884,15 +3884,16 @@ def _setup_reasoning_and_tools(args) -> None:
         model=args.model,
         rendered_probe=tools_probe,
     )
-    preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
-    if not preserve_tool_call_arguments and template_needs_tool_call_argument_strings(
+    keeps = template_keeps_tool_call_arguments(tools_probe)
+    needs_strings = not keeps and template_needs_tool_call_argument_strings(
         tokenizer, custom_message_encoder
-    ):
-        preserve_tool_call_arguments = True
+    )
+    if needs_strings:
         logger.info(
             "The chat template renders history tool-call arguments as strings; "
             "passing them as sent."
         )
+    preserve_tool_call_arguments = keeps or needs_strings
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
 

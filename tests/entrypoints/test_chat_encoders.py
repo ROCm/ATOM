@@ -23,6 +23,7 @@ from atom.entrypoints.openai.chat_encoders import (
     resolve_reasoning_toggle,
     template_needs_tool_call_argument_strings,
 )
+from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.tool_parser.registry import resolve_tool_call_parser
 
 
@@ -425,6 +426,33 @@ class TestToolCallArgumentStrings:
         assert not template_needs_tool_call_argument_strings(
             self.Tok(self.ITERATE), None
         )
+
+    def test_a_template_that_refuses_both_forms_keeps_the_mapping(self):
+        refuses_both = (
+            "{% for m in messages %}{% for t in m.get('tool_calls', []) %}"
+            "{{ t['function']['arguments'] + 1 }}{% endfor %}{% endfor %}"
+        )
+        assert not template_needs_tool_call_argument_strings(
+            self.Tok(refuses_both), None
+        )
+
+    def test_a_chat_message_history_renders_only_with_strings(self):
+        msg = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": '{"a": 1}'},
+                }
+            ],
+        )
+        tok = self.Tok(self.CONCAT)
+        with pytest.raises(TypeError):
+            apply_chat_template(tok, None, [msg], preserve_tool_call_arguments=False)
+        out = apply_chat_template(tok, None, [msg], preserve_tool_call_arguments=True)
+        assert '{"a": 1}' in out
 
     def test_a_custom_encoder_is_not_probed(self):
         assert not template_needs_tool_call_argument_strings(
