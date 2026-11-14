@@ -1,0 +1,22 @@
+                        [--disagg-prefill-max-num-seqs DISAGG_PREFILL_MAX_NUM_SEQS]
+                        [--disagg-constrained]
+                        [--online_quant_config ONLINE_QUANT_CONFIG]
+                        [--hf-overrides HF_OVERRIDES]
+                        [--dspark-config DSPARK_CONFIG]
+                        [--dcp-config DCP_CONFIG] [--eplb-enable]
+                        [--eplb-config EPLB_CONFIG] [--host HOST]
+                        [--tool-call-parser TOOL_CALL_PARSER]
+                        [--server-port SERVER_PORT]
+                        [--timeout-keep-alive TIMEOUT_KEEP_ALIVE]
+                        [--disable-uvicorn-access-log]
+                        [--chat-template CHAT_TEMPLATE]
+                        [--default-chat-template-kwargs DEFAULT_CHAT_TEMPLATE_KWARGS]
+                        [--api-server-count API_SERVER_COUNT]
+                        [--request-log REQUEST_LOG]
+openai_server.py: error: unrecognized arguments: --tensor-parallel-size-local 4 --tensor-parallel-rank 0
+----- node1: last 5 lines -----
+                        [--chat-template CHAT_TEMPLATE]
+                        [--default-chat-template-kwargs DEFAULT_CHAT_TEMPLATE_KWARGS]
+                        [--api-server-count API_SERVER_COUNT]
+                        [--request-log REQUEST_LOG]
+openai_server.py: error: unrecognized arguments: --tensor-parallel-size-local 4 --tensor-parallel-rank 4
