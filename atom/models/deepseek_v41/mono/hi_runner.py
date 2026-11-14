@@ -124,7 +124,7 @@ from atom.models.deepseek_v41.mono.hi_draft import (
     _fp8_pool,
     _Streams,
 )
-from atom.models.deepseek_v41.mono.hi_gate import (  # noqa: F401 (REQ_ROWS re-exported)
+from atom.models.deepseek_v41.mono.hi_gate import (
     BLOCK_SIZE,
     MAX_CTX,
     REQ_ROWS,

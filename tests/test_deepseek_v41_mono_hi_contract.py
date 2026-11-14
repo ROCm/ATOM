@@ -48,3 +48,23 @@ def test_the_one_request_kv8_programs_hold(monkeypatch, tmp_path):
     assert any(n.startswith("atom_v41_draft") for n in kv8), sorted(kv8)
     assert any(n.startswith("atom_v41_consumer") for n in kv8), sorted(kv8)
     assert not [n for n, r in kv8.items() if r["scratch"] or r.get("vgpr_spill")], kv8
+
+
+def test_the_tp8_one_request_kv8_programs_hold(monkeypatch, tmp_path):
+    """TP8 (8 heads and half the experts' columns a rank) on ATOM's fp8 KV pool: the one request's verify width, the
+    one ``hi_runner.install`` builds at TP8, builds for gfx950 and holds the contract, its "_kv8" programs without
+    scratch. The Linear fits come from the frozen table, as the engine's builds read them.
+    """
+    monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "flydsl"))
+    progs = hi_contract.check(
+        hi_contract.config(str(CONFIG)), [6], tp=8, fits=False, kv_dtype="fp8"
+    )
+    kv8 = {
+        k.program.name: k.resources
+        for k in progs.kernels().values()
+        if "_kv8" in k.program.name
+    }
+    assert any(n.startswith("atom_v41_ctx_kv8") for n in kv8), sorted(kv8)
+    assert any(n.startswith("atom_v41_draft") for n in kv8), sorted(kv8)
+    assert any(n.startswith("atom_v41_consumer") for n in kv8), sorted(kv8)
+    assert not [n for n, r in kv8.items() if r["scratch"] or r.get("vgpr_spill")], kv8

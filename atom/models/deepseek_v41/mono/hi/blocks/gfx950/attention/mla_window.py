@@ -331,7 +331,11 @@ def _q_tile(k, p: _APlan, r, ht, pos):
         r0w = (r * p.heads * HD) // 2
         got = mb.poll(
             [
-                (k.mb[p.q], r0w + p.head(ht, w // (HD // 2)) * (HD // 2) + w % (HD // 2), 2)
+                (
+                    k.mb[p.q],
+                    r0w + p.head(ht, w // (HD // 2)) * (HD // 2) + w % (HD // 2),
+                    2,
+                )
                 for w in ws
             ],
             k.tag,
