@@ -19,22 +19,31 @@ class CompressorTail:
 
 
 def compress_batch(
-    cache, owner, compressor, values, scores, step, rope, *, pages, quant_mode
+    cache,
+    owner,
+    compressor,
+    values,
+    scores,
+    step,
+    rope,
+    *,
+    scatter,
+    quant_mode="none",
+    cache_scale=None,
 ):
     """Every compression boundary in the batch, through V4's fused kernel.
 
-    The kernel writes the rotated latent into `pages` (the main pool's
-    `[pages, rows, width]` view, addressed through `step.block_tables`) as
-    `quant_mode` stores a row: "none" BF16, "packed_fp8" / "packed_fp4" the
-    FP8 / FP4 pools' values then scales.
+    `scatter` supplies the value pages and block tables. For quantized caches,
+    `cache_scale` is the separate scale plane. The kernel rounds to BF16 before
+    quantizing and writes both planes directly.
 
-    Returns the post-norm PRE-RoPE latent the index key projects from, `None`
-    when no request crossed a boundary.
+    Returns the pre-RoPE index-key source, or None when the plan has no rows.
     """
     ratio = compressor.ratio
     plan = step.plans[ratio]
     kv_state, score_state = cache.compress_state(owner)
     head_dim = values.shape[-1]
+    pages, block_tables = scatter
     # Ratio 1 has no gate, and a one-element softmax weighs 1 whatever the
     # score is, so the gate input only has to be finite.
     gate = values if scores is None else scores
@@ -71,13 +80,14 @@ def compress_batch(
             cos_cache=rope.cos_cache,
             sin_cache=rope.sin_cache,
             kv_cache=pages,
-            block_tables=step.block_tables,
-            k_per_block=pages.shape[1],
+            block_tables=block_tables,
+            k_per_block=0 if pages is None else pages.shape[1],
             overlap=False,
             ratio=ratio,
             head_dim=head_dim,
             rope_head_dim=rope.rope_dim,
             quant_mode=quant_mode,
+            cache_scale=cache_scale,
             latent_out=latent,
             write_plan=plan.write_plan_gpu if ring_in_launch else None,
             prefix=f"csa2.compress_{owner}",
@@ -99,7 +109,9 @@ def compress_batch(
         overlap=False,
         prefix=f"csa2.compress_state_{owner}",
     )
-    return None if latent is None else latent.unsqueeze(0)
+    if latent is None:
+        return None
+    return latent.unsqueeze(0)
 
 
 class Compressor(nn.Module):

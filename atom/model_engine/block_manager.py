@@ -16,7 +16,6 @@ import numpy as np
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
-    MEDIUM_REMOTE,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -58,6 +57,7 @@ def _make_block_stored(
     block_size: int,
     medium: str = MEDIUM_GPU,
     token_offset: int | None = None,
+    cache_seed: int = -1,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks.
 
@@ -67,6 +67,14 @@ def _make_block_stored(
     `block_size` here is the hash block size (block_size * dcp_world_size),
     the span of one block-table entry in global tokens, so the offset must be
     computed in the same unit.
+
+    `cache_seed` is the seq's. A multimodal seq's (anything but -1) seeds its
+    whole hash chain, so no block of it can be named from its tokens alone.
+    Every block of such a seq, text-only ones included, then carries
+    `extra_keys` `((seed, 0),)`, the seed in 16 hex digits at a fixed offset 0:
+    an ATOM marker that the hash is seeded by media and the block must not be
+    matched by tokens. It borrows the shape of vLLM's `(mm_identifier, offset)`
+    pair, but not its meaning (vLLM's offset is the media's position).
     """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher
@@ -75,12 +83,18 @@ def _make_block_stored(
     assert isinstance(
         tokens, list
     ), f"BlockStored.token_ids must be a list, got {type(tokens).__name__}"
+    extra_keys = None
+    if cache_seed != -1:
+        extra_keys = [((format(cache_seed & (2**64 - 1), "016x"), 0),)] * len(hashes)
     return BlockStored(
         block_hashes=hashes,
         parent_block_hash=parent,
         token_ids=tokens,
         block_size=block_size,
+        lora_id=None,
         medium=medium,
+        lora_name=None,
+        extra_keys=extra_keys,
         token_offset=token_offset,
     )
 
@@ -2468,6 +2482,7 @@ class BlockManager:
                     store_run_parent,
                     hbs,
                     token_offset=start * hbs,
+                    cache_seed=seq.cache_seed,
                 )
             )
         pos = base + num_new_tokens
@@ -3392,6 +3407,7 @@ class BlockManager:
                             parent_hash if parent_hash != -1 else None,
                             hbs,
                             token_offset=i * hbs,
+                            cache_seed=seq.cache_seed,
                         )
                     )
 
@@ -3727,13 +3743,16 @@ class BlockManager:
         token_ids: list[int],
         parent_block_hash: int | None = None,
         token_offset: int | None = None,
+        cache_seed: int = -1,
     ) -> None:
-        """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
-        KV transfer producer (Mooncake/MoriIO decode side). Called by the
-        KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks.
+        """Emit a BlockStored for blocks received from a remote KV transfer
+        producer (Mooncake/MoriIO decode side). Called by the KVConnector
+        worker once the transfer completes so external KV-cache consumers
+        (LMCache, etc.) can track them. The KV now sits in this engine's HBM,
+        so the medium is GPU like any block computed here.
 
-        `token_offset` is the sequence position of the first remote block."""
+        `token_offset` is the sequence position of the first remote block;
+        `cache_seed` is the seq's (see `_make_block_stored`)."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -3742,7 +3761,7 @@ class BlockManager:
                 token_ids,
                 parent_block_hash,
                 self.hash_block_size,
-                medium=MEDIUM_REMOTE,
                 token_offset=token_offset,
+                cache_seed=cache_seed,
             )
         )

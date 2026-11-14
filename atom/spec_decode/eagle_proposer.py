@@ -245,6 +245,10 @@ class EagleProposer(Drafter):
                 self.config.compilation_config
             )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # The draft's attention reads its cache dtype from this config, and
+            # its pool is built at `speculative_config.draft_kv_dtype`: they
+            # must be the one value (DSpark does the same).
+            draft_atom_config.kv_cache_dtype = self.speculative_config.draft_kv_dtype
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(
