@@ -367,7 +367,7 @@ def sgpr_spill_ok(sparse: int, source: Source | None, rows: int | None = None, e
             'sgpr_spill_ok: pass the program\'s tp (``RESIDUAL`` "auto" depends on it)'
         )
     kind = schedules.kind_of(sparse, source, engram, sparse_ratio)
-    kn = schedules.knobs(kind, rows)
+    kn = schedules.knobs(kind, rows, tp=tp)
     ok = kn["SPILL_OK"]
     if ok != "auto":
         return bool(ok)
@@ -444,7 +444,7 @@ def window_layer_blocks(first: bool, split: bool = False, tp: int = 1, replay: b
     experts = EXPERTS if experts is None else experts
     topk = TOPK if topk is None else topk
     kind = schedules.kind_of(sparse, source, engram, sparse_ratio, split)
-    kn = schedules.knobs(kind, rows, over=knobs, tokens=_tokens(source))
+    kn = schedules.knobs(kind, rows, over=knobs, tokens=_tokens(source), tp=tp)
     k = SimpleNamespace(**kn)
     fold_shared = _fold_shared(tp, k.SHARED)
     if head is not None and (split or push_moe):
