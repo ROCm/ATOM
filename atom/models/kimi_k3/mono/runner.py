@@ -561,11 +561,13 @@ class K3MonoDecodeRunner:
         """This layer's aux hidden state, for a DSpark drafter tapping it.
 
         The drafter hooks ``layers[layer_id]`` (``Drafter.arm_aux_capture``),
-        and NEITHER branch above calls that module -- ``_fallback`` reruns the
-        layer's forward from its submodules -- so the hook cannot fire on a
-        mono step and the drafter would keep reading whatever the last
-        production step left in the buffer: every DSpark deployment would
-        draft from stale features.
+        or below the stage's last layer the next layer's attention residual
+        (``KimiLinearModel.aux_tap_site``). NEITHER branch above calls the
+        layer -- ``_fallback`` reruns its forward from its submodules -- and
+        only ``_seam`` calls the attention residual, which K1 does not, so the
+        hook cannot be relied on for a mono step and the drafter would keep
+        reading whatever the last production step left in the buffer: every
+        DSpark deployment would draft from stale features.
 
         The reconstruction is the layer's own ``aux_hidden_state``, called on
         this step's return rather than reimplemented, so the two cannot drift

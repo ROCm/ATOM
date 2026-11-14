@@ -8,15 +8,20 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 pytest.importorskip("aiter", reason="atom.models.kimi_k3.model imports aiter")
 
 from aiter import dtypes
 from aiter.dist import communication_op
 
+from atom.model_ops import kimi_k3 as kimi_k3_ops
+from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.kimi_k3 import attention_residual
 from atom.models.kimi_k3 import model as kimi
 from atom.mono.runtime import peer_memory
+from atom.spec_decode import drafter
+from atom.spec_decode.dspark_proposer import DSparkProposer
 from tests.models.test_kimi_k3_moe_column_tail import (  # noqa: F401
     HIDDEN,
     _blocks,
@@ -144,3 +149,90 @@ def test_layer_defers_its_gather(ranks, column_gather, tokens):  # noqa: F811
     for (gathered, _), deferred, tapped in ranks(on_rank):
         assert torch.equal(deferred, gathered)
         assert torch.equal(tapped, prefix + gathered)
+
+
+class _Layer(nn.Module):
+    """A decoder layer as a drafter's taps see it: its attention residual on
+    the previous layer's return, then its own return."""
+
+    aux_hidden_state = staticmethod(kimi.KimiDecoderLayer.aux_hidden_state)
+
+    def __init__(self, score_weight, out):
+        super().__init__()
+        self.self_attention_attn_res = AttnRes(nn.Identity(), nn.Identity())
+        self.self_attention_attn_res.score_weight = score_weight
+        self.out = out
+
+    def forward(self, previous=None):
+        if previous is not None:
+            prefix, add, add2, bank = previous
+            self.self_attention_attn_res(prefix, bank, add, add2)
+        return self.out
+
+
+class _Stage(nn.Module):
+    aux_tap_site = kimi.KimiLinearModel.aux_tap_site
+
+    def __init__(self, *layers):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+        self.start_layer, self.end_layer = 0, len(layers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="runs the Triton kernel")
+def test_tap_reads_the_next_layers_gather(monkeypatch):
+    """DSpark's tap on a layer whose column tail deferred its all-gather is
+    bitwise the all-gathered post-layer sum, read off the next layer's
+    attention residual without an all-gather of its own. The stage's last
+    layer is tapped on its own return."""
+    monkeypatch.setattr(peer_memory, "SymmetricPeerBuffer", _Peers)
+    # the kernel, where `tail_calls` puts a torch stand-in
+    monkeypatch.setattr(
+        kimi_k3_ops, "apply_attn_res", attention_residual.apply_attn_res
+    )
+
+    def all_gather(*args, **kwargs):
+        raise AssertionError("the tap all-gathered the deferred column tail")
+
+    monkeypatch.setattr(
+        communication_op, "tensor_model_parallel_all_gather", all_gather
+    )
+    ctx = SimpleNamespace(
+        is_draft=False, ubatch_token_offset=0, ubatch_token_order=None
+    )
+    monkeypatch.setattr(
+        drafter, "get_forward_context", lambda: SimpleNamespace(context=ctx)
+    )
+    rank, hidden, tokens = 3, 7168, 4
+    gather = attention_residual.PeerColumnGather(hidden, 64, rank, WORLD, None)
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=gen).bfloat16()
+
+    shares, prefix, last = (
+        randn(WORLD, tokens, gather.cols),
+        randn(tokens, hidden),
+        randn(3, tokens, hidden),
+    )
+    bank, score_weight = randn(tokens, 2, hidden), randn(hidden).float()
+    epoch, rows = gather.epochs[:tokens] + 1, torch.arange(tokens, device="cuda")
+    for src in set(range(WORLD)) - {rank}:
+        _slots(gather.scratch, gather)[epoch % 2, src, rows] = _pushed(
+            shares[src], epoch
+        )
+    stand_in = gather.defer(shares[rank]).fill_(float("nan"))  # never read
+    stage = _Stage(
+        _Layer(score_weight, (prefix, stand_in, None, bank)),
+        _Layer(score_weight, (*last, bank)),
+    )
+    taps = torch.zeros(2, tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    spec = drafter.AuxCaptureSpec((0, 1), hidden, DSparkProposer._extract_layer_hidden)
+
+    def hook(lid, extract):
+        return drafter._aux_hook(extract, lambda t, at: taps[lid].__setitem__(at, t))
+
+    drafter.install_aux_taps(stage, spec, spec.layer_ids, hook)
+    stage.layers[1](stage.layers[0]())
+    assert torch.equal(taps[0], prefix + torch.cat(list(shares), -1))
+    assert torch.equal(taps[1], last[0] + last[1] + last[2])
