@@ -107,6 +107,33 @@ def receive_success(seq, *, as_str=False):
     )
 
 
+class SizedSeq(SimpleNamespace):
+    """A request with one prompt token per block of its `block_table`."""
+
+    def __len__(self):
+        return len(self.block_table)
+
+
+NO_HIT = SimpleNamespace(num_cached_blocks=0, block_hashes=[])
+
+
+def standalone(max_bytes):
+    """A controller over a one-token-per-block pool and a full-transfer connector."""
+    connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
+    block_manager = SimpleNamespace(
+        num_pool_blocks=lambda tokens: tokens,
+        kv=SimpleNamespace(lookup=lambda h: -1),
+    )
+    return PdAdmissionController(max_bytes, 1024, connector, block_manager)
+
+
+def try_admit(policy, seq):
+    admitted, plan = policy.check(seq, NO_HIT)
+    if admitted:
+        policy.commit(seq, plan)
+    return admitted
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_ready_credit_held_until_first_batch(build, chunked):
     sched, request = build(chunked=chunked)
@@ -144,12 +171,15 @@ def test_bytes_limit_and_isolated_large_request(build, chunked):
     assert a.block_table and not b.block_table
     sched.schedule()
     assert not b.block_table
+    # B waited two passes; it is one deferred request, not two attempts.
+    assert sched.pd_admission.deferred == {"bytes": 1}
     sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     # Alone, B is admitted past the 3072-byte limit.
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert sched.pd_admission.pending_bytes == 4096
+    assert sched.pd_admission.deferred == {"bytes": 1}
 
 
 @pytest.mark.parametrize("fraction", [None, 0.25])
@@ -561,3 +591,71 @@ def test_physical_targets_are_deduplicated_and_release_is_idempotent():
     assert policy.pending_bytes == 2048
     policy.release(b)
     assert policy.pending_bytes == 0
+
+
+def test_rejected_deferred_request_leaves_no_marker():
+    policy = standalone(1024)
+    a = SizedSeq(id=1, block_table=[1])
+    b = SizedSeq(id=2, block_table=[2])
+    assert try_admit(policy, a)
+    assert not try_admit(policy, b)
+    # B is rejected from waiting without ever being admitted.
+    policy.cancel(b)
+    assert not policy._deferred_by
+
+
+def test_admission_state_is_exported_from_the_metrics_snapshot(build):
+    from queue import Queue
+
+    from atom.metrics.exporter import _AtomMetricsCollector
+    from atom.model_engine.engine_utility import EngineUtilityHandler
+    from atom.model_engine.llm_engine import LLMEngine
+
+    sched, request = build()
+    handler = EngineUtilityHandler(None, Queue(), scheduler=sched)
+    exporter = SimpleNamespace(stream_silence=lambda: 0.0, other_processes_gc=list)
+
+    def exported():
+        """The admission series a scrape serves, through the engine's DP aggregation."""
+        engine = SimpleNamespace(
+            core_mgr=SimpleNamespace(
+                latest_metrics={0: handler.collect_metrics()},
+                get_dp_router_statistics=dict,
+            )
+        )
+        snapshot = LLMEngine.get_metrics_statistics(engine)
+        return {
+            (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+            for family in _AtomMetricsCollector(exporter)._collect((snapshot, 0, 0.0))
+            for sample in family.samples
+            if sample.name.startswith("atom:pd_admission_")
+        }
+
+    # A plain `Scheduler` reports no role, which aggregation exports as "default".
+    labels = (("dp_rank", "0"), ("engine_role", "default"))
+    pending_bytes = ("atom:pd_admission_pending_kv_bytes", labels)
+    deferred = ("atom:pd_admission_deferred_total", (*labels, ("reason", "bytes")))
+
+    def pending(**counts):
+        states = {"receiving": 0, "ready": 0, "cancel_draining": 0} | counts
+        return {
+            ("atom:pd_admission_pending_requests", (*labels, ("state", s))): n
+            for s, n in states.items()
+        }
+
+    a, b = request(), request()
+    sched.extend([a, b])
+    sched.schedule()
+    sched.schedule()
+    assert exported() == pending(receiving=1) | {pending_bytes: 2048, deferred: 1}
+    sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
+    assert exported() == pending(ready=1) | {pending_bytes: 2048, deferred: 1}
+    # A's first forward returns its credit; B is admitted on the next pass.
+    sched.schedule()
+    assert exported() == pending() | {pending_bytes: 0, deferred: 1}
+    sched.schedule()
+    assert sched.abort_request(b.id)
+    # A cancelled receive keeps its credit while its writes drain.
+    assert exported() == pending(cancel_draining=1) | {pending_bytes: 2048, deferred: 1}
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={str(b.id)}))
+    assert exported() == pending() | {pending_bytes: 0, deferred: 1}

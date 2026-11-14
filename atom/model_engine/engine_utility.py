@@ -992,5 +992,12 @@ class EngineUtilityHandler:
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,
                 }
+                admission = self.scheduler.pd_admission
+                if admission is not None:
+                    result["scheduler_metrics"]["pd_admission"] = {
+                        "pending": admission.pending_states,
+                        "pending_kv_bytes": admission.pending_bytes,
+                        "deferred": dict(admission.deferred),
+                    }
 
         return result
