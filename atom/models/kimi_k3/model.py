@@ -867,6 +867,12 @@ class KimiFullAttention(nn.Module):
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+        # Otherwise (attn_res emits bf16) quantize once for both consumers.
+        self.share_input_quant = (
+            a_scheme == g_scheme
+            and a_scheme[0] in (QuantType.per_1x128, QuantType.per_Token)
+            and a_scheme[1] == dtypes.fp8
+        )
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
         # (ptpc_fp8) or per-1x128 block.
@@ -897,9 +903,20 @@ class KimiFullAttention(nn.Module):
         hidden_states_scale = None
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
+        # The indexer keeps the bf16 hidden_states.
+        proj_input = hidden_states
+        if (
+            hidden_states_scale is None
+            and self.share_input_quant
+            and self.fused_qkv_a_proj.native_a8_group_rows is None
+            and self.g_proj.native_a8_group_rows is None
+        ):
+            proj_input, hidden_states_scale = self.fused_qkv_a_proj.quantize_input(
+                hidden_states
+            )
 
         projected = torch.split(
-            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
+            self.fused_qkv_a_proj(proj_input, hidden_states_scale),
             self.projection_split_sizes,
             dim=-1,
         )
@@ -941,7 +958,7 @@ class KimiFullAttention(nn.Module):
                 projected_k_weights=(projected[3], projected[4]),
             )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
-        gate = self.g_proj(hidden_states, hidden_states_scale)
+        gate = self.g_proj(proj_input, hidden_states_scale)
         # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
         # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
