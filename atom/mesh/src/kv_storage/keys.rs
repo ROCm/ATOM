@@ -94,26 +94,33 @@ mod tests {
         );
     }
 
-    /// `cargo test --release --lib kv_storage::keys::tests::bench -- --ignored --nocapture`
+    /// `cargo test --release --lib kv_storage::keys::tests::bench -- --ignored --nocapture`;
+    /// `KV_BENCH_TOKENS` (100k) and `KV_BENCH_SAMPLES` (2000) size it.
     #[test]
     #[ignore]
     fn bench_keys_of_100k_tokens() {
-        let tokens: Vec<u32> = (0..100_000).map(|i| (i * 7919) % 150_000).collect();
-        let samples = (0..2000).map(|_| {
+        let size = |name: &str, default: usize| {
+            std::env::var(name).map_or(default, |value| value.parse().unwrap())
+        };
+        let tokens: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000) as u32)
+            .map(|i| (i * 7919) % 150_000)
+            .collect();
+        let samples = (0..size("KV_BENCH_SAMPLES", 2000)).map(|_| {
             let started = std::time::Instant::now();
             let keys = rank0_keys(
                 "atomkv1-0123456789abcdef01234567",
                 8,
                 &chunk_chain(&tokens, 256),
             );
-            assert_eq!(keys.len(), 390);
+            assert_eq!(keys.len(), tokens.len() / 256);
             started.elapsed()
         });
         let mut samples: Vec<_> = samples.collect();
         samples.sort();
         let at = |q: f64| samples[(samples.len() as f64 * q) as usize];
         println!(
-            "keys of 100k tokens in chunks of 256: p50 {:?}, p99 {:?}",
+            "keys of {} tokens in chunks of 256: p50 {:?}, p99 {:?}",
+            tokens.len(),
             at(0.5),
             at(0.99)
         );
