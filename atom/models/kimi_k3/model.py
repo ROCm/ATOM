@@ -13,11 +13,15 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.tuned_gemm import tgemm
@@ -190,6 +194,16 @@ def _is_e8m0_blockscale(
         and quant_type.value == QuantType.per_1x128.value
         and quant_config.blockscale_e8m0_scale
     )
+
+
+def _custom_all_gather_on() -> bool:
+    """Whether the TP group's all-gather takes aiter's custom kernel:
+    `ATOM_USE_CUSTOM_ALL_GATHER` on and a `ca_comm` built and enabled, both
+    fixed at group build and so alike on every rank."""
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+        return False
+    ca_comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    return ca_comm is not None and not ca_comm.disabled
 
 
 class SituAndMul(nn.Module):
@@ -524,6 +538,24 @@ class KimiSparseMoeBlock(nn.Module):
             and not tbo_active
         )
         self._use_dispatch_op = self._use_dual_stream or self.row_shardable
+        # The most rows a step runs the tail on this rank's columns (0: none);
+        # behind the split op only, so the row check stays out of traced graphs.
+        self.column_tail_rows = 0
+        if (
+            self.row_shardable
+            and self.routed_expert_norm is not None
+            and up_proj_quant_type == QuantType.No
+            and config.hidden_size % self.tp_size == 0
+        ):
+            from atom.model_ops.kimi_k3 import latent_tail
+
+            if (
+                latent_tail.fits(
+                    self.moe_hidden_size, config.hidden_size // self.tp_size
+                )
+                and _custom_all_gather_on()
+            ):
+                self.column_tail_rows = latent_tail.MAX_TOKENS
         if self._use_dispatch_op:
             # Register self so `maybe_dual_stream_split_forward` can look this module up
             # by prefix from static_forward_context (the op is Dynamo-opaque).
@@ -580,9 +612,9 @@ class KimiSparseMoeBlock(nn.Module):
         """Returns ``(first, shared)``, where ``shared`` may be None.
 
         When ``shared`` is a tensor the two branches are left unsummed and
-        ``first`` is the routed branch alone (on the row-sharded tail, the sum,
-        with ``shared`` a folded zero: unwritten, so a caller that adds it in
-        torch zeroes it first through ``materialize_folded_zeros``): the
+        ``first`` is the routed branch alone (on a row- or column-sharded tail,
+        the sum, with ``shared`` a folded zero: unwritten, so a caller that adds
+        it in torch zeroes it first through ``materialize_folded_zeros``): the
         caller's next apply_attn_res folds both into its prefix on-load, so
         deferring the add removes a whole [T, H] elementwise kernel and its HBM
         round-trip per MoE layer.
@@ -669,7 +701,7 @@ class KimiSparseMoeBlock(nn.Module):
         """
         if self.takes_row_tail(hidden_states.shape[0]):
             return self._row_sharded_split_moe_forward(hidden_states)
-        return self._assert_split(self.split_moe_forward(hidden_states))
+        return self._split_op_pair(self.split_moe_forward(hidden_states))
 
     def takes_row_tail(self, num_tokens: int) -> bool:
         """Whether a step of `num_tokens` rows runs the latent tail on this
@@ -725,18 +757,15 @@ class KimiSparseMoeBlock(nn.Module):
         return rows.gather(output)
 
     @staticmethod
-    def _assert_split(
+    def _split_op_pair(
         pair: tuple[torch.Tensor, torch.Tensor | None],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Both returns of the split op must be real tensors (its schema has no
-        optional). `_defer_shared_add` gates every call, so a None here means
-        that flag and `split_moe_forward` have drifted apart."""
-        routed, shared = pair
-        assert shared is not None, (
-            "maybe_dual_stream_split_forward requires an unsummed shared output, but "
-            "the MoE summed it; _defer_shared_add disagrees with split_moe_forward"
-        )
-        return routed, shared
+        """The split op's schema has no optional tensor, so a summed output's
+        missing addend crosses it as a folded zero."""
+        from atom.model_ops.kimi_k3.attention_residual import folded_zero_like
+
+        first, shared = pair
+        return first, folded_zero_like(first) if shared is None else shared
 
     def split_moe_forward(
         self, hidden_states: torch.Tensor
@@ -793,10 +822,14 @@ class KimiSparseMoeBlock(nn.Module):
         gate_up: torch.Tensor,
         router_logits: torch.Tensor,
         routed_input: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The latent and shared partial sums reduced by one all-reduce: the
         experts and the shared down_proj write them into one buffer, the
-        latent block first, each block contiguous as its writer requires."""
+        latent block first, each block contiguous as its writer requires.
+
+        Up to `column_tail_rows` rows, `latent_tail` runs the routed norm,
+        up-projection and shared add on this rank's columns, and an all-gather
+        hands back their sum."""
         latent_numel = routed_input.numel()
         partials = hidden_states.new_empty(latent_numel + hidden_states.numel())
         self.experts(
@@ -808,10 +841,23 @@ class KimiSparseMoeBlock(nn.Module):
             gate_up, out=partials[latent_numel:].view_as(hidden_states)
         )
         reduced = tensor_model_parallel_all_reduce(partials)
-        routed_output = self._apply_routed_norm_and_up_proj(
-            reduced[:latent_numel].view_as(routed_input)
-        )
-        return routed_output, reduced[latent_numel:].view_as(hidden_states)
+        latent = reduced[:latent_numel].view_as(routed_input)
+        shared = reduced[latent_numel:].view_as(hidden_states)
+        if self.column_tail_rows and 0 < shared.shape[0] <= self.column_tail_rows:
+            from atom.model_ops.kimi_k3.latent_tail import latent_tail
+
+            n, rank = self.hidden_dim // self.tp_size, get_tensor_model_parallel_rank()
+            cols = slice(rank * n, (rank + 1) * n)
+            output = latent_tail(
+                latent,
+                self.routed_expert_norm.weight,
+                self.routed_expert_norm.eps,
+                self.routed_expert_up_proj.weight[cols],
+                shared[:, cols],
+            )
+            output = tensor_model_parallel_all_gather(output, use_custom=True, dim=-1)
+            return output, None
+        return self._apply_routed_norm_and_up_proj(latent), shared
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Summed dual-stream dispatch target, for callers that cannot defer."""
@@ -822,7 +868,7 @@ class KimiSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Unsummed dual-stream dispatch target for `maybe_dual_stream_split_forward`."""
-        return self._assert_split(self._dual_stream_split(hidden_states))
+        return self._split_op_pair(self._dual_stream_split(hidden_states))
 
     def _dual_stream_split(
         self, hidden_states: torch.Tensor
@@ -2119,7 +2165,7 @@ class KimiDecoderLayer(nn.Module):
         layer defers its routed and shared outputs separately so that same fold
         absorbs their sum too. So add the pendings back here. Each is None on
         the layers that already folded it in, and an unwritten folded zero on
-        a row-sharded step.
+        a row- or column-sharded step.
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
