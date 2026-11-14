@@ -167,28 +167,40 @@ fn index_matches_the_naive_reference() {
     }
 }
 
+/// Walks without pause starve no writer, and two writers deadlock with no walk.
 #[test]
 fn concurrent_walks_and_writes_finish() {
     let index = PrefixIndex::default();
-    let tokens: Vec<u32> = (0..1024).collect();
+    let tokens: Vec<u32> = (0..4096).collect();
     let prefix = hash::prefix_hashes(&tokens, 1);
     let holders: Vec<HolderId> = (0..8).map(HolderId).collect();
+    let written = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        for writer in 0..2u8 {
-            let (index, prefix) = (&index, &prefix);
+        for _ in 0..4 {
+            let (index, prefix, holders, written) = (&index, &prefix, &holders, &written);
             scope.spawn(move || {
-                for round in 0..100u8 {
-                    let holder = HolderId(writer * 4 + round % 4);
-                    for op in [Op::Store, Op::Remove] {
-                        index.apply(holder, &mut prefix.iter().copied().map(op).collect());
-                    }
+                while !written.load(Ordering::Relaxed) {
+                    drop(index.find_matches(prefix, holders));
                 }
             });
         }
-        for _ in 0..4 {
-            let (index, prefix, holders) = (&index, &prefix, &holders);
-            scope.spawn(move || (0..100).for_each(|_| drop(index.find_matches(prefix, holders))));
+        let writers: Vec<_> = (0..2u8)
+            .map(|writer| {
+                let (index, prefix) = (&index, &prefix);
+                scope.spawn(move || {
+                    for round in 0..100u8 {
+                        let holder = HolderId(writer * 4 + round % 4);
+                        for op in [Op::Store, Op::Remove] {
+                            index.apply(holder, &mut prefix.iter().copied().map(op).collect());
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
         }
+        written.store(true, Ordering::Relaxed);
     });
     assert_eq!(index.stats().0, 0);
 }
@@ -332,6 +344,51 @@ async fn predictions_last_a_ttl_from_their_last_routing() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert_eq!(match_predicted(&seq, &[Some(predictor.lane())]), [Some(0)]);
+}
+
+/// A worker holds the more of what its rank's events and its predictions hold: the
+/// predictions go on where the events end, and alone stand in for missing events.
+#[tokio::test]
+async fn predictions_go_on_where_the_events_end() {
+    let ttl = Duration::from_secs(120);
+    let partition = Partition::start(4, ttl, &tokio::runtime::Handle::current());
+    let status = Arc::new(Mutex::new(SourceStatus::default()));
+    let seq: Vec<u32> = (0..17).collect();
+    let prefix = hash::prefix_hashes(&seq[..16], 4);
+    // Blocks of the events and of the predictions, by worker; `None` without a lane.
+    let held = [
+        (Some(2), Some(4)),
+        (Some(3), Some(1)),
+        (None, Some(2)),
+        (Some(1), None),
+    ];
+    let holders: Vec<_> = held
+        .iter()
+        .map(|_| partition.hold(status.clone()).unwrap())
+        .collect();
+    let predictors: Vec<_> = held
+        .iter()
+        .map(|_| partition.predict("w").unwrap())
+        .collect();
+    let store = |index: &PrefixIndex, lane: Lane, blocks: usize| {
+        index.apply(
+            lane.1,
+            &mut prefix[..blocks].iter().copied().map(Op::Store).collect(),
+        );
+        lane
+    };
+    let (events, predicted): (Vec<_>, Vec<_>) = held
+        .iter()
+        .zip(holders.iter().zip(&predictors))
+        .map(|(&(on_events, on_predicted), (holder, predictor))| {
+            (
+                on_events.map(|blocks| store(&partition.index, holder.lane(), blocks)),
+                on_predicted.map(|blocks| store(&partition.predicted, predictor.lane(), blocks)),
+            )
+        })
+        .unzip();
+    let want = [Some(16), Some(12), Some(8), Some(4)];
+    assert_eq!(match_lanes(&seq, &events, &predicted), want);
 }
 
 fn resident_bytes() -> u64 {
@@ -524,17 +581,32 @@ async fn bench_match_workers_16_workers() {
     );
 }
 
-/// One routing of a 100k-token prompt, routed again and again, as many times as the writer
-/// queues: the request's hashing, and the writer's time. `KV_BENCH_TOKENS` sizes the prompt.
+/// One routing of a 100k-token prompt, routed again and again: the request's time, each
+/// once the writer is done with the one before, and the writer's, hashing included, for
+/// routings queued at once. `KV_BENCH_TOKENS` sizes the prompt.
 #[tokio::test]
 #[ignore]
 async fn bench_predict_100k_tokens() {
-    const ROUTINGS: u32 = 256;
+    const ROUTINGS: u32 = 32;
     let ttl = Duration::from_secs(120);
     let partition = Partition::start(16, ttl, &tokio::runtime::Handle::current());
     let predictor = partition.predict("w").unwrap();
     let lanes = [Some(predictor.lane())];
     let prompt: Vec<u32> = (0..size("KV_BENCH_TOKENS", 100_000) as u32).collect();
+    let mut request = Duration::ZERO;
+    for round in 0..=ROUTINGS {
+        let last: Vec<u32> = (0..17).map(|i| (round << 20) | i).collect();
+        let started = Instant::now();
+        predictor.record(&prompt);
+        // The first only warms the allocator up.
+        if round > 0 {
+            request += started.elapsed();
+        }
+        predictor.record(&last);
+        while match_predicted(&last, &lanes) != [Some(16)] {
+            tokio::task::yield_now().await;
+        }
+    }
     let last: Vec<u32> = (0..17).rev().collect();
     let started = Instant::now();
     for _ in 1..ROUTINGS {
@@ -548,14 +620,15 @@ async fn bench_predict_100k_tokens() {
     println!(
         "predict, {} tokens: request {:?}, writer {:?}",
         prompt.len(),
-        queued / ROUTINGS,
+        request / ROUTINGS,
         (started.elapsed() - queued) / ROUTINGS
     );
 }
 
 /// Both sides of the shard locks: a prefill step's store of 512 blocks applied to a
 /// 1M-entry index, alone and while walkers query a 100k-token prompt without pause, and
-/// those walks meanwhile. `KV_BENCH_WALKERS` (0,4) lists the walker counts.
+/// those walks, alone and meanwhile. `KV_BENCH_WALKERS` (0,4) lists the walker counts;
+/// `KV_BENCH_WRITE_EVERY_US` (0) paces the writer, which otherwise writes without pause.
 #[test]
 #[ignore]
 fn bench_writer_with_walkers() {
@@ -572,7 +645,8 @@ fn bench_writer_with_walkers() {
             .map(|walkers| walkers.parse().unwrap())
             .collect()
     });
-    for walkers in counts {
+    // The walks of `walkers` walkers while `work` runs.
+    let walking = |walkers: usize, work: &mut dyn FnMut()| {
         let stop = AtomicBool::new(false);
         let walks = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
@@ -587,8 +661,24 @@ fn bench_writer_with_walkers() {
                     walks.lock().extend(samples);
                 });
             }
-            let samples = (0..500u32)
+            work();
+            stop.store(true, Ordering::Relaxed);
+        });
+        walks.into_inner()
+    };
+    for walkers in counts {
+        if walkers > 0 {
+            let walks = walking(walkers, &mut || {
+                std::thread::sleep(Duration::from_millis(500))
+            });
+            println!("walks alone, {walkers} walkers: {}", percentiles(walks));
+        }
+        let mut samples = Vec::new();
+        let pause = Duration::from_micros(size("KV_BENCH_WRITE_EVERY_US", 0) as u64);
+        let walks = walking(walkers, &mut || {
+            samples = (0..500u32)
                 .map(|round| {
+                    std::thread::sleep(pause);
                     let seq: Vec<u32> = (0..512 * 16).map(|i| round << 20 | i).collect();
                     let stores = hash::prefix_hashes(&seq, 16);
                     let started = Instant::now();
@@ -604,14 +694,13 @@ fn bench_writer_with_walkers() {
                     elapsed
                 })
                 .collect();
-            stop.store(true, Ordering::Relaxed);
-            println!(
-                "apply 512 stores, {walkers} walkers: {}",
-                percentiles(samples)
-            );
         });
+        println!(
+            "apply 512 stores, {walkers} walkers: {}",
+            percentiles(samples)
+        );
         if walkers > 0 {
-            println!("walks meanwhile: {}", percentiles(walks.into_inner()));
+            println!("walks meanwhile: {}", percentiles(walks));
         }
     }
 }
