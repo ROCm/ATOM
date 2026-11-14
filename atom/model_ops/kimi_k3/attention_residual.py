@@ -53,6 +53,31 @@ except ImportError:  # pragma: no cover
 if _HAS_TRITON:
 
     @triton.jit
+    def _mix_tile(
+        br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
+    ):
+        # One tile of the online softmax over a row's candidates; candidate B is ps.
+        o_l = i_l * BL + tl.arange(0, BL)
+        m_d = o_d < H
+        v = tl.load(
+            br_row + o_l[:, None] * stride_br_b + o_d[None, :],
+            mask=(o_l < B)[:, None] & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        v = tl.where((o_l == B)[:, None], ps[None, :], v)
+
+        # score_weight = norm_weight * proj_weight, precomputed at load time
+        rstd = tl.rsqrt(tl.sum(v * v, axis=1) / H + eps)
+        s = tl.where(o_l <= B, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf"))
+
+        b_m, b_mp = tl.maximum(b_m, tl.max(s, axis=0)), b_m
+        r = tl.exp(b_mp - b_m)  # rescale for the new max
+        p = tl.exp(s - b_m)
+        b_acc = b_acc * r + tl.sum(p, axis=0)
+        b_o = b_o * r + tl.sum(p[:, None] * v, axis=0)
+        return b_m, b_acc, b_o
+
+    @triton.jit
     def _attn_res_fused_kernel(
         br_ptr,
         ps_ptr,
@@ -137,9 +162,7 @@ if _HAS_TRITON:
         #
         # GATHER: add_hidden is the all-gather of every rank's share of it,
         # exchanged here (see PeerColumnGather). The push goes first and the
-        # poll right after the prefix load. Polling after the bank rows' tiles
-        # would hide more of the exchange, but splitting the loop changes how
-        # the compiler fuses the mix's multiply-adds, and y with it.
+        # poll waits behind the tiles of bank rows alone.
         t = tl.program_id(0)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
@@ -176,6 +199,20 @@ if _HAS_TRITON:
         if DO_ADD:
             ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
                 tl.float32
+            )
+        b_m = tl.full([], float("-inf"), dtype=tl.float32)  # running max
+        b_acc = tl.zeros([], dtype=tl.float32)  # running softmax denominator
+        b_o = tl.zeros([BD], dtype=tl.float32)  # running weighted sum
+
+        # Tiles of bank rows alone run first, with or without a gather, so the
+        # mix's multiply-adds fuse alike in both. The compiler merges a single
+        # such tile into the prefix's tile only without a gather, so then every
+        # tile waits for the prefix instead.
+        BANK_TILES: tl.constexpr = B // BL if B >= 2 * BL else 0
+        br_row = br_ptr + t * stride_br_t
+        for i_l in range(BANK_TILES):
+            b_m, b_acc, b_o = _mix_tile(
+                br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
             )
         if GATHER:
             # This rank's columns from its share, the others' from the scratch
@@ -214,30 +251,10 @@ if _HAS_TRITON:
                 mask=m_d,
             )
 
-        b_m = tl.full([], float("-inf"), dtype=tl.float32)  # running max
-        b_acc = tl.zeros([], dtype=tl.float32)  # running softmax denominator
-        b_o = tl.zeros([BD], dtype=tl.float32)  # running weighted sum
-
-        for i_l in range(tl.cdiv(Bp, BL)):
-            o_l = i_l * BL + tl.arange(0, BL)
-            m_l = o_l < Bp
-            is_last = o_l == B
-            v = tl.load(
-                br_ptr + t * stride_br_t + o_l[:, None] * stride_br_b + o_d[None, :],
-                mask=(o_l < B)[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            v = tl.where(is_last[:, None], ps[None, :], v)
-
-            # score_weight = norm_weight * proj_weight, precomputed at load time
-            rstd = tl.rsqrt(tl.sum(v * v, axis=1) / H + eps)
-            s = tl.where(m_l, tl.sum(v * sw[None, :], axis=1) * rstd, float("-inf"))
-
-            b_m, b_mp = tl.maximum(b_m, tl.max(s, axis=0)), b_m
-            r = tl.exp(b_mp - b_m)  # rescale for the new max
-            p = tl.exp(s - b_m)
-            b_acc = b_acc * r + tl.sum(p, axis=0)
-            b_o = b_o * r + tl.sum(p[:, None] * v, axis=0)
+        for i_l in range(BANK_TILES, tl.cdiv(Bp, BL)):
+            b_m, b_acc, b_o = _mix_tile(
+                br_row, stride_br_b, i_l, o_d, ps, sw, b_m, b_acc, b_o, B, H, eps, BL
+            )
 
         b_o = b_o / b_acc
         if OUT_NORM:
