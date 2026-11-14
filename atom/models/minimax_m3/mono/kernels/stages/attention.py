@@ -905,12 +905,13 @@ def o_defs(k4ctx):
                     )
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if tid < W:  # one flag a rank (lane w -> rank w)
-                mb_put(
-                    preg(peer_addr(fx.min(tid, W - 1), "attn"), SY["attnb_agf"], "attnb_agf"),
-                    t,
-                    fx.Int32(1),
-                )
+            for w in range_constexpr(W):  # a buffer resource is scalar: one rank's base a lane, not a lane-varying one
+                if tid == w:
+                    mb_put(
+                        preg(peer_addr(w, "attn"), SY["attnb_agf"], "attnb_agf"),
+                        t,
+                        fx.Int32(1),
+                    )
             gpu.barrier()
         stamp(24)
 
