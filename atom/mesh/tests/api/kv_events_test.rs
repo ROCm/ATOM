@@ -1,9 +1,9 @@
 //! With `--kv-events`, a worker registered through `/workers`, or each rank of a DP-aware
 //! one, is followed at the endpoint it reports at `/kv_event_sources` until it is
-//! removed, as `/kv_events/sources` shows. The batches are ATOM's own, from the decoder's
-//! samples.
+//! removed, as `/kv_events/sources` shows, and `cache_aware` places requests by the blocks
+//! it holds. The batches are ATOM's own, from the decoder's samples.
 
-use std::time::Duration;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -12,7 +12,8 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use serde_json::{json, Value};
+use mesh::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+use serde_json::{json, Map, Value};
 use tower::ServiceExt;
 use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
 
@@ -178,6 +179,150 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
     sources_once(&app, None, |sources| sources == &json!([])).await;
     ctx.shutdown().await;
     worker.stop().await;
+}
+
+/// The worker that served a request.
+async fn served_by(app: &Router, uri: &str, body: &Value) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.headers()["x-worker-id"].to_str().unwrap().into()
+}
+
+/// Registers a worker and waits until it is listed among `listed` workers.
+async fn register(app: &Router, url: &str, listed: usize) {
+    let (status, _) = call(app, "POST", "/workers", Some(json!({"url": url}))).await;
+    assert!(status.is_success(), "{status}");
+    for _ in 0..1500 {
+        let (_, workers) = call(app, "GET", "/workers", None).await;
+        if workers["workers"].as_array().map(Vec::len) == Some(listed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{url} was not listed");
+}
+
+/// A tokenizer that, as Llama's, puts `<s>` before the words `a` to `i`, and renders a
+/// chat as its messages' text.
+fn bos_tokenizer(dir: &Path) -> Arc<dyn Tokenizer> {
+    let words = ["<s>", "<unk>", "a", "b", "c", "d", "e", "f", "g", "h", "i"];
+    let vocab: Map<String, Value> = (words.iter().enumerate())
+        .map(|(id, word)| (word.to_string(), json!(id)))
+        .collect();
+    let special = |id: usize| {
+        json!({"id": id, "content": words[id], "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true})
+    };
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [special(0), special(1)], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}});
+    let config = json!({"add_bos_token": true, "bos_token": "<s>",
+        "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}"});
+    let path = dir.join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+    Arc::new(HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap())
+}
+
+/// ATOM's batch storing blocks of 4 `tokens` from the root, at rank 0.
+fn stored(hashes: &[u64], tokens: &[u32]) -> Bytes {
+    let event = json!({"type": "BlockStored", "block_hashes": hashes, "token_ids": tokens,
+        "block_size": 4, "medium": "GPU"});
+    let batch = rmpv::ext::to_value(json!([1.0, [event], 0])).unwrap();
+    let mut payload = Vec::new();
+    rmpv::encode::write_value(&mut payload, &batch).unwrap();
+    payload.into()
+}
+
+/// With `cache_aware`, a request whose tokens a worker's device cache holds goes to that
+/// worker, whatever the tree learned: its `input_ids`, or its prompt or chat encoded with
+/// the special tokens, as ATOM stores the blocks. One with media is placed by its text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_aware_places_requests_by_the_kv_event_index() {
+    let mut publisher = PubSocket::new();
+    let bound = publisher.bind("tcp://127.0.0.1:0").await.unwrap();
+    let port = bound.to_string().rsplit_once(':').unwrap().1.to_string();
+    let source = json!({"endpoint": format!("tcp://*:{port}"), "topic": "", "block_size": 4});
+    let mut workers = Vec::new();
+    for sources in [json!({"0": source}), json!({})] {
+        let mut worker = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let url = worker.start().await.unwrap();
+        worker.set_kv_event_sources(sources).await;
+        let id = format!("worker-{}", url.rsplit_once(':').unwrap().1);
+        workers.push((worker, url, id));
+    }
+    let mut config = TestRouterConfig::cache_aware(3991);
+    config.kv_events = true;
+    let ctx = AppTestContext::new_with_config(config, vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = bos_tokenizer(dir.path());
+    (ctx.app_context.tokenizer_registry)
+        .load("bos", "test-model", "test", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let app = ctx.create_app().await;
+    let request = json!({"input_ids": (100..112).collect::<Vec<u32>>(),
+        "sampling_params": {"max_new_tokens": 1}});
+    let text = "a b c d e f g h i";
+    let requests = [
+        ("/generate", request.clone()),
+        (
+            "/v1/completions",
+            json!({"model": "test-model", "prompt": text, "max_tokens": 1}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": text}]}),
+        ),
+    ];
+
+    // The tree learns each request on the worker without KV events, alone yet.
+    register(&app, &workers[1].1, 1).await;
+    for (uri, body) in &requests {
+        assert_eq!(served_by(&app, uri, body).await, workers[1].2);
+    }
+    register(&app, &workers[0].1, 2).await;
+    let joined = |sources: &Value| sources[0]["batches"].as_u64() > Some(0);
+    sources_once(&app, Some(&mut publisher), joined).await;
+    publish(&mut publisher, 1, sample("stored_root")).await;
+    sources_once(&app, None, |sources| sources[0]["indexed_blocks"] == 2).await;
+
+    // With media, the tree places it: an engine keys a media prompt's blocks by the media.
+    let mut media = request.clone();
+    media["image_data"] = json!("https://example.com/cat.png");
+    assert_eq!(served_by(&app, "/generate", &media).await, workers[1].2);
+    // stored_root holds tokens 100..=107, two of the request's three blocks.
+    for _ in 0..4 {
+        assert_eq!(served_by(&app, "/generate", &request).await, workers[0].2);
+    }
+    // `<s>` and a to g: two of the text's three blocks, as ATOM encodes it.
+    publish(
+        &mut publisher,
+        2,
+        stored(&[21, 22], &[0, 2, 3, 4, 5, 6, 7, 8]),
+    )
+    .await;
+    sources_once(&app, None, |sources| sources[0]["indexed_blocks"] == 4).await;
+    for (uri, body) in &requests[1..] {
+        assert_eq!(served_by(&app, uri, body).await, workers[0].2, "{uri}");
+    }
+    ctx.shutdown().await;
+    for (mut worker, _, _) in workers {
+        worker.stop().await;
+    }
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ pub mod core;
 #[cfg(feature = "ext-proc")]
 pub mod ext_proc;
 pub mod kv_events;
+mod kv_index;
 pub mod middleware;
 pub mod observability;
 pub mod policies;

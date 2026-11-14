@@ -1,10 +1,12 @@
 //! Follows the KV event stream of every registered worker rank, one task each on a thread
 //! of the monitor's own, so that decoding never holds up the request path. A task's SUB
 //! socket connects once the engine binds, and reconnects after the engine restarts.
+//! Admitted batches go to the writer of the rank's index partition, on the same threads.
 //! What each stream carried is what `/kv_events/sources` shows.
 
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -27,12 +29,26 @@ use super::{
     source::KvEventSource,
     wire::{self, DecodedBatch},
 };
+use crate::{
+    core::Worker,
+    kv_index::{match_holders, Holder, Partition, PrefixMatchProvider},
+};
 
-/// The subscriptions by worker URL.
+/// The subscriptions by worker URL, and the index partitions by model, pool and block
+/// size.
 pub struct KvEventMonitor {
     subscriptions: DashMap<String, Subscription>,
+    partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
     threads: Handle,
     runtime: Option<Runtime>,
+}
+
+impl fmt::Debug for KvEventMonitor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvEventMonitor")
+            .field("subscriptions", &self.subscriptions.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for KvEventMonitor {
@@ -46,6 +62,9 @@ impl Drop for KvEventMonitor {
 
 struct Subscription {
     status: Arc<Mutex<SourceStatus>>,
+    /// The rank's lane, when its partition had one left. The task holds it too, and the
+    /// lane is freed once both let go of it.
+    holder: Option<Arc<Holder>>,
     task: JoinHandle<()>,
 }
 
@@ -79,6 +98,8 @@ pub struct SourceStatus {
     pub dropped_events: BTreeMap<DropReason, u64>,
     /// Payloads that are not a batch of this rank.
     pub dropped_batches: u64,
+    /// The rank's blocks in the router's index; null when its partition had no lane left.
+    pub indexed_blocks: Option<u64>,
 }
 
 impl KvEventMonitor {
@@ -90,13 +111,22 @@ impl KvEventMonitor {
             .build()?;
         Ok(Self {
             subscriptions: DashMap::new(),
+            partitions: DashMap::new(),
             threads: runtime.handle().clone(),
             runtime: Some(runtime),
         })
     }
 
-    /// Follows `source` as `worker`'s stream, in place of any earlier one.
-    pub fn attach(&self, worker: &str, model_id: &str, dp_rank: u32, source: KvEventSource) {
+    /// Follows `source` as `worker`'s stream, in place of any earlier one, and indexes it
+    /// with the other ranks of the model in the worker's pool.
+    pub fn attach(
+        &self,
+        worker: &str,
+        model_id: &str,
+        pool: &'static str,
+        dp_rank: u32,
+        source: KvEventSource,
+    ) {
         info!(worker, dp_rank, endpoint = %source.endpoint, "Following KV events");
         let status = Arc::new(Mutex::new(SourceStatus {
             worker: worker.into(),
@@ -105,8 +135,29 @@ impl KvEventMonitor {
             source: source.clone(),
             ..Default::default()
         }));
-        let task = self.threads.spawn(follow(source, dp_rank, status.clone()));
-        let subscription = Subscription { status, task };
+        let partition = self
+            .partitions
+            .entry((model_id.into(), pool, source.block_size))
+            .or_insert_with(|| Partition::start(source.block_size, &self.threads))
+            .clone();
+        let holder = partition.hold(status.clone()).map(Arc::new);
+        match &holder {
+            Some(_) => status.lock().indexed_blocks = Some(0),
+            None => warn!(
+                worker,
+                model_id,
+                pool,
+                "Not indexing the rank's KV events: the 64 lanes of its model and pool are taken"
+            ),
+        }
+        let task = self
+            .threads
+            .spawn(follow(source, dp_rank, status.clone(), holder.clone()));
+        let subscription = Subscription {
+            status,
+            holder,
+            task,
+        };
         self.subscriptions.insert(worker.into(), subscription);
     }
 
@@ -126,7 +177,31 @@ impl KvEventMonitor {
     }
 }
 
-async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceStatus>>) {
+impl PrefixMatchProvider for KvEventMonitor {
+    fn match_workers(&self, tokens: &[u32], workers: &[Arc<dyn Worker>]) -> Vec<Option<u32>> {
+        let lanes: Vec<_> = workers
+            .iter()
+            .map(|worker| {
+                let subscription = self.subscriptions.get(worker.url())?;
+                // A stream that could not start tells nothing of the rank's cache.
+                let followed = !subscription.task.is_finished();
+                subscription
+                    .holder
+                    .as_ref()
+                    .filter(|_| followed)
+                    .map(|h| h.lane())
+            })
+            .collect();
+        match_holders(tokens, &lanes)
+    }
+}
+
+async fn follow(
+    source: KvEventSource,
+    dp_rank: u32,
+    status: Arc<Mutex<SourceStatus>>,
+    holder: Option<Arc<Holder>>,
+) {
     let mut options = SocketOptions::default();
     options.no_connect_timeout();
     let mut socket = SubSocket::with_options(options);
@@ -157,7 +232,10 @@ async fn follow(source: KvEventSource, dp_rank: u32, status: Arc<Mutex<SourceSta
             message = socket.recv() => match message {
                 Ok(message) => {
                     let batch = batch(&message.into_vec(), source.block_size, dp_rank);
-                    record(&mut status.lock(), &mut admission, batch);
+                    let admitted = record(&mut status.lock(), &mut admission, batch);
+                    if let (Some(holder), Some((reset, events))) = (&holder, admitted) {
+                        holder.write(reset, events).await;
+                    }
                 }
                 // The socket reconnects by itself.
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -182,11 +260,13 @@ fn batch(frames: &[Bytes], block_size: u32, dp_rank: u32) -> Result<(u64, Decode
     }
 }
 
+/// Counts a batch, and returns its events if admitted, with whether to clear the rank's
+/// holder first.
 fn record(
     status: &mut SourceStatus,
     admission: &mut RankState,
     batch: Result<(u64, DecodedBatch), String>,
-) {
+) -> Option<(bool, Vec<KvEvent>)> {
     let (seq, batch) = match batch {
         Ok(batch) => batch,
         Err(e) => {
@@ -194,11 +274,12 @@ fn record(
             if status.dropped_batches == 1 {
                 warn!(worker = %status.worker, error = %e, "Dropping KV event batches");
             }
-            return;
+            return None;
         }
     };
     let clears = batch.events.contains(&KvEvent::Cleared);
-    if admission.admit(seq, clears) == Admit::ClearAndApply {
+    let reset = admission.admit(seq, clears) == Admit::ClearAndApply;
+    if reset {
         info!(worker = %status.worker, seq, last_seq = ?status.last_seq, "KV event stream restarted or lost batches");
         status.resets += 1;
     }
@@ -209,7 +290,7 @@ fn record(
     status.batches += 1;
     for event in &batch.events {
         match event {
-            KvEvent::Stored { hashes } => status.stored_blocks += hashes.len() as u64,
+            KvEvent::Stored { blocks, .. } => status.stored_blocks += blocks.len() as u64,
             KvEvent::Removed { hashes } => status.removed_blocks += hashes.len() as u64,
             KvEvent::Cleared => status.clears += 1,
         }
@@ -217,6 +298,7 @@ fn record(
     for reason in batch.dropped {
         *status.dropped_events.entry(reason).or_default() += 1;
     }
+    Some((reset, batch.events))
 }
 
 #[cfg(test)]
@@ -225,7 +307,7 @@ mod tests {
     use zeromq::{PubSocket, SocketSend, ZmqMessage};
 
     use super::*;
-    use crate::kv_events::wire::tests::encode;
+    use crate::{core::BasicWorkerBuilder, kv_events::wire::tests::encode};
 
     const WORKER: &str = "http://127.0.0.1:8000@1";
     const CLEAR: &str = r#"[{"type": "AllBlocksCleared"}]"#;
@@ -266,6 +348,21 @@ mod tests {
         panic!("timed out at {:?}", status(monitor));
     }
 
+    /// Waits for the writer, which applies a batch after the batch is counted, to leave the
+    /// rank with `blocks` indexed, the first `hit` tokens of 1..=10 among them.
+    async fn indexed(monitor: &KvEventMonitor, blocks: u64, hit: u32) {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(WORKER).build());
+        let tokens: Vec<u32> = (1..=10).collect();
+        for _ in 0..500 {
+            let matched = monitor.match_workers(&tokens, std::slice::from_ref(&worker));
+            if status(monitor).indexed_blocks == Some(blocks) && matched == [Some(hit)] {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("not indexed at {:?}", status(monitor));
+    }
+
     /// Publishes the startup clear, as every publisher does at seq 0, until `done` holds:
     /// what is published before a subscription reaches the publisher is lost.
     async fn clear_until(
@@ -300,7 +397,7 @@ mod tests {
             block_size: 4,
         };
         // Registered before its engine binds, as a worker whose HTTP server is up first.
-        monitor.attach(WORKER, "model", 1, source);
+        monitor.attach(WORKER, "model", "regular", 1, source);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!status(&monitor).connected);
         let mut publisher = bind(&endpoint).await;
@@ -312,9 +409,14 @@ mod tests {
             {"type": "BlockRemoved", "block_hashes": [12], "medium": "CPU"}]"#;
         publish(&mut publisher, "kv", 1, stored, 1).await;
         publish(&mut publisher, "other", 2, stored, 1).await;
+        indexed(&monitor, 2, 8).await;
+        // Without its first block, the chain matches nothing.
         publish(&mut publisher, "kv", 2, removed, 1).await;
+        indexed(&monitor, 1, 0).await;
+        // The gap before seq 5 clears the holder before the blocks are stored again.
         publish(&mut publisher, "kv", 3, stored, 7).await;
         publish(&mut publisher, "kv", 5, stored, 1).await;
+        indexed(&monitor, 2, 8).await;
         let status = status_once(&monitor, |s| s.last_seq == Some(5)).await;
         assert_eq!(status.batches - base.batches, 3);
         assert_eq!((status.stored_blocks, status.removed_blocks), (4, 1));
@@ -338,6 +440,34 @@ mod tests {
 
         monitor.detach(WORKER);
         assert!(monitor.sources().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_cannot_start_keeps_its_lane_and_matches_nothing() {
+        const OTHER: &str = "http://127.0.0.1:8001@1";
+        let monitor = KvEventMonitor::start().unwrap();
+        let source = |endpoint: &str| KvEventSource {
+            endpoint: endpoint.into(),
+            topic: "kv".into(),
+            block_size: 4,
+        };
+        monitor.attach(WORKER, "model", "regular", 1, source("not an endpoint"));
+        status_once(&monitor, |s| s.error.is_some()).await;
+        // Time for a lane given up too early to be freed by the writer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        monitor.attach(OTHER, "model", "regular", 1, source("tcp://127.0.0.1:1"));
+        let lane = |worker: &str| {
+            let subscription = monitor.subscriptions.get(worker).unwrap();
+            subscription.holder.as_ref().unwrap().lane().1
+        };
+        assert_ne!(lane(WORKER), lane(OTHER));
+        let workers: Vec<Arc<dyn Worker>> = [WORKER, OTHER]
+            .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
+            .into();
+        assert_eq!(
+            monitor.match_workers(&[1, 2, 3, 4], &workers),
+            [None, Some(0)]
+        );
     }
 
     #[test]

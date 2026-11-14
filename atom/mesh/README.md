@@ -256,7 +256,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load, workers without indexed events and the ext-proc path stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 

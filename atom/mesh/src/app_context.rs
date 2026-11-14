@@ -263,6 +263,12 @@ impl AppContextBuilder {
                 tracing::error!(error = %e, "Cannot start the KV event monitor's thread");
                 AppContextBuildError("kv_event_monitor")
             })?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError("policy_registry"))?;
+        if let Some(monitor) = &kv_event_monitor {
+            policy_registry.set_kv_events(monitor.clone());
+        }
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
@@ -277,9 +283,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError("policy_registry"))?,
+            policy_registry,
             router_manager: self.router_manager,
             response_storage: self
                 .response_storage

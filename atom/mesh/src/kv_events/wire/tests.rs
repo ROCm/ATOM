@@ -15,16 +15,19 @@ const SAMPLES: &str = include_str!(concat!(
 const EXPECTED: &str = r#"
 startup_clear         | rank 0: cleared
 stored_root           | rank 0: stored 2
-stored_child          | rank 0: stored 1
+stored_child          | rank 0: stored 1 child
 removed               | rank 0: removed 1; removed 1; removed 1
-remote_kv_gpu         | rank 0: stored 2
+remote_kv_gpu         | rank 0: stored 2 child
 multimodal_extra_keys | rank 0: drop namespace
 dp_rank_2             | rank 2: stored 2
 "#;
 
 fn render(batch: &DecodedBatch) -> String {
     let events = batch.events.iter().map(|event| match event {
-        KvEvent::Stored { hashes } => format!("stored {}", hashes.len()),
+        KvEvent::Stored { parent, blocks } => {
+            let child = if parent.is_some() { " child" } else { "" };
+            format!("stored {}{child}", blocks.len())
+        }
         KvEvent::Removed { hashes } => format!("removed {}", hashes.len()),
         KvEvent::Cleared => "cleared".into(),
     });
@@ -42,15 +45,21 @@ fn unhex(hex: &str) -> Vec<u8> {
     (0..hex.len()).step_by(2).map(byte).collect()
 }
 
-/// The block hashes of each event.
-type Keys = Vec<Vec<u64>>;
+/// Hashes, parent and tokens of each event.
+type Keys = Vec<(Vec<u64>, Option<u64>, Vec<u64>)>;
 
 fn decoded_keys(batch: &DecodedBatch) -> Keys {
     let keys = |event: &KvEvent| match event {
-        KvEvent::Stored { hashes } | KvEvent::Removed { hashes } => {
-            hashes.iter().map(|hash| hash.0).collect()
-        }
-        KvEvent::Cleared => vec![],
+        KvEvent::Stored { parent, blocks } => (
+            blocks.iter().map(|block| block.hash.0).collect(),
+            parent.map(|hash| hash.0),
+            blocks
+                .iter()
+                .flat_map(|block| block.tokens.iter().map(|&token| token.into()))
+                .collect(),
+        ),
+        KvEvent::Removed { hashes } => (hashes.iter().map(|hash| hash.0).collect(), None, vec![]),
+        KvEvent::Cleared => Default::default(),
     };
     batch.events.iter().map(keys).collect()
 }
@@ -63,11 +72,16 @@ fn input_keys(events: &Json) -> Keys {
             .unwrap_or_else(|| value.as_i64().unwrap() as u64)
     };
     let keys = |event: &Json| {
-        let hashes = event["block_hashes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        hashes.iter().map(hash).collect()
+        let list = |field: &str| event[field].as_array().cloned().unwrap_or_default();
+        let parent = Some(&event["parent_block_hash"]).filter(|parent| !parent.is_null());
+        (
+            list("block_hashes").iter().map(hash).collect(),
+            parent.map(hash),
+            list("token_ids")
+                .iter()
+                .map(|t| t.as_u64().unwrap())
+                .collect(),
+        )
     };
     events.as_array().unwrap().iter().map(keys).collect()
 }
@@ -129,12 +143,21 @@ fn only_the_device_tier_of_the_full_attention_group_is_followed() {
             r#", "extra_keys": [null], "lora_id": null"#,
             "rank 0: stored 1",
         ),
+        (r#", "parent_block_hash": -1"#, "rank 0: stored 1 child"),
     ] {
         let batch = decode_json(&stored(fields), 4).unwrap();
         assert_eq!(render(&batch), want, "{fields}");
     }
     let other_size = decode_json(&stored(""), 8).unwrap();
     assert_eq!(render(&other_size), "rank 0: drop blocksize");
+    let parent = decode_json(&stored(r#", "parent_block_hash": -1"#), 4).unwrap();
+    assert!(matches!(
+        &parent.events[0],
+        KvEvent::Stored {
+            parent: Some(EngineHash(u64::MAX)),
+            ..
+        }
+    ));
     let negative = r#"[1.0, [{"type": "BlockRemoved", "block_hashes": [-1]}]]"#;
     assert_eq!(
         decode_json(negative, 4).unwrap().events,
