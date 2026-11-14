@@ -2288,6 +2288,11 @@ def _attach_column_gather(layers) -> None:
         moe.column_gather = gather
 
 
+def _prefix_out(output: tuple, _attn_res: nn.Module) -> torch.Tensor:
+    """`AttnRes.forward`'s running sum, from its ``(mixed, prefix_out)``."""
+    return output[1]
+
+
 @token_graph
 @support_torch_compile
 class KimiLinearModel(nn.Module):
@@ -2371,6 +2376,19 @@ class KimiLinearModel(nn.Module):
         tokens, hidden = hidden_states.shape
         blocks = -(-self.config.num_hidden_layers // block_size)
         return hidden_states.new_empty(tokens, blocks, hidden)
+
+    def aux_tap_site(self, layer_id: int):
+        """``(module, extract)`` a drafter taps for layer ``layer_id``'s
+        post-layer hidden state, or None to tap the layer itself.
+
+        The next layer's attention residual forms that sum as its
+        ``prefix_out``, after its kernel gathers a deferred column tail; the
+        layer's own return would all-gather that tail a second time
+        (``KimiDecoderLayer.aux_hidden_state``). The stage's last layer has no
+        next layer here."""
+        if not self.start_layer <= layer_id < self.end_layer - 1:
+            return None
+        return self.layers[layer_id + 1].self_attention_attn_res, _prefix_out
 
     def forward(
         self,

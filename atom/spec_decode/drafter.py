@@ -205,7 +205,8 @@ def install_aux_taps(
     must be strictly increasing and each in {-1} U [0, n_layers). Each id
     resolves to a (module, extract) tap: -1 taps the embedding output
     (hidden_states[0], taken verbatim); k taps decoder layer k through
-    ``spec.extract``.
+    ``spec.extract``, or for an output tap the module and extract the target's
+    ``aux_tap_site(k)`` names instead.
     """
     layers = _resolve_decoder_layers(target_model)
     n_layers = len(layers)
@@ -221,12 +222,16 @@ def install_aux_taps(
                 f"{spec.layer_ids}."
             )
         prev = lid
+    tap_site = _descend_wrappers(
+        target_model, lambda m: getattr(m, "aux_tap_site", None)
+    )
     for lid in layer_ids:
-        module, extract = (
-            (_resolve_embedding(target_model), _identity_extract)
-            if lid == -1
-            else (layers[lid], spec.extract)
-        )
+        if lid == -1:
+            module, extract = _resolve_embedding(target_model), _identity_extract
+        elif spec.capture == "output" and tap_site and (site := tap_site(lid)):
+            module, extract = site
+        else:
+            module, extract = layers[lid], spec.extract
         hook = make_hook(lid, extract)
         if lid != -1 and spec.capture == "input":
 
