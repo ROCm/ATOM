@@ -733,7 +733,9 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     seq, request = start_engine_load(engine)
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
-    assert engine.block_manager.kv.num_free == 31
+    # One fewer than the pool's 41: block 0 is the null page under PAGE
+    # checkpoints (`BlockPool.reserve_null_block`).
+    assert engine.block_manager.kv.num_free == 30
 
     batch, scheduled = engine.schedule()
     assert scheduled == {} and batch.connector_meta_output.requests == []
@@ -750,7 +752,7 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
         KVConnectorOutput(finished_loading={request.load_operation})
     )
     # The three transfer units remain as an unpinned READY checkpoint.
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == 30
     assert engine.block_manager.paged_state_checkpoints.contains(
         request.native_state.prefix_hash
     )
@@ -884,7 +886,7 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert engine.deferred_free_blocks[seq.id] is seq
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == 30  # block 0 reserved
 
     kwargs = {
         "finished_loading" if succeeded else "failed_loading": {request.load_operation}
@@ -893,7 +895,7 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert seq.id not in engine.deferred_free_blocks
     assert list(seq.block_table) == []
     assert seq.state_slot == -1
-    expected_free = 37 if succeeded else 40
+    expected_free = 36 if succeeded else 39  # block 0 reserved
     assert engine.block_manager.kv.num_free == expected_free
     assert (
         engine.block_manager.paged_state_checkpoints.contains(
@@ -972,7 +974,7 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector.has_pending_work()
     engine._update_from_kv_xfer_finished(KVConnectorOutput())
     assert seq.id not in engine.deferred_free_blocks
-    assert bm.kv.num_free == 40
+    assert bm.kv.num_free == 39  # all 41 minus the reserved null block 0
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()

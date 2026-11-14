@@ -3934,7 +3934,7 @@ class TestTheCacheCannotStarveLiveKv:
         cache can put the pool in.
         """
         bm = make_block_manager(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         checkpoints = bm.paged_state_checkpoints
@@ -3998,7 +3998,7 @@ class TestTheCacheCannotStarveLiveKv:
         possible once the pinned image becomes spendable again.
         """
         scheduler = make_scheduler(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         # The same pinned pool as the tests above, built inside a scheduler,
