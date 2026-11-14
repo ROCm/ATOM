@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -22,16 +22,17 @@ use tracing::warn;
 
 use super::{
     hash,
-    index::{HolderTable, Op, PrefixIndex},
+    index::{find_matches, HolderTable, Op, PrefixIndex},
     HolderId, PrefixHash,
 };
 use crate::kv_events::{model::KvEvent, SourceStatus};
 
 /// Admitted batches a partition's writer may fall behind by before its ranks wait.
 const QUEUED_BATCHES: usize = 1024;
-/// Routed prompts the writer may fall behind by before more are dropped, each its prefix
-/// hashes, 8 bytes a block.
+/// Routed prompts the writer may fall behind by before more are dropped.
 const QUEUED_PREDICTIONS: usize = 256;
+/// Their tokens, 4 bytes each, the writer may fall behind by: 64 MB.
+const QUEUED_PREDICTION_TOKENS: usize = 1 << 24;
 /// Blocks one worker's predictions may hold, as many as a rank's events.
 const MAX_PREDICTED_BLOCKS: usize = 1 << 22;
 
@@ -49,6 +50,8 @@ pub(crate) struct Partition {
     crowded: AtomicBool,
     /// Apart from `writes`, so that routing never delays a rank's batches.
     predictions: mpsc::Sender<Write>,
+    /// Tokens of the prompts queued in `predictions`.
+    queued_tokens: AtomicUsize,
 }
 
 enum Write {
@@ -61,8 +64,8 @@ enum Write {
     },
     /// The rank is no longer followed: its blocks leave the index and its lane is free.
     Release(HolderId),
-    /// The prefix hashes of a prompt routed to the worker on the prediction lane.
-    Predict(HolderId, Vec<PrefixHash>),
+    /// The tokens of a prompt routed to the worker on the prediction lane.
+    Predict(HolderId, Vec<u32>),
     /// The worker's predictions leave the index and its lane is free.
     Unpredict(HolderId),
 }
@@ -82,6 +85,7 @@ impl Partition {
             predicting: Mutex::new(0),
             crowded: AtomicBool::new(false),
             predictions,
+            queued_tokens: AtomicUsize::new(0),
         });
         runtime.spawn(write(partition.clone(), batches, routed, ttl));
         partition
@@ -170,14 +174,23 @@ impl Predictor {
         (self.partition.clone(), self.id)
     }
 
-    /// Predicts the full blocks of a prompt routed to the worker; dropped while the writer
-    /// is behind, so that routing never waits for it.
+    /// Predicts the full blocks of a prompt routed to the worker, which the writer hashes;
+    /// dropped while the writer is behind, so that routing never waits for it.
     pub(crate) fn record(&self, tokens: &[u32]) {
-        let prefix = hash::prefix_hashes(tokens, self.partition.block_size);
-        let _ = self
-            .partition
-            .predictions
-            .try_send(Write::Predict(self.id, prefix));
+        let partition = &self.partition;
+        let queued = partition
+            .queued_tokens
+            .fetch_add(tokens.len(), Ordering::Relaxed);
+        let sent = queued + tokens.len() <= QUEUED_PREDICTION_TOKENS
+            && partition
+                .predictions
+                .try_send(Write::Predict(self.id, tokens.to_vec()))
+                .is_ok();
+        if !sent {
+            partition
+                .queued_tokens
+                .fetch_sub(tokens.len(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -265,10 +278,13 @@ async fn write(
                 }
                 *partition.lanes.lock() &= !(1 << holder.0);
             }
-            Write::Predict(lane, prefix) => {
+            Write::Predict(lane, tokens) => {
+                partition
+                    .queued_tokens
+                    .fetch_sub(tokens.len(), Ordering::Relaxed);
                 let until = Instant::now() + ttl;
                 let blocks = predicted.entry(lane).or_default();
-                for hash in prefix {
+                for hash in hash::prefix_hashes(&tokens, partition.block_size) {
                     if let Some(last) = blocks.get_mut(&hash) {
                         *last = until;
                     } else if blocks.len() < MAX_PREDICTED_BLOCKS {
@@ -293,8 +309,8 @@ async fn write(
 pub(crate) type Lane = (Arc<Partition>, HolderId);
 
 /// The leading tokens of `tokens` each worker holds, the more of what its rank's events
-/// and its predictions hold, in the order of the lanes: one hashing per partition, and one
-/// walk of each of its indexes.
+/// and its predictions hold, in the order of the lanes: one hashing and one walk of both
+/// indexes per partition.
 pub(crate) fn match_lanes(
     tokens: &[u32],
     events: &[Option<Lane>],
@@ -307,29 +323,26 @@ pub(crate) fn match_lanes(
             continue;
         }
         walked.push(partition);
+        let here = |lanes: &[Option<Lane>], j: usize| match lanes.get(j) {
+            Some(Some((other, id))) if Arc::ptr_eq(other, partition) => Some(*id),
+            _ => None,
+        };
+        let (workers, lanes): (Vec<usize>, Vec<_>) = (0..hits.len())
+            .map(|j| (j, [here(events, j), here(predicted, j)]))
+            .filter(|(_, lanes)| lanes != &[None, None])
+            .unzip();
         // The engine computes the block of the prompt's last token, so it never reports
         // that block as cached.
         let reusable = &tokens[..tokens.len().saturating_sub(1)];
         let prefix = hash::prefix_hashes(reusable, partition.block_size);
-        for (lanes, index) in [
-            (events, &partition.index),
-            (predicted, &partition.predicted),
-        ] {
-            let walk: Vec<(usize, HolderId)> = lanes
-                .iter()
-                .enumerate()
-                .filter_map(|(j, lane)| match lane {
-                    Some((other, id)) if Arc::ptr_eq(other, partition) => Some((j, *id)),
-                    _ => None,
-                })
-                .collect();
-            if walk.is_empty() {
-                continue;
-            }
-            let ids: Vec<HolderId> = walk.iter().map(|&(_, id)| id).collect();
-            for ((j, _), blocks) in walk.into_iter().zip(index.find_matches(&prefix, &ids)) {
-                hits[j] = hits[j].max(Some(blocks * partition.block_size));
-            }
+        let found = if lanes.iter().all(|[_, predicted]| predicted.is_none()) {
+            let holders: Vec<_> = lanes.iter().filter_map(|[events, _]| *events).collect();
+            partition.index.find_matches(&prefix, &holders)
+        } else {
+            find_matches([&partition.index, &partition.predicted], &lanes, &prefix)
+        };
+        for (j, blocks) in workers.into_iter().zip(found) {
+            hits[j] = hits[j].max(Some(blocks * partition.block_size));
         }
     }
     hits
