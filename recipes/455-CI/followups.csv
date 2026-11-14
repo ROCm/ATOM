@@ -1,1 +1,5 @@
 test_date,model,action,link,owner,note
+2026-11-14,deepseek-r1,our_pr,https://github.com/ROCm/ATOM/pull/3345,,"Fixes the chat-template TypeError on history tool-call arguments (728 turns). The other 971 turns were rejected because prompts exceed max_num_batched_tokens=16384 with chunked prefill off: a recipe setting, not covered by the PR. Not GPU-verified."
+2026-11-14,qwen-35b-a3b,open_pr,https://github.com/ROCm/ATOM/pull/2794,,"Makes GU interleave required on gfx1250 (moe.py is_guinterleave), which is the ValueError here; PR open since 2026-10-28. Adding ATOM_MOE_GU_ITLV=1 to the recipe would also avoid it."
+2026-11-14,deepseek-v4.1-flash,open_pr,https://github.com/ROCm/ATOM/pull/2989,,"Relaxes the V4.1 DSpark KV-cache check to allow fp4 (the c64/DEP4 ValueError); open. Its aiter dependency ROCm/aiter#7407 merged on 2026-11-13."
+2026-11-14,kimi-k3,open_pr,https://github.com/ROCm/ATOM/pull/2647 https://github.com/ROCm/ATOM/pull/2760,,"#2647 adds --tensor-parallel-size-local/--tensor-parallel-rank (one TP group across nodes), the argparse error here; #2760 (on #2647) lifts the gfx950-only assert for DSpark + DCP. Both open."
