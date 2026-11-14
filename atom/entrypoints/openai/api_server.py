@@ -1363,24 +1363,28 @@ def _prepare_prompt(
     preserve_tool_call_arguments: bool,
     max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
-) -> tuple[PrefixEncoding | list[int], str]:
+) -> tuple[PrefixEncoding | list[int], bool]:
     """Render, tokenize the engine's way and cut to the context, in one
     executor step for ``/v1/messages`` and ``/v1/responses``.
 
-    Returns ``(engine_input, text)``: what preprocess takes in place of the
-    prompt (no second tokenize), and the text the engine runs, which seeds the
-    reasoning channel. A prompt longer than the context minus the output
-    headroom is cut from the end; a context with no room for any prompt is
-    refused (ValueError, a 400)."""
+    Returns ``(engine_input, starts_in_reasoning)``: what preprocess takes in
+    place of the prompt (no second tokenize), and whether the prompt the
+    engine runs opens the reasoning channel. A prompt longer than the context
+    minus the output headroom is cut from the end; a context with no room for
+    any prompt is refused (ValueError, a 400)."""
     prompt = apply_chat_template(
         tokenizer,
         custom_message_encoder,
         messages,
         tools=tools,
         preserve_tool_call_arguments=preserve_tool_call_arguments,
+        token_ids=True,
         **template_kwargs,
     )
-    encoded = engine.io_processor.encode_prompt(prompt)
+    if isinstance(prompt, list):
+        encoded = prompt
+    else:
+        encoded = engine.io_processor.encode_prompt(prompt)
     max_ctx = int(_get_engine_max_model_len() or 30720)
     cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
     if cap < 1:
@@ -1390,13 +1394,15 @@ def _prepare_prompt(
         )
     token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
     if len(token_ids) <= cap:
-        return encoded, prompt
+        if isinstance(prompt, list):
+            return encoded, prompt_tokens_start_in_reasoning(prompt, tokenizer.decode)
+        return encoded, prompt_starts_in_reasoning(prompt)
     logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
     token_ids = list(token_ids[:cap])
     text = tokenizer.decode(token_ids, skip_special_tokens=False)
     if not text:
         raise ValueError("The prompt is empty after truncation to the context")
-    return token_ids, text
+    return token_ids, prompt_starts_in_reasoning(text)
 
 
 async def _prepare_engine_input(
@@ -1424,7 +1430,7 @@ async def _prepare_engine_input(
         )
         starts = prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
         return token_ids, multimodal_data, starts
-    engine_input, prompt = await asyncio.to_thread(
+    engine_input, starts = await asyncio.to_thread(
         _prepare_prompt,
         messages,
         template_kwargs,
@@ -1433,7 +1439,7 @@ async def _prepare_engine_input(
         max_tokens=max_tokens,
         kv_transfer_params=kv_transfer_params,
     )
-    return engine_input, None, prompt_starts_in_reasoning(prompt)
+    return engine_input, None, starts
 
 
 def _generate_nonstream(
@@ -2239,6 +2245,8 @@ async def _chat_completions(
                 messages,
                 tools=request.tools,
                 preserve_tool_call_arguments=preserve_tool_call_arguments,
+                # continue_prompt appends to text.
+                token_ids=assistant_prefix is None,
                 **merged_kwargs,
             )
 

@@ -147,6 +147,55 @@ def test_jinja_path_forwards_tools_and_generation_kwargs():
     }
 
 
+class _SegmentTokenizer:
+    """Stands in for Kimi-K3's tokenizer: encodes chats by segment, so
+    ``tokenize=True`` returns ids (or, to test the guard, whatever it is told)."""
+
+    def __init__(self, tokenized):
+        self.tokenized = tokenized
+        self.kwargs = None
+
+    def _encode_chat_segments(self, *_a, **_kw):
+        raise AssertionError("apply_chat_template calls the tokenizer's own method")
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.kwargs = kwargs
+        return self.tokenized if kwargs["tokenize"] else "rendered"
+
+
+@pytest.mark.parametrize("token_ids", [False, True])
+def test_a_segment_encoding_tokenizer_returns_ids_only_when_asked(token_ids):
+    tokenizer = _SegmentTokenizer([5, 6, 7])
+    result = apply_chat_template(
+        tokenizer, None, [{"role": "user", "content": "hi"}], token_ids=token_ids
+    )
+    assert result == ([5, 6, 7] if token_ids else "rendered")
+    assert tokenizer.kwargs["tokenize"] is token_ids
+
+
+def test_token_ids_is_ignored_by_a_tokenizer_without_a_segment_encoder():
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["tokenize"] is False
+            return "rendered"
+
+    result = apply_chat_template(
+        Tokenizer(), None, [{"role": "user", "content": "hi"}], token_ids=True
+    )
+    assert result == "rendered"
+
+
+@pytest.mark.parametrize("tokenized", ["text", {"input_ids": [1]}, [1, "2"]])
+def test_ids_that_are_not_ids_are_refused(tokenized):
+    with pytest.raises(TypeError, match="expected a list of token ids"):
+        apply_chat_template(
+            _SegmentTokenizer(tokenized),
+            None,
+            [{"role": "user", "content": "hi"}],
+            token_ids=True,
+        )
+
+
 class TestChatTemplateSource:
     """The template's own text, for the question a rendered prompt cannot answer.
 

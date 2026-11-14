@@ -281,8 +281,9 @@ def apply_chat_template(
     *,
     tools: list[dict] | None = None,
     preserve_tool_call_arguments: bool = False,
+    token_ids: bool = False,
     **kwargs: Any,
-) -> str:
+) -> str | list[int]:
     """Render ``messages`` to a prompt string.
 
     Dispatches to ``custom_encoder`` if one was discovered for this model,
@@ -290,6 +291,10 @@ def apply_chat_template(
     (``tokenize``, ``add_generation_prompt``) are stripped on the custom path.
     Model-scoped adapters prepare tools for custom encoders that support them;
     the generic path does not apply DeepSeek-V4-specific message rewriting.
+
+    ``token_ids=True`` asks for the prompt as token ids when the tokenizer
+    encodes a chat itself, segment by segment (:func:`encodes_chat_segments`);
+    the caller then skips its own tokenize. Otherwise the string is returned.
     """
     if messages and isinstance(messages[0], ChatMessage):
         preserve_content = (
@@ -313,8 +318,36 @@ def apply_chat_template(
         messages = custom_encoder.prepare_messages(messages, tools)
         return custom_encoder(messages, **kwargs)
 
-    kwargs["tokenize"] = False
+    kwargs["tokenize"] = token_ids and encodes_chat_segments(tokenizer)
     kwargs["add_generation_prompt"] = True
     if tools:
         kwargs["tools"] = tools
-    return tokenizer.apply_chat_template(messages, **kwargs)
+    rendered = tokenizer.apply_chat_template(messages, **kwargs)
+    if not kwargs["tokenize"]:
+        return rendered
+    # A tokenizer that rendered text (or a BatchEncoding) despite tokenize=True
+    # would otherwise reach the engine as characters or keys taken for ids.
+    if not isinstance(rendered, list) or not all(isinstance(i, int) for i in rendered):
+        raise TypeError(
+            f"{type(tokenizer).__name__}.apply_chat_template(tokenize=True) "
+            f"returned {type(rendered).__name__}, expected a list of token ids"
+        )
+    return rendered
+
+
+def encodes_chat_segments(tokenizer: Any) -> bool:
+    """Whether ``tokenizer.apply_chat_template(tokenize=True)`` encodes the
+    chat segment by segment, so its ids are the prompt and the rendered
+    string is not.
+
+    Kimi-K3's tokenizer does: structure markers are encoded as control
+    tokens, message, tool and attribute text with special tokens disabled,
+    and each segment on its own. Encoding the rendered string in one pass
+    instead (allowed_special="all") turns special-token text inside a message
+    into control tokens, merges BPE pieces across segment boundaries (e.g.
+    tool-argument keys such as ``-C``), and cuts every 400 000 characters of
+    the whole prompt rather than of one segment, which can split a structure
+    marker into plain-text tokens. On 610 Kimi-K3.1 DeepSWE agent requests
+    the text matched the reference in 610 and the ids in 164.
+    """
+    return callable(getattr(tokenizer, "_encode_chat_segments", None))

@@ -1062,17 +1062,38 @@ class TestPreparePrompt:
         return run
 
     def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
-        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+        engine_input, starts = prepare("x" * 46 + "<think>", max_tokens=10, chain=True)
         # The engine's own encoding, chain included, so preprocess reuses it.
-        assert engine_input.token_ids == list(range(50))
+        assert engine_input.token_ids == list(range(53))
         assert engine_input.block_hashes == "chain"
-        assert text == "x" * 50
+        assert starts is True
 
     def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
-        # 100-token context, 10 reserved for output: 90 kept.
-        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
+        # 100-token context, 10 reserved for output: 90 kept. The channel is
+        # read from the cut, which no longer ends in the marker.
+        engine_input, starts = prepare("x" * 150 + "<think>", max_tokens=10, chain=True)
         assert engine_input == list(range(90))
-        assert text == "k" * 90
+        assert starts is False
+
+    def test_ids_from_the_template_skip_the_engine_encode(self, prepare, monkeypatch):
+        # A segment-encoding tokenizer (Kimi-K3) hands back ids: they go to the
+        # engine as they are, and the channel is read from their decode.
+        monkeypatch.setattr(
+            api_server, "apply_chat_template", lambda *_a, **_kw: [7, 8, 9]
+        )
+        monkeypatch.setattr(
+            api_server.engine.io_processor,
+            "encode_prompt",
+            lambda _text: pytest.fail("ids must not be encoded again"),
+        )
+        monkeypatch.setattr(
+            api_server,
+            "tokenizer",
+            SimpleNamespace(decode=lambda ids, **_kw: "x<think>"),
+        )
+        engine_input, starts = prepare("unused", max_tokens=10)
+        assert engine_input == [7, 8, 9]
+        assert starts is True
 
     @pytest.mark.parametrize("max_tokens", [100, 1024])
     def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
