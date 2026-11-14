@@ -8,7 +8,13 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.drafter import AuxCaptureSpec, Drafter, _resolve_decoder_layers
+from atom.spec_decode.drafter import (
+    AuxCaptureSpec,
+    Drafter,
+    _resolve_decoder_layers,
+    aux_blocks,
+    pcp_aux_rows,
+)
 from atom.spec_decode.dspark_lossless import DSparkLossless
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -716,6 +722,9 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
+        After a PCP row-split prefill the aux hooks hold this rank's stripe;
+        it goes to the model as is, which gathers what it needs.
+
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
@@ -724,19 +733,25 @@ class DSparkProposer(Drafter):
         metadata = get_forward_context().attn_metadata
         if metadata is not None and metadata.served_by_round:
             return
-        aux_hidden_states = self.aux_for(hidden_states)
-        if aux_hidden_states is None:
-            return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
         num_rows = positions.shape[0]
-        # One block when every tap was relayed from earlier PP stages.
-        if len(aux_hidden_states) == 1:
-            main_hidden_all = aux_hidden_states[0][:num_rows]
+        n = hidden_states.shape[0]
+        n_local = pcp_aux_rows(n)
+        if n_local is None:
+            aux, kw = self.aux_for(hidden_states), {}
+            if aux is not None:
+                aux = [h[:num_rows] for h in aux]
         else:
-            main_hidden_all = torch.cat(
-                [h[:num_rows] for h in aux_hidden_states], dim=-1
+            # PCP row-split prefill: hand the model this rank's stripe, ungathered.
+            aux = (
+                [b[:n_local] for b in aux_blocks(self)] if self._captures_aux else None
             )
+            kw = {"pcp_num_tokens": min(n, num_rows)}
+        if aux is None:
+            return
+        # One block when every tap was relayed from earlier PP stages.
+        aux = aux[0] if len(aux) == 1 else torch.cat(aux, dim=-1)
         spec = self.model.kv_pool_spec
         if spec is not None and spec.needs_own_ctx_slots(self.config):
             ctx_slots = self.runner.forward_vars.get("draft_ctx_slots")
@@ -756,10 +771,8 @@ class DSparkProposer(Drafter):
             slot_mapping = forward_context.attn_metadata.slot_mapping
             if slot_mapping is not None:
                 slot_mapping = slot_mapping[:num_rows]
-        with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
-        ):
-            self.model.write_context_kv(main_hidden_all, positions, slot_mapping)
+        with record_function(f"draft_kv[bs={scheduled_bs} tok={min(n, num_rows)}]"):
+            self.model.write_context_kv(aux, positions, slot_mapping, **kw)
 
     def _propose(
         self,

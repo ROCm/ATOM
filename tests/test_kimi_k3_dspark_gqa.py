@@ -172,13 +172,16 @@ def test_gqa_context_write_clamps_verify_rows_to_the_rope_cache(monkeypatch):
     monkeypatch.setattr(
         mod.DSparkDraftModel,
         "write_context_kv",
-        lambda self, aux, positions, slots=None: seen.update(positions=positions),
+        lambda self, aux, positions, slots=None, pcp_num_tokens=None: seen.update(
+            positions=positions, pcp_num_tokens=pcp_num_tokens
+        ),
     )
     draft = object.__new__(mod.KimiK3DSparkGQA)
     draft._rope_max_row = 99
     positions = torch.tensor([97, 98, 99, 100, 101])
-    draft.write_context_kv(torch.zeros(5, 4), positions, None)
+    draft.write_context_kv(torch.zeros(5, 4), positions, None, pcp_num_tokens=5)
     assert seen["positions"].tolist() == [97, 98, 99, 99, 99]
+    assert seen["pcp_num_tokens"] == 5
     assert positions.tolist() == [97, 98, 99, 100, 101]
 
 

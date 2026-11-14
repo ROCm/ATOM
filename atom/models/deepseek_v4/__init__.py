@@ -60,6 +60,7 @@ from atom.config import (
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_pad_len,
     pcp_round_robin_split,
 )
@@ -134,11 +135,7 @@ from atom.utils.forward_context import (
     pass_scheduled_tokens_gpu,
 )
 from atom.utils.region_graph import token_graph
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatching import tbo_active, tbo_on_comm
 
 logger = logging.getLogger(__name__)
 
@@ -1222,9 +1219,17 @@ class Compressor(nn.Module):
             persistent=False,
         )
 
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """`[num_tokens, dim]` -> `[num_tokens, 2 * coff * head_dim]`, the kv and
+        score `forward` pools. Single fused BF16 GEMM via tgemm."""
+        assert (
+            x.dim() == 2 and x.shape[-1] == self.dim
+        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
+        return self.wkv_gate(x)
+
     def forward(
         self,
-        x: torch.Tensor,  # [num_tokens, dim]
+        projected: torch.Tensor,  # [num_tokens, 2*coff*head_dim]
         plan: "CompressPlan",
         state_slot_in: torch.Tensor,  # [bs] int32
         state_slot_out: torch.Tensor,  # [bs] int32
@@ -1257,7 +1262,9 @@ class Compressor(nn.Module):
         because the input act_quant simulation is applied upstream.
 
         Args:
-            x:           [num_tokens, dim] flat ragged batch hidden state.
+            projected:   `project(x)` of the flat ragged batch hidden state,
+                         gathered to the full sequence under PCP
+                         (`_pcp_gather_compressor_inputs`).
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
                          (or a synthetic bs=1 plan during warmup).
             state_slot_in:  [bs] int32 — state group each seq READS its incoming
@@ -1271,40 +1278,19 @@ class Compressor(nn.Module):
                          Required for the Indexer FP8 path (slot resolution).
         """
         assert self.rotary_emb is not None, "compressor.rotary_emb must be set by owner"
-        assert (
-            x.dim() == 2 and x.shape[-1] == self.dim
-        ), f"Compressor expects [num_tokens, {self.dim}], got {tuple(x.shape)}"
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
         rd = self.rope_head_dim
 
-        # Single fused BF16 GEMM via tgemm. (Probing whether dropping the
-        # otype=fp32 upcast — relying on fused_compress_attn's internal fp32
-        # accumulator instead — is accuracy-neutral.) torch.split returns
-        # zero-copy strided views; downstream kernels (fused_compress_attn,
-        # update_compressor_states) accept strided kv/score (only inner
-        # stride must be 1).
+        # torch.split returns zero-copy strided views; downstream kernels
+        # (fused_compress_attn, update_compressor_states) accept strided
+        # kv/score (only inner stride must be 1).
         coff_d = (1 + overlap) * d
-        combined = self.wkv_gate(x)
-        # ===== PCP (full-KV) =====
-        # `x` here is this rank's 1/W round-robin shard (model.forward entry split).
-        # The wkv_gate projection above is per-token (parallelizable), but the
-        # downstream fused_compress_attn compresses `ratio` CONSECUTIVE tokens
-        # into one entry — which round-robin split breaks. So all-gather the
-        # projected `combined` back to full sequence order before compression,
-        # mirroring SGLang's compute_kv_score (all-gather kv_score after the
-        # projection, before the cross-token compress). The plan /
-        # state_slot_out passed to fused_compress_attn are full-sequence
-        # (never split in the builder), so they match the gathered `combined`.
-        if _pcp_active():
-            _tbo = tbo_active()
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            combined = pcp_allgather_rerange(combined, get_pcp_world_size())
-            if _tbo:
-                tbo_switch_to_compute_sync()
-        kv, score = torch.split(combined, [coff_d, coff_d], dim=-1)
+        assert projected.dim() == 2 and projected.shape[-1] == 2 * coff_d, tuple(
+            projected.shape
+        )
+        kv, score = torch.split(projected, [coff_d, coff_d], dim=-1)
 
         # ====== Unified fused kernel path (CSA + Indexer) ======
         # Order is critical: fused kernel reads state cache as-of-end-of-
@@ -2020,6 +2006,7 @@ class DeepseekV4Attention(nn.Module):
         return at once: main Compressor -> alt_stream (CSA + HCA), Indexer
         Compressor -> indexer_stream (CSA only). Launched ahead of the Q/KV
         projections, which they then overlap; `_sparse_attention` joins them.
+        A PCP prefill first gathers their projections in one collective.
 
         A dummy run skips them: warmup runs before allocate_kv_cache, so their
         caches are unbound."""
@@ -2031,17 +2018,42 @@ class DeepseekV4Attention(nn.Module):
             attn_md.compress_plans[self.compress_ratio] if self.compress_ratio else None
         )
         side = self._compressors_async()
-        for compressor, stream in self._compressor_streams():
+        pairs = self._compressor_streams()
+        gathered = (
+            self._pcp_gather_compressor_inputs(x, [c for c, _ in pairs])
+            if pairs and _pcp_active()
+            else [None] * len(pairs)
+        )
+        for (compressor, stream), projected in zip(pairs, gathered):
             if side:
                 stream.wait_stream(fc.main_stream)
+                if projected is not None:
+                    # Made on the main stream, which may reuse it once this
+                    # returns: hold it until the side stream has read it.
+                    projected.record_stream(stream)
             with torch.cuda.stream(stream) if side else nullcontext():
+                # Without PCP the projection runs on the side stream too.
+                if projected is None:
+                    projected = compressor.project(x)
                 compressor(
-                    x,
+                    projected,
                     plan=plan,
                     state_slot_in=attn_md.state_slot_in,
                     state_slot_out=attn_md.state_slot_out,
                     block_tables=attn_md.block_tables,
                 )
+
+    @staticmethod
+    def _pcp_gather_compressor_inputs(
+        x: torch.Tensor, compressors: list["Compressor"]
+    ) -> list[torch.Tensor]:
+        """Each compressor's projection of `x`, gathered to the full sequence
+        in one collective. Under PCP `x` is this rank's round-robin 1/W rows,
+        while a compressor pools `ratio` consecutive tokens; its plan and
+        state slots are already full-sequence. Mirrors SGLang's
+        compute_kv_score: gather after the projection, before the pooling."""
+        projected = [c.project(x) for c in compressors]
+        return tbo_on_comm(pcp_allgather_rerange_many, projected, get_pcp_world_size())
 
     def _compressor_streams(self):
         """Each compressor this layer runs and the side stream it runs on:
@@ -2520,42 +2532,32 @@ class DeepseekV4Attention(nn.Module):
             #     rank keeps full KV), and
             #   - sparse_attn's extend source must be the FULL extend K so each
             #     1/W query can attend the whole in-chunk SWA window.
-            # So all-gather the extend K back to full order; positions/
-            # cu_seqlens_q/state_slot_out for the SWA write stay full
-            # (cu_seqlens_q / state_slot_out are per-seq, never split;
-            # positions_full comes from the forward context which holds the
-            # pre-split copy).
+            # So all-gather the extend K back to full order, together with the
+            # positions the SWA write addresses the ring by, in one collective
+            # (cu_seqlens_q / state_slot_out are per-seq, never split).
+            # Positions are gathered rather than read off the forward context:
+            # an MTP draft pass runs at the target's positions + 1.
             #
             # The extend K's representation depends on the kv-cache layout:
-            #   - bf16 → single `qkn.kv` [T, 1, 576]; all-gather it (kv_full).
+            #   - bf16 → single `qkn.kv` [T, 512].
             #   - fp8 2buff → `qkn.k_packed` [T, 1, 512] fp8 (nope + inline e8m0
-            #     scale) + `qkn.k_rope` [T, 1, 64] bf16; all-gather BOTH (the
-            #     scale rides inside k_packed, so no separate scale gather). fp8
-            #     all_gather is a pure byte movement — RCCL supports it directly.
-            # Both use the SAME rerange, so the gathered tensors stay aligned
-            # with the full-sequence kv_indices_extend / positions_full.
+            #     scale) + `qkn.k_rope` [T, 1, 64] bf16 (the scale rides inside
+            #     k_packed, so no separate scale gather).
             pcp_on = _pcp_active()
             if pcp_on:
                 pcp_ws = get_pcp_world_size()
-                _tbo_attn = tbo_active()
-                if _tbo_attn:
-                    tbo_yield_and_switch_from_compute_to_comm()
                 if self.kv_fp8:
-                    k_packed_full = pcp_allgather_rerange(qkn.k_packed, pcp_ws)
-                    k_rope_full = pcp_allgather_rerange(qkn.k_rope, pcp_ws)
+                    k_packed_full, k_rope_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many,
+                        [qkn.k_packed, qkn.k_rope, positions],
+                        pcp_ws,
+                    )
                     kv_full = None
                 else:
                     k_packed_full = k_rope_full = None
-                    kv_full = pcp_allgather_rerange(qkn.kv, pcp_ws)
-                # positions must match the full-sequence coords for the
-                # swa_write ring addressing (`positions[src] % cache_size`).
-                # `positions` here is this rank's 1/W shard (split in
-                # ForCausalLM.forward); all-gather it back to full order with
-                # the same rerange used for the extend K (NOT fc.context.
-                # positions, which the builder reindexed to 1/W).
-                positions_full = pcp_allgather_rerange(positions, pcp_ws)
-                if _tbo_attn:
-                    tbo_switch_to_compute_sync()
+                    kv_full, positions_full = tbo_on_comm(
+                        pcp_allgather_rerange_many, [qkn.kv, positions], pcp_ws
+                    )
             else:
                 k_packed_full, k_rope_full = qkn.k_packed, qkn.k_rope
                 kv_full = qkn.kv

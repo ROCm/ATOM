@@ -417,8 +417,8 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
     from atom.model_ops.engram.device.hashing import engram_row_indices_reference
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
     from tests.model_ops.engram.test_hash_bounds import build, tiny_config
     from tests.model_ops.engram.test_overlap import (
@@ -449,7 +449,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
             step.selected[0] = ids.clone()
             # Alternate workers twice while the earlier layer's state lives.
             for _ in range(2):
-                tbo_yield_and_switch_from_compute_to_comm()
+                _tbo_yield_and_switch_from_compute_to_comm()
                 copy = ids.clone()
                 tbo_switch_to_compute_sync()
             rows = ctx.attn_metadata.engram_embeddings.get(mapping.config.layer_ids[-1])
@@ -558,8 +558,8 @@ def test_microbatch_steps_are_freed_with_their_step(monkeypatch):
 
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
 
     slices = cut_prefill_ubatches(2, [9, 5], 14)
@@ -569,7 +569,7 @@ def test_microbatch_steps_are_freed_with_their_step(monkeypatch):
     class Model(torch.nn.Module):
         def forward(self, ids, positions, inputs_embeds=None):
             seen.append(weakref.ref(get_forward_context().attn_metadata))
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             out = ids.float()[:, None].clone()
             tbo_switch_to_compute_sync()
             return out
@@ -615,14 +615,14 @@ def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
     `switch_to_compute_sync`. The wrapper still orders the comm stream before
     later compute-stream work, which is where the next forward republishes
     the microbatch buffers."""
-    from atom.utils.tbo.ubatching import tbo_yield_and_switch_from_compute_to_comm
+    from atom.utils.tbo.ubatching import _tbo_yield_and_switch_from_compute_to_comm
 
     slices = cut_prefill_ubatches(2, [9, 5], 14)
     builder, parent = make_parent("cuda", lengths=(9, 5), parts=slices)
 
     class Model(torch.nn.Module):
         def forward(self, ids, positions, inputs_embeds=None):
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             raise RuntimeError("collective failed")
 
     wrapper = UBatchWrapper(Model(), builder)
@@ -703,9 +703,9 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     cache.backing.copy_(before)
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
+        _tbo_yield_and_switch_from_compute_to_comm,
         tbo_current_ubatch_id,
         tbo_switch_to_compute_sync,
-        tbo_yield_and_switch_from_compute_to_comm,
     )
 
     order = []
@@ -721,7 +721,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
             order.append((index, "write_window"))
             # Match the production boundary: attention writes its window before
             # FFN yields to the other worker. GPU launches remain asynchronous.
-            tbo_yield_and_switch_from_compute_to_comm()
+            _tbo_yield_and_switch_from_compute_to_comm()
             torch.cuda._sleep(2_000_000)
             tbo_switch_to_compute_sync()
             return output

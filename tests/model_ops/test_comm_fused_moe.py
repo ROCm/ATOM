@@ -526,8 +526,7 @@ def test_dpa_gather_inserts_bucket_padding_inside_each_rank_shard(
     torch.testing.assert_close(hidden_sent[2:], torch.zeros(2, 2))
     torch.testing.assert_close(weights_sent[:2], local_weights)
     torch.testing.assert_close(weights_sent[2:], torch.zeros(2, 1))
-    # The pad rows are routed nowhere (ids travel as their float carrier).
-    ids_sent = ids_sent.view(torch.int32)
+    # The pad rows are routed nowhere (ids travel as int32).
     assert torch.equal(ids_sent[:2], local_ids)
     assert (ids_sent[2:] == -1).all()
     assert gathered_hidden.shape == (32, 2)

@@ -13,7 +13,7 @@ from torch import nn
 from atom.config import Config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_pad_len,
 )
 from atom.model_loader.loader import load_model
@@ -54,6 +54,32 @@ class AuxCaptureSpec:
     def __post_init__(self):
         if self.capture not in ("output", "input"):
             raise ValueError("Aux capture must select layer input or output")
+
+
+def pcp_aux_rows(n: int) -> int | None:
+    """The rows the base `arm_aux_capture`'s layer hooks hold after a PCP
+    row-split target prefill of `n` rows -- this rank's round-robin stripe --
+    or None when the target did not split. A drafter that strips aux off the
+    target's output instead (EAGLE3) holds whatever the target returns. Keyed on
+    the batch-global `target_pcp_split`, never on hook-side bookkeeping, which a
+    cudagraph replay skips."""
+    ctx = getattr(get_forward_context(), "context", None)
+    # `target_pcp_split` implies PCP is enabled (ws > 1); see
+    # `ModelRunner._settle_target_pcp_split`.
+    if n <= 0 or not getattr(ctx, "target_pcp_split", False):
+        return None
+    pcp_ws = get_pcp_world_size()
+    return pcp_pad_len(n, pcp_ws) // pcp_ws
+
+
+def aux_blocks(drafter: "Drafter") -> list[torch.Tensor]:
+    """The drafter's capture buffers, the leading ones replaced by the block
+    relayed from earlier PP stages (`take_relayed_aux`), if any."""
+    blocks = drafter._aux_buffers
+    if drafter._relayed_aux is not None:
+        relayed = drafter._relayed_aux.shape[-1] // blocks[0].shape[-1]
+        blocks = [drafter._relayed_aux, *blocks[relayed:]]
+    return blocks
 
 
 # Descent bound for the `.model` wrapper chain below — big enough for every
@@ -604,21 +630,19 @@ class Drafter(abc.ABC):
         token counts.
 
         After a PCP row-split prefill the hooks hold only this rank's 1/pcp
-        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
-        on hook-side bookkeeping, which a cudagraph replay skips.
+        stripe, so gather it (`pcp_aux_rows`).
         """
         if not self._captures_aux:
             return None
-        blocks = self._aux_buffers
-        if self._relayed_aux is not None:
-            relayed = self._relayed_aux.shape[-1] // blocks[0].shape[-1]
-            blocks = [self._relayed_aux, *blocks[relayed:]]
+        blocks = aux_blocks(self)
         n = target_hidden_states.shape[0]
-        pcp_ws = get_pcp_world_size()
-        ctx = getattr(get_forward_context(), "context", None)
-        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
-            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
-            return [pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in blocks]
+        n_local = pcp_aux_rows(n)
+        if n_local is not None:
+            pcp_ws = get_pcp_world_size()
+            gathered = pcp_allgather_rerange_many(
+                [buf[:n_local] for buf in blocks], pcp_ws
+            )
+            return [g[:n] for g in gathered]
         return [buf[:n] for buf in blocks]
 
     def take_relayed_aux(self, block: torch.Tensor) -> None:

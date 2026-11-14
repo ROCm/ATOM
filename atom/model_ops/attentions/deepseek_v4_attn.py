@@ -59,10 +59,7 @@ from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
     pcp_owned_rows_by_request,
-    pcp_pad_dense,
-    pcp_pad_indptr,
     pcp_pad_len,
-    pcp_reindex_ragged,
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -2843,6 +2840,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 publication_group=group,
             )
         if self.num_state_slots:
+            # Under PCP this rank's rows; a PCP+TBO step builds its groups'
+            # own (`_stage_pcp_group`) and leaves these unread, as the groups
+            # are not cut yet here.
             self._stage_paged_prefill(
                 positions_np,
                 extend_lens_np,
@@ -2851,6 +2851,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 scheduled_tokens,
                 running_tokens,
                 replay_start,
+                pcp_split=pcp_is_enabled() and not batch.is_dummy_run,
                 publication_group=group,
             )
         attn_metadata.compress_plans = self._build_compress_plans(
@@ -2908,49 +2909,36 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 positions_gpu=positions,
                 query_start_loc=attn_metadata.cu_seqlens_q[: running_bs + 1],
             )
-        # Two-source paged_2src index buffers (extend + per-ratio prefix). Sets
-        # attn_metadata.{kv_indices,kv_indptr}_{extend,prefix_swa,prefix_csa,prefix_hca}
-        # plus skip_prefix_len_csa and envelope_rows.
-        self._build_paged_prefill_meta(
-            attn_metadata, scheduled_bs, scheduled_tokens, running_tokens
-        )
-
-        # ----- PCP: reindex per-query metadata to this rank's 1/W shard -----
-        # Mirrors SGLang's apply_cp_reindex (deepseek_v4_backend_hip_radix.py):
-        # all metadata above was built for the FULL sequence; under PCP the
-        # model.forward entry round-robin-splits hidden/positions to 1/W, so the
-        # per-query (per-token) metadata must be reduced to the SAME owned-query
-        # set. Per-seq / KV-write fields stay full (every rank keeps full KV).
-        # PCP+TBO request-boundary split: DEFER reindex to per-group in
-        # `finish_ubatch_prefill` (each request group reindexed independently
-        # on its own pcp pad). Keep the FULL un-reindexed metadata here so each
-        # group slices it.
-        if (
-            pcp_is_enabled()
-            and not batch.is_dummy_run
-            and attn_metadata.pcp_groups is None
-        ):
-            # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
-            # skipped on dummy/warmup runs (_pcp_active() returns False there),
-            # so reindexing metadata to 1/W here would pair full-size
-            # input_ids/positions with 1/W metadata (length mismatch). Keeping
-            # both full on dummy runs stays self-consistent.
-            # Reindex metadata to 1/W in-place. We intentionally DISCARD the
-            # returned 1/W positions: `positions` must stay FULL here so it
-            # lands on context.positions full, and ForCausalLM.forward does the
-            # one and only round-robin-split of positions (symmetric with input_ids,
-            # which never passes through the builder). Splitting here too would
-            # double-split positions (full -> 1/W -> 1/2W) while input_ids/kv
-            # are only split once, desyncing swa_write (kv full vs positions
-            # under-length). The builder still uses its internal 1/W positions
-            # for the index rows (rebuilt inside _apply_pcp_reindex).
+        if not (pcp_is_enabled() and not batch.is_dummy_run):
+            # Two-source paged_2src index buffers (extend + per-ratio prefix).
+            # Sets attn_metadata.{kv_indices,kv_indptr}_{extend,prefix_swa,
+            # prefix_csa,prefix_hca} plus skip_prefix_len_csa and envelope_rows.
+            self._build_paged_prefill_meta(
+                attn_metadata, scheduled_bs, scheduled_tokens, running_tokens
+            )
+        elif attn_metadata.pcp_groups is None:
+            # ----- PCP: per-query metadata built for this rank's 1/W shard -----
+            # Mirrors SGLang's apply_cp_reindex (deepseek_v4_backend_hip_radix.py):
+            # the model.forward entry round-robin-splits hidden/positions to 1/W,
+            # so the per-query metadata covers the SAME owned-query set. Per-seq
+            # / KV-write fields stay full (every rank keeps full KV). Not on
+            # dummy runs, whose forward skips the split. A PCP+TBO step builds
+            # each request group's in `finish_ubatch_prefill`; the whole-batch
+            # per-seq fields and `batch_id_per_q_token` stay unsplit so
+            # `_finish_pcp_group` can slice them.
+            # The 1/W positions it returns are discarded: `positions` stays
+            # FULL on context.positions, and ForCausalLM.forward does the one
+            # and only round-robin split (as for input_ids).
             self._apply_pcp_reindex(
                 attn_metadata,
                 positions,
                 scheduled_bs,
                 running_bs,
+                scheduled_tokens,
                 running_tokens,
                 cu_seqlens_q_np,
+                cu_q_per_seq_gpu=var["cu_seqlens_q"].gpu[:scheduled_bs],
+                block_tables_gpu=var["block_tables"].gpu[:scheduled_bs],
             )
 
     def _apply_pcp_reindex(
@@ -2959,23 +2947,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions: torch.Tensor,
         scheduled_bs: int,
         running_bs: int,
+        scheduled_tokens: int,
         total_tokens: int,
         cu_seqlens_q_cpu: np.ndarray,
+        *,
+        cu_q_per_seq_gpu: torch.Tensor,
+        block_tables_gpu: torch.Tensor,
         buf_prefix_ubatch: str = "",
     ) -> torch.Tensor:
         """Reduce per-query prefill metadata to this PCP rank's round-robin shard.
 
         Splits the per-token / per-query fields by `token_idx % pcp == rank`
         (matching model.forward's round-robin split of hidden/positions) while
-        leaving per-seq and KV-write fields full. The indexer metadata is
-        REBUILT from the sliced batch_id_per_q_token + positions (its per-token
-        fields all derive from those two), mirroring SGLang's
-        init_forward_metadata_indexer(core_meta) after apply_cp_reindex.
+        leaving per-seq and KV-write fields full. The paged prefill indices
+        and the indexer metadata are BUILT from the sliced batch_id_per_q_token
+        + positions (their per-token fields all derive from those two),
+        mirroring SGLang's init_forward_metadata_indexer(core_meta) after
+        apply_cp_reindex. The paged-prefill inputs were staged split
+        (`_stage_paged_prefill(pcp_split=True)`) over the same rows.
+
+        `cu_q_per_seq_gpu` / `block_tables_gpu` are required: the whole batch
+        passes its own, a PCP+TBO group passes its rows, its `cu_q` rebased to
+        the group, since the extend indices are rows of the group's `kv`.
 
         Returns the sliced `positions` (the model.forward entry slices its own
         copy identically; this keeps attn_metadata-internal users consistent).
 
-        Token count is padded to a multiple of pcp_size (dummy queries with
+        ``total_tokens`` is padded to a multiple of pcp_size (dummy queries with
         zero-length KV) so every rank gets an equal shard — matching
         model.forward's pad-then-split of hidden/positions.
         """
@@ -2987,30 +2985,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # on its own pcp pad). Either way the divisor is pcp_size.
         padded_total = pcp_pad_len(total_tokens, pcp_size)
         n_pad = padded_total - total_tokens
-        # This rank's round-robin queries, generated on the GPU.
+        # This rank's round-robin queries.
         owned_q = torch.arange(get_pcp_rank(), padded_total, pcp_size, device=device)
 
-        # --- ragged per-query buffers: pad indptr to padded_total, then 1/W ---
-        for ind_attr, idx_attr in (
-            ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
-            ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
-            ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
-            ("kv_indptr_extend", "kv_indices_extend"),
-        ):
-            indptr = getattr(attn_metadata, ind_attr, None)
-            indices = getattr(attn_metadata, idx_attr, None)
-            if indptr is None or indices is None:
-                continue
-            indptr = pcp_pad_indptr(indptr, n_pad)  # dummy queries: 0-length KV
-            new_indptr, new_indices = pcp_reindex_ragged(indptr, indices, owned_q)
-            setattr(attn_metadata, ind_attr, new_indptr)
-            setattr(attn_metadata, idx_attr, new_indices)
-
-        # --- dense per-token fields: pad then round-robin-slice to 1/W ---
-        if attn_metadata.skip_prefix_len_csa is not None:
-            skip = pcp_pad_dense(attn_metadata.skip_prefix_len_csa, n_pad)
-            attn_metadata.skip_prefix_len_csa = skip[owned_q].contiguous()
-        # batch_id_per_q_token drives the indexer rebuild below. Pad with -1
+        # batch_id_per_q_token drives the builds below. Pad with -1
         # (dummy-token sentinel; downstream kernels skip on bid < 0), then slice.
         bid = attn_metadata.batch_id_per_q_token[:total_tokens]
         if n_pad > 0:
@@ -3020,6 +2998,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if n_pad > 0:
             pos_padded = torch.cat([pos_padded, pos_padded.new_zeros(n_pad)], dim=0)
         positions_local = pos_padded[owned_q].contiguous()
+
+        # --- this rank's paged prefill indices, over its real rows ---
+        self._build_paged_prefill_meta(
+            attn_metadata,
+            scheduled_bs,
+            *self._pcp_split_rows(scheduled_tokens, total_tokens),
+            positions_gpu=positions_local,
+            cu_q_per_seq_gpu=cu_q_per_seq_gpu,
+            block_tables_gpu=block_tables_gpu,
+            buf_prefix_ubatch=buf_prefix_ubatch,
+        )
 
         # --- this rank's index rows, from the sliced batch_id + positions ---
         # Every per-row field derives from those two, so publishing from them
@@ -3062,19 +3051,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         `attn_metadata` is the FULL, UN-reindexed metadata (global); its
         ``ubatches`` the group's base fields over the group's global token
-        range (`stage_ubatch_prefill`). We slice the rest to this group's
-        requests + global token range, then run the proven
-        `_apply_pcp_reindex` on the group (pads the group to a pcp multiple and
-        round-robin strides to 1/pcp — matching run_model's per-group stripe).
-        Per-seq / KV-write fields (cu_seqlens_q, compress_plans, state_slot) stay
-        GLOBAL for the group (the compressor/swa_write see the group's full
-        all-gathered tokens), exactly as non-TBO PCP does for the whole batch.
+        range (`stage_ubatch_prefill`). We slice its per-seq fields to this
+        group's requests, then run `_apply_pcp_reindex` on the group (pads the
+        group to a pcp multiple and round-robin strides to 1/pcp — matching
+        run_model's per-group stripe) over the group's own staged inputs
+        (`_stage_pcp_group`). Per-seq / KV-write fields (cu_seqlens_q,
+        compress_plans, state_slot) stay whole for the group (the
+        compressor/swa_write see the group's full all-gathered tokens),
+        exactly as non-TBO PCP does for the whole batch.
         """
         rs0, rs1 = pcp_group.req_start, pcp_group.req_stop
         gts, gte = pcp_group.tok_start, pcp_group.tok_end
         group_bs = rs1 - rs0
         group_total = gte - gts  # group's global token count (real, pre-pad)
-        device = self.device
         var = self.model_runner.forward_vars
         src = attn_metadata
 
@@ -3090,49 +3079,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub.state_slot_out_cpu = src.state_slot_out_cpu[rs0:rs1]
         if src.n_committed_csa_per_seq_cpu is not None:
             ub.n_committed_csa_per_seq_cpu = src.n_committed_csa_per_seq_cpu[rs0:rs1]
-
-        # ---- per-token DSV4 fields sliced by the GLOBAL token range [gts,gte) ----
-        owned = torch.arange(gts, gte, device=device)
-        for ind_attr, idx_attr in (
-            ("kv_indptr_prefix_swa", "kv_indices_prefix_swa"),
-            ("kv_indptr_prefix_csa", "kv_indices_prefix_csa"),
-            ("kv_indptr_prefix_hca", "kv_indices_prefix_hca"),
-            ("kv_indptr_extend", "kv_indices_extend"),
-        ):
-            indptr = getattr(src, ind_attr, None)
-            indices = getattr(src, idx_attr, None)
-            if indptr is None or indices is None:
-                continue
-            ni, nx = pcp_reindex_ragged(indptr, indices, owned)
-            # kv_indices_extend are ROW offsets into the per-fwd kv_full tensor.
-            # In the full metadata they index the WHOLE sequence's kv_full [0,T);
-            # for this group kv_full only holds the group's tokens (global order
-            # [gts,gte) → rows [0, gte-gts)), so rebase by gts. (prefix indices
-            # point into unified_kv by absolute cache slot — no rebase.) Balanced
-            # splits on request boundaries so each query's SWA window stays within
-            # its sequence (within the group) → row >= gts, rebased value >= 0.
-            if idx_attr == "kv_indices_extend" and nx.numel() > 0:
-                nx = nx - gts
-            setattr(ub, ind_attr, ni)
-            setattr(ub, idx_attr, nx)
-        if src.skip_prefix_len_csa is not None:
-            ub.skip_prefix_len_csa = src.skip_prefix_len_csa[gts:gte].contiguous()
-        ub.envelope_rows = src.envelope_rows
+        if src.replay_end_cpu is not None:
+            ub.replay_start_cpu = src.replay_start_cpu[rs0:rs1]
+            ub.replay_end_cpu = src.replay_end_cpu[rs0:rs1]
         gcu = var["cu_seqlens_q"].np
         ub.compress_plans = attn_metadata.ubatch_compress_plans[ubatch_idx]
 
-        # ---- reindex the group to 1/pcp (proven path) ----
+        # ---- reindex the group to 1/pcp ----
         # positions: group's GLOBAL positions (forward_vars stay global for the
-        # request-boundary split). _apply_pcp_reindex pads group_total to pcp + strides —
-        # matching run_model's per-group pcp_round_robin_split.
-        group_positions = var["positions"].gpu[gts:gte]
+        # request-boundary split). The group's `kv` holds only its own tokens,
+        # so its extend rows count from `gts`: `ub.cu_seqlens_q` is already
+        # rebased to the group.
         self._apply_pcp_reindex(
             ub,
-            group_positions,
+            var["positions"].gpu[gts:gte],
             group_bs,
             group_bs,
             group_total,
+            group_total,
             gcu[rs0 : rs1 + 1] - gcu[rs0],
+            cu_q_per_seq_gpu=ub.cu_seqlens_q[:group_bs],
+            block_tables_gpu=var["block_tables"].gpu[rs0:rs1],
             buf_prefix_ubatch=f"ub{ubatch_idx}_",
         )
         # cu_committed_gpu already belongs to this ubatch's runner slot.
@@ -3161,7 +3128,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         else:
             attn_metadata.ubatch_compress_plans = [
-                self._stage_pcp_group_plans(ub_idx, pcp_group, group)
+                self._stage_pcp_group(attn_metadata, ub_idx, pcp_group, group)
                 for ub_idx, (pcp_group, group) in enumerate(zip(pcp_groups, groups))
             ]
         return groups
@@ -3228,19 +3195,52 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             write_from=replay_end,
         )
 
-    def _stage_pcp_group_plans(
-        self, ubatch_idx: int, pcp_group: PcpBalGroup, group
+    def _stage_pcp_group(
+        self,
+        attn_metadata: AttentionMetaData_DSV4,
+        ubatch_idx: int,
+        pcp_group: PcpBalGroup,
+        group,
     ) -> dict:
-        """One PCP request group's compression plans into ``group``."""
+        """One PCP request group's paged-prefill inputs, this rank's rows of
+        it, into ``group``; return its compression plans."""
         var = self.model_runner.forward_vars
+        p = f"ub{ubatch_idx}_"
         rs0, rs1 = pcp_group.req_start, pcp_group.req_stop
+        gts, gte = pcp_group.tok_start, pcp_group.tok_end
         cu = var["cu_seqlens_q"].np
+        extend_lens = (cu[rs0 + 1 : rs1 + 1] - cu[rs0:rs1]).astype(np.int32)
+        # Unreachable under PCP today (`state_replay_tokens` is 0 with CP on);
+        # kept so the group matches the whole batch once that guard lifts.
+        replay_start, replay_end = (
+            (None, None)
+            if attn_metadata.replay_end_cpu is None
+            else (
+                attn_metadata.replay_start_cpu[rs0:rs1],
+                attn_metadata.replay_end_cpu[rs0:rs1],
+            )
+        )
+        if self.num_state_slots:
+            positions_np = var["positions"].np
+            self._stage_paged_prefill(
+                positions_np[gts:gte],
+                extend_lens,
+                positions_np[cu[rs0:rs1]],
+                rs1 - rs0,
+                gte - gts,
+                gte - gts,
+                replay_start,
+                pcp_split=True,
+                buf_prefix_ubatch=p,
+                publication_group=group,
+            )
         return self._build_compress_plans(
-            (cu[rs0 + 1 : rs1 + 1] - cu[rs0:rs1]).astype(np.int32),
+            extend_lens,
             np.asarray(var["context_lens"].np[rs0:rs1], dtype=np.int32),
-            buf_prefix_ubatch=f"ub{ubatch_idx}_",
+            buf_prefix_ubatch=p,
             group=group,
-            extra_write=self.max_spec_steps,
+            extra_write=0,  # TBO prefill is eager-only; nothing rejects it.
+            write_from=replay_end,
         )
 
     def finish_ubatch_prefill(
@@ -3716,6 +3716,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         qo_buf.np[T + 1 : T_pad + 1] = T
         return T_pad + 1
 
+    @staticmethod
+    def _pcp_split_rows(scheduled_tokens: int, running_tokens: int) -> tuple[int, int]:
+        """This PCP rank's real rows and all its rows: the round-robin share
+        of ``scheduled_tokens``, and of ``running_tokens`` padded to a pcp
+        multiple, its real rows first."""
+        pcp_size, rank = get_pcp_world_size(), get_pcp_rank()
+        return (
+            len(range(rank, scheduled_tokens, pcp_size)),
+            pcp_pad_len(running_tokens, pcp_size) // pcp_size,
+        )
+
     def _stage_paged_prefill(
         self,
         positions_np: np.ndarray,
@@ -3726,6 +3737,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         swa_floor_per_seq_np: np.ndarray | None = None,
         *,
+        pcp_split: bool = False,
         buf_prefix_ubatch: str = "",
         publication_group=None,
     ) -> None:
@@ -3739,6 +3751,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         `swa_floor_per_seq_np` raises each seq's `swa_low` to its replay start,
         below which a replaying seq's ring holds no window; None leaves it at 0.
+
+        `pcp_split` stages only this PCP rank's round-robin rows
+        (`t % pcp == rank` over ``running_tokens`` padded to a pcp multiple),
+        `pcp_pad_len(running_tokens) / pcp` of them, as the model splits its
+        input: the build then runs on `_pcp_split_rows`.
         """
         win = self.window_size
         T = scheduled_tokens
@@ -3760,16 +3777,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # map that second form builds has no other reader here, and the two are
         # the same array for any non-negative counts.
         chunk_start_pt = np.repeat(chunk_start_per_seq_np, token_num_per_seq)
-        token_pos_in_chunk = positions_arr - chunk_start_pt
-        swa_low = np.maximum(positions_arr - win + 1, 0)
+        swa_floor_pt = None
         if swa_floor_per_seq_np is not None:
             swa_floor_per_seq_np = np.ascontiguousarray(
                 swa_floor_per_seq_np[:scheduled_bs], dtype=np.int32
             )
-            swa_low = np.maximum(
-                swa_low, np.repeat(swa_floor_per_seq_np, token_num_per_seq)
-            )
+            swa_floor_pt = np.repeat(swa_floor_per_seq_np, token_num_per_seq)
             stage("swa_floor", swa_floor_per_seq_np)
+        if pcp_split:
+            T, running_tokens = self._pcp_split_rows(T, running_tokens)
+            owned = slice(get_pcp_rank(), scheduled_tokens, get_pcp_world_size())
+            positions_arr = positions_arr[owned]
+            chunk_start_pt = chunk_start_pt[owned]
+            if swa_floor_pt is not None:
+                swa_floor_pt = swa_floor_pt[owned]
+        token_pos_in_chunk = positions_arr - chunk_start_pt
+        swa_low = np.maximum(positions_arr - win + 1, 0)
+        if swa_floor_pt is not None:
+            swa_low = np.maximum(swa_low, swa_floor_pt)
 
         prefix_swa_count_np = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
         # These SIZE each slice while `_v4_paged_prefill_indices_kernel` FILLS
@@ -3886,17 +3911,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
         # NB: no `csa_indices.fill_(-1)` — per-token CSA reservation now
         # matches Indexer visibility exactly (csa_valid_k_per_token), so
-        # csa_translate_pack writes every reserved cell.
-        # PCP exception: under prefill context parallel, _apply_pcp_reindex
-        # rebuilds this buffer via pcp_reindex_ragged into a FRESH torch.empty
-        # tensor and re-slices the indptr, so the "every cell written" invariant
-        # no longer holds (the CSA-topk section is filled per-layer in forward
-        # AFTER reindex). Restore the -1 sentinel the consumer relies on: fill
-        # BEFORE the builder kernel writes the SWA section, so SWA stays real and
-        # unwritten cells stay -1 through reindex until csa_translate_pack
-        # overwrites the CSA head. pcp=1 keeps the original zero-fill fast path.
-        if pcp_is_enabled():
-            csa_indices.fill_(-1)
+        # csa_translate_pack writes every reserved cell. Under PCP too: the
+        # build covers only this rank's rows (`pcp_split` staging).
 
         # ----- Single Triton kernel: scatter SWA-prefix / extend / HCA-compress -----
         write_v4_paged_prefill_indices(

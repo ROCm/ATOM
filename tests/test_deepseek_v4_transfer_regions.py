@@ -146,10 +146,7 @@ def _stub_v4_runtime_imports():
         "get_pcp_world_size",
         "pcp_is_enabled",
         "pcp_owned_rows_by_request",
-        "pcp_pad_dense",
-        "pcp_pad_indptr",
         "pcp_pad_len",
-        "pcp_reindex_ragged",
     ):
         setattr(pcp_utils, name, lambda *args, **kwargs: None)
     pcp_utils.PcpBalGroup = tuple
