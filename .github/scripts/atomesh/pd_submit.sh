@@ -201,6 +201,7 @@ exports = {
     "ROUTER_PORT": router.get("port", 8000),
     "ROUTER_POLICY": router.get("policy", "random"),
     "ROUTER_BALANCE_ABS_THRESHOLD": router.get("balance_abs_threshold", ""),
+    "ROUTER_KV_EVENTS": str(router.get("kv_events", False)).lower(),
     "PROMETHEUS_PORT": router.get("prometheus_port", 29100),
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),
     "BLOCK_SIZE": server_args.get("block_size", 16),
