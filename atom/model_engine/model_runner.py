@@ -3723,7 +3723,9 @@ class ModelRunner:
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
-            synced = get_tp_group().broadcast(sampled_tokens.clone(), src=0)
+            synced = get_tp_group().broadcast(
+                sampled_tokens.clone() if head_ids else sampled_tokens, src=0
+            )
             if head_ids and not torch.equal(synced, sampled_tokens):
                 self._head_ids_mismatch = getattr(self, "_head_ids_mismatch", 0) + 1
                 logger.warning(

@@ -237,14 +237,17 @@ def test_forced_acceptance_serves_as_without_it(runner_module, spec_step):
     assert runner._head_ids_serve(_head(), _batch((1.0,)))
 
 
+@pytest.mark.parametrize("sync", ["1", "check", "0"])
 @pytest.mark.parametrize("bs, nb", [(2, 2), (2, 4)])
 def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
-    monkeypatch, runner_module, bs, nb
+    monkeypatch, runner_module, bs, nb, sync
 ):
     """A step the head output stands for: its output ids and verdict (the step's requests: the first of a padded
     bucket's) in place of the samplers'; the ids are broadcast over TP and every id that feeds the next step (the
     next forward's ids, the drafter's anchors) is taken from the broadcast ids, at the verdict's accepted counts, as
-    on every other step."""
+    on every other step. By default (``ATOM_HEAD_IDS_SYNC`` 0) the head's ids are the same on every rank and not
+    broadcast; "check" broadcasts a copy and counts the steps whose ids differed."""
+    monkeypatch.setenv("ATOM_HEAD_IDS_SYNC", sync)
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
         target_logits_indices=torch.arange(10),
@@ -283,6 +286,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         raise Stop
 
     runner = _runner(runner_module, _Model())
+    runner.rank = 1
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=True,
         is_pd_producer=False,
@@ -317,12 +321,18 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
             True,
             hidden_states=torch.zeros(12, 4),
         )
-    assert len(broadcasts) == 1 and broadcasts[0].shape == (bs, 6)
-    assert broadcasts[0].data_ptr() == out.data_ptr()
     assert sent[0].tolist() == [[3, 5], [2, 0]]
+    assert runner.tokenID_processor.prev_token_ids is proposed[0]
+    if sync == "0":
+        # this rank's own picks at each request's accepted count, no collective
+        assert broadcasts == [] and proposed[0].tolist() == [0, 0]
+        return
+    assert len(broadcasts) == 1 and broadcasts[0].shape == (bs, 6)
+    # in place, except under "check" (a copy, compared with this rank's after)
+    assert (broadcasts[0].data_ptr() == out.data_ptr()) == (sync == "1")
+    assert getattr(runner, "_head_ids_mismatch", 0) == (sync == "check")
     # rank 0's ids at each request's accepted count (3 and 5), not this rank's picks
     assert proposed[0].tolist() == [103, 111]
-    assert runner.tokenID_processor.prev_token_ids is proposed[0]
 
 
 # ---- the deferrable status wait

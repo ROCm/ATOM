@@ -490,7 +490,9 @@ def _install_world(hi_dispatch, monkeypatch, *, local=None, others=(None, None, 
         use_decode_round=lambda rnd: log.append("use round"),
     )
     cfg = SimpleNamespace(max_model_len=4096, index_cache_dtype="fp4")
-    return log, (object(), cfg, drafter, builder, 0), draft
+    # (TP8's replicated vocab table: none here)
+    monkeypatch.setattr(hi_dispatch, "_replicated_embedding", lambda embed: None)
+    return log, (SimpleNamespace(embed=None), cfg, drafter, builder, 0), draft
 
 
 @pytest.mark.parametrize(
