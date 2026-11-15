@@ -172,23 +172,33 @@ def _build_v41_pool_geometry(
 def v41_kv_cache_dtype(vllm_config) -> str:
     """Map vLLM's ``--kv-cache-dtype`` onto ATOM's V4.1 pool dtype.
 
-    V4.1's pool is either unpacked bf16 or the packed fp4 layout; there is no
-    fp8 variant, so the fp8 spellings are refused rather than silently
-    downgraded -- the choice changes ``paged_bytes`` and therefore the proxy
-    layer's ``head_size``, and a mismatch between the sizing vLLM allocated
-    with and the geometry the kernels read would corrupt the pool.
+    Proxy sizing, runtime cache binding and KV transport use this spelling
+    normalization. Explicit NVFP4 remains FP4 on every supported head count.
+    FP8 denotes ATOM's MXFP8 source planes, not a vLLM FP8 page layout.
     """
+    resolved = getattr(vllm_config, "_atom_v41_kv_cache_dtype", None)
+    if resolved is not None:
+        return resolved
     cache_config = getattr(vllm_config, "cache_config", None)
     cache_dtype = getattr(cache_config, "cache_dtype", None) if cache_config else None
     dtype = str(cache_dtype or "auto")
     if dtype == "nvfp4":
-        return "fp4"
-    if dtype in ("auto", "bfloat16", "float16"):
-        return "bf16"
-    raise ValueError(
-        f"DeepSeek-V4.1 on the vLLM plugin supports --kv-cache-dtype auto/"
-        f"bfloat16/nvfp4 (nvfp4 selects ATOM's packed fp4 pool); got {dtype!r}"
-    )
+        resolved = "fp4"
+    elif dtype in ("fp8", "fp8_e4m3"):
+        resolved = "fp8"
+    elif dtype in ("auto", "bfloat16", "float16"):
+        resolved = "bf16"
+    else:
+        raise ValueError(
+            "DeepSeek-V4.1 on the vLLM plugin supports --kv-cache-dtype "
+            "auto/bfloat16/float16/fp8/fp8_e4m3/nvfp4; "
+            f"got {dtype!r}"
+        )
+    try:
+        vllm_config._atom_v41_kv_cache_dtype = resolved
+    except AttributeError:  # pragma: no cover - frozen config
+        pass
+    return resolved
 
 
 def v41_speculative_tokens(vllm_config) -> int:
@@ -1281,6 +1291,7 @@ def bind_deepseek_v41_proxy_cache(
         # on the native path: it is sized before the memory profile and shared
         # with the throwaway profiling cache.
         workspace=builder.score_workspace,
+        prefill_window_staging=builder._prefill_window_staging,
         backing=raw,
     )
     from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
@@ -2307,20 +2318,18 @@ def _v41_checkpoint_restore(adapter, worker):
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
     """The PAGE-indexed planes of a bound V4.1 pool, in key-space order.
 
-    One main page plus that page's rows in each index plane -- the same
-    decomposition, in the same order, that ``PagedAttentionCache.unit_regions``
-    reports and that the native backend publishes to ``lmcache_mp``. The order
-    *is* the key space: an object stored under one plane order is unreadable
-    under another, so it is derived here from ``index_planes`` rather than
-    rebuilt by any caller.
+    Main page regions followed by each owner's index planes, in the same
+    order as ``PagedAttentionCache.unit_regions`` and the native backend's
+    ``lmcache_mp`` export. BF16 has one main page region; quantized caches
+    expose separate data/scale planes and any page padding. The order is the
+    stored object's key space, so derive it from the cache's region lists.
 
-    The STATE region is not here and must never be: ``page_bytes`` and the
-    index planes are views of the arena's head, while the per-request state is
-    a disjoint view of its tail. STATE is addressed by request slot, not by
-    page, so a positional mover would hand one request another's rings.
+    Per-request STATE regions are disjoint from these PAGE regions and are
+    excluded. STATE is addressed by request slot, not by page; a positional
+    mover would hand one request another's rings.
     """
     names = [name for name, _ in cache.geometry.index_planes]
-    return [("dsv41.page", cache.page_bytes)] + [
+    return [(f"dsv41.{name}", plane) for name, plane in cache.page_regions] + [
         (f"dsv41.{name}_plane.{owner}", plane)
         for owner, owned in cache.index_planes.items()
         for name, plane in zip(names, owned)

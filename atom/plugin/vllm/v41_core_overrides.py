@@ -17,7 +17,7 @@ address on every replay.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 
 import numpy as np
@@ -80,13 +80,47 @@ def _v41_publication_epoch(owner, *, resume=False):
         owner.finish()
 
 
+@contextmanager
+def _unverified_steps(cache):
+    """Begin `cache`'s steps as non-verifying while inside.
+
+    Native `_prepare_step` verifies every tentative step with requests (#3136
+    dropped its `not batch.is_dummy_run`: native capture batches are not
+    dummies). A plugin dummy batch is fabricated on private scratch with its
+    requests at position 0, which `begin_step` refuses to verify. It keeps the
+    verify write grid `tentative` selects; only its step is not a
+    verification, as before #3136.
+
+    A non-verifying step of multi-token requests is a prefill step
+    (`BatchStep.decode`), so such a dummy runs the prefill FFN, not
+    `decode_ffn` -- also as before #3136, and intended: dummy batches only
+    feed eager forwards whose output is discarded (vLLM's warmup before each
+    capture size, dummy runs before the serving pool is bound).
+    `v41_stage_step` refuses to stage inside a stream capture, and the batches
+    captures do record (`_v41_capture_batch`, `_v41_profile_capture_batch`)
+    are not dummies: they start a full window in and stay verifying, so the
+    graphs record `decode_ffn`.
+    """
+    begin_step = cache.begin_step
+
+    def begin_unverified(*args, **kwargs):
+        kwargs["tentative"] = False
+        return begin_step(*args, **kwargs)
+
+    cache.begin_step = begin_unverified
+    try:
+        yield
+    finally:
+        del cache.begin_step
+
+
 def _publish_v41_metadata(prepare):
     @wraps(prepare)
     def publish(self, *args, **kwargs):
         runner = self.model_runner
         if not hasattr(runner, "h2d_owner"):
             owner, groups = _v41_publication_owner(runner.forward_vars, self.device)
-            for name, names in self.h2d_group_members.items():
+            for name, names in self.h2d_group_members().items():
                 groups[name] = owner.group(
                     name, [runner.forward_vars[item]._publication for item in names]
                 )
@@ -143,6 +177,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
         cached = getattr(self, "_capture_dummy", None)
         if cached is None:
@@ -159,6 +194,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=ceiling_tokens,
                 workspace=self.score_workspace,
+                prefill_window_staging=self._prefill_window_staging,
             )
             self._capture_dummy = cached
         elif (
@@ -242,19 +278,24 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         self.publish_query_metadata(
             np.asarray(batch.num_scheduled_tokens, np.int32), running_bs, running_tokens
         )
-        return self._prepare_step(
-            batch,
-            spans,
-            rows,
-            cache,
-            running_bs,
-            running_tokens,
-            max_q_len=max_q_len,
-            tentative=tentative,
-            is_prefill=is_prefill,
-            engram_live=engram_live,
-            replay_layout=(resumes, floors, cached_until, histories),
-        )
+        with (
+            _unverified_steps(cache)
+            if tentative and batch.is_dummy_run
+            else nullcontext()
+        ):
+            return self._prepare_step(
+                batch,
+                spans,
+                rows,
+                cache,
+                running_bs,
+                running_tokens,
+                max_q_len=max_q_len,
+                tentative=tentative,
+                is_prefill=is_prefill,
+                engram_live=engram_live,
+                replay_layout=(resumes, floors, cached_until, histories),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +444,16 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         )
         super()._report_stale_state(cursors, starts, requests, fresh | warmup)
 
+    def _allocate_buffers(self, sizes, device):
+        # vLLM owns the allocation. Consume its budgeted slab once, then expose
+        # one tensor per source with the same layout as native allocations.
+        slab = self._allocate_backing(sum(sizes), device)
+        views, offset = [], 0
+        for size in sizes:
+            views.append(slab[offset : offset + size])
+            offset += size
+        return tuple(views)
+
     def _allocate_backing(self, size, device):
         """The slab, trimmed and zeroed to core's contract.
 
@@ -538,27 +589,31 @@ def _attend_block(
     # decode allows it, the window write. `window_kv` is what is left for
     # `write_window` below, which is nothing when that fold happened. The
     # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-    query_fp8 = None
+    a8w4, query_fp8 = False, None
     if not fused:
-        query_fp8 = cache.query_fp8(query)
+        a8w4 = self._use_a8w4_attention(query, cache)
+        query_fp8 = cache.query_fp8(query, a8w4=a8w4)
         if queries is None:
             kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
             )
         else:
             kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, None, kv_normed, rope, step
+                self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
             )
             cache.rotate_query(query, rope, queries.positions, query_fp8)
     # A forked compressor was already waited at the scorer, on whichever
     # stream that ran; joining it again costs one wait and keeps one rule.
     join_stream(self.index_stream, self.compress_stream)
     prefix, prefix_indptr, second, second_indptr = (
-        cache.attention_indices(self.spec, step)
+        cache.attention_indices(self.spec, step, a8w4=a8w4)
         if queries is None
-        else queries.indices(cache, self.spec)
+        else queries.indices(cache, self.spec, a8w4=a8w4)
     )
     flat_query = query.flatten(0, 1)
+    pool = cache.main_view(self.spec.kv_owner)
+    if cache.packed and not a8w4:
+        pool = (pool, cache.ring_view(self.spec.layer_id))
     kwargs = {"out": flat_query}
     if fused:
         attend = fused_sparse_attn_v41_paged_2src
@@ -571,18 +626,20 @@ def _attend_block(
             "out": attn_out,
             "out_scale": attn_out_scale.view(torch.float8_e8m0fnu),
         }
-    elif cache.kv_fp8:
+    elif a8w4 or cache.kv_fp8:
         attend = sparse_attn_v41_paged_2src
         attending = tuple(part.flatten(0, 1) for part in query_fp8)
+        if a8w4:
+            kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
     else:
         attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
         attending = flat_query
     if step.decode:
         cache.write_window(self.spec.layer_id, window_kv, step)
-        if cache.packed:
+        if cache.packed and not a8w4:
             output = packed_decode(
                 flat_query,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
                 self.attn_sink,
@@ -593,7 +650,7 @@ def _attend_block(
             # ring: the second source, beside the selection in the pool.
             output = attend(
                 attending,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
                 cache.ring_view(self.spec.layer_id),
@@ -606,10 +663,10 @@ def _attend_block(
     else:
         output = attend(
             attending,
-            cache.pool,
+            pool,
             prefix,
             prefix_indptr,
-            kv.flatten(0, -2),
+            kv if cache.kv_fp8 or a8w4 else kv.flatten(0, -2),
             second,
             second_indptr,
             self.attn_sink,

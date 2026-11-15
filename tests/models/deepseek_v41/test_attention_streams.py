@@ -243,6 +243,11 @@ def test_forward_orders_window_and_side_stream_joins(
     instance.wq_b = lambda *a, **k: torch.zeros(1, 32)
     instance.heads, instance.head_dim, instance.groups = 8, 4, 1
     instance.spec = SimpleNamespace(layer_id=0)
+    instance._prepare_attention = lambda *a: None
+    instance._prepare_fused_attention = lambda *a: (
+        log.append("norm/window"),
+        (None, None),
+    )[1]
     instance._use_fused_attention = lambda *a: fused
     instance._attend = lambda query, *a, **k: (log.append("attend"), query)[1]
     instance._project_out = lambda *a: None

@@ -331,12 +331,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
-    # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
-    # + SiLU, because it keeps a single copy of the weights in the FlyDSL layout
-    # and hands Triton a zero-copy view of it -- which is only valid where the
-    # two preshuffles agree byte-for-byte -- which is what ATOM_MOE_GU_ITLV=1
-    # buys, and why the prep asserts it: only the interleaved layout is shared,
-    # so at ATOM_MOE_GU_ITLV=0 the FlyDSL prep and the Triton view disagree.
+    # flag, it cannot enable Triton on its own) plus gfx1250 + SiLU, because it
+    # keeps a single copy of the weights in the FlyDSL layout and hands Triton a
+    # zero-copy view of it -- which is only valid where the two preshuffles agree
+    # byte-for-byte. They agree only for the gate/up interleaved layout, which
+    # the MXFP4 MoE always uses on gfx1250, and the prep asserts it.
     # tests/test_mxfp4_triton_moe_decode.py runs both real preps and compares.
     #
     # Arms under EP as well as TP, at both EP entry points -- the modular-kernel
@@ -459,6 +458,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_QKNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_QKNORM_FUSION", "1") == "1"
+    ),
+    # DeepSeek-V4/V4.1 shared expert: clamp + silu(gate)*up + FP8 quant in one
+    # aiter triton kernel feeding w2. Ranks whose intermediate width is not a
+    # multiple of 128 keep the unfused path.
+    "ATOM_V4_USE_TRITON_FUSION": lambda: (
+        os.getenv("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
@@ -642,6 +647,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # Direct NVFP4 CSA / MXFP8 SWA attention; off retains the BF16 adapter.
+    "ATOM_DSV41_A8W4_ATTN": lambda: os.getenv("ATOM_DSV41_A8W4_ATTN", "auto")
+    .strip()
+    .lower(),
     # DeepSeek-V4.1 mono decode's high-interactivity (hi) monokernels (the
     # `mono/hi` package, imported only with this on): on the decode steps it
     # serves, every decoder layer, the verify head, the DSpark draft and the
@@ -1063,7 +1072,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
     ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
-    # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
+    # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout. Always
+    # INTERLEAVE on gfx1250: aiter's gfx1250 fused_moe takes no other layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",
@@ -1333,6 +1343,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # Optional override of the file that serializes shared in-place
+    # registration. Empty: host_memory names one from the checkpoint path.
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", ""),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

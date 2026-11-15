@@ -16,11 +16,13 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Lock, RLock, Thread, local
+from typing import Any
 
 import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
@@ -32,14 +34,19 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
     engine_budget,
 )
-from atom.model_engine.dp_policy import LoadPolicy, PrefixPolicy, SessionPolicy
-from atom.model_engine.dp_route import (
+from atom.model_engine.dp_routing.policies import (
+    LoadPolicy,
+    PrefixPolicy,
+    SessionPolicy,
+)
+from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.dp_routing.route import (
     PREFIX_LABELS,
     PREFIX_MOVED_TOKENS,
     PREFIX_OWNER,
     Route,
 )
-from atom.model_engine.dp_routing import prefix_spread_enabled
+from atom.model_engine.dp_routing.topology import prefix_spread_enabled
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
@@ -48,8 +55,7 @@ from atom.model_engine.engine_utility import (
     completes_weight_sync,
     kv_change,
 )
-from atom.model_engine.prefix_hash import take_shipped_chains
-from atom.model_engine.prefix_spread import PrefixSpreadRouter
+from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -163,6 +169,27 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
     ]
 
 
+def kv_event_sources(config) -> dict[str, dict[str, Any]]:
+    """Where each engine on this node publishes KV events (`/kv_event_sources`),
+    keyed by the global DP rank its publisher binds for: the endpoint after the
+    per-rank offset (a wildcard host stays a wildcard), the topic, and the
+    tokens per hashed block. Empty with events off or the null publisher."""
+    events = config.kv_events_config
+    if not events.enable or events.publisher == "null":
+        return {}
+    block_size = hash_block_size_for(
+        config.kv_cache_block_size, config.decode_context_parallel_size
+    )
+    return {
+        str(rank): {
+            "endpoint": offset_endpoint(events.endpoint, rank),
+            "topic": events.topic,
+            "block_size": block_size,
+        }
+        for rank, _ in iter_dp_rank_assignments(config)
+    }
+
+
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     """How many DP-attention EngineCores to launch for a `logical`-wide run.
 
@@ -255,6 +282,8 @@ class CoreManager:
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
+        # Fixed for the engines' lifetime, so `/kv_event_sources` serves it as is.
+        self.kv_event_sources = kv_event_sources(config)
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
@@ -332,10 +361,10 @@ class CoreManager:
             "explicit_total": 0,
             "load_balanced_total": 0,
         }
-        # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
-        # request on the rank holding its prompt's prefix unless that rank has
-        # a prefill backlog and another is about to idle. Created only when
-        # this manager actually routes between eligible DP ranks.
+        # Prefix-spread routing (`atom/model_engine/dp_routing/prefix_spread.py`):
+        # keeps a request on the rank holding its prompt's prefix unless that
+        # rank has a prefill backlog and another is about to idle. Created only
+        # when this manager actually routes between eligible DP ranks.
         self._prefix_router = self._build_prefix_router(config)
         if self._prefix_router is not None:
             self._dp_route_counters.update(
@@ -423,10 +452,15 @@ class CoreManager:
     def _start_distributed_store(
         self, config: Config, *, multinode: bool = False
     ) -> None:
-        """Bind the actual rendezvous server before publishing its port to workers."""
+        """Bind the actual rendezvous server before publishing its port to workers.
+
+        Also names the server (`server_instance_id`), which every engine of it
+        copies from `config`.
+        """
         from torch.distributed import TCPStore
 
         pc = config.parallel_config
+        pc.server_instance_id = uuid.uuid4().hex[:12]
         if multinode and pc.data_parallel_base_port == 0:
             raise ValueError(
                 "Multi-node DP requires the same nonzero --data-parallel-base-port "
@@ -1588,6 +1622,8 @@ class CoreManager:
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
             }
+            if self._prefix_router is not None:
+                snapshot["prefix_index"] = self._prefix_router.index_counters()
             if PREFIX_OWNER in self._dp_route_counters:
                 snapshot["prefix_route"] = {
                     label: self._dp_route_counters[name]

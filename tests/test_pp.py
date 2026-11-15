@@ -66,6 +66,7 @@ from atom.models.utils import (
     PPMissingLayer,
     get_pp_indices,
     make_layers,
+    pp_holds_embedding,
 )
 from tests.conftest import MockConfig
 
@@ -205,6 +206,42 @@ def test_send_packs_only_proxy_keys_to_group_relative_next(monkeypatch):
     assert set(sent["tensors"].keys()) == {"hidden_states", "residual"}
     assert sent["dst"] == 1
     assert torch.equal(sent["tensors"]["hidden_states"], torch.ones(3, 4))
+
+
+@pytest.mark.parametrize(
+    "pp_rank,pp_size,arch,method,holds,producer",
+    [
+        (0, 2, "KimiK3ForConditionalGeneration", None, True, False),
+        (1, 2, "KimiK3ForConditionalGeneration", None, False, False),
+        # A declared PP method's drafter shares the target's embedding.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        (1, 4, "KimiK3ForConditionalGeneration", "dspark", False, False),
+        (3, 4, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        # Undeclared: the drafter keeps its own, so build none for it.
+        (1, 2, "KimiK3ForConditionalGeneration", "eagle", False, False),
+        (1, 2, "MiniMaxM3SparseForCausalLM", "dspark", False, False),
+        (0, 1, "KimiK3ForConditionalGeneration", "dspark", True, False),
+        # A P/D producer's draft only writes context K/V: no last-stage copy.
+        (1, 2, "KimiK3ForConditionalGeneration", "dspark", False, True),
+        (0, 2, "KimiK3ForConditionalGeneration", "dspark", True, True),
+    ],
+)
+def test_pp_holds_embedding(
+    monkeypatch, pp_rank, pp_size, arch, method, holds, producer
+):
+    grp = MagicMock(is_first_rank=pp_rank == 0, is_last_rank=pp_rank == pp_size - 1)
+    fake_ps = MagicMock()
+    fake_ps.get_pp_group.return_value = grp
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", fake_ps)
+    spec = method and types.SimpleNamespace(
+        method=method, use_dspark=lambda: method == "dspark"
+    )
+    config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(architectures=[arch]),
+        speculative_config=spec,
+        kv_transfer_config={"kv_role": "kv_producer"} if producer else {},
+    )
+    assert pp_holds_embedding(config) is holds
 
 
 def test_send_tolerates_missing_residual(monkeypatch):

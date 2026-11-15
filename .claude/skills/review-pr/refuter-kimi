@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# A refuter that is not the worker's model family.
+#
+# The worker runs on GLM. Pointing the refuter at the same binary makes Step 7.7 a model
+# re-reading its own output: across every run recorded so far it has judged 41+ findings
+# and killed zero. A refutation that never refutes is a ceremony, and -- worse -- it is
+# indistinguishable on the card from one that genuinely tried, which is why run_one
+# records SAME_FAMILY and says so.
+#
+# `claude-glm --backend kimi` cannot be used as REFUTER_AGENT directly: the flag must come
+# first and run_one appends `-p --dangerously-skip-permissions` after the binary name.
+# This wrapper exists only to put the flag in the right place.
+#
+#   ATOM_REVIEW_REFUTER_AGENT=.../refuter-kimi bash run_one.sh <PR> ROCm/ATOM
+exec claude-glm --backend kimi "$@"

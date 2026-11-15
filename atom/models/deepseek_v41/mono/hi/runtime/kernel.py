@@ -6,6 +6,7 @@ import copy
 from dataclasses import dataclass, field
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from ..device.gfx950.hazards import srcc_hazards
 from ..emit.compile import ResourceError, compile_traced, device_cus, gate, resources
@@ -339,11 +340,12 @@ class MonoKernel:
             peers.launched(layer, self.program.name)
         if torch.cuda.is_current_stream_capturing():
             bufs.captured = True
-        self.launcher(
+        _run_compiled(
+            self.launcher,
             bufs.step.data_ptr(),
             layer,
             table.data_ptr(),
             bufs.scratch.data_ptr(),
             0 if bufs.private is None else bufs.private.data_ptr(),
-            stream=stream or torch.cuda.current_stream(),
+            stream or torch.cuda.current_stream(),
         )

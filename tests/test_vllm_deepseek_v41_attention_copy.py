@@ -37,10 +37,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
-# sha256 of core's `Attention.forward` and `_attend`, comments and blank
-# lines stripped.
-CORE_PREPARE_DIGEST = "50a174931df035a4"
-CORE_FORWARD_DIGEST = "cf3b6f63a9e378be"
+# sha256 of core's attention forward/preparation helpers, comments and blank
+# lines stripped. vLLM keeps preparation inside its existing attention break;
+# native TokenGraph's fixed/live placement does not change the copied math.
+CORE_PREPARE_DIGEST = "1f897780d89a3205"
+CORE_FORWARD_DIGEST = "a9ca0db53b507de5"
 
 
 @pytest.fixture
@@ -263,13 +264,15 @@ def test_core_fused_output_scale_crosses_break_without_copy(core_attention, stag
         ring_view=Mock(return_value=object()),
         write_window=Mock(),
         pool=object(),
+        main_view=Mock(return_value=object()),
         packed=False,
+        kv_fp8=True,
     )
     step = SimpleNamespace(
         requests=() if stage == "idle" else (object(),), decode=stage == "decode"
     )
     attention = SimpleNamespace(
-        spec=SimpleNamespace(layer_id=0),
+        spec=SimpleNamespace(layer_id=0, kv_owner=0),
         heads=8,
         head_dim=4,
         groups=1,
@@ -281,10 +284,12 @@ def test_core_fused_output_scale_crosses_break_without_copy(core_attention, stag
         _fork_compress=Mock(),
         project_qkv=Mock(return_value=(hidden, kv)),
         _use_fused_attention=Mock(return_value=True),
+        _prepare_fused_attention=Mock(return_value=(hidden, None)),
         _fork_select=Mock(),
         wq_b=Mock(return_value=hidden),
         _project_quantized_out=Mock(),
     )
+    step.attention_inputs = (False, None, kv, None)
     addresses = []
 
     def byte_only_boundary(*args, **kwargs):
@@ -316,8 +321,7 @@ def test_core_fused_output_scale_crosses_break_without_copy(core_attention, stag
 
 def _core_forward() -> str:
     """The source of the attention half the plugin copies: `Attention.forward`
-    and `_attend`, the region it attends in, by AST rather than by text
-    markers.
+    and its preparation/attention helpers, by AST rather than text markers.
 
     A "next def" marker would have nothing to find after the class's last
     method -- and a marker that silently matches to end-of-file would fold
@@ -332,7 +336,15 @@ def _core_forward() -> str:
     lines = src.split("\n")
     return "\n".join(
         line.rstrip()
-        for name in ("forward", "_attend")
+        for name in (
+            "forward",
+            "_prepare_fused_attention",
+            "_prepare_fused_attention_live",
+            "_prepare_attention",
+            "_prepare_attention_live",
+            "_attention_inputs",
+            "_attend",
+        )
         for fn in cls.body
         if isinstance(fn, ast.FunctionDef) and fn.name == name
         for line in lines[fn.lineno - 1 : fn.end_lineno]
@@ -549,13 +561,14 @@ def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
         write_window=write,
         ring_view=Mock(return_value=object()),
         pool=object(),
+        main_view=Mock(return_value=object()),
         packed=False,
         kv_fp8=True,
     )
     model = SimpleNamespace(
         heads=8,
         head_dim=4,
-        spec=SimpleNamespace(layer_id=0),
+        spec=SimpleNamespace(layer_id=0, kv_owner=0),
         attn_sink=object(),
         softmax_scale=0.5,
         _fork_compress=Mock(return_value=True),
@@ -579,7 +592,7 @@ def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
     def attend(query, pool, *args, **kwargs):
         events.append("attend")
         assert query.shape == (rows, 8, 4) and query.dtype == torch.bfloat16
-        assert pool is cache.pool
+        assert pool is cache.main_view.return_value
         assert kwargs["out"] is values
         assert kwargs["out_scale"].data_ptr() == scales.data_ptr()
         assert kwargs["out_scale"].dtype == torch.float8_e8m0fnu

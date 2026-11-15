@@ -21,6 +21,9 @@ except ImportError:
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
+    supports_a8w4_attention,
+)
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     fused_attention_available,
     fused_sparse_attn_v41_paged_2src,
@@ -48,7 +51,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.utils import forward_context
+from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
@@ -468,6 +471,10 @@ class Attention(nn.Module):
             and rope.cos_cache.shape[-1] == 32
         )
 
+    def _use_a8w4_attention(self, query, cache):
+        """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
+        return cache.packed and supports_a8w4_attention(query, self.softmax_scale)
+
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
 
@@ -528,8 +535,8 @@ class Attention(nn.Module):
         # safe: the scorer reads the index plane, the compressor its arena.
         fused = self._use_fused_attention(kv_pre, cache, rope)
         if fused:
-            qr, qr_scale, kv, window_kv = cache.norm_rope_quant_window(
-                self.spec.layer_id, self.qk_norm, q_lora, kv_pre, rope, step
+            qr, qr_scale = self._prepare_fused_attention(
+                q_lora, kv_pre, cache, step, rope
             )
         else:
             qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
@@ -541,23 +548,11 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        # Unfused: one launch for both rotations, the KV row's FP8 bytes and,
-        # where a decode allows it, the window write. `window_kv` is what is
-        # left for `write_window` below, which is nothing when that fold
-        # happened. The FP8 pool's attention reads the query as MXFP8
-        # (`query_fp8`).
-        query_fp8 = None
-        if not fused:
-            query_fp8 = cache.query_fp8(query)
-            if queries is None:
-                kv, window_kv = cache.rope_quant_window(
-                    self.spec.layer_id, query, kv_normed, rope, step, query_fp8
-                )
-            else:
-                kv, window_kv = cache.rope_quant_window(
-                    self.spec.layer_id, None, kv_normed, rope, step
-                )
-                cache.rotate_query(query, rope, queries.positions, query_fp8)
+        prepared = (
+            None
+            if fused
+            else self._prepare_attention(query, kv_normed, cache, step, rope, queries)
+        )
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
@@ -578,9 +573,6 @@ class Attention(nn.Module):
             )
             self._attend(
                 query,
-                query_fp8,
-                kv,
-                window_kv,
                 cache,
                 step,
                 queries,
@@ -592,33 +584,96 @@ class Attention(nn.Module):
             return self._project_quantized_out(
                 x_fp8, x_scale, query.shape[:-2], query.dtype
             )
-        output = self._attend(query, query_fp8, kv, window_kv, cache, step, queries)
+        output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
             rope,
             cache.rope_positions(step) if queries is None else queries.positions,
         )
 
+    def _prepare_fused_attention(self, q, kv, cache, step, rope):
+        """Graph-owned Q planes; request-dependent KV destinations stay live."""
+        qr = torch.empty_like(q, dtype=FP8_DTYPE)
+        qr_scale = torch.empty(
+            (*q.shape[:-1], q.shape[-1] // 32), dtype=torch.uint8, device=q.device
+        )
+        self._prepare_fused_attention_live(q, kv, qr, qr_scale, cache, step, rope)
+        return qr, qr_scale.view(torch.float8_e8m0fnu)
+
+    @eager_region(live=_live_step)
+    def _prepare_fused_attention_live(self, q, kv, qr, qr_scale, cache, step, rope):
+        if not step.requests:
+            qr.view(torch.uint8).zero_()
+            qr_scale.fill_(127)
+            return
+        _, _, source, window = cache.norm_rope_quant_window(
+            self.spec.layer_id,
+            self.qk_norm,
+            q,
+            kv,
+            rope,
+            step,
+            q_out=(qr, qr_scale.view(torch.float8_e8m0fnu)),
+        )
+        step.attention_inputs = False, None, source, window
+
+    def _prepare_attention(self, query, kv_normed, cache, step, rope, queries):
+        """Capture fixed-shape preparation; stage variable sources live.
+
+        A token bucket fixes ordinary BF16/fallback Q and current-KV buffers.
+        Quantized prefill also stages per-request SWA history, and bounded
+        replay may change the query rows, so those paths need live preparation.
+        """
+        if queries is not None or (
+            not step.decode
+            and (cache.kv_fp8 or (cache.packed and envs.ATOM_DSV41_A8W4_ATTN != "off"))
+        ):
+            # FP4 auto eligibility can change with live query dimensions.
+            # Query inside the live region, never in the captured caller too.
+            self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
+            return None
+        a8w4 = self._use_a8w4_attention(query, cache)
+        return self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+        )
+
+    @eager_region(live=_live_rows)
+    def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
+        """Keep request-dependent source addresses on the live step."""
+        if not step.requests:
+            return
+        a8w4 = self._use_a8w4_attention(query, cache)
+        step.attention_inputs = self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+        )
+
+    def _attention_inputs(self, query, kv_normed, cache, step, rope, queries, *, a8w4):
+        query_fp8 = cache.query_fp8(query, a8w4=a8w4)
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
+            )
+            cache.rotate_query(query, rope, queries.positions, query_fp8)
+        return a8w4, query_fp8, kv, window_kv
+
     @eager_region(live=_live_rows)
     def _attend(
         self,
         query,
-        query_fp8,
-        kv,
-        window_kv,
         cache,
         step,
         queries,
+        prepared=None,
         *,
         rope=None,
         out=None,
         out_scale=None,
     ):
-        """Indices, sparse attention and the window write: the TR-graph break
-        whose launches follow each request's query length and context. The
-        result is written over ``query`` in place wherever the kernel takes
-        ``out=``. Fused attention writes both graph-owned FP8 output buffers
-        and returns None so replay needs no result copy."""
+        """Consume live sources; fused output planes belong to the caller's graph."""
         if out_scale is not None:
             out_scale = out_scale.view(torch.float8_e8m0fnu)
         if not step.requests:  # a dummy prefill on a token graph
@@ -627,20 +682,23 @@ class Attention(nn.Module):
                 out_scale.view(torch.uint8).fill_(127)
                 return None
             return query
+        if prepared is None:
+            prepared = step.attention_inputs
+        a8w4, query_fp8, kv, window_kv = prepared
+        step.attention_inputs = None
         prefix, prefix_indptr, second, second_indptr = (
-            cache.attention_indices(self.spec, step)
+            cache.attention_indices(self.spec, step, a8w4=a8w4)
             if queries is None
-            else queries.indices(cache, self.spec)
+            else queries.indices(cache, self.spec, a8w4=a8w4)
         )
         flat_query = query.flatten(0, 1)
+        pool = cache.main_view(self.spec.kv_owner)
+        if cache.packed and not a8w4:
+            pool = (pool, cache.ring_view(self.spec.layer_id))
         kwargs = {"out": flat_query}
         if out is not None:
             attend = fused_sparse_attn_v41_paged_2src
-            attending = (
-                flat_query
-                if query_fp8 is None
-                else tuple(part.flatten(0, 1) for part in query_fp8)
-            )
+            attending = flat_query
             kwargs = {
                 "rope": rope,
                 "positions": (
@@ -649,18 +707,20 @@ class Attention(nn.Module):
                 "out": out,
                 "out_scale": out_scale,
             }
-        elif cache.kv_fp8:
+        elif a8w4 or cache.kv_fp8:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
+            if a8w4:
+                kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
         else:
             attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             attending = flat_query
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
-            if cache.packed:
+            if cache.packed and not a8w4:
                 output = packed_decode(
                     flat_query,
-                    cache.pool,
+                    pool,
                     prefix,
                     prefix_indptr,
                     self.attn_sink,
@@ -671,7 +731,7 @@ class Attention(nn.Module):
                 # ring: the second source, beside the selection in the pool.
                 output = attend(
                     attending,
-                    cache.pool,
+                    pool,
                     prefix,
                     prefix_indptr,
                     cache.ring_view(self.spec.layer_id),
@@ -684,10 +744,10 @@ class Attention(nn.Module):
         else:
             output = attend(
                 attending,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
-                kv.flatten(0, -2),
+                kv if cache.kv_fp8 or a8w4 else kv.flatten(0, -2),
                 second,
                 second_indptr,
                 self.attn_sink,

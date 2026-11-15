@@ -9,6 +9,7 @@
 import importlib.util
 import random
 import sys
+import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -583,3 +584,47 @@ def test_tail_slots_ordered():
 
 def test_lds_regions():
     assert LY.TP_PAYLOAD < LY.FRONT_LDS < LY.RKEEP
+
+
+def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
+    """Four ranks' target kernels traced at once on four threads, compile-only (``ARCH``: no GPU): every trace counts
+    its poll timeouts through its own kernel's counter, and no IR value of one trace reaches another (a module-level
+    counter pointer failed this: 'operand from a different MLIRContext', or an LLVM abort).
+    """
+    pytest.importorskip("flydsl")
+    monkeypatch.setenv("ARCH", "gfx1250")
+    monkeypatch.setenv(
+        "FLYDSL_RUNTIME_ENABLE_CACHE", "0"
+    )  # a cached build is not traced
+    from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
+    from atom.models.deepseek_v41.mono.gfx1250.kernels import step
+    from atom.mono.runtime.compile import compile_only
+
+    seen, errors = {}, {}
+    counter = hx._counter
+
+    def traced_counter():  # each thread's view of the counter while its trace emits the timeout checks
+        ptr = counter()
+        seen.setdefault(threading.get_ident(), set()).add(ptr is not None)
+        return ptr
+
+    monkeypatch.setattr(hx, "_counter", traced_counter)
+
+    def build(rank):
+        try:
+            launcher = step.build(6, rank, part="target", trd=5)[0]
+            with compile_only():
+                launcher(0, 0, 0, 0, 0, 0, 1.0, 0, 0)
+        except Exception as error:  # noqa: BLE001 - reported below, per rank
+            errors[rank] = error
+
+    threads = [threading.Thread(target=build, args=(rank,)) for rank in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors, errors
+    assert len(seen) == 4 and all(v == {True} for v in seen.values()), seen
+    assert (
+        hx._counter() is None
+    )  # cleared at the end of this thread's traces (none ran here)

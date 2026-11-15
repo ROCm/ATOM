@@ -17,7 +17,6 @@ from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     fused_attention_available,
 )
-from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
@@ -32,6 +31,17 @@ from tests.attentions.deepseek_v41.helpers import (
     begin_step,
     metadata_buffers,
 )
+
+
+def window_bytes(cache):
+    return torch.cat(list(cache.window_sources))
+
+
+def restore_windows(cache, snapshot):
+    offset = 0
+    for source in cache.window_sources:
+        source.copy_(snapshot[offset : offset + source.numel()])
+        offset += source.numel()
 
 
 @pytest.fixture
@@ -108,9 +118,15 @@ def fused_factory(single_rank):
             index_topk=topk,
         )
         cache = PagedAttentionCache(geo, pages, slots, "cuda", max_tokens=max_tokens)
-        for field in (cache.pages.view("main_0"), cache.state.view("window")):
-            source = torch.randn(*field.shape[:-1], 512, device="cuda").bfloat16()
-            field.copy_(pack_rows(*quantize_fp8(source)))
+        for values, scales in (
+            cache.main_view(0),
+            cache.ring_view(0),
+            cache.ring_view(1),
+        ):
+            source = torch.randn(values.shape, device="cuda").bfloat16()
+            quantized = quantize_fp8(source)
+            values.copy_(quantized[0].view(torch.uint8))
+            scales.copy_(quantized[1].view(torch.uint8))
         rope = RotaryEmbedding(64, context + max_tokens + 256, base=10000).cuda()
         return SimpleNamespace(
             model=model,
@@ -118,7 +134,7 @@ def fused_factory(single_rank):
             rope=rope,
             topk=topk,
             context=context,
-            initial=cache.backing.clone(),
+            initial=window_bytes(cache),
             config=config,
             selection=torch.arange(topk, device="cuda", dtype=torch.int32)
             .expand(1, max_tokens, -1)
@@ -234,21 +250,23 @@ def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage, q_lor
     q, kv = latent[..., :q_lora_rank], latent[..., q_lora_rank:]
     layer = model.spec.layer_id
 
-    cache.backing.copy_(case.initial)
+    restore_windows(cache, case.initial)
     qr, qr_scale, normed = model.qk_norm(q, kv)
     rows, window = cache.rope_quant_window(layer, None, normed, rope, step)
-    ring = cache.backing.clone()
+    ring = window_bytes(cache)
+    if rows is not None:
+        rows = tuple(part.clone() for part in rows)
 
-    cache.backing.copy_(case.initial)
+    restore_windows(cache, case.initial)
     actual = cache.norm_rope_quant_window(layer, model.qk_norm, q, kv, rope, step)
     assert torch.equal(actual[0].view(torch.uint8), qr.view(torch.uint8))
     assert torch.equal(actual[1].view(torch.uint8), qr_scale.view(torch.uint8))
-    assert torch.equal(cache.backing, ring)
+    assert torch.equal(window_bytes(cache), ring)
     if stage == "decode":
         assert not torch.equal(ring, case.initial)
         assert actual[2:] == (None, None) == (rows, window)
     else:
-        assert torch.equal(actual[2], rows)
+        assert all(torch.equal(a, b) for a, b in zip(actual[2], rows))
 
 
 @torch.inference_mode()
@@ -270,9 +288,9 @@ def test_fused_forward_matches_unfused(fused_factory, heads, stage, record_prope
     outputs, caches = {}, {}
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
-        case.cache.backing.copy_(case.initial)
+        restore_windows(case.cache, case.initial)
         outputs[mode] = case.model(hidden, None, case.cache, step, case.rope, queries)
-        caches[mode] = case.cache.backing.clone()
+        caches[mode] = window_bytes(case.cache)
     assert outputs["unfused"].abs().max() > 0
     assert not torch.equal(caches["unfused"], case.initial)
     metrics = assert_output(outputs["fused"], outputs["unfused"])
@@ -295,13 +313,13 @@ def test_window_layer_fused_forward(fused_factory, stage, record_property):
     reference, ring = None, None
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
-        case.cache.backing.copy_(case.initial)
+        restore_windows(case.cache, case.initial)
         output = case.model(hidden, None, case.cache, step, case.rope, queries)
         if mode == "unfused":
-            reference, ring = output, case.cache.backing.clone()
+            reference, ring = output, window_bytes(case.cache)
         else:
             record_property(mode, assert_output(output, reference))
-            assert torch.equal(case.cache.backing, ring)
+            assert torch.equal(window_bytes(case.cache), ring)
 
 
 @torch.inference_mode()
@@ -317,13 +335,13 @@ def test_fused_forward_with_2048_prefix_rows(
     reference, ring = None, None
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
-        case.cache.backing.copy_(case.initial)
+        restore_windows(case.cache, case.initial)
         output = case.model(hidden, None, case.cache, step, case.rope)
         if mode == "unfused":
-            reference, ring = output, case.cache.backing.clone()
+            reference, ring = output, window_bytes(case.cache)
         else:
             record_property(mode, assert_output(output, reference))
-            assert torch.equal(case.cache.backing, ring)
+            assert torch.equal(window_bytes(case.cache), ring)
 
 
 @torch.inference_mode()
@@ -348,13 +366,13 @@ def test_fused_forward_t32_small_heads(
     reference, ring = None, None
     for mode in ("unfused", "fused"):
         case.model.fused_attn = mode == "fused"
-        case.cache.backing.copy_(case.initial)
+        restore_windows(case.cache, case.initial)
         output = case.model(hidden, None, case.cache, step, case.rope)
         if mode == "unfused":
-            reference, ring = output, case.cache.backing.clone()
+            reference, ring = output, window_bytes(case.cache)
         else:
             record_property(mode, assert_output(output, reference))
-            assert torch.equal(case.cache.backing, ring)
+            assert torch.equal(window_bytes(case.cache), ring)
     assert calls == [False]
 
 
@@ -391,9 +409,9 @@ def test_fused_forward_graph_replay(fused_factory, monkeypatch, kind, idle):
     with torch.cuda.stream(stream):
         ctx.main_stream = stream
         for _ in range(3):
-            cache.backing.copy_(case.initial)
+            restore_windows(cache, case.initial)
             forward(hidden)
-        cache.backing.copy_(case.initial)
+        restore_windows(cache, case.initial)
         ctx.in_hipgraph = True
         graph.record(forward, (hidden,), {}, key="attention", phase="prefill")
         ctx.in_hipgraph = False
@@ -402,7 +420,13 @@ def test_fused_forward_graph_replay(fused_factory, monkeypatch, kind, idle):
     try:
         phases = [(True, lengths), (True, lengths)]
         if kind == "token":
-            phases += [(True, (3, 5)), (True, (4, 4)), (True, ())]
+            phases += [
+                (True, (8,)),
+                (True, (3, 5)),
+                (True, (4, 4)),
+                (False, (1,) * 8),
+                (True, ()),
+            ]
         previous = None
         for i, (prefill, lengths) in enumerate(phases):
             step, _ = make_step(
@@ -419,12 +443,12 @@ def test_fused_forward_graph_replay(fused_factory, monkeypatch, kind, idle):
             ctx.attn_metadata.step = step
             ctx.context.is_prefill = prefill
             fresh = torch.randn_like(hidden)
-            cache.backing.copy_(case.initial)
+            restore_windows(cache, case.initial)
             actual = graph.replay(
                 (fresh,), {}, key="attention", phase="prefill"
             ).clone()
-            actual_cache = cache.backing.clone()
-            cache.backing.copy_(case.initial)
+            actual_cache = window_bytes(cache)
+            restore_windows(cache, case.initial)
             expected = forward(fresh)
             if lengths:
                 assert_output(actual, expected)
@@ -434,7 +458,7 @@ def test_fused_forward_graph_replay(fused_factory, monkeypatch, kind, idle):
             else:
                 assert torch.equal(actual, torch.zeros_like(actual))
                 assert torch.equal(actual_cache, case.initial)
-            assert torch.equal(actual_cache, cache.backing)
+            assert torch.equal(actual_cache, window_bytes(cache))
     finally:
         graph.release_graphs()
         held_steps.clear()
@@ -451,9 +475,6 @@ def test_fused_dummy_initializes_both_output_planes(fused_factory):
     scale = torch.full((8, 8, 128), 255, device="cuda", dtype=torch.uint8)
     result = case.model._attend(
         query,
-        None,
-        None,
-        None,
         case.cache,
         step,
         None,
@@ -463,7 +484,7 @@ def test_fused_dummy_initializes_both_output_planes(fused_factory):
     )
     assert result is None
     assert out.count_nonzero() == 0 and torch.all(scale == 127)
-    assert torch.equal(case.cache.backing, case.initial)
+    assert torch.equal(window_bytes(case.cache), case.initial)
 
 
 @pytest.mark.parametrize("heads", [16, 32, 64, 128])
@@ -502,13 +523,13 @@ def test_vllm_fused_region_matches_native(fused_factory, monkeypatch, stage):
     hidden = torch.randn(
         1, step.running_tokens, 256, device="cuda", dtype=torch.bfloat16
     )
-    case.cache.backing.copy_(case.initial)
+    restore_windows(case.cache, case.initial)
     expected = case.model(hidden, None, case.cache, step, case.rope, queries)
-    expected_ring = case.cache.backing.clone()
+    expected_ring = window_bytes(case.cache)
     monkeypatch.setattr(
         Attention, "_atom_v41_attend_block", _attend_block, raising=False
     )
-    case.cache.backing.copy_(case.initial)
+    restore_windows(case.cache, case.initial)
     actual = _forward(case.model, hidden, None, case.cache, step, case.rope, queries)
     assert_output(actual, expected)
-    assert torch.equal(case.cache.backing, expected_ring)
+    assert torch.equal(window_bytes(case.cache), expected_ring)
