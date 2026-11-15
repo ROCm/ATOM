@@ -39,6 +39,9 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #   - `_use_dual_stream: bool`
 #   - `single_stream_moe_forward(hidden_states) -> Tensor`
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
+#   - with `shared_fp8` / `shared_scale` (V4.1's FFN seam): both also take
+#     `shared_quantized=(shared_fp8, shared_scale)`, the shared expert's MXFP8
+#     input. Other callers leave them None.
 #
 # Per-token gating: decode benefits from dual-stream, prefill doesn't —
 # threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
@@ -66,18 +69,23 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
 def maybe_dual_stream_forward(
     hidden_states: torch.Tensor,
     layer_name: str,
+    shared_fp8: torch.Tensor | None = None,
+    shared_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
+    shared_quantized = None if shared_fp8 is None else (shared_fp8, shared_scale)
     if _dual_stream_is_active(self, hidden_states.shape[0]):
-        return self.dual_stream_moe_forward(hidden_states)
-    return self.single_stream_moe_forward(hidden_states)
+        return self.dual_stream_moe_forward(hidden_states, shared_quantized)
+    return self.single_stream_moe_forward(hidden_states, shared_quantized)
 
 
 def _maybe_dual_stream_forward_fake(
     hidden_states: torch.Tensor,
     layer_name: str,
+    shared_fp8: torch.Tensor | None = None,
+    shared_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -115,10 +123,12 @@ direct_register_custom_op(
 # from its own static config, NOT from anything about these tensors. A model
 # whose branches must be summed before a collective keeps using the op above.
 #
-# Deliberately a separate op rather than a widened signature on
-# `maybe_dual_stream_forward`: that one is shared with DeepSeek V2/V3.2/V4,
-# none of which defer the add, and all of which live in @support_torch_compile
-# files.
+# Deliberately a separate op from `maybe_dual_stream_forward`, not a flag on it:
+# the split exists only to return the routed + shared branches UNSUMMED, which
+# the schema cannot express as an optional tensor in a tuple return. The
+# optional `shared_fp8`/`shared_scale` on `maybe_dual_stream_forward` are a
+# different axis (a pre-quantized shared input going in, one summed tensor still
+# coming out) and do not need the split.
 
 
 def maybe_dual_stream_split_forward(

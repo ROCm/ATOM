@@ -2783,6 +2783,7 @@ class Expert(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         weights: torch.Tensor | None = None,  # [num_tokens, 1]  optional gate
+        quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
@@ -2790,7 +2791,20 @@ class Expert(nn.Module):
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
         # feed the bf16 GEMM output directly.
-        combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+        # `quantized_input`: x's MXFP8 rows and their row-major group-32 E8M0
+        # scales (V4.1's FFN seam quantizes them with its norm), so gate_up
+        # skips quantizing the same bf16 rows itself.
+        if quantized_input is not None:
+            x_fp8, x_scale = quantized_input
+            assert (
+                self.gate_up_proj.native_a8_group_rows is not None
+            ), "quantized_input needs a native MX gate_up_proj"
+            assert (
+                x_fp8.shape[0] == x.shape[0]
+            ), f"quantized_input has {x_fp8.shape[0]} rows, x has {x.shape[0]}"
+            combined = self.gate_up_proj(x_fp8, x_scale=x_scale)
+        else:
+            combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
@@ -3071,9 +3085,14 @@ class MoE(nn.Module):
     def single_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
+        shared_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        shared = (
+            self.shared_experts(x, quantized_input=shared_quantized)
+            if self.shared_experts is not None
+            else None
+        )
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
             return routed
@@ -3086,6 +3105,7 @@ class MoE(nn.Module):
     def dual_stream_moe_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
+        shared_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
@@ -3097,7 +3117,9 @@ class MoE(nn.Module):
         self.alt_stream.wait_stream(routed_stream)
         if self.experts.combine_accepts_shared(x.shape[0]):
             with torch.cuda.stream(self.alt_stream):
-                shared = self.shared_experts.forward(x)
+                shared = self.shared_experts.forward(
+                    x, quantized_input=shared_quantized
+                )
                 shared_ready = torch.cuda.Event()
                 shared_ready.record(self.alt_stream)
             shared.record_stream(routed_stream)
@@ -3117,7 +3139,9 @@ class MoE(nn.Module):
         def produce_shared(output_rows):
             nonlocal shared_produced
             with torch.cuda.stream(self.alt_stream):
-                shared = self.shared_experts.forward(x)
+                shared = self.shared_experts.forward(
+                    x, quantized_input=shared_quantized
+                )
                 if shared.shape[0] != output_rows:
                     padded = shared.new_zeros((output_rows, *shared.shape[1:]))
                     padded[: shared.shape[0]].copy_(shared)
@@ -3150,7 +3174,7 @@ class MoE(nn.Module):
                 )
             return routed
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts.forward(x)
+            shared = self.shared_experts.forward(x, quantized_input=shared_quantized)
         routed_stream.wait_stream(self.alt_stream)
         return self.combine_outputs(
             routed, shared, prefix=f"{self.prefix}.combine_outputs"
@@ -3159,6 +3183,7 @@ class MoE(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]  hidden state (post ffn_norm)
+        shared_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         # Hash-layer routing reads `input_ids` from forward_context.context
         # inside `_hash_topk` (FusedMoE.custom_routing_function callback);
@@ -3168,8 +3193,11 @@ class MoE(nn.Module):
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
         if self._use_dual_stream or self._use_comm_fused_dispatch:
             # Keep stream and comm-fused dispatch opaque to torch.compile.
-            return torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
-        return self.single_stream_moe_forward(x)
+            shared_fp8, shared_scale = shared_quantized or (None, None)
+            return torch.ops.aiter.maybe_dual_stream_forward(
+                x, self.prefix, shared_fp8, shared_scale
+            )
+        return self.single_stream_moe_forward(x, shared_quantized)
 
 
 @dataclass

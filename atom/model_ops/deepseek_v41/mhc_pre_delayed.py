@@ -8,15 +8,15 @@ the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950
 and gfx1250; Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 
-The norm is the sublayer's own. Attention can request HIP's fused MXFP8
-output alongside BF16 for its other readers; FFN keeps the BF16 interface.
+The norm is the sublayer's own. Attention and the FFN seam can both request
+HIP's fused MXFP8 output alongside BF16 for its other readers: attention for
+wqkv_a, the FFN seam for the shared expert's gate_up (`Block.hc_ffn_fuse_quant`).
 Its consumers (wqkv_a's group32 GEMM, the bounded-replay row gather) read
 row-major (T, H/32) E8M0 scales. gfx950 writes those; gfx1250 writes its
 m32k4 GEMM A-scale layout unless asked for `scale_row_major`, so there the
 fused output needs an AITER with that option, else the GEMM quantizes.
 """
 
-import inspect
 from functools import cache
 
 import torch
@@ -49,11 +49,11 @@ def _row_major_scale_options():
     arch, ops = get_gfx_runtime(), _hip_ops()
     if arch == "gfx950":
         return {}
-    if (
-        arch == "gfx1250"
-        and ops is not None
-        and "scale_row_major" in inspect.signature(ops[0]).parameters
-    ):
+    if arch == "gfx1250" and ops is not None:
+        # aiter main's mega_mhc takes `scale_row_major` (aiter/ops/mega_mhc.py)
+        # and ATOM CI installs aiter main, so ask for it directly. No
+        # inspect.signature probe: that pattern misread aiter and broke
+        # MiniMax-M3 on gfx1250 (#3162).
         return {"scale_row_major": True}
     return None
 
