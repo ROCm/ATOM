@@ -300,7 +300,7 @@ def test_qwen3_5_prefix_hit_scatters_only_the_image_rows_left_in_the_forward(cac
     torch.testing.assert_close(actual, expected[cached:], rtol=0, atol=0)
 
 
-def test_qwen3_5_image_prompt_is_chunked_and_resumes_after_a_prefix_hit():
+def qwen3_5_built_inputs():
     from atom.models.qwen3_5_vl import build_qwen_vl_inputs
 
     def processor(**kwargs):
@@ -321,10 +321,14 @@ def test_qwen3_5_image_prompt_is_chunked_and_resumes_after_a_prefix_hit():
         atom_config, processor, "<|image_pad|> prompt", [object()], {}
     )
     assert data["embedding_spans"] == ((3, 8),)
+    assert data["atomic_prefill"] is True
+    return token_ids, data
 
-    scheduler = Scheduler(
+
+def qwen3_5_scheduler(max_num_batched_tokens):
+    return Scheduler(
         MockConfig(
-            max_num_batched_tokens=6,
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=128,
             num_kvcache_blocks=100,
             enable_chunked_prefill=True,
@@ -332,31 +336,52 @@ def test_qwen3_5_image_prompt_is_chunked_and_resumes_after_a_prefix_hit():
         )
     )
 
-    def prefill(seq):
-        """Schedule `seq` to the end of its prompt; return each chunk's size."""
-        assert scheduler._unschedulable_reason(seq) is None
-        assert not scheduler._requires_atomic_prefill(seq)
-        scheduler.add(seq)
-        chunks = []
-        while seq.num_cached_tokens < len(token_ids):
-            batch, _ = scheduler.schedule()
-            assert batch.multimodal_data[seq.id]["embedding_spans"] == ((3, 8),)
-            chunks.append(batch.total_tokens_num_prefill)
-            scheduler.postprocess(
-                list(scheduler.running),
-                ScheduledBatchOutput([], [], None, None, None),
-                batch=batch,
-            )
-        return chunks
 
+def run_prefills(scheduler, *seqs):
+    """Schedule until every seq has prefilled its prompt; return each step's
+    prefill token count per seq id."""
+    for seq in seqs:
+        assert scheduler._unschedulable_reason(seq) is None
+        scheduler.add(seq)
+    steps = []
+    while any(seq.num_cached_tokens < seq.num_prompt_tokens for seq in seqs):
+        batch, _ = scheduler.schedule()
+        steps.append(dict(zip(batch.req_ids, batch.num_scheduled_tokens)))
+        for seq in seqs:
+            if seq.id in batch.multimodal_data:
+                assert batch.multimodal_data[seq.id]["embedding_spans"] == ((3, 8),)
+        scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput([], [], None, None, None),
+            batch=batch,
+        )
+    return steps
+
+
+def test_qwen3_5_image_prompt_is_prefilled_whole_and_resumes_after_a_prefix_hit():
+    # Spans fix the ROCm/ATOM#2865 prefix-hit crash, but chunking a Qwen3.5
+    # image prompt waits for that repro on MI355X: no GPU test yet covers the
+    # GDN state or MRoPE across a chunk boundary inside an image.
+    token_ids, data = qwen3_5_built_inputs()
     params = SamplingParams(temperature=0, max_tokens=2)
-    # The 16-token prompt no longer has to fit one forward.
-    assert prefill(Sequence(token_ids, 4, params, multimodal_data=data)) == [6, 6, 4]
-    # The same image again hits the 12 published tokens, past the image's end
-    # at 11: the forward holds 4 text tokens and none of the image (the
-    # `[0, 2048]` crash in ROCm/ATOM#2865).
+    scheduler = qwen3_5_scheduler(16)
+    first = Sequence(token_ids, 4, params, multimodal_data=data)
+    assert scheduler._requires_atomic_prefill(first)
+    assert run_prefills(scheduler, first) == [{first.id: 16}]
+    # The same image again hits the published prefix, past the image's end at
+    # 11: the forward holds only text and none of the image (the `[0, 2048]`
+    # crash in ROCm/ATOM#2865).
     again = Sequence(token_ids, 4, params, multimodal_data=dict(data))
-    assert prefill(again) == [4]
+    assert run_prefills(scheduler, again) == [{again.id: 4}]
+
+
+def test_qwen3_5_image_prompt_longer_than_the_token_budget_is_rejected():
+    token_ids, data = qwen3_5_built_inputs()
+    scheduler = qwen3_5_scheduler(6)
+    seq = Sequence(
+        token_ids, 4, SamplingParams(temperature=0, max_tokens=2), multimodal_data=data
+    )
+    assert "never chunked" in scheduler._unschedulable_reason(seq)
 
 
 def _cached_qwen3_5_processor():

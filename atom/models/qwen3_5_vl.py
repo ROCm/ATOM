@@ -455,8 +455,12 @@ def build_qwen_vl_inputs(
     so the runner scatters only the slice of each image a forward contains.
     Without spans the prompt goes through the whole-image merge, which assumes
     every image token is in the forward; a prefix-cache hit that ends inside or
-    past an image breaks that assumption (ROCm/ATOM#2865). Spans also let an
-    image prompt be chunked instead of prefilled in one forward.
+    past an image breaks that assumption (ROCm/ATOM#2865).
+
+    The prompt is still prefilled in one forward (``atomic_prefill``): no GPU
+    test yet covers the GDN state or MRoPE across a chunk boundary inside an
+    image, so chunking Qwen3.5 image prompts waits for the #2865 repro on
+    MI355X.
     """
     if isinstance(prompt, str):
         text = prompt
@@ -492,4 +496,5 @@ def build_qwen_vl_inputs(
             spatial_merge_size=multimodal_config.vision_config.spatial_merge_size,
         )
         multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
+        multimodal_data["atomic_prefill"] = True
     return input_ids, multimodal_data
