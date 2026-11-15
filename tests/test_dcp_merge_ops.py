@@ -1448,10 +1448,12 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("num_spec_tokens", [0, 3])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
-    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype, num_spec_tokens
 ):
-    """12 heads per rank need distinct decode and prefill work buffers."""
+    """12 heads per rank need distinct decode and prefill work buffers. A
+    verify step's sparse_mtp_ plan is made at the decode kernel's width."""
     from aiter import get_mla_metadata_info_v1
 
     from atom.model_ops.attentions import aiter_mla, backends
@@ -1485,7 +1487,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         device=torch.device("cuda"),
         max_num_batched_tokens=16,
         max_bs=4,
-        num_spec_tokens=0,
+        num_spec_tokens=num_spec_tokens,
         has_mla_indexer=True,
         forward_vars={},
     )
@@ -1500,10 +1502,16 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         "reduce_final_map",
         "reduce_partial_map",
     )
-    for prefix, rows, heads in (
-        ("", 4, decode_heads),
-        ("sparse_prefill_", 16, prefill_heads),
-    ):
+    buffers = [("", 4, decode_heads), ("sparse_prefill_", 16, prefill_heads)]
+    if num_spec_tokens:
+        buffers.append(("sparse_mtp_", 4 * (num_spec_tokens + 1), decode_heads))
+        planned = []
+        monkeypatch.setattr(
+            aiter_mla, "get_mla_metadata_v1", lambda *args, **_: planned.append(args[3])
+        )
+        builder._set_mla_persistent_worker_buffers_sparse_mtp(4)
+        assert planned == [decode_heads]
+    for prefix, rows, heads in buffers:
         info = get_mla_metadata_info_v1(
             rows,
             1,

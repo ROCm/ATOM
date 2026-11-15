@@ -229,12 +229,16 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
     assert torch.equal(info[:items, 5], kvptr[planned + 1])
 
 
+@pytest.mark.parametrize("q_len", [8, 1])
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
-def test_patched_decode_step_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype):
-    """A verify step's sparse_mtp_ plan, made once by the builder and patched
-    by each owning layer's `_forward_decode`, against the plan each layer used
-    to rebuild. Rows owning no keys get an empty work item, which the DCP
-    merge drops by owned count; they must not disturb the other rows."""
+def test_patched_decode_step_plan_matches_per_layer_rebuild(
+    monkeypatch, cache_dtype, q_len
+):
+    """A decode step's plan, made once by the builder and patched by each
+    owning layer's `_forward_decode`, against the plan each layer used to
+    rebuild: a verify step's sparse_mtp_ plan (q_len 8) or a plain decode
+    step's (q_len 1). Rows owning no keys get an empty work item, which the
+    DCP merge drops by owned count; they must not disturb the other rows."""
     from types import SimpleNamespace
 
     from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -273,31 +277,41 @@ def test_patched_decode_step_plan_matches_per_layer_rebuild(monkeypatch, cache_d
 
     # Past index_topk tokens of context every query selects topk keys.
     selected = indptr(torch.full((rows,), topk, dtype=torch.int32, device="cuda"))
+    prefix = "sparse_mtp_" if q_len > 1 else ""
     builder = SimpleNamespace(
         dcp_world_size=8,
         block_size=1,
         index_topk_out=topk,
+        is_sparse=True,
+        kv_shuffled=False,
         sparse_mtp_num_heads=heads,
+        persistent_num_heads=heads,
         dtype_q=dtype,
         dtype_kv=dtype,
         model_runner=SimpleNamespace(
-            forward_vars=work_buffers("sparse_mtp_")
+            forward_vars=work_buffers(prefix)
             | {
+                "cu_seqlens_q": SimpleNamespace(gpu=qptr),
                 "sparse_cu_seqlens_q": SimpleNamespace(gpu=qptr),
                 "sparse_kv_indptr": SimpleNamespace(gpu=selected),
                 "sparse_kv_last_page_lens": SimpleNamespace(gpu=last),
             }
         ),
     )
-    meta = AttentionMetaData(max_seqlen_q=8)
-    for (
-        name,
-        value,
-    ) in AiterMLAMetadataBuilder._set_mla_persistent_worker_buffers_sparse_mtp(
-        builder, rows
-    ).items():
+    meta = AttentionMetaData(max_seqlen_q=q_len)
+    if q_len > 1:
+        plan = AiterMLAMetadataBuilder._set_mla_persistent_worker_buffers_sparse_mtp(
+            builder, rows
+        )
+    else:
+        plan = AiterMLAMetadataBuilder.set_mla_persistent_worker_buffers(
+            builder, rows, 1
+        )
+    for name, value in plan.items():
         setattr(meta, name, value)
-    assert int(meta.sparse_mtp_work_indptr[-1]) == rows, "not one work item a row"
+    work_indptr = getattr(meta, prefix + "work_indptr")
+    assert int(work_indptr[-1]) == rows, "not one work item a row"
+    meta.cu_seqlens_q = qptr
     meta.sparse_cu_seqlens_q = qptr
     meta.sparse_kv_indptr = selected
     meta.sparse_kv_last_page_lens = last

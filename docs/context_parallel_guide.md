@@ -575,24 +575,24 @@ With an **fp8 Q and an fp8 KV cache**, aiter serves gqa=64 only from the
 **persistent** decode kernel and aborts the process otherwise (`asm_mla.cu`:
 *"fp8/fp8 with gqa_ratio=64 only supports persistent mode"*).
 
-Native sparse MLA / DSA attention under DCP handles this on gfx950 by rebuilding
-the persistent work/reduce metadata after every **full IndexShare layer**
-compacts its rank-local top-k. The rebuild consumes that layer's
-`dcp_sparse_kv_indptr`; following shared layers reuse the same indices, compact
-indptr, and work plan. This makes the persistent descriptors and the actual
-sparse regions agree without rebuilding metadata on shared layers.
+Native sparse MLA / DSA attention under DCP handles this on gfx950 with one
+persistent work plan a step, one whole query row a work item. After every
+**full IndexShare layer** compacts its rank-local top-k, `patch_work_kv_ranges`
+points the items at that layer's `dcp_sparse_kv_indptr`; following shared layers
+reuse the same indices, compact indptr, and work plan. This makes the persistent
+descriptors and the actual sparse regions agree without planning again per layer.
 
 The implementation is scoped to native, non-speculative serving on gfx950 with
 page size 1: decode is q_len=1, while sparse prefill is represented as per-token
 virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
-speculative sparse DCP paths without the per-layer rebuild) remain
+speculative sparse DCP paths without the per-layer patch) remain
 non-persistent and round a gathered 64 up to **128**.
 
 **Sparse prefill's persistent path is not fp8-only.** Unlike the fp8-and-fp8
 requirement above (which is specifically about decode's gqa=64 kernel), sparse
 *prefill*'s persistent mode has no KV-dtype gate at all:
-`mla_dcp_sparse_prefill_is_persistent()` only checks DCP world size, per-layer
-metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
+`mla_dcp_sparse_prefill_is_persistent()` only checks DCP world size, the
+per-layer plan patch, and page size. A bf16-KV sparse DCP prefill that satisfies
 those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
 one of those (e.g. gfx942, or DCP≤1) still pads to 128.
 
@@ -710,7 +710,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 patch the step's persistent work plan per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |

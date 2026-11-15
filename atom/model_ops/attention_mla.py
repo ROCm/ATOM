@@ -699,7 +699,7 @@ class MLAAttention(nn.Module):
         # A layer that runs its own top-k produces a new layer-local DCP compact
         # indptr. A layer that skips it (IndexShare "shared", or a DeepSeek
         # index_topk_freq skip, which still holds its indexer module) reuses
-        # both the prior layer's indices and the work plan rebuilt from them.
+        # both the prior layer's indices and the work plan patched to them.
         self.owns_sparse_indexer = mla_modules.indexer is not None and not (
             skips_index_topk(atom_config.hf_config, layer_num)
         )
