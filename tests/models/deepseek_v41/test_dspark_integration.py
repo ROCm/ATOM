@@ -319,6 +319,12 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_s
     from atom.model_ops.deepseek_v41 import dspark as dspark_ops
     from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 
+    # Imported here: that module skips itself without a GPU.
+    from tests.attentions.deepseek_v41.test_draft_fp8 import (
+        assert_sources_equal,
+        expected_sources,
+    )
+
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry = V41PoolGeometry(1, (), 16, 4, 512, 32, speculative_tokens=5)
@@ -411,23 +417,14 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_s
         )
         torch.testing.assert_close(actual_ids[: len(slots)], ids + 1, rtol=0, atol=0)
         if two_source:
-            expected_src = dspark_ops.draft_src_indices(
-                staged["anchor_positions"],
-                builder.cache.geometry.ring_slots,
-                draft.window_size,
-                5,
-                dspark_ops.DraftSrcBuffers(4, 5),
+            ring = builder.cache.geometry.ring_slots
+            _, indices, _ = dspark_ops.draft_step_indices(
+                staged["anchor_positions"], ring, draft.window_size, 5
             )
-            got = dspark_ops.DraftSrcIndices(*actual_src)
-            # The lists are only meaningful up to their indptr's end; the
-            # rest of the buffer is never written.
-            assert torch.equal(got.context_ptr, expected_src.context_ptr)
-            assert torch.equal(got.block_ptr, expected_src.block_ptr)
-            for name, ptr in (("context", got.context_ptr), ("block", got.block_ptr)):
-                used = int(ptr[-1])
-                assert torch.equal(
-                    getattr(got, name)[:used], getattr(expected_src, name)[:used]
-                )
+            assert_sources_equal(
+                dspark_ops.DraftSrcIndices(*actual_src),
+                expected_sources(indices, ring),
+            )
             assert draft.draft_src_buffers.context.data_ptr() == src_ptr
         else:
             assert not actual_src
