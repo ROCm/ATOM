@@ -62,8 +62,7 @@
     device cache, as its KV events show, holds the largest share of its tokens,
     if that share is above cache_threshold. The tree places all other requests:
     those at or below the threshold, those with media, those under imbalanced
-    load, those whose candidates have no indexed events, and those on the
-    ext-proc path, which tokenizes only for policies that need tokens.
+    load, and those whose candidates have no indexed events.
 */
 
 use std::sync::{Arc, OnceLock};
@@ -320,8 +319,8 @@ impl CacheAwarePolicy {
 
     /// The tree's affinity branch, with the match rate of the KV event index: the share of
     /// the request's tokens a worker's device cache holds, the highest first, then the
-    /// lower load. None leaves the request to the tree: it has no tokens, or no candidate
-    /// holds more of them than `cache_threshold`.
+    /// lower load. None leaves the request to the tree: it has no tokens or has media, or no
+    /// candidate holds more of them than `cache_threshold`.
     fn select_by_kv_events(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -329,7 +328,9 @@ impl CacheAwarePolicy {
         healthy_indices: &[usize],
         model_id: &str,
     ) -> Option<(Option<usize>, RouteDecision)> {
-        let tokens = info.tokens.filter(|tokens| !tokens.is_empty())?;
+        let tokens = info
+            .tokens
+            .filter(|tokens| !tokens.is_empty() && !info.carries_media)?;
         let hits = self.kv_events.get()?.match_workers(tokens, workers);
         let (idx, cached) = healthy_indices
             .iter()
@@ -355,9 +356,12 @@ impl CacheAwarePolicy {
         Some((Some(idx), decision))
     }
 
-    /// Where the tree learns a request's text, the KV event index predicts its tokens.
+    /// Where the tree learns a request's text, the KV event index predicts its tokens, but
+    /// not those of a request with media, whose blocks an engine keys by the media.
     fn routed(&self, info: &SelectWorkerInfo<'_>, worker: &dyn Worker) {
-        let tokens = info.tokens.filter(|tokens| !tokens.is_empty());
+        let tokens = info
+            .tokens
+            .filter(|tokens| !tokens.is_empty() && !info.carries_media);
         if let (Some(provider), Some(tokens)) = (self.kv_events.get(), tokens) {
             provider.on_routed(tokens, worker);
         }
@@ -851,6 +855,11 @@ mod tests {
             ..info.clone()
         };
         decide(&policy, &workers, &text).await;
+        let media = SelectWorkerInfo {
+            carries_media: true,
+            ..info.clone()
+        };
+        decide(&policy, &workers, &media).await;
         let urls: Vec<_> = placed.iter().map(|&idx| workers[idx].url()).collect();
         assert_eq!(*routed.0.lock(), urls);
     }
@@ -901,6 +910,12 @@ mod tests {
             decide(&policy(Some(vec![])), &workers, &info).await.1,
             "relocate"
         );
+        let media = SelectWorkerInfo {
+            carries_media: true,
+            ..info.clone()
+        };
+        let held = || policy(Some(vec![("http://w1:8000", 90)]));
+        assert_eq!(decide(&held(), &workers, &media).await.1, "relocate");
 
         workers[1].increment_load();
         let tied = policy(Some(vec![("http://w1:8000", 60), ("http://w2:8000", 60)]));
@@ -910,7 +925,7 @@ mod tests {
         );
         workers[0].increment_load();
         // At most cache_threshold of the prompt cached, the tree places it, then knows it.
-        let cold = policy(Some(vec![("http://w1:8000", 30)]));
+        let cold = policy(Some(vec![("http://w1:8000", 50)]));
         assert_eq!(
             decide(&cold, &workers, &info).await,
             (2, "relocate", Some(0.0))
@@ -918,6 +933,13 @@ mod tests {
         assert_eq!(
             decide(&cold, &workers, &info).await,
             (2, "affinity", Some(1.0))
+        );
+        for _ in 0..40 {
+            workers[0].increment_load();
+        }
+        assert_eq!(
+            decide(&held(), &workers, &info).await,
+            (2, "imbalanced", None)
         );
     }
 
