@@ -7,7 +7,7 @@ mod a_chat_template {
     };
     use crate::routers::prepare::chat_template::{
         process_chat_messages, process_content_format, process_tool_call_arguments,
-        renders_without_template, ProcessedMessages,
+        ProcessedMessages,
     };
     use crate::routers::test_mocks::tokenizer::hf_tokenizer_path;
     use crate::tokenizer::{
@@ -228,26 +228,6 @@ mod a_chat_template {
                 "\nuser:;\nassistant: path=a.txt limit=5;\n",
             )
         );
-    }
-
-    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
-    /// and they ignore the template.
-    #[test]
-    fn test_deepseek_renders_without_template() {
-        let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
-        assert!(!renders_without_template(&mut jinja));
-        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = dir.path().join("tokenizer.json");
-            std::fs::copy(hf_tokenizer_path(), &path).unwrap();
-            std::fs::write(
-                dir.path().join("config.json"),
-                json!({"architectures": [architecture]}).to_string(),
-            )
-            .unwrap();
-            let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
-            assert!(renders_without_template(&mut deepseek), "{architecture}");
-        }
     }
 }
 

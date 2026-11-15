@@ -137,7 +137,7 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         .unwrap();
     for marked in [false, true] {
         if marked {
-            crate::routers::prepare::chat_template::mark_rendered_without_template(&id);
+            app.chats_without_template.write().insert(id.clone());
         }
         let parsed = ParsedInference::parse(
             "/v1/chat/completions",

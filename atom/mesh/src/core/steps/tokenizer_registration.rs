@@ -7,10 +7,12 @@
 //! (startup, worker connection, API) should use this workflow to ensure consistent
 //! behavior (validation, caching, deduplication).
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
@@ -21,9 +23,9 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
-    routers::prepare::chat_template::{mark_rendered_without_template, renders_without_template},
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
+        chat_template::ChatTemplateParams,
         factory,
         registry::LoadOutcome,
         traits::Tokenizer,
@@ -103,6 +105,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
+        let chats_without_template = app_context.chats_without_template.clone();
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -114,6 +117,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let source = source.clone();
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
+                let chats_without_template = chats_without_template.clone();
                 async move {
                     // Load base tokenizer
                     let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
@@ -122,7 +126,14 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     )
                     .await
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-                    probe_chat_render(&id, &name, &source, chat_template.as_deref()).await;
+                    probe_chat_render(
+                        &chats_without_template,
+                        &id,
+                        &name,
+                        &source,
+                        chat_template.as_deref(),
+                    )
+                    .await;
 
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
@@ -199,10 +210,17 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     }
 }
 
-/// Record and warn when llm-tokenizer renders `source`'s chats without the Jinja
-/// template. It has no accessor for that, so a copy is probed; mirroring its
-/// `config.json` check would also mean mirroring how it resolves sources.
-async fn probe_chat_render(id: &str, name: &str, source: &str, chat_template: Option<&str>) {
+/// Record `id` in `chats_without_template`, and warn, when llm-tokenizer renders
+/// `source`'s chats without the Jinja template. It has no accessor for that, so a
+/// copy is probed; mirroring its `config.json` check would also mean mirroring
+/// how it resolves sources.
+async fn probe_chat_render(
+    chats_without_template: &RwLock<HashSet<String>>,
+    id: &str,
+    name: &str,
+    source: &str,
+    chat_template: Option<&str>,
+) {
     const UNPROBED: &str = "Cannot probe whether llm-tokenizer renders these chats without the \
                             Jinja template; HTTP routing tokenizes them as it renders them";
     let mut copy = match factory::create_tokenizer_async_with_chat_template(source, None).await {
@@ -219,7 +237,7 @@ async fn probe_chat_render(id: &str, name: &str, source: &str, chat_template: Op
     if !renders_without_template(copy) {
         return;
     }
-    mark_rendered_without_template(id);
+    chats_without_template.write().insert(id.to_string());
     warn!(
         tokenizer = name,
         "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template{}; \
@@ -230,6 +248,23 @@ async fn probe_chat_render(id: &str, name: &str, source: &str, chat_template: Op
             ""
         }
     );
+}
+
+/// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
+/// does with the encoders it has built in for the architectures in `config.json`
+/// (DeepSeek V3.2 and V4 in 1.4.2). Such a render ignores `--chat-template`, and
+/// its defaults are not ATOM's: DeepSeek renders chat mode unless `thinking` is
+/// true, where ATOM's encoder renders thinking mode. Replaces the template, so
+/// probe a copy.
+fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
+    const PROBE: &str = "probe";
+    tokenizer.set_chat_template(PROBE.to_string()).is_ok()
+        && tokenizer
+            .apply_chat_template(
+                &[json!({"role": "user", "content": ""})],
+                ChatTemplateParams::default(),
+            )
+            .is_ok_and(|text| text != PROBE)
 }
 
 // ============================================================================
@@ -283,24 +318,43 @@ mod tests {
     use crate::{
         routers::{
             comm::tokenize::remove_tokenizer,
-            prepare::chat_template::rendered_without_template,
             test_mocks::{app_context::app_context, tokenizer::hf_tokenizer_path},
         },
-        tokenizer::registry::TokenizerRegistry,
+        tokenizer::{registry::TokenizerRegistry, HuggingFaceTokenizer},
     };
+
+    /// The fixture's tokenizer beside a `config.json` naming `architecture`.
+    fn tokenizer_dir(architecture: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            json!({"architectures": [architecture]}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
+    /// and they ignore the template.
+    #[test]
+    fn test_deepseek_renders_without_template() {
+        let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        assert!(!renders_without_template(&mut jinja));
+        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+            let dir = tokenizer_dir(architecture);
+            let path = dir.path().join("tokenizer.json");
+            let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+            assert!(renders_without_template(&mut deepseek), "{architecture}");
+        }
+    }
 
     /// Registering a tokenizer whose `config.json` picks a built-in encoder marks
     /// it, and removing it drops the mark.
     #[tokio::test]
     async fn test_registration_marks_chats_rendered_without_template() {
         let context = app_context();
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
-        std::fs::write(
-            dir.path().join("config.json"),
-            serde_json::json!({"architectures": ["DeepseekV4ForCausalLM"]}).to_string(),
-        )
-        .unwrap();
+        let dir = tokenizer_dir("DeepseekV4ForCausalLM");
         let deepseek = TokenizerRegistry::generate_id();
         let jinja = TokenizerRegistry::generate_id();
         for (id, source) in [
@@ -322,10 +376,11 @@ mod tests {
             LoadTokenizerStep.execute(&mut workflow).await.unwrap();
         }
 
-        assert!(rendered_without_template(&deepseek));
-        assert!(!rendered_without_template(&jinja));
+        let marked = |id: &str| context.chats_without_template.read().contains(id);
+        assert!(marked(&deepseek));
+        assert!(!marked(&jinja));
         remove_tokenizer(&context, &deepseek).await;
-        assert!(!rendered_without_template(&deepseek));
+        assert!(!marked(&deepseek));
     }
 
     #[test]
