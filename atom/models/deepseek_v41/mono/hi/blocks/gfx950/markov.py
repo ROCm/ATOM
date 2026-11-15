@@ -81,7 +81,9 @@ class _MPlan(ah._Plan):
     blocks: int = (
         1  # 128-id blocks a task (``MarkovHead(blocks=)``: a rank's vocab past one block a CU)
     )
-    w2_early: bool = False  # ``MarkovHead(w2_early=)``: the W2 tile issued before the dot (one request)
+    w2_early: bool = (
+        False  # ``MarkovHead(w2_early=)``: the W2 tile issued before the dot (one request)
+    )
 
     @property
     def single(
@@ -218,11 +220,15 @@ class MarkovHead(Block):
         self.kparts = kparts
         # row groups a task (0 / 8: one a wave; module docstring, "Spread tasks")
         spread = spread or WAVES
-        if not 1 <= spread <= WAVES or (spread < WAVES and (layout != "wave" or logits is not None or blocks == 2)):
+        if not 1 <= spread <= WAVES or (
+            spread < WAVES and (layout != "wave" or logits is not None or blocks == 2)
+        ):
             raise ValueError(f"MarkovHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} in layout "
                              f"'wave', one block a task, the head's own dot")  # fmt: skip
         self.spread = spread
-        self.temporal = bool(temporal)  # the weight loads cacheable (``ArgmaxHead(temporal=)``)
+        self.temporal = bool(
+            temporal
+        )  # the weight loads cacheable (``ArgmaxHead(temporal=)``)
         # one request: the task's W2 rows loaded first (before the dot's lead units, stored to the LDS once x's attempt
         # is issued, before the rest of the prefetch), not after the dot: their latency under x's wait, not between
         # the dot and the first position. The same rows into the same LDS words (``a_w2``: past x and the base
@@ -296,14 +302,18 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
     )  # the task's first 128-id block in the weight's packing
     rg = tb * p.g + wave
     valid = rg < p.n_rg
-    if const_expr(p.g < WAVES):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
+    if const_expr(
+        p.g < WAVES
+    ):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
         valid = valid & (wave < p.g)
     issue = partial(ah._issue, p, r_w, tb, wave, rg, lane, valid)
     n_pre = min(p.prefetch, p.steps)
     lead = min(p.lead, n_pre)
     first = k.rank * p.n if p.tp > 1 else fx.Int32(0)
     early = p.w2_early and p.single
-    if const_expr(early):  # (W2 first: vmcnt is in order, so its stores below wait for it alone)
+    if const_expr(
+        early
+    ):  # (W2 first: vmcnt is in order, so its stores below wait for it alone)
         w2 = _w2_issue(k, p, t, first)
         rocdl.sched_barrier(0)
     q = [issue(i) for i in range(lead)]
@@ -356,7 +366,8 @@ def _mk(k, t, p: _MPlan, lg: str = ""):
 @traced
 def _stream_some(k, p: _MPlan, lane, issue, q):
     """``spread``: the stream on waves 0 .. g - 1 only (a wave-uniform branch, no barrier inside); the other waves'
-    base logit slots are never read (``_position``: ids past ``vt`` hold no candidate)."""
+    base logit slots are never read (``_position``: ids past ``vt`` hold no candidate).
+    """
     if k.wave < p.g:
         _stream(k, p, lane, issue, q)
 
@@ -377,7 +388,9 @@ def _stream(k, p: _MPlan, lane, issue, q):
         acc = mfma_bf16(q[i].bitcast(fx.BFloat16), b.bitcast(fx.BFloat16), acc)
     rocdl.sched_barrier(0)
     vals = [bf16_round(acc[e]) for e in range(4)]
-    if const_expr(p.g < WAVES):  # (spread: the store's lane from the thread id after the sums, not held across the
+    if const_expr(
+        p.g < WAVES
+    ):  # (spread: the store's lane from the thread id after the sums, not held across the
         # stream: TP8's 253 tasks of 4 spilled it, one VGPR)
         lane = fresh_after(k.tid, vals[:1]) % 64
     _base_put(k, p, lane, vals)
@@ -462,7 +475,9 @@ def _w2_issue(k, p: _MPlan, t, first):
         i = fx.min(fx.Int32(c * THREADS) + k.tid, fx.Int32(total - 1))
         v, w4 = i // per, i % per
         gid = first + fx.min(t * p.vt + v, fx.Int32(p.n - 1))
-        got = fx.Vector(bo.buffer_load(r_w2, gid * p.rw + w4 * 4, vec_width=4, dtype=T.i32))
+        got = fx.Vector(
+            bo.buffer_load(r_w2, gid * p.rw + w4 * 4, vec_width=4, dtype=T.i32)
+        )
         out.append((got, p.a_w2 + v * p.w2pitch + w4 * 4))
     return out
 
@@ -490,7 +505,9 @@ def _position(k, p: _MPlan, t, j, xp, first):
     val = fx.ptr_load(k.ldsf + (p.a_base + j * VT + v)) + acc
     lid = t * p.vt + v
     ok = (part == 0) & (lid < p.n)
-    if const_expr(p.vt < VT):  # (spread: the task's ids are its first vt; v past them reads unset LDS)
+    if const_expr(
+        p.vt < VT
+    ):  # (spread: the task's ids are its first vt; v past them reads unset LDS)
         ok = ok & (v < p.vt)
     bits = val.bitcast(fx.Int32)
     bits = (bits == fx.Int32(INT_MIN)).select(fx.Int32(0), bits)  # -0 as +0

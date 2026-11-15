@@ -291,7 +291,8 @@ def place_front(stages, front, before: str, heavy: tuple = ("head",), cus: int =
     """``stages`` with ``front`` inserted before stage ``before`` in program order, each front stage on the least
     loaded cyclic run of CTAs (the load: the tasks of ``stages`` before ``before`` and of the front stages placed so
     far, a ``heavy`` stage's task ``CTX_DOT_LOAD``). Every ``stages`` base is frozen at ``plan``'s placement first, so
-    the host program's own placement is unchanged; the front stages poll only each other (earlier in program order)."""
+    the host program's own placement is unchanged; the front stages poll only each other (earlier in program order).
+    """
     from .recipe import plan_bases
 
     for st, base in zip(stages, plan_bases(stages, cus), strict=True):
@@ -304,7 +305,9 @@ def place_front(stages, front, before: str, heavy: tuple = ("head",), cus: int =
             load[(st.base + t) % cus] += w
     for st in front:
         n = min(st.tasks, cus)
-        at0 = min(range(cus), key=lambda a: (sum(load[(a + t) % cus] for t in range(n)), a))
+        at0 = min(
+            range(cus), key=lambda a: (sum(load[(a + t) % cus] for t in range(n)), a)
+        )
         for t in range(st.tasks):
             load[(at0 + t) % cus] += 1
         st.base = at0
@@ -320,7 +323,8 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
     the end-step's), after the head's stages in program order on the CTAs the dot and the pick leave idle
     (``draft.place_after``); the two share no region, so each keeps its own hand-offs. One request (its
     ``cx.bids`` / ``cx.slots`` are the step's). ``ctx_knobs``: the context write's knobs over ``draft.KNOBS``' (as
-    ``draft.context_program``'s: ``KV_FMT`` "fp8", ATOM's fp8 pool, its rings' rows written as the "_kv8" CTX's)."""
+    ``draft.context_program``'s: ``KV_FMT`` "fp8", ATOM's fp8 pool, its rings' rows written as the "_kv8" CTX's).
+    """
     from ..plan.program import Program
     from .layer import chain_peer_first, residual_layout
     from .schedules import KEY_TP
@@ -328,8 +332,14 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
     stages = place(
         [
             st
-            for b in head_blocks(sc.tp, chain=chain, rows=sc.rows, spread=0 if dyn else dot_spread(sc, ctx),
-                                 temporal=temporal("verify"), **knobs)
+            for b in head_blocks(
+                sc.tp,
+                chain=chain,
+                rows=sc.rows,
+                spread=0 if dyn else dot_spread(sc, ctx),
+                temporal=temporal("verify"),
+                **knobs,
+            )
             for st in b.stages(sc)
         ]
     )
@@ -337,8 +347,14 @@ def head_program(name: str, sc, chain: bool = False, dyn: bool = False, ctx: boo
         from .draft import context_blocks_at, place_after
 
         if sc.batch != 1 or dyn:
-            raise ValueError(f"{name}: the context write merges into a one-request head")
-        cx = [st for b in context_blocks_at(sc, "shard", False, ctx_knobs, taps="streams") for st in b.stages(sc)]
+            raise ValueError(
+                f"{name}: the context write merges into a one-request head"
+            )
+        cx = [
+            st
+            for b in context_blocks_at(sc, "shard", False, ctx_knobs, taps="streams")
+            for st in b.stages(sc)
+        ]
         if ctx_at() == "split":
             early = [st for st in cx if st.name in CTX_EARLY]
             late = [st for st in cx if st.name not in CTX_EARLY]

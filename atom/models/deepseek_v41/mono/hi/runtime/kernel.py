@@ -69,7 +69,8 @@ def bind_group(bufs: "Buffers", peers, name: str, layer: int) -> None:
 
 def has_live(step: torch.Tensor) -> bool:
     """Whether step tensor ``step`` holds the live words after the counter (``Program.dyn_rows``): 4 words or more,
-    unless made without them (``static_step``: a static counter with the fast entry's step-phase words)."""
+    unless made without them (``static_step``: a static counter with the fast entry's step-phase words).
+    """
     return step.numel() >= 4 and not getattr(step, "_hi_static", False)
 
 

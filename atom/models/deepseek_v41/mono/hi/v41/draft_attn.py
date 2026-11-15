@@ -96,7 +96,8 @@ class _BPlan(mw._APlan):
 def _ring_rows(k, p: _BPlan, slot, pos_w):
     """``pipe``: the pool rows of the wave's window keys ``pos_w - 127 + 16 wave ..`` (+ 16), the first key's ring
     position q, q // stride and q % stride divided once, then stepped key by key (q + 1 wraps to 0 at ring_slots,
-    q % stride carries into q // stride at stride): the rows ``_ring_issue``'s divisions give each key."""
+    q % stride carries into q // stride at stride): the rows ``_ring_issue``'s divisions give each key.
+    """
     g = k.args[p.geo]
     slot_rows, ring_slots = uniform(ld_i32(g, 1)), uniform(ld_i32(g, 2))
     stride, run = uniform(ld_i32(g, 3)), uniform(ld_i32(g, 4))
@@ -118,7 +119,8 @@ def _ring_rows(k, p: _BPlan, slot, pos_w):
 
 def _ring_issue(k, p: _BPlan, slot, pos_w):
     """``mla_window._ring_issue`` from the engine's ring: the window's keys ``pos_w - 127 .. pos_w`` at their rows
-    (a position below 0 reads a clamped row, dropped by ``_key_land``). ``pipe``: ``_ring_issue_pipe``."""
+    (a position below 0 reads a clamped row, dropped by ``_key_land``). ``pipe``: ``_ring_issue_pipe``.
+    """
     if p.pipe:
         return _ring_issue_pipe(k, p, slot, pos_w)
     g = k.args[p.geo]
@@ -156,7 +158,8 @@ def _ring_issue(k, p: _BPlan, slot, pos_w):
 def _ring_issue_pipe(k, p: _BPlan, slot, pos_w):
     """``_ring_issue`` with every load of the wave issued before any lands: the rows from ``_ring_rows``, a kv8 row
     as loaded ((the lane's 8 E4M3, the code word), converted by ``_ring_land``; converted here, as ``_ring_issue``
-    does, each row's conversion waits on its loads, so the wave's 16 rows came one round trip after another)."""
+    does, each row's conversion waits on its loads, so the wave's 16 rows came one round trip after another).
+    """
     rows = _ring_rows(k, p, slot, pos_w)
     r_ring = rsrc(k.args[p.ring_arg])
     out = []
@@ -183,7 +186,8 @@ def _ring_issue_pipe(k, p: _BPlan, slot, pos_w):
 
 def _ring_land(k, p: _BPlan, pos_w, vs, base):
     """``_ring_issue``'s rows into LDS (``mla_window._key_land``); kv8 with ``pipe``: each row's bf16 pair words
-    converted here (``paged.kv8_words``: the words ``_ring_issue`` converts without ``pipe``)."""
+    converted here (``paged.kv8_words``: the words ``_ring_issue`` converts without ``pipe``).
+    """
     if p.kv8 and p.pipe:
         vs = [
             fx.Vector.from_elements(

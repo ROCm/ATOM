@@ -164,12 +164,18 @@ class PeerGroup:
         if owners is None:
             owners = step._hi_phase_owners = {}
         other = owners.get(slot)
-        if other is not None and other is not self and not getattr(other, "_retired", False):
+        if (
+            other is not None
+            and other is not self
+            and not getattr(other, "_retired", False)
+        ):
             raise ValueError(f"{name}: step-phase slot {slot} of this step tensor is another peer group's "
                              "(plan.program.phase_slot: a slot a group)")  # fmt: skip
         if other is not None and other is not self:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                raise ValueError(f"{name}: a retired group's step-phase slot {slot} taken over inside a graph capture")
+                raise ValueError(
+                    f"{name}: a retired group's step-phase slot {slot} taken over inside a graph capture"
+                )
             step[w : w + 2].zero_()
         owners[slot] = self
         self._phase_at = (step, slot)

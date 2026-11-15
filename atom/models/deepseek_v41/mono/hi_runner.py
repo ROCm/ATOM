@@ -485,7 +485,9 @@ class HiLayers(HiDraft, HiPrograms):
         self.eng_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         for s, kern in self.eng_programs.items():
             missing = (
-                set(kern.program.args) - set(args) - {"_peers", "_rank", "_peer_top", "_own"}
+                set(kern.program.args)
+                - set(args)
+                - {"_peers", "_rank", "_peer_top", "_own"}
             )
             if missing:
                 raise KeyError(f"Engram kv launch: no pointer for {sorted(missing)}")
@@ -524,7 +526,9 @@ class HiLayers(HiDraft, HiPrograms):
                 i, kern = self.mf[0], self.programs[self._key(self.mf[0], s)]
                 for n in self.eng:
                     for a in (f"{n}.tq", f"{n}.ts"):
-                        self.tables[i, s][kern.program.args.index(a)] = int(self._eng_args[a])
+                        self.tables[i, s][kern.program.args.index(a)] = int(
+                            self._eng_args[a]
+                        )
                 continue
             self.tables[ENGKV, s] = self.eng_programs[s].table(
                 self._eng_args, device=dev, peers=self.eng_peers
@@ -827,7 +831,9 @@ class HiLayers(HiDraft, HiPrograms):
         )  # fmt: skip
         if rows in self.band_of:
             self._band_step(rows)
-        if self.eng and rows not in self.eng_merged:  # (else in the first hi layer's launch)
+        if (
+            self.eng and rows not in self.eng_merged
+        ):  # (else in the first hi layer's launch)
             self._engram_launch(rows)
         if rows in self.ctx_merged:
             # the verify head's tables with the context write's (it runs in the head's launch)
@@ -934,7 +940,11 @@ class HiLayers(HiDraft, HiPrograms):
             launches = self.split[rows][0] if self.head_mode[rows] == "split" else 1
             for b, lid in enumerate(head_launch_ids(i, launches)):
                 # (with the context write: the step's tables, ``begin_step``)
-                table = self.hx_cur[rows][b] if rows in self.ctx_merged else self.tables[HEAD, rows, b]
+                table = (
+                    self.hx_cur[rows][b]
+                    if rows in self.ctx_merged
+                    else self.tables[HEAD, rows, b]
+                )
                 self.head_programs[rows].launch(table, self.head_bufs[rows], layer=lid,
                                                 stream=torch.cuda.current_stream())  # fmt: skip
             # the step's last launch on the group: 41 (odd) flip the step phase (at the forward's end,

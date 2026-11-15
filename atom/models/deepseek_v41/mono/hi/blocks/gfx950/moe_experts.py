@@ -73,16 +73,18 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
+from atom.mono.device.ops import lane_gather, lanes_below
+
 from ...device.gfx950 import buffer_ops as bo
 from ...device.gfx950 import channels as chan
 from ...device.gfx950 import gemv
 from ...device.gfx950 import mailbox as mb
 from ...device.gfx950.ops import (
     CM_DEV,
-    bf2_f32,
-    bf16_round,
     _xpartner,
     ballot,
+    bf2_f32,
+    bf16_round,
     block_excl_scan,
     popcount,
     rsrc,
@@ -90,8 +92,6 @@ from ...device.gfx950.ops import (
     uniform,
     wave_incl_scan,
 )
-from atom.mono.device.ops import lane_gather, lanes_below
-
 from ...device.gfx950.peer import (
     partial3_pairs,
     partial_pairs,
@@ -724,7 +724,8 @@ def _rt_wave(k, t, c: _Cfg):
     (the slots' picks in slot order). A slot starts where the expert changes (a ballot: its number the starts
     below). The same table as the counts and scans: slots ascending by id, each slot's run at the exclusive prefix
     of the picks; a slot's picks in pick (row) order, where the LDS atomics' arrival order only permuted a slot's
-    MFMA columns. No LDS atomics; one barrier (the readers' and the next task's) instead of five."""
+    MFMA columns. No LDS atomics; one barrier (the readers' and the next task's) instead of five.
+    """
     _rt_wave_w0(k, c, k.wave == 0)
     gpu.barrier()
     if (
@@ -742,18 +743,25 @@ def _rt_wave_w0(k, c: _Cfg, w0):
 def _rt_wave_build(k, c: _Cfg):
     n, lane = c.slots, k.lane
     p = fx.min(lane, fx.Int32(n - 1))
-    e, wt = (fx.Int32(v[0]) for v in mb.poll([(k.mb[c.idx], p, 1), (k.mb[c.wts], p, 1)], k.tag))
+    e, wt = (
+        fx.Int32(v[0])
+        for v in mb.poll([(k.mb[c.idx], p, 1), (k.mb[c.wts], p, 1)], k.tag)
+    )
     nl = _live_picks(k, c)  # n, or (``Program.dyn_rows``) the live rows' picks
     dead = fx.Int32(0x7FFFFFFF)
     key = (lane < nl).select((e << 6) | lane, dead)
     size = 2
-    while size <= 64:  # bitonic: blocks of ``size`` ascending where lane & size is 0, the last one ascending
+    while (
+        size <= 64
+    ):  # bitonic: blocks of ``size`` ascending where lane & size is 0, the last one ascending
         j = size // 2
         while j >= 1:
             o = _xpartner(key, j, lane)
             lo, hi = fx.min(key, o), fx.max(key, o)
             lj, ls = j.bit_length() - 1, size.bit_length() - 1
-            keep_lo = (((lane >> lj) ^ (lane >> ls)) & 1) == 0  # the lower lane of an ascending block's pair
+            keep_lo = (
+                ((lane >> lj) ^ (lane >> ls)) & 1
+            ) == 0  # the lower lane of an ascending block's pair
             key = keep_lo.select(lo, hi)
             j //= 2
         size *= 2

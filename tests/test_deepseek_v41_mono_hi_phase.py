@@ -24,10 +24,13 @@ def _group(tp=2):
 
 def test_end_step_adds_now_or_hands_the_word_back():
     """Odd launches since the last call: the host phase flips, and the word gets + 1 now, or (``defer``) is handed
-    back un-bumped (the peer table's entry tp, a view the caller bumps); even: nothing, None."""
+    back un-bumped (the peer table's entry tp, a view the caller bumps); even: nothing, None.
+    """
     g = _group()
     g.since_step = 41  # (a step's launches on the group: 40 layers and the head)
-    assert g.end_step() is None and g.addresses.tolist() == [100, 200, 1] and g._phase == 1
+    assert (
+        g.end_step() is None and g.addresses.tolist() == [100, 200, 1] and g._phase == 1
+    )
     g.since_step = 1
     word = g.end_step(defer=True)
     assert g.addresses.tolist() == [100, 200, 1] and g._phase == 0 and g.since_step == 0
@@ -53,7 +56,8 @@ def test_draft_end_step_collects_due_words():
 @pytest.mark.parametrize("verify", [True, False])
 def test_the_forward_bumps_its_due_phases_once_at_its_end(monkeypatch, verify):
     """``HiLayers.end_step``: the words collected since ``begin_step`` go to the post-verify's launch (a served
-    verify), else to one ``bump_phases``; the collection closes (None: each group's own add outside a forward)."""
+    verify), else to one ``bump_phases``; the collection closes (None: each group's own add outside a forward).
+    """
     from atom.models.deepseek_v41.mono import hi_runner
     from atom.models.deepseek_v41.mono.round import post_verify
 
@@ -64,13 +68,21 @@ def test_the_forward_bumps_its_due_phases_once_at_its_end(monkeypatch, verify):
     hook.split = {6: (1, 6)}
     hook._end_step = lambda *a: calls.append("end")
     hook._ctx_after_target = lambda *a: calls.append("ctx")
-    hook.pv = SimpleNamespace(launch=lambda h, c, s, r, phases=(): calls.append(("pv", list(phases))))
-    monkeypatch.setattr(post_verify, "bump_phases", lambda w: calls.append(("bump", list(w))))
+    hook.pv = SimpleNamespace(
+        launch=lambda h, c, s, r, phases=(): calls.append(("pv", list(phases)))
+    )
+    monkeypatch.setattr(
+        post_verify, "bump_phases", lambda w: calls.append(("bump", list(w)))
+    )
     step = SimpleNamespace(max_q_len=6 if verify else 3)
     hook.end_step(None, step, 6)
     assert calls[:2] == ["end", "ctx"] and len(calls) == 3
     kind, got = calls[2]
-    assert kind == ("pv" if verify else "bump") and all(a is b for a, b in zip(got, words)) and len(got) == 3
+    assert (
+        kind == ("pv" if verify else "bump")
+        and all(a is b for a, b in zip(got, words))
+        and len(got) == 3
+    )
     assert hook.phase_due is None
     # nothing due: no extra launch without a post-verify
     calls.clear()
@@ -101,11 +113,20 @@ def test_fast_entry_phase_word_next_to_the_step_counter():
     g.since_step = 41
     assert g.end_step() is None and g._phase == 1
     w = phase_word(2)
-    assert step[w : w + 2].view(torch.int64).item() == 1 and step[:4].tolist() == [7, 6, 6, 1]
+    assert step[w : w + 2].view(torch.int64).item() == 1 and step[:4].tolist() == [
+        7,
+        6,
+        6,
+        1,
+    ]
     assert g.addresses.tolist() == [100, 200, 0]
     g.since_step = 1
     word = g.end_step(defer=True)
-    assert word.dtype == torch.int64 and word.numel() == 1 and word.data_ptr() == step[w:].data_ptr()
+    assert (
+        word.dtype == torch.int64
+        and word.numel() == 1
+        and word.data_ptr() == step[w:].data_ptr()
+    )
     assert int(word.item()) == 1  # (the caller bumps it)
     with pytest.raises(ValueError):
         g.bind_phase(step, 1, "p")  # (one word a group)
@@ -146,7 +167,12 @@ def test_fast_entry_plan(monkeypatch):
     monkeypatch.setenv(P.FAST_ENTRY_ENV, "1")
     with P.phase_slot(2):
         on = P.plan(make())
-    assert on.fast_entry and on.phase_slot == 2 and P.OWN_ARG in on.args and "phase@2" in on.key()
+    assert (
+        on.fast_entry
+        and on.phase_slot == 2
+        and P.OWN_ARG in on.args
+        and "phase@2" in on.key()
+    )
     assert P.plan(make()).phase_slot == 0  # (the default slot outside the context)
     assert P.step_words(1) == P.STEP_WORDS and P.step_words(4) == P.STEP_WORDS
     with pytest.raises(P.PlanError):

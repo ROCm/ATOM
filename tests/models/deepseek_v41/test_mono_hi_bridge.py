@@ -1729,7 +1729,11 @@ def check_post_verify_pad(pad_slot: int):
     report(f"[pv] post-verify on a bs-4 graph with a padding request (its slot entry {pad_slot}): the live requests'"
            " cursors committed, no padding commit", torch.equal(cursor, want) and int(verdict[0, 0]) == 2,
            f"(rows {(cursor != want).any(1).nonzero().flatten().tolist()} differ; accepted {verdict[0].tolist()})")  # fmt: skip
-    gathered = torch.gather(out.view(nb, rq).long(), 1, verdict[0].view(-1, 1).long()).view(nb).int()
+    gathered = (
+        torch.gather(out.view(nb, rq).long(), 1, verdict[0].view(-1, 1).long())
+        .view(nb)
+        .int()
+    )
     report("[pv] the post-verify's next ids == the runner's gather of its output ids at the accepted counts",
            torch.equal(nxt, gathered), f"({nxt.tolist()} vs {gathered.tolist()})")  # fmt: skip
     want_pos = positions[verdict[2].long()]

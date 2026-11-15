@@ -156,7 +156,11 @@ def _entry_step(step, table, priv):
     entry)."""
     asm = llvm.InlineAsmOp(
         T.i64,
-        [fx.Int64(step).ir_value(), fx.Int64(table).ir_value(), fx.Int64(priv).ir_value()],
+        [
+            fx.Int64(step).ir_value(),
+            fx.Int64(table).ir_value(),
+            fx.Int64(priv).ir_value(),
+        ],
         "; entry $0 $2 $3",
         "=s,0,s,s",
         has_side_effects=True,
@@ -573,7 +577,9 @@ def build(program: Program):
             step_at = _entry_step(step, table, priv)
             args_at = load_table(table, program.args)
             phase_at = _load_live(step_at, phase_word(program.phase_slot))
-            if const_expr(program.dual_on):  # (and the private word: its copy bits, with the others)
+            if const_expr(
+                program.dual_on
+            ):  # (and the private word: its copy bits, with the others)
                 dual_at = _load_live(priv, 0)
             tag = _load_step(step_at) * LAYER_SLOTS + layer + 1
         elif const_expr(
@@ -606,7 +612,9 @@ def build(program: Program):
             w = fx.Int32(
                 llvm.LoadOp(T.i32, hdr.result, alignment=4, invariant=True).result
             )
-            if const_expr(program.peer and program.peer_shared and program.phase_slot >= 0):
+            if const_expr(
+                program.peer and program.peer_shared and program.phase_slot >= 0
+            ):
                 w = dual_at  # (issued with the table's: the load above is dead code)
             # the hardware's XCD: CTA id mod 8 is one only up to the launch's first XCD
             xcc = llvm.InlineAsmOp(

@@ -850,7 +850,9 @@ def plan_bases(stages: list[Stage], cus: int = 256) -> list[int]:
     return out
 
 
-def free_window(stages: list[Stage], avoid: tuple[str, ...], cus: int = 256) -> tuple[int, int]:
+def free_window(
+    stages: list[Stage], avoid: tuple[str, ...], cus: int = 256
+) -> tuple[int, int]:
     """(first CTA, CTAs) of the widest cyclic run of CTAs that runs no task of the ``avoid`` stages of ``stages`` (at
     ``plan``'s placement); every CTA when none is busy, (0, 0) when all are."""
     busy = set()
@@ -877,7 +879,9 @@ def place_in(stages: list[Stage], w0: int, n: int, cus: int = 256) -> None:
     for st in stages:
         if st.tasks > n:
             continue
-        at = min(range(n - st.tasks + 1), key=lambda a: (sum(load[a : a + st.tasks]), a))
+        at = min(
+            range(n - st.tasks + 1), key=lambda a: (sum(load[a : a + st.tasks]), a)
+        )
         for t in range(st.tasks):
             load[at + t] += 1
         st.base = (w0 + at) % cus
@@ -897,7 +901,8 @@ def merge_engram_kv(stages: list[Stage], eng: list[Stage], at: str | None = None
     """A layer program's ``stages`` with ``engram_kv_stages``' (``eng``: the token-only halves the later Engram
     layers' gates read, plain ``<n>.kv``) merged into its launch (``ENGKV_AT``). The two share no region (the
     Engram's peer regions are their own; ``pos`` a plain arg of both), so each keeps its hand-offs: every Engram poll
-    waits on an earlier Engram stage. The layer's stages keep their bases (``plan``'s, frozen first)."""
+    waits on an earlier Engram stage. The layer's stages keep their bases (``plan``'s, frozen first).
+    """
     import os
 
     at = at or os.environ.get("ATOM_DSV41_MONO_HI_ENGKV_AT", "") or ENGKV_AT

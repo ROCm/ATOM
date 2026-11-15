@@ -192,7 +192,11 @@ class HiPrograms:
         # no band: the TP8 width); every Engram layer after it
         self.eng_merged = set()
         if "engkv" in self.merge and self.eng and min(self.eng.values()) > self.mf[0]:
-            self.eng_merged = {s for s, (b, _) in self.split.items() if b == 1 and s not in self.band_of}
+            self.eng_merged = {
+                s
+                for s, (b, _) in self.split.items()
+                if b == 1 and s not in self.band_of
+            }
         # ---- programs: one a (kind, width), shared by the layers of the kind
         # the verify head a width (before the layer programs: the last layer's chain role follows it): one request,
         # the head at its width; B requests, one wide head at Scenario(B, rows) where hi builds it, else B
@@ -241,7 +245,11 @@ class HiPrograms:
                 key = self._key(i, s)
                 if key not in self.programs:
                     self.programs[key] = self._program(
-                        p, s, *self.role(i, s), full_r_a=self.full_r_a(i, s), engkv=self.engkv_in(i, s)
+                        p,
+                        s,
+                        *self.role(i, s),
+                        full_r_a=self.full_r_a(i, s),
+                        engkv=self.engkv_in(i, s),
                     )
         # a width's programs read / write the cross-launch region at the same offset (a step runs one width)
         for s in self.widths:
@@ -264,7 +272,9 @@ class HiPrograms:
                 if s in self.eng_merged:  # (in the first hi layer's launch)
                     continue
                 sc = Scenario(*self.split[s], self.tp)
-                with mf_program.phase_slot(PHASE_ENGKV):  # (its own peer group on the layers' step counter)
+                with mf_program.phase_slot(
+                    PHASE_ENGKV
+                ):  # (its own peer group on the layers' step counter)
                     self.eng_programs[s] = MonoKernel(
                         Program(f"atom_v41_engkv_r{s}", sc, L.engram_kv_stages(sc, self.eng, max_ctx + 16),
                                 sgpr_spill_ok=L.engram_kv_spill_ok(self.tp))
@@ -274,11 +284,15 @@ class HiPrograms:
         self.D = D
         self.ctx_programs = {}
         for s in self.widths:
-            if s in self.ctx_merged:  # (in the verify head's launch, with the same KV_FMT knobs: ``_head_program``)
+            if (
+                s in self.ctx_merged
+            ):  # (in the verify head's launch, with the same KV_FMT knobs: ``_head_program``)
                 continue
             _, prog = D.context_program(f"atom_v41_ctx{self._kv8_tag}_r{s}", Scenario(*self.split[s], self.tp),
                                         "shard", False, knobs=self._kv_knobs or None)  # fmt: skip
-            with mf_program.phase_slot(PHASE_CTX):  # (its own peer group on the layers' step counter)
+            with mf_program.phase_slot(
+                PHASE_CTX
+            ):  # (its own peer group on the layers' step counter)
                 self.ctx_programs[s] = MonoKernel(prog)
         W = int(getattr(cfg, "dspark_block_size", 5) or 5)
         if self.tp < 2:
@@ -444,7 +458,9 @@ class HiPrograms:
             # the Engram token-only halves (``MERGES``: "engkv"), their SGPR rule with the layer's
             from .hi.v41 import recipe
 
-            stages = recipe.merge_engram_kv(stages, L.engram_kv_stages(sc, self.eng, self.max_ctx + 16))
+            stages = recipe.merge_engram_kv(
+                stages, L.engram_kv_stages(sc, self.eng, self.max_ctx + 16)
+            )
             spill = spill or L.engram_kv_spill_ok(self.tp)
         tag = "_".join(str(x) for x in p.program_key).replace(" ", "").replace("+", "")
         tag += (
@@ -462,7 +478,12 @@ class HiPrograms:
                                   peer_first=self._chain_peer() if self.chain else (), **dk))  # fmt: skip
 
     def _head_program(
-        self, s: int, chain: bool, split: tuple | None = None, dyn: bool = False, ctx: bool = False
+        self,
+        s: int,
+        chain: bool,
+        split: tuple | None = None,
+        dyn: bool = False,
+        ctx: bool = False,
     ):
         """The verify head's program at ``s`` rows (module docstring), ``split`` = (requests, rows a request) of its
         scenario (default one request): ``chain``, its fold sums the last layer's pushed MoE partials
@@ -477,7 +498,11 @@ class HiPrograms:
         nb, rq = split or (1, s)
         hkey = (s, nb, chain, dyn) + (("ctx", self._kv8_tag) if ctx else ())
         if hkey not in self._heads:
-            tag = (f"_b{nb}" if nb > 1 else "") + ("_band" if dyn else "") + (f"_ctx{self._kv8_tag}" if ctx else "")
+            tag = (
+                (f"_b{nb}" if nb > 1 else "")
+                + ("_band" if dyn else "")
+                + (f"_ctx{self._kv8_tag}" if ctx else "")
+            )
             name = f"atom_v41_head{'_chain' if chain else ''}_sample_race_r{s}{tag}"
             # sampling (a row with T > 0: one draw in its top-p nucleus), the rows with top_p >= 1 raced in the dot
             # epilogue (module docstring)
@@ -500,7 +525,9 @@ class HiPrograms:
         if key not in self.dr_kerns:
             from .hi.plan import program as mf_program
 
-            with mf_program.phase_slot(PHASE_DRAFT):  # (its own peer group and step counter)
+            with mf_program.phase_slot(
+                PHASE_DRAFT
+            ):  # (its own peer group and step counter)
                 self.dr_kerns[key] = MonoKernel(make())
         return self.dr_kerns[key]
 

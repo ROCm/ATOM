@@ -125,7 +125,10 @@ class HiDraft:
         pb = max([k.program.peer_bytes for k in self.ctx_programs.values()], default=0)
         self.cx_peers = PeerGroup(pb, self._cpu_group) if self.tp > 1 and pb else None
         self.cx_bufs = _buffers(self.ctx_programs, self.arena, dev, self.step)
-        self.hx_tables, self.hx_cur = {}, {}  # the merged heads' tables (``_head_ctx_tables``)
+        self.hx_tables, self.hx_cur = (
+            {},
+            {},
+        )  # the merged heads' tables (``_head_ctx_tables``)
         self.cx_w = D.pack(
             hw.ctx_tensors(draft, D.STAGES), self.tp, self.rank, "shard", device=dev
         )
@@ -258,27 +261,37 @@ class HiDraft:
     def _ctx_streams(self) -> list:
         """The tapped layers' R_A buffers in the draft's tap order (``cx.ra0..2`` of a verify head the context write
         is merged into: ``TapQuant(streams=True)`` takes the taps from them as the end-step's ``_tap`` does from the
-        same buffers into ATOM's aux buffers): the aux taps' layer order once bound, else the config's."""
+        same buffers into ATOM's aux buffers): the aux taps' layer order once bound, else the config's.
+        """
         aux = self.aux
         if aux is None and self.cx_drafter is not None:
             self._ctx_taps()
             aux = self.aux
         ids = tuple(aux.layer_ids) if aux is not None else tuple(self.aux_ids)
         if len(ids) != self.D.TAPS or any(i not in self.r_a for i in ids):
-            raise RuntimeError(f"V4.1 mono hi draft: taps of layers {ids}, the hi layers' R_A of {sorted(self.r_a)}")
+            raise RuntimeError(
+                f"V4.1 mono hi draft: taps of layers {ids}, the hi layers' R_A of {sorted(self.r_a)}"
+            )
         return [self.r_a[i] for i in ids]
 
     def _head_ctx_tables(self, rows: int, cache, step) -> None:
         """A served step's begin (``begin_step``) at a width whose verify head runs the context write
         (``ctx_merged``): the head's pointer tables with the context write's (``hx_cur``, read by the head launch),
-        built eagerly the first time for this pool / these step buffers (as ``_ctx_table``)."""
+        built eagerly the first time for this pool / these step buffers (as ``_ctx_table``).
+        """
         if step.replay is not None:
             raise RuntimeError(
                 f"V4.1 mono hi draft: a served step of {rows} rows without the draft's context write"
             )
         # (in the key: a cache of other geometry at the same address)
         geo, rings = self._ctx_rings(cache)
-        key = (rows, cache.pool.data_ptr(), step.batch_ids.data_ptr(), step.slots.data_ptr(), repr(geo))
+        key = (
+            rows,
+            cache.pool.data_ptr(),
+            step.batch_ids.data_ptr(),
+            step.slots.data_ptr(),
+            repr(geo),
+        )
         tables = self.hx_tables.get(key)
         if tables is None:
             if torch.cuda.is_current_stream_capturing():
@@ -296,11 +309,17 @@ class HiDraft:
                 if s != rows:
                     continue
                 at = {**ptrs, **self.cx_w, **io}
-                missing = {a for a in set(kern.program.args) - set(at) if not a.startswith("_")}
+                missing = {
+                    a for a in set(kern.program.args) - set(at) if not a.startswith("_")
+                }
                 if missing:
-                    raise KeyError(f"verify head + CTX: no pointer for {sorted(missing)}")
+                    raise KeyError(
+                        f"verify head + CTX: no pointer for {sorted(missing)}"
+                    )
                 tables[b] = kern.table(
-                    {n: at[n] for n in kern.program.args if n in at}, device=self.dev, peers=self.peers
+                    {n: at[n] for n in kern.program.args if n in at},
+                    device=self.dev,
+                    peers=self.peers,
                 )
             self.hx_tables[key] = tables
         self.cx_captured |= torch.cuda.is_current_stream_capturing()

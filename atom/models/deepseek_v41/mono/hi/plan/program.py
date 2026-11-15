@@ -110,7 +110,8 @@ def share_peer_groups(on: bool = True) -> None:
 
 def fast_entry_on() -> bool:
     """Whether the fast entry (module docstring) is on: by default (TP8 c1 fp8 step bench -1.0 %, 2 pairs; the TP4
-    builds pass the contract check, not measured on GPU); ``FAST_ENTRY_ENV`` = 0 turns it off."""
+    builds pass the contract check, not measured on GPU); ``FAST_ENTRY_ENV`` = 0 turns it off.
+    """
     return os.environ.get(FAST_ENTRY_ENV, "1").strip() != "0"
 
 
@@ -130,7 +131,8 @@ def step_words(words: int) -> int:
 @contextmanager
 def phase_slot(slot: int):
     """Shared TP programs planned inside read their group's step phase at slot ``slot`` of the step tensor (with the
-    fast entry on; module docstring): a composition gives each peer group on one step counter its own slot."""
+    fast entry on; module docstring): a composition gives each peer group on one step counter its own slot.
+    """
     global _PHASE_SLOT
     phase_word(slot)  # (checked)
     old, _PHASE_SLOT = _PHASE_SLOT, slot
@@ -707,7 +709,9 @@ def plan(program: Program) -> Program:
         )
     if program.phase_slot >= 0:
         if not (program.peer and program.peer_shared):
-            raise PlanError(f"{program.name}: a step-phase slot without a shared peer group")
+            raise PlanError(
+                f"{program.name}: a step-phase slot without a shared peer group"
+            )
         phase_word(program.phase_slot)  # (checked)
     args = []
     for s in program.stages:

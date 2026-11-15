@@ -160,7 +160,10 @@ def _tapq_streams_body(k, t, p: _TPlan):
     row, part = t // PER_TAP, t % PER_TAP
     m = QSPEC.qmap
     words = HIDDEN // 2
-    ld = [_map_load(m, k.args[p.src], (row * HC + h) * words + part * m.words, k.tid) for h in range(HC)]
+    ld = [
+        _map_load(m, k.args[p.src], (row * HC + h) * words + part * m.words, k.tid)
+        for h in range(HC)
+    ]
     q = []
     for v in range(m.chunks):
         ws = []
@@ -181,9 +184,12 @@ class TapQuant(Block):
     ceil scales: ``NormQuant``'s identity spec, the same codes as one quantize of the concatenated row): one stage a
     tap, ``rows * PER_TAP`` tasks each. ``streams``: each src is instead a tapped layer's settled streams (bf16
     [rows, HC, HIDDEN]: the hi layer's R_A, written whole), the tap (their mean, ``_tapq_streams``) taken here: a
-    launch that does not follow the end-step's tap write (the verify head's, ``context_blocks(taps="streams")``)."""
+    launch that does not follow the end-step's tap write (the verify head's, ``context_blocks(taps="streams")``).
+    """
 
-    def __init__(self, name: str, srcs: tuple[str, ...], out: Channel, streams: bool = False):
+    def __init__(
+        self, name: str, srcs: tuple[str, ...], out: Channel, streams: bool = False
+    ):
         if (
             len(srcs) != TAPS
             or out.fmt is not Fmt.MXFP8
@@ -408,14 +414,19 @@ KNOBS_ROWS = {r: {"PROJ_KSPLIT": 6} for r in range(19, 25)}
 
 
 def context_blocks(
-    tp: int = 1, cols: str = "shard", meta: bool = False, knobs: dict | None = None, taps: str = "plain"
+    tp: int = 1,
+    cols: str = "shard",
+    meta: bool = False,
+    knobs: dict | None = None,
+    taps: str = "plain",
 ) -> list[Block]:
     """The context write's blocks (module docstring). ``cols``: "shard" (TP: main_proj column-sharded + ``ColGather``)
     or "rep" (every rank all 5120 columns: the same bits, 4x the weight bytes); ``meta``: the slot / liveness from the
     ``cx.meta`` snapshot (a launch after the target step's) instead of the step's ``cx.bids`` / ``cx.slots``;
     ``knobs``: values over ``KNOBS``'. ``taps``: "plain" (args ``cx.tap0..2``, the taps the end-step wrote) or
     "streams" (args ``cx.ra0..2``: the tapped layers' settled streams [rows, HC, HIDDEN], the taps taken in the
-    program, ``TapQuant(streams=True)``: the context write inside the verify head's launch, before the end-step)."""
+    program, ``TapQuant(streams=True)``: the context write inside the verify head's launch, before the end-step).
+    """
     if cols not in ("shard", "rep"):
         raise ValueError(f"cols {cols!r}: 'shard' or 'rep'")
     if taps not in ("plain", "streams"):
@@ -428,9 +439,13 @@ def context_blocks(
     w8 = {"weight_format": "mxfp8"}
     out = BF16Out(C["fcol"] if shard else C["fco"])
     blocks = [
-        TapQuant("cx_q", tuple(f"cx.tap{i}" for i in range(TAPS)), C["auxq"])
-        if taps == "plain"
-        else TapQuant("cx_q", tuple(f"cx.ra{i}" for i in range(TAPS)), C["auxq"], streams=True),
+        (
+            TapQuant("cx_q", tuple(f"cx.tap{i}" for i in range(TAPS)), C["auxq"])
+            if taps == "plain"
+            else TapQuant(
+                "cx_q", tuple(f"cx.ra{i}" for i in range(TAPS)), C["auxq"], streams=True
+            )
+        ),
         Linear(
             "cx_proj",
             ("main_proj",),
@@ -492,7 +507,9 @@ def context_program(name: str, sc: Scenario, cols: str = "shard", meta: bool = F
 def context_blocks_at(sc: Scenario, cols: str = "shard", meta: bool = False, knobs: dict | None = None,
                       taps: str = "plain") -> list[Block]:  # fmt: skip
     """``context_blocks`` at ``sc`` (its rows' ``KNOBS_ROWS``, as ``context_program``)."""
-    return context_blocks(sc.tp, cols, meta, {**KNOBS_ROWS.get(sc.rows, {}), **(knobs or {})}, taps)
+    return context_blocks(
+        sc.tp, cols, meta, {**KNOBS_ROWS.get(sc.rows, {}), **(knobs or {})}, taps
+    )
 
 
 def place_after(stages: list[Stage], tail: list[Stage], avoid: tuple[str, ...],
@@ -599,9 +616,8 @@ def stage_blocks(
     """Draft stage ``stage``'s blocks: the window layer's with the block attention in place of ``MLAWindowAttn`` and
     no ``RingWrite``."""
     from .draft_attn import MLABlockAttn
-    from .recipe import window_layer_blocks
-
     from .head import env_int
+    from .recipe import window_layer_blocks
 
     first, push, prev = STAGE_ROLES[stage]
     # ATOM's draft ring in its fp8 pool (``KV_FMT`` "fp8"): the block attention reads MXFP8 rows
@@ -757,8 +773,14 @@ def head_program(name: str, sc: Scenario, res_out: str | None = None, **program)
     from .recipe import CHAIN_PEER
     from .schedules import KEY_TP
 
-    blocks = head_blocks(sc.tp, sc.rows, res_out, spread=mk_spread(sc), temporal=H.temporal("draft"),
-                         w2_early=mk_w2_early(sc))
+    blocks = head_blocks(
+        sc.tp,
+        sc.rows,
+        res_out,
+        spread=mk_spread(sc),
+        temporal=H.temporal("draft"),
+        w2_early=mk_w2_early(sc),
+    )
     stages = [st for b in blocks for st in b.stages(sc)]
     # past the entries' tp: SGPR spills into VGPR lanes allowed (TP8: 12), as the verify head's
     program.setdefault("sgpr_spill_ok", sc.tp > KEY_TP)

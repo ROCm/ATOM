@@ -192,8 +192,12 @@ class _Plan:
     balance: int = (
         0  # K parts a row group (``balance``: balanced tasks, module docstring); 0: a task 8 row groups
     )
-    wcm: int = CM_NT  # the weight loads' cache policy (``temporal``: 0, cacheable; else nontemporal)
-    g: int = WAVES  # row groups a task (``spread``: the module docstring's "Spread tasks"); WAVES: one a wave
+    wcm: int = (
+        CM_NT  # the weight loads' cache policy (``temporal``: 0, cacheable; else nontemporal)
+    )
+    g: int = (
+        WAVES  # row groups a task (``spread``: the module docstring's "Spread tasks"); WAVES: one a wave
+    )
 
     probe = False  # ``linear._land_batch``'s probe build: off
 
@@ -410,7 +414,9 @@ class ArgmaxHead(Block):
         self.kparts = kparts
         # row groups a task (0 / 8: one a wave; module docstring, "Spread tasks")
         spread = spread or WAVES
-        if not 1 <= spread <= WAVES or (spread < WAVES and (mx or layout != "wave" or balance)):
+        if not 1 <= spread <= WAVES or (
+            spread < WAVES and (mx or layout != "wave" or balance)
+        ):
             raise ValueError(f"ArgmaxHead {name}: spread 1 .. {WAVES} row groups a task, below {WAVES} with bf16 "
                              f"weights in layout 'wave', not balanced")  # fmt: skip
         self.spread = spread
@@ -573,7 +579,9 @@ def _key(p, v):
 def _issue(p, r_w, t, wave, rg, lane, valid, i):
     """Lane ``lane``'s 16 B of the wave's unit at K step ``i``, nontemporal (``wcm``; ``temporal``: cacheable) (a row
     group past n: read as 0, no memory touched)."""
-    if p.layout == "wave":  # (row group rg = t g + wave: its units contiguous at rg x steps)
+    if (
+        p.layout == "wave"
+    ):  # (row group rg = t g + wave: its units contiguous at rg x steps)
         off = (rg * p.steps + i) * UNIT_WORDS + lane * 4
     off = valid.select(off, fx.Int32(OOB // 4))
     return fx.Vector(
@@ -614,7 +622,9 @@ def _dot(k, t, p):
     lane, wave = k.lane, k.wave
     rg = t * p.g + wave
     valid = rg < p.n_rg
-    if const_expr(p.g < WAVES):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
+    if const_expr(
+        p.g < WAVES
+    ):  # (spread: waves g .. 7 stream nothing; their units read as 0, no memory touched)
         valid = valid & (wave < p.g)
     r_w = rsrc(k.args[f"{p.name}.w"], p.w_bytes)
     issue = partial(_issue, p, r_w, t, wave, rg, lane, valid)
@@ -661,7 +671,8 @@ def _dot(k, t, p):
 @traced
 def _stream_some(k, p, t, rg, lane, valid, issue, q):
     """``spread``: the stream on waves 0 .. g - 1 only (a wave-uniform branch; the stream has no barrier at one
-    16-row chunk and x whole, ``plan``); the other waves' (key, id) slots are never read (``_task_put``)."""
+    16-row chunk and x whole, ``plan``); the other waves' (key, id) slots are never read (``_task_put``).
+    """
     if k.wave < p.g:
         _stream(k, p, t, rg, lane, valid, issue, q)
 

@@ -67,10 +67,14 @@ def _bump_phases_kernel(ph0_ptr, ph1_ptr, ph2_ptr, NPH: tl.constexpr):
 def _phase_args(words: list) -> tuple:
     """(ph0, ph1, ph2, NPH) of up to ``MAX_PHASES`` words (an unused pointer repeats the first)."""
     if not 0 < len(words) <= MAX_PHASES:
-        raise ValueError(f"{len(words)} step-phase words, a launch bumps 1..{MAX_PHASES}")
+        raise ValueError(
+            f"{len(words)} step-phase words, a launch bumps 1..{MAX_PHASES}"
+        )
     for w in words:
         if w.dtype != torch.int64 or w.numel() != 1:
-            raise ValueError(f"a step-phase word is int64 [1], not {w.dtype} {tuple(w.shape)}")
+            raise ValueError(
+                f"a step-phase word is int64 [1], not {w.dtype} {tuple(w.shape)}"
+            )
     pad = list(words) + [words[0]] * (MAX_PHASES - len(words))
     return (*pad, len(words))
 
@@ -102,7 +106,8 @@ def _post_verify_kernel(
 
     The next id (``next_ptr[b]``: the output row's id at the accepted count, the runner's gather) and, for the first
     ``NANCH`` of the DSpark block passes' fixed inputs, the draft's anchor (``aid*[b]`` = the next id clamped to
-    ``[0, vocab_max]``, ``apos*[b]`` = ``positions[anchor row]``: the proposer's ``_stage_anchors``)."""
+    ``[0, vocab_max]``, ``apos*[b]`` = ``positions[anchor row]``: the proposer's ``_stage_anchors``).
+    """
     b = tl.program_id(0)
     seed = seed_base + tl.load(step_ptr).to(tl.int64)
     if b == 0:
@@ -241,7 +246,8 @@ class PostVerify:
 
     def output(self, rows: int):
         """Width ``rows``' outputs, the forward's head output (``HiLayers.head_output``): (output ids [B, rq], verdict
-        [3, B], next ids [B]: each request's id at its accepted count, what the runner would gather)."""
+        [3, B], next ids [B]: each request's id at its accepted count, what the runner would gather).
+        """
         b = self.bufs[rows]
         return b["out"], b["verdict"], b["next"]
 
@@ -251,7 +257,8 @@ class PostVerify:
         the forward that just ran wrote them in its post-verify (``_post_verify_kernel``, ``NANCH``). True only when
         every input is a launched width's own (its next ids and verdict anchors: the runner took this forward's head
         output, so the replay that just ran wrote them; the step positions it read), the destinations are one of the
-        passes' it wrote, and the batch is the width's whole (no padded anchor rows). Host-side."""
+        passes' it wrote, and the batch is the width's whole (no padded anchor rows). Host-side.
+        """
         for w in self.launched:
             dst = self.anchor_dst.get(w)
             b = self.bufs[w]
@@ -307,7 +314,9 @@ def _anchor_dests(hook, nb: int) -> tuple[list, int]:
         if pass_ is None:
             continue
         try:
-            ids, pos = pass_.buffer("anchor_ids", nb), pass_.buffer("anchor_positions", nb)
+            ids, pos = pass_.buffer("anchor_ids", nb), pass_.buffer(
+                "anchor_positions", nb
+            )
         except (AssertionError, AttributeError, KeyError):
             continue
         if ids.dtype == torch.int32 and ids.is_contiguous() and pos.is_contiguous():

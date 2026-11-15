@@ -159,7 +159,9 @@ class _Plan:
         1  # x's rows: groups x rows, group h's answers to rank h (``TopK(groups=)``)
     )
     wmerge: bool = False  # split: the merge as one wave's rank (``TopK(wmerge=)``)
-    xfan: int = 0  # split: the answer's puts to the ranks by ``xfan`` tasks a row (``TopK(xfan=)``); 0: the final level's
+    xfan: int = (
+        0  # split: the answer's puts to the ranks by ``xfan`` tasks a row (``TopK(xfan=)``); 0: the final level's
+    )
 
     @property
     def xlreg(self) -> str:  # (xfan) the answer's local hand-off to the fan-out tasks
@@ -321,8 +323,12 @@ class TopK(Block):
         # rank's slot. One CTA's peer stores run at a fraction of a link's rate (k 2048: 256 KB a row to 8 ranks, ~27
         # µs on one CTA); split over xfan CTAs. The merge polls the same pairs: the same ids.
         # (k / xfan entries a task: a multiple of THREADS, an entry a thread at a time, or THREADS / 2, a pair a thread)
-        if xfan and (not self.split or groups > 1 or k % xfan
-                     or ((k // xfan) % THREADS and 2 * (k // xfan) != THREADS)):
+        if xfan and (
+            not self.split
+            or groups > 1
+            or k % xfan
+            or ((k // xfan) % THREADS and 2 * (k // xfan) != THREADS)
+        ):
             raise ValueError(f"TopK {name}: xfan {xfan} needs split, one group and k / xfan a multiple of {THREADS} "
                              f"or {THREADS // 2} (k {k})")  # fmt: skip
         self.xfan = int(xfan) if self.split else 0
@@ -371,7 +377,9 @@ class TopK(Block):
                 if p.live
                 else ((f"{self.name}.l0",) if short else ()) + (name,)
             )
-            if final and p.split:  # the rank's answers to every rank (xfan: to the fan-out tasks)
+            if (
+                final and p.split
+            ):  # the rank's answers to every rank (xfan: to the fan-out tasks)
                 writes += ((Region(p.xlreg, p.rows * p.k * 2, writers),) if p.xfan
                            else (Region(p.xreg, p.rows * p.k * 2, writers, space=Space.PEER),))  # fmt: skip
                 if (
@@ -721,10 +729,18 @@ def _xfan_live(k, p):
 
 def _xfan(k, t, p):
     """``xfan``: task t, row t / xfan's entries [c e, c e + e) (e = k / xfan, c = t % xfan) of this rank's answer, from
-    the local hand-off to every rank's slot (the final level's puts, unchanged: the same pairs at the same places)."""
+    the local hand-off to every rank's slot (the final level's puts, unchanged: the same pairs at the same places).
+    """
     row, c = t // p.xfan, t % p.xfan
     if p.scap:
-        _xfan_body_if(k, p, row, c, uniform(ld_i32(k.args[p.bound], row // p.spec * p.spec + p.spec - 1)) > p.scap)
+        _xfan_body_if(
+            k,
+            p,
+            row,
+            c,
+            uniform(ld_i32(k.args[p.bound], row // p.spec * p.spec + p.spec - 1))
+            > p.scap,
+        )
     else:
         _xfan_body(k, p, row, c)
 
@@ -737,8 +753,12 @@ def _xfan_body_if(k, p, row, c, live):
 
 def _xfan_body(k, p, row, c):
     e = p.k // p.xfan
-    xdst = [peer.to_rank(k, p.xreg, dst) for dst in range(p.split)]  # (addressed before the poll)
-    if 2 * e == THREADS:  # a pair a thread: entry tid / 2's value (even tid) or global index (odd), each pair tagged
+    xdst = [
+        peer.to_rank(k, p.xreg, dst) for dst in range(p.split)
+    ]  # (addressed before the poll)
+    if (
+        2 * e == THREADS
+    ):  # a pair a thread: entry tid / 2's value (even tid) or global index (odd), each pair tagged
         i = 2 * (row * p.k + c * e) + k.tid
         v = mb.poll([(k.mb[p.xlreg], i, 1)], k.tag)[0][0]
         for dst in range(p.split):
