@@ -357,13 +357,13 @@ def _fail():
 
 @_ASTR.transform
 def _stop_due(prev, t0):
-    """(one poll loop) past FAST_TICKS: the STOP word (after an agent-scope acquire: a CTA's stale cached line of the
-    tag it polls then refreshes); before it, prev (no extra load on the normal path)."""
+    """(one poll loop) past FAST_TICKS: the STOP word (a system-scope load; no fence: the polled tags live in uncached
+    peer memory, and an agent-scope acquire every round of every slow poll stalled whole steps for 0.2-1.7 s whenever
+    a step's ranks started > 100 us apart); before it, prev (no extra load on the normal path)."""
     fc = _fail()
     r = prev
     if fx.const_expr(fc is not None):
         if clock() - t0 > fx.Int64(FAST_TICKS):
-            fence_acquire("agent")
             r = gload(fc[0], fx.Int32, scope="system")
     return r
 
