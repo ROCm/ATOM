@@ -184,8 +184,10 @@ mod a_chat_template {
     }
 
     /// The engine renders with transformers, so routed tokens only match its KV
-    /// cache when this render is byte-identical. The expected text is
-    /// transformers' own output for this template and request.
+    /// cache when this render is byte-identical. The expected text is transformers
+    /// 5.16.1's `_compile_jinja_template(TEMPLATE).render(messages=..., tools=...,
+    /// add_generation_prompt=True)` for this request, arguments as a dict. Its
+    /// `tojson` is `json.dumps`, which leaves `<>&'` unescaped, unlike Jinja's.
     #[test]
     fn test_render_matches_transformers() {
         const TEMPLATE: &str = r#"{% for tool in tools %}
@@ -210,7 +212,7 @@ mod a_chat_template {
             ],
             "tools": [{"type": "function", "function": {
                 "name": "read",
-                "description": "Read a file.",
+                "description": "Read a file's <head> & tail.",
                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
             }}]
         }))
@@ -221,7 +223,7 @@ mod a_chat_template {
         assert_eq!(
             rendered,
             concat!(
-                r#"{"name": "read", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}"#,
+                r#"{"name": "read", "description": "Read a file's <head> & tail.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}"#,
                 "\nuser:;\nassistant: path=a.txt limit=5;\n",
             )
         );
