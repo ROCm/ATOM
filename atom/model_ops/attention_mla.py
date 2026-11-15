@@ -16,7 +16,6 @@ from aiter import (
     flash_attn_varlen_func,
     fused_qk_rope_concat_and_cache_mla,
     get_hip_quant,
-    get_mla_metadata_v1,
 )
 from aiter import indexer_qk_rope_quant_and_cache as _indexer_qk_rope_quant_and_cache
 
@@ -700,7 +699,7 @@ class MLAAttention(nn.Module):
         # A layer that runs its own top-k produces a new layer-local DCP compact
         # indptr. A layer that skips it (IndexShare "shared", or a DeepSeek
         # index_topk_freq skip, which still holds its indexer module) reuses
-        # both the prior layer's indices and the work plan rebuilt from them.
+        # both the prior layer's indices and the work plan patched to them.
         self.owns_sparse_indexer = mla_modules.indexer is not None and not (
             skips_index_topk(atom_config.hf_config, layer_num)
         )
@@ -926,8 +925,8 @@ class MLAAttention(nn.Module):
         ) and not getattr(log_cls, "_sparse_dcp_persistent_logged", False):
             log_cls._sparse_dcp_persistent_logged = True
             logger.info(
-                "Sparse DCP persistent attention enabled: rebuilding metadata "
-                "after each full indexer layer (kernel heads=%d).",
+                "Sparse DCP persistent attention enabled: each full indexer "
+                "layer points the step's work plan at its keys (kernel heads=%d).",
                 self.dcp_kernel_num_heads,
             )
 
@@ -2608,72 +2607,15 @@ class MLAAttention(nn.Module):
         # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
         return kv_cache.view(num_blocks, block_size, d).unsqueeze(1)
 
-    def _should_rebuild_sparse_dcp_persistent_metadata(
-        self, use_persistent_mode: bool
-    ) -> bool:
+    def _patches_sparse_dcp_work_plan(self, use_persistent_mode: bool) -> bool:
+        """Whether this layer points the step's work plan at its own keys: a
+        full indexer layer rewrites ``dcp_sparse_kv_indptr`` with the top-k
+        this rank owns."""
         return (
             use_persistent_mode
             and self.is_sparse_mla
             and self.dcp_world_size > 1
             and self.owns_sparse_indexer
-        )
-
-    def _rebuild_sparse_dcp_persistent_metadata(
-        self,
-        attn_metadata: AttentionMetaData,
-        q: torch.Tensor,
-        kv_buffer: torch.Tensor,
-        paged_cu_seqlens_q: torch.Tensor,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_last_page_lens: torch.Tensor,
-        gathered_num_heads: int,
-        work_prefix: str = "",
-    ) -> None:
-        """Rebuild persistent work/reduce metadata from this layer's DCP top-k.
-
-        A full GLM IndexShare layer rewrites ``dcp_sparse_kv_indptr``
-        after selecting and compacting the rank-owned top-k. Persistent work
-        descriptors embed those region boundaries, so they must be rebuilt
-        after that mutation rather than once per decode step from the global
-        sparse indptr. Shared IndexShare layers reuse the preceding full layer's
-        indices, compact indptr, and work plan and therefore skip this call.
-
-        ``gathered_num_heads`` is the caller's own gathered/padded width
-        (``dcp_kernel_num_heads``), not assumed here. Sparse prefill does not
-        rebuild: it patches the forward's whole-row plan
-        (``patch_work_kv_ranges``).
-        """
-        if not work_prefix:
-            assert attn_metadata.max_seqlen_q == 1, (
-                "The unprefixed sparse DCP work buffers describe a q_len=1 step; "
-                'an MTP verify step must pass work_prefix="sparse_mtp_".'
-            )
-        elif work_prefix == "sparse_mtp_":
-            assert attn_metadata.max_seqlen_q > 1, (
-                "sparse_mtp_ work buffers describe the per-token verify layout; "
-                "a q_len=1 step must use the unprefixed ones."
-            )
-        assert q.shape[1] == gathered_num_heads
-        get_mla_metadata_v1(
-            paged_cu_seqlens_q,
-            paged_kv_indptr,
-            paged_kv_last_page_lens,
-            gathered_num_heads,
-            1,  # nhead_kv
-            True,
-            getattr(attn_metadata, f"{work_prefix}work_meta_data"),
-            getattr(attn_metadata, f"{work_prefix}work_info_set"),
-            getattr(attn_metadata, f"{work_prefix}work_indptr"),
-            getattr(attn_metadata, f"{work_prefix}reduce_indptr"),
-            getattr(attn_metadata, f"{work_prefix}reduce_final_map"),
-            getattr(attn_metadata, f"{work_prefix}reduce_partial_map"),
-            page_size=1,
-            dtype_q=q.dtype,
-            dtype_kv=kv_buffer.dtype,
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=1,
-            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
     def decode_is_persistent(self) -> bool:
@@ -2788,8 +2730,7 @@ class MLAAttention(nn.Module):
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
                     # Cut to q's rows: the drafter's step 0 runs fewer than the
-                    # padded running_tokens these are published for, and the
-                    # DCP rebuild below plans from them.
+                    # padded running_tokens these are published for.
                     paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q[: B + 1]
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens[:B]
@@ -2800,11 +2741,10 @@ class MLAAttention(nn.Module):
                     # The MTP drafter's step 0 reuses this plan with the
                     # target's unpadded stream (#287), hence the check on q's
                     # own rows. Host ints only: no sync, safe under capture.
-                    # DCP rebuilds the sparse_mtp_ plan per layer below.
                     planned_tokens = getattr(
                         attn_metadata, "sparse_mtp_num_tokens", None
                     )
-                    if self.dcp_world_size == 1 and planned_tokens is not None:
+                    if planned_tokens is not None:
                         assert planned_tokens <= B, (
                             f"sparse MTP plan covers {planned_tokens} query "
                             f"rows but q holds {B}: the decode would read q "
@@ -2827,9 +2767,9 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.dcp_sparse_kv_indptr[: B + 1]
 
             use_persistent_mode = self.decode_is_persistent()
-            # Sparse DCP persistent decode rebuilds the work plan below from
-            # the layer-local compact indptr; MTP verify is per-token q_len=1
-            # rows and rebuilds into the sparse_mtp_ buffers.
+            # Sparse DCP persistent decode points the step's work plan at the
+            # layer-local compact indptr below; MTP verify is per-token q_len=1
+            # rows in the sparse_mtp_ buffers.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = (
                     use_persistent_mode and self.sparse_dcp_metadata_rebuild
@@ -2839,18 +2779,6 @@ class MLAAttention(nn.Module):
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
             # (max_seqlen_qo=2).
             is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
-
-            if self._should_rebuild_sparse_dcp_persistent_metadata(use_persistent_mode):
-                self._rebuild_sparse_dcp_persistent_metadata(
-                    attn_metadata,
-                    q,
-                    kv_buffer,
-                    paged_cu_seqlens_q,
-                    paged_kv_indptr,
-                    paged_kv_last_page_lens,
-                    self.dcp_kernel_num_heads,
-                    work_prefix="sparse_mtp_" if is_sparse_mtp else "",
-                )
 
             if not use_persistent_mode:
                 work_meta_data = None
@@ -2873,6 +2801,11 @@ class MLAAttention(nn.Module):
                 reduce_indptr = attn_metadata.reduce_indptr
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
+
+            if self._patches_sparse_dcp_work_plan(use_persistent_mode):
+                # Shared IndexShare layers reuse the preceding full layer's
+                # indices, compact indptr, and so its patched plan.
+                patch_work_kv_ranges(work_info_set, work_indptr, paged_kv_indptr, B)
 
             # persistent lets metadata (reduce_partial_map) drive the split, so
             # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs

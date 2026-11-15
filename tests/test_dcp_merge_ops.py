@@ -1448,10 +1448,12 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 96)]
 )
 @pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("num_spec_tokens", [0, 3])
 def test_sparse_prefill_builder_allocates_for_its_consumer(
-    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype, num_spec_tokens
 ):
-    """12 heads per rank need distinct decode and prefill work buffers."""
+    """12 heads per rank need distinct decode and prefill work buffers. A
+    verify step's sparse_mtp_ plan is made at the decode kernel's width."""
     from aiter import get_mla_metadata_info_v1
 
     from atom.model_ops.attentions import aiter_mla, backends
@@ -1485,7 +1487,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         device=torch.device("cuda"),
         max_num_batched_tokens=16,
         max_bs=4,
-        num_spec_tokens=0,
+        num_spec_tokens=num_spec_tokens,
         has_mla_indexer=True,
         forward_vars={},
     )
@@ -1500,13 +1502,22 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         "reduce_final_map",
         "reduce_partial_map",
     )
-    for prefix, rows, heads in (
-        ("", 4, decode_heads),
-        ("sparse_prefill_", 16, prefill_heads),
-    ):
+    buffers = [
+        ("", 4, num_spec_tokens + 1, decode_heads),
+        ("sparse_prefill_", 16, 1, prefill_heads),
+    ]
+    if num_spec_tokens:
+        buffers.append(("sparse_mtp_", 4 * (num_spec_tokens + 1), 1, decode_heads))
+        planned = []
+        monkeypatch.setattr(
+            aiter_mla, "get_mla_metadata_v1", lambda *args, **_: planned.append(args[3])
+        )
+        builder._set_mla_persistent_worker_buffers_sparse_mtp(4)
+        assert planned == [decode_heads]
+    for prefix, rows, q_len, heads in buffers:
         info = get_mla_metadata_info_v1(
             rows,
-            1,
+            q_len,
             heads,
             builder.dtype_q,
             builder.dtype_kv,
@@ -1569,53 +1580,12 @@ def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengt
     torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
 
 
-def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
-    """Pins gathered_num_heads at the decode call site, not just the function.
-
-    Decode and sparse prefill round the gathered query width through
-    different tables (mla_dcp_kernel_num_heads vs mla_dcp_sparse_prefill_
-    num_heads) and can disagree (e.g. num_heads=12, dcp=4 -> 48 vs 64).
-    Passing the wrong one plans persistent work descriptors for the wrong
-    nhead; nothing importable on the CPU gate would notice a regression
-    here, so read the call sites from source instead. Sparse prefill does
-    not rebuild: the metadata builder plans it once a forward.
-    """
-    tree = ast.parse(_ATTENTION_MLA_PATH.read_text(encoding="utf-8"))
-
-    def _name(node):
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            return f"{node.value.id}.{node.attr}"
-        return None
-
-    by_enclosing_func = {}
-    for func in ast.walk(tree):
-        if not isinstance(func, ast.FunctionDef):
-            continue
-        for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_rebuild_sparse_dcp_persistent_metadata"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                by_enclosing_func[func.name] = _name(node.args[6])
-
-    assert by_enclosing_func == {
-        "_forward_decode": "self.dcp_kernel_num_heads",
-    }, (
-        "a _rebuild_sparse_dcp_persistent_metadata call site is passing the "
-        f"wrong gathered_num_heads (7th positional arg): got {by_enclosing_func}"
-    )
-
-
 @needs_dcp_ops
 def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
-    """Demonstrates the gap the test above guards against is real, not just
-    hypothetical: at 12 heads x DCP4 the two width tables actually disagree.
-    At DCP8 both run aiter's native gqa96 kernel, unpadded.
+    """Decode and sparse prefill round the gathered query width through
+    different tables, so each plans its own work buffers at its own width: at
+    12 heads x DCP4 the two tables disagree. At DCP8 both run aiter's native
+    gqa96 kernel, unpadded.
     """
     widths = {
         dcp: (
@@ -1627,8 +1597,8 @@ def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
     assert widths == {4: (48, 64), 8: (96, 96)}, (
         "expected decode's and sparse prefill's width tables to disagree at "
         f"DCP4 and agree on 96 at DCP8; got {widths} -- if DCP4 now agrees, "
-        "the case above no longer proves the two call sites must use their "
-        "own width, pick another num_heads/dcp pair that still diverges"
+        "this case no longer proves the two plans need their own width, "
+        "pick another num_heads/dcp pair that still diverges"
     )
     assert mla_dcp_sparse_prefill_num_heads(12, 8, persistent=False) == 128
 
