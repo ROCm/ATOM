@@ -145,6 +145,49 @@ def _opening_generation(sync, ticket, blocks):
     return generation
 
 
+# The thread that arrives and later polls: the last wave's first lane, whose
+# first TDM copy in ``gemv_tdm.project``'s issue order is a weight slab several
+# slabs ahead, so the atomic's round trip holds up no copy slab 0 waits on.
+_ARRIVER = 7 * GFX1250.wave_size
+
+
+@traced
+def _arrive(sync, slots, blocks):
+    """``_opening_generation``'s arrival alone: one thread counts its CTA in
+    and keeps the generation it found in ``slots[0]``, the last arrival opens
+    the next one, and no thread waits. ``_await_generation`` collects it."""
+
+    tid = fx.thread_idx.x
+    if tid == _ARRIVER:
+        previous = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
+        arrival = gfx_backend.epoch_arrive_system_atomic(sync, fx.Int32(1))
+        if arrival == fx.Int32(blocks - 1):
+            gfx_backend.epoch_store_system_release(sync, fx.Int32(0))
+            gfx_backend.epoch_store_system_release(
+                sync + fx.Int64(4),
+                previous + fx.Int32(1),
+            )
+        fx.ptr_store(fx.Int64(previous), slots)
+        fx.ptr_store(fx.Int64(-1), slots + 1)
+
+
+@traced
+def _await_generation(sync, slots):
+    """The generation ``_arrive``'s last arrival opened, polled once a CTA."""
+
+    tid = fx.thread_idx.x
+    if tid == _ARRIVER:  # noqa: SIM102
+        if fx.ptr_load(slots + 1) < fx.Int64(0):
+            previous = fx.Int32(fx.ptr_load(slots))
+            generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
+            while generation == previous:
+                rocdl.s_sleep(1)
+                generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
+            fx.ptr_store(fx.Int64(generation), slots + 1)
+    gpu.barrier()
+    return fx.Int32(fx.ptr_load(slots + 1))
+
+
 def _task_start(block, first, blocks):
     return (block - first + blocks) % blocks
 
@@ -381,6 +424,21 @@ def build_resident_k1(
                 )
         device["wait_vector_stores"]()
 
+    def open_generation(sync, slots, ticket):
+        """The launch's generation, or with an external seam (``x`` is the
+        previous launch's output, so only what this launch publishes carries
+        its generation) only the arrival, collected once a CTA needs it, so
+        the projection streams while the arrivals settle."""
+        if spec.external_seam:
+            _arrive(sync, slots, declaration.blocks)
+            return None
+        return _opening_generation(sync, ticket, declaration.blocks)
+
+    def collect_generation(sync, slots, generation):
+        if spec.external_seam:
+            return _await_generation(sync, slots)
+        return generation
+
     @flyc.kernel(name=name, known_block_size=[declaration.threads, 1, 1])
     def resident(
         prefix: Int64,
@@ -423,11 +481,7 @@ def build_resident_k1(
         projection = role.gemv.peek()
         recurrence = role.kda.peek()
         sync = scratch + fx.Int64(layout["sync"][0])
-        generation = _opening_generation(
-            sync,
-            projection.xl.ptr,
-            declaration.blocks,
-        )
+        generation = open_generation(sync, smem.tls.ptr, projection.xl.ptr)
         part = scratch + fx.Int64(layout["part"][0])
         weights = scratch + fx.Int64(layout["wgt"][0])
         mean_squares = scratch + fx.Int64(layout["msq"][0])
@@ -700,6 +754,7 @@ def build_resident_k1(
                         lane,
                     )
             gpu.barrier()
+            projected_tag = collect_generation(sync, smem.tls.ptr, generation)
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
@@ -726,10 +781,12 @@ def build_resident_k1(
                                     projected,
                                     global_token * NPROJ + task * ROWS + row,
                                     value,
-                                    generation,
+                                    projected_tag,
                                 )
             gpu.barrier()
             device["wait_vector_stores"]()
+
+        generation = collect_generation(sync, smem.tls.ptr, generation)
 
         recurrence_context = {
             "S": s,
