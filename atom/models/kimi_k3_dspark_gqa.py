@@ -35,7 +35,9 @@ shared 1.0, and the pool declares no per-token scale planes.
 
 `ATOM_K3_DRAFT_QKROPE` (default on) runs the q/k norm, rope and pool write of
 both passes as one aiter launch, `fused_qk_rope_reshape_and_cache` with its
-q/k-norm prologue (`_fused_qk_rope_write`).
+q/k-norm prologue (`_fused_qk_rope_write`). Only this GQA draft reads it; the
+MLA draft (`kimi_k3_dspark.py`) has its own fused context write
+(`ATOM_DSPARK_FUSED_CTX_KV`).
 """
 
 import functools
