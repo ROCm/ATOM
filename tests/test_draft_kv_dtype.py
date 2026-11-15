@@ -58,32 +58,40 @@ def no_synthetic_acceptance_import(monkeypatch):
     monkeypatch.setattr(SpeculativeConfig, "_resolve_synthetic_acceptance", lambda s: 0)
 
 
-def _draft(method="dspark", asked=None):
-    """A speculative config as `Config` holds it: what `resolve_draft_kv_dtype` reads."""
-    return types.SimpleNamespace(method=method, kv_cache_dtype=asked)
-
-
 @pytest.mark.parametrize("target", ["bf16", "fp8"])
 @pytest.mark.parametrize("asked", [None, "bf16", "fp8"])
 def test_an_own_pool_draft_keeps_the_targets_dtype_unless_asked(target, asked):
-    assert resolve_draft_kv_dtype(_draft(asked=asked), target, own_pool=True) == (
+    assert resolve_draft_kv_dtype(target, own_pool=True, requested=asked) == (
         asked or target
     )
 
 
+def test_an_fp4_target_has_no_fp4_draft_layout_so_an_own_pool_draft_is_bf16():
+    # the clause #2962 added: kept by the one resolver, with and without a request
+    assert resolve_draft_kv_dtype("fp4", own_pool=True) == "bf16"
+    assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="bf16") == "bf16"
+    assert resolve_draft_kv_dtype("fp4", own_pool=True, requested="fp8") == "fp8"
+
+
 @pytest.mark.parametrize("own_pool", [True, False])
-def test_an_unsupported_draft_dtype_is_refused_whoever_asks(own_pool):
+@pytest.mark.parametrize("asked", ["int4", "fp4", "auto", ""])
+def test_an_unsupported_draft_dtype_is_refused_whoever_asks(own_pool, asked):
     with pytest.raises(ValueError, match="must be 'bf16' or 'fp8'"):
-        resolve_draft_kv_dtype(_draft(asked="int4"), "bf16", own_pool=own_pool)
+        resolve_draft_kv_dtype("bf16", own_pool=own_pool, requested=asked)
 
 
 def test_a_shared_pool_draft_has_the_targets_dtype():
-    assert resolve_draft_kv_dtype(_draft("mtp"), "fp8", own_pool=False) == "fp8"
-    assert resolve_draft_kv_dtype(_draft("mtp", "bf16"), "bf16", own_pool=False) == (
-        "bf16"
-    )
+    assert resolve_draft_kv_dtype("fp8", own_pool=False) == "fp8"
+    assert resolve_draft_kv_dtype("bf16", own_pool=False, requested="bf16") == "bf16"
+    assert resolve_draft_kv_dtype("fp4", own_pool=False) == "fp4"  # MTP: refused later
     with pytest.raises(ValueError, match="caches in the target's KV pool"):
-        resolve_draft_kv_dtype(_draft("mtp", "bf16"), "fp8", own_pool=False)
+        resolve_draft_kv_dtype("fp8", own_pool=False, requested="bf16")
+
+
+def test_config_refuses_an_unsupported_draft_dtype_at_configuration(monkeypatch):
+    # a Python caller bypasses argparse's choices
+    with pytest.raises(ValueError, match="must be 'bf16' or 'fp8'"):
+        _llama(monkeypatch, speculative_config=_dspark_spec(kv_cache_dtype="int4"))
 
 
 def _dspark_spec(**kw):
@@ -153,35 +161,6 @@ def test_an_mtp_draft_shares_the_targets_pool(monkeypatch):
     spec.method = "mtp"
     with pytest.raises(ValueError, match="caches in the target's KV pool"):
         _llama(monkeypatch, kv_cache_dtype="fp8", speculative_config=spec)
-
-
-def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_for_a_backend(
-    monkeypatch,
-):
-    """V4.1 DSpark is a supported plugin deployment and vLLM / SGLang have no CSA2
-    backend: whether the draft owns a pool is a native runner's question, so `Config`
-    must not route it through a backend lookup (which raises for CSA2), nor import
-    one (aiter) into the API process."""
-    from atom.plugin import prepare
-    from atom.utils import selector
-
-    def refuse(*_a):
-        raise AssertionError("a backend was resolved")
-
-    hf = PretrainedConfig(
-        architectures=["DeepseekV41DSparkModel"], model_type="deepseek_v41_dspark"
-    )
-    monkeypatch.setattr(selector, "get_attn_backend", refuse)
-    for framework in ("vllm", "atom"):
-        monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", framework)
-        spec = SpeculativeConfig(
-            method="dspark",
-            model="draft",
-            num_speculative_tokens=3,
-            draft_model_hf_config=hf,
-        )
-        _llama(monkeypatch, speculative_config=spec)
-        assert spec.draft_kv_dtype == "bf16"
 
 
 def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(

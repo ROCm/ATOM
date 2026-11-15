@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
     COPYING,
     EVICTING,
@@ -15,6 +16,12 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
+    published_page_unit_bytes,
+)
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
+    page_pool,
+    plan_pools,
+    state_pool,
 )
 
 
@@ -703,3 +710,46 @@ class TestTheTierVotes:
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
         index.hashes.discard(77)  # what `fail_load` -> `forget` does
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+
+class _Builder:
+    def __init__(self, specs, published="absent"):
+        self._specs = specs
+        if published != "absent":
+            self.checkpoint_page_unit_bytes = lambda: published
+
+    def sub_pool_specs(self):
+        return self._specs
+
+
+def test_page_unit_is_the_target_share_not_the_merged_class():
+    target = _Builder(
+        [page_pool(1000), state_pool(STATE_SLOT_CLASS, 64, entries_per_req=2)]
+    )
+    draft = _Builder([page_pool(300)])
+    plan = plan_pools(target.sub_pool_specs() + draft.sub_pool_specs(), 10**6, 4)
+
+    assert plan.entry_bytes[plan.paged_class] == 1300
+    assert published_page_unit_bytes(target) == 1000
+
+
+def test_page_unit_defaults_to_the_target_share_without_a_draft():
+    target = _Builder([page_pool(1000), state_pool("s", 64, entries_per_req=1)])
+    plan = plan_pools(target.sub_pool_specs(), 10**6, 4)
+
+    assert published_page_unit_bytes(target) == plan.entry_bytes[plan.paged_class]
+    assert published_page_unit_bytes(_Builder(target._specs, None)) == 1000
+
+
+def test_backend_published_unit_overrides_the_share():
+    specs = [page_pool(1024), state_pool("s", 64, entries_per_req=1)]
+
+    assert published_page_unit_bytes(_Builder(specs, 1000)) == 1000
+    for bad in (0, 1025):
+        with pytest.raises(RuntimeError, match="checkpoint PAGE unit"):
+            published_page_unit_bytes(_Builder(specs, bad))
+
+
+def test_page_unit_needs_target_page_bytes():
+    with pytest.raises(RuntimeError, match="declares no PAGE bytes"):
+        published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))

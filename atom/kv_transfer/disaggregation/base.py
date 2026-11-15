@@ -97,6 +97,14 @@ class KVConnectorSchedulerBase(ABC):
 
     is_producer: bool
 
+    supports_pd_admission = False
+
+    def pd_receive_block_offset(
+        self, seq: Any, num_blocks: int, num_cached_blocks: int
+    ) -> int | None:
+        """First destination block for this PD load; None for other loads."""
+        return None
+
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """Check if *seq* needs remote KV prefill.

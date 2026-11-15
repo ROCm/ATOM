@@ -587,14 +587,14 @@ def _tier_hit(router, chain):
     return router._tier_hit(router._path(chain))
 
 
-def _chain_seq(seq_id, tokens, first_block=0, session=None):
+def _chain_seq(seq_id, tokens, first_block=0, session=None, hbs=128):
     import array
 
     from atom.model_engine.prefix_hash import ShippedChain
 
     seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
-    blocks = array.array("Q", range(first_block, first_block + tokens // 128))
-    seq.prompt_hash_chain = ShippedChain(128, 0, tokens, 0, blocks)
+    blocks = array.array("Q", range(first_block, first_block + tokens // hbs))
+    seq.prompt_hash_chain = ShippedChain(hbs, 0, tokens, 0, blocks)
     return seq
 
 
@@ -2212,3 +2212,165 @@ def test_prefix_spread_forked_prefix_is_not_merged_into_either_branch():
     for seq in (left, right):
         assert _rank_hits(router, seq.prompt_hash_chain, 2) == ({0: 8192}, 0)
     assert _rank_hits(router, trunk.prompt_hash_chain, 2) == ({0: 4096}, 0)
+
+
+# ── Prefix-spread index counters (trim / evict) ────────────────────
+
+_NO_BUDGET_COUNTERS = (
+    "over_budget_total",
+    "tail_trim_total",
+    "tail_trim_tokens_total",
+    "leaf_evict_total",
+    "leaf_evict_tokens_total",
+    "trim_blocked_total",
+)
+
+
+def test_prefix_spread_index_counters_are_zero_until_something_happens():
+    router = _make_spread_mgr()._prefix_router
+    fresh = router.index_counters()
+    assert set(fresh) == {*_NO_BUDGET_COUNTERS, "indexed_tokens"}
+    assert all(fresh[name] == 0 for name in _NO_BUDGET_COUNTERS)
+    assert fresh["indexed_tokens"] == 0
+    # Placements, completions and releases under the production budget never
+    # reach the budget path.
+    for sid in range(1, 6):
+        seq = _chain_seq(sid, 20 * 128, first_block=sid * 100)
+        router.charge(sid, router.place(seq, sid % 2, 2).credit)
+        router.prefill_complete(sid)
+        router.release(sid)
+    quiet = router.index_counters()
+    assert all(quiet[name] == 0 for name in _NO_BUDGET_COUNTERS)
+    assert quiet["indexed_tokens"] == 5 * 20 * 128
+
+
+def test_prefix_spread_tail_trim_counts_events_and_tokens():
+    router = _make_spread_mgr()._prefix_router
+    for rank, seq_id in ((0, 1), (1, 2)):
+        router.place(_chain_seq(seq_id, 100 * 128), rank, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 100 * 128
+    router.charge(
+        3, router.place(_chain_seq(3, 10 * 128, first_block=5_000), 0, 2).credit
+    )
+    got = router.index_counters()
+    # 10 blocks over, from a 100-block leaf (<= 1/8): one tail trim, no eviction.
+    assert got["tail_trim_total"] == 1
+    assert got["tail_trim_tokens_total"] == 10 * 128
+    assert got["over_budget_total"] == 1 and got["trim_blocked_total"] == 0
+    assert got["leaf_evict_total"] == got["leaf_evict_tokens_total"] == 0
+    assert got["indexed_tokens"] == router.CAP
+
+
+def test_prefix_spread_leaf_evict_counts_events_and_tokens():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id, blocks in ((1, 4), (2, 1)):
+        router.place(_chain_seq(seq_id, blocks * 128, first_block=seq_id * 1_000), 0, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 4 * 128  # one block over: the oldest, 4 blocks, loses 1 (tail)
+    router.reset()
+    mid = router.index_counters()
+    assert (mid["tail_trim_total"], mid["tail_trim_tokens_total"]) == (1, 128)
+    assert mid["leaf_evict_total"] == 0
+    router.CAP = 3 * 128  # the 1-block leaf is oldest now and goes whole
+    router.reset()
+    mid = router.index_counters()
+    assert (mid["leaf_evict_total"], mid["leaf_evict_tokens_total"]) == (1, 128)
+    assert mid["tail_trim_total"] == 1
+    router.CAP = 0  # the 3-block leaf goes whole, with the blocks it holds now
+    router.reset()
+    end = router.index_counters()
+    assert (end["leaf_evict_total"], end["leaf_evict_tokens_total"]) == (2, 4 * 128)
+    assert end["tail_trim_tokens_total"] == 128
+    assert end["indexed_tokens"] == 0
+    assert end["trim_blocked_total"] == 0  # nothing was pinned: never "blocked"
+
+
+def test_prefix_spread_dropping_released_empty_edges_is_not_counted_as_eviction():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id in (1, 2):
+        seq = _chain_seq(seq_id, 10 * 128, first_block=seq_id * 1_000)
+        router.charge(seq_id, router.place(seq, 0, 2).credit)
+    router.release(1)  # unfinished prefill released: its edge empties and goes
+    router.reset()  # the other one's pending claim is dropped: same
+    got = router.index_counters()
+    assert len(router.index) == 0 and got["indexed_tokens"] == 0
+    assert got["leaf_evict_total"] == got["tail_trim_total"] == 0
+    assert got["over_budget_total"] == got["trim_blocked_total"] == 0
+    assert got["leaf_evict_tokens_total"] == got["tail_trim_tokens_total"] == 0
+
+
+def test_prefix_spread_trim_token_counters_use_the_chains_hash_block_size():
+    router = _make_spread_mgr()._prefix_router
+    for seq_id, blocks in ((1, 100), (2, 4)):
+        seq = _chain_seq(seq_id, blocks * 16, first_block=seq_id * 1_000, hbs=16)
+        router.place(seq, 0, 2)
+        router.prefill_complete(seq_id)
+    router.CAP = 98 * 16  # 6 blocks over: 6 <= 100 / 8 -> one tail trim of 6 blocks
+    router.reset()
+    got = router.index_counters()
+    assert got["tail_trim_total"] == 1
+    assert got["tail_trim_tokens_total"] == 6 * 16
+    router.CAP = 0  # both leaves go whole: 94 and 4 blocks
+    router.reset()
+    got = router.index_counters()
+    assert got["leaf_evict_total"] == 2
+    assert got["leaf_evict_tokens_total"] == 98 * 16
+    assert got["trim_blocked_total"] == 0
+
+
+def test_prefix_spread_trim_blocked_counts_over_budget_with_only_pending_edges():
+    router = _make_spread_mgr()._prefix_router
+    producing = _chain_seq(1, 10 * 128)
+    router.CAP = 5 * 128
+    router.charge(1, router.place(producing, 0, 2).credit)
+    got = router.index_counters()
+    assert got["over_budget_total"] >= 1
+    assert got["trim_blocked_total"] == got["over_budget_total"]
+    assert got["tail_trim_total"] == got["leaf_evict_total"] == 0
+    router.prefill_complete(1)  # finished history can now pay: 5 of 10 blocks over
+    got = router.index_counters()
+    assert (got["leaf_evict_total"], got["leaf_evict_tokens_total"]) == (1, 10 * 128)
+    assert got["tail_trim_total"] == 0 and got["indexed_tokens"] == 0
+
+
+def test_prefix_spread_trim_blocked_counts_finished_ancestors_of_a_prefilling_leaf():
+    router = _make_spread_mgr()._prefix_router
+    router.place(_chain_seq(1, 10 * 128), 0, 2)
+    router.prefill_complete(1)
+    router.CAP = 3 * 128
+    # Shares 6 blocks with seq 1 and diverges: the finished 6-block edge gains a
+    # child that is still prefilling, so it is not evictable although it is done.
+    follower = _chain_seq(2, 10 * 128)
+    follower.prompt_hash_chain.hashes[6:] = type(follower.prompt_hash_chain.hashes)(
+        "Q", range(50_000, 50_004)
+    )
+    router.charge(2, router.place(follower, 0, 2).credit)
+    got = router.index_counters()
+    assert got["leaf_evict_total"] == 1  # seq 1's finished 4-block tail went
+    assert got["indexed_tokens"] > router.CAP
+    assert got["trim_blocked_total"] >= 1
+    finished = [e for e, holders in router.index.items() if e.children]
+    assert finished and all(
+        not any((e, r) in router.pending for r in router.index[e]) for e in finished
+    )
+    before = got["trim_blocked_total"]
+    router.prefill_complete(2)  # nothing pinned any more: the budget can be met
+    after = router.index_counters()
+    assert after["indexed_tokens"] <= router.CAP
+    assert after["trim_blocked_total"] == before
+
+
+def test_prefix_spread_index_counters_are_exported_in_router_statistics():
+    mgr = _make_spread_mgr()
+    router = mgr._prefix_router
+    router.CAP = 4 * 128
+    for seq_id, blocks in ((1, 4), (2, 1)):
+        router.place(_chain_seq(seq_id, blocks * 128, first_block=seq_id * 1_000), 0, 2)
+        router.prefill_complete(seq_id)
+    router.reset()
+    snapshot = mgr.get_dp_router_statistics()
+    assert snapshot["prefix_index"] == router.index_counters()
+    assert snapshot["prefix_index"]["tail_trim_total"] == 1
+    # Without the prefix router the section is absent.
+    assert "prefix_index" not in _make_mgr(2).get_dp_router_statistics()

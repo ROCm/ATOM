@@ -283,14 +283,14 @@ def _kv_only_load(hbm=8):
 
 
 def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
-    req = _kv_only_load()
+    req = replace(_kv_only_load(), cache_salt="11")
     page_worker._submit_load(req, object())
     # The lookup that reported the reach also locked it, under this session.
     assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = page_worker.submitted
     # PAGE for [8, 16) and nothing else: the layout has no image group.
     assert spec.block_ids == [[3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == "11"
 
 
 def test_page_only_save_stores_page_alone(page_worker):
@@ -300,7 +300,7 @@ def test_page_only_save_stores_page_alone(page_worker):
     page_worker._submit_save(req, object())
     [spec] = page_worker.submitted
     assert spec.block_ids == [[1, 2, 3, 4]]
-    assert spec.request_configs is None
+    assert spec.cache_salt == ""
     page_worker.future.ready = True
     terminals = [
         completion
@@ -630,6 +630,40 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     assert not second.failed_loading
     assert worker._restore_descriptor_slots == [3]
     assert worker._native_loads == {}
+
+
+def test_restore_deadline_counts_from_the_restore_not_the_retrieve(
+    worker, cuda, monkeypatch
+):
+    """The host may first poll a retrieve long after submitting it. The
+    retrieve is terminal by then and its restore only just enqueued: the
+    deadline bounds the restore from there, and still stops the engine if that
+    copy never completes."""
+    from atom.kv_transfer.offload.mp import transfer
+
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker._restore_descriptor_slots = [3]
+    worker._native_copy = lambda stores, restores, descriptor_slot=0: None
+    req = request(loading=True)
+    worker._submit_load(req, object())
+
+    now[0] += worker._transfer_deadline_s + 5
+    worker.future.value, worker.future.ready = True, True
+    first = worker.get_finished()
+    assert not first.finished_loading and not first.failed_loading
+    assert len(worker._native_loads) == 1
+
+    now[0] += worker._transfer_deadline_s - 1
+    assert not worker.get_finished().finished_loading
+    now[0] += 2
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert worker._restore_descriptor_slots == []
+
+    cuda.events[-1].done = True
+    assert worker.get_finished().finished_loading == {req.load_operation}
+    assert worker._restore_descriptor_slots == [3]
 
 
 def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):

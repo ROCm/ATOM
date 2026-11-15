@@ -60,6 +60,18 @@ class PrefixSpreadRouter:
     # the metrics exporter.
     DECISIONS = PREFIX_DECISIONS
     MOVED_TOKENS = PREFIX_MOVED_TOKENS
+    # Index-maintenance counters (`index_counters`), cumulative since the router
+    # was built; `reset` does not clear them. Plain integer increments made by the
+    # code that already does the work, under `CoreManager`'s lock.
+    #   over_budget_total   `_trim_history` calls that found the index over `CAP`
+    #   tail_trim_*         a leaf shortened from its tail (events, tokens)
+    #   leaf_evict_*        a whole leaf dropped by the budget (events, tokens)
+    #   trim_blocked_total  over-budget calls that ended still over `CAP`: no
+    #                       evictable edge was left, only edges with a pending
+    #                       (still-prefilling) claim and edges with children,
+    #                       e.g. finished ancestors of a still-prefilling leaf
+    # Tail trim / leaf evict are the budget path only; `_prune_empty` drops of
+    # emptied edges are ordinary release bookkeeping and are not counted.
 
     def __init__(
         self, idle_tokens: int, tier: OffloadTierProfile, max_seqs: int
@@ -95,6 +107,25 @@ class PrefixSpreadRouter:
         self._in_flight: dict = {}
         # Placement-time credit backed independently of any pending producer.
         self._independent_credit: dict = {}
+        self._over_budget = 0
+        self._tail_trim = 0
+        self._tail_trim_tokens = 0
+        self._leaf_evict = 0
+        self._leaf_evict_tokens = 0
+        self._trim_blocked = 0
+
+    def index_counters(self) -> dict:
+        """Snapshot of the index-maintenance counters plus the current index size.
+        Read-only; call under the same lock as the other router methods."""
+        return {
+            "over_budget_total": self._over_budget,
+            "tail_trim_total": self._tail_trim,
+            "tail_trim_tokens_total": self._tail_trim_tokens,
+            "leaf_evict_total": self._leaf_evict,
+            "leaf_evict_tokens_total": self._leaf_evict_tokens,
+            "trim_blocked_total": self._trim_blocked,
+            "indexed_tokens": self.indexed_tokens,
+        }
 
     def reset(self) -> None:
         """Forget in-flight state. The index stays: it describes the ranks'
@@ -547,6 +578,7 @@ class PrefixSpreadRouter:
     def _trim_history(self):
         if self.indexed_tokens <= self.CAP:
             return
+        self._over_budget += 1
         # The budget covers unique edges, not replicated rank holders. Pinned
         # active edges may exceed it; releasing them makes them evictable.
         # A small overage shortens the oldest leaf from its tail (its head still
@@ -563,9 +595,15 @@ class PrefixSpreadRouter:
             if excess < len(edge.hashes) and excess <= max(1, len(edge.hashes) // 8):
                 del edge.hashes[-excess:]
                 self.indexed_tokens -= excess * edge.hbs
+                self._tail_trim += 1
+                self._tail_trim_tokens += excess * edge.hbs
                 self._refresh_evictable(edge)  # next victim: another history
             else:
+                self._leaf_evict += 1
+                self._leaf_evict_tokens += len(edge.hashes) * edge.hbs
                 self._drop_edge(edge)
+        if self.indexed_tokens > self.CAP:
+            self._trim_blocked += 1
 
     def _left_unprefilled(self, seq_id) -> dict:
         """Transfer an unfinished producer's intervals and credit debt once."""
