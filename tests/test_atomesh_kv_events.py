@@ -58,7 +58,9 @@ class KvEventsCellsTest(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
-            cls.cells = json.loads(output.read_text())["include"]
+            cells = json.loads(output.read_text())["include"]
+            # The control cell routes without events.
+            cls.cells = [cell for cell in cells if "-noev-" not in cell["name"]]
         cls.router_script = shell_functions(
             "has_cli_flag", "is_agentic_dpa", "is_agentic_multi_prefill", "start_router"
         ) + """
