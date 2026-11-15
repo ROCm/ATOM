@@ -1,7 +1,7 @@
 //! A prompt looked up on the request path in the store a worker reads: ATOM's keys of
 //! its chunks, asked of every pool within a deadline, and what the engine loads of the
 //! prefix the store holds. A source that keeps failing is skipped for a while, and so are
-//! the lookups past a cap on those in flight.
+//! the lookups past a cap on the requests in flight to its pools.
 
 use std::{
     sync::{
@@ -19,7 +19,12 @@ use super::{
     OffloadReport,
 };
 
-const MAX_IN_FLIGHT: usize = 64;
+/// Requests a source's lookups have out to its pools at most, so that a burst of long
+/// prompts neither runs the router out of connections nor floods the admin services.
+const MAX_REQUESTS: usize = 256;
+/// Chunks from the prompt's start a lookup asks after at most: 1M tokens of 256-token
+/// chunks, whose keys take about 5 ms. A longer prompt is looked up that far.
+const MAX_CHUNKS: usize = 4096;
 /// Failures in a row that open a source's breaker, which a lookup probes again after
 /// `BREAKER_OPEN`.
 const BREAKER_FAILURES: u32 = 5;
@@ -79,19 +84,20 @@ impl Lookups {
     }
 }
 
-/// A lookup in flight, counted until it is dropped.
-struct Flight<'a>(&'a AtomicUsize);
+/// A lookup's requests in flight, counted until it is dropped.
+struct Flight<'a>(&'a AtomicUsize, usize);
 
 impl<'a> Flight<'a> {
-    fn board(in_flight: &'a AtomicUsize) -> Option<Self> {
-        let flight = Self(in_flight);
-        (in_flight.fetch_add(1, Ordering::AcqRel) < MAX_IN_FLIGHT).then_some(flight)
+    fn board(in_flight: &'a AtomicUsize, requests: usize) -> Option<Self> {
+        let flight = Self(in_flight, requests);
+        let before = in_flight.fetch_add(requests, Ordering::AcqRel);
+        (before + requests <= MAX_REQUESTS).then_some(flight)
     }
 }
 
 impl Drop for Flight<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0.fetch_sub(self.1, Ordering::AcqRel);
     }
 }
 
@@ -109,7 +115,8 @@ pub(super) struct Read {
 impl Read {
     /// The tokens of `tokens` the engine reports cached when its device cache holds
     /// `device` of them, after it loads what it will of what the store holds; None when
-    /// the store does not answer.
+    /// the store does not answer. This costs the request the keys of at most
+    /// `MAX_CHUNKS` chunks, about 1.2 µs each, and at most `deadline` of waiting.
     pub async fn cached_tokens(
         &self,
         client: &reqwest::Client,
@@ -146,14 +153,19 @@ impl Read {
         if !self.readable {
             return Err("unreadable");
         }
-        let Some(_flight) = Flight::board(&self.lookups.in_flight) else {
+        let chunk = self.report.chunk_tokens;
+        let pools = self.admins.len().max(1);
+        let chunks = (tokens.len().checked_div(chunk as usize).unwrap_or(0))
+            .min(MAX_CHUNKS)
+            .min(MAX_REQUESTS / pools * mooncake::BATCH_KEYS);
+        let requests = chunks.div_ceil(mooncake::BATCH_KEYS) * self.admins.len();
+        let Some(_flight) = Flight::board(&self.lookups.in_flight, requests) else {
             return Err("overloaded");
         };
         if !self.lookups.admit() {
             return Err("breaker_open");
         }
-        let chunk = self.report.chunk_tokens;
-        let chain = keys::chunk_chain(tokens, chunk as usize);
+        let chain = keys::chunk_chain(&tokens[..chunks * chunk as usize], chunk as usize);
         let keys = keys::rank0_keys(&self.report.namespace, self.report.world, &chain);
         let started = Instant::now();
         let asked = mooncake::query_pools(client, &self.admins, &keys);
@@ -352,16 +364,13 @@ mod tests {
         assert_eq!(cached(0).await, Some(0));
         assert!(!read.lookups.breaker_open());
 
-        // Past the cap on lookups in flight, or of a store whose keys the router does not
+        // Past the cap on requests in flight, or of a store whose keys the router does not
         // compute, nothing is asked.
         read.lookups
             .in_flight
-            .store(MAX_IN_FLIGHT, Ordering::Relaxed);
+            .store(MAX_REQUESTS, Ordering::Relaxed);
         assert_eq!(cached(0).await, None);
-        assert_eq!(
-            read.lookups.in_flight.load(Ordering::Relaxed),
-            MAX_IN_FLIGHT
-        );
+        assert_eq!(read.lookups.in_flight.load(Ordering::Relaxed), MAX_REQUESTS);
         read.lookups.in_flight.store(0, Ordering::Relaxed);
         let unreadable = Read {
             readable: false,
@@ -394,5 +403,23 @@ mod tests {
             rendered.contains(lookups),
             "missing {lookups} in\n{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_prompt_is_looked_up_as_far_as_the_chunk_cap() {
+        let admin = Arc::new(Admin::default());
+        let read = source(admin.clone()).await;
+        // The pool holds every key it is asked for, besides the taint key.
+        admin.held.store(mooncake::BATCH_KEYS, Ordering::Relaxed);
+        let prompt: Vec<u32> = (0..(MAX_CHUNKS as u32 + 10) * 16).collect();
+        let cached = read
+            .cached_tokens(&reqwest::Client::new(), &prompt, 0)
+            .await;
+        assert_eq!(cached, Some(MAX_CHUNKS as u32 * 16));
+        assert_eq!(
+            admin.asked.load(Ordering::Relaxed),
+            MAX_CHUNKS / mooncake::BATCH_KEYS
+        );
+        assert_eq!(read.lookups.in_flight.load(Ordering::Relaxed), 0);
     }
 }
