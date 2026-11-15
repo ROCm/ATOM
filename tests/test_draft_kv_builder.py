@@ -16,11 +16,14 @@ runs on CI, which is where such a regression would land.
 
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from atom.kv_transfer.disaggregation.sharded_transfer import consumer_head_slices
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
@@ -387,10 +390,65 @@ def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypa
 
 
 @pytest.mark.parametrize(
-    "target, pool_dtype", [("fp4", "bf16"), ("fp8", "fp8")]  # fp4 has no draft layout
+    "target, draft",
+    [
+        ("fp8", "bf16"),  # the draft below its target
+        ("bf16", "fp8"),  # ... and above it
+        ("fp8", "fp8"),  # no mismatch: the same answer either way
+    ],
+)
+def test_the_real_builder_builds_the_pool_at_the_drafts_dtype_not_the_targets(
+    monkeypatch, target, draft
+):
+    """`draft_kv_builder` hands `make_kv_pool` the dtype of `speculative_config.
+    draft_kv_dtype`; reading the target's `config.kv_cache_dtype` there instead
+    would allocate the pool at one dtype while the draft's attention (built from
+    `draft_kv_dtype`) reads it at another. Every other test replaces the builder,
+    so this one runs the real one, stubbing only its two lookups: the backend
+    (`selector.get_attn_backend`, whose `make_kv_pool` records its arguments)
+    and aiter's dtype map (`aiter.dtypes.d_dtypes`)."""
+    from atom.utils import selector
+
+    seen = {}
+
+    class _Backend:
+        @staticmethod
+        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
+            seen["kv_dtype"] = kv_dtype
+            return object()
+
+    d_dtypes = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
+    aiter = types.ModuleType("aiter")
+    aiter.dtypes = types.SimpleNamespace(d_dtypes=d_dtypes)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setattr(selector, "get_attn_backend", lambda _family: _Backend)
+
+    runner = _runner(draft_layers=2)
+    runner.world_size = 1
+    runner.config = SimpleNamespace(
+        kv_cache_dtype=target,
+        speculative_config=SimpleNamespace(draft_kv_dtype=draft),
+    )
+    builder = draft_kv_builder(
+        runner, PretrainedConfig(model_type="llama"), model=nn.Module()
+    )
+    assert builder is not None
+    assert builder.kv_pool is not None  # builds the pool, through the backend
+
+    assert seen == {"kv_dtype": d_dtypes[draft]}
+
+
+@pytest.mark.parametrize(
+    "target, asked, pool_dtype",
+    [
+        ("fp4", None, "bf16"),  # fp4 has no draft layout
+        ("fp8", None, "fp8"),
+        ("fp8", "bf16", "bf16"),  # --spec-decode-kv-cache-dtype, either way round
+        ("bf16", "fp8", "fp8"),
+    ],
 )
 def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
-    target, pool_dtype
+    target, asked, pool_dtype
 ):
     """The draft's attention reads its dtype off the config it is built with and its
     pool is built at `draft_kv_dtype`: one value; the target's config keeps its own."""
@@ -400,7 +458,7 @@ def test_an_eagle3_draft_attention_is_built_at_the_dtype_of_its_pool(
     from atom.config import CompilationConfig, resolve_draft_kv_dtype
 
     spec = SimpleNamespace(method="eagle3", draft_model_hf_config=SimpleNamespace())
-    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True)
+    spec.draft_kv_dtype = resolve_draft_kv_dtype(target, own_pool=True, requested=asked)
     assert spec.draft_kv_dtype == pool_dtype
     p = mod.EagleProposer.__new__(mod.EagleProposer)
     p.speculative_config, p.runner = spec, SimpleNamespace()
