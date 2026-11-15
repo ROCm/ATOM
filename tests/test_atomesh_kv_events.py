@@ -136,11 +136,38 @@ start_prefill prefill-rank-0 "${SERVER_PORT}"
                 self.assertEqual(args[args.index("--policy") + 1], "cache_aware")
                 self.assertEqual(args.count("--kv-events"), 1)
                 self.assertEqual(args[args.index("--mooncake-admin-port") + 1], "26090")
+                self.assertEqual(args[args.index("--prepare-queue-timeout-ms") + 1], "5000")
+                self.assertEqual(args[args.index("--prepare-prefix-cache-mb") + 1], "4096")
 
     def test_router_follows_no_events_without_the_switch(self):
         args = self.router_args(self.cells[0])
         self.assertNotIn("--kv-events", args)
         self.assertNotIn("--mooncake-admin-port", args)
+        self.assertNotIn("--prepare-queue-timeout-ms", args)
+
+    def test_store_cells_keep_the_checkpoint_cached_while_workers_load(self):
+        script = shell_functions("mooncake_setting", "start_mooncake_page_cache_dropper") + """
+setsid() { printf 'ARG:%s\\n' "$@"; }
+mooncake_page_cache_dropper_running() { true; }
+ATOMESH_SCRIPT_DIR=/scripts
+MODEL_PATH=/models/m
+start_mooncake_page_cache_dropper
+"""
+        self.assertEqual(
+            self.run_script(script),
+            ["python3", "/scripts/drop_page_cache.py", "--every", "45", "--for", "1800", "/models/m"],
+        )
+        stores = [cell for cell in self.cells if cell["env"]["prefill"].get("MOONCAKE_STORE") == "1"]
+        self.assertEqual(len(stores), 3)
+        for cell in stores:
+            with self.subTest(cell=cell["name"]):
+                drop_for = cell["env"]["prefill"]["MOONCAKE_STORE_PAGE_CACHE_DROP_FOR"]
+                self.assertEqual(
+                    self.run_script(
+                        script, ATOMESH_PREFILL_ENV_MOONCAKE_STORE_PAGE_CACHE_DROP_FOR=drop_for
+                    ),
+                    [],
+                )
 
     def test_each_prefill_worker_of_a_node_publishes_on_its_own_ports(self):
         env = dict(
