@@ -691,8 +691,15 @@ class DSparkProposer(Drafter):
         else:
             # The model concatenates its taps (a plugin may fuse the cat away).
             main_hidden_all = aux_hidden_states
+        # A label, not a contract: a tap list has no `.shape` (the model's
+        # `_concat_taps` owns the list form); every tap has the token count.
+        tap_rows = (
+            main_hidden_all[0].shape[0]
+            if isinstance(main_hidden_all, (list, tuple))
+            else main_hidden_all.shape[0]
+        )
         with record_function(
-            f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
+            f"draft_kv[bs={scheduled_bs} tok={tap_rows}]"
         ):
             self.model.write_context_kv(main_hidden_all, positions)
 
