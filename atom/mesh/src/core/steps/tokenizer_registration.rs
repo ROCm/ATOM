@@ -203,11 +203,17 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
 /// template. It has no accessor for that, so a copy is probed; mirroring its
 /// `config.json` check would also mean mirroring how it resolves sources.
 async fn probe_chat_render(id: &str, name: &str, source: &str, chat_template: Option<&str>) {
-    let Ok(mut copy) = factory::create_tokenizer_async_with_chat_template(source, None).await
-    else {
-        return;
+    const UNPROBED: &str = "Cannot probe whether llm-tokenizer renders these chats without the \
+                            Jinja template; HTTP routing tokenizes them as it renders them";
+    let mut copy = match factory::create_tokenizer_async_with_chat_template(source, None).await {
+        Ok(copy) => copy,
+        Err(error) => {
+            warn!(tokenizer = name, %error, "{UNPROBED}");
+            return;
+        }
     };
     let Some(copy) = Arc::get_mut(&mut copy) else {
+        warn!(tokenizer = name, "{UNPROBED}: the loaded copy is shared");
         return;
     };
     if !renders_without_template(copy) {
@@ -271,7 +277,56 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
+    use wfaas::WorkflowInstanceId;
+
     use super::*;
+    use crate::{
+        routers::{
+            comm::tokenize::remove_tokenizer,
+            prepare::chat_template::rendered_without_template,
+            test_mocks::{app_context::app_context, tokenizer::hf_tokenizer_path},
+        },
+        tokenizer::registry::TokenizerRegistry,
+    };
+
+    /// Registering a tokenizer whose `config.json` picks a built-in encoder marks
+    /// it, and removing it drops the mark.
+    #[tokio::test]
+    async fn test_registration_marks_chats_rendered_without_template() {
+        let context = app_context();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::copy(hf_tokenizer_path(), dir.path().join("tokenizer.json")).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({"architectures": ["DeepseekV4ForCausalLM"]}).to_string(),
+        )
+        .unwrap();
+        let deepseek = TokenizerRegistry::generate_id();
+        let jinja = TokenizerRegistry::generate_id();
+        for (id, source) in [
+            (&deepseek, dir.path().to_str().unwrap()),
+            (&jinja, hf_tokenizer_path()),
+        ] {
+            let config = TokenizerConfigRequest {
+                id: id.clone(),
+                name: id.clone(),
+                source: source.to_string(),
+                chat_template_path: None,
+                cache_config: None,
+                fail_on_duplicate: true,
+            };
+            let mut workflow = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            );
+            LoadTokenizerStep.execute(&mut workflow).await.unwrap();
+        }
+
+        assert!(rendered_without_template(&deepseek));
+        assert!(!rendered_without_template(&jinja));
+        remove_tokenizer(&context, &deepseek).await;
+        assert!(!rendered_without_template(&deepseek));
+    }
 
     #[test]
     fn test_tokenizer_config_request_serialization() {

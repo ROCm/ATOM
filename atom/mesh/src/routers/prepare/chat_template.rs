@@ -46,6 +46,11 @@ pub(crate) fn mark_rendered_without_template(id: &str) {
     WITHOUT_TEMPLATE.write().insert(id.to_string());
 }
 
+/// Drop the mark of the tokenizer registered as `id`, once it is removed.
+pub(crate) fn unmark_rendered_without_template(id: &str) {
+    WITHOUT_TEMPLATE.write().remove(id);
+}
+
 /// Whether the tokenizer registered as `id` renders chats without its template.
 pub(crate) fn rendered_without_template(id: &str) -> bool {
     WITHOUT_TEMPLATE.read().contains(id)
