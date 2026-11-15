@@ -1502,19 +1502,22 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         "reduce_final_map",
         "reduce_partial_map",
     )
-    buffers = [("", 4, decode_heads), ("sparse_prefill_", 16, prefill_heads)]
+    buffers = [
+        ("", 4, num_spec_tokens + 1, decode_heads),
+        ("sparse_prefill_", 16, 1, prefill_heads),
+    ]
     if num_spec_tokens:
-        buffers.append(("sparse_mtp_", 4 * (num_spec_tokens + 1), decode_heads))
+        buffers.append(("sparse_mtp_", 4 * (num_spec_tokens + 1), 1, decode_heads))
         planned = []
         monkeypatch.setattr(
             aiter_mla, "get_mla_metadata_v1", lambda *args, **_: planned.append(args[3])
         )
         builder._set_mla_persistent_worker_buffers_sparse_mtp(4)
         assert planned == [decode_heads]
-    for prefix, rows, heads in buffers:
+    for prefix, rows, q_len, heads in buffers:
         info = get_mla_metadata_info_v1(
             rows,
-            1,
+            q_len,
             heads,
             builder.dtype_q,
             builder.dtype_kv,
