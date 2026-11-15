@@ -206,44 +206,56 @@ def _stop_launch(lock, stop: threading.Event) -> None:
         stop.set()  # main process unknown or gone: stop serving and exit
 
 
+def _record(recorder: InputRecorder, config, build, load) -> SimpleNamespace:
+    """Build and load as a server does, recording what loading reads and
+    runs. The export is taken at once: nothing that runs later (the drafter)
+    may show in it."""
+    rec = SimpleNamespace(tracer=_CodeTracer(), kernels={})
+    recorder.enter_construct(config)
+    try:
+        rec.model = build()
+        rec.built, before = structure(rec.model), snapshot(rec.model)
+        with rec.tracer, _record_jit(rec.kernels):
+            recorder.enter_load(rec.model)
+            # Around the load only: what constructing does, clients do.
+            states = [process_snapshot(config)]
+            with _skip_prepare_finalize(rec.model):
+                rec.loaded = load(rec.model)
+            states.append(process_snapshot(config))
+    finally:
+        recorder.finish_load(rec.tracer.codes)  # before anything else reads the model
+    rec.export = build_export(rec.model, before, snapshot(rec.model))
+    rec.process = process_export(states)
+    rec.export["unshippable"] += rec.process["unshippable"]
+    return rec
+
+
 class _RecordingLoad:
-    """get_model's loader in the daemon: the disk load, recording what it
-    reads and runs and the state it starts from; then the drafter's own
-    weights, recorded apart (servers take or load them on their own)."""
+    """get_model's loader in the daemon: the disk load, recorded; then the
+    drafter's own weights, recorded apart (each client binds them to its own
+    target)."""
 
     def __init__(self, rank: int, recorder: InputRecorder):
         self.rank, self.recorder = rank, recorder
-        self.tracer, self.kernels = _CodeTracer(), {}
         self.draft = None
 
     def __call__(self, config, model_class, device):
         self.key = compute_key(config, self.rank, device)
-        self.recorder.enter_construct(config)
-        try:
-            model = build_model(config, model_class, device)
-            self.built, self.before = structure(model), snapshot(model)
-            with self.tracer, _record_jit(self.kernels):
-                self.recorder.enter_load(model)
-                # Around the load only: what constructing does, clients do.
-                self.states = [process_snapshot(config)]
-                with _skip_prepare_finalize(model):
-                    load_weights(model, config)
-                self.states.append(process_snapshot(config))
-        finally:
-            # Before anything else reads the model.
-            self.recorder.finish_load(self.tracer.codes)
-        self.after = snapshot(model)
+        self.rec = _record(
+            self.recorder,
+            config,
+            lambda: build_model(config, model_class, device),
+            lambda model: load_weights(model, config),
+        )
         self.reads = self.recorder.key_reads(local_model_dir(config.model))
         if config.speculative_config:
-            self.draft = _load_draft(config, device, model, self.rank)
-        return model
+            self.draft = _load_draft(config, device, self.rec.model, self.rank)
+        return self.rec.model
 
 
-def _load_draft(config, device, target, rank: int):
-    """The drafter's own weights, loaded as a server's runner loads them and
-    recorded on their own (each client binds them to its own target). None:
-    not cached, and servers load the drafter from disk."""
-    recorder, tracer, kernels = InputRecorder.start(), _CodeTracer(), {}
+def _load_draft(config, device, target, rank: int) -> SimpleNamespace | None:
+    """The drafter's recorded load; None: servers load it from disk."""
+    recorder = InputRecorder.start()
     # What building a drafter reads from its runner, as ModelRunner sets it.
     rope = getattr(get_hf_text_config(config.hf_config), "rope_parameters", None)
     runner = SimpleNamespace(
@@ -254,36 +266,27 @@ def _load_draft(config, device, target, rank: int):
         world_size=config.tensor_parallel_size,
         use_mrope="mrope_section" in (rope or {}),
     )
+    drafters = []
+
+    def build():
+        drafters.append(construct_drafter(config, device, runner))
+        return drafters[0].model
+
     try:
-        recorder.enter_construct(config)
-        drafter = construct_drafter(config, device, runner)
-        built, before = structure(drafter.model), snapshot(drafter.model)
-        with tracer, _record_jit(kernels):
-            recorder.enter_load(drafter.model)
-            states = [process_snapshot(config)]
-            with _skip_prepare_finalize(drafter.model):
-                loaded = drafter.load_weights()
-            states.append(process_snapshot(config))
+        rec = _record(recorder, config, build, lambda _: drafters[0].load_weights())
     except Exception as e:  # noqa: BLE001 - only the drafter goes uncached
         logger.warning(
             f"{_TAG} {worker_process_name(config, rank)}: the drafter is not cached "
             f"({e!r}); servers load it from disk"
         )
         return None
-    finally:
-        recorder.finish_load(tracer.codes)
-    return SimpleNamespace(
-        drafter=drafter,
-        model=drafter.model,
-        built=built,
-        before=before,
-        after=snapshot(drafter.model),
-        loaded=loaded,
-        reads=recorder.key_reads(),
-        codes=tracer.codes,
-        kernels=kernels,
-        states=states,
-    )
+    rec.drafter, rec.reads = drafters[0], recorder.key_reads()
+    return rec
+
+
+def _code(rec) -> dict:
+    """What ran during the recorded load (raises _SourceChanged)."""
+    return code_fingerprint(rec.tracer.codes, rec.kernels.values())
 
 
 def _draft_payload(d, target, label: str) -> dict | None:
@@ -291,15 +294,11 @@ def _draft_payload(d, target, label: str) -> dict | None:
     if d is None:
         return None
     try:
-        code = code_fingerprint(d.codes, d.kernels.values())
+        code = _code(d)
     except _SourceChanged as e:
         why = [f"{e} changed after this daemon started"]
     else:
-        export = build_export(d.model, d.before, d.after)
-        process = process_export(d.states)
-        why = export["unshippable"] + process["unshippable"]
-        if not why:
-            why = _leave_out_shared(d, target, export)
+        why = d.export["unshippable"] or _leave_out_shared(d, target)
     if why:
         logger.warning(
             f"{_TAG} {label}: the drafter is not cached, servers load it from disk: "
@@ -307,16 +306,16 @@ def _draft_payload(d, target, label: str) -> dict | None:
         )
         return None
     return {
-        "export": export,
-        "process": process,
-        "structure": exported_structure(d.built, export),
+        "export": d.export,
+        "process": d.process,
+        "structure": exported_structure(d.built, d.export),
         "reads": d.reads,
         "code": code,
         "loaded": sorted(d.loaded),
     }
 
 
-def _leave_out_shared(d, target, export: dict) -> list[str]:
+def _leave_out_shared(d, target) -> list[str]:
     """Each client's attach_to_target replaces some drafter modules with the
     target's (embed, lm_head); left out, the daemon holds no copies of them.
     Returns why the drafter cannot be cached."""
@@ -326,26 +325,24 @@ def _leave_out_shared(d, target, export: dict) -> list[str]:
     except Exception as e:  # noqa: BLE001 - only the drafter goes uncached
         return [f"attach_to_target failed: {e!r}"]
     after = dict(d.model.named_modules(remove_duplicate=False))
-    leave_out(export, {p for p, m in before.items() if after.get(p) is not m})
+    leave_out(d.export, {p for p, m in before.items() if after.get(p) is not m})
     return []
 
 
 def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
     label = worker_process_name(config, rank)
     load = _RecordingLoad(rank, recorder)
-    model = get_model(config, device, load)
-    reads = load.reads
+    get_model(config, device, load)
+    rec, reads = load.rec, load.reads
     try:
-        codes = code_fingerprint(load.tracer.codes, load.kernels.values())
+        codes = _code(rec)
     except _SourceChanged as e:
         raise RuntimeError(
             f"{_TAG} {label}: {e} changed after this daemon started, so the weights it "
             "loaded may not match the file; restart the daemon"
         ) from None
-    export = build_export(model, load.before, load.after)
-    process = process_export(load.states)
-    export["unshippable"] += process["unshippable"]
-    draft = _draft_payload(load.draft, model, label)
+    export, process = rec.export, rec.process
+    draft = _draft_payload(load.draft, rec.model, label)
     parts = [export, process] + ([draft["export"], draft["process"]] if draft else [])
     keys = [list(p["views"]) for p in parts]
     views = {k: v for p in parts for k, v in p.pop("views").items()}
@@ -359,7 +356,7 @@ def _load_and_serve(config, rank, device, recorder, path, lock, on_idle, t0):
         "key": load.key,
         "reads": reads,
         "code": codes,
-        "structure": exported_structure(load.built, export),
+        "structure": exported_structure(rec.built, export),
         "export": export,
         "process": process,
         "draft": draft,

@@ -23,6 +23,7 @@ from atom.model_loader.weight_cache.transport import (
     _ping,
     daemon_alive,
     daemon_state,
+    running_daemons,
     socket_dir,
 )
 from atom.model_loader.weight_cache.values import _TAG, _Miss, logger
@@ -132,10 +133,7 @@ def start_early() -> None:
     daemon on any GPU here, start one now, so it loads while this server
     starts up. The runners find it through the launch's marker; with a
     daemon present they decide themselves (reuse or restart)."""
-    if not os.environ.get(_LAUNCH_ENV):
-        return
-    locks = glob.glob(os.path.join(socket_dir(), "gpu_*.sock.lock"))
-    if any(daemon_alive(lock[: -len(".lock")]) for lock in locks):
+    if not launch_recorded() or running_daemons():
         return
     try:
         info = _spawn_daemon()
@@ -145,6 +143,12 @@ def start_early() -> None:
     logger.info(
         f"{_TAG} started weight cache daemon pid {info['pid']} (log {info['log']})"
     )
+
+
+def launch_recorded() -> bool:
+    """Whether this process may start daemons: its API server saved the
+    launch to start them with (record_launch)."""
+    return bool(os.environ.get(_LAUNCH_ENV))
 
 
 def _started_by_launch() -> dict | None:
@@ -164,12 +168,7 @@ def _spawn_daemon() -> dict:
     """Start a daemon with this server's command line and environment. Every
     rank calls this; the first one starts it, the others get its pid and log.
     (Per API server launch, so each node of a multi-node launch starts its own.)"""
-    launch_path = os.environ.get(_LAUNCH_ENV)
-    if not launch_path:
-        raise _Miss(
-            "ATOM_PRELOAD starts the daemon with the API server's command line, "
-            "but this engine was not started by the API server"
-        )
+    launch_path = os.environ[_LAUNCH_ENV]  # callers check launch_recorded()
     marker = launch_path + ".daemon"
     try:
         fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

@@ -38,6 +38,7 @@ from atom.model_loader.weight_cache.values import (
     _walk_objects,
     config_objects,
     key_fp,
+    safe_fp,
 )
 
 _REC: InputRecorder | None = None
@@ -135,18 +136,11 @@ def _raw_class_attr(cls: type, name: str):
     raise KeyError(name)
 
 
-def _safe_key_fp(v: Any):
-    try:
-        return key_fp(v)
-    except Exception as e:  # noqa: BLE001
-        # Never matches: the client's side raises too and compares as missing.
-        return ("<error>", type(e).__name__)
-
-
 class InputRecorder:
     def __init__(self):
         self.phase = "init"
-        self.env: dict[str, dict] = {}
+        self.env: dict[str, set] = {}  # variable -> where loading read it
+        self.pre_load_env: dict[str, str] = {}
         self.env_by_line: dict[str, set] = {}
         self.attrs: dict[tuple, dict] = {}  # (kind, path, name) -> info
         self.paths: dict[int, tuple[str, str]] = {}  # id(obj) -> (kind, path)
@@ -196,14 +190,15 @@ class InputRecorder:
         # The construction-time values: what a client builds, and what loading
         # started from. (The first value loading reads may be one it wrote.)
         self.pre_load_globals = _module_globals()
+        self.pre_load_env = dict(os.environ)
         for (kind, path, name), info in self.attrs.items():
             # Read while constructing, which may have rewritten it since.
             if kind == "config" and path in self.configs:
-                info["fp"] = _safe_key_fp(getattr(self.configs[path], name, None))
+                info["fp"] = safe_fp(key_fp, getattr(self.configs[path], name, None))
             elif kind == "class":
                 with contextlib.suppress(Exception):
                     cls = _import_qual(*path.split(":"))
-                    info["fp"] = _safe_key_fp(_raw_class_attr(cls, name))
+                    info["fp"] = safe_fp(key_fp, _raw_class_attr(cls, name))
         values = {}
         for path, obj, is_module in _walk_objects(model):
             self.paths[id(obj)] = ("model", path)
@@ -215,7 +210,7 @@ class InputRecorder:
                         values[(path, f"[buffer]{name}")] = b
             self._patch_class(type(obj))
         # Fingerprint now, before loading mutates anything in place.
-        self.pre_load_fps = {k: _safe_key_fp(v) for k, v in values.items()}
+        self.pre_load_fps = {k: safe_fp(key_fp, v) for k, v in values.items()}
 
     def finish_load(self, codes) -> None:
         """Stop recording; ``codes``: the code objects that ran during load."""
@@ -245,11 +240,8 @@ class InputRecorder:
             if bulk:
                 where = "bulk: " + where
             self.env_by_line.setdefault(where, set()).add(key)
-            info = self.env.setdefault(key, {"load_value": None, "load_where": set()})
             if self.phase == "load":
-                if not info["load_where"]:
-                    info["load_value"] = value
-                info["load_where"].add(where)
+                self.env.setdefault(key, set()).add(where)
         finally:
             self._local.busy = False
 
@@ -403,9 +395,9 @@ class InputRecorder:
         }
         env = {}
         for k, info in self.env.items():
-            where = [w for w in info["load_where"] if w not in bulk]
+            where = [w for w in info if w not in bulk]
             if any(w.startswith(KEY_ENV_PREFIXES) for w in where):
-                env[k] = info["load_value"]
+                env[k] = self.pre_load_env.get(k)  # loading may write it first
         config, attrs, classattrs = {}, {}, {}
         for (kind, path, name), info in self.attrs.items():
             if "load" not in info["phases"]:
@@ -450,7 +442,7 @@ def _module_globals() -> dict[str, dict]:
     for name, mod in list(sys.modules.items()):
         if mod is not None and name.split(".")[0] in ("atom", "aiter"):
             out[name] = {
-                k: _safe_key_fp(v)
+                k: safe_fp(key_fp, v)
                 for k, v in list(vars(mod).items())
                 if not k.startswith("__") and _keyed(v)
             }

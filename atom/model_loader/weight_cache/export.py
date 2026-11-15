@@ -16,6 +16,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from atom.model_engine.model_setup import swap_param
 from atom.model_loader.weight_cache.values import (
     _MODULE_INTERNALS,
     _attrs,
@@ -28,6 +29,7 @@ from atom.model_loader.weight_cache.values import (
     _Unshippable,
     _walk_objects,
     config_objects,
+    safe_fp,
 )
 
 _DEEP_DEPTH = 6  # how far below a module the fingerprints of unwalked objects go
@@ -82,14 +84,23 @@ def _unwalked(model: nn.Module) -> dict:
     return out
 
 
+_MAX_HOST_BYTES = 256 << 20  # host tensors travel in the payload
+
+
 class _Exporter:
+    """Tensors as views of whole storages, so aliasing survives: device ones
+    shared over IPC (``views``), host ones sent by value (``host``)."""
+
     def __init__(self):
-        self.views: dict[int, torch.Tensor] = {}  # whole storages as uint8
+        self.views: dict[int, torch.Tensor] = {}  # device storages as uint8
+        self.host: dict[str, tuple[torch.Tensor, bool]] = {}  # (bytes, pinned)
+
+    def unshippable(self) -> list[str]:
+        n = sum(b.numel() for b, _ in self.host.values())
+        return [f"{n >> 20} MiB of host tensors"] if n > _MAX_HOST_BYTES else []
 
     def tensor(self, t: torch.Tensor) -> dict:
         t = t.detach()
-        if not t.is_cuda:
-            return {"value": t.clone()}
         st = t.untyped_storage()
         if st.nbytes() == 0:
             # No allocation, so no IPC handle: rebuilt locally.
@@ -99,11 +110,17 @@ class _Exporter:
                 "stride": tuple(t.stride()),
                 "dtype": t.dtype,
             }
-        key = st.data_ptr()
-        if key not in self.views:
-            self.views[key] = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                st, 0, (st.nbytes(),), (1,)
-            )
+        whole = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+            st, 0, (st.nbytes(),), (1,)
+        )
+        if t.is_cuda:
+            key = st.data_ptr()
+            self.views.setdefault(key, whole)
+        else:
+            key = f"host:{st.data_ptr()}"
+            if key not in self.host:
+                pinned = torch.cuda.is_available() and t.is_pinned()
+                self.host[key] = (whole.clone(), pinned)
         return {
             "storage": key,
             "offset": t.storage_offset(),
@@ -175,6 +192,7 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
                         item["params"][k] = None  # loading set it to None
                     continue
                 meta = ex.tensor(p)
+                meta["replaced"] = prev["params"].get(k, ("P", id(p)))[1] != id(p)
                 meta["pattrs"] = {}
                 for a, v in vars(p).items():
                     # Loaders (bound methods) are the client's own.
@@ -206,7 +224,8 @@ def build_export(model: nn.Module, before: dict, after: dict) -> dict:
     return {
         "plan": plan,
         "views": ex.views,
-        "unshippable": unshippable,
+        "host": ex.host,
+        "unshippable": unshippable + ex.unshippable(),
     }
 
 
@@ -230,6 +249,7 @@ def leave_out(export: dict, paths: set[str]) -> None:
         for packed in item["attrs"].values():
             _unpack(packed, note)
     export["views"] = {k: v for k, v in export["views"].items() if k in used}
+    export["host"] = {k: v for k, v in export["host"].items() if k in used}
 
 
 def process_snapshot(config=None) -> dict:
@@ -240,7 +260,7 @@ def process_snapshot(config=None) -> dict:
     modules, state = set(), {}
     for path, obj in config_objects(config) if config is not None else ():
         for a, x in list(vars(obj).items()):
-            state[("config", path, a)] = _state_fp(x)
+            state[("config", path, a)] = safe_fp(_fp, x)
     for name, mod in list(sys.modules.items()):
         if mod is None or name.startswith(own) or name.split(".")[0] not in _STATE:
             continue
@@ -252,20 +272,13 @@ def process_snapshot(config=None) -> dict:
                 if v.__module__ == name:  # by the name the module holds it under
                     for a, x in list(vars(v).items()):
                         if not a.startswith("__"):
-                            state[("class", name, k, a)] = _state_fp(x)
+                            state[("class", name, k, a)] = safe_fp(_fp, x)
                 continue
-            state[("global", name, k)] = _state_fp(v)
+            state[("global", name, k)] = safe_fp(_fp, v)
             if _recursable(v):
                 for a, x in list(vars(v).items()):
-                    state[("object", name, k, a)] = _state_fp(x)
+                    state[("object", name, k, a)] = safe_fp(_fp, x)
     return {"modules": modules, "state": state, "env": os.environ.copy()}
-
-
-def _state_fp(v: Any):
-    try:
-        return _fp(v)
-    except Exception as e:  # noqa: BLE001 - one odd global must not stop the daemon
-        return ("<error>", type(e).__name__)
 
 
 def process_export(states: list[dict]) -> dict:
@@ -308,7 +321,8 @@ def process_export(states: list[dict]) -> dict:
         "changes": changes,
         "env": {k: os.environ.get(k) for k in sorted(env)},
         "views": ex.views,
-        "unshippable": unshippable,
+        "host": ex.host,
+        "unshippable": unshippable + ex.unshippable(),
     }
 
 
@@ -318,28 +332,23 @@ def share_storages(views: dict) -> dict:
     return {key: v.untyped_storage()._share_cuda_() for key, v in views.items()}
 
 
-def _swap_param(old, new: nn.Parameter, attrs: dict) -> bool:
-    """Move ``new``'s data into ``old``, keeping the Parameter object other
-    references hold, with attributes ``attrs``. False: it cannot be swapped
-    (another type, or extra references to its data)."""
-    if type(old) is not nn.Parameter:
-        return False
-    try:
-        torch.utils.swap_tensors(old, new)
-    except Exception:  # noqa: BLE001 - the caller installs ``new`` instead
-        return False
-    old.__dict__.clear()
-    old.__dict__.update(attrs)
-    return True
-
-
-def _install_param(obj: nn.Module, k: str, t: torch.Tensor, pattrs: dict) -> None:
-    """Put ``t`` into parameter ``k``, keeping the Parameter object the model
-    was built with (other references to it see the new data)."""
+def _install_param(obj, k: str, t: torch.Tensor, meta: dict, make, filled: dict):
+    """Put ``t`` into parameter ``k``, swapping it into the Parameter object
+    the model was built with (other references see it). ``filled``: objects
+    swapped already; one tied to a parameter loading gave other data (it
+    untied them) gets a Parameter of its own."""
+    built = obj._parameters.get(k)
+    where = (t.untyped_storage().data_ptr(), t.storage_offset(), t.shape, t.stride())
+    tied = built is not None and id(built) in filled
+    if tied and filled[id(built)] == where:
+        return  # still tied: it holds this data already
+    pattrs = {a: _unpack(x, make) for a, x in meta["pattrs"].items()}
+    # A Parameter loading replaced has only the attributes it was given.
+    keep = {} if built is None or meta["replaced"] else vars(built)
+    attrs = {**keep, **pattrs}
     new = nn.Parameter(t, requires_grad=False)
-    old = obj._parameters.get(k)
-    attrs = {**(vars(old) if old is not None else {}), **pattrs}
-    if _swap_param(old, new, attrs):
+    if not tied and swap_param(built, new, attrs):
+        filled[id(built)] = where
         return
     new.__dict__.update(attrs)
     vars(obj).pop(k, None)
@@ -354,19 +363,21 @@ def _maker(export: dict, device: torch.device):
         args = list(share)
         args[0] = device.index  # the daemon's index for this GPU may differ
         storages[key] = torch.UntypedStorage._new_shared_cuda(*args)
+    mapped = sum(s.nbytes() for s in storages.values())
+    for key, (data, pinned) in export["host"].items():
+        storages[key] = (data.pin_memory() if pinned else data).untyped_storage()
 
     def make(meta: dict) -> torch.Tensor:
-        if "value" in meta:
-            return meta["value"]
         if meta.get("empty"):
             return torch.empty_strided(
                 meta["shape"], meta["stride"], dtype=meta["dtype"], device=device
             )
-        t = torch.empty(0, dtype=meta["dtype"], device=device)
-        t.set_(storages[meta["storage"]], meta["offset"], meta["shape"], meta["stride"])
+        st = storages[meta["storage"]]
+        t = torch.empty(0, dtype=meta["dtype"], device=st.device)
+        t.set_(st, meta["offset"], meta["shape"], meta["stride"])
         return t
 
-    return make, sum(s.nbytes() for s in storages.values())
+    return make, mapped
 
 
 def apply_process(export: dict, device: torch.device) -> int:
@@ -392,6 +403,7 @@ def apply_process(export: dict, device: torch.device) -> int:
 def apply_export(model: nn.Module, export: dict, device: torch.device) -> int:
     """Point ``model`` (built on meta) at the daemon's tensors. Returns bytes mapped."""
     make, mapped = _maker(export, device)
+    filled = {}  # id(Parameter the model was built with) -> where its data is
     for path, item in export["plan"].items():
         obj = _resolve(model, path)
         is_module = isinstance(obj, nn.Module)
@@ -407,8 +419,7 @@ def apply_export(model: nn.Module, export: dict, device: torch.device) -> int:
             if meta is None:
                 obj._parameters[k] = None
                 continue
-            pattrs = {a: _unpack(x, make) for a, x in meta["pattrs"].items()}
-            _install_param(obj, k, make(meta), pattrs)
+            _install_param(obj, k, make(meta), meta, make, filled)
         for k, meta in item["buffers"].items():
             obj._buffers[k] = None if meta is None else make(meta)
         for k, packed in item["attrs"].items():
@@ -439,32 +450,6 @@ def _leftover_meta(model: nn.Module) -> list[str]:
     for path, _, _, k, v in _entries(model):
         check(f"{path}.{k}", v)
     return left
-
-
-@contextlib.contextmanager
-def params_on_meta():
-    """Build a model with every nn.Parameter on the meta device; buffers and
-    other tensors are built normally. The registered Parameter stays the
-    object the constructor holds (its data is swapped to meta), so attributes
-    set after registration (set_weight_attrs) land on it."""
-    orig = nn.Module.register_parameter
-
-    def register_parameter(self, name, param):
-        orig(self, name, param)
-        p = self._parameters.get(name)
-        if p is None or p.is_meta:
-            return
-        meta = nn.Parameter(p.detach().to("meta"), requires_grad=p.requires_grad)
-        attrs = dict(vars(p))
-        if not _swap_param(p, meta, attrs):
-            meta.__dict__.update(attrs)
-            self._parameters[name] = meta
-
-    nn.Module.register_parameter = register_parameter
-    try:
-        yield
-    finally:
-        nn.Module.register_parameter = orig
 
 
 @contextlib.contextmanager

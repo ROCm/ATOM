@@ -404,6 +404,15 @@ def _fp(v: Any, depth: int = 0, *, content: bool = True):
     return ("O", id(v), t)
 
 
+def safe_fp(fp, v: Any):
+    """``fp(v)``, never raising: one odd value must not stop the daemon, and
+    an error never matches the other side's."""
+    try:
+        return fp(v)
+    except Exception as e:  # noqa: BLE001
+        return ("<error>", type(e).__name__)
+
+
 def key_fp(v: Any):
     """Process-independent fingerprint of a value a load read: plain values
     by value, functions by name, objects by type; integer tensors (index

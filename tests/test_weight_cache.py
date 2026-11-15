@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Weight cache logic that needs no daemon: code fingerprints, the before/after
-load diff, export/import (CPU tensors travel by value), the key filters, and
+load diff, export/import (CPU tensors stand in for device ones), the key filters, and
 daemon management with fake processes."""
 
 import json
@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 import atom.model_loader.weight_cache.__main__ as cli
+from atom.model_engine import model_setup
 from atom.model_loader.weight_cache import (
     client,
     export,
@@ -202,7 +203,8 @@ def test_pack_unpack_roundtrip():
         "fn": module_level_function,
     }
     packed = export._pack(value, ex)
-    out = export._unpack(packed, lambda meta: meta["value"])
+    make, _ = export._maker({"storages": {}, "host": ex.host}, torch.device("cpu"))
+    out = export._unpack(packed, make)
     assert torch.equal(out["a"][0], torch.arange(3)) and out["a"][1] == 2
     assert isinstance(out["a"][2], tuple) and torch.equal(out["a"][2][1], torch.ones(2))
     assert out["fn"] is module_level_function
@@ -293,7 +295,7 @@ def test_export_import_reproduces_the_load(toy_packages):
     built, exp = _export(daemon, Toy.fake_load)
     assert exp["unshippable"] == []
     assert "scratch" in exp["plan"][""]["buffers"]  # written in place
-    with export.params_on_meta():
+    with model_setup.params_on_meta():
         client = Toy()
     assert key._diff_key(built, key.structure(client)) == []
     export.apply_export(client, exp, torch.device("cpu"))
@@ -316,11 +318,48 @@ def test_none_and_tensors_loading_sets_on_parameters_travel(toy_packages):
 
     _, exp = _export(Toy(), load)
     assert exp["unshippable"] == []
-    with export.params_on_meta():
+    with model_setup.params_on_meta():
         client = Toy()
     export.apply_export(client, exp, torch.device("cpu"))
     assert "bias" in client.child._parameters and client.child.bias is None
     assert torch.equal(client.w.scale, torch.full((2,), 3.0))
+
+
+class Tied(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a, self.b = nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)
+        self.b.weight = self.a.weight
+
+
+@pytest.mark.parametrize("untie", [False, True])
+def test_tied_parameters_stay_tied_unless_loading_untied_them(untie):
+    def load(m):
+        m.a.weight.data.fill_(1.0)
+        if untie:  # e.g. one side quantized
+            m.b.weight = nn.Parameter(torch.full((2, 2), 7.0), requires_grad=False)
+
+    daemon = Tied()
+    _, exp = _export(daemon, load)
+    with model_setup.params_on_meta():
+        client = Tied()
+    export.apply_export(client, exp, torch.device("cpu"))
+    assert torch.equal(client.a.weight, daemon.a.weight)
+    assert torch.equal(client.b.weight, daemon.b.weight)
+    assert (client.a.weight is client.b.weight) is not untie
+
+
+def test_host_tensors_keep_their_aliasing(toy_packages):
+    def load(m):
+        m.absorbed = torch.arange(4.0)
+        m.tail = m.absorbed[2:]
+
+    _, exp = _export(Toy(), load)
+    with model_setup.params_on_meta():
+        client = Toy()
+    export.apply_export(client, exp, torch.device("cpu"))
+    client.absorbed[3] = -1.0
+    assert client.tail.tolist() == [2.0, -1.0]
 
 
 def test_config_written_during_load_is_refused():
@@ -410,7 +449,7 @@ def test_process_state_loading_changes_travels_or_is_refused(monkeypatch):
 
 def test_module_tree_change_is_seen():
     built = key.structure(Toy())
-    with export.params_on_meta():
+    with model_setup.params_on_meta():
         client = Toy()
     client.extra = nn.Linear(2, 2)  # a constructor now builds another submodule
     assert key._diff_key(built, key.structure(client))
@@ -495,6 +534,19 @@ def test_config_read_only_while_constructing_is_not_keyed():
     assert rec.key_reads()["config"] == {}
 
 
+def test_env_loading_writes_then_reads_is_keyed_as_it_found_it(monkeypatch):
+    monkeypatch.setattr(ir, "KEY_ENV_PREFIXES", ir.KEY_ENV_PREFIXES + ("tests/",))
+    monkeypatch.setenv("ATOM_TEST_WRITTEN", "before")
+    rec = ir.InputRecorder.start()
+    try:
+        rec.enter_load(nn.Module())
+        os.environ["ATOM_TEST_WRITTEN"] = "by loading"  # travels as a change
+        os.environ.get("ATOM_TEST_WRITTEN")
+    finally:
+        rec.finish_load(set())
+    assert rec.key_reads()["env"] == {"ATOM_TEST_WRITTEN": "before"}
+
+
 def test_recorder_keys_env_read_during_load_only(monkeypatch):
     monkeypatch.setattr(ir, "KEY_ENV_PREFIXES", ir.KEY_ENV_PREFIXES + ("tests/",))
     monkeypatch.setenv("ATOM_TEST_LOAD_FLAG", "1")
@@ -528,7 +580,7 @@ def test_params_on_meta_keeps_the_constructor_object():
             p.loader = "set after registration"  # like set_weight_attrs
             self.held = p
 
-    with export.params_on_meta():
+    with model_setup.params_on_meta():
         m = M()
     assert m.p.is_meta and m.p is m.held and m.p.loader == "set after registration"
 
@@ -599,8 +651,8 @@ def test_daemon_leaves_out_what_attaching_replaces():
     before = export.snapshot(d.model)
     d.model.w.fill_(1.0)  # its load
     exp = export.build_export(d.model, before, export.snapshot(d.model))
-    load = SimpleNamespace(drafter=d, model=d.model, loaded=set())
-    assert daemon._leave_out_shared(load, target, exp) == []
+    load = SimpleNamespace(drafter=d, model=d.model, loaded=set(), export=exp)
+    assert daemon._leave_out_shared(load, target) == []
     assert set(exp["plan"]) == {""}
     assert list(exp["views"]) == [d.model.w.untyped_storage().data_ptr()]
 
@@ -962,6 +1014,7 @@ def loop(monkeypatch):
         "stop_daemon": stop,
         "socket_path": lambda device: "/nonexistent/gpu.sock",
         "_started_by_launch": lambda: None,
+        "launch_recorded": lambda: True,
         "_in_use_by_others": lambda path: None,
         "exported_structure": lambda built, export: {},
         "diff_reads": lambda reads, kinds, **kw: list(calls.attr_diffs),
@@ -1075,6 +1128,28 @@ def test_a_daemon_that_vanished_is_not_no_daemon(tmp_path):
     assert client._probe(path, "TP0", None, False, dict)[3] == client._NONE
     _, _, reasons, status = client._probe(path, "TP0", None, True, dict)
     assert status == client._UNUSABLE and "exited before serving" in reasons[0]
+
+
+def test_no_rank_stops_a_daemon_another_rank_must_keep(monkeypatch):
+    monkeypatch.setattr(client, "daemon_alive", lambda path: False)
+    monkeypatch.setattr(client, "_in_use_by_others", lambda path: None)  # fine here...
+    monkeypatch.setattr(
+        client, "group_agree", lambda ok, group: False
+    )  # ...not elsewhere
+    monkeypatch.setattr(
+        client, "_stop_and_reclaim", lambda *a: pytest.fail("stopped before agreeing")
+    )
+    with pytest.raises(RuntimeError):
+        client._stop_together("TP0", "/x.sock", None, None, [])
+
+
+def test_preload_outside_the_api_server_only_uses_a_daemon(loop, monkeypatch):
+    monkeypatch.setenv("ATOM_PRELOAD", "1")
+    monkeypatch.setattr(client, "launch_recorded", lambda: False)
+    loop.probes = [(True, ["env X: daemon=1 client=2"])]
+    with pytest.raises(RuntimeError, match="env X"):
+        _from_daemon()
+    assert loop.stopped == loop.spawned == 0
 
 
 def test_give_up_leaves_another_launchs_daemon(monkeypatch):

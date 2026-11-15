@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -101,6 +102,12 @@ def _ping(path: str, timeout: float = 10) -> dict:
         _check_peer(sock)
         _send(sock, {"cmd": "ping"})
         return _recv(sock)
+
+
+def running_daemons() -> list[str]:
+    """The socket paths of the GPUs a daemon here holds."""
+    locks = sorted(glob.glob(os.path.join(socket_dir(), "gpu_*.sock.lock")))
+    return [p for p in (lock[: -len(".lock")] for lock in locks) if daemon_alive(p)]
 
 
 def daemon_alive(path: str) -> bool:

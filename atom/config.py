@@ -2522,11 +2522,8 @@ class Config:
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
 
-        # Weight cache (atom/model_loader/weight_cache/): a daemon loads the
-        # weights once per GPU and serves them; a client maps them. Clients
-        # share the daemon's memory, so runners that write weights in place
-        # (EPLB, RLHF weight updates, RapidServe's own weight sharing) cannot
-        # take part.
+        # Weight cache clients share the daemon's weights: nothing may write
+        # them in place (EPLB, RLHF updates, RapidServe's own sharing).
         cache_mode = envs.ATOM_WEIGHT_CACHE
         if cache_mode in ("daemon", "client"):
             if self.runner_qualname != "atom.model_engine.model_runner.ModelRunner":

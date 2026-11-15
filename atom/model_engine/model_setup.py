@@ -7,6 +7,7 @@ it."""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -34,13 +35,10 @@ ModelLoader = Callable[[Config, type, torch.device], nn.Module]
 def init_model_env(
     config: Config, rank: int, *, device_communicators: bool = True
 ) -> torch.device:
-    """Set up this process for building its rank's model: the current
-    config, its device and its parallel groups (their ranks decide what it
-    loads). ``rank``: this worker's local index
-    (0..tp*pcp-1) within its stage. ``device_communicators=False`` builds the
-    groups without RCCL and the custom and quick all-reduce buffers (about
-    9 GiB per GPU), for a process that runs no device collectives; pipeline
-    parallel groups always get them."""
+    """The current config, the device and the parallel groups (their ranks
+    decide what a rank loads). ``rank``: the worker's index in its stage.
+    ``device_communicators=False``: no RCCL/custom all-reduce buffers (~9 GiB
+    per GPU), for a process that runs no collectives (not with PP)."""
     set_current_atom_config(config)
     if sp_is_enabled():
         check_aiter_sp_api()
@@ -190,6 +188,46 @@ def build_model(config: Config, model_class: type, device: torch.device) -> nn.M
         torch.set_default_device(None)
 
 
+def swap_param(old, new: nn.Parameter, attrs: dict) -> bool:
+    """Move ``new``'s data into ``old``, keeping the Parameter object other
+    references hold, with attributes ``attrs``. False: it cannot be swapped
+    (another type, or extra references to its data)."""
+    if type(old) is not nn.Parameter:
+        return False
+    try:
+        torch.utils.swap_tensors(old, new)
+    except Exception:  # noqa: BLE001 - the caller installs ``new`` instead
+        return False
+    old.__dict__.clear()
+    old.__dict__.update(attrs)
+    return True
+
+
+@contextlib.contextmanager
+def params_on_meta():
+    """Build with every Parameter on the meta device, for a model whose
+    weights come from elsewhere; buffers are built normally. Each Parameter
+    exists on the device only while registered, and stays the object the
+    constructor holds, so attributes set on it later land."""
+    orig = nn.Module.register_parameter
+
+    def register_parameter(self, name, param):
+        orig(self, name, param)
+        p = self._parameters.get(name)
+        if p is None or p.is_meta:
+            return
+        meta = nn.Parameter(p.detach().to("meta"), requires_grad=p.requires_grad)
+        if not swap_param(p, meta, dict(vars(p))):
+            meta.__dict__.update(vars(p))
+            self._parameters[name] = meta
+
+    nn.Module.register_parameter = register_parameter
+    try:
+        yield
+    finally:
+        nn.Module.register_parameter = orig
+
+
 def load_weights(model: nn.Module, config: Config) -> None:
     """Load the checkpoint into a built model and process it for serving."""
     load_model(
@@ -219,7 +257,7 @@ def load_drafter_from_disk(config: Config, device: torch.device, runner, target)
     runner, the loaded target model) -> drafter with its weights."""
     drafter = construct_drafter(config, device, runner)
     logger.info("Loading drafter model...")
-    drafter.load_model(target)
+    drafter.attach_to_target(target, drafter.load_weights())
     return drafter
 
 

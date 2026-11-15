@@ -69,6 +69,7 @@ from atom.model_engine.model_setup import (
     init_model_env,
     load_drafter_from_disk,
     load_from_disk,
+    params_on_meta,
 )
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -4778,33 +4779,6 @@ class RapidServeModelRunner(ModelRunner):
             config.disagg_kvcache_ipc_addr.encode()
         ).hexdigest()[:12]
 
-    @staticmethod
-    @contextmanager
-    def _init_weight_params_on_meta():
-        """Construct a model with all `nn.Parameter`s on the meta device (no
-        persistent GPU weight allocation), leaving the default device unchanged
-        so init code that explicitly targets CUDA (e.g. aiter RoPE) and buffers
-        work normally. Each parameter is briefly created on the real device then
-        replaced with a meta tensor, so the transient peak is one parameter, not
-        the whole model. Used by decode in disagg, which fills params from
-        prefill via IPC.
-        """
-        orig_register = torch.nn.Module.register_parameter
-
-        def register_parameter(self, name, param):
-            orig_register(self, name, param)
-            p = self._parameters.get(name)
-            if p is not None:
-                self._parameters[name] = torch.nn.Parameter(
-                    p.detach().to("meta"), requires_grad=p.requires_grad
-                )
-
-        torch.nn.Module.register_parameter = register_parameter
-        try:
-            yield
-        finally:
-            torch.nn.Module.register_parameter = orig_register
-
     # ------------------------------------------------------------------
     # Base ModelRunner override points
     # ------------------------------------------------------------------
@@ -4819,7 +4793,7 @@ class RapidServeModelRunner(ModelRunner):
         # import_model_weight_ipc_handles() materializes params from prefill,
         # and RoPE caches are recomputed locally.
         def build_on_meta(config, model_class, device):
-            with self._init_weight_params_on_meta():
+            with params_on_meta():
                 return build_model(config, model_class, device)
 
         return build_on_meta

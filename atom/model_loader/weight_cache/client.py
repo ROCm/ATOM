@@ -23,13 +23,13 @@ from atom.model_engine.model_setup import (
     construct_drafter,
     load_drafter_from_disk,
     load_from_disk,
+    params_on_meta,
 )
 from atom.model_loader.weight_cache.export import (
     _leftover_meta,
     _run_prepare_finalize,
     apply_export,
     apply_process,
-    params_on_meta,
 )
 from atom.model_loader.weight_cache.key import (
     _diff_key,
@@ -44,6 +44,7 @@ from atom.model_loader.weight_cache.preload import (
     _pid_running,
     _spawn_daemon,
     _started_by_launch,
+    launch_recorded,
     stop_daemon,
 )
 from atom.model_loader.weight_cache.recorder import STATIC_READS, diff_reads
@@ -225,15 +226,17 @@ def _stop_and_reclaim(path: str, device: torch.device) -> None:
     if not on_gpu:
         return
     deadline = time.monotonic() + 120
-    last, steady_since = free0, time.monotonic()
+    last, steady_since, rose = free0, time.monotonic(), False
     while time.monotonic() < deadline:
         free = torch.cuda.mem_get_info(device)[0]
         if held and free >= free0 + 0.9 * held:
             return
         if free != last:
+            rose = rose or free > free0
             last, steady_since = free, time.monotonic()
-        elif not held and time.monotonic() - steady_since > 2:
-            return  # size unknown (it was loading): settled
+        elif not held and time.monotonic() - steady_since > (2 if rose else 10):
+            # Size unknown (it was loading): freed and settled, or nothing came free.
+            return
         time.sleep(0.2)
     logger.warning(
         f"{_TAG} the stopped daemon's memory is still not free on {device} after 120s"
@@ -245,28 +248,34 @@ def _forward_context(config) -> dict | None:
     return getattr(cc, "static_forward_context", None)
 
 
-def _give_up(label, path, reasons, started, group, config, device, layers) -> None:
-    """The daemon this launch started cannot be used either: stop it so the
-    disk load has its memory, or fail if it won't stop, others use it, or
-    another launch's daemon holds the GPU."""
+def _stop_together(label, path, device, group, why, pid=None, started=None) -> None:
+    """Stop the daemon on every rank's GPU, or on none: fail if any rank's
+    is in use, or (``started``: this launch's own) is another launch's.
+    Returns once the memory is free."""
     holder = (
         (daemon_state(path) or {}).get("daemon_pid") if daemon_alive(path) else None
     )
-    if holder not in (None, started["pid"]):
+    if started is not None and holder not in (None, started["pid"]):
         err = f"another launch's daemon (pid {holder}) holds this GPU"
     else:
         err = _in_use_by_others(path)
-    if err is None:
-        try:
-            _stop_and_reclaim(path, device)
-            if _pid_running(
-                started["pid"]
-            ):  # never took a GPU, so stop_daemon missed it
-                os.kill(started["pid"], signal.SIGTERM)
-        except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-            err = f"could not stop the daemon this launch started: {e}"
     if not group_agree(err is None, group):
-        raise _fail(label, ([err] if err else []) + reasons, preload=True)
+        raise _fail(label, ([err] if err else []) + why, pid, preload=True)
+    err = None
+    try:
+        _stop_and_reclaim(path, device)
+        if started is not None and _pid_running(started["pid"]):
+            os.kill(started["pid"], signal.SIGTERM)  # it never took a GPU
+    except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
+        err = f"could not stop the daemon: {e}"
+    if not group_agree(err is None, group):
+        raise _fail(label, [err] if err else [], pid, preload=True)
+
+
+def _give_up(label, path, reasons, started, group, config, device, layers) -> None:
+    """The daemon this launch started cannot be used either: stop it so the
+    disk load has its memory."""
+    _stop_together(label, path, device, group, reasons, started=started)
     _drop_layers(config, layers)
     detail = "\n  ".join(reasons[:25]) if reasons else "another rank cannot use it"
     logger.warning(
@@ -391,7 +400,9 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
     t0 = time.perf_counter()
     label = worker_process_name(config, rank)
     group = _agree_group()
-    auto = envs.ATOM_PRELOAD
+    # Starting daemons needs the launch the API server saved; elsewhere
+    # (offline LLMEngine) ATOM_PRELOAD only uses the daemon that is there.
+    auto = envs.ATOM_PRELOAD and launch_recorded()
     path = socket_path(device)
     # The daemon this launch started (the API server may have already).
     started = _started_by_launch() if auto else None
@@ -476,14 +487,6 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
             _give_up(label, path, reasons, started, group, config, device, layers)
             return None
         if hi > _NONE:
-            err = _in_use_by_others(path)
-            if not group_agree(err is None, group):
-                why = (
-                    ["it would need a restart, since it cannot be used here:"] + reasons
-                    if reasons
-                    else []
-                )
-                raise _fail(label, ([err] if err else []) + why, pid, preload=True)
             if reasons:
                 logger.warning(
                     f"{_TAG} {label}: restarting the weight cache daemon{f' (pid {pid})' if pid else ''}, "
@@ -493,13 +496,8 @@ def _from_daemon(config, model_class, device, rank: int) -> nn.Module | None:
                 logger.info(
                     f"{_TAG} {label}: restarting the weight cache daemon (another rank cannot use its daemon)"
                 )
-            err = None
-            try:
-                _stop_and_reclaim(path, device)
-            except Exception as e:  # noqa: BLE001 - every rank must reach the agreement
-                err = f"could not stop the daemon: {e}"
-            if not group_agree(err is None, group):
-                raise _fail(label, [err] if err else [], pid, preload=True)
+            why = ["it would need a restart, since it cannot be used here:"] + reasons
+            _stop_together(label, path, device, group, why if reasons else [], pid)
         else:
             logger.info(
                 f"{_TAG} {label}: no weight cache daemon on this launch's GPUs; starting one (ATOM_PRELOAD)"

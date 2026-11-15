@@ -653,9 +653,6 @@ class Drafter(abc.ABC):
             delattr(owner, attr)
             setattr(owner, attr, source)
 
-    def load_model(self, target_model: nn.Module) -> None:
-        self.attach_to_target(target_model, self.load_weights())
-
     def load_weights(self) -> set[str]:
         """Load the draft's own weights into ``self.model``; what it loaded."""
         # Three drafter flavors cover three of the four combinations:

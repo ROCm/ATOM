@@ -7,16 +7,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
-import glob
-import os
 import sys
 import time
 
 from atom.model_loader.weight_cache.preload import stop_daemon
 from atom.model_loader.weight_cache.transport import (
     _ping,
-    daemon_alive,
     daemon_state,
+    running_daemons,
     socket_dir,
 )
 
@@ -24,13 +22,11 @@ from atom.model_loader.weight_cache.transport import (
 def _running_daemons() -> dict:
     """{main pid: [(socket path, state), ...]} of this user's daemons here."""
     launches: dict = {}
-    for lock in sorted(glob.glob(os.path.join(socket_dir(), "gpu_*.sock.lock"))):
-        path = lock[: -len(".lock")]
-        if daemon_alive(path):
-            st = daemon_state(path) or {}
-            launches.setdefault(
-                st.get("daemon_pid") or f"? (process {st.get('pid')})", []
-            ).append((path, st))
+    for path in running_daemons():
+        st = daemon_state(path) or {}
+        launches.setdefault(
+            st.get("daemon_pid") or f"? (process {st.get('pid')})", []
+        ).append((path, st))
     return launches
 
 
