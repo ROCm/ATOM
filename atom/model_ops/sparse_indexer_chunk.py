@@ -82,6 +82,19 @@ def logits_rows(rows, width):
     )
 
 
+def plane_capacity() -> int:
+    """fp32 elements of the widest band `logits_rows` cuts at any width: the
+    byte budget or the buffer-descriptor cap, whichever is smaller, strictly
+    under it. A workspace this large never narrows a band `logits_rows` cut,
+    since `capacity // width` is the same floor `sparse_indexer_row_chunk`
+    takes before rounding down to whole tiles."""
+    cap = _BUFFER_DESCRIPTOR_LIMIT_BYTES
+    budget_mb = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+    if budget_mb > 0:
+        cap = min(cap, budget_mb * 1024 * 1024)
+    return min((cap - 1) // _LOGIT_BYTES, 2**31 - 1)
+
+
 def capped_logits_rows(rows, width, capacity, min_rows=1):
     """`logits_rows` within a workspace of `capacity` rows of `width`; fails
     when it cannot hold `min_rows`."""

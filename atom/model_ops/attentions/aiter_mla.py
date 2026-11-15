@@ -77,7 +77,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
-from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace, plane_capacity
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,
@@ -548,6 +548,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         self.index_n_heads = hf_config.index_n_heads if self.is_sparse else 0
         self.index_logits_workspace: LogitsWorkspace | None = None
+        # DCP prefill's FP4 logits plane (`_prefill_fp4_rows`); DCP decode
+        # scores in its fused exchange and keeps `index_logits_workspace` None.
+        self.index_prefill_workspace: LogitsWorkspace | None = None
         self._fp4_launches = Fp4LaunchStorages(
             self.device, self.max_num_batched_tokens, self.max_bs
         )
@@ -940,6 +943,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 logger.info(
                     "Sparse indexer logits workspace: %.2f GiB",
                     self.index_logits_workspace.nbytes / (1 << 30),
+                )
+            elif self._indexer_fp4 and self.dcp_world_size > 1:
+                # Without it each prefill allocates its plane at its longest
+                # row's width. That grows with the live context, so every new
+                # longest prefill takes a bigger block (up to the 2 GiB cap)
+                # and the caching allocator keeps the smaller ones: about
+                # 15 GiB a rank on AgentX past 500K tokens of context, none of
+                # it in the memory profile, which ran out of VRAM at
+                # utilization 0.94 (wuhuikx/LLM-Booster#564). One plane at the
+                # cap, allocated before the profile, cuts the same bands.
+                self.index_prefill_workspace = LogitsWorkspace(
+                    plane_capacity(), self.device
+                )
+                logger.info(
+                    "Sparse indexer DCP prefill logits workspace: %.2f GiB",
+                    self.index_prefill_workspace.nbytes / (1 << 30),
                 )
             for module in sfc.values():
                 impl = getattr(module, "impl", None)
@@ -2987,7 +3006,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return fp4_rows(
             ends,
             width,
-            self.index_logits_workspace,
+            self.index_logits_workspace or self.index_prefill_workspace,
             Fp4MqaRaggedMetadata(cu_seqlens_q, max_seqlen_q, tables),
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
