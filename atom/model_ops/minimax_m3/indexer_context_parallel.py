@@ -90,11 +90,10 @@ def indexer_context_scores(
         for x in (idx_q, index_cache, block_table, seq_lens)
     ):
         raise ValueError("all score inputs must be on the same GPU")
-    local = triton.cdiv(blocks, world_size)
-    if not tokens:
-        return torch.empty((heads, 0, local), dtype=torch.float32, device=idx_q.device)
     # A LOCAL bound, never the global `blocks`; must match the map's bound.
-    width = max_block or local
+    width = max_block or triton.cdiv(blocks, world_size)
+    if not tokens:
+        return torch.empty((heads, 0, width), dtype=torch.float32, device=idx_q.device)
     # Contiguous on purpose: the scorer's own allocator can return a permuted
     # view, which `local_candidate_keys` rejects. Uninitialised is fine: the
     # trailing slot of an uneven shard is masked there (pinned by

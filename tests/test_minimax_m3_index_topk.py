@@ -157,6 +157,16 @@ class TestTheAiterDependencyIsDeferred:
 CAPACITY_SHAPE = {"max_block": 256, "max_query_len": 1, "num_idx_heads": 1}
 
 
+@pytest.fixture
+def mi355_cu_count(monkeypatch):
+    """The grids below are a function of the compute-unit count (256 on MI355X), which
+    aiter reads from rocminfo: pin it so these assertions hold on any machine, one
+    without a GPU included."""
+    kernel = pytest.importorskip("aiter.ops.flydsl.kernels.minimax_m3_index_score")
+    monkeypatch.setattr(kernel, "_cu_count", lambda device=None: 256)
+
+
+@pytest.mark.usefixtures("mi355_cu_count")
 class TestPersistentWorkMapCapacity:
     """A captured buffer must serve EVERY batch, not just the largest one.
 
@@ -672,13 +682,9 @@ def _score_oracle(idx_q, cache, block_table, seq_lens, max_query_len, heads, sm_
 
 @gpu
 class TestDecodeScoreAgainstTheDefinition:
-    """The decode scorer against `_score_oracle`, not against another kernel.
+    """The decode scorer against `_score_oracle`, the definition, not another kernel.
 
-    This used to compare two kernels -- flydsl against the Triton one it beat --
-    and assert on the SELECTION rather than the scores, because two accumulation
-    orders may legally reorder blocks that tie. The Triton kernel is gone, so
-    both halves of that change: the anchor is the definition, and scores are now
-    comparable directly (with a tolerance, not bit-for-bit).
+    Scores are compared directly, with a tolerance rather than bit-for-bit.
     """
 
     @staticmethod
@@ -769,6 +775,7 @@ class TestDecodeScoreAgainstTheDefinition:
 
 
 @gpu
+@pytest.mark.usefixtures("mi355_cu_count")
 class TestAPaddedReplayWalksTheMapTheCaptureWalks:
     """Capture at graph batch 8, replay with 7 live requests padded to 8.
 
@@ -875,9 +882,9 @@ class TestIndexScoreWorkMapHoist:
     op uses it as handed over and does not rebuild.
 
     The op does build one when none arrives -- there is no second scorer to fall
-    back to any more, so declining would mean raising. That is the slow-but-
-    correct path, and the count below is what keeps it from quietly becoming the
-    fast path's behaviour too.
+    back to, so declining would mean raising. That is the slow-but-correct path,
+    and the count below is what keeps it from quietly becoming the fast path's
+    behaviour too.
     """
 
     @pytest.mark.parametrize("hoisted", [True, False])
@@ -1088,11 +1095,9 @@ def test_the_sglang_pool_refuses_bf16_by_name():
 
 @gpu
 def test_a_bf16_index_cache_is_refused_by_name():
-    """bf16 was served by the Triton decode scorer, which this change deletes.
-
-    The FlyDSL scorers take fp8 only, so ATOM refuses bf16 itself rather than
+    """The FlyDSL scorers take fp8 only, so ATOM refuses bf16 itself rather than
     letting it reach aiter -- aiter's dtype error names neither the flag to pass
-    nor that ATOM is what refuses. `_resolve_index_cache_dtype` refuses the same
+    nor that ATOM is what refuses. `_index_cache_spec` refuses the same
     configuration earlier, when the pool is allocated; this pins the scorer's
     backstop for any path that did not come through it.
     """
@@ -1127,11 +1132,10 @@ class TestPrefillScorersAgree:
 
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
     def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes):
-        # The case `auto` actually dispatches, and now the only one: `k_lds` --
-        # with it any reason to run the flydsl prefill scorer at all -- is legal
-        # only on an fp8 cache, and bf16 is refused before it can reach either
-        # scorer. This is the test that can see a tie resolve to a different
-        # block.
+        # The case `auto` actually dispatches, and the only one: `k_lds` -- with it
+        # any reason to run the flydsl prefill scorer at all -- is legal only on an
+        # fp8 cache, and bf16 is refused before it can reach either scorer. This is
+        # the test that can see a tie resolve to a different block.
         kw = _inputs(qlens, prefixes, 2, "cuda")
         picked = []
         real = m.prefill_index_score

@@ -308,6 +308,22 @@ def build_n_valid_column_per_row(
     return out
 
 
+def _once_per_forward(owner, attr, phase, build):
+    """``build()``, memoized on ``owner.<attr>[phase]``: the one cache both
+    `*_for_forward` hoists share, so they cannot disagree on its rules (see
+    :func:`n_valid_column_per_row_for_forward` for what `owner` must be)."""
+    cache = getattr(owner, attr, None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(owner, attr, cache)
+        except AttributeError:
+            pass  # slotted metadata: correct, just rebuilt per layer
+    if phase not in cache:
+        cache[phase] = build()
+    return cache[phase]
+
+
 def n_valid_column_per_row_for_forward(owner, phase, row_starts, row_prefix, **kw):
     """:func:`build_n_valid_column_per_row`, hoisted to once per forward.
 
@@ -321,16 +337,12 @@ def n_valid_column_per_row_for_forward(owner, phase, row_starts, row_prefix, **k
     shapes or pointers would serve the previous step's bounds. `phase` splits
     decode from prefill, which a hybrid batch runs both of over different rows.
     """
-    cache = getattr(owner, "_n_valid_column_per_row", None)
-    if cache is None:
-        cache = {}
-        try:
-            owner._n_valid_column_per_row = cache
-        except AttributeError:
-            pass  # slotted metadata: correct, just rebuilt per layer
-    if phase not in cache:
-        cache[phase] = build_n_valid_column_per_row(row_starts, row_prefix, **kw)
-    return cache[phase]
+    return _once_per_forward(
+        owner,
+        "_n_valid_column_per_row",
+        phase,
+        lambda: build_n_valid_column_per_row(row_starts, row_prefix, **kw),
+    )
 
 
 def build_index_score_work_map(
@@ -406,16 +418,12 @@ def index_score_work_map_for_forward(owner, phase, seq_lens, **kw):
     live exactly one forward. Native ATOM reads
     `MiniMaxM3SparseMetadata.index_score_work_map` instead.
     """
-    cache = getattr(owner, "_index_score_work_map", None)
-    if cache is None:
-        cache = {}
-        try:
-            owner._index_score_work_map = cache
-        except AttributeError:
-            pass  # slotted metadata: correct, just rebuilt per layer
-    if phase not in cache:
-        cache[phase] = build_index_score_work_map(seq_lens, **kw)
-    return cache[phase]
+    return _once_per_forward(
+        owner,
+        "_index_score_work_map",
+        phase,
+        lambda: build_index_score_work_map(seq_lens, **kw),
+    )
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})

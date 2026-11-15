@@ -261,12 +261,12 @@ def test_m3_context_and_batch_reuse_kernels():
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as ex
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
-    # fp8: the index cache the FlyDSL scorers serve, and the only one ATOM
-    # allocates now. bf16 is refused before it can reach them.
+    # fp8: the index cache the FlyDSL scorers serve; bf16 is refused before it can
+    # reach them.
     cache = torch.zeros(64, 128, 128, device="cuda").to(aiter.dtypes.fp8)
-    # The context scorer is no longer in this list because it is no longer a
-    # Triton kernel: `indexer_context_scores` now dispatches to aiter's FlyDSL
-    # scorer, which `one_variant` cannot instrument and which does not
+    # The context scorer is not in this list because it is not a Triton kernel:
+    # `indexer_context_scores` dispatches to aiter's FlyDSL scorer, which
+    # `one_variant` cannot instrument and which does not
     # specialize on shape the way a `tl.constexpr` does. The call below still
     # runs it at every shape -- what is dropped is the single-variant
     # assertion, not the coverage. The two selector kernels after it are still

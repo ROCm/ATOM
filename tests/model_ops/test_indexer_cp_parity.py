@@ -228,12 +228,12 @@ def _assert_chain_matches_tp(
 # the padded case -- the one production actually captures -- to the same
 # exactness claim as the tight one.
 #
-# Both arms now run the same kernel, and so does `_tp_reference`: there is one
-# decode scorer left. That makes this file's parity claim a claim about the
-# CHAIN around it (shard, reduce, exchange, merge), not about the score, and
-# leaves it blind to a mistake the scorer makes on both sides. That gap is
-# covered by `test_the_shard_scores_match_the_definition` below, which is
-# anchored on torch rather than on a second kernel.
+# Both arms run the same kernel, and so does `_tp_reference`: there is one decode
+# scorer. That makes this file's parity claim a claim about the CHAIN around it
+# (shard, reduce, exchange, merge), not about the score, and leaves it blind to a
+# mistake the scorer makes on both sides. That gap is covered by
+# `test_the_shard_scores_match_the_definition` below, which is anchored on torch
+# rather than on a second kernel.
 SCORERS = pytest.mark.parametrize("pad", [0, 3], ids=["tight", "padded"])
 
 
@@ -321,14 +321,9 @@ def test_parity_holds_across_top_k(topk, pad):
 def test_parity_holds_on_an_fp8_index_cache(max_query_len, pad):
     """``--index-cache-dtype fp8`` is what recipes/MiniMax-M3.md runs.
 
-    It used to be the one dtype where the two sides did not share a dot
-    formulation -- the old Triton ``_context_score`` cast the KEY UP to bf16
-    while the native selector's fp8 branch cast the QUERY DOWN -- and this test
-    existed to show that two different products still ranked 512 blocks the same
-    way. Both sides run the same kernel now, so it no longer pins that. What it
-    still pins is the shard/exchange/merge chain under fp8, where the scores are
-    closer together than in bf16 and ties are ~1 per 25k rows; `_pack_score_key`
-    has to break them identically on both sides.
+    Both sides run the same kernel, so this pins the shard/exchange/merge chain
+    under fp8, where the scores are closer together than in bf16 and ties are ~1
+    per 25k rows; `_pack_score_key` has to break them identically on both sides.
 
     ``aiter.dtypes.fp8`` rather than a hardcoded ``float8_e4m3fn`` because the
     two ROCm archs disagree on which one is native, and this must test the
@@ -350,12 +345,11 @@ def test_parity_holds_on_an_fp8_index_cache(max_query_len, pad):
 
 @needs_gpu
 def test_a_bf16_index_cache_is_refused_by_name():
-    """bf16 used to be served by the Triton decode scorer, which this change
-    deletes. The FlyDSL one takes fp8 only, so bf16 is refused rather than
-    passed down -- a dtype error raised inside aiter names neither the flag to
-    pass nor that ATOM is the thing refusing. The pool allocator refuses the
-    same configuration earlier, at startup; this pins the scorer's own backstop
-    for any path that did not come through it."""
+    """The FlyDSL scorer takes fp8 only, so bf16 is refused rather than passed
+    down -- a dtype error raised inside aiter names neither the flag to pass nor
+    that ATOM is the thing refusing. The pool allocator refuses the same
+    configuration earlier, at startup; this pins the scorer's own backstop for
+    any path that did not come through it."""
     idx_q, cache, block_table, lens, _ = _inputs(2, 512, 1, torch.bfloat16, 11)
     with pytest.raises(ValueError, match="index-cache-dtype fp8"):
         _shard_score(idx_q, cache, block_table, lens, 512, 0, 1, 0)
@@ -380,10 +374,10 @@ def test_both_transports_deliver_the_same_tensor():
 @needs_gpu
 @pytest.mark.parametrize("max_query_len", [1, 4])
 def test_the_shard_scores_match_the_definition(max_query_len):
-    """The anchor the rest of this file no longer has.
+    """The anchor the rest of this file lacks.
 
     Every other test here compares the CP chain against `_tp_reference`, and
-    both now run the same scorer, so a mistake inside it cancels. This one is
+    both run the same scorer, so a mistake inside it cancels. This one is
     anchored on torch: score a shard, then check each live column against the
     max over that block's 128 tokens of q.k*scale, causal-masked -- with the
     round-robin remap ``global = local*WORLD + rank`` done here rather than
