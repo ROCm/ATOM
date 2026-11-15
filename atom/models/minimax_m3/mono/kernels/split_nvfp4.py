@@ -4,7 +4,7 @@
 256-key partition x 16 heads a task, f16 MFMA over the exact dequantized products.
 
 The page (128 tokens, ``KV_PAGE_BYTES`` = 18432 B at one kv head) is aiter's
-``minimax_m3_sparse_pa_nvfp4`` one (``common.py`` here: ``nvfp4_k_store`` documents it),
+``sparse_pa_nvfp4`` one (``common.py`` here: ``nvfp4_k_store`` documents it),
 and a wave's work is that kernel's wave: 32 keys, the quarter ``q`` of a block,
 
   S^T = K Q^T   A = K tile (row r of tile st is key 8 (r // 4) + 4 st + r % 4 of the

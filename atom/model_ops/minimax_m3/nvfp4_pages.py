@@ -21,7 +21,7 @@ KV page, one per block, all kv heads of K then all of V (``2 * Hkv * 9216`` B)::
 
 K scales and V data / scales are in the order the sparse-PA kernel's MFMA lanes
 want them. aiter owns this layout (the writer, ``fused_qknorm_idxrqknorm`` in its NVFP4
-mode, and the readers ``minimax_m3_sparse_pa_nvfp4_{decode,prefill}``); the offsets
+mode, and the readers ``sparse_pa_nvfp4_{decode,prefill}``); the offsets
 below are what the tests' independent reader uses, and the sizes are what the pool and
 the index cache allocate.
 """
