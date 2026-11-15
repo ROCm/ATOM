@@ -29,6 +29,7 @@ from atom.model_ops.dcp_ops import (
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, padded_prefill_rows
 from atom.utils.tbo.ubatching import tbo_active
 
 from .nope import indexer_nope_quant_and_cache
@@ -142,6 +143,9 @@ def _dcp_stage_indexer_fp4_prefill(
     return staged, staged_scale
 
 
+# A token graph's break: the cache write and the selection follow the step's
+# requests (`slot_mapping`, the top-k rows), not its token count.
+@eager_region()
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -170,6 +174,11 @@ def sparse_attn_indexer(
     stable_topk: bool,
     kv_cache_scale: torch.Tensor | None = None,
 ) -> None:
+    rows = padded_prefill_rows(hidden_states.shape[0])
+    if rows is not None:
+        hidden_states, q_input, k, weights, positions = (
+            t[:rows] for t in (hidden_states, q_input, k, weights, positions)
+        )
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
     # than there are prefill rows; giving the allocation that slack is what
