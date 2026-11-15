@@ -129,7 +129,7 @@ def _next_fold_build(key: "k2.K2Build") -> "k2.K2Build":
     """The build a fold build that needs scratch is rebuilt as: the next of
     ``k2.FOLD_SCHEDULERS``, then its layer's default build. The scheduler
     steps work around an LLVM bug (an orphaned SGPR spill slot).
-    Tracked in: <LLVM_ISSUE_URL>
+    Tracked in: https://github.com/llvm/llvm-project/issues/242766
     They can go once the LLVM that FlyDSL ships has the fix; the default build
     stays the last step."""
     order = ("", *k2.FOLD_SCHEDULERS)
