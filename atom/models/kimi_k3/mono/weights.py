@@ -497,8 +497,35 @@ def _ptpc_fp8(module, name: str, rows: int, cols: int):
     stages decode gfx950's FP8), or with a bias (the stages add none)."""
     w, sc = linear_ptpc_fp8(module, name=name, logical_rows=rows, logical_cols=cols)
     _need(w.dtype == FP8, f"{name} is {w.dtype}, the stages read {FP8}")
-    _need(getattr(module, "bias", None) is None, f"{name} has a bias")
+    _need(module.bias is None, f"{name} has a bias")
     return w, sc
+
+
+def _mla_impl_checks(sa, name: str):
+    """The plain DCP-1 decode path the post and prep stages reproduce, returning
+    the MLA impl."""
+    impl = sa.attn.impl
+    _need(impl.dcp_world_size == 1, f"{name}: decode context parallel")
+    for flag in (
+        "use_seg_mla",
+        "kv_shuffled",
+        "is_sparse_mla",
+        "qrep_enabled",
+        "pbm_enabled",
+        "use_triton_mla",
+    ):
+        _need(not getattr(impl, flag), f"{name}: MLA {flag}")
+    _need(
+        impl.num_heads == MLA_HEADS,
+        f"{name}: {impl.num_heads} MLA heads a rank, the stages place {MLA_HEADS}",
+    )
+    _need(
+        (impl.kv_lora_rank, impl.qk_nope_head_dim, impl.qk_rope_head_dim)
+        == (MLA_LORA, MLA_NOPE, MLA_QH - MLA_NOPE),
+        f"{name}: kv_lora_rank / nope / rope {impl.kv_lora_rank} / "
+        f"{impl.qk_nope_head_dim} / {impl.qk_rope_head_dim}",
+    )
+    return impl
 
 
 def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
@@ -508,25 +535,12 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
     BMM), g_proj per-token FP8 fed by the input RMSNorm's fused per-token quant."""
     name = f"layer {layer_id}"
     sa = layer.self_attn
-    impl = sa.attn.impl
-    _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
-    for flag in (
-        "use_seg_mla",
-        "kv_shuffled",
-        "is_sparse_mla",
-        "qrep_enabled",
-        "pbm_enabled",
-        "use_triton_mla",
-    ):
-        _need(not getattr(impl, flag, False), f"{name}: MLA {flag}")
+    impl = _mla_impl_checks(sa, name)
     _need(
-        impl.num_heads == MLA_HEADS and dims.proj == MLA_HEADS * MLA_VH,
-        f"{name}: {impl.num_heads} MLA heads a rank, the stage places {MLA_HEADS}",
+        dims.proj == MLA_HEADS * MLA_VH,
+        f"{name}: core width {dims.proj}, the stage places {MLA_HEADS} heads",
     )
-    _need(
-        impl.kv_lora_rank == MLA_LORA and impl.v_head_dim == MLA_VH,
-        f"{name}: kv_lora_rank {impl.kv_lora_rank} / v_head_dim {impl.v_head_dim}",
-    )
+    _need(impl.v_head_dim == MLA_VH, f"{name}: v_head_dim {impl.v_head_dim}")
     w_v, w_v_s = impl.W_V, impl.W_V_scale
     _need(
         w_v.dtype == FP8
@@ -537,7 +551,7 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
     )
     _need(w_v_s.dtype == F32 and w_v_s.numel() == 1, f"{name}: W_V_scale {w_v_s.dtype}")
     _need(
-        bool(getattr(sa, "fuse_input_norm_quant", False)),
+        sa.fuse_input_norm_quant,
         f"{name}: the input RMSNorm does not emit the FP8 activation g_proj reads",
     )
     w_g, w_g_s = _ptpc_fp8(sa.g_proj, f"{name} g_proj", dims.proj, HIDDEN)
@@ -580,33 +594,6 @@ class MlaPrep:
     q_heads: int  # q_out's head stride (16 under the decode's head pad)
 
 
-def _mla_impl_checks(sa, name: str):
-    """The plain DCP-1 decode path the prep stages reproduce (``bind_mla_post``'s
-    checks), returning the MLA impl."""
-    impl = sa.attn.impl
-    _need(getattr(impl, "dcp_world_size", 1) == 1, f"{name}: decode context parallel")
-    for flag in (
-        "use_seg_mla",
-        "kv_shuffled",
-        "is_sparse_mla",
-        "qrep_enabled",
-        "pbm_enabled",
-        "use_triton_mla",
-    ):
-        _need(not getattr(impl, flag, False), f"{name}: MLA {flag}")
-    _need(
-        impl.num_heads == MLA_HEADS,
-        f"{name}: {impl.num_heads} MLA heads a rank, the stages place 12",
-    )
-    _need(
-        (impl.kv_lora_rank, impl.qk_nope_head_dim, impl.qk_rope_head_dim)
-        == (MLA_LORA, MLA_NOPE, MLA_QH - MLA_NOPE),
-        f"{name}: kv_lora_rank / nope / rope {impl.kv_lora_rank} / "
-        f"{impl.qk_nope_head_dim} / {impl.qk_rope_head_dim}",
-    )
-    return impl
-
-
 def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
     """``layer``'s (an MLA layer's) prep-stage tensors, or ``MonoUnsupported``
     naming why the stages cannot reproduce its production prep: the triton
@@ -618,7 +605,7 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
     site = layer.self_attention_attn_res
     blocks, write_idx = layer_block(layer_id)
     _need(blocks >= 1 and write_idx < 0, f"{name}: a block-write or block-less seam")
-    _need(bool(getattr(site, "enabled", False)), f"{name}: attention residuals off")
+    _need(site.enabled, f"{name}: attention residuals off")
     # (import triton / aiter: after the checks a CPU runner can make)
     from aiter import QuantType
 
@@ -628,15 +615,12 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
         _fused_quant_dtype(site.out_norm) == FP8,
         f"{name}: the attention seam does not fold the per-token FP8 input quant",
     )
-    _need(
-        bool(getattr(sa, "fuse_input_norm_quant", False)),
-        f"{name}: no fused input quant",
-    )
+    _need(sa.fuse_input_norm_quant, f"{name}: no fused input quant")
     seam = _seam(site, f"{name} attn seam")
     impl = _mla_impl_checks(sa, name)
     _need(sa.q_lora_rank == MLA_QL, f"{name}: q_lora_rank {sa.q_lora_rank}")
     # q_c | kv_c | k_rope only: a DSA layer's plane carries its indexer's too
-    split = tuple(getattr(sa, "projection_split_sizes", ()))
+    split = tuple(sa.projection_split_sizes)
     _need(
         split == (MLA_QL, MLA_LORA, MLA_QH - MLA_NOPE),
         f"{name}: fused_qkv_a_proj splits {split}",
@@ -677,14 +661,14 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
         and cos.numel() % 32 == 0,
         f"{name}: rope tables {cos.dtype} {tuple(cos.shape)}, expected contiguous bf16 [pos, 32]",
     )
-    kv_dt = str(getattr(impl, "kv_cache_dtype", ""))
+    kv_dt = impl.kv_cache_dtype
     _need(
         kv_dt.startswith("fp8"),
         f"{name}: kv_cache_dtype {kv_dt}, the stages write FP8",
     )
     scales = {}
     for sc in ("_k_scale", "_q_scale"):
-        t = getattr(impl, sc, None)
+        t = getattr(impl, sc)
         _need(
             isinstance(t, torch.Tensor) and t.dtype == F32 and t.numel() == 1,
             f"{name}: {sc} is not an fp32 scalar tensor",
@@ -692,11 +676,7 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
         # the rope kernel takes them as host scalars; the stages read a
         # device copy, taken here (they are load-time constants)
         scales[sc] = t.detach().reshape(1).to(w_k.device).clone()
-    heads = (
-        impl.padded_num_heads
-        if getattr(impl, "_fused_q_head_pad", False)
-        else MLA_HEADS
-    )
+    heads = impl.padded_num_heads if impl._fused_q_head_pad else MLA_HEADS
     return MlaPrep(
         layer_id=layer_id,
         blocks=blocks,

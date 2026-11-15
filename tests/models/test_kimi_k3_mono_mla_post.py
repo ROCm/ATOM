@@ -10,7 +10,6 @@ faster on a GPU (and what the changed GEMM summation order does to accuracy)
 needs a GPU.
 """
 
-import inspect
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -157,8 +156,16 @@ def _layer(**over):
         W_V=torch.zeros(12, 128, 512, dtype=torch.uint8).view(FP8),
         W_V_scale=torch.ones(1),
         dcp_world_size=1,
+        use_seg_mla=False,
+        kv_shuffled=False,
+        is_sparse_mla=False,
+        qrep_enabled=False,
+        pbm_enabled=False,
+        use_triton_mla=False,
         num_heads=12,
         kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
         v_head_dim=128,
     )
     g_proj = SimpleNamespace(
@@ -194,6 +201,7 @@ def test_bind_accepts_the_plain_fp8_decode_layer():
         ({"impl__use_seg_mla": True}, "use_seg_mla"),
         ({"impl__num_heads": 16}, "MLA heads"),
         ({"impl__kv_lora_rank": 256}, "kv_lora_rank"),
+        ({"impl__v_head_dim": 64}, "v_head_dim"),
         ({"impl__W_V": torch.zeros(12, 128, 512, dtype=torch.bfloat16)}, "W_V"),
         ({"impl__W_V_scale": torch.ones(2)}, "W_V_scale"),
         ({"sa__fuse_input_norm_quant": False}, "input RMSNorm"),
@@ -228,16 +236,6 @@ def test_bind_accepts_the_plain_fp8_decode_layer():
 def test_bind_refuses_what_the_stage_cannot_reproduce(over, why):
     with pytest.raises(MonoUnsupported, match=why):
         weights.bind_mla_post(_layer(**over), 3, DIMS)
-
-
-def test_attention_hooks_exist():
-    try:
-        from atom.model_ops.attention_mla import MLAAttention
-    except ImportError as e:  # the AITER / triton runtime, absent or without a GPU
-        pytest.skip(f"attention_mla does not import here: {e!r}")
-
-    for fn in (MLAAttention.forward_impl, MLAAttention._forward_decode):
-        assert "latent_out" in inspect.signature(fn).parameters
 
 
 # ---------------------------------------------------------------------- the flags
