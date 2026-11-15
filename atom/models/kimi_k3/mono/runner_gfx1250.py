@@ -48,6 +48,7 @@ from atom.models.kimi_k3.mono.config import (
     SITU_BETA,
     SITU_LINEAR_BETA,
     TOPK,
+    layer_block,
 )
 from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
 from atom.models.kimi_k3.mono.grouped_moe_gfx1250 import GroupedMoe
@@ -273,6 +274,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     # the o_proj all-reduce's banks, past the K2 all-reduce's in ``k2_peers``
     oproj_peers: torch.Tensor | None = None
     oproj_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+    # full-attention layers running o_proj and K2 here (``_bind``)
+    ffn_layers: frozenset[int] = frozenset()
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -336,16 +339,56 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             for plan in self.plans
             if plan.kda is not None
         }
-        try:
-            self.oproj_weights = {
-                layer_id: bind_fp8_o_proj(
+        # The full-attention layers whose attention stays production but whose
+        # o_proj and K2 run here (``bind_model``'s rule for the K2-only layers:
+        # a MoE FFN behind at least one block, not one that closes a block). A
+        # layer this cannot bind keeps its production K2, alone.
+        self.ffn_layers = set()
+        for plan in self.plans:
+            layer = self.inner.layers[plan.layer_id]
+            before, write_idx = layer_block(plan.layer_id)
+            if (
+                plan.kda is not None
+                or getattr(layer, "is_linear_attn", False)
+                or not hasattr(layer, "block_sparse_moe")
+                or before < 1
+                or write_idx >= 0
+                or not hasattr(layer.self_attn, "forward_pre_o")
+            ):
+                continue
+            try:
+                moe = bind_external_moe(
+                    layer, plan.layer_id, self.dims, self.rank, GFX1250, fp8_shared=True
+                )
+                # its core is o_proj's input, which the o_proj kernel reads
+                # [rows, proj]: only a layer whose o_proj it binds
+                bind_fp8_o_proj(layer, plan.layer_id, self.dims)
+            except MonoUnsupported as e:
+                logger.warning(
+                    "Kimi-K3 mono: layer %d keeps its production K2 (%s)",
+                    plan.layer_id,
+                    e,
+                )
+                continue
+            self.routed[plan.layer_id] = moe
+            self.ffn_layers.add(plan.layer_id)
+        logger.info(
+            "Kimi-K3 gfx1250 mono: %d KDA and %d full-attention layers run K2",
+            len(self.routed) - len(self.ffn_layers),
+            len(self.ffn_layers),
+        )
+        # A layer whose o_proj the kernel cannot read keeps AITER's GEMM and
+        # all-reduce, alone.
+        self.oproj_weights = {}
+        for layer_id in self.routed:
+            try:
+                self.oproj_weights[layer_id] = bind_fp8_o_proj(
                     self.inner.layers[layer_id], layer_id, self.dims
                 )
-                for layer_id in self.routed
-            }
-        except MonoUnsupported:
-            # o_proj stays on AITER's GEMM and all-reduce
-            self.oproj_weights = None
+            except MonoUnsupported as e:
+                logger.info(
+                    "Kimi-K3 mono: layer %d keeps AITER's o_proj (%s)", layer_id, e
+                )
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -403,6 +446,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
 
+            # K2 for every routed layer: the KDA ones and the full-attention
+            # layers whose attention stays on the production path.
+            if layer.layer_id in self.routed:
                 routed = self.routed[layer.layer_id]
                 reset = routed.write_idx >= 0
                 nblocks = routed.blocks + reset
@@ -632,13 +678,22 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if plan.layer_id not in self.routed:
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
         else:
-            layer, normed, prefix, _, write_idx = self._seam(
-                plan, prefix, blocks, add, add2, bf16=True
-            )
-            if write_idx >= 0:
-                blocks[:, write_idx].copy_(prefix)
-            core = self._k1(build, plan, normed, None, blocks, metadata)
-            if build.oproj is not None:
+            if plan.layer_id in self.ffn_layers:
+                # A full-attention layer: its attention on the production path
+                # up to o_proj's input, then the same o_proj and K2.
+                layer = self.inner.layers[plan.layer_id]
+                core, prefix = self._pre_o_core(
+                    plan, positions, prefix, blocks, add, add2
+                )
+                core = core[: prefix.size(0)]
+            else:
+                layer, normed, prefix, _, write_idx = self._seam(
+                    plan, prefix, blocks, add, add2, bf16=True
+                )
+                if write_idx >= 0:
+                    blocks[:, write_idx].copy_(prefix)
+                core = self._k1(build, plan, normed, None, blocks, metadata)
+            if build.oproj is not None and plan.layer_id in self.oproj_weights:
                 attn_out = self._oproj(build.oproj, plan.layer_id, core)
             elif isinstance(core, tuple):
                 core, core_scale = core

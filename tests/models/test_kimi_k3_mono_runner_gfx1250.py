@@ -249,6 +249,7 @@ def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
     runner = object.__new__(K3Gfx1250MonoDecodeRunner)
     runner.inner = SimpleNamespace(layers={5: layer})
     runner.routed = {5: object()}
+    runner.oproj_weights = {5: object()}
     runner._k1 = lambda *_args: core
     runner._oproj = lambda built, layer_id, value: (
         calls.update(oproj=(built, layer_id, value)) or value + 3
@@ -267,6 +268,61 @@ def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
     assert calls["oproj"][0] is kernel and calls["oproj"][1] == 5
     assert calls["oproj"][2] is core
     torch.testing.assert_close(calls["attn"], core + 3)
+
+
+def test_full_attention_layer_runs_production_attention_then_the_kernel_k2():
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    blocks = torch.zeros(rows, 1, hidden)
+    # the production attention may hand back more rows than the step's
+    core = torch.arange(3 * hidden, dtype=torch.float32).view(3, hidden)
+    kernel = object()
+    calls = {}
+
+    layer = SimpleNamespace(self_attn=SimpleNamespace(o_proj=None))
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.inner = SimpleNamespace(layers={7: layer})
+    runner.routed = {7: object()}
+    runner.ffn_layers = {7}
+    runner.oproj_weights = {7: object()}
+
+    def k1(*_args):
+        raise AssertionError("a full-attention layer ran K1")
+
+    runner._k1 = k1
+    runner._pre_o_core = lambda plan, positions, value, _blocks, add, add2: (
+        calls.update(pre_o=(plan.layer_id, positions)) or core,
+        value + 1,
+    )
+    runner._oproj = lambda built, layer_id, value: (
+        calls.update(oproj=(built, layer_id, value)) or value[:, :hidden] + 3
+    )
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+        calls.update(k2=(attn, value)) or value,
+        attn,
+    )
+    runner._write_aux = lambda *_args: None
+    plan = SimpleNamespace(layer_id=7, mono=False, kda=None)
+    positions = torch.zeros(rows, dtype=torch.long)
+
+    runner._layer(
+        SimpleNamespace(oproj=kernel),
+        plan,
+        positions,
+        prefix,
+        blocks,
+        prefix,
+        None,
+        None,
+    )
+
+    assert calls["pre_o"] == (7, positions)
+    built, layer_id, value = calls["oproj"]
+    assert built is kernel and layer_id == 7
+    torch.testing.assert_close(value, core[:rows])
+    attn, routed_prefix = calls["k2"]
+    torch.testing.assert_close(attn, core[:rows] + 3)
+    torch.testing.assert_close(routed_prefix, prefix + 1)
 
 
 def test_kernel_o_proj_all_reduce_launch_reads_the_layer_weights():

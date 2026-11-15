@@ -300,9 +300,13 @@ def test_forward_pre_o_is_forward_without_o_proj():
         pytest.skip(f"atom.models.kimi_k3.model needs the GPU stack: {error}")
 
     core = torch.ones(2, 4)
-    fake = SimpleNamespace(_gated_core=lambda positions, hidden: (core, None))
-    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    seen = {}
 
-    quantized = SimpleNamespace(_gated_core=lambda positions, hidden: (core, core))
-    with pytest.raises(AssertionError, match="quantized"):
-        KimiFullAttention.forward_pre_o(quantized, None, None)
+    def gated_core(positions, hidden, quantize=True):
+        seen["quantize"] = quantize
+        return core, None
+
+    fake = SimpleNamespace(_gated_core=gated_core)
+    assert KimiFullAttention.forward_pre_o(fake, None, None) is core
+    # the bf16 core even under an FP8 o_proj: the mono K2 quantizes it, if at all
+    assert seen["quantize"] is False
