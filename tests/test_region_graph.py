@@ -491,6 +491,7 @@ def test_a_padded_prefill_region_attends_its_scheduled_rows(context):
     x = torch.randn(scheduled, 64, device="cuda")
     padded = torch.cat([x, torch.randn(bucket - scheduled, 64, device="cuda")])
     context.context = _padded_prefill(scheduled)
+    context.attn_metadata = SimpleNamespace(slot_mapping=torch.arange(bucket))
     context.tr_graph = "replay"
     got = unit(padded).clone()
     context.tr_graph = None

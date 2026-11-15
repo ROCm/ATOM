@@ -296,8 +296,10 @@ def padded_prefill_rows(rows: int) -> int | None:
 
     A region whose launches follow the requests (attention, a recurrence, an
     indexer) works on those rows alone, as the eager step would: its metadata
-    describes the scheduled rows, not the bucket. Rows padded any other way --
-    a TBO micro-batch's -- are left to the region, as before token graphs."""
+    describes the scheduled rows, not the bucket -- all but `slot_mapping`,
+    which the builders pad to the bucket with -1 and which the region cuts.
+    Rows padded any other way -- a TBO micro-batch's -- are left to the
+    region, as before token graphs."""
     context = getattr(forward_context.get_forward_context(), "context", None)
     mode = getattr(context, "forward_mode", None)
     if mode is None or not mode.prefill_token_graph or not context.is_prefill:
@@ -308,18 +310,26 @@ def padded_prefill_rows(rows: int) -> int | None:
 
 def on_scheduled_rows(fn: Callable[..., torch.Tensor], rows: int | None, *args):
     """``fn(*args)`` on the first ``rows`` rows of each tensor argument whose
-    leading dim is the bucket, its result raised back to the bucket with zero
-    rows past ``rows``; ``fn(*args)`` itself when ``rows`` is None
-    (`padded_prefill_rows`)."""
+    leading dim is the bucket, and of the step's `slot_mapping`, its result
+    raised back to the bucket with zero rows past ``rows``; ``fn(*args)``
+    itself when ``rows`` is None (`padded_prefill_rows`)."""
     if rows is None:
         return fn(*args)
     height = next(a.shape[0] for a in args if isinstance(a, torch.Tensor))
-    result = fn(
-        *(
-            a[:rows] if isinstance(a, torch.Tensor) and a.shape[0] == height else a
-            for a in args
+    metadata = forward_context.get_forward_context().attn_metadata
+    # A cache writer walks every slot, and under DCP keeps a padded slot's
+    # query row; the drafter reads the slots at the bucket after the forward.
+    slots = metadata.slot_mapping
+    metadata.slot_mapping = slots[:rows]
+    try:
+        result = fn(
+            *(
+                a[:rows] if isinstance(a, torch.Tensor) and a.shape[0] == height else a
+                for a in args
+            )
         )
-    )
+    finally:
+        metadata.slot_mapping = slots
     padded = result.new_empty((height, *result.shape[1:]))
     padded[:rows].copy_(result)
     padded[rows:].zero_()

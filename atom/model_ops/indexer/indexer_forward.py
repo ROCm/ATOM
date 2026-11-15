@@ -198,6 +198,9 @@ def sparse_attn_indexer(
     attn_metadata = forward_context.attn_metadata
     context = forward_context.context
     slot_mapping = attn_metadata.slot_mapping
+    if rows is not None:
+        # Padded to the bucket with -1; OPUS takes no more slots than K rows.
+        slot_mapping = slot_mapping[:rows]
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner

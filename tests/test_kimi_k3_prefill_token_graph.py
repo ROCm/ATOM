@@ -49,18 +49,32 @@ def test_rows_padded_without_a_token_graph_stay_with_the_region(rows):
     assert rows(32, _step(20, padded=False)) is None
 
 
-def test_a_cut_region_sees_its_rows_and_hands_back_the_bucket():
+def _slots():
+    """A 5-row prefill's KV slots, padded to an 8-row bucket as the builders
+    pad them."""
+    return SimpleNamespace(slot_mapping=torch.tensor([7, 8, 9, 10, 11, -1, -1, -1]))
+
+
+def _slots_seen():
+    return forward_context.get_forward_context().attn_metadata.slot_mapping.shape[0]
+
+
+def test_a_cut_region_sees_its_rows_and_hands_back_the_bucket(monkeypatch):
     seen = []
 
     def region(x, weight, name):
-        seen.append((x.shape[0], weight.shape[0], name))
+        seen.append((x.shape[0], weight.shape[0], name, _slots_seen()))
         return x * 2
 
+    ctx = SimpleNamespace(attn_metadata=_slots())
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
     x = torch.arange(1.0, 9.0).view(8, 1)
     weight = torch.ones(3)
     out = on_scheduled_rows(region, 5, x, weight, "layer")
-    # Only a bucket-high argument is cut.
-    assert seen == [(5, 3, "layer")]
+    # Only a bucket-high argument is cut; the drafter reads the slots at the
+    # bucket after the forward.
+    assert seen == [(5, 3, "layer", 5)]
+    assert _slots_seen() == 8
     assert out.shape == x.shape
     torch.testing.assert_close(out[:5], x[:5] * 2)
     assert not out[5:].any()
@@ -80,6 +94,7 @@ def padded_layer(monkeypatch):
     def attend(query, k_nope, k_rope, positions, q_scale):
         seen["mla"] = (query.shape[0], k_nope.shape[0], k_rope.shape[0])
         seen["positions"] = positions.shape[-1]
+        seen["slots"] = _slots_seen()
         return query[:, :4] + 1
 
     def mix(hidden_states, hidden_states_scale):
@@ -93,7 +108,9 @@ def padded_layer(monkeypatch):
     )
     for module in (base_attention, kimi):
         monkeypatch.setattr(module, "get_current_atom_config", lambda: config)
-    ctx = SimpleNamespace(context=_step(5), main_stream=None, in_hipgraph=False)
+    ctx = SimpleNamespace(
+        context=_step(5), attn_metadata=_slots(), main_stream=None, in_hipgraph=False
+    )
     monkeypatch.setattr(forward_context, "_forward_context", ctx)
     return seen, base_attention, kimi
 
@@ -109,8 +126,50 @@ def test_mla_attention_runs_a_padded_prefills_scheduled_rows(padded_layer):
     out = base_attention.unified_attention_with_output_base(
         x, None, x, x, torch.arange(8), "layer", True, x
     )
-    assert seen == {"mla": (5, 5, 5), "positions": 5}
+    # Under DCP the MLA cache writer keeps a padded slot's query row, so a
+    # bucket of slots would write past the cut query.
+    assert seen == {"mla": (5, 5, 5), "positions": 5, "slots": 5}
+    assert _slots_seen() == 8
     _bucket_of_scheduled_rows(out, 4)
+
+
+def test_the_dsa_indexer_writes_a_padded_prefills_scheduled_slots(
+    padded_layer, monkeypatch
+):
+    """OPUS's cache write aborts the process on more slots than K rows."""
+    from atom.model_ops.indexer import indexer_forward
+
+    class Written(Exception):
+        pass
+
+    def write(q, q_out, weights, weights_out, k, kv_cache, slot_mapping, *_, **__):
+        raise Written(q.shape[0], k.shape[0], slot_mapping.shape[0])
+
+    indexer = SimpleNamespace(_indexer_fp4=True, _index_cache_layout="mfma", rope_dim=0)
+    config = SimpleNamespace(
+        kv_cache_block_size=64,
+        dcp_config=SimpleNamespace(interleave_size=1),
+        compilation_config=SimpleNamespace(static_forward_context={"layer": indexer}),
+    )
+    monkeypatch.setattr(indexer_forward, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(indexer_forward, "indexer_qk_rope_quant_and_cache", write)
+    monkeypatch.setattr(indexer_forward, "get_dcp_world_size", lambda: 1)
+    monkeypatch.setattr(indexer_forward, "pcp_is_enabled", lambda: False)
+    forward_context.get_forward_context().context.is_dummy_run = False
+
+    hidden, q, k, weights = (
+        torch.ones(8, *s) for s in ((64,), (32, 128), (128,), (32,))
+    )
+    none = torch.empty(0)
+    with pytest.raises(Written) as written:
+        indexer_forward.sparse_attn_indexer(
+            hidden, "layer.k_cache", none, q, k, weights, 128, "ue8m0", 64, 128,
+            1024, 1024, none, none, none, none, none, 1e-6,
+            torch.zeros(8, dtype=torch.int64), none, none, 1.0, False, True, False,
+            kv_cache_scale=none,
+        )  # fmt: skip
+    assert written.value.args == (5, 5, 5)
+    assert _slots_seen() == 8
 
 
 def test_kda_mixer_runs_a_padded_prefills_scheduled_rows(padded_layer):
