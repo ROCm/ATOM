@@ -11,7 +11,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
@@ -21,6 +21,7 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
+    routers::prepare::chat_template::{mark_rendered_without_template, renders_without_template},
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         factory,
@@ -108,6 +109,8 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let result = app_context
             .tokenizer_registry
             .load(&id, &name, &source, || {
+                let id = id.clone();
+                let name = name.clone();
                 let source = source.clone();
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
@@ -119,6 +122,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                     )
                     .await
                     .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+                    probe_chat_render(&id, &name, &source, chat_template.as_deref()).await;
 
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
@@ -193,6 +197,33 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true // Network/IO errors are retryable
     }
+}
+
+/// Record and warn when llm-tokenizer renders `source`'s chats without the Jinja
+/// template. It has no accessor for that, so a copy is probed; mirroring its
+/// `config.json` check would also mean mirroring how it resolves sources.
+async fn probe_chat_render(id: &str, name: &str, source: &str, chat_template: Option<&str>) {
+    let Ok(mut copy) = factory::create_tokenizer_async_with_chat_template(source, None).await
+    else {
+        return;
+    };
+    let Some(copy) = Arc::get_mut(&mut copy) else {
+        return;
+    };
+    if !renders_without_template(copy) {
+        return;
+    }
+    mark_rendered_without_template(id);
+    warn!(
+        tokenizer = name,
+        "llm-tokenizer renders these chats with a built-in encoder, not the Jinja template{}; \
+         its defaults are not ATOM's, so HTTP routing does not tokenize them",
+        if chat_template.is_some() {
+            ", so --chat-template does not apply"
+        } else {
+            ""
+        }
+    );
 }
 
 // ============================================================================

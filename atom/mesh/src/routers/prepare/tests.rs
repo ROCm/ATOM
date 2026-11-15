@@ -7,7 +7,7 @@ mod a_chat_template {
     };
     use crate::routers::prepare::chat_template::{
         process_chat_messages, process_content_format, process_tool_call_arguments,
-        ProcessedMessages,
+        renders_without_template, ProcessedMessages,
     };
     use crate::routers::test_mocks::tokenizer::hf_tokenizer_path;
     use crate::tokenizer::{
@@ -184,12 +184,13 @@ mod a_chat_template {
     }
 
     /// The engine renders with transformers, so routed tokens only match its KV
-    /// cache when this render is byte-identical. The expected text is transformers
-    /// 5.16.1's `_compile_jinja_template(TEMPLATE).render(messages=..., tools=...,
-    /// add_generation_prompt=True)` for this request, arguments as a dict. Its
-    /// `tojson` is `json.dumps`, which leaves `<>&'` unescaped, unlike Jinja's.
+    /// cache when this render is byte-identical. This toy template covers two of
+    /// the renders 1.4.2 changed: `tojson` is `json.dumps`, which leaves `<>&'`
+    /// unescaped, unlike Jinja's, and history tool-call arguments are a dict. The
+    /// expected text is transformers 5.16.1's `_compile_jinja_template(TEMPLATE)
+    /// .render(messages=..., tools=..., add_generation_prompt=True)` for this request.
     #[test]
-    fn test_render_matches_transformers() {
+    fn test_tojson_and_tool_call_arguments_render_as_in_transformers() {
         const TEMPLATE: &str = r#"{% for tool in tools %}
 {{ tool.function | tojson }}
 {% endfor %}
@@ -227,6 +228,26 @@ mod a_chat_template {
                 "\nuser:;\nassistant: path=a.txt limit=5;\n",
             )
         );
+    }
+
+    /// llm-tokenizer picks its DeepSeek V3.2 and V4 encoders from `config.json`,
+    /// and they ignore the template.
+    #[test]
+    fn test_deepseek_renders_without_template() {
+        let mut jinja = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        assert!(!renders_without_template(&mut jinja));
+        for architecture in ["DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("tokenizer.json");
+            std::fs::copy(hf_tokenizer_path(), &path).unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                json!({"architectures": [architecture]}).to_string(),
+            )
+            .unwrap();
+            let mut deepseek = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+            assert!(renders_without_template(&mut deepseek), "{architecture}");
+        }
     }
 }
 

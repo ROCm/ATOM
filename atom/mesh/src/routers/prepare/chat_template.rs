@@ -1,8 +1,12 @@
 //! Chat-template rendering helpers: turn `ChatMessage` lists into the JSON
 //! shape that HuggingFace chat templates consume.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
+use parking_lot::RwLock;
 use serde_json::{json, Value};
 
 use crate::{
@@ -15,6 +19,37 @@ use crate::{
         chat_template::ChatTemplateParams, traits::Tokenizer, HuggingFaceTokenizer,
     },
 };
+
+/// Registry ids of the tokenizers whose chats render without their Jinja
+/// template; see [`renders_without_template`].
+static WITHOUT_TEMPLATE: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Whether `tokenizer` renders chats without its Jinja template, as llm-tokenizer
+/// does with the encoders it has built in for the architectures in `config.json`
+/// (DeepSeek V3.2 and V4 in 1.4.2). Such a render ignores `--chat-template`, and
+/// its defaults are not ATOM's: DeepSeek renders chat mode unless `thinking` is
+/// true, where ATOM's encoder renders thinking mode. Replaces the template, so
+/// probe a copy.
+pub(crate) fn renders_without_template(tokenizer: &mut dyn Tokenizer) -> bool {
+    const PROBE: &str = "probe";
+    tokenizer.set_chat_template(PROBE.to_string()).is_ok()
+        && tokenizer
+            .apply_chat_template(
+                &[json!({"role": "user", "content": ""})],
+                ChatTemplateParams::default(),
+            )
+            .is_ok_and(|text| text != PROBE)
+}
+
+/// Record that the tokenizer registered as `id` renders chats without its template.
+pub(crate) fn mark_rendered_without_template(id: &str) {
+    WITHOUT_TEMPLATE.write().insert(id.to_string());
+}
+
+/// Whether the tokenizer registered as `id` renders chats without its template.
+pub(crate) fn rendered_without_template(id: &str) -> bool {
+    WITHOUT_TEMPLATE.read().contains(id)
+}
 
 /// Output of `process_chat_messages`: rendered prompt + the request's stop
 /// sequences (echoed back so the engine layer doesn't have to re-walk the
