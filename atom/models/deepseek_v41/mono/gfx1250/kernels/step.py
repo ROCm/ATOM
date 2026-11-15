@@ -63,6 +63,7 @@ LKEYS = ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink fnh fnl hsc hb
          "afnh afnl ahsc ahbs anw mw13 ms13 mw2 ms2 rcos rsin shplane ksel knsel kring lflags iqw iqws iww cwkv cnw cape cwk cknw cplan wplan ccap wcap cmain crpp cprow cplane ckv cscore cstate btab bstride slots ibat ibound iplane irpp ilog ilw isel irow imain ibmax icand engw engws enggw engemb").split()   # ksel/knsel: the layer's topk owner's selection; kring: ring start row   # rcos/rsin: this layer's RoPE row table (window or global, by the layer's ratio)   # a*: the attention front at the END of layer Ly = layer Ly+1's weights (host fills)
 WAVES_PER_EU = 4      # the step body's occupancy hint (FlyDSL rocdl.waves_per_eu): caps its VGPRs at 256
 RECV_HALF = 16 * 40960 * 16 + (2 << 20)   # bytes a parity half of a receive buffer (TP regions + tail)
+STOP_OFF = 2 * RECV_HALF   # a receive buffer's STOP word, past the two halves (never zeroed a step: runner.STOP_OFF)
 RKOFF = LY.RKEEP        # LDS: the residual streams kept between the fronts
 LCB = LY.LAYER_BYTES             # (+ 128..255: the TP1 / TP2 column-group counters, gpub / gwait)  # bytes of handoff counters a layer (16: the indexer layers' extra phases use 4, 44.., 60)
 IDX_LEVELS = 3        # selection-tree capacity (the index capacity buffers.ILW); actual passes depend on the current bound
@@ -236,7 +237,10 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     def body(recv0: Int64, recv1: Int64, recv2: Int64, recv3: Int64, cnt: Int64, scale: fx.Float32, fp: Int64,
              tp: Int64, lo: fx.Int32, hi: fx.Int32):
         recv = [recv0, recv1, recv2, recv3]
+        stops = [r + i64(STOP_OFF) for r in recv]
         recv, tep = tp_epoch_begin(recv, fp, rank, (lo == fx.Int32(0)) if split else None)
+        # (failure closure) a poll timing out in this launch stops every rank's later polls; the host fails the run
+        hx.fail_ctx(stops[rank], stops, tep | fx.Int32(-2147483648))
         for si in range_constexpr(len(SEGS)):   # layer segments, each its own loop and body (kind 1: target, 4: draft)
             seg_lo, seg_hi, seg_kind = SEGS[si]
             DRS = (seg_kind & 4) != 0
@@ -310,6 +314,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
         tp_epoch_end(fp, tep, (hi == fx.Int32(NL)) if split else None)
         hx.code_end(hx.opaque_v(fx.thread_idx.x), hx.opaque_s(fx.block_idx.x),
                     fptr(fp, "cyc") + i64(CODE_END_OFF + (8 if part == "draft" else 0)))
+        hx.fail_ctx()
         _ = keyed
 
     @flyc.jit

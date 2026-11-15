@@ -134,6 +134,22 @@ class SingleStepRunner(StepInputs):
             fine_grained=True,
         )
         self.recv = [int(a) for a in self.peer.addresses.tolist()]
+        # the STOP word, past the kernel's two parity halves (kernels.step.STOP_OFF; device.fail_ctx): zeroed once, never
+        # a step; a kernel poll that times out writes it on every rank, and the host fails the run at the next launch
+        STOP_OFF = self.K["step"].STOP_OFF
+        if STOP_OFF + 4 > RECV_BYTES:
+            raise MonoUnsupported("receive buffer too small for the STOP word")
+        # the STOP word: zeroed before the first launch (the construction's collectives order it before any peer's
+        # write); its host copy is taken after each verify (``verify_outputs``) and checked at the next launch
+        self._stop = self.peer.storage[STOP_OFF : STOP_OFF + 4].view(torch.int32)
+        self._stop.zero_()
+        self._stop_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        self._stop_ready = torch.cuda.Event()
+        self._stop_ready.record()
+        # an in-rank poll that timed out (a local producer's ready never came) leaves no STOP (in-rank polls stay as
+        # small as before: code size is the step's cost), but costs its launch >= POLL_TICKS: the step's GPU time
+        # bounds it (POLL_TICKS 20 s; a normal step is ~4 ms)
+        self._step_ev = []  # (start, end) timing events of the previous target launch
         logger.info(
             "V4.1 single-launch step: %.1f MB scratch, %.1f MB receive (rank %d)",
             sum(t.numel() for t in self.scratch.values()) / 2**20,
@@ -253,6 +269,27 @@ class SingleStepRunner(StepInputs):
         return ids
 
     def launch(self, input_ids, forward_context, batch=None) -> None:
+        # the previous step's STOP copy (done long before: its output D2H waited for it; never waited for while a graph
+        # captures -- the check then runs at the next eager launch)
+        if not torch.cuda.is_current_stream_capturing():
+            self._stop_ready.synchronize()
+        stop = int(self._stop_host[0])
+        # the previous target launch's timing (its verify copy was waited for just above: no extra wait)
+        while self._step_ev:
+            e0, e1 = self._step_ev.pop(0)
+            e1.synchronize()
+            ms = e0.elapsed_time(e1)
+            if ms > 18000.0:   # (a timed-out poll costs >= POLL_TICKS = 20 s; the first launch's module-load rank skew stays below it)
+                raise RuntimeError(
+                    f"V4.1 single-launch step: a step took {ms:.0f} ms on the GPU (a device poll timed out, "
+                    f"rank {self.rank}); its outputs are invalid"
+                )
+        if stop != 0:
+            # a step's poll timed out (a peer's message never came): its outputs are not this step's; stop the run
+            raise RuntimeError(
+                f"V4.1 single-launch step: a device poll timed out (STOP generation {stop & 0x7FFFFFFF:#x}, "
+                f"rank {self.rank}); the step's outputs are invalid"
+            )
         rows = input_ids.numel()
         if not self.prepare(rows):
             raise MonoUnsupported(f"single-launch step: {rows} rows")
@@ -273,6 +310,8 @@ class SingleStepRunner(StepInputs):
             self._device_inputs(input_ids, forward_context, engs)
             launches[0](*args[:-1], torch.cuda.current_stream())
 
+        ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        ev[0].record()
         g = self._graphs.get(rows)
         if g is not None and g[0] == key:
             g[1].replay()
@@ -293,7 +332,10 @@ class SingleStepRunner(StepInputs):
             self._seen[rows] = key
             first()
         self._ev_verify.record()  # the verdict is ready here; the draft launch follows on the same stream
+        ev[1].record()   # (the target launch's end: the step's outputs; a draft-launch timeout costs only acceptance)
         launches[1](*args)
+        if not torch.cuda.is_current_stream_capturing():
+            self._step_ev.append(ev)
         self._qrow = self._qrow_next
 
     def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
@@ -337,6 +379,9 @@ class SingleStepRunner(StepInputs):
                 .clone()
             )
             self.verify_ready.record()
+            # after the event: the output D2H does not wait for it; the next launch reads it
+            self._stop_host.copy_(self._stop, non_blocking=True)
+            self._stop_ready.record()
         out.record_stream(cur)
         verdict.record_stream(cur)
         cur.wait_event(self.verify_ready)

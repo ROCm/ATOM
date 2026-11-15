@@ -1423,12 +1423,15 @@ def recv_owner(c, region, tag, TR):
         bad = I32(0)
         for o in range_constexpr(4):
             bad = bad | ((got[o][1] != tag) | (got[o][3] != tag)).select(I32(1), I32(0))
-        while (bad != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+        st = I32(0)
+        while (bad != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st == fx.Int32(0)):
             hx.s_sleep(0)
+            st = hx._stop_due(st, t0)
             got = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
             bad = I32(0)
             for o in range_constexpr(4):
                 bad = bad | ((got[o][1] != tag) | (got[o][3] != tag)).select(I32(1), I32(0))
+        hx._stop_mark((bad != 0) & (st == fx.Int32(0)))
         for h in range_constexpr(2):
             sl = F32(0.0)
             sh = F32(0.0)

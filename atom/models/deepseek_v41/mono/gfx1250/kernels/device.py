@@ -328,8 +328,54 @@ def unlikely(b):
 
 
 # Every bounded poll (cross-rank tag waits, device handoffs) gives up after POLL_TICKS clock ticks (20 s: the first
-# launch's rank skew, module load, must not hit it) and the kernel goes on with whatever it read.
+# launch's rank skew, module load, must not hit it) and the kernel goes on with whatever it read. The failure closure:
+# the cross-rank polls (TP1 / TP2 receives, the sampling / Markov exchanges; fail_ctx) also end on the step's STOP word,
+# and one that times out writes STOP on every rank, so a lost peer message costs one timeout, not one a poll; the
+# in-rank waits keep their single loop (their code size is the step's cost: a STOP check in every one of them cost
+# 50-150 us a step) and a timed-out one shows in its launch's GPU time (>= POLL_TICKS). The host fails the run on
+# either before the step's outputs are handed out (runner.launch).
 POLL_TICKS = 2000000000   # (v2 study) 20 s: the first launch's rank skew (module load) must not time out a poll (a timeout desyncs the TP receive halves for every later step)
+# A cross-rank poll reads the STOP word only after FAST_TICKS (the normal waits are microseconds: no extra load).
+FAST_TICKS = 10000        # 100 us
+
+
+import threading as _threading
+
+_FAIL = _threading.local()
+
+
+def fail_ctx(stop=None, peers=(), gen=None):
+    """The traced body's failure closure: stop, this rank's STOP word (an i64 address; zeroed once, at construction),
+    peers, every rank's (this one's included), gen, the launch's generation (i32, never 0), the value a timeout writes
+    (which step failed). fail_ctx() ends it."""
+    _FAIL.c = None if stop is None else (stop, tuple(peers), gen)
+
+
+def _fail():
+    return getattr(_FAIL, "c", None)
+
+
+@_ASTR.transform
+def _stop_due(prev, t0):
+    """(one poll loop) past FAST_TICKS: the STOP word (after an agent-scope acquire: a CTA's stale cached line of the
+    tag it polls then refreshes); before it, prev (no extra load on the normal path)."""
+    fc = _fail()
+    r = prev
+    if fx.const_expr(fc is not None):
+        if clock() - t0 > fx.Int64(FAST_TICKS):
+            fence_acquire("agent")
+            r = gload(fc[0], fx.Int32, scope="system")
+    return r
+
+
+@_ASTR.transform
+def _stop_mark(failed):
+    """A poll that timed out (failed: this lane's, not because of a STOP it saw): STOP = gen on every rank."""
+    fc = _fail()
+    if fx.const_expr(fc is not None):
+        if failed:
+            for a in fc[1]:
+                gstore(a, fc[2], scope="system")
 
 
 @_ASTR.transform

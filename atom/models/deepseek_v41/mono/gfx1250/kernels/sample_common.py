@@ -149,8 +149,13 @@ def zload(base, c0, CH, V, t, k, invT):
 @ASTRewriter.transform
 def poll_unit(addr, tag, site=3):
     t0 = hx.clock()
-    while (hx.gload(addr + i64(12), I32, nt=True) != tag) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+    bad_ = (hx.gload(addr + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    st_ = I32(0)
+    while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
         hx.s_sleep(0)
+        st_ = hx._stop_due(st_, t0)
+        bad_ = (hx.gload(addr + i64(12), I32, nt=True) != tag).select(I32(1), I32(0))
+    hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
     return hx.gload(addr, I32, 4, nt=True)
 
 

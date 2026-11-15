@@ -991,9 +991,13 @@ def tp_allreduce(c, region, tag):
         sh = [hi[k].to(BF16).to(F32) for k in range(3)]
         gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
         t0 = hx.clock()
-        while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
-               | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+        bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        st_ = I32(0)
+        while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
             hx.s_sleep(0)
+            st_ = hx._stop_due(st_, t0)
+            bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
         for got in gots:
             for q in range_constexpr(3):
@@ -1093,9 +1097,13 @@ def tp3(c, region, tag):
         sh = [hi[k].to(BF16).to(F32) for k in range(3)]
         gps = [c["recv"][rank] + (i64((region * 4) * TP_TG) + i64(o * TP_TG) + i64(b * TPG + t)) * 16 for o in range(4) if o != rank]
         t0 = hx.clock()
-        while ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag)
-               | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)):
+        bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        st_ = I32(0)
+        while (bad_ != 0) & (hx.clock() - t0 < fx.Int64(hx.POLL_TICKS)) & (st_ == fx.Int32(0)):
             hx.s_sleep(0)
+            st_ = hx._stop_due(st_, t0)
+            bad_ = ((hx.gload(gps[0] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[1] + i64(12), I32, nt=True) != tag) | (hx.gload(gps[2] + i64(12), I32, nt=True) != tag)).select(I32(1), I32(0))
+        hx._stop_mark((bad_ != 0) & (st_ == fx.Int32(0)))
         gots = [hx.gload(gp, I32, 4, nt=True) for gp in gps]
         for got in gots:
             for q in range_constexpr(3):
