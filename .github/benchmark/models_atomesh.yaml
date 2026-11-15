@@ -17066,6 +17066,20 @@ models:
               ATOMESH_M31_P_CPU_LRU_EVICTION: "true"
               ATOMESH_M31_D_MAX_SEQS: "16"
         - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c24-dcap6
+          concurrency: [24]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "6"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c32-dcap8
+          concurrency: [32]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "8"
+        - <<: *m31_mc_1p2d_ax5035_case
           name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c40-dcap10
           concurrency: [40]
           env:
