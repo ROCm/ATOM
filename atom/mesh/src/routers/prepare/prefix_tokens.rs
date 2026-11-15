@@ -12,10 +12,13 @@
 //!
 //! This is the conversation level of ATOM's `SegmentTokenizer`
 //! (`atom/model_engine/segment_tokenizer.py`), with its conditions for a cut
-//! right after an added token to be exact. The first reuses are also compared
-//! with a plain encode, and a difference turns the cache off for good. The ids
-//! only place requests, so an unchecked one can cost a cache miss on the
-//! engine, never a wrong answer.
+//! right after an added token to be exact. The first reuses within the byte
+//! limit are also compared with a plain encode, special tokens included, and a
+//! difference turns the cache off for good. A longer one is not: its plain
+//! encode is what the cache keeps off the request path, and whether a cut is
+//! exact depends on the tokenizer, not on the prompt's length. The ids only
+//! place requests, so an unchecked one can cost a cache miss on the engine,
+//! never a wrong answer.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -50,8 +53,14 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 const VERIFY_FIRST: usize = 4;
 /// Prompts waiting to be encoded in the background; more are dropped.
 const FILL_QUEUE: usize = 4;
-/// A background encode covers at most this many times the byte limit.
+/// A background encode covers at most this many times the byte limit, and a
+/// longer prompt is rejected before it is rendered.
 const FILL_LIMITS: usize = 16;
+
+/// The longest prompt a cache takes when what it encodes is at most `limit` bytes.
+pub(crate) fn max_prompt_bytes(limit: usize) -> usize {
+    limit.saturating_mul(FILL_LIMITS)
+}
 
 /// Why a prompt was not encoded.
 #[derive(Debug)]
@@ -139,10 +148,11 @@ impl Index {
         }
     }
 
-    fn insert(&mut self, bucket: u64, stored: Arc<Stored>, budget: usize) {
+    /// Whether `stored` was kept: it is not when it is larger than the budget.
+    fn insert(&mut self, bucket: u64, stored: Arc<Stored>, budget: usize) -> bool {
         let size = stored.size();
         if size > budget {
-            return;
+            return false;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -169,6 +179,7 @@ impl Index {
             };
             self.remove(id);
         }
+        true
     }
 
     fn remove(&mut self, id: u64) {
@@ -188,6 +199,8 @@ impl Index {
 
 /// A tokenizer's stored prompts.
 pub(crate) struct PrefixTokens {
+    /// The tokenizer's registered name, which labels the cache's size.
+    name: String,
     /// Added tokens by id; where one ends in a prompt is a cut.
     added: HashMap<u32, String>,
     /// What `encode` wraps a prompt in with its special tokens.
@@ -211,12 +224,17 @@ impl PrefixTokens {
         };
         let description =
             std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        Self::new(entry.tokenizer.as_ref(), &description, budget)
+        Self::new(&entry.name, entry.tokenizer.as_ref(), &description, budget)
     }
 
     /// A cache for `tokenizer`, described by its `tokenizer.json`, or why
     /// reusing ids would not be exact for it.
-    fn new(tokenizer: &dyn Tokenizer, description: &[u8], budget: usize) -> Result<Self, String> {
+    fn new(
+        name: &str,
+        tokenizer: &dyn Tokenizer,
+        description: &[u8],
+        budget: usize,
+    ) -> Result<Self, String> {
         let description: Description =
             serde_json::from_slice(description).map_err(|e| e.to_string())?;
         description.check()?;
@@ -231,6 +249,7 @@ impl PrefixTokens {
             .find(|&at| full[at..].starts_with(&bare))
             .ok_or("encoding adds more than special tokens around a prompt")?;
         let cache = Self {
+            name: name.to_string(),
             added: description
                 .added_tokens
                 .into_iter()
@@ -323,11 +342,11 @@ impl PrefixTokens {
         metrics::counter!("mesh_prepare_prefix_cache_total", "result" => result).increment(1);
         if verify {
             let plain = encoder
-                .encode(&prompt, false)
+                .encode(&prompt, add_special_tokens)
                 .map_err(EncodeError::Failed)?;
-            if plain.token_ids() != ids {
+            if !self.wraps(plain.token_ids(), &ids, add_special_tokens) {
                 self.turn_off();
-                return Ok(self.wrap(plain.token_ids().to_vec(), add_special_tokens));
+                return Ok(plain.token_ids().to_vec());
             }
             self.index.lock().verified += 1;
         }
@@ -335,11 +354,28 @@ impl PrefixTokens {
         Ok(self.wrap(ids, add_special_tokens))
     }
 
+    fn special_tokens(&self, add_special_tokens: bool) -> (&[u32], &[u32]) {
+        match add_special_tokens {
+            true => (&self.head, &self.tail),
+            false => (&[], &[]),
+        }
+    }
+
     fn wrap(&self, ids: Vec<u32>, add_special_tokens: bool) -> Vec<u32> {
-        if !add_special_tokens || (self.head.is_empty() && self.tail.is_empty()) {
+        let (head, tail) = self.special_tokens(add_special_tokens);
+        if head.is_empty() && tail.is_empty() {
             return ids;
         }
-        [&self.head[..], &ids, &self.tail].concat()
+        [head, &ids, tail].concat()
+    }
+
+    /// Whether `encoded` is what `wrap` makes of `ids`.
+    fn wraps(&self, encoded: &[u32], ids: &[u32], add_special_tokens: bool) -> bool {
+        let (head, tail) = self.special_tokens(add_special_tokens);
+        encoded.len() == head.len() + ids.len() + tail.len()
+            && encoded.starts_with(head)
+            && encoded.ends_with(tail)
+            && encoded[head.len()..encoded.len() - tail.len()] == *ids
     }
 
     /// The stored prompt sharing the longest run of whole added tokens with `prompt`.
@@ -412,14 +448,15 @@ impl PrefixTokens {
             .collect()
     }
 
-    /// Keep `prompt` for later turns. It replaces `found` when all `found` has
-    /// past the shared cut is added tokens (the turn's generation prompt, which
-    /// the template rewrites once the turn is answered), and sits beside it
-    /// otherwise (another conversation with the same start, or a fork).
-    fn store(&self, prompt: String, ids: &[u32], found: Option<Found>, new_cuts: Vec<Cut>) {
+    /// Keep `prompt` for later turns, and say whether it was. It replaces `found`
+    /// when all `found` has past the shared cut is added tokens (the turn's
+    /// generation prompt, which the template rewrites once the turn is answered),
+    /// and sits beside it otherwise (another conversation with the same start, or
+    /// a fork).
+    fn store(&self, prompt: String, ids: &[u32], found: Option<Found>, new_cuts: Vec<Cut>) -> bool {
         // With no added token past the reused cut, `found` already serves the prompt.
         let Some(bucket) = bucket_of(&prompt).filter(|_| !new_cuts.is_empty()) else {
-            return;
+            return false;
         };
         let (mut cuts, replaces) = match &found {
             Some(found) => {
@@ -435,7 +472,7 @@ impl PrefixTokens {
         cuts.extend(new_cuts);
         let end = cuts.last().copied().unwrap_or_default();
         if end.bytes <= KEY_BYTES {
-            return;
+            return false;
         }
         let stored = Arc::new(Stored {
             ids: ids[..end.ids].to_vec(),
@@ -444,13 +481,19 @@ impl PrefixTokens {
         });
         let mut index = self.index.lock();
         if !self.on.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         if let Some(id) = replaces {
             index.remove(id);
         }
-        index.insert(bucket, stored, self.budget);
-        metrics::gauge!("mesh_prepare_prefix_cache_bytes").set(index.held as f64);
+        let kept = index.insert(bucket, stored, self.budget);
+        self.publish(&index);
+        kept
+    }
+
+    fn publish(&self, index: &Index) {
+        metrics::gauge!("mesh_prepare_prefix_cache_bytes", "tokenizer" => self.name.clone())
+            .set(index.held as f64);
     }
 
     fn encode_later(self: &Arc<Self>, prompt: String, tokenizer: Arc<dyn Tokenizer>) {
@@ -474,9 +517,10 @@ impl PrefixTokens {
         let found = self.find(&prompt);
         match self.extend(&prompt, found.as_ref(), tokenizer) {
             Ok((ids, cuts)) => {
-                self.store(prompt, &ids, found, cuts);
-                metrics::counter!("mesh_prepare_prefix_cache_total", "result" => "filled")
-                    .increment(1);
+                if self.store(prompt, &ids, found, cuts) {
+                    metrics::counter!("mesh_prepare_prefix_cache_total", "result" => "filled")
+                        .increment(1);
+                }
             }
             Err(error) => warn!(%error, "Failed to encode a prompt in the background"),
         }
@@ -486,8 +530,15 @@ impl PrefixTokens {
         if self.on.swap(false, Ordering::Relaxed) {
             warn!("Reused prompt ids differ from a plain encode; tokenizing each prompt whole from now on");
         }
-        *self.index.lock() = Index::default();
-        metrics::gauge!("mesh_prepare_prefix_cache_bytes").set(0.0);
+        self.close();
+    }
+
+    /// Store nothing more, and drop what is stored.
+    fn close(&self) {
+        let mut index = self.index.lock();
+        self.on.store(false, Ordering::Relaxed);
+        *index = Index::default();
+        self.publish(&index);
     }
 }
 
@@ -654,6 +705,14 @@ struct Slot {
     cache: OnceLock<Option<Arc<PrefixTokens>>>,
 }
 
+impl Slot {
+    fn close(&self) {
+        if let Some(Some(cache)) = self.cache.get() {
+            cache.close();
+        }
+    }
+}
+
 static CACHES: LazyLock<Mutex<HashMap<String, Arc<Slot>>>> = LazyLock::new(Default::default);
 
 /// The stored prompts of `entry`'s tokenizer, or `None` when `budget` is 0, the
@@ -662,6 +721,8 @@ pub(crate) fn cache(entry: &TokenizerEntry, budget: usize) -> Option<Arc<PrefixT
     if budget == 0 {
         return None;
     }
+    // The caches of tokenizers replaced or dropped since, which stop storing.
+    let mut closed = Vec::new();
     let slot = {
         let mut caches = CACHES.lock();
         let current = caches
@@ -670,16 +731,23 @@ pub(crate) fn cache(entry: &TokenizerEntry, budget: usize) -> Option<Arc<PrefixT
         match current {
             Some(slot) => slot.clone(),
             None => {
-                caches.retain(|_, slot| slot.shared.strong_count() > 0);
+                caches.retain(|_, slot| {
+                    let live = slot.shared.strong_count() > 0;
+                    if !live {
+                        closed.push(slot.clone());
+                    }
+                    live
+                });
                 let slot = Arc::new(Slot {
                     shared: Arc::downgrade(&entry.tokenizer),
                     cache: OnceLock::new(),
                 });
-                caches.insert(entry.id.clone(), slot.clone());
+                closed.extend(caches.insert(entry.id.clone(), slot.clone()));
                 slot
             }
         }
     };
+    closed.iter().for_each(|slot| slot.close());
     slot.cache
         .get_or_init(|| match PrefixTokens::for_entry(entry, budget) {
             Ok(cache) => {
@@ -697,11 +765,14 @@ pub(crate) fn cache(entry: &TokenizerEntry, budget: usize) -> Option<Arc<PrefixT
 
 /// Drop a removed tokenizer's stored prompts.
 pub(crate) fn release(tokenizer_id: &str) {
-    CACHES.lock().remove(tokenizer_id);
+    let slot = CACHES.lock().remove(tokenizer_id);
+    if let Some(slot) = slot {
+        slot.close();
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
@@ -720,7 +791,7 @@ mod tests {
     ];
 
     /// A word-level tokenizer with chat tokens, which wraps prompts in `<s>`.
-    fn description() -> Value {
+    pub(crate) fn description() -> Value {
         let added: Vec<&str> = ADDED.into_iter().chain(["</think>"]).collect();
         let vocab: serde_json::Map<String, Value> = added
             .iter()
@@ -742,7 +813,7 @@ mod tests {
             "model": {"type": "WordLevel", "unk_token": "<unk>", "vocab": vocab}})
     }
 
-    fn entry(description: &Value) -> (TempDir, TokenizerEntry) {
+    pub(crate) fn entry(description: &Value) -> (TempDir, TokenizerEntry) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, description.to_string()).unwrap();
@@ -759,7 +830,7 @@ mod tests {
     }
 
     /// A system prompt longer than the bucket key.
-    fn system() -> String {
+    pub(crate) fn system() -> String {
         let words: Vec<&str> = (0..4000).map(|i| WORDS[i % WORDS.len()]).collect();
         format!("<|system|>{}", words.join(" "))
     }
@@ -860,6 +931,8 @@ mod tests {
             encode(&cache, &entry, &turn2, limit).unwrap(),
             plain(&entry, &turn2, true)
         );
+        // Turn 2 is over the limit, so its reuse was not compared with a plain encode.
+        assert_eq!(cache.index.lock().verified, 0);
         // A turn that appends more than the limit is not encoded on the request path.
         let long = format!("{turn2}</think> {}", "gamma ".repeat(1000));
         assert!(matches!(
@@ -894,6 +967,71 @@ mod tests {
         );
         assert!(!cache.on.load(Ordering::Relaxed));
         assert!(cache.index.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn a_reuse_is_compared_with_the_special_tokens_it_is_wrapped_in() {
+        let (_dir, entry) = entry(&description());
+        let mut cache = PrefixTokens::for_entry(&entry, 1 << 30).unwrap();
+        // As if `encode` wrapped this prompt otherwise than the probed one.
+        cache.head.clear();
+        let cache = Arc::new(cache);
+        let system = system();
+        let turn1 = format!("{system}<|user|> alpha<|assistant|><think>");
+        encode(&cache, &entry, &turn1, usize::MAX).unwrap();
+        let turn2 =
+            format!("{system}<|user|> alpha<|assistant|></think> beta<|user|> x<|assistant|>");
+        assert_eq!(
+            encode(&cache, &entry, &turn2, usize::MAX).unwrap(),
+            plain(&entry, &turn2, true)
+        );
+        assert!(!cache.on.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_tokenizer_keeps_its_cache_until_registered_again_or_released() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let named = |(dir, mut entry): (TempDir, TokenizerEntry)| {
+            entry.id = "registered-twice".into();
+            entry.name = "registered-twice".into();
+            (dir, entry)
+        };
+        let reports = |bytes: usize| {
+            let line = format!(
+                r#"mesh_prepare_prefix_cache_bytes{{tokenizer="registered-twice"}} {bytes}"#
+            );
+            let rendered = handle.render();
+            assert!(rendered.contains(&line), "missing {line} in\n{rendered}");
+        };
+        let turn = format!("{}<|user|> alpha<|assistant|><think>", system());
+
+        let (_dir, first) = named(entry(&description()));
+        let cache1 = cache(&first, 1 << 30).unwrap();
+        assert!(Arc::ptr_eq(&cache1, &cache(&first, 1 << 30).unwrap()));
+        encode(&cache1, &first, &turn, usize::MAX).unwrap();
+        let held = cache1.index.lock().held;
+        assert!(held > 0);
+        reports(held);
+
+        // Registered again under its id, the tokenizer has a new cache, and the old one
+        // stops storing.
+        let (_dir, second) = named(entry(&description()));
+        let cache2 = cache(&second, 1 << 30).unwrap();
+        assert!(!Arc::ptr_eq(&cache1, &cache2));
+        assert!(!cache1.on.load(Ordering::Relaxed));
+        assert!(cache1.index.lock().entries.is_empty());
+        reports(0);
+        encode(&cache2, &second, &turn, usize::MAX).unwrap();
+        reports(held);
+
+        // Released, it holds nothing, and its next use starts a cache of its own.
+        release(&second.id);
+        assert!(!cache2.on.load(Ordering::Relaxed));
+        reports(0);
+        assert!(!Arc::ptr_eq(&cache2, &cache(&second, 1 << 30).unwrap()));
+        release(&second.id);
     }
 
     #[test]
