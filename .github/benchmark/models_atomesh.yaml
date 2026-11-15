@@ -17256,6 +17256,20 @@ models:
               <<: *m31_ax5035_mc_env
               ATOMESH_M31_D_MAX_SEQS: "5"
         - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c24-dcap3
+          concurrency: [24]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "3"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c32-dcap4
+          concurrency: [32]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "4"
+        - <<: *m31_mc_1p2d_ax5035_case
           name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c56-dcap7
           concurrency: [56]
           env:
