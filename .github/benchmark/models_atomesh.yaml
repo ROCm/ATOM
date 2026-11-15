@@ -17186,6 +17186,16 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "12"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_DBO: "0"
+        # Both nodbo 1P3D runs then hit P device OOM (free 0) a few minutes in, so P keeps more VRAM free.
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c72-dcap12-cpu15-nodbo-pmem75
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_DBO: "0"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --gpu-memory-utilization 0.75'
         - <<: *m31_mc_1p3d_ax5035_case
           name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c96-dcap16-cpu15-nodbo
           concurrency: [96]
