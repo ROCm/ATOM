@@ -1,21 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""DeepSeek-V4.1's LMCache MP scheduler: every transfer carries its checkpoint.
+"""The plugin's LMCache MP scheduler for a model whose state rides the PAGE object.
 
-V4.1's state checkpoints are ``k`` single-layer vLLM KV cache groups (the
-checkpoint groups) that overlay the proxy pool from byte 0 at the same block
-stride, so the block a checkpoint group holds at a boundary *is* one PAGE unit
-of a native `StateCopies` image, and ascending group id is image unit order. A
-transfer therefore names its checkpoint the way ATOM's native-state transport
-does (`NativeStateTransfer.unit_ids`), and the worker registers and moves it
-through `native_state_layout` -- one mechanism for both engines.
+A hybrid model's prefix is restorable only with the recurrent state at the same
+token boundary. On the plugin that state sits in vLLM KV cache groups whose
+blocks alias the PAGE pool, so the block a state group holds at a boundary *is*
+one PAGE unit, and the state at a boundary is an image of one unit per group.
+A transfer therefore names it the way ATOM's native-state transport does
+(`NativeStateTransfer.unit_ids`), the worker registers and moves it through
+`native_state_layout`, and the state commits and restores as part of the PAGE
+object it continues -- one mechanism for both engines. Two models get here:
+
+- DeepSeek-V4.1's state checkpoints, ``k`` single-layer groups that overlay the
+  proxy pool from byte 0 at the same block stride (`v41_state`);
+- Kimi-K3's KDA state, vLLM's own mamba groups in ``--mamba-cache-mode align``,
+  whose layers alias the leading MLA planes (`kda_ride`).
 
 What differs from native is who owns the units. vLLM does: a save's source is
-the checkpoint vLLM has committed under the boundary's hash, pinned in its pool
+the state vLLM has committed under the boundary's hash, pinned in its pool
 while the save may read it (`PageRideMixin`); a load's destination is what vLLM
-allocated for the external hit, and the plugin restores the state from those
-units itself (`_v41_checkpoint_restore`). So no transfer names an Active SLOT.
+allocated for the external hit. So no transfer names an Active SLOT. Which
+boundary a transfer may carry, and where a hit is capped, is the planner's
+(`bind_planner`).
 """
 
 from __future__ import annotations
@@ -30,8 +37,8 @@ from atom.plugin.vllm.kv_transfer.plugin_schedulers import PluginMPScheduler
 logger = logging.getLogger("atom")
 
 
-class V41StateMPScheduler(PluginMPScheduler):
-    """LMCache MP scheduler whose transfers each carry a V4.1 checkpoint image."""
+class StateRideMPScheduler(PluginMPScheduler):
+    """LMCache MP scheduler whose transfers each carry a state checkpoint image."""
 
     def __init__(self, config: Any, *, checkpoint_spec: Any) -> None:
         # Images on: the namespace names the answer, the workers reach the same
@@ -46,8 +53,9 @@ class V41StateMPScheduler(PluginMPScheduler):
         self._finished_frontiers: dict[str, tuple[Any, int]] = {}
 
     def bind_planner(self, planner: Any, request_of: Any) -> None:
-        """Take the planner that resolves checkpoint units (`V41BoundaryPlanner`)
-        and `request_of(seq)`, the vLLM request a SeqView stands for or None.
+        """Take the planner that resolves checkpoint units (a `BoundaryPlanner`
+        with `PageRideMixin`: `V41BoundaryPlanner`, `KdaRidePlanner`) and
+        `request_of(seq)`, the vLLM request a SeqView stands for or None.
         Bound before any request is scheduled."""
         self._planner = planner
         self._request_of = request_of
@@ -110,7 +118,7 @@ class V41StateMPScheduler(PluginMPScheduler):
         units = self._load_units(seq, transfer_end)
         if units is None:
             raise RuntimeError(
-                f"V4.1 offload load for {seq.id} lost its checkpoint destination "
+                f"Offload load for {seq.id} lost its state checkpoint destination "
                 "between its admission check and its dispatch"
             )
         request.native_state = NativeStateTransfer(
@@ -213,4 +221,4 @@ class V41StateMPScheduler(PluginMPScheduler):
         return metadata
 
 
-__all__ = ["V41StateMPScheduler"]
+__all__ = ["StateRideMPScheduler"]

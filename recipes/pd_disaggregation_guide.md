@@ -21,6 +21,31 @@ publishes its own completed KV; Decode waits for every stage, and source blocks
 remain pinned until all TP/PP readers finish. Existing topology/layout limits
 still apply. See [the implementation and CPU verification notes](../docs/pd_chunked_kv_transfer_zh.md).
 
+## Decode admission
+
+Mooncake reserves D's destination KV blocks before P writes them, so a backlog
+of pending receives can hold most of D's KV pool while few requests decode.
+The opt-in `pd_admission` policy defers a new receive while the receive targets
+already pending would exceed a per-rank byte budget. Set it in the consumer's
+top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
+list the Mooncake consumer first:
+
+```json
+"pd_admission": {"enabled": true, "max_pending_kv_fraction": 0.15}
+```
+
+| Option | Default when enabled | Meaning |
+| --- | --- | --- |
+| `max_pending_kv_fraction` | `0.15` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
+| `max_pending_kv_bytes` | unset | Bytes per D rank, instead of a fraction. |
+
+Only blocks Mooncake transfers are charged; local prefix hits are not.
+Whole-prompt and chunked receives share the budget. A request holds its credit
+until its first local forward; preemption, a failed receive and a cancelled one
+(once its writes drain) return it. With nothing pending, one request may exceed
+the budget, so long prompts are not starved. D must have PP=1, DCP=1, PCP=1,
+SP=1 and a single paged KV pool.
+
 ## Prerequisites
 
 - Two nodes with AMD MI300X GPUs (8 GPUs each for TP=8)

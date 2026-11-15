@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use super::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 use crate::{core::Worker, observability::metrics::MeshMetrics};
 
 /// Configuration for the PrefixHash load balancing policy
@@ -226,14 +226,16 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
     fn needs_tokens(&self) -> bool {
         true
     }
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let (result, branch) = self.select_worker_impl(workers, info);
+        // Kept for existing scrapers until they move to mesh_route_branch_total.
+        #[allow(deprecated)]
         MeshMetrics::record_worker_prefix_hash_policy_branch(branch.as_str());
-        result
+        (result, RouteDecision::branch(branch.as_str()))
     }
 
     fn name(&self) -> &'static str {

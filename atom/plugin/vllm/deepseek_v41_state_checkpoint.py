@@ -222,7 +222,7 @@ class _PluginV41StateCopier:
         self._copies.staging.reserve(descriptor_slots)
 
     def state_entry_views(self, slot):
-        return [self._copies.entry(slot)]
+        return self._copies.entries(slot)
 
 
 def build_v41_state_checkpoint_copier(vllm_config, max_batch: int = 64):

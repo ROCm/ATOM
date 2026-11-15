@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -63,12 +63,6 @@ PAD_SLOT_ID = -1
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    #: Whether a *draft* of this flavor caches into a pool of its own. False
-    #: means its rows are the target's -- an MLA draft's latent is the target's
-    #: latent -- and `make_kv_pool` below is never asked. A property of the
-    #: flavor, so a class answer and not a call.
-    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
-
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -91,14 +85,22 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        blocks_per_entry: int = 1,
+        flash_layout: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
-        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
-        — the target's layers are its builder's own business. Both counts are
-        told rather than read: `layers` only the walk knows, and the block only
-        the target builder, whose it is and not this backend's for the reason
-        in `DraftKvBuilder.kv_pool`.
+        Asked of a *draft* model's backend, and only for a family in
+        `selector.DRAFT_POOL_FAMILIES` — the target's layers are its builder's
+        own business. Both counts are told rather than read: `layers` only the
+        walk knows, and the block only the target builder, whose it is and not
+        this backend's for the reason in `DraftKvBuilder.kv_pool`.
+
+        `blocks_per_entry` and `flash_layout` are what a draft's
+        `DraftKvPoolSpec.pool_kwargs` adds: an entry spanning that many
+        `target_block_size` blocks, stored in the FLASH order. The defaults are
+        the generic pool, one block per entry in the SHUFFLE order, which is
+        all a draft without a `kv_pool_spec` is built with.
         """
         raise NotImplementedError
 
@@ -183,6 +185,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         rank answers alike, and `ForwardMode.decide` agrees it across DP."""
         return False
 
+    def consumes_device_verdict(self, batch: ScheduledBatch, max_seqlen_q: int) -> bool:
+        """True when this step's metadata advances from the previous verify's
+        verdict on the device, not from its host-side status (the rejected /
+        bonus counts): the runner then builds the step as if no draft had been
+        rejected and waits for that status only after the target's launch
+        (`tokenIDProcessor.prepare_input_ids`' `defer_spec_status`). Asked
+        once a step, before its input ids, from the batch and the forwards
+        before it, alike on every TP rank."""
+        return False
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()
@@ -254,6 +266,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         for buf in targets:
             buf.np[:] = PAD_SLOT_ID
             buf.copy_to_gpu()
+
+    def reset_cache_after_capture(self) -> None:
+        """Undo what the capture wrote into the cache, before any request runs.
+
+        `blank_cache_write_targets` keeps writes made through the slot mapping
+        off the cache. A backend whose capture writes through real slots or a
+        placeholder block (there is no null slot or block to point it at)
+        leaves that behind, and the next request given the slot or block
+        inherits it. Such a backend overrides this; the default has nothing to
+        undo.
+        """
 
     # ------------------------------------------------------------------ #
     # Cache sizing — one byte currency for every cache class.             #
@@ -568,7 +591,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         ) // self.block_size
         # Width of every `block_tables` buffer, and of anything gathered from one.
         self.block_table_cols = self.max_num_blocks_per_seq // self.block_ratio
-        # Per-rank attention head count. eagle.propose's mid-step path reads
+        # Per-rank attention head count. EagleProposer._propose's mid-step path reads
         # this to gate the `do_attn_metadata_update` branch. Subclasses that
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
         # separately (it does NOT replace this attribute).

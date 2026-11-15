@@ -504,14 +504,14 @@ def _transfer_stack(num_layers):
     return [torch.zeros(8, dtype=torch.uint8) for _ in range(num_layers)]
 
 
-def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
+def _bind_builder(module, index_cache_layer_map, *, rows_before: int, cls=None):
     """A builder whose walk reaches `module` after `rows_before` MLA layers.
 
     The row is that position, deliberately not the module's `layer_num` -- the
     two agree only while every layer of the model is MLA, which is what the map
     exists to stop being assumed.
     """
-    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder = object.__new__(cls or AiterMLAMetadataBuilder)
     layers = [_MlaLayer() for _ in range(rows_before)] + [module]
     runner = SimpleNamespace(
         index_cache_layer_map=index_cache_layer_map,
@@ -589,6 +589,53 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
 
     assert module.kv_cache == (("kv", 1), (-1, 1, 576))
     assert cache_tensor.index_cache is None
+
+
+@pytest.mark.parametrize(
+    "builder_cls_name",
+    ("KimiAiterMLAGDNMetadataBuilder", "KimiTritonMLAGDNMetadataBuilder"),
+)
+@pytest.mark.parametrize("has_indexer", (False, True))
+def test_kimi_offload_includes_index_bytes(builder_cls_name, has_indexer):
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+    from atom.model_ops.attentions import kimi_mla_gdn_attn
+
+    module = _MlaLayer(
+        layer_num=5,
+        indexer=(
+            SimpleNamespace(k_cache=SimpleNamespace(kv_cache=[None]))
+            if has_indexer
+            else None
+        ),
+    )
+    builder = _bind_builder(
+        module,
+        {3: 0, 5: 1},
+        rows_before=2,
+        cls=getattr(kimi_mla_gdn_attn, builder_cls_name),
+    )
+    builder.model_runner.has_mla_indexer = has_indexer
+    tensors = {
+        "kv": torch.zeros(3, 4, 16, 576, dtype=torch.uint8),
+        "index": torch.zeros(2, 4, 16, 144, dtype=torch.uint8),
+    }
+    builder.kv_pool = SimpleNamespace(
+        entry_dim=576, layer=lambda name, row: tensors[name][row]
+    )
+
+    cache = builder.build_kv_cache_tensor(module)
+    codec = DenseKVByteCodec({"layer5": cache}, num_blocks=4)
+
+    assert cache.k_cache.data_ptr() == tensors["kv"][2].data_ptr()
+    assert codec.bytes_per_block == 16 * (576 + (144 if has_indexer else 0))
+    if has_indexer:
+        assert cache.index_cache.data_ptr() == tensors["index"][1].data_ptr()
+        assert (
+            module.indexer.k_cache.kv_cache[0].data_ptr()
+            == cache.index_cache.data_ptr()
+        )
+    else:
+        assert cache.index_cache is None
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):

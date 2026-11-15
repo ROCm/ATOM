@@ -80,6 +80,23 @@ class Sampler(nn.Module):
         super().__init__()
         self.eps = SAMPLER_EPS
         self.always_independent_noise = always_independent_noise
+        # Keep a tie group at the top-k cut whole (`keep_ties`); off unless
+        # lossless sampling arms.
+        self.keep_top_k_ties = False
+        self._tie_k = None
+
+    def keep_ties(self, per_row_k: torch.Tensor) -> None:
+        """Keep a tie group at the top-k cut whole, as every aiter path but
+        one does: for a scalar top-k (small k, large vocab) with a top-p,
+        aiter's joint op selects exactly k ids first, splitting such a group,
+        while the ratio verify's p_f keeps it whole. Called once lossless
+        sampling arms (aiter's ops only: it does not arm on the native
+        fallback, which keeps exactly k). ``per_row_k`` is the runner's
+        published per-row top-k (`ModelRunner.prepare_sample` writes every
+        row of it while armed): a uniform k's scalar is read from it, so no
+        draw allocates."""
+        self.keep_top_k_ties = True
+        self._tie_k = per_row_k
 
     def sample_verification_tokens(
         self,
@@ -285,6 +302,20 @@ class Sampler(nn.Module):
             return (None, x.item())
         return (x, 0)
 
+    def _per_row_k(
+        self, top_ks: int | torch.Tensor, rows: int, device: torch.device
+    ) -> torch.Tensor:
+        """``top_ks`` as one int32 k per row, without a readback: a per-row k
+        as is; a uniform one (a scalar, or one value) from the runner's
+        published rows (`keep_ties`), which hold that same k."""
+        if (
+            isinstance(top_ks, torch.Tensor)
+            and top_ks.shape == (rows,)
+            and top_ks.dtype == torch.int32
+        ):
+            return top_ks
+        return self._tie_k[:rows]
+
     def _aiter_sample(
         self,
         probs: torch.Tensor,
@@ -296,7 +327,15 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Use aiter optimized ops for top-k/top-p sampling."""
         # Convert to tensor/scalar format for aiter
-        k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
+        keep_ties = self.keep_top_k_ties and has_topk and has_topp
+        if keep_ties:
+            # A per-row k never takes the joint op's top-k-first path, which
+            # keeps exactly k ids; the fused kernel keeps whole tie groups
+            # (see `__init__`).
+            k_tensor = self._per_row_k(top_ks, probs.shape[0], probs.device)
+            k_scalar = 0
+        else:
+            k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
         p_tensor, p_scalar = self._to_tensor_scalar(top_ps)
 
         if has_topk and has_topp:

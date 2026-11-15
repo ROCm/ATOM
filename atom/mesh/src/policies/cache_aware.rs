@@ -69,7 +69,7 @@ use tracing::debug;
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
-    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    CacheAwareConfig, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo, NO_HEALTHY_WORKERS,
 };
 use crate::core::{Worker, WorkerType};
 
@@ -302,16 +302,16 @@ impl CacheAwarePolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for CacheAwarePolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         // The router pre-filters candidates by model and, in PD mode, by role,
@@ -332,7 +332,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            return self.select_worker_min_load(
+            let selected = self.select_worker_min_load(
                 workers,
                 &request_text,
                 &healthy_indices,
@@ -340,6 +340,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 max_load,
                 min_load,
             );
+            return (selected, RouteDecision::branch("imbalanced"));
         }
 
         // Use cache-aware routing when balanced
@@ -358,24 +359,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             } else {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
+            let affinity = match_rate > self.config.cache_threshold;
+            let tenant_url: &str = &result.tenant;
+            let decision = RouteDecision {
+                branch: if affinity { "affinity" } else { "relocate" },
+                match_ratio: Some(match_rate as f64),
+            };
 
-            // The low-match branch places by load instead of affinity, so the
-            // match-rate distribution is what tells you whether cache_threshold
-            // suits the traffic. Kept at debug: this is one line per request.
-            debug!(
-                "cache_aware route: match_rate={:.3} threshold={:.3} path={}",
-                match_rate,
-                self.config.cache_threshold,
-                if match_rate > self.config.cache_threshold {
-                    "affinity"
-                } else {
-                    "relocate"
-                }
-            );
             // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let selected_idx = if affinity {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
-                let tenant_url: &str = &result.tenant;
                 workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
@@ -390,11 +383,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .iter()
                     .map(|&idx| (idx, workers[idx].load()))
                     .collect();
-                let min_load = loads.iter().map(|&(_, load)| load).min()?;
+                let min_load = loads.iter().map(|&(_, load)| load).min();
                 loads
                     .iter()
                     .copied()
-                    .filter(|&(_, load)| load == min_load)
+                    .filter(|&(_, load)| Some(load) == min_load)
                     .map(|(idx, _)| idx)
                     .choose(&mut rand::rng())
             };
@@ -406,18 +399,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
-                return Some(idx);
+                return (Some(idx), decision);
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
-            if match_rate > self.config.cache_threshold {
-                let tenant_url: &str = &result.tenant;
+            if affinity {
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
             }
 
             // Fallback to first healthy worker
-            healthy_indices.first().copied()
+            (
+                healthy_indices.first().copied(),
+                RouteDecision::branch("stale_tenant"),
+            )
         } else {
             // No tree for this key: cache affinity is dead and every request is
             // placed at random, which is indistinguishable from "cache_aware is
@@ -438,7 +433,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             // Return a random healthy worker
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            (
+                Some(healthy_indices[random_idx]),
+                RouteDecision::branch("no_tree"),
+            )
         }
     }
 
@@ -638,6 +636,48 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[tokio::test]
+    async fn each_exit_reports_its_branch_and_match_ratio() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let info = SelectWorkerInfo {
+            request_text: Some("hello world"),
+            ..Default::default()
+        };
+
+        let select = || async {
+            let (selected, decision) = policy.select_with_decision(&workers, &info).await;
+            (selected.unwrap(), decision.branch, decision.match_ratio)
+        };
+
+        let (first, branch, ratio) = select().await;
+        assert_eq!((branch, ratio), ("relocate", Some(0.0)));
+        assert_eq!(select().await, (first, "affinity", Some(1.0)));
+        workers[first].set_healthy(false);
+        assert_eq!(select().await, (1 - first, "stale_tenant", None));
+        workers[first].set_healthy(true);
+        for _ in 0..20 {
+            workers[first].increment_load();
+        }
+        assert_eq!(select().await, (1 - first, "imbalanced", None));
     }
 
     #[tokio::test]

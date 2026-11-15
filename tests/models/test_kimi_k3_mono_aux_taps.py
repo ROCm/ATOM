@@ -23,6 +23,7 @@ pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL"
 pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
 
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+from atom.spec_decode.dspark_proposer import DSparkProposer
 
 HIDDEN, ROWS = 8, 4
 
@@ -43,10 +44,13 @@ class _Layer:
 
 
 def _runner(tapped, *, mono):
-    """A runner stubbed down to `_layer` and the tap it owes."""
+    """A runner stubbed down to `_layer` and the tap it owes, bound with the
+    K3 drafter's extract."""
     runner = object.__new__(K3MonoDecodeRunner)
     runner.aux = AuxTaps(
-        tuple(tapped), tuple(torch.zeros(ROWS, HIDDEN) for _ in tapped)
+        tuple(tapped),
+        tuple(torch.zeros(ROWS, HIDDEN) for _ in tapped),
+        DSparkProposer._extract_layer_hidden,
     )
     runner.inner = SimpleNamespace(layers={i: _Layer() for i in range(4)})
     out = (torch.full((ROWS, HIDDEN), 2.0), torch.full((ROWS, HIDDEN), 3.0), None)
@@ -95,3 +99,35 @@ def test_a_block_write_layer_records_nothing():
     runner._fallback = lambda *a, **k: (None, torch.ones(ROWS, HIDDEN), None)
     _drive(runner, layer_id=1, mono=False, prefix=torch.zeros(ROWS, HIDDEN))
     assert torch.equal(runner.aux.buffers[0], torch.full((ROWS, HIDDEN), 7.0))
+
+
+@pytest.mark.parametrize("mono", [True, False])
+def test_the_drafters_extract_gets_the_layer_return_and_the_block_bank(mono):
+    """The tap is the drafter's own extract, the function its hook runs, on
+    ``(prefix, add, add2, blocks)`` -- the layer's return layout, with mono's
+    slot stack as the bank."""
+    runner, out = _runner([1], mono=mono)
+    blocks = torch.full((ROWS, 3, HIDDEN), 4.0)
+    seen = []
+
+    def extract(output, layer):
+        seen.append((output, layer))
+        return output[0] + output[-1][:, 0]
+
+    runner.aux = AuxTaps(runner.aux.layer_ids, runner.aux.buffers, extract)
+    plan = SimpleNamespace(mono=mono, ffn_only=False, layer_id=1)
+    runner._layer(None, plan, None, out[0], blocks, None, None, None)
+    ((output, layer),) = seen
+    assert len(output) == 4 and output[1] is out[1] and output[3] is blocks
+    assert layer is runner.inner.layers[1]
+    assert torch.equal(runner.aux.buffers[0], torch.full((ROWS, HIDDEN), 6.0))
+
+
+def test_the_drafters_extract_is_not_called_for_an_untapped_layer():
+    runner, out = _runner([1], mono=True)
+    called = []
+    runner.aux = AuxTaps(
+        runner.aux.layer_ids, runner.aux.buffers, lambda o, l: called.append(o)
+    )
+    _drive(runner, layer_id=2, mono=True, prefix=out[0])
+    assert not called

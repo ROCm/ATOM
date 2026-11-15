@@ -245,6 +245,10 @@ class EagleProposer(Drafter):
                 self.config.compilation_config
             )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # The draft's attention reads its cache dtype from this config, and
+            # its pool is built at `speculative_config.draft_kv_dtype`: they
+            # must be the one value (DSpark does the same).
+            draft_atom_config.kv_cache_dtype = self.speculative_config.draft_kv_dtype
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(
@@ -256,7 +260,7 @@ class EagleProposer(Drafter):
             # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
             # binds into the target's pool and gets None here; model_runner
             # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
+            builder = draft_kv_builder(self.runner, draft_model_hf_config, model)
             if builder is not None:
                 self.runner.draft_kv_builder = builder
             return model
@@ -415,7 +419,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -442,7 +446,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, end_trace)
+            super()._warmup_draft_graphs(build_pristine_context, end_trace)
         finally:
             restore()
 
@@ -635,7 +639,7 @@ class EagleProposer(Drafter):
             attn_metadata.__dict__[k] = v
         return workinfos
 
-    def propose(
+    def _propose(
         self,
         # [num_tokens]
         target_token_ids: torch.Tensor,

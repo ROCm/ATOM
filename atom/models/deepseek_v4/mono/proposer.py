@@ -29,7 +29,7 @@ class MonoDSparkProposer(DSparkProposer):
         self.block.warmup_inputs = self._block_warmup_inputs
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         mono = self._mono_session
         capture = self.block.will_capture
         mono.retire_draft_captures_for_startup()
@@ -49,7 +49,7 @@ class MonoDSparkProposer(DSparkProposer):
             context.scheduled_tokens = context.running_tokens = (
                 bs * self.draft_tokens_per_seq
             )
-            # The draft pass's count, as `Drafter.warmup_draft_graphs` points
+            # The draft pass's count, as `Drafter._warmup_draft_graphs` points
             # it: not the target's, which would run past these rows.
             context.scheduled_tokens_gpu = self.runner.forward_vars["batch_info"].gpu[
                 2:3
@@ -141,7 +141,7 @@ class MonoDSparkProposer(DSparkProposer):
             ),
         )
 
-    def propose(
+    def _propose(
         self,
         target_token_ids,
         target_positions,
@@ -188,7 +188,11 @@ class MonoDSparkProposer(DSparkProposer):
                 target_positions=target_positions,
             )
         staged = self._stage_anchors(
-            running_bs, next_token_ids, target_positions, last_token_indices
+            self.block,
+            running_bs,
+            next_token_ids,
+            target_positions,
+            last_token_indices,
         )
         width = self.draft_tokens_per_seq
         self.model.prepare_block(

@@ -32,7 +32,7 @@ logger = logging.getLogger("atom")
 def forward(model, runner, experts, positions, hidden, selected_rows):
     """(state, head input) of predictor ``model``'s draft step: ``runner``'s program (``DraftRunner.serve``) when it
     serves the step, else ``native`` (``experts``: ``prepare_experts``'s)."""
-    got = runner.serve(model, hidden, selected_rows)
+    got = runner.serve(model, positions, hidden, selected_rows)
     if got is not None:
         return got
     return native(model, experts, positions, hidden, selected_rows)
