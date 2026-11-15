@@ -159,8 +159,11 @@ def test_fp8_source_lists_match_host_enumeration(monkeypatch, batch, width, wind
     assert_csr_equal(src, expected)
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
-@pytest.mark.parametrize("supplied_step", [False, True])
+# An FP8 draft always comes with a step: `block_backbone` builds its lists,
+# and `draft_attention_fp8` asserts on a step without them.
+@pytest.mark.parametrize(
+    "dtype, supplied_step", [("bf16", False), ("bf16", True), ("fp8", True)]
+)
 def test_stages_share_one_source_build_per_draft_round(
     monkeypatch, dtype, supplied_step
 ):
@@ -222,9 +225,8 @@ def test_stages_share_one_source_build_per_draft_round(
         )
         assert len(seen) == 3 and all(step is seen[0] for step in seen)
         assert seen[0].decode == supplied_step
-        # A handed-over step is not rebuilt; without one, only FP8 builds.
-        built = int(dtype == "fp8" and not supplied_step)
-        assert len(builds) == before + built
+        # `draft_hidden` builds no source lists; a handed-over step is used as is.
+        assert len(builds) == before
         if dtype == "fp8":
             src = seen[0].src_indices
             assert all(step.src_indices is src for step in seen)

@@ -3,7 +3,6 @@
 
 import logging
 from copy import copy
-from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
@@ -662,7 +661,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         """Pure block math; the caller supplies a committed per-request window.
 
         `step` lets a caller that already built the block's positions and
-        indices hand them over -- `block_backbone` does, from one kernel.
+        indices hand them over -- `block_backbone` does, from one kernel. An
+        FP8 draft reads only the step's two source lists, so it needs a step
+        that carries them; `block_backbone` builds them once a round.
         """
         if self.embed is None or self.head is None:
             raise RuntimeError("DSpark must share the loaded target embedding and head")
@@ -684,22 +685,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
         )
         if step is None:
             step = draft_step(context_positions, anchors, width, self.window_size)
-        context = context_kv[self.mtp[0].attn.spec.layer_id]
-        if isinstance(context, tuple) and step.src_indices is None:
-            # The FP8 draft reads only the two source lists, and every stage
-            # shares them. `block_backbone` hands them over; a caller without
-            # a step gets them from the anchors, whose ring the window is.
-            step = replace(
-                step,
-                src_indices=draft_src_indices(
-                    anchors,
-                    context[0].shape[-2],
-                    self.window_size,
-                    width,
-                    self.draft_src_buffers,
-                    fp8=True,
-                ),
-            )
         for layer in self.mtp:
             state = layer(state, context_kv, step, self.rope)
         hidden = state.collapse()
