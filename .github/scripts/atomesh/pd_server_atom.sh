@@ -1065,6 +1065,10 @@ purge_lmcache_disk() {
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
 #    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_PAGE_CACHE_DROP_FOR (default 1800 s, 0 for none): how long
+#    the model's page cache keeps being dropped while the workers load. A node
+#    whose owners all pin before the workers start needs none, and the drops
+#    leave a TP decode to fault the checkpoint back from NFS.
 #  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
 #    compaction; a node that does not compact in time can leave an owner 4 KiB
 #    pages its NICs refuse to register.
@@ -1437,6 +1441,7 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROP_FOR 1800 integer
   plan_mooncake_store_owners
   plan_mooncake_store_pools
   check_mooncake_store_ports
@@ -1757,12 +1762,15 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s for 30 min while the workers load
-# weights, which would refill it; page cache is per file, so this serves every
-# node.
+# Drops the model's page cache every 45 s for MOONCAKE_STORE_PAGE_CACHE_DROP_FOR
+# while the workers load weights, which would refill it; page cache is per file,
+# so this serves every node.
 start_mooncake_page_cache_dropper() {
+  local drop_for
+  drop_for=$((10#$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_FOR 1800)))
+  ((drop_for > 0)) || return 0
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
-    --every 45 --for 1800 "${MODEL_PATH}" &
+    --every 45 --for "${drop_for}" "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
   # Until the child execs, its cmdline is this shell's, and a cleanup in that
   # window would take the dropper for another process and leave it running:
