@@ -159,6 +159,11 @@ class _Plan:
         1  # x's rows: groups x rows, group h's answers to rank h (``TopK(groups=)``)
     )
     wmerge: bool = False  # split: the merge as one wave's rank (``TopK(wmerge=)``)
+    xfan: int = 0  # split: the answer's puts to the ranks by ``xfan`` tasks a row (``TopK(xfan=)``); 0: the final level's
+
+    @property
+    def xlreg(self) -> str:  # (xfan) the answer's local hand-off to the fan-out tasks
+        return f"{self.name}.xl"
 
     @property
     def vrows(self) -> int:  # x's rows (each group's rows)
@@ -222,6 +227,7 @@ class TopK(Block):
         xhoist: bool = False,
         groups: int = 1,
         wmerge: bool = False,
+        xfan: int = 0,
     ):
         xfmt = Fmt.BF16 if bf16 else Fmt.F32
         if isinstance(x, Channel) and (x.fmt is not xfmt or x.width != n or x.flagged):
@@ -310,6 +316,18 @@ class TopK(Block):
                 f"TopK {name}: wmerge needs split with split x k <= 64 (split {self.split}, k {k})"
             )
         self.wmerge = bool(wmerge)
+        # ``xfan`` (split): the final level writes its answer (the same (value, global index) pairs) to a local region,
+        # and a stage of ``xfan`` tasks a row (``<name>.xf``, each k / xfan of the row's entries) puts them to every
+        # rank's slot. One CTA's peer stores run at a fraction of a link's rate (k 2048: 256 KB a row to 8 ranks, ~27
+        # µs on one CTA); split over xfan CTAs. The merge polls the same pairs: the same ids.
+        # (k / xfan entries a task: a multiple of THREADS, an entry a thread at a time, or THREADS / 2, a pair a thread)
+        if xfan and (not self.split or groups > 1 or k % xfan
+                     or ((k // xfan) % THREADS and 2 * (k // xfan) != THREADS)):
+            raise ValueError(f"TopK {name}: xfan {xfan} needs split, one group and k / xfan a multiple of {THREADS} "
+                             f"or {THREADS // 2} (k {k})")  # fmt: skip
+        self.xfan = int(xfan) if self.split else 0
+        if self.xfan:
+            self.xhoist = False  # (the final level puts nothing to the peers; the fan-out tasks address them first)
 
     def plan(self, sc: Scenario) -> _Plan:
         x_arg, out_arg = isinstance(self.x, str), isinstance(self.out, str)
@@ -318,7 +336,7 @@ class TopK(Block):
             self.x if x_arg else self.x.name, x_arg, self.out if out_arg else self.out.name, out_arg, self.bound,
             self.bf16, self.lift.name if self.lift else "", self.lift_unit,
             self.live, self.split, self.unit, self.gn, sc.spec, self.scap, self.packed, self.xhoist, self.groups,
-            self.wmerge,
+            self.wmerge, self.xfan,
         )  # fmt: skip
 
     def stages(self, sc: Scenario) -> list[Stage]:
@@ -353,8 +371,9 @@ class TopK(Block):
                 if p.live
                 else ((f"{self.name}.l0",) if short else ()) + (name,)
             )
-            if final and p.split:  # the rank's answers to every rank
-                writes += (Region(p.xreg, p.rows * p.k * 2, writers, space=Space.PEER),)
+            if final and p.split:  # the rank's answers to every rank (xfan: to the fan-out tasks)
+                writes += ((Region(p.xlreg, p.rows * p.k * 2, writers),) if p.xfan
+                           else (Region(p.xreg, p.rows * p.k * 2, writers, space=Space.PEER),))  # fmt: skip
                 if (
                     p.scap and not p.out_arg
                 ):  # (requests up to scap: the output from here, else the merge's)
@@ -391,6 +410,11 @@ class TopK(Block):
                     ),
                 )
             )
+        if p.xfan:  # the answers' puts to every rank, xfan tasks a row
+            out.append(Stage(f"{self.name}.xf", p.rows * p.xfan, partial(_xfan, p=p),
+                             writes=(Region(p.xreg, p.rows * p.k * 2, (f"{self.name}.xf",), space=Space.PEER),),
+                             args=(p.bound,) if p.scap else (), key=(p,) + ("xfan",),
+                             live_tasks=partial(_xfan_live, p=p) if p.scap else None))  # fmt: skip
         if p.split:
             mname = f"{self.name}.m"
             writes = (
@@ -678,6 +702,9 @@ def _split_put_if(k, p, row, pos, bits, gidx, direct, xdst=None):
 
 
 def _split_put(k, p, row, pos, bits, gidx, xdst):
+    if p.xfan:  # (to the fan-out tasks: ``_xfan``)
+        mb.put2(k.mb[p.xlreg], 2 * (row * p.k + pos), bits, gidx, k.tag)
+        return
     for dst in range(p.split):
         a = xdst[dst] if xdst else peer.to_rank(k, p.xreg, dst)
         mb.put2(a, 2 * (row * p.k + pos), bits, gidx, k.tag)
@@ -685,6 +712,43 @@ def _split_put(k, p, row, pos, bits, gidx, xdst):
 
 def _out_put(k, p, row, pos, gidx):
     mb.put(k.mb[p.out], row * p.k + pos, gidx, k.tag)
+
+
+def _xfan_live(k, p):
+    """The fan-out's live tasks: the merge's rows x xfan."""
+    return _merge_live(k, p) * p.xfan
+
+
+def _xfan(k, t, p):
+    """``xfan``: task t, row t / xfan's entries [c e, c e + e) (e = k / xfan, c = t % xfan) of this rank's answer, from
+    the local hand-off to every rank's slot (the final level's puts, unchanged: the same pairs at the same places)."""
+    row, c = t // p.xfan, t % p.xfan
+    if p.scap:
+        _xfan_body_if(k, p, row, c, uniform(ld_i32(k.args[p.bound], row // p.spec * p.spec + p.spec - 1)) > p.scap)
+    else:
+        _xfan_body(k, p, row, c)
+
+
+@traced
+def _xfan_body_if(k, p, row, c, live):
+    if live:
+        _xfan_body(k, p, row, c)
+
+
+def _xfan_body(k, p, row, c):
+    e = p.k // p.xfan
+    xdst = [peer.to_rank(k, p.xreg, dst) for dst in range(p.split)]  # (addressed before the poll)
+    if 2 * e == THREADS:  # a pair a thread: entry tid / 2's value (even tid) or global index (odd), each pair tagged
+        i = 2 * (row * p.k + c * e) + k.tid
+        v = mb.poll([(k.mb[p.xlreg], i, 1)], k.tag)[0][0]
+        for dst in range(p.split):
+            mb.put(xdst[dst], i, v, k.tag)
+        return
+    at = [2 * (row * p.k + c * e + k.tid + THREADS * r) for r in range(e // THREADS)]
+    got = mb.poll([(k.mb[p.xlreg], i, 2) for i in at], k.tag)
+    for i, pr in zip(at, got, strict=True):
+        for dst in range(p.split):
+            mb.put2(xdst[dst], i, pr[0], pr[1], k.tag)
 
 
 def _merge(k, t, p):

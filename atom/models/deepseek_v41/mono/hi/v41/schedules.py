@@ -118,6 +118,8 @@ DEFAULT: dict = {
     "IDX_CLIST_SPARSE": False,  # compact readers: the candidate list from the row's live words / set bits
     "IDX_CMASK_LDS": "auto",  # layer 20: the candidate bitmap's words built in LDS (an OR an entry)
     "IDX_BMAX_BF16": "auto",  # layer 20: the block maxima a BF16 channel, the candidate TopK in bf16 mode (same keys)
+    "IDX_CXFAN": 0,  # layer 20 (split): its candidate TopK's answer put to the ranks by this many tasks a row (TopK
+    #                  xfan; 0: by the final level's task, the build of before)
     "IDX_CAND_APART": "auto",  # the candidate source's attention path off the candidate chain's CTAs
     #                            (``recipe.cand_apart``): a bool, 2 (its selection's TopK too) or "auto"
     "IDX_LONG": "auto",  # index sources from this context bucket on (tokens: the Indexer's n_max x ratio): their

@@ -1092,7 +1092,7 @@ class Indexer(Block):
                  persist: int = 0, cseg: int = 0, split: int = 0, punroll: int = 1,
                  pcap: int = 0, lean_epi: bool = False, pnarrow: bool = False,
                  clist_sparse: bool = False, topk_packed: bool = False, cmask_lds: bool = False,
-                 bmax_bf16: bool = False, topk_xhoist: bool = False, scores_f32: bool = False,
+                 bmax_bf16: bool = False, topk_xhoist: bool = False, cxfan: int = 0, scores_f32: bool = False,
                  rows_long: int = 0, rcap: int = 0, items: bool = False, kmfma: bool = False):  # fmt: skip
         if ratio not in (1, 2):
             raise ValueError(f"Indexer {name}: ratio 1 or 2, got {ratio}")
@@ -1275,7 +1275,8 @@ class Indexer(Block):
                     "scap": -(-self.pcap // CBLOCK)} if self.split else {})  # fmt: skip
             self.ctopk = TopK(f"{name}.ctopk", self.bmax, nb, CTOPK, self.cand, bound=cand_bound,
                               seg=min(cseg, nb) if cseg else nb if nb <= ONE_LEVEL else SEG, live=live,
-                              bf16=bmax_bf16, xhoist=topk_xhoist, **csp)  # fmt: skip
+                              bf16=bmax_bf16, xhoist=topk_xhoist, xfan=cxfan if self.split else 0,
+                              **csp)  # fmt: skip
 
     def raw(self, sc: Scenario) -> bool:
         """No qprep stage: q's RoPE / QAT in the score tasks."""
