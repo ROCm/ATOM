@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Profile Kimi-K3.1 Pro bs=4 DSpark decode over long contexts at TP8 + DCP8.
+"""Profile Kimi-K3.1 Pro DSpark decode over long contexts at TP8 + DCP8.
 
-Prefills four random prompts unprofiled, starts the profiler once every request
-has its first token, and profiles the rest of their decode at a fixed acceptance
-length (all drafts accepted unless --spec-decode-acceptance-length says
-otherwise). Graphs are captured for batch sizes 1, 2 and 4 with --mark-trace on,
-so each rank's profiler directory also holds the capture traces
-``tools/parse_decode_trace.py`` attributes the replayed kernels through.
+Prefills --max-num-seqs (default 4) random prompts unprofiled, starts the
+profiler once every request has its first token, and profiles the rest of their
+decode at a fixed acceptance length (all drafts accepted unless
+--spec-decode-acceptance-length says otherwise). Graphs are captured for batch
+sizes 1, 2 and 4 with --mark-trace on (list a larger batch in
+--cudagraph-capture-sizes), so each rank's profiler directory also holds the
+capture traces ``tools/parse_decode_trace.py`` attributes the replayed kernels
+through.
 
 A compile cached without --mark-trace has no layer markers: clear
 ``$HOME/.cache/atom`` before the first run, and whenever --mark-trace changes.
@@ -23,10 +25,9 @@ from transformers import AutoTokenizer
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 
-NUM_PROMPTS = 4
 DECODE_ENV = DEFAULT_ENV | {"ATOM_ENABLE_DETAILED_ANNOTATION": "1"}
 DECODE_ARGS = DEFAULT_ARGS | {
-    "max_num_seqs": NUM_PROMPTS,
+    "max_num_seqs": 4,
     "cudagraph_capture_sizes": "[1, 2, 4]",
     "spec_decode_acceptance_length": None,
 }
@@ -62,7 +63,7 @@ def main():
     rng = random.Random(0)
     prompts = [
         [rng.randrange(vocab) for _ in range(args.prompt_len)]
-        for _ in range(NUM_PROMPTS)
+        for _ in range(args.max_num_seqs)
     ]
     params = SamplingParams(max_tokens=args.output_len, ignore_eos=True)
 
@@ -71,7 +72,7 @@ def main():
     def on_output(output):  # runs on the engine's output thread
         if output.output_tokens:
             decoding.add(output.request_id)
-        if len(decoding) == NUM_PROMPTS:
+        if len(decoding) == args.max_num_seqs:
             all_decoding.set()
 
     llm.add_request(prompts, params, stream_callback=on_output)

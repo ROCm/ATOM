@@ -161,6 +161,15 @@ def _mla_seg_meta_kwargs() -> dict:
     return {}
 
 
+def _sparse_kv_granularity(builder: "AiterMLAMetadataBuilder") -> int:
+    """KV granularity of ``builder``'s sparse work plans. Under DCP it exceeds
+    every row, as no row selects more than ``index_topk_out`` keys, so a plan
+    holds one whole row a work item for `patch_work_kv_ranges`."""
+    if builder.dcp_world_size > 1:
+        return triton.next_power_of_2(builder.index_topk_out)
+    return max(builder.block_size, 16)
+
+
 def mla_kv_entry_dim(hf_config) -> int:
     """Width of one MLA KV cache entry.
 
@@ -835,9 +844,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Allocate a second set of persistent work buffers for sparse MTP
             # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
             smt_max_bs = self.max_bs * max_seqlen_qo
-            # Same widening as sparse prefill: the DCP rebuild regenerates these
-            # for the gathered query width, not for a single rank's heads.
-            sparse_mtp_num_heads = (
+            # Same widening as sparse prefill: under DCP these describe the
+            # gathered query width, not a single rank's heads.
+            self.sparse_mtp_num_heads = sparse_mtp_num_heads = (
                 self.persistent_num_heads
                 if self.sparse_dcp_metadata_rebuild
                 else self.padded_num_attention_heads
@@ -1058,7 +1067,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         split_params = {
-            "kv_granularity": max(self.block_size, 16),
+            "kv_granularity": _sparse_kv_granularity(self),
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
@@ -1074,7 +1083,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var["sparse_cu_seqlens_q"].gpu[: num_tokens + 1],
             var["sparse_kv_indptr"].gpu[: num_tokens + 1],
             var["sparse_kv_last_page_lens"].gpu[:num_tokens],
-            self.padded_num_attention_heads,
+            self.sparse_mtp_num_heads,
             1,  # nhead_kv
             True,
             work_meta_data,
@@ -1096,8 +1105,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "sparse_mtp_reduce_final_map": reduce_final_map,
             "sparse_mtp_reduce_partial_map": reduce_partial_map,
             # Rows the plan addresses; every consumer's q / o must hold at
-            # least this many. MLAAttention._forward_decode asserts it without
-            # DCP, on eager steps and at capture (a host check: not on replay).
+            # least this many. MLAAttention._forward_decode asserts it on eager
+            # steps and at capture (a host check: not on replay).
             "sparse_mtp_num_tokens": num_tokens,
         }
 
@@ -1152,6 +1161,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # of the persistent sparse-index buffer once the context exceeds
         # index_topk (dense >> sparse) -> illegal KV-cache access.
         use_sparse_meta = self.is_sparse and (max_q_len == 1 or sparse_decode)
+        if use_sparse_meta:
+            split_params["kv_granularity"] = _sparse_kv_granularity(self)
         kv_indptr_for_metadata = (
             var[f"{prefix}sparse_kv_indptr"].gpu[: bs + 1]
             if use_sparse_meta
@@ -1187,7 +1198,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 reduce_final_map,
                 reduce_partial_map,
                 page_size=self.block_size,
-                kv_granularity=max(self.block_size, 16),
+                kv_granularity=split_params["kv_granularity"],
                 max_seqlen_qo=max_q_len,
                 dtype_q=self.dtype_q,
                 dtype_kv=self.dtype_kv,
@@ -2274,12 +2285,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
-            # No row selects more than index_topk_out keys.
-            kv_granularity=(
-                triton.next_power_of_2(self.index_topk_out)
-                if self.dcp_world_size > 1
-                else max(self.block_size, 16)
-            ),
+            kv_granularity=_sparse_kv_granularity(self),
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,

@@ -97,28 +97,52 @@ def test_drafter_step0_rows_below_the_padded_plan_are_refused(monkeypatch):
     assert seen == [], "the kernel must not be reached with a plan past q"
 
 
-def test_dcp_rebuild_plans_only_the_rows_q_holds(monkeypatch):
-    """Under DCP the sparse_mtp_ plan is rebuilt per layer; its inputs must be
-    cut to the drafter's unpadded rows, not the padded running_tokens."""
-    _stub_decode(monkeypatch, [])
-    layer = _layer()
+def _dcp(layer, metadata, owns_indexer=True):
     layer.dcp_world_size = 4
     layer.sparse_dcp_metadata_rebuild = True
-    layer.owns_sparse_indexer = True
+    layer.owns_sparse_indexer = owns_indexer
     layer.dcp_kernel_num_heads = HEADS
-    metadata = _metadata(40 * Q_LEN)
     metadata.dcp_sparse_kv_indptr = torch.zeros(64 * Q_LEN, dtype=torch.int32)
+    return layer, metadata
+
+
+def test_dcp_drafter_rows_below_the_padded_plan_are_refused(monkeypatch):
+    """Under DCP no layer plans its own work either, so the step's plan must
+    fit q's rows just the same."""
     seen = []
-
-    def fake_rebuild(md, q, kv, cu_seqlens_q, kv_indptr, last_page_lens, *a, **k):
-        seen.append((len(cu_seqlens_q), len(kv_indptr), len(last_page_lens)))
-        raise StopIteration
-
-    layer._rebuild_sparse_dcp_persistent_metadata = fake_rebuild
+    _stub_decode(monkeypatch, seen)
+    layer, metadata = _dcp(_layer(), _metadata(40 * Q_LEN))
     q = torch.zeros(39 * Q_LEN, HEADS, RANK + ROPE)
-    with pytest.raises(StopIteration):
+    with pytest.raises(
+        AssertionError, match="plan covers 160 query rows but q holds 156"
+    ):
         layer._forward_decode(q, torch.zeros(8, RANK + ROPE), metadata)
-    assert seen == [(39 * Q_LEN + 1, 39 * Q_LEN + 1, 39 * Q_LEN)]
+    assert seen == [], "the kernel must not be reached with a plan past q"
+
+
+@pytest.mark.parametrize("owns_indexer", [True, False])
+def test_dcp_layer_points_the_step_plan_at_its_own_keys(monkeypatch, owns_indexer):
+    """A full indexer layer patches the step's sparse_mtp_ plan with its
+    compact ranges for q's rows; a shared layer runs the plan as it finds it."""
+    seen, patched = [], []
+    _stub_decode(monkeypatch, seen)
+    monkeypatch.setattr(
+        attention_mla,
+        "patch_work_kv_ranges",
+        lambda *args: patched.append(args),
+    )
+    layer, metadata = _dcp(_layer(), _metadata(39 * Q_LEN), owns_indexer)
+    q = torch.zeros(39 * Q_LEN, HEADS, RANK + ROPE)
+    layer._forward_decode(q, torch.zeros(8, RANK + ROPE), metadata)
+    assert seen == [(39 * Q_LEN, 39 * Q_LEN)]
+    if not owns_indexer:
+        assert patched == []
+        return
+    [(info, items, kv_indptr, rows)] = patched
+    assert info is metadata.sparse_mtp_work_info_set
+    assert items is metadata.sparse_mtp_work_indptr
+    assert kv_indptr.data_ptr() == metadata.dcp_sparse_kv_indptr.data_ptr()
+    assert (len(kv_indptr), rows) == (39 * Q_LEN + 1, 39 * Q_LEN)
 
 
 @pytest.mark.parametrize("q_rows", [39 * Q_LEN, 40 * Q_LEN])

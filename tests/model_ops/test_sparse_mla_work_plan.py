@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""A DCP sparse prefill's one work plan a forward, patched per layer, against
-the per-layer rebuild it replaces, on aiter's persistent MLA kernel."""
+"""A DCP sparse MLA work plan, made once a prefill forward or decode step and
+patched per layer, against the per-layer rebuild it replaces, on aiter's
+persistent MLA kernel."""
 
 import pytest
 import torch
@@ -78,11 +79,6 @@ def test_patched_forward_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype
         "get_forward_context",
         lambda: SimpleNamespace(context=SimpleNamespace(scheduled_bs=rows)),
     )
-
-    def no_layer_plan(*args, **kwargs):
-        raise AssertionError("a prefill layer planned its own work")
-
-    monkeypatch.setattr(attention_mla, "get_mla_metadata_v1", no_layer_plan)
     attn = MLAAttention.__new__(MLAAttention)
     torch.nn.Module.__init__(attn)
     for name, value in {
@@ -231,3 +227,162 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
     planned = info[:items, 0].long()
     assert torch.equal(info[:items, 4], kvptr[planned])
     assert torch.equal(info[:items, 5], kvptr[planned + 1])
+
+
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_patched_decode_step_plan_matches_per_layer_rebuild(monkeypatch, cache_dtype):
+    """A verify step's sparse_mtp_ plan, made once by the builder and patched
+    by each owning layer's `_forward_decode`, against the plan each layer used
+    to rebuild. Rows owning no keys get an empty work item, which the DCP
+    merge drops by owned count; they must not disturb the other rows."""
+    from types import SimpleNamespace
+
+    from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
+    from aiter.mla import mla_decode_fwd
+
+    from atom.model_ops import attention_mla
+    from atom.model_ops.attention_mla import MLAAttention
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.sparse_mla_head_groups import (
+        PERSISTENT_WORK_BUFFERS,
+    )
+    from atom.utils.forward_context import AttentionMetaData
+
+    fp8 = cache_dtype == "fp8"
+    dtype = dtypes.fp8 if fp8 else torch.bfloat16
+    # Kimi-K3.1 at DCP8: 16 requests verifying 8 tokens, 96 gathered heads.
+    rows, heads, topk, slots, scale = 128, 96, 2048, 1 << 17, 576**-0.5
+    gen = torch.Generator(device="cuda").manual_seed(518)
+    q = (torch.randn(rows, heads, 576, generator=gen, device="cuda") / 2).to(dtype)
+    kv = (torch.randn(slots, 1, 576, generator=gen, device="cuda") / 2).to(dtype)
+    qptr = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    last = torch.ones(rows, dtype=torch.int32, device="cuda")
+    unit = torch.ones(1, dtype=torch.float32, device="cuda")
+    sizes = get_mla_metadata_info_v1(
+        rows, 1, heads, dtype, dtype, is_sparse=True, fast_mode=True
+    )
+
+    def work_buffers(prefix=""):
+        return {
+            prefix + name: torch.empty(shape, dtype=dt, device="cuda")
+            for name, (shape, dt) in zip(PERSISTENT_WORK_BUFFERS, sizes)
+        }
+
+    def indptr(counts):
+        return torch.cat([counts.new_zeros(1), counts.cumsum(0)]).int()
+
+    # Past index_topk tokens of context every query selects topk keys.
+    selected = indptr(torch.full((rows,), topk, dtype=torch.int32, device="cuda"))
+    builder = SimpleNamespace(
+        dcp_world_size=8,
+        block_size=1,
+        index_topk_out=topk,
+        sparse_mtp_num_heads=heads,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+        model_runner=SimpleNamespace(
+            forward_vars=work_buffers("sparse_mtp_")
+            | {
+                "sparse_cu_seqlens_q": SimpleNamespace(gpu=qptr),
+                "sparse_kv_indptr": SimpleNamespace(gpu=selected),
+                "sparse_kv_last_page_lens": SimpleNamespace(gpu=last),
+            }
+        ),
+    )
+    meta = AttentionMetaData(max_seqlen_q=8)
+    for (
+        name,
+        value,
+    ) in AiterMLAMetadataBuilder._set_mla_persistent_worker_buffers_sparse_mtp(
+        builder, rows
+    ).items():
+        setattr(meta, name, value)
+    assert int(meta.sparse_mtp_work_indptr[-1]) == rows, "not one work item a row"
+    meta.sparse_cu_seqlens_q = qptr
+    meta.sparse_kv_indptr = selected
+    meta.sparse_kv_last_page_lens = last
+
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    monkeypatch.setattr(
+        attention_mla, "get_dp_group", lambda: SimpleNamespace(world_size=1)
+    )
+    attn = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(attn)
+    for name, value in {
+        "is_sparse_mla": True,
+        "dcp_world_size": 8,
+        "dcp_rank": 0,
+        "dcp_head_pad": 0,
+        "use_seg_mla": False,
+        "use_triton_mla": False,
+        "kv_shuffled": False,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "dtype": torch.bfloat16,
+        "_q_scale": unit if fp8 else None,
+        "_k_scale": unit if fp8 else None,
+        "scale": scale,
+        "_dpa_persistent_supported": True,
+        "dcp_persistent_supported": True,
+        "sparse_dcp_metadata_rebuild": True,
+        "owns_sparse_indexer": True,
+    }.items():
+        setattr(attn, name, value)
+
+    for _layer in range(2):
+        owned = torch.randint(0, 512, (rows,), generator=gen, device="cuda").int()
+        owned[:12] = torch.tensor([0, 0, 0, 1, 2, 3, 5, 15, 17, topk, topk, 0])
+        kvptr = indptr(owned)
+        # Sized for the step's candidates, so a plan still holding their
+        # ranges reads wrong keys rather than past the end.
+        indices = torch.randint(
+            0, slots, (int(selected[-1]),), generator=gen, device="cuda"
+        ).int()
+        meta.dcp_sparse_kv_indptr = kvptr
+        meta.sparse_kv_indices = indices
+        out, lse = attn._forward_decode(q, kv, meta, return_lse=True)
+
+        # What each layer used to plan: its own owned ranges, rows split.
+        work = work_buffers()
+        get_mla_metadata_v1(
+            qptr,
+            kvptr,
+            last,
+            heads,
+            1,
+            True,
+            work["work_meta_data"],
+            work["work_info_set"],
+            work["work_indptr"],
+            work["reduce_indptr"],
+            work["reduce_final_map"],
+            work["reduce_partial_map"],
+            page_size=1,
+            dtype_q=dtype,
+            dtype_kv=dtype,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=1,
+            max_split_per_batch=-1,
+        )
+        expected = torch.empty(rows, heads, 512, dtype=torch.bfloat16, device="cuda")
+        _, expected_lse = mla_decode_fwd(
+            q,
+            kv.view(-1, 1, 1, 576),
+            expected,
+            qptr,
+            kvptr,
+            indices,
+            last,
+            1,
+            page_size=1,
+            num_kv_splits=16,
+            sm_scale=scale,
+            q_scale=unit if fp8 else None,
+            kv_scale=unit if fp8 else None,
+            return_lse=True,
+            **work,
+        )
+        live = owned > 0
+        torch.testing.assert_close(out[live], expected[live], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(lse[live], expected_lse[live], rtol=0, atol=1e-4)

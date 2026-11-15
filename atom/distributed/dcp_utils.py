@@ -78,8 +78,8 @@ def mla_dcp_decode_is_persistent(
 
     Settled at construction time (mirrors the live per-step decision in
     ``_forward_decode``) because the gathered head width must be fixed before
-    forward. Sparse MLA needs the caller to rebuild work/reduce metadata per
-    full indexer layer first; only gfx950 supports persistent mode at all.
+    forward. Sparse MLA needs the caller to point the work plan at each full
+    indexer layer's keys first; only gfx950 supports persistent mode at all.
 
     Lives here, not in ``atom.model_ops.attention_mla``: dependency-free, so
     it stays importable without triton/aiter, and
@@ -131,7 +131,7 @@ def mla_dcp_sparse_prefill_uses_nonps(
     """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
 
     Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
-    no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
+    no work metadata, so no work plan is built for it.
     Every prefill token of a step is one q row, so a step budget above
     NONPS_MAX_Q_ROWS stays on the persistent path.
     """

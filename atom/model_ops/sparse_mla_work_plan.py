@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Point a DCP sparse prefill's per-forward MLA work plan at one layer's keys.
+"""Point a DCP sparse MLA work plan at one layer's keys.
 
-The metadata builder plans the forward's query rows once, one whole row a work
-item (`AiterMLAMetadataBuilder._sparse_prefill_work_plan`). Only each row's
-rank-owned key range changes from one DSA layer to the next, so a layer rewrites
-the items' KV start and end instead of planning again.
+The metadata builder plans a prefill forward's or a decode step's query rows
+once, one whole row a work item (`aiter_mla._sparse_kv_granularity`). Only each
+row's rank-owned key range changes from one DSA layer to the next, so a layer
+rewrites the items' KV start and end instead of planning again.
 """
 
 import torch
