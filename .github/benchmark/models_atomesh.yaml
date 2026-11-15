@@ -1003,6 +1003,15 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c72
           display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-KVEV
           concurrency: [72]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              # NUMA1 of pit2-p03 nodes has kept ~0.8-1.1 TiB of page cache the
+              # drop cannot reach, and compacting it for 768 GiB timed out
+              # (owner registration then fails), so NUMA0 takes more.
+              MOONCAKE_STORE_OWNERS: "0:832:rdma4,rdma5;1:448:rdma6,rdma7"
+            decode: *glm52_cpp4_dcp4_decode_env
           router: &kv_events_router
             policy: cache_aware
             kv_events: true
