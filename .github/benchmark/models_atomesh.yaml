@@ -17110,6 +17110,30 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "20"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
+        # D caps just under the decode peaks (running p90 5 at C48, 9-11 at C72): shorter decode
+        # batches for some wait before decode.
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c48-dcap4
+          concurrency: [48]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "4"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c64-dcap6
+          concurrency: [64]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "6"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c72-dcap8-cpu15
+          concurrency: [72]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "8"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
