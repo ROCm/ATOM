@@ -1,7 +1,10 @@
 //! A partition of the index: the ranks of one model, pool and block size, each on a lane,
-//! and the writer task that alone applies their admitted batches, in order.
+//! and the writer thread that alone applies their admitted batches, in order.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use parking_lot::Mutex;
 use tokio::{
@@ -25,7 +28,7 @@ pub(crate) struct Partition {
     /// Lanes taken, by bit.
     lanes: Mutex<u64>,
     writes: mpsc::Sender<Write>,
-    /// Where the writer runs, and a release waits for room in `writes`.
+    /// Where a release waits for room in `writes`.
     runtime: Handle,
 }
 
@@ -42,7 +45,9 @@ enum Write {
 }
 
 impl Partition {
-    /// A partition whose writer runs on `runtime`.
+    /// A partition whose ranks write from `runtime`. The writer has its own thread, as it
+    /// waits for walks to leave the shards and then lets them run, and ends with the
+    /// partition.
     pub(crate) fn start(block_size: u32, runtime: &Handle) -> Arc<Self> {
         let (writes, batches) = mpsc::channel(QUEUED_BATCHES);
         let partition = Arc::new(Self {
@@ -52,7 +57,11 @@ impl Partition {
             writes,
             runtime: runtime.clone(),
         });
-        runtime.spawn(write(partition.clone(), batches));
+        let writer = Arc::downgrade(&partition);
+        std::thread::Builder::new()
+            .name("kv-index-writer".into())
+            .spawn(move || write(writer, batches))
+            .expect("the KV index writer thread starts");
         partition
     }
 
@@ -108,16 +117,19 @@ impl Drop for Holder {
                     .runtime
                     .spawn(async move { writes.send(release).await });
             }
-            // Closed only once the monitor's runtime, and the index with it, is gone.
+            // The writer ends with the partition, which this holder keeps, or by panicking.
             Ok(()) | Err(TrySendError::Closed(_)) => {}
         }
     }
 }
 
-async fn write(partition: Arc<Partition>, mut writes: mpsc::Receiver<Write>) {
+fn write(partition: Weak<Partition>, mut writes: mpsc::Receiver<Write>) {
     let mut tables: HashMap<HolderId, HolderTable> = HashMap::new();
     let mut ops = Vec::new();
-    while let Some(write) = writes.recv().await {
+    while let Some(write) = writes.blocking_recv() {
+        let Some(partition) = partition.upgrade() else {
+            return;
+        };
         match write {
             Write::Batch {
                 holder,

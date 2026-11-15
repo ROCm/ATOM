@@ -194,6 +194,8 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// The request has media, so its tokens cannot match the KV event index.
+    pub carries_media: bool,
 }
 
 #[cfg(test)]

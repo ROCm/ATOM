@@ -1043,7 +1043,8 @@ async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
 }
 
 /// With `--kv-events`, `cache_aware` wants tokens, and a request whose model the router
-/// cannot tokenize is still prepared, by its text, its model warned about once.
+/// cannot tokenize is still prepared, by its text, its model warned about once. Messages,
+/// which have no token-routing template, are not tokenized or warned about.
 #[tokio::test]
 async fn wanted_tokens_fall_back_to_the_text() {
     let pool = PreparePoolRuntime::new(default_pool()).unwrap();
@@ -1068,14 +1069,17 @@ async fn wanted_tokens_fall_back_to_the_text() {
         .await
         .unwrap();
     let chat = json!({"model": "untokenized", "messages": [{"role": "user", "content": "hi"}]});
-    for (path, body, model, tokenized) in [
+    let messages = json!({"model": "messages", "messages": [{"role": "user", "content": "hi"}]});
+    for (path, body, model, tokenized, warned) in [
         (
             "/generate",
             json!({"model": "m", "text": "hello world"}),
             "m",
             true,
+            false,
         ),
-        ("/v1/chat/completions", chat, "untokenized", false),
+        ("/v1/chat/completions", chat, "untokenized", false, true),
+        ("/v1/messages", messages, "messages", false, false),
     ] {
         let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
         let text = parsed.metadata_with_text(true).text;
@@ -1093,7 +1097,7 @@ async fn wanted_tokens_fall_back_to_the_text() {
             .unwrap();
         assert_eq!(metadata.text, text);
         assert_eq!(tokens.is_some(), tokenized, "{model}");
-        assert_eq!(UNTOKENIZED_MODELS.contains(model), !tokenized, "{model}");
+        assert_eq!(UNTOKENIZED_MODELS.contains(model), warned, "{model}");
     }
 }
 
@@ -1152,21 +1156,30 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
             })
             .await
             .unwrap();
-        let body = br#"{"model": "m", "text": "a b"}"#;
-        let parsed = ParsedInference::parse("/generate", body).unwrap();
-        let routing = IngressRouting::new(&app);
-        let (_, tokens) = app
-            .prepare_pool
-            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
-            })
-            .await
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
+        // With media, `prefix_hash` keeps the tokens, and `cache_aware` leaves it to the tree.
+        for (body, media) in [
+            (json!({"model": "m", "text": "a b"}), false),
+            (
+                json!({"model": "m", "text": "a b", "image_data": "x.png"}),
+                true,
+            ),
+        ] {
+            let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
+            assert_eq!(metadata.carries_media, media);
+        }
     }
 }
 
