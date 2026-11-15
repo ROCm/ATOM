@@ -8,6 +8,7 @@ import importlib.util
 import logging
 import os
 import re
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -1703,8 +1704,13 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
+    # auto retains the existing BF16 path, independently of target CSA precision.
+    draft_kv_dtype: str = "auto"
 
     def __post_init__(self):
+        if self.draft_kv_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1713,6 +1719,26 @@ class DSparkConfig:
             raise ValueError(
                 "DSpark calibration_profile requires a path and confidence_schedule=True"
             )
+
+    def validate_draft_kv(self, config):
+        if self.draft_kv_dtype == "auto":
+            return
+        spec = config.speculative_config
+        target_dtypes = ("fp8", "fp4")
+        if (
+            config.hf_config.model_type != "deepseek_v41_text"
+            or config.kv_cache_dtype not in target_dtypes
+            or spec is None
+            or spec.method != "dspark"
+            or config.plugin_config is not None
+        ):
+            raise ValueError(
+                f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
+                f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
+            )
+        from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
+
+        validate_fp8_draft_support(config)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -1985,7 +2011,7 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    mxfp4_caches: bool = False,
+    nvfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2013,8 +2039,8 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if mxfp4_caches:
-        return "the MXFP4 caches are not wired to the CP scorer"
+    if nvfp4_caches:
+        return "the NVFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2052,6 +2078,95 @@ def indexer_cp_unsupported_reason(
         # discipline deadlock.
         return "TBO (two-batch overlap)"
     return None
+
+
+_HF_SCALAR_TYPES = (bool, int, float, str, type(None))
+# A value that does not key the cache. The sentinel itself is never hashed,
+# so its identity (not its repr) is all that matters.
+_HF_UNKEYED = object()
+
+
+def _hf_keyable(value):
+    """``value``'s cache-key form, or ``_HF_UNKEYED`` if it does not key.
+
+    A scalar keys by value, and a flat list / tuple of scalars by its ordered
+    contents. Anything else -- a nested object, a dict, a list of non-scalars
+    -- keys nothing on its own.
+    """
+    if isinstance(value, _HF_SCALAR_TYPES):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, _HF_SCALAR_TYPES) for item in value
+    ):
+        return tuple(value)
+    return _HF_UNKEYED
+
+
+def _hf_dict_entries(mapping) -> tuple:
+    """A dict-valued config field's sorted scalar entries, one level deep.
+
+    ``rope_parameters`` / ``rope_scaling`` is what this is for: it holds the
+    YaRN ``factor`` and ``mscale_all_dim`` that ``deepseek_v2`` folds into
+    ``self.scaling``, a Python float the traced graph bakes in as a constant,
+    so two checkpoints that differ only there must not share an artifact.
+    Entries whose value is itself a dict or a list of non-scalars key nothing,
+    and sorting by key keeps the factor independent of insertion order.
+    """
+    return tuple(
+        (str(key), keyed)
+        for key, item in sorted(mapping.items(), key=lambda kv: str(kv[0]))
+        if (keyed := _hf_keyable(item)) is not _HF_UNKEYED
+    )
+
+
+def _hf_config_fields(config) -> tuple:
+    """A config's public keyable fields, sorted by name.
+
+    ``config`` is a config object, or a plain mapping: ``PretrainedConfig.from_dict``
+    can leave ``text_config`` as the raw mapping, which
+    ``_normalize_minimax_m3_text_config`` converts only for the MiniMax-M3
+    exports. Any other type raises through ``vars`` rather than silently
+    keying nothing.
+    """
+    items = config.items() if isinstance(config, Mapping) else vars(config).items()
+    out = []
+    for name, value in sorted(items, key=lambda kv: str(kv[0])):
+        name = str(name)
+        if name.startswith("_"):
+            continue
+        if isinstance(value, Mapping):
+            out.append((name, _hf_dict_entries(value)))
+        else:
+            keyed = _hf_keyable(value)
+            if keyed is not _HF_UNKEYED:
+                out.append((name, keyed))
+    return tuple(out)
+
+
+def _hf_architecture_factor(hf_config) -> tuple:
+    """The HF model-config values that key the compile cache.
+
+    Every public scalar (and flat list / tuple of scalars, and the scalar
+    entries of dict-valued fields) of the backbone's text config, plus the
+    top-level config when that is a separate object. ``num_hidden_layers``,
+    widths, head and expert counts and per-layer patterns decide how many
+    weights the traced graph takes and their shapes; scalars such as the norm
+    eps or the routing scale are baked into it as constants. Two checkpoints of
+    one architecture run the same model code, so without them two that differ
+    only in such values (e.g. the layer count) can hash identically.
+
+    The rule is deliberately conservative: metadata such as
+    ``transformers_version`` keys too, which costs at most a cold compile when
+    it changes. Private attributes (``_name_or_path``, ``_commit_hash``) are
+    skipped so the key does not move with where the checkpoint is mounted, as
+    are nested objects (sub-configs, dtypes); ``quantization_config`` is keyed
+    by ``quant_config.compute_hash()`` and, as a dict on the HF config, by the
+    one-level rule as well.
+    """
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or text_config is hf_config:
+        return (_hf_config_fields(hf_config),)
+    return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
 @dataclass
@@ -2488,6 +2603,8 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
+        if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
+            raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2638,6 +2755,8 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        self._check_kv_cache_dtype()
+        self.dspark.validate_draft_kv(self)
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
@@ -2934,7 +3053,7 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                bool({"fp4", "nvfp4"} & {self.index_cache_dtype, self.kv_cache_dtype}),
+                "nvfp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3029,6 +3148,29 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_kv_cache_dtype(self) -> None:
+        """Validate FP4 support and report performance guidance before sizing."""
+        if self.kv_cache_dtype != "fp4":
+            return
+        from atom.utils.selector import Family, attn_family
+
+        if _is_minimax_m3_config(self.hf_config):
+            # MiniMax's model-specific restrictions are checked later in startup.
+            return
+        if attn_family(self.hf_config) is not Family.CSA2:
+            raise ValueError(
+                "--kv_cache_dtype=fp4 is only supported by MiniMax-M3.1 and "
+                "DeepSeek-V4.1 (CSA2); use bf16 or fp8 for this model."
+            )
+        from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
+
+        warn_fp4_performance(
+            num_heads=self.hf_config.num_attention_heads,
+            attention_tp_size=(
+                1 if self.enable_dp_attention else self.tensor_parallel_size
+            ),
+        )
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None
@@ -3246,16 +3388,14 @@ class Config:
         # draft layer's KV.
         if self.speculative_config is None or role == "kv_producer":
             return
-        from atom.models.registry import pp_speculative_methods
+        from atom.models.registry import pp_speculative_method, serves_pp_speculation
 
-        archs = getattr(self.hf_config, "architectures", None) or ()
-        spec = self.speculative_config
-        method = "dspark" if spec.use_dspark() else spec.method
-        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
+        if not serves_pp_speculation(self):
             raise ValueError(
                 "pipeline_parallel_size > 1 with speculative decoding supports "
                 "only the methods registry.pp_speculative_methods declares, got "
-                f"architectures={list(archs)}, method={method!r}."
+                f"architectures={getattr(self.hf_config, 'architectures', None)}, "
+                f"method={pp_speculative_method(self)!r}."
             )
         if self.dspark.confidence_schedule:
             raise ValueError(
@@ -3354,7 +3494,7 @@ class Config:
         # This reads the field AFTER __post_init__, which is the only correct
         # value: it already folds in the ATOM_M3_INDEXER_CP override AND every
         # indexer_cp_unsupported_reason fallback (plugin mode, TP != kv heads,
-        # block != 128, DCP, TBO, an MXFP4 KV or index cache). Two topologies that both fall back therefore
+        # block != 128, DCP, TBO). Two topologies that both fall back therefore
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
@@ -3367,31 +3507,6 @@ class Config:
         # writes in both V4 and V4.1. Hash the same snapshot their caches use.
         if self.index_cache_layout is not None:
             factors.append(("index_cache_layout", self.index_cache_layout))
-        text_config = getattr(self.hf_config, "text_config", self.hf_config)
-        factors.append(
-            (
-                getattr(
-                    text_config,
-                    "use_index_cache",
-                    getattr(self.hf_config, "use_index_cache", False),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_freq",
-                    getattr(self.hf_config, "index_topk_freq", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_pattern",
-                    getattr(self.hf_config, "index_topk_pattern", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_skip_topk_offset",
-                    getattr(self.hf_config, "index_skip_topk_offset", None),
-                ),
-            )
-        )
         # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
         # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
         # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
@@ -3437,6 +3552,13 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
+        architecture_factor = _hf_architecture_factor(self.hf_config)
+        factors.append(architecture_factor)
+        # hf_config also carries values ATOM writes itself (rope_parameters,
+        # dspark_*, an expert_dtype probed from disk), so a value that moved
+        # between runs would otherwise show up only as a cold compile, with no
+        # error; logged at debug so two runs can be diffed.
+        logger.debug("Compile cache HF architecture factor: %s", architecture_factor)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

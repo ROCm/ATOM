@@ -172,9 +172,11 @@ def make_sparse_decode_metadata(
     """``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
     index cache): the step's work map is built into its capacity buffer here, once, at
     its ``max_block``, and the metadata carries the record with that map; an empty batch
-    builds none. ``seq_lens`` and ``block_table`` must be the requests whose rows the
-    scorer, selector and attention run (pad requests: length 0): the map and
-    ``n_valid_column_per_row`` both follow that batch.
+    builds none. Under indexer CP the map is the record's shard over every index head
+    (``num_idx_heads``, this rank's, times the world). ``seq_lens`` and
+    ``block_table`` must be the requests whose rows the scorer, selector and attention
+    run (pad requests: length 0): the map and ``n_valid_column_per_row`` both follow
+    that batch.
     """
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
@@ -188,8 +190,9 @@ def make_sparse_decode_metadata(
                 seq_lens,
                 index_scorer.max_block,
                 max_query_len,
-                num_idx_heads,
+                num_idx_heads * index_scorer.cp_world,
                 out=index_scorer.work_map,
+                **index_scorer.shard,
             ),
         )
     return MiniMaxM3SparseMetadata(

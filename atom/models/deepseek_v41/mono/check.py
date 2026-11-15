@@ -174,7 +174,11 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
         runner.ring_rel.long()
         + cache.geometry.window(layer_id, cache.num_pages).ring_start
     )
-    ring = cache.pool[rows.clamp_min(0)]
+    ring = (
+        pack_rows(*(p[rows.clamp_min(0)] for p in cache.ring_view(layer_id)))
+        if cache.kv_fp8
+        else cache.pool[rows.clamp_min(0)]
+    )
     if cache.kv_fp8:
         qat = pack_rows(values, scales)
     parts = [
@@ -198,7 +202,11 @@ def decode_keys(cache, spec, step):
     selection, then its window (``cache.attention_indices`` hands a BF16
     decode's window over as rows of the layer's ring, made pool rows here)."""
     prefix, pptr, window, wptr = cache.attention_indices(spec, step)
-    start = cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
+    start = (
+        cache.main_view(spec.kv_owner)[0].shape[0]
+        if cache.kv_fp8
+        else cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
+    )
     pb, wb = pptr.tolist(), wptr.tolist()
     rows = [
         torch.cat([prefix[pb[t] : pb[t + 1]], window[wb[t] : wb[t + 1]] + start])
@@ -224,12 +232,32 @@ def _key_set_rows(runner, spec, keys, cache):
             n_sel = ip.selected(int(runner.bounds[owner][t]))
             rows = runner.irow[owner][t, :n_sel].tolist()
         rows += [
-            base + window.ring_start + (first + k) % window.ring_slots
+            base
+            + (
+                cache.main_view(spec.kv_owner)[0].shape[0]
+                if cache.kv_fp8
+                else window.ring_start
+            )
+            + (first + k) % window.ring_slots
             for k in range(count)
         ]
         if sorted(rows) != sorted(prefix[indptr[t] : indptr[t + 1]]):
             bad.append(t)
     return f"key rows {bad}"
+
+
+def _gather_key_rows(main, window, ids):
+    """Pack only the selected rows, preserving interleaved source order."""
+    is_main = ids < main[0].shape[0]
+    main_ids = ids[is_main].long()
+    window_ids = (ids[~is_main] - main[0].shape[0]).long()
+    selected = []
+    for data, ring in zip(main, window):
+        rows = data.new_empty((ids.numel(), data.shape[-1]))
+        rows[is_main] = data[main_ids]
+        rows[~is_main] = ring[window_ids]
+        selected.append(rows)
+    return pack_rows(*selected)
 
 
 def _attention_ref(runner, block, keys, cache):
@@ -263,7 +291,9 @@ def _attention_ref(runner, block, keys, cache):
         pool = cache.pool
         if cache.kv_fp8:
             dim = q.shape[-1]
-            key_rows = cache.pool[ids.long()]
+            main = cache.main_view(block.attn.spec.kv_owner)
+            window = cache.ring_view(block.attn.spec.layer_id)
+            key_rows = _gather_key_rows(main, window, ids)
             pool = dequantize_rows(
                 key_rows[:, :dim].view(FP8_DTYPE), key_rows[:, dim:]
             ).bfloat16()

@@ -13,7 +13,7 @@ import types
 import pytest
 import torch
 
-from atom.config import _check_fp4_kv, resolve_draft_kv_dtype
+from atom.config import DCPConfig, _check_fp4_kv, resolve_draft_kv_dtype
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.nvfp4_pages import (
     INDEX_PAGE_BYTES,
@@ -157,6 +157,23 @@ def test_nvfp4_kv_is_for_minimax_m3_only():
 def test_a_config_with_nvfp4_kv_defaults_the_index_to_nvfp4(monkeypatch):
     cfg = _m3(monkeypatch, kv_cache_dtype="nvfp4", hf=sparse_hf())
     assert cfg.index_cache_dtype == "nvfp4"
+
+
+@pytest.mark.parametrize("kv,index", [("nvfp4", "nvfp4"), ("nvfp4", None)])
+def test_nvfp4_caches_clear_the_indexer_cp_flag(monkeypatch, caplog, kv, index):
+    """The NVFP4 index scorer takes no CP shard, so the flag is cleared with a warning
+    (the MXFP4 index keeps it)."""
+    with caplog.at_level("WARNING", logger="atom"):
+        cfg = _m3(
+            monkeypatch,
+            kv_cache_dtype=kv,
+            index_cache_dtype=index,
+            tensor_parallel_size=4,
+            hf={**sparse_hf(), "num_key_value_heads": 4},
+            dcp_config=DCPConfig(indexer_dcp_only=True),
+        )
+    assert cfg.dcp_config.indexer_dcp_only is False
+    assert "NVFP4 caches are not wired to the CP scorer" in caplog.text
 
 
 def test_nvfp4_index_is_refused_off_minimax_m3(monkeypatch):

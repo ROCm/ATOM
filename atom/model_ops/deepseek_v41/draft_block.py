@@ -16,6 +16,7 @@ class DraftStep:
     positions: torch.Tensor
     indices: torch.Tensor
     decode: bool = False
+    csr: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 def draft_step(context_positions, anchors, width, window):

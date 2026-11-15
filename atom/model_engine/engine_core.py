@@ -65,6 +65,12 @@ HELD_POLL_S = 0.01
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+def publish_idle_state_work(scheduler) -> None:
+    """Publish the state loads and stores `scheduler` holds while no batch runs."""
+    scheduler._publish_state_loads()
+    scheduler._publish_state_stores()
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -151,6 +157,7 @@ class EngineCore:
             # sliding-window pool each look up the class they declared, so
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
+            config.pool_entry_bytes = block_info.get("pool_entry_bytes", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
@@ -554,7 +561,7 @@ class EngineCore:
     def _release_request_resources(self, sequences):
         structured_ids = [seq.id for seq in sequences if is_structured(seq)]
         if structured_ids:
-            self.runner_mgr.call_func("release_structured_requests", structured_ids)
+            self.runner_mgr.call_func("release_constraints", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -800,10 +807,6 @@ class EngineCore:
             )
         ):
             return
-        # getattr for the same reason as `kv_connector` above: this path is
-        # reached with scheduler doubles that implement only the connector
-        # surface.
-        #
         # `dispatch_new=False` on the shutdown drain: publishing new state
         # loads/stores there hands the connector work whose bytes nothing will
         # read back, and -- worse -- each fresh store keeps `has_pending_kv_work`
@@ -811,10 +814,7 @@ class EngineCore:
         # condition and never converges. Still build/process the meta so
         # already-dispatched transfers finish and report.
         if dispatch_new:
-            for name in ("_publish_state_loads", "_publish_state_stores"):
-                publish = getattr(self.scheduler, name, None)
-                if publish is not None:
-                    publish()
+            publish_idle_state_work(self.scheduler)
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return
