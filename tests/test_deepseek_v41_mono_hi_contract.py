@@ -20,11 +20,15 @@ from atom.models.deepseek_v41.mono import hi_contract
 CONFIG = Path(__file__).parent / "models" / "deepseek_v41" / "fixtures" / "config.json"
 
 
-def test_the_one_request_programs_hold(monkeypatch, tmp_path):
+@pytest.mark.parametrize("layout", ["preshuffle", "mfma"])
+def test_the_one_request_programs_hold(monkeypatch, tmp_path, layout):
     # (FlyDSL's runtime cache dir: its compiled programs and the hi fit cache, ``linear.fit_cache``)
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "flydsl"))
-    progs = hi_contract.check(hi_contract.config(str(CONFIG)), [6])
+    progs = hi_contract.check(hi_contract.config(str(CONFIG)), [6], index_layout=layout)
     kinds = {key[0] for key in progs.kernels()}
+    # the index sources' programs in the layout checked: the ones ATOM's index plane serves (mfma: gfx950's default)
+    mfma = [k for k in progs.kernels().values() if k.program.name.endswith("_mfma_r6")]
+    assert bool(mfma) == (layout == "mfma")
     assert {"layer", "head", "ctx", "draft"} <= kinds, kinds
     assert all(
         k.record is not None and k.record.stages for k in progs.kernels().values()
