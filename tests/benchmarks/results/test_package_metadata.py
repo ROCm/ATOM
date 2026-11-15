@@ -95,6 +95,25 @@ def test_git_install_preserves_full_commit(
     )
 
 
+@pytest.mark.parametrize("wheel", [True, False])
+def test_agentx_harness_commit_comes_from_its_build_info(tmp_path, monkeypatch, wheel):
+    full_sha = "fbcfc8923e46d489621d177c50fe05fe792213eb"
+    directory = tmp_path / "agentx_harness-1.0.9.dist-info"
+    directory.mkdir()
+    (directory / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: agentx-harness\nVersion: 1.0.9\n"
+    )
+    if wheel:
+        (tmp_path / "aiperf").mkdir()
+        (tmp_path / "aiperf/_build_info.py").write_text(f'COMMIT_SHA = "{full_sha}"\n')
+    distribution = importlib.metadata.PathDistribution(directory)
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda name: distribution)
+    identity = metadata.installed_package("agentx-harness")
+    assert identity["version"] == "1.0.9"
+    assert identity["sha"] == (full_sha if wheel else None)
+    assert identity["sha_source"] == ("wheel_build_info" if wheel else None)
+
+
 @pytest.mark.parametrize(
     "version", ["0.1.1", "0.1.1+g123", "0.1.1+ga75ba53de.d20260925"]
 )

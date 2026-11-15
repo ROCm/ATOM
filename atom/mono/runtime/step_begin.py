@@ -19,6 +19,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -206,11 +207,12 @@ def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
     for b in scratch:
         args += [b.data_ptr(), b.nbytes]
     args += [0, 0] * (MAX_SCRATCH - len(scratch))
-    _build(StepBeginBuild(peers.addresses.numel(), debug))(
+    _run_compiled(
+        _build(StepBeginBuild(peers.addresses.numel(), debug)),
         *args,
         peers.addresses.data_ptr(),
         peers.bytes.nbytes,
         peers.rank,
         state.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
     )

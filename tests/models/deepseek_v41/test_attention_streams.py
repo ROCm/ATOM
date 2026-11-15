@@ -238,10 +238,13 @@ def test_a_compressor_forked_alone_is_joined_before_attention(monkeypatch, recor
     instance.wq_b = lambda *a, **k: torch.zeros(1, 4)
     instance.heads, instance.head_dim = 2, 2
     instance.spec = SimpleNamespace(layer_id=0)
+    instance._prepare_attention = lambda *a: None
     instance._attend = lambda query, *a: (log.append("attend"), query)[1]
     instance._project_out = lambda *a: None
     cache = SimpleNamespace(
-        rope_quant_window=lambda *a: (None, None), rope_positions=lambda step: None
+        rope_quant_window=lambda *a: (None, None),
+        rope_positions=lambda step: None,
+        query_fp8=lambda query: None,
     )
 
     Attention.forward(instance, None, None, cache, SELECT_ARGS[4], None)

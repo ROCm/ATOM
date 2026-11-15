@@ -15,6 +15,7 @@ separate replicas on separate ports, not two branches of one load.
 import argparse
 import contextlib
 import logging
+import os
 import signal
 import sys
 
@@ -26,6 +27,7 @@ from atom.diffusion.registry import (
     pipeline_class_for_checkpoint,
     supported_architectures,
 )
+from atom.utils import envs, set_atom_log_level
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30010)
-    parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        help="log level for this server, its workers and the atom loggers; "
+        "defaults to $ATOM_LOG_LEVEL, else info",
+    )
     return parser
 
 
@@ -95,8 +102,6 @@ def pipeline_class_for_model(model_path: str) -> str:
 
 
 def config_from_args(args: argparse.Namespace) -> DiffusionConfig:
-    import os
-
     # Partitions are separate replicas, so the variant is a path, not a runtime
     # branch. Accept --model /root --model-variant FL2VA or --model /root/FL2VA.
     model_path = args.model
@@ -129,16 +134,32 @@ def build_app(engine: DiffusionEngine):
     return app
 
 
+def apply_atom_log_level(log_level: str | None) -> str:
+    """Give the atom loggers of this process and of its workers one level.
+
+    basicConfig() only sets the root logger's level, and atom.* records never
+    consult it: they are filtered by the atom logger's own level, then printed
+    by the root handler main() installs. The workers configure their atom
+    logger from ATOM_LOG_LEVEL when they import atom.utils after spawn, so an
+    explicit --log-level is exported there; this process imported atom.utils
+    before parsing argv, so its atom logger is set directly. Without
+    --log-level, ATOM_LOG_LEVEL (or INFO) stays in charge. Returns the
+    canonical name of the level applied.
+    """
+    if log_level is not None:
+        os.environ["ATOM_LOG_LEVEL"] = log_level
+    return set_atom_log_level(envs.ATOM_LOG_LEVEL)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    log_level = apply_atom_log_level(args.log_level)
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=log_level,
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
     )
 
     if args.attn_backend:
-        import os
-
         from atom.diffusion.attention import ATTENTION_BACKEND_ENV
 
         # Set before the workers are spawned so they inherit it: the backend is
@@ -165,7 +186,14 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGTERM, _shutdown)
 
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            # An explicit value goes to uvicorn untouched (it also knows
+            # "trace"); otherwise the canonical name applied above.
+            log_level=args.log_level or log_level.lower(),
+        )
     finally:
         engine.close()
     return 0

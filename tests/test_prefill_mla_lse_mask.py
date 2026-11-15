@@ -49,7 +49,19 @@ def _new(o, lse):
 # of the last block. Every shape here used to be 512, which never touched it.
 @pytest.mark.parametrize(
     "shape",
-    [(1, 16, 512), (7, 64, 512), (128, 1, 512), (5, 3, 513), (2, 7, 129), (3, 2, 1025)],
+    [
+        (1, 16, 512),
+        (7, 64, 512),
+        (128, 1, 512),
+        (5, 3, 513),
+        (2, 7, 129),
+        (3, 2, 1025),
+        (1, 33, 129),
+        # Around a multiple of the kernel's 32-row group.
+        (8191, 1, 7),
+        (8192, 1, 7),
+        (8193, 1, 7),
+    ],
 )
 def test_matches_the_where_it_replaced(dtype, shape):
     tokens, heads, _dim = shape
@@ -125,3 +137,26 @@ def test_mask_is_per_head_not_per_token():
     assert torch.count_nonzero(out[0, 1]) == 0
     assert torch.count_nonzero(out[0, 2]) == 512
     assert torch.count_nonzero(out[1]) == 3 * 512
+
+
+def test_grouped_mask_preserves_strided_storage_and_finite_nan_payloads():
+    storage = torch.full((5, 68, 137), -13, device="cuda", dtype=torch.bfloat16)
+    output = storage[1:4, 1:67:2, 3:132]
+    output.fill_(float("nan"))
+    output[0, 0].fill_(-0.0)
+    lse_storage = torch.zeros(68, 8, device="cuda")
+    lse = lse_storage[1:67:2, 1:7:2].transpose(0, 1)
+    # Both sides of a grouped row boundary and the final masked tile.
+    lse[0, 31] = float("-inf")
+    lse[0, 32] = float("nan")
+    lse[-1, -1] = float("inf")
+    expected = storage.clone()
+    expected_output = expected[1:4, 1:67:2, 3:132]
+    expected_output[~torch.isfinite(lse)] = 0
+    original_lse_bits = lse_storage.view(torch.int32).clone()
+
+    assert _new(output, lse) is output
+    # Compare the entire backing allocation: guards, NaN payloads and signed
+    # zeros must survive whenever their corresponding LSE is finite.
+    assert torch.equal(storage.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(lse_storage.view(torch.int32), original_lse_bits)

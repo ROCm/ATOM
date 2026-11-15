@@ -17,10 +17,10 @@ docker pull rocm/atom-dev:latest
 ### Launching Server
 
 
-> **`--index-cache-dtype fp8` is required, not a tuning choice.** The index
-> scorers are aiter's FlyDSL kernels and they serve an fp8 index cache only; a
-> bf16 one is refused when the KV pool is allocated, with a message naming this
-> flag. Omitting the flag inherits `--kv_cache_dtype`, so a run that passes
+> **`--index-cache-dtype fp8` (or `fp4`, the native MXFP4 index cache) is required,
+> not a tuning choice.** The index scorers are aiter's FlyDSL kernels and they serve
+> those two only; a bf16 one is refused when the KV pool is allocated, with a message
+> naming this flag. Omitting the flag inherits `--kv_cache_dtype`, so a run that passes
 > `--kv_cache_dtype bf16` and nothing else is refused at startup rather than
 > silently served.
 
@@ -452,6 +452,9 @@ How ATOM runs it:
   block attends that context plus its own K/V.
 - The target layers' outputs are tapped with forward hooks (all-reduced across TP, plus the
   residual). This is why mono decode, which replaces those layers, is off under DSpark.
+- The context is each tapped layer's output before the final norm, as the checkpoint was trained:
+  feeding the last tap through the target's final norm instead (the NeMo recipe's post-norm
+  feature) dropped GSM8K acceptance from 51% to 39%.
 - Block attention. The block's K/V are written into the draft cache at the block's slots and
   the non-causal `[context | block]` attention runs as one q_len = 1 paged decode row per block
   token (the per-row decode the target's sparse layers use), through page tables built outside

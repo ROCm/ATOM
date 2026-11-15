@@ -122,6 +122,10 @@ def indexer_weights(layer, cfg) -> dict[str, torch.Tensor]:
         f"indexer.head_dim {indexer.head_dim} != build constant INDEX_DIM {INDEX_DIM}",
     )
 
+    need(
+        not indexer.external_k_weights,
+        "indexer wk / weights_proj ride in fused_qkv_a_proj (FusedIndexerProjection)",
+    )
     wk_proj = indexer.wk_weights_proj
     wk_bf16 = linear_bf16(
         wk_proj,

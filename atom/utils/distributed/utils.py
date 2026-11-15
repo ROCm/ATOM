@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ipaddress
+from datetime import timedelta
+
+import torch
+from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
     _get_default_timeout,
     _unregister_process_group,
 )
-from torch.distributed import ProcessGroup
 from torch.distributed.rendezvous import rendezvous
-import torch
-from datetime import timedelta
 
-
-from atom.utils import is_torch_equal_or_newer
+from atom.utils import envs, is_torch_equal_or_newer
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -30,6 +30,32 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://[{ip}]:{port}"
     else:
         return f"tcp://{ip}:{port}"
+
+
+def raise_default_group_timeout(seconds: int) -> None:
+    """Raise, never lower, the timeout torch gives groups created without one.
+
+    aiter builds its gloo groups that way. Across nodes their first collective
+    after the weight load waits for the slowest node, and a cold read of a large
+    checkpoint from NFS can trail another node's by more than the 30 minutes.
+    """
+    from torch.distributed import distributed_c10d
+
+    distributed_c10d.default_pg_timeout = max(
+        distributed_c10d.default_pg_timeout, timedelta(seconds=seconds)
+    )
+
+
+def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the DP group has ranks on other nodes.
+
+    Read from the topology, the group's ranks against the ranks this node runs,
+    so every rank of a group agrees. ParallelConfig.is_multinode_dp also reads
+    data_parallel_rank, which in a worker is its own global rank, so it would
+    match ranks 1.. of a single-node group.
+    """
+    if parallel_config.data_parallel_size_local < parallel_config.data_parallel_size:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 
 def init_gloo_process_group(

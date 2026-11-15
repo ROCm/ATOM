@@ -48,10 +48,6 @@ on:
         description: "Benchmark gpt-oss-120b"
         type: boolean
         default: true
-      kimi-k27-code-mxfp4:
-        description: "Benchmark Kimi-K2.7-Code-MXFP4"
-        type: boolean
-        default: true
       kimi-k3:
         description: "Benchmark Kimi-K3 (+ DSpark)"
         type: boolean

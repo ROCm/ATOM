@@ -12,6 +12,8 @@ both). DCP compute / communication primitives live in ``atom.model_ops.dcp_ops``
 this module is only the distributed-access layer.
 """
 
+import functools
+
 from atom.config import get_current_atom_config
 from atom.utils import envs
 
@@ -31,11 +33,20 @@ def dcp_is_enabled() -> bool:
     return get_dcp_world_size() > 1
 
 
+@functools.cache
 def get_dcp_group():
-    """The DCP process group (aiter parallel state). Only valid when DCP is enabled."""
+    """The DCP group coordinator (aiter parallel state). Only valid when DCP is
+    enabled. When the DCP group is the TP group's ranks in the same order (DCP
+    = TP, e.g. DCP8 at TP8) it is the TP group's coordinator itself,
+    so every DCP collective runs on the TP communicator rather than a second
+    one over the same GPUs. The order matters: a collective splits by rank in
+    group, so the same set ordered differently is not the same group. Cached:
+    the groups are fixed once built (a call before then raises, uncached)."""
     from aiter.dist.parallel_state import get_dcp_group as _get_dcp_group
+    from aiter.dist.parallel_state import get_tp_group
 
-    return _get_dcp_group()
+    dcp, tp = _get_dcp_group(), get_tp_group()
+    return tp if list(tp.ranks) == list(dcp.ranks) else dcp
 
 
 def get_dcp_rank() -> int:

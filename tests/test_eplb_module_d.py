@@ -159,10 +159,8 @@ def test_migrate_experts_chunk_reads_config_and_returns_plan(monkeypatch):
 
     monkeypatch.setattr(eplb, "_migrate_single_layer", _fake_migrate_single_layer)
     # Avoid touching real config state in this test.
-    import atom.config as atom_config
-
     monkeypatch.setattr(
-        atom_config,
+        eplb,
         "get_current_atom_config",
         lambda: type(
             "Cfg",

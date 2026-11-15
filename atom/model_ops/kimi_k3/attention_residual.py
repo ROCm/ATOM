@@ -18,9 +18,9 @@ Attention Residuals: https://arxiv.org/abs/2603.15031
 Four deliberate divergences from that reference:
 
 * ``residuals`` is a Sequence of separate ``[..., D]`` tensors there; here it is
-  one packed ``[T, B, H]`` block_residual plus ``prefix_sum`` read as the final
-  candidate. Not just cheaper -- their pointer-table gather cannot run on ROCm
-  at all (details at the ``Adapted from FLA`` note in the kernel body).
+  one ``[T, B, H]`` block_residual (read by stride) plus ``prefix_sum`` read as
+  the final candidate. Not just cheaper -- their pointer-table gather cannot run
+  on ROCm at all (details at the ``Adapted from FLA`` note in the kernel body).
 * the caller's ``prefix_sum = prefix_sum + ...`` adds are folded into the last
   candidate's on-load (``DO_ADD``/``DO_ADD2``), which fla leaves to the caller.
   That fold is what lets the decoder layers defer their FFN and routed/shared
@@ -61,9 +61,11 @@ if _HAS_TRITON:
         hs2_ptr,
         pref_ptr,
         ow_ptr,
-        B,
-        Bp,
-        H,
+        # Shapes are known at dispatch; specialize loop bounds and masks
+        # without changing the fixed BF16 reduction layout below.
+        B: tl.constexpr,
+        Bp: tl.constexpr,
+        H: tl.constexpr,
         eps,
         out_eps,
         fp8_max,
@@ -108,7 +110,7 @@ if _HAS_TRITON:
         #
         # Adapted from FLA's fused_attnres (see the module docstring). Theirs
         # gathers from a tuple of separate residual tensors via a pointer table;
-        # ours indexes one contiguous [T, B, H] block_residual, which is both
+        # ours indexes one [T, B, H] block_residual by stride, which is both
         # cheaper and necessary here -- the pointer-table form miscompiles on
         # ROCm (TritonAMDGPUCanonicalizePointers rejects arith.select on
         # tensor<Nx!tt.ptr>), so their kernel cannot run on this backend at all.
@@ -202,6 +204,10 @@ _ATTN_RES_CONFIGS = (
     (2048, 4, 2, 2),
 )
 _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
+# Use one FP32 reduction layout for unquantized BF16 output. Changing the
+# warp count at T=512 can move a value across a BF16 midpoint and alter MoE
+# routing when the same prefix is evaluated with different batch peers.
+_ATTN_RES_BF16_CONFIG = (8, 2, 2)
 
 
 def _pick_attn_res_config(tokens: int):
@@ -213,7 +219,7 @@ def _pick_attn_res_config(tokens: int):
 
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
-    block_residual: torch.Tensor,  # [T, B, H]
+    block_residual: torch.Tensor,  # [T, B, H]; by stride, H unit-stride or copied
     score_weight: torch.Tensor,  # [H] (norm_weight * proj_weight, precomputed)
     eps: float,
     add_hidden: torch.Tensor | None = None,  # [T, H], folded: prefix += add_hidden
@@ -258,7 +264,13 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    br = block_residual.contiguous()
+    # the kernel reads T and B by stride (i32 offsets) and H unit-stride, so a
+    # slice of a wider block bank needs no copy
+    br = (
+        block_residual
+        if block_residual.stride(-1) == 1
+        else block_residual.contiguous()
+    )
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty(
@@ -279,7 +291,11 @@ def _apply_attn_res_impl(
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
 
-    nw, ns, bl = _pick_attn_res_config(T)
+    nw, ns, bl = (
+        _ATTN_RES_BF16_CONFIG
+        if ps.dtype == torch.bfloat16 and quant_dtype is None
+        else _pick_attn_res_config(T)
+    )
     _attn_res_fused_kernel[(T,)](
         br,
         ps,

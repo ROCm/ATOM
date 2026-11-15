@@ -42,6 +42,16 @@ def test_stacked_expert_loader_ignores_fused_shared_expert_map_tail():
     torch.testing.assert_close(w2, source_w2[:3].float())
 
 
+@pytest.mark.parametrize(
+    ("intermediate", "tp", "expected"),
+    [(640, 1, 128), (640, 2, None), (640, 4, None), (640, 8, None), (1024, 4, 128)],
+)
+def test_moe_pad_align_skips_padding_only_for_128_multiple_shards(
+    intermediate, tp, expected
+):
+    assert qwen4_exp.moe_pad_align(intermediate, tp) == expected
+
+
 def ptpc_config():
     config = QuantizationConfig()
     config.quant_method = "compressed-tensors"

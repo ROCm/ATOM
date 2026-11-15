@@ -96,6 +96,71 @@ def dcp_all_gather_query_heads(cp_group, q: torch.Tensor) -> torch.Tensor:
     return gathered.view(tokens, -1, head_dim)
 
 
+@triton.jit
+def _dcp_prefill_query_reorder_pad_kernel(
+    X,
+    Y,
+    tokens,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    WORLD: tl.constexpr,
+    PADDED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Y[token] = the token's rows of every rank's X, end to end, then zeros up
+    to PADDED heads; each program copies BLOCK contiguous elements of it."""
+    token = tl.program_id(0).to(tl.int64)
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    owner = (column // (HEADS * DIM)).to(tl.int64)
+    local = column % (HEADS * DIM)
+    value = tl.load(
+        X + owner * tokens * HEADS * DIM + token * HEADS * DIM + local,
+        mask=column < WORLD * HEADS * DIM,
+        other=0,
+    )
+    tl.store(Y + token * PADDED * DIM + column, value, mask=column < PADDED * DIM)
+
+
+def dcp_all_gather_prefill_query_heads(cp_group, q: torch.Tensor, padded_heads: int):
+    """Gather prefill Q and pad heads without an intermediate token-major copy.
+
+    BF16 Q is produced contiguous. Gather it on the first dimension, preserving
+    rank-major storage, then fuse rank-to-token reorder and zero padding. The
+    collective retains its existing size/topology fallback and synchronization.
+    Other layouts/dtypes keep the existing gather-plus-pad behavior.
+    """
+    tokens, heads, dim = q.shape
+    world = cp_group.world_size
+    real_heads = heads * world
+    assert padded_heads >= real_heads
+    if q.dtype != torch.bfloat16 or not q.is_contiguous() or tokens == 0:
+        gathered = cp_group.all_gather(q, dim=1)
+        return torch.nn.functional.pad(gathered, (0, 0, 0, padded_heads - real_heads))
+    if padded_heads == real_heads:
+        return dcp_all_gather_query_heads(cp_group, q)
+    gathered = dcp_all_gather(cp_group, q, 0)
+    out = torch.empty((tokens, padded_heads, dim), dtype=q.dtype, device=q.device)
+    # Reinterpret as integers to preserve every BF16 bit, including NaN payloads.
+    # One 16-byte access a lane across the program's waves: the copy runs as
+    # fully coalesced vector loads/stores over the flat [padded_heads * dim] row.
+    num_warps = 4
+    block = num_warps * 64 * (16 // out.element_size())
+    _dcp_prefill_query_reorder_pad_kernel[
+        (tokens, triton.cdiv(padded_heads * dim, block))
+    ](
+        gathered.view(torch.int16),
+        out.view(torch.int16),
+        tokens,
+        heads,
+        dim,
+        world,
+        padded_heads,
+        block,
+        num_warps=num_warps,
+    )
+    return out
+
+
 class CPTritonContext:
     """Cache compiled Triton kernel to avoid recompilation on every call."""
 
@@ -304,78 +369,71 @@ def _lse_pack_slots(dtype: torch.dtype) -> int:
 
 @triton.jit
 def _zero_nonfinite_rows_kernel(
-    out_ptr,  # [B, H, D]   attention output, written in place
-    lse_ptr,  # [B, H]      fp32 per-head LSE
+    out_ptr,
+    lse_ptr,
     out_stride_b,
     out_stride_h,
     lse_stride_b,
     lse_stride_h,
+    rows,
+    HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Zero the (token, head) rows whose LSE is not finite. One program per row.
+    """Zero the (token, head) rows whose LSE is not finite, ROW_BLOCK rows a
+    program.
 
-    Replaces five launches with one. The Python it stands in for --
-
-        o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0.0)
-
-    -- costs four kernels just to build the mask, because torch decomposes
-    isfinite into abs/ne/eq/mul, and a fifth to apply it. The mask is [B, H],
-    a few KB; at ~5.5 us per launch that chain is pure launch overhead.
-
-    The bigger win is the early return. A non-finite LSE means the row saw no
-    valid KV, which is an edge case -- nearly every row is finite. `where`
-    cannot know that: it reads and rewrites all of `o` regardless. Here a
-    finite row exits before touching `o` at all, so the common case costs one
-    scalar load per row instead of a full read-modify-write of [B, H, D].
+    Stands in for ``o = torch.where(torch.isfinite(lse).unsqueeze(-1), o, 0)``,
+    which is five launches (isfinite decomposes into four) and a full
+    read-modify-write of ``o``. A non-finite LSE means the row saw no valid KV,
+    an edge case, so a tile whose rows are all finite exits after one LSE
+    load without touching ``o``.
     """
-    b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
-
-    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
-    # isfinite: NaN fails `lse == lse`, +-inf fails the abs bound. `&` rather
-    # than `and` to match the rest of this file and to keep the predicate a
-    # single elementwise op; `tl.abs` has no side effect, so nothing is lost by
-    # not short-circuiting.
-    if (lse == lse) & (tl.abs(lse) < float("inf")):  # noqa: PLR0124
+    # Inactive tail rows use a valid address even though their loads are masked.
+    row = tl.program_id(0) * ROW_BLOCK + tl.arange(0, ROW_BLOCK)
+    valid = row < rows
+    safe_row = tl.where(valid, row, 0).to(tl.int64)
+    b = safe_row // HEADS
+    h = safe_row % HEADS
+    lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h, mask=valid, other=0.0)
+    finite = (lse == lse) & (tl.abs(lse) < float("inf"))  # noqa: PLR0124
+    clear = valid & ~finite
+    if tl.sum(clear.to(tl.int32), axis=0) == 0:
         return
-
     base = out_ptr + b * out_stride_b + h * out_stride_h
-    for off in tl.range(0, HEAD_DIM, BLOCK):
-        idx = off + tl.arange(0, BLOCK)
-        keep = idx < HEAD_DIM
-        # BLOCK rounds HEAD_DIM up, so the tail lanes of the last block are out
-        # of range. The store mask already keeps them from writing; folding them
-        # onto 0 keeps the address itself inside the row too, as the two a2a
-        # kernels in this file do for their padding rank lanes.
+    for off in range(tl.cdiv(HEAD_DIM, BLOCK)):
+        col = off * BLOCK + tl.arange(0, BLOCK)
+        keep = col < HEAD_DIM
         tl.store(
-            base + tl.where(keep, idx, 0),
-            tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty),
-            mask=keep,
+            base[:, None] + tl.where(keep, col, 0)[None, :],
+            tl.full((ROW_BLOCK, BLOCK), 0, out_ptr.dtype.element_ty),
+            mask=clear[:, None] & keep[None, :],
         )
 
 
 def zero_nonfinite_rows(out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-    """In-place `out[~isfinite(lse)] = 0`, one kernel. See the kernel docstring."""
+    """Zero non-finite LSE rows in place, preserving finite output bits."""
     assert out.dim() == 3 and lse.dim() == 2, (out.shape, lse.shape)
     assert out.shape[:2] == lse.shape, (out.shape, lse.shape)
-    # The kernel indexes the head dim as `base + idx`, i.e. it assumes a unit
-    # stride there. Every caller passes a fresh `torch.empty` or the result of
-    # `.contiguous()`, but a violation would write the wrong memory silently,
-    # so it is checked rather than assumed.
     assert out.stride(2) == 1, f"head dim must be contiguous, got {out.stride()}"
     b, h, d = out.shape
     if b == 0 or h == 0:
         return out
-    _zero_nonfinite_rows_kernel[(b, h)](
+    row_block = 32
+    _zero_nonfinite_rows_kernel[(triton.cdiv(b * h, row_block),)](
         out,
         lse,
         out.stride(0),
         out.stride(1),
         lse.stride(0),
         lse.stride(1),
+        b * h,
+        HEADS=h,
         HEAD_DIM=d,
-        BLOCK=min(1024, triton.next_power_of_2(d)),
+        ROW_BLOCK=row_block,
+        BLOCK=min(128, triton.next_power_of_2(d)),
+        num_warps=4,
     )
     return out
 
@@ -394,29 +452,38 @@ def _dcp_a2a_pack_kernel(
     send_stride_b,
     send_stride_h,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     LSE_PACK: tl.constexpr,
     HAS_OWNED_COUNTS: tl.constexpr,
 ):
     """Scatter (output, lse) into the per-destination send buffer.
 
-    One program per (token, GLOBAL head). Head ``h`` belongs to destination rank
-    ``h // H_LOCAL`` -- the same contiguous split the ReduceScatter path uses, so
-    a rank ends up owning exactly the heads it owned before.
+    One program per (token, DESTINATION RANK), handling that destination's whole
+    H_LOCAL-head slice: one program per (token, head) leaves the kernel
+    launch-bound. Head ``h`` belongs to destination ``h // H_LOCAL`` -- the same
+    contiguous split the ReduceScatter path uses, so a rank ends up owning
+    exactly the heads it owned before. H_ROUNDED rounds H_LOCAL up to the power of
+    two ``tl.arange`` needs; the extra lanes alias lane 0 and are masked on
+    store.
     """
     b = tl.program_id(axis=0).to(tl.int64)
-    h = tl.program_id(axis=1).to(tl.int64)
+    dst = tl.program_id(axis=1).to(tl.int64)
 
-    dst = h // H_LOCAL
-    h_local = h % H_LOCAL
+    hb = tl.arange(0, H_ROUNDED)
+    h_valid = hb < H_LOCAL
+    # Padding lanes alias lane 0, so their loads read lane 0's (valid) data and
+    # no pointer is formed past this destination's slice; only stores are masked.
+    hb_safe = tl.where(h_valid, hb, 0).to(tl.int64)
+    h = dst * H_LOCAL + hb_safe
 
     d = tl.arange(0, HEAD_DIM)
-    src = tl.load(out_ptr + b * out_stride_b + h * out_stride_h + d)
+    src = tl.load(out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :])
 
     dst_base = (
-        send_ptr + dst * send_stride_n + b * send_stride_b + h_local * send_stride_h
+        send_ptr + dst * send_stride_n + b * send_stride_b + hb_safe * send_stride_h
     )
-    tl.store(dst_base + d, src)
+    tl.store(dst_base[:, None] + d[None, :], src, mask=h_valid[:, None])
 
     lse = tl.load(lse_ptr + b * lse_stride_b + h * lse_stride_h)
     if HAS_OWNED_COUNTS:
@@ -425,7 +492,7 @@ def _dcp_a2a_pack_kernel(
         # payload; this adds no kernel launch to the decode path.
         lse = tl.where(tl.load(owned_counts_ptr + b) == 0, float("-inf"), lse)
     if LSE_PACK == 1:
-        tl.store(dst_base + HEAD_DIM, lse)
+        tl.store(dst_base + HEAD_DIM, lse, mask=h_valid)
     else:
         # Split the fp32 into two raw 16-bit halves. Nothing does arithmetic on
         # these slots -- the collective copies bits and the combine kernel puts
@@ -433,8 +500,8 @@ def _dcp_a2a_pack_kernel(
         bits = lse.to(tl.uint32, bitcast=True)
         hi = (bits >> 16).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
         lo = (bits & 0xFFFF).to(tl.uint16).to(dst_base.dtype.element_ty, bitcast=True)
-        tl.store(dst_base + HEAD_DIM, hi)
-        tl.store(dst_base + HEAD_DIM + 1, lo)
+        tl.store(dst_base + HEAD_DIM, hi, mask=h_valid)
+        tl.store(dst_base + HEAD_DIM + 1, lo, mask=h_valid)
 
 
 @triton.jit
@@ -543,6 +610,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     N_RANKS,
     HEAD_DIM: tl.constexpr,
     H_LOCAL: tl.constexpr,
+    H_ROUNDED: tl.constexpr,
     LSE_PACK: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -566,21 +634,27 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     b = tl.program_id(axis=0).to(tl.int64)
 
     n = tl.arange(0, N_ROUNDED)
-    h = tl.arange(0, H_LOCAL)
+    h = tl.arange(0, H_ROUNDED)
     d = tl.arange(0, HEAD_DIM)
     valid = n < N_RANKS
-    # The padding lanes are masked at every load, which is the documented Triton
+    # The N padding lanes are masked at every load, which is the documented Triton
     # contract. They are also folded onto lane 0 here so no pointer is ever
     # FORMED outside `recv` -- belt and braces, asked for in review, and free:
     # the select folds into the address arithmetic.
     n_safe = tl.where(valid, n, 0)
+    # H_LOCAL need not be a power of two (K3: 96/8 = 12). Padding heads alias
+    # head 0 instead: they compute head 0's values, which cannot change the row
+    # max, and are dropped by the store mask. The N axis cannot do the same,
+    # since an aliased rank would be summed twice.
+    h_valid = h < H_LOCAL
+    h_safe = tl.where(h_valid, h, 0)
 
     # [N, H] base of each (shard, head) record for this token.
     hbase = (
         recv_ptr
         + n_safe[:, None].to(tl.int64) * recv_stride_n
         + b * recv_stride_b
-        + h[None, :].to(tl.int64) * recv_stride_h
+        + h_safe[None, :].to(tl.int64) * recv_stride_h
     )
 
     if LSE_PACK == 1:
@@ -611,7 +685,7 @@ def _dcp_a2a_unpack_combine_quant_kernel(
     factor_is_nan = factor != factor  # noqa: PLR0124
     factor = tl.where(factor_is_nan | (~valid[:, None]), 0.0, factor)
 
-    # [N, H, D]. Mask the padding lanes: N_ROUNDED rounds up to a power of two,
+    # [N, H, D]. Mask the N padding lanes: N_ROUNDED rounds up to a power of two,
     # so for a non-power-of-two group the high lanes address memory past `recv`.
     # Their factor is already 0, so this changes no result -- it stops the read.
     vals = tl.load(
@@ -643,8 +717,9 @@ def _dcp_a2a_unpack_combine_quant_kernel(
 
     q = tl.minimum(tl.maximum(acc * inv, -FP8_MAX), FP8_MAX)
     tl.store(
-        out_ptr + b * out_stride_b + h[:, None] * out_stride_h + d[None, :],
+        out_ptr + b * out_stride_b + h_safe[:, None] * out_stride_h + d[None, :],
         q.to(out_ptr.dtype.element_ty),
+        mask=h_valid[:, None],
     )
 
 
@@ -696,6 +771,7 @@ def cp_lse_a2a(
         f"got H={h_total}, N={n_ranks}"
     )
     h_local = h_total // n_ranks
+    h_rounded = triton.next_power_of_2(h_local)
 
     dtype = cp_attn_out.dtype
     pack = _lse_pack_slots(dtype)
@@ -713,7 +789,7 @@ def cp_lse_a2a(
         owned_counts = cp_attn_lse
 
     send = torch.empty((n_ranks, b, h_local, head_dim + pack), dtype=dtype, device=dev)
-    _dcp_a2a_pack_kernel[(b, h_total)](
+    _dcp_a2a_pack_kernel[(b, n_ranks)](
         cp_attn_out,
         cp_attn_lse,
         owned_counts,
@@ -726,6 +802,7 @@ def cp_lse_a2a(
         send.stride(1),
         send.stride(2),
         H_LOCAL=h_local,
+        H_ROUNDED=h_rounded,
         HEAD_DIM=head_dim,
         LSE_PACK=pack,
         HAS_OWNED_COUNTS=has_owned_counts,
@@ -752,6 +829,7 @@ def cp_lse_a2a(
             n_ranks,
             HEAD_DIM=head_dim,
             H_LOCAL=h_local,
+            H_ROUNDED=h_rounded,
             LSE_PACK=pack,
             N_ROUNDED=triton.next_power_of_2(n_ranks),
             FP8_MAX=float(torch.finfo(quant_dtype).max),
@@ -1013,21 +1091,19 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_
 
 
 def get_dcp_local_window_lens(
-    seq_lens, max_seqlen_q, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
+    positions, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1
 ):
     """Per-DCP-rank local KV length of each query token's causal window.
 
-    Draft position ``j`` attends to global positions ``[0, seq_len -
-    max_seqlen_q + j]``; that extra position belongs to a single rank, so the
-    ranks' local lengths do not all advance with j. Returns a flat
-    ``[len(seq_lens) * max_seqlen_q]`` array in (sequence, draft position)
-    order. ``max_seqlen_q == 1`` reproduces ``get_dcp_local_seq_lens``.
+    The token at global position ``p`` attends to ``[0, p]``; a draft
+    position's extra key belongs to a single rank, so the ranks' local lengths
+    do not all advance with it. One entry per token of ``positions``; a step of
+    one token a sequence reproduces ``get_dcp_local_seq_lens``.
     """
-    windows = seq_lens[:, None] - max_seqlen_q + 1 + np.arange(max_seqlen_q)
     return get_dcp_local_seq_lens(
-        # Row 0 is the committed token count, which a scheduled decode row
-        # always has at least one of; the clip is for callers that do not.
-        windows.clip(min=0).ravel(),
+        # A scheduled decode token always sees itself; the clip is for callers
+        # that do not.
+        (positions + 1).clip(min=0),
         dcp_size,
         dcp_rank,
         cp_kv_cache_interleave_size,
@@ -1073,13 +1149,18 @@ def dcp_prefill_slot_mapping(
     return slot_mapping
 
 
-def dcp_local_logits_width(max_model_len: int, dcp_world_size: int) -> int:
+def dcp_local_logits_width(
+    max_model_len: int,
+    dcp_world_size: int,
+    cp_kv_cache_interleave_size: int = 1,
+) -> int:
     """Column count of one DCP rank's local indexer logits plane.
 
-    The FP4 metadata builder bakes this into a CUDAGraph-captured schedule while
-    the scorer allocates the plane, so the two have to read it off one formula.
+    Reserve the longest shard (rank zero). A partial interleave group can give
+    it more than ceil(max_model_len / world_size) tokens when S > 1.
     """
-    return -(-max_model_len // dcp_world_size)
+    full, tail = divmod(max_model_len, dcp_world_size * cp_kv_cache_interleave_size)
+    return full * cp_kv_cache_interleave_size + min(tail, cp_kv_cache_interleave_size)
 
 
 def dcp_local_context_lens(
@@ -1119,6 +1200,42 @@ def dcp_local_context_lens(
     base = full_chunks * S
     remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
     return (base + remainder).to(torch.int32)
+
+
+@triton.jit
+def _dcp_owns(pos, RANK: tl.constexpr, WORLD: tl.constexpr, INTERLEAVE: tl.constexpr):
+    """Whether this rank holds the KV of request positions `pos` (-1 = none)."""
+    return (pos >= 0) & ((pos // INTERLEAVE) % WORLD == RANK)
+
+
+@triton.jit
+def _owned_dcp_slots(
+    pos,
+    valid,
+    table_row,
+    bt_stride_col,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """`(owned, slot)` of request positions `pos` on this rank, read through
+    the request's block-table row `table_row`. A table page holds PAGE of the
+    rank's tokens, i.e. a virtual page of PAGE * WORLD request positions:
+
+        slot = table[pos // (PAGE*W)] * PAGE + (vb // (W*S)) * S + vb % S,
+        vb   = pos % (PAGE*W)
+    """
+    owned = valid & _dcp_owns(pos, RANK, WORLD, INTERLEAVE)
+    virtual_page = PAGE * WORLD
+    within = pos % virtual_page
+    page = tl.load(table_row + (pos // virtual_page) * bt_stride_col, owned, other=0)
+    slot = (
+        page * PAGE
+        + (within // (WORLD * INTERLEAVE)) * INTERLEAVE
+        + within % INTERLEAVE
+    )
+    return owned, slot
 
 
 # ---------------------------------------------------------------------------
@@ -1212,7 +1329,9 @@ def dcp_decode_candidate_exchange_fused(
         cp_kv_cache_interleave_size,
         num_decode_tokens,
     )
-    l_max = dcp_local_logits_width(max_model_len, dcp_world_size)
+    l_max = dcp_local_logits_width(
+        max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+    )
     local_logits = torch.empty(
         [num_decode_tokens, l_max], dtype=torch.float32, device="cuda"
     )
@@ -1281,19 +1400,18 @@ def dcp_decode_candidate_exchange_fused(
         values=send,
     )
 
-    # Half the payload of the (score, gid) exchange. Still moved as int32 so no
-    # float canonicalization can touch the bits; bitcast back is free.
+    # Half the payload of the (score, gid) exchange, on the custom all-gather:
+    # a pure copy, so the score bits arrive untouched.
     n_cand = dcp_world_size * k_loc
     gathered_sc = (
-        get_dcp_group()
-        .all_gather(send.view(torch.int32), dim=0)
+        dcp_all_gather(get_dcp_group(), send, 0)
         .view(dcp_world_size, num_decode_tokens, k_loc)
         .permute(1, 0, 2)
         .reshape(num_decode_tokens, n_cand)
     )
 
     flydsl_dcp_topk_merge(
-        gathered_sc.view(torch.float32),
+        gathered_sc,
         local_idx,
         block_tables,
         out_kv_indices,
@@ -1357,10 +1475,7 @@ def _count_owned_dcp_prefill_kernel(
             other=-1,
         )
         owned = (
-            col_valid
-            & valid_req
-            & (indice >= 0)
-            & (((indice // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+            col_valid & valid_req & _dcp_owns(indice, DCP_RANK, DCP_WORLD, INTERLEAVE)
         )
         count += tl.sum(owned.to(tl.int32))
 
@@ -1388,13 +1503,8 @@ def _compact_filter_dcp_prefill_kernel(
     bt_stride1: tl.constexpr,
 ):
     """Pass 2 for sparse PREFILL: keep only this rank's owned candidates, map
-    them through the interleave-S (virtual-block) layout, and pack them to the
-    front of the token's region (S=1 -> the original round-robin):
-
-        vbs  = PAGE_SIZE * W
-        vb   = pos % vbs
-        slot = block_table[req, pos // vbs] * PAGE_SIZE
-               + (vb // (W*S)) * S + (vb % S)
+    them through the interleave-S (virtual-block) layout (`_owned_dcp_slots`),
+    and pack them to the front of the token's region.
 
     Same rationale as the decode twin: no `-1` holes (they break aiter's lse
     path) and compaction is order-preserving so the fp accumulation order is
@@ -1406,7 +1516,6 @@ def _compact_filter_dcp_prefill_kernel(
     valid_req = req_id >= 0
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
-    vbs = PAGE_SIZE * DCP_WORLD
     written = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         col_id = tile_start + tl.arange(0, BLOCK_N)
@@ -1420,24 +1529,16 @@ def _compact_filter_dcp_prefill_kernel(
             mask=col_valid,
             other=-1,
         )
-        idx_valid = (
-            col_valid
-            & valid_req
-            & (indice >= 0)
-            & (((indice // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        idx_valid, slot = _owned_dcp_slots(
+            indice,
+            col_valid & valid_req,
+            block_table + req_id * bt_stride0,
+            bt_stride1,
+            DCP_RANK,
+            DCP_WORLD,
+            INTERLEAVE,
+            PAGE_SIZE,
         )
-
-        block_id = indice // vbs
-        vb = indice % vbs
-        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
-            vb % INTERLEAVE
-        )
-        physical_block = tl.load(
-            block_table + req_id * bt_stride0 + block_id * bt_stride1,
-            mask=idx_valid,
-            other=0,
-        )
-        slot = physical_block * PAGE_SIZE + inblock_offset
 
         owned_i32 = idx_valid.to(tl.int32)
         dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
@@ -1451,6 +1552,19 @@ def _compact_filter_dcp_prefill_kernel(
     # `owned_counts == 0` to replace this row with the exact softmax identity
     # (O=0, LSE=-inf), so the dummy never contributes to the DCP merge.
     tl.store(out_kv_indices + out_kv_start, 0, mask=written == 0)
+
+
+@triton.jit
+def _scan_dcp_metadata_counts_kernel(Indptr, rows, BLOCK: tl.constexpr):
+    """Indptr[1:rows+1] = inclusive prefix sum of the counts stored there, and
+    Indptr[0] = 0: one program, BLOCK rows at a time with a running carry."""
+    carry = tl.zeros((), dtype=tl.int32)
+    for start in range(0, rows, BLOCK):
+        row = start + tl.arange(0, BLOCK)
+        counts = tl.load(Indptr + row + 1, row < rows, other=0)
+        tl.store(Indptr + row + 1, tl.cumsum(counts, axis=0) + carry, row < rows)
+        carry += tl.sum(counts, axis=0)
+    tl.store(Indptr, 0)
 
 
 def triton_filter_and_convert_dcp_index_prefill(
@@ -1514,14 +1628,9 @@ def triton_filter_and_convert_dcp_index_prefill(
     )
 
     # The count kernel already wrote max(count, 1) into the destination tail,
-    # so this per-full-layer path needs neither an allocation nor another
-    # pointwise operator. Exact input/output overlap is supported by cumsum.
-    out_kv_indptr[:1].zero_()
-    torch.cumsum(
-        metadata_counts,
-        dim=0,
-        dtype=torch.int32,
-        out=metadata_counts,
+    # so the scan runs in place and needs no allocation.
+    _scan_dcp_metadata_counts_kernel[(1,)](
+        out_kv_indptr, num_tokens, BLOCK=2048, num_warps=8
     )
 
     _compact_filter_dcp_prefill_kernel[grid](

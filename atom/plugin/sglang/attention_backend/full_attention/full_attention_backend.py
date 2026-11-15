@@ -287,10 +287,26 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.spec_info,
             )
         else:
+            seq_lens = forward_batch.seq_lens
+            req_pool_indices = forward_batch.req_pool_indices
+            num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+            # MLA replay builds kv indices from seq_lens inside
+            # _init_mla_cuda_graph_metadata and then leaves kv_lens as None.
+            # Padding rows arrive as seq_len=1, req_pool_index=0. Clear the
+            # length before that builder so those rows do not read request 0.
+            if (
+                self.use_mla
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and num_padding > 0
+                and torch.is_tensor(seq_lens)
+            ):
+                real_bs = int(forward_batch.batch_size) - num_padding
+                seq_lens = seq_lens.clone()
+                seq_lens[real_bs:] = 0
             self.init_forward_metadata_replay_cuda_graph(
                 forward_batch.batch_size,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                req_pool_indices,
+                seq_lens,
                 forward_batch.seq_lens_sum,
                 forward_batch.encoder_lens,
                 forward_batch.forward_mode,
@@ -298,17 +314,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and (num_padding := int(getattr(forward_batch, "num_padding", 0))) > 0
-            ):
-                # Decode CUDA graphs pad batches to a captured bucket. SGLang
-                # fills those rows with seq_len=1 and req_pool_index=0, but ATOM
-                # uses kv_lens to derive the KV write slot inside the graph.
-                # Mark padded rows as empty so their slot_mapping becomes -1
-                # instead of overwriting request-pool row 0.
-                real_bs = forward_batch.batch_size - num_padding
-                self.forward_metadata.kv_lens[real_bs:].zero_()
+            if forward_batch.forward_mode.is_decode_or_idle() and num_padding > 0:
+                # MHA stores the padded lengths on kv_lens and uses them as
+                # the KV write slot. MLA leaves kv_lens unset.
+                real_bs = int(forward_batch.batch_size) - num_padding
+                kv_lens = self.forward_metadata.kv_lens
+                if kv_lens is not None:
+                    kv_lens[real_bs:].zero_()
 
     def _set_qwen4_exp_qsa_graph_forward_metadata(self) -> None:
         """Placeholder so the hybrid parent still sees a ForwardMetadata.
@@ -712,36 +724,31 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             run_graph=False,
         )
 
-    def _init_draft_extend_v2_mha(self, bs, forward_batch):
+    def _init_draft_extend_v2_mha(self, _bs, forward_batch):
         spec_info = forward_batch.spec_info
         if spec_info is None:
             raise RuntimeError("MHA draft_extend_v2 requires speculative metadata")
-        if forward_batch.extend_prefix_lens is None:
-            raise RuntimeError("MHA draft_extend_v2 requires extend_prefix_lens")
-        self.indices_updater_prefill.update(
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.seq_lens_sum,
-            prefix_lens=forward_batch.extend_prefix_lens,
-            encoder_lens=forward_batch.encoder_lens,
-            spec_info=None,
+        # AiterIndicesUpdaterPrefill.update ignores plan when spec_info is
+        # None and scans req_to_token. 0.5.22's MHA draft-extend path asks the
+        # spec metadata to place KV through the parent's translator instead.
+        kv_indices, kv_indptr, qo_indptr, _ = spec_info.generate_attn_arg_prefill(
+            req_pool_indices=forward_batch.req_pool_indices,
+            paged_kernel_lens=forward_batch.seq_lens,
+            paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+            translator=self.kv_index_translator,
+            plan=forward_batch.kv_loc_plan,
         )
-        max_q_len = self._max_len(
-            forward_batch.extend_seq_lens_cpu,
-            forward_batch.extend_seq_lens,
-        )
+        max_q_len = spec_info.num_tokens_per_req
         max_kv_len = self._max_len(forward_batch.seq_lens_cpu, forward_batch.seq_lens)
         self.forward_metadata = ForwardMetadata(
-            self.indices_updater_prefill.kv_indptr,
-            self.indices_updater_prefill.kv_indices,
-            self.qo_indptr[: bs + 1],
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
             None,
             max_q_len,
             max_kv_len,
             None,
             None,
-            custom_mask=None,
-            mask_indptr=None,
             max_extend_len=max_q_len,
         )
 
@@ -871,6 +878,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_seq_lens.max().item(),
             forward_batch.seq_lens.max().item(),
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
 
         max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -950,6 +958,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_prefix_lens,
             encoder_lens=forward_batch.encoder_lens,
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
         self.forward_metadata = ForwardMetadata(
             self.indices_updater_prefill.kv_indptr,
@@ -2119,6 +2128,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if k is None or v is None:
             raise RuntimeError("MHA speculative extend requires explicit k/v tensors")
 
+        # gfx95 extend attention consumes these tensors from a bf16 FMHA kernel.
+        # FP8 storage with a bf16 stride is an HSA aperture violation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -2151,8 +2167,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         cu_seqlens_q = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
-        if q.dtype != k.dtype and k.dtype == dtypes.fp8:
-            q = q.to(dtypes.fp8)
+        # hd256 varlen on gfx95 is the bf16 FMHA kernel. Casting Q down to FP8
+        # still launches that kernel and then strides off the FP8 allocation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
         o = flash_attn_varlen_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -2866,29 +2886,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             out = torch.empty_like(q_3d, dtype=self.input_dtype)
             num_seqs = self.forward_metadata.kv_lens.shape[0]
-            query_group_size = 1 * (layer.tp_q_head_num // layer.tp_k_head_num)
             max_context_partition_num = get_recommended_splits(
                 num_seqs, layer.tp_k_head_num
             )
             context_partition_size = 256
-            intermediate_shape = (
-                num_seqs,
-                layer.tp_k_head_num,
-                max_context_partition_num,
-                query_group_size,
-            )
-            exp_sums = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            max_logits = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            temporary_output = torch.empty(
-                *intermediate_shape,
-                layer.head_dim,
-                dtype=q.dtype,
-                device=q.device,
-            )
             run_pa_decode(
                 output=out,
                 q=q_3d,
@@ -2904,9 +2905,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 q_scale=None,
                 k_scale=None,
                 v_scale=None,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
                 alibi_slopes=None,
                 sinks=None,
                 sliding_window=-1,

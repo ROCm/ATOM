@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import deepseek_v41_encoder
+from .reasoning_controls import ReasoningRules
 
 logger = logging.getLogger("atom")
 
@@ -66,6 +67,15 @@ class MessageEncoderAdapter:
     defaults: dict[str, Any] = field(default_factory=dict, compare=False)
     prepare_kwargs: KwargsPreparer = _identity_kwargs
     preserve_content: bool = False
+    reasoning_rules: ReasoningRules | None = None
+    # The encoder module's own message processing, when it has one
+    # (DeepSeek-V4.1's `process_image_messages`: joins a content list's text
+    # blocks and refuses image placeholder tokens). Text this server places
+    # after the render -- an assistant prefix -- goes through it as the
+    # rendered messages do.
+    process_image_messages: Callable[[list[dict]], tuple[list[dict], list]] | None = (
+        field(default=None, compare=False)
+    )
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Render, passing on only the kwargs this encoder can take.
@@ -103,6 +113,7 @@ class _EncoderPreparation:
     kwargs: KwargsPreparer = _identity_kwargs
     supports_tools: bool = False
     preserve_content: bool = False
+    reasoning_rules: ReasoningRules | None = None
 
 
 _PREPARERS = {
@@ -114,6 +125,7 @@ _PREPARERS = {
         kwargs=deepseek_v41_encoder.prepare_kwargs,
         supports_tools=True,
         preserve_content=True,
+        reasoning_rules=deepseek_v41_encoder.REASONING_RULES,
     ),
 }
 
@@ -151,6 +163,7 @@ def build_message_encoder_adapter(
     accepts_from: MessageEncoder | None = None,
     defaults: dict[str, Any] | None = None,
     model_type: str | None = None,
+    process_image_messages: Callable | None = None,
 ) -> MessageEncoderAdapter:
     """Build an adapter registered for ``module_name`` or an identity adapter.
 
@@ -169,7 +182,9 @@ def build_message_encoder_adapter(
         prepare_kwargs=preparation.kwargs,
         supports_tools=preparation.supports_tools,
         preserve_content=preparation.preserve_content,
+        reasoning_rules=preparation.reasoning_rules,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),
         defaults=dict(defaults or {}),
+        process_image_messages=process_image_messages,
     )

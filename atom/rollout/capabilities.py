@@ -44,6 +44,9 @@ class CapabilityProviderMixin:
             features.add("vocab_masking")
         if self._holds_fp8_weights():
             features.add("fp8_weight_update")
+        # Engine-side (AsyncLLMEngine.pause_generation), reported here so a
+        # caller has one place to ask what this ATOM supports.
+        features.add("pause_generation")
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {

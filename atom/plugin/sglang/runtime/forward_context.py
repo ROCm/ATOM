@@ -319,6 +319,7 @@ def _build_glm52_dsa_metadata(
         return None
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
+        SHARED_SPARSE_INDICES_ATTR,
         build_atom_glm52_attention_metadata_from_sglang,
         get_draft_decode_sub_step,
         is_draft_decode_metadata,
@@ -415,6 +416,12 @@ def _build_glm52_dsa_metadata(
                         graph_cache
                     )
                 graph_cache[graph_cache_key] = attn_metadata
+    if attn_metadata is not None and token_to_kv_pool is not None:
+        # The selection the indexer writes and every sparse MLA layer reads:
+        # the buffer `bind_glm52_dsa_cache_views` binds onto the indexers.
+        attn_metadata.sparse_kv_indices = getattr(
+            token_to_kv_pool, SHARED_SPARSE_INDICES_ATTR, None
+        )
     return attn_metadata
 
 
@@ -689,7 +696,11 @@ def _build_kimi_k3_metadata(
             "reduce_partial_map",
             "num_kv_splits",
         ):
-            setattr(attn_metadata, name, getattr(forward_metadata, name, None))
+            value = getattr(forward_metadata, name, None)
+            if name == "work_meta_data" and not torch.is_tensor(value):
+                # SGLang's ForwardMetadata field is work_metadata.
+                value = getattr(forward_metadata, "work_metadata", None)
+            setattr(attn_metadata, name, value)
 
     linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
     attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(

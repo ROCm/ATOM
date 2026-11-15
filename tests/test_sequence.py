@@ -7,9 +7,11 @@ from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequen
 from atom.sampling_params import SamplingParams
 
 
-def test_speculative_logprobs_are_rejected_before_request_admission():
-    with pytest.raises(ValueError, match="logprobs.*speculative"):
-        Sequence([1, 2], 16, SamplingParams(logprobs=True), num_draft_tokens=5)
+def test_speculative_logprobs_request_is_admitted():
+    seq = Sequence(
+        [1, 2], 16, SamplingParams(logprobs=True, top_logprobs=5), num_draft_tokens=5
+    )
+    assert seq.return_logprobs and seq.top_logprobs == 5
     assert Sequence([1, 2], 16, SamplingParams(logprobs=True)).return_logprobs
 
 

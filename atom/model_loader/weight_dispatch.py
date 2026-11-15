@@ -29,6 +29,10 @@ from torch import nn
 
 from atom.model_loader.weight_names import extract_expert_target_and_id
 
+# Unquantized storage dtypes: between two of these a copy is a precision change,
+# not a format conversion.
+_PLAIN_FLOAT_DTYPES = frozenset({torch.float32, torch.bfloat16, torch.float16})
+
 logger = logging.getLogger("atom")
 
 
@@ -85,6 +89,10 @@ class WeightDispatcher:
 
         self.loaded_weights_record: set[str] = set()
         self.dropped_ckpt_keys: list[tuple[str, str]] = []
+        # (checkpoint name, its dtype, the parameter's) where both are plain
+        # floats that differ: the copy converts, so the model runs at a
+        # precision the checkpoint did not store.
+        self.dtype_mismatches: list[tuple[str, torch.dtype, torch.dtype]] = []
         # Latched on the first tensor that looks like a fused-expert one, then
         # used for every tensor after it. Per-load state on purpose: the same
         # model class loads a fused-expert target checkpoint and a per-expert
@@ -125,7 +133,7 @@ class WeightDispatcher:
                     param_name = name.replace(k, target_name)
                     if "output_scale" in param_name:
                         continue
-                    param = self._parameter(orig_ckpt_name, param_name)
+                    param = self._parameter(orig_ckpt_name, param_name, tensor)
                     if param is None:
                         continue
                     self.submit(param.weight_loader, param, tensor, shard_idx)
@@ -136,7 +144,7 @@ class WeightDispatcher:
                 param_name = name.replace(k, v)
                 # FIXME output_scale has a value, so accuracy is incorrect. this should be loaded and used in llfp4.
                 if "output_scale" not in param_name:
-                    param = self._parameter(orig_ckpt_name, param_name)
+                    param = self._parameter(orig_ckpt_name, param_name, tensor)
                     if param is None:
                         return True
                     self.submit(param.weight_loader, param, tensor, shard_id)
@@ -252,7 +260,7 @@ class WeightDispatcher:
             return
         if merged_target := extract_expert_target_and_id(name):
             fused_name, expert_id = merged_target
-            param = self._parameter(orig_ckpt_name, fused_name)
+            param = self._parameter(orig_ckpt_name, fused_name, tensor)
             if param is None:
                 return
             # Merged loader writes expert slots directly; same ownership rule
@@ -274,7 +282,7 @@ class WeightDispatcher:
     def _dispatch_generic(
         self, orig_ckpt_name: str, name: str, tensor: torch.Tensor
     ) -> None:
-        param = self._parameter(orig_ckpt_name, name)
+        param = self._parameter(orig_ckpt_name, name, tensor)
         if param is None:
             return
         weight_loader = getattr(param, "weight_loader", self.default_weight_loader)
@@ -283,12 +291,15 @@ class WeightDispatcher:
 
     # ── helpers ───────────────────────────────────────────────────────────
 
-    def _parameter(self, orig_ckpt_name: str, param_name: str) -> nn.Parameter | None:
+    def _parameter(
+        self, orig_ckpt_name: str, param_name: str, tensor: torch.Tensor
+    ) -> nn.Parameter | None:
         try:
             param = self.model.get_parameter(param_name)
         except AttributeError:
             self.dropped_ckpt_keys.append((orig_ckpt_name, param_name))
             return None
+        self._note_precision_change(orig_ckpt_name, param, tensor)
         # Loaders are handed `(param, tensor)` and nothing else, so a failure
         # inside one can only report shapes, leaving the weight to be identified
         # by arithmetic. Carry both names on the parameter instead. Each
@@ -296,6 +307,16 @@ class WeightDispatcher:
         # here and read from the worker.
         param._atom_load_names = (param_name, orig_ckpt_name)
         return param
+
+    def _note_precision_change(
+        self, orig_ckpt_name: str, param: nn.Parameter, tensor: torch.Tensor
+    ) -> None:
+        if (
+            param.dtype != tensor.dtype
+            and param.dtype in _PLAIN_FLOAT_DTYPES
+            and tensor.dtype in _PLAIN_FLOAT_DTYPES
+        ):
+            self.dtype_mismatches.append((orig_ckpt_name, tensor.dtype, param.dtype))
 
     def _record(self, param_name: str) -> None:
         self.loaded_weights_record.add(self.prefix + param_name)

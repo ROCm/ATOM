@@ -832,6 +832,9 @@ def _producer(mc, regions, *, staging_rows=None):
     conn._per_block_bytes_list = [PAGE_BYTES] * len(regions)
     conn._block_region_roles = [MLA_KV_ROLE] * len(regions)
     conn._block_region_consumer_indices = None
+    conn._block_unit_specs = None
+    conn._block_head_major_runs = ()
+    conn._unit_layout = None
     conn._consumer_region_map = lambda *_a, **_k: list(range(len(regions)))
     conn._prepare_sharded_index = None
     conn._gather_sharded_index = None
@@ -1231,6 +1234,7 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_recv_slots = {}
     # A landing request is not in the write-done tables: the receiver has it.
     conn._pending_recv_expected = {}
+    conn._pending_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
@@ -1298,6 +1302,11 @@ def _listen(monkeypatch, mc, listener, messages):
         pass
 
     class _Socket:
+        def poll(self, timeout):
+            if not messages:
+                raise _Stop
+            return mc.zmq.POLLIN
+
         def getsockopt(self, _option):
             return b"tcp://0.0.0.0:1"
 
@@ -1307,6 +1316,10 @@ def _listen(monkeypatch, mc, listener, messages):
             return [b"peer", *messages.pop(0)]
 
     conn = listener.__self__
+    conn._completed_prefills_lock = threading.Lock()
+    conn._pending_chunked_requests = []
+    conn._chunked_admissions = {}
+    conn._chunked_local_ids = {}
     conn._listener_bound = threading.Event()
     conn._listener_error = None
     monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))

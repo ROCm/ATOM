@@ -156,14 +156,27 @@ if __name__ == "__main__":
     for s in sizes:
         for feeds_index, fp4 in ((False, False), (True, False), (True, True)):
             check_k1(k1.AttnPreBuild(tokens=s, feeds_index=feeds_index, index_fp4=fp4))
-        for bound, fp4 in ((0, False), (65536, False), (65536, True)):
-            check_k2(k2.LayerPostBuild(tokens=s, index_bound_max=bound, index_fp4=fp4))
+        for bound, fp4, mfma in (
+            (0, False, False),
+            (65536, False, False),
+            (65536, True, False),
+            (65536, True, True),
+        ):
+            check_k2(k2.LayerPostBuild(
+                tokens=s, index_bound_max=bound, index_fp4=fp4, index_mfma=mfma
+            ))  # fmt: skip
+        # an FP8 pool: the window row's bytes, the attention's dequant
+        check_k1(k1.AttnPreBuild(tokens=s, kv_fp8=True))
+        check_k2(k2.LayerPostBuild(
+            tokens=s, index_bound_max=65536, index_fp4=True, kv_fp8=True
+        ))  # fmt: skip
         if s % 4 == 0 and s >= 12:
             for feeds_index in (False, True):
                 check_k1(k1.AttnPreBuild(
                     tokens=s, feeds_index=feeds_index, index_fp4=feeds_index,
                     tok_par=True,
                 ))  # fmt: skip
+            check_k1(k1.AttnPreBuild(tokens=s, tok_par=True, kv_fp8=True))
             check_k2(k2.LayerPostBuild(
                 tokens=s, index_bound_max=65536, index_fp4=True, tok_par=True
             ))  # fmt: skip

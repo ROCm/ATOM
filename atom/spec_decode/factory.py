@@ -11,6 +11,11 @@ def build_drafter(config: Config, device, runner) -> Drafter:
     downstream call-site depends on the ``Drafter`` contract, not the concrete
     type.
     """
+    return drafter_class(config)(config, device, runner)
+
+
+def drafter_class(config: Config) -> type[Drafter]:
+    """The drafter class this config speculates with, on every PP stage."""
     if config.speculative_config.use_dspark():
-        return DSparkProposer(config, device, runner)
-    return EagleProposer(config, device, runner)
+        return DSparkProposer
+    return EagleProposer

@@ -321,8 +321,8 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.kv_cache_dtype != "bf16":
-        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
+    if config.kv_cache_dtype not in ("bf16", "fp8", "fp4"):
+        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16, FP8 or FP4 KV cache")
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
@@ -375,13 +375,16 @@ def validate_runtime_config(config):
             config.enable_tbo and not config.enable_dp_attention,
         ),
         (
-            # `lmcache_mp` checkpoints STATE through the backend's PAGE-backed
-            # copies; Mooncake P/D moves whole PAGE units plus the request's one
-            # STATE slot (`get_kv_transfer_tensors`). MoRI-IO and in-process
-            # offload read SLOT codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp or mooncake",
+            # The Store moves PAGEs and rebuilds STATE through replay (it is
+            # refused without bounded replay, below). `lmcache_mp` moves PAGEs
+            # and either replays STATE or, without bounded replay, carries
+            # native-state images. Mooncake P/D moves whole PAGE units plus the
+            # request's one STATE slot (`get_kv_transfer_tensors`). MoRI-IO and
+            # in-process offload read SLOT codecs this runtime does not publish.
+            # A `multi` (P/D plus an offload tier) is not admitted.
+            "KV transfer other than lmcache_mp, mooncake or mooncake_store",
             KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp", "mooncake"),
+            not in (None, "lmcache_mp", "mooncake", "mooncake_store"),
         ),
         (
             # Mooncake defaults a missing role to producer, but producer
@@ -394,19 +397,28 @@ def validate_runtime_config(config):
             and config.kv_transfer_config.get("kv_role")
             not in ("kv_producer", "kv_consumer"),
         ),
+        (
+            # The Store moves V4.1's PAGEs and relies on replay to rebuild the
+            # state a hit does not carry; without bounded replay the backend
+            # copies state instead and the Store's PAGE-only load is unsound.
+            "Mooncake Store without encoder SWA bounded replay",
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            == "mooncake_store"
+            and not config.enable_encoder_swa_bounded_replay,
+        ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
             # The plane the paged scorer reads: FP8, or FP4 in the row-group
             # scorer's page-8 layout (`index_plane`). The main pool stays
-            # independent of it and takes bf16 or fp4 either way.
+            # independent of it and takes bf16, fp8 or fp4 either way.
             "an index plane other than fp8 or fp4",
             config.index_cache_dtype not in ("fp8", "fp4"),
         ),
         (
-            "a KV cache other than bf16 or fp4",
-            config.kv_cache_dtype not in ("bf16", "fp4"),
+            "a KV cache other than bf16, fp8 or fp4",
+            config.kv_cache_dtype not in ("bf16", "fp8", "fp4"),
         ),
         (
             # A hit rebuilds the window a row at it reads from the one PAGE

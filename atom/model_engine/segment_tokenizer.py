@@ -39,6 +39,7 @@ from typing import NamedTuple
 import numpy as np
 
 from atom.model_engine.byte_lru import ByteLRU
+from atom.model_engine.prefix_block_hashes import PrefixBlockHashes, extend_block_hashes
 from atom.model_engine.segment_split import AddedTokenSplitter
 
 logger = logging.getLogger("atom")
@@ -74,6 +75,7 @@ class _Prefix(NamedTuple):
     ids: np.ndarray  # int32, without the BOS/EOS `encode` wraps a prompt in
     cut_chars: np.ndarray  # int64, ascending; the last is `len_chars`
     cut_ids: np.ndarray  # int64
+    block_hashes: PrefixBlockHashes | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -86,7 +88,13 @@ class _Prefix(NamedTuple):
             + sys.getsizeof(self.ids)
             + sys.getsizeof(self.cut_chars)
             + sys.getsizeof(self.cut_ids)
+            + (self.block_hashes.payload_bytes if self.block_hashes is not None else 0)
         )
+
+
+class PrefixEncoding(NamedTuple):
+    token_ids: list[int]
+    block_hashes: PrefixBlockHashes | None
 
 
 def _shared_chars(a: str, b: str, limit: int) -> int:
@@ -152,13 +160,38 @@ class SegmentTokenizer:
     # -- public ------------------------------------------------------------
 
     def encode(self, prompt: str) -> list[int]:
+        return self._checked_encode(prompt)
+
+    def encode_with_prefix(self, prompt, block_size, seed=-1):
+        """Encode, and extend the prompt block-hash chain kept with the same
+        stored prefix.
+
+        Token IDs and block hashes are verified and evicted as one record.
+        Unsupported/short/disabled paths return no hint; ordinary hashing
+        remains available to the caller.
+        """
+        if not self._prefix_ok:
+            # No stored prefix is ever found or kept, so the chain would be
+            # rebuilt in full every request: let the caller hash as before.
+            return PrefixEncoding(self._checked_encode(prompt), None)
+        return self._checked_encode(prompt, (block_size, seed))
+
+    def _checked_encode(self, prompt, hash_spec=None):
+        def plain(ids):
+            return ids if hash_spec is None else PrefixEncoding(ids, None)
+
         if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
-            return self._tokenizer.encode(prompt)
+            return plain(self._tokenizer.encode(prompt))
         # Decided before encoding: a request either checks its own result or
         # was admitted once enough others had.
         with self._lock:
             verify = self._verified < _VERIFY_FIRST
-        ids = self._encode_cached(prompt)
+        result = (
+            self._encode_cached(prompt)
+            if hash_spec is None
+            else self._encode_cached(prompt, hash_spec)
+        )
+        ids = result if hash_spec is None else result.token_ids
         if verify:
             ref = self._tokenizer.encode(prompt)
             with self._lock:
@@ -175,15 +208,16 @@ class SegmentTokenizer:
                     self._buckets.clear()
                 elif self.enabled:
                     self._verified += 1
-            return ref
+                enabled = self.enabled
+            return result if enabled else plain(ref)
         with self._lock:
             enabled = self.enabled
         # Turned off while this request encoded: its ids are unchecked.
-        return ids if enabled else self._tokenizer.encode(prompt)
+        return result if enabled else plain(self._tokenizer.encode(prompt))
 
     # -- the two levels ----------------------------------------------------
 
-    def _encode_cached(self, prompt: str) -> list[int]:
+    def _encode_cached(self, prompt: str, hash_spec=None):
         t0 = time.perf_counter()
         split = self._split
         base, k = self._find_prefix(prompt)
@@ -247,13 +281,30 @@ class SegmentTokenizer:
         body = np.concatenate(chunks)
         out = body.tolist()
 
+        block_hashes = None
+        if hash_spec is not None:
+            block_hashes = extend_block_hashes(
+                body,
+                *hash_spec,
+                base=None if base is None else base.block_hashes,
+                shared_tokens=(len(split.head) + n_base if base is not None else 0),
+            )
+
         # With no added token past the reused cut, the new entry would be a
         # part of `base`, which already serves it.
         if new_cut_chars:
-            self._store_prefix(prompt, body, base, k, new_cut_chars, new_cut_ids)
+            self._store_prefix(
+                prompt,
+                body,
+                base,
+                k,
+                new_cut_chars,
+                new_cut_ids,
+                block_hashes=block_hashes,
+            )
         fresh_ids = sum(len(v) for v in fresh.values())
         self._count(len(out) - fresh_ids, fresh_ids, time.perf_counter() - t0, base)
-        return out
+        return out if hash_spec is None else PrefixEncoding(out, block_hashes)
 
     def _find_prefix(self, prompt: str):
         """`(entry, k)`: the stored prompt sharing the most with `prompt` and
@@ -285,7 +336,9 @@ class SegmentTokenizer:
                 self._lru.get(("p", best_pid))
         return best, best_k
 
-    def _store_prefix(self, prompt, body, base, k, new_cut_chars, new_cut_ids):
+    def _store_prefix(
+        self, prompt, body, base, k, new_cut_chars, new_cut_ids, block_hashes=None
+    ):
         """Keep `prompt` for later turns; it replaces `base` if it extends it
         whole, and sits beside it otherwise (another conversation with the
         same start, a fork)."""
@@ -310,6 +363,11 @@ class SegmentTokenizer:
             body[head : head + int(cut_ids[-1])].copy(),
             cut_chars,
             cut_ids,
+            (
+                block_hashes.truncated(head + int(cut_ids[-1]))
+                if block_hashes is not None
+                else None
+            ),
         )
         # The new prompt supersedes `base` when what it does not share of
         # `base` is added tokens only, no text: the previous turn's generation

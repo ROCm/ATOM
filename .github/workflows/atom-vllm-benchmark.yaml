@@ -31,112 +31,96 @@ on:
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_2:
         description: "Manual selection slot 2: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_3:
         description: "Manual selection slot 3: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_4:
         description: "Manual selection slot 4: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_5:
         description: "Manual selection slot 5: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_6:
         description: "Manual selection slot 6: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_7:
         description: "Manual selection slot 7: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       model_slot_8:
         description: "Manual selection slot 8: choose a model + TP size candidate."
         type: choice
         default: none
         options:
           - none
-          - DeepSeek-V3.2 FP8 PTPC TP4
-          - DeepSeek-V3.2 FP8 PTPC MTP TP4
-          - DeepSeek-V4-Pro TP8
-          - Kimi-K3 TP8
-          - GLM-5.2-MXFP4 TP4
-          - GLM-5.2-MXFP4-MTP TP4
+          - DeepSeek-V4-Flash TP4
+          - MiniMax-M3-MXFP4 EAGLE3 TP4
+          - Kimi-K3 DSpark DCP8 TP8
+          - DeepSeek-V4.1-Flash DSpark TP4
+          - GLM-5.3-Flash kpool MTP prefix-cache TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
-          - MiniMax-M3-MXFP4 TP4
       isl_osl_pairs:
         description: |
           Benchmark ISL/OSL pairs.
@@ -146,9 +130,9 @@ on:
         type: string
         default: "1024,1024;1024,8192;8192,1024"
       concurrency_values:
-        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide."
+        description: "Benchmark concurrency values. Use comma-separated values from 4,8,16,32,64,128,256,512. The workflow will benchmark exactly the values you provide. The default matches the SGLang benchmark's."
         type: string
-        default: "4,8,16,32,64,128,256,512"
+        default: "4,8,16,32,64"
       random_range_ratios:
         description: "Benchmark random range ratios. Use comma-separated values like 0.8,1.0."
         type: string
@@ -502,7 +486,7 @@ jobs:
         id: parse-benchmark-params
         env:
           ISL_OSL_PAIRS: ${{ inputs.isl_osl_pairs || '1024,1024;1024,8192;8192,1024' }}
-          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64,128,256,512' }}
+          CONCURRENCY_VALUES: ${{ inputs.concurrency_values || '4,8,16,32,64' }}
           RANDOM_RANGE_RATIOS: ${{ inputs.random_range_ratios || '0.8' }}
         run: |
           set -euo pipefail
@@ -675,15 +659,15 @@ jobs:
                   m for m in variants if str(m.get("display", "")) in displays
               ]
 
+          # The models the vLLM plugin PR CI (atom-vllm-test.yaml) gates on,
+          # under the same display names.
           BENCHMARK_DISPLAYS = {
-              "DeepSeek-V3.2 FP8 PTPC TP4",
-              "DeepSeek-V3.2 FP8 PTPC MTP TP4",
-              "DeepSeek-V4-Pro TP8",
-              "Kimi-K3 TP8",
-              "GLM-5.2-MXFP4 TP4",
-              "GLM-5.2-MXFP4-MTP TP4",
+              "DeepSeek-V4-Flash TP4",
+              "MiniMax-M3-MXFP4 EAGLE3 TP4",
+              "Kimi-K3 DSpark DCP8 TP8",
+              "DeepSeek-V4.1-Flash DSpark TP4",
+              "GLM-5.3-Flash kpool MTP prefix-cache TP4",
               "Qwen3.5-397B-A17B-MXFP4 TP4",
-              "MiniMax-M3-MXFP4 TP4",
           }
 
           if event == "schedule":
@@ -822,26 +806,17 @@ jobs:
               excluded_pairs = set(model.get("excluded_input_output_pairs", []))
               model_params = []
               seen = set()
-              extra_concurrency = (128, 256)
 
               for param in params:
-                  base_params = [param]
+                  variants = [param]
                   if is_aw_model:
-                      base_params = []
+                      variants = []
                       for input_length, output_length in aw_pairs:
                           aw_param = dict(param)
                           aw_param["input_length"] = input_length
                           aw_param["output_length"] = output_length
                           aw_param["random_range_ratio"] = "0.0"
-                          base_params.append(aw_param)
-
-                  variants = []
-                  for base_param in base_params:
-                      variants.append(base_param)
-                      for concurrency in extra_concurrency:
-                          variant = dict(base_param)
-                          variant["concurrency"] = concurrency
-                          variants.append(variant)
+                          variants.append(aw_param)
 
                   for variant in variants:
                       key = (
@@ -1066,6 +1041,7 @@ jobs:
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
+      DRAFT_MODEL_PATH: ${{ matrix.model.draft_model_path || '' }}
       OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
@@ -1179,7 +1155,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/shared_nfs/huggingface_models" ]; then
+          if [ -d "/share_nfs/models" ]; then
+            MODEL_CACHE_MOUNT="-v /share_nfs/models:/models"
+            MODEL_CACHE_DESC="/share_nfs/models (shared host path)"
+          elif [ -d "/shared_nfs/huggingface_models" ]; then
             MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
             MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
           elif [ -d "/shared_nfs/models" ]; then
@@ -1251,6 +1230,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /share_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/share_nfs/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
@@ -1276,6 +1257,24 @@ jobs:
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
+            # A separate draft checkpoint (EAGLE3, DSpark) is referenced from
+            # the speculative config as /models/<hf id>, as in the PR CI.
+            if [ -n "${DRAFT_MODEL_PATH}" ]; then
+              draft_id="${DRAFT_MODEL_PATH#/models/}"
+              echo "Checking cache and lock-protected download for draft model /models/${draft_id}"
+              if ! $CONTAINER_ENGINE exec \
+                -e HF_TOKEN="${HF_TOKEN:-}" \
+                -e MODEL_ID="${draft_id}" \
+                -e TARGET_DIR="/models/${draft_id}" \
+                -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+                -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+                -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+                -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+                "$CONTAINER_NAME" bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+                echo "Draft model download failed for '${draft_id}'. Aborting."
+                exit 1
+              fi
+            fi
           else
             echo "/models directory not mounted; skipping model download"
           fi
@@ -1290,6 +1289,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /share_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/share_nfs/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
@@ -1307,6 +1308,19 @@ jobs:
           else
             echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
+            if [ -n "${DRAFT_MODEL_PATH}" ]; then
+              # No /models mount: point the speculative config at the draft's
+              # hub id so vLLM fetches it itself.
+              source .github/scripts/plugin_ci/cache_model.sh
+              draft_id="${DRAFT_MODEL_PATH#/models/}"
+              rewritten_args="$(plugin_ci_rewrite_extra_args "${OOT_EXTRA_ARGS}" "${draft_id}" "${draft_id}")"
+              {
+                echo "OOT_SERVE_EXTRA_ARGS<<OOT_SERVE_EXTRA_ARGS_EOF"
+                echo "${rewritten_args}"
+                echo "OOT_SERVE_EXTRA_ARGS_EOF"
+              } >> "$GITHUB_ENV"
+              echo "Using draft model id: ${draft_id}"
+            fi
           fi
 
       - name: Prepare benchmark client in container
@@ -1335,7 +1349,7 @@ jobs:
           $CONTAINER_ENGINE exec \
             -e OOT_MODEL_NAME="${MODEL_NAME}" \
             -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e OOT_EXTRA_ARGS="${OOT_SERVE_EXTRA_ARGS:-${OOT_EXTRA_ARGS}}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \

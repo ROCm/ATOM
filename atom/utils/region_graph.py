@@ -380,6 +380,9 @@ class TokenGraph:
         # a recording without a phase serves both, but only a phase that
         # records counts it among its own (`captured_sizes`).
         self._captured: dict[tuple, set[str]] = {}
+        # (phase or None, bucket) -> the step's rows, when the forward ran a
+        # shard of them (`Context.step_rows`).
+        self._rows: dict[tuple, int] = {}
         # Argument position or name -> the buffer every bucket's input slices.
         self._buffers: dict[int | str, torch.Tensor] = {}
         # The pools this records into, each retired when this goes.
@@ -398,9 +401,9 @@ class TokenGraph:
             sizes = TokenGraph._sizes[phase] = tuple(
                 sorted(
                     {
-                        key[0][0]
+                        graph._rows.get(bucket, bucket[1][0][0])
                         for graph in TokenGraph._live
-                        for (_, key), phases in graph._captured.items()
+                        for bucket, phases in graph._captured.items()
                         if phase is None or phase in phases
                     }
                 )
@@ -431,6 +434,7 @@ class TokenGraph:
         dropped = len(self._buckets)
         self._buckets.clear()
         self._captured.clear()
+        self._rows.clear()
         TokenGraph._sizes.clear()
         TokenGraph._pool = None
         self._buffers.clear()
@@ -470,6 +474,9 @@ class TokenGraph:
         segments, output = self._record(forward, *inputs, pool=pool, **kw)
         self._buckets[(phase, key)] = (segments, inputs, kw)
         self._captured[(phase, key)] = {_phase()}
+        context = getattr(forward_context.get_forward_context(), "context", None)
+        if getattr(context, "step_rows", 0):
+            self._rows[(phase, key)] = context.step_rows
         TokenGraph._sizes.clear()
         return output
 
@@ -553,11 +560,16 @@ def token_graph(cls: type | None = None, *, per_phase: bool = False):
 
 def _phase() -> str | None:
     """The phase a recording of this step is keyed under (`token_graph`), and
-    the phase its record pass captures for (`captured_sizes`); None off a step."""
+    the phase its record pass captures for (`captured_sizes`); None off a step.
+    A rank decoding beside a prefilling DP peer replays the prefill recording
+    the group settled on (`ForwardMode.prefill_token_graph`)."""
     context = getattr(forward_context.get_forward_context(), "context", None)
     if context is None:
         return None
-    return "prefill" if context.is_prefill else "decode"
+    mode = getattr(context, "forward_mode", None)
+    if context.is_prefill or (mode is not None and mode.prefill_token_graph):
+        return "prefill"
+    return "decode"
 
 
 def _run_token_graph(owner, forward: Callable, args, kwargs, per_phase=False):

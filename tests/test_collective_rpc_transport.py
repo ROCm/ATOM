@@ -46,6 +46,50 @@ with stubbed_aiter():
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
+def test_worker_death_reports_failure_before_blocking_cleanup(monkeypatch):
+    mgr = object.__new__(AsyncIOProcManager)
+    proc = SimpleNamespace(
+        sentinel=17, name="ModelRunner0", exitcode=1, join=lambda timeout: None
+    )
+    mgr.procs = [proc]
+    mgr._dead_ranks = {}
+    mgr.runner_label = mgr.label = "test"
+    calls = []
+    mgr.on_worker_failure = lambda: calls.append("notify")
+    mgr.exit = lambda: calls.append("cleanup")
+    targets = []
+    monkeypatch.setattr(
+        async_proc_module,
+        "Thread",
+        lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
+    )
+    monkeypatch.setattr(
+        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+    )
+    mgr.monitor_procs()
+    targets[0]()
+    assert calls == ["notify", "cleanup"]
+    assert mgr._dead_ranks == {0: 1}
+
+
+def test_expected_worker_shutdown_does_not_report_failure(monkeypatch):
+    mgr = object.__new__(AsyncIOProcManager)
+    mgr.procs = [SimpleNamespace(sentinel=17)]
+    mgr.runner_label = "test"
+    targets = []
+    monkeypatch.setattr(
+        async_proc_module,
+        "Thread",
+        lambda **kw: SimpleNamespace(start=lambda: targets.append(kw["target"])),
+    )
+    monkeypatch.setattr(
+        async_proc_module.multiprocessing.connection, "wait", lambda sentinels: [17]
+    )
+    mgr.monitor_procs()
+    mgr.keep_monitoring = False
+    targets[0]()  # Must return without notifying or running failure cleanup.
+
+
 class _Runner:
     """Stand-in for a ModelRunner: one method per outcome under test."""
 

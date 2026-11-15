@@ -120,7 +120,7 @@ def replayable(forward, running_tokens: int) -> bool:
         step is not None
         and step.decoder is not None
         and not step.decode
-        and running_tokens == step.width
+        and running_tokens == step.running_tokens
     )
 
 
@@ -195,11 +195,13 @@ class QueryRows:
         """``tensors`` ([1, rows, ...]) at the queries, in one launch."""
         return _gather_rows(self.rows, *tensors, dim=1)
 
-    def indices(self, cache, spec):
+    def indices(self, cache, spec, *, a8w4=False):
         """`cache.attention_indices` for the queries alone: built afresh, never
         the index group its step's other layers already built over every row."""
         prefix, pptr, extend, eptr = cache.attention_indices(
-            spec, replace(self.index, group_indices={})
+            spec,
+            replace(self.index, group_indices={}, a8w4_indptrs={}, window_rows=None),
+            a8w4=a8w4,
         )
         return prefix, pptr[self.ptr_rows], extend, eptr[self.ptr_rows]
 
@@ -208,7 +210,9 @@ class QueryRows:
 class ReplayPlan:
     """The decoder's rows of a replayed prefill, on the device at the
     addresses every step of its request bucket publishes (`TailLayout`).
-    ``tail``: their step."""
+    ``tail``: their step. ``filled_gpu`` / ``finishing_gpu``: [1] int32 on
+    the device, the real rows of the decoder's passes -- the tail's ``filled``
+    rows (layers 20-38), its finishing requests (layer 39's one row each)."""
 
     tail: BatchStep
     tail_rows: torch.Tensor
@@ -217,6 +221,8 @@ class ReplayPlan:
     query_ptrs: torch.Tensor
     last_rows: torch.Tensor
     filled: int
+    filled_gpu: torch.Tensor
+    finishing_gpu: torch.Tensor
 
     def queries(self) -> QueryRows:
         """Layer 39's queries. Built where they are read, so a recording reads

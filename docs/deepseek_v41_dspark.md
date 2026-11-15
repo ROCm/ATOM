@@ -11,16 +11,16 @@ and throughput require validation for the deployment workload.
 
 ## Supported configuration
 
-DSpark requires BF16 KV and text requests. The index plane is FP8 by default
-or FP4. Tensor
+DSpark requires an FP8 (the deployed configuration) or BF16 KV cache and text
+requests. The index plane is FP8 by default or FP4. Tensor
 parallelism follows the model's dimension-divisibility checks, with no TP4-only
 admission gate. Configuration tests cover TP1/2/4/8; the GPU benchmark evidence
 covers TP2 and TP4 without EP at level 3 FULL. See the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) for commands and the
 fixed acceptance length used in those measurements.
 
-Data-parallel attention is also supported with BF16 KV and the FP8
-index plane. Text prefill can use TBO with tensor-sharded experts or the
+Data-parallel attention is also supported, on the same KV caches and index
+planes. Text prefill can use TBO with tensor-sharded experts or the
 validated DPA4 + MORI EP4 high-throughput configuration (16 GiB MoRI heap);
 see the [DPA and TBO configuration](deepseek_v41_runtime.md#data-parallel-attention).
 
@@ -33,8 +33,8 @@ Fixed acceptance schedules use the common `--spec-decode-acceptance-length`
 or `--spec-decode-acceptance-rate` options and the shared rejection sampler.
 
 Not admitted: packed speculative caches, multimodal speculation,
-relaxed MTP acceptance, and speculative output token logprobs — the
-current output protocol cannot return the last of these correctly. Both target
+and relaxed MTP acceptance. Text Chat logprobs support DSpark; see
+[Chat token logprobs](chat_logprobs.md) for probability semantics and limitations. Both target
 and draft MoE reuse V4 FusedMoE. Non-speculative vision and packed cache support
 are independent of all of this.
 
@@ -48,8 +48,8 @@ config = Config(
     model=model,
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    kv_cache_dtype="bf16",
-    index_cache_dtype="fp8",
+    kv_cache_dtype="fp8",
+    index_cache_dtype="fp4",
     max_num_seqs=4,
     max_num_batched_tokens=512,
     max_model_len=4096,

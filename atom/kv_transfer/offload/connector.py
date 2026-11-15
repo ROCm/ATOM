@@ -37,8 +37,24 @@ def select_variant(config) -> str:
     return select_offload_layout(config)
 
 
-def _build_worker(config):
+def _in_process_variant(config) -> str:
+    """The family this in-process shell serves; ``dsv41`` it never does.
+
+    DeepSeek-V4.1's checkpoints restore only through the MP server's PAGE
+    units, and the dense codec would restore KV over a window ring it does
+    not carry.
+    """
     variant = select_variant(config)
+    if variant == "dsv41":
+        raise ValueError(
+            "DeepSeek-V4.1 offload runs only on the LMCache MP server: use the "
+            "lmcache_mp connector"
+        )
+    return variant
+
+
+def _build_worker(config):
+    variant = _in_process_variant(config)
     logger.info("lmcache_offload: worker family=%s", variant)
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -74,7 +90,7 @@ def _build_worker(config):
 
 
 def _build_scheduler(config):
-    variant = select_variant(config)
+    variant = _in_process_variant(config)
     logger.info("lmcache_offload: scheduler family=%s", variant)
     if variant == "hybrid":
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -157,6 +173,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if callable(callback):
             callback(req_ids)
 
+    def after_forward(self) -> None:
+        """Pass the post-forward hook on to an impl that has one (lmcache_mp)."""
+        callback = getattr(self._impl, "after_forward", None)
+        if callable(callback):
+            callback()
+
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
 
@@ -202,6 +224,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "prefetch_lookups", None)
         if callable(callback):
             callback(seqs)
+
+    def note_scheduled_tokens(self, scheduled_seqs, num_scheduled_tokens) -> None:
+        callback = getattr(self._impl, "note_scheduled_tokens", None)
+        if callable(callback):
+            callback(scheduled_seqs, num_scheduled_tokens)
 
     def lookup_pending(self, seq) -> bool:
         callback = getattr(self._impl, "lookup_pending", None)
@@ -334,6 +361,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def enqueue_state_stores(self, stores) -> bool:
         callback = getattr(self._impl, "enqueue_state_stores", None)
         return bool(callback(stores)) if callback is not None else False
+
+    def enqueue_state_touches(self, hashes) -> bool:
+        """State touches for the impl; False when it carries none."""
+        callback = getattr(self._impl, "enqueue_state_touches", None)
+        return bool(callback(hashes)) if callback is not None else False
+
+    def take_state_touch_verdicts(self) -> dict:
+        """`{hash: resident}` for touches that reached quorum."""
+        callback = getattr(self._impl, "take_state_touch_verdicts", None)
+        return callback() if callback is not None else {}
 
     def take_state_reports(self):
         # Contract is a 2-tuple (indexed, failed) -- matched by the kimi_k3 impl

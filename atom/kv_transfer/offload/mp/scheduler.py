@@ -5,33 +5,43 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import threading
 import time
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
+    req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    tier_lookup_kwargs,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
     _mp_session_id,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.lookup import _MPLookupClient
+from atom.kv_transfer.offload.mp.lookup import _DEFAULT_READ_TTL_S, _MPLookupClient
+from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
+from atom.kv_transfer.offload.mp.metadata import MPOffloadMetadata, MPReqMeta
+from atom.kv_transfer.offload.mp.token_shipping import ShippedTokens, TokenShipper
 from atom.kv_transfer.offload.mp.transfer import (
     _SCHEDULER_DEADLINE_MARGIN_S,
     LMCacheTransferUnprovable,
     _enforce_transfer_deadline,
     _transfer_deadline_s,
 )
+from atom.model_engine.sequence import SequenceStatus
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -40,11 +50,19 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
     _supports_early_block_release = True
+    _request_meta_type = MPReqMeta
+    _step_meta_type = MPOffloadMetadata
+    # Whether a save may cover KV the current step computes (see
+    # `note_scheduled_tokens`). A subclass whose save reads more than the
+    # PAGE blocks that forward writes turns it off.
+    _supports_same_step_save = True
 
     def __init__(
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
     ) -> None:
         _validate_mp_config(config)
+        # Incremental token shipping (`token_shipping.py`).
+        self._token_shipper = TokenShipper()
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
         offcfg._strict_integer(
@@ -55,15 +73,28 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         adapter = _make_scheduler_adapter(
             config, checkpoint_spec=checkpoint_spec, images=images
         )
+        lock = None
+        driver_window = None
+        if envs.OFFLOAD_MP_LOOKUP_THREAD:
+            # The driver thread and this one both call the adapter.
+            lock = threading.RLock()
+            adapter = _LockedAdapter(adapter, lock)
+            driver_window = envs.OFFLOAD_MP_LOOKUP_WINDOW
         try:
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))
             poll_interval = float(extra.get("lmcache.mp.lookup_poll_interval", 0.01))
+            read_ttl_s = float(
+                extra.get("lmcache.mp.read_ttl_seconds", _DEFAULT_READ_TTL_S)
+            )
             lookup_client = _MPLookupClient(
                 adapter,
                 config=config,
                 timeout=timeout,
                 poll_interval=poll_interval,
+                lock=lock,
+                driver_window=driver_window,
+                read_ttl_s=read_ttl_s,
             )
             self._mp_adapter = adapter
             self._scheduler_deadline_s = (
@@ -76,10 +107,103 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 lookup_client=lookup_client,
             )
         except Exception:
+            close = getattr(locals().get("lookup_client"), "close", None)
+            if callable(close):
+                close()
             shutdown = getattr(adapter, "shutdown", None)
             if callable(shutdown):
                 shutdown()
             raise
+        # Under PP the frontier already advances at dispatch, and a stage's
+        # forward is not the one the save fence follows; keep the next-step
+        # emission there.
+        self._same_step_save = bool(
+            envs.OFFLOAD_MP_SAVE_SAME_STEP
+            and self._supports_same_step_save
+            and int(getattr(config, "pipeline_parallel_size", 1) or 1) == 1
+        )
+        # sid -> prompt tokens computed once this step's forward runs; set by
+        # `note_scheduled_tokens`, consumed by the next `build_connector_meta`.
+        self._step_compute_end: dict[str, int] = {}
+        # sids whose save frontier this step's forward extended.
+        self._step_extended: set[str] = set()
+        if envs.OFFLOAD_MP_SAVE_SAME_STEP and not self._same_step_save:
+            logger.info(
+                "LMCache MP same-step saves are off for %s (pipeline parallel "
+                "or a layout that does not support them)",
+                type(self).__name__,
+            )
+
+    # -- lookups offered on arrival -----------------------------------------
+
+    def offer_lookups(self, seqs: Any) -> None:
+        """Start tier lookups for newly arrived requests (input IO thread).
+
+        A no-op unless the lookup driver runs. Prefetch and admission are
+        unchanged: whichever sends a request's lookup first, the others find
+        it in flight.
+        """
+        client = self._lookup_client
+        if not self._do_load or not getattr(client, "driving", False):
+            return
+        for seq in seqs:
+            if self._lookup_len(seq) <= 0:
+                continue
+            client.offer(
+                str(seq.id),
+                functools.partial(self._offered_tokens, seq),
+                **tier_lookup_kwargs(seq),
+            )
+
+    def _offered_tokens(self, seq: Any) -> list[int] | None:
+        """The prompt to look up, or None once `seq` stopped waiting for one.
+
+        Runs on the driver thread; reads only the request's own fields.
+        """
+        if getattr(seq, "status", None) != SequenceStatus.WAITING:
+            return None
+        return self._lookup_token_ids(seq)
+
+    # -- same-step saves -------------------------------------------------------
+
+    def note_scheduled_tokens(
+        self, scheduled_seqs: Any, num_scheduled_tokens: Any
+    ) -> None:
+        """Let this step's saves cover the KV this step's forward computes.
+
+        Called right before `build_connector_meta` with the batch's sequences
+        and their scheduled token counts, in the same order. A save that then
+        reaches past what earlier forwards computed is marked `after_forward`:
+        the worker records its fence after this step's forward is enqueued, so
+        the server reads those blocks only once the forward wrote them.
+        """
+        if not getattr(self, "_same_step_save", False) or not self._do_save:
+            return
+        seqs = list(scheduled_seqs.values())
+        counts = list(num_scheduled_tokens)
+        if len(seqs) != len(counts):
+            logger.warning(
+                "LMCache MP: %d scheduled sequences but %d token counts; this "
+                "step's saves wait for the next step",
+                len(seqs),
+                len(counts),
+            )
+            return
+        self._step_compute_end = {
+            str(seq.id): int(seq.num_cached_tokens) + int(count)
+            for seq, count in zip(seqs, counts)
+        }
+
+    def _save_computed_tokens(self, seq: Any) -> int:
+        computed = super()._save_computed_tokens(seq)
+        end = self.__dict__.get("_step_compute_end", {}).get(str(seq.id))
+        if end is None:
+            return computed
+        reach = min(end, int(seq.num_prompt_tokens))
+        if self._chunk_floor(reach) <= self._chunk_floor(computed):
+            return computed
+        self.__dict__.setdefault("_step_extended", set()).add(str(seq.id))
+        return reach
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         matched = super().get_num_new_matched_tokens(seq)
@@ -116,9 +240,22 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
-    def build_connector_meta(self) -> LMCacheOffloadMetadata:
-        metadata = super().build_connector_meta()
+    def _transfer_tokens(self, seq: Any, end: int) -> ShippedTokens:
+        return self._token_shipper.ship(seq, end)
+
+    def build_connector_meta(self) -> MPOffloadMetadata:
+        try:
+            metadata = super().build_connector_meta()
+        finally:
+            # Only the build right after `note_scheduled_tokens` may use them:
+            # an idle-path build has no forward behind it.
+            self._step_compute_end = {}
+            extended = self.__dict__.get("_step_extended", set())
+            self._step_extended = set()
         for req in metadata.requests:
+            if req.save_spec is not None and str(req.req_id) in extended:
+                req.after_forward = True
+                self._perf_bump("save_same_step")
             if req.load_spec is not None:
                 end = req.load_spec.transfer_end_tokens
                 if end is None:
@@ -131,42 +268,58 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         # Also catches retirements that bypass _finish_retired_request, such as
         # a late save with nothing left to store.
         self._end_finished_sessions()
+        stats = getattr(self._lookup_client, "driver_stats", None)
+        if stats:
+            for key, value in stats.items():
+                self._perf_counters_set(f"lookup_driver_{key}", value)
+        # Last: `_end_finished_sessions` above queues this step's drops.
+        metadata.token_drops = self._token_shipper.take_drops()
         return metadata
+
+    def _perf_counters_set(self, key: str, value: int) -> None:
+        current = self.__dict__.get("_perf_counters", {}).get(key, 0)
+        if value != current:
+            self._perf_bump(key, int(value) - int(current))
 
     def load_finished(self, req_id: Any) -> bool:
         finished = super().load_finished(req_id)
         if finished:
-            raw_id = req_id.req_id if hasattr(req_id, "req_id") else req_id
+            sid = req_id_of(req_id)
             try:
                 self._lookup_client.complete_retrieve(
-                    str(raw_id),
+                    sid,
                     succeeded=True,
                 )
             except Exception:
                 logger.warning(
                     "LMCache MP successful-load cleanup failed for request %s",
-                    raw_id,
+                    sid,
                     exc_info=True,
                 )
         return finished
 
     def load_failed(self, req_id: Any) -> bool:
-        raw_id = req_id.req_id if hasattr(req_id, "req_id") else req_id
-        active = self._active_load_operations.get(str(raw_id))
-        if isinstance(req_id, LoadOperationId):
-            is_current = active is not None and active[1] == req_id
-        else:
-            is_current = active is None
+        sid = req_id_of(req_id)
+        active = self._active_load_operations.get(sid)
+        # Only a submitted retrieve hands its lookup's read locks to the
+        # transfer. A promise withdrawn before dispatch (a raw request id) did
+        # not: the base's cleanup reaches `clear_lookup_status`, which frees
+        # them, as long as nothing popped the lookup first.
+        is_current = (
+            isinstance(req_id, LoadOperationId)
+            and active is not None
+            and active[1] == req_id
+        )
         if is_current:
             try:
                 self._lookup_client.complete_retrieve(
-                    str(raw_id),
+                    sid,
                     succeeded=False,
                 )
             except Exception:
                 logger.warning(
                     "LMCache MP failed-load cleanup failed for request %s",
-                    raw_id,
+                    sid,
                     exc_info=True,
                 )
         return super().load_failed(req_id)
@@ -233,7 +386,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._end_finished_sessions()
 
     def has_pending_work(self) -> bool:
-        """Also report pending session ends and unreleased discarded lookups.
+        """Also report pending session ends, queued token drops and unreleased
+        discarded lookups.
 
         A detached lookup can outlive its request. If no other request is
         running, nothing else steps the connector, so without this the lookup
@@ -245,6 +399,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return (
             super().has_pending_work()
             or bool(self._pending_session_ends())
+            or self._token_shipper.has_drops()
             or bool(callable(orphans) and orphans())
         )
 
@@ -283,6 +438,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
+            # No save can follow now: the workers' copy of its tokens goes.
+            self._token_shipper.drop(seq.id, seq)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:

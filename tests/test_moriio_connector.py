@@ -234,22 +234,37 @@ class ConnectorSourceTest(unittest.TestCase):
         self.assertIn("logger.error", body)
         self.assertIn("unchanged", body)
 
+    def test_per_request_state_never_joins_the_block_layout(self):
+        body = self.segment("register_kv_caches")
+        # Chunked as blocks, a slot-addressed tensor would be pushed to block
+        # offsets, and `_kv_layout` refuses the mixed model outright.
+        self.assertLess(
+            body.index('getattr(kv_cache, "per_request_state", False)'),
+            body.index("chunk_tensor_for_rdma("),
+        )
+        self.assertIn("self._register_state(layer_name, kv_cache)", body)
 
-def import_connector():
-    """The connector class, or None where it cannot be imported.
+    def test_state_is_checked_before_any_block_is_written(self):
+        body = self.segment("_write_blocks")
+        self.assertLess(
+            body.index("self._state_writes(request, engine_id)"),
+            body.index("write_remote_data_status("),
+        )
+
+
+def import_connector(name: str = "MoRIIOConnector"):
+    """A class from the connector module, or None where it cannot be imported.
 
     aiter resolves the gfx arch from rocminfo while importing, so this only
     succeeds in a container that can see the GPUs.
     """
     try:
-        from atom.kv_transfer.disaggregation.moriio.moriio_connector import (
-            MoRIIOConnector,
-        )
+        from atom.kv_transfer.disaggregation.moriio import moriio_connector
     # Broad on purpose: whatever stops the native stack loading means skip,
     # and an unexpected type must not turn the CPU lane red.
     except Exception:  # noqa: BLE001
         return None
-    return MoRIIOConnector
+    return getattr(moriio_connector, name)
 
 
 class ConnectorBehaviourTest(unittest.TestCase):
@@ -266,6 +281,7 @@ class ConnectorBehaviourTest(unittest.TestCase):
 
     def make_connector(self, layers: int = 3, blocks: int = 4, block_size: int = 2):
         """A connector with only the attributes the verify path reads."""
+        import threading
         import types
 
         conn = object.__new__(self.connector)
@@ -282,7 +298,21 @@ class ConnectorBehaviourTest(unittest.TestCase):
         }
         conn._verify_rows = {}
         conn._verify_before = {}
+        conn._state_tensors = {}
+        conn._verify_state_before = {}
+        conn._write_state_digests = {}
+        conn._write_reports_lock = threading.Lock()
         return conn, names
+
+    def add_state(self, conn, slots: int = 4):
+        """One KDA layer of state on `conn`: a bf16 conv and an fp32 SSM tensor."""
+        conv = self.torch.zeros((slots, 3, 4), dtype=self.torch.bfloat16)
+        ssm = self.torch.zeros((slots, 2, 2, 2), dtype=self.torch.float32)
+        conn._state_tensors = {
+            "kda.k": (b"k", conv.stride(0) * conv.element_size(), conv),
+            "kda.v": (b"v", ssm.stride(0) * ssm.element_size(), ssm),
+        }
+        return conv, ssm
 
     def read_blocks(self, local, remote):
         object.__new__(self.connector)._read_blocks(
@@ -420,6 +450,56 @@ class ConnectorBehaviourTest(unittest.TestCase):
             ([0], [0], [200]),
         )
 
+    def test_state_digest_reads_one_slot_of_each_tensor(self):
+        conn, _ = self.make_connector()
+        conv, ssm = self.add_state(conn)
+        before = conn._state_digest(1)
+        conv[1] = 1.5
+        after = conn._state_digest(1)
+        self.assertNotEqual(before["kda.k"], after["kda.k"])
+        self.assertEqual(before["kda.v"], after["kda.v"])
+        # Another request's slot is no part of this one's digest.
+        ssm[2] = 3.0
+        self.assertEqual(conn._state_digest(1), after)
+
+    def test_a_slot_that_matches_the_producer_is_reported_as_info(self):
+        conn, _ = self.make_connector()
+        conv, ssm = self.add_state(conn)
+        conn._verify_state_before["req"] = (1, conn._state_digest(1))
+        conv[1] = 0.25
+        ssm[1] = -2.0
+        # What the producer digested from its own slot before pushing it.
+        conn._write_state_digests["req"] = conn._state_digest(1)
+
+        with self.assertLogs("atom", "INFO") as logs:
+            conn._verify_state_landed("req")
+        self.assertIn("all 2 state tensors match the producer", logs.output[0])
+        # Both maps are popped, or a long run accumulates a digest per request.
+        self.assertEqual(conn._verify_state_before, {})
+        self.assertEqual(conn._write_state_digests, {})
+
+    def test_a_slot_unlike_the_producers_is_reported(self):
+        conn, _ = self.make_connector()
+        _conv, ssm = self.add_state(conn)
+        conn._verify_state_before["req"] = (1, conn._state_digest(1))
+        ssm[1] = 2.0
+        conn._write_state_digests["req"] = conn._state_digest(1)
+        # Something other than the producer's slot landed in the SSM state.
+        ssm[1] = 1.0
+
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_state_landed("req")
+        self.assertIn("1 of 2 state tensors differ", logs.output[0])
+        self.assertIn("kda.v", logs.output[0])
+
+    def test_a_missing_producer_digest_is_reported(self):
+        conn, _ = self.make_connector()
+        self.add_state(conn)
+        conn._verify_state_before["req"] = (1, conn._state_digest(1))
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._verify_state_landed("req")
+        self.assertIn("the producer sent no state digest", logs.output[0])
+
 
 class FakeStatus:
     """Stands in for mori's TransferStatus; ``state`` is flipped by the test."""
@@ -521,6 +601,11 @@ class WritePathTest(unittest.TestCase):
         conn._done_sending_lock = threading.Lock()
         conn._write_ids = {}
         conn._finished_writes = collections.deque()
+        conn._state_tensors = {}
+        conn._num_state_slots = 0
+        conn._built_state_sessions = {}
+        conn._verify_state_before = {}
+        conn._write_state_digests = {}
 
         conn.sent = []
         conn.writes = []
@@ -539,10 +624,12 @@ class WritePathTest(unittest.TestCase):
                 (transfer_id, host, port)
             ),
             write_remote_data_status=write,
+            register_local_buffer=lambda ptr, size, device: f"{ptr}+{size}".encode(),
+            get_agent_metadata=lambda: b"agent",
         )
         return conn
 
-    def recv_meta(self, local, remote):
+    def recv_meta(self, local, remote, **extra):
         import types
 
         return types.SimpleNamespace(
@@ -556,7 +643,76 @@ class WritePathTest(unittest.TestCase):
             remote_dp_size=1,
             tp_size=8,
             transfer_id=0,
+            **extra,
         )
+
+    def make_stateful(self, conn, *, slots: int = 6, conv: int = 24, ssm: int = 128):
+        """Give `conn` one KDA layer of state, with its sessions stubbed.
+
+        Two uint8 tensors of `slots` rows: a conv slot of `conv` bytes and an
+        SSM slot of `ssm`. The consumer is taken to have as many slots.
+        """
+        import types
+
+        conn._num_state_slots = slots
+        conn._state_tensors = {
+            "kda.k": (
+                b"k",
+                conv,
+                self.torch.zeros((slots, conv), dtype=self.torch.uint8),
+            ),
+            "kda.v": (
+                b"v",
+                ssm,
+                self.torch.zeros((slots, ssm), dtype=self.torch.uint8),
+            ),
+        }
+        conn.remote_moriio_metadata = {
+            "engine": types.SimpleNamespace(num_state_slots=slots)
+        }
+        conn._get_or_build_state_sessions = lambda engine_id: [
+            ("S-k", conv),
+            ("S-v", ssm),
+        ]
+        return conn
+
+    @staticmethod
+    def block_sessions():
+        """Two layers' K sessions over two chunks, as the push tests use."""
+        return [({(0, 0): f"L{i}-00", (0, 1): f"L{i}-01"}, {}) for i in range(2)]
+
+    def hybrid_caches(self, slots: int = 6):
+        """A KDA layer ahead of two MLA layers, as Kimi-K3 interleaves them."""
+        import types
+
+        state = types.SimpleNamespace(
+            k_cache=self.torch.zeros((slots, 3, 8), dtype=self.torch.bfloat16),
+            v_cache=self.torch.zeros((slots, 2, 4, 4), dtype=self.torch.float32),
+            replay_buf_k=None,
+            replay_buf_u=None,
+            replay_buf_g=None,
+            per_request_state=True,
+        )
+        caches = {"layer_0": state}
+        for name in ("layer_1", "layer_2"):
+            caches[name] = types.SimpleNamespace(
+                k_cache=self.torch.zeros((16, 1, 4), dtype=self.torch.uint8),
+                v_cache=None,
+            )
+        return caches
+
+    def register(self, conn, kv_caches):
+        """Run `register_kv_caches` with the listener stubbed; return its metadata."""
+        conn.kv_cache_shape = None
+        conn.blocks_per_chunk = None
+        conn.layer_name_to_local_kv_cache_metadata = {}
+        conn.engine_id = "10.0.0.2:7400"
+        conn.side_channel_port = 7401
+        advertised = []
+        conn._handshake_listener = lambda metadata, *_rest: advertised.append(metadata)
+        conn.register_kv_caches(kv_caches)
+        conn._handshake_listener_thread.join(timeout=5)
+        return advertised[0]
 
     def push_request(self, **overrides):
         request = {
@@ -1083,6 +1239,287 @@ class WritePathTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             conn._get_or_build_sessions("engine")
         self.assertEqual(conn._built_sessions, {})
+
+    def test_state_is_registered_apart_from_the_block_layout(self):
+        conn = self.make(producer=True)
+        conn.transfer_mode = "write"
+        advertised = self.register(conn, self.hybrid_caches())
+
+        self.assertEqual(
+            list(conn.layer_name_to_local_kv_cache_metadata), ["layer_1", "layer_2"]
+        )
+        self.assertEqual(list(conn._state_tensors), ["layer_0.k", "layer_0.v"])
+        # The block geometry comes from the MLA layers, never from the state.
+        self.assertEqual(tuple(conn.kv_cache_shape), (16, 1, 4))
+        self.assertEqual(conn._kv_layout(), (True, 8))
+        self.assertEqual(
+            advertised.state_slot_bytes, {"layer_0.k": 48, "layer_0.v": 128}
+        )
+        self.assertEqual(set(advertised.state_descs), {"layer_0.k", "layer_0.v"})
+        self.assertEqual(advertised.num_state_slots, 6)
+
+    def test_a_model_without_state_advertises_none_on_the_wire(self):
+        import msgspec
+
+        conn = self.make(producer=True)
+        conn.transfer_mode = "write"
+        caches = self.hybrid_caches()
+        del caches["layer_0"]
+        advertised = self.register(conn, caches)
+        # Omitted rather than empty, so the handshake is byte-for-byte what a
+        # peer without state support sends.
+        fields = msgspec.msgpack.decode(msgspec.msgpack.encode(advertised))
+        self.assertFalse(
+            {"state_descs", "state_slot_bytes", "num_state_slots"} & set(fields)
+        )
+
+    def test_read_mode_refuses_per_request_state(self):
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        with self.assertRaises(NotImplementedError):
+            self.register(conn, self.hybrid_caches())
+
+    def test_replayssm_buffers_are_refused(self):
+        conn = self.make(producer=True)
+        state = self.hybrid_caches()["layer_0"]
+        state.replay_buf_k = self.torch.zeros(1)
+        with self.assertRaises(NotImplementedError):
+            conn._register_state("layer_0", state)
+        self.assertEqual(conn._state_tensors, {})
+
+    def test_a_state_slot_that_is_not_one_run_is_refused(self):
+        conn = self.make(producer=True)
+        state = self.hybrid_caches()["layer_0"]
+        state.k_cache = self.torch.zeros((8, 6), dtype=self.torch.uint8).t()
+        with self.assertRaises(ValueError):
+            conn._register_state("layer_0", state)
+
+    def test_state_tensors_must_agree_on_the_slot_count(self):
+        conn = self.make(producer=True)
+        state = self.hybrid_caches(slots=6)["layer_0"]
+        state.v_cache = self.torch.zeros((5, 2, 4, 4))
+        with self.assertRaises(ValueError):
+            conn._register_state("layer_0", state)
+
+    def test_a_stateless_request_names_no_state_slot(self):
+        conn = self.make(producer=False)
+        conn._request_write("d1", self.recv_meta([4, 5], [10, 11]))
+        ((frames, _host, _port),) = conn.sent
+        request = self.msgpack.loads(frames[1])
+        self.assertEqual(
+            (request["src_slot_index"], request["dst_slot_index"]), (-1, -1)
+        )
+
+    def test_the_consumer_names_both_state_slots(self):
+        conn = self.make_stateful(self.make(producer=False))
+        meta = self.recv_meta([4, 5], [10, 11], local_slot_index=3, remote_slot_index=5)
+        conn._request_write("d1", meta)
+        ((frames, _host, _port),) = conn.sent
+        request = self.msgpack.loads(frames[1])
+        # The producer's slot is the source, ours the destination.
+        self.assertEqual(request["src_slot_index"], 5)
+        self.assertEqual(request["dst_slot_index"], 3)
+        self.assertIn("d1", conn._awaiting_write)
+
+    def test_a_stateful_request_without_a_slot_is_refused_before_asking(self):
+        conn = self.make_stateful(self.make(producer=False))
+        meta = self.recv_meta(
+            [4, 5], [10, 11], local_slot_index=3, remote_slot_index=-1
+        )
+        with self.assertLogs("atom", "ERROR") as logs:
+            conn._request_write("d1", meta)
+        self.assertIn("refusing to move the KV without it", logs.output[0])
+        self.assertEqual(conn.sent, [])
+        self.assertEqual(conn._failed_before_read, {"d1"})
+        self.assertNotIn("d1", conn._awaiting_write)
+        # Rank 1 of the producer still holds the source blocks; let it go.
+        self.assertEqual(conn.notified, [(0, "10.0.0.1", 7302)])
+
+    def test_the_producer_writes_the_state_slot_with_the_blocks(self):
+        conn = self.make_stateful(self.make(producer=True))
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(
+            dst_block_ids=[5, 1],
+            src_block_ids=[2, 3],
+            src_slot_index=2,
+            dst_slot_index=5,
+        )
+
+        statuses = conn._write_blocks(request, "engine")
+
+        # The four block writes as before, then one per state tensor at its slot.
+        self.assertEqual(len(statuses), 6)
+        self.assertIn(("S-k", [48], [120], [24]), conn.writes)
+        self.assertIn(("S-v", [256], [640], [128]), conn.writes)
+
+    def test_the_producer_refuses_a_push_that_names_no_slot(self):
+        conn = self.make_stateful(self.make(producer=True))
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        with self.assertRaises(ValueError):
+            conn._write_blocks(self.push_request(), "engine")
+        self.assertEqual(conn.writes, [])
+
+    def test_a_slot_past_the_consumers_pool_is_refused(self):
+        conn = self.make_stateful(self.make(producer=True), slots=6)
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(src_slot_index=2, dst_slot_index=6)
+        with self.assertRaises(ValueError):
+            conn._write_blocks(request, "engine")
+        self.assertEqual(conn.writes, [])
+
+    def test_state_cannot_cross_a_tp_mismatch(self):
+        conn = self.make_stateful(self.make(producer=True))
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(
+            src_slot_index=2, dst_slot_index=5, decode_tp_size=4
+        )
+        with self.assertRaises(ValueError) as caught:
+            conn._write_blocks(request, "engine")
+        self.assertIn("the consumer runs TP 4", str(caught.exception))
+        self.assertEqual(conn.writes, [])
+
+    def test_under_verify_the_report_carries_the_source_digest(self):
+        conn = self.make_stateful(self.make(producer=True))
+        conn._verify_kv = True
+        _desc, _slot_bytes, conv = conn._state_tensors["kda.k"]
+        conv[2] = 9
+        sessions = self.block_sessions()
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        request = self.push_request(src_slot_index=2, dst_slot_index=5)
+
+        conn._write_blocks(request, "engine")
+        # Digested from our slot before it is pushed, not from the consumer's.
+        self.assertEqual(request["state_digest"], conn._state_digest(2))
+        conn._finish_write(request, ok=True)
+        ((frames, _host, _port),) = conn.sent
+        self.assertEqual(
+            self.msgpack.loads(frames[1])["state_digest"], request["state_digest"]
+        )
+
+    def stateful_peer(self, conn, **remote):
+        """`conn` holding one KDA layer of state, facing a consumer's `remote`."""
+        import types
+
+        conn._state_tensors = {
+            "kda.k": (b"k-ours", 24, None),
+            "kda.v": (b"v-ours", 128, None),
+        }
+        conn.remote_moriio_metadata = {"engine": types.SimpleNamespace(**remote)}
+        conn.moriio_wrapper.get_unpack_memory_metadata = lambda packed: packed
+        conn.moriio_wrapper.build_session = lambda local, remote: (local, remote)
+        return conn
+
+    def test_state_sessions_pair_each_tensor_with_the_peers(self):
+        conn = self.stateful_peer(
+            self.make(producer=True),
+            state_slot_bytes={"kda.k": 24, "kda.v": 128},
+            state_descs={"kda.k": b"k-theirs", "kda.v": b"v-theirs"},
+        )
+        sessions = conn._get_or_build_state_sessions("engine")
+        self.assertEqual(
+            sessions,
+            [((b"k-ours", b"k-theirs"), 24), ((b"v-ours", b"v-theirs"), 128)],
+        )
+        # Built once per consumer.
+        conn.moriio_wrapper.build_session = None
+        self.assertIs(conn._get_or_build_state_sessions("engine"), sessions)
+
+    def test_state_sessions_refuse_a_peer_with_different_state(self):
+        descs = {"kda.k": b"k-theirs", "kda.v": b"v-theirs"}
+        for remote in (
+            {"state_slot_bytes": None, "state_descs": None},
+            {"state_slot_bytes": {"kda.k": 24, "kda.v": 64}, "state_descs": descs},
+            {"state_slot_bytes": {"kda.k": 24}, "state_descs": descs},
+        ):
+            with self.subTest(remote=remote):
+                conn = self.stateful_peer(self.make(producer=True), **remote)
+                with self.assertRaises(ValueError):
+                    conn._get_or_build_state_sessions("engine")
+                self.assertEqual(conn._built_state_sessions, {})
+
+    def test_state_sessions_refuse_our_own_descriptors(self):
+        conn = self.stateful_peer(
+            self.make(producer=True),
+            state_slot_bytes={"kda.k": 24, "kda.v": 128},
+            state_descs={"kda.k": b"k-ours", "kda.v": b"v-theirs"},
+        )
+        with self.assertRaises(ValueError):
+            conn._get_or_build_state_sessions("engine")
+
+
+class SchedulerSlotTest(unittest.TestCase):
+    """Both ends' state slots ride the scheduler's transfer params."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scheduler = import_connector("MoRIIOConnectorScheduler")
+        if cls.scheduler is None:
+            raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+
+    def make(self, *, producer: bool):
+        """A scheduler holding only what `request_finished` and the recv path read."""
+        sched = object.__new__(self.scheduler)
+        sched.is_producer = producer
+        sched.engine_id = "10.0.0.1:7300"
+        sched.host_ip = "10.0.0.1"
+        sched.handshake_port = 7300
+        sched.base_handshake_port = 7300
+        sched.tp_size = 8
+        sched.dp_rank = 0
+        sched._reqs_need_recv = {}
+        sched._awaiting_send = set()
+        sched.request_id_to_transfer_id = {}
+        sched.transfer_id_to_request_id = {}
+        return sched
+
+    @staticmethod
+    def seq(**attrs):
+        import types
+
+        fields = {
+            "id": 7,
+            "block_table": [1, 2, 3],
+            "kv_transfer_params": {},
+            "output_tokens": [42],
+            "spec_token_ids": None,
+        }
+        fields.update(attrs)
+        return types.SimpleNamespace(**fields)
+
+    def test_the_producer_publishes_its_state_slot(self):
+        sched = self.make(producer=True)
+        seq = self.seq(state_slot=6)
+        sched.request_finished(seq)
+        self.assertEqual(seq.kv_transfer_params_output["remote_slot_index"], 6)
+
+    def test_a_model_without_state_publishes_no_slot(self):
+        sched = self.make(producer=True)
+        seq = self.seq()
+        sched.request_finished(seq)
+        self.assertEqual(seq.kv_transfer_params_output["remote_slot_index"], -1)
+
+    def test_the_consumer_hands_both_slots_to_its_worker(self):
+        sched = self.make(producer=False)
+        seq = self.seq(
+            state_slot=4,
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "transfer_id": 9,
+                "remote_block_ids": [5, 6, 7],
+                "remote_slot_index": 6,
+                "remote_host": "10.0.0.1",
+                "remote_handshake_port": 7300,
+                "tp_size": 8,
+            },
+        )
+        sched.update_state_after_alloc(seq)
+        meta = sched.build_connector_meta().reqs_to_recv[7]
+        self.assertEqual((meta.local_slot_index, meta.remote_slot_index), (4, 6))
+        self.assertEqual(meta.local_block_ids, [1, 2, 3])
 
 
 class WrapperMessagingTest(unittest.TestCase):

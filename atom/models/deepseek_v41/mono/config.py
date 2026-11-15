@@ -41,7 +41,7 @@ def config_refusal(atom_config) -> str | None:
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
         (
-            atom_config.kv_cache_dtype == "bf16",
+            atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",
         ),
         (

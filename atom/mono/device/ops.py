@@ -47,7 +47,7 @@ CM_SYS = 17
 
 
 # NT = 2: nontemporal. A weight a layer reads once streams past the caches it
-# would only evict the step's reused data from (K2b at 48 rows: 143 -> 133 us)
+# would only evict the step's reused data from
 CM_NT = 2
 
 
@@ -115,7 +115,7 @@ def memrealtime():
 def unlikely(cond):
     """``cond`` marked cold (llvm.expect): LLVM lays the branch out of the hot
     path. A rare path's code inline among the hot stages costs them even when it
-    never runs (the long-context selection: S = 16, 3k context +1.4 us)."""
+    never runs."""
     return fx.Boolean(
         llvm.call_intrinsic(
             ir.IntegerType.get_signless(1),
@@ -161,6 +161,11 @@ def hw_rcp(x):
 
 def hw_exp2(x):
     return _hw_f32("llvm.amdgcn.exp2.f32", x)
+
+
+def hw_log2(x):
+    """v_log_f32 (no libm denormal fixup: the caller keeps x normal)."""
+    return _hw_f32("llvm.amdgcn.log.f32", x)
 
 
 def div_rn(x, d, r):
@@ -219,6 +224,73 @@ def butterfly(v, offsets, op=_add):
     return v
 
 
+def butterflies(vs, offsets, op=_add):
+    """``butterfly`` of each of ``vs``, an offset of all of them before the next:
+    independent reductions issued side by side, so their cross-lane latencies
+    overlap instead of adding up. Each value's order is ``butterfly``'s."""
+    for off in offsets:
+        vs = [xred(v, off, op) for v in vs]
+    return vs
+
+
+def _scatter_offsets(n, offsets):
+    """The offsets ``lane_reduce_scatter`` halves over: the first log2(n)."""
+    k = n.bit_length() - 1
+    assert n == 1 << k and k <= len(offsets), (n, offsets)
+    assert all(off <= 16 for off in offsets[:k]), offsets
+    return offsets[:k]
+
+
+def lane_reduce_scatter(vs, offsets, lane):
+    """``butterflies(vs, offsets)`` (a power-of-two count of f32 sums over the
+    lanes the offsets span) when a lane needs one of the sums: over the first
+    log2(len(vs)) offsets a lane keeps half of what it carries -- the values
+    its offset bit selects -- adding the partner's same value, then reduces
+    the one left. -> (the sum, its index in ``vs``). Each sum adds the same
+    pairs in the same order as ``butterflies``: the same bits."""
+    scat = _scatter_offsets(len(vs), offsets)
+    row = fx.Int32(0)
+    for off in scat:
+        h = len(vs) // 2
+        bit = (lane & off) != 0
+        if off == 16:
+            # v_permlane16_swap(x, y): the even row gets (its x, the odd row's
+            # x), the odd row (the even row's y, its y): the low half's sum on
+            # the even row, the high half's on the odd -- low + high both
+            pairs = [permlane_swap(16, vs[i].bitcast(fx.Int32), vs[i + h].bitcast(fx.Int32))
+                     for i in range(h)]  # fmt: skip
+            vs = [a.bitcast(fx.Float32) + b.bitcast(fx.Float32) for a, b in pairs]
+        else:
+            keep = [bit.select(vs[i + h], vs[i]) for i in range(h)]
+            send = [bit.select(vs[i], vs[i + h]) for i in range(h)]
+            vs = [fx.Float32(k) + xshfl(fx.Float32(s), off) for k, s in zip(keep, send)]
+        row = row + bit.select(fx.Int32(h), fx.Int32(0))
+    (v,) = vs
+    return butterfly(v, offsets[len(scat) :]), row
+
+
+def lane_all_gather(v, n, offsets, lane):
+    """Every lane all n sums of ``lane_reduce_scatter(.., offsets, ..)`` from its own
+    one (v), in ``vs``' order: the halving undone, the last offset first."""
+    vs = [v]
+    for off in reversed(_scatter_offsets(n, offsets)):
+        if off == 16:
+            # x = y: the even row gets (its own, the odd row's), the odd row
+            # (the even row's, its own) -- (low half's, high half's) both
+            pairs = [permlane_swap(16, x.bitcast(fx.Int32), x.bitcast(fx.Int32))
+                     for x in vs]  # fmt: skip
+            vs = [a.bitcast(fx.Float32) for a, _ in pairs] + [
+                b.bitcast(fx.Float32) for _, b in pairs
+            ]
+        else:
+            bit = (lane & off) != 0
+            other = [xshfl(x, off) for x in vs]
+            vs = [fx.Float32(bit.select(o, x)) for x, o in zip(vs, other)] + [
+                fx.Float32(bit.select(x, o)) for x, o in zip(vs, other)
+            ]
+    return vs
+
+
 def wave_sum(v):
     return butterfly(v, (32, 16, 8, 4, 2, 1))
 
@@ -263,10 +335,11 @@ def _xpartner(v, off, lane):
     return ((lane & off) != 0).select(a, b)
 
 
-def wave_incl_scan(v, lane):
-    """Inclusive prefix sum of an Int32 over the wave, in lane order."""
+def wave_incl_scan(v, lane, lanes=64):
+    """Inclusive prefix sum of an Int32 in lane order, within each run of
+    ``lanes`` (a power of two) lanes: the whole wave by default."""
     blk = v
-    for off in (1, 2, 4, 8, 16, 32):
+    for off in (1, 2, 4, 8, 16, 32)[: (lanes - 1).bit_length()]:
         o = _xpartner(blk, off, lane)
         v = v + ((lane & off) != 0).select(o, 0)
         blk = blk + o
@@ -306,6 +379,19 @@ def global_load(addr, words=1, nt=False):
 def ld_i32(ptr, i):
     """Word ``i`` of a buffer, a plain Int32 load."""
     return fx.Int32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32))
+
+
+def ld_f32(ptr, i, dtype=None):
+    """Element ``i`` of a buffer of ``dtype`` (f32 when None, or bf16 widened)
+    as f32. (``T.f32`` needs an MLIR context: not a default argument.)"""
+    dtype = T.f32 if dtype is None else dtype
+    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=dtype))
+
+
+def st_dev(v, ptr, i):
+    """Word ``i`` of a buffer stored at device scope: past the per-XCD L2, so
+    another CTA reads it after the flag that follows."""
+    bo.buffer_store(v, rsrc(ptr), i, cache_modifier=CM_DEV)
 
 
 def row_live(batch_ids, k):
@@ -381,6 +467,23 @@ def row_sum(red, r, t, waves=None):
     for w in waves if waves is not None else range(WAVES):
         tot = tot + fx.ptr_load(red + ((w * 64 + 16 * (r // 4) + t) * 4 + r % 4))
     return tot
+
+
+def head_sum(terms):
+    """The sum over 32 index heads of w_h relu(dot_h), in the order aiter's
+    gluon ``deepgemm_fp8_paged_mqa_logits`` reduces it: ``terms[h, e]`` =
+    (relu term, weight) of head 16 h + 4 (lane // 16) + e; k = 4 h + e, pairs
+    (0,2)(1,3)(4,6)(5,7) as fma(w_a r_a, w_b r_b), (s0 + s2) + (s1 + s3), then
+    the lane groups xor 32, then xor 16."""
+    rw = [terms[k // 4, k % 4] for k in range(8)]
+    firsts = [
+        fx.Float32(fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1]))
+        for a, b in ((0, 2), (1, 3), (4, 6), (5, 7))
+    ]
+    v = (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
+    for off in (32, 16):
+        v = xred(v, off, lambda x, y: x + y)
+    return v
 
 
 def mfma_fp8(a, b, c):

@@ -48,6 +48,30 @@ from atom.model_ops.minimax_m3.index_topk import (
 TOPK = 16
 
 
+@pytest.mark.parametrize(
+    "arch,dtype,want",
+    [
+        ("gfx942", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
+        ("gfx942", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.float8_e4m3fn, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.bfloat16, (8, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.float8_e4m3fn, (4, 1)),
+        ("gfx1250", torch.float8_e4m3fnuz, (4, 1)),
+        ("gfx1250", torch.float8_e5m2, (4, 1)),
+        ("gfx1250", torch.float8_e5m2fnuz, (4, 1)),
+    ],
+)
+def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    m._prefill_score_launch_config.cache_clear()
+    try:
+        assert m._prefill_score_launch_config(dtype) == want
+    finally:
+        m._prefill_score_launch_config.cache_clear()
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
@@ -112,8 +136,7 @@ class TestTheAiterDependencyIsDeferred:
     take down far more than MiniMax-M3.
 
     Neither phase has a production fallback, so using one without the kernel
-    must fail loudly and name what to install; these tests pin that for the
-    import itself, for decode, and for prefill.
+    fails at the call with aiter's own error; this pins the import itself.
     """
 
     def test_the_symbols_are_not_imported_at_module_scope(self):
@@ -127,55 +150,6 @@ class TestTheAiterDependencyIsDeferred:
             and "minimax_m3_index_score" in line
         ]
         assert not offenders, f"module-scope aiter M3 import reintroduced: {offenders}"
-
-    def test_using_it_without_the_kernel_names_the_dependency(self, monkeypatch):
-        import sys
-        import types
-
-        real = sys.modules["aiter.ops.flydsl"]
-        stub = types.ModuleType("aiter.ops.flydsl")
-        # `__getattr__` is excluded deliberately, not incidentally: aiter's
-        # flydsl package resolves its kernels through a module-level lazy
-        # loader, so copying it would hand the stub the very symbols this test
-        # is pretending do not exist.
-        stub.__dict__.update(
-            {
-                k: v
-                for k, v in real.__dict__.items()
-                if "minimax" not in k.lower() and k not in ("__getattr__", "__dir__")
-            }
-        )
-        # Both, and the attribute is the one that matters: the resolver says
-        # `from aiter.ops import flydsl`, which reads the attribute off the
-        # parent package rather than going through sys.modules.
-        monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", stub)
-        monkeypatch.setattr("aiter.ops.flydsl", stub)
-        m._flydsl.cache_clear()
-        try:
-            with pytest.raises(RuntimeError, match="aiter#5626"):
-                m.index_score_work_map_size(1, 1, 1, 1)
-        finally:
-            # The resolver memoizes across tests; a stubbed entry left behind
-            # would fail every later GPU test in this file.
-            m._flydsl.cache_clear()
-
-    def test_prefill_without_the_kernel_names_the_dependency(self, monkeypatch):
-        # The guarded import leaves `score_prefill_flydsl` None on an older
-        # aiter, and the default route is the only production route, so an
-        # unguarded call site would surface this as a bare TypeError.
-        monkeypatch.setattr(m, "score_prefill_flydsl", None)
-        with pytest.raises(RuntimeError, match="aiter#5626"):
-            m.prefill_index_score(
-                torch.empty((1, 1, 1)),
-                torch.empty((1, 128, 1)),
-                torch.empty((1, 1), dtype=torch.int32),
-                torch.zeros(2, dtype=torch.int32),
-                torch.zeros(1, dtype=torch.int32),
-                torch.zeros(1, dtype=torch.int32),
-                1,
-                128,
-                1.0,
-            )
 
 
 # The shape the non-monotonicity shows up at: at max_block 256 a batch of 8
@@ -626,7 +600,7 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
 
     # Resolved on use, and not optional: an aiter without it is an ImportError
     # here rather than a skip, which is the whole point of dropping the guard.
-    m2._topk_small_k()
+    m2._small_k_selector()
     batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
@@ -963,34 +937,39 @@ class TestPrefillScoreAgainstTheDefinition:
 def test_the_vllm_pool_allocator_refuses_bf16_by_name():
     """The refusal that matters most: it happens before anything is allocated.
 
-    `_resolve_index_cache_dtype` runs when the KV pool is sized. Without this
-    the same configuration starts, serves a prefill and dies at the first
-    decode inside aiter, which names neither the flag nor ATOM as the refuser.
+    `_index_cache_spec` runs when the KV pool is sized. Without this the same
+    configuration starts, serves a prefill and dies at the first decode inside
+    aiter, which names neither the flag nor ATOM as the refuser.
 
     Pinned because a refusal nothing watches is one refactor from disappearing,
-    and this one is the whole of the fp8 narrowing on the vLLM/native path.
+    and this one is the whole of the fp8 narrowing on the native path.
     """
-    from atom.model_ops.attentions.aiter_attention import _resolve_index_cache_dtype
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
 
-    # explicit bf16
-    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
-        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="bf16"))
-    # and the case nobody passes a flag for: inherited from --kv_cache_dtype
-    with pytest.raises(ValueError, match="inherited from --kv_cache_dtype"):
-        _resolve_index_cache_dtype(
-            SimpleNamespace(index_cache_dtype=None, kv_cache_dtype="bf16")
+    def spec(index_cache_dtype):
+        b = object.__new__(AiterAttentionMetadataBuilder)
+        b._has_sparse_attention, b.block_size = True, 128
+        b.row_counts = dict
+        b.model_runner = SimpleNamespace(
+            config=SimpleNamespace(
+                index_cache_dtype=index_cache_dtype,
+                hf_config=SimpleNamespace(
+                    sparse_attention_config={"sparse_index_dim": 128}
+                ),
+            )
         )
+        return b._index_cache_spec(128)
+
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        spec("bf16")
     # fp8 still resolves, so the guard is not refusing everything
-    assert (
-        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="fp8"))
-        == aiter.dtypes.fp8
-    )
+    assert spec("fp8").view_dtype == aiter.dtypes.fp8
 
 
 def test_the_sglang_pool_refuses_bf16_by_name():
     """The same refusal, at the same stage, on the other front end.
 
-    SGLang does not go through `_resolve_index_cache_dtype`; it resolves the
+    SGLang does not go through `_index_cache_spec`; it resolves the
     index dtype itself in `_atom_m3_index_dtype`, called from `configure`
     before weights load. Left unguarded that path kept the old behaviour --
     start, then die at the first decode -- which is the one thing the narrowing
@@ -1084,3 +1063,182 @@ class TestPrefillScorersAgree:
                 sa = {int(v) for v in ia[h, r] if v >= 0}
                 sb = {int(v) for v in ib[h, r] if v >= 0}
                 assert sa == sb, f"head {h} row {r}"
+
+
+@gpu
+@pytest.mark.parametrize(
+    "S,heads,width",
+    [
+        (8, 2, 70),
+        (1, 2, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+        (8, 1, m._AITER_MIN_WIDTH_WITH_EMIT + 252),
+    ],
+)
+def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
+    monkeypatch, S, heads, width
+):
+    """A decode step padded from 3 to 6 requests (pad rows length 0, a poisoned block
+    table), on both selectors: a pad row emits context 0 and page 0 and never reads
+    its table; a live row's context is the closed form of its selection. The wide
+    case must actually be served by aiter's selector, and agree with Triton."""
+    live_lens = [width * SPARSE_BLOCK_SIZE - 5, 300 + S, 9 * SPARSE_BLOCK_SIZE + S]
+    batch, live = 6, len(live_lens)
+    dev = "cuda"
+    seq = torch.zeros(batch, dtype=torch.int32, device=dev)
+    seq[:live] = torch.tensor(live_lens, dtype=torch.int32)
+    table = torch.full((batch, width), 0x7FFFFFFF, dtype=torch.int32, device=dev)
+    table[:live] = torch.randperm(10_000, device=dev)[: live * width].reshape(live, -1).int()  # fmt: skip
+    total_q = batch * S
+    score = torch.randn(heads, total_q, width, device=dev)
+    nvalid = m.build_n_valid_column_per_row(
+        seq, seq, batch=batch, total_q=total_q, num_idx_heads=heads, decode_max_q=S
+    )
+
+    served = []
+    real, supported = m._small_k_selector()
+
+    def served_by(*a):
+        served.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(m, "_small_k_selector", lambda: (served_by, supported))
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+
+    def run(bounds):
+        topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
+        m._launch_select(
+            score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
+            heads, rows_per_req=S, decode_max_q=S,
+            block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
+            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
+            pages_per_block=1,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    tri_idx, tri_bt, tri_ctx = run(None)
+    assert not served
+    ait_idx, ait_bt, ait_ctx = run(nvalid)
+    assert bool(served) == (width >= m._AITER_MIN_WIDTH_WITH_EMIT)
+    rows = heads * total_q
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    for bt, ctx in ((tri_bt, tri_ctx), (ait_bt, ait_ctx)):
+        n = live * S * heads
+        # live rows (token-major, head-minor): the closed form of the context
+        for r in range(live * S):
+            b, t = divmod(r, S)
+            causal = live_lens[b] - S + t + 1
+            last = (causal - 1) // SPARSE_BLOCK_SIZE
+            want = (min(TOPK, last + 1) - 1) * SPARSE_BLOCK_SIZE + causal - last * SPARSE_BLOCK_SIZE  # fmt: skip
+            assert ctx[r * heads : (r + 1) * heads].tolist() == [want] * heads
+        # pad rows: nothing, and no poisoned page id got out
+        assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
+        assert int(bt[:n].max()) < 10_000 * 8 * heads
+    assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("strided_q", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "qlens,prefixes,q_zero",
+    [
+        ([1], [128], False),
+        ([129, 17, 0], [127, 4096, 0], False),
+        ([257], [4096], True),
+        ([2517], [102784], False),
+    ],
+)
+def test_prefill_launch_policy_preserves_scores_and_selection(
+    monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
+):
+    """The launch-only optimization must preserve the previous PR's exact output.
+
+    Compare every causally valid score and all top-k/page-table outputs against
+    the previous (8 warps, FP8 stages=1 / BF16 stages=3) launch, on identical
+    tensor values. This supplements rather than replaces the independent
+    selector/oracle tests above.
+    """
+    import triton
+
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 launch-policy regression")
+    kw = _inputs(qlens, prefixes, heads, "cuda")
+    q = kw["idx_q"]
+    if strided_q:
+        storage = torch.empty(
+            (q.shape[0], heads * 2, HEAD_DIM), dtype=q.dtype, device=q.device
+        )
+        storage[:, 1 : heads + 1].copy_(q)
+        q = storage[:, 1 : heads + 1]
+        kw["idx_q"] = q
+    if q_zero:
+        q.zero_()
+    cache = kw["index_kv_cache"].to(cache_dtype)
+    kw["index_kv_cache"] = cache
+    # Check that logical and physical page ids are not accidentally conflated.
+    kw["block_table"] = torch.randperm(
+        cache.shape[0], dtype=torch.int32, device=q.device
+    ).reshape(kw["block_table"].shape)
+    total_q = sum(qlens)
+    max_block = triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
+    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
+    chunk = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, q.device)
+    valid_counts = torch.cat(
+        [
+            (torch.arange(length, device=q.device) + prefix + SPARSE_BLOCK_SIZE)
+            // SPARSE_BLOCK_SIZE
+            for length, prefix in zip(qlens, prefixes)
+        ]
+    )
+    valid = (
+        torch.arange(max_block, device=q.device)[None, None, :]
+        < valid_counts[None, :, None]
+    ).expand(heads, -1, -1)
+
+    def score(config):
+        result = torch.full((heads, total_q, max_block), float("nan"), device=q.device)
+        m._index_block_score_kernel[
+            (q_tiles, len(qlens) * heads, triton.cdiv(max_block, chunk))
+        ](
+            q,
+            cache,
+            result,
+            kw["block_table"],
+            kw["cu_seqlens_q"],
+            kw["seq_lens"],
+            kw["prefix_lens"],
+            heads,
+            HEAD_DIM,
+            kw["sm_scale"],
+            chunk,
+            *q.stride(),
+            *cache.stride(),
+            *result.stride(),
+            kw["block_table"].stride(0),
+            BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=config[0],
+            num_stages=config[1],
+        )
+        return result
+
+    old_config = (8, 1 if cache_dtype == torch.float8_e4m3fn else m.SCORE_NUM_STAGES)
+    new_config = m._prefill_score_launch_config(cache_dtype)
+    old_score, new_score = score(old_config), score(new_config)
+    torch.cuda.synchronize()
+    assert torch.isfinite(old_score[valid]).all()
+    assert torch.equal(old_score[valid], new_score[valid])
+
+    # Exercise the production wrapper too; do not validate only a raw launch.
+    new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(m, "_prefill_score_launch_config", lambda dtype: old_config)
+        old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    for old_output, new_output in zip(old_outputs, new_outputs):
+        assert torch.equal(old_output, new_output)

@@ -117,14 +117,14 @@ def test_paged_scoring_bands_match_one_shot(
     # Both full and compacted widths cross 1 MiB and leave a short tail.
     monkeypatch.setattr(envs, "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", 1)
     bands = []
-    real_score = shared.deepgemm_fp8_paged_mqa_logits
+    real_score = shared._fp8_paged_mqa_logits
 
     def observe_band(*args, **kwargs):
         logits = args[3]
         bands.append((logits.shape[0], logits.numel() * logits.element_size()))
         return real_score(*args, **kwargs)
 
-    monkeypatch.setattr(shared, "deepgemm_fp8_paged_mqa_logits", observe_band)
+    monkeypatch.setattr(shared, "_fp8_paged_mqa_logits", observe_band)
     # unit_table materializes a contiguous output after slicing page columns.
     live_tiles = tiles[:, :live_units].contiguous()
     workspace = None

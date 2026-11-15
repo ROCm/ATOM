@@ -149,23 +149,30 @@ class PublicationOwner:
         self._groups.append(group)
         return group
 
-    def use_packed_transport(self):
-        """Configure maximal eligible groups once; covered groups stay direct.
+    def use_packed_transport(self, boundaries=()):
+        """Configure eligible groups once; covered producer groups stay direct.
 
-        The runner defines consumer boundaries. This layer chooses storage,
-        avoiding duplicate arenas for producer groups covered by a boundary.
+        The runner defines consumer boundaries: the groups named in
+        ``boundaries`` each get their own arena, even when another boundary
+        covers them (one phase's members may be a subset of another's). Any other
+        group is a producer group, left direct when a packed group covers it.
         Standalone calls to those groups still use checked direct copies.
         """
         if self._state != "idle":
             raise PublicationError("choose the transport during initialization")
         packed_members = []
         configured = []
-        for group in sorted(self._groups, key=lambda g: -len(g.members)):
+        for group in sorted(
+            self._groups,
+            key=lambda g: (g.name not in boundaries, -len(g.members)),
+        ):
             members = set(group.members)
-            if len(members) < 2 or any(members <= packed for packed in packed_members):
+            if len(members) < 2 or (
+                group.name not in boundaries
+                and any(members <= packed for packed in packed_members)
+            ):
                 continue
-            group.use_transport("packed")
-            if group.transport == "packed":
+            if group.use_packed() == "packed":
                 packed_members.append(members)
             configured.append(group)
         return configured
@@ -218,6 +225,7 @@ class PublicationOwner:
             binding._writable = True
         for group in self._groups:
             group._header_busy = False
+            group._after_publish = []
         self._state = "active"
 
     def finish(self):
@@ -365,7 +373,8 @@ class BufferPublication:
                     else 0
                 )
             )
-        self._single.publish((count,), republish_reasons=(republish_reason,))
+        self._single.counts[0] = count
+        self._single.publish(republish_reasons=(republish_reason,))
         return self.destination if n is None else self.destination[:n]
 
 
@@ -381,6 +390,7 @@ class PublicationGroup:
         self._buffer_indices = {member.buffer: i for i, member in enumerate(members)}
         self._counts = [None] * len(members)
         self._header_busy = False
+        self._after_publish = []
         self.transport = "direct"
         self.fallback_reason = None
         self._backend = None
@@ -394,6 +404,18 @@ class PublicationGroup:
         """
         self.counts[self._buffer_indices[buffer]] = count
 
+    def set_counts(self, counts):
+        """Record the count of each member ``counts`` names, by name.
+
+        A name that is not a member raises: dropping it would leave its
+        destination holding the previous step's rows.
+        """
+        unknown = counts.keys() - self.indices.keys()
+        if unknown:
+            raise KeyError(f"{self.name}: not members: {sorted(unknown)}")
+        for name, count in counts.items():
+            self.counts[self.indices[name]] = count
+
     def check_writable(self):
         """Check fresh sources before a producer writes any group member.
 
@@ -406,30 +428,31 @@ class PublicationGroup:
         for binding in self.members:
             binding._validate(0, None)
 
-    def use_transport(self, transport):
-        """Choose direct or packed at initialization, before sources are used."""
+    def use_packed(self):
+        """Pack at initialization, before sources are used; a group packing
+        cannot serve (`fallback_reason`) stays direct."""
         if self.owner._state != "idle":
             raise PublicationError("choose the transport during initialization")
-        if transport == "packed":
-            if self.owner.device.type != "cuda":
-                backend, reason = None, "packing requires GPU destinations"
-            else:
-                from atom.utils.packed_h2d import PackedCopy
-
-                backend, reason = PackedCopy.create(self.members, self.owner.device)
-        elif transport == "direct":
-            backend, reason = None, None
+        if self.owner.device.type != "cuda":
+            backend, reason = None, "packing requires GPU destinations"
         else:
-            raise ValueError("H2D transport must be direct or packed")
+            from atom.utils.packed_h2d import PackedCopy
+
+            backend, reason = PackedCopy.create(self.members, self.owner.device)
         self._backend, self.fallback_reason = backend, reason
         self.transport = "packed" if backend is not None else "direct"
         return self.transport
 
-    def publish(self, counts, *, republish_reasons=None):
+    def after_publish(self, callback):
+        """Run ``callback`` once this group's next publish has succeeded."""
+        self._after_publish.append(callback)
+
+    def publish(self, *, republish_reasons=None):
+        """Upload every member at the count its producers recorded
+        (`set_count` / `set_counts`), then clear those counts."""
         self.owner._check_active()
         backend = self._backend
-        if len(counts) != len(self.members):
-            raise ValueError(f"{self.name}: one count required per member")
+        counts = self.counts
         if republish_reasons is not None and len(republish_reasons) != len(counts):
             raise ValueError(f"{self.name}: one reason entry required per member")
         # Legacy wrapper uploads use a fixed single-member group. Preserve its
@@ -438,6 +461,7 @@ class PublicationGroup:
             count = counts[0]
             if count is None:
                 self._counts[0] = None
+                self._published()
                 return
             binding = self._single_member
             count = binding._validate(
@@ -452,6 +476,7 @@ class PublicationGroup:
             except BaseException:
                 self.owner.fail()
                 raise
+            self._published()
             return
         active_members = 0
         for i, (binding, count) in enumerate(zip(self.members, counts)):
@@ -484,3 +509,13 @@ class PublicationGroup:
         except BaseException:
             self.owner.fail()
             raise
+        self._published()
+
+    def _published(self):
+        """Clear the counts the upload consumed, so the next publish uploads
+        only what its producers count, then run the `after_publish` callbacks."""
+        for i in range(len(self.counts)):
+            self.counts[i] = None
+        callbacks, self._after_publish = self._after_publish, []
+        for callback in callbacks:
+            callback()

@@ -114,9 +114,15 @@ class HostEmbeddingTable:
     # table. Registering the whole table on every rank is what a TP=4 job cannot
     # afford: 4 x 203 GB of unswappable pages.
 
-    def enable_uva(self, row_start: int = 0, row_end: int | None = None) -> bool:
+    def enable_uva(
+        self, row_start: int = 0, row_end: int | None = None, shared: bool = False
+    ) -> bool:
         """Page-lock rows `[row_start, row_end)` so a device kernel can read
         them (`host_memory.pin_rows`); all-or-nothing.
+
+        `shared`: every DP-attention rank of the node page-locks this same
+        whole table, so it is registered in place rather than copied unless
+        `ATOM_ENGRAM_UVA_COPY` is set (`host_memory.copies`).
 
         A table holds one range: enabling a different one while a range is
         held raises -- `disable_uva()` first.
@@ -137,7 +143,7 @@ class HostEmbeddingTable:
         sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
             sources.append(self._scale[row_start:row_end])
-        shard = host_memory.pin_rows(sources)
+        shard = host_memory.pin_rows(sources, shared=shared)
         if shard is None:
             return False
         self._shard = shard

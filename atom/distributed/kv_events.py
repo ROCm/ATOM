@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """KV cache events: wire-compatible with vLLM's `vllm.distributed.kv_events`,
-plus ATOM extensions (`BlockTransferred`, CPU/DISK/REMOTE medium constants)."""
+plus ATOM extensions (`BlockTransferred`, CPU/DISK medium constants)."""
 
 from __future__ import annotations
 
@@ -25,25 +25,30 @@ logger = logging.getLogger("atom")
 MEDIUM_GPU: Final[str] = "GPU"
 MEDIUM_CPU: Final[str] = "CPU"
 MEDIUM_DISK: Final[str] = "DISK"
-MEDIUM_REMOTE: Final[str] = "REMOTE"
 
-# Reserved seq frame that terminates a replay response. Its payload is a
-# msgpack `[oldest_available_seq, latest_seq]` window so a consumer knows when
-# the replay is complete and whether earlier events were already evicted
-# (start_seq < oldest). 2**64-1 is reserved for this and never used as a data
-# seq. (Replay requires a DEALER/ROUTER-style client that can read the
-# multi-message reply; a REQ socket cannot.)
+# Reserved seq frame that terminates a replay response (vLLM's END_SEQ). Its
+# payload is a msgpack `[oldest_available_seq, latest_seq]` window so a consumer
+# knows whether earlier events were already evicted (start_seq < oldest); vLLM
+# sends it empty, and consumers of vLLM's protocol ignore it. 2**64-1 is
+# reserved for this and never used as a data seq. (Replay requires a
+# DEALER/ROUTER-style client that can read the multi-message reply; a REQ
+# socket cannot.)
 REPLAY_DONE: Final[bytes] = b"\xff" * 8
 
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,
     omit_defaults=True,
     gc=False,
     tag=True,
 ):
-    """Tagged-union base so subscribers can dispatch on event type."""
+    """Tagged-union base so subscribers can dispatch on event type.
+
+    Encoded as vLLM encodes its events: a msgpack map, the class name under
+    `type`, fields still at their default left out. A field vLLM declares
+    without a default must have none here either, or vLLM's decoder rejects
+    the event for the missing key.
+    """
 
 
 class BlockStored(KVCacheEvent):
@@ -53,17 +58,17 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
-    lora_id: int | None = None
-    medium: str | None = MEDIUM_GPU
-    lora_name: str | None = None
+    lora_id: int | None
+    medium: str | None
+    lora_name: str | None
     extra_keys: list[tuple[Any, ...] | None] | None = None
     group_idx: int | None = None
-    # Reserved wire slots; emitted as None until hybrid-cache wiring lands.
+    # Reserved; left out until hybrid-cache wiring lands.
     kv_cache_spec_kind: str | None = None
     kv_cache_spec_sliding_window: int | None = None
-    # ATOM extension (trailing, so strict vLLM array_like consumers ignore it):
-    # sequence position of the first token of the first block in this run.
-    # With block_size, block i covers [token_offset + i*block_size, +block_size).
+    # ATOM extension (vLLM's decoder skips the unknown key): sequence position
+    # of the first token of the first block in this run. With block_size,
+    # block i covers [token_offset + i*block_size, +block_size).
     token_offset: int | None = None
 
 
@@ -71,7 +76,7 @@ class BlockRemoved(KVCacheEvent):
     """One or more blocks were evicted from the given medium."""
 
     block_hashes: list[int]
-    medium: str | None = MEDIUM_GPU
+    medium: str | None
     group_idx: int | None = None
 
 
@@ -84,7 +89,7 @@ class AllBlocksCleared(KVCacheEvent):
 class BlockTransferred(KVCacheEvent):
     """A block moved between tiers without changing identity.
 
-    Emitted on GPU↔CPU/DISK swap, REMOTE→GPU receive, and GPU→REMOTE send.
+    Meant for GPU↔CPU/DISK offload; nothing in ATOM emits it yet.
     ATOM-only — strict vLLM consumers should narrow the union to exclude it.
     """
 
@@ -443,10 +448,12 @@ class ZmqEventPublisher(EventPublisher):
         When the buffer is exhausted, send a terminal frame so the consumer
         knows the reply is complete, and clear the pending replay.
 
-        The terminal frame is `[*prefix, REPLAY_DONE, [oldest, latest]]`:
-        REPLAY_DONE distinguishes it from data frames, and the msgpack window
-        lets the consumer see whether events before `start_seq` were already
-        evicted (start_seq < oldest) and terminate without a timeout even on a
+        Frames follow vLLM's replay layout: a data frame is
+        `[*prefix, topic, seq, payload]`, the terminal frame
+        `[*prefix, b"", REPLAY_DONE, [oldest, latest]]`. REPLAY_DONE
+        distinguishes it from data frames, and the msgpack window lets the
+        consumer see whether events before `start_seq` were already evicted
+        (start_seq < oldest) and terminate without a timeout even on a
         zero-match request.
 
         Ordering is plain integer comparison. A window straddling the 2**64-1
@@ -464,7 +471,7 @@ class ZmqEventPublisher(EventPublisher):
         for seq, seq_bytes, payload in buf:
             if seq < next_seq:
                 continue
-            if not self._replay_send([*prefix, seq_bytes, payload]):
+            if not self._replay_send([*prefix, self._topic_bytes, seq_bytes, payload]):
                 self._pending_replay = None
                 return
             with self._lock:
@@ -480,7 +487,7 @@ class ZmqEventPublisher(EventPublisher):
         oldest = buf[0][0] if buf else None
         latest = buf[-1][0] if buf else None
         window = msgspec.msgpack.encode([oldest, latest])
-        self._replay_send([*prefix, REPLAY_DONE, window])
+        self._replay_send([*prefix, b"", REPLAY_DONE, window])
         self._pending_replay = None
 
     def _replay_send(self, frames: list[bytes]) -> bool:
@@ -537,7 +544,7 @@ def make_publisher(
     if not enabled or publisher_kind == "null":
         return NullEventPublisher()
     if publisher_kind == "zmq":
-        return ZmqEventPublisher(
+        publisher = ZmqEventPublisher(
             endpoint=endpoint,
             topic=topic,
             hwm=hwm,
@@ -546,4 +553,9 @@ def make_publisher(
             replay_buffer_steps=replay_buffer_steps,
             data_parallel_rank=data_parallel_rank,
         )
+        # Seq 0 of every stream, retained for replay like any batch: a consumer
+        # still holding blocks under this endpoint from an earlier engine drops
+        # them. SGLang's stream starts the same way.
+        publisher.publish([AllBlocksCleared()])
+        return publisher
     raise ValueError(f"unknown KV event publisher: {publisher_kind!r}")

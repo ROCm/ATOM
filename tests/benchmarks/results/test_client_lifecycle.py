@@ -97,7 +97,7 @@ def lifecycle_env(tmp_path):
 
 
 def test_aiperf_failure_after_export_is_not_reported_as_success(tmp_path):
-    executable = tmp_path / "bin/aiperf"
+    executable = tmp_path / "bin/agentx"
     executable.parent.mkdir()
     executable.write_text(
         "#!/usr/bin/env bash\nprintf '{}' > \"$TEST_OUT/profile_export_aiperf.json\"\n"
@@ -108,7 +108,7 @@ def test_aiperf_failure_after_export_is_not_reported_as_success(tmp_path):
     env = os.environ.copy()
     env.pop("ATOM_BUNDLE_WORK", None)
     env.update(
-        AIPERF_VENV=str(tmp_path),
+        AGENTX_VENV=str(tmp_path),
         AIPERF_BENCHMARK_DURATION="900",
         MODEL_PATH="fixture",
         TEST_OUT=str(output),

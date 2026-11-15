@@ -48,6 +48,7 @@ from atom.models.deepseek_v41.mono.kernels.attention import (
     COLS,
     GROUPS,
     SCORE_LDS_WORDS,
+    SCORE_Q_WORDS,
     only_live,
     pv_groups,
     score_tasks,
@@ -97,7 +98,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
     bf16_round,
     butterfly,
@@ -149,6 +150,8 @@ class AttnPostBuild:
     # the index plane is FP4: its scorer is ``index_score_fp4`` (``iqs``,
     # ``pscale`` and the FULL layers' task plan ``iplan``)
     index_fp4: bool = False
+    # FP4 keys in OPUS 64-row groups; the query remains Mono's own layout.
+    index_mfma: bool = False
     # the TP size: every width a rank holds (``Dims``)
     tp: int = 4
     timeline: bool = field(default=False, metadata={"sym": "tl"})
@@ -159,6 +162,9 @@ class AttnPostBuild:
     # reduce-scatter), and the slice, gate and norm run on this rank's tokens
     # (``own_view``); the caller gathers the normed rows
     tok_par: bool = False
+    # the pool's rows are MXFP8: QK on FP8 (q quantized by the original path's
+    # rule), PV on the rows dequantized (``attention``)
+    kv_fp8: bool = False
 
 
 # the per-token arguments the token-parallel stages read and write
@@ -188,7 +194,7 @@ ABI = KernelAbi(
         "itab_len", "ibatch", "ishift", "ibound",
         "ilog", "lstride", "isel", "icand", "ilift", "iprod", "ibmax", "bstride",
         "icout", "irow", "sbound",
-        "q", "pool", "sel", "topk", "kmeta", "table", "rows_per_page", "page_rows",
+        "q", "pool", "pool_scale", "window", "window_scale", "sel", "topk", "kmeta", "table", "rows_per_page", "page_rows",
         "main_off", "ring_off", "ring_slots", "sink", "qk_scale", "pos", "cos", "sin",
         "woa", "woa_s", "wob", "wob_s",
         "res_in", "post_in", "comb_in", "pre_in", "hc_fn", "hc_scale", "hc_base",
@@ -283,7 +289,7 @@ def irq_group(c, t, tile, dc, out, rope):
     o1 = o * cs - e * sn
     amax = butterfly(fx.max(abs(e1), abs(o1)), (1, 2, 4, 8), fx.max)
     code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
-    inv = pow2(254 - code)
+    inv = rcp_pow2(code)
     # this thread's two bytes and its neighbour's make a word (4 dims)
     q0, q1 = clamp_fp8(e1 * inv), clamp_fp8(o1 * inv)
     n0, n1 = xshfl(q0, 1), xshfl(q1, 1)
@@ -358,7 +364,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     )
     amax = fx.max(butterfly(abs(y), (1, 2, 4, 8, 16), fx.max), fx.Float32(AMAX_FLOOR))
     code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-    q = clamp_fp8(y / pow2(code))
+    q = clamp_fp8(y * rcp_pow2(code))
     # rows row .. row + 3 (row a multiple of 4) make a word
     lane = c["lane"]
     w = fp8_pack4(
@@ -521,18 +527,22 @@ def lds_union(name, members):
     )
 
 
-def attn_post_smem(s, timeline, bound_max, d) -> dict:
+def attn_post_smem(s, timeline, bound_max, d, kv_fp8=False) -> dict:
     """K2a's LDS, a struct a stage: the members of a union, so only one stage's
     buffers take space at a time (``run_attn_post`` fences each hand-over).
     Each opens with what every stage shares at the same offsets -- ``red`` and
-    the stamp record (``timeline``)."""
+    the stamp record (``timeline``). ``kv_fp8``: the score's MXFP8 q operands
+    (``attention._q_shared``)."""
     shared = {
         "red": fx.Array[fx.Float32, k1.WAVES * 2 * 64 * 4, 16],
         "tls": fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16],
     }
     stages = {
         # the score's key rows, a wave's split at a time (``attention``)
-        "score": {"sc_kv": fx.Array[fx.Int32, WAVES * SCORE_LDS_WORDS, 16]},
+        "score": {
+            "sc_kv": fx.Array[fx.Int32, WAVES * SCORE_LDS_WORDS, 16],
+            "sc_q": fx.Array[fx.Int32, SCORE_Q_WORDS if kv_fp8 else 1, 16],
+        },
         "sel": {
             "sk": fx.Array[fx.Int32, SEL_KEYS if bound_max else 1, 16],
             "sh": fx.Array[fx.Int32, SEL_HIST, 16],
@@ -579,13 +589,14 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
         "att": {
             "tree": at.at_tree.ptr, "alpha": at.at_alpha.ptr,
             "stat": at.at_stat.ptr, "out": at.at_out.ptr, "kv": at.at_kv.ptr,
-            "score_kv": sc.sc_kv.ptr,
+            "score_kv": sc.sc_kv.ptr, "score_q": sc.sc_q.ptr,
         },
         "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
         "poll": mb.poll, "peer_addr": lambda p: bases[p], "rank": rank, "sym": sym,
         "peer": peer_offsets(s, Dims(key.tp)),
         "fold": True, "index": False, "aux": False, "ffn": True,
-        "index_fp4": key.index_fp4, "tok_par": key.tok_par,
+        "index_fp4": key.index_fp4, "index_mfma": key.index_mfma,
+        "tok_par": key.tok_par, "kv_fp8": key.kv_fp8,
         "args": args, "d": Dims(key.tp),
     }  # fmt: skip
     for region, (off, _) in layout.items():
@@ -762,7 +773,7 @@ def build_attn_post(key: AttnPostBuild):
     bound_max = key.index_bound_max
     layout = scratch_layout(key)
     keyed = key_tuple(key, SOURCES)
-    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp))
+    members = attn_post_smem(s, timeline, bound_max, Dims(key.tp), key.kv_fp8)
     Smem = lds_union("K2aLds", members)
 
     name = kernel_symbol(
@@ -771,6 +782,7 @@ def build_attn_post(key: AttnPostBuild):
         tl=int(timeline),
         ix=int(bound_max > 0),
         i4=int(key.index_fp4),
+        im=int(key.index_mfma),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -781,7 +793,7 @@ def build_attn_post(key: AttnPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -799,7 +811,7 @@ def build_attn_post(key: AttnPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
@@ -823,7 +835,7 @@ def build_attn_post(key: AttnPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -838,7 +850,7 @@ def build_attn_post(key: AttnPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in,
             pre_in, hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out,

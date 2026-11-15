@@ -66,9 +66,8 @@ def test_backbone_gives_every_moe_the_one_stream_it_made(
     assert instance.compress_stream is (instance.alt_stream if level else None)
 
 
-@pytest.mark.parametrize("entrypoint", ["draft", "draft_offline"])
 def test_draft_forks_on_the_stream_it_is_handed(
-    single_rank, unallocated_moe, build_v41, created_streams, entrypoint
+    single_rank, unallocated_moe, build_v41, created_streams
 ):
     """The draft forks too, on the backbone's stream rather than one of its own.
 
@@ -82,7 +81,7 @@ def test_draft_forks_on_the_stream_it_is_handed(
     graph already does exactly that, so the capture was never the obstacle.
     """
     handed = FakeStream()
-    instance = build_v41(entrypoint, alt_stream=handed)
+    instance = build_v41("draft", alt_stream=handed)
 
     assert created_streams == []
     assert instance.alt_stream is handed

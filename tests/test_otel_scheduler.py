@@ -6,7 +6,7 @@
 
 import asyncio
 import pickle
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 from conftest import MockConfig
@@ -123,6 +123,9 @@ def test_core_manager_captures_context_after_executor_preprocess(spans):
             _seq_id_to_callback={},
             _send_request=lambda rank, payload: frames.append(payload),
         )
+        manager._add_prepared_requests = MethodType(
+            CoreManager._add_prepared_requests, manager
+        )
         CoreManager.add_request(manager, [seq])
 
     execute(app)
@@ -206,6 +209,7 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
     core.is_head = engine_kind == "pp_head"
     core.kv_transfer_enabled = False
     core._is_rl_weights_offloaded = core._weight_sync_fenced = False
+    core._generation_paused = False
     core._sync_dp_state = lambda *a: (False, True, False)
     monkeypatch.setattr(tracing, "shutdown", lambda: calls.append("trace"))
     if failure in {"drain", "shutdown"} and not (
@@ -316,6 +320,8 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
             result = output([seq.id], [42])
             if batch.produces_output():
                 completions.append((batch.req_ids, result))
+            elif batch.pp_completion_ack:
+                completions.append((batch.req_ids, None))
             return result
 
         core.runner_mgr = SimpleNamespace(call_func=run)
@@ -363,9 +369,14 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
             else True
         )
 
-    monkeypatch.setattr(
-        engine_core, "AsyncIOProcManager", lambda *a: SimpleNamespace(call_func=call)
-    )
+    failure_callbacks = []
+
+    def runner_manager(*args, on_worker_failure, kv_progress_event):
+        assert kv_progress_event is not None
+        failure_callbacks.append(on_worker_failure)
+        return SimpleNamespace(call_func=call)
+
+    monkeypatch.setattr(engine_core, "AsyncIOProcManager", runner_manager)
     monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
@@ -376,14 +387,15 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     config = MockConfig(
         parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
         tp_world_size=1,
-        prefill_context_parallel_size=1,
+        pcp_group_size=1,
         runner_qualname="unused",
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,
         kv_transfer_config=None,
     )
-    cls(config, "unused", "unused")
+    core = cls(config, "unused", "unused")
+    assert failure_callbacks == [core._send_engine_dead]
     # Only the order around `initialize` is the contract; other startup RPCs
     # may come and go between these points.
     order = [

@@ -21,11 +21,14 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
+from atom.kv_transfer.offload.mp.deployment import (
+    _validate_mp_config,
+    require_native_state_server,
+)
+from atom.kv_transfer.offload.mp.native_state_layout import stores_state_images
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
-    require_native_state_server,
-    stores_state_images,
+    restore_slot_count,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
@@ -62,6 +65,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     for the worker's terminal transfer-and-restore report. Neither side recycles
     these units in response to elapsed time.
     """
+
+    # A native save also stores the boundary image of the request's SLOT,
+    # which the following forwards overwrite; its ordering with the forward
+    # that computes the chunk has not been worked out. Next-step emission.
+    _supports_same_step_save = False
 
     _supports_early_block_release = True
 
@@ -291,6 +299,41 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._hit_save_floors[sid] = reach
         super().update_state_after_alloc(seq)
 
+    def lookup_pending(self, seq: Any) -> bool:
+        """Also hold back a request that may restore an image while every
+        restore slot of the worker is taken; only a known miss goes ahead.
+
+        The worker restores into `restore_slot_count` slots, and only between
+        forwards. A load dispatched past them queues there with no clock of the
+        worker running, while its deadline here counts from dispatch, so a few
+        slow forwards (a cold restart) would stop the engine.
+        """
+        if super().lookup_pending(seq):
+            return True
+        # With images every native load restores one (a KV-only load comes
+        # only with a replay, which stores no images).
+        if self._page_only or not seq.has_per_req_cache:
+            return False
+        if not self._restore_slots_full():
+            return False
+        return self._lookup_client.answered_hit(str(seq.id)) != 0
+
+    def _restore_slots_full(self) -> bool:
+        return len(self._native_loads) >= restore_slot_count(self._max_pending_saves)
+
+    def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
+        """While every restore slot is taken, a hand-off reserves no load: it
+        keeps prefilling, and is weighed again next step from where the
+        prefill has reached.
+
+        A hit off the chunk grid is admitted with no load: it prefills to the
+        next chunk boundary and reserves its load there, after `lookup_pending`
+        let it through.
+        """
+        if str(seq.id) in self._handoff_loads and self._restore_slots_full():
+            return False
+        return super().should_park_partial_prefill_for_load(seq)
+
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         parks = super().should_park_for_load_after_alloc(seq)
         if parks:
@@ -302,7 +345,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             self._block_manager.fall_back_to_hbm_replay(seq)
         return parks
 
-    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool:
+    def _ensure_lookup_pin(self, seq: Any, sid: str, spec) -> bool | None:
         operation = self._native_load_operations.get(sid)
         lease = self._native_loads.get(operation)
         if lease is None or lease.seq is not seq or not lease.transfer.kv_only:
@@ -316,7 +359,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # what the base does for a load admitted on a remembered hit -- would
         # weigh a hit of 0 (no image), and drop the load.
         reach = self._lookup_client.hit_tokens(sid)
-        return reach is not None and int(reach) >= int(spec.lmcache_cached_tokens)
+        if reach is None:
+            return None
+        return int(reach) >= int(spec.lmcache_cached_tokens)
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):

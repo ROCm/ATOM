@@ -19,6 +19,12 @@ from atom.model_engine.prefill_delayer import (
 )
 
 MAX_BATCHED = 16384
+# reduce-buffer slot of the requests that arrived since the previous tick
+ARRIVED = 8
+# reduce-buffer slot of the ranks with waiting work they cannot admit
+BLOCKED = 9
+# reduce-buffer slot of the ranks without prefill that cannot align in time
+UNREACHABLE = 10
 
 
 def _noop_all_reduce(tensor, op=None, group=None):
@@ -276,16 +282,160 @@ class TestAlignmentGate:
         assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is True  # ttft
         assert d._stat_fire_ttft == 1
 
-    def test_mixed_released_by_stall(self):
-        # One rank's lone request, the other decoding: nothing more arrives, so
-        # the gate gives up after stall_ticks instead of waiting out ttft.
+    def test_mixed_flat_queue_released_by_stall(self):
+        # Nothing changes anywhere in the group: no arrival, no rank turning
+        # prefillable, and the peer completes no decode in time. Waiting
+        # longer cannot align it, so stall releases.
         d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
         skip_first(d)
-        mixed = _add_rank({2: 64})
-        assert call(d, pending_tokens=500, reduce=mixed) is False  # grew
+        mixed = _add_rank({2: 64, UNREACHABLE: 1})
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # first look
         assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
         assert call(d, pending_tokens=500, reduce=mixed) is True  # stall 2
         assert d._stat_fire_stall == 1
+
+    def test_low_concurrency_idle_ranks_release_on_stall(self):
+        # DP8 at concurrency 4: three ranks decode, this rank just got a
+        # prompt, four ranks are idle and will get no work. Default bounds.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        mixed = _add_rank({2: 3, UNREACHABLE: 4})
+        ticks = 0
+        while not call(d, pending_tokens=800, running_decode_batch=0, reduce=mixed):
+            ticks += 1
+            assert ticks < 200
+        assert ticks == 10
+        assert d._stat_fire_stall == 1
+        assert d._stat_fire_ttft == 0
+
+    def test_arrivals_restart_the_stall_count(self):
+        # Requests keep arriving in the group while the capped pending sum
+        # stays flat: peers are still receiving work, so keep waiting.
+        d = make_delayer(dp_size=2, ttft_max_ticks=6, stall_ticks=2)
+        skip_first(d)
+        arriving = _add_rank({2: 64, ARRIVED: 1})
+        for _ in range(6):
+            assert call(d, pending_tokens=500, reduce=arriving) is False
+        assert call(d, pending_tokens=500, reduce=arriving) is True
+        assert d._stat_fire_ttft == 1
+        assert d._stat_fire_stall == 0
+
+    def test_unaligned_ticks_do_not_stall_an_aligned_group(self):
+        d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=3)
+        skip_first(d)
+        mixed = _add_rank({2: 64})
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # first look
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 2
+        # The peer turns prefillable with a request estimated at 0 tokens:
+        # the flat, underfilled aligned group restarts the count.
+        aligned = _add_rank({0: 1, 2: 64})
+        assert call(d, pending_tokens=500, reduce=aligned) is False
+        assert d._stat_fire_stall == 0
+
+    def test_kv_full_blocked_rank_does_not_release_every_tick(self):
+        # DP8: this rank's head cannot allocate KV (prefillable=False, KV 0.95,
+        # 4 waiting), one peer holds 300 tokens, the group decodes. The blocked
+        # rank counts as aligned, so only the stall bound releases the
+        # underfilled forward, never KV pressure on every tick.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        peer = _add_rank({0: 1, 1: 300, 2: 7 * 16, UNREACHABLE: 6})
+        fired = [
+            call(d, prefillable=False, kv_usage=0.95, waiting_requests=4, reduce=peer)
+            for _ in range(100)
+        ]
+        assert sum(fired) == 9
+        assert d._stat_fire_kv == 0
+        assert d._stat_fire_stall == 9
+
+    def test_blocked_rank_does_not_hold_full_peers(self):
+        # DP8: this rank is blocked below the watermark, the seven peers each
+        # hold a full budget, and requests keep arriving on a peer. Waiting
+        # cannot make this rank admittable, so the full peers fire at once.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        peers = _add_rank({0: 7, 1: 7 * MAX_BATCHED, 2: 7 * 16, ARRIVED: 1})
+        assert (
+            call(d, prefillable=False, kv_usage=0.85, waiting_requests=4, reduce=peers)
+            is True
+        )
+        assert d._stat_fire_fill == 1
+
+    def test_blocked_rank_pending_does_not_fill_the_forward(self):
+        # This rank is blocked with a full budget of waiting tokens; its one
+        # prefillable peer holds 300. Aligned, but the forward is underfilled:
+        # hold instead of firing `fill` on tokens the blocked rank cannot admit.
+        d = make_delayer(dp_size=2, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        peer = _add_rank({0: 1, 1: 300, 2: 64})
+        assert (
+            call(
+                d,
+                prefillable=False,
+                pending_tokens=MAX_BATCHED,
+                waiting_requests=4,
+                reduce=peer,
+            )
+            is False
+        )
+        assert d._reduce_buf[1] == 300
+        assert d._stat_fire_fill == 0
+
+    def test_kv_high_ignores_a_rank_that_cannot_prefill(self):
+        d = make_delayer()
+        skip_first(d)
+        call(d, prefillable=False, kv_usage=0.95, waiting_requests=1)
+        assert d._reduce_buf[3] == 0
+        assert d._reduce_buf[BLOCKED] == 1
+
+    def test_quiet_group_waits_for_a_straggler_completing_in_time(self):
+        # c128-like: seven ranks hold prefill, the eighth decodes and frees a
+        # slot within the TTFT bound. Nothing changes for many more ticks than
+        # stall_ticks, yet the group waits and fires aligned.
+        d = make_delayer(dp_size=8, ttft_max_ticks=200, stall_ticks=10)
+        skip_first(d)
+        mixed = _add_rank({0: 6, 1: 6 * MAX_BATCHED, 2: 7 * 16})
+        for _ in range(50):
+            assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is False
+        aligned = _add_rank({0: 7, 1: 6 * MAX_BATCHED, 2: 7 * 16, ARRIVED: 1})
+        assert call(d, pending_tokens=MAX_BATCHED, reduce=aligned) is True
+        assert d._stat_fire_fill == 1
+        assert d._stat_fire_stall == 0
+
+    def test_unreachable_flag_compares_to_the_remaining_hold(self):
+        d = make_delayer(dp_size=2, ttft_max_ticks=200)
+        skip_first(d)
+        prefilling_peer = _add_rank({0: 1, 1: 500, 2: 64})
+
+        def unreachable(**kw):
+            call(d, prefillable=False, reduce=prefilling_peer, **kw)
+            return d._reduce_buf[UNREACHABLE]
+
+        assert unreachable(next_completion_steps=150) == 0
+        # one held tick so far leaves 199 of the TTFT bound
+        assert d._hold_ticks == 1
+        assert unreachable(next_completion_steps=199) == 0
+        assert unreachable(next_completion_steps=199) == 1
+        assert unreachable() == 1  # no decode running
+        # waiting work makes it blocked, not a straggler
+        assert unreachable(waiting_requests=1) == 0
+        assert d._reduce_buf[BLOCKED] == 1
+
+    def test_capped_pending_waits_for_decoding_peer_to_refill(self):
+        d = make_delayer(dp_size=8, ttft_max_ticks=8, stall_ticks=10)
+        skip_first(d)
+        # Seven ranks have prefill, one still decodes. The sum is already
+        # above the fill target, but every local probe caps pending tokens.
+        mixed = _add_rank({0: 6, 1: 6 * MAX_BATCHED, 2: 7 * 16})
+        for _ in range(5):
+            assert call(d, pending_tokens=MAX_BATCHED, reduce=mixed) is False
+        # The peer completes and receives a replacement. Its admission flag
+        # changes even though capped aggregate pending stays exactly flat.
+        aligned = _add_rank({0: 7, 1: 6 * MAX_BATCHED, 2: 7 * 16})
+        assert call(d, pending_tokens=MAX_BATCHED, reduce=aligned) is True
+        assert d._stat_fire_fill == 1
+        assert d._stat_fire_stall == 0
 
     def test_mixed_holds_while_growing(self):
         d = make_delayer(dp_size=2, ttft_max_ticks=1000, stall_ticks=2)
@@ -317,8 +467,8 @@ WAITING, DECODE_US, PREFILL_PS, TIMED, ARRIVALS = range(
 )
 # The sibling decodes 1 seq with no prefill; it timed a 10 ms decode step and
 # 100 ps a cost unit. Firing stalls 2 decodes for 3e8 x 100 ps = 30 ms: 60 ms
-# of decode stall.
-TIMED_SIBLING = {2: 1, DECODE_US: 10_000, PREFILL_PS: 100, TIMED: 1}
+# of decode stall. Its decode does not complete within the TTFT bound.
+TIMED_SIBLING = {2: 1, DECODE_US: 10_000, PREFILL_PS: 100, TIMED: 1, UNREACHABLE: 1}
 
 
 def lone_request(d, reduce):
@@ -367,6 +517,17 @@ class TestCostGate:
             assert lone_request(d, mixed) is False
         assert lone_request(d, mixed) is True
         assert d._stat_fire_cost == 1
+
+    def test_waits_for_a_sibling_completing_in_time(self):
+        # Same sibling, but its decode completes within the TTFT bound: its
+        # next request comes with that completion, so the gate does not judge.
+        d = make_gated()
+        skip_first(d)
+        reachable = {**TIMED_SIBLING, ARRIVALS: 10}
+        del reachable[UNREACHABLE]
+        for _ in range(20):
+            assert lone_request(d, _add_rank(reachable)) is False
+        assert d._stat_fire_cost == 0
 
     def test_untimed_holds_for_the_stall_bound(self):
         d = make_gated()
@@ -502,6 +663,28 @@ class TestPrefillDecodeInterval:
         # notification, the next eligible prefill must not be delayed.
         assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
         assert d._stat_hold_decode_interval == 0
+
+    def test_arrival_in_window_restarts_the_stall_count(self):
+        d = make_delayer(
+            dp_size=2, prefill_decode_interval=2, ttft_max_ticks=1000, stall_ticks=3
+        )
+        skip_first(d)
+        mixed = _add_rank({2: 64, UNREACHABLE: 1})
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # first look
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 2
+        d.notify_prefill_executed()
+        # A request arrives on the peer inside the decode-protection window.
+        arriving = _add_rank({2: 64, ARRIVED: 1, UNREACHABLE: 1})
+        assert call(d, pending_tokens=500, reduce=arriving) is False
+        assert call(d, pending_tokens=500, reduce=mixed) is False
+        assert d._stat_hold_decode_interval == 2
+        assert d._stall_count == 0
+        # The count restarts from the arrival instead of resuming at 2.
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 1
+        assert call(d, pending_tokens=500, reduce=mixed) is False  # stall 2
+        assert call(d, pending_tokens=500, reduce=mixed) is True  # stall 3
+        assert d._stat_fire_stall == 1
 
     def test_execution_on_peer_arms_all_ranks(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=1)

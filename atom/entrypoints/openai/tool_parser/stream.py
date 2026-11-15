@@ -17,6 +17,7 @@ compares them, but no second implementation to compare against.
 
 import logging
 
+from ..logprobs import LogprobText, join_text
 from ..marker_scanner import MarkerScanner
 from .schema import ParamTypes, build_param_types
 from .tool_parser import (
@@ -67,9 +68,10 @@ class Region:
     scan it already fixed once could come back.
     """
 
-    __slots__ = ("_len", "_parts", "head")
+    __slots__ = ("_join", "_len", "_parts", "head")
 
-    def __init__(self) -> None:
+    def __init__(self, *, any_logprobs=False) -> None:
+        self._join = join_text if any_logprobs else "".join
         self._parts: list[str] = []
         self._len = 0
         self.head = ""
@@ -90,7 +92,7 @@ class Region:
         literal that could close the region has actually arrived.
         """
         if len(self._parts) > 1:
-            self._parts = ["".join(self._parts)]
+            self._parts = [self._join(self._parts)]
         return self._parts[0] if self._parts else ""
 
     def take(self) -> str:
@@ -343,6 +345,18 @@ class ToolCallStreamParser:
         """The format this stream is being read as, or None."""
         return self.parser_cls.NAME if self.parser_cls is not None else None
 
+    @property
+    def has_pending_text(self) -> bool:
+        """Whether an earlier input span can still become visible content."""
+        return self._region is not None or bool(self._scanner and self._scanner.held)
+
+    @property
+    def held_text(self):
+        """Earliest unresolved text, without materializing an open region."""
+        if self._region is not None:
+            return self._region.head
+        return self._scanner.held if self._scanner else ""
+
     # -- public ------------------------------------------------------------
     def process(self, text: str) -> list:
         """Consume one chunk; return the events it completed."""
@@ -366,11 +380,14 @@ class ToolCallStreamParser:
         per delivery mode.
         """
         out: list = []
+        # The scanner still holds text past the marker it last stopped at.
+        resume = False
         while True:
             if self._region is None:
-                if text:
+                if text or resume:
                     scan = self._scanner.feed(text)
                     text = ""
+                    resume = False
                     if scan.released:
                         out.append(("content", scan.released))
                     if scan.hit is not None:
@@ -382,7 +399,7 @@ class ToolCallStreamParser:
                             # `<|open|>response<|sep|>`, buffered its entire
                             # body to EOS -- 324 of 324 characters in one
                             # frame at the end.
-                            text = scan.rest
+                            resume = True
                         else:
                             # The region has opened. Opened, but not read
                             # here: the marker goes back through the region
@@ -395,9 +412,11 @@ class ToolCallStreamParser:
                             # wire tokens in the answer. A region is buffered
                             # the same way whatever the request said about
                             # dispatch; only `_close_region` differs.
-                            self._region = Region()
+                            self._region = Region(
+                                any_logprobs=isinstance(scan.hit, LogprobText)
+                            )
                             self._end_tail = ""
-                            text = scan.hit + scan.rest
+                            text = scan.hit + self._scanner.take_rest()
                         continue
                 if not final:
                     return out
@@ -783,4 +802,6 @@ def flatten_tool_events(events: list) -> tuple[str, list[ToolCall]]:
                 )
             )
             pending = None
-    return "".join(content), calls
+    any_logprobs = isinstance(next((part for part in content if part), ""), LogprobText)
+    join = join_text if any_logprobs else "".join
+    return join(content), calls
