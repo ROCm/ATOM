@@ -492,8 +492,11 @@ def _env_over(kind: str, rows: int | None) -> dict:
 
 
 # TP-keyed entries over the (kind, rows) ones (``knobs(tp=)``): (tp, kind, rows) -> knobs, a split kind taking its
-# base kind's. None yet: TP8's are measured on the served deployment before they go in.
-TP_SCHEDULES: dict[tuple, dict] = {}
+# base kind's, measured on the served deployment (TP8 c1, fp8 KV, step bench with the GSM8K gate):
+# - the consumers' MoE routing table built by one wave (MOE_RT_WAVE: the same table): 1K -0.9 %, 128K -0.4 % a step
+TP_SCHEDULES: dict[tuple, dict] = {
+    (8, _k, 6): {"MOE_RT_WAVE": True} for _k in (C2, C1, CONSUMER)
+}
 
 
 def _check_entries() -> None:
