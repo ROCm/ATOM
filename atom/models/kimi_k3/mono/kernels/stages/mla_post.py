@@ -19,14 +19,15 @@ g_proj's preshuffled per-token FP8 plane.
 
 Placement (``mla_post_plan.CTA_RANGES``): 96 tasks of 16 core columns (one
 g_proj row tile of K = 7168 and one 16-row tile of one head's W_V, K = 512) on
-the CTAs with the least other work queued behind them; every CTA issues its
-o_proj weights first. Each task publishes a tagged pair in ``mpdone`` after its
-device-scope core stores (``publish``, the K1 XRDY pattern). Every CTA's o_proj
--- which needs every core column, exactly as it needed the previous kernel's
-whole output -- polls the 96 pairs one thread each (one round trip after the
-last lands) and reads ``core`` at device scope. That is the only hand-off, and
-it replaces a kernel boundary that already existed: there is no grid-wide
-barrier.
+the CTAs with the least other work queued behind them. A CTA runs its post
+task first, then issues its o_proj weights, which are in flight across the wait
+for the core (``stage_oproj_post``). Each task publishes a tagged pair in
+``mpdone`` after its device-scope core stores (``publish``, the K1 XRDY
+pattern). Every CTA's o_proj -- which needs every core column, exactly as it
+needed the previous kernel's whole output -- polls the 96 pairs one thread each
+(one round trip after the last lands) and reads ``core`` at device scope. That
+is the only hand-off, and it replaces a kernel boundary that already existed:
+there is no grid-wide barrier.
 
 Numerics: the elementwise tail (sigmoid with libm ``expf`` and IEEE division,
 the bf16 roundings, the product) is the torch kernels' bit for bit given equal
