@@ -455,7 +455,7 @@ def _padded_prefill(scheduled, **step):
 
 class PaddedPrefillUnit(torch.nn.Module):
     """A unit whose region attends a prefill's scheduled rows alone: its
-    launch follows the step (a cumulative sum over the rows), as attention's
+    launch follows the step (every row less the rows' mean), as attention's
     and a recurrence's do."""
 
     def __init__(self, dim=64):
@@ -466,7 +466,7 @@ class PaddedPrefillUnit(torch.nn.Module):
     @eager_region()
     def attend(self, x: torch.Tensor):
         return on_scheduled_rows(
-            lambda h: h.cumsum(0), padded_prefill_rows(x.shape[0]), x
+            lambda h: h - h.mean(0), padded_prefill_rows(x.shape[0]), x
         )
 
     def forward(self, x):
@@ -496,7 +496,7 @@ def test_a_padded_prefill_region_attends_its_scheduled_rows(context):
     context.tr_graph = None
 
     # The scheduled rows are the eager step's: no padded row reached the
-    # region's cumulative sum. The padded rows leave it as zeros.
+    # region's mean. The padded rows leave it as zeros.
     torch.testing.assert_close(got[:scheduled], unit(x), rtol=1e-5, atol=1e-5)
     bias = unit.b.bias.expand(bucket - scheduled, -1)
     torch.testing.assert_close(got[scheduled:], bias, rtol=0, atol=0)

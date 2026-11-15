@@ -67,6 +67,59 @@ def test_a_cut_region_sees_its_rows_and_hands_back_the_bucket():
     torch.testing.assert_close(on_scheduled_rows(region, None, x, weight, "l"), x * 2)
 
 
+@pytest.fixture
+def padded_layer(monkeypatch):
+    """A prefill of 5 rows padded to an 8-row bucket, and a layer registered
+    as "layer" that records the rows each of its calls is handed."""
+    pytest.importorskip("aiter", reason="the attention and KDA ops are AITER ops")
+    from atom.model_ops import base_attention
+    from atom.models.kimi_k3 import model as kimi
+
+    seen = {}
+
+    def attend(query, k_nope, k_rope, positions, q_scale):
+        seen["mla"] = (query.shape[0], k_nope.shape[0], k_rope.shape[0])
+        seen["positions"] = positions.shape[-1]
+        return query[:, :4] + 1
+
+    def mix(hidden_states, hidden_states_scale):
+        seen["kda"] = hidden_states.shape[0]
+        return hidden_states + 1
+
+    layer = SimpleNamespace(impl=SimpleNamespace(forward=attend), _forward_impl=mix)
+    static = {"layer": layer}
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context=static)
+    )
+    for module in (base_attention, kimi):
+        monkeypatch.setattr(module, "get_current_atom_config", lambda: config)
+    ctx = SimpleNamespace(context=_step(5), main_stream=None, in_hipgraph=False)
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    return seen, base_attention, kimi
+
+
+def _bucket_of_scheduled_rows(out, width):
+    assert out.shape == (8, width)
+    assert out[:5].eq(2).all() and not out[5:].any()
+
+
+def test_mla_attention_runs_a_padded_prefills_scheduled_rows(padded_layer):
+    seen, base_attention, _ = padded_layer
+    x = torch.ones(8, 6)
+    out = base_attention.unified_attention_with_output_base(
+        x, None, x, x, torch.arange(8), "layer", True, x
+    )
+    assert seen == {"mla": (5, 5, 5), "positions": 5}
+    _bucket_of_scheduled_rows(out, 4)
+
+
+def test_kda_mixer_runs_a_padded_prefills_scheduled_rows(padded_layer):
+    seen, _, kimi = padded_layer
+    out = kimi.kda_attention_with_output(torch.ones(8, 6), None, "layer")
+    assert seen == {"kda": 5}
+    _bucket_of_scheduled_rows(out, 6)
+
+
 def test_kimi_records_prefill_token_graphs_without_dp_and_a_quantized_query():
     """Under DP every rank pads to a prefill bucket some rank chose, so a
     decoding or idle rank would replay a recording whose regions serve a
