@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Probability-ratio verification must honor masks and retain raw logprobs."""
 
+import sys
 from types import SimpleNamespace as NS
 
 import pytest
@@ -195,14 +196,15 @@ def test_required_channel_verifies_the_masked_copy(modules, monkeypatch):
     runner.structured_output = None
     observed = {}
 
-    def constrain(batch, bonus_logits, md=None, target_logits=None):
+    def constrain(runner, batch, logits, metadata=None, target=None):
         # The channel forbids token 0 in the compacted target rows.
-        assert target_logits is not None
-        target_logits[:, 0] = -torch.inf
-        observed["masked"] = target_logits
+        assert target is not None
+        target[:, 0] = -torch.inf
+        observed["masked"] = target
         # None: no channel states to advance after the step.
 
-    monkeypatch.setattr(runner, "_constrain_required_channel", constrain)
+    boundary = sys.modules[mod.TokenConstraints.__module__]
+    monkeypatch.setattr(boundary, "apply_required_channel", constrain)
 
     class Sampler:
         def __call__(self, logits, **kwargs):
