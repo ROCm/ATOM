@@ -10,8 +10,8 @@ of the MLA layers folded (gaps between folded layers, 92 unfolded); three
 decode steps, one of them past the folds' 16-row width (the unfused path).
 
 The attention seam is the tree's own ``_apply_attn_res_impl`` (its
-allocations, which always copy a strided block slice), only its triton kernel
-replaced.
+allocations: a copy of the block slice only when the bank is strided along H),
+only its triton kernel replaced.
 
 The kernels and the production modules are CPU stand-ins with one shared
 arithmetic: K2's post stage computes what the production v-up / g_proj / gate
@@ -338,9 +338,9 @@ if not hasattr(AR, "triton"):
 
 
 class SeamModule:
-    """``AttnRes`` -> the tree's own ``_apply_attn_res_impl`` (its allocations,
-    which always copy a strided block slice), the triton
-    kernel replaced by the shared seam arithmetic."""
+    """``AttnRes`` -> the tree's own ``_apply_attn_res_impl`` (its allocations:
+    a copy of the block slice only when the bank is strided along H), the
+    triton kernel replaced by the shared seam arithmetic."""
 
     def __init__(self, lid):
         self.lid = lid
