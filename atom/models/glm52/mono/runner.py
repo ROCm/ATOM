@@ -271,8 +271,8 @@ def _publish_selected_indices(
       ``cu_seqlens_q``/``kv_indptr``, matching ``sparse_kv_indptr``'s
       per-request shape at this width.
     - ``max_seqlen_q > 1`` (MTP): ``triton_gather_kv_indices_sparse``, a
-      per-token GATHER driven by ``batch_id_per_q_token`` (published by
-      decode metadata exactly when ``max_seqlen_q > 1``), matching
+      per-token GATHER driven by ``batch_id_per_q_token`` (published every
+      step by ``prepare_query_metadata``), matching
       ``sparse_kv_indptr``'s per-token shape at these widths. Calling the
       per-request converter here instead silently aliases every row of a
       multi-row request onto the same ``sparse_kv_indptr`` slice (last

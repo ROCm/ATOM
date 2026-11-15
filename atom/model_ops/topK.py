@@ -9,6 +9,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.fused_moe.gathered_shared_ids import copy_shared_expert_ids_
 from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
@@ -200,7 +201,9 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
         f"but {rows} rows were gathered."
     )
     top_k = layer.top_k
-    topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
+    # The routed columns mark padded and DP-dummy rows with -1. Copy shared
+    # IDs only onto valid rows so reassignment does not reactivate padding.
+    copy_shared_expert_ids_(topk_ids, total_topk_ids[:rows, top_k:], top_k)
 
 
 # Rows per CU up to which `triton_topk_softmax` is faster than AITER's

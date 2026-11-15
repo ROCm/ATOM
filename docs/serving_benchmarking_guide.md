@@ -412,7 +412,7 @@ closes (`<|close|>response<|sep|>`) the next tokens are forced to
 `<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
 model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
 has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
-`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+`/v1/responses` sample as before; see `atom/model_ops/triton_required_channel.py`.
 A required request's own `stop` strings can still end it before a call.
 
 Forwarding it to the chat template is a separate step, and one that used to be
@@ -908,10 +908,14 @@ Eagle-style speculative decoding framework.
 - **EagleProposer** (`atom/spec_decode/eagle.py`): Loads and runs the draft
   (MTP) model to propose speculative tokens.  Supports the `DeepSeekMTPModel`
   architecture via `DeepSeekMTP`.
-- **RejectionSampler** (`atom/model_ops/rejection_sampler.py`): Implements
-  greedy rejection sampling with a Triton kernel.  Compares draft token IDs
-  against target model argmax and accepts matching prefixes; appends a bonus
-  token if all drafts are accepted.
+- **RejectionSampler** (`atom/model_ops/rejection_sampler.py`): Verifies the
+  drafts with Triton kernels and accepts each request's prefix up to the first
+  rejection; appends a bonus token if all drafts are accepted. By default a
+  draft is accepted iff it equals the target's own token: its argmax for a
+  greedy request, its temperature/top-k/top-p draw otherwise. With
+  `ATOM_SPEC_LOSSLESS_SAMPLING=1`, sampled DSpark drafts are verified by the
+  probability ratio instead (`u * q(x) < p(x)`). See `RejectionSampler` in
+  [`model_ops_guide.md`](model_ops_guide.md) for every rule.
 
 ### Configuration
 
@@ -967,6 +971,9 @@ MTP Statistics:
      subsequent draft tokens are discarded.
    - If all draft tokens match, a bonus token from the target model is
      appended.
+
+That is the greedy case; sampled requests and the probability-ratio rule are
+covered under [Architecture](#architecture).
 
 ### Forced acceptance length
 

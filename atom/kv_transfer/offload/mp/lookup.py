@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from atom.kv_transfer.offload._offload_common import CACHE_SALT_TAG
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.lookup_driver import _DRIVER_POLL_S, _LookupDriver
 
@@ -157,13 +158,19 @@ class _MPLookupClient:
     # admission consuming the answer, `discard`, the save floor -- is the
     # same path a prefetched lookup takes.
 
-    def offer(self, lookup_id: str, tokens: Callable[[], list[int] | None]) -> bool:
+    def offer(
+        self,
+        lookup_id: str,
+        tokens: Callable[[], list[int] | None],
+        request_configs: dict | None = None,
+    ) -> bool:
         """Queue an arrived request's lookup for the driver. False if not queued."""
 
         driver = self._driver
         if driver is None:
             return False
         with self._lock:
+            self._salt_session(lookup_id, request_configs)
             if (
                 lookup_id in self._offered
                 or lookup_id in self._async
@@ -242,9 +249,15 @@ class _MPLookupClient:
     # locks after the adapter's result cache was cleaned up.
 
     @_locked
-    def submit(self, token_ids: list[int], lookup_id: str) -> bool:
+    def submit(
+        self,
+        token_ids: list[int],
+        lookup_id: str,
+        request_configs: dict | None = None,
+    ) -> bool:
         """Send this request's lookup without waiting. False if not sent."""
 
+        self._salt_session(lookup_id, request_configs)
         self._offered.pop(lookup_id, None)
         if (
             not self._async_supported
@@ -275,6 +288,14 @@ class _MPLookupClient:
         self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
         self._async_tokens[lookup_id] = token_ids
         return True
+
+    def _salt_session(self, lookup_id: str, request_configs: dict | None) -> None:
+        """Have the adapter key `lookup_id`'s session by its prompt's media
+        (`tier_cache_salt`), until the session ends."""
+        salt = (request_configs or {}).get(CACHE_SALT_TAG)
+        if salt:
+            session = _mp_session_id(self._config, lookup_id)
+            self._adapter.salt_session(session, salt)
 
     def supports_async(self) -> bool:
         """Whether `submit` can send a lookup without waiting for it."""
@@ -510,7 +531,12 @@ class _MPLookupClient:
         if lookup_id in self._async_tokens:
             self._try_release_unconsumed(lookup_id)
 
-    def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
+    def lookup(
+        self,
+        token_ids: list[int],
+        lookup_id: str,
+        request_configs: dict | None = None,
+    ) -> int | None:
         """Hit length for this prompt, or None if the tier never answered.
 
         None is a non-answer, not an empty answer: the caller must ask again
@@ -522,6 +548,7 @@ class _MPLookupClient:
         """
 
         with self._lock:
+            self._salt_session(lookup_id, request_configs)
             self._orphans.discard(lookup_id)
             self._offered.pop(lookup_id, None)
             in_flight = lookup_id in self._async
@@ -658,6 +685,11 @@ class _MPLookupClient:
     def hit_tokens(self, lookup_id: str) -> int | None:
         state = self._lookups.get(lookup_id)
         return None if state is None else state.hit
+
+    @_locked
+    def answered_hit(self, lookup_id: str) -> int | None:
+        """`hit_tokens`, or the answer of an async lookup not consumed yet."""
+        return self._async_hits.get(lookup_id, self.hit_tokens(lookup_id))
 
     @_locked
     def clear_lookup_status(self, lookup_id: str) -> None:

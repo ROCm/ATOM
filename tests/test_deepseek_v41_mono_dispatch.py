@@ -3,6 +3,7 @@
 """Which deployments and which steps the DeepSeek-V4.1 mono decode takes."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -225,7 +226,7 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
             "decode": True,
             "tentative": True,
             "requests": [object()],
-            "width": 6,
+            "running_tokens": 6,
             **step_fields,
         }
     )
@@ -245,13 +246,13 @@ def test_verify_step_is_routed(monkeypatch):
 
 def test_plain_decode_step_is_routed(monkeypatch):
     # no drafter: a token a request, not a tentative verify
-    _context(monkeypatch, tentative=False, requests=[object()] * 3, width=3)
+    _context(monkeypatch, tentative=False, requests=[object()] * 3, running_tokens=3)
     assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
 
 
 def test_ragged_verify_step_is_routed(monkeypatch):
     # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
-    _context(monkeypatch, requests=[object()] * 3, width=12)
+    _context(monkeypatch, requests=[object()] * 3, running_tokens=12)
     assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
 
 
@@ -263,7 +264,7 @@ def test_ragged_verify_step_is_routed(monkeypatch):
         (6, {"prefill": True}),
         (6, {"ubatch": object()}),
         (6, {"decode": False}),
-        (6, {"width": 12}),
+        (6, {"running_tokens": 12}),
     ],
 )
 def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
@@ -278,7 +279,7 @@ def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
     monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
-    _context(monkeypatch, width=tokens, requests=[object()])
+    _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
     assert dispatch.step_supported(ids, None) is routed
 
@@ -293,19 +294,24 @@ class _DraftRunner:
 
 class _Draft(torch.nn.Module):
     block_size = 5
+    draft_kv_dtype = "auto"
 
     def block_backbone(self, input_ids, positions, num_draft):
         return "original"
 
 
+@pytest.mark.parametrize("draft_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("prefill", [False, True])
 @pytest.mark.parametrize("requests, routed", [(1, True), (8, True), (9, False)])
 def test_the_draft_is_routed_by_its_request_count(
-    monkeypatch, prefill, requests, routed
+    monkeypatch, prefill, requests, routed, draft_dtype
 ):
     # the target step before the draft pass (a prefill or a decode) is not read
     _context(monkeypatch, prefill=prefill)
-    model = dispatch.MonoDraftModel(_Draft())
+    draft = _Draft()
+    draft.draft_kv_dtype = draft_dtype
+    routed = routed and draft_dtype != "fp8"
+    model = dispatch.MonoDraftModel(draft)
     runner = _DraftRunner()
     model._mono = SimpleNamespace(
         runner=runner, ready=lambda rows: runner.rows.append(rows) or True
@@ -314,6 +320,37 @@ def test_the_draft_is_routed_by_its_request_count(
     out = model.block_backbone(ids, ids, None)
     assert out == ("mono" if routed else "original")
     assert runner.rows == ([requests * 5] if routed else [])
+
+
+@pytest.mark.parametrize("draft_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("requests", [1, 8])
+def test_explicit_fp8_draft_bypasses_hi_and_mono(monkeypatch, draft_dtype, requests):
+    from atom.models.deepseek_v41.mono import hi_dispatch
+
+    fwd = _context(monkeypatch)
+    monkeypatch.setattr(hi_dispatch, "get_forward_context", lambda: fwd)
+    fwd.attn_metadata.cache = object()
+    fwd.attn_metadata.state_slot_out = torch.arange(requests)
+    draft = _Draft()
+    draft.draft_kv_dtype = draft_dtype
+    draft.embed = torch.nn.Embedding(2, 4)
+    draft._noise_embedding = lambda: None
+    hook = SimpleNamespace(draft_serves=Mock(return_value=True), draft_run=Mock())
+    model = hi_dispatch.HiDraftModel(draft, 1, hook)
+    model._mono = SimpleNamespace(
+        ready=Mock(side_effect=AssertionError("unexpected Mono draft"))
+    )
+    ids = torch.zeros(requests, dtype=torch.int64)
+    result = model.block_backbone(ids, ids, None)
+    model._mono.ready.assert_not_called()
+    if draft_dtype == "fp8":
+        assert result == "original"
+        hook.draft_serves.assert_not_called()
+        hook.draft_run.assert_not_called()
+    else:
+        assert result is hi_dispatch._HI_DRAFT
+        hook.draft_serves.assert_called_once_with(requests, 5)
+        hook.draft_run.assert_called_once()
 
 
 def test_embeddings_or_images_keep_the_original_model(monkeypatch):

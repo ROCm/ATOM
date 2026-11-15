@@ -150,8 +150,8 @@ def test_sp_token_graphs_are_bucketed_by_step_rows(monkeypatch, load, model_runn
             unified=True,
             running_bs=rows,
             scheduled_tokens=rows,
-            scheduled_tokens_per_dp_rank=None,
-            is_block_drafter=False,
+            running_tokens_per_dp_rank=None,
+            packed_decode=False,
             max_seqlen_q=1,
         )
 

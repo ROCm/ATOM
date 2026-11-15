@@ -147,6 +147,7 @@ class EngineArgs:
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     enable_request_context_metrics: bool = False
+    sampler_independent_noise: bool = False
     throughput_log_interval: float = 10.0
     throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
@@ -319,10 +320,12 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
+            "or DeepSeek-V4.1's own FP4 KV; other models refuse it. M3's conditions "
+            "are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
@@ -332,7 +335,8 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype.",
+            "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
+            "cache or another model's own FP4 layout; see the configuration guide.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -410,6 +414,11 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
@@ -595,6 +604,24 @@ class EngineArgs:
             help="Enable per-request prefill/decode context metrics (default: disabled). "
             "Retains request-labelled series after completion; use only for short "
             "diagnostic captures. Aggregate metrics are unaffected.",
+        )
+        parser.add_argument(
+            "--sampler-independent-noise",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Draw fresh per-row exponential noise for unfiltered "
+            "temperature sampling instead of broadcasting one row across the "
+            "batch, so ordinary n=1 stochastic requests are sampled "
+            "independently, not only fan-out siblings (n>1) and speculative "
+            "verification. Off by default; enabling it allocates a "
+            "(num_tokens, vocab_size) float32 noise tensor per sampler call "
+            "and changes the RNG stream, so identical seeds no longer "
+            "reproduce the default tokens. The top-k/top-p path already "
+            "draws per-row noise, so the option is inert there by design; "
+            "greedy rows never draw noise. Native ATOM "
+            "engine only (vLLM/SGLang plugin paths are unaffected). "
+            "Use --no-sampler-independent-noise to state the default "
+            "explicitly.",
         )
         parser.add_argument(
             "--enable-log-stats",

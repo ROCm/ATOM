@@ -37,6 +37,32 @@ from atom.utils.region_graph import ReqGraph
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 
 
+def gpu_stack_import(name):
+    """Import an atom module that may need the aiter/triton GPU stack.
+
+    Tries the import first, so a module that imports fine without the stack
+    still runs on the CPU-only CI runner. A failure is turned into a skip only
+    when the stack is genuinely absent -- no aiter or triton, or no GPU for
+    aiter to probe the arch of at import. On a GPU host any import error FAILS.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        try:
+            importlib.import_module("aiter")
+            importlib.import_module("triton")
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception as e:  # noqa: BLE001 - any failure here means no stack
+            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
+        if not gpu:
+            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
+        raise
+
+
 class _MockHFConfig:
     """Minimal hf_config stub. Default is non-V4 so Scheduler's V4 SWA-warmup
     detection stays inert; pass architectures=[...] to exercise the V4 path."""
@@ -70,6 +96,8 @@ class MockConfig:
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
             "decode_context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "kv_transfer_config": {},
             "max_model_len": 64,
             "bos_token_id": 1,
             "eos_token_id": 2,
@@ -293,6 +321,14 @@ def req_graph_recordings(monkeypatch):
     monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
     monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
     return recordings
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
 
 
 @pytest.fixture(autouse=True)

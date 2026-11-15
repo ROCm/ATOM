@@ -153,7 +153,7 @@ ATOM annotates the critical path with `torch.profiler.record_function`. The **ki
 | `eager_decode[bs= tok= ctx=]` | real decode forced eager |
 | `dummy_decode[...]` | **DP-sync dummy** (idle rank keeps the MoE collective aligned) |
 | `dummy_eager_decode[...]` | DP-sync dummy, forced eager |
-| `dummy_prefill[...]` | warmup dummy prefill |
+| `dummy_prefill[...]` | DP-sync dummy in a prefilling group |
 | `propose_eagle[i/k tok= bs=<real>/<pad> (graph)]` | eagle/MTP draft step `i` of `k` |
 | `propose_dspark[bs=<real>/<pad> T= (graph)]` | DSpark block draft (one parallel pass) |
 | `draft_kv[bs= tok=]` | DSpark rolling-window KV write, after every target forward |

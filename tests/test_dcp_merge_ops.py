@@ -39,7 +39,7 @@ import ast
 import collections
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -657,12 +657,16 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
 
     sends = []
     for r in range(n_ranks):
-        send = torch.empty((n_ranks, b, h_local, d + pack), dtype=dtype, device=DEV)
+        # An unwritten record is NaN, not stale data, so the combine drops it
+        # and the reference comparison fails.
+        send = torch.full(
+            (n_ranks, b, h_local, d + pack), float("nan"), dtype=dtype, device=DEV
+        )
         o_r = o_per_rank[r].contiguous()
         l_r = lse_per_rank[r].contiguous().to(torch.float32)
         has_owned_counts = owned_counts_per_rank is not None
         counts_r = owned_counts_per_rank[r].contiguous() if has_owned_counts else l_r
-        _dcp_a2a_pack_kernel[(b, h_total)](
+        _dcp_a2a_pack_kernel[(b, n_ranks)](
             o_r,
             l_r,
             counts_r,
@@ -675,6 +679,7 @@ def _a2a_roundtrip(o_per_rank, lse_per_rank, n_ranks, owned_counts_per_rank=None
             send.stride(1),
             send.stride(2),
             H_LOCAL=h_local,
+            H_ROUNDED=triton.next_power_of_2(h_local),
             HEAD_DIM=d,
             LSE_PACK=pack,
             HAS_OWNED_COUNTS=has_owned_counts,
@@ -733,6 +738,34 @@ def test_a2a_reproduces_the_ag_rs_merge(n_ranks, dtype):
 
     tol = 1e-5 if dtype == torch.float32 else 3e-2
     torch.testing.assert_close(got.float(), ref.float(), rtol=tol, atol=tol)
+
+
+@needs_gpu
+def test_a2a_handles_a_non_power_of_two_head_split():
+    """K3's shape: H=96 over DCP 8, so each destination owns 12 heads.
+
+    The pack kernel handles one destination's whole H_LOCAL slice per program,
+    and tl.arange needs a power of two, so 12 heads are processed as 16 lanes
+    with the top 4 masked. Those lanes must neither write outside the
+    destination's slice nor drop a real head.
+
+    _a2a_roundtrip fills the staging buffer with NaN before packing: a head the
+    pack kernel skipped is NaN, not stale data, so the combine drops it and the
+    reference comparison fails.
+    """
+    b, h, d, n_ranks = 3, 96, 128, 8
+    assert (h // n_ranks) & (h // n_ranks - 1), "meaningless if H_LOCAL is 2**k"
+    g = torch.Generator(device=DEV).manual_seed(96)
+    o = [
+        torch.randn(b, h, d, generator=g, device=DEV).to(torch.bfloat16)
+        for _ in range(n_ranks)
+    ]
+    lse = [torch.randn(b, h, generator=g, device=DEV) for _ in range(n_ranks)]
+
+    got = _a2a_roundtrip(o, lse, n_ranks)
+    ref = _merge_partials(torch.stack(o), torch.stack(lse))
+
+    torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
 
 
 @needs_gpu
@@ -1028,14 +1061,24 @@ def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
         dtype_kv=None,
         model_runner=SimpleNamespace(forward_vars=collections.defaultdict(object)),
     )
+    forward_vars = builder.model_runner.forward_vars
+    forward_vars["sparse_cu_seqlens_q"] = SimpleNamespace(
+        gpu=torch.arange(5, dtype=torch.int32)
+    )
+    forward_vars["sparse_kv_last_page_lens"] = SimpleNamespace(
+        gpu=torch.ones(4, dtype=torch.int32)
+    )
+    builder._sparse_prefill_work_plan = MethodType(
+        aiter_mla.AiterMLAMetadataBuilder._sparse_prefill_work_plan, builder
+    )
     md = SimpleNamespace(
         cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
         cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
-        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
         slot_mapping=torch.arange(4),
+        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
     )
     aiter_mla.AiterMLAMetadataBuilder._apply_pcp_reindex(
-        builder, md, 4, np.array([1, 2, 3, 4])
+        builder, md, 4, np.array([1, 2, 3, 4]), ""
     )
     assert len(built) == plans
     assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
@@ -1274,6 +1317,7 @@ def test_sparse_prefill_builder_allocates_for_its_consumer(
         index_cache_dtype="fp8",
         attn_prefill_chunk_size=0,
         enable_tbo=False,
+        enable_tbo_decode=False,
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner = SimpleNamespace(

@@ -3,11 +3,10 @@
 # that hold no state.
 #
 # `prepare_state_indices` publishes one row per scheduled seq, but only seqs with
-# a state slot are in `batch.state_slots`. The DP-sync dummy decode
-# (`ModelRunner.dummy_execution`) is one seq with no slot. Its row used to keep
-# the last real batch's first slot, and the dummy's decode then updated that
-# request's conv and recurrent state in place: the GDN/KDA kernels skip a row
-# only when its index is PAD_SLOT_ID.
+# a state slot are in `batch.state_slots`. A row past them (the DP-sync dummy's,
+# which schedules nothing) used to keep the last real batch's first slot, and
+# its decode then updated that request's conv and recurrent state in place: the
+# GDN/KDA kernels skip a row only when its index is PAD_SLOT_ID.
 
 from types import SimpleNamespace
 
@@ -44,7 +43,7 @@ def batch(state_slots, fork_srcs=()):
     return SimpleNamespace(state_slots=state_slots, state_fork_srcs=list(fork_srcs))
 
 
-# What `ModelRunner.dummy_execution` schedules: one seq, no state slot.
+# What `ModelRunner.dummy_execution` schedules: no state slot.
 DUMMY = batch([])
 
 
