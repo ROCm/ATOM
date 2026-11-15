@@ -592,6 +592,46 @@ def _wmax(v):
     return _smax(v, shx(v, 16))
 
 
+
+def _oem_pairs(n):
+    """Batcher odd-even merge sort comparators (i < j) for n keys: the network for the next power of two, those past
+    n dropped (padding there is the minimum: its comparators never swap)."""
+    N = 1
+    while N < n:
+        N *= 2
+    out = []
+
+    def merge(lo, hi, r):
+        st = r * 2
+        if st < hi - lo:
+            merge(lo, hi, st)
+            merge(lo + r, hi, st)
+            out.extend((i, i + r) for i in range(lo + r, hi - r, st))
+        else:
+            out.append((lo, lo + r))
+
+    def sort(lo, hi):
+        if hi - lo >= 1:
+            mid = lo + (hi - lo) // 2
+            sort(lo, mid)
+            sort(mid + 1, hi)
+            merge(lo, hi, 1)
+
+    sort(0, N - 1)
+    return [(i, j) for i, j in out if j < n]
+
+
+def _sort_desc(keys):
+    """A lane's (key, reversed id, score) triples sorted descending by (key, reversed id): the network's comparators are
+    independent within a stage (depth ~log^2 n, not one dependent pass a pick)."""
+    k = list(keys)
+    for i, j in _oem_pairs(len(k)):
+        a, b = k[i], k[j]
+        gt = (b[0] > a[0]) | ((b[0] == a[0]) & (b[1] > a[1]))
+        k[i] = tuple(gt.select(b[q], a[q]) for q in range(3))
+        k[j] = tuple(gt.select(a[q], b[q]) for q in range(3))
+    return k
+
 def _score(lg):
     """sqrt(softplus(lg)) exactly as front_E1 (raw intrinsics)."""
     sp = (lg > F32(20.0)).select(lg, F32(hx.intrin(F32.ir_type, "llvm.amdgcn.log.f32", [F32(1.0) + F32(hx.intrin(F32.ir_type, "llvm.amdgcn.exp2.f32", [lg * F32(1.4426950408889634)]))])) * F32(0.6931471805599453))
@@ -761,11 +801,13 @@ def topk_v2(c, TR, pid_off, wts_off, write_ids):
         # tie on the reversed id among the lanes at that key (max again): single-op steps, no 64-bit compare + selects
         wl = F32(0.0)
         sel = I32(0)
+        # each lane's NI_ keys sorted once (a comparator network), its best TOPK_ kept; a pick is then the wave max over
+        # the lanes' heads alone and the winner lane pops its head (no NI_-wide max / select / update a pick)
+        lst = _sort_desc([(mh[i], ml[i], ms[i]) for i in range(NI_)])[:TOPK_]
         for r in range_constexpr(TOPK_):
-            bh = _wmax(_tree(list(mh), _smax))
-            # (fast path) the lane's own tie-broken candidate; one lane holding the max -> read it there (scalar), not a
-            # second wave max (ties across lanes: the wave max of the candidates, as before)
-            bll = _tree([(mh[i] == bh).select(ml[i], I32(-1)) for i in range(NI_)], _smax)
+            h0, l0, s0 = lst[0]
+            bh = _wmax(h0)
+            bll = (h0 == bh).select(l0, I32(-1))
             hm = I32(hx.intrin(hx.i32(), "llvm.amdgcn.ballot.i32", [bll >= I32(0)]))
             one = I32(hx.intrin(hx.i32(), "llvm.ctpop.i32", [hm])) == I32(1)
             bl = I32(0)
@@ -774,20 +816,18 @@ def topk_v2(c, TR, pid_off, wts_off, write_ids):
                                    [bll, I32(hx.intrin(hx.i32(), "llvm.cttz.i32", [hm, fx.Int32(0) != fx.Int32(0)]))]))
             else:
                 bl = _wmax(bll)
-            hv = []
-            for i in range_constexpr(NI_):
-                hit = ml[i] == bl
-                mh[i] = hit.select(I32(-2147483647 - 1), mh[i])
-                ml[i] = hit.select(I32(-1), ml[i])
-                hv.append(hit.select(ms[i], F32(0.0)))
-            hsc = _tree(hv, lambda a, b: a + b)
+            win = l0 == bl
+            hsc = win.select(s0, F32(0.0))
             wl = wl + hsc
-            if l == (I32(NE_ - 1) - bl) % 32:   # the lane holding the r-th pick: its raw score into slot r
-                hx.lstore(sm + wts_off + (srow * TOPK_ + r) * 4, hsc)
+            if win:   # the lane holding the r-th pick: its raw score into slot r
+                hx.lstore(sm + wts_off + (srow * TOPK_ + r) * 4, s0)
             if fx.const_expr(write_ids):
                 if l == r:
                     hx.lstore(sm + pid_off + (srow * TOPK_ + l) * 4, I32(NE_ - 1) - bl)
             sel = (l == r).select(I32(NE_ - 1) - bl, sel)
+            pad = (I32(-2147483647 - 1), I32(-1), F32(0.0))
+            lst = [tuple(win.select((lst[j + 1] if j + 1 < len(lst) else pad)[q], lst[j][q]) for q in range(3))
+                   for j in range(len(lst))]
         for o in range_constexpr(5):
             if fx.const_expr(o < 4):
                 wl = wl + xdpp(wl.bitcast(I32), 8 >> o).bitcast(F32)
