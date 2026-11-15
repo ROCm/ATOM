@@ -890,6 +890,9 @@ impl IngressRouting {
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "template")
             .record(template_started.elapsed().as_secs_f64());
         ctx.check()?;
+        if cache.is_none() && prompt.len() > limit {
+            return Err(IngressError::tokenizer_input_too_large());
+        }
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
         let tokens = match cache {
@@ -900,7 +903,6 @@ impl IngressRouting {
                 &entry.tokenizer,
                 limit,
             ),
-            None if prompt.len() > limit => Err(EncodeError::TooLarge),
             None => encoder
                 .encode(&prompt, add_special_tokens)
                 .map(|e| e.token_ids().to_vec())
