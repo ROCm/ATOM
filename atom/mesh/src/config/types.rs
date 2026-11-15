@@ -123,6 +123,8 @@ pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
 pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
 /// Default `--prepare-max-tokenize-bytes`.
 pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
+/// Default `--prepare-prefix-cache-mb`.
+pub const DEFAULT_PREFIX_CACHE_MB: usize = 1024;
 /// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
 pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
 
@@ -155,6 +157,14 @@ pub struct PreparePoolConfig {
     /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
+    /// Memory for prompts kept so that a conversation's next turn encodes only
+    /// what it appends, and the byte limit applies to that; 0 turns this off.
+    #[arg(
+        id = "prepare_prefix_cache_mb",
+        long = "prepare-prefix-cache-mb",
+        default_value_t = DEFAULT_PREFIX_CACHE_MB
+    )]
+    pub prefix_cache_mb: usize,
 }
 
 impl Default for PreparePoolConfig {
@@ -165,6 +175,7 @@ impl Default for PreparePoolConfig {
             queue_timeout_ms: DEFAULT_PREPARE_QUEUE_TIMEOUT_MS,
             prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
             max_tokenize_bytes: None,
+            prefix_cache_mb: DEFAULT_PREFIX_CACHE_MB,
         }
     }
 }
