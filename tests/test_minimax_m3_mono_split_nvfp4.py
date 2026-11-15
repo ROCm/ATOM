@@ -3,7 +3,7 @@
 """Mono's split-K sparse attention over NVFP4 K/V pages (gfx950, single-buffer 18432 B
 pages, f16 MFMA over the exact dequantized products): the partitions' output, max
 and sum against a torch float64 reference of the same pages, and the merged
-attention against aiter's ``minimax_m3_sparse_pa_nvfp4_decode``.
+attention against aiter's ``sparse_pa_nvfp4_decode``.
 
 Needs ``ATOM_NVFP4_VLLM_REF`` (vLLM's ``tests/kernels/attention``: the page writer) and,
 for the aiter comparison, ``ATOM_NVFP4_PA_KERNELS`` (the aiter
@@ -196,7 +196,7 @@ def test_merged_split_equals_aiter_sparse_pa_decode():
     import aiter.ops.flydsl.kernels as pkg
 
     pkg.__path__.insert(0, PA_KERNELS)
-    from aiter.ops.flydsl.kernels import minimax_m3_sparse_pa_nvfp4_decode as pa
+    from aiter.ops.flydsl.kernels import sparse_pa_nvfp4_decode as pa
 
     n_logical, n_sel, tail, k_gs, v_gs = 40, 16, 77, 0.8, 1.3
     _ref, pages, page_of, sel, q, ctx, _ = _case(2, n_logical, n_sel, tail, k_gs, v_gs)
@@ -222,7 +222,7 @@ def test_merged_split_equals_aiter_sparse_pa_decode():
     topk[0, 0, : len(sel)] = torch.tensor(sel, dtype=torch.int32, device="cuda")
     bt = page_of.view(1, -1).contiguous()
     seq = torch.tensor([ctx], dtype=torch.int32, device="cuda")
-    theirs = pa.minimax_m3_sparse_pa_nvfp4_decode(
+    theirs = pa.sparse_pa_nvfp4_decode(
         q,
         pages,
         topk,

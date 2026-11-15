@@ -24,8 +24,8 @@ aiter = pytest.importorskip("aiter")
 _KERNELS = (
     "minimax_m3_index_score_nvfp4_flydsl",
     "minimax_m3_index_score_prefill_nvfp4_flydsl",
-    "minimax_m3_sparse_pa_nvfp4_decode",
-    "minimax_m3_sparse_pa_nvfp4_prefill",
+    "sparse_pa_nvfp4_decode",
+    "sparse_pa_nvfp4_prefill",
 )
 
 
