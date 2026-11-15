@@ -76,13 +76,18 @@ STAGES = 3
 # A pick's gate/up output where a down on another CTA reads it: 48 FP4 words,
 # then its 12 E8M0 codes, padded to a 256-byte row of its own cache lines.
 INTER_ROW_WORDS = 64
-# LDS row strides of the fused MoE's activations: 4 words past a multiple of
-# the 64 banks, so a WMMA operand's 16 rows land on distinct banks (at a
-# multiple, every read was a 16-way conflict).
-LATENT_LDS_WORDS = LATENT // 8 + 4
+# The fused MoE's LDS row stride of its down's activations: 4 words past a
+# multiple of the 64 banks, so a WMMA operand's 16 rows land on distinct banks
+# (at a multiple, every read was a 16-way conflict).
 INTER_LDS_WORDS = INTER_ROW_WORDS + 4
 LATENT_WORDS = LATENT // 8
 LATENT_SCALES = LATENT // 32
+# The fused MoE's latent lands by one TDM copy, whose padding has a
+# power-of-two interval: a dword after every 64, so its rows sit
+# LATENT_TDM_WORDS apart -- an odd count of banks on, distinct for 16 rows.
+LATENT_PAD_EVERY = 64
+LATENT_TDM_WORDS = LATENT_WORDS + LATENT_WORDS // LATENT_PAD_EVERY
+assert LATENT_WORDS % LATENT_PAD_EVERY == 0 and LATENT_TDM_WORDS % 2 == 1
 INTER_GROUPS = 12  # MXFP4 blocks of an expert's 384 intermediates
 INTER_WORDS = 48
 
@@ -101,6 +106,18 @@ def _union(ids, rows, tid, lane, wave, lds, threads=THREADS):
     in ``picks`` (token * TOPK + k). Returns the union size."""
     routes = rows * TOPK
     count, slot, start = lds["count"], lds["slot"], lds["start"]
+    # The routes' loads go out first, their latency under the zeroing.
+    loaded = [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(ids),
+                fx.min(tid + index * threads, routes - 1),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        for index in range((routes + threads - 1) // threads)
+    ]
     for index in range_constexpr((EXPERTS + threads - 1) // threads):
         expert = tid + index * threads
         if expert < EXPERTS:
@@ -108,8 +125,7 @@ def _union(ids, rows, tid, lane, wave, lds, threads=THREADS):
     gpu.barrier()
     rank = []
     for index in range_constexpr((routes + threads - 1) // threads):
-        at = fx.min(tid + index * threads, routes - 1)
-        expert = fx.Int32(bo.buffer_load(rsrc(ids), at, vec_width=1, dtype=T.i32))
+        expert = loaded[index]
         taken = fx.atomic_add(
             count + expert,
             (tid + index * threads < routes).select(fx.Int32(1), fx.Int32(0)),
@@ -868,7 +884,7 @@ def build_moe(
     routes = rows * TOPK
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
-        + rows * (LATENT_LDS_WORDS + LATENT_SCALES // 4)
+        + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
         + UP_WAVES * GFX1250.wave_size * 8
         + 2 * EXPERTS
         + 4 * routes
@@ -886,7 +902,7 @@ def build_moe(
     class Lds:
         stages: fx.Array[fx.Int32, ring_words, 16]
         item_scales: fx.Array[fx.Int32, ring * SCALE_WORDS, 16]
-        latq: fx.Array[fx.Int32, rows * LATENT_LDS_WORDS, 16]
+        latq: fx.Array[fx.Int32, rows * LATENT_TDM_WORDS, 16]
         latsc: fx.Array[fx.Int32, rows * LATENT_SCALES // 4, 16]
         red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 8, 16]
         count: fx.Array[fx.Int32, EXPERTS, 16]
@@ -937,8 +953,6 @@ def build_moe(
                 "scan",
             )
         }
-        epoch = uniform(fx.Int32(ld_dev(state, 2)))
-        tag = epoch + 1
 
         def stamp(i, value=None):
             if const_expr(profile):  # noqa: SIM102
@@ -1063,11 +1077,41 @@ def build_moe(
             else:
                 rocdl.s_wait_tensorcnt(0)
 
+        # Every token's latent and its E8M0 bytes, ahead of the issuers' first
+        # weights: a TDM counter drains in order, so the first item's wait
+        # covers them. A CTA with no gate/up task (whose down tiles reuse
+        # this LDS) loads none.
+        if mine > 0:
+            if wave == WEIGHT_ISSUER:
+                gemv_tdm.load_rows(
+                    latent,
+                    LATENT // 4,
+                    lds["latq"],
+                    rows,
+                    rows,
+                    padded=False,
+                    whole=True,
+                    width=LATENT // 4,
+                    pad_every=LATENT_PAD_EVERY,
+                )
+            if wave == SCALE_ISSUER:
+                gemv_tdm.load_rows(
+                    scales,
+                    LATENT_SCALES // 2,
+                    lds["latsc"],
+                    rows,
+                    rows,
+                    padded=False,
+                    whole=True,
+                    width=LATENT_SCALES // 2,
+                )
         for ahead in range_constexpr(ring - 1):
             if ahead < flat:
                 issue(fx.Int32(ahead), ahead)
-        # The weights stream in while the latent goes to LDS.
-        _stage_latent(latent, scales, rows, tid, lds, LATENT_LDS_WORDS)
+        # Read only now: a wave waits on this load where it reads it, and the
+        # flags' tag is not needed before the first task's flag.
+        epoch = uniform(fx.Int32(ld_dev(state, 2)))
+        tag = epoch + 1
         # A task's flag goes out a K tile into the next, its stores drained.
         pending = fx.Int32(-1)
         up_wait = fx.Int32(0)
@@ -1131,8 +1175,8 @@ def build_moe(
                                 accumulators[m] = _wmma(
                                     weights[step],
                                     _activation_fragment(
-                                        lds["latq"],
-                                        LATENT_LDS_WORDS,
+                                        lds["latq"] + k_step * 16 // LATENT_PAD_EVERY,
+                                        LATENT_TDM_WORDS,
                                         tokens[m],
                                         k_step,
                                         lane,

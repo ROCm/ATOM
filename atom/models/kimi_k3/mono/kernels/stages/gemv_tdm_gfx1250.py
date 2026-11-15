@@ -85,15 +85,24 @@ def load_rows(
     cache_policy: int = 0,
     whole: bool = False,
     width: int = SLAB,
+    pad_every: int = 0,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, width] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
     ``mask`` is the cluster multicast mask of identical loads to merge.
     ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``width`` apart.
+    ``pad_every``: with ``padded`` off, one pad dword after every ``pad_every``
+    dwords the copy writes (a power of two up to 256), across rows alike.
     ``whole``: the first ``rows_per_wave`` rows in one copy, by the caller's
     one wave. Widths and strides are in BF16 units, whatever the bytes hold."""
     if padded and width != SLAB:
         raise ValueError("only a SLAB-wide copy pads its LDS rows")
+    if pad_every and (
+        padded or pad_every & (pad_every - 1) or not 2 <= pad_every <= 256
+    ):
+        raise ValueError(
+            f"pad_every {pad_every}: a power of two in [2, 256], unpadded rows"
+        )
 
     wave = fx.Int32(rocdl.wave_id())
     row0 = fx.Int32(0) if whole else wave * rows_per_wave
@@ -118,6 +127,8 @@ def load_rows(
     config = (1 << 16) | mask
     if padded:
         config |= (1 << 20) | (pad_interval << 22) | (pad_amount << 25)
+    elif pad_every:
+        config |= (1 << 20) | ((int(math.log2(pad_every)) - 1) << 22)
     group1 = vector.from_elements(
         T.vec(8, T.i32),
         [
