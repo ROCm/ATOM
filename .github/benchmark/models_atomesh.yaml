@@ -17176,6 +17176,44 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "20"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
+        # P without DBO: every 1P3D run above and both 1P2D C80 runs hung in P's execute_model
+        # (32768-token DBO prefill steps in the 1P3D dumps), so P runs single-batch.
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c72-dcap12-cpu15-nodbo
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_DBO: "0"
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c96-dcap16-cpu15-nodbo
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "16"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_DBO: "0"
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c108-dcap18-cpu15-nodbo
+          concurrency: [108]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_DBO: "0"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c80-dcap20-cpu15-lpt4k-nodbo
+          concurrency: [80]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
+              ATOMESH_M31_P_DBO: "0"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
