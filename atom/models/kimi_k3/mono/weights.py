@@ -47,6 +47,7 @@ from atom.models.kimi_k3.mono.config import (
     Dims,
     layer_block,
 )
+from atom.models.kimi_k3.mono.kernels.stages import mla_post_plan as mla
 from atom.models.kimi_k3.mono.layouts import (
     SCALE_GROUP_ALIGN,
     SCALE_ROW_ALIGN,
@@ -473,9 +474,6 @@ def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
 
 # ---------------------------------------------- MLA post stage (ATOM_MONO_MLA_POST)
 FP8 = torch.float8_e4m3fn
-MLA_HEADS = 12  # a TP8 rank's MLA heads (96 / 8): the stage's task placement
-MLA_LORA = 512  # kv_lora_rank
-MLA_VH = 128  # v_head_dim
 
 
 @dataclass(frozen=True)
@@ -516,12 +514,12 @@ def _mla_impl_checks(sa, name: str):
     ):
         _need(not getattr(impl, flag), f"{name}: MLA {flag}")
     _need(
-        impl.num_heads == MLA_HEADS,
-        f"{name}: {impl.num_heads} MLA heads a rank, the stages place {MLA_HEADS}",
+        impl.num_heads == mla.HEADS,
+        f"{name}: {impl.num_heads} MLA heads a rank, the stages place {mla.HEADS}",
     )
     _need(
         (impl.kv_lora_rank, impl.qk_nope_head_dim, impl.qk_rope_head_dim)
-        == (MLA_LORA, MLA_NOPE, MLA_QH - MLA_NOPE),
+        == (mla.LORA, mla.QK_NOPE, mla.ROPE),
         f"{name}: kv_lora_rank / nope / rope {impl.kv_lora_rank} / "
         f"{impl.qk_nope_head_dim} / {impl.qk_rope_head_dim}",
     )
@@ -537,17 +535,17 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
     sa = layer.self_attn
     impl = _mla_impl_checks(sa, name)
     _need(
-        dims.proj == MLA_HEADS * MLA_VH,
-        f"{name}: core width {dims.proj}, the stage places {MLA_HEADS} heads",
+        dims.proj == mla.HEADS * mla.VH,
+        f"{name}: core width {dims.proj}, the stage places {mla.HEADS} heads",
     )
-    _need(impl.v_head_dim == MLA_VH, f"{name}: v_head_dim {impl.v_head_dim}")
+    _need(impl.v_head_dim == mla.VH, f"{name}: v_head_dim {impl.v_head_dim}")
     w_v, w_v_s = impl.W_V, impl.W_V_scale
     _need(
         w_v.dtype == FP8
-        and tuple(w_v.shape) == (MLA_HEADS, MLA_VH, MLA_LORA)
+        and tuple(w_v.shape) == (mla.HEADS, mla.VH, mla.LORA)
         and w_v.is_contiguous(),
         f"{name}: W_V {w_v.dtype} {tuple(w_v.shape)}, expected contiguous "
-        f"{FP8} {(MLA_HEADS, MLA_VH, MLA_LORA)} (the FP8 BMM path)",
+        f"{FP8} {(mla.HEADS, mla.VH, mla.LORA)} (the FP8 BMM path)",
     )
     _need(w_v_s.dtype == F32 and w_v_s.numel() == 1, f"{name}: W_V_scale {w_v_s.dtype}")
     _need(
@@ -560,12 +558,6 @@ def bind_mla_post(layer, layer_id: int, dims: Dims) -> MlaPost:
 
 
 # ---------------------------------------------- MLA prep stages (ATOM_MONO_MLA_PREP)
-MLA_QL = 1536  # q_lora_rank
-MLA_QKV_A = 1536 + 512 + 64  # fused_qkv_a_proj rows: q_c | kv_c | k_rope
-MLA_QH = 192  # qk_nope_head_dim + qk_rope_head_dim
-MLA_NOPE = 128
-
-
 @dataclass(frozen=True)
 class MlaPrep:
     """What layer M's prep stages, run at the tail of K2(M-1), read
@@ -618,15 +610,15 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
     _need(sa.fuse_input_norm_quant, f"{name}: no fused input quant")
     seam = _seam(site, f"{name} attn seam")
     impl = _mla_impl_checks(sa, name)
-    _need(sa.q_lora_rank == MLA_QL, f"{name}: q_lora_rank {sa.q_lora_rank}")
+    _need(sa.q_lora_rank == mla.QL, f"{name}: q_lora_rank {sa.q_lora_rank}")
     # q_c | kv_c | k_rope only: a DSA layer's plane carries its indexer's too
     split = tuple(sa.projection_split_sizes)
     _need(
-        split == (MLA_QL, MLA_LORA, MLA_QH - MLA_NOPE),
+        split == (mla.QL, mla.LORA, mla.ROPE),
         f"{name}: fused_qkv_a_proj splits {split}",
     )
     w_qa, w_qa_s = _ptpc_fp8(
-        sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", MLA_QKV_A, HIDDEN
+        sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", mla.QKV_A, HIDDEN
     )
     _need(
         sa.qknorm_dtype == FP8
@@ -635,15 +627,15 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
         "the stages emit per-token FP8",
     )
     w_qb, w_qb_s = _ptpc_fp8(
-        impl.q_proj, f"{name} q_b_proj", MLA_HEADS * MLA_QH, MLA_QL
+        impl.q_proj, f"{name} q_b_proj", mla.HEADS * mla.QH, mla.QL
     )
     w_k, w_k_s = impl.W_K, impl.W_K_scale
     _need(
         w_k.dtype == FP8
-        and tuple(w_k.shape) == (MLA_HEADS, MLA_LORA, MLA_NOPE)
+        and tuple(w_k.shape) == (mla.HEADS, mla.LORA, mla.QK_NOPE)
         and w_k.is_contiguous(),
         f"{name}: W_K {w_k.dtype} {tuple(w_k.shape)}, expected contiguous {FP8} "
-        f"{(MLA_HEADS, MLA_LORA, MLA_NOPE)} (the FP8 BMM path)",
+        f"{(mla.HEADS, mla.LORA, mla.QK_NOPE)} (the FP8 BMM path)",
     )
     _need(
         w_k_s.dtype == F32 and w_k_s.numel() == 1,
@@ -676,15 +668,15 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
         # the rope kernel takes them as host scalars; the stages read a
         # device copy, taken here (they are load-time constants)
         scales[sc] = t.detach().reshape(1).to(w_k.device).clone()
-    heads = impl.padded_num_heads if impl._fused_q_head_pad else MLA_HEADS
+    heads = impl.padded_num_heads if impl._fused_q_head_pad else mla.HEADS
     return MlaPrep(
         layer_id=layer_id,
         blocks=blocks,
         seam=seam,
         w_qa=w_qa,
         w_qa_s=w_qa_s,
-        qa_nw=_vec(sa.q_a_layernorm.weight, MLA_QL, f"{name} q_a_layernorm"),
-        kva_nw=_vec(sa.kv_a_layernorm.weight, MLA_LORA, f"{name} kv_a_layernorm"),
+        qa_nw=_vec(sa.q_a_layernorm.weight, mla.QL, f"{name} q_a_layernorm"),
+        kva_nw=_vec(sa.kv_a_layernorm.weight, mla.LORA, f"{name} kv_a_layernorm"),
         qa_eps=_eps(sa.q_a_layernorm, f"{name} q_a_layernorm"),
         kva_eps=_eps(sa.kv_a_layernorm, f"{name} kv_a_layernorm"),
         w_qb=w_qb,

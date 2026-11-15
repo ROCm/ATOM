@@ -2,7 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The MLA post stage's geometry in plain integers (``stages.mla_post`` is the
 kernel): which core columns, weight rows and x slabs each task takes, and where
-the tasks sit. Free of FlyDSL so it is testable on a CPU runner."""
+the tasks sit; and the MLA layer's shapes both folds' stages and binders
+(``weights.bind_mla_post`` / ``bind_mla_prep``) are built for. Free of FlyDSL
+so it is testable on a CPU runner."""
 
 from atom.mono.plan.execution import WAVES
 
@@ -10,9 +12,15 @@ ROWS = 16  # weight rows a task (gemv.ROWS)
 KCH = 128  # K a chunk (gemv.KCH)
 HIDDEN = 7168  # g_proj K
 PROJ = 1536  # core width a rank: 12 heads x 128
-HEADS = 12
+# the MLA layer's shapes (a TP8 rank)
+HEADS = 12  # a TP8 rank's MLA heads (96 / 8)
 LORA = 512  # kv_lora_rank: v-up K
 VH = 128  # v_head_dim
+QL = 1536  # q_lora_rank
+QK_NOPE = 128  # qk_nope_head_dim
+ROPE = 64  # qk_rope_head_dim
+QH = QK_NOPE + ROPE  # 192: q_b_proj's columns a head
+QKV_A = QL + LORA + ROPE  # 2112: fused_qkv_a_proj's rows, q_c | kv_c | k_rope
 PT = PROJ // ROWS  # 96 post tasks
 GROUP_COLS = WAVES * KCH  # 1024: one chunk a wave (gemv.KGROUP)
 G_GROUPS = HIDDEN // GROUP_COLS  # 7
