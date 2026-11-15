@@ -622,9 +622,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
-    # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere.
+    # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the
+    # widest whose LDS fits.
     "ATOM_KIMI_MONO_FUSED_MOE_ROWS": lambda: int(
-        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "16")
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_ROWS", "48")
     ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
