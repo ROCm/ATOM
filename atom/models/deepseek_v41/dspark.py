@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
+from atom import plugin_host
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
