@@ -296,9 +296,11 @@ def padded_prefill_rows(rows: int) -> int | None:
 
     A region whose launches follow the requests (attention, a recurrence, an
     indexer) works on those rows alone, as the eager step would: its metadata
-    describes the scheduled rows, not the bucket."""
+    describes the scheduled rows, not the bucket. Rows padded any other way --
+    a TBO micro-batch's -- are left to the region, as before token graphs."""
     context = getattr(forward_context.get_forward_context(), "context", None)
-    if context is None or not context.is_prefill:
+    mode = getattr(context, "forward_mode", None)
+    if mode is None or not mode.prefill_token_graph or not context.is_prefill:
         return None
     scheduled = context.scheduled_tokens
     return scheduled if 0 < scheduled < rows else None

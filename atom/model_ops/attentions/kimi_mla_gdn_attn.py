@@ -534,9 +534,17 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
-        prefill alone."""
-        config = getattr(self.model_runner, "config", None)
-        return config is not None and config.parallel_config.data_parallel_size == 1
+        prefill alone. Nor with the MLA query quantized (`fuse_qknorm_quant`):
+        its scale is stored by column or shuffled, so a row slice does not cut
+        it to the scheduled rows the way it cuts the query."""
+        runner = self.model_runner
+        config = getattr(runner, "config", None)
+        if config is None or config.parallel_config.data_parallel_size != 1:
+            return False
+        model = getattr(runner, "model", None)
+        return model is None or not any(
+            getattr(m, "fuse_qknorm_quant", False) for m in model.modules()
+        )
 
     def build_for_token_graph_capture(self, tokens: int):
         """A request-less prefill of ``tokens`` rows for recording that
