@@ -108,6 +108,8 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
     runner._dspark_prob_state = MethodType(
         runner_module.ModelRunner._dspark_prob_state, runner
     )
+    # Without a prob draft the bonus draw stays inline on the current stream.
+    runner._sample_bonus = MethodType(runner_module.ModelRunner._sample_bonus, runner)
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
             runner,
@@ -187,6 +189,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     runner._dspark_prob_state = MethodType(
         runner_module.ModelRunner._dspark_prob_state, runner
     )
+    # Without a prob draft the bonus draw stays inline on the current stream.
+    runner._sample_bonus = MethodType(runner_module.ModelRunner._sample_bonus, runner)
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
     )
