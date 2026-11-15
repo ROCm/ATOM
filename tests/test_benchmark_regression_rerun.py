@@ -219,7 +219,8 @@ def test_shared_display_name_resolves_by_concurrency_band(models_path):
         assert len(matches) == 1
         assert matches[0]["args"].endswith(EPLB_CFG + extra)
     # Outside both bands there is no candidate; without a concurrency there is
-    # nothing to pick between two different recipes.
+    # nothing to pick between two different recipes, so both are returned
+    # (generate_configs reports such an entry as incomplete, see below).
     assert regression_rerun._find_model_configs(_reg(EPLB, V4, 64, -9, 9), models) == []
     no_conc = {"model": EPLB, "model_id": V4}
     assert len(regression_rerun._find_model_configs(no_conc, models)) == 2
@@ -275,6 +276,25 @@ def test_ambiguous_match_is_reported_separately_from_no_match(tmp_path, capsys):
     assert "org/Band-Model-dpa conc 256-1024" in err
     assert "No model config found for Missing-Model" in err
     assert "No model config found for Band-Model DPA" not in err
+
+
+def test_entry_without_concurrency_is_reported_as_incomplete(
+    tmp_path, models_path, capsys
+):
+    # The EPLB pair is a valid catalog: it shares a display and the concurrency
+    # band tells the two recipes apart. An entry with no concurrency therefore
+    # has no catalog error to report — the report entry is what is incomplete.
+    # It must say so instead of "ambiguous ... at conc ?", and it must not use
+    # up the one rerun slot.
+    entry = {**_reg(EPLB, V4, 512, -9.0, 9.0), "conc": None}
+    report = _report(tmp_path, [entry] + REGRESSIONS_9A0A5202)
+
+    configs = regression_rerun.generate_configs(report, models_path, top_n=1)
+
+    assert [(c["model_path"], c["conc"]) for c in configs] == [(V4_DSPARK_ID, 64)]
+    err = capsys.readouterr().err
+    assert f"WARNING: skipping {EPLB} — missing isl/osl/conc" in err
+    assert "ambiguous" not in err
 
 
 def test_9a0a5202_report_yields_rerun_cells(tmp_path, models_path):

@@ -46,7 +46,11 @@ def _find_model_configs(regression_entry, models):
     are reported as "<checkpoint basename>[-mtp<N>]"; those match basename +
     suffix. Variants sharing a display are told apart by their concurrency
     band. Returns zero (unmapped), one (resolved) or several (ambiguous)
-    records; the caller reports the last two cases differently.
+    records; the caller reports zero and several differently.
+
+    An entry without a concurrency cannot pick between variants that share a
+    display, so every candidate is returned; generate_configs reports such an
+    entry as incomplete before it resolves anything.
     """
     model_id = regression_entry.get("model_id", "")
     display = regression_entry.get("model", "")
@@ -89,18 +93,29 @@ def generate_configs(report_path, models_path, top_n=3):
         return []
 
     # Sort by severity; top N is taken after resolution so an entry that has
-    # no catalog config does not use up a rerun slot.
+    # no catalog config, or is incomplete, does not use up a rerun slot.
     regressions.sort(key=_regression_severity)
 
     configs = []
     for r in regressions:
         isl, osl, conc = r.get("isl"), r.get("osl"), r.get("conc")
+        # Checked before resolution: without all three there is nothing to
+        # rerun, and a missing concurrency cannot tell variants that share a
+        # display apart, so the report entry is what is incomplete here — the
+        # catalog may well be fine.
+        if None in (isl, osl, conc):
+            print(
+                f"WARNING: skipping {r.get('model', '?')} — missing isl/osl/conc",
+                file=sys.stderr,
+            )
+            continue
+
         matches = _find_model_configs(r, models)
         if len(matches) != 1:
             if matches:
                 # Several variants share the display and their concurrency
-                # bands both contain the entry's concurrency (or the entry has
-                # no concurrency): a catalog error, not an unknown model.
+                # bands both contain the entry's concurrency: a catalog error,
+                # not an unknown model.
                 candidates = "; ".join(
                     f"{m['path']}{m.get('suffix', '')} "
                     f"conc {m['conc_min']}-{m['conc_max']}"
@@ -108,7 +123,7 @@ def generate_configs(report_path, models_path, top_n=3):
                 )
                 print(
                     f"WARNING: ambiguous model config for {r.get('model', '?')} "
-                    f"at conc {conc if conc is not None else '?'}: "
+                    f"at conc {conc}: "
                     f"{len(matches)} candidates ({candidates}), skipping",
                     file=sys.stderr,
                 )
@@ -121,13 +136,6 @@ def generate_configs(report_path, models_path, top_n=3):
             continue
 
         model_cfg = matches[0]
-        if None in (isl, osl, conc):
-            print(
-                f"WARNING: skipping {r.get('model', '?')} — missing isl/osl/conc",
-                file=sys.stderr,
-            )
-            continue
-
         configs.append(
             {
                 "model_path": model_cfg["path"],
