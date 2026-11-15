@@ -781,8 +781,6 @@ class KimiSparseMoeBlock(nn.Module):
         legal. See `forward` for why the add is worth deferring."""
         if self.front_proj is not None and self.front_proj.merged_weight is not None:
             gate_up, router_logits, routed_input = self.front_proj(hidden_states)
-            # aiter's fused MoE takes its tuned kernels only on contiguous input.
-            routed_input = routed_input.contiguous()
             if self.tp_size > 1 and self.shared_experts.down_proj.supports_out():
                 return self._one_reduce_split(
                     hidden_states, gate_up, router_logits, routed_input
