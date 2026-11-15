@@ -20,7 +20,6 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     mla_dcp_persistent_width,
     mla_kernel_num_heads,
-    mla_layers_query_heads,
 )
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
@@ -1320,6 +1319,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         ), "num_attention_heads is not found in config"
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
+        self.min_query_heads = _MLA_MIN_HEADS
 
         # The layers handed to this builder are not necessarily the target's: a
         # DSpark draft owns its own KV cache group, and therefore its own
@@ -1343,17 +1343,27 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             ).values()
             if getattr(layer, "num_heads", None) is not None
         ]
-        self.num_attention_heads, self.min_query_heads = mla_layers_query_heads(
-            mla_layers, self.num_attention_heads
-        )
+        layer_heads = {layer.num_heads for layer in mla_layers}
+        if len(layer_heads) == 1:
+            self.num_attention_heads = layer_heads.pop()
+            layer_min_heads = {
+                getattr(layer, "min_query_heads", _MLA_MIN_HEADS)
+                for layer in mla_layers
+            }
+            if len(layer_min_heads) == 1:
+                self.min_query_heads = layer_min_heads.pop()
+        elif layer_heads:
+            logger.warning(
+                "MLA metadata builder spans layers of differing query-head "
+                "counts %s; falling back to the model config (%d per rank).",
+                sorted(layer_heads),
+                self.num_attention_heads,
+            )
 
         # Must equal `MLAAttention.padded_num_heads`, which the plugin's MLA
-        # layer inherits: that pads the query, this plans the work for it. A
-        # layer's floor is 16 in plugin mode (`mla_dense_min_query_heads`), as
-        # this builder runs the decode non-persistent under DP, where aiter has
-        # no 12-head kernel; whatever it is, it comes off the layers.
+        # layer inherits: that pads the query, this plans the work for it.
         self.padded_num_attention_heads = mla_kernel_num_heads(
-            self.num_attention_heads, self.min_query_heads
+            max(self.num_attention_heads, self.min_query_heads)
         )
         # DCP decode all-gathers Q across the DCP group on the head dim, so the
         # head count reaching mla_decode_fwd (and thus the persistent decode

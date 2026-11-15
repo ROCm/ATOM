@@ -102,7 +102,6 @@ from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
-    MlaWorkPlan,
     get_forward_context,
 )
 from atom.utils.tbo import NUM_TBO_UBATCHES, UBatchSlice
@@ -532,8 +531,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._mtp_fuse_block = triton.next_power_of_2(self.max_bs + 1)
         config = model_runner.config
         hf_config = config.hf_config
+        # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
+        # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
+        # sizes the kernel's work descriptors for it. Both take the floor from
+        # the one model-level `mla_dense_min_query_heads`.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            self.num_attention_heads,
+            mla_dense_min_query_heads(
+                config, self.num_attention_heads, get_dcp_world_size()
+            ),
+        )
         self.is_sparse = model_runner.has_mla_indexer
-        self._configure_decode_head_widths(config)
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
         # index_topk tokens -- and then appends the trailing incomplete pool,
@@ -901,30 +909,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 smt_rpm_size, dtype=smt_rpm_type, device=self.device
             )
 
-        if self.dense_work_num_heads is not None:
-            # The dense layers' own plan (`_configure_decode_head_widths`),
-            # sized like work_* for the verify width but for their heads.
-            dense_info = get_mla_metadata_info_v1(
-                self.max_bs,
-                max_seqlen_qo,
-                self.dense_work_num_heads,
-                self.dtype_q,
-                self.dtype_kv,
-                is_sparse=False,
-                fast_mode=True,
-                **_mla_seg_meta_kwargs(),
-            )
-            for name, (size, dtype) in zip(PERSISTENT_WORK_BUFFERS, dense_info):
-                mla_metadata[f"dense_{name}"] = torch.empty(
-                    size, dtype=dtype, device=self.device
-                )
-            logger.info(
-                "MLA decode work plans: %d query heads for sparse layers, %d "
-                "for dense layers",
-                self.padded_num_attention_heads,
-                self.dense_work_num_heads,
-            )
-
         self.model_runner.forward_vars.update(mla_metadata)
 
         # Chunked-context workspaces for the prefill has_cached path. Sized
@@ -1017,57 +1001,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if config.enable_tbo:
             self._allocate_ubatch_buffers(max_seqlen_qo)
 
-    def _mla_impls(self) -> list[MLAAttention]:
-        sfc = self.model_runner.config.compilation_config.static_forward_context
-        return [
-            impl
-            for module in sfc.values()
-            if isinstance(impl := getattr(module, "impl", module), MLAAttention)
-        ]
-
-    def _configure_decode_head_widths(self, config) -> None:
-        """The query-head widths the decode work plans are laid out for.
-
-        Each must equal the `MLAAttention.padded_num_heads` of the layers that
-        read its plan: that pads the query, this sizes the kernel's work
-        descriptors for it. Both sides take the floor from the one model-level
-        `mla_dense_min_query_heads`, sparse layers from 16. A non-sparse
-        model's layers all read work_*. A sparse model's sparse layers read
-        work_*, at 16, planned over their top-k selection on a plain decode.
-        Its non-sparse layers (dense MLA between DSA layers, or every layer
-        under ATOM_GLM5_FORCE_DENSE_MLA) read neither that width nor that KV,
-        so they get a plan of their own, `dense_work_num_heads` wide (without
-        DCP; under it every layer dispatches its gathered width).
-        """
-        # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        dense_heads = mla_kernel_num_heads(
-            self.num_attention_heads,
-            mla_dense_min_query_heads(
-                config, self.num_attention_heads, get_dcp_world_size()
-            ),
-        )
-        self.dense_work_num_heads = None
-        if not self.is_sparse:
-            self.padded_num_attention_heads = dense_heads
-            return
-        self.padded_num_attention_heads = mla_kernel_num_heads(self.num_attention_heads)
-        # Only when some layer reads it: an all-sparse model plans no extra.
-        # Not under DCP, whose decode dispatches the gathered width.
-        if get_dcp_world_size() == 1 and any(
-            not impl.is_sparse_mla and impl.padded_num_heads == dense_heads
-            for impl in self._mla_impls()
-        ):
-            self.dense_work_num_heads = dense_heads
-
-    def _dense_work_plan(self, prefix: str = "") -> MlaWorkPlan | None:
-        if self.dense_work_num_heads is None:
-            return None
-        var = self.model_runner.forward_vars
-        return MlaWorkPlan(
-            self.dense_work_num_heads,
-            *(var[f"{prefix}dense_{name}"] for name in PERSISTENT_WORK_BUFFERS),
-        )
-
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before `kv_indices_generate_triton`, the step's first
         # consumer, sharing prefill destinations.
@@ -1123,9 +1056,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             shapes["index_logits_offsets"] = (tokens,)
         if "index_pool_rows" in var:
             shapes["index_pool_rows"] = (bs + 1 + 3 * tokens,)
-        for name in PERSISTENT_WORK_BUFFERS:
-            if f"dense_{name}" in var:
-                shapes[f"dense_{name}"] = tuple(var[f"dense_{name}"].shape)
         if self.is_sparse:
             # A decode's per request, a prefill's per token.
             shapes["sparse_kv_indptr"] = (tokens + 1,)
@@ -1277,70 +1207,46 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             else var[f"{prefix}kv_last_page_lens"].gpu[:bs]
         )
         cu_seqlens_q = var[f"{prefix}cu_seqlens_q"].gpu[: bs + 1]
-
-        def plan(kv_indptr, kv_last_page_lens, num_heads, buffers):
-            if only_update:
-                decode_update_mla_metadata_v1(
-                    cu_seqlens_q,
-                    kv_indptr,
-                    kv_last_page_lens,
-                    num_heads,
-                    1,  # nhead_kv,
-                    True,
-                    *buffers,
-                    page_size=self.block_size,
-                    kv_granularity=max(self.block_size, 16),
-                    max_seqlen_qo=max_q_len,
-                    dtype_q=self.dtype_q,
-                    dtype_kv=self.dtype_kv,
-                    num_reject_tokens=num_reject_tokens,
-                )
-            else:
-                get_mla_metadata_v1(
-                    cu_seqlens_q,
-                    kv_indptr,
-                    kv_last_page_lens,
-                    num_heads,
-                    1,  # nhead_kv,
-                    True,
-                    *buffers,
-                    page_size=self.block_size,
-                    dtype_q=self.dtype_q,
-                    dtype_kv=self.dtype_kv,
-                    is_cp_round_robin=is_cp_round_robin,
-                    **split_params,
-                )
-
-        plan(
-            kv_indptr_for_metadata,
-            kv_last_page_lens_for_metadata,
-            self.persistent_num_heads,
-            (
+        if only_update:
+            decode_update_mla_metadata_v1(
+                cu_seqlens_q,
+                kv_indptr_for_metadata,
+                kv_last_page_lens_for_metadata,
+                self.persistent_num_heads,
+                1,  # nhead_kv,
+                True,
                 work_meta_data,
                 work_info_set,
                 work_indptr,
                 reduce_indptr,
                 reduce_final_map,
                 reduce_partial_map,
-            ),
-        )
-        # Dense layers read the dense KV: their plan comes off kv_indptr even
-        # where work_* is planned over the sparse selection.
-        dense_plan = self._dense_work_plan(prefix)
-        if dense_plan is not None:
-            assert not is_cp_round_robin, "a dense work plan is never under DCP"
-            plan(
-                var[f"{prefix}kv_indptr"].gpu[: bs + 1],
-                var[f"{prefix}kv_last_page_lens"].gpu[:bs],
-                dense_plan.num_heads,
-                (
-                    dense_plan.work_meta_data,
-                    dense_plan.work_info_set,
-                    dense_plan.work_indptr,
-                    dense_plan.reduce_indptr,
-                    dense_plan.reduce_final_map,
-                    dense_plan.reduce_partial_map,
-                ),
+                page_size=self.block_size,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=max_q_len,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                num_reject_tokens=num_reject_tokens,
+            )
+        else:
+            get_mla_metadata_v1(
+                cu_seqlens_q,
+                kv_indptr_for_metadata,
+                kv_last_page_lens_for_metadata,
+                self.persistent_num_heads,
+                1,  # nhead_kv,
+                True,
+                work_meta_data,
+                work_info_set,
+                work_indptr,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                is_cp_round_robin=is_cp_round_robin,
+                **split_params,
             )
         return {
             "work_meta_data": work_meta_data,
@@ -1349,8 +1255,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "reduce_indptr": reduce_indptr,
             "reduce_final_map": reduce_final_map,
             "reduce_partial_map": reduce_partial_map,
-            "work_num_heads": self.persistent_num_heads,
-            "dense_work_plan": dense_plan,
         }
 
     def compact_topk_indices(self, rows: torch.Tensor) -> None:
@@ -3738,9 +3642,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         running_bs = ub.running_bs
         running_tokens = ub.running_tokens
         attn.kv_last_page_lens = var[f"{p}kv_last_page_lens"].gpu[:running_bs]
-        # `finish_ubatch` plans both into the micro-batch's buffers.
-        attn.work_num_heads = self.persistent_num_heads
-        attn.dense_work_plan = self._dense_work_plan(p)
         if self._publishes_dcp_local_lens:
             attn.dcp_local_context_lens = var[f"{p}dcp_local_context_lens"].gpu[
                 :running_tokens

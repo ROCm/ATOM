@@ -153,15 +153,14 @@ def mla_builder_cls():
         ),
         "atom.model_ops.attention_mla": _module(
             "atom.model_ops.attention_mla",
+            _MLA_MIN_HEADS=16,
             _MLA_SPLIT_BUDGET_AUTO=-1,
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_kernel_num_heads=noop,
             mla_dcp_persistent_width=lambda *args, **kwargs: None,
             mla_dcp_sparse_prefill_num_heads=noop,
             mla_dense_min_query_heads=noop,
-            mla_kernel_num_heads=lambda heads, floor=16: max(
-                floor, -(-heads // 16) * 16
-            ),
+            mla_kernel_num_heads=lambda heads: max(16, -(-heads // 16) * 16),
         ),
         "atom.model_ops.glm5_next.geometry": _module(
             "atom.model_ops.glm5_next.geometry",
@@ -196,7 +195,6 @@ def mla_builder_cls():
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),
             Context=type("Context", (), {}),
-            MlaWorkPlan=type("MlaWorkPlan", (), {}),
             get_forward_context=noop,
         ),
         "atom.model_ops.fp4_mqa_ragged_metadata": _module(

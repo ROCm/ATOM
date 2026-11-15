@@ -1163,10 +1163,6 @@ class DSparkProposer(Drafter):
         attn_metadata.reduce_indptr = ps["reduce_indptr"]
         attn_metadata.reduce_final_map = ps["reduce_final_map"]
         attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
-        # The block's plan, at the draft's width, replaces the target's for
-        # every layer the block runs, dense ones included.
-        attn_metadata.work_num_heads = self._blk_padded_heads
-        attn_metadata.dense_work_plan = None
 
     @property
     def _paged_pad_ctx_len(self) -> int:
