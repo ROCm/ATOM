@@ -11,7 +11,8 @@ macro_rules! set_env {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Every .proto is compiled by protox, so no build needs a protoc binary.
+    // This crate's .protos are compiled by protox, but the smg-grpc-client
+    // dependency's build script still runs protoc, so builds need it.
     #[cfg(feature = "atom-engine")]
     {
         // The EngineCore's wire protocol, kept beside the EngineCore.

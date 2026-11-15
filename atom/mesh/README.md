@@ -77,8 +77,9 @@ listing it; accepting an unknown JSON field does not establish rank-routing supp
   source "$HOME/.cargo/env"
   ```
 
-- **Protocol Buffers compiler (`protoc`)**, only when enabling the optional
-  `ext-proc` Cargo feature, for the vendored Envoy protocol bindings:
+- **Protocol Buffers compiler (`protoc`)**, for every build: the `smg-grpc-client`
+  dependency's build script runs it (this crate's own protos, including the optional
+  `ext-proc` Envoy bindings, are compiled in-process by protox):
   ```bash
   sudo apt-get install protobuf-compiler
   ```
@@ -94,7 +95,7 @@ cargo build
 # Release build (optimized)
 cargo build --release
 
-# Release build with optional Envoy ext-proc support (requires protoc)
+# Release build with optional Envoy ext-proc support
 cargo build --release --features ext-proc
 ```
 
@@ -129,8 +130,8 @@ ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .
 
 `ATOM_MESH_FEATURES` accepts Cargo's comma- or space-separated feature list and
 defaults to empty. Both `docker/Dockerfile` and `docker/atom_release.dockerfile`
-accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in; the build
-image must provide `protoc` when enabling it.
+accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in. The build
+image must provide `protoc` either way, for `smg-grpc-client`.
 
 ## Usage
 
