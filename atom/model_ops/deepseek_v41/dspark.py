@@ -245,16 +245,15 @@ def draft_attention_fp8(query, context_kv, draft_kv, sink, step, scale):
 
     src = step.src_indices
     assert src is not None, "FP8 draft attention needs the step's source lists"
-    pi, pp, ei, ep = src
     output = torch.empty_like(query[0], dtype=torch.bfloat16)
     sparse_attn_v41_paged_2src(
         tuple(p.flatten(0, 1) for p in query),
         tuple(p.flatten(0, 1) for p in context_kv),
-        pi,
-        pp,
+        src.context,
+        src.context_ptr,
         tuple(p.flatten(0, 1) for p in draft_kv),
-        ei,
-        ep,
+        src.block,
+        src.block_ptr,
         sink,
         scale,
         out=output.flatten(0, 1),

@@ -23,6 +23,10 @@ from atom.model_ops.deepseek_v41.dspark import (
     draft_src_indices,
     draft_step_indices,
 )
+from tests.attentions.deepseek_v41.test_draft_fp8 import (
+    assert_sources_equal,
+    expected_sources,
+)
 
 
 @pytest.fixture
@@ -113,21 +117,6 @@ def test_draft_src_indices_follows_the_arch_gate(monkeypatch):
     assert draft_src_indices(anchors, 8, 4, 5, buffers) is not None
 
 
-def _expected_sources(indices, ring):
-    """The index list with its -1 entries dropped, as flat window / block rows
-    and their indptrs: what the two sources must say."""
-    batch, width, _ = indices.shape
-    context, block, context_ptr, block_ptr = [], [], [0], [0]
-    for b in range(batch):
-        for t in range(width):
-            row = indices[b, t].tolist()
-            context += [b * ring + i for i in row[:ring] if i >= 0]
-            block += [b * width + i - ring for i in row[ring:] if i >= 0]
-            context_ptr.append(len(context))
-            block_ptr.append(len(block))
-    return context, context_ptr, block, block_ptr
-
-
 @pytest.mark.parametrize(
     "batch,width,ring,window,low",
     [
@@ -150,11 +139,7 @@ def test_draft_src_indices_match_the_index_list(
     src = draft_src_indices(
         anchors, ring, window, width, DraftSrcBuffers(batch + 3, width + 1)
     )
-    context, context_ptr, block, block_ptr = _expected_sources(indices, ring)
-    assert src.context_ptr.tolist() == context_ptr
-    assert src.block_ptr.tolist() == block_ptr
-    assert src.context[: len(context)].tolist() == context
-    assert src.block[: len(block)].tolist() == block
+    assert_sources_equal(src, expected_sources(indices, ring))
 
 
 def test_draft_src_buffers_are_reused_across_batches(two_source):
@@ -166,11 +151,7 @@ def test_draft_src_buffers_are_reused_across_batches(two_source):
     second = draft_src_indices(anchors, 64, 32, 3, buffers)
     assert second.context.data_ptr() == first.context.data_ptr()
     _, indices, _ = draft_step_indices(anchors, 64, 32, 3)
-    context, context_ptr, block, block_ptr = _expected_sources(indices, 64)
-    assert second.context_ptr.tolist() == context_ptr
-    assert second.block_ptr.tolist() == block_ptr
-    assert second.context[: len(context)].tolist() == context
-    assert second.block[: len(block)].tolist() == block
+    assert_sources_equal(second, expected_sources(indices, 64))
 
 
 def test_draft_src_buffers_refuse_what_they_were_not_sized_for(two_source):

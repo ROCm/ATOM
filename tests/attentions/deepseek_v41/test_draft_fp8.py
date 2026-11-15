@@ -14,7 +14,7 @@ pytest.importorskip("triton")
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.blockscale import quantize_fp8
-from atom.model_ops.deepseek_v41.draft_block import DraftStep
+from atom.model_ops.deepseek_v41.draft_block import DraftSrcIndices, DraftStep
 from atom.model_ops.deepseek_v41.dspark import (
     DraftSrcBuffers,
     draft_attention_fp8,
@@ -106,25 +106,27 @@ def oracle(query, context, current, anchors, window, sink):
     return torch.einsum("bhtk,bkd->bthd", scores.softmax(-1)[..., :-1], keys).bfloat16()
 
 
-def csr_oracle(indices, ring):
-    """Independent host enumeration, including request-relative source offsets."""
-    prefix, pp, extend, ep = [], [0], [], [0]
+def expected_sources(indices, ring):
+    """`DraftSrcIndices` by host enumeration of the index list: the window and
+    block rows of every query, -1 entries dropped, offset by request, with
+    their indptrs."""
+    context, context_ptr, block, block_ptr = [], [0], [], [0]
     width = indices.shape[1]
     for batch, queries in enumerate(indices.cpu().tolist()):
         for query in queries:
-            prefix.extend(batch * ring + i for i in query if 0 <= i < ring)
-            extend.extend(batch * width + i - ring for i in query if i >= ring)
-            pp.append(len(prefix))
-            ep.append(len(extend))
-    return prefix, pp, extend, ep
+            context.extend(batch * ring + i for i in query if 0 <= i < ring)
+            block.extend(batch * width + i - ring for i in query if i >= ring)
+            context_ptr.append(len(context))
+            block_ptr.append(len(block))
+    return DraftSrcIndices(context, context_ptr, block, block_ptr)
 
 
-def assert_csr_equal(actual, expected):
-    prefix, pp, extend, ep = [p.cpu().tolist() for p in actual]
-    assert pp == expected[1]
-    assert ep == expected[3]
-    assert prefix[: pp[-1]] == expected[0]
-    assert extend[: ep[-1]] == expected[2]
+def assert_sources_equal(actual, expected):
+    """Field by field; the buffers past each indptr's end are not compared."""
+    assert actual.context_ptr.tolist() == expected.context_ptr
+    assert actual.block_ptr.tolist() == expected.block_ptr
+    assert actual.context[: expected.context_ptr[-1]].tolist() == expected.context
+    assert actual.block[: expected.block_ptr[-1]].tolist() == expected.block
 
 
 @pytest.mark.parametrize(
@@ -152,24 +154,30 @@ def test_fp8_source_lists_match_host_enumeration(monkeypatch, batch, width, wind
         device="cuda",
     )
     _, indices, _ = draft_step_indices(anchors, window + 5, window, width)
-    expected = csr_oracle(indices, window + 5)
+    expected = expected_sources(indices, window + 5)
     src = draft_src_indices(
         anchors, window + 5, window, width, DraftSrcBuffers(batch, width), fp8=True
     )
-    assert_csr_equal(src, expected)
+    assert_sources_equal(src, expected)
 
 
 # An FP8 draft always comes with a step: `block_backbone` builds its lists,
-# and `draft_attention_fp8` asserts on a step without them.
+# and `draft_attention_fp8` asserts on a step without them. The arch gate is
+# pinned both ways: it decides the BF16 draft's lists, and the FP8 draft must
+# get its lists whichever way it is set.
+@pytest.mark.parametrize("two_source", [False, True])
 @pytest.mark.parametrize(
     "dtype, supplied_step", [("bf16", False), ("bf16", True), ("fp8", True)]
 )
 def test_stages_share_one_source_build_per_draft_round(
-    monkeypatch, dtype, supplied_step
+    monkeypatch, dtype, supplied_step, two_source
 ):
     from torch import nn
 
+    from atom.model_ops.deepseek_v41 import dspark as ops
     from atom.models.deepseek_v41 import dspark
+
+    monkeypatch.setattr(ops, "two_source_draft", lambda: two_source)
 
     seen, builds = [], []
 
@@ -206,13 +214,14 @@ def test_stages_share_one_source_build_per_draft_round(
     for anchors in ([-1, 3, 260], [400, -1, 2]):
         anchors = torch.tensor(anchors, device="cuda")
         positions, indices, context_positions = draft_step_indices(anchors, 133, 128, 5)
-        step = None
+        step, src = None, None
         if supplied_step:
             # What `block_backbone` hands over: the lists it built for the
-            # draft that runs, None on a BF16 draft off the two-source arch.
+            # draft that runs, None on a BF16 draft with the gate closed.
             src = draft_src_indices(
                 anchors, 133, 128, 5, draft.draft_src_buffers, fp8=dtype == "fp8"
             )
+            assert (src is None) == (dtype == "bf16" and not two_source)
             step = DraftStep(positions, indices, True, src)
         seen.clear()
         before = len(builds)
@@ -225,15 +234,13 @@ def test_stages_share_one_source_build_per_draft_round(
         )
         assert len(seen) == 3 and all(step is seen[0] for step in seen)
         assert seen[0].decode == supplied_step
-        # `draft_hidden` builds no source lists; a handed-over step is used as is.
+        # `draft_hidden` builds no source lists; a handed-over step is used as
+        # is, and without one the BF16 draft concatenates.
         assert len(builds) == before
-        if dtype == "fp8":
-            src = seen[0].src_indices
-            assert all(step.src_indices is src for step in seen)
-            assert_csr_equal(src, csr_oracle(indices, 133))
+        assert all(step.src_indices is src for step in seen)
+        if src is not None:
+            assert_sources_equal(src, expected_sources(indices, 133))
             assert src.context.data_ptr() == draft.draft_src_buffers.context.data_ptr()
-        else:
-            assert all(step.src_indices is None for step in seen)
 
 
 @pytest.mark.parametrize("heads", [16, 64])
@@ -410,7 +417,7 @@ def test_native_draft_graph_replays_live_requests_queries_and_sources(
         torch.testing.assert_close(out, expected, rtol=0.03, atol=0.02)
         _, indices, _ = draft_step_indices(staged["anchors"], 133, 128, 5)
         assert len(captured) == build_count
-        assert_csr_equal(captured[-1], csr_oracle(indices, 133))
+        assert_sources_equal(captured[-1], expected_sources(indices, 133))
     assert graph.is_captured(4)
 
 

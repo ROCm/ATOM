@@ -10,8 +10,8 @@ if not torch.cuda.is_available():
 from atom.model_ops.attentions.deepseek_v41 import planes
 from atom.model_ops.deepseek_v41 import dspark
 from tests.attentions.deepseek_v41.test_draft_fp8 import (
-    assert_csr_equal,
-    csr_oracle,
+    assert_sources_equal,
+    expected_sources,
     mxfp8,
 )
 
@@ -93,7 +93,7 @@ def test_draft_source_counts_reuse_one_variant():
         anchors = torch.arange(count, device="cuda") * 3 - 1
         _, indices, _ = dspark.draft_step_indices(anchors, 13, 8, 5)
         actual = dspark.draft_src_indices(anchors, 13, 8, 5, buffers, fp8=True)
-        assert_csr_equal(actual, csr_oracle(indices, 13))
+        assert_sources_equal(actual, expected_sources(indices, 13))
         if compiled is None:
             compiled = variants(dspark._draft_src_kernel)
         assert (
