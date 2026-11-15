@@ -9,7 +9,7 @@ use serde::{de::IgnoredAny, Deserialize};
 use super::keys::TAINT_KEY;
 
 /// Keys a request asks for at most, besides the taint key: they go in its URL.
-const BATCH_KEYS: usize = 64;
+pub(super) const BATCH_KEYS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {

@@ -874,8 +874,13 @@ impl IngressRouting {
             })?;
         let limit = self.max_tokenize_bytes;
         let cache = prefix_tokens::cache(&entry, self.prefix_cache_bytes);
-        // With earlier prompts stored, only what they do not cover is bounded.
-        if cache.is_none() && metadata.text.len() > limit {
+        // With earlier prompts stored, only what they do not cover is bounded, in a
+        // prompt of at most `max_prompt_bytes`.
+        let max_prompt = match cache {
+            Some(_) => prefix_tokens::max_prompt_bytes(limit),
+            None => limit,
+        };
+        if metadata.text.len() > max_prompt {
             return Err(IngressError::tokenizer_input_too_large());
         }
         ctx.check()?;
@@ -890,7 +895,7 @@ impl IngressRouting {
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "template")
             .record(template_started.elapsed().as_secs_f64());
         ctx.check()?;
-        if cache.is_none() && prompt.len() > limit {
+        if prompt.len() > max_prompt {
             return Err(IngressError::tokenizer_input_too_large());
         }
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
