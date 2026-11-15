@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794674560431,
+  "lastUpdate": 1794762318511,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5000,6 +5000,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8939,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43614165007 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611141523 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1759 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yelkhamra",
+            "username": "yelkhamra",
+            "email": "yelkhamr@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0c94a00a92dbad27e05ddcf3f8681e3aae3f2d27",
+          "message": "feat(benchmarks): record AITER_AR_1STAGE_MAX_BYTES in benchmark metadata (#3077)\n\nAITER's fused all-reduce one-stage limit now has a byte-named setting,\nAITER_AR_1STAGE_MAX_BYTES, and keeps AITER_AR_1STAGE_MAX_KB as a deprecated\nalias whose integer has always been a byte count (ROCm/aiter#7357).\n\nThe benchmark metadata allowlist recorded only the legacy name, so a run\nconfigured through the new name would not record the limit that selected its\nall-reduce stage. Capture both names: the legacy entry is retained so existing\nrecipes stay identifiable, and the new entry covers recipes that migrate.\n\nCover both names in the metadata regression test.\n\nSigned-off-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>\nCo-authored-by: Yaakoub El Khamra <176948988+yelkhamra@users.noreply.github.com>",
+          "timestamp": "2026-11-15T15:15:31Z",
+          "url": "https://github.com/ROCm/ATOM/commit/0c94a00a92dbad27e05ddcf3f8681e3aae3f2d27"
+        },
+        "date": 1794762318062,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43734009738 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611151511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8954,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43734009738 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611151511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1766 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
