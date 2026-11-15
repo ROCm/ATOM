@@ -979,6 +979,15 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-kvev-1m-c56
           concurrency: [56]
 
+        # Control for the Store cells above: the same workers and Store, with
+        # neither events nor event routing.
+        - <<: *glm52_agentic_mcstore_kvev_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-noev-1m-c96
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE
+          concurrency: [96]
+          router:
+            policy: random
+
         - &glm52_agentic_lmcache_kvev_cpp4_dcp4
           <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-kvev-1m-c72
