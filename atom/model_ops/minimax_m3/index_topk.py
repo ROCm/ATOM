@@ -1547,10 +1547,13 @@ def minimax_m3_index_topk_decode(
             sm_scale,
             index_score_work_map,
             # Contiguous, so the aiter selector can serve it: from
-            # `total_q * num_idx_heads >= 16` the scorer's own allocation is a
-            # permuted view, which `_select_with_aiter` declines.
-            out=torch.empty(
+            # `max_query_len * num_idx_heads >= 16` (TP2 with 7 draft tokens, TP1)
+            # the scorer's own allocation is a permuted view, which
+            # `_select_with_aiter` declines. -inf like `alloc_score`'s, the sentinel
+            # a caller's own `out` owes for the tail pages a short request never writes.
+            out=torch.full(
                 (num_idx_heads, total_q, score_max_block),
+                float("-inf"),
                 dtype=torch.float32,
                 device=idx_q.device,
             ),

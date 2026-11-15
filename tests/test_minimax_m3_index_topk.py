@@ -643,6 +643,62 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
 
 # ---------------------------------------------------------------------------
 # The decode score kernel, and the hoist that makes it worth having.
+@gpu
+def test_plain_decode_reaches_the_aiter_selector_where_the_scorer_allocates_permuted(
+    monkeypatch,
+):
+    """From `max_query_len * num_idx_heads >= 16` (here TP2 with 7 draft tokens: 8 x 2)
+    aiter's own score allocation is a feature-contiguous permuted view, which
+    `_select_with_aiter` declines for want of `score.view(rows, max_block)`. The plain
+    decode op asks for a contiguous score instead, so the selector that wins at wide rows
+    still serves them, and picks what the Triton selector picks."""
+    from atom.model_ops.minimax_m3 import index_topk as m2
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    batch, heads, q = 2, 2, 8
+    ctx = m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
+    # self-validating: the allocation this test is about really is permuted here
+    assert (
+        not m2.flydsl_ops()
+        .minimax_m3_index_score_alloc(batch, q, heads, ctx // SPARSE_BLOCK_SIZE, "cuda")
+        .is_contiguous()
+    )
+    kw = _inputs([q] * batch, [ctx - q] * batch, heads, "cuda")
+    md = make_sparse_decode_metadata(
+        seq_lens=kw["seq_lens"],
+        block_table=kw["block_table"],
+        slot_mapping=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        max_seq_len=ctx,
+        max_query_len=q,
+        num_idx_heads=heads,
+    )
+    served = []
+    real = m2._select_with_aiter
+    monkeypatch.setattr(
+        m2, "_select_with_aiter", lambda *a, **k: served.append(real(*a, **k))
+    )
+
+    def run(bounds):
+        return m2.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            ctx, TOPK, INIT, LOCAL, heads, kw["sm_scale"],
+            emit_sparse_block_table=True, max_query_len=q,
+            n_valid_column_per_row=bounds,
+            index_score_work_map=md.index_score_work_map,
+            index_score_max_block=md.index_score_max_block,
+        )  # fmt: skip
+
+    ait_idx, _, ait_ctx = run(md.n_valid_column_per_row)
+    assert served == [True], "the aiter selector declined the plain decode's score"
+    tri_idx, _, tri_ctx = run(None)
+    rows = heads * batch * q
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    assert torch.equal(ait_ctx, tri_ctx)
+
+
 # ---------------------------------------------------------------------------
 def _score_oracle(idx_q, cache, block_table, seq_lens, max_query_len, heads, sm_scale):
     """Block scores in fp32 on the device, straight from the definition.
