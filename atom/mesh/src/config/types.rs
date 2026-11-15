@@ -159,6 +159,8 @@ pub struct PreparePoolConfig {
     pub max_tokenize_bytes: Option<usize>,
     /// Memory for prompts kept so that a conversation's next turn encodes only
     /// what it appends, and the byte limit applies to that; 0 turns this off.
+    /// Each registered tokenizer has this much, if its `tokenizer.json` is on
+    /// local disk and `tokenizer_cache` is off.
     #[arg(
         id = "prepare_prefix_cache_mb",
         long = "prepare-prefix-cache-mb",
