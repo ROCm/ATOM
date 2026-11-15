@@ -55,6 +55,11 @@ from atom.model_engine.engine_utility import (
     kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
+from atom.model_engine.plugin_hotplug import (
+    DEFAULT_HOTPLUG_TIMEOUT_S,
+    HOTPLUG_CMD,
+    aggregate_reports,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -83,6 +88,7 @@ def _pp_head_first(cmd: str, args: dict) -> bool:
     return (
         cmd in WEIGHT_UPDATE_UTILITY_CMDS
         or cmd == PAUSE_GENERATION_CMD
+        or cmd == HOTPLUG_CMD
         or kv_change(cmd, args) is not None
     )
 
@@ -2126,6 +2132,41 @@ class CoreManager:
             with self._weight_sync_lock:
                 return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
         return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def hotplug_plugin(self, payload: dict, timeout: float | None = None) -> dict:
+        """Install a plugin plan/arm and recapture decode graphs on every rank.
+
+        Synchronous on purpose: it returns only once every engine has installed
+        the plan and its ranks have recaptured the requested graphs, so the
+        caller can send traffic at the new plan immediately.  A refusal or a
+        capture failure raises (the API answers 4xx/409) instead of returning a
+        half-applied plan, and a rank that misses the deadline raises
+        ``TimeoutError``.
+
+        One engine at a time for now: a capture records the TP group's
+        collectives, and a DP fleet would have to pause and enter the capture
+        together (``plugin_hotplug.topology_refusal`` documents both cases).
+        """
+        timeout = (
+            DEFAULT_HOTPLUG_TIMEOUT_S if timeout is None else checked_timeout(timeout)
+        )
+        engines = len(self.control_sockets)
+        if engines != 1:
+            raise RuntimeError(
+                f"{self.label}: plugin hot-plug needs exactly one engine (one TP "
+                f"group, no pipeline/data parallelism); this manager has {engines}"
+            )
+        if not isinstance(payload, dict):
+            raise ValueError("hotplug_plugin needs a payload dict")
+        responses = self.broadcast_utility_command_sync(
+            HOTPLUG_CMD, timeout=timeout, payload=payload
+        )
+        reports = [
+            response.get("result") if isinstance(response, dict) else None
+            for response in responses
+        ]
+        reports = [report for report in reports if isinstance(report, dict)]
+        return aggregate_reports(reports)
 
     def _sync_weight_update(
         self, cmd: str, timeout: float, in_session: bool, kwargs: dict

@@ -28,6 +28,11 @@ Rules:
 - Traced Python (``torch.compiler.is_compiling()``) is native; a seam inside a
   compiled region with an owner runs as one opaque op (``atom_plugin::span``)
   that decides on every execution.
+- Hot-plug boot (``configure(..., hotplug=True)`` before the build): every
+  bindable seam binds to a ``Router`` (an opaque-op seam to the span op) and
+  every call seam dispatches even while the boot plan owns none, so a plan can
+  be installed afterwards (``hotplug_plan``) without rebuilding the model.
+  Captures made before the install keep their decisions: recapture them.
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
 """
 
@@ -253,6 +258,11 @@ SEAMS = MappingProxyType(
     )
 )
 
+# What a hot-plug boot binds whatever the boot plan owns: the seams the model
+# calls through a ``bind`` made at build. Call seams dispatch by name and need
+# no list (`call` checks `_hotplug`).
+_HOTPLUG_BINDS = frozenset(name for name, spec in SEAMS.items() if spec.form == "bind")
+
 
 @dataclass(frozen=True)
 class Capability:
@@ -331,6 +341,7 @@ _CACHE_LIMIT = 4096
 _counts: Counter = Counter()
 _refusals: list[Registration] = []
 _last: Decision | None = None
+_hotplug = False  # bind every seam; a plan may be installed after the build
 
 
 def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
@@ -414,6 +425,7 @@ def configure(
     config: Any = None,
     kill_switch: bool | None = None,
     strict: bool | None = None,
+    hotplug: bool = False,
 ) -> None:
     """Load and route ``plan`` (a ``plugin_recipe.Plan``, the
     ``RecipeSource`` a Config carries, or names for the ``--plugin-enable``
@@ -423,11 +435,18 @@ def configure(
     owner that did not register, refuses the start. Under the shorthand a
     failing plugin is logged and skipped. The same plan's AITER providers go to
     ``aiter.plugin.configure`` when AITER has it.
+
+    ``hotplug=True`` boots for a plan installed later: every seam the model
+    binds is bound now (so no rebuild is needed) even where the boot plan owns
+    nothing, and ``hotplug_plan`` may replace the plan after the build. The
+    kill switch wins: with ``ATOM_PLUGIN_HOST=0`` nothing binds and
+    ``hotplug_plan`` refuses.
     """
     from atom import plugin_recipe
     from atom.utils import envs
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
+    global _hotplug
     if isinstance(plan, plugin_recipe.RecipeSource):
         plan = plan.resolve()  # Config carries the recipes; each process resolves
     elif not isinstance(plan, (plugin_recipe.Plan, type(None))):
@@ -437,7 +456,9 @@ def configure(
         # A second runner in this process may restate the plan the built binds
         # were made with; any other plan would leave them on the old one.
         if requested != _requested:
-            raise RuntimeError("plugin_host.configure after model build; use set_arm")
+            raise RuntimeError(
+                "plugin_host.configure after model build; use hotplug_plan or set_arm"
+            )
         set_arm(arm if _plan is not None else "plugin")
         return
     _requested = requested
@@ -445,6 +466,7 @@ def configure(
         plugin_recipe.check_runtime(plan, config)
     kill = not envs.ATOM_PLUGIN_HOST if kill_switch is None else kill_switch
     with _lock:
+        _hotplug = bool(hotplug) and not kill
         _plan = None if kill else plan
         _kill_switch = kill
         _strict = (
@@ -481,6 +503,9 @@ def configure(
                     _loading = None
             _tables.update(_route_tables(_plan, shorthand))
         _owned = frozenset(s for table in _tables.values() for s in table)
+        if _hotplug:
+            # Bind the seams no plan owns yet: a later one may claim them.
+            _owned = _owned | _HOTPLUG_BINDS
         set_arm(arm if _plan is not None else "plugin")
     _configure_aiter(() if kill or plan is None else plan.aiter)
     if plan is not None:
@@ -530,6 +555,177 @@ def set_arm(arm: str) -> None:
         }
         _arm = arm
         _cache.clear()
+
+
+# -- hot-plug -----------------------------------------------------------------
+
+
+def hotplug_enabled() -> bool:
+    """True when this process booted with ``configure(hotplug=True)`` and the
+    host was not killed: a plan may be installed with ``hotplug_plan``."""
+    return _hotplug
+
+
+def _plan_argument(plan: Any) -> Any:
+    """``hotplug_plan``'s argument as a ``plugin_recipe.Plan`` (or None).
+
+    Accepts the ``Plan`` itself, the ``RecipeSource`` a Config carries, a
+    payload of recipe texts + enable names
+    (``atom.plugin_recipe.from_payload``), a single recipe JSON text, or names
+    for the ``--plugin-enable`` shorthand.
+    """
+    from atom import plugin_recipe
+
+    if plan is None or isinstance(plan, plugin_recipe.Plan):
+        return plan
+    if isinstance(plan, (plugin_recipe.RecipeSource, Mapping, str, bytes)):
+        source = plugin_recipe.from_payload(plan)
+    else:
+        source = plugin_recipe.shorthand(plan)
+    return None if source is None else source.resolve()
+
+
+def _snapshot() -> dict[str, Any]:
+    """The plan state ``hotplug_plan`` swaps and restores on any failure."""
+    return {
+        "plan": _plan,
+        "requested": _requested,
+        "kill_switch": _kill_switch,
+        "strict": _strict,
+        "on_decline": _on_decline,
+        "owned": _owned,
+        "registered": {seam: dict(routes) for seam, routes in _registered.items()},
+        "tables": dict(_tables),
+        "arm": _arm,
+        "refusals": len(_refusals),
+        "aiter": () if _plan is None else _plan.aiter,
+    }
+
+
+def _restore(snapshot: dict[str, Any]) -> None:
+    """Put the previous plan back after a failed ``hotplug_plan``."""
+    global _plan, _requested, _kill_switch, _strict, _on_decline, _owned
+    with _lock:
+        _plan = snapshot["plan"]
+        _requested = snapshot["requested"]
+        _kill_switch = snapshot["kill_switch"]
+        _strict = snapshot["strict"]
+        _on_decline = snapshot["on_decline"]
+        _owned = snapshot["owned"]
+        _registered.clear()
+        _registered.update(snapshot["registered"])
+        _tables.clear()
+        _tables.update(snapshot["tables"])
+        del _refusals[snapshot["refusals"] :]
+        set_arm(snapshot["arm"])
+    _configure_aiter(snapshot["aiter"])
+
+
+def _swap_in(plan, arm: str) -> dict[str, Any]:
+    """Build the new plan's state in place; the caller restores on any error.
+
+    Every planned provider's entry point is asked again (not only the ones the
+    boot plan loaded): a plan may claim a seam the provider registered for no
+    earlier one, and ``register`` answers against the plan it runs under.
+    """
+    from atom import plugin_recipe
+    from atom.utils import envs
+
+    global _plan, _requested, _kill_switch, _strict, _on_decline, _owned, _loading
+    _plan = plan
+    _kill_switch = False
+    _strict = envs.ATOM_PLUGIN_HOST_STRICT or bool(
+        plan is not None and plan.strict_overlap
+    )
+    _on_decline = plan.on_decline if plan is not None else "native"
+    _requested = None if plan is None else plan.plan_id
+    _registered.clear()
+    _tables.clear()
+    _refusals.clear()
+    _loading = None
+    shorthand = plan is not None and None in plan.tables.values()
+    if plan is not None:
+        available = _entry_points()
+        for name in plan.providers:
+            if name not in available:
+                if not shorthand:
+                    raise plugin_recipe.RecipeRefused(
+                        "recipe-plugin-drift", f"{name} is not installed"
+                    )
+                continue  # not installed, or AITER-only
+            _loading = name
+            try:
+                available[name].load()(sys.modules[__name__])
+            except Exception as error:
+                _refusals.append(Registration("*", name, False, "load-error"))
+                raise plugin_recipe.RecipeRefused(
+                    "recipe-plugin-drift", f"{name} failed to load: {error}"
+                ) from error
+            finally:
+                _loading = None
+        _tables.update(_route_tables(plan, shorthand))
+    # Conservative: seams bound before stay bound (their call sites exist), and
+    # a seam once planned keeps dispatching even under a plan that drops it.
+    _owned = _owned | frozenset(s for table in _tables.values() for s in table)
+    _configure_aiter(() if plan is None else plan.aiter)
+    set_arm(arm if plan is not None else "plugin")
+    return {
+        "hotplug": True,
+        "plan_id": None if plan is None else plan.plan_id,
+        "providers": [] if plan is None else list(plan.providers),
+        "aiter": [] if plan is None else list(plan.aiter),
+        "capture_rows": _declared_rows(),
+        "tables": sorted(str(key) for key in _tables),
+    }
+
+
+def hotplug_plan(plan, *, arm: str = "plugin", config: Any = None) -> dict[str, Any]:
+    """Install a new plan after the model build, on a hot-plug boot.
+
+    ``plan`` is a ``plugin_recipe.Plan``, the ``RecipeSource`` a Config carries,
+    a payload of recipe texts + enable names, or names for the shorthand; None
+    installs the empty plan (every seam native, every binding kept). Every
+    planned provider is loaded and must cover the plan, and the arm must be
+    valid for it; a failure raises ``RecipeRefused`` / ``RuntimeError`` and the
+    plan that was serving keeps serving. Call it with generation quiesced: the
+    swap itself is under the lock, but in-flight dispatches may have already
+    cached a decision, and captures made before it must be recaptured.
+
+    Returns ``{"hotplug", "plan_id", "providers", "aiter", "capture_rows",
+    "tables"}``: the installed plan and the capture buckets (padded rows) its
+    tables declare, so the caller knows which graphs to recapture.
+    """
+    from atom import plugin_recipe
+    from atom.utils import envs
+
+    resolved = _plan_argument(plan)
+    with _lock:
+        if not _hotplug:
+            raise RuntimeError(
+                "plugin_host.hotplug_plan needs a hot-plug boot: configure with "
+                "hotplug=True before the model build"
+            )
+        if not _bound:
+            raise RuntimeError(
+                "plugin_host.hotplug_plan is only allowed after the model build"
+            )
+        if _kill_switch or not envs.ATOM_PLUGIN_HOST:
+            raise RuntimeError(
+                "plugin_host is disabled (ATOM_PLUGIN_HOST=0); refusing to install"
+            )
+        if resolved is not None and config is not None:
+            plugin_recipe.check_runtime(resolved, config)  # before any state change
+        snapshot = _snapshot()
+        try:
+            result = _swap_in(resolved, arm)
+        except BaseException:
+            try:
+                _restore(snapshot)
+            except Exception:  # restoring is best effort; report the install error
+                logger.exception("plugin_host: restoring the previous plan failed")
+            raise
+    logger.info("plugin_host: hotplug plan installed: %s", result)
+    return result
 
 
 # -- dispatch -----------------------------------------------------------------
@@ -774,7 +970,7 @@ def bind(
     if spec is None or spec.form != "bind":
         raise KeyError(f"hook API {HOOK_API} has no bound seam {seam!r}")
     _bound.add(seam)
-    if seam not in _owned:
+    if seam not in _owned and not _hotplug:
         return native
     router = Router(seam, native, capability)
     if spec.graph == "opaque_op" and layer is not None and fake is not None:
@@ -798,7 +994,7 @@ _call_capability: dict[str, Callable[..., Mapping[str, Any]]] = {
 
 def call(seam: str, native: Callable[..., Any], *inputs: Any, **kwargs: Any) -> Any:
     """``native(*inputs, **kwargs)``, unless a planned owner of ``seam`` serves."""
-    if seam not in _owned:
+    if seam not in _owned and not _hotplug:
         return native(*inputs, **kwargs)
     return _dispatch(seam, native, _call_capability.get(seam), inputs, kwargs)
 
@@ -858,10 +1054,11 @@ def span_op(
     No planned owner of ``seam``: ``run`` itself, inline, the graph ATOM has
     without plugins. Else one opaque op (``atom_plugin::span``, shapes from
     ``fake``) whose body runs ``run`` eagerly, where the seam's owners are
-    asked on every execution.
+    asked on every execution. A hot-plug boot always takes the opaque op: the
+    plan that will serve the seam is installed after the build.
     """
     _bound.add(seam)
-    if seam not in _owned:
+    if seam not in _owned and not _hotplug:
         return run
     if layer in _spans:
         raise ValueError(f"span layer name {layer!r} is not unique")
@@ -929,6 +1126,7 @@ def route_proof(seam: str, owner: str, n: int = 1) -> int:
 def status() -> dict[str, Any]:
     return {
         "hook_api": HOOK_API,
+        "hotplug": _hotplug,
         "plan_id": None if _plan is None else _plan.plan_id,
         "strategy": None if _plan is None else _plan.strategy,
         "arm": _arm,
@@ -948,7 +1146,7 @@ def status() -> dict[str, Any]:
         # A captured pass routes by its padded rows; these are the ones planned.
         "capture_rows": _declared_rows(),
         "span_ops": tuple(_spans),
-        "bound": tuple(sorted(_bound)),
+        "bound": sorted(_bound),
         "refusals": tuple(_refusals),
     }
 
@@ -978,8 +1176,9 @@ def overhead_probe(
 
 
 def _reset_for_testing() -> None:
-    """Forget the plan, the binds and the record (tests only)."""
+    """Forget the plan, the binds, the hot-plug boot and the record (tests only)."""
     global _plan, _owned, _last, _kill_switch, _strict, _on_decline, _requested
+    global _hotplug
     with _lock:
         _bound.clear()
         _registered.clear()
@@ -990,6 +1189,7 @@ def _reset_for_testing() -> None:
         _warned_misses.clear()
         _plan, _owned, _last, _requested = None, frozenset(), None, None
         _kill_switch, _strict, _on_decline = False, False, "native"
+        _hotplug = False
         set_arm("plugin")
 
 

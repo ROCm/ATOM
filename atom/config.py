@@ -2211,6 +2211,11 @@ class Config:
     # process resolves it to the plugin plan. None: native. --plugin-arm.
     plugin_source: Any = None
     plugin_arm: str = "plugin"
+    # --plugin-hotplug / ATOM_PLUGIN_HOTPLUG=1: bind every seam when the model
+    # is built (even with no plan installed) so a plan and arm can be switched
+    # at runtime and the affected decode CUDA graphs recaptured, instead of
+    # rebuilding the model. Enables nothing by itself; a recipe still does.
+    plugin_hotplug: bool = False
     # only for quark_online_quantization
     online_quant_config: dict | None = None
     hf_overrides: dict[str, Any] | None = None

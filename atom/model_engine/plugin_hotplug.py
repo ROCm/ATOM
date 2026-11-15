@@ -1,0 +1,427 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Wire shapes of the plugin hot-plug command, without the engine behind them.
+
+The API server, the engine core manager and the model runner all need to agree
+on what a ``POST /plugin/hotplug`` body is and on how the per-rank reports of a
+hot-plug are merged.  Each of those three modules imports an inference engine
+(AITER, the model runner, FastAPI); this one imports neither, so the payload
+rules and the row arithmetic can be exercised on a CPU with only a recipe.
+
+Nothing here touches the GPU or the plugin host's state: a payload is parsed
+into a :class:`HotplugRequest`, the runner resolves and applies it, and the
+manager merges what the ranks report.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from atom import plugin_recipe
+
+# The utility command the EngineCore handler registers, and the internal
+# endpoint that sends it.  Shared constants so the three planes cannot drift.
+HOTPLUG_CMD = "hotplug_plugin"
+HOTPLUG_ENDPOINT = "/plugin/hotplug"
+# A capture of a handful of decode buckets is seconds, not minutes; the
+# default leaves room for a slow first kernel build without waiting on a
+# wedged rank forever.  Overridable per request ("timeout", seconds).
+DEFAULT_HOTPLUG_TIMEOUT_S = 300.0
+
+
+class HotplugPayloadError(ValueError):
+    """A request the endpoint can refuse with its ``reason`` and a HTTP 400."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class HotplugRequest:
+    """What the endpoint validated: a plan source plus what to do with it.
+
+    ``source`` is a ``plugin_recipe.RecipeSource`` (plain, picklable data) and
+    is what travels to every TP rank; each rank resolves it to the same Plan
+    (the ``plan_id`` checks that).  ``rows`` are padded ``running_tokens`` of
+    the decode request graphs to capture -- empty means "derive them from the
+    plan" (the runner does that, since only it knows the verify width).
+    """
+
+    source: Any
+    arm: str
+    rows: tuple[int, ...]
+    capture: bool
+    timeout: float
+
+
+def _canonical(document: Any) -> str:
+    """The canonical JSON text a recipe is carried as.
+
+    Byte-identical to ``atom.plugin_recipe``'s own canonical form, because a
+    ``RecipeSource`` compares the plan it resolves to against the ``plan_id``
+    computed when it was built.
+    """
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _documents_of(items: Iterable[Any]) -> tuple[str, ...]:
+    """Recipe documents given as JSON text, as mappings, or as file paths."""
+    documents: list[str] = []
+    for item in items:
+        if isinstance(item, Mapping):
+            documents.extend(_documents_of([_canonical(item)]))
+        elif isinstance(item, str) and item.strip():
+            text = item.strip()
+            try:
+                documents.append(_canonical(json.loads(text)))
+                continue
+            except ValueError:
+                pass
+            path = Path(text)
+            if path.is_dir():
+                files = sorted(path.glob("*.json"))
+            elif path.is_file():
+                files = [path]
+            else:
+                raise HotplugPayloadError(
+                    "recipe-unreadable",
+                    f"recipe item is neither JSON text nor an existing path: "
+                    f"{text[:120]!r}",
+                )
+            for file in files:
+                try:
+                    documents.append(
+                        _canonical(json.loads(file.read_text(encoding="utf-8")))
+                    )
+                except (OSError, ValueError) as error:
+                    raise HotplugPayloadError(
+                        "recipe-unreadable", f"{file}: {error}"
+                    ) from error
+        else:
+            raise HotplugPayloadError(
+                "payload-schema",
+                "recipe must be a list of JSON strings, recipe objects or paths",
+            )
+    return tuple(documents)
+
+
+def _plan_of(documents: tuple[str, ...], enable: tuple[str, ...]):
+    """Recipes plus ``enable`` -> Plan, through the recipe module's own rules.
+
+    ``atom.plugin_recipe._plan_of`` is the one function that both applies the
+    ``--plugin-enable`` narrowing and computes the plan id a ``RecipeSource``
+    checks itself against; re-deriving either here would let the two drift.
+    Falls back to the public pieces if the helper ever moves.
+    """
+    plan_of = getattr(plugin_recipe, "_plan_of", None)
+    if callable(plan_of):
+        return plan_of(documents, enable)
+    plan = (
+        plugin_recipe.resolve([json.loads(d) for d in documents]) if documents else None
+    )
+    names = plugin_recipe.shorthand(enable)
+    if plan is None or names is None:
+        return names if plan is None else plan
+    arms = dict(plan.arms)
+    arms["plugin"] = arms["identity"] = names.providers
+    return plugin_recipe.replace(
+        plan,
+        arms=plugin_recipe.MappingProxyType(arms),
+        plan_id=plugin_recipe._digest([plan.plan_id, "enable", names.providers]),
+    )
+
+
+def source_from_body(
+    recipe: Any = None,
+    enable: Any = None,
+    arm: str = "plugin",
+    model_arch: str | None = None,
+):
+    """The ``RecipeSource`` a hot-plug body names, validated now.
+
+    Resolving once here refuses a bad recipe at the endpoint, before any rank
+    is asked to change its plan; the source (not the plan) travels so each rank
+    resolves it again and the ``plan_id`` catches a recipe that resolves
+    differently in a worker.
+    """
+    if recipe is None:
+        recipe = []
+    if isinstance(recipe, (str, Mapping)):
+        recipe = [recipe]
+    if not isinstance(recipe, (list, tuple)):
+        raise HotplugPayloadError("payload-schema", "recipe must be a list")
+
+    if enable is None:
+        enable = []
+    if isinstance(enable, str):
+        enable = [n.strip() for n in enable.split(",") if n.strip()]
+    if not isinstance(enable, (list, tuple)) or not all(
+        isinstance(n, str) and n for n in enable
+    ):
+        raise HotplugPayloadError(
+            "payload-schema", "enable must be a list of non-empty names"
+        )
+    names = tuple(dict.fromkeys(enable))
+    if not recipe and not names:
+        raise HotplugPayloadError(
+            "no-recipe",
+            "a hot-plug needs a recipe and/or an enable list; use arm=native "
+            "with a recipe to switch an installed plan to the native arm",
+        )
+
+    documents = _documents_of(recipe)
+    plan = _plan_of(documents, names)
+    if plan is None:
+        raise HotplugPayloadError("no-recipe", "the recipe/enable list is empty")
+    if model_arch is not None and plan.model_arch != model_arch:
+        raise HotplugPayloadError(
+            "recipe-model-mismatch",
+            f"recipe is for {plan.model_arch!r}, this server serves {model_arch!r}",
+        )
+    if not isinstance(arm, str) or not arm:
+        raise HotplugPayloadError("payload-schema", "arm must be a non-empty string")
+    if arm not in plan.arms:
+        raise HotplugPayloadError(
+            "unknown-arm",
+            f"{arm!r} not in {sorted(plan.arms)}; a hot-plug switches arms of a "
+            f"recipe, it cannot add one",
+        )
+    return plugin_recipe.RecipeSource(
+        documents=documents,
+        enable=names,
+        plan_id=plan.plan_id,
+        empty=plan.empty,
+    )
+
+
+def _positive_int(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise HotplugPayloadError(
+            "rows-invalid", f"{where} must be a positive integer, got {value!r}"
+        )
+    return value
+
+
+def parse_hotplug_payload(
+    body: Mapping[str, Any], *, model_arch: str | None = None
+) -> HotplugRequest:
+    """Validate a ``POST /plugin/hotplug`` body; raise ``HotplugPayloadError``.
+
+    Unknown keys are ignored on purpose: the internal caller and the server
+    version are updated separately, and a stray field is not a reason to refuse
+    a plan switch once every field that matters has been checked.
+    """
+    if not isinstance(body, Mapping):
+        raise HotplugPayloadError("payload-schema", "body must be a JSON object")
+
+    source = source_from_body(
+        body.get("recipe"),
+        body.get("enable"),
+        body.get("arm", "plugin"),
+        model_arch=model_arch,
+    )
+
+    raw_rows = body.get("rows", [])
+    if raw_rows is None:
+        raw_rows = []
+    if not isinstance(raw_rows, (list, tuple)):
+        raise HotplugPayloadError("payload-schema", "rows must be a list")
+    rows = tuple(sorted({_positive_int(row, "rows[]") for row in raw_rows}))
+
+    capture = body.get("capture", True)
+    if not isinstance(capture, bool):
+        raise HotplugPayloadError(
+            "payload-schema", f"capture must be true or false, got {capture!r}"
+        )
+
+    timeout = body.get("timeout", DEFAULT_HOTPLUG_TIMEOUT_S)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise HotplugPayloadError("payload-schema", "timeout must be a number")
+    if timeout <= 0:
+        raise HotplugPayloadError("payload-schema", "timeout must be positive")
+
+    return HotplugRequest(
+        source=source,
+        arm=body.get("arm", "plugin"),
+        rows=rows,
+        capture=capture,
+        timeout=float(timeout),
+    )
+
+
+def capture_rows(plan: Any, full_q_len: int | None = None) -> list[int]:
+    """The padded rows a plan's capture tables declare, ascending.
+
+    A plan's tables are keyed by ``"any"``, ``"eager"`` or a padded-rows int; a
+    DSpark recipe set also declares the draft pass's rows (``bs * mtp_k``).
+    ``full_q_len`` restricts the answer to target verify rows (``bs *
+    (1 + mtp_k)``), which are the only ones a decode request graph is keyed by.
+    """
+    if plan is None:
+        return []
+    rows = sorted(
+        int(key)
+        for key in plan.tables
+        if isinstance(key, int) and not isinstance(key, bool) and key > 0
+    )
+    if full_q_len:
+        rows = [row for row in rows if row % int(full_q_len) == 0]
+    return rows
+
+
+def default_capture_rows(
+    plan: Any, full_q_len: int, ladder: Iterable[int]
+) -> list[int]:
+    """Which rows to recapture when the request names none.
+
+    A plan whose capture tables touch buckets this server recorded is
+    targeted: recapture exactly those.  A plan that only changes the ``any`` /
+    ``eager`` tables (or whose capture buckets are all outside this server's
+    ladder) changes every recorded graph's decisions, so recapture the whole
+    ladder.
+    """
+    ladder = sorted({int(bs) for bs in ladder})
+    targeted = [
+        row
+        for row in capture_rows(plan, full_q_len)
+        if row // int(full_q_len) in set(ladder)
+    ]
+    if targeted:
+        return targeted
+    return [bs * int(full_q_len) for bs in ladder]
+
+
+def rows_to_bs(rows: Iterable[int], full_q_len: int) -> list[int]:
+    """Padded ``running_tokens`` -> the decode batch sizes they replay.
+
+    Rows are the *padded* token count of a decode step, so a row is a legal
+    request bucket only when it divides by the verify width: ``bs =
+    row // (mtp_k + 1)``.  Anything else is a draft-pass row or a recipe
+    authored for another deployment, and recapturing it would record a target
+    graph under a bucket the runtime never asks for.
+    """
+    full_q_len = int(full_q_len)
+    if full_q_len < 1:
+        raise HotplugPayloadError("rows-invalid", f"full_q_len {full_q_len} < 1")
+    sizes: set[int] = set()
+    for row in rows:
+        row = _positive_int(row, "rows[]")
+        if row % full_q_len:
+            raise HotplugPayloadError(
+                "rows-not-decodable",
+                f"row {row} is not a multiple of the verify width {full_q_len} "
+                f"(mtp_k + 1); only target decode rows can be recaptured",
+            )
+        sizes.add(row // full_q_len)
+    return sorted(sizes)
+
+
+def aggregate_reports(reports: Iterable[Mapping[str, Any]]) -> dict:
+    """Merge the per-engine rank-0 reports of one hot-plug into the reply.
+
+    A refusal has already been raised by the manager's synchronous broadcast
+    (it inspects each engine's ``error``), so every input here is a successful
+    report; the check that their plan ids agree is what makes "one plan on
+    every rank" observable rather than assumed.
+    """
+    reports = [dict(report or {}) for report in reports]
+    if not reports:
+        raise RuntimeError("no engine reported this hot-plug")
+    plan_ids = {report.get("plan_id") for report in reports}
+    if len(plan_ids) > 1:
+        raise HotplugPayloadError(
+            "plan-id-mismatch",
+            f"the ranks resolved the request to different plans: {sorted(plan_ids)}",
+        )
+    captured = [report for report in reports if report.get("status") == "ok"]
+    rows = sorted({int(row) for report in captured for row in report.get("rows") or ()})
+    sizes = sorted(
+        {int(size) for report in captured for size in report.get("sizes") or ()}
+    )
+    return {
+        "status": "ok",
+        "plan_id": next(iter(plan_ids)),
+        "rows": rows,
+        "sizes": sizes,
+        "capture_seconds": max(
+            (float(report.get("capture_seconds") or 0.0) for report in reports),
+            default=0.0,
+        ),
+        "ranks": reports,
+    }
+
+
+def hotplug_enabled(config: Any = None) -> bool:
+    """Whether this server permits a runtime plan switch.
+
+    ``--plugin-hotplug`` (or ``ATOM_PLUGIN_HOTPLUG=1``, folded into the same
+    Config field when the engine args are parsed) binds every seam at build
+    time and keeps the process able to install a plan later.  The environment
+    is consulted only when a Config was built without the field at all.
+    """
+    if bool(getattr(config, "plugin_hotplug", False)):
+        return True
+    from atom.utils import envs  # heavy package: only the fallback needs it
+
+    return bool(envs.ATOM_PLUGIN_HOTPLUG)
+
+
+def topology_refusal(config: Any) -> str | None:
+    """Why this deployment cannot hot-plug its decode graphs, if it cannot.
+
+    A capture is a whole-TP-group operation and this first cut orchestrates one
+    engine at a time: under data parallelism the DP peers would have to pause
+    and capture in lockstep (their MoE/attention collectives are captured too)
+    and under pipeline parallelism the verify width differs per stage.  Both
+    are follow-ups; refusing them is better than capturing a graph whose
+    collective the peers are not in.
+    """
+    if getattr(config, "pipeline_parallel_size", 1) > 1:
+        return "pipeline parallelism (pp > 1) is not supported by hot-plug yet"
+    parallel = getattr(config, "parallel_config", None)
+    if getattr(parallel, "data_parallel_size", 1) > 1:
+        return "data parallelism (dp > 1) is not supported by hot-plug yet"
+    if getattr(config, "enable_dp_attention", False):
+        return "DP attention is not supported by hot-plug yet"
+    if getattr(config, "enable_rapidserve", False):
+        return (
+            "intra-GPU prefill/decode disaggregation is not supported by "
+            "hot-plug yet"
+        )
+    return None
+
+
+def refusal_status(error: BaseException) -> int:
+    """The HTTP status a hot-plug failure should answer with.
+
+    A recipe or payload the caller can fix is a 400; anything the engine state
+    refuses (hot-plug off, unsupported topology, a plan the host declines, a
+    capture that failed) is a 409, and a rank that did not answer in time is a
+    504.  The endpoint never answers 500 for these: a refusal is not a server
+    bug, and a caller polling a fleet needs to tell the two apart.
+    """
+    if isinstance(error, (HotplugPayloadError, plugin_recipe.RecipeRefused)):
+        return 400
+    if isinstance(error, TimeoutError):
+        return 504
+    if isinstance(error, ValueError):
+        return 400
+    return 409
+
+
+def refusal_reason(error: BaseException) -> str:
+    """The short reason code an endpoint puts beside a refusal's message."""
+    reason = getattr(error, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    if isinstance(error, TimeoutError):
+        return "hotplug-timeout"
+    if isinstance(error, ValueError):
+        return "hotplug-refused"
+    return "hotplug-failed"

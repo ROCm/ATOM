@@ -188,6 +188,7 @@ class EngineArgs:
     plugin_recipe: str | None = None
     plugin_enable: str | None = None
     plugin_arm: str = "plugin"
+    plugin_hotplug: bool = False
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -842,6 +843,15 @@ class EngineArgs:
             help="Which planned plugins serve: plugin (all), native (none), "
             "identity (decide, run native) or a recipe arm.",
         )
+        plugins.add_argument(
+            "--plugin-hotplug",
+            action="store_true",
+            help="Keep the plugin host hot-pluggable: bind every seam at build "
+            "time and expose the internal POST /plugin/hotplug endpoint, which "
+            "switches the plan/arm and recaptures the requested decode CUDA "
+            "graphs without a restart. ATOM_PLUGIN_HOTPLUG=1 sets the same "
+            "flag.",
+        )
         dcp_group = parser.add_argument_group("DCP options")
         dcp_group.add_argument(
             "--dcp-config",
@@ -1001,6 +1011,11 @@ class EngineArgs:
         # worker exists; the Plan rides Config to every worker.
         kwargs["plugin_source"] = plugin_recipe.from_cli(
             kwargs.pop("plugin_recipe"), kwargs.pop("plugin_enable"), self.plugin_arm
+        )
+        # ATOM_PLUGIN_HOTPLUG=1 is the env fallback for --plugin-hotplug; it
+        # only permits a runtime plan switch, it enables no plugin.
+        kwargs["plugin_hotplug"] = bool(
+            kwargs.get("plugin_hotplug") or envs.ATOM_PLUGIN_HOTPLUG
         )
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).

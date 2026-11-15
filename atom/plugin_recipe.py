@@ -442,6 +442,83 @@ def from_cli(
     return RecipeSource(documents, names, plan.plan_id, plan.empty)
 
 
+def _document_text(document: Any, where: str) -> str:
+    """One recipe document (JSON text, bytes or a decoded object) as JSON text."""
+    if isinstance(document, Mapping):
+        return _canonical(dict(document))
+    if isinstance(document, (bytes, bytearray)):
+        document = document.decode("utf-8")
+    if isinstance(document, str):
+        try:
+            decoded = json.loads(document)
+        except ValueError as error:
+            raise RecipeRefused("recipe-schema", f"{where}: {error}") from error
+        if not isinstance(decoded, Mapping):
+            raise RecipeRefused("recipe-schema", f"{where}: a recipe is an object")
+        return document
+    raise RecipeRefused("recipe-schema", f"{where}: {type(document).__name__}")
+
+
+def _enable_names(enable: Any) -> tuple[str, ...]:
+    if enable is None:
+        return ()
+    if isinstance(enable, str):
+        enable = enable.split(",")
+    return tuple(
+        dict.fromkeys(n.strip() for n in _names(enable, "enable") if n.strip())
+    )
+
+
+def from_payload(payload: Any) -> RecipeSource | None:
+    """The ``RecipeSource`` a hot-plug payload describes.
+
+    The payload is plain, picklable data so an engine can carry it to a
+    worker: a ``RecipeSource`` (returned as is); a mapping with ``documents``
+    (or ``recipe``: recipe JSON texts, or decoded documents) and ``enable``
+    names, plus an optional ``plan_id`` to check; one recipe document; or one
+    recipe JSON text. None or nothing at all is the empty source: no plugin.
+    The source is not resolved here; ``.resolve()`` checks it against this
+    ATOM (the optional ``plan_id`` must then agree).
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, RecipeSource):
+        return payload
+    plan_id = None
+    if isinstance(payload, Mapping):
+        if "schema" in payload:  # one decoded recipe document
+            documents, enable = (payload,), ()
+        else:
+            documents = payload.get("documents", payload.get("recipe", ()))
+            enable = payload.get("enable", ())
+            plan_id = payload.get("plan_id")
+    elif isinstance(payload, (str, bytes)):
+        documents, enable = (payload,), ()
+    else:
+        try:
+            documents = tuple(payload)
+        except TypeError as error:
+            raise RecipeRefused(
+                "recipe-schema", f"payload documents: {type(payload).__name__}"
+            ) from error
+    if isinstance(documents, (str, bytes, Mapping)):
+        documents = (documents,)
+    texts = tuple(
+        _document_text(document, f"documents[{index}]")
+        for index, document in enumerate(documents)
+    )
+    names = _enable_names(enable)
+    plan = _plan_of(texts, names)
+    if plan is None:
+        return RecipeSource(texts, names, "", True)
+    if plan_id is not None and plan_id != plan.plan_id:
+        raise RecipeRefused(
+            "recipe-set-conflict",
+            f"payload plan_id {plan_id!r} does not resolve to the same plan here",
+        )
+    return RecipeSource(texts, names, plan.plan_id, plan.empty)
+
+
 def check_runtime(plan: Plan, config: Any) -> None:
     """``runtime.expect``: the server must be the one the recipe was made for."""
     actual = {

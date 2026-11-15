@@ -674,6 +674,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "1": ask every owner of a seam and raise when two accept one call (their
     # cells overlap). Off by default; like the switch above it enables nothing.
     "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
+    # Plugin hot-plug: "1" is the env fallback for --plugin-hotplug. It makes
+    # the host bind every seam at model build and exposes the internal
+    # POST /plugin/hotplug endpoint, which switches the plan/arm and recaptures
+    # the requested decode graphs in place. It enables no plugin and changes
+    # no routing by itself.
+    "ATOM_PLUGIN_HOTPLUG": lambda: os.getenv("ATOM_PLUGIN_HOTPLUG", "0") == "1",
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

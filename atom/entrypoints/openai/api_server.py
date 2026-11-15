@@ -50,6 +50,15 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import load_tokenizer
+from atom.model_engine.plugin_hotplug import (
+    HOTPLUG_ENDPOINT,
+    HotplugPayloadError,
+    hotplug_enabled,
+    parse_hotplug_payload,
+    refusal_reason,
+    refusal_status,
+    topology_refusal,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
@@ -3678,6 +3687,104 @@ async def stop_profile():
     except Exception as e:
         logger.exception("Failed to stop profiling")
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
+
+
+def _plugin_hotplug_error(status: int, error: BaseException) -> JSONResponse:
+    """A refusal envelope with its reason code; never a bare 500 for one."""
+    return JSONResponse(
+        status_code=status,
+        content={
+            "status": "error",
+            "error": {
+                "reason": refusal_reason(error),
+                "message": str(error),
+            },
+        },
+    )
+
+
+@_engine_route(HOTPLUG_ENDPOINT, methods=["POST"], include_in_schema=False)
+async def plugin_hotplug(request: Request):
+    """Install a new plugin plan/arm and recapture decode graphs, in place.
+
+    Internal endpoint (deliberately absent from the OpenAI schema): the plugin
+    hot-plug client and the benchmark harness call it to change which planned
+    plugins serve while the server keeps running.  The body is::
+
+        {
+          "recipe": ["<recipe JSON text>" | "<path>" | {...recipe document}],
+          "enable": ["plugin-name", ...],   # optional, narrows the recipes
+          "arm": "plugin",                  # optional, one of the plan's arms
+          "rows": [8, 16, ...],             # optional padded running_tokens;
+                                            # omitted: rows the plan declares
+                                            # (else every recorded bucket)
+          "capture": true                   # optional, default true
+        }
+
+    The answer carries ``plan_id``, the rows and buckets actually recaptured,
+    ``capture_seconds``, and one report per rank.  Recipe/binding errors are a
+    400 with the reason, a state or capture refusal a 409, and a rank that
+    misses its deadline a 504; the server stays up for all of them.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    config = _get_engine_config()
+    if config is None:
+        raise HTTPException(status_code=503, detail="Engine has no config yet")
+    if not hotplug_enabled(config):
+        return _plugin_hotplug_error(
+            409,
+            RuntimeError(
+                "plugin hot-plug is off; start the server with --plugin-hotplug "
+                "or ATOM_PLUGIN_HOTPLUG=1"
+            ),
+        )
+    unsupported = topology_refusal(config)
+    if unsupported is not None:
+        error = RuntimeError(unsupported)
+        error.reason = "topology-unsupported"
+        return _plugin_hotplug_error(409, error)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - the body, not the server, is wrong
+        return _plugin_hotplug_error(
+            400, HotplugPayloadError("payload-schema", "body is not valid JSON")
+        )
+    hf = getattr(config, "hf_config", None)
+    architectures = getattr(hf, "architectures", None) or [None]
+    try:
+        hotplug = parse_hotplug_payload(body, model_arch=architectures[0])
+    except Exception as exc:  # noqa: BLE001 - a validated refusal, not a crash
+        return _plugin_hotplug_error(refusal_status(exc), exc)
+
+    manager = getattr(engine, "core_mgr", None)
+    call = getattr(manager, "hotplug_plugin", None)
+    if not callable(call):
+        return _plugin_hotplug_error(
+            409,
+            RuntimeError(
+                "this engine manager cannot hot-plug a plugin plan "
+                "(no hotplug_plugin method)"
+            ),
+        )
+
+    payload = {
+        "source": hotplug.source,
+        "arm": hotplug.arm,
+        "rows": list(hotplug.rows),
+        "capture": hotplug.capture,
+    }
+    try:
+        # In a thread: a capture takes seconds and this loop also delivers
+        # every open SSE stream.
+        result = await asyncio.to_thread(call, payload, hotplug.timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - answered as a refusal, not a crash
+        logger.exception("plugin hotplug failed")
+        return _plugin_hotplug_error(refusal_status(exc), exc)
+    return JSONResponse(result)
 
 
 # ============================================================================
