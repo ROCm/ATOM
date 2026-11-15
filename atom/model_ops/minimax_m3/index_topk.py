@@ -1177,7 +1177,7 @@ def minimax_m3_index_topk(
     ``index_kv_cache`` is the uint8 ``[num_blocks, 8704]`` page cache and aiter's
     FlyDSL prefill scorer writes the scores into ``index_scorer.scores`` (shared by
     every layer, never filled: the selection reads a row only up to its valid
-    blocks). Without one the Triton scorer runs. ``pages_per_block`` /
+    blocks). Without one the FP8 scorer runs (:func:`prefill_index_score`). ``pages_per_block`` /
     ``block_page_stride`` describe the emitted block table: 8 / 8 page-16 SHUFFLE,
     1 / 1 MXFP4 KV.
 

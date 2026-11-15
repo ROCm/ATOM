@@ -1814,8 +1814,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         world*topk keys per token at any context length.
 
         ``index_scorer`` (the MXFP4 index cache's, the step's record of this shard)
-        scores with aiter's FlyDSL scorer into its workspace; without one the
-        Triton scorer reads the BF16/FP8 cache.
+        scores with aiter's FlyDSL MXFP4 scorer into its workspace; without one the
+        FP8 cache is scored by the FlyDSL FP8 scorer on the step's
+        ``index_score_work_map`` (the shard's map, at its local ``index_score_max_block``).
         """
         from atom.distributed.indexer_cp import exchange_candidates
         from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
