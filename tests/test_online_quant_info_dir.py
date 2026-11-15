@@ -1,37 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Tests for the directory rank 0's online-quantization dump lands in.
 
-import importlib
 from types import SimpleNamespace
 
 import pytest
-
-
-def _import_loader():
-    """The loader module, against AITER's stand-ins when it cannot import.
-
-    Its import chain binds AITER kernels, which a CPU-only runner does not
-    have. ``atom_under_stubs`` drops the modules it imported on the way out;
-    the module object returned here keeps its own globals, which is all these
-    tests reach for.
-    """
-    try:
-        return importlib.import_module("atom.model_loader.loader")
-    except ImportError as exc:
-        # A third-party module missing is this CPU image. An import error
-        # naming one of ours is a bug in the loader and has to surface
-        # (tests/import_guard.py's rule), not be retried behind stand-ins.
-        if (exc.name or "").startswith("atom"):
-            raise
-        from aiter_stub import atom_under_stubs
-
-        with atom_under_stubs() as load:
-            return load("atom.model_loader.loader")
+from aiter_stub import atom_without_aiter
 
 
 @pytest.fixture(scope="module")
 def loader():
-    return _import_loader()
+    """The loader module, against AITER's stand-ins when it cannot import.
+
+    Its import chain binds AITER kernels, which a CPU-only runner does not
+    have. The stand-ins drop the modules they imported on the way out; the
+    module object returned here keeps its own globals, which is all these
+    tests reach for.
+    """
+    with atom_without_aiter() as load:
+        return load("atom.model_loader.loader")
 
 
 @pytest.fixture(autouse=True)
