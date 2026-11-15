@@ -28,7 +28,7 @@ logger = logging.getLogger("atom")
 
 # The tuned FHMoE rows (aiter/configs/tuned_fhmoe.csv) cover 1..2048 rows.
 MAX_ROWS = 2048
-A8_MAX_ROWS = 4  # ATOM_M3_FHMOE_ACT=auto: MXFP8 activations up to here, MXFP4 above
+A4_FROM_ROWS = 256  # ATOM_M3_FHMOE_ACT=auto: MXFP8 activations below this many rows, MXFP4 from here (production routed is a4w4 from 256 too)
 _ACTS = ("auto", "a8", "a4")
 # Per-rank shape the rows are tuned for: MiniMax-M3.1 at TP4.
 _HIDDEN, _INTER, _ROUTED, _TOP_K, _TP = 6144, 768, 128, 4, 4
@@ -46,7 +46,7 @@ def act_mode() -> str:
 def pick_act(rows: int) -> str:
     """The activation dtype ('a8' MXFP8, 'a4' MXFP4) of a step of ``rows`` rows."""
     act = act_mode()
-    return ("a8" if rows <= A8_MAX_ROWS else "a4") if act == "auto" else act
+    return ("a8" if rows < A4_FROM_ROWS else "a4") if act == "auto" else act
 
 
 def refusal(
