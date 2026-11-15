@@ -1011,6 +1011,10 @@ models:
               # drop cannot reach, and compacting it for 768 GiB timed out
               # (owner registration then fails), so NUMA0 takes more.
               MOONCAKE_STORE_OWNERS: "0:832:rdma4,rdma5;1:448:rdma6,rdma7"
+              # The owners pin before the workers start; dropping the
+              # checkpoint's cache while they load left the TP4 decode faulting
+              # it from NFS at under 100 MB/s, past the 5000 s start limit.
+              MOONCAKE_STORE_PAGE_CACHE_DROP_FOR: "0"
             decode: *glm52_cpp4_dcp4_decode_env
           router: &kv_events_router
             policy: cache_aware
