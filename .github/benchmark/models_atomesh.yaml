@@ -17247,6 +17247,21 @@ models:
               <<: *m31_ax5035_mc_env
               ATOMESH_M31_D_MAX_SEQS: "10"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        # D cap = C/8, as C64/dcap8 (+27.5% over the single-node curve, TTFT p90 2.3 s).
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c40-dcap5
+          concurrency: [40]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "5"
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-c56-dcap7
+          concurrency: [56]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "7"
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case
