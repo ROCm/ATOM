@@ -51,11 +51,13 @@ HYBRID_MAX_ROWS = 64
 # ATOM_MONO_WIDTHS overrides per run.
 # Widths whose whole-layer build all-reduces o_proj tag-free (``o_flag``: plain bf16 payload + flag pairs, bit-equal to the tagged form;
 # task-mono-wide-r4/RESULTS.md, TP4, ctx 2K, q4, in-process A/B, 4 passes, A/A control +-0.3 us): the wide o stage ends
-# 2.0-2.3 us earlier at 64 rows (E 60 / 97 / 110), 1.8-2.0 at 48 (not under the 2 us rule at every E), 0.4-0.5 at 32 (no gain).
+# 2.0-2.3 us earlier at 64 rows (E 60 / 97 / 110), 1.8-2.0 at 48, 0.4-0.5 at 32 (no gain). 48 rows is enabled since task-two-style/expA/RESULTS.md: whole-layer
+# harness, random expert weights, 4-12 interleaved passes, o_flag alone -4.1 / -4.3 / -4.4 us a layer at E 59 / 65 / 73 (every pass negative, A/A range 0.5-2.0 us).
 O_FLAG_WIDTHS: tuple[int, ...] = (48, 64)
 # the whole-layer back half's options per width (build kwargs, ``hybrid.back_options``): measured in the TP4 harness, ctx 2K, q=4,
 # slowest-rank replay time, 4 interleaved passes (task-mono-wide-opt/RESULTS.md): the tag-free FFN all-reduce (``ar_flag``) wins at 64 rows
-# (-2.9 / -3.5 / -4.8 us at 59 / 93 / 112 distinct experts), is within the spread at 48 (-1.9 / -2.0) and loses at 32 (+0.5 / +1.6)
+# (-2.9 / -3.5 / -4.8 us at 59 / 93 / 112 distinct experts), loses at 32 (+0.5 / +1.6) and, at 48, adds to o_flag -1.6 / -2.5 / -0.6 us at E 59 / 65 / 73 on its own
+# (both flags together -5.8 / -6.5 / -4.9 us; in-server ITL -2.7% DSpark c12, -2.9% non-spec c48 against the build without them: task-two-style/expA/RESULTS.md)
 BACK_OPTIONS: dict[int, dict] = {48: {"ar_flag": 1}, 64: {"ar_flag": 1}}
 MEASURED_HYBRID: str | None = None
 MEASURED_WIDE: str | None = "32:mono,48:mono,64:mono"
