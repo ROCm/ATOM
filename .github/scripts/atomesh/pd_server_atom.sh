@@ -106,6 +106,7 @@ PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
 ROUTER_POLICY="${ROUTER_POLICY:-random}"
+ROUTER_KV_EVENTS="${ROUTER_KV_EVENTS:-false}"
 ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
@@ -130,6 +131,9 @@ ATOMESH_MOONCAKE_MASTER_PORT="${ATOMESH_MOONCAKE_MASTER_PORT:-26051}"
 ATOMESH_MOONCAKE_METADATA_PORT="${ATOMESH_MOONCAKE_METADATA_PORT:-26080}"
 ATOMESH_MOONCAKE_METRICS_PORT="${ATOMESH_MOONCAKE_METRICS_PORT:-26090}"
 ATOMESH_MOONCAKE_OWNER_PORT="${ATOMESH_MOONCAKE_OWNER_PORT:-26052}"
+# KV events (ROUTER_KV_EVENTS=true): prefill worker i of a node publishes from
+# the base + 32 * i plus its DP rank, and replays from 16 ports further.
+ATOMESH_KV_EVENTS_PORT="${ATOMESH_KV_EVENTS_PORT:-5557}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
@@ -156,6 +160,7 @@ ATOMESH_MOONCAKE_MASTER_PORT=$((ATOMESH_MOONCAKE_MASTER_PORT + ATOMESH_SERVICE_P
 ATOMESH_MOONCAKE_METADATA_PORT=$((ATOMESH_MOONCAKE_METADATA_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ATOMESH_MOONCAKE_METRICS_PORT=$((ATOMESH_MOONCAKE_METRICS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 ATOMESH_MOONCAKE_OWNER_PORT=$((ATOMESH_MOONCAKE_OWNER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_KV_EVENTS_PORT=$((ATOMESH_KV_EVENTS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 validate_shifted_port() {
   local name="$1"
   local value="${!name}"
@@ -173,7 +178,8 @@ for shifted_port_name in \
   PREFILL_DP_MASTER_PORT \
   PREFILL_DP_BASE_PORT \
   DECODE_DP_MASTER_PORT \
-  DECODE_DP_BASE_PORT; do
+  DECODE_DP_BASE_PORT \
+  ATOMESH_KV_EVENTS_PORT; do
   validate_shifted_port "${shifted_port_name}"
 done
 # The Store's ports only bound the offset when it runs (mooncake_store_requested).
@@ -2052,6 +2058,16 @@ start_prefill() {
   fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
+  local -a prefill_kv_events_env=()
+  if [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]]; then
+    # The router reads a wildcard host as this worker's.
+    local kv_events_port=$((ATOMESH_KV_EVENTS_PORT + 32 * (server_port - PREFILL_PORT)))
+    prefill_kv_events_env=(
+      "ATOM_KV_EVENTS_ENABLE=1"
+      "ATOM_KV_EVENTS_ENDPOINT=tcp://*:${kv_events_port}"
+      "ATOM_KV_EVENTS_REPLAY_ENDPOINT=tcp://*:$((kv_events_port + 16))"
+    )
+  fi
   local -a prefill_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     prefill_dp_env=(
@@ -2075,8 +2091,8 @@ start_prefill() {
     "${prefill_profiler_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_kv_events_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -2247,6 +2263,12 @@ start_router() {
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
+  local -a router_kv_events_args=()
+  if [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]]; then
+    # start_prefill turns the publishers on. A Mooncake Store answers on its
+    # master's metrics port (with per-NIC pools, only the first pool's).
+    router_kv_events_args=(--kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}")
+  fi
   local -a router_cmd=(
     "${mesh_binary}" launch
     --host 0.0.0.0
@@ -2258,6 +2280,7 @@ start_router() {
     "${router_prefill_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
     "${router_dp_aware_args[@]}"
+    "${router_kv_events_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
