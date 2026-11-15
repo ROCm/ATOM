@@ -71,7 +71,10 @@ def test_the_refusal_is_logged_once(caplog):
     [
         ("auto", 1, "a8"),
         ("auto", 4, "a8"),
-        ("auto", 5, "a4"),
+        ("auto", 5, "a8"),
+        ("auto", 64, "a8"),
+        ("auto", 255, "a8"),
+        ("auto", 256, "a4"),
         ("auto", 2048, "a4"),
         ("a8", 64, "a8"),
         ("a4", 1, "a4"),

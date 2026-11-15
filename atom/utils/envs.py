@@ -1125,7 +1125,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3.1 (MXFP4 routed + MXFP8 shared): run the shared expert inside the
     # routed fused MoE (aiter FHMoE) without re-quantizing it: one kernel pair, one
     # atomic add into the MoE output. Activation dtype per step: ATOM_M3_FHMOE_ACT
-    # = auto (MXFP8 for <= 4 rows, MXFP4 above) | a8 | a4. Unsupported configs are
+    # = auto (MXFP8 below 256 rows, MXFP4 from 256, where production is a4w4 too) | a8 | a4. Unsupported configs are
     # refused in the log and keep the unfused path. Off by default.
     "ATOM_M3_FHMOE": lambda: os.getenv("ATOM_M3_FHMOE", "0") == "1",
     "ATOM_M3_FHMOE_ACT": lambda: os.getenv("ATOM_M3_FHMOE_ACT", "auto").lower(),
