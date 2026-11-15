@@ -1,7 +1,8 @@
 //! Follows the KV event stream of every registered worker rank, one task each on a thread
 //! of the monitor's own, so that decoding never holds up the request path. A task's SUB
 //! socket connects once the engine binds, and reconnects after the engine restarts.
-//! Admitted batches go to the writer of the rank's index partition, on the same threads.
+//! Admitted batches go to the writer of the rank's index partition, which has a thread of
+//! its own.
 //! What each stream carried is what `/kv_events/sources` shows.
 
 use std::{
