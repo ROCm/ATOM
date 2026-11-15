@@ -612,13 +612,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
-    # Kimi-K3 gfx1250 mono: all-reduce K2's routed and shared partials inside a
-    # kernel over the TP group's torch.symm_mem buffers (the transport aiter's
-    # custom all-reduce maps across trays) instead of the custom all-reduce
-    # call. Used only where that transport maps every peer. Opt-in until
-    # validated end to end at TP8.
+    # Kimi-K3 gfx1250 mono: all-reduce K2's routed and shared partials, and
+    # o_proj's output, inside kernels over the TP group's torch.symm_mem
+    # buffers (the transport aiter's custom all-reduce maps across trays)
+    # instead of the custom all-reduce call. Used only where that transport
+    # maps every peer; 0 keeps the custom all-reduce call.
     "ATOM_KIMI_MONO_KERNEL_AR": lambda: (
-        os.getenv("ATOM_KIMI_MONO_KERNEL_AR", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_KERNEL_AR", "1") == "1"
     ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
