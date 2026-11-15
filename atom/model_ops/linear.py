@@ -181,15 +181,57 @@ def mxfp4_k_pad_align(quant_config, prefix: str) -> int | None:
     return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
 
 
+# AITER's gfx950 group32 FP8 GEMM (bmm_a8w8_mxscale_gfx950) steps K in 64s and
+# zero-fills no 32-wide tail; gfx1250's runs a ragged K (a 32x32 w_scale).
+GROUP32_FP8_K_ALIGN = 64
+
+
+def _is_fp8_group32(quant_type, quant_dtype) -> bool:
+    # By value, as _is_mxfp4: plugin-mode QuantType members do not compare equal.
+    return (
+        quant_type is not None
+        and quant_type.value == QuantType.per_1x32.value
+        and quant_dtype == dtypes.fp8
+    )
+
+
+def fp8_group32_k_pad_align(quant_config, prefix: str) -> int | None:
+    """K step an MLP pair pads its intermediate to where its down projection
+    (``prefix``) is a native group32 FP8 linear on gfx950; None elsewhere. Pass
+    it as gate_up's output_pad_align and down's input_pad_align, as
+    ``mxfp4_k_pad_align``'s (DeepSeek-V4.1's shared expert at TP8: 288 -> 320).
+
+    TODO(ROCm/aiter#7967): drop the align once bmm_a8w8_mxscale_gfx950 takes a
+    32-wide K tail.
+    """
+    if quant_config is None:
+        return None
+    if not _is_fp8_group32(*effective_layer_quant(quant_config, prefix)):
+        return None
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return GROUP32_FP8_K_ALIGN if get_gfx() == "gfx950" else None
+
+
+def _zero_pad_tail(param, dim: int, start: int, length: int) -> None:
+    """Zero a K-padded pair's pad behind the real shard a load just wrote.
+    Allocation zeroes it too, but a weight sync's loader writes the real shard
+    over a weight already preshuffled, whose bytes in the pad's place belong to
+    other tiles; re-shuffled, they would land in the pad."""
+    if length > 0:
+        param.data.narrow(dim, start, length).view(torch.uint8).zero_()
+
+
 def padded_partition_size(size: int, align: int | None) -> int:
     return size if not align else (size + align - 1) // align * align
 
 
 def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
-    """Like MoE's intermediate_pad: a half that is MXFP4 or bf16 in the
-    checkpoint is padded, zeroed at allocation (byte 0 is finite in e8m0); loads
-    fill the front. A bf16 half may be requantized online (zero rows quantize to
-    zero); other sources would need their scales padded and are refused."""
+    """Like MoE's intermediate_pad: a half that is MXFP4, group32 FP8 or bf16
+    in the checkpoint is padded, zeroed at allocation (byte 0 is finite in
+    e8m0: zero codes under it are exact zeros); loads fill the front. A bf16
+    half may be requantized online (zero rows quantize to zero); other sources
+    would need their scales padded and are refused."""
     qt, dt = layer.quant_type, layer.params_dtype
     if qt.value == QuantType.No.value:
         pass
@@ -199,10 +241,10 @@ def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
             "requantized online; list this MLP in exclude_layer of "
             "--online_quant_config."
         )
-    elif not _is_mxfp4(qt, dt):
+    elif not (_is_mxfp4(qt, dt) or _is_fp8_group32(qt, dt)):
         raise NotImplementedError(
-            f"{prefix}: MXFP4 K padding needs both halves of the MLP pair to be "
-            f"MXFP4 or unquantized in the checkpoint; got {qt.name}."
+            f"{prefix}: K padding needs both halves of the MLP pair to be MXFP4, "
+            f"group32 FP8 or unquantized in the checkpoint; got {qt.name}."
         )
     for name in ("weight", "weight_scale", "bias"):
         p = getattr(layer, name, None)
@@ -2010,6 +2052,7 @@ class MergedColumnParallelLinear(LinearBase):
         # Padded offset; the real shard goes at the front of its slot.
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self._ckpt_output_sizes[loaded_shard_id] // self.tp_size
+        slot_size = self.output_sizes[loaded_shard_id] // self.tp_size
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
@@ -2017,6 +2060,7 @@ class MergedColumnParallelLinear(LinearBase):
                 group = self.weight_scale_row_group
                 shard_offset = (shard_offset + group - 1) // group
                 shard_size = (shard_size + group - 1) // group
+                slot_size = (slot_size + group - 1) // group
             elif self.quant_type == QuantType.per_Tensor:
                 param_data = param_data.narrow(self.tp_dim, loaded_shard_id, 1)
                 if (
@@ -2042,6 +2086,9 @@ class MergedColumnParallelLinear(LinearBase):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param.weight_loader_process(param_data, loaded_weight)
+        _zero_pad_tail(
+            param, self.tp_dim, shard_offset + shard_size, slot_size - shard_size
+        )
 
 
 class QKVZBAParallelLinear(ColumnParallelLinear):
@@ -2830,6 +2877,15 @@ class RowParallelLinear(LinearBase):
                 param_data = param_data.narrow(self.tp_dim, 0, shard_size)
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
+            if self._k_padded:
+                param.weight_loader_process(param_data, loaded_weight)
+                _zero_pad_tail(
+                    param,
+                    self.tp_dim,
+                    shard_size,
+                    param.data.size(self.tp_dim) - shard_size,
+                )
+                return
         else:
             if self.tp_size > 0 and self.tp_rank != 0:
                 loaded_weight.zero_()
