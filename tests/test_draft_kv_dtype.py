@@ -5,7 +5,9 @@ asked, ``SpeculativeConfig.kv_cache_dtype``) and what ``Config`` settles it to
 (``draft_kv_dtype``, the one every reader uses). GPU-free: a real ``Config`` over a
 stubbed HF config."""
 
+import sys
 import types
+from pathlib import Path
 
 import pytest
 from transformers import PretrainedConfig
@@ -22,10 +24,11 @@ from tests.test_v4_indexer_defaults import _GfxProbe, _install_chip_info_stub
 OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
 
 
-def _config(monkeypatch, *, architectures, **overrides):
-    hf_config = PretrainedConfig(
-        architectures=architectures, max_position_embeddings=8192
-    )
+def _config(monkeypatch, *, architectures=None, hf_config=None, **overrides):
+    if hf_config is None:
+        hf_config = PretrainedConfig(
+            architectures=architectures, max_position_embeddings=8192
+        )
     monkeypatch.setattr(
         config_module, "get_hf_config", lambda _m, trust_remote_code=False: hf_config
     )
@@ -40,10 +43,9 @@ def _config(monkeypatch, *, architectures, **overrides):
     monkeypatch.setattr(config_module, "is_plugin_mode", lambda: False)
     _install_chip_info_stub(monkeypatch, _GfxProbe("gfx950"))
     return Config(
-        model="test-model",
         torch_profiler_dir=None,
         compilation_config=CompilationConfig(level=0, use_cudagraph=False),
-        **{"kv_cache_dtype": "bf16", **overrides},
+        **{"model": "test-model", "kv_cache_dtype": "bf16", **overrides},
     )
 
 
@@ -180,3 +182,68 @@ def test_a_draft_dtype_beside_the_targets_cannot_share_the_offload_namespace(
     spec = _dspark_spec(kv_cache_dtype="bf16")
     _llama(monkeypatch, kv_transfer_config=OFFLOAD, speculative_config=spec)
     assert spec.draft_kv_dtype == "bf16"
+
+
+V41_FIXTURES = Path(__file__).parent / "models/deepseek_v41/fixtures"
+
+
+def _v41_dspark(monkeypatch, *, target, asked=None, knob="auto"):
+    """A real `Config` for a native DeepSeek-V4.1 DSpark run (the target checkpoint is
+    the draft), built the way the CLI builds it; only the fp8 capability probe, which
+    needs a GPU-side aiter symbol, is stubbed."""
+    hf = PretrainedConfig(
+        architectures=["DeepseekV41DSparkModel"], model_type="deepseek_v41_dspark"
+    )
+    spec = SpeculativeConfig(
+        method="dspark",
+        model=str(V41_FIXTURES),
+        num_speculative_tokens=5,
+        draft_model_hf_config=hf,
+        kv_cache_dtype=asked,
+    )
+    probe = types.ModuleType("atom.models.deepseek_v41.draft_kv")
+    probe.validate_fp8_draft_support = lambda _config: None
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    config = _config(
+        monkeypatch,
+        hf_config=config_module.get_hf_config(str(V41_FIXTURES)),
+        model=str(V41_FIXTURES),
+        kv_cache_dtype=target,
+        enforce_eager=True,
+        speculative_config=spec,
+        dspark=config_module.DSparkConfig(draft_kv_dtype=knob),
+    )
+    return config
+
+
+@pytest.mark.parametrize("knob", ["auto", "fp8"])
+@pytest.mark.parametrize("asked", ["bf16", "fp8"])
+@pytest.mark.parametrize("target", ["bf16", "fp8", "fp4"])
+def test_the_flag_is_refused_for_a_v41_dspark_draft_and_names_its_own_knob(
+    monkeypatch, target, asked, knob
+):
+    # V4.1's draft reads the target's pool; its dtype is DSparkConfig.draft_kv_dtype.
+    # (A bf16 target with knob fp8 is the knob's own refusal, raised first.)
+    refused = (
+        "requires native DeepSeek-V4.1"
+        if (target, knob) == ("bf16", "fp8")
+        else r"does not apply to a DeepSeek-V4\.1.*draft_kv_dtype"
+    )
+    with pytest.raises(ValueError, match=refused):
+        _v41_dspark(monkeypatch, target=target, asked=asked, knob=knob)
+
+
+@pytest.mark.parametrize(
+    ("target", "knob"),
+    [
+        ("bf16", "auto"),
+        ("fp8", "auto"),
+        ("fp8", "fp8"),
+        ("fp4", "auto"),
+        ("fp4", "fp8"),
+    ],
+)
+def test_a_v41_dspark_draft_is_set_by_dspark_config_alone(monkeypatch, target, knob):
+    config = _v41_dspark(monkeypatch, target=target, knob=knob)
+    assert config.dspark.draft_kv_dtype == knob
+    assert config.speculative_config.draft_kv_dtype == target  # the target's pool
