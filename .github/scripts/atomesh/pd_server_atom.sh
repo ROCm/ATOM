@@ -2267,7 +2267,13 @@ start_router() {
   if [[ "${ROUTER_KV_EVENTS:-false}" == "true" ]]; then
     # start_prefill turns the publishers on. A Mooncake Store answers on its
     # master's metrics port (with per-NIC pools, only the first pool's).
-    router_kv_events_args=(--kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}")
+    # Routing by the events tokenizes every prompt: the opening burst of
+    # 1M-token sessions above --prepare-workers outlasts the 250 ms default
+    # queue wait, and 72 sessions already fill the default 1 GiB of kept prompts.
+    router_kv_events_args=(
+      --kv-events --mooncake-admin-port "${ATOMESH_MOONCAKE_METRICS_PORT}"
+      --prepare-queue-timeout-ms 5000 --prepare-prefix-cache-mb 4096
+    )
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch
