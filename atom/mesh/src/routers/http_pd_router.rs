@@ -284,6 +284,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
+    carries_media: bool,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -297,6 +298,7 @@ impl<'a> PDRequestContext<'a> {
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
             tokens: None,
+            carries_media: metadata.carries_media,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
@@ -792,6 +794,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
+            carries_media: context.carries_media,
         };
         let plan = planner
             .plan(&descriptor)
@@ -2306,6 +2309,7 @@ mod tests {
                 return_logprob: false,
                 request_text: None,
                 tokens: None,
+                carries_media: false,
                 model_id: None,
                 headers: None,
             };
@@ -3062,6 +3066,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
+            carries_media: false,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };
