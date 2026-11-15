@@ -147,6 +147,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     [
         (True, 3, 24, 8, None, 3),  # a DP step padded past its requests: rows decide
         (False, 3, 24, 8, None, 8),  # the other index caches keep the padded batch
+        (False, 7, 8, 1, None, 8),  # 7 live of a bs=8 graph: the map is the capture's
         (True, 9, 24, 8, None, ValueError),  # fewer rows than scheduled: refused
         (True, 8, 8, 1, [1, 2], "split"),  # a split decode builds no whole-batch scorer
     ],

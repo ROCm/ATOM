@@ -769,6 +769,99 @@ class TestDecodeScoreAgainstTheDefinition:
 
 
 @gpu
+class TestAPaddedReplayWalksTheMapTheCaptureWalks:
+    """Capture at graph batch 8, replay with 7 live requests padded to 8.
+
+    The captured launch walks `index_score_work_map_size(8, ...)` rows; a map built over
+    the 7 live requests alone has another row count (at max_block 256: 455 against 256)
+    and another row format, and the kernel would read it as the first geometry's -- wrong
+    scores, no error, since replay runs no Python. The builder therefore hands
+    `make_sparse_decode_metadata` the padded batch (`context_lens[:running_bs]`, pad rows
+    of length 0), so every replay's map is the capture's geometry.
+    """
+
+    SHAPE = CAPACITY_SHAPE  # 32768 tokens, one query token, one head
+    LIVE_LENS = (32768, 20000, 9000, 30000, 128, 25000, 700)
+
+    def _padded_step(self, graph_bs=8):
+        max_block = self.SHAPE["max_block"]
+        lens = [*self.LIVE_LENS, *[0] * (graph_bs - len(self.LIVE_LENS))]
+        kw = _inputs([1] * graph_bs, [n - 1 for n in lens], 1, "cuda")
+        # the table is `max_model_len` wide, as the engine sizes it
+        kw["block_table"] = torch.arange(
+            graph_bs * max_block, dtype=torch.int32, device="cuda"
+        ).view(graph_bs, max_block)
+        kw["index_kv_cache"] = (
+            (torch.randn(graph_bs * max_block, SPARSE_BLOCK_SIZE, HEAD_DIM) * 0.3)
+            .to(torch.bfloat16)
+            .to(aiter.dtypes.fp8)
+            .cuda()
+        )
+        kw["seq_lens"] = torch.tensor(lens, dtype=torch.int32, device="cuda")
+        return kw
+
+    def _metadata(self, kw, buf):
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        return make_sparse_decode_metadata(
+            seq_lens=kw["seq_lens"],
+            block_table=kw["block_table"],
+            slot_mapping=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            max_seq_len=self.SHAPE["max_block"] * SPARSE_BLOCK_SIZE,
+            max_query_len=1,
+            num_idx_heads=1,
+            index_score_work_map_out=buf,
+            index_score_max_block=self.SHAPE["max_block"],
+        )
+
+    def test_the_geometry_really_differs_between_the_live_and_the_padded_batch(self):
+        # Self-validating, like the capacity class: if aiter makes the two equal this
+        # whole class proves nothing and says so.
+        assert m.index_score_work_map_size(7, **self.SHAPE) != (
+            m.index_score_work_map_size(8, **self.SHAPE)
+        )
+
+    def test_the_replay_map_is_the_captured_launchs_and_scores_the_live_rows(self):
+        kw = self._padded_step()
+        buf = torch.empty(
+            (m.index_score_work_map_capacity(8, **self.SHAPE), 2),
+            dtype=torch.int32, device="cuda",
+        )  # fmt: skip
+        replay = self._metadata(kw, buf).index_score_work_map
+        assert replay.shape[0] == m.index_score_work_map_size(8, **self.SHAPE)
+        assert replay.data_ptr() == buf.data_ptr()
+
+        max_block = self.SHAPE["max_block"]
+        score = m.decode_index_score(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            max_block, 1, 1, kw["sm_scale"], replay,
+        )  # fmt: skip
+        want = _score_oracle(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            1, 1, kw["sm_scale"],
+        )  # fmt: skip
+        live = ~torch.isnan(want)
+        live[:, len(self.LIVE_LENS) :] = False  # pad rows have no key to score
+        neg_inf = want == -torch.inf
+        finite = live & ~neg_inf
+        assert finite.any()
+        assert torch.allclose(
+            score[..., : want.shape[-1]][finite], want[finite], rtol=2e-2, atol=2e-2
+        )
+
+    def test_a_map_over_the_live_requests_alone_is_the_one_that_is_refused(self):
+        kw = self._padded_step()
+        live_only = m.build_index_score_work_map(
+            kw["seq_lens"][: len(self.LIVE_LENS)], **self.SHAPE
+        )
+        with pytest.raises(ValueError, match="different bounds"):
+            m.decode_index_score(
+                kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+                self.SHAPE["max_block"], 1, 1, kw["sm_scale"], live_only,
+            )  # fmt: skip
+
+
+@gpu
 class TestIndexScoreWorkMapHoist:
     """One build per decode step, not one per sparse layer.
 
