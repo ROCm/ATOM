@@ -41,7 +41,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
 CORE_PREPARE_DIGEST = "1f897780d89a3205"
-CORE_FORWARD_DIGEST = "a9ca0db53b507de5"
+CORE_FORWARD_DIGEST = "c8458d062cc2e62e"
 
 
 @pytest.fixture

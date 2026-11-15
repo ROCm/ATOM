@@ -37,6 +37,10 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # reference.
 _HEAD_BLOCK = True
 
+# At this token count the norm grid is large enough for one-warp programs;
+# group-aligned Q splitting also reduces padding for the 1280-wide latent.
+_NORM_PREFILL_MIN_TOKENS = 768
+
 # The MXFP8 query's heads quantized by one program rather than one each, with
 # the same bytes out. 8 heads on 2 warps, 64 heads at 1344 / 16384 tokens:
 # MI455X 31.8 -> 16.2 / 422 -> 205 us (c1024 serving +4.1%), MI355X 22.4 ->
@@ -495,11 +499,11 @@ def _norm_rope_window_kernel(
     through `_rope_window_kernel`'s KV chain. `SPLIT_Q` holds Q as a
     `BLOCK_KQ` head and a power-of-two tail rather than one padded tile.
 
-    This extends AITER's dual latent RMSNorm with ATOM's window address and
-    byte-layout contract. AITER's QK norm/RoPE/SWA op instead normalizes
-    projected per-head Q and emits BF16 rows: it cannot consume Q's latent
-    width or emit this MXFP8 ring. Quantization reuses `_mxfp8_quant_op`;
-    the KV chain reuses the shared `_quantized_values` and `_store_ring` helpers.
+    This extends AITER's dual latent RMSNorm with ATOM's window addressing.
+    AITER also has a dual-norm KV epilogue; this Triton path is retained for
+    its large-prefill throughput (Q1280/KV512, gfx950). Quantization reuses
+    `_mxfp8_quant_op`; the KV chain shares `_quantized_values` and `_store_ring`
+    with the unfused attention path.
     """
     groups: tl.constexpr = BLOCK_KQ // 32
     cols = tl.arange(0, BLOCK_KQ)
@@ -625,7 +629,7 @@ def norm_rope_quant_window(
     # Both pieces are reshaped into group-32 rows. In particular, a 32-wide
     # Q must stay unsplit: two 16-wide pieces contain no quantization group.
     split_q = (
-        tokens >= 768
+        tokens >= _NORM_PREFILL_MIN_TOKENS
         and block_kq // 2 % 32 == 0
         and tail > 0
         and tail % 32 == 0
@@ -670,9 +674,8 @@ def norm_rope_quant_window(
         EMIT_PACKED=values is not None,
         WRITE_RING=ring is not None,
         PLANAR_RING=planar_ring,
-        # Four warps hide a decode bucket's latency; past a few hundred rows
-        # the grid fills the device and one-warp programs win (MI355X, 8192
-        # rows: 14.6us at four warps, 10.5us at one with `SPLIT_Q`).
-        num_warps=4 if tokens < 768 else 1,
+        # Use more warps for short grids. Large prefills combine one warp
+        # with group-aligned Q splitting; the measured gain includes both.
+        num_warps=4 if tokens < _NORM_PREFILL_MIN_TOKENS else 1,
     )
     return q_values, q_scales

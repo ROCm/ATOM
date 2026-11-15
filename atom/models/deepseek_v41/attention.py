@@ -458,8 +458,10 @@ class Attention(nn.Module):
     def _use_fused_attention(self, activation, cache, rope):
         """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
         the layer qualifies (`fused_attn`), the pool holds unpacked MXFP8 rows
-        and the activations (Q follows `wq_a`'s) and the 64-dimension RoPE
-        tables are BF16. A BF16 or packed pool, and every other case, keeps
+        and the residual activation and the 64-dimension RoPE tables are
+        BF16. Native and vLLM callers pass `hidden`; optional `hidden_fp8`
+        feeds only the QKV GEMM, which produces BF16 latents.
+        A BF16 or packed pool, and every other case, keeps
         the unfused path."""
         return (
             self.fused_attn
@@ -533,7 +535,7 @@ class Attention(nn.Module):
         # KV row alone on `rope_quant_window`; it rides on the dual RMSNorm
         # instead. A decode's window store moving ahead of the scorer is
         # safe: the scorer reads the index plane, the compressor its arena.
-        fused = self._use_fused_attention(kv_pre, cache, rope)
+        fused = self._use_fused_attention(hidden, cache, rope)
         if fused:
             qr, qr_scale = self._prepare_fused_attention(
                 q_lora, kv_pre, cache, step, rope
@@ -673,7 +675,12 @@ class Attention(nn.Module):
         out=None,
         out_scale=None,
     ):
-        """Consume live sources; fused output planes belong to the caller's graph."""
+        """Consume live sources in one of two output modes.
+
+        With `out` and `out_scale`, fill the caller's MXFP8 planes (including
+        inverse RoPE) and return None. Both buffers belong to the caller's
+        graph. Without them, return BF16 attention for `_project_out`.
+        """
         if out_scale is not None:
             out_scale = out_scale.view(torch.float8_e8m0fnu)
         if not step.requests:  # a dummy prefill on a token graph

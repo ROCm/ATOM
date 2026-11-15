@@ -9,20 +9,23 @@ Legacy packed rows remain accepted by the standalone wrappers.
 
 import torch
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.fused_norm_rope_attn_rope_cast import fused_norm_rope_attn_rope_cast
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41
 
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src_reference
 from atom.utils.decorators import mark_trace
 
-try:
-    from aiter.ops.fused_norm_rope_attn_rope_cast import fused_norm_rope_attn_rope_cast
-except ImportError:
-    fused_norm_rope_attn_rope_cast = None
-
 
 def fused_attention_available():
-    return fused_norm_rope_attn_rope_cast is not None and get_gfx_runtime() == "gfx950"
+    """The API is required; only its GPU architecture support is optional."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except RuntimeError:
+        # Model inspection and meta construction can lack a usable device.
+        return False
 
 
 def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):
@@ -105,8 +108,6 @@ def fused_sparse_attn_v41_paged_2src(
     out_scale=None,
 ):
     """Raw BF16 Q to inverse-rotated MXFP8 output."""
-    if fused_norm_rope_attn_rope_cast is None:
-        raise RuntimeError("Fused V4.1 attention needs AITER PR #6821")
     dim = query.shape[-1]
     output, output_scale, _ = fused_norm_rope_attn_rope_cast(
         query,

@@ -63,6 +63,7 @@ def fused_factory(single_rank):
         o_lora_rank=128,
         norm_eps=1e-6,
         prefix_context=None,
+        speculative_tokens=0,
     ):
         torch.manual_seed(6821 + heads + ratio)
         config = SimpleNamespace(
@@ -116,6 +117,7 @@ def fused_factory(single_rank):
             kv_dtype="fp8",
             layer_ratios=(0, 1),
             index_topk=topk,
+            speculative_tokens=speculative_tokens,
         )
         cache = PagedAttentionCache(geo, pages, slots, "cuda", max_tokens=max_tokens)
         for values, scales in (
@@ -231,6 +233,133 @@ def assert_output(actual, expected):
     assert metrics["relative"] < 0.03, metrics
     assert metrics["cosine"] > 0.999, metrics
     return metrics
+
+
+@pytest.mark.parametrize(
+    "gpu,arch,expected",
+    [
+        (False, None, False),
+        (True, "unavailable", False),
+        (True, "gfx942", False),
+        (True, "gfx950", True),
+    ],
+)
+def test_fused_architecture_probe(monkeypatch, gpu, arch, expected):
+    from atom.model_ops.attentions.deepseek_v41 import fp8_attention
+
+    calls = []
+
+    def probe():
+        calls.append(True)
+        if arch == "unavailable":
+            raise RuntimeError("No GPU architecture available")
+        assert gpu, "Do not probe architecture without a GPU"
+        return arch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: gpu)
+    monkeypatch.setattr(fp8_attention, "get_gfx_runtime", probe)
+    assert fused_attention_available() is expected
+    assert len(calls) == int(gpu)
+
+
+@pytest.mark.parametrize("gpu", [False, True])
+def test_attention_meta_constructor_without_architecture(single_rank, monkeypatch, gpu):
+    from atom.model_ops.attentions.deepseek_v41 import fp8_attention
+
+    def unavailable():
+        raise RuntimeError("No GPU architecture available")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: gpu)
+    monkeypatch.setattr(fp8_attention, "get_gfx_runtime", unavailable)
+    config = SimpleNamespace(
+        head_dim=512,
+        hidden_size=256,
+        q_lora_rank=1280,
+        num_attention_heads=64,
+        o_groups=8,
+        o_lora_rank=128,
+        rms_norm_eps=1e-6,
+    )
+    spec = LayerAttentionSpec(1, 0, AttentionMode.WINDOW, None, None)
+    with torch.device("meta"):
+        model = Attention(config, spec)
+    assert not model.fused_attn
+    assert all(p.device.type == "meta" for p in model.parameters())
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("heads", [16, 64])
+@pytest.mark.parametrize("tokens", [128, 4096])
+def test_fused_full_prefill(fused_factory, monkeypatch, heads, tokens, record_property):
+    from atom.models.deepseek_v41 import attention
+
+    original = attention.fused_sparse_attn_v41_paged_2src
+    calls = []
+
+    def tracked(query, *args, **kwargs):
+        calls.append(query.shape[0])
+        return original(query, *args, **kwargs)
+
+    monkeypatch.setattr(attention, "fused_sparse_attn_v41_paged_2src", tracked)
+    case = fused_factory(heads, max_tokens=tokens, q_lora_rank=1280)
+    step, _ = make_step(case, (tokens,), prefill=True)
+    hidden = torch.randn(1, tokens, 256, device="cuda", dtype=torch.bfloat16)
+    outputs, rings = [], []
+    for fused in (False, True):
+        case.model.fused_attn = fused
+        restore_windows(case.cache, case.initial)
+        outputs.append(case.model(hidden, None, case.cache, step, case.rope))
+        rings.append(window_bytes(case.cache))
+    assert calls == [tokens], "The full forward must invoke fused attention"
+    record_property("fused", assert_output(outputs[1], outputs[0]))
+    assert torch.equal(rings[1], rings[0])
+    assert not torch.equal(rings[0], case.initial)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("ratio", [0, 1])
+def test_fused_verify_is_causal(fused_factory, monkeypatch, ratio, record_property):
+    from atom.models.deepseek_v41 import attention
+
+    original = attention.fused_sparse_attn_v41_paged_2src
+    calls = []
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(attention, "fused_sparse_attn_v41_paged_2src", tracked)
+    case = fused_factory(64, ratio=ratio, q_lora_rank=1280, speculative_tokens=4)
+    # Both requests cross the ring boundary, and their slots are permuted.
+    ring = case.cache.geometry.ring_slots
+    position = case.context + (-case.context % ring) + ring - 2
+    step, _ = make_step(
+        case, (5, 3), prefill=False, position=position, slot_order=(1, 0)
+    )
+    hidden = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
+    changed = hidden.clone()
+    changed[:, 4] = torch.randn_like(changed[:, 4]) * 4
+    outputs, rings = {}, {}
+    for fused in (False, True):
+        case.model.fused_attn = fused
+        for label, value in (("original", hidden), ("changed", changed)):
+            restore_windows(case.cache, case.initial)
+            outputs[fused, label] = case.model(value, None, case.cache, step, case.rope)
+            rings[fused, label] = window_bytes(case.cache)
+        before, after = outputs[fused, "original"], outputs[fused, "changed"]
+        # No indices from the implementation enter this oracle: rows 0..3
+        # precede the mutation; rows 5..7 belong to a different request.
+        unaffected = [0, 1, 2, 3, 5, 6, 7]
+        torch.testing.assert_close(
+            before[:, unaffected], after[:, unaffected], rtol=0, atol=0
+        )
+        assert not torch.equal(before[:, 4], after[:, 4])
+    assert len(calls) == 2
+    for label in ("original", "changed"):
+        record_property(
+            label, assert_output(outputs[True, label], outputs[False, label])
+        )
+        assert torch.equal(rings[True, label], rings[False, label])
 
 
 @torch.inference_mode()

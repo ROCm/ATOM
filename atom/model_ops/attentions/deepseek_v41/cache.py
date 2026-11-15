@@ -976,6 +976,38 @@ class PagedAttentionCache:
             ),
         )
 
+    def _window_ring(self, layer, step):
+        """The decode writer's storage and addressing, shared by both epilogues."""
+        return (
+            self.ring_view(layer) if self.window_fp8 else self.pool,
+            step,
+            self.geometry.window(layer, self.num_pages),
+        )
+
+    def _window_prefill(self, layer, kv, step, *, quantized_attn):
+        """Attention source and deferred ring rows, preserving KV's leading dims."""
+        dim = self.geometry.head_dim
+        source = None if quantized_attn else torch.empty_like(kv)
+        if not self.window_fp8:
+            return source, source
+        if quantized_attn:
+            source, current = prefill_window(
+                self.ring_view(layer), step, self.geometry.ring_slots
+            )
+        else:
+            current = split_source(
+                torch.empty(
+                    step.running_tokens * self.geometry.window_row_bytes,
+                    dtype=torch.uint8,
+                    device=kv.device,
+                ),
+                dim,
+            )
+        return source, (
+            current[0].view(FP8_DTYPE).view_as(kv),
+            current[1].view(torch.float8_e8m0fnu).view(*kv.shape[:-1], dim // 32),
+        )
+
     def rope_quant_window(
         self, layer, query, kv, rope, step, query_fp8=None, *, a8w4=False
     ):
@@ -1013,48 +1045,27 @@ class PagedAttentionCache:
         if step.decode:
             # An FP8 window is stored as bytes, a BF16 one into the
             # `[rows, head_dim]` pool, which is the whole difference.
-            ring = (
-                (
-                    self.ring_view(layer),
-                    step,
-                    self.geometry.window(layer, self.num_pages),
-                )
-                if window_fp8
-                else (self.pool, step, self.geometry.window(layer, self.num_pages))
-            )
             rope_quant_window(
-                *seam, rope_dim=rope.rope_dim, ring=ring, query_fp8=query_fp8
+                *seam,
+                rope_dim=rope.rope_dim,
+                ring=self._window_ring(layer, step),
+                query_fp8=query_fp8,
             )
             return None, None
         quantized_attn = self.kv_fp8 or a8w4
-        qat = None if quantized_attn else torch.empty_like(kv)
-        values = scales = None
-        attention_source = qat
-        if window_fp8:
-            if quantized_attn:
-                attention_source, current = prefill_window(
-                    self.ring_view(layer), step, self.geometry.ring_slots
-                )
-            else:
-                source = torch.empty(
-                    step.running_tokens * self.geometry.window_row_bytes,
-                    dtype=torch.uint8,
-                    device=kv.device,
-                )
-                current = split_source(source, dim)
-            values = current[0].view(FP8_DTYPE).view_as(kv)
-            scales = (
-                current[1].view(torch.float8_e8m0fnu).view(*kv.shape[:-1], dim // 32)
-            )
+        attention_source, window_kv = self._window_prefill(
+            layer, kv, step, quantized_attn=quantized_attn
+        )
+        values, scales = window_kv if window_fp8 else (None, None)
         rope_quant_window(
             *seam,
             rope_dim=rope.rope_dim,
-            qat=qat,
+            qat=None if quantized_attn else attention_source,
             values=values,
             scales=scales,
             query_fp8=query_fp8,
         )
-        return attention_source, (values, scales) if window_fp8 else qat
+        return attention_source, window_kv
 
     def norm_rope_quant_window(self, layer, qk_norm, q, kv, rope, step, *, q_out=None):
         """`qk_norm` and `rope_quant_window`'s KV half in one launch, for an
@@ -1078,27 +1089,18 @@ class PagedAttentionCache:
         if q_out is not None:
             options["q_out"] = tuple(part.reshape(-1, part.shape[-1]) for part in q_out)
         if step.decode:
-            ring = (
-                (
-                    self.ring_view(layer),
-                    step,
-                    self.geometry.window(layer, self.num_pages),
-                )
-                if self.window_fp8
-                else (self.pool, step, self.geometry.window(layer, self.num_pages))
+            qr, qr_scale = norm_rope_quant_window(
+                *seam, ring=self._window_ring(layer, step), **options
             )
-            qr, qr_scale = norm_rope_quant_window(*seam, ring=ring, **options)
             kv_out, window_kv = None, None
         else:
-            kv_out, current = prefill_window(
-                self.ring_view(layer), step, self.geometry.ring_slots
+            kv_out, window_kv = self._window_prefill(
+                layer, seam[1], step, quantized_attn=True
             )
-            values = current[0].view(FP8_DTYPE)
-            scales = current[1].view(torch.float8_e8m0fnu)
+            values, scales = window_kv
             qr, qr_scale = norm_rope_quant_window(
                 *seam, values=values, scales=scales, **options
             )
-            window_kv = (values, scales)
         lead = q.shape[:-1]
         return qr.view(*lead, -1), qr_scale.view(*lead, -1), kv_out, window_kv
 
