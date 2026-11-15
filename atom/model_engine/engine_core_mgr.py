@@ -56,9 +56,16 @@ from atom.model_engine.engine_utility import (
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.plugin_hotplug import (
+    BEGIN_ROUND_CMD,
     DEFAULT_HOTPLUG_TIMEOUT_S,
+    DEFAULT_PLUGIN_ROUND_TIMEOUT_S,
+    END_ROUND_CMD,
     HOTPLUG_CMD,
+    PluginRefusal,
     aggregate_reports,
+    aggregate_round_replies,
+    checked_round_id,
+    command_refusal_reason,
 )
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
@@ -73,6 +80,9 @@ from atom.utils import (
 
 logger = logging.getLogger("atom")
 _WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
+# A partial begin is undone before the caller hears about it; that round trip
+# may only be short, or a wedged rank would delay the failure it already knows.
+_PLUGIN_ROUND_ROLLBACK_TIMEOUT_S = 5.0
 # Only the sync that owns them sends these. A FINISH unfences every engine,
 # and a DISCARD aborts whichever sync is between its buckets.
 _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
@@ -320,6 +330,10 @@ class CoreManager:
         # Identity-only marker: unlike request_id, a caller cannot forge it by
         # choosing a string. Never put it on the wire.
         self._weight_sync_dispatch_token = object()
+        # The plugin round the last begin took, for the cheap /plugin/status
+        # view only. The engines own the lease and the hot-plug refusal -- this
+        # cache must never gate one.
+        self._plugin_round: dict | None = None
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
@@ -2143,6 +2157,11 @@ class CoreManager:
         half-applied plan, and a rank that misses the deadline raises
         ``TimeoutError``.
 
+        While a plugin round is active (``begin_plugin_round``) every engine
+        refuses this before pausing or installing anything, and the refusal is
+        raised as ``PluginRefusal("round-in-progress")``: the caller retries
+        once the round ends rather than swapping the plan mid-measurement.
+
         One engine at a time for now: a capture records the TP group's
         collectives, and a DP fleet would have to pause and enter the capture
         together (``plugin_hotplug.topology_refusal`` documents both cases).
@@ -2167,6 +2186,103 @@ class CoreManager:
         ]
         reports = [report for report in reports if isinstance(report, dict)]
         return aggregate_reports(reports)
+
+    def begin_plugin_round(self, round_id: str, timeout: float | None = None) -> dict:
+        """Begin the one plugin round on every engine, or raise.
+
+        The round holds the plan on each engine: while it is active a
+        ``hotplug_plugin`` there is refused with ``round-in-progress`` instead
+        of swapping the plan under the measurement.  Begin only writes state
+        (no pause, no capture), so it answers in one round trip; the caller
+        hot-plugs after ``end_plugin_round``.
+
+        A begin that fails on any engine is rolled back best-effort on the
+        engines that did take it.  The rollback ends the same id, so it cannot
+        clear a round this call did not start: an engine already holding
+        another refuses the mismatch.
+        """
+        round_id = checked_round_id(round_id)
+        timeout = (
+            DEFAULT_PLUGIN_ROUND_TIMEOUT_S
+            if timeout is None
+            else checked_timeout(timeout)
+        )
+        try:
+            replies = self.broadcast_utility_command_sync(
+                BEGIN_ROUND_CMD, timeout=timeout, round_id=round_id
+            )
+        except BaseException:
+            self._abandon_plugin_round(round_id)
+            raise
+        answer = aggregate_round_replies("begin", round_id, replies)
+        self._plugin_round = {
+            "round_id": round_id,
+            "started_at": answer["started_at"],
+        }
+        logger.info(
+            f"{self.label}: plugin round {round_id!r} began on "
+            f"{answer['engines']} engine(s)"
+        )
+        return answer
+
+    def end_plugin_round(self, round_id: str, timeout: float | None = None) -> dict:
+        """Release the plugin round named *round_id* on every engine, or raise.
+
+        The id must match the active round on every engine: an end naming
+        another round raises ``PluginRefusal("round-mismatch")`` and leaves the
+        active one in place, so a stale retry cannot free someone else's round.
+        """
+        round_id = checked_round_id(round_id)
+        timeout = (
+            DEFAULT_PLUGIN_ROUND_TIMEOUT_S
+            if timeout is None
+            else checked_timeout(timeout)
+        )
+        replies = self.broadcast_utility_command_sync(
+            END_ROUND_CMD, timeout=timeout, round_id=round_id
+        )
+        answer = aggregate_round_replies("end", round_id, replies)
+        self._plugin_round = None
+        logger.info(
+            f"{self.label}: plugin round {round_id!r} ended after "
+            f"{answer.get('duration_s')}s"
+        )
+        return answer
+
+    def _abandon_plugin_round(self, round_id: str) -> None:
+        """Undo a partial begin; never raises, never ends another round.
+
+        An engine that refused this begin (another round, no engine) answers
+        with a state refusal here too, which is expected: there is nothing on
+        it to undo.  Only a rank that did not answer at all is notable, and it
+        must not keep the begin's own failure from reaching the caller.
+        """
+        try:
+            self.broadcast_utility_command_sync(
+                END_ROUND_CMD,
+                timeout=_PLUGIN_ROUND_ROLLBACK_TIMEOUT_S,
+                round_id=round_id,
+            )
+        # Best effort: a failure here must not hide the begin's own failure.
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"{self.label}: best-effort rollback of plugin round "
+                f"{round_id!r} reported: {exc}"
+            )
+
+    def plugin_round_status(self) -> dict:
+        """The manager's cached view of the round lease; cheap, no engine RPC.
+
+        Advisory only: the engines own the lease and the authoritative
+        refusal is theirs.  This exists so a watcher can see, without a round
+        trip, that a round is holding the plan before it tries to hot-plug.
+        """
+        active = getattr(self, "_plugin_round", None)
+        return {
+            "status": "ok",
+            "active_round": dict(active) if isinstance(active, dict) else None,
+            "engines": len(getattr(self, "control_sockets", ()) or ()),
+        }
 
     def _sync_weight_update(
         self, cmd: str, timeout: float, in_session: bool, kwargs: dict
@@ -2276,11 +2392,18 @@ class CoreManager:
                 self._discard_failed_weight_sync(cmd)
             # Callers read r["result"]; an error reply has none, and handing it
             # back would turn a named failure into a KeyError somewhere else.
-            raise RuntimeError(
+            message = (
                 f"{self.label}: utility command {cmd!r} failed on {len(failed)} "
                 f"of {len(responses)} engine(s): "
                 + "; ".join(str(r["error"]) for r in failed)
             )
+            reason = command_refusal_reason(failed)
+            if reason is not None:
+                # A coded refusal (round-in-progress) is raised as one, so the
+                # API answers that reason and the client knows to retry after
+                # the round instead of reading a generic 409.
+                raise PluginRefusal(reason, message)
+            raise RuntimeError(message)
         if completes_weight_sync(cmd, kwargs):
             try:
                 self._broadcast_and_wait(

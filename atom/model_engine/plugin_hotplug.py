@@ -12,11 +12,20 @@ rules and the row arithmetic can be exercised on a CPU with only a recipe.
 Nothing here touches the GPU or the plugin host's state: a payload is parsed
 into a :class:`HotplugRequest`, the runner resolves and applies it, and the
 manager merges what the ranks report.
+
+The same file carries the rules of the plugin **round** -- the lease a
+benchmark or evaluation run takes on the running server, so that a hot-plug
+arriving mid-measurement is refused with ``round-in-progress`` instead of
+swapping the plan underneath it.  The lease itself is two attributes on each
+engine (:class:`PluginRound` is just the read-only view of them); the
+transitions and the refusal envelopes are here so they can be tested without
+an engine.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,9 +42,45 @@ HOTPLUG_ENDPOINT = "/plugin/hotplug"
 # wedged rank forever.  Overridable per request ("timeout", seconds).
 DEFAULT_HOTPLUG_TIMEOUT_S = 300.0
 
+# The plugin-round lease: a benchmark/evaluation run holds the plan, so a
+# hot-plug that arrives mid-run must not swap it.  Begin/end are synchronous
+# utility commands, one round is active per engine, and neither command pauses
+# generation or waits for anything -- the busy loop only writes two fields.
+PLUGIN_ROUND_ENDPOINT = "/plugin/round"
+PLUGIN_STATUS_ENDPOINT = "/plugin/status"
+BEGIN_ROUND_CMD = "begin_plugin_round"
+END_ROUND_CMD = "end_plugin_round"
+# The reasons a round command, or a hot-plug during a round, is refused with.
+# They travel in the utility reply's "reason" field up to the HTTP JSON, so a
+# client can tell "wait for the round" from "the id is wrong".
+ROUND_IN_PROGRESS_REASON = "round-in-progress"
+ROUND_MISMATCH_REASON = "round-mismatch"
+NO_ACTIVE_ROUND_REASON = "no-active-round"
+ROUND_STATE_MISMATCH_REASON = "round-state-mismatch"
+# A begin/end is a state write on every engine, not a capture: one round trip
+# is enough.  The body's optional "timeout" overrides it per request.
+DEFAULT_PLUGIN_ROUND_TIMEOUT_S = 30.0
+
 
 class HotplugPayloadError(ValueError):
     """A request the endpoint can refuse with its ``reason`` and a HTTP 400."""
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+
+
+class RoundPayloadError(HotplugPayloadError):
+    """A ``POST /plugin/round`` body the endpoint refuses with a HTTP 400."""
+
+
+class PluginRefusal(RuntimeError):
+    """A state refusal carrying the reason code an endpoint answers with.
+
+    ``reason`` is the machine-readable code (``round-in-progress``,
+    ``round-mismatch``, ...) that becomes ``error.reason`` in the JSON
+    envelope; :func:`refusal_status` maps every instance to a HTTP 409.
+    """
 
     def __init__(self, reason: str, detail: str):
         super().__init__(f"{reason}: {detail}")
@@ -58,6 +103,29 @@ class HotplugRequest:
     rows: tuple[int, ...]
     capture: bool
     timeout: float
+
+
+@dataclass(frozen=True)
+class PluginRoundRequest:
+    """A validated ``POST /plugin/round`` body: which end of the lease to move.
+
+    ``round_id`` is the benchmark run's own name; it is what a later hot-plug
+    refusal reports and what ``end`` must match.  ``timeout`` bounds the
+    synchronous round trip only, not the round itself: a round lasts until it
+    is ended.
+    """
+
+    action: str
+    round_id: str
+    timeout: float
+
+
+@dataclass(frozen=True)
+class PluginRound:
+    """The round an engine holds, as read off its two state attributes."""
+
+    round_id: str
+    started_at: float
 
 
 def _canonical(document: Any) -> str:
@@ -255,6 +323,42 @@ def parse_hotplug_payload(
     )
 
 
+def checked_round_id(round_id: Any) -> str:
+    """A round id as the lease carries it: a non-empty string."""
+    if not isinstance(round_id, str) or not round_id.strip():
+        raise RoundPayloadError(
+            "payload-schema", f"round_id must be a non-empty string, got {round_id!r}"
+        )
+    return round_id
+
+
+def parse_plugin_round_payload(body: Mapping[str, Any]) -> PluginRoundRequest:
+    """Validate a ``POST /plugin/round`` body; raise ``RoundPayloadError``.
+
+    Unknown keys are ignored for the same reason as in a hot-plug body: the
+    caller and the server are deployed separately, and a stray field is not a
+    reason to refuse a state the caller can change.
+    """
+    if not isinstance(body, Mapping):
+        raise RoundPayloadError("payload-schema", "body must be a JSON object")
+    action = body.get("action")
+    if action not in ("begin", "end"):
+        raise RoundPayloadError(
+            "payload-schema", f"action must be 'begin' or 'end', got {action!r}"
+        )
+    round_id = checked_round_id(body.get("round_id"))
+    timeout = body.get("timeout", DEFAULT_PLUGIN_ROUND_TIMEOUT_S)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise RoundPayloadError(
+            "payload-schema", f"timeout must be a number, got {timeout!r}"
+        )
+    if timeout <= 0:
+        raise RoundPayloadError("payload-schema", "timeout must be positive")
+    return PluginRoundRequest(
+        action=str(action), round_id=round_id, timeout=float(timeout)
+    )
+
+
 def capture_rows(plan: Any, full_q_len: int | None = None) -> list[int]:
     """The padded rows a plan's capture tables declare, ascending.
 
@@ -355,6 +459,173 @@ def aggregate_reports(reports: Iterable[Mapping[str, Any]]) -> dict:
         ),
         "ranks": reports,
     }
+
+
+# -- the plugin-round lease --------------------------------------------------
+
+
+def active_plugin_round(engine: Any) -> PluginRound | None:
+    """The round *engine* holds right now, read off its state attributes.
+
+    ``None`` for an engine that never began one and for one whose id was
+    cleared.  Only the utility handlers write those attributes, so the
+    scheduler, the generation loop and the model never observe a round.
+    """
+    round_id = getattr(engine, "plugin_round_id", None)
+    if not isinstance(round_id, str) or not round_id:
+        return None
+    started_at = getattr(engine, "plugin_round_started_at", None)
+    if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
+        started_at = 0.0
+    return PluginRound(round_id=round_id, started_at=float(started_at))
+
+
+def take_plugin_round(
+    engine: Any, round_id: Any, *, started_at: float | None = None
+) -> dict:
+    """Make *round_id* the engine's one active plugin round.
+
+    Raises ``RoundPayloadError`` for a malformed id and ``PluginRefusal``
+    (``round-in-progress``) when another round already holds the plan.  That
+    second refusal is what the API turns into a 409: an overlapping benchmark
+    is a state conflict, not a bad request.
+    """
+    round_id = checked_round_id(round_id)
+    active = active_plugin_round(engine)
+    if active is not None:
+        raise PluginRefusal(
+            ROUND_IN_PROGRESS_REASON,
+            f"plugin round {active.round_id!r} is already active on this engine; "
+            f"end it before beginning another",
+        )
+    started_at = time.time() if started_at is None else float(started_at)
+    engine.plugin_round_id = round_id
+    engine.plugin_round_started_at = started_at
+    return {"status": "ok", "round_id": round_id, "started_at": started_at}
+
+
+def release_plugin_round(
+    engine: Any, round_id: Any, *, ended_at: float | None = None
+) -> dict:
+    """Clear the engine's round when *round_id* is the one holding it.
+
+    An end that names another round is refused (``round-mismatch``) and leaves
+    the active one in place: only the run that took the lease may drop it.
+    """
+    round_id = checked_round_id(round_id)
+    active = active_plugin_round(engine)
+    if active is None:
+        raise PluginRefusal(
+            NO_ACTIVE_ROUND_REASON,
+            "no plugin round is active on this engine; nothing to end",
+        )
+    if active.round_id != round_id:
+        raise PluginRefusal(
+            ROUND_MISMATCH_REASON,
+            f"this engine runs plugin round {active.round_id!r}, not "
+            f"{round_id!r}; end the active one",
+        )
+    ended_at = time.time() if ended_at is None else float(ended_at)
+    engine.plugin_round_id = None
+    engine.plugin_round_started_at = None
+    return {
+        "status": "ok",
+        "round_id": round_id,
+        "started_at": active.started_at,
+        "ended_at": ended_at,
+        "duration_s": max(0.0, ended_at - active.started_at),
+    }
+
+
+def round_in_progress_reply(cmd: str, engine: Any) -> dict | None:
+    """The refusal a hot-plug answers with while a round holds the plan.
+
+    ``None`` when no round is active, and the caller may proceed.  Building
+    the reply here rather than in the handler is what lets a CPU test pin the
+    exact envelope -- reason code plus the active round -- that the manager
+    raises and the API answers with a 409.
+    """
+    active = active_plugin_round(engine)
+    if active is None:
+        return None
+    elapsed = max(0.0, time.time() - active.started_at)
+    return {
+        "cmd": cmd,
+        "error": (
+            f"refused: plugin round {active.round_id!r} has held the plan for "
+            f"{elapsed:.1f}s; end it (POST {PLUGIN_ROUND_ENDPOINT} with "
+            f'{{"action": "end", "round_id": {active.round_id!r}}}) before a '
+            f"hot-plug, then retry"
+        ),
+        "reason": ROUND_IN_PROGRESS_REASON,
+        "active_round": {
+            "round_id": active.round_id,
+            "started_at": active.started_at,
+            "elapsed_s": round(elapsed, 3),
+        },
+    }
+
+
+def command_refusal_reason(replies: Iterable[Any]) -> str | None:
+    """The one reason code every failing utility reply agrees on, if any.
+
+    The manager raises its refusal with this code, so the HTTP layer can
+    answer ``round-in-progress`` without parsing prose, and two engines that
+    failed for different (or unnamed) reasons stay a generic 409.
+    """
+    codes = {
+        reply.get("reason")
+        for reply in replies or ()
+        if isinstance(reply, Mapping) and reply.get("error")
+    }
+    codes = {code for code in codes if isinstance(code, str) and code}
+    return next(iter(codes)) if len(codes) == 1 else None
+
+
+def aggregate_round_replies(action: str, round_id: str, replies: Iterable[Any]) -> dict:
+    """Merge the per-engine replies of one begin/end into the answer.
+
+    Every engine must report the same round: a begin that only some engines
+    took, or an end they disagree about, is a state mismatch the caller has to
+    see rather than a plan that silently differs per rank.  The engines' wall
+    clocks are not comparable, so the lease interval is the earliest start and
+    the latest end any engine reported.
+    """
+    reports = [dict(reply) for reply in replies or () if isinstance(reply, Mapping)]
+    if not reports:
+        raise RuntimeError(f"no engine reported the plugin round {action}")
+    ids = {report.get("round_id") for report in reports}
+    if ids != {round_id}:
+        raise PluginRefusal(
+            ROUND_STATE_MISMATCH_REASON,
+            f"the engines disagree about the round they {action}: "
+            f"{sorted(map(str, ids))}",
+        )
+    starts = [
+        float(report["started_at"])
+        for report in reports
+        if isinstance(report.get("started_at"), (int, float))
+    ]
+    answer = {
+        "status": "ok",
+        "action": action,
+        "round_id": round_id,
+        "started_at": min(starts) if starts else None,
+        "engines": len(reports),
+    }
+    if action == "end":
+        ends = [
+            float(report["ended_at"])
+            for report in reports
+            if isinstance(report.get("ended_at"), (int, float))
+        ]
+        answer["ended_at"] = max(ends) if ends else time.time()
+        answer["duration_s"] = (
+            max(0.0, answer["ended_at"] - answer["started_at"])
+            if answer["started_at"] is not None
+            else None
+        )
+    return answer
 
 
 def hotplug_enabled(config: Any = None) -> bool:

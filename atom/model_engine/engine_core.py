@@ -97,6 +97,13 @@ class EngineCore:
         self._rl_weights_inconsistent = False
         # pause_generation .. resume_generation: nothing new is scheduled.
         self._generation_paused = False
+        # The plugin round a benchmark/evaluation run is holding, if any: the
+        # run's id and when it began.  A hot-plug is refused while one is
+        # active instead of swapping the plan under the measurement; these two
+        # attributes are all a round touches, so the scheduler and the model
+        # loop never see it (see engine_utility's round handlers).
+        self.plugin_round_id: str | None = None
+        self.plugin_round_started_at: float | None = None
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the

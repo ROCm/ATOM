@@ -15,8 +15,15 @@ from atom.model_engine.collective_rpc import (
     checked_timeout,
 )
 from atom.model_engine.plugin_hotplug import (
+    BEGIN_ROUND_CMD,
+    END_ROUND_CMD,
     HOTPLUG_CMD,
+    HotplugPayloadError,
+    PluginRefusal,
     hotplug_enabled,
+    release_plugin_round,
+    round_in_progress_reply,
+    take_plugin_round,
     topology_refusal,
 )
 from atom.model_engine.sequence import SequenceStatus
@@ -152,6 +159,8 @@ class EngineUtilityHandler:
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
         HOTPLUG_CMD: "_handle_hotplug_plugin",
+        BEGIN_ROUND_CMD: "_handle_begin_plugin_round",
+        END_ROUND_CMD: "_handle_end_plugin_round",
     }
 
     def __init__(
@@ -816,6 +825,19 @@ class EngineUtilityHandler:
         try:
             if engine is None:
                 raise RuntimeError("no engine to hot-plug")
+            # A plugin round holds the plan for a whole benchmark run: refuse
+            # before pausing anything, so the run keeps its plan, nothing is
+            # installed or captured, and the caller retries once the round
+            # ends.  State here is written only by the round handlers, so this
+            # is the engine's own arbitration, not the manager's cache.
+            round_refusal = round_in_progress_reply(HOTPLUG_CMD, engine)
+            if round_refusal is not None:
+                logger.info(
+                    f"{self.label}: hotplug_plugin refused: plugin round "
+                    f"{round_refusal['active_round']['round_id']!r} is active"
+                )
+                self.output_queue.put_nowait(("UTILITY_RESPONSE", round_refusal))
+                return round_refusal
             if not isinstance(payload, dict):
                 raise TypeError(
                     "hotplug_plugin needs a payload dict carrying the plan source"
@@ -864,6 +886,61 @@ class EngineUtilityHandler:
                     engine.resume_generation()
                 except Exception:  # noqa: BLE001 - a resume must not hide the reason
                     logger.exception(f"{self.label}: could not resume after hot-plug")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_begin_plugin_round(self, args: dict) -> dict:
+        """Take the plugin-round lease; state only, nothing is rescheduled.
+
+        While the lease is held a hot-plug is refused with
+        ``round-in-progress``, so a benchmark can measure one plan without
+        another caller swapping it mid-run.  Deliberately synchronous but
+        cheap: no pause, no drain, no wait, so the busy loop never blocks on a
+        round and the caller just retries its hot-plug after ``end``.
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            if self.engine is None:
+                raise RuntimeError("no engine to begin a plugin round on")
+            reply = {
+                "cmd": BEGIN_ROUND_CMD,
+                **take_plugin_round(self.engine, args.get("round_id")),
+            }
+            logger.info(f"{self.label}: plugin round {reply['round_id']!r} began")
+        except (PluginRefusal, HotplugPayloadError) as exc:
+            reply = {"cmd": BEGIN_ROUND_CMD, "error": str(exc), "reason": exc.reason}
+            logger.info(f"{self.label}: begin_plugin_round refused: {exc.reason}")
+        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
+            reply = self._error_reply(BEGIN_ROUND_CMD, exc)
+            logger.error(f"{self.label}: begin_plugin_round failed: {reply['error']}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_end_plugin_round(self, args: dict) -> dict:
+        """Release the plugin-round lease when ``round_id`` is the active one.
+
+        A mismatched id is refused and the active round stays: only the run
+        that took the lease may drop it, so one benchmark cannot end another's
+        round (or a newer one by a stale retry).
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            if self.engine is None:
+                raise RuntimeError("no engine to end a plugin round on")
+            reply = {
+                "cmd": END_ROUND_CMD,
+                **release_plugin_round(self.engine, args.get("round_id")),
+            }
+            logger.info(
+                f"{self.label}: plugin round {reply['round_id']!r} ended after "
+                f"{reply['duration_s']:.1f}s"
+            )
+        except (PluginRefusal, HotplugPayloadError) as exc:
+            reply = {"cmd": END_ROUND_CMD, "error": str(exc), "reason": exc.reason}
+            logger.info(f"{self.label}: end_plugin_round refused: {exc.reason}")
+        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
+            reply = self._error_reply(END_ROUND_CMD, exc)
+            logger.error(f"{self.label}: end_plugin_round failed: {reply['error']}")
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
