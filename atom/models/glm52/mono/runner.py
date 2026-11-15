@@ -542,20 +542,16 @@ class Glm52MonoRunner:
                 world_size=npes,
                 context="GLM-5.2 weight mapping failed",
             )
+            if self._attention is None:
+                code = list(AttentionWeight).index(attention)
+                group = get_tp_group().cpu_group
+                if group_max(code, group) != group_min(code, group):
+                    raise MonoUnsupported("TP ranks loaded different attention formats")
         except MonoUnsupported as error:
             self._refused.add(rows)
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
         if self._attention is None:
-            code = list(AttentionWeight).index(attention)
-            group = get_tp_group().cpu_group
-            if group_max(code, group) != group_min(code, group):
-                self._refused.add(rows)
-                logger.warning(
-                    "GLM-5.2 MonoKernel fallback before launch: TP ranks loaded "
-                    "different attention formats"
-                )
-                return False
             self._attention = attention
             # The kernel fuses its indexer only beside PTPC projections.
             if attention is not AttentionWeight.FP8_PTPC and self._fused_indexer_on:

@@ -41,6 +41,7 @@ def _linear(kind, rows, cols):
         return SimpleNamespace(
             quant_type=SimpleNamespace(name="No"),
             params_dtype=torch.bfloat16,
+            input_size=cols,
             weight=torch.empty(rows, cols, dtype=torch.bfloat16),
         )
     weight = torch.empty(rows, cols, dtype=FP8)
@@ -71,30 +72,20 @@ def _layer(kinds=("No", "No", "No"), *, folded_indexer=True, absorb_fp8=True):
     return SimpleNamespace(self_attn=attn)
 
 
-def test_bf16_checkpoint_maps_production_storage_in_place():
-    layer = _layer()
+@pytest.mark.parametrize(
+    "kind, attention",
+    [("No", AttentionWeight.BF16_ABSORB_FP8), ("per_Token", AttentionWeight.FP8_PTPC)],
+)
+def test_projections_are_read_in_place_in_the_format_production_loaded(kind, attention):
+    layer = _layer((kind,) * 3, folded_indexer=kind == "No")
     attn = layer.self_attn
-    assert attention_format(layer) is AttentionWeight.BF16_ABSORB_FP8
-    tensors = projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)
-    assert set(tensors) == {"w_qkv_a", "w_q_b", "w_o"}
+    assert attention_format(layer) is attention
+    tensors = projection_weights(attn, CFG, attention)
     for key, name in zip(("qkv_a", "q_b", "o"), SHAPES):
-        weight = getattr(attn, name).weight
-        assert tensors[f"w_{key}"].data_ptr() == weight.data_ptr()
-        assert tensors[f"w_{key}"].shape == weight.shape
-    # the folded indexer rows trail q_a / kv_a; the kernel reads the first
-    # `qkv_a_rows` of them
-    assert tensors["w_qkv_a"].shape[0] == CFG.qkv_a_rows + sum(INDEX_ROWS)
-
-
-def test_ptpc_checkpoint_keeps_its_mapping():
-    layer = _layer(("per_Token",) * 3, folded_indexer=False)
-    attn = layer.self_attn
-    assert attention_format(layer) is AttentionWeight.FP8_PTPC
-    tensors = projection_weights(attn, CFG, AttentionWeight.FP8_PTPC)
-    for key, name in zip(("qkv_a", "q_b", "o"), SHAPES):
-        linear = getattr(attn, name)
-        assert tensors[f"w_{key}"].data_ptr() == linear.weight.data_ptr()
-        assert tensors[f"s_{key}"].shape == (linear.weight.shape[0],)
+        assert tensors[f"w_{key}"].data_ptr() == getattr(attn, name).weight.data_ptr()
+    if kind == "No":
+        # q_a / kv_a lead the folded indexer's rows
+        assert tensors["w_qkv_a"].shape == SHAPES["fused_qkv_a_proj"]
 
 
 @pytest.mark.parametrize(
@@ -115,13 +106,17 @@ def test_a_layer_stored_unlike_the_deployment_is_refused():
         layer_weights(_layer(), 0, 4, attention=AttentionWeight.FP8_PTPC)
 
 
-def test_bf16_storage_the_kernel_cannot_read_in_place_is_refused():
-    layer = _layer()
-    attn = layer.self_attn
+def test_a_preshuffled_bf16_projection_is_refused():
+    attn = _layer().self_attn
     attn.o_proj.weight.is_shuffled = True
-    with pytest.raises(MonoUnsupported, match="o_proj BF16 weight must be row-major"):
+    with pytest.raises(
+        MonoUnsupported, match="o_proj BF16 weight must not be preshuffled"
+    ):
         projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)
-    attn.o_proj.weight.is_shuffled = False
+
+
+def test_a_fused_qkv_a_not_led_by_q_a_and_kv_a_is_refused():
+    attn = _layer().self_attn
     attn.qkv_a_split = [CFG.kv_lora, CFG.q_lora, CFG.pe_dim]
     with pytest.raises(MonoUnsupported, match="fused_qkv_a split"):
         projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)

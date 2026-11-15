@@ -339,7 +339,7 @@ def test_bf16_attention_builds_only_the_external_indexer_path(monkeypatch):
     # The kernel fuses its indexer only beside PTPC projections, so a BF16
     # checkpoint must turn the fused path off before mapping or building it,
     # and every base op must be built, and packed, in the format production
-    # loaded rather than the PTPC this runner used to hard-code.
+    # loaded.
     _RecordingOp.instances = []
     monkeypatch.setattr(runner_mod, "_GlmLayerOp", _RecordingOp)
     monkeypatch.setattr(runner_mod, "_GlmFusedLayerOp", _RecordingOp)

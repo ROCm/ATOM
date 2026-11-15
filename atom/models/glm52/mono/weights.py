@@ -32,7 +32,6 @@ from atom.mono.weights.layer import (
     LayerWeights,
     atom_mxfp4_storage_view,
     linear_bf16,
-    linear_bf16_rows,
     linear_ptpc_fp8,
 )
 
@@ -407,7 +406,8 @@ def projection_weights(attn, cfg, attention: AttentionWeight) -> dict:
     """q_a / kv_a, q_b and W_o in the storage production holds them in."""
 
     # q_a and kv_a lead fused_qkv_a; a layer that folds in its indexer's wk /
-    # weights_proj appends them after, where the kernel never reads.
+    # weights_proj appends them after, where the kernel never reads, so its
+    # BF16 rows are read as a prefix of the whole.
     need(
         list(attn.qkv_a_split[:3]) == [cfg.q_lora, cfg.kv_lora, cfg.pe_dim],
         f"fused_qkv_a split {attn.qkv_a_split}",
@@ -421,7 +421,12 @@ def projection_weights(attn, cfg, attention: AttentionWeight) -> dict:
                 linear, name=name, logical_rows=rows, logical_cols=cols
             )
         else:
-            tensors[f"w_{key}"] = linear_bf16_rows(
-                linear, name=name, logical_rows=rows, logical_cols=cols
+            stored = sum(attn.qkv_a_split) if key == "qkv_a" else rows
+            tensors[f"w_{key}"] = linear_bf16(
+                linear,
+                name=name,
+                logical_rows=stored,
+                logical_cols=cols,
+                row_count=rows,
             )
     return tensors

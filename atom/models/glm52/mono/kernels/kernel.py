@@ -296,7 +296,7 @@ def build_glm5_monokernel(
     assert not atom_experts or expert_mxfp4
     assert not native_fp4_mfma or atom_experts
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
-    absorb_k_chunks_per_unit = 1 if attention_bf16 and not absorb_ptpc else 2
+    absorb_k_chunks_per_unit = 1 if attention_weight is AttentionWeight.BF16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S, heads)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
     assert 1 <= launches_per_step <= LAYER_SLOTS
@@ -383,8 +383,9 @@ def build_glm5_monokernel(
     # traffic; it is bit-identical, because the samples are independent output
     # columns and each one's K chunks accumulate in the same order either way.
     # The row-major BF16 weight is 32 MB: S=8 reads it once, staging the tile
-    # before the prefetch (`S > qkv_sample_tile`) to stay in registers.
+    # before the prefetch to stay in registers.
     SAMPLE_TILE = S if attention_bf16_rows and S <= 8 else min(S, qkv_sample_tile)
+    QA_PREFETCH_FIRST = S <= qkv_sample_tile
     # Per-sample strides of the MoE FP8 activation tile and its block scales,
     # in LDS.  ``HIDDEN // 4`` (1536) and ``XQ_GROUPS`` (192) are both multiples
     # of the 32 LDS banks, so when the up/gate MFMA's B column is the SAMPLE --
@@ -1673,7 +1674,7 @@ def build_glm5_monokernel(
                         res.append([v[j] for j in range(4)])
                     return res
 
-                if const_expr(S <= qkv_sample_tile):
+                if const_expr(QA_PREFETCH_FIRST):
                     h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
                     pre = [u_qa(c) for c in range(QA_UNITS)]
                     if const_expr(attention_ptpc):
@@ -3086,18 +3087,64 @@ def build_glm5_monokernel(
                 stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
-        # 4 row groups x 8 chunks: 2 waves per row group, 4 chunks each
+        # below four rows: 4 row groups x 8 chunks, 2 waves per row group, 4 chunks each
         r_wuv, r_suv = _rsrc(w_uv), _rsrc(s_uv)
         UV_NKC = KV_LORA // 64
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (absorb_k_chunks_per_unit * UV_WPR)
-        # From four rows a task takes a (sample, head) and 16 * WAVES of its rows: one
-        # per UV_TILE re-merged the head's split partials for every tile, and those
-        # polls cost more than the extra tasks gained.
+        # From four rows a task takes a (sample, head) and 16 * WAVES of its rows, so
+        # a head's split partials are merged once rather than once per UV_TILE.
+        def uv_split_weights(ml_got):
+            """wave 0: a head's per-split weights exp(m - M) / L -> misc[split], then
+            M and L, from each split's polled (m, l)."""
+            ok_sp = lane < N_SPLIT
+            m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+            l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+            m_all = wave_max(m_sp)
+            w_sp = _exp(m_sp - m_all)
+            den = wave_sum(l_sp * w_sp)
+            if ok_sp:
+                lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+            if lane == 0:
+                lds_st(misc, N_SPLIT, m_all)
+                lds_st(misc, N_SPLIT + 1, den)
+
+        def sum_quarters():
+            o0 = fx.Float32(0.0)
+            o1 = fx.Float32(0.0)
+            for q in range_constexpr(4):
+                o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
+                o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
+            return o0, o1
+
+        def uv_latent(merged):
+            """Thread tid's (< KV_LORA / 2) latent pair, ``merged()`` of red's partial
+            sums, rounded to bf16 -> xs, or for the FP8 W_UV quantized with a scale a
+            128 dims -> its LDS tile."""
+            uv_valid = tid < KV_LORA // 2
+            uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
+            if uv_valid:
+                o0, o1 = merged()
+                uv0, uv1 = bf16_round(o0), bf16_round(o1)
+                if const_expr(not absorb_ptpc):
+                    lds_st(xs, tid, bf16_pair(uv0, uv1))
+            if const_expr(absorb_ptpc):
+                uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
+                if (lane == 0) & (wave < KV_LORA // 128):
+                    lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
+            gpu.barrier()
+            if const_expr(absorb_ptpc):
+                if uv_valid:
+                    uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                    uv_rcp = 1.0 / uv_scale
+                    st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+                gpu.barrier()
+
         UV_PARTS = V_DIM // (16 * WAVES)
-        UV_BY_HEAD = S >= 4 and D == 1 and V_DIM % (16 * WAVES) == 0 and THREADS == KV_LORA and N_SPLIT <= 64
+        UV_BY_HEAD = S >= 4 and D == 1
         if const_expr(UV_BY_HEAD):
+            assert V_DIM % (16 * WAVES) == 0 and THREADS == KV_LORA and N_SPLIT <= 64
             UVH_UNITS = UV_NKC // absorb_k_chunks_per_unit
             UVH_SPLITS = N_SPLIT // 2  # a thread sums one half of the splits
             for tt in range(start("uv"), S * H * UV_PARTS, G):
@@ -3128,18 +3175,7 @@ def build_glm5_monokernel(
                 if wave == 0:
                     spi = fx.min(lane, N_SPLIT - 1)
                     ml = (s * N_SPLIT + spi) * H + head
-                    ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
-                    ok_sp = lane < N_SPLIT
-                    m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                    l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                    m_all = wave_max(m_sp)
-                    w_sp = _exp(m_sp - m_all)
-                    den = wave_sum(l_sp * w_sp)
-                    if ok_sp:
-                        lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
-                    if lane == 0:
-                        lds_st(misc, N_SPLIT, m_all)
-                        lds_st(misc, N_SPLIT + 1, den)
+                    uv_split_weights(poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)]))
                 gpu.barrier()
                 stamp("uv", tt, 5)
                 hf = tid // (KV_LORA // 2)
@@ -3161,25 +3197,12 @@ def build_glm5_monokernel(
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
                 lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
                 gpu.barrier()
-                uv_valid = tid < KV_LORA // 2
-                uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
-                if uv_valid:
-                    o0 = lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2)
-                    o1 = lds_ld(red, tid * 2 + 1) + lds_ld(red, (KV_LORA // 2 + tid) * 2 + 1)
-                    uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                    if const_expr(not absorb_ptpc):
-                        lds_st(xs, tid, bf16_pair(uv0, uv1))
-                if const_expr(absorb_ptpc):
-                    uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
-                    if (lane == 0) & (wave < KV_LORA // 128):
-                        lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
-                gpu.barrier()
-                if const_expr(absorb_ptpc):
-                    if uv_valid:
-                        uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
-                        uv_rcp = 1.0 / uv_scale
-                        st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
-                    gpu.barrier()
+                uv_latent(
+                    lambda: (
+                        lds_ld(red, tid * 2) + lds_ld(red, (KV_LORA // 2 + tid) * 2),
+                        lds_ld(red, tid * 2 + 1) + lds_ld(red, (KV_LORA // 2 + tid) * 2 + 1),
+                    )
+                )
                 stamp("uv", tt, 2)
                 acc = run_units(u_uvh, UVH_UNITS, UVH_UNITS, pre)
                 if const_expr(absorb_ptpc):
@@ -3234,18 +3257,8 @@ def build_glm5_monokernel(
                 spi = fx.min(lane, N_SPLIT - 1)
                 ml = (s * N_SPLIT + spi) * H + head
                 ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
-                if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
-                    ok_sp = lane < N_SPLIT
-                    m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                    l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                    m_all = wave_max(m_sp)
-                    w_sp = _exp(m_sp - m_all)
-                    den = wave_sum(l_sp * w_sp)
-                    if ok_sp:
-                        lds_st(misc, lane, w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
-                    if lane == 0:
-                        lds_st(misc, N_SPLIT, m_all)
-                        lds_st(misc, N_SPLIT + 1, den)
+                if wave == 0:
+                    uv_split_weights(ml_got)
                 gpu.barrier()
                 for dh in range_constexpr(2):
                     dp = dp_lo + dh * (KV_LORA // 4)
@@ -3265,28 +3278,7 @@ def build_glm5_monokernel(
                     lds_st(red, (hf * (KV_LORA // 2) + dp) * 2, o0)
                     lds_st(red, (hf * (KV_LORA // 2) + dp) * 2 + 1, o1)
                 gpu.barrier()
-                uv_valid = tid < KV_LORA // 2
-                uv0, uv1 = fx.Float32(0.0), fx.Float32(0.0)
-                if uv_valid:
-                    o0 = fx.Float32(0.0)
-                    o1 = fx.Float32(0.0)
-                    for q in range_constexpr(4):
-                        o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
-                        o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
-                    uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                    if const_expr(not absorb_ptpc):
-                        lds_st(xs, tid, bf16_pair(uv0, uv1))
-                if const_expr(absorb_ptpc):
-                    uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
-                    if (lane == 0) & (wave < KV_LORA // 128):
-                        lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
-                gpu.barrier()
-                if const_expr(absorb_ptpc):
-                    if uv_valid:
-                        uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
-                        uv_rcp = 1.0 / uv_scale
-                        st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
-                    gpu.barrier()
+                uv_latent(sum_quarters)
                 # Debug stamp placed HERE, not after the per-split weights where it
                 # used to sit, so ``timeline_report``'s "stage" and "compute" cut
                 # this stage where the question is: everything above reconstructs
