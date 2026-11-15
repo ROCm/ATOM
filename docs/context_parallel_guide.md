@@ -432,7 +432,7 @@ LSE through two 16-bit halves of a bf16 buffer).
 
 | Value | Pattern | Collectives |
 |-------|---------|-------------|
-| `auto` (default) | `mailbox` on gfx950 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
+| `auto` (default) | `mailbox` on gfx950 with DCP > 1 when decode TBO and plugin mode are off, `a2a` otherwise; the choice is logged at startup | |
 | `a2a` | one all-to-all with the LSE packed alongside the output, combine done locally | **1** |
 | `ag_rs` | AllGather LSE + local correct + ReduceScatter output | 2 |
 | `mailbox` | decode only: aiter's FlyDSL `dcp_lse_combine`, one launch that stores each owner's rows and LSEs into its IPC-mapped mailbox and combines them there | **0** (no collective launch) |
@@ -441,11 +441,10 @@ Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
 
 `mailbox` needs aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972, in
-main from `d223b16cf`) and FlyDSL >= 0.5.0,
-whose `dcp_lse_combine` takes `row_counts` (sparse MLA's empty-row mask) on
-every rank; without it, when the peer memory cannot be mapped (e.g. a DCP
-group spanning nodes), and in plugin mode, the layer logs a warning and merges
-with `a2a`. Only graph-captured decode steps take it (each token count is its
+main from `d223b16cf`) and FlyDSL >= 0.5.0; without them startup fails (set
+`comm_backend` to `a2a`). When the peer memory cannot be allocated or mapped
+(e.g. a DCP group spanning nodes), and in plugin mode, the layer logs a
+warning and merges with `a2a`. Only graph-captured decode steps take it (each token count is its
 own kernel build, ~0.4-0.8 s on first use, so eager steps and prefill merge
 with `a2a`). An explicit `mailbox` is refused together with decode TBO
 (`--enable-tbo all`); `auto` takes `a2a` there. After graph capture the ranks

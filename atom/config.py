@@ -2449,9 +2449,20 @@ class Config:
     def _resolve_dcp_comm_backend(self) -> None:
         """``dcp.comm_backend="auto"``: the mailbox combine where it has been
         validated (gfx950, DCP > 1, no decode TBO, not plugin mode), else
-        all-to-all. An explicit backend is kept as given."""
+        all-to-all. An explicit backend is kept as given. Runs after
+        ``_resolve_tbo``, so ``enable_tbo_decode`` is final here."""
         dcp = self.dcp_config
         if dcp.comm_backend != "auto":
+            # The mailbox combine spins in-kernel on its peers; next to decode
+            # TBO's comm-stream collectives that is unverified.
+            assert not (
+                self.decode_context_parallel_size > 1
+                and self.enable_tbo_decode
+                and dcp.comm_backend == "mailbox"
+            ), (
+                "DCP comm_backend 'mailbox' with decode TBO (--enable-tbo all) is "
+                "unverified. Use --enable-tbo (prefill only) or comm_backend 'a2a'."
+            )
             return
         if self.decode_context_parallel_size <= 1:
             reason = "no DCP"
@@ -2460,12 +2471,9 @@ class Config:
         elif self.enable_tbo_decode:
             reason = "decode TBO (--enable-tbo all)"
         else:
-            try:
-                from aiter.jit.utils.chip_info import get_gfx
+            from aiter.jit.utils.chip_info import get_gfx
 
-                gfx = get_gfx()
-            except Exception:  # noqa: BLE001 - no GPU / aiter: keep a2a
-                gfx = "unknown"
+            gfx = get_gfx()
             reason = None if gfx == "gfx950" else f"validated on gfx950 only, not {gfx}"
         dcp.comm_backend = "a2a" if reason else "mailbox"
         if self.decode_context_parallel_size > 1:
@@ -2571,14 +2579,6 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
-            # The mailbox combine spins in-kernel on its peers; next to decode
-            # TBO's comm-stream collectives that is unverified.
-            assert not (
-                self.enable_tbo_decode and self.dcp_config.comm_backend == "mailbox"
-            ), (
-                "DCP comm_backend 'mailbox' with decode TBO (--enable-tbo all) is "
-                "unverified. Use --enable-tbo (prefill only) or comm_backend 'a2a'."
-            )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups

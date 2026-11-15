@@ -19,7 +19,6 @@ Also here: the sparse indexer's DCP support -- the decode candidate exchange
 (fused into one aiter op) and the sparse-prefill owned-slot filter.
 """
 
-import inspect
 import logging
 
 import numpy as np
@@ -861,13 +860,14 @@ def mask_empty_dcp_lse(
 # every rank stores each owner's head rows and LSEs straight into the owner's
 # IPC-mapped mailbox as (value, launch tag) pairs, then polls its own heads and
 # combines them. It replaces pack -> all_to_all_single -> combine. Decode only:
-# its peer buffer is sized for the widest decode step, and its launch epoch
+# its peer buffer is sized for the widest decode step, capped at the widest
+# merge under _MAILBOX_MAX_ELEMS, and its launch epoch
 # lives on each rank, so every rank must launch it the same number of times in
 # the same order -- which a DCP group's lock-step decode does. Each token count
 # is its own kernel build (~0.4-0.8 s on first use), so only graph-captured
 # steps take it: the build lands in capture, and eager steps stay on a2a.
 # Sparse MLA's empty rows (owned_counts == 0) are masked inside the combine
-# through its ``row_counts``; an aiter without that argument keeps a2a.
+# through its ``row_counts``.
 
 _MAILBOX_WORKSPACES: dict = {}
 # Mailbox merges taken, per workspace. A merge can only take the mailbox inside
@@ -901,8 +901,7 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     ``cp_group`` in the same order, before any CUDA graph is captured. Its
     memory sits outside torch's allocator, so it must exist before the KV
     cache is sized. Returns False on every rank, and the merge stays on
-    all-to-all, when any rank's aiter has no mailbox combine (or one without
-    ``row_counts``) or the peer memory cannot be mapped. ``max_tokens`` is
+    all-to-all, when the peer memory cannot be allocated or mapped. ``max_tokens`` is
     capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
     all-to-all, so room for them would never be used.
     """
@@ -917,27 +916,17 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     if max_tokens < 1:
         return False
     try:
-        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace, dcp_lse_combine
-
-        usable = "row_counts" in inspect.signature(dcp_lse_combine).parameters
-        if not usable:
-            logger.warning("DCP mailbox: aiter's dcp_lse_combine has no row_counts")
-    except Exception as error:  # noqa: BLE001 - any failure must reach the vote
-        usable = False
-        logger.warning("DCP mailbox: aiter mailbox combine unavailable: %r", error)
-    # agree first: a rank that skipped the mapping would leave its peers
-    # waiting in it
-    ok = torch.tensor([int(usable)], dtype=torch.int32, device="cpu")
-    torch.distributed.all_reduce(
-        ok, op=torch.distributed.ReduceOp.MIN, group=cp_group.cpu_group
-    )
-    if not ok.item():
-        if usable:
-            logger.warning("DCP mailbox: another rank cannot run it; using a2a")
-        return False
+        from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
+    except ImportError as error:
+        raise ImportError(
+            "DCP comm_backend 'mailbox' needs aiter with the FlyDSL mailbox "
+            "combine (d223b16cf or later) and FlyDSL >= 0.5.0. Set --dcp-config "
+            '\'{"comm_backend": "a2a"}\' to run without it.'
+        ) from error
     device = torch.device("cuda", torch.cuda.current_device())
     try:
-        # its handshake agrees across the group before raising
+        # aiter agrees on the allocation and on the IPC mapping across the
+        # group before raising, so every rank falls back alike.
         ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
     except RuntimeError as error:
         logger.warning("DCP mailbox peer memory: %s", error)
@@ -965,8 +954,7 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
     if (
         ws is None
         or tokens == 0
-        or tokens > ws.max_tokens
-        or tokens * heads * dim > _MAILBOX_MAX_ELEMS
+        or tokens > ws.max_tokens  # capped at _MAILBOX_MAX_ELEMS
         or cp_attn_out.dtype != torch.bfloat16
     ):
         return None

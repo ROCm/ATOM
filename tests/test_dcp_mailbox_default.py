@@ -27,8 +27,6 @@ def _resolve(monkeypatch, backend, dcp=4, plugin=False, tbo=False, gfx="gfx950")
     monkeypatch.setattr(atom_config, "is_plugin_mode", lambda: plugin)
 
     def get_gfx():
-        if gfx is None:
-            raise RuntimeError("No gfx arch found")
         return gfx
 
     monkeypatch.setitem(
@@ -52,7 +50,6 @@ def _resolve(monkeypatch, backend, dcp=4, plugin=False, tbo=False, gfx="gfx950")
         ({"tbo": True}, "a2a"),
         ({"gfx": "gfx1250"}, "a2a"),
         ({"gfx": "gfx942"}, "a2a"),
-        ({"gfx": None}, "a2a"),  # gfx detection raises: no GPU / aiter
     ],
 )
 def test_auto_takes_the_mailbox_only_where_it_was_validated(monkeypatch, kw, expected):
@@ -61,9 +58,16 @@ def test_auto_takes_the_mailbox_only_where_it_was_validated(monkeypatch, kw, exp
 
 @pytest.mark.parametrize("backend", ["a2a", "ag_rs", "mailbox"])
 def test_an_explicit_backend_is_kept(monkeypatch, backend):
-    """Explicit `mailbox` with decode TBO is refused later in __post_init__,
-    not quietly swapped like `auto`."""
-    assert _resolve(monkeypatch, backend, tbo=True, gfx="gfx942") == backend
+    assert _resolve(monkeypatch, backend, gfx="gfx942") == backend
+
+
+def test_an_explicit_mailbox_is_refused_next_to_decode_tbo(monkeypatch):
+    """Not quietly swapped like `auto`. Checked after `_resolve_tbo`, so a TBO
+    it turned off (tbo=False here) no longer refuses the mailbox."""
+    with pytest.raises(AssertionError, match="decode TBO"):
+        _resolve(monkeypatch, "mailbox", tbo=True)
+    assert _resolve(monkeypatch, "mailbox", tbo=False) == "mailbox"
+    assert _resolve(monkeypatch, "a2a", tbo=True) == "a2a"
 
 
 def _peer_vote(peer_count):

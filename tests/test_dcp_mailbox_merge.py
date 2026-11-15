@@ -27,17 +27,6 @@ needs_dcp_ops = pytest.mark.skipif(
 )
 
 
-def _min_vote(record):
-    """A stub for the CPU vote's all_reduce: the vote must take the minimum,
-    so one rank that cannot run the mailbox keeps the whole group on a2a."""
-
-    def all_reduce(t, op, group):
-        assert op == torch.distributed.ReduceOp.MIN
-        record(t)
-
-    return all_reduce
-
-
 def test_mailbox_is_a_comm_backend():
     assert DCPConfig(comm_backend="mailbox").comm_backend == "mailbox"
 
@@ -88,35 +77,6 @@ def test_a_call_the_workspace_cannot_take_is_all_to_all(
 
 
 @needs_dcp_ops
-@pytest.mark.parametrize("extra,taken", [(0, True), (1, False)])
-def test_a_merge_past_the_size_limit_is_all_to_all(
-    monkeypatch, a2a_calls, capturing, extra, taken
-):
-    """The widest merge under the element limit takes the mailbox; one token
-    more takes all-to-all, with the workspace still wide enough for it."""
-    tokens = dcp_ops._MAILBOX_MAX_ELEMS // (64 * 256) + extra
-    group = _group()
-    key = dcp_ops._mailbox_key(group, 16, 256)
-    monkeypatch.setitem(
-        dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=tokens + 1)
-    )
-    combined = []
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.ops.flydsl.dcp_mailbox",
-        SimpleNamespace(
-            dcp_lse_combine=lambda ws, o, l, base_e, row_counts=None: combined.append(o)
-            or o
-        ),
-    )
-    out = torch.zeros(tokens, 64, 256, dtype=torch.bfloat16)
-    lse = torch.zeros(tokens, 64)
-    dcp_ops.dcp_lse_merge(out, lse, group, backend="mailbox")
-    assert len(combined) == int(taken)
-    assert a2a_calls == ([] if taken else [None])
-
-
-@needs_dcp_ops
 def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
     """Sparse MLA's owned_counts reach the combine as its row_counts, with the
     LSE handed over unmasked."""
@@ -145,52 +105,6 @@ def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
 
 
 @needs_dcp_ops
-def test_an_aiter_without_row_counts_keeps_all_to_all(monkeypatch):
-    """Its combine would raise mid-capture on row_counts: no workspace at all."""
-
-    class Workspace:
-        def __init__(self, *a):
-            raise AssertionError("the mapping must not start")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.ops.flydsl.dcp_mailbox",
-        SimpleNamespace(
-            CombineWorkspace=Workspace,
-            dcp_lse_combine=lambda ws, out, lse, base_e=True: out,
-        ),
-    )
-    votes = []
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.item()))
-    )
-    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
-    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
-    assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
-    assert votes == [0]
-
-
-@needs_dcp_ops
-def test_a_broken_aiter_import_still_votes(monkeypatch):
-    """Any failure loading the combine, not only ImportError, has to reach the
-    vote: a rank that raised out of it would leave its peers waiting in gloo."""
-
-    class Broken:
-        def __getattr__(self, name):
-            raise RuntimeError("flydsl failed to initialise")
-
-    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.dcp_mailbox", Broken())
-    votes = []
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.item()))
-    )
-    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
-    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
-    assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
-    assert votes == [0]
-
-
-@needs_dcp_ops
 def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
     """Each token count is its own kernel build; outside a capture it would
     compile mid-serving."""
@@ -204,24 +118,37 @@ def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
 
 
 @needs_dcp_ops
-def test_an_unavailable_mailbox_is_voted_once_on_the_cpu(monkeypatch):
-    """The layers share one attempt: a fallback is remembered, not retried per
-    layer. The vote crosses a gloo group, so it must stay on the CPU even
-    though the model is built under a GPU default device."""
-    votes = []
+def test_an_aiter_without_the_mailbox_fails_startup_with_the_way_out(monkeypatch):
+    """No probing: a missing module raises, naming the a2a escape hatch."""
     monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.dcp_mailbox", None)
-    monkeypatch.setattr(
-        torch.distributed, "all_reduce", _min_vote(lambda t: votes.append(t.device))
-    )
     monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
     group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
-    torch.set_default_device("meta")
-    try:
-        for _ in range(3):  # three MLA layers
-            assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
-    finally:
-        torch.set_default_device(None)
-    assert votes == [torch.device("cpu")]
+    with pytest.raises(ImportError, match='"comm_backend": "a2a"'):
+        dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+
+
+@needs_dcp_ops
+def test_a_failed_mapping_falls_back_once(monkeypatch):
+    """aiter raises on every rank alike when the peer memory cannot be
+    allocated or mapped; the layers share that one attempt."""
+    tries = []
+
+    class Workspace:
+        def __init__(self, *a):
+            tries.append(a)
+            raise RuntimeError("peer memory allocation failed on another TP rank")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(CombineWorkspace=Workspace),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
+    for _ in range(3):  # three MLA layers
+        assert not dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+    assert len(tries) == 1
 
 
 @needs_dcp_ops
@@ -254,7 +181,6 @@ def test_the_workspace_is_sized_for_merges_the_mailbox_can_take(
             dcp_lse_combine=lambda ws, out, lse, base_e=True, row_counts=None: out,
         ),
     )
-    monkeypatch.setattr(torch.distributed, "all_reduce", _min_vote(lambda t: None))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
     monkeypatch.setattr(dcp_ops, "_MAILBOX_GROUPS", {})
@@ -374,16 +300,6 @@ def test_a_layer_without_a_workspace_merges_with_all_to_all(
 
 
 # ------------------------------------------------------------ across ranks
-def _mailbox_available():
-    import inspect
-
-    try:
-        from aiter.ops.flydsl.dcp_mailbox import dcp_lse_combine
-    except ImportError:
-        return False
-    return "row_counts" in inspect.signature(dcp_lse_combine).parameters
-
-
 def _worker(rank, world, init, results):
     import torch.distributed as dist
 
@@ -462,9 +378,6 @@ def _check_mailbox_merge(rank, world, group, heads, dim, tokens):
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="needs two GPUs",
-)
-@pytest.mark.skipif(
-    not _mailbox_available(), reason="aiter has no dcp_mailbox with row_counts"
 )
 def test_the_mailbox_merges_what_all_to_all_merges():
     import torch.multiprocessing as mp
