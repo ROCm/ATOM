@@ -60,6 +60,7 @@ class NodeSelectionTest(unittest.TestCase):
             ("multi_node", 2, 1, 3),
             ("prefill_single_node", 2, 1, 2),
             ("decode_single_node", 1, 2, 2),
+            ("shared_prefill_node", 1, 3, 2),
         ]
         for layout, prefill, decode, expected in cases:
             with self.subTest(layout=layout, prefill=prefill, decode=decode):

@@ -17134,6 +17134,48 @@ models:
               <<: *m31_ax5035_mc_env
               ATOMESH_M31_D_MAX_SEQS: "8"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        # 1P3D on two full nodes: P TP4 and D0 TP4 share node 0, D1 and D2 fill node 1 (16 GPUs). Each D
+        # carries C/3 sessions with the D cap of the 1P2D case at the same sessions per D; P gets its
+        # node share of host KV (1,499 GB).
+        - &m31_mc_1p3d_ax5035_case
+          <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c72-dcap12-cpu15
+          topology: 1p3d
+          pd_worker_layout: shared_prefill_node
+          concurrency: [72]
+          decode:
+            workers: 3
+            tp: 4
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "12"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c96-dcap16-cpu15
+          concurrency: [96]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "16"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c108-dcap18-cpu15
+          concurrency: [108]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "18"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+        - <<: *m31_mc_1p3d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p3d-ax5035-mc-c120-dcap20-cpu15-lpt4k
+          concurrency: [120]
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_D_MAX_SEQS: "20"
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096'
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

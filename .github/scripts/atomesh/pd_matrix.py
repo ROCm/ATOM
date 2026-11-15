@@ -154,6 +154,8 @@ def required_node_count(
         return 1 + int(decode_cfg.get("workers", 1))
     if pd_worker_layout == "decode_single_node":
         return int(prefill_cfg.get("workers", 1)) + 1
+    if pd_worker_layout == "shared_prefill_node":
+        return 2
     return int(prefill_cfg.get("workers", 1)) + int(decode_cfg.get("workers", 1))
 
 
