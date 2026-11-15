@@ -515,16 +515,18 @@ class IndexerUnit(torch.nn.Module):
         super().__init__()
         self.a = torch.nn.Linear(dim, dim, device="cuda")
         self.b = torch.nn.Linear(dim, dim, device="cuda")
-        self.empty = torch.empty(0, device="cuda")
+        # The cache and the three selection buffers the op mutates, then the
+        # norm and rope tables it reads.
+        self.state = [torch.empty(0, device="cuda") for _ in range(8)]
         self.positions = torch.zeros(1024, dtype=torch.int64, device="cuda")
 
     def forward(self, x):
         h = self.a(x)
-        e = self.empty
+        cache, indices, indptr, owned, w, b, cos, sin = self.state
         torch.ops.aiter.sparse_attn_indexer(
-            h, "layer.k_cache", e, h, h, h, 128, None, 64, 64, 1024, 1024,
-            e, e, e, e, e, 1e-6, self.positions[: x.shape[0]], e, e, 1.0,
-            False, False, False,
+            h, "layer.k_cache", cache, h, h, h, 128, None, 64, 64, 1024, 1024,
+            indices, indptr, owned, w, b, 1e-6, self.positions[: x.shape[0]],
+            cos, sin, 1.0, False, False, False,
         )  # fmt: skip
         return self.b(h)
 
