@@ -892,11 +892,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # WARNING, ...); applied by atom.utils.set_atom_log_level(), which turns
     # NOTSET and unknown names into INFO.
     "ATOM_LOG_LEVEL": lambda: os.getenv("ATOM_LOG_LEVEL", "INFO"),
-    # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
-    # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
-    # GPU timestamps for both prefill and decode phases. Empty reads as unset,
-    # like the other directory knobs, so `VAR=` disables it rather than naming
-    # "" as the output directory.
+    # RTL (rocm-trace-lite) GPU kernel tracing. No Python code outside tests
+    # consumes this value: it names the output directory that
+    # .github/scripts/atom_test.sh passes to `rtl trace -o` when
+    # ENABLE_RTL_PROFILER=1, and reads back when the server stops; an empty
+    # value falls back to /app/rtl_traces there. Empty reads as unset here,
+    # like the other directory knobs.
     "ATOM_RTL_TRACE_DIR": lambda: _optional_path_env("ATOM_RTL_TRACE_DIR"),
     # --- Model Loading ---
     "ATOM_DISABLE_MMAP": lambda: (
