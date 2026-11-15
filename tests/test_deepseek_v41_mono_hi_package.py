@@ -139,6 +139,25 @@ def test_the_served_schedules_build_dual_copy_mailboxes(tp):
             )
 
 
+@pytest.mark.parametrize("tp", [2, 8])
+def test_a_tp_schedule_entry_cannot_set_a_steps_or_a_process_knob(monkeypatch, tp):
+    """``schedules._check_entries`` holds ``TP_SCHEDULES`` to the rule ``SCHEDULES`` is held to: a (kind, rows)
+    entry never sets a chain knob (``CHAIN_KNOBS``, a step's) or a precision knob (``PRECISION_KNOBS``, a
+    process's)."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip(
+        "aiter"
+    )  # (the hi device code re-exports atom.mono.device's primitives)
+    from atom.models.deepseek_v41.mono.hi.v41 import schedules
+
+    schedules._check_entries()  # the shipped tables pass
+    for knob in (*schedules.CHAIN_KNOBS, *schedules.PRECISION_KNOBS):
+        table = {**schedules.TP_SCHEDULES[tp], (schedules.WINDOW, 6): {knob: True}}
+        monkeypatch.setitem(schedules.TP_SCHEDULES, tp, table)
+        with pytest.raises(ValueError, match=f"TP{tp} schedule entry"):
+            schedules._check_entries()
+
+
 def test_a_dual_copy_scratch_takes_its_calibrated_word(monkeypatch):
     """``MonoKernel.buffers`` of a dual-copy program: the run area at the start of a 2 MiB page, the copy word
     ``runtime.dual.scratch_word`` calibrates (stubbed here: its probe times the device) in word 0 of the program's

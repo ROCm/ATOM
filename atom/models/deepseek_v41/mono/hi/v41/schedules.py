@@ -506,13 +506,16 @@ def knobs(
 
 
 def _check_entries() -> None:
-    """No (kind, rows) entry sets a step's knob (``CHAIN_KNOBS``) or a process's numerics (``PRECISION_KNOBS``)."""
-    for key, entry in SCHEDULES.items():
-        bad = [n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS) if n in entry]
-        if bad:
-            raise ValueError(
-                f"V4.1 schedule entry {key}: {bad} are a step's or a process's, not a kind's"
-            )
+    """No (kind, rows) entry, at ``KEY_TP`` or in ``TP_SCHEDULES``, sets a step's knob (``CHAIN_KNOBS``) or a
+    process's numerics (``PRECISION_KNOBS``)."""
+    tables = [("", SCHEDULES)] + [(f"TP{tp} ", t) for tp, t in TP_SCHEDULES.items()]
+    for tag, table in tables:
+        for key, entry in table.items():
+            bad = [n for n in (*CHAIN_KNOBS, *PRECISION_KNOBS) if n in entry]
+            if bad:
+                raise ValueError(
+                    f"V4.1 {tag}schedule entry {key}: {bad} are a step's or a process's, not a kind's"
+                )
 
 
 _check_entries()

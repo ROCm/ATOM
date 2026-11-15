@@ -68,9 +68,10 @@ def _prefetch(prefetch, rows: int | None, race: bool | str = False) -> int:
 
 
 # x's K slices at least (ArgmaxHead kparts; 0: the fewest that fit the LDS), by rows: KPARTS_ROWS[r] from r rows on.
-# The batch band's widths (compile only at TP4): at 28-30 rows the 2 slices that fit the LDS land ~75 VGPRs of
-# x beside the prefetch (14-15 spilled to memory at any prefetch); 4 slices build at 30 rows (B5, prefetch 16, greedy
-# and sampling); from 36 rows (3 16-row chunks) 10 slices with 8 units of prefetch build at 36-48 (B6-8), 16 do not
+# The batch band's widths (measured compile-only at TP4; not TP-keyed, so TP2 / TP8 bands take them too): at 28-30
+# rows the 2 slices that fit the LDS land ~75 VGPRs of x beside the prefetch (14-15 spilled to memory at any
+# prefetch); 4 slices build at 30 rows (B5, prefetch 16, greedy and sampling); from 36 rows (3 16-row chunks) 10
+# slices with 8 units of prefetch build at 36-48 (B6-8), 16 do not
 KPARTS_ROWS: dict[int, int] = {25: 4, 31: 10}
 
 

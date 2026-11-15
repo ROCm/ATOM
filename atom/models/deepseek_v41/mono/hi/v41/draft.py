@@ -544,8 +544,8 @@ DRAFT_KPARTS_TP: dict[tuple[int, int], int] = {(30, 2): 16}
 def DRAFT_KPARTS(rows: int, tp: int = 4) -> int:
     """x's K slices at least (``MarkovHead(kparts=)``; 0: the fewest that fit) at a draft of ``rows`` positions: 10
     past 20 rows (5-6 requests of 5: the fewest that fit spill 18-20 VGPRs to memory, 10 build at prefetch 8 and 16;
-    7-8 requests spill 10-18 at any K slices: the B requests' side-by-side Markov steps, not x; compile only, TP4).
-    ``DRAFT_KPARTS_TP``'s (rows, tp) entry first.
+    7-8 requests spill 10-18 at any K slices: the B requests' side-by-side Markov steps, not x; measured compile-only
+    at TP4). Another TP size's measured exceptions are ``DRAFT_KPARTS_TP``'s (rows, tp) entries, taken first.
     """
     return DRAFT_KPARTS_TP.get((rows, tp)) or (10 if rows > 20 else 0)
 
