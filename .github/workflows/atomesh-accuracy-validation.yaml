@@ -244,7 +244,7 @@ jobs:
                 echo "=== Installing Rust toolchain for atomesh build ===" && \\
                 apt-get update && \\
                 apt --fix-broken install -y && \\
-                apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev && \\
+                apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev && \\
                 rm -rf /var/lib/apt/lists/* && \\
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \\
                   | sh -s -- -y --default-toolchain "\${RUST_VERSION}" --profile minimal && \\
@@ -305,7 +305,7 @@ jobs:
               RUST_VERSION='1.94.0'
               apt-get update
               apt --fix-broken install -y
-              apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev protobuf-compiler libprotobuf-dev
+              apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev
               rm -rf /var/lib/apt/lists/*
               curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --default-toolchain \"\$RUST_VERSION\" --profile minimal
