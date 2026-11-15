@@ -366,3 +366,30 @@ pub(crate) fn match_lanes(
     }
     hits
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// A writer woken after its partition is gone ends, which closes the partition's queue.
+    #[test]
+    fn writer_ends_with_its_partition() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let partition = Partition::start(16, Duration::from_secs(3600), runtime.handle());
+        let writes = partition.writes.clone();
+        drop(partition);
+        writes.blocking_send(Write::Release(HolderId(0))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !writes.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "the writer outlived its partition"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
