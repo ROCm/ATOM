@@ -99,9 +99,10 @@ def _reference(ctx, weight):
 
 
 def _dequant(values, scales, rows=1):
-    # The E8M0 cast is exact. `torch.ldexp` is not on the GPU: it comes out
-    # an ulp low for some exponents, so the same value stored under two
-    # adjacent scales would dequantize to two different numbers.
+    # The E8M0 cast is exact. `torch.ldexp` is not on every GPU: on gfx950
+    # (torch 2.10 / ROCm 7.2.4) it comes out an ulp low for some exponents,
+    # 2**-12 among them in fp64, so the same value stored under two adjacent
+    # scales would dequantize to two different numbers.
     scale = scales.view(torch.float8_e8m0fnu).double()
     scale = scale.repeat_interleave(32, dim=-1)
     if rows > 1:
@@ -115,12 +116,9 @@ def _quantize_32x32(weight):
     blocks = weight.float().reshape(n // 32, 32, k // 32, 32)
     amax = blocks.abs().amax(dim=(1, 3)).clamp(min=1e-10)
     code = torch.ceil(torch.log2(amax / 448.0)).to(torch.int32) + 127
-    scale = torch.ldexp(torch.ones_like(amax), code - 127)
-    values = (blocks / scale[:, None, :, None]).clamp(-448.0, 448.0)
-    return (
-        values.reshape(n, k).to(torch.float8_e4m3fn),
-        code.to(torch.uint8).view(torch.float8_e8m0fnu),
-    )
+    scale = code.to(torch.uint8).view(torch.float8_e8m0fnu)
+    values = (blocks / scale.float()[:, None, :, None]).clamp(-448.0, 448.0)
+    return values.reshape(n, k).to(torch.float8_e4m3fn), scale
 
 
 @pytest.mark.parametrize("width", [1, 37, 384])
