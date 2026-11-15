@@ -279,7 +279,7 @@ jobs:
       contents: read
     env:
       CONTAINER_NAME: atom_fused_attention_${{ github.run_id }}_${{ github.run_attempt }}
-      AITER_WHL_DIR: ${{ runner.temp }}/fused-attention-aiter
+      AITER_WHL_DIR: /tmp/fused-attention-aiter-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
