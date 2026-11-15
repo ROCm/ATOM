@@ -3,13 +3,25 @@
 import pytest
 
 from atom.model_ops.minimax_m3.prefill_policy import (
-    DEFAULT_PREFILL_SCORE_CONFIG,
     PrefillScoreConfig,
     parallel_prefill_selector_wins,
     prefill_score_config,
 )
 
 TOPK = 16
+
+
+def default_config(arch, is_fp8, q_len, blocks, batch, heads):
+    q_tiles = (q_len + 127) // 128
+    chunks = max(1, 256 * 8 // max(1, q_tiles * batch * heads))
+    chunks = min(1 << (max(1, chunks).bit_length() - 1), max(1, blocks))
+    chunk_blocks = (blocks + chunks - 1) // chunks
+    if arch == "gfx1250":
+        warps, stages = (4, 1) if is_fp8 else (8, 3)
+    else:
+        warps, stages = 4, 3
+    return PrefillScoreConfig(128, chunk_blocks, warps, stages, 1, False, False)
+
 
 MULTI_PLANE = PrefillScoreConfig(
     block_size_q=128,
@@ -68,7 +80,7 @@ def test_parallel_prefill_selector_resource_bounds(
         parallel_prefill_selector_wins(
             arch=arch,
             width=width,
-            rows=rows,
+            query_rows=rows,
             compute_units=256,
             emit=emit,
             topk=TOPK,
@@ -86,7 +98,7 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
         parallel_prefill_selector_wins(
             arch="gfx1250",
             width=1280,
-            rows=512,
+            query_rows=512,
             compute_units=256,
             emit=True,
             topk=TOPK,
@@ -101,7 +113,15 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
 @pytest.mark.parametrize(
     "arch,is_fp8,q_len,blocks,batch,heads,want",
     [
-        ("gfx950", True, 2517, 823, 1, 1, DEFAULT_PREFILL_SCORE_CONFIG),
+        (
+            "gfx950",
+            True,
+            2517,
+            823,
+            1,
+            1,
+            default_config("gfx950", True, 2517, 823, 1, 1),
+        ),
         (
             "gfx1250",
             False,
@@ -109,9 +129,17 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
             823,
             1,
             1,
-            DEFAULT_PREFILL_SCORE_CONFIG,
+            default_config("gfx1250", False, 2517, 823, 1, 1),
         ),
-        ("gfx1250", True, 96, 640, 1, 4, DEFAULT_PREFILL_SCORE_CONFIG),
+        (
+            "gfx1250",
+            True,
+            96,
+            640,
+            1,
+            4,
+            default_config("gfx1250", True, 96, 640, 1, 4),
+        ),
         ("gfx1250", True, 512, 640, 1, 4, q64(14)),
         (
             "gfx1250",
@@ -120,7 +148,7 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
             256,
             1,
             1,
-            DEFAULT_PREFILL_SCORE_CONFIG,
+            default_config("gfx1250", True, 2048, 256, 1, 1),
         ),
         ("gfx1250", True, 2048, 640, 1, 1, q64(14)),
         ("gfx1250", True, 2517, 823, 1, 1, q64(22)),
@@ -143,7 +171,15 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
         ("gfx1250", True, 4096, 320, 1, 4, q64(80)),
         ("gfx1250", True, 8192, 320, 1, 4, q64(160)),
         ("gfx1250", True, 4096, 640, 1, 4, q64(107)),
-        ("gfx1250", True, 1024, 640, 1, 1, DEFAULT_PREFILL_SCORE_CONFIG),
+        (
+            "gfx1250",
+            True,
+            1024,
+            640,
+            1,
+            1,
+            default_config("gfx1250", True, 1024, 640, 1, 1),
+        ),
         ("gfx1250", True, 1025, 640, 1, 1, q64(8)),
         ("gfx1250", True, 8192, 640, 1, 1, q256(40)),
         ("gfx1250", True, 8193, 640, 1, 1, q256(43)),
@@ -158,7 +194,7 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
             640,
             1,
             1,
-            DEFAULT_PREFILL_SCORE_CONFIG,
+            default_config("gfx1250", True, 65536, 640, 1, 1),
         ),
         ("gfx1250", True, 65536, 640, 1, 4, MULTI_PLANE),
         ("gfx1250", True, 32768, 2048, 1, 4, MULTI_PLANE),
@@ -169,7 +205,7 @@ def test_parallel_prefill_selector_fits_emitted_workspace(pages_per_block, want)
             2048,
             1,
             4,
-            DEFAULT_PREFILL_SCORE_CONFIG,
+            default_config("gfx1250", True, 65536, 2048, 1, 4),
         ),
         ("gfx1250", True, 131072, 2048, 1, 1, q256(2048)),
     ],

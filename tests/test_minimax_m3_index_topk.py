@@ -38,35 +38,8 @@ from atom.model_ops.minimax_m3.index_topk import (
     _prefill_topk_block_size_k,
     _require_packable,
 )
-from atom.model_ops.minimax_m3.prefill_policy import (
-    DEFAULT_PREFILL_SCORE_CONFIG,
-)
 
 TOPK = 16
-
-
-@pytest.mark.parametrize(
-    "arch,dtype,want",
-    [
-        ("gfx942", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
-        ("gfx942", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.float8_e4m3fn, (4, m.SCORE_NUM_STAGES)),
-        ("gfx950", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
-        ("gfx1250", torch.bfloat16, (8, m.SCORE_NUM_STAGES)),
-        ("gfx1250", torch.float8_e4m3fn, (4, 1)),
-        ("gfx1250", torch.float8_e4m3fnuz, (4, 1)),
-        ("gfx1250", torch.float8_e5m2, (4, 1)),
-        ("gfx1250", torch.float8_e5m2fnuz, (4, 1)),
-    ],
-)
-def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
-    monkeypatch.setattr(m, "get_gfx_runtime", lambda: arch)
-    m._prefill_score_launch_config.cache_clear()
-    try:
-        assert m._prefill_score_launch_config(dtype) == want
-    finally:
-        m._prefill_score_launch_config.cache_clear()
 
 
 class TestPrefillTileWidth:
@@ -306,20 +279,26 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
     kw = _inputs(qlens, prefixes, heads, "cuda")
     total_q, max_block = sum(qlens), triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
     score = torch.empty((heads, total_q, max_block), dtype=torch.float32, device="cuda")
-    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    cb = m._score_chunk_blocks(
+    config = m._prefill_score_config(
+        m.get_gfx_runtime(),
+        kw["index_kv_cache"].dtype in m._FP8_DTYPES,
+        kw["max_query_len"],
         max_block,
-        q_tiles,
         len(qlens),
         heads,
-        torch.device("cuda"),
+        m._compute_units(kw["idx_q"].device.index),
     )
+    q_tiles = triton.cdiv(kw["max_query_len"], config.block_size_q)
+    cb = config.chunk_blocks
     m._index_block_score_kernel[(q_tiles, len(qlens) * heads, triton.cdiv(max_block, cb))](
         kw["idx_q"], kw["index_kv_cache"], score, kw["block_table"], kw["cu_seqlens_q"],
         kw["seq_lens"], kw["prefix_lens"], heads, HEAD_DIM, kw["sm_scale"], cb,
         *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), *score.stride(),
-        kw["block_table"].stride(0), BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, num_stages=m.SCORE_NUM_STAGES,
+        kw["block_table"].stride(0), BLOCK_SIZE_Q=config.block_size_q,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, STORE_GROUP=config.store_group,
+        PREFETCH_PAGES=config.prefetch_pages,
+        POST_REDUCE_SCALE=config.post_reduce_scale,
+        num_warps=config.num_warps, num_stages=config.num_stages,
     )  # fmt: skip
     idx, sbt, _ = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
 
@@ -537,24 +516,34 @@ class TestSelectorDispatch:
     stricter when the call also emits.
     """
 
+    @staticmethod
+    def _gfx950_wins(width, emit):
+        return m._aiter_selector_wins(
+            width,
+            emit,
+            arch="gfx950",
+            selector_rows=1,
+            compute_units=256,
+        )
+
     def test_narrow_rows_stay_on_triton(self):
         for width in (1, 64, 512, m._AITER_MIN_WIDTH - 1):
-            assert not m._aiter_selector_wins(width, emit=False)
-            assert not m._aiter_selector_wins(width, emit=True)
+            assert not self._gfx950_wins(width, emit=False)
+            assert not self._gfx950_wins(width, emit=True)
 
     def test_emission_raises_the_bar(self):
         between = m._AITER_MIN_WIDTH
         assert between < m._AITER_MIN_WIDTH_WITH_EMIT
-        assert m._aiter_selector_wins(between, emit=False)
-        assert not m._aiter_selector_wins(between, emit=True)
+        assert self._gfx950_wins(between, emit=False)
+        assert not self._gfx950_wins(between, emit=True)
 
     def test_wide_rows_take_aiter(self):
         for width in (m._AITER_MIN_WIDTH_WITH_EMIT, 8192):
-            assert m._aiter_selector_wins(width, emit=False)
-            assert m._aiter_selector_wins(width, emit=True)
+            assert self._gfx950_wins(width, emit=False)
+            assert self._gfx950_wins(width, emit=True)
 
     @pytest.mark.parametrize(
-        "width,rows,want",
+        "width,selector_rows,want",
         [
             (511, 65536, False),
             (512, 8191, False),
@@ -562,13 +551,13 @@ class TestSelectorDispatch:
             (1895, 4104, True),
         ],
     )
-    def test_gfx1250_uses_work_per_cu(self, width, rows, want):
+    def test_gfx1250_uses_work_per_cu(self, width, selector_rows, want):
         assert (
             m._aiter_selector_wins(
                 width,
                 emit=True,
                 arch="gfx1250",
-                rows=rows,
+                selector_rows=selector_rows,
                 compute_units=256,
             )
             == want
@@ -589,7 +578,7 @@ class TestSelectorDispatch:
                 width,
                 emit=emit,
                 arch="gfx1250",
-                rows=65536,
+                selector_rows=65536,
                 compute_units=256,
                 decode_max_q=4,
             )
@@ -727,10 +716,7 @@ def test_gfx1250_wave32_selector_matches_prefill_fallback(
 ):
     if m.get_gfx_runtime() != "gfx1250":
         pytest.skip("gfx1250 wave32 selector regression")
-    try:
-        m._small_k_selector()
-    except ImportError:
-        pytest.skip("aiter's small-k selector is not installed")
+    m._small_k_selector()
 
     kw = _inputs([q_len], [prefix_len], heads, "cuda")
     bounds = m.build_n_valid_column_per_row(
@@ -845,6 +831,7 @@ def test_page128_prefill_emit_uses_aiter_or_fallback_without_parallel_workspace(
         ([2858], [501632], False),
         ([4104], [238336], False),
         ([2331], [343936], True),
+        ([2858, 2331], [501632, 343936], False),
     ],
 )
 def test_prefill_launch_policy_preserves_scores_and_selection(
@@ -919,12 +906,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         return result
 
     arch, is_fp8 = m.get_gfx_runtime(), cache_dtype in m._FP8_DTYPES
-    old_warps, old_stages = m._prefill_score_launch_config(cache_dtype)
-    old_q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
-    old_chunk = m._score_chunk_blocks(
-        max_block, old_q_tiles, len(qlens), heads, q.device
-    )
-    score_config = m._prefill_score_config(
+    policy_args = (
         arch,
         is_fp8,
         kw["max_query_len"],
@@ -933,27 +915,29 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         heads,
         m._compute_units(q.device.index),
     )
-    new_q_tiles = triton.cdiv(kw["max_query_len"], score_config.block_size_q)
-    new_chunk = score_config.chunk_blocks or m._score_chunk_blocks(
-        max_block,
-        new_q_tiles,
-        len(qlens),
-        heads,
-        q.device,
-    )
+    old_config = m._prefill_policy._default_prefill_score_config(*policy_args)
+    score_config = m._prefill_score_config(*policy_args)
     kernel_config = (
         score_config.store_group,
         score_config.prefetch_pages,
         score_config.post_reduce_scale,
     )
     old_score = score(
-        m.SCORE_BLOCK_SIZE_Q, old_chunk, old_warps, old_stages, (1, False, False)
+        old_config.block_size_q,
+        old_config.chunk_blocks,
+        old_config.num_warps,
+        old_config.num_stages,
+        (
+            old_config.store_group,
+            old_config.prefetch_pages,
+            old_config.post_reduce_scale,
+        ),
     )
     new_score = score(
         score_config.block_size_q,
-        new_chunk,
-        score_config.num_warps or old_warps,
-        score_config.num_stages or old_stages,
+        score_config.chunk_blocks,
+        score_config.num_warps,
+        score_config.num_stages,
         kernel_config,
     )
     torch.cuda.synchronize()
@@ -961,12 +945,32 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     assert torch.equal(old_score[valid], new_score[valid])
 
     # Exercise the production wrapper too; do not validate only a raw launch.
+    parallel_launches = []
+    real_parallel_launch = m._launch_parallel_prefill_selector
+
+    def tracked_parallel_launch(*args, **kwargs):
+        parallel_launches.append(1)
+        return real_parallel_launch(*args, **kwargs)
+
+    monkeypatch.setattr(m, "_launch_parallel_prefill_selector", tracked_parallel_launch)
     new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    expect_parallel = m._parallel_prefill_selector_wins(
+        arch=arch,
+        width=max_block,
+        query_rows=total_q,
+        compute_units=m._compute_units(q.device.index),
+        emit=True,
+        topk=TOPK,
+        num_idx_heads=heads,
+        decode_max_q=0,
+        pages_per_block=m.PAGES_PER_SPARSE_BLOCK,
+    )
+    assert bool(parallel_launches) is expect_parallel
     with monkeypatch.context() as patch:
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
+            m._prefill_policy._default_prefill_score_config,
         )
         patch.setattr(m, "_parallel_prefill_selector_wins", lambda **kwargs: False)
         old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
@@ -997,7 +1001,7 @@ def test_gfx1250_issue_341_tp4_launch_is_bit_exact(
         patch.setattr(
             m,
             "_prefill_score_config",
-            lambda *args: DEFAULT_PREFILL_SCORE_CONFIG,
+            m._prefill_policy._default_prefill_score_config,
         )
         previous = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
     torch.cuda.synchronize()

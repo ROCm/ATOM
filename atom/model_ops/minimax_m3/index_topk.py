@@ -70,10 +70,6 @@ def _small_k_selector():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# Stages, both score kernels. 2 -- triton's default -- was the worst of 1/2/3
-# nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1 wins the
-# short-context rows, which is not where a step spends its time.
-SCORE_NUM_STAGES = 3
 DECODE_SCORE_NUM_STAGES = 3
 _FP8_DTYPES = tuple(
     dtype
@@ -85,19 +81,6 @@ _FP8_DTYPES = tuple(
     )
     if dtype is not None
 )
-
-
-@functools.cache
-def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
-    """Return (warps, stages) without changing the tuned gfx950 path."""
-    if get_gfx_runtime() != "gfx1250":
-        return 4, SCORE_NUM_STAGES
-
-    # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
-    # enough that four warps outperform eight on long-context prefill. Keep
-    # the BF16 configuration separate: it does not have the same tradeoff.
-    return (4, 1) if dtype in _FP8_DTYPES else (8, SCORE_NUM_STAGES)
-
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
 # floors the blocks a chunk walks -- the query tile is loaded once outside the
@@ -530,40 +513,9 @@ def _index_block_score_kernel(
     if blk_lo >= blk_end:
         return
     blk_hi = min(blk_lo + chunk_blocks, blk_end)
-    if STORE_GROUP == 1 and not POST_REDUCE_SCALE:
-        # Preserve main's exact fallback body: short/underfilled shapes select
-        # this specialization, so the optimized kernel must not tax them.
-        for blk in tl.range(blk_lo, blk_hi):
-            i = blk * BLOCK_SIZE_K
-            page = tl.load(bt_row + blk).to(tl.int64)
-            pos = i + off_k
-            # Every page id names a fully allocated 128-row cache page; the
-            # causal mask below removes positions past the live sequence.
-            k = tl.load(
-                ik_cache_ptr
-                + page * stride_ik_blk
-                + off_k[None, :] * stride_ik_pos
-                + off_d[:, None] * stride_ik_d,
-            )
-            if k.dtype.is_fp8():
-                qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
-            else:
-                qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
-            if q_start < i + BLOCK_SIZE_K:
-                qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
-            score = tl.max(qk, axis=1)
-            s_ptrs = (
-                score_ptr
-                + pid_h * stride_s_h
-                + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
-                * stride_s_n
-                + blk * stride_s_k
-            )
-            q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-            tl.store(s_ptrs, score, mask=q_store_mask)
-    elif STORE_GROUP == 1:
-        q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+    q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+    if STORE_GROUP == 1:
         for blk in tl.range(blk_lo, blk_hi):
             page = tl.load(bt_row + blk).to(tl.int64)
             score = _index_block_score_page(
@@ -588,8 +540,6 @@ def _index_block_score_kernel(
             tl.store(s_ptrs, score, mask=q_store_mask)
     else:
         tl.static_assert(STORE_GROUP == 4)
-        q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
         slots = tl.arange(0, STORE_GROUP)
         num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
         for group in tl.range(0, num_groups):
@@ -755,11 +705,8 @@ def _score_tile_keys(
 # a process sees would fix the width for every later one. That lottery is not
 # academic -- the widths differ by more than 4x across these shapes.
 #
-# Warps go opposite ways for the same reason the widths do. Prefill runs one
-# program per query token (16k CTAs), so one warp per row is plenty and more
-# only adds cross-lane work: 1 won all 28 cells of the sweep. Decode's selector
-# grid is 50-200 CTAs, far too few to fill the machine on their own, so it wants
-# the warps instead.
+# Decode's selector grid is only 50-200 CTAs, so it needs multiple warps per
+# program; the best single pair over the deployed shapes is (512, 8).
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 
@@ -767,24 +714,6 @@ DECODE_TOPK_NUM_WARPS = 8
 @functools.cache
 def _compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, device):
-    """128-blocks one prefill score program owns.
-
-    The query tile decides how many rows share a loaded page; this decides how
-    many programs there are. Keeping them separate is the point -- without it
-    the only way to raise the grid is to shrink the tile, which is the same
-    thing as reading every page more times.
-
-    Derived from max_block, which is a launch-time bound, so a cuda graph
-    replays the grid it captured. Chunks are sized rather than counted so that
-    chunk z is the same pages for every query tile that reaches it.
-    """
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return _prefill_policy.score_chunk_blocks(
-        max_block, q_tiles, batch * heads, _compute_units(index)
-    )
 
 
 def _decode_score_chunks(batch: int, max_block: int) -> int:
@@ -883,22 +812,22 @@ def _alloc_emit(
 # of thousands in DPEP prefill, and its one-pass narrowing repays the separate
 # emit launch once rows * width supplies 16K cells per CU. The work gate keeps
 # short eager calls on the fused Triton selector instead of turning a device win
-# into two host submissions. GPU0 complete-path A/B at width 1895/3942 was
-# 128.2 -> 113.9us and 189.4 -> 167.8us; DPEP q16K was 655.2 -> 579.2us.
+# into two host submissions. Complete-path A/B at width 1895/3942 was
+# 128.2 -> 113.9us and 189.4 -> 167.8us; DPEP q16K was 655.2 -> 579.2us
+# (raw logs: https://gist.github.com/XiaobingSuper/8c205499e3dac1349c24d1914fde771d).
 _AITER_MIN_WIDTH = 1024
 _AITER_MIN_WIDTH_WITH_EMIT = 2048
 _GFX1250_AITER_MIN_WIDTH = 512
 _GFX1250_AITER_MIN_CELLS_PER_CU = 1 << 14
 
 
-@functools.cache
 def _aiter_selector_wins(
     width,
     emit,
     *,
-    arch=None,
-    rows=1,
-    compute_units=1,
+    arch,
+    selector_rows,
+    compute_units,
     decode_max_q=0,
 ):
     if arch == "gfx1250":
@@ -907,7 +836,7 @@ def _aiter_selector_wins(
             return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
         return (
             width >= _GFX1250_AITER_MIN_WIDTH
-            and rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
+            and selector_rows * width >= compute_units * _GFX1250_AITER_MIN_CELLS_PER_CU
         )
     return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
 
@@ -1236,7 +1165,7 @@ def _launch_select(
         score.shape[2],
         emit,
         arch=arch,
-        rows=score.shape[0] * score.shape[1],
+        selector_rows=score.shape[0] * score.shape[1],
         compute_units=compute_units,
         decode_max_q=decode_max_q,
     )
@@ -1264,7 +1193,7 @@ def _launch_select(
     if _parallel_prefill_selector_wins(
         arch=arch,
         width=score.shape[2],
-        rows=score.shape[1],
+        query_rows=score.shape[1],
         compute_units=compute_units,
         emit=emit,
         topk=topk,
@@ -1714,19 +1643,12 @@ def _triton_prefill_score(
         ),
     )
     q_tiles = triton.cdiv(max_query_len, score_config.block_size_q)
-    chunk_blocks = score_config.chunk_blocks or _score_chunk_blocks(
-        max_block, q_tiles, batch, num_idx_heads, idx_q.device
-    )
+    chunk_blocks = score_config.chunk_blocks
     grid_score = (
         q_tiles,
         batch * num_idx_heads,
         triton.cdiv(max_block, chunk_blocks),
     )
-    score_num_warps, score_num_stages = _prefill_score_launch_config(
-        index_kv_cache.dtype
-    )
-    score_num_warps = score_config.num_warps or score_num_warps
-    score_num_stages = score_config.num_stages or score_num_stages
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -1754,8 +1676,8 @@ def _triton_prefill_score(
         STORE_GROUP=score_config.store_group,
         PREFETCH_PAGES=score_config.prefetch_pages,
         POST_REDUCE_SCALE=score_config.post_reduce_scale,
-        num_warps=score_num_warps,
-        num_stages=score_num_stages,
+        num_warps=score_config.num_warps,
+        num_stages=score_config.num_stages,
     )
     return score
 
