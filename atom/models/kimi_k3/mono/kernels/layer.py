@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.kimi_k3.mono.kernels.attention import back as k2a
@@ -43,13 +43,17 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     NA,
     TG,
     groups,
-    slice_compute,
-    slice_loads,
-    stage_gate,
-    stage_mix,
+)
+from atom.models.kimi_k3.mono.kernels.layer_stages import (
+    O0,
+    oproj,
+    stage_attnres,
+    stage_attnres_far,
+    stage_routes,
 )
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
 from atom.models.kimi_k3.mono.kernels.stages import mla_prep as pr
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep_qkv as pq
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.mono.device import gemv
 from atom.mono.device.ops import kernel_symbol, lds_bytes, load_ptr64, traced
@@ -62,18 +66,6 @@ from atom.mono.plan.layout import byte_layout, pair_layout
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.debug import region_ids
-
-O0 = NA  # the CTAs past AttnRes's: o_proj's first round, then the early GEMVs
-OTASKS = k2a.OTASKS  # 448
-O_ROUNDS = (OTASKS + BLOCKS - 1) // BLOCKS  # 2: every CTA takes o_proj tasks
-
-
-def o_slot(bid):
-    """CTA bid's first o_proj task: CTAs O0 .. take 0 .., the AttnRes CTAs the
-    last 56 slots, whose second task is past OTASKS (one task each: their
-    reduce waits on the slowest partial)."""
-    return (bid + BLOCKS - O0) % BLOCKS
-
 
 E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
@@ -260,107 +252,6 @@ def plain_bytes(key: K2Build) -> int:
 
 
 @traced
-def stage_oproj(c, gi):
-    """o_proj tasks gi, gi + 256 (< 448): every task's weights in flight at
-    once (one memory latency, not two), then the MFMAs, a token group's core
-    rows at a time. A CTA with one task loads its own slab again for the
-    round it skips (cache hits), not task 447's on 64 CTAs at once."""
-    # K2's bf16 GEMV weights (here, the MoE's early / shared down / up) a load
-    # two slabs of 8 rows (``gemv.chunk_ops`` paired)
-    ops = [
-        k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
-        for j in range(O_ROUNDS)
-    ]
-    for g in range_constexpr(c["G"]):
-        # ``stage_o`` ends at a barrier: the previous group's core rows are read
-        cg = k2a.group_view(c, g)
-        k2a.load_core(cg)
-        for j in range_constexpr(O_ROUNDS):
-            t = gi + BLOCKS * j
-            if t < OTASKS:
-                k2a.stage_o(cg, t, ops[j])
-
-
-@traced
-def stage_oproj_post(c, gi, task):
-    """``stage_oproj`` reading the core this launch's MLA post stage writes:
-    this CTA's post task (if any), the o_proj weights in flight across the
-    wait for every task's ``mpdone`` pair, then a token group at a time its
-    core rows at device scope and the MFMAs. (The weights issued before the
-    post task stay live across it: one VGPR spilled from 4 rows.)"""
-    # one stage on every CTA: a task publishes its pair before the CTA waits
-    # on all of them (an exchange, as an all-reduce's push and poll)
-    enter_stage("k2.mlapost")
-    if task >= 0:
-        mp.post_task(c, task)
-    ops = [
-        k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
-        for j in range(O_ROUNDS)
-    ]
-    mp.wait_core(c)
-    enter_stage("k2.o")
-    for g in range_constexpr(c["G"]):
-        cg = k2a.group_view(c, g)
-        mp.load_core_dev(cg, 0, cg["S"], k2a.OK, gemv.LDS_PAD)
-        for j in range_constexpr(O_ROUNDS):
-            t = gi + BLOCKS * j
-            if t < OTASKS:
-                k2a.stage_o(cg, t, ops[j])
-
-
-def _oproj(c, key, bid):
-    """CTA ``bid``'s o_proj: ``stage_oproj``, or in an ``mla_post`` build
-    ``stage_oproj_post`` (with the CTA's post task)."""
-    if key.mla_post:
-        stage_oproj_post(c, o_slot(bid), mp.task_of(bid))
-    else:
-        stage_oproj(c, o_slot(bid))
-
-
-@traced
-def stage_attnres(c, task, g, on, tls):
-    """Task ``task`` (< NA) of token group g's AttnRes seam: the reduced o_proj
-    -> slice -> gate (tasks 0 .. 15) -> mix -> x rows, XRDY. Group g runs on
-    CTAs 56 g ..: the groups' hand-off chains side by side."""
-    cg = k2a.group_view(c, g)
-    enter_stage("k2.ar")
-    # the slice's sources and weights in flight across the reduce's wait
-    sld = slice_loads(cg, task)
-    k2a.stage_reduce(cg, task)
-    stamp(on, tls, c["tid"], 1)
-    enter_stage("k2.slice")
-    slice_compute(cg, task, sld)
-    stamp(on, tls, c["tid"], 2)
-    enter_stage("k2.gate")
-    if task < cg["S"]:
-        stage_gate(cg, task)
-    stamp(on, tls, c["tid"], 8)
-    enter_stage("k2.mix")
-    stage_mix(cg, task)
-    stamp(on, tls, c["tid"], 9)
-
-
-@traced
-def stage_attnres_far(c, bid, on, tls):
-    """CTA bid's AttnRes task of the groups past the first (CTAs 56 .., after
-    their o_proj, before their early GEMV: that waits for every group's x)."""
-    for g in range_constexpr(1, c["G"]):
-        if (bid >= NA * g) & (bid < NA * (g + 1)):
-            stage_attnres(c, bid - NA * g, g, on, tls)
-
-
-@traced
-def stage_routes(c, bid):
-    """CTA bid (< NA) after the AttnRes seam: route tokens bid, bid + 56, .."""
-    s = c["S"]
-    enter_stage("k2.route")
-    for i in range_constexpr(-(-s // NA)):
-        if bid + NA * i < s:
-            k2b.stage_route(c, bid + NA * i)
-    stamp(c["tl_on"], c["tls"], c["tid"], 10)
-
-
-@traced
 def _body(
     bk,
     core: Int64,
@@ -527,7 +418,7 @@ def _body(
         c["rope_maxpos"] = key.rope_maxpos
     on, tls = key.timeline, lds.tls.ptr
     stamp_begin(on, tls, tid, TL_POINTS)
-    # ---- o_proj on every CTA (``o_slot``)
+    # ---- o_proj on every CTA (``layer_stages.o_slot``)
     eb = bid - E0
     lb = eb - k2b.R_TASKS
     is_r = (bid >= E0) & (eb < k2b.R_TASKS)
@@ -536,7 +427,7 @@ def _body(
     # retire in order), the early weights after: they land before x does
     if bid >= O0:
         enter_stage("k2.o")
-        _oproj(c, key, bid)
+        oproj(c, key, bid)
         stamp(on, tls, tid, 1)
         stage_attnres_far(c, bid, on, tls)
     enter_stage("k2.early")
@@ -552,7 +443,7 @@ def _body(
     # ---- AttnRes: the reduced o_proj -> x; then route
     if bid < NA:
         enter_stage("k2.o")
-        _oproj(c, key, bid)
+        oproj(c, key, bid)
         stage_attnres(c, bid, 0, on, tls)
         stamp(on, tls, tid, 13)
         stage_routes(c, bid)
@@ -612,12 +503,12 @@ def _body(
         if (bid >= pr.P1_CTA0) & (bid < pr.P1_CTA0 + pr.P1_TASKS):
             pr.p1_task(c, bid - pr.P1_CTA0)
         if bid < 2 * s:
-            pr.p2_norm(c, bid)
+            pq.p2_norm(c, bid)
         # P3 on the lnorm CTAs and P1's (after it), P4 past them
         if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
-            pr.p3_task(c, bid - pr.P3_CTA0)
+            pq.p3_task(c, bid - pr.P3_CTA0)
         if bid >= pr.P4_CTA0:
-            pr.p4_task(c, bid - pr.P4_CTA0)
+            pq.p4_task(c, bid - pr.P4_CTA0)
     stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
