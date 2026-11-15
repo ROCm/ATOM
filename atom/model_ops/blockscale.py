@@ -82,13 +82,15 @@ FP8_TAPS = 3  # V4.1 DSpark's target taps, `dspark_target_layer_ids`
 def quantize_fp8_taps(taps):
     """``quantize_fp8(torch.cat(taps, -1))`` without the concatenation.
 
-    The taps are equal-shape [T, W] rows (row stride free, unit column stride);
-    the fp8 values and E8M0 scales come out bit-identical to quantizing the
-    concatenated tensor, one kernel instead of a copy plus a quantize. The
-    kernel is cut for V4.1 DSpark's ``FP8_TAPS`` taps; any other count, and
-    shapes it does not tile (W not a multiple of 1024, mixed dtypes or
-    shapes), take the concatenating path; a single tap, e.g. a block already
-    joined by a PP relay, is quantized as it is, without a copy.
+    The taps are equal-shape [T, W] rows (any row stride, unit column
+    stride); the fp8 values and E8M0 scales come out bit-identical to
+    quantizing the concatenated tensor, one kernel instead of a copy plus a
+    quantize. The kernel is cut for V4.1 DSpark's ``FP8_TAPS`` CUDA taps of
+    bf16, fp16 or fp32. Anything else takes the concatenating path: another
+    tap count, taps that are not 2-D, a column stride other than 1, W not a
+    multiple of 1024, mixed shapes, dtypes or devices, non-CUDA tensors and
+    other dtypes. A single tap, e.g. a block already joined by a PP relay, is
+    quantized as it is, without a copy.
     """
     taps = tuple(taps)
     first = taps[0]

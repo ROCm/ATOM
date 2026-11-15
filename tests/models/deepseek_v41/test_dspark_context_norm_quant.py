@@ -12,10 +12,11 @@ into one block first, the taps give the same bytes.
 
 That is not bit-exact: the fused kernel quantizes the fp32 normalized value,
 the chain the bf16-rounded one. So, as in the draft-KV tail's test, the claim
-is that where the two disagree the fused value is the one nearer an fp64
-reference. The second test covers the scale layout: a scale read in the wrong
-view does not fail, it writes a wrong KV row, so the GEMM output is checked
-against fp64 and a misread scale is shown to fail that check.
+is that where the two disagree under the same scale the fused value is the
+one nearer an fp64 reference, and that per scale group it is never farther.
+The second test covers the scale layout: a scale read in the wrong view does
+not fail, it writes a wrong KV row, so the GEMM output is checked against
+fp64 and a misread scale is shown to fail that check.
 """
 
 from types import SimpleNamespace
@@ -127,12 +128,13 @@ def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
     with torch.inference_mode():
         reference = _reference(draft._project_taps(taps), draft.mtp[0].main_norm.weight)
         values, scales = draft.project_context_quant(taps)
-        chain = _dequant(*quantize_fp8(draft.project_context(taps)))
+        chain_values, chain_scales = quantize_fp8(draft.project_context(taps))
     assert values.shape == (1, width, HIDDEN)
     assert values.dtype == torch.float8_e4m3fn
     assert scales.shape == (1, width, HIDDEN // 32)
     assert scales.dtype == torch.float8_e8m0fnu
     fused = _dequant(values, scales)
+    chain = _dequant(chain_values, chain_scales)
 
     # Disagreements come from the bf16 rounding the fused path skips, so the
     # fused side of each should be nearer fp64 -- except a straddle, where the
@@ -146,7 +148,16 @@ def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
     straddles = (torch.minimum(fused, chain) <= reference) & (
         reference <= torch.maximum(fused, chain)
     )
-    assert (worse & ~straddles).sum() == 0
+    # Element by element only where both paths chose the same scale. A group
+    # whose amax sits on a power-of-two boundary can take adjacent scales --
+    # the fp32 amax just past it, the bf16-rounded one on it -- and then one
+    # path codes the whole group on a step twice the other's, so single
+    # elements of it can land farther from fp64 without straddling. Such a
+    # group is held to the per-group check below like every other.
+    same_scale = (
+        scales.view(torch.uint8) == chain_scales.view(torch.uint8).view_as(scales)
+    ).repeat_interleave(32, dim=-1)
+    assert (worse & ~straddles & same_scale).sum() == 0
     grouped = (width, HIDDEN // 32, 32)
     fused_group = fused_error.reshape(grouped).pow(2).mean(-1).sqrt()
     chain_group = chain_error.reshape(grouped).pow(2).mean(-1).sqrt()

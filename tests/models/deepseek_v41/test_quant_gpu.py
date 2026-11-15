@@ -48,7 +48,8 @@ def test_fp8_quantization_bytes_and_qat(shape):
         # Fewer rows than the taps hold (the caller's row cut), and none.
         (3, 9, 1024, 32, 4, False),
         (3, 9, 1024, 0, 0, False),
-        # Shapes the kernel does not take go through the concatenation.
+        # Shapes the kernel does not take: a width it does not tile, other tap
+        # counts. Several taps are joined first; one tap is quantized as it is.
         (3, 7, 288, 0, None, False),
         (1, 7, 1024, 0, None, False),
         (2, 5, 2048, 96, None, False),
