@@ -3,7 +3,7 @@
 //! `cache_aware` routes by.
 //!
 //! One partition per model, pool and block size, each rank on a lane of its own. The partition's
-//! writer task alone applies the ranks' admitted batches (`partition`); requests walk the
+//! writer thread alone applies the ranks' admitted batches (`partition`); requests walk the
 //! index concurrently (`index`). Keys chain hashes of the blocks' tokens (`hash`), so the
 //! engines' own block hashes are only translated, never compared.
 

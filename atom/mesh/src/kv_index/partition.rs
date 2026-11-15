@@ -1,5 +1,5 @@
 //! A partition of the index: the ranks of one model, pool and block size, each on a lane,
-//! and the writer task that alone applies their admitted batches, in order. The prompts
+//! and the writer thread that alone applies their admitted batches, in order. The prompts
 //! routed to each worker are predictions on lanes of a second index, kept apart from the
 //! events, each block until a TTL after it was last routed.
 
@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::Duration,
 };
@@ -42,7 +42,7 @@ pub(crate) struct Partition {
     /// Lanes taken, by bit.
     lanes: Mutex<u64>,
     writes: mpsc::Sender<Write>,
-    /// Where the writer runs, and a release waits for room in its queue.
+    /// Where a release waits for room in its queue.
     runtime: Handle,
     pub(super) predicted: PrefixIndex,
     predicting: Mutex<u64>,
@@ -71,7 +71,9 @@ enum Write {
 }
 
 impl Partition {
-    /// A partition whose writer runs on `runtime` and keeps predictions for `ttl`.
+    /// A partition whose ranks write from `runtime`, and whose writer keeps predictions for
+    /// `ttl`. The writer has its own thread, as it waits for walks to leave the shards and
+    /// then lets them run, and ends with the partition.
     pub(crate) fn start(block_size: u32, ttl: Duration, runtime: &Handle) -> Arc<Self> {
         let (writes, batches) = mpsc::channel(QUEUED_BATCHES);
         let (predictions, routed) = mpsc::channel(QUEUED_PREDICTIONS);
@@ -87,7 +89,17 @@ impl Partition {
             predictions,
             queued_tokens: AtomicUsize::new(0),
         });
-        runtime.spawn(write(partition.clone(), batches, routed, ttl));
+        let writer = Arc::downgrade(&partition);
+        std::thread::Builder::new()
+            .name("kv-index-writer".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("the KV index writer's runtime starts")
+                    .block_on(write(writer, batches, routed, ttl))
+            })
+            .expect("the KV index writer thread starts");
         partition
     }
 
@@ -206,22 +218,23 @@ impl Drop for Predictor {
     }
 }
 
-/// Queues a lane's release, waiting on the writer's runtime while the queue is full.
+/// Queues a lane's release, waiting on `runtime` while the queue is full.
 fn release(runtime: &Handle, writes: &mpsc::Sender<Write>, release: Write) {
     match writes.try_send(release) {
         Err(TrySendError::Full(release)) => {
             let writes = writes.clone();
             runtime.spawn(async move { writes.send(release).await });
         }
-        // Closed only once the monitor's runtime, and the index with it, is gone.
+        // The writer ends with the partition, which the lane keeps, or by panicking.
         Ok(()) | Err(TrySendError::Closed(_)) => {}
     }
 }
 
 /// Applies the ranks' batches before any prediction. Expired predictions leave at the next
-/// sweep, due every eighth of the TTL.
+/// sweep, due every eighth of the TTL, and the first sweep after the partition ends the
+/// writer.
 async fn write(
-    partition: Arc<Partition>,
+    partition: Weak<Partition>,
     mut writes: mpsc::Receiver<Write>,
     mut predictions: mpsc::Receiver<Write>,
     ttl: Duration,
@@ -236,6 +249,9 @@ async fn write(
             Some(write) = writes.recv() => write,
             Some(prediction) = predictions.recv() => prediction,
             now = sweeps.tick() => {
+                let Some(partition) = partition.upgrade() else {
+                    return;
+                };
                 for (&lane, blocks) in &mut predicted {
                     blocks.retain(|&hash, &mut until| {
                         let live = until > now;
@@ -248,6 +264,9 @@ async fn write(
                 }
                 continue;
             }
+        };
+        let Some(partition) = partition.upgrade() else {
+            return;
         };
         match write {
             Write::Batch {

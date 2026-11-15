@@ -725,7 +725,16 @@ impl IngressRouting {
         let metadata = parsed.metadata();
         let tokens = match tokens {
             Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
-            Tokens::Wanted if parsed.carries_media() => None,
+            // The index cannot match media, and these APIs have no token-routing template.
+            Tokens::Wanted
+                if metadata.carries_media
+                    || matches!(
+                        parsed,
+                        ParsedInference::Messages(_) | ParsedInference::Responses(_)
+                    ) =>
+            {
+                None
+            }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
             Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),

@@ -17,6 +17,8 @@ pub struct InferenceMetadata {
     pub batch_size: Option<usize>,
     pub stream: bool,
     pub return_logprob: bool,
+    /// See [`ParsedInference::carries_media`]; set by `ParsedInference` only.
+    pub carries_media: bool,
 }
 
 impl InferenceMetadata {
@@ -29,6 +31,7 @@ impl InferenceMetadata {
             batch_size: self.batch_size,
             stream: self.stream,
             return_logprob: self.return_logprob,
+            carries_media: self.carries_media,
         }
     }
 }
@@ -59,6 +62,7 @@ impl InferenceRequest for ChatCompletionRequest {
             batch_size: self.n.filter(|n| *n > 1).map(|n| n as usize),
             stream: self.is_stream(),
             return_logprob: self.logprobs,
+            carries_media: false,
         }
     }
 }
@@ -82,6 +86,7 @@ impl InferenceRequest for CompletionRequest {
             batch_size,
             stream: self.is_stream(),
             return_logprob: self.logprobs.is_some(),
+            carries_media: false,
         }
     }
 }
@@ -105,6 +110,7 @@ impl InferenceRequest for GenerateRequest {
             batch_size,
             stream: self.is_stream(),
             return_logprob: self.return_logprob.unwrap_or(false),
+            carries_media: false,
         }
     }
 }
@@ -335,7 +341,7 @@ impl InferenceRequest for ParsedInference {
         self.metadata_with_text(true)
     }
     fn metadata_with_text(&self, include_text: bool) -> InferenceMetadata {
-        match self {
+        let mut metadata = match self {
             Self::Chat(r) => r.metadata_with_text(include_text),
             Self::Completion(r) => r.metadata_with_text(include_text),
             Self::Generate(r) => r.metadata_with_text(include_text),
@@ -370,9 +376,12 @@ impl InferenceRequest for ParsedInference {
                     batch_size: None,
                     stream: body["stream"].as_bool().unwrap_or(false),
                     return_logprob: false,
+                    carries_media: false,
                 }
             }
-        }
+        };
+        metadata.carries_media = self.carries_media();
+        metadata
     }
 }
 
@@ -495,6 +504,7 @@ mod tests {
         ] {
             let parsed = ParsedInference::parse(route, body.as_bytes()).unwrap();
             assert_eq!(parsed.carries_media(), media, "{body}");
+            assert_eq!(parsed.metadata_with_text(false).carries_media, media);
         }
     }
 }

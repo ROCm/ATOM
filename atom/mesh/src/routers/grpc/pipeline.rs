@@ -249,6 +249,7 @@ impl Pipeline {
             tokens,
             headers: resp_ctx.headers.as_ref(),
             stream: resp_ctx.original.is_streaming(),
+            carries_media: false,
         };
         self.planner
             .plan(&descriptor)
