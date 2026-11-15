@@ -30,27 +30,32 @@ def test_native_mx_scale_kwargs():
 
 def test_width_gate(monkeypatch):
     monkeypatch.delenv("ATOM_V4_USE_TRITON_FUSION", raising=False)
-    assert v4.shared_expert_fused_act_enabled(2304) is False
+    assert v4.shared_expert_fused_act_enabled(2304, 32) is False  # flag off
 
     monkeypatch.setenv("ATOM_V4_USE_TRITON_FUSION", "1")
     v4._log_unfused_width.cache_clear()
-    # V4.1-Flash: unsharded 2304 and TP2 1152 pass; TP4 576 and TP8 288 do not.
-    assert v4.shared_expert_fused_act_enabled(2304) is True
-    assert v4.shared_expert_fused_act_enabled(1152) is True
-    assert v4.shared_expert_fused_act_enabled(128) is True
-    assert v4.shared_expert_fused_act_enabled(576) is False
-    assert v4.shared_expert_fused_act_enabled(288) is False
-    assert v4.shared_expert_fused_act_enabled(64) is False
+    # A native MX w2 always fuses: LinearBase rejects input_size % 32 != 0, so
+    # the per-rank intermediate is always a whole number of 32-wide groups.
+    for width in (2304, 1152, 576, 288, 128, 64, 32):
+        assert v4.shared_expert_fused_act_enabled(width, 32) is True
+    # Blockscale w2 (128-wide groups): TP4 576 and TP8 288 stay unfused.
+    assert v4.shared_expert_fused_act_enabled(2304, None) is True
+    assert v4.shared_expert_fused_act_enabled(1152, None) is True
+    assert v4.shared_expert_fused_act_enabled(576, None) is False
+    assert v4.shared_expert_fused_act_enabled(288, None) is False
+    assert v4.shared_expert_fused_act_enabled(64, None) is False
 
 
 def test_width_fallback_logs_once(monkeypatch, caplog):
     monkeypatch.setenv("ATOM_V4_USE_TRITON_FUSION", "1")
     v4._log_unfused_width.cache_clear()
     with caplog.at_level(logging.INFO, logger=v4.__name__):
-        assert v4.shared_expert_fused_act_enabled(576) is False
-        assert v4.shared_expert_fused_act_enabled(576) is False
-        assert v4.shared_expert_fused_act_enabled(288) is False
-    # One log per width: repeated layers of 576 do not log again.
+        # Only a blockscale w2 can reject a width; TP4/TP8 widths log once each.
+        assert v4.shared_expert_fused_act_enabled(576, None) is False
+        assert v4.shared_expert_fused_act_enabled(576, None) is False
+        assert v4.shared_expert_fused_act_enabled(288, None) is False
+    # One log per width: repeated 576 does not log again.
     assert caplog.text.count("Using the unfused path") == 2
+    assert "multiple of 128" in caplog.text
     assert "576" in caplog.text
     assert "288" in caplog.text

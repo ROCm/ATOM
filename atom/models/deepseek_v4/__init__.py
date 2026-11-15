@@ -2772,11 +2772,12 @@ class Expert(nn.Module):
         self.swiglu_limit = swiglu_limit
         # ATOM_V4_USE_TRITON_FUSION: clamp + silu(gate)*up [+ weights] + FP8
         # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
-        # of quantizing itself. The kernel needs this rank's intermediate
-        # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
-        # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
+        # of quantizing itself. A quantized row must hold whole quant groups,
+        # so the gate takes w2's activation layout: 32-wide groups for a native
+        # MX w2 (V4.1-Flash fuses at TP4 576 and TP8 288), 128 for a blockscale
+        # one. Other widths keep the unfused path.
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
-            self.w2.input_size
+            self.w2.input_size, self.w2.native_a8_group_rows
         )
 
     def forward(
