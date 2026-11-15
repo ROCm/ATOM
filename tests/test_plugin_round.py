@@ -465,6 +465,23 @@ def test_a_manager_round_gates_a_hotplug_and_end_releases_it(wired):
     assert wired.runner.calls == [(rounds.HOTPLUG_CMD, {"capture": False})]
 
 
+def test_a_duplicate_begin_does_not_end_the_active_round(wired):
+    wired.manager.begin_plugin_round("run-1")
+    calls_after_begin = list(wired.broadcast_calls)
+
+    with pytest.raises(rounds.PluginRefusal) as refused:
+        wired.manager.begin_plugin_round("run-1")
+
+    assert refused.value.reason == rounds.ROUND_IN_PROGRESS_REASON
+    # The manager refused before broadcasting, so no rollback END was sent:
+    # the active round is still held by the engine and its cache.
+    assert wired.broadcast_calls == calls_after_begin
+    assert wired.engine.plugin_round_id == "run-1"
+    assert wired.manager.plugin_round_status()["active_round"]["round_id"] == "run-1"
+    wired.manager.end_plugin_round("run-1")
+    assert wired.engine.plugin_round_id is None
+
+
 def test_a_conflicting_begin_is_rolled_back_and_keeps_its_reason(wired):
     calls = []
 

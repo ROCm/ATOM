@@ -62,6 +62,7 @@ from atom.model_engine.plugin_hotplug import (
     END_ROUND_CMD,
     HOTPLUG_CMD,
     PluginRefusal,
+    ROUND_IN_PROGRESS_REASON,
     aggregate_reports,
     aggregate_round_replies,
     checked_round_id,
@@ -2207,6 +2208,18 @@ class CoreManager:
             if timeout is None
             else checked_timeout(timeout)
         )
+        # A duplicate begin must not reach the broadcast: the failure path
+        # below rolls a partial begin back with END_ROUND_CMD(round_id), and
+        # if the duplicate named the round that is already active that
+        # rollback would end the live round. Refuse from the manager's own
+        # authoritative cache instead, before anything is sent.
+        active = getattr(self, "_plugin_round", None)
+        if isinstance(active, dict) and active.get("round_id"):
+            raise PluginRefusal(
+                ROUND_IN_PROGRESS_REASON,
+                f"plugin round {active['round_id']!r} is already active; end "
+                f"it before beginning another",
+            )
         try:
             replies = self.broadcast_utility_command_sync(
                 BEGIN_ROUND_CMD, timeout=timeout, round_id=round_id
