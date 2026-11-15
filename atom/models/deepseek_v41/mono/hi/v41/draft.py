@@ -513,7 +513,7 @@ def stage_program(
 
     blocks = stage_blocks(stage, sc.tp, sc.rows, knobs)
     kn = schedules.knobs("window", sc.rows, over=knobs, tp=sc.tp)
-    stages = moe_route_early([st for b in blocks for st in b.stages(sc)], kn)
+    stages = moe_route_early([st for b in blocks for st in b.stages(sc)], kn, tp=sc.tp)
     return blocks, Program(
         name, sc, stages, peer_first=CHAIN_PEER, sgpr_spill_ok=True, **program
     )

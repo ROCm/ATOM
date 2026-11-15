@@ -10,9 +10,11 @@ programs.
 
 Usage: python -m atom.models.deepseek_v41.mono.hi_contract CONFIG.json [WIDTH ...] [--tp N] [--fits]
 (``CONFIG.json``: the model's ``config.json``; widths default to every served one, ``hi_compose.ROWS``: the 108
-programs and their fits, about 10 minutes a TP size on 8 CPUs; ``--tp``: one served TP size, ``hi_gate.SERVED_TPS``, default
-every one). The Linear prefetch fits are derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``);
-``--fits`` prints the table instead (to regenerate it: every fit of the TP sizes checked).
+programs and their fits, in every FP4 index layout the programs address, ``hi_gate.INDEX_LAYOUTS``: the index
+sources' programs differ by layout, and the engine serves gfx950 with ATOM's default "mfma"; about 10 minutes a TP
+size and layout on 8 CPUs; ``--tp``: one served TP size, ``hi_gate.SERVED_TPS``, default every one). The Linear
+prefetch fits are derived and held to the frozen table (``hi.blocks.gfx950.linear_fits``); ``--fits`` prints the
+table instead (to regenerate it: every fit of the TP sizes and layouts checked).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from types import SimpleNamespace
 
 from atom.models.deepseek_v41.config import build_attention_topology
 from atom.models.deepseek_v41.mono import hi_compose
-from atom.models.deepseek_v41.mono.hi_gate import MAX_CTX, SERVED_TPS
+from atom.models.deepseek_v41.mono.hi_gate import INDEX_LAYOUTS, MAX_CTX, SERVED_TPS
 
 
 def config(path: str) -> SimpleNamespace:
@@ -35,12 +37,14 @@ def config(path: str) -> SimpleNamespace:
     return SimpleNamespace(**raw.get("text_config", raw))
 
 
-def check(cfg, widths=None, tp: int = 4, fits: bool = True) -> hi_compose.HiPrograms:
+def check(
+    cfg, widths=None, tp: int = 4, fits: bool = True, index_layout: str = "preshuffle"
+) -> hi_compose.HiPrograms:
     """Every hi program of ``widths`` (default ``hi_compose.ROWS``) at ``tp`` (one of ``SERVED_TPS``) built for gfx950
-    compile-only, its trace checked (module docstring); -> the composition. Raises ``ContractError`` on a violation,
-    ``ValueError`` on a TP size the programs are not built for. ``fits``: the Linear prefetch fits derived by their
-    probes, not read from the frozen table (``linear_fits``), and each held to the table's (``ContractError`` on a
-    difference; a plan the table lacks: ``missing_fits``).
+    compile-only on ATOM's FP4 index plane in ``index_layout``, its trace checked (module docstring); -> the
+    composition. Raises ``ContractError`` on a violation, ``ValueError`` on a TP size the programs are not built for.
+    ``fits``: the Linear prefetch fits derived by their probes, not read from the frozen table (``linear_fits``), and
+    each held to the table's (``ContractError`` on a difference; a plan the table lacks: ``missing_fits``).
     """
     from .hi.blocks.gfx950 import linear, linear_fits
 
@@ -52,7 +56,9 @@ def check(cfg, widths=None, tp: int = 4, fits: bool = True) -> hi_compose.HiProg
     widths = list(hi_compose.ROWS) if widths is None else list(widths)
     frozen, linear.FROZEN = linear.FROZEN, not fits
     try:
-        progs = hi_compose.HiPrograms(cfg, topology, widths, MAX_CTX, tp)
+        progs = hi_compose.HiPrograms(
+            cfg, topology, widths, MAX_CTX, tp, index_layout=index_layout
+        )
     finally:
         linear.FROZEN = frozen
     if fits:
@@ -109,14 +115,19 @@ def main(argv: list[str]) -> int:
     tps = SERVED_TPS
     if "--tp" in argv:
         i = argv.index("--tp")
+        if i + 1 >= len(argv) or not argv[i + 1].isdigit():
+            print(f"--tp takes a TP size, one of {SERVED_TPS}")
+            return 2
         tps, argv = (int(argv[i + 1]),), argv[:i] + argv[i + 2 :]
     cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
-    for tp in tps:  # (one process: the derived fits of every TP size)
-        t0 = time.time()
-        progs = check(cfg, widths, tp)
-        if not write:
-            print(f"TP{tp}: {len(progs.kernels())} hi programs built and checked in {time.time() - t0:.0f} s; "
-                  f"{len(missing_fits())} fits not in the frozen table")  # fmt: skip
+    # (one process: the derived fits of every TP size and layout)
+    for tp in tps:
+        for layout in INDEX_LAYOUTS:
+            t0 = time.time()
+            progs = check(cfg, widths, tp, index_layout=layout)
+            if not write:
+                print(f"TP{tp} {layout}: {len(progs.kernels())} hi programs built and checked in "
+                      f"{time.time() - t0:.0f} s; {len(missing_fits())} fits not in the frozen table")  # fmt: skip
     if (
         write
     ):  # the frozen table, every fit of the compositions (the derived ones it lacked included)
