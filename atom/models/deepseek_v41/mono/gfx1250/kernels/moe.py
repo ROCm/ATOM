@@ -1164,7 +1164,7 @@ CTAS_R = 240                       # routed CTAs
 DRED = 254000                      # LDS: the down's 7 x 128 f32 partials, then 64 packed words
 SHDL = 110000                      # LDS: this CTA's shared-expert down slice (8 tiles x 5 K steps x UNIT8 = 87040 B)
 NSHD = 8 * DNU * UNIT8 // 16       # its 16-byte chunks
-DNPD = 4                           # routed down tiles in flight a wave
+DNPD = 2                           # routed down tiles in flight a wave (2: with the body's waves_per_eu 4, step.WAVES_PER_EU)
 TP_TG = 40960
 KB = 8                             # UG K steps in flight a wave
 
