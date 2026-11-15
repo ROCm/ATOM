@@ -1483,16 +1483,17 @@ def shared_ug(c, j, TR):
 
 
 @ASTRewriter.transform
-def x8_pub(c, r):
-    """CTA (r, 0): its LDS x8 row -> the global x8 row r (fx8 / fxs) + the row's LL flag (the union UG's B rows)."""
+def x8_pub(c, r, lr=0):
+    """CTA (r, 0), or a shared CTA (x8_self: every row, LDS row lr = r): its LDS x8 row lr -> the global x8 row r
+    (fx8 / fxs) + the row's LL flag (the union UG's B rows)."""
     t = c["t"]
     if t < 160:
-        v0 = hx.lload(c["sm"] + X8LO + t * 32, I32, 4, align=16)
-        v1 = hx.lload(c["sm"] + X8LO + t * 32 + 16, I32, 4, align=16)
+        v0 = hx.lload(c["sm"] + X8LO + lr * H + t * 32, I32, 4, align=16)
+        v1 = hx.lload(c["sm"] + X8LO + lr * H + t * 32 + 16, I32, 4, align=16)
         hx.stx_dev(c["x8"] + i64(r * H + t * 32), v0)
         hx.stx_dev(c["x8"] + i64(r * H + t * 32 + 16), v1)
     if t < 40:   # the 160 codes as 40 words
-        hx.stx_dev(c["xs"] + i64(r * (H // 32) + t * 4), hx.lload(c["sm"] + X8LS + t * 4, I32))
+        hx.stx_dev(c["xs"] + i64(r * (H // 32) + t * 4), hx.lload(c["sm"] + X8LS + lr * (H // 32) + t * 4, I32))
     hx.wait_storecnt0()
     gpu.barrier()
     if t == 0:

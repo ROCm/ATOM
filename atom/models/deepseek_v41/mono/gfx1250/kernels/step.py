@@ -610,6 +610,10 @@ def target_layer(E, Ly):
     if shc:   # the shared expert's UG (all rows), then (6 of them) the FFN mix sums + Sinkhorn
         FS.x8_self(dict(t=t, w=w, l=l, sm=sm + FLO, x1g=plog(X1F), part2=plog(P2F), nw=ltab(fp, Ly, "nw")(),
                         norm_eps=D.RMS_EPS, **fpf), TR)
+        jsh = b - MS.SC0
+        ip = jsh * MS.NRC
+        if (jsh < TR) & ((ip < MS.SC0).select(ip, ip + MS.NSC) >= FS.RCTA0):   # a row whose (r, 0) CTA routes: its x8 out
+            MS.x8_pub(cr, jsh, jsh)   # from here (x8_self: every row already in LDS)
         MS.shared_ug(cr, b - MS.SC0, TR)
         if (b >= MS.SC0 + 6) & (b < MS.SC0 + 6 + FS.NL1):
             FS.mix_l1(dict(t=t, part2=plog(P2F), part3=plog(P3F), cnt2=lc + i64(LY.MIX_POST), cnt3=lc + i64(LY.MIX_L1)),
@@ -622,8 +626,8 @@ def target_layer(E, Ly):
     else:
         crr = dict(cr, row=fx.min(rr_, fx.Int32(TR - 1)))
         if rr_ < TR:
-            MS.f0_row(crr, rr_)
-            if ss_ == 0:   # the row's x8 to global for the union UG (one CTA a row)
+            if (ss_ == 0) & (b < FS.RCTA0):   # the row's x8 to global for the union UG (one CTA a row: the LDS row is
+                MS.f0_row(crr, rr_)          # read by nothing else; a router CTA's row: the shared CTA's)
                 MS.x8_pub(crr, rr_)
             MS.shdn_prefetch(crr, ss_)
         # every row's top-k (wave r = row r) and the expert union (each (expert, group) of the UG once, its rows as N)
