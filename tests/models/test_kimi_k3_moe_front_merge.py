@@ -119,8 +119,9 @@ def test_one_front_gemm_feeds_what_three_did(block):
     assert sum(w is merged for w in gemms) == 1
     for key in ("router_logits", "routed_input", "gate_up"):
         assert torch.equal(seen[key], want_seen[key]), key
-    # The fused MoE kernels take their tuned path only on contiguous rows.
-    assert seen["routed_input"].is_contiguous()
+    # The experts read the latent columns of the merged GEMM's output, uncopied.
+    front_output = seen["router_logits"].untyped_storage().data_ptr()
+    assert seen["routed_input"].untyped_storage().data_ptr() == front_output
     assert torch.equal(routed, want_routed)
     assert torch.equal(shared, want_shared)
 
