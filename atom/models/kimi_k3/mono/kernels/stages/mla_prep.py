@@ -89,6 +89,15 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     sum_polled,
 )
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
+from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (
+    HEADS,
+    QH,
+    QK_NOPE,
+    QKV_A,
+    QL,
+    ROPE,
+)
+from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import LORA as KVL
 from atom.mono.device import gemv
 from atom.mono.device.ops import (
     CM_DEV,
@@ -117,10 +126,6 @@ AMX0 = 1024  # P0's AMX sums in ``red``, past the MSQ sums
 MAX_ROWS = 16  # one token group: the AttnRes CTAs wrote prefix(M-1) themselves
 
 ROWS = gemv.ROWS  # 16
-QL = 1536  # q_lora_rank
-KVL = 512  # kv_lora_rank
-ROPE = 64  # qk_rope_head_dim
-QKV_A = QL + KVL + ROPE  # 2112: fused_qkv_a_proj's rows
 P1_TASKS = QKV_A // ROWS  # 132
 P1_CTA0 = 84  # past the lnorm CTAs (56 .. 83); 84 .. 215
 P1_Q = QL // ROWS  # tasks 0 .. 95 make q_c
@@ -133,9 +138,6 @@ P2_TDS = 8
 FLT_MIN = 1.1754943508222875e-38
 
 # P3 .. P5
-HEADS = 12  # a TP8 rank's MLA heads
-QK_NOPE = 128
-QH = QK_NOPE + ROPE  # 192: q_b_proj's columns a head
 QB = HEADS * QH  # 2304
 P3_TASKS = QB // ROWS  # 144
 P3_CTA0 = 56  # 56 .. 199 (the lnorm CTAs, then P1's)
