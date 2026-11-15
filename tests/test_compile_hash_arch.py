@@ -70,9 +70,8 @@ def test_widths_patterns_and_constants_key_the_compile_cache():
 
 
 def test_index_cache_fields_key_the_compile_cache():
-    # compute_hash hashed these four explicitly until hf_architecture_factor
-    # covered them; key them from hf_config and from a separate text_config,
-    # where a multimodal checkpoint carries them.
+    # The four index-cache fields key the cache from hf_config and from a
+    # separate text_config, where a multimodal checkpoint carries them.
     variants = {
         "use_index_cache": (False, True),
         "index_topk_freq": (1, 4),

@@ -2133,7 +2133,7 @@ def _hf_config_fields(config) -> tuple:
     return tuple(out)
 
 
-def hf_architecture_factor(hf_config) -> tuple:
+def _hf_architecture_factor(hf_config) -> tuple:
     """The HF model-config values that key the compile cache.
 
     Every public scalar (and flat list / tuple of scalars, and the scalar
@@ -3492,10 +3492,6 @@ class Config:
         # writes in both V4 and V4.1. Hash the same snapshot their caches use.
         if self.index_cache_layout is not None:
             factors.append(("index_cache_layout", self.index_cache_layout))
-        # The four index-cache fields (use_index_cache, index_topk_freq,
-        # index_topk_pattern, index_skip_topk_offset) used to be hashed here;
-        # ``hf_architecture_factor`` below keys them, reading both hf_config
-        # and a separate text_config.
         # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
         # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
         # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
@@ -3541,12 +3537,7 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
-        # The factors above read the checkpoint config only through the
-        # quantization settings and the flags derived from it (e.g. indexer
-        # CP), so without this there is no general architecture input: two
-        # checkpoints of one architecture that differ only in a scalar field
-        # (the layer count, a width) would share one artifact.
-        architecture_factor = hf_architecture_factor(self.hf_config)
+        architecture_factor = _hf_architecture_factor(self.hf_config)
         factors.append(architecture_factor)
         # hf_config also carries values ATOM writes itself (rope_parameters,
         # dspark_*, an expert_dtype probed from disk), so a value that moved
