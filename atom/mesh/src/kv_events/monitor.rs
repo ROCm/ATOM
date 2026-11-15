@@ -2,9 +2,9 @@
 //! of the monitor's own, so that decoding never holds up the request path. A task's SUB
 //! socket connects once the engine binds, and reconnects after the engine restarts.
 //! Batches the stream missed are replayed from the engine, if it serves a replay.
-//! Admitted batches go to the writer of the rank's index partition, on the same threads.
-//! What each stream carried is what `/kv_events/sources` shows. A worker without exact
-//! events is also predicted to hold the prompts routed to it. What a worker's engine
+//! Admitted batches go to the writer of the rank's index partition, which has a thread of
+//! its own. What each stream carried is what `/kv_events/sources` shows. A worker without
+//! exact events is also predicted to hold the prompts routed to it. What a worker's engine
 //! will report cached also counts what it loads from the store it reads, if any.
 
 use std::{
