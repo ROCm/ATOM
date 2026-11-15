@@ -34,6 +34,7 @@ from atom.spec_decode.draft_kv import (
     draft_kv_builder,
     draft_owns_kv_pool,
 )
+from atom.utils.selector import Family
 
 
 class _PagedAttention(nn.Module):
@@ -371,6 +372,35 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+def _spec_config(method="dspark", draft_hf="draft-hf"):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method, draft_model_hf_config=draft_hf
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "config, family, want",
+    [
+        (_spec_config(), Family.MHA, True),
+        (_spec_config(), Family.MLA, False),  # a family outside DRAFT_POOL_FAMILIES
+        (_spec_config("eagle3"), Family.MHA, True),  # a draft model of its own
+        (_spec_config("eagle3"), Family.MLA, False),  # binds into the target's
+        (_spec_config("mtp"), Family.MHA, False),  # MTP runs the target's layers
+        (_spec_config(draft_hf=None), Family.MHA, False),
+        (SimpleNamespace(speculative_config=None), Family.MHA, False),
+    ],
+)
+def test_a_native_draft_owns_a_pool_when_its_family_is_in_the_draft_pool_table(
+    monkeypatch, config, family, want
+):
+    from atom.utils import selector
+
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: family)
+    assert draft_owns_kv_pool(config) is want
 
 
 def test_a_plugin_config_answers_no_without_reading_native_draft_fields(monkeypatch):
