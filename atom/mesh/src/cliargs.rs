@@ -794,6 +794,7 @@ mod tests {
                 queue_timeout_ms: 100,
                 prepare_timeout_ms: 2000,
                 max_tokenize_bytes: Some(8192),
+                ..Default::default()
             }
         );
         assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);

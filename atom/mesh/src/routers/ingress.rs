@@ -28,7 +28,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+            prefix_tokens::{self, EncodeError},
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -631,6 +634,7 @@ pub struct IngressRouting {
     tokenizer_registry: Arc<TokenizerRegistry>,
     pd: bool,
     max_tokenize_bytes: usize,
+    prefix_cache_bytes: usize,
 }
 
 impl IngressRouting {
@@ -641,6 +645,11 @@ impl IngressRouting {
             tokenizer_registry: app.tokenizer_registry.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+            prefix_cache_bytes: app
+                .router_config
+                .prepare_pool
+                .prefix_cache_mb
+                .saturating_mul(1 << 20),
         }
     }
 
@@ -855,7 +864,9 @@ impl IngressRouting {
                 )
             })?;
         let limit = self.max_tokenize_bytes;
-        if metadata.text.len() > limit {
+        let cache = prefix_tokens::cache(&entry, self.prefix_cache_bytes);
+        // With earlier prompts stored, only what they do not cover is bounded.
+        if cache.is_none() && metadata.text.len() > limit {
             return Err(IngressError::tokenizer_input_too_large());
         }
         ctx.check()?;
@@ -870,16 +881,26 @@ impl IngressRouting {
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "template")
             .record(template_started.elapsed().as_secs_f64());
         ctx.check()?;
-        if prompt.len() > limit {
-            return Err(IngressError::tokenizer_input_too_large());
-        }
         let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
-        let tokens = encoder
-            .encode(&prompt, add_special_tokens)
-            .map_err(|e| IngressError::invalid(e.to_string()))?
-            .token_ids()
-            .to_vec();
+        let tokens = match cache {
+            Some(cache) => cache.encode(
+                prompt,
+                add_special_tokens,
+                &*encoder,
+                &entry.tokenizer,
+                limit,
+            ),
+            None if prompt.len() > limit => Err(EncodeError::TooLarge),
+            None => encoder
+                .encode(&prompt, add_special_tokens)
+                .map(|e| e.token_ids().to_vec())
+                .map_err(EncodeError::Failed),
+        }
+        .map_err(|error| match error {
+            EncodeError::TooLarge => IngressError::tokenizer_input_too_large(),
+            EncodeError::Failed(e) => IngressError::invalid(e.to_string()),
+        })?;
         metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "encode")
             .record(encode_started.elapsed().as_secs_f64());
         Ok(tokens)
