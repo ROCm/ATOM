@@ -54,6 +54,7 @@ from atom.model_engine.plugin_hotplug import (
     HOTPLUG_ENDPOINT,
     PLUGIN_ROUND_ENDPOINT,
     PLUGIN_STATUS_ENDPOINT,
+    RELOAD_UNSUPPORTED_REASON,
     HotplugPayloadError,
     PluginRefusal,
     RoundPayloadError,
@@ -3728,13 +3729,27 @@ async def plugin_hotplug(request: Request):
           "rows": [8, 16, ...],             # optional padded running_tokens;
                                             # omitted: rows the plan declares
                                             # (else every recorded bucket)
-          "capture": true                   # optional, default true
+          "capture": true,                  # optional, default true
+          "reload": false,                  # optional, dev mode only: re-import
+                                            # the plugin code under the server's
+                                            # --plugin-dev-root trees from disk
+                                            # and re-run prepare(device) before
+                                            # installing the plan
+          "code_digest": "sha256:<hex>"     # optional with reload: the digest
+                                            # the caller read from the code; a
+                                            # rank whose local digest differs
+                                            # refuses the reload
         }
 
     The answer carries ``plan_id``, the rows and buckets actually recaptured,
-    ``capture_seconds``, and one report per rank.  Recipe/binding errors are a
-    400 with the reason, a state or capture refusal a 409, and a rank that
-    misses its deadline a 504; the server stays up for all of them.
+    ``capture_seconds``, and one report per rank; a dev reload additionally
+    lifts ``reloaded``, ``code_digest``, ``reload_seconds``, ``prepared`` and
+    ``native`` (provider -> prepare() result) to the top level.  Recipe/binding
+    errors are a 400 with the reason, a state or capture refusal a 409
+    (``reload-unsupported`` when the server did not boot with ``--plugin-dev``,
+    ``reload-digest-mismatch`` when the code on disk is not what the caller
+    hashed), and a rank that misses its deadline a 504; the server stays up for
+    all of them.
 
     While a plugin round is active this answers 409 with reason
     ``round-in-progress`` and changes nothing: the caller retries after
@@ -3771,6 +3786,17 @@ async def plugin_hotplug(request: Request):
         hotplug = parse_hotplug_payload(body, model_arch=architectures[0])
     except Exception as exc:  # noqa: BLE001 - a validated refusal, not a crash
         return _plugin_refusal(refusal_status(exc), exc)
+    if hotplug.reload and not getattr(config, "plugin_dev", False):
+        # Refuse before the manager round trip: this server cannot reload code,
+        # so a reload must not pause generation or touch a graph.
+        return _plugin_refusal(
+            409,
+            PluginRefusal(
+                RELOAD_UNSUPPORTED_REASON,
+                "reload hot-plug needs plugin dev mode: start the server with "
+                "--plugin-hotplug --plugin-dev --plugin-dev-root DIR",
+            ),
+        )
 
     manager = getattr(engine, "core_mgr", None)
     call = getattr(manager, "hotplug_plugin", None)
@@ -3788,6 +3814,8 @@ async def plugin_hotplug(request: Request):
         "arm": hotplug.arm,
         "rows": list(hotplug.rows),
         "capture": hotplug.capture,
+        "reload": hotplug.reload,
+        "code_digest": hotplug.code_digest,
     }
     try:
         # In a thread: a capture takes seconds and this loop also delivers
@@ -3898,6 +3926,11 @@ async def plugin_status():
     status: dict[str, Any] = {
         "status": "ok",
         "hotplug_enabled": hotplug_enabled(config),
+        # Advisory dev-mode view: a code watcher can refuse to send a reload to
+        # a server that would answer 409 reload-unsupported without a round trip
+        # that pauses generation first.
+        "dev_mode": bool(getattr(config, "plugin_dev", False)),
+        "dev_roots": list(getattr(config, "plugin_dev_roots", ()) or ()),
         "active_round": None,
         "engines": 0,
     }

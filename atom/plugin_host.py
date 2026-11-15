@@ -39,14 +39,19 @@ Rules:
 from __future__ import annotations
 
 import functools
+import hashlib
+import importlib
 import logging
+import os
 import sys
 import threading
 import time
+import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import metadata
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -59,6 +64,10 @@ ENTRY_POINT_GROUP = "atom.layer_plugins"
 AITER_SOURCE = "atom plugin plan"
 GRAPHS = ("eager", "capture_safe")  # what a plugin may claim
 MX = "mxfp8_e8m0_g32"  # e4m3 values, row-major group-32 e8m0 scales
+# What a dev-mode reload hashes: plugin Python code, its precompiled native
+# libraries and the headers they were built from. Anything else under a
+# ``--plugin-dev-root`` is not plugin code (recipes, docs, test data).
+DEV_CODE_SUFFIXES = frozenset({".py", ".so", ".h", ".hpp", ".hh", ".hxx"})
 
 
 @dataclass(frozen=True)
@@ -342,6 +351,8 @@ _counts: Counter = Counter()
 _refusals: list[Registration] = []
 _last: Decision | None = None
 _hotplug = False  # bind every seam; a plan may be installed after the build
+_dev = False  # developer mode: re-import plugin code from disk on a reload
+_dev_roots: tuple[str, ...] = ()  # resolved allowlist of plugin source trees
 
 
 def api_satisfies(requires: str, api: int = HOOK_API) -> bool:
@@ -418,6 +429,354 @@ def _entry_points() -> dict[str, metadata.EntryPoint]:
     return {ep.name: ep for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)}
 
 
+# -- dev mode: reloadable plugin code -----------------------------------------
+
+
+def _dev_roots_argument(roots: Any) -> tuple[str, ...]:
+    """``dev_roots`` as a resolved, de-duplicated allowlist of existing dirs.
+
+    Only trees an operator named at boot may be reloaded: resolving here (and
+    keeping absolute paths) is what makes ``reload_plugins`` able to check that
+    a module it is about to drop lives under one of them.
+    """
+    if roots is None:
+        return ()
+    if isinstance(roots, (str, os.PathLike)):
+        roots = (roots,)
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not isinstance(root, (str, os.PathLike)):
+            raise TypeError(
+                f"plugin dev root must be a path, got {type(root).__name__}"
+            )
+        try:
+            path = Path(root).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                f"plugin dev root {root!r} is not an existing directory: {error}"
+            ) from error
+        if not path.is_dir():
+            raise ValueError(f"plugin dev root {path} is not a directory")
+        text = str(path)
+        if text not in seen:
+            seen.add(text)
+            resolved.append(text)
+    return tuple(resolved)
+
+
+def _root_paths(roots: Iterable[str]) -> tuple[Path, ...]:
+    return tuple(Path(root).resolve() for root in roots)
+
+
+def _module_file(module: Any) -> Path | None:
+    """The file a module was imported from, resolved; None for a fileless one."""
+    file = getattr(module, "__file__", None)
+    if not isinstance(file, str) or not file:
+        return None
+    try:
+        return Path(file).resolve()
+    except OSError:
+        return None
+
+
+def _under_roots(path: Path, roots: tuple[Path, ...]) -> bool:
+    return any(path == root or path.is_relative_to(root) for root in roots)
+
+
+def _snapshot_modules(roots: tuple[Path, ...]) -> dict[str, Any]:
+    """The ``sys.modules`` entries whose source file is under ``roots``."""
+    saved: dict[str, Any] = {}
+    for name, module in list(sys.modules.items()):
+        path = _module_file(module)
+        if path is not None and _under_roots(path, roots):
+            saved[name] = module
+    return saved
+
+
+def _remove_modules(modules: Mapping[str, Any]) -> None:
+    """Drop the modules under the reload roots from ``sys.modules``.
+
+    Deepest (longest path) first: the entry must be gone before its provider's
+    entry point is asked again, and submodules go before their package so a
+    re-import of the package does not hand back the previous attempt's
+    attributes.
+    """
+
+    def depth(name: str) -> int:
+        path = _module_file(modules[name])
+        return 0 if path is None else len(path.parts)
+
+    for name in sorted(modules, key=lambda item: (-depth(item), item)):
+        sys.modules.pop(name, None)
+
+
+def _drop_bytecode(modules: Mapping[str, Any], roots: tuple[Path, ...]) -> list[str]:
+    """Delete the stale ``.pyc`` of every module about to be re-imported.
+
+    ``importlib.invalidate_caches`` refinds modules but does not invalidate a
+    timestamp-based bytecode cache: an edit made within the same second and
+    changing no file-size digit would import the old code from
+    ``__pycache__``. A dev reload unlinks each module's own ``__cached__`` file
+    (under the allowlisted roots) so the re-import compiles the current source.
+    """
+    dropped: list[str] = []
+    for module in modules.values():
+        cached = getattr(module, "__cached__", None)
+        if not isinstance(cached, str) or not cached:
+            continue
+        try:
+            path = Path(cached).resolve()
+        except OSError:
+            continue
+        if not path.is_file() or not _under_roots(path, roots):
+            continue
+        try:
+            path.unlink()
+        except OSError as error:
+            logger.warning(  # still pick the source up if the pyc is stale
+                "plugin_host: could not drop bytecode cache %s: %s", path, error
+            )
+            continue
+        dropped.append(str(path))
+    if dropped:
+        logger.info(
+            "plugin_host: dropped %d bytecode cache file(s) under the dev roots",
+            len(dropped),
+        )
+    return dropped
+
+
+def _restore_modules(saved: dict[str, Any], roots: tuple[Path, ...]) -> None:
+    """Put ``sys.modules`` back after a failed reload attempt.
+
+    Modules imported during the attempt -- a refreshed version of a module the
+    boot imported, or a dependency the new code pulled in -- are closed
+    best-effort and dropped, then every module the attempt removed is restored
+    to its previous object. The previous objects are never closed: the old
+    native library stays mapped, exactly as it does after a successful reload.
+    """
+    for name, module in _snapshot_modules(roots).items():
+        if module is saved.get(name):
+            continue
+        close = getattr(module, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.exception("plugin_host: closing fresh module %s failed", name)
+        if name not in saved:
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
+
+
+def _refuse_extension_modules(modules: Mapping[str, Any]) -> None:
+    """Refuse rather than re-initialize a compiled Python extension module.
+
+    A CPython extension module's init code runs once per process; removing it
+    from ``sys.modules`` and importing the new file can register its types and
+    static state twice and crash. A dev reload therefore re-imports Python
+    source only; versioned native code belongs in ``prepare(device)`` behind a
+    shared-library loader, not in the Python import system.
+    """
+    compiled = [
+        f"{name} ({path})"
+        for name, module in modules.items()
+        if (path := _module_file(module)) is not None and path.suffix.lower() != ".py"
+    ]
+    if compiled:
+        raise RuntimeError(
+            "plugin dev reload cannot re-import compiled Python extension "
+            f"module(s): {', '.join(sorted(compiled))}; load versioned native "
+            "code from a shared library in prepare(device), or restart ATOM"
+        )
+
+
+def plugin_code_digest(roots: Iterable[str] | None = None) -> str:
+    """A stable fingerprint of the plugin code under ``roots``.
+
+    The digest a dev watcher sends back as ``code_digest``: a sha256 over the
+    plugin files under the allowlisted roots, in a fixed, documented layout so
+    an out-of-tree tool can compute exactly the same string:
+
+    - recurse the roots; regular files only; skip ``__pycache__`` and ``.pyc``;
+    - keep the extensions in :data:`DEV_CODE_SUFFIXES`, case-insensitive;
+    - de-duplicate by resolved absolute path (the first root wins);
+    - sort records by the path relative to its root, POSIX form;
+    - per record, feed ``<relative>\\0<sha256 hex of the file bytes>\\n``.
+
+    Returns ``"sha256:" + hexdigest()``. A missing/unreadable root or file
+    raises, never returns a digest for code it did not read.
+    """
+    resolved_roots = _dev_roots_argument(_dev_roots if roots is None else roots)
+    if not resolved_roots:
+        raise ValueError("plugin_code_digest needs at least one plugin dev root")
+    digest = hashlib.sha256()
+    seen: set[Path] = set()
+    entries: list[tuple[str, Path]] = []
+    for root in resolved_roots:
+        root_path = Path(root)
+        for path in sorted(root_path.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            if path.suffix.lower() not in DEV_CODE_SUFFIXES:
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            entries.append((path.relative_to(root_path).as_posix(), path))
+    for relative, path in sorted(entries, key=lambda item: item[0]):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+def _entry_point_module(entry_point: metadata.EntryPoint) -> types.ModuleType | None:
+    """The module an entry point's ``attr`` is defined in (loading it if needed).
+
+    ``prepare(device)``/``close()`` are module-level conventions, so the module
+    is found from the entry point value (``package.module:register``), not from
+    the register callable: an entry point may export a wrapper defined
+    elsewhere.
+    """
+    loaded = entry_point.load()
+    if isinstance(loaded, types.ModuleType):
+        return loaded
+    module_name = getattr(entry_point, "module", None)
+    if not isinstance(module_name, str) or not module_name:
+        module_name = getattr(loaded, "__module__", None)
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # noqa: BLE001 - the caller reports the provider
+            return None
+    return module
+
+
+def _jsonable(value: Any) -> Any:
+    """A prepare() return value as plain JSON data (the reply carries it)."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _prepare_providers(plan: Any, device: Any) -> tuple[list[str], dict[str, Any]]:
+    """Call the optional module-level ``prepare(device)`` of every planned provider.
+
+    A provider declares it by exporting ``prepare`` next to its ``register``;
+    the call is where a plugin loads and warms its versioned native library.
+    Its return value is surfaced to the reload reply under ``native``. A
+    prepare that raises is a refusal, never a silent native fallback.
+    """
+    if plan is None:
+        return [], {}
+    available = _entry_points()
+    prepared: list[str] = []
+    native: dict[str, Any] = {}
+    for name in plan.providers:
+        entry_point = available.get(name)
+        if entry_point is None:
+            continue  # an AITER-only provider has no Python module to prepare
+        try:
+            module = _entry_point_module(entry_point)
+        except Exception as error:
+            raise RuntimeError(
+                f"plugin provider {name!r} could not be loaded for "
+                f"prepare(device): {type(error).__name__}: {error}"
+            ) from error
+        prepare = None if module is None else getattr(module, "prepare", None)
+        if not callable(prepare):
+            continue
+        try:
+            result = prepare(device)
+        except Exception as error:
+            raise RuntimeError(
+                f"plugin provider {name!r} prepare(device={device!r}) failed: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        prepared.append(name)
+        native[name] = _jsonable(result)
+        logger.info(
+            "plugin_host: provider %s prepared (device=%r): %s",
+            name,
+            device,
+            native[name],
+        )
+    return prepared, native
+
+
+def _check_provider_roots(plan: Any, roots: tuple[Path, ...]) -> dict[str, Path]:
+    """Refuse a reload of a plan whose providers are not under the dev roots.
+
+    A provider imported from an installed copy outside the allowlist would be
+    re-registered from the module still in ``sys.modules`` -- a reload that
+    silently kept the old code. Refuse before any module is dropped instead.
+    """
+    if plan is None:
+        return {}
+    available = _entry_points()
+    files: dict[str, Path] = {}
+    for name in plan.providers:
+        entry_point = available.get(name)
+        if entry_point is None:
+            continue  # AITER-only provider: nothing under the roots to reload
+        try:
+            module = _entry_point_module(entry_point)
+        except Exception as error:
+            raise RuntimeError(
+                f"planned provider {name!r} could not be loaded to check its dev "
+                f"root: {type(error).__name__}: {error}"
+            ) from error
+        path = None if module is None else _module_file(module)
+        if path is None:
+            raise RuntimeError(
+                f"planned provider {name!r} has no source module on disk, so a "
+                f"dev reload cannot re-import it"
+            )
+        if not _under_roots(path, roots):
+            raise RuntimeError(
+                f"planned provider {name!r} is imported from {path}, which is not "
+                f"under a --plugin-dev-root {[str(root) for root in roots]}; "
+                f"install the plugin editable (pip install -e) or add that tree "
+                f"as a dev root -- a reload would otherwise keep the old module"
+            )
+        files[name] = path
+    return files
+
+
+def _reload_roots(roots: Any) -> tuple[str, ...]:
+    """The roots one reload may touch: exactly the configured allowlist."""
+    configured = _dev_roots
+    if not configured:
+        raise RuntimeError("plugin dev mode has no allowlisted dev roots configured")
+    if roots is None:
+        return configured
+    resolved = _dev_roots_argument(roots)
+    outside = [root for root in resolved if root not in set(configured)]
+    if outside:
+        raise ValueError(
+            f"reload roots {outside} are not allowlisted; the configured "
+            f"--plugin-dev-root trees are {list(configured)}"
+        )
+    missing = [root for root in configured if root not in resolved]
+    if missing:
+        raise ValueError(
+            f"reload roots must include every configured dev root; missing "
+            f"{missing} would leave its plugin modules on the old code"
+        )
+    return resolved
+
+
 def configure(
     plan=None,
     *,
@@ -426,6 +785,8 @@ def configure(
     kill_switch: bool | None = None,
     strict: bool | None = None,
     hotplug: bool = False,
+    dev: bool = False,
+    dev_roots: Iterable[str] = (),
 ) -> None:
     """Load and route ``plan`` (a ``plugin_recipe.Plan``, the
     ``RecipeSource`` a Config carries, or names for the ``--plugin-enable``
@@ -441,12 +802,35 @@ def configure(
     nothing, and ``hotplug_plan`` may replace the plan after the build. The
     kill switch wins: with ``ATOM_PLUGIN_HOST=0`` nothing binds and
     ``hotplug_plan`` refuses.
+
+    ``dev=True, dev_roots=(...)`` adds developer mode on top of a hot-plug
+    boot: ``reload_plugins`` may re-import the plugin Python modules under those
+    allowlisted directories from disk. It is opt-in because a reloaded process
+    can hold an old native library and a half-old Python state; a production
+    boot never enables it.
     """
     from atom import plugin_recipe
     from atom.utils import envs
 
     global _plan, _kill_switch, _strict, _on_decline, _loading, _owned, _requested
-    global _hotplug
+    global _hotplug, _dev, _dev_roots
+    roots = _dev_roots_argument(dev_roots)
+    dev = bool(dev)
+    if roots and not dev:
+        raise ValueError(
+            "plugin dev roots were given without plugin dev mode: set --plugin-dev "
+            "(configure(dev=True, ...)) or drop the roots"
+        )
+    if dev and not hotplug:
+        raise ValueError(
+            "plugin dev mode needs a hot-plug boot: --plugin-dev requires "
+            "--plugin-hotplug (configure(..., hotplug=True))"
+        )
+    if dev and not roots:
+        raise ValueError(
+            "plugin dev mode needs at least one allowlisted root: --plugin-dev "
+            "requires --plugin-dev-root (configure(dev_roots=(...)))"
+        )
     if isinstance(plan, plugin_recipe.RecipeSource):
         plan = plan.resolve()  # Config carries the recipes; each process resolves
     elif not isinstance(plan, (plugin_recipe.Plan, type(None))):
@@ -459,14 +843,25 @@ def configure(
             raise RuntimeError(
                 "plugin_host.configure after model build; use hotplug_plan or set_arm"
             )
+        if dev != _dev or roots != _dev_roots:
+            raise RuntimeError(
+                "plugin_host.configure after model build; dev mode cannot change"
+            )
         set_arm(arm if _plan is not None else "plugin")
         return
     _requested = requested
     if plan is not None and config is not None:
         plugin_recipe.check_runtime(plan, config)
     kill = not envs.ATOM_PLUGIN_HOST if kill_switch is None else kill_switch
+    if dev and kill:
+        raise ValueError(
+            "plugin dev mode needs the plugin host enabled: ATOM_PLUGIN_HOST=0 "
+            "kills the hot-plug path a reload installs the plan through"
+        )
     with _lock:
         _hotplug = bool(hotplug) and not kill
+        _dev = dev and not kill
+        _dev_roots = roots if _dev else ()
         _plan = None if kill else plan
         _kill_switch = kill
         _strict = (
@@ -572,7 +967,7 @@ def _plan_argument(plan: Any) -> Any:
     Accepts the ``Plan`` itself, the ``RecipeSource`` a Config carries, a
     payload of recipe texts + enable names
     (``atom.plugin_recipe.from_payload``), a single recipe JSON text, or names
-    for the ``--plugin-enable`` shorthand.
+    for the ``--plugin-enable`` shorthand (a ``Plan`` already).
     """
     from atom import plugin_recipe
 
@@ -580,9 +975,9 @@ def _plan_argument(plan: Any) -> Any:
         return plan
     if isinstance(plan, (plugin_recipe.RecipeSource, Mapping, str, bytes)):
         source = plugin_recipe.from_payload(plan)
-    else:
-        source = plugin_recipe.shorthand(plan)
-    return None if source is None else source.resolve()
+        return None if source is None else source.resolve()
+    # Names for the --plugin-enable shorthand: ``shorthand`` resolves to a Plan.
+    return plugin_recipe.shorthand(plan)
 
 
 def _snapshot() -> dict[str, Any]:
@@ -725,6 +1120,152 @@ def hotplug_plan(plan, *, arm: str = "plugin", config: Any = None) -> dict[str, 
                 logger.exception("plugin_host: restoring the previous plan failed")
             raise
     logger.info("plugin_host: hotplug plan installed: %s", result)
+    return result
+
+
+def dev_enabled() -> bool:
+    """True when this process booted for a dev reload: a hot-plug boot with an
+    allowlisted set of plugin source roots (``configure(dev=True, ...)``)."""
+    return bool(_dev and _dev_roots)
+
+
+def prepare_plan(device: Any = None) -> dict[str, Any]:
+    """Let the boot plan's providers prepare native code once, after the build.
+
+    Every planned provider that exports a module-level ``prepare(device)`` is
+    asked once; that is where a plugin loads and warms its versioned native
+    library before warmup and CUDA-graph capture freeze the call sites. A
+    ``prepare`` that raises refuses the start with the provider named -- a
+    provider that advertised prepare never silently falls back to native.
+
+    Returns ``{"prepared": [provider, ...], "native": {provider: <return>}}``;
+    ``native`` carries what each prepare returned (JSON-safe) so the caller can
+    log or report it. No plan, or no prepare hook: both lists are empty.
+    """
+    with _lock:
+        if _plan is None:
+            return {"prepared": [], "native": {}}
+        prepared, native = _prepare_providers(_plan, device)
+    logger.info("plugin_host: boot plan prepared providers: %s", prepared)
+    return {"prepared": prepared, "native": native}
+
+
+def reload_plugins(
+    plan: Any,
+    *,
+    roots: Iterable[str] | None = None,
+    arm: str = "plugin",
+    config: Any = None,
+    device: Any = None,
+) -> dict[str, Any]:
+    """Re-import the plugin code under the dev roots, then install ``plan``.
+
+    Developer mode only (``configure(dev=True, dev_roots=...)``): the host state
+    and every ``sys.modules`` entry whose source file is under the allowlisted
+    roots are snapshotted, the modules are dropped (deepest first) after
+    ``importlib.invalidate_caches()``, and ``_swap_in`` asks the planned
+    providers' entry points again -- which re-imports their new code from disk.
+    Each planned provider that exports ``prepare(device)`` is then asked to
+    prepare its versioned native library, and only then is the new plan serving.
+
+    All or nothing: on any failure (import, registration, plan coverage,
+    prepare) the saved modules and host state are restored and the error is
+    re-raised, so the previous plan keeps serving and the caller must not
+    recapture anything.
+
+    Deliberately **not** unloaded on success: the old module objects' native
+    libraries stay mapped (a versioned ``.so`` is expected to leak its previous
+    copy in dev mode), and compiled Python extension modules under the roots
+    are refused instead of re-initialized. Old decode graphs are released and
+    recaptured by the caller's existing hot-plug path, because the new module
+    code may make different routing decisions.
+
+    ``roots`` defaults to the configured allowlist and may only restate it
+    (every configured root must be present). Returns the installed plan's
+    description plus ``code_digest``, ``reloaded_modules``, ``prepared``,
+    ``native`` and ``reload_seconds``.
+    """
+    from atom import plugin_recipe
+    from atom.utils import envs
+
+    resolved = _plan_argument(plan)
+    started = time.perf_counter()
+    with _lock:
+        if not _hotplug:
+            raise RuntimeError(
+                "plugin_host.reload_plugins needs a hot-plug boot: configure with "
+                "hotplug=True before the model build"
+            )
+        if not dev_enabled():
+            raise RuntimeError(
+                "plugin_host.reload_plugins needs plugin dev mode: boot with "
+                "--plugin-dev --plugin-dev-root (configure(dev=True, dev_roots=...))"
+            )
+        if not _bound:
+            raise RuntimeError(
+                "plugin_host.reload_plugins is only allowed after the model build"
+            )
+        if _kill_switch or not envs.ATOM_PLUGIN_HOST:
+            raise RuntimeError(
+                "plugin_host is disabled (ATOM_PLUGIN_HOST=0); refusing to reload"
+            )
+        use_roots = _reload_roots(roots)
+        root_paths = _root_paths(use_roots)
+        # Read the code first: an unreadable tree must refuse without touching
+        # anything, and the caller's expected digest is checked against this.
+        code_digest = plugin_code_digest(use_roots)
+        snapshot = _snapshot()
+        before = _snapshot_modules(root_paths)
+        try:
+            if resolved is not None and config is not None:
+                plugin_recipe.check_runtime(resolved, config)  # before any change
+            # Fail closed when a provider was imported from outside the roots:
+            # re-loading a module still in sys.modules would be a silent no-op.
+            _check_provider_roots(resolved, root_paths)
+            live = _snapshot_modules(root_paths)
+            _refuse_extension_modules(live)
+            _drop_bytecode(live, root_paths)
+            importlib.invalidate_caches()
+            _remove_modules(live)
+            installed = _swap_in(resolved, arm)
+            prepared, native = _prepare_providers(resolved, device)
+        except BaseException:
+            try:
+                _restore_modules(before, root_paths)
+            except Exception:
+                logger.exception(
+                    "plugin_host: restoring sys.modules after a failed dev reload "
+                    "failed"
+                )
+            try:
+                _restore(snapshot)
+            except Exception:
+                logger.exception(
+                    "plugin_host: restoring the previous plan after a failed dev "
+                    "reload failed"
+                )
+            raise
+        elapsed = time.perf_counter() - started
+        result = dict(installed)
+        result.update(
+            reloaded=True,
+            dev=True,
+            plan_id=installed.get("plan_id"),
+            code_digest=code_digest,
+            reloaded_modules=sorted(live),
+            prepared=prepared,
+            native=native,
+            reload_seconds=elapsed,
+        )
+    logger.info(
+        "plugin_host: dev reload installed plan %s: %d module(s) re-imported, "
+        "prepared %s, digest %s, %.2fs",
+        result["plan_id"],
+        len(result["reloaded_modules"]),
+        result["prepared"],
+        result["code_digest"],
+        elapsed,
+    )
     return result
 
 
@@ -1123,10 +1664,25 @@ def route_proof(seam: str, owner: str, n: int = 1) -> int:
     return served
 
 
+def _code_digest_or_none() -> str | None:
+    """The dev code digest for ``status``; unreadable roots report None."""
+    if not dev_enabled():
+        return None
+    try:
+        return plugin_code_digest()
+    except (OSError, ValueError):
+        return None
+
+
 def status() -> dict[str, Any]:
     return {
         "hook_api": HOOK_API,
         "hotplug": _hotplug,
+        "dev": _dev,
+        "dev_roots": list(_dev_roots),
+        # Cheap only in dev mode and only read at boot / on demand; a reload's
+        # reply carries the digest it actually loaded.
+        "code_digest": _code_digest_or_none(),
         "plan_id": None if _plan is None else _plan.plan_id,
         "strategy": None if _plan is None else _plan.strategy,
         "arm": _arm,
@@ -1178,7 +1734,7 @@ def overhead_probe(
 def _reset_for_testing() -> None:
     """Forget the plan, the binds, the hot-plug boot and the record (tests only)."""
     global _plan, _owned, _last, _kill_switch, _strict, _on_decline, _requested
-    global _hotplug
+    global _hotplug, _dev, _dev_roots
     with _lock:
         _bound.clear()
         _registered.clear()
@@ -1190,6 +1746,7 @@ def _reset_for_testing() -> None:
         _plan, _owned, _last, _requested = None, frozenset(), None, None
         _kill_switch, _strict, _on_decline = False, False, "native"
         _hotplug = False
+        _dev, _dev_roots = False, ()
         set_arm("plugin")
 
 

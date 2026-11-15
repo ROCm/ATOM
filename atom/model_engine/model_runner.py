@@ -72,7 +72,13 @@ from atom.model_engine.model_setup import (
 )
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.plugin_hotplug import default_capture_rows, rows_to_bs
+from atom.model_engine.plugin_hotplug import (
+    RELOAD_DIGEST_MISMATCH_REASON,
+    RELOAD_UNSUPPORTED_REASON,
+    checked_code_digest,
+    default_capture_rows,
+    rows_to_bs,
+)
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -914,12 +920,16 @@ class ModelRunner:
 
         # Before the build: seams bind at construction, and capture freezes them.
         # A hot-plug boot binds every seam (not just the planned owners), so a
-        # later plan can be installed without rebuilding the model.
+        # later plan can be installed without rebuilding the model. Dev mode
+        # additionally allows a plan install to re-import plugin code from the
+        # allowlisted source trees.
         plugin_host.configure(
             config.plugin_source,
             arm=config.plugin_arm,
             config=config,
             hotplug=getattr(config, "plugin_hotplug", False),
+            dev=getattr(config, "plugin_dev", False),
+            dev_roots=getattr(config, "plugin_dev_roots", ()),
         )
         self.model = get_model(config, self.device, self._model_loader())
         # After weight processing, before warmup and capture. Here rather than in
@@ -1026,6 +1036,17 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        # The boot plan's providers may need to load native code once the device
+        # is up: run their optional prepare(device) now, before warmup and
+        # capture freeze the call sites. A prepare that advertises itself but
+        # fails refuses the start rather than silently serving native.
+        boot_prepare = plugin_host.prepare_plan(self.device)
+        if boot_prepare["prepared"]:
+            logger.info(
+                "%s: plugin providers prepared before warmup: %s",
+                self.label,
+                boot_prepare["native"],
+            )
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -4407,6 +4428,31 @@ class ModelRunner:
         )
         return int(flag.item())
 
+    def _tp_agreed_code_digest(self, digest: str) -> str:
+        """The one plugin code digest every TP rank reads, or refuse on all.
+
+        Each rank computes the digest over its own filesystem view; a dev reload
+        would otherwise be able to install different code per rank. Every rank
+        gathers the digests and compares them against rank 0's, so a
+        disagreement raises the same ``reload-digest-mismatch`` refusal on the
+        whole group before any module is dropped.
+        """
+        group = get_tp_group()
+        if getattr(group, "world_size", 1) <= 1:
+            return digest
+        if not torch.distributed.is_initialized():
+            return digest
+        digests: list = [None] * group.world_size
+        torch.distributed.all_gather_object(digests, digest, group=group.cpu_group)
+        agreed = digests[0] if digests else digest
+        if any(other != agreed for other in digests):
+            error = RuntimeError(
+                f"TP ranks computed different plugin code digests: {digests}"
+            )
+            error.reason = RELOAD_DIGEST_MISMATCH_REASON
+            raise error
+        return str(agreed)
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
@@ -4786,6 +4832,15 @@ class ModelRunner:
             "seconds": elapsed,
         }
 
+    def _install_hotplug_plan(self, plan, report: dict) -> dict:
+        """Install a plan/arm with no code reload: the plain hot-plug path.
+
+        The dev-mode reload path replaces this call with
+        ``plugin_host.reload_plugins`` (which also re-imports the code and
+        prepares the providers); both return the host's installed-plan dict.
+        """
+        return plugin_host.hotplug_plan(plan, arm=report["arm"], config=self.config)
+
     def hotplug_plugin(self, payload: dict) -> dict:
         """Install a plugin plan/arm and recapture the requested decode graphs.
 
@@ -4793,6 +4848,15 @@ class ModelRunner:
         Every rank validates, installs and captures in the same order, and the
         group agrees on any refusal before it returns, so one rank's failure is
         never answered as another rank's success.
+
+        ``payload["reload"]`` asks for a **dev-mode code reload** instead of a
+        plain plan switch: the local plugin source digest is computed (and must
+        equal ``payload["code_digest"]`` when the caller sent one), every TP
+        rank must have computed the same digest, and only then does
+        ``plugin_host.reload_plugins`` re-import the code, prepare the planned
+        providers and install the plan. A reload refusal happens before the
+        install (so no graph is released and no host state changes), and the
+        report carries ``reloaded``/``code_digest``/``native`` for the caller.
 
         It never raises into the RPC transport on purpose: the plain
         ``call_func`` path lets a worker exception end that worker (and with it
@@ -4806,33 +4870,54 @@ class ModelRunner:
             "tp_world_size": self.tp_world_size,
             "status": "ok",
             "error": None,
+            "reason": None,
             "plan_id": None,
             "arm": None,
             "rows": [],
             "sizes": [],
             "capture_seconds": 0.0,
             "captured": False,
+            "reloaded": False,
+            "code_digest": None,
+            "reload_seconds": 0.0,
+            "reloaded_modules": [],
+            "prepared": [],
+            "native": None,
         }
         failure: str | None = None
+        failure_reason: str | None = None
 
         def fail(exc: BaseException) -> None:
-            nonlocal failure
+            nonlocal failure, failure_reason
             failure = f"{type(exc).__name__}: {exc}"
-            logger.error("%s: plugin hot-plug failed: %s", self.label, failure)
+            reason = getattr(exc, "reason", None)
+            failure_reason = reason if isinstance(reason, str) and reason else None
+            logger.error(
+                "%s: plugin hot-plug failed%s: %s",
+                self.label,
+                f" ({failure_reason})" if failure_reason else "",
+                failure,
+            )
 
         def abort() -> dict:
             report.update(
                 status="error",
                 error=failure or "another TP rank refused this hot-plug",
+                reason=failure_reason,
                 plan_id=None,
                 rows=[],
                 sizes=[],
+                reloaded=False,
+                code_digest=None,
+                native=None,
                 elapsed_seconds=time.time() - started,
             )
             return report
 
         plan = None
         rows: list[int] = []
+        reload_requested = False
+        local_digest: str | None = None
         try:
             if not isinstance(payload, dict):
                 raise TypeError(
@@ -4866,6 +4951,31 @@ class ModelRunner:
                 rows = default_capture_rows(
                     plan, self._hotplug_full_q_len(), self.capture_sizes
                 )
+            reload_requested = payload.get("reload", False)
+            if not isinstance(reload_requested, bool):
+                raise TypeError(
+                    f"hot-plug reload flag must be true or false, got "
+                    f"{reload_requested!r}"
+                )
+            if reload_requested:
+                if not plugin_host.dev_enabled():
+                    refused = RuntimeError(
+                        "reload hot-plug needs plugin dev mode: start the server "
+                        "with --plugin-hotplug --plugin-dev --plugin-dev-root DIR"
+                    )
+                    refused.reason = RELOAD_UNSUPPORTED_REASON
+                    raise refused
+                roots = tuple(getattr(self.config, "plugin_dev_roots", ()) or ())
+                local_digest = plugin_host.plugin_code_digest(roots)
+                expected = checked_code_digest(payload.get("code_digest"))
+                if expected is not None and expected != local_digest:
+                    refused = RuntimeError(
+                        f"reload code digest mismatch: the request expects "
+                        f"{expected}, this rank reads {local_digest} from "
+                        f"{list(roots)}"
+                    )
+                    refused.reason = RELOAD_DIGEST_MISMATCH_REASON
+                    raise refused
         except BaseException as exc:  # noqa: BLE001 - agreed below
             fail(exc)
         # Agree before touching the plan: a rank that refused must not be left
@@ -4874,15 +4984,32 @@ class ModelRunner:
             return abort()
 
         try:
-            installed = (
-                plugin_host.hotplug_plan(plan, arm=report["arm"], config=self.config)
-                or {}
-            )
+            if reload_requested:
+                # All ranks must serve the same code: a digest disagreement is a
+                # refusal on every rank, never "some ranks reloaded".
+                local_digest = self._tp_agreed_code_digest(local_digest)
+                installed = plugin_host.reload_plugins(
+                    plan,
+                    roots=getattr(self.config, "plugin_dev_roots", ()) or None,
+                    arm=report["arm"],
+                    config=self.config,
+                    device=self.device,
+                )
+                report.update(
+                    reloaded=True,
+                    code_digest=installed.get("code_digest") or local_digest,
+                    reload_seconds=installed.get("reload_seconds") or 0.0,
+                    reloaded_modules=installed.get("reloaded_modules") or [],
+                    prepared=installed.get("prepared") or [],
+                    native=installed.get("native"),
+                )
+            else:
+                installed = self._install_hotplug_plan(plan, report) or {}
             report["plan_id"] = installed.get("plan_id") or (
                 None if plan is None else plan.plan_id
             )
-            if not rows and installed.get("rows"):
-                rows = [int(row) for row in installed["rows"]]
+            if not rows and installed.get("capture_rows"):
+                rows = [int(row) for row in installed["capture_rows"]]
             report["rows"] = [int(row) for row in rows]
         except BaseException as exc:  # noqa: BLE001 - agreed below
             fail(exc)
@@ -4914,7 +5041,12 @@ class ModelRunner:
         report["elapsed_seconds"] = time.time() - started
         if failure is not None:
             report.update(
-                status="error", error=failure, plan_id=None, rows=[], sizes=[]
+                status="error",
+                error=failure,
+                reason=failure_reason,
+                plan_id=None,
+                rows=[],
+                sizes=[],
             )
         return report
 

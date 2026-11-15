@@ -2158,10 +2158,19 @@ class CoreManager:
         half-applied plan, and a rank that misses the deadline raises
         ``TimeoutError``.
 
+        The payload is forwarded as plain data, so a dev-mode request's
+        ``reload``/``code_digest`` fields reach the runner unchanged; the
+        refusal it raises (``reload-unsupported``, ``reload-digest-mismatch``)
+        keeps its reason code through :func:`command_refusal_reason` and the
+        API answers it as a 409.  A dev reload is all-or-nothing on each rank:
+        a refused reload changed no plan, no module and no graph, so the caller
+        may retry once the code on disk matches the digest.
+
         While a plugin round is active (``begin_plugin_round``) every engine
-        refuses this before pausing or installing anything, and the refusal is
-        raised as ``PluginRefusal("round-in-progress")``: the caller retries
-        once the round ends rather than swapping the plan mid-measurement.
+        refuses this before pausing, reloading or installing anything, and the
+        refusal is raised as ``PluginRefusal("round-in-progress")``: the caller
+        retries once the round ends rather than swapping the plan
+        mid-measurement.
 
         One engine at a time for now: a capture records the TP group's
         collectives, and a DP fleet would have to pause and enter the capture

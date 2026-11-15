@@ -25,6 +25,7 @@ an engine.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -41,6 +42,15 @@ HOTPLUG_ENDPOINT = "/plugin/hotplug"
 # default leaves room for a slow first kernel build without waiting on a
 # wedged rank forever.  Overridable per request ("timeout", seconds).
 DEFAULT_HOTPLUG_TIMEOUT_S = 300.0
+# Dev-mode code reload (atom/plugin_host.reload_plugins) is requested with
+# "reload": true on the same hot-plug body.  `code_digest` is optional: when a
+# caller sends the digest it computed (a code watcher did), every rank must
+# agree with it before any module is dropped.  The two reason codes travel to
+# the HTTP JSON like the round reasons, so a watcher can tell "this server is
+# not a dev server" from "my digest is stale, re-read and retry".
+RELOAD_UNSUPPORTED_REASON = "reload-unsupported"
+RELOAD_DIGEST_MISMATCH_REASON = "reload-digest-mismatch"
+_SHA256_DIGEST = re.compile(r"[0-9a-fA-F]{64}")
 
 # The plugin-round lease: a benchmark/evaluation run holds the plan, so a
 # hot-plug that arrives mid-run must not swap it.  Begin/end are synchronous
@@ -96,6 +106,11 @@ class HotplugRequest:
     (the ``plan_id`` checks that).  ``rows`` are padded ``running_tokens`` of
     the decode request graphs to capture -- empty means "derive them from the
     plan" (the runner does that, since only it knows the verify width).
+
+    ``reload`` asks a dev-mode server to re-import the plugin code under its
+    ``--plugin-dev-root`` trees before installing the plan; ``code_digest`` is
+    the optional fingerprint the caller computed over that code (normalized to
+    ``sha256:<64 lowercase hex>``), which every rank must match.
     """
 
     source: Any
@@ -103,6 +118,8 @@ class HotplugRequest:
     rows: tuple[int, ...]
     capture: bool
     timeout: float
+    reload: bool = False
+    code_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +293,33 @@ def _positive_int(value: Any, where: str) -> int:
     return value
 
 
+def checked_code_digest(value: Any) -> str | None:
+    """A dev-mode code digest as a request may carry it.
+
+    Accepts ``sha256:<64 hex>`` or a bare 64-hex string and normalizes to
+    ``sha256:<lowercase hex>``, the form ``plugin_host.plugin_code_digest``
+    returns and the ranks compare against.  None stays None (the caller is
+    saying "reload to whatever is on disk"; a watcher should always send one).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HotplugPayloadError(
+            "payload-schema",
+            f"code_digest must be a string, got {type(value).__name__}",
+        )
+    text = value.strip()
+    if text.lower().startswith("sha256:"):
+        text = text[len("sha256:") :]
+    if not _SHA256_DIGEST.fullmatch(text):
+        raise HotplugPayloadError(
+            "code-digest-invalid",
+            "code_digest must be a sha256 hex digest (64 hex digits, "
+            f"optionally 'sha256:'-prefixed), got {value[:80]!r}",
+        )
+    return "sha256:" + text.lower()
+
+
 def parse_hotplug_payload(
     body: Mapping[str, Any], *, model_arch: str | None = None
 ) -> HotplugRequest:
@@ -314,12 +358,21 @@ def parse_hotplug_payload(
     if timeout <= 0:
         raise HotplugPayloadError("payload-schema", "timeout must be positive")
 
+    reload_requested = body.get("reload", False)
+    if not isinstance(reload_requested, bool):
+        raise HotplugPayloadError(
+            "payload-schema", f"reload must be true or false, got {reload_requested!r}"
+        )
+    code_digest = checked_code_digest(body.get("code_digest"))
+
     return HotplugRequest(
         source=source,
         arm=body.get("arm", "plugin"),
         rows=rows,
         capture=capture,
         timeout=float(timeout),
+        reload=reload_requested,
+        code_digest=code_digest,
     )
 
 
@@ -433,6 +486,14 @@ def aggregate_reports(reports: Iterable[Mapping[str, Any]]) -> dict:
     (it inspects each engine's ``error``), so every input here is a successful
     report; the check that their plan ids agree is what makes "one plan on
     every rank" observable rather than assumed.
+
+    A dev-mode reload's fields are lifted from the per-rank reports to the
+    top level, so a watcher reads the reply without walking ``ranks``:
+    ``reloaded`` (every rank re-imported the code), ``code_digest`` (the one
+    digest every reloading rank computed; disagreeing ranks are refused),
+    ``reload_seconds`` (the slowest rank), ``prepared`` (provider names whose
+    ``prepare(device)`` ran) and ``native`` (rank 0's provider -> prepare
+    result map, i.e. the native build the reload loaded).
     """
     reports = [dict(report or {}) for report in reports]
     if not reports:
@@ -448,6 +509,24 @@ def aggregate_reports(reports: Iterable[Mapping[str, Any]]) -> dict:
     sizes = sorted(
         {int(size) for report in captured for size in report.get("sizes") or ()}
     )
+    digests = {
+        digest
+        for report in reports
+        if isinstance((digest := report.get("code_digest")), str) and digest
+    }
+    if len(digests) > 1:
+        # Not a plan mismatch: the same plan was reloaded from different code on
+        # different ranks. The runner agrees the digest across its TP group
+        # before reloading, so this is a cross-engine disagreement (a DP fleet
+        # is refused before this point); surface it instead of hiding it.
+        raise HotplugPayloadError(
+            "code-digest-mismatch",
+            f"the engines reloaded different plugin code: {sorted(digests)}",
+        )
+    natives = [report.get("native") for report in reports if report.get("native")]
+    prepared = sorted(
+        {name for report in reports for name in report.get("prepared") or ()}
+    )
     return {
         "status": "ok",
         "plan_id": next(iter(plan_ids)),
@@ -457,6 +536,15 @@ def aggregate_reports(reports: Iterable[Mapping[str, Any]]) -> dict:
             (float(report.get("capture_seconds") or 0.0) for report in reports),
             default=0.0,
         ),
+        "reloaded": bool(reports)
+        and all(report.get("reloaded") is True for report in reports),
+        "code_digest": next(iter(digests)) if digests else None,
+        "reload_seconds": max(
+            (float(report.get("reload_seconds") or 0.0) for report in reports),
+            default=0.0,
+        ),
+        "prepared": prepared,
+        "native": natives[0] if natives else None,
         "ranks": reports,
     }
 

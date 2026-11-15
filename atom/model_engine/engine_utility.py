@@ -18,6 +18,7 @@ from atom.model_engine.plugin_hotplug import (
     BEGIN_ROUND_CMD,
     END_ROUND_CMD,
     HOTPLUG_CMD,
+    RELOAD_UNSUPPORTED_REASON,
     HotplugPayloadError,
     PluginRefusal,
     hotplug_enabled,
@@ -408,7 +409,14 @@ class EngineUtilityHandler:
 
     @staticmethod
     def _error_reply(cmd: str, exc: Exception) -> dict:
-        return {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
+        reply = {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
+        # A coded refusal (round-in-progress, reload-unsupported,
+        # reload-digest-mismatch, ...) keeps its machine-readable reason on the
+        # way to the manager and the HTTP envelope; a plain failure has none.
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, str) and reason:
+            reply["reason"] = reason
+        return reply
 
     def _handle_collective_rpc(self, args: dict):
         """Invoke an arbitrary ModelRunner method on every TP rank.
@@ -815,6 +823,13 @@ class EngineUtilityHandler:
         - refusal and failure keep the engine alive: the reason is answered as
           a utility error (the manager raises it to the API) and generation is
           resumed in the ``finally``.
+
+        A dev-mode reload (``payload["reload"] is True``) travels through the
+        same command and pauses nothing earlier: the round guard below still
+        refuses it with ``round-in-progress`` first, then a deployment without
+        dev mode is refused with ``reload-unsupported`` before the pause, and
+        the runner itself refuses digest mismatches before any module is
+        dropped.  No new waiting is added to the busy loop.
         """
         args = args if isinstance(args, dict) else {}
         payload = args.get("payload")
@@ -850,6 +865,18 @@ class EngineUtilityHandler:
                 )
             if refusal is not None:
                 raise RuntimeError(refusal)
+            if payload.get("reload") is True and not getattr(
+                config, "plugin_dev", False
+            ):
+                # Refuse before the pause: a reload on a deployment that never
+                # opted into dev mode cannot do anything, so it must not stop
+                # generation even briefly.
+                refused = RuntimeError(
+                    "reload hot-plug needs plugin dev mode: start the server with "
+                    "--plugin-hotplug --plugin-dev --plugin-dev-root DIR"
+                )
+                refused.reason = RELOAD_UNSUPPORTED_REASON
+                raise refused
             deadline = time.monotonic() + _remaining_timeout(
                 args, _HOTPLUG_HANDLER_TIMEOUT_S
             )
@@ -867,15 +894,28 @@ class EngineUtilityHandler:
                     f"per-rank report"
                 )
             if result.get("error") or result.get("status") not in (None, "ok"):
-                raise RuntimeError(
+                error = RuntimeError(
                     result.get("error")
                     or f"rank reported status {result.get('status')!r}"
                 )
+                # The runner names its refusal (reload-unsupported,
+                # reload-digest-mismatch, ...): keep the code so the caller can
+                # react to it rather than to prose.
+                reason = result.get("reason")
+                if isinstance(reason, str) and reason:
+                    error.reason = reason
+                raise error
             reply = {"cmd": HOTPLUG_CMD, "result": result}
             logger.info(
                 f"{self.label}: plugin hot-plug installed plan "
                 f"{result.get('plan_id')} rows={result.get('rows')} "
                 f"capture={result.get('capture_seconds')}s"
+                + (
+                    f" reloaded={result.get('code_digest')} "
+                    f"native={result.get('native')}"
+                    if result.get("reloaded")
+                    else ""
+                )
             )
         except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
             reply = self._error_reply(HOTPLUG_CMD, exc)
