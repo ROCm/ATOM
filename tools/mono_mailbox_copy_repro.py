@@ -44,6 +44,12 @@ if not 1 <= args.repeats <= 1024 or args.deadline <= 0:
     parser.error("invalid repeats/deadline")
 
 
+def require(ok, message):
+    # Not assert: these calls and checks must also run under python -O.
+    if not ok:
+        raise RuntimeError(message)
+
+
 def run_fixture(args):
     from types import SimpleNamespace
 
@@ -57,14 +63,18 @@ def run_fixture(args):
     def emit(value):
         print(json.dumps(value), flush=True)
 
-    assert torch.cuda.device_count() == 1, "expose exactly one owned GPU"
+    require(torch.cuda.device_count() == 1, "expose exactly one owned GPU")
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     props = torch.cuda.get_device_properties(0)
-    assert props.multi_processor_count == 256 and "gfx950" in props.gcnArchName
+    require(
+        props.multi_processor_count == 256 and "gfx950" in props.gcnArchName,
+        "needs a 256-CU gfx950",
+    )
     root = pathlib.Path(__file__).resolve().parents[1]
-    assert (
-        pathlib.Path(inspect.getfile(DSV4PageSlotCodec)).resolve().is_relative_to(root)
+    require(
+        pathlib.Path(inspect.getfile(DSV4PageSlotCodec)).resolve().is_relative_to(root),
+        "atom is not imported from this checkout",
     )
     torch.manual_seed(0)
     hip = ctypes.CDLL("libamdhip64.so")
@@ -84,12 +94,15 @@ def run_fixture(args):
     def full_stream(role):
         mask = (U * 8)(*[0xFFFFFFFF] * 8)
         raw = P()
-        assert hip.hipExtStreamCreateWithCUMask(ctypes.byref(raw), 8, mask) == 0
+        rc = hip.hipExtStreamCreateWithCUMask(ctypes.byref(raw), 8, mask)
+        require(rc == 0, f"hipExtStreamCreateWithCUMask failed: {rc}")
         actual = (U * 8)()
-        assert hip.hipExtStreamGetCUMask(raw, 8, actual) == 0
+        rc = hip.hipExtStreamGetCUMask(raw, 8, actual)
+        require(rc == 0, f"hipExtStreamGetCUMask failed: {rc}")
         flags = U()
-        assert hip.hipStreamGetFlags(raw, ctypes.byref(flags)) == 0
-        assert list(actual) == list(mask) and flags.value == 0
+        rc = hip.hipStreamGetFlags(raw, ctypes.byref(flags))
+        require(rc == 0, f"hipStreamGetFlags failed: {rc}")
+        require(list(actual) == list(mask) and flags.value == 0, "unexpected stream")
         owners.append(raw)
         emit(
             {
@@ -132,7 +145,7 @@ def run_fixture(args):
     # strided_view API or an actual NIC registration.
     slots = pool.acquire("load", 1)
     contig = slots[0].tensor
-    assert contig.is_contiguous() and contig.numel() == 267822080
+    require(contig.is_contiguous() and contig.numel() == 267822080, "bad slot")
     srcids = list(range(724))
     dstids = list(range(724, 1448))
     codec.gpu_to_chunk_major_device_buffer(contig, srcids, stream=compute)
@@ -143,10 +156,13 @@ def run_fixture(args):
             contig, owner, 0, stream=restore
         )
         restore.synchronize()
-        assert all(
-            torch.equal(v[: 724 * u], v[724 * u : 1448 * u])
-            for v, u in zip(regions, units)
-        ), "setup byte validation failed"
+        require(
+            all(
+                torch.equal(v[: 724 * u], v[724 * u : 1448 * u])
+                for v, u in zip(regions, units)
+            ),
+            "setup byte validation failed",
+        )
         emit(
             {
                 "stage": "setup_complete",
@@ -172,8 +188,11 @@ def run_fixture(args):
     from atom.mono.runtime.peer_memory import PeerBuffer
     from atom.mono.runtime.uncached import uncached_bytes
 
-    assert pathlib.Path(k1.__file__).resolve().is_relative_to(root)
-    assert pathlib.Path(sync.__file__).resolve().is_relative_to(root)
+    for module in (k1, sync):
+        require(
+            pathlib.Path(module.__file__).resolve().is_relative_to(root),
+            f"{module.__name__} is not imported from this checkout",
+        )
     emit(
         {
             "stage": "code_identity_before_K1",
@@ -202,8 +221,8 @@ def run_fixture(args):
         keepers.append(t)
         return t
 
-    # Explicit ABI fields; unused index and peer pointers are0 in this non-token-
-    # parallel K1. Zero FP8 weights are valid in every shuffled block layout.
+    # Explicit ABI fields; unused index and peer pointers are 0 in this non-token-
+    # parallel K1. The FP8 weights are filled with 0x38 below.
     vals = {
         name: 0
         for name in (
@@ -315,17 +334,24 @@ def run_fixture(args):
     mailboxes.begin_step()
     model_once()
     torch.cuda.synchronize()
-    assert not torch.equal(
-        checked[0], baseline[0]
-    ), "input perturbation did not affect Q output"
+    require(
+        not torch.equal(checked[0], baseline[0]),
+        "input perturbation did not affect Q output",
+    )
     keepers[10].fill_(0x38)
     mailboxes.begin_step()
     model_once()
     torch.cuda.synchronize()
-    assert all(torch.equal(a, b) for a, b in zip(checked, baseline))
-    assert torch.count_nonzero(keepers[-5]).item() > 0
-    assert all(
-        torch.isfinite(t).all().item() for t in keepers if t.dtype.is_floating_point
+    require(
+        all(torch.equal(a, b) for a, b in zip(checked, baseline)),
+        "restored input did not reproduce the baseline",
+    )
+    require(torch.count_nonzero(keepers[-5]).item() > 0, "empty output")
+    require(
+        all(
+            torch.isfinite(t).all().item() for t in keepers if t.dtype.is_floating_point
+        ),
+        "non-finite tensor",
     )
     emit(
         {
@@ -339,7 +365,10 @@ def run_fixture(args):
         }
     )
 
-    assert pathlib.Path(k1.__file__).resolve().is_relative_to(root)
+    require(
+        pathlib.Path(k1.__file__).resolve().is_relative_to(root),
+        "k1 is not imported from this checkout",
+    )
 
     emit(
         {
@@ -414,14 +443,18 @@ def run_fixture(args):
             )
             overlap_samples += int(event_overlap)
         if model:
-            assert all(
-                torch.equal(a, b) for a, b in zip(checked, baseline)
-            ), "Q/ring changed"
+            require(
+                all(torch.equal(a, b) for a, b in zip(checked, baseline)),
+                "Q/ring changed",
+            )
         if copy:
-            assert all(
-                torch.equal(v[: 724 * u], v[724 * u : 1448 * u])
-                for v, u in zip(regions, units)
-            ), "native KV bytes differ"
+            require(
+                all(
+                    torch.equal(v[: 724 * u], v[724 * u : 1448 * u])
+                    for v, u in zip(regions, units)
+                ),
+                "native KV bytes differ",
+            )
         emit(
             {
                 "stage": "complete_round",
@@ -467,7 +500,8 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         for handle in handles:
-            assert hip_owner.hipStreamDestroy(handle) == 0
+            rc = hip_owner.hipStreamDestroy(handle)
+            require(rc == 0, f"hipStreamDestroy failed: {rc}")
     except BaseException:  # noqa: BLE001 - retain owners even on interrupts
         # The traceback keeps run_fixture's frames (and all in-flight owners)
         # alive. No manual cleanup or successful completion on this path.

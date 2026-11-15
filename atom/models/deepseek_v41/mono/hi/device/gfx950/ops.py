@@ -178,7 +178,8 @@ def fresh_s64(v):
 
 
 def spin_pause():
-    """An opaque, side-effecting op inside a poll loop: keeps its loads from being hoisted."""
+    """An opaque, side-effecting op inside a poll loop: keeps its loads from being
+    hoisted, and sleeps ``POLL_SLEEP_UNITS`` between polls."""
     llvm.InlineAsmOp(None, [], f"s_sleep {POLL_SLEEP_UNITS}", "", has_side_effects=True)
 
 

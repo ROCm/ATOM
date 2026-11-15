@@ -46,8 +46,9 @@ On other exceptions it logs the original error/traceback, retains frame owners,
 and waits for the watchdog too. A failed setup/import/submit is distinguished
 from pending_deadline; watchdog exit124 alone is not evidence of GPU hang.
 It deliberately does not report success or prematurely release in-flight data.
-A successful run emits one complete_round per requested sample, checks bytes and
-Q/ring, then emits complete and must also exit normally. Completion is still only
+A successful run emits one complete_round per requested sample (Q/ring is checked
+when Mono runs, restored bytes when the copy runs, so both in `--mode side`),
+then emits complete and must also exit normally. Completion is still only
 a sampled liveness result; a rare hang remains possible and the hardware root
 cause and Store/Mono residency/ordering restrictions are not solved by backoff.
 

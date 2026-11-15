@@ -43,7 +43,8 @@ def uniform_f32(value):
 
 
 def spin_pause() -> None:
-    """Keep tagged-mailbox polling loads inside the retry loop."""
+    """Keep tagged-mailbox polling loads inside the retry loop and sleep
+    ``POLL_SLEEP_UNITS`` between polls (see ``atom.mono.polling``)."""
 
     llvm.InlineAsmOp(None, [], f"s_sleep {POLL_SLEEP_UNITS}", "", has_side_effects=True)
 

@@ -4191,7 +4191,7 @@ def build_glm5_monokernel(
         layer: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        assert source_key
+        _ = source_key
         glm5_monokernel(
             h_in,
             x_out,

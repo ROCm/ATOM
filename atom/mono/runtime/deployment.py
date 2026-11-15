@@ -185,7 +185,9 @@ def _cu_count() -> int | None:
 def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
     and spin on each other (``plan.execution.BLOCKS``). ``connectors``: the KV
-    connectors a model admits, whose copy kernels finish on their own."""
+    connectors a model admits anyway. A copy kernel beside these kernels can
+    still wedge them (``tools/mono_mailbox_copy_repro.md``); the polling backoff
+    only mitigates that, see ROCm/ATOM#3369."""
     from atom.kv_transfer.disaggregation import KVConnectorFactory
 
     cus = _cu_count()
