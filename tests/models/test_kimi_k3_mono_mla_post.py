@@ -56,7 +56,7 @@ G_TASKS, R_TASKS, L_TASKS = 96, 28, 56
 
 
 def _o_tasks(bid):
-    """CTA bid's o_proj task count (``layer.o_slot``)."""
+    """CTA bid's o_proj task count (``layer_stages.o_slot``)."""
     slot = (bid + BLOCKS - O0) % BLOCKS
     return sum(slot + BLOCKS * j < OTASKS for j in range(2))
 
@@ -88,12 +88,13 @@ def test_tasks_avoid_the_shared_and_router_gemv_ctas():
 def test_placement_constants_match_k2():
     pytest.importorskip("flydsl", reason="the K2 modules are FlyDSL")
     from atom.models.kimi_k3.mono.kernels import layer as k2
+    from atom.models.kimi_k3.mono.kernels import layer_stages as k2s
     from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 
-    assert (k2.O0, k2.OTASKS, k2.E0) == (O0, OTASKS, E0)
+    assert (k2s.O0, k2s.OTASKS, k2.E0) == (O0, OTASKS, E0)
     assert (k2b.G_TASKS, k2b.R_TASKS, k2b.L_TASKS) == (G_TASKS, R_TASKS, L_TASKS)
     for b in range(BLOCKS):
-        slot = k2.o_slot(b)
+        slot = k2s.o_slot(b)
         assert sum(slot + BLOCKS * j < OTASKS for j in range(2)) == _o_tasks(b)
 
 

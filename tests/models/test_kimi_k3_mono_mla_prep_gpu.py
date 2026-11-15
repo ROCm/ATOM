@@ -51,6 +51,7 @@ from flydsl.expr.typing import Int32, Int64
 from atom.models.kimi_k3.mono.kernels.attention.kda import COLS, HIDDEN, NA
 from atom.models.kimi_k3.mono.kernels.stages import mla_post_plan as pl
 from atom.models.kimi_k3.mono.kernels.stages import mla_prep as pr
+from atom.models.kimi_k3.mono.kernels.stages import mla_prep_qkv as pq
 from atom.mono.device.ops import kernel_symbol, load_ptr64
 from atom.mono.device.sync import Mailbox, preg, sreg
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
@@ -167,13 +168,13 @@ def _build(s: int, build: str, neox: bool = True):
                 pr.p1_task(c, bid - pr.P1_CTA0)
         if const_expr("p2" in stages):  # noqa: SIM102
             if bid < 2 * s:
-                pr.p2_norm(c, bid)
+                pq.p2_norm(c, bid)
         if const_expr("p3" in stages):  # noqa: SIM102
             if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
-                pr.p3_task(c, bid - pr.P3_CTA0)
+                pq.p3_task(c, bid - pr.P3_CTA0)
         if const_expr("p4" in stages):  # noqa: SIM102
             if bid >= pr.P4_CTA0:
-                pr.p4_task(c, bid - pr.P4_CTA0)
+                pq.p4_task(c, bid - pr.P4_CTA0)
 
     @flyc.jit
     def launch(
