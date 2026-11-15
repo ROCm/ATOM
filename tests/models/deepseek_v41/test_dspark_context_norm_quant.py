@@ -12,13 +12,14 @@ into one block first, the taps give the same bytes.
 
 That is not bit-exact: the fused kernel quantizes the fp32 normalized value,
 the chain the bf16-rounded one. So, as in the draft-KV tail's test, the claim
-is that where the two disagree under the same scale the fused value is the
-one nearer an fp64 reference, and that per scale group it is never farther.
-The second test covers the scale layout: a scale read in the wrong view does
-not fail, it writes a wrong KV row, so the GEMM output is checked against
-fp64 and a misread scale is shown to fail that check.
+is that where the two disagree the fused value is the one nearer an fp64
+reference, and that per scale group it is never farther. The second test
+covers the scale layout: a scale read in the wrong view does not fail, it
+writes a wrong KV row, so the GEMM output is checked against fp64 and a
+misread scale is shown to fail that check.
 """
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -98,8 +99,10 @@ def _reference(ctx, weight):
 
 
 def _dequant(values, scales, rows=1):
-    exponent = scales.view(torch.uint8).to(torch.int32) - 127
-    scale = torch.ldexp(torch.ones_like(exponent, dtype=torch.float64), exponent)
+    # The E8M0 cast is exact. `torch.ldexp` is not on the GPU: it comes out
+    # an ulp low for some exponents, so the same value stored under two
+    # adjacent scales would dequantize to two different numbers.
+    scale = scales.view(torch.float8_e8m0fnu).double()
     scale = scale.repeat_interleave(32, dim=-1)
     if rows > 1:
         scale = scale.repeat_interleave(rows, dim=-2)
@@ -141,23 +144,19 @@ def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
     # two take the adjacent E4M3 codes either side of the reference and which
     # one is nearer is decided by the fp32 reduction order. Per quantization
     # group, the unit a scale is chosen over, the fused path is never worse.
+    # A group whose fp32 amax is just past 448 * 2**k while its bf16-rounded
+    # amax is on it takes the next scale up on the fused path. Its normal
+    # codes then sit one binade lower and stand for the same values, so it is
+    # held to the same checks as every other group.
     differs = fused != chain
+    assert differs.any()  # otherwise the element check below compares nothing
     fused_error = (fused - reference).abs()
     chain_error = (chain - reference).abs()
     worse = differs & (fused_error > chain_error)
     straddles = (torch.minimum(fused, chain) <= reference) & (
         reference <= torch.maximum(fused, chain)
     )
-    # Element by element only where both paths chose the same scale. A group
-    # whose amax sits on a power-of-two boundary can take adjacent scales --
-    # the fp32 amax just past it, the bf16-rounded one on it -- and then one
-    # path codes the whole group on a step twice the other's, so single
-    # elements of it can land farther from fp64 without straddling. Such a
-    # group is held to the per-group check below like every other.
-    same_scale = (
-        scales.view(torch.uint8) == chain_scales.view(torch.uint8).view_as(scales)
-    ).repeat_interleave(32, dim=-1)
-    assert (worse & ~straddles & same_scale).sum() == 0
+    assert (worse & ~straddles).sum() == 0
     grouped = (width, HIDDEN // 32, 32)
     fused_group = fused_error.reshape(grouped).pow(2).mean(-1).sqrt()
     chain_group = chain_error.reshape(grouped).pow(2).mean(-1).sqrt()
@@ -170,6 +169,17 @@ def test_context_norm_quant_beats_op_chain_against_fp64(single_rank, width):
 
     assert _relative_rms(fused) <= _relative_rms(chain)
     assert _relative_rms(fused) < 2.0**-4
+
+
+def test_dequant_scales_are_exact_powers_of_two():
+    """Every E8M0 byte but NaN, against `math.ldexp`. Identical values under
+    adjacent scales must dequantize to the same number, or the fp64 check
+    above reads a one-ulp scale error as a worse code."""
+    codes = torch.arange(255, device=DEV, dtype=torch.int32)
+    ones = torch.ones(1, 1, 255 * 32, device=DEV).to(torch.float8_e4m3fn)
+    got = _dequant(ones, codes.to(torch.uint8).view(1, 1, 255))[0, 0, ::32]
+    expected = [math.ldexp(1.0, code - 127) for code in range(255)]
+    assert got.cpu().tolist() == expected
 
 
 @pytest.mark.parametrize("width", [1, 37, 384])
