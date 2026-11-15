@@ -73,6 +73,10 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
+        # The engine's own Config. Utility handlers that gate on a server flag
+        # (`plugin_hotplug`, topology) read it from here; nothing else needs the
+        # reference, and the workers own their own copies.
+        self.config = config
         self._kv_progress_event = threading.Event()
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
