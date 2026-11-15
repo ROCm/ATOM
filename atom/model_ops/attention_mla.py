@@ -235,13 +235,12 @@ logger = logging.getLogger("atom")
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 # The one width below 16 aiter's MLA decode dispatches; see mla_decode_min_heads.
 _MLA_NARROW_MIN_HEADS = 12
-# Verify widths at which ATOM takes it (mla_dense_min_query_heads). Below 5, 16
-# heads have their own qh16 kernels, which beat 12 heads on the gqa=32
-# qseqlen=4 tile by 4-44%; from 5 to 8 both widths run that tile and 12 is
-# 1.8% faster at the median (11% faster to 7.5% slower) with bit-identical
-# output; past 8, 16 heads overflow the tile and 12 wins or loses by batch
-# size. Measured on MI355X (aiter 0dd2716).
-_MLA_NARROW_QLENS = range(5, 9)
+# The one verify width at which ATOM takes it (mla_dense_min_query_heads).
+# aiter mla_decode_fwd on MI355X (aiter 0dd2716), 12- vs 16-head time,
+# median over ctx 4k/32k/128k: at qlen 8, -2.4% / -3.1% / -3.7% / -9.1% at
+# bs 1 / 2 / 4 / 8, with bit-identical output. At qlen 1-4 12 heads is slower
+# at every shape (3.5-44%), and at qlen 5 and 7 slower at bs 1.
+_MLA_NARROW_QLEN = 8
 _MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
@@ -289,8 +288,8 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
     AiterMLAMetadataBuilder plans the step's single ``work_*`` plan for, so
     the two cannot disagree. 12 only for a rank with exactly 12 heads (Kimi-K3
     at tp8), where it drops the padding altogether, and only where aiter
-    serves 12 and it is the faster width: a speculative verify of 5 to 8
-    tokens (``_MLA_NARROW_QLENS``; Kimi-K3's interactive band verifies 8). 16
+    serves 12 and it is the faster width: an 8-token verify
+    (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's DSpark 7). 16
     otherwise, including:
 
     - a model with an indexer (``has_mla_indexer``): its sparse layers'
@@ -308,7 +307,7 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
         return _MLA_MIN_HEADS
     spec = atom_config.speculative_config
     max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
-    if max_seqlen_q not in _MLA_NARROW_QLENS:
+    if max_seqlen_q != _MLA_NARROW_QLEN:
         return _MLA_MIN_HEADS
     # The decode runs aiter's persistent kernel over the builder's plan only on
     # the plain page_size=1 asm path (see MLAAttention.decode_is_persistent).

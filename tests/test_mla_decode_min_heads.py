@@ -189,11 +189,12 @@ def _set(monkeypatch, cfg, change):
         ("dp2", 12),
         ("dp2, no dpa persistent", 16),
         ("indexer", 16),
-        # aiter serves 12 up to qlen 10; ATOM takes it where it is faster.
+        # aiter serves 12 up to qlen 10; ATOM takes it only at qlen 8.
         ("qlen 1", 16),
         ("qlen 4", 16),
-        ("qlen 5", 12),
-        ("qlen 6", 12),
+        ("qlen 5", 16),
+        ("qlen 6", 16),
+        ("qlen 7", 16),
         ("qlen 9", 16),
         ("vllm", 16),
     ],
