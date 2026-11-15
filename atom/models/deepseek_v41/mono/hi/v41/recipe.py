@@ -4,9 +4,9 @@
 
 The contract is a hardware-arithmetic reference of the checkpoint's layer (its operations with the kernels'
 roundings): a layer's ``h_out`` within D10 of it, routing ids and the index sources' selections exact (the near-tie
-rule). Every kind is one program at TP4 (64 / 4 heads a rank; the KV path, q_a, the router and HC replicated; wo_b
-row-parallel; the routed and the shared experts sharded), a single-layer 16-row build two (``split``: the attention
-kernel, then the FFN kernel). Stages, in order (channels between them):
+rule). Every kind is one program at TP2, TP4 or TP8 (64 / TP heads a rank; the KV path, q_a, the router and HC
+replicated; wo_b row-parallel; the routed and the shared experts sharded), a single-layer 16-row build two (``split``:
+the attention kernel, then the FFN kernel). Stages, in order (channels between them):
 
     seam A        HCSeam: fold of the previous layer's MoE output into the 4 streams (layer 0: the embedding streams,
                   no fold) -> lin_a (BF16), gate_a (F32 24); Engram layers: R -> ra, Engram gate half -> re, then

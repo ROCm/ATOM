@@ -16,7 +16,7 @@ import torch
 pytest.importorskip("flydsl")
 shuffle = pytest.importorskip("aiter.ops.shuffle")
 
-RANK = 1  # (a rank past the first, at either TP size)
+RANK = 1  # (a rank past the first, at every TP size)
 
 
 def _fp8(*shape, g=None):

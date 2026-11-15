@@ -666,7 +666,7 @@ def _attn(k, t, p: _APlan):
 
 
 class MLAWindowAttn(Block):
-    """``heads``: this rank's query heads (64 at TP1; TP shards them, 16 a rank at TP4, 8 at TP8): 16-head tiles, the
+    """``heads``: this rank's query heads (64 at TP1; TP shards them, 32 a rank at TP2, 16 at TP4, 8 at TP8): 16-head tiles, the
     last one ragged when heads is not a multiple of 16 (``_APlan.tiles``)."""
 
     def __init__(self, name: str, q: Channel, kvn: Channel, out: Channel, ring: str, pos: str, rope: str, sink: str,

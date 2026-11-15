@@ -115,10 +115,13 @@ def main(argv: list[str]) -> int:
     tps = SERVED_TPS
     if "--tp" in argv:
         i = argv.index("--tp")
-        if i + 1 >= len(argv) or not argv[i + 1].isdigit():
-            print(f"--tp takes a TP size, one of {SERVED_TPS}")
+        if i + 1 >= len(argv) or argv[i + 1] not in {str(t) for t in SERVED_TPS}:
+            print(f"--tp takes a served TP size, one of {SERVED_TPS}\n\n{__doc__}")
             return 2
         tps, argv = (int(argv[i + 1]),), argv[:i] + argv[i + 2 :]
+    if not argv:
+        print(__doc__)
+        return 2
     cfg, widths = config(argv[0]), [int(w) for w in argv[1:]] or None
     # (one process: the derived fits of every TP size and layout)
     for tp in tps:
