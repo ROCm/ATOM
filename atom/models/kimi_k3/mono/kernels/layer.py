@@ -200,7 +200,7 @@ FOLD_FIELDS = (
 # slot frame finalization adds for it, become a private segment no instruction
 # touches, which the scratch guard refuses all the same. Another schedule
 # changes which values the allocator spills; the computation is the same.
-# Tracked in: <LLVM_ISSUE_URL>
+# Tracked in: https://github.com/llvm/llvm-project/issues/242766
 # This retry chain (and ``K2Build.sched``) can go once the LLVM that FlyDSL
 # ships has the fix.
 FOLD_SCHEDULERS = ("iterative-ilp", "iterative-minreg")
