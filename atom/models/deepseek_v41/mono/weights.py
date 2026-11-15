@@ -5,16 +5,24 @@
 Nothing is copied or re-laid-out: a kernel reads a parameter where the original
 model keeps it, so a layout the kernels were not written for must be refused here
 rather than read wrong. Every tensor is checked against the shape and dtype the
-kernels assume for the rank's shard. The one exception is an FP8 weight the
-original path keeps row-major because its preshuffled GEMM runs no such K (the
-shared expert's down projection at TP8, K = 288: ``linear.weight_is_stored_preshuffled``):
-the kernels read the (16, 16)-preshuffled layout, so they get a shuffled copy.
+kernels assume for the rank's shard, and every FP8 weight against the
+(16, 16)-preshuffled layout the kernels read it in (``kernels.attn_pre``).
+
+The one exception is an FP8 weight whose K gfx950's preshuffled group32 GEMM
+cannot step (``PRESHUFFLED_K_STEP``), which the original path keeps row-major
+for the plain group32 GEMM (``linear.weight_is_stored_preshuffled``): the shared
+expert's down projection at TP8, K = 2304 / 8 = 288. The kernels get a
+(16, 16)-shuffled copy of it, made once here: 5120 x 288 bytes a layer, about
+60 MB a rank over the target's layers and the draft's. A row-major FP8 weight of
+any other K (the original path's preshuffle switched off,
+``ATOM_GROUP32_WEIGHT_PRESHUFFLE=0``) is refused, not copied. The copy is not the
+parameter, so a rollout weight sync would not reach it; mono refuses a runner
+that takes one (``atom.mono.runtime.deployment._takes_weight_updates``).
 """
 
 from dataclasses import dataclass
 
 import torch
-from aiter.ops.shuffle import shuffle_weight
 
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
@@ -41,6 +49,9 @@ FP4X2 = torch.float4_e2m1fn_x2
 BLOCK = 32
 # a routed expert's intermediate width is padded to the 128-k MXFP4 step
 MOE_PAD = 128
+# the K step of gfx950's preshuffled group32 FP8 GEMM: the original path keeps
+# a weight of any other K row-major (``linear.weight_is_stored_preshuffled``)
+PRESHUFFLED_K_STEP = 64
 
 
 def _fp8(rows: int, cols: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
@@ -135,8 +146,21 @@ def bind_layer(block, config, dims: Dims, moe_tp: int = 1) -> LayerWeights:
         if not tensor.is_contiguous():
             raise MonoUnsupported(f"layer {spec.layer_id}: {name} not contiguous")
         if dtype == FP8 and not getattr(tensor, "is_shuffled", False):
-            params[name] = shuffle_weight(tensor.data, layout=(16, 16))
+            if shape[-1] % PRESHUFFLED_K_STEP == 0:
+                raise MonoUnsupported(
+                    f"layer {spec.layer_id}: {name} is row-major, the kernels read "
+                    "it (16, 16)-preshuffled (ATOM_GROUP32_WEIGHT_PRESHUFFLE=0?)"
+                )
+            params[name] = _shuffled_copy(tensor)
     return LayerWeights(spec.layer_id, spec.mode, params)
+
+
+def _shuffled_copy(weight: torch.Tensor) -> torch.Tensor:
+    """The one copy (module docstring): ``weight`` (16, 16)-shuffled into new
+    storage, the layout the original path's load gives any other FP8 weight."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight(weight.data, layout=(16, 16))
 
 
 def bind_model(model, dims: Dims, moe_tp: int = 1) -> list[LayerWeights]:

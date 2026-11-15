@@ -383,7 +383,9 @@ def _v41_config():
 
 class _Block(torch.nn.Module):
     # the deployed routed experts: A8W4 (gate / up interleaved, MXFP8 activations)
-    def __init__(self, table, mode, *, interleaved=True, fp8_activations=True):
+    def __init__(
+        self, table, mode, *, interleaved=True, fp8_activations=True, row_major=None
+    ):
         super().__init__()
         self.attn = SimpleNamespace(spec=SimpleNamespace(layer_id=2, mode=mode))
         method = SimpleNamespace(
@@ -391,10 +393,20 @@ class _Block(torch.nn.Module):
         )
         self.ffn = SimpleNamespace(experts=SimpleNamespace(quant_method=method))
         self.table = table
+        # the FP8 weights the original path keeps row-major; by default those
+        # gfx950's preshuffled group32 GEMM cannot step (K % 64), as it loads
+        self.row_major = row_major
 
     def named_parameters(self):
         for name, (shape, dtype) in self.table.items():
-            yield name, torch.empty(shape, dtype=dtype, device="meta")
+            tensor = torch.empty(shape, dtype=dtype, device="meta")
+            if dtype == torch.float8_e4m3fn:
+                row_major = (
+                    shape[-1] % 64 if self.row_major is None else name in self.row_major
+                )
+                if not row_major:
+                    tensor.is_shuffled = True
+            yield name, tensor
 
 
 def test_weight_table_is_the_loaded_tp4_shard():
@@ -458,6 +470,82 @@ def test_a_weight_off_the_table_is_refused():
     missing = {k: v for k, v in table.items() if k != "ffn_norm.weight"}
     with pytest.raises(MonoUnsupported, match="no ffn_norm.weight"):
         weights.bind_layer(_Block(missing, AttentionMode.FULL), _v41_config(), Dims(4))
+
+
+def test_tp8_shared_expert_down_projection_binds_its_one_shuffled_copy(monkeypatch):
+    """TP8's shared-expert down projection (K = 2304 / 8 = 288) is the one FP8
+    weight the original path keeps row-major on gfx950: the kernels get a
+    (16, 16)-shuffled copy of it; every other tensor is bound in place."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+
+    name = "ffn.shared_experts.w2.weight"
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(8))
+    assert table[name] == ((5120, 288), torch.float8_e4m3fn)
+    torch.manual_seed(288)
+    w2 = (torch.randn(5120, 288) * 16).to(torch.float8_e4m3fn)
+    block = _Block(table, AttentionMode.FULL)
+    params = dict(block.named_parameters(), **{name: w2})
+    monkeypatch.setattr(block, "named_parameters", lambda: iter(params.items()))
+    bound = weights.bind_layer(block, _v41_config(), Dims(8))
+    want = shuffle_weight(w2, layout=(16, 16))
+    assert bound[name].data_ptr() != w2.data_ptr()
+    assert torch.equal(bound[name].view(torch.uint8), want.view(torch.uint8))
+    assert not getattr(w2, "is_shuffled", False)  # the parameter is untouched
+    for other, tensor in params.items():
+        if other != name:
+            assert bound[other] is tensor
+
+
+@pytest.mark.parametrize(
+    "tp, row_major",
+    [
+        # one weight the original path left row-major at a K it could step
+        (4, ("attn.wq_b.weight",)),
+        # ATOM_GROUP32_WEIGHT_PRESHUFFLE=0: every FP8 weight row-major
+        (8, None),
+    ],
+)
+def test_any_other_row_major_fp8_weight_is_refused_not_copied(tp, row_major):
+    from atom.models.deepseek_v41.config import AttentionMode
+    from atom.models.deepseek_v41.mono import weights
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(tp))
+    if row_major is None:
+        row_major = [n for n, (_, dt) in table.items() if dt == torch.float8_e4m3fn]
+    block = _Block(table, AttentionMode.FULL, row_major=row_major)
+    with pytest.raises(MonoUnsupported, match="row-major"):
+        weights.bind_layer(block, _v41_config(), Dims(tp))
+
+
+class _UpdatingRunner:
+    def update_weights(self, named_tensors, clear_kv_cache=True):
+        raise NotImplementedError
+
+
+class _PlainRunner:
+    pass
+
+
+@pytest.mark.parametrize("tp", [4, 8])
+@pytest.mark.parametrize(
+    ("resolved", "refused"), [(_PlainRunner, False), (_UpdatingRunner, True)]
+)
+def test_a_runner_that_takes_weight_updates_is_refused(
+    native, monkeypatch, tp, resolved, refused
+):
+    """A rollout sync rewrites the parameters in place and would not reach the
+    copy ``weights.bind_layer`` keeps of TP8's shared-expert down projection, so
+    a runner that takes one gets no V4.1 mono (nor the hi path inside it)."""
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", lambda _: resolved)
+    why = mono_config.config_refusal(
+        _atom_config(tensor_parallel_size=tp, runner_qualname="a.runner.Class")
+    )
+    assert (why is not None and "rollout weight updates" in why) is refused
 
 
 @pytest.mark.parametrize(

@@ -120,9 +120,13 @@ def test_parallel_source_slices_and_scale_alignment(linear_modules, kind):
         module.weight_loader(module.weight_scale, scales)
         module.process_weights_after_loading()
         # The shard's bytes, (16, 16)-shuffled where the preshuffled group32
-        # GEMM reads it (gfx950); the compact scales stay as loaded.
+        # GEMM reads it (gfx950, at a K it can step: the row shards' 32 is
+        # not one); the compact scales stay as loaded.
         preshuffled = linear.weight_is_stored_preshuffled(
-            module.quant_type, module.params_dtype, native_group_rows=32
+            module.quant_type,
+            module.params_dtype,
+            native_group_rows=32,
+            input_size=module.weight.shape[-1],
         )
         shard = weight.chunk(4, axis)[rank].contiguous()
         if preshuffled:
@@ -281,3 +285,68 @@ def test_merged_replicated_splits_v41_qkv_a_scale_rows(linear_modules):
     assert torch.equal(module.weight[1280:].float(), shards[1][0].float())
     assert torch.equal(module.weight_scale[:40].float(), shards[0][1].float())
     assert torch.equal(module.weight_scale[40:].float(), shards[1][1].float())
+
+
+@pytest.mark.parametrize(
+    "gfx, k, want",
+    [("gfx950", 288, False), ("gfx950", 512, True), ("gfx1250", 288, True)],
+)
+def test_gfx950_group32_weight_whose_k_is_not_a_multiple_of_64_stays_row_major(
+    linear_modules, monkeypatch, gfx, k, want
+):
+    """V4.1-Flash's shared-expert down projection at TP8 (K = 2304 / 8 = 288):
+    gfx950's preshuffled group32 GEMM runs no such K, so the weight stays
+    row-major for AITER's plain group32 GEMM."""
+    linear, _ = linear_modules
+    from aiter import QuantType
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: gfx)
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1")
+    got = linear.weight_is_stored_preshuffled(
+        QuantType.per_1x32, linear.dtypes.fp8, native_group_rows=32, input_size=k
+    )
+    assert got == want
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("m", [1, 6, 300])
+def test_k288_runs_row_major_with_the_preshuffle_on(linear_modules, monkeypatch, m):
+    """The same weight end to end on gfx950, preshuffle on: it loads row-major
+    and the forward (the plain group32 GEMM) equals the fp32 oracle."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("gfx950's preshuffled group32 GEMM is the one that cannot step it")
+    from . import oracle_kernels as oracle
+
+    linear, group = linear_modules
+    group.world_size = 1
+    monkeypatch.setenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1")
+    torch.manual_seed(288 + m)
+    n, k = 5120, 288
+    module = linear.ReplicatedLinear(k, n, quant_config=_config()).cuda()
+    weight = (torch.randn(n, k) * 32).to(torch.float8_e4m3fn)
+    scale = torch.exp2(torch.randint(-8, -1, (n // 32, k // 32)).float()).to(
+        torch.float8_e8m0fnu
+    )
+    module.weight_loader(module.weight, weight)
+    module.weight_loader(module.weight_scale, scale)
+    module.process_weights_after_loading()
+    assert not getattr(module.weight, "is_shuffled", False)
+    assert torch.equal(module.weight.cpu().view(torch.uint8), weight.view(torch.uint8))
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    q, s = oracle.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    activation = (q.float().reshape(m, k // 32, 32) * s.float()[:, :, None]).reshape(
+        m, k
+    )
+    full_weight = weight.float() * scale.float().repeat_interleave(
+        32, 0
+    ).repeat_interleave(32, 1)
+    expected = torch.nn.functional.linear(activation, full_weight)
+    torch.testing.assert_close(
+        module(x.cuda(), otype=torch.float32).cpu(),
+        expected,
+        rtol=3e-5,
+        atol=5e-5 * expected.abs().max().item(),
+    )
