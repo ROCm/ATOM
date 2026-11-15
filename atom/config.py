@@ -3139,24 +3139,20 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            if (
-                spec.kv_cache_dtype is not None
-                and spec.draft_kv_dtype != self.kv_cache_dtype
-                and self.kv_transfer_config
-            ):
+            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
                 # The offload namespace keys the target's KV dtype alone, so a
                 # draft page of another dtype would share a key with the target's.
+                # The flag has no fp4 to match an fp4 target with.
+                hint = (
+                    ""
+                    if self.kv_cache_dtype == "fp4"
+                    else ". Pass --spec-decode-kv-cache-dtype "
+                    f"{self.kv_cache_dtype} to match the target"
+                )
                 raise ValueError(
                     f"draft KV dtype {spec.draft_kv_dtype} differs from the "
                     f"target's {self.kv_cache_dtype}: not supported with KV "
-                    "offload or --kv-transfer-config"
-                    # the flag has no fp4 to match an fp4 target with
-                    + (
-                        ""
-                        if self.kv_cache_dtype == "fp4"
-                        else ". Pass --spec-decode-kv-cache-dtype "
-                        f"{self.kv_cache_dtype} to match the target"
-                    )
+                    f"offload or --kv-transfer-config{hint}"
                 )
         if is_m3:
             from atom.models.minimax_m3.config import validate_runtime_config

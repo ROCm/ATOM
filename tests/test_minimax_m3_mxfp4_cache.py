@@ -244,6 +244,22 @@ def test_a_shared_pool_draft_has_the_targets_dtype_and_fp4_beside_offload_refuse
         )
 
 
+@pytest.mark.parametrize("asked", [None, "bf16"])
+def test_beside_offload_an_fp4_targets_bf16_draft_is_refused_asked_for_or_not(
+    monkeypatch, asked
+):
+    spec = _dspark_spec()
+    spec.kv_cache_dtype = asked
+    with pytest.raises(ValueError, match="draft KV dtype bf16 differs.*fp4"):
+        _m3(
+            monkeypatch,
+            kv_cache_dtype="fp4",
+            kv_transfer_config=OFFLOAD,
+            speculative_config=spec,
+            **FP4,
+        )
+
+
 def test_a_plugin_config_with_a_v41_dspark_draft_never_asks_for_a_backend(
     monkeypatch,
 ):
