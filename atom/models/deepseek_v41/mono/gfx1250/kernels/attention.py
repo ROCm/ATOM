@@ -516,9 +516,17 @@ def stage_C(c):
         preQ = [(ld_op(brp, ((w % 4) * KQp + i) * 128, l),
                  hx.gload(c["wqb_s"] + i64(((n0p + l % 16) // 32) * (QL // 32) + ((w % 4) * KQp + i) * 4), I32, align=4))
                 for i in range(KQp)]
+    # the epilogue's RoPE cos / sin (position -> table row: two dependent loads a row) before the wait: they do not
+    # depend on A2, and after it they were the epilogue's critical path (two serial round trips behind the GEMV)
+    mi_p = fx.min(w % 3, I32(MT - 1))
+    n0_p = (b + (w // 3) * CTAS) * 16
+    fi_p = fx.max((n0_p % HD + l % 16 - (HD - 64)) // 2, I32(0))
+    rcs = [rope_cs(c, mi_p * 16 + (l // 16) * 8 + i, fi_p) for i in range(8)]
     if fx.const_expr("a2flag" in c):   # (v3 e3) the q blocks of A2 (wave 0: 2 flags a lane)
         hx.wait_flags(c["a2flag"], QL // 32, c["a2tag"], w, l, 8)
         gpu.barrier()
+    # the rows' sums of squares (complete once every A2 flag is in): issued before the GEMV, used after it
+    ssv = [hx.gload(c["ss"] + i64(mi_p * 16 + (l // 16) * 8 + i) * 4, F32) for i in range(8)]
     if fx.const_expr(MT == 1 and C_WIDE):
         # (v2) the CTA's 2 tiles x 4 K quarters on the 8 waves (operands in flight), partials summed in LDS by waves 0 / 4
         KQ = QL // 128 // 4
@@ -561,7 +569,7 @@ def stage_C(c):
                 acc = fx.Vector.from_elements([acc[i] + rv[i] for i in range(8)], F32)
         else:
             acc = mx_loop(QL // 128, fa, fb)
-        cv = [acc[i] * rsq(hx.gload(c["ss"] + i64(mi * 16 + (l // 16) * 8 + i) * 4, F32) / F32(QL) + F32(NORM_EPS)) for i in range(8)]
+        cv = [acc[i] * rsq(ssv[i] / F32(QL) + F32(NORM_EPS)) for i in range(8)]
         is_rope = n0 % HD >= HD - 64
         fi = fx.max((n0 % HD + l % 16 - (HD - 64)) // 2, I32(0))
         odd = (l & 1) == 1
@@ -570,7 +578,7 @@ def stage_C(c):
             r = mi * 16 + (l // 16) * 8 + i
             x = cv[i].to(BF16).to(F32)
             y = cv[i].shuffle_xor(1, 32).to(BF16).to(F32)
-            cs, sn = rope_cs(c, r, fi)
+            cs, sn = rcs[i]
             res.append(is_rope.select(odd.select(y * sn + x * cs, x * cs - y * sn), cv[i]))
         for i in range_constexpr(8):
             c["stx"](c["q"] + i64((mi * 16 + (l // 16) * 8 + i) * NQ + n0 + l % 16) * 2, res[i].to(BF16))
