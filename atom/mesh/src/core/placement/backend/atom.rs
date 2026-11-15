@@ -44,6 +44,23 @@ impl AtomAdapter {
         body.get("prompt")
             .and_then(Value::as_array)
             .is_none_or(|items| items.iter().all(Value::is_number))
+            && !Self::has_media_parts(body)
+    }
+
+    /// Whether a chat body has a non-text content part. Such a request goes
+    /// to an encode worker first when one is available, and takes the
+    /// response relay rather than chunked mode: chunked mode starts decode
+    /// before prefill answers, so decode would lack the prompt ids prefill
+    /// expands from media and would preprocess the media itself.
+    pub(crate) fn has_media_parts(body: &Value) -> bool {
+        let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+            return false;
+        };
+        messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .any(|part| part.get("type").and_then(Value::as_str) != Some("text"))
     }
 
     /// Fill in fields the prefill response omits but decode's ReqMeta needs:
@@ -190,5 +207,38 @@ impl BackendAdapter for AtomAdapter {
 
     fn correlation_id(&self, ctx: &PairCtx) -> Option<String> {
         downcast(ctx).ok().map(|c| c.transfer_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::AtomAdapter;
+
+    fn user_parts(parts: serde_json::Value) -> serde_json::Value {
+        json!({"model": "m", "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": parts},
+        ]})
+    }
+
+    #[test]
+    fn chat_with_media_parts_is_not_chunked() {
+        let text = json!({"type": "text", "text": "Which color is this?"});
+        for media in [
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/red.png"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/v.mp4"}}),
+        ] {
+            let body = user_parts(json!([text, media]));
+            assert!(!AtomAdapter::can_chunk_request(&body), "{body}");
+        }
+        for body in [
+            user_parts(json!([text, text])),
+            user_parts(json!("Which color is this?")),
+            json!({"prompt": [1, 2, 3]}),
+        ] {
+            assert!(AtomAdapter::can_chunk_request(&body), "{body}");
+        }
     }
 }

@@ -5,6 +5,7 @@
 
 import importlib.util
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_matri
 SPEC = importlib.util.spec_from_file_location("atomesh_pd_matrix", SCRIPT)
 pd_matrix = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pd_matrix)
+CONFIG = Path(__file__).resolve().parents[1] / ".github/benchmark/models_atomesh.yaml"
+IMAGE_CASE = "minimax-m31-flash-mxfp4-agg-tp4-mmmu"
 
 
 def expand_cell(
@@ -27,6 +30,7 @@ def expand_cell(
     prefill=None,
     decode=None,
     env=None,
+    suite=None,
 ):
     with patch.dict(
         os.environ,
@@ -50,6 +54,7 @@ def expand_cell(
                 "osl": 128,
                 "concurrency": [1],
                 "env": env or {},
+                **(suite or {}),
             },
             override_image=None,
             override_benchmark_concurrency=None,
@@ -276,6 +281,80 @@ class TopologyKindTest(unittest.TestCase):
             with self.subTest(topology=topology):
                 cell = expand_cell(topology=topology, layout="single_node")
                 self.assertIs(cell["disaggregated"], disaggregated)
+
+
+def expand_file(suite):
+    """Every cell of a suite of the checked-in file, the variables it reads
+    blank and its nodes picked by the scheduler."""
+    names = set(re.findall(r"\$\{([A-Z0-9_]+)\}", CONFIG.read_text()))
+    ci_env = dict.fromkeys(names, "")
+    ci_env["ATOMESH_SLURM_SUBMIT_RUNNER"] = "atomesh-cicd"
+    with patch.dict(os.environ, ci_env):
+        return pd_matrix.build_cells(
+            pd_matrix.load_config(CONFIG),
+            suite=suite,
+            model_filter=None,
+            case_filter=None,
+            benchmark_kind_filter=None,
+            override_image=None,
+            override_benchmark_concurrency=None,
+            override_eval_concurrency=None,
+        )
+
+
+def file_suites():
+    models = pd_matrix.load_config(CONFIG)["models"].values()
+    return sorted({suite for model in models for suite in model.get("suites", {})})
+
+
+class ModelsFileTest(unittest.TestCase):
+    """The checked-in file, expanded as the benchmark workflow expands it."""
+
+    def test_the_image_case_is_an_aggregated_eval_with_its_threshold(self):
+        (cell,) = [c for c in expand_file("accuracy") if c["name"] == IMAGE_CASE]
+        self.assertFalse(cell["disaggregated"])
+        self.assertTrue(cell["eval_only"])
+        self.assertEqual(cell["num_nodes"], 1)
+        self.assertEqual(cell["service"]["decode"]["tp"], 4)
+        accuracy = cell["accuracy"]
+        self.assertEqual(accuracy["task"], "mmmu_val")
+        self.assertEqual(accuracy["metric"], "acc,none")
+        self.assertEqual(accuracy["model_type"], "local-chat-completions")
+        self.assertTrue(accuracy["apply_chat_template"])
+        # lm_eval sends one image a question unless told otherwise.
+        self.assertRegex(accuracy["model_args"], r"(^|,)max_images=\d+")
+        # Above mmmu_val's own cap of 512 tokens.
+        cap = re.search(r"(?:^|,)max_gen_toks=(\d+)", accuracy["gen_kwargs"])
+        self.assertGreater(int(cap.group(1)), 512)
+        self.assertGreater(accuracy["threshold"], 0)
+
+    def test_every_other_cell_keeps_its_eval_unchanged(self):
+        for suite in file_suites():
+            for cell in expand_file(suite):
+                if cell["name"] == IMAGE_CASE:
+                    continue
+                with self.subTest(suite=suite, cell=cell["name"]):
+                    accuracy = cell["accuracy"]
+                    self.assertEqual(accuracy["metric"], "exact_match,flexible-extract")
+                    self.assertIsNone(accuracy["model_args"])
+                    self.assertIsNone(accuracy["gen_kwargs"])
+
+
+class EvalOnlyTaskTest(unittest.TestCase):
+    def eval_only(self, task):
+        return expand_cell(
+            layout="single_node",
+            suite={"run_eval": True, "eval_only": True, "accuracy": {"task": task}},
+        )
+
+    def test_an_eval_only_cell_runs_a_task_run_eval_runs(self):
+        for task in ("gsm8k", "mmmu_val", "swebench_lite"):
+            with self.subTest(task=task):
+                self.assertEqual(self.eval_only(task)["accuracy"]["task"], task)
+
+    def test_an_eval_only_cell_with_another_task_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "supported accuracy task"):
+            self.eval_only("mmmu_pro")
 
 
 if __name__ == "__main__":

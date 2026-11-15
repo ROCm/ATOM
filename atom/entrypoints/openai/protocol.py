@@ -299,6 +299,8 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
+    # Where an encoder-only server keeps this request's image embeddings.
+    ec_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
     # Pre-tokenized text prompt; messages are still required and validated.
     prompt_token_ids: PromptTokenIds | None = None

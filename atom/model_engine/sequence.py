@@ -309,7 +309,9 @@ class Sequence:
         self.multimodal_data = multimodal_data
         self.multimodal_cache_ready = False
         # Immutable content identity survives payload release and preemption.
-        self.cache_seed = -1
+        # A decode leg has no media: it keeps what its prefill derived from it.
+        handoff = kv_transfer_params or {}
+        self.cache_seed = handoff.get("cache_seed", -1)
         if multimodal_data is not None:
             from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
@@ -317,7 +319,11 @@ class Sequence:
             if self.cache_seed is None:
                 self.cache_seed = multimodal_cache_seed(multimodal_data)
         self.mrope_positions = mrope_positions
-        self.mrope_position_delta = mrope_position_delta
+        self.mrope_position_delta = (
+            mrope_position_delta
+            if multimodal_data is not None
+            else handoff.get("mrope_position_delta", mrope_position_delta)
+        )
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         # Host-known prefix, excluding deferred outputs and draft placeholders.

@@ -286,12 +286,15 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 
 RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_TASK="${EVAL_TASK:-gsm8k}"
+EVAL_METRIC="${EVAL_METRIC:-exact_match,flexible-extract}"
 EVAL_FEWSHOT="${EVAL_FEWSHOT:-3}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 EVAL_MODEL_TYPE="${EVAL_MODEL_TYPE:-local-completions}"
 EVAL_ENDPOINT="${EVAL_ENDPOINT:-completions}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-}"
 EVAL_MAX_GEN_TOKS="${EVAL_MAX_GEN_TOKS:-}"
+EVAL_MODEL_ARGS="${EVAL_MODEL_ARGS:-}"
+EVAL_GEN_KWARGS="${EVAL_GEN_KWARGS:-}"
 EVAL_APPLY_CHAT_TEMPLATE="${EVAL_APPLY_CHAT_TEMPLATE:-false}"
 EVAL_FEWSHOT_AS_MULTITURN="${EVAL_FEWSHOT_AS_MULTITURN:-false}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
@@ -2730,7 +2733,7 @@ run_eval() {
     run_swebench_lite_eval
     return
   fi
-  if [[ "${EVAL_TASK}" != "gsm8k" ]]; then
+  if [[ "${EVAL_TASK}" != "gsm8k" && "${EVAL_TASK}" != "mmmu_val" ]]; then
     echo "[eval] unsupported task ${EVAL_TASK}; skipping"
     return 0
   fi
@@ -2751,9 +2754,16 @@ run_eval() {
   if [[ "${EVAL_FEWSHOT_AS_MULTITURN}" == "true" || "${EVAL_FEWSHOT_AS_MULTITURN}" == "1" ]]; then
     eval_extra_args+=(--fewshot_as_multiturn)
   fi
+  # A task's own generation_kwargs override the model's max_gen_toks; these do not.
+  if [[ -n "${EVAL_GEN_KWARGS:-}" ]]; then
+    eval_extra_args+=(--gen_kwargs "${EVAL_GEN_KWARGS}")
+  fi
   local eval_model_args_extra=""
   if [[ -n "${EVAL_MAX_GEN_TOKS}" ]]; then
     eval_model_args_extra=",max_gen_toks=${EVAL_MAX_GEN_TOKS}"
+  fi
+  if [[ -n "${EVAL_MODEL_ARGS:-}" ]]; then
+    eval_model_args_extra="${eval_model_args_extra},${EVAL_MODEL_ARGS}"
   fi
   local eval_model_args_base
   if [[ "${EVAL_MODEL_TYPE}" == "local-chat-completions" ]]; then
@@ -2769,31 +2779,35 @@ run_eval() {
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
-    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${eval_conc}"
+    tag="$(date +%Y%m%d%H%M%S)_${EVAL_TASK}_${TOPOLOGY}_c${eval_conc}"
     result_dir="${RUN_DIR}/eval_results/${tag}"
 
     echo ""
     echo "========================================="
-    echo "[eval] gsm8k concurrent=${eval_conc}"
+    echo "[eval] ${EVAL_TASK} concurrent=${eval_conc}"
     echo "========================================="
 
     lm_eval --model "${EVAL_MODEL_TYPE}" \
       --model_args "${eval_model_args_base}${eval_conc},max_retries=3${eval_model_args_extra}" \
-      --tasks gsm8k \
+      --tasks "${EVAL_TASK}" \
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
       --log_samples \
       --output_path "${result_dir}"
 
-    if ! python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
+    if ! EVAL_TASK="${EVAL_TASK}" EVAL_METRIC="${EVAL_METRIC:-}" \
+      python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
 threshold = sys.argv[3]
+task = os.environ.get("EVAL_TASK") or "gsm8k"
+metric = os.environ.get("EVAL_METRIC") or "exact_match,flexible-extract"
 json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
@@ -2801,23 +2815,19 @@ if not json_files:
 
 result_file = max(json_files, key=lambda path: path.stat().st_mtime)
 data = json.loads(result_file.read_text(encoding="utf-8"))
-score = (
-    data.get("results", {})
-    .get("gsm8k", {})
-    .get("exact_match,flexible-extract", "N/A")
-)
+score = data.get("results", {}).get(task, {}).get(metric, "N/A")
 print("=========================================")
-print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
+print(f"[eval] concurrent={eval_conc} {task} {metric} = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
 if threshold:
     if not isinstance(score, (int, float)) or score < float(threshold):
         raise SystemExit(
-            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"[eval] FAIL: concurrent={eval_conc} {task} score {score} "
             f"is below threshold {float(threshold):.4f}"
         )
     print(
-        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f"[eval] PASS: concurrent={eval_conc} {task} score {score:.4f} "
         f">= threshold {float(threshold):.4f}"
     )
 PY
@@ -2826,7 +2836,7 @@ PY
     fi
   done
 
-  echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  echo "[eval] ${EVAL_TASK} runs done, results saved to ${RUN_DIR}/eval_results"
   if (( ${#below[@]} )); then
     echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
     return 1

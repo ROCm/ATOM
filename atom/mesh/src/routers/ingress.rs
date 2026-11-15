@@ -728,7 +728,13 @@ impl IngressRouting {
         workers.retain(|w| matches!(w.connection_mode(), ConnectionMode::Http));
         let configured = !workers.is_empty();
         workers.retain(|w| {
-            endpoint.supports(w.as_ref()) && matches!(w.worker_type(), WorkerType::Regular) != pd
+            let in_topology = match w.worker_type() {
+                WorkerType::Regular => !pd,
+                WorkerType::Prefill { .. } | WorkerType::Decode => pd,
+                // Encode workers serve only the encode step, never a request
+                WorkerType::Encode => false,
+            };
+            in_topology && endpoint.supports(w.as_ref())
         });
         if configured && workers.is_empty() {
             return Err(IngressError::new(
@@ -800,9 +806,13 @@ impl IngressRouting {
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            let routed = super::prepare::inference::with_media_digests(chat);
+            super::prepare::chat_template::process_chat_messages(
+                routed.as_ref().unwrap_or(chat),
+                &*entry.tokenizer,
+            )
+            .map_err(IngressError::invalid)?
+            .text
         } else {
             metadata.text.clone()
         };

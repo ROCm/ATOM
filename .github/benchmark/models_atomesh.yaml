@@ -2102,6 +2102,71 @@ models:
       apply_chat_template: true
       fewshot_as_multiturn: true
 
+  # recipes/MiniMax-M3.md, "MiniMax-M3.1-Flash on 4xMI355 GPUs".
+  MiniMax-M3.1-Flash-MXFP4:
+    backend: atom
+    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    precision: MXFP4
+    env:
+      common:
+        ATOM_FORCE_ATTN_TRITON: "1"
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4: "1"
+    server:
+      common_args:
+        trust_remote_code: true
+        kv_cache_dtype: fp8
+        block_size: 128
+        enable_prefix_caching: false
+        gpu_memory_utilization: 0.9
+        max_model_len: 131072
+        max_num_seqs: 128
+        max_num_batched_tokens: 32768
+        online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}'
+        method: dspark
+        draft_model: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4/dspark"
+        num_speculative_tokens: 7
+        # The launcher splits these on spaces, so the JSON carries none.
+        extra_args: '--index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"}'
+    suites:
+      accuracy:
+        # The image CI case: tests/accept/atomesh_mm/checks/ci_case.py serves
+        # this cell with USE_ATOMESH_ENTRYPOINTS=1 and holds it to the threshold.
+        - name: minimax-m31-flash-mxfp4-agg-tp4-mmmu
+          topology: agg
+          display_topology: AGG-TP4
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [32]
+          prefill: {}
+          decode:
+            workers: 1
+            tp: 4
+            # The server's own capture sizes, as the recipe runs it.
+            cudagraph: none
+          benchmark:
+            wait_server_timeout: 3600
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            task: mmmu_val
+            metric: acc,none
+            fewshot: 0
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            apply_chat_template: true
+            # MMMU questions carry up to 7 images; lm_eval sends one by
+            # default, and gives up on a request after 300 s.
+            model_args: max_images=7,timeout=3600
+            # mmmu_val caps generation at 512 tokens; M3.1's thinking runs
+            # past that cap and leaves the answer empty.
+            gen_kwargs: max_gen_toks=65536
+            # 2 x the standard error under a measured score.
+            threshold: 0.77
+
   DeepSeek-V4-Pro-0813:
     backend: atom
     model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Pro-0813/"

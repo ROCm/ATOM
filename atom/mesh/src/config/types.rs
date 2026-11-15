@@ -69,6 +69,12 @@ pub struct RouterConfig {
     pub atom_standalone: bool,
     #[serde(default)]
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
+    /// Encode workers; valid only in PD mode
+    #[serde(default)]
+    pub encode_urls: Vec<String>,
+    /// Encode worker policy (falls back to `policy` when unset)
+    #[serde(default)]
+    pub encode_policy: Option<PolicyConfig>,
 
     pub policy: PolicyConfig,
     pub host: String,
@@ -466,6 +472,8 @@ impl Default for RouterConfig {
             connection_mode: ConnectionMode::Http,
             atom_standalone: false,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
+            encode_urls: vec![],
+            encode_policy: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,

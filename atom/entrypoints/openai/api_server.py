@@ -104,6 +104,7 @@ from .protocol import (
     BetaChatCompletionRequest,
     BetaCompletionRequest,
     ChatCompletionRequest,
+    ChatCompletionResponse,
     CompletionRequest,
     ModelCard,
     ModelList,
@@ -210,6 +211,8 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
+# `EncoderOnly` under --encoder-only, which builds no engine.
+encoder = None
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -685,6 +688,8 @@ def _validate_context_length(
 
 
 def _get_engine_config():
+    if encoder is not None:
+        return encoder.config
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
@@ -747,30 +752,42 @@ def _has_multimodal_content(messages: list[Any]) -> bool:
     )
 
 
+def load_multimodal_processor(config, tokenizer, custom_message_encoder):
+    """The processor that turns a chat with images into the engine's input."""
+    processor = get_native_multimodal_processor(
+        config, tokenizer, custom_message_encoder
+    )
+    if processor is None:
+        # The checkpoint path: model_name may be --served-model-name.
+        processor = AutoProcessor.from_pretrained(config.model, trust_remote_code=True)
+        # A checkpoint that ships its template for the tokenizer only
+        # (MiniMax-M3.1) renders with the server's, --chat-template included.
+        if processor.chat_template is None:
+            processor.chat_template = tokenizer.chat_template
+    return processor
+
+
 def _get_multimodal_processor():
     global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
-        processor = get_native_multimodal_processor(
+        processor = load_multimodal_processor(
             _get_engine_config(), tokenizer, custom_message_encoder
         )
-        if processor is None:
-            # The checkpoint path: model_name may be --served-model-name.
-            processor = AutoProcessor.from_pretrained(
-                _get_engine_config().model, trust_remote_code=True
-            )
-            # A checkpoint that ships its template for the tokenizer only
-            # (MiniMax-M3.1) renders with the server's, --chat-template included.
-            if processor.chat_template is None:
-                processor.chat_template = tokenizer.chat_template
     return processor
 
 
-def _prepare_multimodal_inputs(
+def prepare_chat_multimodal_inputs(
+    config,
+    processor,
     messages: list[Any],
     chat_template_kwargs: dict[str, Any],
     tools: Any = None,
+    *,
+    preserve_tool_call_arguments: bool,
 ) -> tuple[list[int], dict[str, Any]]:
+    """The prompt token ids and multimodal data for ``messages``, whose image
+    parts ``check_chat_images`` has checked. Blocking: it fetches the images."""
     # The images arrive decoded: the processor's media loader reads any
     # source it is given, server paths included.
     conversation, media = parse_chat_messages(
@@ -787,12 +804,27 @@ def _prepare_multimodal_inputs(
         )
     )
     return prepare_multimodal_inputs(
-        _get_engine_config(),
-        _get_multimodal_processor(),
+        config,
+        processor,
         conversation,
         media,
         chat_template_kwargs,
         tools=tools,
+    )
+
+
+def _prepare_multimodal_inputs(
+    messages: list[Any],
+    chat_template_kwargs: dict[str, Any],
+    tools: Any = None,
+) -> tuple[list[int], dict[str, Any]]:
+    return prepare_chat_multimodal_inputs(
+        _get_engine_config(),
+        _get_multimodal_processor(),
+        messages,
+        chat_template_kwargs,
+        tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
     )
 
 
@@ -1038,6 +1070,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1053,8 +1086,13 @@ async def generate_async_multimodal(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    kv_transfer_output_meta_info = None
 
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        kv_transfer_output_meta_info = getattr(
+            request_output, "kv_transfer_params_output", None
+        )
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -1071,6 +1109,7 @@ async def generate_async_multimodal(
             token_ids,
             sampling_params,
             stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1132,6 +1171,13 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if kv_transfer_output_meta_info is not None:
+        # Decode has no media: it seeds its prefix cache and positions with these.
+        response["kv_transfer_output_meta_info"] = {
+            **kv_transfer_output_meta_info,
+            "cache_seed": seq.cache_seed,
+            "mrope_position_delta": seq.mrope_position_delta,
+        }
     if return_token_ids and seq is not None:
         response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
@@ -1850,6 +1896,8 @@ async def lifespan(app: FastAPI):
         try:
             if engine is not None:
                 engine.close()
+            if encoder is not None:
+                encoder.close()
         finally:
             try:
                 # After the engine: its output threads flush into the hub.
@@ -2203,12 +2251,17 @@ async def _chat_completions(
 
         _log_request_model("request", request_id, request)
 
-        is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if assistant_prefix is not None and (
-            is_multimodal or request.get_prompt_token_ids() is not None
-        ):
+        pretokenized = request.get_prompt_token_ids()
+        # A decode leg takes its prefill's expanded ids; its media went to P.
+        is_multimodal = _has_multimodal_content(messages) and not (
+            pretokenized is not None
+            and (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        if encoder is not None and not is_multimodal:
+            raise ValueError("an encoder-only server takes image requests only")
+        if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
             raise ValueError(
                 "an assistant prefix cannot be combined with image input or "
@@ -2228,7 +2281,14 @@ async def _chat_completions(
                 merged_kwargs,
                 request.tools,
             )
-        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+            if encoder is not None:
+                return await _encoder_only_response(
+                    request_id, len(prompt_or_tokens), multimodal_data
+                )
+            if request.ec_transfer_params is not None:
+                # The prefill encode reads these rows instead of running the tower.
+                multimodal_data["ec_transfer_params"] = request.ec_transfer_params
+        elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
@@ -2374,6 +2434,7 @@ async def _chat_completions(
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),
@@ -2475,6 +2536,42 @@ async def _chat_completions(
     except Exception as e:
         logger.exception("Error in %s", route)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def _encoder_only_response(
+    request_id: str, num_prompt_tokens: int, multimodal_data: dict[str, Any]
+) -> JSONResponse:
+    """No choices: where the prefill server reads the image embeddings."""
+    from atom.kv_transfer.disaggregation.mooncake.ec_transport import EcPoolFull
+
+    try:
+        params = await encoder.encode(multimodal_data)
+    except EcPoolFull as e:
+        # The router sends the request on without these, and prefill encodes.
+        logger.warning("Embedding pool full for %s: %s", request_id, e)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "internal_server_error",
+                    "code": 503,
+                }
+            },
+        )
+    resp = ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model_name,
+        choices=[],
+        usage={
+            "prompt_tokens": num_prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": num_prompt_tokens,
+        },
+        ec_transfer_params=params,
+    )
+    return JSONResponse(content=resp.model_dump(mode="json", exclude_none=True))
 
 
 @app.post("/v1/completions")
@@ -3514,6 +3611,8 @@ async def list_models():
 @_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
+    if encoder is not None:
+        return {"status": "ok"}
     if engine is None or not engine.core_mgr.is_healthy():
         raise HTTPException(status_code=503, detail="Engine workers unavailable")
     dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
@@ -3695,7 +3794,7 @@ async def stop_profile():
 
 def main():
     """Main entry point for the server."""
-    global engine
+    global engine, encoder
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3779,8 +3878,16 @@ def main():
 
     _setup_frontend(args)
 
-    logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.encoder_only:
+        if args.api_server_count > 1:
+            parser.error("--encoder-only serves from one process")
+        logger.info(f"Initializing the vision encoder of {args.model}...")
+        _setup_reasoning_and_tools(args)
+        encoder = engine_args.create_encoder()
+        _serve(args)
+        return
+    logger.info(f"Initializing engine with model {args.model}...")
     # Remote DP nodes block inside engine startup and never run the API loop.
     # Expose their local mmap metrics on the same configured HTTP port.
     dp_rank = (
@@ -4061,7 +4168,7 @@ def _serve(args) -> None:
 
     def _sigint_handler(signum, frame):
         logger.info("Received SIGINT, shutting down engine...")
-        engine.close()
+        (encoder or engine).close()
         import psutil
 
         try:

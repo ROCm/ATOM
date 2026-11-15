@@ -161,6 +161,7 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
                 bootstrap_port: config.bootstrap_port,
             },
             "decode" => WorkerType::Decode,
+            "encode" => WorkerType::Encode,
             _ => WorkerType::Regular,
         })
         .unwrap_or(WorkerType::Regular)

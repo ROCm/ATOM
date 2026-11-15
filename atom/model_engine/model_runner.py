@@ -813,6 +813,8 @@ class ModelRunner:
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
+        # Reads an encoder server's image embeddings; built on first use.
+        self.ec_reader = None
         self.mark_trace = getattr(config, "mark_trace", False)
         from atom.utils.graph_marker import set_graph_marker_enabled
 
@@ -1231,6 +1233,27 @@ class ModelRunner:
         arange = self.arange_np[:total_num_tokens] - cumsums_offsets
 
         return cu_num_tokens, arange
+
+    def read_image_embeddings(self, params, cache_seed, dtype):
+        """The rows an encoder server stored for ``cache_seed``, or None when
+        this rank must run its own vision tower."""
+        if self.ec_reader is None:
+            from atom.kv_transfer.disaggregation.mooncake.ec_transport import (
+                EcReader,
+            )
+
+            # A request's image rows never outnumber its prompt's tokens.
+            row_bytes = self.config.hf_config.hidden_size * dtype.itemsize
+            self.ec_reader = EcReader(
+                self.config.max_model_len * row_bytes, self.device
+            )
+        rows = self.ec_reader.read(params, cache_seed, dtype)
+        if rows is None:
+            logger.warning(
+                "Image embeddings from %s are unavailable; running the vision tower",
+                params["session"],
+            )
+        return rows
 
     def release_multimodal_requests(self, request_ids):
         self.vision_embeddings.release(request_ids)
@@ -3273,6 +3296,7 @@ class ModelRunner:
                             batch,
                             self.device,
                             self.config.torch_dtype,
+                            self.read_image_embeddings,
                         )
                     else:
                         mm_data_values = list(batch.multimodal_data.values())

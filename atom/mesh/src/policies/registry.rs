@@ -29,6 +29,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// Encode policy for PD mode (set once at startup, lock-free reads via OnceLock)
+    encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 }
 
 impl PolicyRegistry {
@@ -42,6 +45,7 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            encode_policy: Arc::new(OnceLock::new()),
         }
     }
 
@@ -206,6 +210,11 @@ impl PolicyRegistry {
         let _ = self.decode_policy.set(policy);
     }
 
+    /// Set the encode policy for PD mode (lock-free, set once at startup)
+    pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        let _ = self.encode_policy.set(policy);
+    }
+
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
     pub fn get_prefill_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         self.prefill_policy
@@ -222,6 +231,14 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
+    /// Get the encode policy for PD mode, or default if not set (lock-free)
+    pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        self.encode_policy
+            .get()
+            .map(Arc::clone)
+            .unwrap_or_else(|| self.get_default_policy())
+    }
+
     /// Get all PowerOfTwo policies that need load updates (lock-free)
     pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut power_of_two_policies = Vec::new();
@@ -230,20 +247,17 @@ impl PolicyRegistry {
             power_of_two_policies.push(Arc::clone(&self.default_policy));
         }
 
-        // Get prefill and decode policies (lock-free via OnceLock::get)
-        let prefill_policy_opt = self.prefill_policy.get();
-        let decode_policy_opt = self.decode_policy.get();
-
-        if let Some(policy) = prefill_policy_opt {
-            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
-                power_of_two_policies.push(Arc::clone(policy));
-            }
-        }
-
-        if let Some(policy) = decode_policy_opt {
+        // PD-mode policies (lock-free via OnceLock::get)
+        for policy in [
+            self.prefill_policy.get(),
+            self.decode_policy.get(),
+            self.encode_policy.get(),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if policy.name() == "power_of_two"
-                && !Arc::ptr_eq(policy, &self.default_policy)
-                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+                && !power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy))
             {
                 power_of_two_policies.push(Arc::clone(policy));
             }
@@ -298,9 +312,13 @@ impl PolicyRegistry {
         // PD mode keeps separate prefill/decode policy instances with their own
         // trees. Skipping them leaves a removed worker as a live tenant, so the
         // next matching prefix routes to a worker that no longer exists.
-        for policy in [self.prefill_policy.get(), self.decode_policy.get()]
-            .into_iter()
-            .flatten()
+        for policy in [
+            self.prefill_policy.get(),
+            self.decode_policy.get(),
+            self.encode_policy.get(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
@@ -310,11 +328,12 @@ impl PolicyRegistry {
         }
     }
 
-    /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
+    /// Initialize cache-aware policies for PD mode (prefill, decode and encode) - lock-free
     pub fn init_pd_cache_aware_policies(
         &self,
         prefill_workers: &[Arc<dyn Worker>],
         decode_workers: &[Arc<dyn Worker>],
+        encode_workers: &[Arc<dyn Worker>],
     ) {
         // Both call sites (worker registration and router construction) race:
         // whichever runs second is the one that actually seeds. Log the inputs
@@ -322,44 +341,34 @@ impl PolicyRegistry {
         // mysteriously routes at random".
         tracing::info!(
             "init_pd_cache_aware_policies: prefill_workers={} decode_workers={} \
-             prefill_policy={:?} decode_policy={:?}",
+             encode_workers={} prefill_policy={:?} decode_policy={:?} encode_policy={:?}",
             prefill_workers.len(),
             decode_workers.len(),
+            encode_workers.len(),
             self.prefill_policy.get().map(|p| p.name()),
             self.decode_policy.get().map(|p| p.name()),
+            self.encode_policy.get().map(|p| p.name()),
         );
-        // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
-        if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !prefill_workers.is_empty() {
-                        // info-level: a silently skipped seed leaves cache_aware
-                        // treeless, which is invisible until throughput tanks.
-                        tracing::info!(
-                            "Initializing prefill cache-aware policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        cache_aware.init_workers(prefill_workers);
-                    }
-                }
-            }
-        }
-
-        // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
-        if let Some(decode_policy) = self.decode_policy.get() {
-            if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !decode_workers.is_empty() {
-                        debug!(
-                            "Initializing decode cache-aware policy with {} workers",
-                            decode_workers.len()
-                        );
-                        cache_aware.init_workers(decode_workers);
-                    }
-                }
+        for (pool, policy, workers) in [
+            ("prefill", &self.prefill_policy, prefill_workers),
+            ("decode", &self.decode_policy, decode_workers),
+            ("encode", &self.encode_policy, encode_workers),
+        ] {
+            let Some(cache_aware) = policy
+                .get()
+                .and_then(|p| p.as_any().downcast_ref::<CacheAwarePolicy>())
+            else {
+                continue;
+            };
+            if !workers.is_empty() {
+                // info-level: a silently skipped seed leaves cache_aware
+                // treeless, which is invisible until throughput tanks.
+                tracing::info!(
+                    "Initializing {} cache-aware policy with {} workers",
+                    pool,
+                    workers.len()
+                );
+                cache_aware.init_workers(workers);
             }
         }
     }
@@ -510,6 +519,12 @@ mod tests {
 
         let p2_policies = registry.get_all_power_of_two_policies();
         assert_eq!(p2_policies.len(), 2); // prefill + decode (different instances)
+
+        // Encode falls back to the default, then joins the load updates once set
+        assert_eq!(registry.get_encode_policy().name(), "round_robin");
+        registry.set_encode_policy(Arc::new(crate::policies::PowerOfTwoPolicy::new()));
+        assert_eq!(registry.get_encode_policy().name(), "power_of_two");
+        assert_eq!(registry.get_all_power_of_two_policies().len(), 3);
     }
 
     #[tokio::test]
