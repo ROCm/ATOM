@@ -161,6 +161,44 @@ export SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1
   batch. They are not recommended here: the window counts scheduler
   iterations rather than time, so its length depends on the host and the load.
 
+Measured with the MTP command above on 2x MI308X (gfx942), ROCm 7.2.4, SGLang
+v0.5.22. The default was run twice, before and after the switch, to show
+run-to-run drift. Burst TTFT in ms, median (mean), for N requests sent
+together to an idle server:
+
+| Prompt | N | Default | Default, repeat | Switch on |
+|---|---|---|---|---|
+| 2048 | 1 | 233 (238) | 229 (240) | 228 (230) |
+| 2048 | 2 | 453 (455) | 477 (474) | 344 (343) |
+| 2048 | 4 | 585 (585) | 613 (614) | 587 (498) |
+| 2048 | 8 | 1003 (1001) | 1046 (1045) | 1000 (907) |
+| 4096 | 1 | 275 (282) | 282 (292) | 274 (274) |
+| 4096 | 2 | 538 (539) | 549 (552) | 411 (410) |
+| 4096 | 4 | 947 (950) | 950 (971) | 948 (780) |
+| 4096 | 8 | 1813 (1731) | 1868 (1785) | 1159 (1299) |
+
+In every wave the first request of the burst was admitted alone (splits
+`1+1`, `1+3`, `1+7`, and `1+4+3` for 4096 x 8). The switch returns
+that request after its own batch instead of after the next one. When the
+median request falls in the second batch (N=4, and 2048 x 8), only the mean
+improves. P99 does not change.
+
+Steady-load output throughput in tok/s, mean of 2 runs (`bench_serving`
+random, 128 prompts, `--max-concurrency 8`; the concurrency cap holds the
+achieved rate at 1.0 / 1.3 req/s for both request rates):
+
+| Input / output | Request rate | Default | Default, repeat | Switch on |
+|---|---|---|---|---|
+| 2048 / 512 | inf | 508 | 520 | 518 |
+| 2048 / 512 | 2 | 515 | 498 | 487 |
+| 6144 / 256 | inf | 324 | 343 | 340 |
+| 6144 / 256 | 2 | 338 | 340 | 332 |
+
+The differences are within the run-to-run spread of the default (single runs
+ranged 488-517 tok/s at 2048 / 512, rate 2). Median ITL is 9.7-9.8 ms in all
+runs. GSM8K (5-shot, chat, 200 questions): 0.98 / 0.985 default, 0.99 with the
+switch.
+
 ## Benchmark
 
 ```bash
