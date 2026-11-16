@@ -164,6 +164,9 @@ class ReceivedRequest:
     generation: int = 0
     state: str = RESERVED
     active_writers: int = 0
+    claimed: bool = (
+        False  # a decode call is reading its KV (``receive.ReceiveServer.claim``)
+    )
 
     @property
     def has_live_writer(self) -> bool:

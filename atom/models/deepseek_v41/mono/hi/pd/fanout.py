@@ -18,18 +18,24 @@ chunks, then sleeps 0.2 ms between polls while idle; the server's wait yields th
 x86-64 (TSO): the payload's stores precede the sequence number's, and the reader re-reads the number until stable.
 
 Every op goes to every rank and waits for all answers (a rank's step polls the others, so ranks must not drift);
-``wait_read`` returns rank 0's logs. Failures:
+``wait_read`` returns rank 0's logs. One caller at a time: the mailbox holds one command a rank, so a second thread's
+command would overwrite the first's before every rank read it, and the ranks' command streams would part (one rank
+missing a ``step``, or running a ``wait_read`` twice); ``call`` refuses a concurrent caller (``RankGroupBusy``)
+instead. Failures:
 
 - an op raising in a worker: ``RankError`` (every failing rank's text); the group stays usable (the next request
   re-admits and reloads every rank);
 - an answer not in ``timeout`` (per op: ``TIMEOUTS``) or a worker process gone: ``RankTimeout`` / ``RankDied``, and the
   group is broken (``RankGroupBroken`` on every later call): the host must restart;
-- a worker whose parent died exits (polls ``os.getppid``).
+- a worker whose parent died exits (polls ``os.getppid``);
+- an op's error text ends with the rank's last commands (sequence number, op, arguments), so a rank whose command
+  stream differs from the others' shows it.
 
 Ops (``OPS``): ``hello`` (the backend's report: rank 0's ``max_seq_len``, ``num_mtp``, ``stop_token_ids``, ``greedy``,
 ``base_ptr`` / ``transport`` / ``session_id`` of the receive buffer it owns), ``set_sampling(on, p0..p3)``,
 ``admit(first, pos, mtp, has_params, p0..p3)``, ``load_kv(seq_len, generation)``, ``step(k, ticket)``,
-``wait_read(ticket, acc_from, k, tok_from)``, ``sync``, ``state`` (a backend's JSON, for tests), ``stop``.
+``wait_read(ticket, acc_from, k, tok_from)``, ``discard(tickets...)`` (every chunk the rank holds dropped, without a
+wait; answers the tickets it held), ``sync``, ``state`` (a backend's JSON, for tests), ``stop``.
 
 The sampling counter (``samp_params[3]``): TileRT's .so keeps one int32 counter a process, bumped by every
 ``dsv41_e2e_set_sampling`` and ``dsv41_e2e_begin`` (host ``fn_86bf60`` / ``fn_86b390``, global ``0x8b5d5c``) and written
@@ -44,8 +50,10 @@ import logging
 import multiprocessing as mp
 import os
 import struct
+import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 
@@ -71,6 +79,7 @@ OPS = {
     "sync": 7,
     "state": 8,
     "stop": 9,
+    "discard": 10,
 }
 _OP_NAMES = {v: k for k, v in OPS.items()}
 TIMEOUTS = {  # seconds an op may take on every rank (wait_read: a chunk of up to 8 steps, or a device fault's timeout)
@@ -83,6 +92,7 @@ TIMEOUTS = {  # seconds an op may take on every rank (wait_read: a chunk of up t
     "sync": 150.0,
     "state": 30.0,
     "stop": 30.0,
+    "discard": 30.0,
 }
 
 
@@ -107,6 +117,10 @@ class RankDied(RuntimeError):
 
 class RankGroupBroken(RuntimeError):
     pass
+
+
+class RankGroupBusy(RuntimeError):
+    """``RankGroup.call`` from a second thread while a call is in flight (module docstring)."""
 
 
 @dataclass
@@ -205,6 +219,8 @@ def _run_op(backend, op: str, a: list[int]) -> tuple[list[int], str]:
         if out is not None:
             acc, toks = out
             return [len(acc), *acc, *toks], ""
+    elif op == "discard":
+        return [int(t) for t in backend.discard(a)], ""
     elif op == "sync":
         backend.sync()
     elif op == "state":
@@ -242,6 +258,7 @@ def _serve(rank, nranks, slot: _Slot, factory, kwargs, spin_s) -> None:
         err = traceback.format_exc()
     last = 0  # the server's first sequence number is 1 (hello), which may be posted before this process starts
     idle_since, polls = time.monotonic(), 0
+    recent: deque = deque(maxlen=12)  # (seq, op, args): appended to an op's error text
     while True:
         if slot.cmd() == last:
             polls += 1
@@ -255,12 +272,19 @@ def _serve(rank, nranks, slot: _Slot, factory, kwargs, spin_s) -> None:
         if err:
             slot.answer(seq, 1, [], err)
             return
+        recent.append((seq, op, args[:5]))
         try:
             res, text = _run_op(backend, op, args)
             slot.answer(seq, 0, res, text)
         # any failure goes back to the server, as the op's answer
         except BaseException:  # noqa: BLE001
-            slot.answer(seq, 1, [], traceback.format_exc())
+            cmds = "; ".join(f"{q} {o}{list(a)}" for q, o, a in recent)
+            slot.answer(
+                seq,
+                1,
+                [],
+                f"{traceback.format_exc()}rank {rank} recent commands: {cmds}\n",
+            )
         last, idle_since, polls = seq, time.monotonic(), 0
         if op == "stop":
             close = getattr(backend, "close", None)
@@ -294,6 +318,9 @@ class RankGroup:
         self.slots = [_Slot(self.shm.buf, r) for r in range(nranks)]
         self.seq = 0
         self.broken: str | None = None
+        self._calling = threading.Lock()
+        # (op, thread) of the call in flight
+        self._caller: tuple[str, str] | None = None
         ctx = mp.get_context("spawn")
         self.procs = [
             ctx.Process(
@@ -321,7 +348,20 @@ class RankGroup:
             raise
 
     def call(self, op: str, args=(), timeout: float | None = None) -> list[Answer]:
-        """``op(*args)`` on every rank; the answers in rank order."""
+        """``op(*args)`` on every rank; the answers in rank order. One caller at a time (``RankGroupBusy``)."""
+        me = threading.current_thread().name
+        if not self._calling.acquire(blocking=False):
+            raise RankGroupBusy(
+                f"{op} from thread {me} while {self._caller} is in flight: one caller at a time"
+            )
+        try:
+            self._caller = (op, me)
+            return self._call(op, args, timeout)
+        finally:
+            self._caller = None
+            self._calling.release()
+
+    def _call(self, op: str, args, timeout: float | None) -> list[Answer]:
         if self.broken:
             raise RankGroupBroken(self.broken)
         self.seq = (self.seq + 1) & 0xFFFFFFFF or 1
@@ -439,6 +479,20 @@ class RankEngine:
         acc = res[1 : 1 + n]
         return acc, res[1 + n : 1 + n + sum(acc)]
 
+    def discard(self, tickets: list) -> list[list[int]]:
+        """Every rank drops every chunk it holds (``tickets``: the ones the reply left; a rank holding others is
+        logged, as its command stream parted from the rest); each rank's dropped tickets.
+        """
+        self._waiting = None
+        want = sorted(int(t) for t in tickets)
+        held = [a.res for a in self.group.call("discard", want)]
+        odd = {r: h for r, h in enumerate(held) if h != want}
+        if odd:
+            logger.warning(
+                "discard %s: ranks held other chunks in flight: %s", want, odd
+            )
+        return held
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # the CPU rank
@@ -538,6 +592,10 @@ class FakeRank:
 
     def wait_read(self, ticket, acc_from, k, tok_from):
         self._hooks("wait_read")
+        if ticket not in self.ready:
+            raise RuntimeError(
+                f"rank {self.rank}: chunk {ticket} is not in flight (in flight: {sorted(self.ready)})"
+            )
         delay = self.ready.pop(ticket) - time.monotonic()
         if delay > 0:
             time.sleep(delay)
@@ -545,12 +603,20 @@ class FakeRank:
             self.engine.read_outputs(acc_from, k, tok_from) if self.rank == 0 else None
         )
 
+    def discard(self, tickets) -> list[int]:
+        self._hooks("discard")
+        held = sorted(self.ready)
+        self.log.append(["discard", list(tickets), held])
+        self.ready.clear()
+        return held
+
     def sync(self) -> None:
         self.ready.clear()
 
     def state(self) -> dict:
         return {
             "rank": self.rank,
+            "in_flight": sorted(self.ready),
             "log": self.log,
             "admit_blob": self.admit_blob.hex(),
             "addr": self.addr,

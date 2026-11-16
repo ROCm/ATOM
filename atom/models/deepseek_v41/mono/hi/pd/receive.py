@@ -16,7 +16,10 @@ Per connection (``wire``'s framing; TileRT ``receive_server.py:221-263``):
    once every sender rank (``wire.SENDER_RANKS``: rank 0) is done the request is ``COMPLETE`` and queued on
    ``completed``, which the decode call drains (``server``).
 
-The slot (one request at a time): ``RESERVED`` -> ``TRANSFERRING`` (a writer admitted) -> ``COMPLETE``; ``release``
+The slot (one request at a time): ``RESERVED`` -> ``TRANSFERRING`` (a writer admitted) -> ``COMPLETE``; the decode
+call ``claim``s a complete request while it reads the KV out of the buffer, and the slot is not reusable until it is
+``read_done`` (a P left behind by an abandoned request, landing late, would otherwise overwrite the buffer under the
+read: TileRT's slot is reusable once complete); ``release``
 frees it (``CANCELLING`` while a writer is still connected) and tombstones the rid for ``request_timeout`` s, so a
 late P of an abandoned request is refused (``cancelling``, ``detail: no_consumer``) instead of overwriting the next
 request's KV; ``expect`` (the decode call arriving) lifts the tombstone. A request's ``generation`` (a counter over
@@ -151,6 +154,23 @@ class ReceiveServer:
             if self._cancelled.pop(rid, None) is not None:
                 logger.info("request %s re-announced; its tombstone is dropped", rid)
 
+    def claim(self, rec: W.ReceivedRequest) -> bool:
+        """The decode call reads ``rec``'s KV: no other P is admitted until ``read_done`` / ``release``. False when the
+        slot has moved on (another P was admitted since ``rec`` completed: the buffer may hold its KV).
+        """
+        with self._lock:
+            if self._current is not rec or rec.state != W.COMPLETE:
+                return False
+            rec.claimed = True
+            return True
+
+    def read_done(self, rid: str) -> None:
+        """``rid``'s KV is out of the buffer: the slot is reusable again (TileRT's rule)."""
+        with self._lock:
+            cur = self._current
+            if cur is not None and cur.rid == rid:
+                cur.claimed = False
+
     def release(self, rid: str) -> None:
         """``rid`` is done with (decoded, refused or abandoned): tombstone it and free the slot if it holds it."""
         with self._lock:
@@ -223,7 +243,7 @@ class ReceiveServer:
 
     def _reusable(self, cur: W.ReceivedRequest) -> bool:
         if cur.state == W.COMPLETE:
-            return True
+            return not cur.claimed
         if cur.has_live_writer:
             return False
         if cur.state in (W.FREE, W.CANCELLING):

@@ -20,7 +20,8 @@ Ops: ``set_sampling`` (``on`` only: greedy needs mode-2 graphs) -> ``TkRank.set_
 ``TkRank.admit_request``; ``load_kv`` -> ``pd.convert.convert`` + ``TkRank.import_planes``, synchronized (the receive
 buffer is free when every rank answered); ``step(k, ticket)`` -> k graph replays and an event (at most 4 in flight, as
 TileRT's ring); ``wait_read`` -> the event polled up to ``device_timeout_s`` (TileRT ``TILERT_DEVICE_TIMEOUT_SECONDS``,
-120), then rank 0's ``read_logs``.
+120), then rank 0's ``read_logs``; ``discard`` -> every event dropped, no wait (the chunks finish on the stream before
+anything enqueued after them: the next request's admission, its KV import), at a reply's end with chunks unread.
 
 Test options: ``receive=False`` (no receive buffer, no Mooncake), ``planes=<file>`` (``load_kv`` imports the planes of a
 ``torch.save``d ``{"n", "first", "planes"}``, as TileRT's ``restore()`` re-imports its prefill's snapshot, instead of
@@ -396,7 +397,11 @@ class TkRankWorker:
         self.events[ticket] = ev
 
     def wait_read(self, ticket: int, acc_from: int, k: int, tok_from: int):
-        ev = self.events.pop(ticket)
+        ev = self.events.pop(ticket, None)
+        if ev is None:
+            raise RuntimeError(
+                f"rank {self.rank}: chunk {ticket} is not in flight (in flight: {sorted(self.events)})"
+            )
         deadline = time.monotonic() + self.device_timeout_s
         while not ev.query():
             if time.monotonic() > deadline:
@@ -406,6 +411,11 @@ class TkRankWorker:
         if self.rank == 0:
             return self.tk.read_logs(acc_from, k, tok_from)
         return None
+
+    def discard(self, tickets) -> list[int]:
+        held = sorted(self.events)
+        self.events.clear()
+        return held
 
     def sync(self) -> None:
         self.stream.synchronize()

@@ -24,6 +24,8 @@ up to two chunks of DSpark steps in flight and streams what they accepted.
 ``wait(ticket)``                    ``dsv41_e2e_wait(ticket)``
 ``read_outputs(s, k, t)``           ``T('ar_num')[0][1+s : 1+s+k]`` (each step's accepted count) and
                                     ``T('ar_acc')[0][1+t : 1+t+sum]`` (the accepted tokens), rank 0
+``discard(tickets)``                (ours) the chunks a reply no longer reads dropped, on every rank, without a
+                                    wait: they finish on the device before anything enqueued after them
 =================================  =============================================================================
 
 The device logs ``ar_acc`` / ``ar_num`` are ``[count, entries...]``; the admission writes ``[1, first]`` / ``[1, 1]``
@@ -37,6 +39,10 @@ budget, the cache room (8 positions of slack) and the device log's room need; to
 dropped (the device may have computed them); a cancel stops enqueueing and the chunks in flight still stream. One
 deliberate difference: a zero budget streams the first token (TileRT returns it without streaming it, which its router
 then reports as a truncated stream).
+
+A reply that ends with chunks still in flight (a stop id, or a failure) hands them to ``discard`` before it returns:
+every rank drops every chunk it holds, so no rank carries one into the next request (``last_stats['discarded']``).
+Any engine failure also forgets the sampling mode, so the next admission sets it on every rank again.
 
 Engines: ``FakeEngine`` (CPU: the logs as the admission and the steps write them, scripted accept counts and tokens;
 for tests and for wiring a real P and router to this host without a decode) and ``fanout.RankEngine`` (one worker process
@@ -369,6 +375,8 @@ class DecodeEngine(Protocol):
         self, acc_from: int, k: int, tok_from: int
     ) -> tuple[list[int], list[int]]: ...
 
+    def discard(self, tickets: list) -> Any: ...
+
 
 class Decoder:
     """TileRT's ``RocmDsV41EngineAdapter`` over a ``DecodeEngine``: ``check_sampling`` / ``prepare_grammar`` (the
@@ -424,6 +432,7 @@ class Decoder:
         check_supported(sp)
         on = sp is not None and sp.temperature > 0.0
         params = pack_params(sp if on else SamplingParams())
+        self._samp_mode = None  # until every rank has it
         self.engine.set_sampling(params, on)
         self._samp_mode = (on, tuple(params[1:]))
 
@@ -452,11 +461,15 @@ class Decoder:
             )
         begin, self._begin, self._begun = self._begin, None, None
         t = time.perf_counter()
-        if begin is not None:
-            self._begin_request(sampling_params(begin[1]), begin[0], seq)
-            self._begun = begin[0]
-        self._t_begin_ms = round(1000 * (time.perf_counter() - t), 2)
-        self.engine.load_kv(received, buffer)
+        try:
+            if begin is not None:
+                self._begin_request(sampling_params(begin[1]), begin[0], seq)
+                self._begun = begin[0]
+            self._t_begin_ms = round(1000 * (time.perf_counter() - t), 2)
+            self.engine.load_kv(received, buffer)
+        except BaseException:
+            self._begun, self._samp_mode = None, None  # (module docstring)
+            raise
         self._seq_len = seq
 
     # ---- the loop
@@ -494,10 +507,14 @@ class Decoder:
         tokens = [first]
         if on_token:
             on_token(first)
-        if not begun:
-            self.engine.admit(first, self._seq_len, None)
-            self._cursor = (1, 1)
-        self.last_stats = self._run(tokens, budget, stop_ids, on_token, cancel_event)
+        try:
+            if not begun:
+                self.engine.admit(first, self._seq_len, None)
+                self._cursor = (1, 1)
+            self.last_stats = self._run(tokens, budget, stop_ids, on_token, cancel_event)  # fmt: skip
+        except BaseException:
+            self._samp_mode = None  # (module docstring)
+            raise
         self.last_stats["a_begin"] = self._t_begin_ms if begun else 0
         return tokens
 
@@ -536,42 +553,70 @@ class Decoder:
             return max(0, min(self.ar_steps, want, room, log_room))
 
         fly: deque = deque()
-        while True:
-            while len(fly) < self.ahead:
-                fs = sum(k for _, k in fly)
-                k = plan(fs * per, fs)
-                if k < 1:
+        try:
+            while True:
+                while len(fly) < self.ahead:
+                    fs = sum(k for _, k in fly)
+                    k = plan(fs * per, fs)
+                    if k < 1:
+                        break
+                    fly.append((eng.step(k), k))
+                if not fly:
                     break
-                fly.append((eng.step(k), k))
-            if not fly:
-                break
-            ticket, k = fly.popleft()
-            eng.wait(ticket)
-            acc, new = eng.read_outputs(s_cnt, k, t_cnt)
-            if len(new) != sum(acc):
-                raise RuntimeError(
-                    f"device logs: {sum(acc)} tokens accepted, {len(new)} logged"
-                )
-            s_cnt += k
-            t_cnt += len(new)
-            steps += k
-            logged += len(new)
-            accepts += acc
-            if t_first is None:
-                t_first = time.perf_counter()
-            finish = emit(new)
-            if finish:
-                break
+                ticket, k = fly.popleft()
+                eng.wait(ticket)
+                acc, new = eng.read_outputs(s_cnt, k, t_cnt)
+                if len(new) != sum(acc):
+                    raise RuntimeError(
+                        f"device logs: {sum(acc)} tokens accepted, {len(new)} logged"
+                    )
+                s_cnt += k
+                t_cnt += len(new)
+                steps += k
+                logged += len(new)
+                accepts += acc
+                if t_first is None:
+                    t_first = time.perf_counter()
+                finish = emit(new)
+                if finish:
+                    break
+        except BaseException:
+            # every rank drops what it holds: a rank whose last op failed may hold a chunk the others do not
+            self._discard([t for t, _ in fly], failed=True)
+            raise
+        discarded = len(fly)
+        if fly:  # past a stop id: computed, not read
+            self._discard([t for t, _ in fly], failed=False)
         if finish is None:
             cancelled = cancel_event is not None and cancel_event.is_set()
             finish = "cancelled" if cancelled else "length"
         stats = {"finish_reason": finish, "steps": steps}
+        if discarded:
+            stats["discarded"] = discarded
         if t_first is not None:
             stats["a_chunk1"] = round(1000 * (t_first - t0), 2)
         if accepts:
             stats["mtp_verify_calls"] = len(accepts)
             stats["mtp_accept_mean"] = round(sum(accepts) / len(accepts), 3)
         return stats
+
+    def _discard(self, tickets: list, failed: bool) -> None:
+        """``engine.discard(tickets)`` (an engine without it holds no chunks); its own failure is logged, not raised: a
+        failed reply keeps its error, and an engine that cannot discard fails the next request's admission anyway.
+        """
+        discard = getattr(self.engine, "discard", None)
+        if discard is None:
+            return
+        try:
+            discard(list(tickets))
+        except Exception:
+            self._samp_mode = None
+            logger.log(
+                logging.WARNING if failed else logging.ERROR,
+                "discarding chunks %s failed",
+                tickets,
+                exc_info=True,
+            )
 
     def reset(self) -> None:
         self._seq_len = 0
@@ -660,6 +705,9 @@ class FakeEngine:
 
     def wait(self, ticket) -> None:
         pass
+
+    def discard(self, tickets: list) -> None:
+        self.calls.append(("discard", len(tickets)))
 
     def read_outputs(
         self, acc_from: int, k: int, tok_from: int

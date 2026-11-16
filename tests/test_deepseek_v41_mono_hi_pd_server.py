@@ -561,11 +561,20 @@ def test_fanout_eight_ranks_end_to_end():
         logs = [st["log"] for st in states]
         assert all(lg == logs[0] for lg in logs)  # every rank got the same commands
         ops = [e[0] for e in logs[0]]
-        assert ops == ["set_sampling", "admit", "load_kv", "admit", "load_kv"]
+        # f1 stopped with a chunk in flight: every rank dropped it
+        assert ops == [
+            "set_sampling",
+            "admit",
+            "load_kv",
+            "discard",
+            "admit",
+            "load_kv",
+        ]
+        assert all(st["in_flight"] == [] for st in states)
         (_, p1, on), (_, f, pos, mtp, p_none) = logs[0][0], logs[0][1]
         assert on and p1[3] == 1 and (f, pos, mtp, p_none) == (12345, 1000, True, None)
         _, f, pos, mtp, p2 = logs[0][
-            3
+            4
         ]  # same sampling mode: the parameters ride with the admission
         assert (
             (f, pos, mtp) == (777, 2000, True) and p2[1:3] == p1[1:3] and p2[3] == 2
@@ -653,6 +662,266 @@ def test_fanout_failures():
         assert e.op == "hello" and "no_such_arg" in e.errors[0]
     else:
         raise AssertionError("bad backend started")
+
+
+def _reply(lines):
+    """``(tokens, terminal line)`` of a finished reply, or ``(None, the error line)``."""
+    if lines and "error" in lines[-1]:
+        return None, lines[-1]
+    return read_reply(lines)
+
+
+def test_fanout_stop_with_chunks_in_flight_then_many_requests():
+    """A reply that ends at a stop id leaves the chunk enqueued after the one holding it (two in flight): every rank
+    drops it at the reply's end (``discard``), so any number of such replies run back to back. Before: nothing popped
+    it, so the fifth one left behind made the next request's first ``step`` fail on every rank ("more than 4 chunks in
+    flight"). A reply ended by its budget leaves none."""
+    buf = torch.zeros(W.HDR_BYTES, dtype=torch.uint8)
+    replies, states = [], []
+    with rank_stack(nranks=4, eos_at=10) as (group, _eng, recv, port):
+        for i in range(9):
+            rid, length = f"s{i}", i % 3 == 2
+            send_kv(recv.port, rid, 1000 + i, buf)
+            body = {"rid": rid, "first_token_id": 100 + i, "max_tokens": 40 if length else 256,
+                    "sampling": {"temperature": 1.0, "ignore_eos": length}}  # fmt: skip
+            replies.append((length, i, stream(port, body)[1]))
+            wait_idle(port)
+            states.append([a.json() for a in group.call("state")])
+        for length, i, lines in replies:  # every reply finished
+            toks, term = _reply(lines)
+            assert toks is not None, (i, term)
+            if length:
+                assert term["finish_reason"] == "length" and len(toks) == 40
+                assert "discarded" not in term["timing_ms"]
+            else:
+                assert term["finish_reason"] == "stop" and toks == expected(100 + i, 10)
+                assert term["timing_ms"]["discarded"] == 1
+        assert all(
+            st["in_flight"] == [] for sts in states for st in sts
+        )  # nothing carried over, on any rank
+        logs = [st["log"] for st in states[-1]]
+        assert all(lg == logs[0] for lg in logs)  # every rank got the same commands
+        assert sum(e[0] == "discard" for e in logs[0]) == 6
+        assert group.broken is None
+
+
+def test_fanout_rank_failure_mid_reply_leaves_no_chunks():
+    """An op failing on one rank mid-reply (here rank 0's ``wait_read``, before it pops the chunk, as a KeyError there
+    would): the ranks' in-flight chunks differ, and the failed reply's ``discard`` empties every rank's; the error
+    names the rank's last commands."""
+    buf = torch.zeros(W.HDR_BYTES, dtype=torch.uint8)
+    with rank_stack(nranks=2, fail={"op": "wait_read", "rank": 0}) as (
+        group,
+        _eng,
+        recv,
+        port,
+    ):
+        send_kv(recv.port, "x1", 500, buf)
+        _, lines = stream(port, {"rid": "x1", "first_token_id": 9, "max_tokens": 256})
+        toks, err = _reply(lines)
+        assert toks is None and "wait_read failed on rank(s) [0]" in err["error"]
+        assert "recent commands" in err["error"] and "step[" in err["error"]
+        wait_idle(port)
+        states = [a.json() for a in group.call("state")]
+        assert [s["in_flight"] for s in states] == [[], []]
+        (d0,), (d1,) = ([e for e in s["log"] if e[0] == "discard"] for s in states)
+        # rank 0 still held the chunk it failed on, rank 1 had popped it; both dropped what they held
+        assert d0[1] == d1[1] == d1[2] and len(d0[2]) == len(d1[2]) + 1
+        assert group.broken is None
+
+
+def test_fanout_cancel_reconnect_and_abandoned_request():
+    """The sequence around a router restart, every request on every rank: a cancel after the first token (the chunks
+    in flight still stream: nothing to drop), a client gone mid-stream, a request abandoned before its KV came (504;
+    its late P refused), a P of a request this node never heard of (the old router's: admitted, landed, never asked
+    for), then a request that stops early (its stale predecessor in the completed queue dropped, its own leftover chunk
+    discarded). No rank keeps a chunk, every rank got the same commands, the group stays whole.
+    """
+    buf = torch.zeros(W.HDR_BYTES, dtype=torch.uint8)
+    with rank_stack(nranks=4, step_s=0.002, eos_at=30) as (group, _eng, recv, port):
+
+        def in_flight():
+            wait_idle(port)
+            return [a.json()["in_flight"] for a in group.call("state")]
+
+        send_kv(recv.port, "c1", 100, buf)
+
+        def cancel_after_first(line, conn):
+            if line == {"t": [42]}:
+                assert post(port, "/pd/cancel", {"rid": "c1"}) == (
+                    200,
+                    {"cancelled": "c1"},
+                )
+            return False
+
+        _, lines = stream(port, {"rid": "c1", "first_token_id": 42, "max_tokens": 100000,
+                                 "sampling": {"temperature": 1.0, "ignore_eos": True}}, cancel_after_first)  # fmt: skip
+        toks, term = _reply(lines)
+        assert (
+            term["finish_reason"] == "cancelled"
+            and "discarded" not in term["timing_ms"]
+        )
+        assert in_flight() == [[]] * 4
+
+        send_kv(recv.port, "c2", 100, buf)
+
+        def leave(line, conn):
+            conn.sock.shutdown(socket.SHUT_RDWR)
+            return True
+
+        stream(port, {"rid": "c2", "first_token_id": 43, "max_tokens": 100000,
+                      "sampling": {"temperature": 1.0, "ignore_eos": True}}, leave)  # fmt: skip
+        assert in_flight() == [[]] * 4
+
+        # abandoned: the decode call gives up on its KV; its P, late, is refused
+        st, out = post(
+            port, "/pd/decode", {"rid": "gone", "first_token_id": 1, "timeout_s": 0.3}
+        )
+        assert st == 504 and out["error"] == "kv_transfer_timeout"
+        _, reply, _ = send_kv(recv.port, "gone", 100, buf)
+        assert reply["error"] == "cancelling" and reply["detail"] == "no_consumer"
+        # the old router's request, never asked for here: its P lands
+        _, reply, _ = send_kv(recv.port, "orphan", 300, buf)
+        assert reply["accepted"]
+        # the next request: the orphan is dropped from the completed queue, the reply stops with a chunk in flight
+        send_kv(recv.port, "n1", 4000, buf)
+        _, lines = stream(port, {"rid": "n1", "first_token_id": 77, "max_tokens": 256})
+        toks, term = _reply(lines)
+        assert (
+            toks == expected(77, 30)
+            and term["finish_reason"] == "stop"
+            and term["seq_len"] == 4000
+        )
+        assert term["timing_ms"]["discarded"] == 1
+        assert in_flight() == [[]] * 4
+        logs = [a.json()["log"] for a in group.call("state")]
+        assert all(lg == logs[0] for lg in logs)
+        assert [e[1] for e in logs[0] if e[0] == "load_kv"] == [100, 100, 4000]
+        assert group.broken is None and recv.state_snapshot()["rid"] is None
+
+
+def test_rank_group_one_caller_at_a_time():
+    """A second thread's call while one is in flight is refused (``RankGroupBusy``) instead of overwriting the
+    mailbox under ranks that have not read it yet; the call in flight completes and the group stays whole.
+    """
+    g = F.RankGroup(2, "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank", {"hang": {"op": "set_sampling", "rank": 0, "s": 1.0}})  # fmt: skip
+    try:
+        out = {}
+
+        def first():
+            out["first"] = g.call("set_sampling", [1, 1, 2, 3, 4])
+
+        th = threading.Thread(target=first, name="first")
+        th.start()
+        time.sleep(0.2)
+        try:
+            g.call("discard", [7])
+        except F.RankGroupBusy as e:
+            assert "('set_sampling', 'first')" in str(e)
+        else:
+            raise AssertionError("a concurrent call went through")
+        th.join(10)
+        assert len(out["first"]) == 2 and g.broken is None
+        assert [a.res for a in g.call("discard", [])] == [[], []]
+        logs = [a.json()["log"] for a in g.call("state")]
+        # the refused call reached no rank
+        assert logs[0] == logs[1] == [["set_sampling", [1, 2, 3, 4], True], ["discard", [], []]]  # fmt: skip
+    finally:
+        g.close()
+
+
+def test_decoder_discards_what_a_reply_leaves():
+    """``Decoder`` over ``FakeEngine``: a stop with a chunk in flight discards it; a budget end has none; a failure
+    mid-reply discards and forgets the sampling mode, so the next request sets it again.
+    """
+    eng = S.FakeEngine(max_seq_len=1 << 16, eos_at=10)
+    dec = S.Decoder(eng)
+
+    def run(first, max_tokens, sampling, on_token=None):
+        rec = W.ReceivedRequest(rid=str(first), seq_len=100, last_prompt_token=0, first_token_id=None, sampling=None)  # fmt: skip
+        dec.begin(first, sampling)
+        dec.inject(rec, None)
+        eng.calls.clear()
+        return dec.decode(first, max_tokens, sampling, on_token=on_token)
+
+    assert run(5, 256, {"temperature": 1.0}) == expected(5, 10)
+    assert eng.calls[-1] == ("discard", 1) and dec.last_stats["discarded"] == 1
+    run(6, 20, {"temperature": 1.0, "ignore_eos": True})
+    assert dec.last_stats["finish_reason"] == "length" and not any(
+        c[0] == "discard" for c in eng.calls
+    )
+
+    def boom(tok):
+        if tok != 7:
+            raise ConnectionError("client gone")
+
+    try:
+        run(7, 256, {"temperature": 1.0, "ignore_eos": True}, on_token=boom)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("no error")
+    assert eng.calls[-1][0] == "discard" and dec._samp_mode is None
+    eng.calls.clear()
+    dec.begin(8, {"temperature": 1.0})
+    dec.inject(W.ReceivedRequest(rid="8", seq_len=100, last_prompt_token=0, first_token_id=None, sampling=None), None)  # fmt: skip
+    assert eng.calls[0] == (
+        "set_sampling",
+        True,
+    )  # not the parameters riding with the admission
+
+
+def test_receive_slot_held_while_its_kv_is_read():
+    """While the decode call reads a request's KV out of the buffer (``claim`` .. ``read_done``), a P of another
+    request (one left behind by an abandoned request, landing late) is refused busy; after it, TileRT's rule.
+    """
+    buf = torch.zeros(W.HDR_BYTES, dtype=torch.uint8)
+    recv = R.ReceiveServer(MAX_SEQ, 0, FakeTransport(), port=0, host="127.0.0.1", buffer=buf)  # fmt: skip
+    try:
+        send_kv(recv.port, "a", 100, buf)
+        rec = recv.completed.get(timeout=5)
+        assert recv.claim(rec)
+        _, reply, _ = send_kv(recv.port, "late", 200, buf)
+        assert reply["error"] == "busy" and reply["busy_rid"] == "a"
+        recv.read_done("a")
+        _, reply, _ = send_kv(recv.port, "late", 200, buf)
+        assert reply["accepted"]
+        assert not recv.claim(rec)  # the slot moved on: a's buffer may hold late's KV
+        recv.release("a")
+        assert recv.state_snapshot()["rid"] == "late"
+    finally:
+        recv.close()
+
+
+def test_stream_release_waits_for_the_decode_worker():
+    """A streamed decode whose worker outlives its stream (here a slow chunk when the client leaves) keeps the
+    request until the worker stops: a decode call meanwhile is answered busy, not started beside it.
+    """
+    with stack(step_s=0.05) as (_eng, recv, app, port, buf):
+        app.join_s = 0.01
+        send_kv(recv.port, "w1", 100, buf)
+
+        def leave(line, conn):
+            conn.sock.shutdown(socket.SHUT_RDWR)
+            return True
+
+        stream(port, {"rid": "w1", "first_token_id": 3, "max_tokens": 100000}, leave)
+        time.sleep(0.1)
+        assert get(port, "/decode_status")["status"] == "busy"
+        assert post(port, "/pd/decode", {"rid": "w2", "first_token_id": 4})[0] == 429
+        assert wait_idle(port)["current_rid"] is None
+
+
+def test_tk_worker_discard_and_missing_chunk():
+    w = TW.TkRankWorker.__new__(TW.TkRankWorker)
+    w.rank, w.events = 3, {5: object(), 6: object()}
+    try:
+        w.wait_read(9, 1, 8, 1)
+    except RuntimeError as e:
+        assert "rank 3: chunk 9 is not in flight (in flight: [5, 6])" in str(e)
+    else:
+        raise AssertionError("no error")
+    assert w.discard([6]) == [5, 6] and w.events == {}
 
 
 def test_tk_worker_greedy():

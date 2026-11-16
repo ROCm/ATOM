@@ -25,7 +25,11 @@ Endpoints (TileRT ``decode_server.py:42-301``), one request decoded at a time:
     without progress. A client gone mid-stream cancels the decode.
 
 Each finished, refused or failed request resets the decoder and releases the receive slot (the rid is tombstoned, so
-a late P of it is refused). The HTTP server is the standard library's (threads, HTTP/1.1, chunked streaming), bound
+a late P of it is refused). The request lock is released only once nothing of the request can drive the engine: a
+streamed decode's worker thread that outlives its stream (``join_s``) releases it when it stops, never before, so two
+requests never drive the rank group at once. The decode call holds the receive slot while its KV is read
+(``ReceiveServer.claim`` .. ``read_done``): a late P of another request is refused busy until then. The HTTP server
+is the standard library's (threads, HTTP/1.1, chunked streaming), bound
 dual-stack on ``::`` as TileRT's uvicorn is.
 
 ``python -m atom.models.deepseek_v41.mono.hi.pd.server``: ``--engine tk`` (8 ``tkworker.TkRankWorker`` processes behind
@@ -63,6 +67,7 @@ DECODE_POLL_S = (
 )
 ABANDON_DRAIN_S = 30.0
 STALL_S = 600.0
+JOIN_S = 120.0
 STREAM = "stream"
 _CANCELLED = object()
 
@@ -146,10 +151,12 @@ class DecodeServer:
         poll_s: float = DECODE_POLL_S,
         abandon_drain_s: float = ABANDON_DRAIN_S,
         stall_s: float = STALL_S,
+        join_s: float = JOIN_S,
     ):
         self.receive, self.decoder, self.profile = receive, decoder, profile
         self.poll_s = max(poll_s, 5e-4)
         self.abandon_drain_s, self.stall_s = abandon_drain_s, stall_s
+        self.join_s = join_s
         self._lock = threading.Lock()
         self.current_rid: str | None = None
         self.cancel_event: threading.Event | None = None
@@ -209,6 +216,10 @@ class DecodeServer:
             except queue.Empty:
                 continue
             if cand.rid == rid:
+                if not self.receive.claim(cand):
+                    raise RuntimeError(
+                        f"the KV of {rid} cannot be read: the receive slot has moved on to another request"
+                    )
                 return cand
             logger.warning(
                 "dropping unmatched request %s (waiting for %s)", cand.rid, rid
@@ -286,6 +297,7 @@ class DecodeServer:
             t_recv = time.time()
             dec.begin(req.first_token_id, req.sampling)
             dec.inject(rec, self.receive.buffer)
+            self.receive.read_done(req.rid)  # its KV is in the ranks' caches
             t_inj = time.time()
         except Exception as e:
             logger.exception("prepare failed for %s", req.rid)
@@ -464,9 +476,24 @@ class _DecodeStream:
         self._closed = True
         self.cancel.set()
         if self.worker.ident is not None:
-            self.worker.join(120)
+            self.worker.join(self.app.join_s)
             if self.worker.is_alive():
-                logger.error("decode worker failed to stop for %s", self.req.rid)
+                # it may still be inside a rank-group call: the next request must not start until it stops
+                logger.error(
+                    "decode worker for %s still running %.0fs after its stream ended; the request is released when "
+                    "it stops",
+                    self.req.rid,
+                    self.app.join_s,
+                )
+                threading.Thread(
+                    target=self._release_when_stopped, name="pd-reap", daemon=True
+                ).start()
+                return
+        self.app._cleanup()
+
+    def _release_when_stopped(self) -> None:
+        self.worker.join()
+        logger.info("decode worker for %s stopped; request released", self.req.rid)
         self.app._cleanup()
 
 
