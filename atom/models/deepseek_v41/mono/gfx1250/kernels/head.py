@@ -21,7 +21,8 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 # the LM-head weights (331 MB a rank) are streamed non-temporal: default caching evicted the layer loop's hot scratch
 
-T, HID, VR = D.T_MAX, D.HID, D.VR
+T, HID, VR = 16, D.HID, D.VR   # (c1: 6 target / 5 draft rows) one 16-row WMMA group, not 48 rows
+NN = T // 16                  # 16-row WMMA groups
 NT = VR // 16                 # 2020 vocab tiles
 F32, I32, BF16 = fx.Float32, fx.Int32, fx.BFloat16
 
@@ -54,7 +55,7 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
     grp = w // TW
     tiles = [fx.min(b * 8 + grp * TW + i, I32(NT - 1)) for i in range(TW)]
     wt = [wb + i64(tiles[i]) * (16 * HID * 2) + i64(kq * NS) * 1024 + i64(l) * 32 for i in range(TW)]
-    acc = [[fx.Vector.filled(8, 0.0, F32) for _ in range(3)] for _ in range(TW)]
+    acc = [[fx.Vector.filled(8, 0.0, F32) for _ in range(NN)] for _ in range(TW)]
 
     def stage(ph):   # every K part's columns [part*HID/TW + ph*CK, +CK) -> buffer ph % 2 (async)
         for it in range_constexpr(T * TW * (CK // 8) // 256):
@@ -81,14 +82,14 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
             sp = fx.min(s + D, I32(NS - 1))   # last phase re-loads the final step (unused) instead of a branch
             for i in range_constexpr(TW):
                 A[i][kk % D] = hx.gload(wt[i] + i64(sp) * 1024, BF16, 16, nt=True)
-            for n in range_constexpr(3):
+            for n in range_constexpr(NN):
                 bv = hx.lload(xb + (n * 16 + l % 16) * XS + (kk * 32 + (l // 16) * 16) * 2, BF16, 16)
                 for i in range_constexpr(TW):
                     acc[i][n] = hx.wmma_bf16(a[i], bv, acc[i][n])
             hx.intrin(None, "llvm.amdgcn.sched.barrier", [fx.Int32(0)])
     if fx.const_expr(TW == 1):
         if b * 8 + w < NT:
-            for n in range_constexpr(3):
+            for n in range_constexpr(NN):
                 for e in range_constexpr(8):
                     hx.gstore(out + (i64(n * 16 + l % 16) * VR + i64(tiles[0] * 16 + (l // 16) * 8 + e)) * 4, acc[0][n][e])
     else:
@@ -96,12 +97,12 @@ def head_once_r(x, wb, out, t, l, w, sm, b, D, TW, NPH):
         gpu.barrier()
         gbase = sm + grp * (TW * TW * 3 * 32 * 32)
         for i in range_constexpr(TW):
-            for n in range_constexpr(3):
+            for n in range_constexpr(NN):
                 hx.lstore(gbase + (((i * TW + kq) * 3 + n) * 32 + l) * 32, acc[i][n])
         gpu.barrier()
         tile = b * 8 + grp * TW + kq
         if tile < NT:
-            for n in range_constexpr(3):
+            for n in range_constexpr(NN):
                 sacc = hx.lload(gbase + (((kq * TW + 0) * 3 + n) * 32 + l) * 32, F32, 8)
                 for q in range_constexpr(1, TW):
                     sacc = sacc + hx.lload(gbase + (((kq * TW + q) * 3 + n) * 32 + l) * 32, F32, 8)

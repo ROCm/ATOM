@@ -107,6 +107,14 @@ def stage_hnorm(c, T):
         gpu.barrier()
 
 
+def ctx_fp8_lane16(ro, inv):
+    """(FP4 KV) a context row's 16 dims (BF16 values; lanes 2g, 2g + 1 a 32-group, inv = 2^(127 - its code)) -> 4 words
+    of E4M3 bytes: clamp(x * inv, +-448), RNE (quantize_fp8's values, the QAT's e4m3_round)."""
+    cl = [fx.min(fx.max(ro[i] * inv, F32(-448.0)), F32(448.0)) for i in range(16)]
+    return [hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+            for h in range(4)]
+
+
 @ASTRewriter.transform
 def stage_kvrow(c, T):
     """a wave a (draft layer, row): lane l holds cols 16 l .. 16 l + 15 (half a 32-group: lanes 2g, 2g+1 share one)."""
@@ -139,10 +147,22 @@ def stage_kvrow(c, T):
         qv = [e4m3_round(fx.min(fx.max(ro[i] * inv, F32(-448.0)), F32(448.0))) * sc for i in range(16)]
         kw = hx.gload(c["kvw"] + i64(r) * 4, I32)
         roff = (d == 0).select(c["roff0"], (d == 1).select(c["roff1"], c["roff2"]))
-        if kw >= 0:
-            dst = c["ring"] + ((i64(kw) + i64(roff)) * KVD + i64(c0)) * 2
-            hx.gstore(dst, fx.Vector.from_elements([qv[i].to(BF16) for i in range(8)], BF16))
-            hx.gstore(dst + i64(16), fx.Vector.from_elements([qv[i].to(BF16) for i in range(8, 16)], BF16))
+        if fx.const_expr(c["kvfp4"]):
+            # FP4 KV: the stage's window ring holds the MXFP8 row itself (quantize_fp8(dequantize=False): the same E4M3
+            # values and code): 16 bytes at row kw of its data plane, the code (even lanes) in its scale plane
+            wdp = (d == 0).select(c["wd0"], (d == 1).select(c["wd1"], c["wd2"]))
+            wsp = (d == 0).select(c["ws0"], (d == 1).select(c["ws1"], c["ws2"]))
+            w8 = ctx_fp8_lane16(ro, inv)
+            kr8 = i64(kw) + i64(roff)
+            if kw >= 0:
+                hx.gstore(wdp + kr8 * 512 + i64(c0), fx.Vector.from_elements(w8, I32))
+            if (kw >= 0) & (l % 2 == 0):
+                hx.gstore(wsp + kr8 * 16 + i64(l // 2), e8m0_of(am).to(fx.Int8))
+        else:
+            if kw >= 0:
+                dst = c["ring"] + ((i64(kw) + i64(roff)) * KVD + i64(c0)) * 2
+                hx.gstore(dst, fx.Vector.from_elements([qv[i].to(BF16) for i in range(8)], BF16))
+                hx.gstore(dst + i64(16), fx.Vector.from_elements([qv[i].to(BF16) for i in range(8, 16)], BF16))
 
 
 @ASTRewriter.transform
@@ -355,7 +375,8 @@ def stage_wkv_skb(c, T):
 
 # ---------------------------------------------------------------- the step tail block (after the target layers)
 CTPTRS = ['aux8', 'auxs', 'mpw', 'mps', 'mnw', 'hpre', 'h8', 'hs', 'wkv0', 'wkv1', 'wkv2', 'wks0', 'wks1', 'wks2',
-          'knw0', 'knw1', 'knw2', 'kvp', 'rcos', 'rsin', 'kvw', 'ring', 'roff', 'hpref']   # roff: int32 [3] ring row offsets
+          'knw0', 'knw1', 'knw2', 'kvp', 'rcos', 'rsin', 'kvw', 'ring', 'roff', 'hpref',
+          'wd0', 'wd1', 'wd2', 'ws0', 'ws1', 'ws2']   # roff: int32 [3] ring row offsets; wd* / ws*: FP4 KV's ring planes (else 0)
 
 
 def ctptr(tab, name):
@@ -365,23 +386,23 @@ def ctptr(tab, name):
     return (fx.Int64(rf(v[1])) << 32) | (fx.Int64(rf(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-def ctx_parts(tab, t, b, T, smoff):
+def ctx_parts(tab, t, b, T, smoff, kv_fp4=False):
     """ctx_tail's 4 stages as callables (no handoffs: the caller separates them by grid-wide barriers -- the target
     sampling's handoffs, which use the same agent-scope fences), LDS at lds_base + smoff."""
     c = {k: ctptr(tab, k) for k in CTPTRS if k != 'roff'}
     ro = ctptr(tab, 'roff')
     c.update(t=t, b=b, w=t // 32, l=t % 32, sm=hx.lds_base() + smoff, roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
-             roff2=hx.gload(ro + i64(8), I32))
+             roff2=hx.gload(ro + i64(8), I32), kvfp4=kv_fp4)
     return [lambda: stage_proj_skb(c, T), lambda: stage_hnorm(c, T), lambda: stage_wkv_skb(c, T), lambda: stage_kvrow(c, T)]
 
 
-def ctx_tail(tab, t, b, T, cnt, handoff, hdev=False):
+def ctx_tail(tab, t, b, T, cnt, handoff, hdev=False, kv_fp4=False):
     """main_proj -> main_norm -> 3 x wkv -> kv_norm / RoPE / QAT -> ring (aux8 / auxs written by stage_tap1 in the target
     loop). cnt: 3 zeroed handoff counters (16 B apart)."""
     c = {k: ctptr(tab, k) for k in CTPTRS if k != 'roff'}
     ro = ctptr(tab, 'roff')
     c.update(t=t, b=b, w=t // 32, l=t % 32, sm=hx.lds_base(), roff0=hx.gload(ro, I32), roff1=hx.gload(ro + i64(4), I32),
-             roff2=hx.gload(ro + i64(8), I32))
+             roff2=hx.gload(ro + i64(8), I32), kvfp4=kv_fp4)
     stage_proj_skb(c, T)   # split-K GEMV tiles, a weight operand shared by all row tiles
     handoff(cnt, t, hdev)
     stage_hnorm(c, T)

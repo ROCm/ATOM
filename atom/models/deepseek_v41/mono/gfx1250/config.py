@@ -2,8 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The one deployment the single-launch step is written for, and why a deployment cannot run it.
 
-TP4, DSpark with a block of 5 (a verify of 6 rows a request), BF16 KV cache, FP8 index cache, up to 8 requests (48
-target rows, 40 draft rows), the 40 target layers and 3 draft stages of DeepSeek-V4.1-Flash.
+TP4, DSpark with a block of 5 (a verify of 6 rows a request), BF16 or FP4 KV cache (FP4: the main pool's compressed rows
+E2M1 + E4M3 group-16 scales, the window rings MXFP8, each in its own data / scale planes), FP8 or FP4 (natural layout)
+index cache, up to 8 requests (48 target rows, 40 draft rows), the 40 target layers and 3 draft stages of
+DeepSeek-V4.1-Flash.
 """
 
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -29,12 +31,17 @@ def config_refusal(atom_config, dims) -> str | None:
     ]
     checks = shared + [
         (
-            atom_config.kv_cache_dtype == "bf16",
+            atom_config.kv_cache_dtype in ("bf16", "fp4"),
             f"kv cache {atom_config.kv_cache_dtype}",
         ),
         (
-            atom_config.index_cache_dtype == "fp8",
-            f"index cache {atom_config.index_cache_dtype}",
+            atom_config.index_cache_dtype == "fp8"
+            or (
+                atom_config.index_cache_dtype == "fp4"
+                and getattr(atom_config, "index_cache_layout", None) == "natural"
+            ),
+            f"index cache {atom_config.index_cache_dtype}"
+            f" ({getattr(atom_config, 'index_cache_layout', None)})",
         ),
         (method == "dspark", f"speculative method {method}"),
         (

@@ -5,13 +5,14 @@ preparation the launch's graph captures (``_host_inputs`` / ``_device_inputs``),
 parameters (``_sampling``). ``SingleStepRunner`` inherits them."""
 
 import logging
-import time
 
 import numpy as np
 import torch
 
 from atom.models.deepseek_v41.mono.gfx1250 import buffers
 from atom.models.deepseek_v41.mono.gfx1250.config import ROWS_PER_REQ
+from atom.models.deepseek_v41.mono.gfx1250.step_plans import fill_step_plans
+from atom.models.deepseek_v41.mono.gfx1250.step_prep import prep_step
 from atom.models.deepseek_v41.mono.gfx1250.tables import BCOLS, ILW
 from atom.models.deepseek_v41.mono.gfx1250.tables import T as T_MAX
 from atom.models.deepseek_v41.mono.step_meta import write_step_meta
@@ -44,11 +45,6 @@ class StepInputs:
                 why = f"index bound {end} > {ILW}"
             elif -(-end // geom.block_size) > BCOLS or bt.shape[0] > 8:
                 why = f"block table {bt.shape[0]} x {-(-end // geom.block_size)}"
-            elif self.tables.comp:
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    if plan.num_compress > T_MAX or plan.num_write > T_MAX:
-                        why = f"plan {r} rows"
         if why is None:
             self._precheck_why = None
         else:
@@ -86,7 +82,6 @@ class StepInputs:
                 cache.num_slots,
             )
         gk = self._gk
-        self._hm("hi_geom")
         if gk != getattr(
             self, "_dgeom_key", None
         ):  # (static for a cache: an H2D copy only when it changes)
@@ -124,17 +119,6 @@ class StepInputs:
                 )
             ]
             key += [bt.data_ptr(), tuple(bt.shape), bt.stride(0)]
-            if self.tables.comp:
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    for src, nl in (
-                        (plan.compress_plan_gpu, plan.num_compress),
-                        (plan.write_plan_gpu, plan.num_write),
-                    ):
-                        if nl > T_MAX:
-                            raise MonoUnsupported(f"plan {r}: {nl} rows > {T_MAX}")
-                        key += [src.data_ptr(), tuple(src.shape)]
-        self._hm("hi_key")
         # the Engram layers' embedding rows (staged on Engram's side stream: ``get`` makes this stream wait for them)
         emb = getattr(md, "engram_embeddings", None)
         engs = {}
@@ -169,7 +153,6 @@ class StepInputs:
                     st.candidates,
                 )
             ]
-        self._hm("host_inputs")
         return engs, tuple(key)
 
     def _device_inputs(self, input_ids, forward_context, engs):
@@ -192,59 +175,61 @@ class StepInputs:
             {},
             (0, rows),
         )
-        S["rpos"][:rows].copy_(step.positions[:rows])
-        S["tids"][:rows].copy_(input_ids.view(-1))
-        S["dids"][: req * 5].copy_(input_ids.view(req, 6)[:, 1:].reshape(-1))
-        # each request's state slot (the draft context's rows): not its batch position once requests have finished
-        S["dgeom"][8 : 8 + req].copy_(step.slots[:req])
-        S["ctx_kvw"][:rows].copy_(S["kvw"][:rows])
-        pos = step.positions[:rows]
-        torch.index_select(
-            self._ctx_rope[0], 0, pos, out=S["ctx_rcos"][: rows * 32].view(rows, 32)
-        )
-        torch.index_select(
-            self._ctx_rope[1], 0, pos, out=S["ctx_rsin"][: rows * 32].view(rows, 32)
-        )
-        if self.tables.idx:
-            S["ibat"][:rows].copy_(step.batch_ids[:rows])
+        if self.tables.idx and self.tables.comp:
+            # the visible counts and the compress / write plans from the step's positions, on the device (the
+            # host's arithmetic, ``step_plans``): they hold on a step whose positions the device advanced
+            fill_step_plans(
+                step.positions[:rows],
+                ROWS_PER_REQ,
+                (1, 2),
+                geom.speculative_tokens,
+                {r: S[f"ibound{r}"] for r in (1, 2)},
+                {r: S[f"cplan{r}"] for r in (1, 2)},
+                {r: S[f"wplan{r}"] for r in (1, 2)},
+                T_MAX,
+            )
+        elif self.tables.idx:
             for r in (1, 2):
                 S[f"ibound{r}"][:rows].copy_(step.visible[r][:rows])
-            # the requests' page tables: a fixed BCOLS columns (past the step's reach: never read)
-            bt = step.block_tables
-            n = bt.shape[0]
-            cc = min(bt.shape[1], BCOLS)
-            S["btab"][: n * BCOLS].view(n, BCOLS)[:, :cc].copy_(bt[:, :cc])
-            if (
-                self.tables.comp
-            ):  # the compress / ring-write plans, -1 padded (pos < 0: skipped); the plan's rows past
-                # its live count are sentinels (its fixed-capacity layout) or absent (a tight one)
-                for r in (1, 2):
-                    plan = step.plans[r]
-                    for name, src in (
-                        ("cplan", plan.compress_plan_gpu),
-                        ("wplan", plan.write_plan_gpu),
-                    ):
-                        dst = S[f"{name}{r}"]
-                        dst.fill_(-1)
-                        m = min(src.shape[0], T_MAX)
-                        if m:
-                            dst[: m * 4].copy_(src[:m].reshape(-1))
-                S["slots"][:n].copy_(step.slots[:n])
+        # every other per-row copy, the draft context's RoPE rows, the page tables (a fixed BCOLS columns: past the
+        # step's reach never read) and the scratch the launch counts / maxes into: one launch (``step_prep``)
+        prep_step(
+            positions=step.positions,
+            input_ids=input_ids.view(-1),
+            batch_ids=step.batch_ids,
+            # each request's state slot (the draft context's rows): not its batch position once requests have finished
+            slots=step.slots,
+            kvw=S["kvw"],
+            rope=self._ctx_rope,
+            block_tables=step.block_tables,
+            out={
+                "rpos": S["rpos"],
+                "first_pos": self.first_positions,
+                "tids": S["tids"],
+                "dids": S["dids"],
+                "dgeom_slots": S["dgeom"][8:],
+                "ctx_kvw": S["ctx_kvw"],
+                "ctx_cos": S["ctx_rcos"],
+                "ctx_sin": S["ctx_rsin"],
+                "ibat": S["ibat"] if self.tables.idx else S["tids"],
+                "btab": S["btab"] if self.tables.idx else S["tids"],
+                "slots": S["slots"] if self.tables.comp else S["tids"],
+            },
+            rows=rows,
+            req=req,
+            rows_per_request=ROWS_PER_REQ,
+            bcols=BCOLS,
+            idx=bool(self.tables.idx),
+            comp=bool(self.tables.comp),
+            cnt=self.scratch["cnt"].view(torch.int32),
+            ss=self.scratch["ss"].view(torch.int32),
+            # Markov's per-(position, request) global argmax is an atomic max: it must restart from INT64_MIN every
+            # step (as the fixture does), else the drafts keep earlier steps' winners
+            mbest=self.scratch["mbest"].view(torch.int64),
+        )
         for k, w in self.tables.engram.items():
             e = engs[k]
             w["engemb"][:rows].copy_(e.reshape(-1, e.shape[-1])[:rows])
-        self.scratch["cnt"].zero_()
-        self.scratch["ss"].zero_()
-        # Markov's per-(position, request) global argmax is an atomic max: it must restart from INT64_MIN every step
-        # (as the fixture does), else the drafts keep earlier steps' winners
-        self.scratch["mbest"].view(torch.int64).fill_(-(1 << 63))
-        self._hm("device_inputs")
-
-    def _hm(self, name) -> None:
-        """ATOM_MONO_TIMELINE: a host time mark inside the step's preparation (``debug.StepTimer``)."""
-        r = getattr(self, "_t_rec", None)
-        if r is not None:
-            r.setdefault("hm", []).append((name, time.perf_counter()))
 
     def _sampling(self, batch, req) -> None:
         """Each target row's sampling from its request (``ScheduledBatch`` temperatures / top_ps / top_ks), as the

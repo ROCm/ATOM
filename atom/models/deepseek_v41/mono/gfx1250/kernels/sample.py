@@ -54,7 +54,7 @@ def ln(x):
 
 
 def unif(row, idx, seed):
-    return (F32(lshr(hash32(row, idx, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+    return (F32(lshr(hash32(row, idx, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
 
 
 def gumbel(row, idx, seed):
@@ -291,7 +291,7 @@ def sample_once_p(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, recv, rank,
     for kk in range(PT):
         z = hx.lload(sm + ZOFF + (kk * 256 + t) * 4, F32)
         j = c0 + t + kk * 256
-        u = (F32(lshr(hash32(row, j + rank * V, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+        u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
         g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
         g = greedy.select(F32(0.0), g)
         pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))
