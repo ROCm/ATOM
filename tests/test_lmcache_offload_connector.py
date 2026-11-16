@@ -1274,6 +1274,35 @@ def test_mp_page_layout_publishes_qsa_side_planes_by_name():
     ]
 
 
+def test_every_qsa_side_plane_is_published_under_its_own_name():
+    """LMCache keys a layer's MP regions by these roles: each QSA side plane
+    publishes under its own name."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.config import KVCacheTensor
+    from atom.plugin.vllm.kv_transfer.mp_page_layout import build_mp_transfer_tensors
+
+    names = (
+        "index_raw",
+        "index_compressed",
+        "rope_positions",
+        "index_compressed_scale",
+    )
+    blocks = 4
+    k, v, *sides = _block_planes(blocks, 8, 8, 4, 2, 3, 1)
+    tensor = KVCacheTensor(
+        layer_num=0, k_cache=k, v_cache=v, extra_planes=tuple(zip(names, sides))
+    )
+    pages = build_mp_transfer_tensors([tensor], num_blocks=blocks).pages
+    assert [page.region.semantic_role for page in pages] == [
+        "L0000.k_cache",
+        "L0000.v_cache",
+        *(f"L0000.{name}" for name in names),
+    ]
+
+
 def test_mp_page_layout_refuses_an_extra_plane_it_cannot_name():
     import torch
 

@@ -88,6 +88,8 @@ and draft share the embedding and output head.
   parallelism, DP attention, and TBO are not supported.
 - LMCache offload (`lmcache_offload`, `lmcache_mp`) stores the QSA pages plus
   a checkpoint of the GDN and PLE state.
+  With MTP, decode steps keep no such checkpoint, so a follow-up turn resumes
+  from the previous turn's prompt end and recomputes the previous answer.
   P/D connectors are rejected: they would move the pages without the state.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.

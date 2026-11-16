@@ -44,6 +44,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     QSA_DRAFT_ROWS,
     QSA_ROWS,
+    QSA_SIDE_PLANES,
     check_kv_transfer,
     kv_transfer_leaves,
     qsa_cache_formats,
@@ -570,15 +571,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
         key, value = optional("k"), optional("v")
         k_scale, v_scale = optional("k_scale"), optional("v_scale")
-        extras = {
-            name: optional(name)
-            for name in (
-                "index_raw",
-                "index_compressed",
-                "rope_positions",
-                "index_compressed_scale",
-            )
-        }
+        extras = {name: optional(name) for name in QSA_SIDE_PLANES}
         module.bind_caches(
             key,
             value,

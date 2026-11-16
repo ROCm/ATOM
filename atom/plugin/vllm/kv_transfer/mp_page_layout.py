@@ -41,6 +41,7 @@ import torch
 from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
+from atom.model_ops.qwen4_exp.qsa_cache_rules import QSA_SIDE_PLANES
 
 # Fixed and total: every movable plane a ``KVCacheTensor`` can carry on the
 # attention leg. A plane added to that dataclass and not added here would be
@@ -54,16 +55,6 @@ _PAGE_ROLES: tuple[str, ...] = (
     "v_scale",
     "index_cache",
     "index_scale",
-)
-
-# What ``KVCacheTensor.extra_planes`` may name, published after ``_PAGE_ROLES``
-# in this order: QSA's side caches, each present only under the formats that
-# use it. Fixed for the same reason as the list above.
-_EXTRA_PLANE_ROLES: tuple[str, ...] = (
-    "index_raw",
-    "index_compressed",
-    "rope_positions",
-    "index_compressed_scale",
 )
 
 # The recurrent planes. They are deliberately NOT published through the PAGE
@@ -96,15 +87,16 @@ def _movable_planes(tensor: KVCacheTensor) -> list[tuple[str, torch.Tensor]]:
         if isinstance(plane, torch.Tensor) and plane.numel():
             planes.append((role, plane))
     extra = dict(tensor.extra_planes)
-    unknown = set(extra) - set(_EXTRA_PLANE_ROLES)
+    unknown = set(extra) - set(QSA_SIDE_PLANES)
     if unknown:
         raise ValueError(
             f"ATOM LMCache MP: layer {int(tensor.layer_num)} carries extra "
             f"plane(s) {sorted(unknown)} the PAGE layout does not publish; a "
             "plane left behind is restored as the previous occupant's bytes. "
-            "Add it to _EXTRA_PLANE_ROLES."
+            "Add it to qsa_cache_rules.QSA_SIDE_PLANES."
         )
-    for role in _EXTRA_PLANE_ROLES:
+    # Published after _PAGE_ROLES, in QSA_SIDE_PLANES order.
+    for role in QSA_SIDE_PLANES:
         plane = extra.get(role)
         if plane is not None and plane.numel():
             planes.append((role, plane))

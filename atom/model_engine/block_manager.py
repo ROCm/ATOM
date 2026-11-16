@@ -3291,9 +3291,10 @@ class BlockManager:
             # back on this one. The twin of the `checkpoint_cut` gate; see
             # there for why the two cannot move separately.
             if not (aimed and c.readable_midstep)
-            # A decode keep is copied out of the slot before the next forward,
-            # which is what settles a spec step for a class that is not
-            # `spec_step_settled`.
+            # A decode keep is copied out of the slot before the next forward
+            # runs, and for a class that is not `spec_step_settled` that
+            # forward is what settles the spec step: the copy would read an
+            # unsettled slot.
             and (aimed or not self.speculative_decode or c.spec_step_settled)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room

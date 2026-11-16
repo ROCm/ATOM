@@ -137,6 +137,7 @@ def _quark_mxfp4(atom_config) -> bool:
 def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
     """The checkpoint, parallelism, speculative decode and cache format Mono serves."""
     spec = getattr(atom_config, "speculative_config", None)
+    formats = normalize_qsa_cache_formats(atom_config)
     checks = common_refusals(atom_config, Shard, SUPPORTED_TP)
     # every program's CTAs are resident, one a CU, and spin on each other
     checks += resident_grid_refusals(atom_config, connectors=OFFLOAD_CONNECTORS)
@@ -147,8 +148,8 @@ def _deployment_checks(atom_config) -> list[tuple[bool, str]]:
             "not MTP3 speculative decode",
         ),
         (
-            normalize_qsa_cache_formats(atom_config) == ("fp8", "bf16"),
-            f"KV / index caches {normalize_qsa_cache_formats(atom_config)}",
+            formats == ("fp8", "bf16"),
+            f"KV / index caches {formats}",
         ),
         (
             atom_config.kv_cache_block_size == KV_BLOCK,
