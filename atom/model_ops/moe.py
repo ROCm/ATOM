@@ -108,7 +108,7 @@ from atom.quantization.quark.utils import (
     quant_weight_online,
 )
 from atom.utils import envs
-from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.custom_register import direct_register_custom_op, eager_direct_call
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
 from atom.utils.tbo.ubatch_splitting import NUM_TBO_UBATCHES
@@ -1255,12 +1255,19 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+_ROCM_AITER_FUSED_MOE_IS_OURS = direct_register_custom_op(
     op_name="rocm_aiter_fused_moe",
     op_func=rocm_aiter_fused_moe_impl,
     mutates_args=[],
     fake_impl=rocm_aiter_fused_moe_fake,
 )
+
+
+def rocm_aiter_fused_moe(hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """``torch.ops.aiter.rocm_aiter_fused_moe``, run without the dispatch in eager mode."""
+    if _ROCM_AITER_FUSED_MOE_IS_OURS and eager_direct_call(hidden_states):
+        return rocm_aiter_fused_moe_impl(hidden_states, *args, **kwargs)
+    return torch.ops.aiter.rocm_aiter_fused_moe(hidden_states, *args, **kwargs)
 
 
 class Nvfp4MoEMethod(FusedMoEMethodBase):
@@ -2997,7 +3004,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 x_scale=x_scale,
             )
         else:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3405,7 +3412,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            return rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -3462,7 +3469,7 @@ def moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
-direct_register_custom_op(
+_MOE_FORWARD_IS_OURS = direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
     mutates_args=["hidden_states"],
@@ -5344,10 +5351,12 @@ class FusedMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        router_logits = self._routing_logits(hidden_states, router_logits)
+        # The custom op only gives torch.compile an opaque boundary.
+        if _MOE_FORWARD_IS_OURS and eager_direct_call(hidden_states):
+            return moe_forward(hidden_states, router_logits, self.layer_name)
         return torch.ops.aiter.moe_forward(
-            hidden_states,
-            self._routing_logits(hidden_states, router_logits),
-            self.layer_name,
+            hidden_states, router_logits, self.layer_name
         )
 
     def combine_accepts_shared(self, rows: int) -> bool:
