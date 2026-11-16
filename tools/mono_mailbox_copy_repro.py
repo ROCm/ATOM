@@ -11,10 +11,13 @@ Store service, profiler, sampling change, or synthetic mailbox replacement.
 
 Run from the checkout with matching ROCm PyTorch/FlyDSL/AITER dependencies:
   PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py
-Use separate fresh processes/caches at the PR head and its parent to verify a
-revert; do not monkeypatch `_spin` or free owners after a pending GPU operation.
+For a revert control, use a separate checkout with the backoff reverted (see
+the .md); do not monkeypatch `_spin` or free owners after a pending GPU operation.
 A hang is probabilistic: one completed run is not proof that it cannot recur.
-On deadline this tool retains owners and waits for the external watchdog.
+On deadline or any other failure this tool retains the in-flight owners and
+waits for the external watchdog (`timeout`); a normal run releases them and
+exits. Setup does a real GPU pack/unpack but no NIC registration. GPU event-
+window overlap in `side` mode is not physical CU residency.
 """
 
 import argparse
@@ -170,8 +173,6 @@ def run_fixture(args):
                 "actual_codec": str(type(codec)),
                 "bytes_checked": 267822080,
                 "prepared_groups": owner.group_count,
-                "real_GPU_pack_unpack": True,
-                "NIC_registration_tested": False,
             }
         )
         torch.cuda.synchronize()
@@ -195,7 +196,8 @@ def run_fixture(args):
         )
     emit(
         {
-            "stage": "code_identity_before_K1",
+            "stage": "code_identity",
+            "mode": args.mode,
             "k1": k1.__file__,
             "sync": sync.__file__,
             "sync_sha256": hashlib.sha256(
@@ -210,7 +212,6 @@ def run_fixture(args):
             "stage": "actual_native_factory",
             "launch_api": "ordinary production factory",
             "StepBegin": "ordinary actual StepMailboxes.begin_step",
-            "real_tensor_shim_run_compiled": True,
         }
     )
 
@@ -219,58 +220,16 @@ def run_fixture(args):
         keepers.append(t)
         return t
 
-    # Explicit ABI fields; unused index and peer pointers are 0 in this non-token-
-    # parallel K1. The FP8 weights are filled with 0x38 below.
-    vals = {
-        name: 0
-        for name in (
-            "res_in",
-            "pend",
-            "post_in",
-            "comb_in",
-            "pre_in",
-            "hc_fn",
-            "hc_scale",
-            "hc_base",
-            "attn_w",
-            "wqkv",
-            "wqkv_s",
-            "qn_w",
-            "kvn_w",
-            "wqb",
-            "wqb_s",
-            "cos",
-            "sin",
-            "pos",
-            "ring",
-            "ring_rows",
-            "ring_off",
-            "res_out",
-            "post_out",
-            "comb_out",
-            "pre_out",
-            "q_out",
-            "normed",
-            "qr_out",
-            "qrs_out",
-            "aux",
-            "iq_w",
-            "iq_ws",
-            "iw_w",
-            "iq_out",
-            "iqs_out",
-            "iw_out",
-            "scratch",
-            "sym",
-            "peers",
-            "rank",
-            "layer",
-            "tl",
-        )
-    }
-    # ring_scale (#2989) is 0 for the bf16 ring, as in the runner; older ABIs lack it
-    if "ring_scale" in k1.ABI.names:
-        vals["ring_scale"] = 0
+    # Every K1 argument is a pointer or scalar: the buffers below, or 0 for the
+    # index, peer and unused fields of this non-token-parallel K1 (ring_scale is
+    # 0 for the bf16 ring, as in the runner). A new ABI field that is neither
+    # fails here, not in the watchdog loop. The FP8 weights are filled with 0x38.
+    zeros = {
+        "pend", "post_in", "comb_in", "ring_scale", "ring_off", "aux", "iq_w",
+        "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out", "sym", "peers", "rank",
+        "layer", "tl",
+    }  # fmt: skip
+    bufs = {}
     for name, n, dtype, value in [
         ("res_in", (20480) * 6, torch.bfloat16, 1),
         ("pre_in", (4) * 6, torch.float32, 0.25),
@@ -306,17 +265,20 @@ def run_fixture(args):
             tensor_value = tensor(n, dtype, value)
         if name == "ring_rows":
             tensor_value.copy_(torch.arange(6, dtype=dtype, device=device))
-        vals[name] = tensor_value.data_ptr()
+        bufs[name] = tensor_value
+    vals = {name: 0 for name in k1.ABI.names}
+    for name, buf in bufs.items():
+        vals[name] = buf.data_ptr()
+    missing = set(k1.ABI.names) - set(bufs) - zeros
+    require(not missing, f"K1 ABI fields without a buffer or a zero: {sorted(missing)}")
     peer_buffer = PeerBuffer(16, None, 0, 1, device)
-    mailboxes = StepMailboxes(peer_buffer, keepers[-1])
+    mailboxes = StepMailboxes(peer_buffer, bufs["scratch"])
     emit(
         {
             "stage": "legal_step_setup",
-            "scratch_uncached": True,
             "step_begin": "actual StepMailboxes.begin_step",
             "local_peer_ranks": 1,
             "K1_projection_tp": 4,
-            "tok_par": False,
         }
     )
 
@@ -329,9 +291,9 @@ def run_fixture(args):
     mailboxes.begin_step()
     model_once()
     torch.cuda.synchronize()
-    checked = [keepers[21], keepers[15]]  # actual q_out and ring KV
+    checked = [bufs["q_out"], bufs["ring"]]  # actual q_out and ring KV
     baseline = [t.clone() for t in checked]
-    keepers[10][:4096].fill_(0)
+    bufs["wqb"][:4096].fill_(0)
     mailboxes.begin_step()
     model_once()
     torch.cuda.synchronize()
@@ -339,7 +301,7 @@ def run_fixture(args):
         not torch.equal(checked[0], baseline[0]),
         "input perturbation did not affect Q output",
     )
-    keepers[10].fill_(0x38)
+    bufs["wqb"].fill_(0x38)
     mailboxes.begin_step()
     model_once()
     torch.cuda.synchronize()
@@ -347,7 +309,7 @@ def run_fixture(args):
         all(torch.equal(a, b) for a, b in zip(checked, baseline)),
         "restored input did not reproduce the baseline",
     )
-    require(torch.count_nonzero(keepers[-5]).item() > 0, "empty output")
+    require(torch.count_nonzero(bufs["q_out"]).item() > 0, "empty output")
     require(
         all(
             torch.isfinite(t).all().item() for t in keepers if t.dtype.is_floating_point
@@ -366,22 +328,6 @@ def run_fixture(args):
         }
     )
 
-    require(
-        pathlib.Path(k1.__file__).resolve().is_relative_to(root),
-        "k1 is not imported from this checkout",
-    )
-
-    emit(
-        {
-            "stage": "code_identity",
-            "k1": k1.__file__,
-            "sync": sync.__file__,
-            "sync_sha256": hashlib.sha256(
-                pathlib.Path(sync.__file__).read_bytes()
-            ).hexdigest(),
-            "mode": args.mode,
-        }
-    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=compute):
         mailboxes.begin_step()
@@ -420,7 +366,6 @@ def run_fixture(args):
                 "stage": "submitted",
                 "repeat": repeat,
                 "model_busy_before_copy": busy,
-                "owners_retained": True,
             }
         )
         deadline = time.monotonic() + args.deadline
@@ -430,8 +375,6 @@ def run_fixture(args):
                     {
                         "stage": "pending_deadline",
                         "repeat": repeat,
-                        "owners_retained": True,
-                        "external_watchdog_required": True,
                     }
                 )
                 while True:
@@ -466,7 +409,6 @@ def run_fixture(args):
                 "Q_ring_checked": model,
                 "busy_precondition": busy,
                 "GPU_event_window_overlap": event_overlap,
-                "GPU_event_window_not_CU_residency": True,
             }
         )
     if args.mode == "side" and (busy_samples == 0 or overlap_samples == 0):
@@ -479,7 +421,6 @@ def run_fixture(args):
             "busy_samples": busy_samples,
             "overlap_samples": overlap_samples,
             "mode": args.mode,
-            "event_window_not_physical_CU_overlap": True,
         }
     )
     # The current prepared owner is caller-retained; completion is the GPU
@@ -514,8 +455,6 @@ if __name__ == "__main__":
                     "stage": "failed",
                     "error_type": failure[0].__name__,
                     "error": str(failure[1]),
-                    "owners_retained_in_traceback": True,
-                    "external_watchdog_required": True,
                 }
             ),
             flush=True,
@@ -526,8 +465,6 @@ if __name__ == "__main__":
         json.dumps(
             {
                 "stage": "complete",
-                "normal_exit_required": True,
-                "owners_released_after_completion": True,
             }
         ),
         flush=True,

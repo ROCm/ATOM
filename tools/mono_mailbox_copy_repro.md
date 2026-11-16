@@ -31,10 +31,14 @@ PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode copy-alone --repeats 3
 ```
 
-For a rollback control, prepare a separate clean checkout at the original PR's
-parent (79149c7f10c0a58fce13997fcece3e1bd123bd27), copy these two tool files into
-it unchanged, and repeat with its own fresh JIT cache and the same dependencies,
-GPU, masks and inputs. Do not monkeypatch the current wait functions or overwrite
+For a rollback control, make a separate clean checkout of the same revision and
+revert only the backoff there: set `POLL_SLEEP_UNITS = 1` in
+`atom/mono/polling.py` and make the three `spin_pause` definitions
+(`atom/mono/device/ops.py`, `atom/models/deepseek_v4/mono/kernels/primitives.py`,
+`atom/models/deepseek_v41/mono/hi/device/gfx950/ops.py`) emit `"s_nop 0"`
+instead of `f"s_sleep {POLL_SLEEP_UNITS}"`. That restores the pre-backoff polling
+instructions. Repeat the commands above in that checkout with its own fresh JIT
+cache and the same dependencies, GPU, masks and inputs. Do not monkeypatch the current wait functions or overwrite
 the candidate checkout. Save both source identities, logs, process exit codes,
 per-round busy preconditions and post-process KFD/VRAM ownership checks. The tool
 logs the actual K1/sync import paths and sync SHA256. A side sample in which Mono
