@@ -205,9 +205,11 @@ On the deployment they are built for, V4.1 mono decode's served steps run the hi
 |----------|------|---------|-------------|
 | **ATOM_DSV41_MONO_HI** | str | auto | `auto`: the hi monokernels on the deployment they serve (above), ATOM's mono decode on any other with one info line (`V4.1 mono hi off: <why>`), also when only the loaded model shows the mismatch; `1`: on, or an error naming why not; `0`: off. Off, the `mono/hi` package is never imported. |
 | **ATOM_DSV41_TK_STEP** | bool | 0 | `1`: V4.1 decode steps on the TileRT-derived TP8 step (`mono/tk_step`: gfx950 TP8, DSpark 5, `max_num_seqs` 1, sampling only; a request it admits stays on it), the production path for any step it does not serve. |
-| **ATOM_DSV41_TK_CO** | str | "" | With ATOM_DSV41_TK_STEP: the directory of TileRT's code objects the step launches (required). |
-| **ATOM_DSV41_TK_TOKTAB_DIR** | str | "" | With ATOM_DSV41_TK_STEP: the DSpark token tables, `rank<r>.pt` (not yet built in ATOM). |
-| **ATOM_DSV41_TK_SWAP** | str | "" | With ATOM_DSV41_TK_STEP: a swap table of FlyDSL builds for TileRT's kernels (`tk.codeobj.CodeTable.swap`). |
+| **ATOM_DSV41_TK_CO** | str | "" | Dev only, with ATOM_DSV41_TK_STEP: launch TileRT's code objects from this directory instead of our FlyDSL builds. |
+| **ATOM_DSV41_TK_TOKTAB_DIR** | str | "" | With ATOM_DSV41_TK_STEP: a cache of the DSpark token tables, `rank<r>.pt` (read when every rank has one, else built from the checkpoint by `hi/tk/toktab.py` and saved there). |
+| **ATOM_DSV41_TK_SWAP** | str | "" | Dev only, with ATOM_DSV41_TK_STEP: a swap table over the code table (`tk.codeobj.CodeTable.swap`). |
+| **ATOM_DSV41_TK_TOKTAB_HW** | str | cpu | With ATOM_DSV41_TK_STEP: the token table build's `v_rsq_f32` / `v_exp_f32` / `v_rcp_f32`: `cpu` (modelled correctly rounded, not bit-exact to the GPU's) or `device` (evaluated by the rank's GPU, `hi/kernels/gfx950/hwmath.py`). |
+| **ATOM_DSV41_TK_FLY_CACHE** | str | "" | With ATOM_DSV41_TK_STEP: the node-local cache of the step's FlyDSL code objects built from source (`hi/tk/flybuild.py`; default `~/.cache/atom/tk_fly`). |
 
 The hi path serves the step widths 6 to 48 rows (1 to 8 requests verifying DSpark's 5 drafts and the anchor; past 4 requests on the batch bands of 6 and 8) and a context up to 1 Mi tokens (a `--max-model-len` past it keeps ATOM's mono decode). Its builds use FlyDSL's disk cache (`FLYDSL_RUNTIME_CACHE_DIR`), which also holds the gfx950 linear blocks' fitted prefetch depths where the frozen table does not apply (`dsv41_hi_fits`); `FLYDSL_DEBUG_MAX_LOC_DEPTH=1` shortens the trace of a first start's builds.
 

@@ -216,8 +216,6 @@ def install_tk_step(
     """``TkStepModel`` over ``model``, its ``TkRound`` on ``metadata_builder`` (V4.1's, ``use_decode_round``), or
     ``model`` when this deployment cannot run it (logged)."""
     why = refusal(atom_config)
-    if why is None and not envs.ATOM_DSV41_TK_CO:
-        why = "ATOM_DSV41_TK_CO (TileRT's code objects) unset"
     if why is None and not hasattr(metadata_builder, "use_decode_round"):
         why = "no V4.1 metadata builder to take its decode round (ATOM's state bookkeeping)"
     if why is not None:
@@ -228,9 +226,11 @@ def install_tk_step(
     runner = TkStepRunner.create(
         atom_config,
         atom_config.model,
-        envs.ATOM_DSV41_TK_CO,
-        envs.ATOM_DSV41_TK_TOKTAB_DIR or None,
-        envs.ATOM_DSV41_TK_SWAP or None,
+        co=envs.ATOM_DSV41_TK_CO or None,
+        toktab_dir=envs.ATOM_DSV41_TK_TOKTAB_DIR or None,
+        swap=envs.ATOM_DSV41_TK_SWAP or None,
+        fly_cache=envs.ATOM_DSV41_TK_FLY_CACHE or None,
+        toktab_hw=envs.ATOM_DSV41_TK_TOKTAB_HW,
     )
     wrapped = TkStepModel(model, drafter, runner)
     metadata_builder.use_decode_round(TkRound(wrapped, metadata_builder))

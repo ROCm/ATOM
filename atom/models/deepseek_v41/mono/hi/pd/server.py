@@ -30,7 +30,8 @@ dual-stack on ``::`` as TileRT's uvicorn is.
 
 ``python -m atom.models.deepseek_v41.mono.hi.pd.server``: ``--engine tk`` (8 ``tkworker.TkRankWorker`` processes behind
 ``fanout.RankEngine``; rank 0's worker owns the receive buffer and its Mooncake registration, this process only the
-control plane and HTTP; needs ``--toktab-dir`` until the token tables are built here) or ``--engine fake``
+control plane and HTTP; the token tables are built from ``--model-weights-dir``, ``--toktab-dir`` their cache; the
+kernels are our FlyDSL builds, ``--co`` / ``--swap`` dev options) or ``--engine fake``
 (``session.FakeEngine``: the receive path, the KV header check and the router protocol with scripted tokens, to wire a
 real P and router to this host before the decode is ready).
 """
@@ -580,10 +581,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda",
         help="fake engine: cpu = plain host memory (TileRT's pinned huge pages are not ported)",
     )
-    ap.add_argument("--co", help="tk: TileRT's code objects (*.co)")
-    ap.add_argument("--swap", help="tk: a swap table of FlyDSL builds")
     ap.add_argument(
-        "--toktab-dir", help="tk: the token tables, rank<r>.pt (TileRT's g.toktab[r])"
+        "--co",
+        help="tk, dev only: TileRT's code objects (*.co) instead of our FlyDSL builds",
+    )
+    ap.add_argument("--swap", help="tk, dev only: a swap table over the code table")
+    ap.add_argument(
+        "--fly-cache",
+        help="tk: the FlyDSL code object cache (default ~/.cache/atom/tk_fly)",
+    )
+    ap.add_argument(
+        "--toktab-hw",
+        choices=["cpu", "device"],
+        default="cpu",
+        help="tk: the token table build's v_rsq / v_exp / v_rcp: modelled on the CPU, or evaluated by rank 0's GPU",
+    )
+    ap.add_argument(
+        "--toktab-dir",
+        help="tk: a token table cache, rank<r>.pt (built from the checkpoint when absent)",
     )
     ap.add_argument(
         "--dist-port", type=int, default=29561, help="tk: the workers' gloo group"
@@ -612,13 +627,15 @@ def build_engine(args):
         return engine, R.open_receive_server(
             args.max_seq_len, args.ctrl_port, args.transport, device=device
         )
-    if not (args.model_weights_dir and args.co):
-        raise SystemExit("--engine tk needs --model-weights-dir and --co")
+    if not args.model_weights_dir:
+        raise SystemExit("--engine tk needs --model-weights-dir")
     kw = {
         "ckpt": args.model_weights_dir,
         "co": args.co,
         "toktab_dir": args.toktab_dir,
         "swap": args.swap,
+        "fly_cache": args.fly_cache,
+        "toktab_hw": args.toktab_hw,
         "dist_addr": f"127.0.0.1:{args.dist_port}",
         "mooncake_host": W.local_ip(),
         "accept": args.accept,

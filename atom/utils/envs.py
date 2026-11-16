@@ -663,13 +663,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # V4.1 decode steps on the TileRT-derived TP8 step (`mono/tk_step`): "1" on
     # (its deployment: gfx950 TP8, DSpark 5, max_num_seqs 1), default off. Its
-    # inputs: TileRT's code objects (ATOM_DSV41_TK_CO, required), the DSpark
-    # token tables until they are built in ATOM (ATOM_DSV41_TK_TOKTAB_DIR:
-    # rank<r>.pt), an optional CodeTable swap table (ATOM_DSV41_TK_SWAP).
+    # inputs: the kernels are our FlyDSL builds from source, cached node-locally
+    # (ATOM_DSV41_TK_FLY_CACHE, default ~/.cache/atom/tk_fly); the DSpark token
+    # tables are built from the checkpoint, ATOM_DSV41_TK_TOKTAB_DIR (rank<r>.pt)
+    # their cache. Dev options only: TileRT's code objects (ATOM_DSV41_TK_CO) and
+    # a CodeTable swap table over them (ATOM_DSV41_TK_SWAP).
     "ATOM_DSV41_TK_STEP": lambda: os.getenv("ATOM_DSV41_TK_STEP", "0") == "1",
     "ATOM_DSV41_TK_CO": lambda: os.getenv("ATOM_DSV41_TK_CO", ""),
     "ATOM_DSV41_TK_TOKTAB_DIR": lambda: os.getenv("ATOM_DSV41_TK_TOKTAB_DIR", ""),
     "ATOM_DSV41_TK_SWAP": lambda: os.getenv("ATOM_DSV41_TK_SWAP", ""),
+    "ATOM_DSV41_TK_FLY_CACHE": lambda: os.getenv("ATOM_DSV41_TK_FLY_CACHE", ""),
+    # the token table build's v_rsq / v_exp / v_rcp: cpu (modelled) | device (the GPU's)
+    "ATOM_DSV41_TK_TOKTAB_HW": lambda: os.getenv("ATOM_DSV41_TK_TOKTAB_HW", "cpu"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

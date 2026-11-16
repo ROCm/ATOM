@@ -214,12 +214,15 @@ class TkStepRunner:
         cls,
         atom_config,
         ckpt: str,
-        co: str,
-        toktab_dir: str | None,
+        co: str | None = None,
+        toktab_dir: str | None = None,
         swap: str | None = None,
+        fly_cache: str | None = None,
+        toktab_hw: str = "cpu",
     ):
-        """This rank's TkRank (collective over the TP group): packed parameters, token tables, TileRT's code objects
-        (or a swap set), real acceptance, warmup and both graphs."""
+        """This rank's TkRank (collective over the TP group): packed parameters, token tables (built from ``ckpt``, or
+        ``toktab_dir``'s, a cache the build fills), our FlyDSL kernels from source (dev: TileRT's code objects ``co``,
+        a swap set over them), real acceptance, warmup and both graphs."""
         from aiter.dist.parallel_state import (
             get_tensor_model_parallel_rank,
             get_tp_group,
@@ -230,13 +233,27 @@ class TkStepRunner:
         from ..hi.weights import ckpt as CK
 
         rank = get_tensor_model_parallel_rank()
-        tk = host.TkRank(rank, get_tp_group().cpu_group, accept="real")
-        # The packers run on the CPU; inside a ModelRunner the default device is the rank's GPU.
+        group = get_tp_group().cpu_group
+        tk = host.TkRank(rank, group, accept="real")
+        # The packers and the token table build run on the CPU; inside a ModelRunner the default device is the
+        # rank's GPU.
         with torch.device("cpu"):
             consts = CK.compute_engram_consts(ckpt)
             tk.load_params(ckpt, consts)
-        tkworker.load_toktab(tk, rank, toktab_dir)
-        table = codeobj.CodeTable.from_dir(co)
+            tkworker.load_toktab(
+                tk,
+                rank,
+                toktab_dir,
+                ckpt=ckpt,
+                group=group,
+                log=logger.info if rank == 0 else None,
+                hw=toktab_hw,
+            )
+        table = (
+            codeobj.CodeTable.from_dir(co)
+            if co
+            else codeobj.CodeTable.from_source(fly_cache, log=logger.info)
+        )
         tk.load_kernels(table.swap(swap) if swap else table, extra=(host.ADMIT_SYMBOL,))
         tk.warmup()
         tk.capture()

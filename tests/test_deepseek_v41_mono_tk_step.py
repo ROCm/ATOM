@@ -418,9 +418,10 @@ def test_tk_step_refuses_prefix_caching_and_eager(monkeypatch):
 
 def test_install_needs_the_v41_builder(monkeypatch):
     monkeypatch.setattr(D, "refusal", lambda c: None)
-    monkeypatch.setattr(D.envs, "ATOM_DSV41_TK_CO", "/co", raising=False)
     runner = RN.TkStepRunner(FakeTk())
-    monkeypatch.setattr(RN.TkStepRunner, "create", classmethod(lambda cls, *a: runner))
+    monkeypatch.setattr(
+        RN.TkStepRunner, "create", classmethod(lambda cls, *a, **k: runner)
+    )
     model, cfg = torch.nn.Identity(), SimpleNamespace(model="m")
     assert (
         D.install_tk_step(model, cfg, None) is model

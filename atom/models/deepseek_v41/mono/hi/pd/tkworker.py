@@ -4,16 +4,17 @@
 # ``e2e_graph.DsV41Graph``'s request calls (``set_sampling``, ``begin_request``, ``import_kv``, ``chunks``' enqueue /
 # wait) and ``receive_server.ReceiveServer``'s buffer and transport set-up.
 """One GPU's worker of the decode host (``fanout.RankGroup`` backend): a ``tk.TkRank`` with its parameters, token tables,
-code objects (TileRT's ``.co``, or a swap table's FlyDSL builds) and captured mode-5 graphs, every op on one stream of
-its own. Rank 0 also owns the receive buffer (``receive.alloc_receive_buffer`` on its GPU) and the Mooncake transport
+code objects (our FlyDSL builds from source; TileRT's ``.co`` or a swap table only as dev options) and captured mode-5
+graphs, every op on one stream of its own. Rank 0 also owns the receive buffer (``receive.alloc_receive_buffer`` on its GPU) and the Mooncake transport
 that registers it; the other ranks map that buffer over HIP IPC at start and convert a landed request themselves
 (``pd.convert`` on their own device, the same planes TileRT copies from cuda:0 to every rank).
 
 Startup (collective over a gloo group at ``dist_addr``): ``TkRank`` (its ``sym:`` arena exchange), ``load_params`` (the
-checkpoint, ``weights.ckpt.compute_engram_consts``), the token tables (``toktab_dir/rank<r>.pt``: TileRT's
-``g.toktab[r]``, ``[q, kv, hc]`` of ``layers.0`` then ``mtp.0``; without it ``build_toktab``, a stub, raises), kernels
-with ``host.ADMIT_SYMBOL``, ``warmup`` + ``capture``, the receive buffer (rank 0: allocate, Mooncake init + register;
-broadcast its IPC handle; ranks 1..7 open it).
+checkpoint, ``weights.ckpt.compute_engram_consts``), the token tables (``load_toktab``: built from the checkpoint by
+``tk.toktab``, or read from ``toktab_dir/rank<r>.pt`` when every rank has one there, a cache the build fills; ``[q,
+kv, hc]`` of ``layers.0`` then ``mtp.0``), kernels (``codeobj.CodeTable.from_source``, ``admit_kernel`` included; dev:
+``co`` = TileRT's ``.co``, ``swap`` a swap table over it), ``warmup`` + ``capture``, the receive buffer (rank 0:
+allocate, Mooncake init + register; broadcast its IPC handle; ranks 1..7 open it).
 
 Ops: ``set_sampling`` (``on`` only: greedy needs mode-2 graphs) -> ``TkRank.set_sampling``; ``admit`` ->
 ``TkRank.admit_request``; ``load_kv`` -> ``pd.convert.convert`` + ``TkRank.import_planes``, synchronized (the receive
@@ -34,14 +35,7 @@ from __future__ import annotations
 
 import os
 import time
-
-
-def build_toktab(tk, rank: int):
-    """A rank's DSpark token tables (``toktab:layers.0.*`` / ``toktab:mtp.0.*``). Stub."""
-    raise NotImplementedError(
-        "the DSpark token tables are not built yet (TileRT: toktab.build_table, its embed / mHC / q-kv / kv-extract "
-        "ops over the vocabulary); give the worker toktab_dir (TileRT's g.toktab[r] saved as rank<r>.pt)"
-    )
+from datetime import timedelta
 
 
 def load_planes_file(path: str, seq_len: int | None = None) -> dict:
@@ -119,14 +113,49 @@ def _to_device(o, device):
     return type(o)(_to_device(v, device) for v in o)
 
 
-def load_toktab(tk, rank: int, toktab_dir: str | None) -> None:
-    """``toktab_dir/rank<r>.pt``: 6 tensors (TileRT's order: q, kv, hc of ``layers.0``, then of ``mtp.0``) or
-    ``{scope: [q, kv, hc]}``."""
+def load_toktab(
+    tk,
+    rank: int,
+    toktab_dir: str | None = None,
+    ckpt: str | None = None,
+    group=None,
+    log=None,
+    hw: str = "cpu",
+) -> None:
+    """This rank's token tables into ``tk``: ``toktab_dir/rank<r>.pt`` (6 tensors in TileRT's order: q, kv, hc of
+    ``layers.0``, then of ``mtp.0``; or ``{scope: [q, kv, hc]}``) when it is there on every rank of ``group``, else
+    built from ``ckpt`` (``tk.toktab.build_rank_tables``, collective over ``group``) and, with ``toktab_dir``, saved
+    there. ``hw``: the build's hardware approximations, ``cpu`` (modelled) or ``device`` (this rank's GPU).
+    """
     import torch
+    import torch.distributed as dist
 
-    if toktab_dir is None:
-        build_toktab(tk, rank)
-    tabs = torch.load(os.path.join(toktab_dir, f"rank{rank}.pt"), map_location="cpu")
+    path = os.path.join(toktab_dir, f"rank{rank}.pt") if toktab_dir else None
+    have = path is not None and os.path.isfile(path)
+    distributed = dist.is_available() and dist.is_initialized()
+    if distributed:  # every rank reads, or every rank builds (the build is collective)
+        seen = [None] * dist.get_world_size(group)
+        dist.all_gather_object(seen, have, group=group)
+        have = all(seen)
+    if have:
+        tabs = torch.load(path, map_location="cpu")
+    else:
+        if ckpt is None:
+            raise ValueError(
+                f"no token tables at {path} and no checkpoint to build them from"
+            )
+        from ..tk import toktab
+
+        grp = (
+            (group if group is not None else dist.group.WORLD) if distributed else None
+        )
+        provider = toktab.DeviceHw(tk.device) if hw == "device" else toktab.CpuHw()
+        tabs = toktab.build_rank_tables(ckpt, rank, group=grp, log=log, hw=provider)
+        if path is not None:
+            os.makedirs(toktab_dir, exist_ok=True)
+            tmp = f"{path}.tmp{os.getpid()}"
+            torch.save(tabs, tmp)
+            os.replace(tmp, path)
     if isinstance(tabs, (list, tuple)):
         tabs = {"layers.0": tabs[0:3], "mtp.0": tabs[3:6]}
     for scope in ("layers.0", "mtp.0"):
@@ -141,9 +170,11 @@ class TkRankWorker:
         rank: int,
         nranks: int,
         ckpt: str,
-        co: str,
+        co: str | None = None,
         toktab_dir: str | None = None,
         swap: str | None = None,
+        fly_cache: str | None = None,
+        toktab_hw: str = "cpu",
         dist_addr: str = "127.0.0.1:29561",
         mooncake_host: str | None = None,
         cached_sym: bool = False,
@@ -167,8 +198,13 @@ class TkRankWorker:
         self._progress("init")
         self.device = torch.device("cuda", rank)
         torch.cuda.set_device(self.device)
+        # (a long timeout: without a token table cache, rank 0 builds the shared rows while the others wait)
         dist.init_process_group(
-            "gloo", init_method=f"tcp://{dist_addr}", rank=rank, world_size=nranks
+            "gloo",
+            init_method=f"tcp://{dist_addr}",
+            rank=rank,
+            world_size=nranks,
+            timeout=timedelta(hours=3),
         )
         self.max_seq_len = alloc.MAX_SEQ_LEN
         self.device_timeout_s = device_timeout_s
@@ -183,9 +219,14 @@ class TkRankWorker:
         self.tk.load_params(ckpt, consts)
         self.token_map = torch.as_tensor(consts["token_map"]).to(torch.int64)
         self._progress("toktab")
-        load_toktab(self.tk, rank, toktab_dir)
+        load_toktab(self.tk, rank, toktab_dir, ckpt=ckpt, log=self._log, hw=toktab_hw)
         self._progress("kernels")
-        table = codeobj.CodeTable.from_dir(co)
+        # ours from source by default; TileRT's .co / a swap table only as dev options
+        table = (
+            codeobj.CodeTable.from_dir(co)
+            if co
+            else codeobj.CodeTable.from_source(fly_cache, log=self._log)
+        )
         if swap:
             table = table.swap(swap)
         self.tk.load_kernels(table, extra=(host.ADMIT_SYMBOL,))
@@ -212,6 +253,10 @@ class TkRankWorker:
         self.events: dict = {}
         dist.barrier()
         self._progress("ready")
+
+    def _log(self, msg: str) -> None:
+        if self.rank == 0:
+            print(f"[tkworker r{self.rank}] {msg}", flush=True)
 
     def _progress(self, phase: str) -> None:
         if self.progress_dir:

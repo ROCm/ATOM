@@ -13,7 +13,7 @@ TileRT's ``DecodeReader`` reads it: the ``t`` batches, then a ``done`` whose ``n
 - the KV landing before or after the decode call; a non-streamed request;
 - refusals (busy, sampling, penalties, grammar, logprobs, malformed body, KV timeout), each releasing the request;
 - ``/pd/cancel`` and a client gone mid-stream; the control plane's busy / tombstone / oversize rejects;
-- the loop's chunking against the budget; ``TkEngine``'s stubs; the modules import without the GPU stack.
+- the loop's chunking against the budget; greedy refused; the modules import without the GPU stack.
 
 Runs under pytest or as a script (``python -B tests/test_deepseek_v41_mono_hi_pd_server.py``).
 """
@@ -655,13 +655,7 @@ def test_fanout_failures():
         raise AssertionError("bad backend started")
 
 
-def test_tk_worker_stubs_and_greedy():
-    try:
-        TW.build_toktab(None, 0)
-    except NotImplementedError as e:
-        assert "toktab" in str(e)
-    else:
-        raise AssertionError("build_toktab did not raise")
+def test_tk_worker_greedy():
     eng = F.RankEngine.__new__(F.RankEngine)
     eng._S, eng.greedy = S, False
     try:
