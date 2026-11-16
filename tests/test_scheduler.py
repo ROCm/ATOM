@@ -4513,7 +4513,7 @@ class TestRoutedExpertPatches:
             num_rejected=None,
             num_bonus=None,
             draft_token_ids=None,
-            structured_errors={seq.id: "grammar compile failed"},
+            constraint_errors={seq.id: "grammar compile failed"},
         )
         finished = scheduler.postprocess(list(scheduler.running), out, batch=batch)
         assert finished == [seq]

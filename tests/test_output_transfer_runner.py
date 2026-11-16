@@ -102,7 +102,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         forward_done_event=mock.Mock(),
         _served=None,
         structured_output=None,
-        _return_routed_experts=False,
+        _gather_routed_experts_step=lambda _batch: None,
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(

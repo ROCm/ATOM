@@ -476,7 +476,7 @@ def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, ena
 
     def transfer(_batch, ids, _event, payload, **kwargs):
         seen.update(ids=ids.clone(), payload=payload)
-        return {}, None
+        return {}, None, None
 
     runner.tokenID_processor.prepare_sampled_ids = transfer
     if not enabled:

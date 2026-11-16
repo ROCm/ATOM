@@ -160,7 +160,7 @@ def _postprocess_runner(ids, grammar):
     runner.forward_done_event = SimpleNamespace(record=lambda stream=None: None)
 
     def prepare_sampled_ids(batch, sampled, event, payload, **kwargs):
-        return dict(ids), None
+        return dict(ids), None, None
 
     runner.tokenID_processor = SimpleNamespace(
         is_deferred_out=False,
