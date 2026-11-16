@@ -126,7 +126,9 @@ def _assert_key_is_at_least_tritons(launcher, base):
 def test_key_tells_apart_what_triton_tells_apart(monkeypatch, buffer_ops):
     """Two launches with the same `CachedLauncher` key must have the same
     Triton cache key, or a cached kernel would serve a launch it was not
-    specialized for. Fails if a Triton upgrade changes what it specializes on."""
+    specialized for. Where Triton is installed, also fails if a Triton upgrade
+    changes what it specializes on; ATOM's CPU unit-test job has no Triton and
+    skips it."""
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
     launcher = CachedLauncher(_probe_kernel, num_warps=4)

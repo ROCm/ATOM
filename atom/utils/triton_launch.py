@@ -5,8 +5,8 @@
 `kernel[grid](*args)` runs all of `JITFunction.run` on every call: it derives
 each argument's specialization, formats the compile options into the cache
 key, checks the kernel's globals and builds launch metadata, and only then
-calls the compiled kernel's launcher. With Triton 3.8 on ROCm that is 13-35 us
-of host time per launch, several times the launch itself.
+calls the compiled kernel's launcher. With Triton 3.8 on ROCm that host time
+is several times the launch itself (ROCm/ATOM#3429).
 
 `CachedLauncher` sends the first launch of each specialization through
 `kernel[grid]` and keeps the compiled kernel under a key made of the facts
@@ -29,7 +29,8 @@ A launch this key cannot describe goes through `kernel[grid]` as before:
 launch, pre-run or stages-inspection hooks; a kernel with checked globals,
 with annotated or unspecialized parameters, or with a constexpr before a
 runtime parameter; torch.compile tracing; a callable grid; keyword arguments
-out of signature order; any other argument kind.
+out of signature order; an int outside int32; a constexpr that is not an int,
+float, bool, str or None; any other argument kind.
 """
 
 import torch
