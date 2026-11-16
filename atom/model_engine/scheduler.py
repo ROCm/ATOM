@@ -630,10 +630,10 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
-        structured_errors: dict[int, str] | None = None,
+        constraint_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
-        self.structured_errors = structured_errors or {}
+        self.constraint_errors = constraint_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
@@ -4426,7 +4426,7 @@ class Scheduler:
         num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
-            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            error = fwd_output.constraint_errors.get(seq.id)
             if error is not None:
                 logger.error(
                     "Structured decoding failed for request %s: %s", seq.id, error
@@ -5446,6 +5446,8 @@ class PrefillScheduler:
     _METRICS_ROLE = "prefill"
     # Its KV blocks are the decode engine's, assigned per request.
     can_recompute_prompts = False
+    # P/D admission is decode-side Mooncake policy; this prefill side has none.
+    pd_admission: PdAdmissionController | None = None
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs

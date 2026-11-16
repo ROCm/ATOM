@@ -280,6 +280,7 @@ def test_postprocess_takes_ids_without_sampler(monkeypatch):
         return_logprobs=[False] * 3,
         any_logprobs=False,
         logprob_rows=None,
+        structured_requests={},
         required_channel=None,
         num_spec_step=0,
     )
