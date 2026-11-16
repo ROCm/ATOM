@@ -208,7 +208,9 @@ class PdAdmissionController:
         """Blocks `seq` and every admitted request need to grow by the reserve.
 
         An admitted request is pending or running, counted once: a ready one
-        can already be RUNNING. A cancelled receive drains without decoding.
+        can already be RUNNING. A cancelled receive drains without decoding. A
+        request parked for an offload tier or replay load is neither: it holds
+        its blocks but counts only once it runs.
         """
         growing = {s.id: s for s in running}
         for entry in self.pending.values():
