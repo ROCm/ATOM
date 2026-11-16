@@ -75,6 +75,7 @@ from atom.kv_transfer.disaggregation.port_offset import (
     side_channel_port_offset as _port_offset,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import (
+    DCPShardPlan,
     build_dcp_shard_plan,
     coalesce_contiguous,
     consumer_head_slices,
@@ -3164,7 +3165,7 @@ class MooncakeConnector(KVConnectorBase):
 
     def _consumer_dcp_plan(
         self, request_data: dict, src_block_ids: list[int], dst_block_ids: list[int]
-    ):
+    ) -> DCPShardPlan:
         """The token plan an unsharded producer pushes to a DCP consumer."""
         return build_dcp_shard_plan(
             src_block_ids,

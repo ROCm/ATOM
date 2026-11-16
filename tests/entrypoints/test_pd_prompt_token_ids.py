@@ -481,7 +481,7 @@ class TestChunkedAdmissionTopology:
         )
 
     @pytest.mark.parametrize("model_type", ["kimi_linear", "deepseek_v3"])
-    def test_a_dcp_decode_of_a_stateful_model_is_http_400(
+    def test_a_dcp_decode_refuses_chunked_receive_only_for_a_stateful_model(
         self, monkeypatch, model_type
     ):
         monkeypatch.setattr(

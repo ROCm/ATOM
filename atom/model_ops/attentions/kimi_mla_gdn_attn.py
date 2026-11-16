@@ -233,7 +233,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             tensors.slot_region_consumer_indices = slots
         return tensors
 
-    def _kda_slot_tp_segments(self, num_regions: int) -> list:
+    def _kda_slot_tp_segments(self, num_regions: int) -> list[tuple[int, ...] | None]:
         """How each KDA slot region's unit splits over TP ranks.
 
         A conv unit is `W` rows of `[q | k | v]`, each run as wide as its conv
@@ -251,7 +251,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         """
         runner = self.model_runner
         hf = runner.config.hf_config
-        segments: list = [None] * num_regions
+        segments: list[tuple[int, ...] | None] = [None] * num_regions
         caches = slot_indexed_caches(runner, self.replayssm)
         conv_cache = caches[0]
         n_kda = conv_cache.shape[0]
