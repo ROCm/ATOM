@@ -71,6 +71,7 @@ def _layout(monkeypatch, **kwargs):
     )
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
+        replayssm=False,
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),

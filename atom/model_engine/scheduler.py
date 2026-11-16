@@ -5270,12 +5270,16 @@ class Scheduler:
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
+            # The store runs before the next commit, so the slot then holds the
+            # forward after this one (deferred: its first token is the boundary)
+            # or this one (undeferred: the boundary is its last accepted token).
             self.block_manager.hash_decode_blocks(
                 seq,
                 num_tokens - (0 if is_deferred_out else 1),
                 next_forward_tokens=self._checkpoint_room(
                     seq, leave_reason is not None
                 ),
+                snapshot_step=0 if is_deferred_out else num_new_token - 1,
             )
 
             if leave_reason is not None:

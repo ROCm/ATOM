@@ -135,12 +135,17 @@ class StateCache(Protocol):
         """
         ...
 
-    def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+    def checkpoint(
+        self, seq: Sequence, boundary_blocks: int, h: int, step: int = -1
+    ) -> None:
         """Keep `seq`'s state as of `boundary_blocks`, filed under hash `h`.
 
         Called only at a ladder position `BlockManager` has already vetted
         against `successor_room`. Best-effort: a class out of room keeps
         nothing, and the hit it later declines is the only consequence.
+
+        `step` is the boundary's step in the slot's last verify window for a
+        decode boundary, -1 for one a prefill wrote whole.
         """
         ...
 

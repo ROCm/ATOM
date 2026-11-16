@@ -575,7 +575,7 @@ class StateSlotPool:
             self.release(slot)
 
     # ---------------------------- checkpointing ---------------------------- #
-    def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
+    def checkpoint(self, seq, boundary_blocks: int, h: int, step: int = -1) -> None:
         """Keep `seq`'s state as of this boundary, filed under hash `h`.
 
         The owner moves to a fresh slot and the old slot becomes read-only.
@@ -585,8 +585,10 @@ class StateSlotPool:
 
         `boundary_blocks` names the position, which is all this needs it for:
         whether the position is this prompt's own end decides where the
-        checkpoint sits in the LRU order — see `mark_speculative`.
+        checkpoint sits in the LRU order — see `mark_speculative`. A fork hands
+        the slot itself on, so `step` is never needed: speculation never forks.
         """
+        del step
         if not self.applies(seq) or not self.transfer.forks:
             return
         old = seq.state_slot

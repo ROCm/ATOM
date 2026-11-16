@@ -3890,6 +3890,14 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         # between two of them has nothing to file it under.
         assert not self.keepers(bm, seq, INTERVAL + 1, aimed=False)
 
+    def test_a_copy_keeps_nothing_with_no_forward_after(self):
+        """A copy needs no successor room, so 0 has to refuse on its own: the
+        stopping request's slot is freed before anything reads it."""
+        bm = make_block_manager(demand_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = stateful_seq(PROMPT)
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, 1, aimed=False)
+        assert not bm.checkpointers_at(seq, INTERVAL + BLOCK, 0, aimed=False)
+
     def test_spacing_is_measured_from_the_last_one_kept(self):
         bm = make_block_manager(demand_config())
         seq = stateful_seq(PROMPT)
