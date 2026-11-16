@@ -3072,8 +3072,31 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
     ) -> torch.Tensor:  # [num_tokens, dim]
-        """Sequential: shared_experts → routed_experts → combine."""
+        """Sequential: shared_experts → routed_experts → combine.
+
+        Where the routed combine adds the shared output
+        (`FusedMoE.combine_accepts_shared`), it is handed down as the
+        dual-stream path hands it, with the event recorded on this same
+        stream, and there is no separate add.
+        """
         shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if (
+            shared is not None
+            and not torch.compiler.is_compiling()
+            and self.experts.combine_accepts_shared(x.shape[0])
+        ):
+            shared_ready = torch.cuda.Event()
+            shared_ready.record()
+            routed, is_complete = self.routed_expert_forward(
+                x, shared_partial=shared, shared_ready=shared_ready
+            )
+            if is_complete:
+                raise RuntimeError(
+                    "a comm-fused step reached the shared-in-combine path"
+                )
+            return self.combine_outputs(
+                routed, None, prefix=f"{self.prefix}.combine_outputs"
+            )
         routed, is_complete = self.routed_expert_forward(x, shared_partial=shared)
         if is_complete:
             return routed
