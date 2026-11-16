@@ -1171,7 +1171,7 @@ def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invali
 
 
 @pytest.mark.parametrize("pp_rank", [0, 1])
-def test_pp_stage_drops_its_producer_entry_once_its_consumers_are_served(pp_rank):
+def test_only_a_pp_stage_past_0_drops_its_producer_entry_once_served(pp_rank):
     captured = []
     conn = _make_transfer_connector({}, captured)
     conn.pp_size = 2
