@@ -1492,9 +1492,7 @@ class MLAAttention(nn.Module):
         # passes the raw decode output, which is not guaranteed contiguous the
         # way the post-ReduceScatter tensor is.
         x = x.reshape(-1, num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
+        # All V-up GEMMs write into the same contiguous (B, N, V) output.
         output = torch.empty(
             x.shape[1],
             x.shape[0],
