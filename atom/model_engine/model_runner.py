@@ -1024,14 +1024,29 @@ class ModelRunner:
             drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         self._refuse_unrelayed_pp_taps(drafter)
-        installer = mono_decode_installers.get(hf_config.architectures[0])
+        mono_arch = hf_config.architectures[0]
+        installer = mono_decode_installers.get(mono_arch)
         if installer is not None:
-            self.model = resolve_obj_by_qualname(installer)(
-                self.model,
-                config,
-                drafter,
-                metadata_builder=self.attn_metadata_builder,
-            )
+            install = resolve_obj_by_qualname(installer)
+            if mono_arch == "DeepseekV41ForCausalLM":
+                # Boot-only seam: a planned plugin may install its own
+                # whole-step decode instead (same arguments, returns the model
+                # to serve). With no owner this is exactly the call below.
+                self.model = plugin_host.call(
+                    "v41.mono.install",
+                    install,
+                    self.model,
+                    config,
+                    drafter,
+                    metadata_builder=self.attn_metadata_builder,
+                )
+            else:
+                self.model = install(
+                    self.model,
+                    config,
+                    drafter,
+                    metadata_builder=self.attn_metadata_builder,
+                )
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
