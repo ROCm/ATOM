@@ -4,8 +4,10 @@
 """CPU contract of the DeepSeek-V4.1 radix (prefix) cache on the SGLang plugin.
 
 Replay first: a prefix hit at ``P`` recomputes ``[P - R, P)`` into its freshly
-reset STATE slot in one side forward per step (``deepseek_v41_radix``), which
-the bridge translates into ATOM's ``ScheduledBatch.replaying``. Covered here:
+reset STATE slot (``deepseek_v41_radix``), which the bridge translates into
+ATOM's ``ScheduledBatch.replaying`` -- fused into the step's own forward (the
+hit's span starts at ``P - R``), or in one side forward before it (A/B).
+Covered here:
 
 1. the bridge's replay branch and the main forward's stamp guard;
 2. ATOM's ``_replay_layout`` over a plugin-shaped replay batch;
@@ -13,7 +15,10 @@ the bridge translates into ATOM's ``ScheduledBatch.replaying``. Covered here:
 4. ``PagedAttentionCache``: replay then main, no replay, coincidental cursor;
 5. the seam: which rows replay, the one side batch, capacity splits;
 6. the admission charge;
-7. the refusal matrix, and that nothing is installed with radix off.
+7. the refusal matrix, and that nothing is installed with radix off;
+8. the fused replay: the seam's record, the widened inputs and the output
+   rows, the bridge's widened spans, the runtime hook, ATOM's cache over a
+   fused span, and the host-row invalidation that lets overlap run.
 """
 
 import sys
@@ -33,12 +38,19 @@ from atom.plugin.sglang.deepseek_v41_bridge import (
     sglang_radix_cache_enabled,
 )
 from atom.plugin.sglang.deepseek_v41_radix import (
+    FUSED_ATTR,
+    FusedReplay,
     ReplayHit,
+    carry_fused_replay,
     check_state_stamps,
+    expand_v41_forward_inputs,
+    fused_layout,
     plan_prefix_replay,
     replay_admission_rows,
+    resolve_replay_mode,
     resolve_replay_rows,
     run_v41_prefix_replay,
+    run_with_fused_replay,
     split_replay_groups,
 )
 
@@ -79,14 +91,26 @@ def _isolated_process_state(monkeypatch):
     # One builder and one replay length per process; no test may leak either.
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
     monkeypatch.setattr(radix, "_REPLAY_ROWS", None)
-    monkeypatch.setattr(
-        radix, "_STATS", {"side_forwards": 0, "hits": 0, "rows": 0, "steps": 0}
-    )
+    monkeypatch.setattr(radix, "_REPLAY_MODE", None)
+    monkeypatch.setattr(radix, "_STATS", dict.fromkeys(radix._STATS, 0))
+    monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+    monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", None)
+    monkeypatch.setattr(bridge, "_HOST_ROWS_RADIX_SAFE", False)
 
 
 @pytest.fixture
 def radix_on(monkeypatch):
+    """The side-forward replay (the A/B arm)."""
     monkeypatch.setattr(radix, "_REPLAY_ROWS", R)
+    monkeypatch.setattr(radix, "_REPLAY_MODE", "side")
+    return R
+
+
+@pytest.fixture
+def radix_fused(monkeypatch):
+    """The fused replay (the default)."""
+    monkeypatch.setattr(radix, "_REPLAY_ROWS", R)
+    monkeypatch.setattr(radix, "_REPLAY_MODE", "fused")
     return R
 
 
@@ -488,8 +512,9 @@ def test_page_digests_see_main_and_index_writes(kv_dtype):
 # ---------------------------------------------------------------------------
 
 
-def _req(tokens, return_logprob=False, logprob_start_len=-1):
+def _req(tokens, return_logprob=False, logprob_start_len=-1, rid=None):
     return SimpleNamespace(
+        rid=rid,
         full_untruncated_fill_ids=array("q", tokens),
         return_logprob=return_logprob,
         logprob_start_len=logprob_start_len,
@@ -532,12 +557,18 @@ class _World:
             radix, "_run_side_forward", lambda runner, side: self.sides.append(side)
         )
 
-    def batch(self, prefix, slots, reqs=None, mode=EXTEND):
-        reqs = reqs or [_req(range(1000, 1000 + p + 300)) for p in prefix]
+    def batch(self, prefix, slots, reqs=None, mode=EXTEND, lengths=None):
+        reqs = reqs or [
+            _req(range(1000, 1000 + p + 300), rid=f"q{i}")
+            for i, p in enumerate(prefix)
+        ]
+        lengths = list(lengths or [7] * len(prefix))
         return SimpleNamespace(
             forward_mode=mode,
             reqs=reqs,
             prefix_lens=list(prefix),
+            extend_lens=lengths,
+            extend_num_tokens=sum(lengths),
             req_pool_indices=torch.tensor(slots),
             req_pool_indices_cpu=torch.tensor(slots),
             sampling_info="main",
@@ -555,10 +586,8 @@ class TestSeam:
     def test_new_tenant_with_a_hit_replays(self, monkeypatch, radix_on):
         world = _World(monkeypatch)
         req = _req(range(1000, 1000 + 2 * PAGE + 7))
-        replayed = run_v41_prefix_replay(
-            world.worker, world.batch([2 * PAGE], [3], [req])
-        )
-        assert replayed == R
+        fused = run_v41_prefix_replay(world.worker, world.batch([2 * PAGE], [3], [req]))
+        assert fused is None and radix._STATS["rows"] == R
         (side,) = world.sides
         start, end = 2 * PAGE - R, 2 * PAGE
         assert side.input_ids.tolist() == list(range(1000 + start, 1000 + end))
@@ -584,7 +613,7 @@ class TestSeam:
     def test_chunk_continuation_does_not_replay(self, monkeypatch, radix_on):
         world = _World(monkeypatch)
         world.stamp([3])
-        assert run_v41_prefix_replay(world.worker, world.batch([2 * PAGE], [3])) == 0
+        assert run_v41_prefix_replay(world.worker, world.batch([2 * PAGE], [3])) is None
         assert world.sides == []
 
     def test_retracted_readmission_replays(self, monkeypatch, radix_on):
@@ -597,7 +626,7 @@ class TestSeam:
 
     def test_cold_row_is_stamped_without_a_replay(self, monkeypatch, radix_on):
         world = _World(monkeypatch)
-        assert run_v41_prefix_replay(world.worker, world.batch([0], [2])) == 0
+        assert run_v41_prefix_replay(world.worker, world.batch([0], [2])) is None
         assert world.sides == []
         assert world.pool.state_gen[2] == world.generation[2]
 
@@ -606,7 +635,8 @@ class TestSeam:
         world.stamp([4])
         reqs = [_req(range(k * 10000, k * 10000 + 3 * PAGE)) for k in range(4)]
         batch = world.batch([PAGE, 0, 2 * PAGE, PAGE], [1, 2, 3, 4], reqs)
-        assert run_v41_prefix_replay(world.worker, batch) == 2 * R
+        assert run_v41_prefix_replay(world.worker, batch) is None
+        assert radix._STATS["rows"] == 2 * R
         (side,) = world.sides
         # Rows 0 and 2 hit; row 1 is cold, row 3 continues its chunk.
         assert side.reqs == [reqs[0], reqs[2]]
@@ -675,7 +705,7 @@ class TestSeam:
         elif case == "none":
             monkeypatch.setattr(radix, "_REPLAY_ROWS", R)
             batch = None
-        assert run_v41_prefix_replay(world.worker, batch) == 0
+        assert run_v41_prefix_replay(world.worker, batch) is None
         assert world.sides == []
         assert not world.pool.state_gen.any()
 
@@ -691,9 +721,20 @@ class TestSeam:
             split_replay_groups(many, 8, R - 2)
 
 
-def test_worker_seam_runs_before_the_forward(monkeypatch, radix_on):
+def _sglang_module(name):
+    """SGLang's ``name``, or a skip where it cannot import (some SGLang
+    modules probe the GPU at import)."""
     pytest.importorskip("sglang")
-    from sglang.srt.managers.tp_worker import TpModelWorker
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except RuntimeError as exc:
+        pytest.skip(f"{name} does not import here: {exc}")
+
+
+def test_worker_seam_runs_before_the_forward(monkeypatch, radix_on):
+    TpModelWorker = _sglang_module("sglang.srt.managers.tp_worker").TpModelWorker
 
     calls = []
 
@@ -703,7 +744,9 @@ def test_worker_seam_runs_before_the_forward(monkeypatch, radix_on):
 
     monkeypatch.setattr(TpModelWorker, "forward_batch_generation", original)
     monkeypatch.setattr(
-        radix, "run_v41_prefix_replay", lambda worker, batch: calls.append("replay")
+        radix,
+        "run_v41_prefix_replay",
+        lambda worker, batch, checks=None: calls.append("replay"),
     )
     radix._install_worker_seam()
     radix._install_worker_seam()  # idempotent
@@ -745,8 +788,7 @@ def test_replay_admission_rows(req, prefix, charge):
 
 
 def test_admission_charge_wraps_sglang(monkeypatch):
-    pytest.importorskip("sglang")
-    from sglang.srt.managers.schedule_policy import PrefillAdder
+    PrefillAdder = _sglang_module("sglang.srt.managers.schedule_policy").PrefillAdder
 
     seen = []
     monkeypatch.setattr(
@@ -787,6 +829,9 @@ def _radix_bags(**overrides):
             enable_session_radix_cache=False,
             enable_unified_memory=False,
             radix_cache_backend=None,
+            enable_lmcache=False,
+            enable_flexkv=False,
+            enable_unified_cache_external_linker=False,
         ),
         "exec": SimpleNamespace(
             features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
@@ -824,6 +869,7 @@ def launch(monkeypatch):
     monkeypatch.setattr(bridge, "_sglang_bag", lambda name: state.bags.get(name))
     monkeypatch.setattr(plugin_config, "get_sglang_server_args", lambda: state.args)
     monkeypatch.delenv(radix.REPLAY_ROWS_ENV, raising=False)
+    monkeypatch.delenv(radix.REPLAY_MODE_ENV, raising=False)
     return state
 
 
@@ -836,10 +882,17 @@ class TestRefusals:
         ("bag", "path", "value", "match"),
         [
             ("schedule", "enable_mixed_chunk", True, "mixed chunk"),
-            ("schedule", "disable_overlap_schedule", False, "overlap scheduling"),
             ("memory", "enable_session_radix_cache", True, "session radix cache"),
             ("memory", "radix_cache_backend", "custom", "custom radix cache"),
             ("memory", "enable_unified_memory", True, "unified memory"),
+            ("memory", "enable_lmcache", True, "KV storage backend"),
+            ("memory", "enable_flexkv", True, "KV storage backend"),
+            (
+                "memory",
+                "enable_unified_cache_external_linker",
+                True,
+                "KV storage backend",
+            ),
             ("schedule", "chunked_prefill_size", 64, "--chunked-prefill-size 64"),
             ("spec", "speculative_algorithm", "DSPARK", "speculative decoding with"),
         ],
@@ -855,15 +908,34 @@ class TestRefusals:
         with pytest.raises(ValueError, match="prefill CUDA graphs"):
             refuse_unsupported_sglang_features()
 
+    def test_overlap_scheduling_runs_with_radix(self, launch):
+        # The seam runs inside forward_batch_generation under overlap too, and
+        # a radix checkpoint drops the slot's host rows (section 8).
+        launch.bags["schedule"].disable_overlap_schedule = False
+        refuse_unsupported_sglang_features()
+
     def test_raw_args_are_the_fallback(self, launch):
         launch.bags = {"disagg": launch.bags["disagg"]}
         launch.args.disable_radix_cache = False
         launch.args.cuda_graph_backend_prefill = "full"
-        with pytest.raises(ValueError, match="overlap.*prefill CUDA graphs"):
+        launch.args.enable_lmcache = True
+        with pytest.raises(ValueError, match="storage backend.*prefill CUDA graphs"):
             refuse_unsupported_sglang_features()
-        launch.args.disable_overlap_schedule = True
+        launch.args.enable_lmcache = False
         launch.args.cuda_graph_backend_prefill = "disabled"
         refuse_unsupported_sglang_features()
+
+    @pytest.mark.parametrize("value", ["", "both", "SIDEWAYS"])
+    def test_invalid_replay_mode_is_refused(self, launch, monkeypatch, value):
+        monkeypatch.setenv(radix.REPLAY_MODE_ENV, value)
+        with pytest.raises(ValueError, match=radix.REPLAY_MODE_ENV):
+            refuse_unsupported_sglang_features()
+
+    def test_replay_mode(self, monkeypatch):
+        monkeypatch.delenv(radix.REPLAY_MODE_ENV, raising=False)
+        assert resolve_replay_mode() == "fused"
+        monkeypatch.setenv(radix.REPLAY_MODE_ENV, " Side ")
+        assert resolve_replay_mode() == "side"
 
     def test_disabled_chunking_is_not_below_r(self, launch):
         launch.bags["schedule"].chunked_prefill_size = -1
@@ -915,10 +987,11 @@ def _v41_atom_config():
     )
 
 
+@pytest.mark.parametrize("mode", ["fused", "side"])
 @pytest.mark.parametrize("decoder_replay", ["1", "0"])
 @pytest.mark.parametrize("radix_cache", [False, True])
 def test_prepare_installs_the_replay_only_with_radix(
-    launch, monkeypatch, radix_cache, decoder_replay
+    launch, monkeypatch, radix_cache, decoder_replay, mode
 ):
     from atom.plugin.sglang.runtime import model_arch
 
@@ -929,7 +1002,7 @@ def test_prepare_installs_the_replay_only_with_radix(
     monkeypatch.setattr(
         radix,
         "install_deepseek_v41_radix",
-        lambda window=None: installed.append(window) or R,
+        lambda window=None: installed.append(window) or (R, mode),
     )
     launch.bags["memory"].disable_radix_cache = not radix_cache
     launch.bags["schedule"] = None  # leave the builder sizing alone
@@ -940,6 +1013,9 @@ def test_prepare_installs_the_replay_only_with_radix(
     assert config.enable_decoder_swa_bounded_replay is (decoder_replay == "1")
     assert installed == ([128] if radix_cache else [])
     assert config.kv_cache_block_size == PAGE
+    # A fused step runs its hits' replay rows on top of its chunk.
+    fused = radix_cache and mode == "fused"
+    assert config.max_num_batched_tokens == 16384 + (R if fused else 0)
 
 
 def test_side_forward_runs_every_decoder_row(monkeypatch, radix_on):
@@ -982,3 +1058,637 @@ def test_proxy_pool_owns_a_stamp_per_request_slot(monkeypatch):
     assert pool.state_gen.tolist() == [0] * pool.num_req_slots
     with pytest.raises(NotImplementedError, match="relocation"):
         pool.move_kv_cache(torch.zeros(1), torch.zeros(1))
+
+
+# ---------------------------------------------------------------------------
+# 8. The fused replay: the rows below each hit ride in the step's own forward
+# ---------------------------------------------------------------------------
+
+
+class TestFusedSeam:
+    def test_hit_rides_in_the_step(self, monkeypatch, radix_fused):
+        world = _World(monkeypatch)
+        req = _req(range(1000, 1000 + 2 * PAGE + 7), rid="a")
+        fused = run_v41_prefix_replay(world.worker, world.batch([2 * PAGE], [3], [req]))
+        # No side forward: the rows ride in the step's forward.
+        assert world.sides == []
+        start, end = 2 * PAGE - R, 2 * PAGE
+        assert fused.rows.tolist() == [0] and fused.slots.tolist() == [3]
+        assert fused.rids == ["a"]
+        assert fused.starts.tolist() == [start] and fused.ends.tolist() == [end]
+        assert fused.ids.tolist() == list(range(1000 + start, 1000 + end))
+        assert fused.positions().tolist() == list(range(start, end))
+        assert fused.histories.tolist() == [
+            [1000 + start - 3, 1000 + start - 2, 1000 + start - 1]
+        ]
+        assert fused.expanded is None
+        # Stamped before the forward that rebuilds it runs.
+        assert world.pool.state_gen[3] == world.generation[3]
+        assert radix._STATS["fused_steps"] == 1 and radix._STATS["rows"] == R
+
+    def test_only_new_tenants_above_zero_ride(self, monkeypatch, radix_fused):
+        world = _World(monkeypatch)
+        world.stamp([4])
+        reqs = [
+            _req(range(k * 10000, k * 10000 + 3 * PAGE), rid=f"r{k}") for k in range(4)
+        ]
+        batch = world.batch([PAGE, 0, 2 * PAGE, PAGE], [1, 2, 3, 4], reqs)
+        fused = run_v41_prefix_replay(world.worker, batch)
+        # Row 1 is cold, row 3 continues its chunk.
+        assert fused.rows.tolist() == [0, 2]
+        assert fused.rids == ["r0", "r2"]
+        assert fused.replay_rows(4).tolist() == [R, 0, R, 0]
+        assert fused.ids.tolist() == (
+            list(range(PAGE - R, PAGE))
+            + list(range(20000 + 2 * PAGE - R, 20000 + 2 * PAGE))
+        )
+        assert world.sides == []
+        assert world.pool.state_gen[[1, 2, 3, 4]].tolist() == [1, 1, 1, 1]
+
+    @pytest.mark.parametrize("prefix,stamped", [([0], False), ([PAGE], True)])
+    def test_no_hit_carries_nothing(self, monkeypatch, radix_fused, prefix, stamped):
+        world = _World(monkeypatch)
+        if stamped:
+            world.stamp([1])
+        assert run_v41_prefix_replay(world.worker, world.batch(prefix, [1])) is None
+        assert world.sides == [] and radix._STATS["fused_steps"] == 0
+
+    def test_a_step_past_the_builder_falls_back_to_a_side_forward(
+        self, monkeypatch, radix_fused
+    ):
+        world = _World(monkeypatch, max_tokens=R + 6)
+        batch = world.batch([PAGE], [1], lengths=[7])
+        assert run_v41_prefix_replay(world.worker, batch) is None
+        (side,) = world.sides
+        assert side.prefix_lens == [PAGE - R]
+        assert radix._STATS["fallbacks"] == 1 and radix._STATS["fused_steps"] == 0
+        assert world.pool.state_gen[1] == world.generation[1]
+
+    def test_short_hit_replays_from_zero(self, monkeypatch):
+        monkeypatch.setattr(radix, "_REPLAY_ROWS", 512)
+        monkeypatch.setattr(radix, "_REPLAY_MODE", "fused")
+        world = _World(monkeypatch)
+        req = _req(range(50, 50 + PAGE + 3), rid="z")
+        fused = run_v41_prefix_replay(world.worker, world.batch([PAGE], [1], [req]))
+        assert fused.starts.tolist() == [0] and fused.ends.tolist() == [PAGE]
+        assert fused.histories.tolist() == [[0, 0, 0]]
+
+    def test_cached_prompt_logprobs_are_refused(self, monkeypatch, radix_fused):
+        world = _World(monkeypatch)
+        req = _req(range(2 * PAGE), True, 10, rid="x")
+        with pytest.raises(ValueError, match="prompt logprobs"):
+            run_v41_prefix_replay(world.worker, world.batch([PAGE], [1], [req]))
+
+
+def _fused(rows, slots, rids, starts, ends, history=((1, 2, 3),), ids=None):
+    if ids is None:
+        ids = [
+            1000 * (k + 1) + t
+            for k, (s, e) in enumerate(zip(starts, ends))
+            for t in range(e - s)
+        ]
+    histories = np.asarray(history, np.int64)
+    if histories.shape[0] != len(rows):
+        histories = np.repeat(histories[:1], len(rows), axis=0)
+    return FusedReplay(rows, slots, rids, starts, ends, ids, histories)
+
+
+class TestFusedRecord:
+    def test_record_shape_is_checked(self):
+        with pytest.raises(ValueError, match="ascend"):
+            _fused([2, 1], [1, 2], ["a", "b"], [0, 0], [4, 4])
+        with pytest.raises(ValueError, match="non-empty"):
+            _fused([0], [1], ["a"], [4], [4])
+        with pytest.raises(ValueError, match="ids for"):
+            _fused([0], [1], ["a"], [0], [4], ids=[1, 2, 3])
+        with pytest.raises(ValueError, match="disagree"):
+            FusedReplay([0], [1, 2], ["a"], [0], [4], [1, 2, 3, 4], [[1, 2, 3]])
+        with pytest.raises(ValueError, match="outside a batch"):
+            _fused([3], [1], ["a"], [0], [4]).replay_rows(2)
+
+    def test_layout_puts_each_replay_before_its_request(self):
+        keep, replay_at = fused_layout([3, 2, 4], [0, 5, 2])
+        # req0: 0..2; req1: replay 3..7, own 8..9; req2: replay 10..11, own 12..15
+        assert keep.tolist() == [0, 1, 2, 8, 9, 12, 13, 14, 15]
+        assert replay_at.tolist() == [3, 4, 5, 6, 7, 10, 11]
+        keep, replay_at = fused_layout([4], [0])
+        assert keep.tolist() == [0, 1, 2, 3] and replay_at.tolist() == []
+
+
+def _fused_fb(lengths, fused, mode=EXTEND):
+    fb = SimpleNamespace(
+        forward_mode=mode,
+        batch_size=len(lengths),
+        extend_seq_lens_cpu=list(lengths),
+    )
+    setattr(fb, FUSED_ATTR, fused)
+    return fb
+
+
+class TestFusedInputs:
+    def _case(self):
+        fused = _fused([1], [4], ["b"], [6], [10], ids=[60, 70, 80, 90])
+        fb = _fused_fb([3, 2], fused)
+        ids = torch.tensor([11, 12, 13, 21, 22])
+        positions = torch.tensor([0, 1, 2, 10, 11])
+        return fused, fb, ids, positions
+
+    def test_rows_below_the_hit_are_prepended(self):
+        fused, fb, ids, positions = self._case()
+        wide_ids, wide_pos, rows = expand_v41_forward_inputs(fb, ids, positions)
+        assert wide_ids.tolist() == [11, 12, 13, 60, 70, 80, 90, 21, 22]
+        assert wide_pos.tolist() == [0, 1, 2, 6, 7, 8, 9, 10, 11]
+        assert wide_ids.dtype == ids.dtype and wide_pos.dtype == positions.dtype
+        # SGLang's rows of the widened output, in order.
+        assert rows.tolist() == [0, 1, 2, 7, 8]
+        hidden = torch.arange(9)[:, None].expand(9, 4)
+        assert hidden.index_select(0, rows)[:, 0].tolist() == [0, 1, 2, 7, 8]
+        # Kept on the record for the bridge; one expansion per forward.
+        assert fused.expanded.input_ids is wide_ids
+        assert expand_v41_forward_inputs(fb, ids, positions) is fused.expanded
+
+    def test_other_forwards_are_not_widened(self):
+        fb = _fused_fb([3], None)
+        assert expand_v41_forward_inputs(fb, torch.zeros(3), torch.zeros(3)) is None
+
+    def test_mismatched_rows_are_refused(self):
+        _, fb, ids, positions = self._case()
+        with pytest.raises(ValueError, match="extend rows"):
+            expand_v41_forward_inputs(fb, ids[:4], positions[:4])
+
+    def test_embeddings_and_mrope_are_refused(self):
+        _, fb, ids, positions = self._case()
+        with pytest.raises(NotImplementedError, match="input_ids"):
+            expand_v41_forward_inputs(fb, ids, positions, torch.zeros(5, 2))
+        with pytest.raises(NotImplementedError, match="1-D positions"):
+            expand_v41_forward_inputs(fb, ids, positions.expand(3, 5))
+
+    def test_the_v41_adapter_hook(self):
+        from atom.plugin.sglang.runtime import model_arch
+
+        spec = model_arch.MODEL_ADAPTER_SPECS[bridge.DEEPSEEK_V41_ARCH]
+        _, fb, ids, positions = self._case()
+        assert spec.expand_forward_inputs(fb, ids, positions, None)[0].numel() == 9
+        plain = _fused_fb([5], None)
+        assert spec.expand_forward_inputs(plain, ids, positions, None) is None
+
+
+class TestFusedBridge:
+    def _fb(self):
+        fb = _extend_fb([2 * PAGE, 0, PAGE], [5, 9, 300], [1, 2, 3])
+        fused = _fused(
+            [0, 2],
+            [1, 3],
+            ["r0", "r2"],
+            [2 * PAGE - R, PAGE - R],
+            [2 * PAGE, PAGE],
+            history=[[1, 2, 3], [4, 5, 6]],
+        )
+        setattr(fb, FUSED_ATTR, fused)
+        return fb, fused
+
+    def test_hits_are_scheduled_from_below_the_hit(self, req_to_token):
+        from atom.model_engine.sequence import Replay
+
+        fb, _ = self._fb()
+        batch = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert batch.num_scheduled_tokens.tolist() == [5 + R, 9, 300 + R]
+        assert batch.context_lens.tolist() == [2 * PAGE + 5, 9, PAGE + 300]
+        assert batch.replay_rows.tolist() == [R, 0, R]
+        assert batch.total_tokens_num == 5 + 9 + 300 + 2 * R
+        assert [span.position for span in _spans(batch)] == [2 * PAGE - R, 0, PAGE - R]
+        assert batch.replaying == {
+            0: Replay(2 * PAGE, True, (1, 2, 3), 2 * PAGE - R),
+            2: Replay(PAGE, True, (4, 5, 6), PAGE - R),
+        }
+        # The block tables cover the request, prefix pages included.
+        assert [row.tolist() for row in batch.block_tables] == [
+            [7, 3, 9],
+            [5],
+            [2, 11, 4],
+        ]
+
+    def test_history_keeps_only_real_tokens(self, req_to_token):
+        fb = _extend_fb([PAGE], [3], [1])
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [2], [PAGE], [[0, 7, 8]]))
+        batch = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert batch.replaying[0].history_ids == (7, 8)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [("slots", [2, 3]), ("ends", [PAGE, PAGE]), ("rids", ["r0", "rX"])],
+    )
+    def test_a_record_of_another_forward_is_refused(
+        self, req_to_token, field, value
+    ):
+        fb, fused = self._fb()
+        setattr(
+            fused, field, value if field == "rids" else np.asarray(value, np.int64)
+        )
+        with pytest.raises(ValueError, match="does not describe this forward"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+
+    def test_spans_must_be_page_aligned_and_history_sized(self, req_to_token):
+        fb = _extend_fb([PAGE + 2], [3], [1])
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [2], [PAGE + 2]))
+        with pytest.raises(ValueError, match="PAGE boundary"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        fb, _ = self._fb()
+        with pytest.raises(ValueError, match="history width"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY + 1)
+
+    def test_side_forwards_and_decode_carry_none(self, req_to_token):
+        fb, _ = self._fb()
+        fb.encoder_swa_replay = True
+        with pytest.raises(ValueError, match="side forward carries a fused"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        decode = SimpleNamespace(
+            forward_mode=DECODE,
+            rids=["a"],
+            batch_size=1,
+            seq_lens=torch.tensor([PAGE + 1]),
+            seq_lens_cpu=torch.tensor([PAGE + 1]),
+            req_pool_indices=torch.tensor([1]),
+            req_pool_indices_cpu=None,
+        )
+        setattr(decode, FUSED_ATTR, _fused([0], [1], ["a"], [PAGE - R], [PAGE]))
+        with pytest.raises(NotImplementedError, match="rides on an EXTEND"):
+            build_v41_scheduled_batch(decode, PAGE)
+
+    def test_the_stamp_guard_still_reads_sglang_prefix(
+        self, monkeypatch, req_to_token, radix_fused
+    ):
+        seen = []
+        monkeypatch.setattr(
+            radix,
+            "check_state_stamps",
+            lambda state_gen, generation, slots, prefix: seen.append(prefix.tolist()),
+        )
+        monkeypatch.setattr(bridge, "_radix_stamps", lambda: (None, None))
+        fb, _ = self._fb()
+        build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert seen == [[2 * PAGE, 0, PAGE]]
+
+    def test_a_short_suffix_still_replays_its_decoder(self, req_to_token):
+        """The fused span is at least R >= window rows, so even a hit whose
+        own suffix is shorter than the window runs the decoder on its tail,
+        as native ATOM's hit forward from ``P - 128`` does."""
+        fb, _ = self._fb()
+        fb.is_prefill_only = False
+        fb.return_logprob = False
+        batch = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert bridge.v41_extend_replays(fb, batch, 128)
+        # Without the fused rows, the 5-row hit could not.
+        setattr(fb, FUSED_ATTR, None)
+        plain = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert not bridge.v41_extend_replays(fb, plain, 128)
+
+    @pytest.mark.parametrize(
+        "starts,replays", [([5, 9, 300], True), ([4, 9, 300], False)]
+    )
+    def test_input_logprobs_count_sglang_rows_only(
+        self, req_to_token, starts, replays
+    ):
+        fb, _ = self._fb()
+        fb.return_logprob = True
+        fb.extend_logprob_start_lens_cpu = starts
+        batch = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert bridge.v41_extend_replays(fb, batch, 128) is replays
+
+
+class TestFusedMetadata:
+    def _builder(self, monkeypatch, captured):
+        def prepare_prefill(batch, running_bs, running_tokens):
+            captured.update(batch=batch, bs=running_bs, tokens=running_tokens)
+            return SimpleNamespace(engram_embeddings=None), None
+
+        builder = SimpleNamespace(
+            cache=object(),
+            block_size=PAGE,
+            geometry=SimpleNamespace(history_size=HISTORY, window_size=128),
+            max_bs=8,
+            max_num_batched_tokens=4096,
+            _decoder_replays=True,
+            prepare_prefill=prepare_prefill,
+            prepare_model_inputs=lambda ids, md: captured.update(ids=ids),
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        return builder
+
+    def _fb(self):
+        fb = _extend_fb([PAGE, 0], [3, 2], [1, 2])
+        fb.input_ids = torch.tensor([11, 12, 13, 21, 22])
+        fb.is_prefill_only = False
+        fb.return_logprob = False
+        fused = _fused([0], [1], ["r0"], [PAGE - R], [PAGE])
+        setattr(fb, FUSED_ATTR, fused)
+        return fb, fused
+
+    def test_atom_stages_the_widened_inputs(self, monkeypatch, req_to_token):
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb, fused = self._fb()
+        positions = torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1])
+        wide_ids, wide_pos, _ = expand_v41_forward_inputs(fb, fb.input_ids, positions)
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb, wide_pos)
+        assert metadata.staged_outside_forward
+        assert captured["ids"] is wide_ids
+        assert captured["tokens"] == 5 + R and captured["bs"] == 2
+        assert captured["batch"].num_scheduled_tokens.tolist() == [3 + R, 2]
+        assert captured["batch"].decoder_replays
+
+    def test_unexpanded_inputs_are_refused(self, monkeypatch, req_to_token):
+        self._builder(monkeypatch, {})
+        fb, _ = self._fb()
+        with pytest.raises(RuntimeError, match="widened inputs"):
+            bridge.build_deepseek_v41_forward_metadata(fb, torch.zeros(5 + R))
+
+
+class TestRuntimeExpansion:
+    def _runtime(self, monkeypatch, expand, mode=EXTEND):
+        from atom.plugin.sglang.runtime import model_arch
+        from atom.plugin.sglang.runtime.forward_context import SGLangPluginRuntime
+
+        spec = model_arch.SGLangModelAdapterSpec(expand_forward_inputs=expand)
+        monkeypatch.setattr(
+            model_arch, "resolve_model_arch_spec", lambda config: ("X", spec)
+        )
+        return SGLangPluginRuntime(
+            atom_config=SimpleNamespace(hf_config=None),
+            forward_batch=SimpleNamespace(forward_mode=mode),
+            positions=torch.tensor([0, 1, 2]),
+            input_ids=torch.tensor([5, 6, 7]),
+            set_forward_context=False,
+        )
+
+    def test_widened_inputs_and_sglang_rows_out(self, monkeypatch):
+        seen = []
+
+        def expand(fb, ids, positions, embeds):
+            seen.append((ids.tolist(), positions.tolist(), embeds))
+            return (
+                torch.tensor([9, 9, 5, 6, 7]),
+                torch.tensor([8, 9, 10, 11, 12]),
+                torch.tensor([2, 3, 4]),
+            )
+
+        with self._runtime(monkeypatch, expand) as runtime:
+            assert runtime.input_ids.tolist() == [9, 9, 5, 6, 7]
+            assert runtime.positions.tolist() == [8, 9, 10, 11, 12]
+            hidden = torch.arange(10).view(5, 2)
+            assert runtime.trim_output(hidden).tolist() == [[4, 5], [6, 7], [8, 9]]
+            pair = runtime.trim_output((hidden, None))
+            assert pair[0].shape == (3, 2) and pair[1] is None
+            with pytest.raises(TypeError, match="widened forward"):
+                runtime.trim_output([hidden])
+        assert seen == [([5, 6, 7], [0, 1, 2], None)]
+
+    def test_forwards_the_hook_declines_are_untouched(self, monkeypatch):
+        with self._runtime(monkeypatch, lambda *args: None) as runtime:
+            assert runtime.input_ids.tolist() == [5, 6, 7]
+            hidden = torch.ones(3, 2)
+            assert runtime.trim_output(hidden) is hidden
+
+    def test_dummy_forwards_are_not_expanded(self, monkeypatch):
+        idle = _Mode("IDLE")
+
+        def expand(*args):
+            raise AssertionError("an IDLE forward was expanded")
+
+        with self._runtime(monkeypatch, expand, mode=idle) as runtime:
+            assert runtime.trim_output(torch.ones(1, 2)).shape == (0, 2)
+
+
+class TestFusedCarrier:
+    def test_init_new_carries_the_record_onto_an_extend(self):
+        fused = _fused([0], [1], ["a"], [0], [4])
+        batch = SimpleNamespace()
+        setattr(batch, FUSED_ATTR, fused)
+        fb = SimpleNamespace(forward_mode=EXTEND)
+        carry_fused_replay(batch, fb)
+        assert getattr(fb, FUSED_ATTR) is fused
+        # A batch with none (the side batch copy, any other step) adds none.
+        for none in (SimpleNamespace(), SimpleNamespace(**{FUSED_ATTR: None})):
+            fb = SimpleNamespace(forward_mode=EXTEND)
+            carry_fused_replay(none, fb)
+            assert getattr(fb, FUSED_ATTR, None) is None
+        with pytest.raises(NotImplementedError, match="rides on an EXTEND"):
+            carry_fused_replay(batch, SimpleNamespace(forward_mode=DECODE))
+
+    def test_the_record_lives_for_one_call(self):
+        fused = _fused([0], [1], ["a"], [0], [4])
+        batch = SimpleNamespace()
+        seen = []
+
+        def original(worker, batch, *args, **kwargs):
+            seen.append((getattr(batch, FUSED_ATTR), args, kwargs))
+            return "result"
+
+        out = run_with_fused_replay(original, "w", batch, fused, (1,), {"k": 2})
+        assert out == "result" and seen == [(fused, (1,), {"k": 2})]
+        assert getattr(batch, FUSED_ATTR) is None
+
+        def failing(worker, batch, *args, **kwargs):
+            raise RuntimeError("forward failed")
+
+        with pytest.raises(RuntimeError, match="forward failed"):
+            run_with_fused_replay(failing, "w", batch, fused, (), {})
+        assert getattr(batch, FUSED_ATTR) is None
+
+    def test_the_side_batch_carries_none(self, monkeypatch, radix_on):
+        world = _World(monkeypatch)
+        batch = world.batch([PAGE], [1])
+        setattr(batch, FUSED_ATTR, _fused([0], [1], ["q0"], [0], [4]))
+        run_v41_prefix_replay(world.worker, batch)
+        (side,) = world.sides
+        assert getattr(side, FUSED_ATTR) is None
+
+    def test_worker_seam_attaches_the_record_around_the_forward(
+        self, monkeypatch, radix_fused
+    ):
+        import types
+
+        calls, reports = [], []
+
+        class TpModelWorker:
+            def forward_batch_generation(self, batch=None, *args, **kwargs):
+                calls.append(getattr(batch, FUSED_ATTR, None))
+                return "result"
+
+        module = types.ModuleType("sglang.srt.managers.tp_worker")
+        module.TpModelWorker = TpModelWorker
+        monkeypatch.setitem(sys.modules, "sglang.srt.managers.tp_worker", module)
+        fused = _fused([0], [1], ["a"], [0], [4])
+
+        def plan(worker, batch, checks=None):
+            checks.append(SimpleNamespace(report=lambda: reports.append(calls[:])))
+            return fused
+
+        monkeypatch.setattr(radix, "run_v41_prefix_replay", plan)
+        radix._install_worker_seam()
+        radix._install_worker_seam()  # idempotent
+        batch = SimpleNamespace()
+        assert TpModelWorker().forward_batch_generation(batch) == "result"
+        # Set for the call, gone after it; debug checks report after it.
+        assert calls == [fused] and getattr(batch, FUSED_ATTR) is None
+        assert reports == [[fused]]
+        monkeypatch.setattr(radix, "run_v41_prefix_replay", lambda *a: None)
+        TpModelWorker().forward_batch_generation(batch)
+        assert calls == [fused, None]
+
+
+class TestFusedCache:
+    """ATOM's cache over a step in which one request's span starts below its
+    hit (the fused replay) beside a continuing request."""
+
+    P, START = 64, 32
+
+    def test_the_fused_span_resets_its_slot_and_resumes_past_the_hit(self):
+        from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
+
+        cache = _tiny_cache()
+        cache.state_bytes[1].fill_(77)
+        cache.cursor[1] = torch.tensor([1000, 1, 2, 3])
+        cache.state_bytes[2].fill_(55)
+        cache.cursor[2] = torch.tensor([40, 7, 8, 9])
+        length = self.P + 5 - self.START
+        step = cache.begin_step(
+            [
+                RequestSpan(9, self.START, 0, length, 1),
+                RequestSpan(8, 40, length, 6, 2),
+            ],
+            block_tables=[
+                np.arange(1, 4, dtype=np.int32),
+                np.arange(4, 6, dtype=np.int32),
+            ],
+            floors=np.asarray([self.START, 0], np.int32),
+            cached_until=np.zeros(2, np.int32),
+            start_histories=np.asarray([[4, 5, 6], [-1, -1, -1]], np.int64),
+        )
+        histories = cache.prepare_state(step)
+        # The hit's slot starts over at its floor with its seeded history; the
+        # continuation keeps its state and history.
+        assert histories.tolist() == [[4, 5, 6], [7, 8, 9]]
+        window = cache.state.view("window")
+        assert window[:, 1].count_nonzero() == 0
+        assert bool((window[:, 2] != 0).all())
+        cache.advance_cursor(step, histories)
+        assert cache.cursor[1, 0] == self.P + 5 and cache.cursor[2, 0] == 46
+
+
+@pytest.mark.parametrize("prefix,suffix", [(PAGE, 6), (3 * PAGE, 200)])
+def test_fused_compress_plans_write_only_from_the_hit(prefix, suffix):
+    """One span over ``[P - R, P + suffix)`` with ``write_from = P``: every
+    compressed group from the hit on is written, none below it."""
+    from atom.model_ops.v4_kernels import make_compress_plans
+    from atom.utils import CpuGpuBuffer
+
+    geo = _small_geometry()
+    lengths = np.asarray([R + suffix], dtype=np.int32)
+    ends = np.asarray([prefix + suffix], dtype=np.int32)
+
+    def plans(lengths, ends, write_from):
+        width = int(lengths.max()) + 1
+        buffers = {
+            ratio: {
+                name: CpuGpuBuffer(
+                    width, 4, dtype=torch.int32, device="cpu", pin_memory=False
+                )
+                for name in ("compress", "write")
+            }
+            for ratio, _ in geo.compress_ratios
+        }
+        return make_compress_plans(
+            lengths,
+            ends,
+            geo.compress_ratios,
+            plan_buffers=buffers,
+            extra_write=0,
+            write_from=write_from,
+        )
+
+    fused = plans(lengths, ends, np.asarray([prefix], dtype=np.int32))
+    # What an extend resuming at P (the side-forward path's main forward)
+    # compresses.
+    resumed = plans(
+        np.asarray([suffix], dtype=np.int32), ends, np.zeros(1, dtype=np.int32)
+    )
+    for ratio, plan in fused.items():
+        assert plan.num_compress == resumed[ratio].num_compress == suffix // ratio
+
+
+class TestHostRowsUnderRadix:
+    def _fake_tree(self, monkeypatch):
+        import types
+
+        class UnifiedRadixCache:
+            def checkpoint_into_tree(self, req, *, up_to, **kwargs):
+                if up_to < 0:
+                    raise RuntimeError("insert failed")
+                return up_to
+
+        module = types.ModuleType("sglang.srt.mem_cache.unified_radix_cache")
+        module.UnifiedRadixCache = UnifiedRadixCache
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.mem_cache.unified_radix_cache", module
+        )
+        return UnifiedRadixCache
+
+    def test_a_checkpoint_drops_its_slots_host_rows(self, monkeypatch, launch):
+        tree_cls = self._fake_tree(monkeypatch)
+        rows = [np.asarray([7, 3], np.int32), np.asarray([5], np.int32)]
+        bridge._HOST_ROWS.record([3, 4], ["a", "b"], rows)
+        # Radix on: host rows are off until every rewrite drops its copy.
+        assert not bridge.host_page_rows_supported()
+        radix._install_checkpoint_invalidation()
+        radix._install_checkpoint_invalidation()  # idempotent
+        assert bridge.host_page_rows_supported()
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        assert tree_cls().checkpoint_into_tree(req, up_to=512) == 512
+        assert bridge._HOST_ROWS.lookup([3], ["a"], [1]) is None
+        assert bridge._HOST_ROWS.lookup([4], ["b"], [1])[0].tolist() == [5]
+        # A failed insert may have rewritten part of the row: dropped too.
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=4))
+        with pytest.raises(RuntimeError, match="insert failed"):
+            tree_cls().checkpoint_into_tree(req, up_to=-1)
+        assert bridge._HOST_ROWS.lookup([4], ["b"], [1]) is None
+
+    def test_radix_off_keeps_host_rows(self, launch):
+        launch.bags["memory"].disable_radix_cache = True
+        assert bridge.host_page_rows_supported()
+
+
+def test_replay_layout_over_a_fused_step(req_to_token):
+    pytest.importorskip("aiter")
+    if not torch.cuda.is_available():
+        pytest.skip("aiter's arch probe needs a visible GPU")
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+    from tests.model_ops.engram.test_hash_bounds import build, tiny_config
+
+    mapping = build(tiny_config())
+    width = mapping.config.max_ngram_size - 1
+    fb = _extend_fb([2 * PAGE, 0], [5, 9], [1, 2])
+    setattr(
+        fb,
+        FUSED_ATTR,
+        _fused([0], [1], ["r0"], [2 * PAGE - R], [2 * PAGE], [[11, 12, 13][-width:]]),
+    )
+    batch = build_v41_scheduled_batch(fb, PAGE, history=width)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.engram = SimpleNamespace(mapping=mapping)
+    builder.geometry = SimpleNamespace(history_size=width)
+    builder.config = SimpleNamespace(image_token_id=None)
+    resumes, floors, cached, histories = builder._replay_layout(
+        batch.replaying, _spans(batch)
+    )
+    # The hit: nothing global below P, its window floored at P - R, its slot
+    # rebuilt; the cold row beside it untouched by the replay.
+    assert resumes.tolist() == [2 * PAGE, 0]
+    assert floors.tolist() == [2 * PAGE - R, 0]
+    assert cached.tolist() == [0, 0]
+    expected = mapping.advance_history(
+        None, mapping.compress_tokens(np.asarray([11, 12, 13][-width:], np.int64))
+    )[0]
+    assert histories[0].tolist() == np.asarray(expected).tolist()

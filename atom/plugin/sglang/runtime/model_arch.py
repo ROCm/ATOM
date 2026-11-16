@@ -69,6 +69,12 @@ class SGLangModelAdapterSpec:
     install_adapters: Callable[[Any], None] | None = None
     bind_cache_views: Callable[[Any, Any], None] | None = None
     build_forward_metadata: Callable[[Any, Any, Any], Any] | None = None
+    # (forward_batch, input_ids, positions, input_embeds) -> None, or the
+    # (input_ids, positions, output_rows) the ATOM model runs instead for this
+    # forward, ``output_rows`` being SGLang's rows of its output
+    # (`SGLangPluginRuntime`). For rows ATOM executes that SGLang's batch does
+    # not hold, such as DeepSeek-V4.1's fused radix replay.
+    expand_forward_inputs: Callable[[Any, Any, Any, Any], Any] | None = None
 
 
 def _build_kimi_k3_forward_metadata(
@@ -119,18 +125,25 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
         atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds the state below a prefix hit: on exactly when
-    # SGLang's radix cache is (`deepseek_v41_radix`, which it installs). Its
-    # side forward is prefill-only, so the decoder replay above computes all
-    # of its rows (`v41_extend_replays`).
+    # SGLang's radix cache is (`deepseek_v41_radix`, which it installs).
+    # Fused (default), the rows below a hit ride in the step's forward as one
+    # span from P - R, at least the window long, so the decoder replay above
+    # treats it as any span; in a side forward, which is prefill-only, it
+    # computes all of their rows (`v41_extend_replays`).
     radix = sglang_radix_cache_enabled()
     atom_config.enable_encoder_swa_bounded_replay = radix
-    radix_rows = None
+    radix_rows = radix_mode = None
     if radix:
         from atom.plugin.sglang.deepseek_v41_radix import install_deepseek_v41_radix
 
-        radix_rows = install_deepseek_v41_radix(
+        radix_rows, radix_mode = install_deepseek_v41_radix(
             window=getattr(atom_config.hf_config, "sliding_window", None)
         )
+        if radix_mode == "fused":
+            # A step's rows plus its hits' replay rows: SGLang charges each
+            # hit's R to the budget after admitting it, so a step can run R
+            # rows past its chunk.
+            atom_config.max_num_batched_tokens += radix_rows
     # The remap every other adapter gets from prepare_model, as native's
     # ModelRunner and the vLLM wrapper apply it. (gfx942's FP4PTPC routed-
     # expert ptpc_fp8 default is already in the quant config: it is set
@@ -144,12 +157,13 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     logger.info(
         "DeepSeek-V4.1 SGLang config: kv_cache_dtype=%s index_cache_dtype=%s "
         "online_quant_config=%s decoder_replay=%s radix_replay_rows=%s "
-        "max_num_seqs=%d max_num_batched_tokens=%d",
+        "radix_replay_mode=%s max_num_seqs=%d max_num_batched_tokens=%d",
         atom_config.kv_cache_dtype,
         atom_config.index_cache_dtype,
         atom_config.online_quant_config,
         atom_config.enable_decoder_swa_bounded_replay,
         radix_rows,
+        radix_mode,
         atom_config.max_num_seqs,
         atom_config.max_num_batched_tokens,
     )
@@ -159,6 +173,19 @@ def _install_deepseek_v41_adapters(model: Any) -> None:
     from atom.plugin.sglang.deepseek_v41_bridge import log_deepseek_v41_runtime_once
 
     log_deepseek_v41_runtime_once(model)
+
+
+def _expand_deepseek_v41_forward_inputs(
+    forward_batch: Any, input_ids: Any, positions: Any, input_embeds: Any
+) -> Any:
+    from atom.plugin.sglang.deepseek_v41_radix import (
+        FUSED_ATTR,
+        expand_v41_forward_inputs,
+    )
+
+    if getattr(forward_batch, FUSED_ATTR, None) is None:
+        return None
+    return expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds)
 
 
 def _build_deepseek_v41_forward_metadata(
@@ -633,6 +660,7 @@ MODEL_ADAPTER_SPECS = {
         prepare_config=_prepare_deepseek_v41_config,
         install_adapters=_install_deepseek_v41_adapters,
         build_forward_metadata=_build_deepseek_v41_forward_metadata,
+        expand_forward_inputs=_expand_deepseek_v41_forward_inputs,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,

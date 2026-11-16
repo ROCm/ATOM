@@ -474,8 +474,12 @@ class TestLaunchContract:
         sglang_launch.bags["memory"].disable_radix_cache = False
         sglang_launch.args.disable_overlap_schedule = True
         refuse_unsupported_sglang_features()
+        # Overlap scheduling runs beside it (the radix seam drops a slot's
+        # host rows on every checkpoint).
         sglang_launch.args.disable_overlap_schedule = False
-        with pytest.raises(ValueError, match="overlap scheduling with radix cache"):
+        refuse_unsupported_sglang_features()
+        sglang_launch.args.enable_mixed_chunk = True
+        with pytest.raises(ValueError, match="mixed chunk with radix cache"):
             refuse_unsupported_sglang_features()
 
     def test_every_refusal_is_reported_at_once(self, sglang_launch):

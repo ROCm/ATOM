@@ -112,6 +112,21 @@ def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
     return hidden_states
 
 
+def _select_rows_for_output(hidden_states, rows: torch.Tensor):
+    """SGLang's ``rows`` of an output computed over widened inputs."""
+    if torch.is_tensor(hidden_states):
+        return hidden_states.index_select(0, rows)
+    if isinstance(hidden_states, tuple):
+        return tuple(
+            tensor.index_select(0, rows) if torch.is_tensor(tensor) else tensor
+            for tensor in hidden_states
+        )
+    raise TypeError(
+        "Cannot map a widened forward's output of type "
+        f"{type(hidden_states).__name__} back to SGLang's rows"
+    )
+
+
 def _resolve_running_tokens_per_dp_rank(
     atom_config: Any,
     forward_batch: ForwardBatch,
@@ -864,10 +879,14 @@ class SGLangPluginRuntime:
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
+    # SGLang's rows of the ATOM model's output, when the adapter widened this
+    # forward's inputs (`SGLangModelAdapterSpec.expand_forward_inputs`).
+    _output_rows: torch.Tensor | None = field(init=False, default=None)
 
     def __enter__(self) -> SGLangPluginRuntime:  # noqa: PYI034
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
+        self._output_rows = None
 
         if self._is_dummy_run:
             (
@@ -881,6 +900,8 @@ class SGLangPluginRuntime:
                 self.input_embeds,
                 self.forward_batch,
             )
+        else:
+            self._expand_inputs()
 
         self._exit_stack = ExitStack()
         self._exit_stack.enter_context(bind_current_forward_batch(self.forward_batch))
@@ -897,9 +918,28 @@ class SGLangPluginRuntime:
     def __exit__(self, exc_type, exc, tb) -> None:
         self._exit_stack.close()
 
+    def _expand_inputs(self) -> None:
+        """Run the adapter's ``expand_forward_inputs``: rows ATOM executes
+        that SGLang's batch does not hold, derived from this forward only.
+        ``trim_output`` maps the output back to SGLang's rows."""
+        from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
+
+        _, spec = resolve_model_arch_spec(getattr(self.atom_config, "hf_config", None))
+        expand = spec.expand_forward_inputs
+        if expand is None:
+            return
+        expanded = expand(
+            self.forward_batch, self.input_ids, self.positions, self.input_embeds
+        )
+        if expanded is None:
+            return
+        self.input_ids, self.positions, self._output_rows = expanded
+
     def trim_output(self, hidden_states):
         """Map ATOM-visible outputs back to SGLang-visible token count."""
 
         if self._is_dummy_run:
             return _trim_hidden_states_for_output(hidden_states, 0)
+        if self._output_rows is not None:
+            return _select_rows_for_output(hidden_states, self._output_rows)
         return hidden_states
