@@ -1116,8 +1116,8 @@ class TestPrefillScoreAgainstTheDefinition:
         assert not torch.allclose(moved[live], want[live], rtol=2e-2, atol=2e-2)
 
 
-def test_the_vllm_pool_allocator_refuses_bf16_by_name():
-    """The refusal that matters most: it happens before anything is allocated.
+def test_the_native_kv_pool_allocator_refuses_bf16_by_name():
+    """The native refusal that matters most: it happens before anything is allocated.
 
     `_index_cache_spec` runs when the KV pool is sized. Without this the same
     configuration starts, serves a prefill and dies at the first decode inside
@@ -1142,10 +1142,51 @@ def test_the_vllm_pool_allocator_refuses_bf16_by_name():
         )
         return b._index_cache_spec(128)
 
-    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+    with pytest.raises(ValueError, match="--kv_cache_dtype fp8") as native:
         spec("bf16")
+    assert "--index-cache-dtype fp8" in str(
+        native.value
+    )  # the native server's own flag
     # fp8 still resolves, so the guard is not refusing everything
     assert spec("fp8").view_dtype == aiter.dtypes.fp8
+
+
+def _vllm_index_cache_torch_dtype():
+    """The vLLM plugin's `_index_cache_torch_dtype`, from its source: that module imports
+    vLLM at the top and vLLM is not installed where this file runs, so the function is
+    compiled out of the file on its own (it needs only `torch` and `aiter.dtypes`)."""
+    import ast
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "atom/plugin/vllm/attention/minimax_m3_attnetion.py"
+    )
+    fn = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_index_cache_torch_dtype"
+    )
+    ns = {"torch": torch, "dtypes": aiter.dtypes}
+    exec(compile(ast.Module([fn], []), str(path), "exec"), ns)  # noqa: S102
+    return ns["_index_cache_torch_dtype"]
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "bf16", "bfloat16"])
+def test_the_vllm_plugin_refuses_a_non_fp8_kv_cache_by_name(kv_cache_dtype):
+    """vLLM's `--kv-cache-dtype auto` (what the shipped recipe passed) and `bf16` reach
+    `_index_cache_torch_dtype` at layer construction, and nothing else guards them: the
+    refusal names vLLM's own flag, not the native server's."""
+    with pytest.raises(ValueError, match="--kv-cache-dtype fp8") as refused:
+        _vllm_index_cache_torch_dtype()(kv_cache_dtype)
+    assert "--index-cache-dtype" not in str(refused.value)
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
+def test_the_vllm_plugin_passes_an_fp8_kv_cache_through(kv_cache_dtype):
+    # a real fp8 dtype, not the torch.uint8 vLLM's own table maps `fp8` to; and the
+    # refusal above is not refusing everything
+    assert _vllm_index_cache_torch_dtype()(kv_cache_dtype) == aiter.dtypes.fp8
 
 
 def test_the_sglang_pool_refuses_bf16_by_name():
