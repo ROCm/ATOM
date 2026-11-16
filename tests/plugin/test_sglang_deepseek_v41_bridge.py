@@ -1173,6 +1173,45 @@ class TestForwardMetadata:
         )
         _staged(monkeypatch, builder, fb, torch.arange(200))
         assert builder.batch.decoder_replays is True
+        assert builder.batch.is_final_chunk is None  # no per-request rest
+
+    def test_extend_marks_the_chunk_sglang_continues(self, monkeypatch, req_to_token):
+        """A middle chunk with a window or more of its prompt left finishes
+        nothing (`v41_chunk_finals`); one with less keeps its tail."""
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        before = dict(bridge.V41_DSPARK_COUNTERS)
+        builder = _RecordingBuilder(positions=torch.arange(300))
+        builder._decoder_replays = True
+        builder.geometry = SimpleNamespace(window_size=128, speculative_tokens=0)
+
+        def extend(rest):
+            fb = _forward_batch(
+                ForwardMode.EXTEND,
+                req_pool_indices=[1, 2],
+                seq_lens=[PAGE + 200, 100],
+                extend_seq_lens=[200, 100],
+                extend_prefix_lens=[PAGE, 0],
+            )
+            setattr(fb, bridge.PROMPT_REST_ATTR, rest)
+            _staged(monkeypatch, builder, fb, torch.arange(300))
+            return builder.batch.is_final_chunk
+
+        assert extend((0, 5000)) == (True, False)
+        assert extend((0, 127)) is None
+        assert extend((0, 0)) is None
+        assert extend((9000, 5000)) == (False, False)
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        assert extend((9000, 5000)) is None
+        counters = bridge.V41_DSPARK_COUNTERS
+        assert (
+            counters["prefill_chunk_nonfinal"] - before.get("prefill_chunk_nonfinal", 0)
+            == 1
+        )
+        assert (
+            counters["prefill_decoder_skipped"]
+            - before.get("prefill_decoder_skipped", 0)
+            == 1
+        )
 
     def test_no_verdict_without_replay(self, monkeypatch, req_to_token):
         builder = _RecordingBuilder(positions=torch.arange(2))
@@ -2468,8 +2507,17 @@ def test_host_mirror_patch_carries_v41_decode_and_verify_rows(real_sglang, monke
     assert verify.atom_v41_req_pool_indices_cpu is slots
     extend = ForwardBatch.init_new(batch(ForwardMode.EXTEND), v41)
     assert not hasattr(extend, "atom_v41_req_pool_indices_cpu")
+    # An EXTEND carries each request's prompt rows left (`v41_chunk_finals`).
+    assert getattr(extend, bridge.PROMPT_REST_ATTR) is None  # no request list
+    cont = SimpleNamespace(full_untruncated_fill_ids=[0] * 20000, extend_end=8192)
+    done = SimpleNamespace(full_untruncated_fill_ids=[0] * 300, extend_end=300)
+    chunked = batch(ForwardMode.EXTEND)
+    chunked.reqs, chunked.chunked_req = [done, cont], cont
+    rest = ForwardBatch.init_new(chunked, v41)
+    assert getattr(rest, bridge.PROMPT_REST_ATTR) == (0, 11808)
     other = ForwardBatch.init_new(batch(ForwardMode.DECODE), v4)
     assert not hasattr(other, "atom_v41_req_pool_indices_cpu")
+    assert not hasattr(ForwardBatch.init_new(chunked, v4), bridge.PROMPT_REST_ATTR)
 
     view = runner_module.build_replay_fb_view(forward_batch=decode, bs=2)
     assert view.atom_v41_req_pool_indices_cpu is slots
@@ -2713,6 +2761,135 @@ def _replays(lengths, prefix, window=128, **fields):
     return bridge.v41_extend_replays(fb, batch, window)
 
 
+def _req(prompt, end):
+    return SimpleNamespace(full_untruncated_fill_ids=[0] * prompt, extend_end=end)
+
+
+class TestChunkFinals:
+    """A chunk SGLang continues with at least a window of its prompt left runs
+    none of the decoder, as native's middle chunk (`v41_chunk_finals`)."""
+
+    def test_the_eager_runners_view_carries_the_prompt_rest(self, monkeypatch):
+        import dataclasses
+        import types
+
+        @dataclasses.dataclass
+        class ForwardBatch:
+            forward_mode: object
+            input_ids: object = None
+
+        class EagerRunner:
+            def load_batch(self, forward_batch, pp_proxy_tensors=None, **kwargs):
+                # SGLang's view over its static buffers: fields only.
+                return dataclasses.replace(forward_batch, input_ids="static")
+
+        module = types.ModuleType("sglang.srt.model_executor.runner.eager_runner")
+        module.EagerRunner = EagerRunner
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.model_executor.runner.eager_runner", module
+        )
+        bridge._install_prompt_rest_view_carrier()
+        bridge._install_prompt_rest_view_carrier()  # idempotent
+        fb = ForwardBatch("EXTEND")
+        setattr(fb, bridge.PROMPT_REST_ATTR, (0, 9000))
+        view = EagerRunner().load_batch(fb)
+        assert view is not fb and view.input_ids == "static"
+        assert getattr(view, bridge.PROMPT_REST_ATTR) == (0, 9000)
+        other = EagerRunner().load_batch(ForwardBatch("DECODE"))
+        assert getattr(other, bridge.PROMPT_REST_ATTR, None) is None
+
+    def test_prompt_rest_is_the_continued_request_rows_left(self):
+        a, b = _req(300, 300), _req(29000, 8192)
+        batch = SimpleNamespace(reqs=[a, b], chunked_req=b)
+        assert bridge.v41_prompt_rest(batch) == (0, 20808)
+        # No continued request: every chunk finishes its prompt.
+        assert bridge.v41_prompt_rest(SimpleNamespace(reqs=[a, b])) == (0, 0)
+        # A parked chunked request (not in this batch) marks nobody.
+        parked = _req(29000, 8192)
+        assert bridge.v41_prompt_rest(
+            SimpleNamespace(reqs=[a, b], chunked_req=parked)
+        ) == (0, 0)
+        # Fields SGLang does not set count as finishing.
+        odd = SimpleNamespace(extend_end=None, full_untruncated_fill_ids=[0])
+        assert bridge.v41_prompt_rest(SimpleNamespace(reqs=[odd], chunked_req=odd)) == (
+            0,
+        )
+        assert bridge.v41_prompt_rest(SimpleNamespace(reqs=[])) is None
+        assert bridge.v41_prompt_rest(SimpleNamespace()) is None
+
+    def _finals(self, rest, count=None, window=128):
+        fb = SimpleNamespace()
+        if rest is not None:
+            setattr(fb, bridge.PROMPT_REST_ATTR, rest)
+        n = len(rest) if count is None else count
+        batch = SimpleNamespace(num_scheduled_tokens=np.ones(n, np.int32))
+        return bridge.v41_chunk_finals(fb, batch, window)
+
+    def test_middle_chunks_with_a_window_left_finish_nothing(self, monkeypatch):
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        assert self._finals((0, 20808)) == (True, False)
+        assert self._finals((8192,)) == (False,)
+        assert self._finals((128,)) == (False,)  # exactly a window left
+
+    def test_a_chunk_short_of_a_window_left_keeps_its_tail(self, monkeypatch):
+        """Its next chunk is shorter than the window and reads the decoder
+        rings this chunk's tail writes (`v41_extend_replays`)."""
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        assert self._finals((127,)) is None
+        assert self._finals((0, 1)) is None
+        assert self._finals((0, 0)) is None
+
+    def test_unknown_rest_or_kill_switch_finishes_every_request(self, monkeypatch):
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        assert self._finals(None, count=2) is None
+        assert self._finals((8192,), count=2) is None  # misaligned
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        assert self._finals((0, 20808)) is None
+
+    @staticmethod
+    def _forward(finals, mode=None, dp=None):
+        step = SimpleNamespace(request_finals=np.asarray(finals, np.bool_))
+        return SimpleNamespace(
+            context=SimpleNamespace(forward_mode=mode),
+            dp_metadata=dp,
+            attn_metadata=SimpleNamespace(step=step),
+        )
+
+    def test_step_finishing_no_prompt(self):
+        assert bridge.v41_step_finishes_no_prompt(self._forward([False]))
+        assert bridge.v41_step_finishes_no_prompt(self._forward([False, False]))
+        assert not bridge.v41_step_finishes_no_prompt(self._forward([True, False]))
+        assert not bridge.v41_step_finishes_no_prompt(self._forward([]))
+        # Native's context (a forward mode) and DP peers keep core's verdict.
+        assert not bridge.v41_step_finishes_no_prompt(
+            self._forward([False], mode="mode")
+        )
+        assert not bridge.v41_step_finishes_no_prompt(self._forward([False], dp="dp"))
+        assert not bridge.v41_step_finishes_no_prompt(SimpleNamespace(context=None))
+
+    def test_decoder_gate_wraps_core_decoder_runs(self, monkeypatch):
+        runtime = pytest.importorskip("atom.models.deepseek_v41.runtime")
+        calls = []
+
+        def core(forward):
+            calls.append(forward)
+            return True
+
+        monkeypatch.setattr(runtime, "decoder_runs", core)
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        assert not bridge.install_v41_chunk_decoder_gate()
+        assert runtime.decoder_runs is core
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV)
+        assert bridge.install_v41_chunk_decoder_gate()
+        gate = runtime.decoder_runs
+        assert bridge.install_v41_chunk_decoder_gate()  # idempotent
+        assert runtime.decoder_runs is gate
+        assert gate(self._forward([False])) is False
+        assert calls == []
+        final = self._forward([True, False])
+        assert gate(final) is True and calls == [final]
+
+
 class TestExtendReplays:
     def test_fresh_and_long_resumed_prefills_replay(self):
         assert _replays([8192], [0])
@@ -2752,3 +2929,285 @@ class TestExtendReplays:
             [4096], [0], return_logprob=True, extend_logprob_start_lens_cpu=[4096]
         )
         assert not _replays([4096], [0], return_logprob=True)
+
+
+def _extend_batch(spans, *, replays, finals=None, replaying=None, replay_rows=None):
+    """An EXTEND ScheduledBatch over ``spans`` = [(slot, prefix, length)]."""
+    slots = [s for s, _, _ in spans]
+    lengths = np.asarray([n for _, _, n in spans], np.int64)
+    ends = np.asarray([p + n for _, p, n in spans], np.int64)
+    rows = np.zeros(len(spans), np.int64) if replay_rows is None else replay_rows
+    return SimpleNamespace(
+        state_slots_committed=slots,
+        num_scheduled_tokens=(lengths + rows).astype(np.int32),
+        context_lens=ends,
+        replay_rows=np.asarray(rows, np.int64),
+        decoder_replays=replays,
+        is_final_chunk=finals,
+        replaying=replaying or {},
+    )
+
+
+class TestDecoderFloors:
+    """A step computing every row after a chunk that skipped the decoder
+    (`v41_chunk_finals`) starts that request's decoder window where its
+    rings hold rows (`v41_decoder_floors`), never below."""
+
+    W = 128
+
+    def _step(self, rows_from, batch):
+        floors = bridge.v41_decoder_floors(batch, rows_from, self.W)
+        bridge.v41_note_decoder_rows(batch, rows_from, self.W)
+        return None if floors is None else floors.tolist()
+
+    def test_skipped_chunk_then_a_logprob_step(self):
+        """X (slot 1) skips its decoder on chunk [0, 8192); the next step
+        carries another request's input logprobs, so it computes every row:
+        X's decoder window starts at 8192, Z (fresh) at 0."""
+        rows_from = np.zeros(8, np.int64)
+        assert (
+            self._step(
+                rows_from, _extend_batch([(1, 0, 8192)], replays=True, finals=(False,))
+            )
+            is None
+        )
+        assert rows_from[1] == 8192
+        step2 = _extend_batch([(1, 8192, 300), (2, 0, 200)], replays=False)
+        assert self._step(rows_from, step2) == [8192, 0]
+        # Rows written from the floor on stay where they were.
+        assert rows_from[1] == 8192 and rows_from[2] == 0
+        # A window above the floor, its rings hold the window again; a
+        # replaying finishing chunk writes its tail.
+        assert (
+            self._step(rows_from, _extend_batch([(1, 8492, 50)], replays=False)) is None
+        )
+        assert (
+            self._step(rows_from, _extend_batch([(1, 8542, 300)], replays=True)) is None
+        )
+        assert rows_from[1] == 8842 - self.W
+
+    def test_short_continuations_after_a_skip_stay_floored(self):
+        """SGLang may cut a continuation below the window (its memory
+        budget): such a chunk computes every row, from the floor, and so does
+        the next one while it still reaches below the floor."""
+        rows_from = np.zeros(4, np.int64)
+        self._step(
+            rows_from, _extend_batch([(1, 0, 8192)], replays=True, finals=(False,))
+        )
+        assert self._step(rows_from, _extend_batch([(1, 8192, 50)], replays=False)) == [
+            8192
+        ]
+        assert self._step(rows_from, _extend_batch([(1, 8242, 50)], replays=False)) == [
+            8192
+        ]
+        assert self._step(
+            rows_from, _extend_batch([(1, 8292, 200)], replays=False)
+        ) == [8192]
+        assert (
+            self._step(rows_from, _extend_batch([(1, 8492, 20)], replays=False)) is None
+        )
+
+    def test_rings_a_tail_wrote_are_read_as_before(self):
+        """The kill switch's (and a chunk short of a window's) tail writes
+        ``[e - W, e)``: the next step reads it, unfloored."""
+        rows_from = np.zeros(8, np.int64)
+        self._step(rows_from, _extend_batch([(1, 0, 8192)], replays=True))
+        assert rows_from[1] == 8192 - self.W
+        assert (
+            self._step(rows_from, _extend_batch([(1, 8192, 60)], replays=False)) is None
+        )
+        # A step that computed every row leaves every row.
+        rows_from[3] = 0
+        self._step(rows_from, _extend_batch([(3, 0, 4096)], replays=False))
+        assert (
+            self._step(rows_from, _extend_batch([(3, 4096, 10)], replays=False)) is None
+        )
+        # A replaying step that finishes no prompt leaves nothing below its end.
+        self._step(
+            rows_from, _extend_batch([(3, 4106, 8192)], replays=True, finals=(False,))
+        )
+        assert rows_from[3] == 4106 + 8192
+
+    def test_radix_side_forward_and_short_main_extend(self):
+        """A side forward rebuilds ``[P - R, P)`` every row (prefill-only, no
+        replay): its main extend shorter than the window reads those rows,
+        unfloored, while a request that skipped its last chunk in the same
+        step is floored; a fused hit brings its own floor."""
+        from atom.model_engine.sequence import Replay
+
+        P, R = 2048, 128
+        rows_from = np.full(8, 99999, np.int64)  # a previous tenant's
+        rows_from[1] = 0
+        self._step(
+            rows_from, _extend_batch([(1, 0, 8192)], replays=True, finals=(False,))
+        )
+        side = _extend_batch(
+            [(4, P - R, R)],
+            replays=False,
+            replaying={0: Replay(until=P, rebuilds=True, history_ids=(), start=P - R)},
+        )
+        assert self._step(rows_from, side) is None
+        assert rows_from[4] == P - R
+        main = _extend_batch([(4, P, 50), (1, 8192, 300)], replays=False)
+        assert self._step(rows_from, main) == [0, 8192]
+        # Fused: the hit's span [P - R, end) in this forward, its own floor.
+        rows_from[5] = 99999
+        fused = _extend_batch(
+            [(5, P, 50)],
+            replays=False,
+            replay_rows=np.asarray([R]),
+            replaying={0: Replay(until=P, rebuilds=True, history_ids=(), start=P - R)},
+        )
+        assert self._step(rows_from, fused) is None
+        assert rows_from[5] == P - R
+        # A fresh request reads nothing below 0, whatever the slot held.
+        rows_from[6] = 99999
+        assert self._step(rows_from, _extend_batch([(6, 0, 10)], replays=False)) is None
+        assert rows_from[6] == 0
+
+    def test_untracked_or_replaying_steps_floor_nothing(self):
+        batch = _extend_batch([(1, 8192, 300)], replays=False)
+        assert bridge.v41_decoder_floors(batch, None, self.W) is None
+        rows_from = np.full(4, 8192, np.int64)
+        replay = _extend_batch([(1, 8192, 300)], replays=True)
+        assert bridge.v41_decoder_floors(replay, rows_from, self.W) is None
+        # A slot outside the request rows (a capture slot) is left alone.
+        outside = _extend_batch([(9, 8192, 300)], replays=False)
+        assert bridge.v41_decoder_floors(outside, rows_from, self.W) is None
+        bridge.v41_note_decoder_rows(outside, rows_from, self.W)
+
+    def test_kill_switch_tracks_nothing(self, monkeypatch):
+        pool = SimpleNamespace(decoder_rows_from=np.zeros(4, np.int64))
+        monkeypatch.setattr(bridge, "_current_token_pool", lambda: pool)
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        assert bridge._decoder_rows_from() is pool.decoder_rows_from
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        assert bridge._decoder_rows_from() is None
+
+    def test_staged_logprob_step_after_a_skipped_chunk(self, monkeypatch, req_to_token):
+        """Through the EXTEND staging: the chunk is skipped, the next step's
+        logprob request turns replay off, and the continued request carries
+        its decoder floor, eager (no prefill token graph)."""
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV, raising=False)
+        pool = SimpleNamespace(decoder_rows_from=np.zeros(5, np.int64))
+        monkeypatch.setattr(bridge, "_current_token_pool", lambda: pool)
+        monkeypatch.setattr(
+            bridge, "prefill_token_graph_bucket", lambda tokens, **_: 1024
+        )
+        monkeypatch.setattr(bridge, "_PREFILL_GRAPHS", bridge._PrefillTokenGraphs())
+        before = dict(bridge.V41_DSPARK_COUNTERS)
+
+        def run():
+            builder = _RecordingBuilder(positions=torch.arange(1024))
+            builder._decoder_replays = True
+            builder.geometry = SimpleNamespace(window_size=128, speculative_tokens=0)
+            first = _forward_batch(
+                ForwardMode.EXTEND,
+                req_pool_indices=[3],
+                seq_lens=[512],
+                extend_seq_lens=[512],
+                extend_prefix_lens=[0],
+            )
+            setattr(first, bridge.PROMPT_REST_ATTR, (300,))
+            _staged(monkeypatch, builder, first, torch.arange(512))
+            first_finals = builder.batch.is_final_chunk
+            second = _forward_batch(
+                ForwardMode.EXTEND,
+                req_pool_indices=[3, 2],
+                seq_lens=[812, 100],
+                extend_seq_lens=[300, 100],
+                extend_prefix_lens=[512, 0],
+            )
+            second.return_logprob = True
+            second.extend_logprob_start_lens_cpu = [300, 0]
+            setattr(second, bridge.PROMPT_REST_ATTR, (0, 0))
+            metadata = _staged(monkeypatch, builder, second, torch.arange(400))
+            return first_finals, builder, metadata
+
+        finals, builder, metadata = run()
+        assert finals == (False,)
+        assert builder.batch.decoder_replays is False
+        floors = getattr(metadata, bridge.DECODER_FLOORS_ATTR)
+        assert floors.tolist() == [512, 0] and floors.dtype == torch.int32
+        assert builder.calls[-4] == ("prefill", 2, 400)  # eager, unpadded
+        assert pool.decoder_rows_from[3] == 512 and pool.decoder_rows_from[2] == 0
+        counters = bridge.V41_DSPARK_COUNTERS
+        assert (
+            counters["prefill_decoder_floored"]
+            - before.get("prefill_decoder_floored", 0)
+            == 1
+        )
+        # Kill switch: the chunk keeps its tail, nothing is floored.
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        pool.decoder_rows_from[:] = 0
+        finals, builder, metadata = run()
+        assert finals is None
+        assert getattr(metadata, bridge.DECODER_FLOORS_ATTR, None) is None
+        assert builder.calls[-4] == ("prefill", 2, 1024)  # the token graph
+
+    def test_logprob_request_keeps_its_chunk_tail(self):
+        """A continued request asking input logprobs of a later prompt row
+        counts as finishing each chunk: the chunk holding that row computes
+        every row and reads the tail this one writes, as the kill switch."""
+
+        def req(start, asks=True):
+            r = _req(9000, 8192)
+            r.return_logprob, r.logprob_start_len = asks, start
+            return SimpleNamespace(reqs=[r], chunked_req=r)
+
+        assert bridge.v41_prompt_rest(req(8950)) == (0,)
+        assert bridge.v41_prompt_rest(req(0)) == (0,)
+        # Output logprobs only (-1), past the prompt, or none asked.
+        assert bridge.v41_prompt_rest(req(-1)) == (808,)
+        assert bridge.v41_prompt_rest(req(9000)) == (808,)
+        assert bridge.v41_prompt_rest(req(0, asks=False)) == (808,)
+
+    def test_floor_gate_runs_the_decoder_on_the_floors(self, monkeypatch):
+        runtime = pytest.importorskip("atom.models.deepseek_v41.runtime")
+        seen = []
+        zeros = torch.zeros(2, dtype=torch.int32)
+
+        def core(forward, stages, first, middle, last):
+            step = forward.attn_metadata.step
+            seen.append((step.swa_replay_start, dict(step.indptrs)))
+            step.indptrs = {"ratio": "decoder's"}
+            return "hidden"
+
+        monkeypatch.setattr(runtime, "run_decoder_stages", core)
+        monkeypatch.setenv(bridge.V41_CHUNK_FINALS_ENV, "0")
+        assert not bridge.install_v41_decoder_floor_gate()
+        assert runtime.run_decoder_stages is core
+        monkeypatch.delenv(bridge.V41_CHUNK_FINALS_ENV)
+        assert bridge.install_v41_decoder_floor_gate()
+        gate = runtime.run_decoder_stages
+        assert bridge.install_v41_decoder_floor_gate()  # idempotent
+        assert runtime.run_decoder_stages is gate
+
+        def forward(floors, decode=False):
+            step = SimpleNamespace(
+                swa_replay_start=zeros, indptrs={"ratio": "encoder's"}, decode=decode
+            )
+            metadata = SimpleNamespace(step=step)
+            if floors is not None:
+                setattr(metadata, bridge.DECODER_FLOORS_ATTR, floors)
+            return SimpleNamespace(attn_metadata=metadata), step
+
+        floors = torch.tensor([512, 0], dtype=torch.int32)
+        fwd, step = forward(floors)
+        assert gate(fwd, None, None, None, None) == "hidden"
+        assert seen[-1][0] is floors and seen[-1][1] == {}
+        assert step.swa_replay_start is zeros and step.indptrs == {}
+        for fwd, step in (forward(None), forward(floors, decode=True)):
+            gate(fwd, None, None, None, None)
+            assert seen[-1] == (zeros, {"ratio": "encoder's"})
+            assert step.indptrs == {"ratio": "decoder's"}
+
+    def test_publish_takes_the_step_floor_too(self):
+        step = SimpleNamespace(
+            request_floors=np.asarray([0, 1920, 0], np.int32),
+            positions=torch.zeros(3),
+        )
+        metadata = SimpleNamespace(step=step)
+        bridge.publish_v41_decoder_floors(metadata, np.asarray([512, 0, 0]))
+        floors = getattr(metadata, bridge.DECODER_FLOORS_ATTR)
+        assert floors.tolist() == [512, 1920, 0] and floors.dtype == torch.int32

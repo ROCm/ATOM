@@ -1404,6 +1404,13 @@ def _make_proxy_pool_cls():
             # extend guard; the generation SGLang bumps on every row allocation
             # is how a new tenant is told from a chunked continuation.
             self.state_gen = np.zeros(self.num_req_slots, dtype=np.int64)
+            # Per request-row STATE slot, the lowest position its decoder
+            # (layers 20-39) rings hold a row at, as the last EXTEND on it
+            # left them: a chunk that skipped the decoder wrote none below
+            # its end. Written and read only by the EXTEND staging
+            # (`v41_note_decoder_rows`, `v41_decoder_floors`); every new
+            # tenant's first EXTEND starts at 0 or replays its own floor.
+            self.decoder_rows_from = np.zeros(self.num_req_slots, dtype=np.int64)
             total_bytes = _arena_bytes(geometry, self.num_pages, self.num_slots)
             self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
             # Reported by /get_internal_state and the scheduler metrics, in GiB.
@@ -1760,6 +1767,9 @@ def _install_host_mirror_patch() -> None:
     V4.1 DECODE and TARGET_VERIFY batches only (DSpark's verify is built from
     the ScheduleBatch by ``prepare_for_verify``), so
     `build_v41_graph_replay_batch` can stage without reading the device back.
+    A V4.1 EXTEND carries each request's prompt rows left after its chunk
+    (``PROMPT_REST_ATTR``, `v41_prompt_rest`), which ``ForwardBatch`` does
+    not say either.
     """
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -1776,11 +1786,17 @@ def _install_host_mirror_patch() -> None:
                 forward_batch.atom_v41_req_pool_indices_cpu = getattr(
                     batch, "req_pool_indices_cpu", None
                 )
+            elif getattr(mode, "name", None) == "EXTEND" and _is_v41_runner(
+                model_runner
+            ):
+                # Which request this chunk leaves unfinished (`v41_chunk_finals`).
+                setattr(forward_batch, PROMPT_REST_ATTR, v41_prompt_rest(batch))
             return forward_batch
 
         ForwardBatch.init_new = classmethod(init_new)
         ForwardBatch._atom_v41_host_mirror_patched = True
 
+    _install_prompt_rest_view_carrier()
     try:
         from sglang.srt.model_executor.runner import decode_cuda_graph_runner
     except Exception:  # noqa: BLE001 - graphs are optional
@@ -1801,6 +1817,36 @@ def _install_host_mirror_patch() -> None:
 
     build_replay_fb_view._atom_v41_patched = True
     decode_cuda_graph_runner.build_replay_fb_view = build_replay_fb_view
+
+
+def carry_prompt_rest_view(forward_batch, view) -> None:
+    """``EagerRunner.load_batch``'s addition: the view it hands the model
+    (``dataclasses.replace`` of the ForwardBatch over its static input
+    buffers, which keeps dataclass fields only) carries the EXTEND's
+    per-request prompt rows left (``PROMPT_REST_ATTR``)."""
+    rest = getattr(forward_batch, PROMPT_REST_ATTR, None)
+    if rest is None or view is forward_batch:
+        return
+    setattr(view, PROMPT_REST_ATTR, rest)
+
+
+def _install_prompt_rest_view_carrier() -> None:
+    try:
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+    except Exception:  # noqa: BLE001 - no eager runner, no view to carry to
+        return
+    original = EagerRunner.load_batch
+    if getattr(original, "_atom_v41_prompt_rest_patched", False):
+        return
+
+    @wraps(original)
+    def load_batch(self, forward_batch, *args, **kwargs):
+        view = original(self, forward_batch, *args, **kwargs)
+        carry_prompt_rest_view(forward_batch, view)
+        return view
+
+    load_batch._atom_v41_prompt_rest_patched = True
+    EagerRunner.load_batch = load_batch
 
 
 def install_deepseek_v41_proxy_pool_patch() -> None:
@@ -2692,11 +2738,13 @@ def build_v41_scheduled_batch(
         req_ids=rids,
         num_scheduled_tokens=lengths.astype(np.int32),
         context_lens=ends,
-        # SGLang's ForwardBatch does not say whether a chunk finishes its
-        # prompt, so every request counts as finishing (None): under decoder
+        # Every request counts as finishing (None) here: under decoder
         # bounded replay a chunk SGLang continues runs the decoder on its last
         # window rows too, whose ring the next chunk then reads if it is
-        # shorter than the window (`v41_extend_replays`). A radix replay side
+        # shorter than the window (`v41_extend_replays`). The EXTEND staging
+        # narrows it (`v41_chunk_finals`): a chunk SGLang continues with at
+        # least a window of its prompt left runs none of the decoder, as
+        # native's middle chunk. A radix replay side
         # forward (``replaying``) is prefill-only, so its decoder computes
         # every row of ``[start, P)``: the ring rows below the hit that a main
         # extend shorter than the window reads, as the next chunk does above.
@@ -2710,6 +2758,288 @@ def build_v41_scheduled_batch(
         total_seqs_num=bs,
         total_tokens_num=int(lengths.sum()),
     )
+
+
+# Kill switch: "0" counts every request of an EXTEND as finishing its prompt,
+# so a chunk SGLang continues runs the decoder on its tail too (the behavior
+# before middle chunks skipped it).
+V41_CHUNK_FINALS_ENV = "ATOM_SGLANG_V41_CHUNK_FINALS"
+# Per request of a V4.1 EXTEND ForwardBatch (`_install_host_mirror_patch`):
+# the rows of its prompt after this chunk, 0 for a request this chunk finishes.
+PROMPT_REST_ATTR = "atom_v41_prompt_rest"
+
+
+def v41_chunk_finals_enabled() -> bool:
+    return os.environ.get(V41_CHUNK_FINALS_ENV, "1") != "0"
+
+
+def v41_prompt_rest(batch) -> tuple[int, ...] | None:
+    """The rows each request of an EXTEND ScheduleBatch has left of its prompt
+    after this chunk: nonzero only for the request SGLang continues
+    (``batch.chunked_req``, the identity SGLang's own EAGLE path tests for a
+    chunk that does not finish its prompt), ``len(full_untruncated_fill_ids)
+    - extend_end``. None when the batch has no request list.
+
+    Zero, too, for a continued request that asks input logprobs of a prompt
+    row (``return_logprob`` with ``0 <= logprob_start_len <
+    len(full_untruncated_fill_ids)``): the chunk holding that row computes
+    every row (`v41_extend_replays`) and reads the decoder rings below its
+    start, so this chunk keeps its tail, which writes them -- what the kill
+    switch does for every chunk. Known here, at the chunk, unlike another
+    request's logprobs in the next step (`v41_decoder_floors`)."""
+    reqs = getattr(batch, "reqs", None)
+    if not reqs:
+        return None
+    chunked = getattr(batch, "chunked_req", None)
+    rest = []
+    for req in reqs:
+        left = 0
+        if chunked is not None and req is chunked:
+            full = getattr(req, "full_untruncated_fill_ids", None)
+            end = getattr(req, "extend_end", None)
+            if full is not None and end is not None:
+                left = max(len(full) - int(end), 0)
+                if left and _asks_prompt_logprobs(req, len(full)):
+                    left = 0
+        rest.append(left)
+    return tuple(rest)
+
+
+def _asks_prompt_logprobs(req, prompt_len: int) -> bool:
+    """Whether ``req`` asks input logprobs of a prompt row (SGLang's
+    ``compute_extend_logprob_start_len``: -1 asks none)."""
+    if not getattr(req, "return_logprob", False):
+        return False
+    start = getattr(req, "logprob_start_len", -1)
+    return start is not None and 0 <= int(start) < int(prompt_len)
+
+
+def v41_chunk_finals(forward_batch, batch, window: int) -> tuple[bool, ...] | None:
+    """``is_final_chunk`` for a replaying EXTEND, or None (every request counts
+    as finishing, as before).
+
+    A request whose chunk leaves at least ``window`` rows of its prompt
+    (`v41_prompt_rest`) does not finish it here, so under decoder bounded
+    replay it needs none of the decoder, as native's middle chunk
+    (`bounded_replay`: "one that does not runs none of it"): nothing after it
+    reads its decoder rows. Its next chunk either holds at least the window
+    and replays its own tail from the tail start, or is shorter -- then the
+    chunk before it left fewer than ``window`` rows and so counted as
+    finishing, which wrote the decoder rings the short chunk reads
+    (`v41_extend_replays`), as today. A request with fewer than ``window``
+    rows left keeps the tail for the same reason. The draft's context is
+    the finishing chunk's tail (`V41DSparkTargetSurface.finish_forward`), and
+    a radix hit below a skipped chunk's end replays its own ``R >= window``
+    rows. The next step need not replay, though: another request's input
+    logprobs, or a continuation SGLang cut below the window (its memory
+    budget), make it compute every row. Then the request's decoder window
+    starts where its rings hold rows (`v41_decoder_floors`), as a native
+    forward's tail starts at its own rows. None when the kill switch is off,
+    the ForwardBatch carries no per-request rest, or every request
+    finishes."""
+    if not v41_chunk_finals_enabled():
+        return None
+    rest = getattr(forward_batch, PROMPT_REST_ATTR, None)
+    count = len(batch.num_scheduled_tokens)
+    if rest is None or len(rest) != count:
+        return None
+    finals = tuple(int(left) < int(window) for left in rest)
+    return None if all(finals) else finals
+
+
+def v41_step_finishes_no_prompt(forward) -> bool:
+    """Whether this plugin forward is a replaying prefill whose requests all
+    continue their prompts (`v41_chunk_finals` marked none finishing): the
+    plugin's context sets no ``forward_mode`` (native's carries the DP
+    group's final-request count, `bounded_replay.decoder_runs`), and without
+    DP attention no peer's collectives count on this rank's decoder."""
+    context = getattr(forward, "context", None)
+    if context is None or getattr(context, "forward_mode", None) is not None:
+        return False
+    if getattr(forward, "dp_metadata", None) is not None:
+        return False
+    step = getattr(getattr(forward, "attn_metadata", None), "step", None)
+    finals = getattr(step, "request_finals", None)
+    return finals is not None and len(finals) > 0 and not bool(np.any(finals))
+
+
+def install_v41_chunk_decoder_gate() -> bool:
+    """Let the runtime model skip the decoder on a plugin prefill that
+    finishes no prompt (`v41_step_finishes_no_prompt`), as native skips it on
+    a middle chunk; every other forward keeps core's ``decoder_runs``.
+    Idempotent; returns whether the gate is installed (off under the
+    ``ATOM_SGLANG_V41_CHUNK_FINALS=0`` kill switch, which also leaves every
+    request finishing)."""
+    if not v41_chunk_finals_enabled():
+        return False
+    from atom.models.deepseek_v41 import runtime as v41_runtime
+
+    original = v41_runtime.decoder_runs
+    if getattr(original, "_atom_v41_chunk_gate", False):
+        return True
+
+    @wraps(original)
+    def decoder_runs(forward):
+        if v41_step_finishes_no_prompt(forward):
+            return False
+        return original(forward)
+
+    decoder_runs._atom_v41_chunk_gate = True
+    v41_runtime.decoder_runs = decoder_runs
+    return True
+
+
+# Per V4.1 EXTEND attention metadata that computes every row and resumes a
+# request whose decoder rings lack rows below its start: [running_bs] int32 on
+# the device, each request's lowest decoder window row (`v41_decoder_floors`).
+DECODER_FLOORS_ATTR = "atom_v41_decoder_floors"
+
+
+def _decoder_rows_from() -> np.ndarray | None:
+    """The proxy pool's per-slot decoder row floor
+    (``ATOMDeepSeekV41ProxyKVPool.decoder_rows_from``), off the pools of the
+    current forward context; None when chunk finals are off (no chunk skips
+    the decoder, so every ring holds what a later step reads) or outside a
+    forward."""
+    if not v41_chunk_finals_enabled():
+        return None
+    return getattr(_current_token_pool(), "decoder_rows_from", None)
+
+
+def _current_token_pool():
+    """The current forward context's token pool, or None outside one."""
+    from sglang.srt.model_executor.forward_context import (
+        get_token_to_kv_pool,
+        has_forward_context,
+    )
+
+    return get_token_to_kv_pool() if has_forward_context() else None
+
+
+def _extend_spans(batch):
+    """Each request's ``(start, prefix, end)`` in an EXTEND ScheduledBatch:
+    where ATOM's span starts (a fused radix replay's rows included), where
+    SGLang's own rows start, and where they end."""
+    ends = np.asarray(batch.context_lens, np.int64)
+    lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
+    replay = np.asarray(getattr(batch, "replay_rows", np.zeros_like(lengths)), np.int64)
+    starts = ends - lengths
+    return starts, starts + replay, ends
+
+
+def v41_decoder_floors(batch, rows_from, window: int) -> np.ndarray | None:
+    """Per request of an EXTEND that computes every row
+    (``decoder_replays`` False), the lowest position its decoder (layers
+    20-39) window may read, or None when every request's rings hold the
+    window below its start.
+
+    A request resuming at ``p`` reads its decoder rings' rows ``[p - window +
+    1, p)``. ``rows_from[slot]`` is where they hold rows
+    (`v41_note_decoder_rows`): a chunk that skipped the decoder
+    (`v41_chunk_finals`) left none below its end, so such a request's window
+    starts there -- where its rows do, as a native forward's decoder window
+    starts at its own tail (``swa_replay_start``) -- instead of reading rows
+    nobody wrote. Its encoder keeps the exact window: its rings hold every
+    row. A radix replay (``batch.replaying``) brings its own floor; a fresh
+    request reads nothing below 0."""
+    if getattr(batch, "decoder_replays", True) or rows_from is None:
+        return None
+    _, prefix, _ = _extend_spans(batch)
+    slots = np.asarray(batch.state_slots_committed, np.int64)
+    replaying = getattr(batch, "replaying", None) or {}
+    floors = np.zeros(len(slots), np.int64)
+    for i, slot in enumerate(slots):
+        p = int(prefix[i])
+        if i in replaying or p <= 0 or not 0 <= slot < len(rows_from):
+            continue
+        held = int(rows_from[slot])
+        if held > max(p - int(window) + 1, 0):
+            floors[i] = held
+    return floors if np.any(floors) else None
+
+
+def v41_note_decoder_rows(batch, rows_from, window: int) -> None:
+    """Record, per request slot, where its decoder rings hold rows once this
+    EXTEND has run (``rows_from[slot]``, read by `v41_decoder_floors`): a
+    replaying step writes a finishing request's tail (its last ``window``
+    rows of the span) and nothing for one that continues; a step computing
+    every row writes all of them, from its radix replay's start or from 0,
+    and continues a resumed request's rings as they were. Verify and decode
+    rows only append above a finished prompt's tail."""
+    if rows_from is None:
+        return
+    starts, prefix, ends = _extend_spans(batch)
+    slots = np.asarray(batch.state_slots_committed, np.int64)
+    replaying = getattr(batch, "replaying", None) or {}
+    finals = getattr(batch, "is_final_chunk", None)
+    replays = bool(getattr(batch, "decoder_replays", False))
+    for i, slot in enumerate(slots):
+        if not 0 <= slot < len(rows_from):
+            continue
+        if replays:
+            if finals is None or finals[i]:
+                tail = min(int(ends[i] - starts[i]), int(window))
+                rows_from[slot] = int(ends[i]) - tail
+            else:
+                rows_from[slot] = int(ends[i])
+        elif i in replaying:
+            rows_from[slot] = int(starts[i])
+        elif int(prefix[i]) <= 0:
+            rows_from[slot] = 0
+
+
+def publish_v41_decoder_floors(metadata, floors: np.ndarray) -> None:
+    """Hang ``floors`` on ``metadata`` for `install_v41_decoder_floor_gate`,
+    each at least the step's own floor (a radix replay's start)."""
+    step = getattr(metadata, "step", None)
+    own = getattr(step, "request_floors", None)
+    floors = np.asarray(floors, np.int64)
+    if own is not None and len(own) >= len(floors):
+        floors = np.maximum(floors, np.asarray(own[: len(floors)], np.int64))
+    floors = floors.astype(np.int32)
+    positions = getattr(step, "positions", None)
+    device = positions.device if isinstance(positions, torch.Tensor) else "cpu"
+    setattr(metadata, DECODER_FLOORS_ATTR, torch.from_numpy(floors).to(device))
+
+
+def install_v41_decoder_floor_gate() -> bool:
+    """Run a non-replaying prefill's decoder layers (runtime
+    ``run_decoder_stages``) under its decoder floors
+    (``DECODER_FLOORS_ATTR``): the step's ``swa_replay_start`` -- the floor
+    every window index build reads -- is swapped for them and its memoized
+    indptrs dropped, so layers 20-39 build theirs from the floors, and both
+    are restored after them (the indptrs dropped again: their fixed buffers
+    now hold the decoder's). The encoder, run before, keeps its own. Every
+    other forward runs core's function unchanged. Idempotent; off (False)
+    under the ``ATOM_SGLANG_V41_CHUNK_FINALS=0`` kill switch, under which no
+    chunk skips the decoder."""
+    if not v41_chunk_finals_enabled():
+        return False
+    from atom.models.deepseek_v41 import runtime as v41_runtime
+
+    original = v41_runtime.run_decoder_stages
+    if getattr(original, "_atom_v41_floor_gate", False):
+        return True
+
+    @wraps(original)
+    def run_decoder_stages(forward, *args, **kwargs):
+        metadata = getattr(forward, "attn_metadata", None)
+        floors = getattr(metadata, DECODER_FLOORS_ATTR, None)
+        step = getattr(metadata, "step", None)
+        if floors is None or step is None or getattr(step, "decode", False):
+            return original(forward, *args, **kwargs)
+        held = step.swa_replay_start
+        step.swa_replay_start = floors
+        step.indptrs = {}
+        try:
+            return original(forward, *args, **kwargs)
+        finally:
+            step.swa_replay_start = held
+            step.indptrs = {}
+
+    run_decoder_stages._atom_v41_floor_gate = True
+    v41_runtime.run_decoder_stages = run_decoder_stages
+    return True
 
 
 def v41_extend_replays(
@@ -2829,6 +3159,7 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
             "and --chunked-prefill-size / --max-prefill-tokens"
         )
     verify = _is_target_verify(mode)
+    decoder_floors = None
     if verify:
         width = int(batch.num_scheduled_tokens[0])
         if running_tokens != running_bs * width:
@@ -2852,15 +3183,41 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
                 # Only DSpark speculates on V4.1 here (`v41_dspark_capability_error`).
                 dspark_context_in_forward=speculative_tokens > 0,
             )
+            if batch.decoder_replays and not batch.replaying:
+                finals = v41_chunk_finals(
+                    forward_batch, batch, builder.geometry.window_size
+                )
+                if finals is not None:
+                    batch.is_final_chunk = finals
+                    count_v41_dspark(
+                        "prefill_decoder_skipped"
+                        if not any(finals)
+                        else "prefill_chunk_nonfinal"
+                    )
+            # Where each request's decoder rings hold rows: a step computing
+            # every row starts a request's decoder window there when a chunk
+            # that skipped the decoder left none below its start.
+            rows_from = _decoder_rows_from()
+            decoder_floors = v41_decoder_floors(
+                batch, rows_from, builder.geometry.window_size
+            )
+            v41_note_decoder_rows(batch, rows_from, builder.geometry.window_size)
         # A radix replay's rows are rows of the step like any other (native
         # pads a replaying prefill too): a fused step buckets on its widened
         # row count, its Replay records staged here for the eager regions.
         radix_replay = bool(batch.replaying)
         bucket = prefill_token_graph_bucket(running_tokens, radix_replay=radix_replay)
+        if decoder_floors is not None:
+            # Eager: the floors ride on the live step for the decoder's
+            # Python-side swap (`install_v41_decoder_floor_gate`).
+            bucket = None
         if bucket is None:
             metadata, step_positions = builder.prepare_prefill(
                 batch, running_bs, running_tokens
             )
+            if decoder_floors is not None:
+                publish_v41_decoder_floors(metadata, decoder_floors)
+                count_v41_dspark("prefill_decoder_floored")
         else:
             # Padded to the recorded bucket, as native pads a prefill
             # (`ForwardMode._pad_to_token_graph`): the builder lays the spans
@@ -2879,6 +3236,12 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
             count_v41_dspark("prefill_token_graph")
             if radix_replay:
                 count_v41_dspark("prefill_token_graph_radix")
+    if (
+        decoder_floors is None
+        and getattr(metadata, DECODER_FLOORS_ATTR, None) is not None
+    ):
+        # Never a previous forward's (a builder may hand one object back).
+        setattr(metadata, DECODER_FLOORS_ATTR, None)
     builder.prepare_model_inputs(input_ids, metadata)
     pending = getattr(getattr(metadata, "cache", None), "pending", None)
     if verify:
@@ -3563,6 +3926,13 @@ V41_DSPARK_COUNTER_NAMES = (
     # verifies whose staging took the round's host lengths
     # (`_take_late_prefix`)
     "late_seq_lens",
+    # replaying EXTENDs with a request SGLang continues (`v41_chunk_finals`):
+    # some finishing request beside it, and none (the decoder skipped)
+    "prefill_chunk_nonfinal",
+    "prefill_decoder_skipped",
+    # EXTENDs computing every row whose decoder window starts at a request's
+    # floor: rings a skipped chunk left without rows (`v41_decoder_floors`)
+    "prefill_decoder_floored",
 )
 V41_DSPARK_COUNTERS = dict.fromkeys(V41_DSPARK_COUNTER_NAMES, 0)
 _V41_DSPARK_COUNTERS_EXIT = False

@@ -32,6 +32,7 @@ from atom.plugin.sglang.deepseek_v41_bridge import (
     _is_target_verify,
     install_deepseek_v41_dspark_commit_patch,
     v41_dspark_checks_enabled,
+    v41_step_finishes_no_prompt,
 )
 
 logger = logging.getLogger("atom")
@@ -100,6 +101,8 @@ class V41DSparkTargetSurface:
         self.layer_ids: tuple[int, ...] | None = None
         self.draft = None
         self._rows: dict[int, torch.Tensor] = {}
+        # Columns of the aux block (`take_aux`): one hidden row per tap.
+        self.aux_width: int | None = None
 
     @property
     def wrapper(self):
@@ -153,6 +156,7 @@ class V41DSparkTargetSurface:
         )
         install_aux_taps(wrapper.model, spec, ids, self._make_hook)
         self.layer_ids = ids
+        self.aux_width = len(ids) * int(hf.hidden_size)
         wrapper.capture_aux_hidden_states = True
         logger.info(
             "ATOM V4.1 DSpark aux taps layers=%s capture=input "
@@ -217,7 +221,13 @@ class V41DSparkTargetSurface:
                     f"DeepSeek-V4.1 DSpark tap {layer_id} has shape "
                     f"{tuple(tap.shape)}, the forward {rows} rows"
                 )
-        return torch.cat(taps, dim=-1)
+        aux = torch.cat(taps, dim=-1)
+        if self.aux_width is not None and int(aux.shape[-1]) != self.aux_width:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 DSpark aux block is {int(aux.shape[-1])} wide, "
+                f"{len(taps)} taps x hidden {self.aux_width // len(taps)}"
+            )
+        return aux
 
     def finish_forward(self, hidden_states, positions, forward_batch) -> torch.Tensor:
         """After the target model, inside its ATOM forward context: write the
@@ -293,6 +303,13 @@ class V41DSparkTargetSurface:
                 "DeepSeek-V4.1 DSpark target forward ran with no draft attached"
             )
         plan = getattr(step, "replay", None)
+        if plan is not None and not self._rows and v41_step_finishes_no_prompt(forward):
+            # Every request continues its prompt: the decoder, whose layers
+            # hold the taps, did not run (`install_v41_chunk_decoder_gate`),
+            # as native's middle chunk writes no draft context. The finishing
+            # chunk's tail writes the window the first draft block reads.
+            # Zero rows, as every non-tail row of a replay's aux.
+            return hidden_states.new_zeros(rows, self.aux_width)
         if plan is None:
             aux = self.take_aux(rows)
         else:

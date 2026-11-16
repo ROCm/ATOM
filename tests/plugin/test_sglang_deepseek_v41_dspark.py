@@ -1926,6 +1926,50 @@ class TestTargetSurface:
         )
         assert aux.shape == (6, 12) and writes[0][0] is aux
 
+    def test_chunk_finishing_no_prompt_writes_no_draft_context(
+        self, monkeypatch, target_forward
+    ):
+        """Every request continues its prompt: the decoder (the taps' layers)
+        did not run (`install_v41_chunk_decoder_gate`), so no context row is
+        written and SGLang gets zero aux rows, as native's middle chunk."""
+        import atom.utils.forward_context as fc
+
+        _wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        plan = _plan([6, 3], window=4, running_bs=2)
+
+        def finish(finals, dp=None):
+            step = SimpleNamespace(
+                running_tokens=9,
+                replay=plan,
+                request_finals=np.asarray(finals, np.bool_),
+            )
+            forward = SimpleNamespace(
+                attn_metadata=SimpleNamespace(step=step, served_by_round=0),
+                context=SimpleNamespace(forward_mode=None),
+                dp_metadata=dp,
+            )
+            monkeypatch.setattr(fc, "get_forward_context", lambda: forward)
+            fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND, batch_size=2)
+            return surface.finish_forward(torch.zeros(9, 4), torch.arange(9), fb)
+
+        surface.begin_forward()
+        aux = finish([False, False])
+        assert aux.shape == (9, surface.aux_width) == (9, 12)
+        assert not aux.any() and writes == []
+        # A finishing request ran the decoder: its taps are required.
+        surface.begin_forward()
+        with pytest.raises(RuntimeError, match="did not fire"):
+            finish([True, False])
+        # A DP peer's collectives make every rank run it (core's verdict).
+        surface.begin_forward()
+        with pytest.raises(RuntimeError, match="did not fire"):
+            finish([False, False], dp="dp")
+
     def test_replay_writes_the_tail_rows_at_their_forward_rows(
         self, monkeypatch, target_forward
     ):

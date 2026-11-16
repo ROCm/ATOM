@@ -209,8 +209,18 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
 
 
 def _install_deepseek_v41_adapters(model: Any) -> None:
-    from atom.plugin.sglang.deepseek_v41_bridge import log_deepseek_v41_runtime_once
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        install_v41_chunk_decoder_gate,
+        install_v41_decoder_floor_gate,
+        log_deepseek_v41_runtime_once,
+    )
 
+    # A prefill finishing no prompt skips the decoder, as native's middle
+    # chunk (`v41_chunk_finals`; ATOM_SGLANG_V41_CHUNK_FINALS=0 turns it off),
+    # and a later step computing every row of such a request starts its
+    # decoder window where its rings hold rows (`v41_decoder_floors`).
+    install_v41_chunk_decoder_gate()
+    install_v41_decoder_floor_gate()
     log_deepseek_v41_runtime_once(model)
 
 
