@@ -497,6 +497,8 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
+**Per-row noise.** When a batch needs independent noise and has no top-k/top-p, the sampler draws a `(num_tokens, vocab_size)` `exponential_` tensor (one noise row per token) and calls aiter's `fused_mixed_sample` (ROCm/aiter#7416): the same race as `mixed_sample_outer_exponential` plus the greedy override (rows at or below `SAMPLER_EPS` take the lowest-id argmax), in two vocab-tiled launches. That covers the speculative bonus token and exact-match verification rows of a non-greedy batch, any batch with `n>1` fan-out siblings, and every unfiltered batch under `--sampler-independent-noise`. A sampling row can differ from `mixed_sample_outer_exponential` only on a near tie of its two best race keys. Other unfiltered batches share one broadcast noise row and keep `mixed_sample_outer_exponential` + `topk_select`.
+
 ### Shared token constraints
 
 `TokenConstraints` in `atom/model_engine/token_constraints.py` is the shared
