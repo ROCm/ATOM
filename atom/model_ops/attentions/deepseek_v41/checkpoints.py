@@ -45,22 +45,25 @@ class StateCopies:
         )
         self.staging.reserve([0])
 
+    def entries(self, slot):
+        """A logical slot's contiguous segments, including compressor state."""
+        return self.cache.state_views(slot)
+
     def entry(self, slot):
-        self.cache.require_committed()
-        if not 0 <= slot < self.cache.num_slots:
-            raise IndexError(f"STATE slot {slot} is out of range")
-        return self.cache.state_bytes[slot]
+        views = self.entries(slot)
+        if len(views) != 1:
+            raise ValueError("Quantized STATE is segmented; use entries(slot)")
+        return views[0]
 
     def relocate(self, pairs):
-        # Snapshot sources first: swaps and overlapping relocation chains must
-        # not read a destination that an earlier copy has already replaced.
-        sources = [self.entry(src).clone() for src, _ in pairs]
-        targets = [self.entry(dst) for _, dst in pairs]
+        # Validate all destinations and snapshot all sources before any writes.
+        targets = [view for _, dst in pairs for view in self.entries(dst)]
+        sources = [view.clone() for src, _ in pairs for view in self.entries(src)]
         if targets:
             torch._foreach_copy_(targets, sources)
 
     def _validate(self, op, storing):
-        self.entry(op.src_slot if storing else op.dst_slot)
+        self.entries(op.src_slot if storing else op.dst_slot)
         if (
             op.layout_id != self.spec.layout_id
             or op.total_bytes != self.spec.image_bytes
@@ -124,19 +127,21 @@ class StateCopies:
         launch_copy_descriptor(descriptor[cut:], self.plan)
 
     def _range_addresses(self, slot):
-        base = self.entry(slot).data_ptr()
-        return [base + offset for offset, _ in self._ranges]
+        return [
+            view.data_ptr() for view in self.cache.state_views(slot, checkpoint=True)
+        ]
 
     def _copy_on_host(self, op, storing):
         """One image, span by span, off the same plan the device copy reads."""
-        slot = self.entry(op.src_slot if storing else op.dst_slot)
+        slot = self.cache.state_views(
+            op.src_slot if storing else op.dst_slot, checkpoint=True
+        )
         views = [view for unit in op.unit_ids for view in self.cache.unit_views(unit)]
         plan = self.plan
         for src_seg, src_off, dst_seg, dst_off, length in zip(
             plan.src_seg, plan.src_off, plan.dst_seg, plan.dst_off, plan.length
         ):
-            at = self._ranges[src_seg][0] + src_off
-            state = slot[at : at + length]
+            state = slot[src_seg][src_off : src_off + length]
             page = views[dst_seg][dst_off : dst_off + length]
             (page if storing else state).copy_(state if storing else page)
 

@@ -11,8 +11,9 @@ The RMSNorm ahead of this stays where it is. It shares a launch with Q's, so
 pulling its half in saves nothing and would leave Q's on a different kernel
 than the one whose bytes the checkpoint was validated against.
 
-The row this writes is `packed_rows`': `head_dim` FP8 values then
-`head_dim // 32` E8M0 scales. Where it lands is the cache's, not this file's.
+Quantized rows contain `head_dim` FP8 values and `head_dim // 32` E8M0
+scales. A quantized ring stores them in separate contiguous planes; a BF16
+ring stores the dequantized values.
 """
 
 import functools
@@ -179,6 +180,7 @@ def _rope_window_kernel(
     query_values,
     query_scales,
     pool,
+    pool_scale,
     batches,
     cu,
     slots,
@@ -192,12 +194,11 @@ def _rope_window_kernel(
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
-    ROW_UNITS: tl.constexpr,
     EMIT_QAT: tl.constexpr,
     EMIT_PACKED: tl.constexpr,
     EMIT_QUERY_FP8: tl.constexpr,
     WRITE_RING: tl.constexpr,
-    PACKED_RING: tl.constexpr,
+    PLANAR_RING: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     FP8_HEADS: tl.constexpr,
     QUERY_PROGRAMS: tl.constexpr,  # a token's query slots
@@ -276,27 +277,24 @@ def _rope_window_kernel(
             # way, because that is the width a captured replay runs.
             batch = tl.load(batches + token)
             if batch >= 0 and token >= tl.load(cu + batch + 1) - RING_SLOTS:
-                base = (
-                    window_row(
-                        tl.load(slots + batch).to(tl.int64),
-                        position,
-                        ring_start,
-                        RING_SLOTS,
-                        SLOT_ROWS,
-                        RING_STRIDE,
-                        RUN_ROWS,
-                    )
-                    * ROW_UNITS
+                row = window_row(
+                    tl.load(slots + batch).to(tl.int64),
+                    position,
+                    ring_start,
+                    RING_SLOTS,
+                    SLOT_ROWS,
+                    RING_STRIDE,
+                    RUN_ROWS,
                 )
-                if PACKED_RING:
+                if PLANAR_RING:
                     tl.store(
-                        pool + base + dim,
+                        pool + row * D + dim,
                         tl.reshape(quantized, (D,)).to(tl.uint8, bitcast=True),
                     )
-                    tl.store(pool + base + D + tl.arange(0, D // 32), code)
+                    tl.store(pool_scale + row * (D // 32) + tl.arange(0, D // 32), code)
                 else:
                     tl.store(
-                        pool + base + dim,
+                        pool + row * D + dim,
                         tl.reshape(quantized.to(tl.float32) * step[:, None], (D,)),
                     )
 
@@ -324,14 +322,17 @@ def rope_quant_window(
     be None. `query_fp8`: `(values, scales)` the rotated query is quantized
     into instead of being rotated in place.
 
-    One address serves both ring layouts: `window_row` returns a byte offset
-    for a byte pool (FP8 values then codes, `V41PoolGeometry.window_bytes`)
-    and a row index for a `[rows, head_dim]` BF16 one.
+    `ring`'s pool is either `(data, scale)` with contiguous uint8 planes or a
+    `[rows, head_dim]` BF16 tensor. `window_row` returns a row index in both
+    layouts; the data and scale planes have their own row strides.
     """
     tokens, heads, dim = query.shape
     kv_half = ring is not None or qat is not None or values is not None
     pool, step, window = ring or (None, None, None)
-    byte_ring = pool is not None and pool.dtype == torch.uint8
+    planar_ring = isinstance(pool, tuple)
+    pool, pool_scale = pool if planar_ring else (pool, None)
+    if pool is not None and not planar_ring and pool.dtype == torch.uint8:
+        raise ValueError("Quantized rings require separate (data, scale) planes")
     query_values, query_scales = query_fp8 or (None, None)
     # The tile's shape must be powers of two; anything else, a query-less KV
     # launch (no heads: slot 0 must stay the KV), and the MXFP8 query keep a
@@ -369,6 +370,7 @@ def rope_quant_window(
         query_values,
         None if query_scales is None else query_scales.view(torch.uint8),
         pool,
+        pool_scale,
         None if step is None else step.batch_ids,
         None if step is None else step.cu_seqlens_q,
         None if step is None else step.slots,
@@ -382,8 +384,7 @@ def rope_quant_window(
         SLOT_ROWS=0 if window is None else window.slot_rows,
         RING_STRIDE=1 if window is None else window.ring_stride,
         RUN_ROWS=0 if window is None else window.run_rows,
-        ROW_UNITS=1 if pool is None or byte_ring else dim,
-        PACKED_RING=byte_ring,
+        PLANAR_RING=planar_ring,
         EMIT_QAT=qat is not None,
         EMIT_PACKED=values is not None,
         EMIT_QUERY_FP8=query_fp8 is not None,

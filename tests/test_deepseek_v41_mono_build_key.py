@@ -86,3 +86,11 @@ def test_one_field_changed_is_a_new_binary(cache, build, name):
     _compile(build, base)
     _compile(build, dataclasses.replace(base, **{name: other[name]}))
     assert len(_entries(cache)) == 2
+
+
+@pytest.mark.parametrize("build", ["k1", "k2a", "k2"])
+def test_fp8_attention_build_compiles(cache, build):
+    """Exercise lane-dependent loads from separate FP8 data/scale planes."""
+    key = dataclasses.replace(BUILDS[build][2], tokens=6, tp=4, kv_fp8=True)
+    _compile(build, key)
+    assert _entries(cache)

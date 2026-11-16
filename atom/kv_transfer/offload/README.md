@@ -1257,6 +1257,30 @@ key unchanged. DSV4's SLOT boundary hashes start from the same `cache_seed`, as
 | AOS1 identity, size, TP, and CRC match | `decode_checkpoint` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
 | Exact save generations aggregate across TP | `SaveOperationId`, aggregator | A failed or delayed rank from another save cannot commit a boundary. |
 | Dense save packs wait on the step's producer event | dense `start_load_kv`, `batched_from_gpu` | A non-final prefill chunk yields no token, so nothing else orders the save thread's pack stream after the producing kernels; `producer_fenced` in the transfer stats reports the wait was enqueued. Under PP the save frontier runs ahead of the forwards (`schedule()` advances it at dispatch), but it never covers the chunk of the batch whose metadata carries the save, and every stage takes metadata and batches in dispatch order: each records the event after enqueueing the forward of every chunk the save reads. |
+| Kimi-K3 state stores wait on the step's producer event | K3 `_start_state_stores`, `StateOffloadTier._do_store` | A checkpoint is READY once the batch carrying its slot->PAGE copy is issued, not once the copy has run, so the gather is ordered after the copy only by this event. |
+
+### Async save contract
+
+The dense KV save and the Kimi-K3 state store share one contract, written out
+above `record_save_fence` in `_offload_common.py`:
+
+- **Fence.** One event per step, recorded on the current stream after the
+  writes the step's saves read are enqueued (`record_save_fence`), is handed to
+  every save of the step; the save thread host-waits on it (`wait_save_fence`)
+  before it reads the source, and the KV save also passes it to `store()` for
+  the pack stream. A fence that cannot be recorded fails the step's saves, and
+  one that raises while waited on fails that save.
+- **Lifecycle.** "Source safe to release" and "store succeeded" are separate
+  facts. Each save releases its source at most once and reports exactly one
+  terminal outcome on every path. The state store reports them apart through
+  `SaveLifecycle`: the release as soon as the D2H drains, or at the terminal
+  when the store was refused or raised. The KV save's terminal comes from
+  `_do_save_req`, or from `_guard` when it raised; with early block release the
+  GPU connector reports the source per staging group, and without it (Kimi-K3)
+  the terminal releases the source.
+
+KV chunk packing and state image packing stay separate, and both saves keep
+the host wait.
 
 ### Failure handling
 
@@ -1557,7 +1581,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
 | `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
-| `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
+| `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)`, × `pipeline_parallel_size` on Kimi-K3's connector | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — (48 MiB for `mooncake_store`) | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
