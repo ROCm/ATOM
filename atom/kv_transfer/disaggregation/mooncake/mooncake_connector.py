@@ -3552,12 +3552,6 @@ class MooncakeConnector(KVConnectorBase):
             view = self._kv_source_views[region.source_region]
             if last_source_unit >= view.numel() // region.gather.source_bytes:
                 raise ValueError("KV staging source unit out of bounds")
-        offset = request.get("_transfer_dst_offset", 0)
-        full_pages = request.get("dst_block_ids")
-        if full_pages is not None and list(
-            full_pages[offset : offset + len(dst_pages)]
-        ) != list(dst_pages):
-            raise ValueError("KV staging destination cursor mismatch")
         return plan
 
     def _execute_staged_transfer(
