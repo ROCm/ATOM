@@ -101,9 +101,11 @@ def failed_requests(lines):
     return sum(FAILED_MARK in line for line in lines)
 
 
-def reference():
-    """The reference topology's recorded result for this model and check."""
-    path = Path(env("RESULTS_DIR"), env("ACCEPT_MODEL"), env("REF_TOPOLOGY"))
+def reference(topology=None):
+    """The recorded result of this model and check on topology, by default
+    the reference topology."""
+    topology = topology or env("REF_TOPOLOGY")
+    path = Path(env("RESULTS_DIR"), env("ACCEPT_MODEL"), topology)
     path = path / f"{env('ACCEPT_CHECK')}.json"
     if not path.exists():
         raise RuntimeError(f"no reference at {path}")
