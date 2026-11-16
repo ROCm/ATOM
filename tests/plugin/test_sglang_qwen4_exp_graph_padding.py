@@ -1499,3 +1499,5 @@ def test_flydsl_prefill_layout_context_rows_on_device_tensors():
         for t in range(seq)
     ]
     assert slots.device == tables.device
+    # The layers pass it to aiter as the int32 slot table.
+    assert slots.dtype == torch.int32 and slots.is_contiguous()

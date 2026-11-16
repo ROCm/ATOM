@@ -157,12 +157,115 @@ def test_first_flydsl_call_is_logged_once(flydsl, caplog):
     assert len(active) == 1 and len(flydsl) == 3
 
 
+def test_layout_is_made_once_per_forward(flydsl, monkeypatch):
+    """The QSA layers of one forward share the first layer's layout: the
+    checks and the prefix lengths are not redone per layer. Another row
+    count is another layout."""
+    checks = []
+    real = qsa_attention.flydsl_fallback_reason
+    monkeypatch.setattr(
+        qsa_attention,
+        "flydsl_fallback_reason",
+        lambda *a, **kw: checks.append(a) or real(*a, **kw),
+    )
+    layer, tokens = _layer(), 8
+    query = torch.zeros(tokens, 12, 256, dtype=torch.bfloat16)
+    qsa = SimpleNamespace(host_lens=((tokens,), (tokens,)), context_slots=None)
+    for _ in range(12):
+        out = Qwen4ExpAttention._flydsl_attention(
+            layer, query, query[:, :1], query[:, :1], _selection(tokens, 2051), qsa
+        )
+        assert out is not None
+    assert len(checks) == 1 and len(flydsl) == 12
+    plan = qsa.flydsl_prefill
+    assert plan.query_lens == (tokens,) and plan.prefix_lens == (0,)
+    shorter = query[:4]
+    qsa.host_lens = ((4,), (4,))
+    Qwen4ExpAttention._flydsl_attention(
+        layer, shorter, shorter[:, :1], shorter[:, :1], _selection(4, 2051), qsa
+    )
+    assert len(checks) == 2 and qsa.flydsl_prefill is not plan
+
+
+def test_selection_written_in_place_reaches_the_kernel_unpadded(flydsl):
+    """`forward` selects into the layout's kernel-width buffer; that buffer,
+    -1 past the selection, is what the kernel gets, with no padded copy."""
+    layer, tokens = _layer(), 8
+    query = torch.zeros(tokens, 12, 256, dtype=torch.bfloat16)
+    qsa = SimpleNamespace(host_lens=((tokens,), (tokens,)), context_slots=None)
+    plan = qsa_attention._FlyDSLPrefill.of(layer, query, qsa, 11, 4)
+    buffer = plan.selection_out(query.device)
+    assert buffer.shape == (tokens, 1027) and bool((buffer == -1).all())
+    assert plan.selection_out(query.device) is buffer
+    selected = buffer[:, :11]
+    selected.copy_(_selection(tokens, 11))
+    for _ in range(2):  # a second layer reuses the same buffer
+        out = Qwen4ExpAttention._flydsl_attention(
+            layer, query, query, query, selected, qsa
+        )
+        assert out is not None
+    assert all(indices is buffer for indices in flydsl)
+    assert torch.equal(buffer[:, :11], _selection(tokens, 11))
+    assert bool((buffer[:, 11:] == -1).all())
+
+
+@pytest.mark.parametrize(
+    "slot_dtype, contiguous, in_place",
+    [
+        (torch.int32, True, True),
+        (torch.int64, True, False),
+        (torch.int32, False, False),
+    ],
+    ids=["int32-slot-table", "int64-rows-gathered", "strided-pool-gathered"],
+)
+def test_prefixed_layout_reads_the_pool_through_the_slot_table(
+    flydsl, monkeypatch, slot_dtype, contiguous, in_place
+):
+    """With a prefix the kernel reads the paged pool in place through the
+    bridge's int32 slot table; rows it cannot address that way (another slot
+    dtype, a strided pool) are gathered as before."""
+    calls = []
+    monkeypatch.setattr(
+        qsa_attention,
+        "_flydsl_attention_op",
+        lambda: lambda q, k, v, indices, **kw: calls.append((k, v, kw)) or q,
+    )
+    pages, block, prefix, tokens = 4, 8, 5, 3
+    rows = torch.arange(pages * block, dtype=torch.bfloat16)
+    k_cache = rows.view(pages, block, 1, 1).expand(-1, -1, 1, 256).contiguous()
+    v_cache = -k_cache
+    if not contiguous:
+        k_cache = torch.cat([k_cache, k_cache], dim=-2)[:, :, :1]
+        v_cache = -k_cache
+    slots = torch.tensor([16, 17, 18, 19, 20, 21, 22, 23], dtype=slot_dtype)
+    layer = _layer(k_cache=k_cache, v_cache=v_cache)
+    query = torch.zeros(tokens, 12, 256, dtype=torch.bfloat16)
+    qsa = SimpleNamespace(
+        host_lens=((tokens,), (prefix + tokens,)), context_slots=slots
+    )
+    out = Qwen4ExpAttention._flydsl_attention(
+        layer, query, query[:, :1], query[:, :1], _selection(tokens, 2051), qsa
+    )
+    assert out is not None
+    ((k, v, kwargs),) = calls
+    assert kwargs["prefix_lens"] == (prefix,)
+    if in_place:
+        assert kwargs["kv_slots"] is slots
+        assert k.data_ptr() == k_cache.data_ptr() and k.shape == (pages * block, 1, 256)
+        assert v.data_ptr() == v_cache.data_ptr()
+    else:
+        assert kwargs["kv_slots"] is None
+        assert k[:, 0, 0].tolist() == slots.tolist()
+        assert torch.equal(v, -k)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
     """Prefixed and fresh requests with unequal lengths on non-consecutive
     pages, crossing page boundaries: the bridge's context rows must be every
     request's full context in request-major order, and the kernel must receive
-    exactly those K/V rows plus the per-request query / prefix lengths."""
+    the pool with exactly those rows as its slot table, plus the per-request
+    query / prefix lengths."""
     from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
 
     device, block, pages = "cuda", 4, 12
@@ -204,7 +307,12 @@ def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
         is not None
     )
     ((k, v, kwargs),) = calls
-    assert k[:, 0, 0].tolist() == expected_slots
+    assert context_slots.dtype == torch.int32
+    assert kwargs["kv_slots"] is context_slots
+    assert (
+        k.data_ptr() == k_cache.data_ptr() and v.data_ptr() == layer.v_cache.data_ptr()
+    )
+    assert k[context_slots.long(), 0, 0].tolist() == expected_slots
     assert torch.equal(v, -k)
     assert kwargs["query_lens"] == extends
     assert kwargs["prefix_lens"] == prefixes
@@ -318,3 +426,109 @@ def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
         num_decode_requests=None,
     )
     torch.testing.assert_close(flydsl, native, atol=1.6e-2, rtol=1.6e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "prefixes, extends",
+    [
+        ((6080,), (2112,)),
+        ((8192,), (2048,)),
+        ((6001, 0, 1234), (2111, 300, 517)),
+        ((200,), (300,)),
+        ((0,), (2112,)),
+    ],
+    ids=["8192-hit-6080", "second-chunk", "mixed-unaligned", "short", "no-prefix"],
+)
+def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, extends):
+    """The real kernel on the slot table (pool read in place, selection written
+    into the kernel-width buffer, two layers sharing one layout) gives the same
+    bits as gathering every context row and padding a copy of the selection.
+    Stale pool rows hold random finite values."""
+    from atom.model_ops.qwen4_exp.ops.qsa import qsa_select_paged_tokens
+    from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
+
+    if not qsa_attention._flydsl_arch_supported():
+        pytest.skip("FlyDSL QSA attention needs gfx942")
+    try:
+        qsa_attention._flydsl_attention_op()
+    except ImportError:
+        pytest.skip("aiter without FlyDSL QSA attention (ROCm/aiter#6576)")
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+
+    device, block, ratio, budget, heads, dim, pages = "cuda", 64, 4, 2048, 12, 256, 512
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, dtype=torch.bfloat16, device=device, generator=gen)
+
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    width = max(-(-s // block) for s in seqs)
+    tables = (
+        torch.randperm(pages, device=device, generator=gen)[: len(seqs) * width]
+        .view(len(seqs), width)
+        .to(torch.int32)
+    )
+    positions = torch.cat(
+        [torch.arange(p, p + e, device=device) for p, e in zip(prefixes, extends)]
+    )
+    token_to_req = torch.cat(
+        [
+            torch.full((e,), r, dtype=torch.int32, device=device)
+            for r, e in enumerate(extends)
+        ]
+    )
+    compressed = randn(pages, block // ratio, 1, 128)
+    index_q = randn(positions.numel(), 4, 128)
+    seq_lens = torch.tensor(seqs, dtype=torch.int32, device=device)
+
+    def select(out=None):
+        return qsa_select_paged_tokens(
+            index_q,
+            compressed,
+            tables,
+            token_to_req,
+            positions,
+            seq_lens,
+            budget,
+            ratio,
+            out=out,
+            max_seq_len=max(seqs),
+            allow_flydsl=True,
+        )
+
+    query = randn(positions.numel(), heads, dim)
+    slots = (
+        tables[token_to_req.long(), positions // block].long() * block
+        + positions % block
+    )
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=seqs)
+    host_lens, context_slots = _flydsl_prefill_layout(
+        batch, len(seqs), positions.numel(), tables, block
+    )
+    qsa = SimpleNamespace(host_lens=host_lens, context_slots=context_slots)
+    for _ in range(2):
+        k_cache, v_cache = randn(pages, block, 1, dim), randn(pages, block, 1, dim)
+        layer = _layer(
+            indexer=SimpleNamespace(compress_ratio=ratio, token_topk=budget),
+            num_heads=heads,
+            k_cache=k_cache,
+            v_cache=v_cache,
+        )
+        key = k_cache.flatten(0, 1)[slots]
+        value = v_cache.flatten(0, 1)[slots]
+        gathered = SimpleNamespace(
+            host_lens=host_lens,
+            context_slots=None if context_slots is None else context_slots.long(),
+        )
+        reference = Qwen4ExpAttention._flydsl_attention(
+            layer, query, key, value, select(), gathered
+        )
+        plan = qsa_attention._FlyDSLPrefill.of(layer, query, qsa, select().shape[1], 4)
+        selected = select(plan.selection_out(device))
+        assert selected.data_ptr() == plan.indices.data_ptr()
+        in_place = Qwen4ExpAttention._flydsl_attention(
+            layer, query, key, value, selected, qsa
+        )
+        assert reference is not None and in_place is not None
+        assert torch.equal(in_place, reference)
