@@ -10,9 +10,10 @@
 import os
 
 import torch
-
 import triton
 import triton.language as tl
+
+from atom.utils.triton_launch import CachedLauncher
 
 BT_LIST = [8, 16, 32, 64, 128]
 
@@ -99,6 +100,9 @@ def l2norm_fwd_kernel2(X, Y, eps, M, N: tl.constexpr, MBLOCK: tl.constexpr):
     tl.store(Y + (rindex + N * row_idx), xs * rsqrt, xmask)
 
 
+_l2norm_fwd2 = CachedLauncher(l2norm_fwd_kernel2)
+
+
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
 ):
@@ -121,7 +125,8 @@ def l2norm_fwd(
     if not USE_DEFAULT_FLA_NORM:
         MBLOCK = 32
         # M, N = x.shape
-        l2norm_fwd_kernel2[(triton.cdiv(T, MBLOCK),)](
+        _l2norm_fwd2(
+            (triton.cdiv(T, MBLOCK),),
             x,
             y,
             eps,

@@ -22,6 +22,7 @@ from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
+from atom.utils.triton_launch import CachedLauncher
 
 
 @triton.jit
@@ -64,6 +65,9 @@ def fused_gdn_gating_kernel(
     )
 
 
+_fused_gdn_gating = CachedLauncher(fused_gdn_gating_kernel, num_warps=1)
+
+
 def fused_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -83,7 +87,8 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
-    fused_gdn_gating_kernel[grid](
+    _fused_gdn_gating(
+        grid,
         g,
         beta_output,
         A_log,
@@ -97,7 +102,6 @@ def fused_gdn_gating(
         beta,
         threshold,
         8,
-        num_warps=1,
     )
     return g, beta_output
 

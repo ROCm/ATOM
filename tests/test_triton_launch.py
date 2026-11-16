@@ -115,7 +115,7 @@ def _variants(launcher, base):
                 _tensor(shape, dtype, misaligned=True, big=True),
                 _tensor(shape, other),
                 _tensor(shape, torch.float8_e4m3fnuz),
-                torch.nn.Parameter(_tensor(shape, dtype)),
+                torch.nn.Parameter(_tensor(shape, dtype), dtype.is_floating_point),
             ]
         elif isinstance(arg, bool):
             options = [not arg, 1, 1.0, None]
