@@ -10,8 +10,6 @@ from itertools import pairwise
 
 import torch
 
-_BUCKET_FIELDS = ("shape", "dtype", "offset", "nbytes")
-
 
 def _is_count(value) -> bool:
     """A size a sender could have written: an integer, not negative, and not
@@ -27,8 +25,8 @@ def decode_bucket(
 
     Views, not copies, except for a tensor whose offset is not a multiple of
     its element size, which ``view`` cannot reinterpret in place. Each entry is
-    checked as sent, not coerced: ``int()`` made a shape of [2.5] into [2] and
-    let -1 through as "infer this dimension". As a set, no name may repeat and
+    checked as sent, not coerced: ``int()`` would read a shape of [2.5] as [2],
+    and -1 as "infer this dimension". As a set, no name may repeat and
     no two ranges overlap: either hands one tensor's bytes to two parameters.
     A zero-element tensor holds no bytes, so its range overlaps none.
     """
@@ -88,12 +86,18 @@ def decode_bucket(
 
 def bucket_entries(bucket_meta: Mapping) -> list[dict]:
     """``{name: {shape, dtype, offset, nbytes}}`` as ``decode_bucket`` takes
-    it, with those four keys alone: any other the sender put in, a ``name``
-    among them, would have overridden the bucket's own."""
+    it, with those four keys alone, so no other the sender put in -- a
+    ``name`` among them -- replaces the bucket's own."""
     entries = []
     for name, meta in bucket_meta.items():
         fields = meta if isinstance(meta, Mapping) else {}
         entries.append(
-            {"name": name, **{key: fields.get(key) for key in _BUCKET_FIELDS}}
+            {
+                "name": name,
+                "shape": fields.get("shape"),
+                "dtype": fields.get("dtype"),
+                "offset": fields.get("offset"),
+                "nbytes": fields.get("nbytes"),
+            }
         )
     return entries

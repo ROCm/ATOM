@@ -10,10 +10,15 @@ from typing import ClassVar
 
 import numpy as np
 
+from atom.model_engine.capabilities import (
+    RDMA_WEIGHT_RECEIVE_FEATURE,
+    WEIGHT_RELOAD_FEATURE,
+)
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
     FINISH_WEIGHT_SYNC_CMD,
+    RECEIVE_WEIGHTS_RDMA_CMD,
     RpcPayload,
     checked_timeout,
 )
@@ -28,7 +33,6 @@ logger = logging.getLogger("atom")
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
     {"abort_request", "get_mtp_stats", "release_constraints"}
 )
-RECEIVE_WEIGHTS_RDMA_CMD = "receive_weights_rdma"
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {
         "update_weights",
@@ -81,7 +85,7 @@ def physical_block_count(tables: Iterable[BlockTable], num_blocks: int) -> int:
 def completes_weight_sync(cmd: str, args: dict) -> bool:
     """Whether *cmd* is the update a sync ends on: direct, a weight stream, or
     a last bucket. A weight stream is a whole sync in one command, so it
-    carries no ``is_last``; one split over commands would have to send it."""
+    carries no ``is_last``."""
     return cmd == "update_weights" or (
         cmd in WEIGHT_UPDATE_UTILITY_CMDS and bool(args.get("is_last", True))
     )
@@ -113,7 +117,7 @@ def _remaining_timeout(args: dict, default: float) -> float:
     return checked_timeout(args.get("timeout", default))
 
 
-def ask_what_runners_take(runner_mgr, label: str) -> dict[str, str]:
+def ask_what_runners_cannot_take(runner_mgr, label: str) -> dict[str, str]:
     """The weight syncs *runner_mgr*'s runners cannot take, by feature, with
     why. Raises if a runner cannot answer: no sync could drive that one."""
     payload = RpcPayload(request_id=f"get_worker_capabilities-{uuid.uuid4().hex}")
@@ -232,9 +236,9 @@ class EngineUtilityHandler:
         # a FINISH may commit.
         self._awaiting_finish: str | None = None
         # What the runners cannot take, by feature, with why, as they said at
-        # startup (ask_what_runners_take); None if they were not asked, and
-        # then they refuse before writing themselves.
-        self._unavailable = unavailable
+        # startup (ask_what_runners_cannot_take); empty if they were not
+        # asked, and then they refuse before writing themselves.
+        self._unavailable = dict(unavailable or {})
         # Whether the engine was fenced when the current sync began, and
         # whether any update of it may have written; a sync that fails having
         # written nothing leaves the fence as it was.
@@ -424,15 +428,13 @@ class EngineUtilityHandler:
         Decided before its first update, so a refusal writes nothing and
         fences nothing.
         """
-        if (
-            cmd not in WEIGHT_UPDATE_UTILITY_CMDS
-            or self._continues_weight_sync(cmd, args)
-            or self._unavailable is None
+        if cmd not in WEIGHT_UPDATE_UTILITY_CMDS or self._continues_weight_sync(
+            cmd, args
         ):
             return None
         if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
-            return self._unavailable.get("rdma_weight_receive")
-        return self._unavailable.get("weight_reload")
+            return self._unavailable.get(RDMA_WEIGHT_RECEIVE_FEATURE)
+        return self._unavailable.get(WEIGHT_RELOAD_FEATURE)
 
     def _prepare_engine(self, engine, cmd: str, change: str | None, args) -> str | None:
         """Ready *engine* for *cmd*; return why it cannot be, or None.

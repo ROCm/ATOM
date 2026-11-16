@@ -89,10 +89,10 @@ def _receiving_runner(device: torch.device, rejects_buckets: bool, refuses: bool
         def _reload_refusal(self):
             return "this rank refuses" if refuses else None
 
-        def _apply_named_tensors(self, named_tensors):
+        def _apply_named_tensors(self, named_tensors, prepare=None):
             if rejects_buckets:
                 raise RuntimeError("this rank rejects its first bucket")
-            return super()._apply_named_tensors(named_tensors)
+            return super()._apply_named_tensors(named_tensors, prepare)
 
         def weights(self) -> dict[str, list]:
             return {n: p.cpu().tolist() for n, p in self.model.named_parameters()}

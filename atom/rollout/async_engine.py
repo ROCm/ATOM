@@ -37,6 +37,7 @@ class AsyncLLMEngine(LLMEngine):
             "runner_qualname",
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
+        kwargs.setdefault("weight_sync_runner", True)
         super().__init__(model, **kwargs)
 
     def collective_rpc(

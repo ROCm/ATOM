@@ -2374,6 +2374,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # The runners take weight syncs and say which they cannot
+    # (`get_worker_capabilities`), as RLHFModelRunner does: EngineCore asks
+    # them once, at startup. Set by AsyncLLMEngine.
+    weight_sync_runner: bool = False
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)

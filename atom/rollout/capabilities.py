@@ -11,7 +11,11 @@ useful failure.
 
 import logging
 
-from atom.model_engine.capabilities import COLLECTIVE_RPC_PROTOCOL_VERSION
+from atom.model_engine.capabilities import (
+    COLLECTIVE_RPC_PROTOCOL_VERSION,
+    RDMA_WEIGHT_RECEIVE_FEATURE,
+    WEIGHT_RELOAD_FEATURE,
+)
 from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
 
 logger = logging.getLogger("atom")
@@ -48,12 +52,12 @@ class CapabilityProviderMixin:
         # caller has one place to ask what this ATOM supports.
         features.add("pause_generation")
         # A weight sync that rewrites this model in place (direct, SHM, IPC),
-        # and AsyncLLMEngine.receive_weights_rdma. The engine asks before a
-        # sync's first update, and refuses one these rule out with the reason.
+        # and AsyncLLMEngine.receive_weights_rdma. The engine asks once, at
+        # startup, and refuses a sync these rule out with the reason.
         unavailable = {}
         for feature, refusal in (
-            ("weight_reload", "_reload_refusal"),
-            ("rdma_weight_receive", "_rdma_receive_refusal"),
+            (WEIGHT_RELOAD_FEATURE, "_reload_refusal"),
+            (RDMA_WEIGHT_RECEIVE_FEATURE, "_rdma_receive_refusal"),
         ):
             ask = getattr(self, refusal, None)
             if not callable(ask):

@@ -41,7 +41,8 @@ import torch.distributed as dist
 from atom.distributed.group_agreement import group_min_each
 from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.rollout.weight_bucket import decode_bucket
-from atom.rollout.weight_updater import _one_update
+from atom.rollout.weight_updater import _discard_sync_state_on_error, _one_update
+from atom.utils.distributed import utils as dist_utils
 
 logger = logging.getLogger("atom")
 
@@ -98,8 +99,9 @@ def _aborted_not_ended_on_timeout():
     """Build a group under TORCH_NCCL_ASYNC_ERROR_HANDLING=2, which a
     ProcessGroupNCCL reads once, when built: a collective of it that times
     out -- a trainer gone mid-stream -- aborts its communicator, and its wait
-    raises. Under torch's default the watchdog ended the runner, and the
-    engine with it. The engine's other groups keep the process's setting."""
+    raises. Under torch's default the watchdog ends the process instead: the
+    runner, and the engine with it. The engine's other groups keep the
+    process's setting."""
     name = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
     saved = os.environ.get(name)
     os.environ[name] = "2"
@@ -191,8 +193,8 @@ def _recv_header(
 def _decode_frame(
     metadata_tensor: torch.Tensor, payload: torch.Tensor
 ) -> list[tuple[str, torch.Tensor]]:
-    # Through a byte buffer: tolist() builds a list slot per byte, which at the
-    # metadata ceiling is half a gigabyte of host memory before JSON sees it.
+    # Through a byte buffer, not tolist(), which builds a Python int per byte
+    # of metadata before JSON sees any of it.
     metadata = json.loads(metadata_tensor.cpu().numpy().tobytes().decode("utf-8"))
     if not isinstance(metadata, list) or not metadata:
         raise ValueError("invalid RDMA weight metadata: expected a non-empty list")
@@ -230,18 +232,13 @@ class _Votes:
         self.decided = True
         return left
 
-    def break_off(self, leave: Callable[[], object], version: int) -> None:
+    def break_off(self, leave: Callable[[], object], version: int) -> bool:
         """Broken off between votes, in a broadcast a peer may still be in:
         *leave* this rank's end of the group, which releases that peer, then
-        cast the ballot it waits for."""
+        cast the ballot it waits for. Whether it left."""
         if self.decided:
-            return
-        try:
-            leave()
-        except Exception:  # the stream's own failure is raised
-            logger.exception(
-                "RDMA weight stream v%d: leaving its group failed", version
-            )
+            return False
+        _leave(leave, version)
         if not self.failed:
             try:
                 self._agree(_LEFT)
@@ -249,6 +246,14 @@ class _Votes:
                 logger.exception(
                     "RDMA weight stream v%d: its last vote failed", version
                 )
+        return True
+
+
+def _leave(leave: Callable[[], object], version: int) -> None:
+    try:
+        leave()
+    except Exception:  # the stream's own failure is raised
+        logger.exception("RDMA weight stream v%d: leaving its group failed", version)
 
 
 @dataclass
@@ -257,7 +262,6 @@ class _Received:
 
     # Raised at the end marker; the rest of the stream is still received.
     failure: Exception | None
-    opened: bool = False
     may_have_written: bool = False
     ended: bool = False
     updated: int = 0
@@ -280,7 +284,6 @@ def _open_sync_for_stream(runner, got: _Received, version: int) -> None:
             if runner._sync is not None:
                 raise RuntimeError("another weight sync is open on this rank")
             runner._open_sync()
-            got.opened = True
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
             got.failure = exc
     if got.failure is not None:
@@ -359,14 +362,15 @@ def _take_frames(
         try:
             weights = _decode_frame(metadata_tensor, payload)
             try:
-                counts = runner._apply_named_tensors(weights)
+                updated = runner._write_batch(
+                    "RDMA", weights, complete=False, require_full=False
+                )
             except WeightReloadRefused:
                 raise  # this bucket wrote nothing
             except Exception:
                 got.may_have_written = True
                 raise
             got.may_have_written = True
-            runner._refuse_unwritten(counts)
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
             # Kept until the end marker; its frames must not keep this bucket
             # alive while the rest of the stream is drained.
@@ -379,7 +383,7 @@ def _take_frames(
                 exc,
             )
             continue
-        got.updated += counts["updated"]
+        got.updated += updated
         got.bytes += payload_bytes
         got.buckets += 1
 
@@ -414,9 +418,10 @@ def receive_weight_stream(
     is raised at the end marker. What breaks the stream off before then -- a
     header that frames no bucket, a frame some rank cannot receive, a
     broadcast that fails or does not arrive within *timeout*, as when the
-    trainer is gone -- raises ``RDMAStreamOutOfStep``. *leave* tears
-    down this rank's end of *group* before its last vote: a peer still in the
-    failed broadcast is released only once that end is gone.
+    trainer is gone -- raises ``RDMAStreamOutOfStep``, and *leave* tears down
+    this rank's end of *group*: before its last vote if it broke off between
+    votes, as a peer still in the failed broadcast is released only once that
+    end is gone, and after it otherwise.
 
     *refusal*, if given, refuses the stream: it is received in full and
     discarded, nothing is written, and the refusal is raised at the end.
@@ -458,10 +463,14 @@ def receive_weight_stream(
                 raise WeightReloadRefused(str(got.failure)) from got.failure
             raise got.failure
     except Exception as exc:
-        votes.break_off(leave, version)
-        if got.opened:
-            runner._discard_failed_weight_sync()
-        if not isinstance(exc, RDMAStreamOutOfStep) and (not got.ended or votes.failed):
+        left = votes.break_off(leave, version)
+        broke_off = (
+            isinstance(exc, RDMAStreamOutOfStep) or not got.ended or votes.failed
+        )
+        if broke_off and not left:
+            # At a vote every rank cast, so no peer is in a broadcast.
+            _leave(leave, version)
+        if not isinstance(exc, RDMAStreamOutOfStep) and broke_off:
             raise _out_of_step(
                 got, f"RDMA weight stream v{version} broke off: {exc}"
             ) from exc
@@ -545,10 +554,6 @@ class RDMAWeightReceiverMixin:
         the others have not would leave them in the rendezvous waiting for it.
         Idempotent for the same join, as the orchestrator may retry.
         """
-        from atom.utils.distributed.utils import (
-            stateless_init_torch_distributed_process_group,
-        )
-
         rank = int(base_rank) + int(self.rank)
         join = {
             "master": f"{master_addr}:{int(master_port)}",
@@ -604,7 +609,7 @@ class RDMAWeightReceiverMixin:
 
         timeout = timedelta(seconds=int(timeout_s))
         with _aborted_not_ended_on_timeout():
-            group = stateless_init_torch_distributed_process_group(
+            group = dist_utils.stateless_init_torch_distributed_process_group(
                 master_addr,
                 int(master_port),
                 rank,
@@ -625,6 +630,7 @@ class RDMAWeightReceiverMixin:
         return True
 
     @_one_update
+    @_discard_sync_state_on_error
     def receive_weights_rdma(
         self,
         group_name: str,
@@ -687,7 +693,6 @@ class RDMAWeightReceiverMixin:
                 group_name,
                 exc,
             )
-            self.destroy_rdma_weight_group(group_name)
             raise
         weight_group.pending_version = version
         logger.info(
@@ -696,8 +701,6 @@ class RDMAWeightReceiverMixin:
         return stats["updated"]
 
     def destroy_rdma_weight_group(self, group_name: str) -> bool:
-        from atom.utils.distributed.utils import forget_process_group
-
         weight_group = self._rdma_groups.pop(group_name, None)
         if weight_group is None:
             return True
@@ -705,7 +708,7 @@ class RDMAWeightReceiverMixin:
             dist.destroy_process_group(weight_group.group)
         except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
             # Or the group's name stays taken, and it cannot be joined again.
-            forget_process_group(weight_group.group)
+            dist_utils.forget_process_group(weight_group.group)
             logger.warning(
                 "%s: tearing down RDMA weight group %s failed: %s",
                 self.label,

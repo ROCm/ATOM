@@ -21,6 +21,7 @@ from dataclasses import dataclass
 COLLECTIVE_RPC_CMD = "collective_rpc"
 DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
 FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
+RECEIVE_WEIGHTS_RDMA_CMD = "receive_weights_rdma"
 
 
 class WeightReloadRefused(RuntimeError):
@@ -58,7 +59,7 @@ UTILITY_MANAGED_RUNNER_METHODS = frozenset(
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
-        "receive_weights_rdma",
+        RECEIVE_WEIGHTS_RDMA_CMD,
         DISCARD_WEIGHT_SYNC_CMD,
         "release_memory",
         "resume_memory",

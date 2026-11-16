@@ -24,7 +24,7 @@ import zmq.asyncio
 from atom.config import Config
 from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.model_engine.capabilities import pcp_group_size_of
+from atom.model_engine.capabilities import WEIGHT_RELOAD_FEATURE, pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
@@ -2298,7 +2298,7 @@ class CoreManager:
         Not a weight stream: its trainer is already broadcasting, so each
         engine takes it in and refuses it there.
         """
-        reason = self._weight_syncs_unavailable.get("weight_reload")
+        reason = self._weight_syncs_unavailable.get(WEIGHT_RELOAD_FEATURE)
         if cmd == RECEIVE_WEIGHTS_RDMA_CMD or reason is None:
             return
         if in_session:

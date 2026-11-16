@@ -13,7 +13,6 @@ from atom.model_loader.weight_names import have_shared_expert
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
-    is_expert_parallel,
 )
 from atom.rollout.weight_bucket import bucket_entries, decode_bucket
 from atom.rollout.weight_sync_record import WeightSyncRecord
@@ -486,9 +485,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             if not callable(weight_loader):
                 continue
 
-            self._check_expert_sync_supported(
-                name, atom_name, param_name, module, param, tensor
-            )
+            self._check_expert_sync_supported(name, param_name)
             self._load_into_param(
                 param,
                 weight_loader,
@@ -537,9 +534,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         if not callable(weight_loader):
             return "skipped"
 
-        self._check_expert_sync_supported(
-            name, atom_name, param_name, module, param, tensor
-        )
+        self._check_expert_sync_supported(name, param_name)
         if tensor.dim() != 3:
             raise NotImplementedError(
                 f"{self.label}: {name} resolves to the fused expert buffer "
@@ -600,7 +595,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         width; ``FusedMoE``'s full-load path does not slice the source by
         ``tp_rank`` either.
         """
-        self._check_expert_sync_supported(name, name, param_name, module, param, tensor)
+        self._check_expert_sync_supported(name, param_name)
         if param.dim() != 3:
             raise NotImplementedError(
                 f"{self.label}: {name} carries an expert-buffer name but is "
@@ -624,47 +619,16 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
                 _EXPERT_BUFFER_SHARDS[param_name]
             )
 
-    def _check_expert_sync_supported(
-        self,
-        name: str,
-        atom_name: str,
-        param_name: str,
-        module: torch.nn.Module,
-        param: torch.nn.Parameter,
-        tensor: torch.Tensor,
-    ) -> None:
-        """Refuse the combinations this path does not actually implement.
-
-        Loud, and before the write. ``FusedMoE.weight_loader`` copies into
-        whatever buffer it is handed: on a quantized layer it byte-copies or
-        numerically casts, either of which leaves the expert computing
-        something else while the sync reports updated=1. A silent wrong answer
-        in a rollout is worse than a stopped job.
-        """
+    def _check_expert_sync_supported(self, name: str, param_name: str) -> None:
+        """Refuse an expert tensor that resolves to a buffer this path does
+        not write. Quantized and expert-parallel layers never reach it:
+        ``_reload_refusal`` refuses them before a sync writes anything."""
         if param_name not in _EXPERT_BUFFER_SHARDS:
             raise NotImplementedError(
                 f"{self.label}: routed-expert weight sync writes "
                 f"{sorted(_EXPERT_BUFFER_SHARDS)}, not {param_name!r} "
                 f"(resolved from {name!r}). Scales and packed metadata are not "
                 f"synced; send an unquantized MoE checkpoint."
-            )
-        if not (param.dtype.is_floating_point and param.element_size() >= 2):
-            raise NotImplementedError(
-                f"{self.label}: {atom_name} holds experts as {param.dtype}, a "
-                f"quantized storage format. Writing {tensor.dtype} into it needs "
-                f"the weight and its scale recomputed together, which this path "
-                f"does not do -- FusedMoE.weight_loader would byte-copy or "
-                f"numerically cast, leaving the existing scale describing the old "
-                f"weight. Run the rollout with an unquantized MoE, or extend this "
-                f"path with a requantizing loader for the format."
-            )
-        if is_expert_parallel(module):
-            raise NotImplementedError(
-                f"{self.label}: {atom_name} is expert-parallel or carries redundant "
-                f"expert replicas. Incoming ids then address a rank's local slots "
-                f"through expert_map, only some arrive on this rank, and the "
-                f"replicas are filled after loading rather than sent -- none of "
-                f"which this path tracks. Run the rollout MoE with EP off."
             )
 
     def _finalize_expert_weight_sync(self) -> None:
@@ -912,8 +876,8 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         Computes new per-block (or per-tensor/per-token) scale factors and writes
         both the FP8 weight and scale into the module in place.
 
-        Returns whether it wrote anything. A shape it cannot shard to this rank,
-        or a quant type it does not know, leaves the parameter as it was.
+        Returns whether it wrote anything. A shape it cannot shard to this
+        rank leaves the parameter as it was.
         """
         weight_scale = module.weight_scale
         fp8_dtype = param.dtype
@@ -946,13 +910,11 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             return False
 
         quant_type = getattr(module, "quant_type", None)
-        requantise = FP8_REQUANTISERS.get(getattr(quant_type, "name", None))
-        if requantise is None:
-            logger.warning(
-                f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize"
-            )
-            return False
-        q_weight, scale = requantise(module, tensor_gpu, fp8_dtype)
+        # A quant type missing from the table is refused before any write
+        # (_unreloadable_params), so every one that reaches here is in it.
+        q_weight, scale = FP8_REQUANTISERS[quant_type.name](
+            module, tensor_gpu, fp8_dtype
+        )
         # The scale writes ride on the weight's fence: `_await_readers_of`
         # synchronizes the device, so the reader that held the weight held its
         # scale too and both are done by the time this returns.

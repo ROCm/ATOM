@@ -379,8 +379,6 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     monkeypatch.setattr(engine_core, "AsyncIOProcManager", runner_manager)
     monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
-    # A runner that does not say which weight syncs it takes is not asked.
-    monkeypatch.setattr(engine_core, "resolve_obj_by_qualname", lambda name: object)
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
     monkeypatch.setattr(
@@ -393,6 +391,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
+        weight_sync_runner=False,
         enforce_eager=True,
         disagg_is_decode=False,
         pipeline_parallel_size=1,

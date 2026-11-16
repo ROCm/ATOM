@@ -824,14 +824,14 @@ def _engine_with(runner, runners=None):
 
     from atom.model_engine.engine_utility import (
         EngineUtilityHandler,
-        ask_what_runners_take,
+        ask_what_runners_cannot_take,
     )
 
     out = queue.Queue()
     runners = runners or _InProcessRunners(runner)
     unavailable = None
     if callable(getattr(runner, "get_worker_capabilities", None)):
-        unavailable = ask_what_runners_take(runners, "test")
+        unavailable = ask_what_runners_cannot_take(runners, "test")
     handler = EngineUtilityHandler(runners, out, unavailable=unavailable)
     engine = _Engine()
 
@@ -870,11 +870,11 @@ def test_the_engine_refuses_a_model_a_reload_cannot_rewrite_without_a_fence(
 def test_runners_that_cannot_say_what_they_take_stop_the_engine_starting(how):
     """Asked on the way into every sync instead, a slow or failing answer cost
     each sync up to 30 s at its start, and then went unheeded without a word."""
-    from atom.model_engine.engine_utility import ask_what_runners_take
+    from atom.model_engine.engine_utility import ask_what_runners_cannot_take
 
     runner = _ReportingRunner(_dense_model())
     with pytest.raises((RuntimeError, TimeoutError), match="rank 1"):
-        ask_what_runners_take(_UnansweredQuery(runner, how), "test")
+        ask_what_runners_cannot_take(_UnansweredQuery(runner, how), "test")
 
 
 def test_a_sync_asks_the_runners_nothing():

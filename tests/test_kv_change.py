@@ -33,7 +33,7 @@ from atom.model_engine.engine_utility import (
     RECEIVE_WEIGHTS_RDMA_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     EngineUtilityHandler,
-    ask_what_runners_take,
+    ask_what_runners_cannot_take,
     kv_change,
 )
 from atom.model_engine.scheduler import (
@@ -394,7 +394,9 @@ def _wired(schedulers, runners=None):
             scheduler=sched,
             # As EngineCore asks at startup.
             unavailable=(
-                None if runner.unasked else ask_what_runners_take(runner, f"dp{i}")
+                None
+                if runner.unasked
+                else ask_what_runners_cannot_take(runner, f"dp{i}")
             ),
         )
         for i, (runner, out, sched) in enumerate(zip(runners, outs, schedulers))

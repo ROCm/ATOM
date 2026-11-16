@@ -23,7 +23,7 @@ from atom.model_engine.dynamic_chunking import (
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     EngineUtilityHandler,
-    ask_what_runners_take,
+    ask_what_runners_cannot_take,
 )
 from atom.model_engine.prefill_backlog import prefill_backlog
 from atom.model_engine.prefix_hash import attach_shipped_chains
@@ -42,7 +42,6 @@ from atom.utils import (
     envs,
     init_exit_handler,
     make_zmq_socket,
-    resolve_obj_by_qualname,
     set_process_title,
 )
 from atom.utils.distributed.utils import (
@@ -225,11 +224,12 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
-            unavailable = None
-            runner_class = resolve_obj_by_qualname(config.runner_qualname)
-            if callable(getattr(runner_class, "get_worker_capabilities", None)):
-                # Fixed once the model is loaded, so asked once.
-                unavailable = ask_what_runners_take(self.runner_mgr, self.label)
+            # Fixed once the model is loaded, so asked once.
+            unavailable = (
+                ask_what_runners_cannot_take(self.runner_mgr, self.label)
+                if config.weight_sync_runner
+                else {}
+            )
             good = True
         finally:
             logger.info(

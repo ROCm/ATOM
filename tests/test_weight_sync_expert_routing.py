@@ -21,6 +21,7 @@ import pytest
 import torch
 from torch import nn
 
+from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.rollout.weight_updater import WeightUpdaterMixin
 
 needs_aiter = pytest.mark.skipif(
@@ -145,34 +146,25 @@ def test_a_partial_named_expert_buffer_is_refused():
     assert not updater._expert_relayout_pending
 
 
-def test_a_named_expert_buffer_is_refused_on_a_quantized_moe():
-    """The plain dispatch would have written it and reported updated=1.
-    `_check_expert_sync_supported` is the check this route was missing."""
-    model, experts = _moe_model(dtype=torch.float8_e4m3fnuz)
+@pytest.mark.parametrize(
+    ("layer", "reason"),
+    [
+        ({"dtype": torch.float8_e4m3fnuz}, "full-precision write cannot produce"),
+        ({"expert_map": torch.zeros(EXPERTS, dtype=torch.int32)}, "expert-parallel"),
+    ],
+    ids=["quantized", "expert-parallel"],
+)
+def test_a_named_expert_buffer_is_refused_before_it_is_written(layer, reason):
+    """The plain dispatch would have written it and reported updated=1."""
+    model, experts = _moe_model(**layer)
     updater = _updater(model)
+    before = experts.w13_weight.detach().clone()
 
-    with pytest.raises(NotImplementedError, match="quantized storage format"):
-        updater._apply_named_expert_buffer(
-            "mlp.experts.w13_weight",
-            "w13_weight",
-            experts,
-            experts.w13_weight,
-            torch.zeros_like(experts.w13_weight),
+    with pytest.raises(WeightReloadRefused, match=reason):
+        updater.update_weights(
+            [("mlp.experts.w13_weight", torch.ones_like(experts.w13_weight))]
         )
-
-
-def test_a_named_expert_buffer_is_refused_under_expert_parallelism():
-    model, experts = _moe_model(expert_map=torch.zeros(EXPERTS, dtype=torch.int32))
-    updater = _updater(model)
-
-    with pytest.raises(NotImplementedError, match="expert-parallel"):
-        updater._apply_named_expert_buffer(
-            "mlp.experts.w13_weight",
-            "w13_weight",
-            experts,
-            experts.w13_weight,
-            torch.zeros_like(experts.w13_weight),
-        )
+    assert experts.w13_weight.view(torch.uint8).equal(before.view(torch.uint8))
 
 
 # ── the wrappers ModelRunner rebinds onto self.model ──────────────────────

@@ -272,15 +272,20 @@ parameter as it was. Weights may be resumed while fenced, since after
 ``sleep(level=2)`` only a resume gives released parameters storage again; the
 fence keeps serving off until that complete sync commits.
 
-What syncs the runners can take is asked once, at engine startup, of a runner
-that answers ``get_worker_capabilities``; one that cannot answer fails startup.
-A sync they cannot take -- a model a reload cannot rewrite in place, such as
-MLA, prefill context parallelism, expert-parallel or redundant-expert MoE, or
-weights in a format a full-precision write cannot produce -- is refused before
-its first update, with nothing preempted, written or fenced. The runners also
-refuse it themselves before writing. A sync whose updates every rank refused
-before writing, or that never reached a rank, leaves the fence as it was when
-the sync began.
+What syncs the runners can take is asked once, at engine startup, when
+``Config.weight_sync_runner`` says they answer ``get_worker_capabilities``
+(``AsyncLLMEngine`` sets it); a runner that cannot answer fails startup. Each
+engine reports the answer in its READY, and CoreManager refuses a reload that
+any engine's runners cannot take before any engine runs it -- under PP, one
+stage's runners alone may be the ones that cannot. Such a sync -- a model a
+reload cannot rewrite in place, such as MLA, prefill context parallelism,
+expert-parallel or redundant-expert MoE, or weights in a format a
+full-precision write cannot produce -- writes nothing and fences nothing. The
+engine and the runners refuse it too, before writing. A sync whose updates
+every rank refused before writing, or that never reached a rank, leaves the
+fence and the prefix cache as they were when the sync began. Weights a sleep
+discards are not whole either: the engine stays fenced until a sync that
+rewrites every parameter.
 
 An RDMA stream is decided by the runners. Each waits for every broadcast for
 at most its weight group's ``timeout_s``, and the group is built to abort its
@@ -289,7 +294,9 @@ mid-stream fails the stream on every rank once that timeout passes, plus up to
 about a minute to tear the group down. The group then has to be joined again,
 and the engine stays fenced until a sync rewrites every parameter. A caller
 that stops waiting before the engine answers does not learn whether the stream
-was written, and the engine stays fenced the same way.
+was written, and the engine stays fenced the same way. A stream's version is
+used up only once FINISH commits it, so a sync the engine failed can be
+retried at the same version.
 
 ## Sequence lifecycle
 

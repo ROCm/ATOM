@@ -360,6 +360,11 @@ class _Runner:
     def _refuse_unwritten(self, counts):
         pass
 
+    def _write_batch(self, path, weights, *, complete, require_full):
+        counts = self._apply_named_tensors(weights)
+        self._refuse_unwritten(counts)
+        return counts["updated"]
+
     def _complete_sync(self, require_full):
         self.events.append(f"complete(require_full={require_full})")
         self._sync = None
@@ -495,7 +500,7 @@ def test_a_failed_bucket_is_raised_only_after_the_stream_ends(monkeypatch):
         _receive(monkeypatch, trainer, runner, agree=agree)
 
     assert trainer.frames == [], "every remaining broadcast must still be joined"
-    assert runner.events == ["open", "apply1", "discard"]
+    assert runner.events == ["open", "apply1"]
     assert agree.ballots[-1] == receiver._ENDED, "still in step at the end"
 
 
@@ -509,7 +514,6 @@ def test_a_sync_that_cannot_complete_is_raised_once_the_ranks_are_done(monkeypat
         _receive(monkeypatch, trainer, runner)
 
     assert not isinstance(raised.value, receiver.RDMAStreamOutOfStep)
-    assert runner.events[-1] == "discard"
 
 
 def test_a_version_mismatch_drains_before_raising(monkeypatch):
@@ -520,7 +524,7 @@ def test_a_version_mismatch_drains_before_raising(monkeypatch):
         _receive(monkeypatch, trainer, runner)
 
     assert trainer.frames == []
-    assert runner.events == ["open", "discard"]
+    assert runner.events == ["open"]
 
 
 @pytest.mark.parametrize(
@@ -554,7 +558,7 @@ def test_a_frame_that_cannot_be_allocated_for_fails_at_its_header(
     with pytest.raises(receiver.RDMAStreamOutOfStep, match=reason):
         _receive(monkeypatch, trainer, runner)
     assert allocated == [], "nothing may be allocated for the frame"
-    assert runner.events == ["open", "discard"]
+    assert runner.events == ["open"]
 
 
 def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
@@ -594,7 +598,7 @@ def test_a_header_that_frames_no_bucket_breaks_the_stream_off(monkeypatch, heade
         _receive(monkeypatch, trainer, runner)
 
     assert len(trainer.frames) == after_the_header, "a broadcast was posted for it"
-    assert runner.events == ["open", "discard"]
+    assert runner.events == ["open"]
 
 
 def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
@@ -607,7 +611,6 @@ def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):
     with pytest.raises(RuntimeError, match="end marker"):
         _receive(monkeypatch, _Trainer(frames), runner)
 
-    assert runner.events[-1] == "discard"
     assert not any(e.startswith("complete") for e in runner.events)
 
 
@@ -678,9 +681,10 @@ def test_a_frame_a_peer_cannot_receive_is_broken_off_here_too(monkeypatch):
 
     assert agree.ballots == [receiver._RECEIVING] * 2
     assert len(trainer.frames) == 6, "the frame's broadcasts were entered"
-    assert runner.events == ["open", "apply1", "discard"]
-    # Every rank left at that vote, so none is in a broadcast to release.
-    assert left == []
+    assert runner.events == ["open", "apply1"]
+    # Every rank broke off at that vote, so it leaves the group after it, with
+    # no last vote owed.
+    assert left == [1] and agree.ballots[-1] == receiver._RECEIVING
 
 
 def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
@@ -727,7 +731,6 @@ def test_a_rank_that_left_the_group_takes_its_peers_out_of_it_too(monkeypatch):
             runner,
             agree=_peers(at_end=receiver._LEFT),
         )
-    assert runner.events[-1] == "discard"
 
 
 def test_a_vote_that_failed_puts_the_rank_out_of_step(monkeypatch):
