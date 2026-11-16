@@ -320,10 +320,12 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
+            "or DeepSeek-V4.1's own FP4 KV; other models refuse it. M3's conditions "
+            "are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
@@ -333,7 +335,8 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype.",
+            "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
+            "cache or another model's own FP4 layout; see the configuration guide.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -411,6 +414,12 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'share_cache': with an offload tier every rank shares "
+            "(mooncake_store, lmcache_mp), route to the rank with the least "
+            "prefill left as the ranks report it, charging a request only what "
+            "it will compute (prompt minus the prefix any rank already put in "
+            "the tier); needs --enable_prefix_caching and "
+            "ATOM_FRONTEND_PREFIX_HASH=1, excludes ATOM_DP_SESSION_AFFINITY. "
             "'prefix_spread': keep a request on the rank holding its prompt's "
             "prefix unless that rank has a prefill backlog and another is "
             "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "

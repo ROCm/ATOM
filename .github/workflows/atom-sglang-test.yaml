@@ -46,11 +46,13 @@ jobs:
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
+            .claude/**
             atom/plugin/vllm/**
             atom/mesh/**
             .github/benchmark/models_atomesh.yaml
             .github/scripts/atomesh/**
             .github/workflows/atomesh-*.yaml
+            .github/workflows/atom-review-bot*.yml
             .github/scripts/atomesh_*.sh
             .github/dashboard/atomesh_*.html
             .github/workflows/atom-vllm-*.yaml

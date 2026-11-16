@@ -446,6 +446,7 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     builder.geometry, builder.device, builder.block_size = geo, "cpu", 32
     builder.cache = None
     builder.score_workspace = None
+    builder._prefill_window_staging = None
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(1, 6, 1, "cpu", geo)
     )

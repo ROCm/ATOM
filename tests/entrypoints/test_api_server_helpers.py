@@ -876,6 +876,109 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
     assert events == ["initialize", "serving", "shutdown"]
 
 
+# ---- /kv_event_sources: where a router follows each DP rank's KV events ----
+
+
+def _kv_events_engine(
+    monkeypatch, parallel=None, *, enable_dp_attention=False, tp=1, **events
+):
+    """An engine with KV events configured as `events`, by default DP=2 on one
+    node, serving the sources its CoreManager builds."""
+    from atom.config import KVEventsConfig, ParallelConfig
+    from atom.model_engine.engine_core_mgr import kv_event_sources
+
+    config = SimpleNamespace(
+        kv_events_config=KVEventsConfig(**events),
+        parallel_config=parallel or ParallelConfig(data_parallel_size=2),
+        enable_dp_attention=enable_dp_attention,
+        tensor_parallel_size=tp,
+        kv_cache_block_size=16,
+        decode_context_parallel_size=2,
+    )
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            config=config,
+            core_mgr=SimpleNamespace(kv_event_sources=kv_event_sources(config)),
+        ),
+    )
+
+
+def _tcp_sources(ports):
+    # 16-token KV blocks under DCP 2 hash 32 tokens per block.
+    return {
+        str(rank): {"endpoint": f"tcp://*:{port}", "topic": "kv", "block_size": 32}
+        for rank, port in ports.items()
+    }
+
+
+def test_kv_event_sources_reports_every_dp_rank_publisher(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="tcp://*:5557", topic="kv")
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({0: 5557, 1: 5558})
+    assert "kv_event_sources" not in asyncio.run(api_server.server_info())
+
+
+def test_kv_event_sources_keys_the_global_rank_on_a_later_node(monkeypatch):
+    from atom.config import ParallelConfig
+
+    # The second node of a DP=4 run: its engines are global ranks 2 and 3 and
+    # bind their endpoints offset from rank 2, not from 0.
+    parallel = ParallelConfig(
+        data_parallel_size=4, data_parallel_size_local=2, data_parallel_rank=2
+    )
+    _kv_events_engine(
+        monkeypatch, parallel, enable=True, endpoint="tcp://*:5557", topic="kv"
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({2: 5559, 3: 5560})
+
+
+@pytest.mark.parametrize("node_rank, first", [(0, 0), (2, 4)])
+def test_kv_event_sources_lists_every_tp_rank_under_dp_attention(
+    monkeypatch, node_rank, first
+):
+    from atom.config import ParallelConfig
+
+    # DP-attention runs one engine, and so one publisher, per TP rank: DP=2
+    # per node at TP=2 is four, numbered globally in TP units.
+    parallel = ParallelConfig(
+        data_parallel_size=2 + node_rank,
+        data_parallel_size_local=2,
+        data_parallel_rank=node_rank,
+    )
+    _kv_events_engine(
+        monkeypatch,
+        parallel,
+        enable_dp_attention=True,
+        tp=2,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+    )
+    ranks = range(first, first + 4)
+    sources = asyncio.run(api_server.kv_event_sources())
+    assert sources == _tcp_sources({rank: 5557 + rank for rank in ranks})
+
+
+def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
+    _kv_events_engine(monkeypatch, enable=True, endpoint="ipc:///tmp/kv")
+    assert asyncio.run(api_server.kv_event_sources()) == {
+        "0": {"endpoint": "ipc:///tmp/kv", "topic": "", "block_size": 32},
+        "1": {"endpoint": "ipc:///tmp/kv_dp1", "topic": "", "block_size": 32},
+    }
+
+
+@pytest.mark.parametrize(
+    "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
+)
+def test_kv_event_sources_is_empty_without_a_publisher(monkeypatch, events):
+    _kv_events_engine(monkeypatch, **events)
+    assert asyncio.run(api_server.kv_event_sources()) == {}
+
+
 # ---- --api-server-count: the worker side of api_server ----
 
 
@@ -889,6 +992,7 @@ def test_engine_routes_are_the_management_endpoints():
         "/debug/mtp_stats",
         "/debug/cache_stats",
         "/kv_transfer_info",
+        "/kv_event_sources",
         "/server_info",
         "/start_profile",
         "/stop_profile",
@@ -1142,7 +1246,14 @@ class TestDeploymentDefaultOutputCap:
         assert seq.max_tokens == 512
 
 
-def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
+@pytest.mark.parametrize(
+    "keeps, needs_strings, preserve",
+    [(True, False, True), (False, True, True), (False, False, False)],
+    ids=["kimi-k3", "concatenating-template", "mapping-template"],
+)
+def test_reasoning_and_tool_setup_publishes_every_module_global(
+    monkeypatch, keeps, needs_strings, preserve
+):
     # Front-end workers run this split-out part of main(); an assignment
     # without its `global` would set a local and leave the module default.
     names = (
@@ -1163,7 +1274,8 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
         "template_opens_reasoning_implicitly": lambda *_a: True,
         "resolve_reasoning_toggle": lambda *_a: ("thinking", False, True),
         "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
-        "template_keeps_tool_call_arguments": lambda *_a: True,
+        "template_keeps_tool_call_arguments": lambda *_a: keeps,
+        "template_needs_tool_call_argument_strings": lambda *_a: needs_strings,
         "required_call_channel": lambda *_a: "channel",
     }
     for name, stub in stubs.items():
@@ -1179,5 +1291,5 @@ def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
     assert api_server.model_starts_in_reasoning is True
     assert api_server.reasoning_toggle == ("thinking", False, True)
     assert api_server.tool_call_parser_cls == "parser"
-    assert api_server.preserve_tool_call_arguments is True
+    assert api_server.preserve_tool_call_arguments is preserve
     assert api_server.required_tool_channel == "channel"

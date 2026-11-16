@@ -114,6 +114,16 @@ def test_configuration_f_is_served_on_either_verify(native, monkeypatch, replays
 
 
 @pytest.mark.parametrize(
+    "name", ["LMCache_Offload", "LMCacheOffloadConnector", "LMCacheConnectorV1"]
+)
+def test_the_offload_connector_is_served_under_any_name_the_factory_builds(
+    native, name
+):
+    offload = {"kv_connector": name, "kv_role": "offload"}
+    assert mono_config.config_refusal(_atom_config(kv_transfer_config=offload)) is None
+
+
+@pytest.mark.parametrize(
     "overrides,reason",
     [
         ({"tensor_parallel_size": 8}, "TP 8"),

@@ -94,6 +94,7 @@ def config(**extra):
         kv_cache_block_size=4,
         tensor_parallel_size=2,
         hf_config=SimpleNamespace(model_type="reusable_test_model", kv_lora_rank=512),
+        speculative_config=None,
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
             "kv_role": "offload",

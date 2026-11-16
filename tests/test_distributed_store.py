@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from atom.config import ParallelConfig
+from atom.config import KVEventsConfig, ParallelConfig
 from atom.model_engine.engine_core_mgr import CoreManager
 
 
@@ -35,6 +35,7 @@ def manager(monkeypatch):
             dp_load_balance="round_robin",
             keep_finished_outputs=False,
             asyncio_mode=False,
+            kv_events_config=KVEventsConfig(),
         ),
         label="test",
         local_engine_count=0,

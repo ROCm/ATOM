@@ -364,6 +364,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn kv_events(mut self, enable: bool) -> Self {
+        self.config.kv_events = enable;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

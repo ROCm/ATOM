@@ -351,15 +351,20 @@ class KVCacheBinding(nn.Module):
 
     ``check_cache``, if given, is called with the views before they are bound,
     and raises for a pool its reader was not built for.
+    ``page_tokens`` declares the page the reader views; None uses the pool's
+    own block, while a reader that re-pages it must name that page explicitly.
     """
 
     base_attention = None
     use_mla = False
 
-    def __init__(self, layer_num: int, check_cache=None) -> None:
+    def __init__(
+        self, layer_num: int, check_cache=None, *, page_tokens: int | None = None
+    ) -> None:
         super().__init__()
         self.layer_num = layer_num
         self.check_cache = check_cache
+        self.page_tokens = page_tokens
         self.max_model_len = 0
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
@@ -526,6 +531,7 @@ class DSparkDraftModel(nn.Module):
         aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
         positions: torch.Tensor,  # [N] absolute positions
         slot_mapping: torch.Tensor | None = None,  # [N] paged-pool slots
+        pcp_num_tokens: int | None = None,
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
 
@@ -540,6 +546,10 @@ class DSparkDraftModel(nn.Module):
         ``aux_concat``. A drafter that has already retargeted the metadata to
         its own block pass (see ``DSparkProposer._propose_with_draft``) is
         past the point where these rows can be placed.
+
+        After a PCP row-split target prefill of ``pcp_num_tokens`` rows,
+        ``aux_concat`` is only this rank's round-robin stripe of them
+        (``pcp_aux_rows``); see ``write_split_context_kv``.
         """
         from atom.utils.forward_context import get_forward_context
 
@@ -551,9 +561,29 @@ class DSparkDraftModel(nn.Module):
         # the memory-profiling pass, so it must still run.
         if get_forward_context().context.is_dummy_run:
             return
+        if pcp_num_tokens is not None:
+            self.write_split_context_kv(
+                aux_concat, positions, pcp_num_tokens, slot_mapping
+            )
+            return
         ctx_hidden = self.project_context(aux_concat)
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions, slot_mapping)
+
+    def write_split_context_kv(
+        self,
+        aux_local: torch.Tensor,  # this PCP rank's round-robin stripe
+        positions: torch.Tensor,  # [num_tokens] absolute positions
+        num_tokens: int,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """`write_context_kv` from this rank's stripe of the aux rows: gather
+        them, then write as usual. A draft that projects its context KV row by
+        row overrides this to gather the (smaller) KV rows instead."""
+        from atom.distributed.pcp_utils import pcp_allgather_rerange
+
+        aux = pcp_allgather_rerange(aux_local)[:num_tokens]
+        self.write_context_kv(aux, positions, slot_mapping)
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         """Fuse the concatenated target aux hidden states into one [N, hidden]
@@ -685,8 +715,7 @@ class DSparkDraftModel(nn.Module):
                 f"vocab {target_vocab}. The draft shares the target's embedding "
                 "and LM head, so the two must agree."
             )
-        # A draft that loaded its own embedding (K3 DSpark on PP stage > 0)
-        # keeps it.
-        if self.embed_tokens is None:
-            self.embed_tokens = target_base.model.embed_tokens
+        # A stage without the target's embedding binds its PPMissingLayer,
+        # which the drafter's check_shared_embedding refuses.
+        self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head

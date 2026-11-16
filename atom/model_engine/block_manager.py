@@ -16,12 +16,12 @@ import numpy as np
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
-    MEDIUM_REMOTE,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     KVCacheEvent,
 )
+from atom.kv_transfer.offload.load_math import chunk_floor, tier_load_tokens
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
@@ -58,6 +58,7 @@ def _make_block_stored(
     block_size: int,
     medium: str = MEDIUM_GPU,
     token_offset: int | None = None,
+    cache_seed: int = -1,
 ) -> BlockStored:
     """Construct a BlockStored event from a coalesced run of new blocks.
 
@@ -67,6 +68,14 @@ def _make_block_stored(
     `block_size` here is the hash block size (block_size * dcp_world_size),
     the span of one block-table entry in global tokens, so the offset must be
     computed in the same unit.
+
+    `cache_seed` is the seq's. A multimodal seq's (anything but -1) seeds its
+    whole hash chain, so no block of it can be named from its tokens alone.
+    Every block of such a seq, text-only ones included, then carries
+    `extra_keys` `((seed, 0),)`, the seed in 16 hex digits at a fixed offset 0:
+    an ATOM marker that the hash is seeded by media and the block must not be
+    matched by tokens. It borrows the shape of vLLM's `(mm_identifier, offset)`
+    pair, but not its meaning (vLLM's offset is the media's position).
     """
     # A list, not the `array("i")` the publish paths carry: the event is
     # msgpack-encoded and msgspec has no encoding for an array. The publisher
@@ -75,12 +84,18 @@ def _make_block_stored(
     assert isinstance(
         tokens, list
     ), f"BlockStored.token_ids must be a list, got {type(tokens).__name__}"
+    extra_keys = None
+    if cache_seed != -1:
+        extra_keys = [((format(cache_seed & (2**64 - 1), "016x"), 0),)] * len(hashes)
     return BlockStored(
         block_hashes=hashes,
         parent_block_hash=parent,
         token_ids=tokens,
         block_size=block_size,
+        lora_id=None,
         medium=medium,
+        lora_name=None,
+        extra_keys=extra_keys,
         token_offset=token_offset,
     )
 
@@ -219,6 +234,7 @@ class BlockManager:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
+        self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -353,7 +369,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
-            state_tier_cpu_bytes,
+            state_tier_cpu_entries,
             state_tier_verified_for_s,
         )
 
@@ -529,10 +545,8 @@ class BlockManager:
                 # Not `slot_bytes`: under MTP a slot holds more than an image
                 # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
                 # this index a third below the codec, hiding images it holds.
-                # Under PP every stage's codec evicts by its own image, so the
-                # stage with the largest one keeps the fewest entries.
                 max_cpu_entries=(
-                    state_tier_cpu_bytes() // checkpoint_spec.largest_image_bytes
+                    state_tier_cpu_entries(checkpoint_spec, config)
                     if checkpoint_spec is not None
                     else None
                 ),
@@ -840,7 +854,7 @@ class BlockManager:
             return hit
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
-        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        min_load = self._min_load_tokens
         resume = hit * hbs
         tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
@@ -1632,6 +1646,78 @@ class BlockManager:
         if joint_hash != -1:
             return joint_hash
         return -1 if self.tier_resume_replays(seq) else hit_hash
+
+    def lower_hit_to_chunk(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        chunk: int,
+        tier_hit: int,
+    ) -> bool:
+        """Lower an unaligned HBM hit to the tier's chunk floor, so a load can
+        start there.
+
+        A tier moves whole `chunk`-token chunks, so a load starts only on a
+        chunk boundary. Without lowering, an HBM hit that ends inside a chunk
+        needs a hand-off prefill up to the next boundary, then the load, then
+        the rest: two prefill releases. Lowering treats the part of the hit
+        past the floor as a miss. `allocate` then claims only the blocks below the floor
+        and fills the rest with fresh ones, which the load writes whole; the
+        shared blocks past the floor are left alone. The tier re-supplies at
+        most `chunk - hash_block` tokens that HBM already held.
+
+        Lowers `probe` in place and returns True when:
+          - the hit is a chunk multiple off, and the tier's hit reaches past
+            the HBM hit and, from the floor, clears `min_load`;
+          - the hit can be lowered at all: no joint boundary, and a request
+            state that is rebuilt by replay (or none);
+          - every cache class still accepts the lowered boundary -- the same
+            SWA-window and state gates `can_allocate` applied to the original,
+            so a lowered hit never claims a block whose window is gone;
+          - the pool can give the extra fresh blocks.
+        Otherwise leaves `probe` untouched and returns False.
+        """
+        hbs = self.hash_block_size
+        hit_blocks = probe.num_cached_blocks
+        if hit_blocks <= 0 or probe.num_new_blocks is None:
+            return False
+        if chunk <= 0 or chunk % hbs:
+            return False
+        hit = hit_blocks * hbs
+        floor = chunk_floor(hit, chunk)
+        if (
+            floor == hit
+            or tier_hit <= hit
+            or not tier_load_tokens(floor, tier_hit, chunk, self._min_load_tokens)
+        ):
+            return False
+        if seq.offload_joint.boundary_tokens:
+            return False
+        if seq.has_per_req_cache and not self.state.transfer.replays:
+            # A checkpointed state cannot be rebuilt below the hit it was
+            # taken at.
+            return False
+        lowered = floor // hbs
+        chain = probe.block_hashes
+        if lowered > len(chain):
+            return False
+        if lowered and self._gated_hit(seq, lowered, chain) != lowered:
+            return False
+        # `probe.num_new_blocks` already counts a cached-free block of the hit
+        # as one to allocate: claiming it or taking a fresh one costs the same
+        # unit. Only a dropped block some request still holds is a new unit.
+        in_use = 0
+        for i in range(lowered, hit_blocks):
+            block_id = self.kv.lookup(chain[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                in_use += 1
+        demand = probe.num_new_blocks + in_use
+        protected = chain[lowered - 1] if lowered else None
+        if not self._has_page_units(demand, protected):
+            return False
+        probe.num_cached_blocks = lowered
+        probe.num_new_blocks = demand
+        return True
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -2475,6 +2561,7 @@ class BlockManager:
                     store_run_parent,
                     hbs,
                     token_offset=start * hbs,
+                    cache_seed=seq.cache_seed,
                 )
             )
         pos = base + num_new_tokens
@@ -3404,6 +3491,7 @@ class BlockManager:
                             parent_hash if parent_hash != -1 else None,
                             hbs,
                             token_offset=i * hbs,
+                            cache_seed=seq.cache_seed,
                         )
                     )
 
@@ -3739,13 +3827,16 @@ class BlockManager:
         token_ids: list[int],
         parent_block_hash: int | None = None,
         token_offset: int | None = None,
+        cache_seed: int = -1,
     ) -> None:
-        """Emit a BlockStored(medium=REMOTE) for blocks received from a remote
-        KV transfer producer (Mooncake/MoriIO decode side). Called by the
-        KVConnector worker once the transfer completes so external KV-cache
-        consumers (LMCache, etc.) can track remote-resident blocks.
+        """Emit a BlockStored for blocks received from a remote KV transfer
+        producer (Mooncake/MoriIO decode side). Called by the KVConnector
+        worker once the transfer completes so external KV-cache consumers
+        (LMCache, etc.) can track them. The KV now sits in this engine's HBM,
+        so the medium is GPU like any block computed here.
 
-        `token_offset` is the sequence position of the first remote block."""
+        `token_offset` is the sequence position of the first remote block;
+        `cache_seed` is the seq's (see `_make_block_stored`)."""
         if self._event_log is None or not block_hashes:
             return
         self._event_log.append(
@@ -3754,7 +3845,7 @@ class BlockManager:
                 token_ids,
                 parent_block_hash,
                 self.hash_block_size,
-                medium=MEDIUM_REMOTE,
                 token_offset=token_offset,
+                cache_seed=cache_seed,
             )
         )

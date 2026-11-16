@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
@@ -127,6 +128,7 @@ def _init_with_strategy(strategy):
             max_num_seqs=1536,
             keep_finished_outputs=False,
             asyncio_mode=False,
+            kv_events_config=KVEventsConfig(),
         ),
         label="test",
         local_engine_count=2,

@@ -7,8 +7,23 @@ not.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
+
+
+class DraftSrcIndices(NamedTuple):
+    """`DraftStep.indices` as the two sources of the draft attention kernels.
+
+    Built by `draft_src_indices`: int32 rows of the flattened `[B * ring]`
+    window and `[B * width]` block, -1 entries dropped, each with its
+    `[B * width + 1]` indptr.
+    """
+
+    context: torch.Tensor
+    context_ptr: torch.Tensor
+    block: torch.Tensor
+    block_ptr: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -16,6 +31,9 @@ class DraftStep:
     positions: torch.Tensor
     indices: torch.Tensor
     decode: bool = False
+    # Built once per draft step and shared by every stage. The FP8 draft always
+    # has them; on the BF16 draft, None keeps the concatenating path.
+    src_indices: DraftSrcIndices | None = None
 
 
 def draft_step(context_positions, anchors, width, window):

@@ -67,6 +67,15 @@ class Family(StrEnum):
         return self in (Family.KIMI_MLA, Family.QSA_GDN, Family.GDN, Family.CSA2)
 
 
+#: The families whose *draft* caches into a KV pool of its own: an MHA draft keeps
+#: its own K and V, there is no target tensor its rows could be. Every other family's
+#: draft binds into the target's pool (an MLA / CSA draft's latent is the target's).
+#: A table on the family, not a flag on the backend class, so `Config` (which runs in
+#: the API process, where importing a backend would import aiter) and the draft
+#: builder read the same answer; tests/test_kv_pool_contract.py pins it to the
+#: backends that define `make_kv_pool`.
+DRAFT_POOL_FAMILIES = frozenset({Family.MHA})
+
 # What makes a hybrid one is which of its layers are linear, and no field says
 # that -- so these two are named, and everything else is read off the shape.
 _KIMI_MLA_TYPES = ("kimi_linear", "glm5_next_text")

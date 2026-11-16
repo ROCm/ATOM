@@ -444,6 +444,23 @@ class MooncakeAgentMetadata(
 # ===================================================================
 
 
+def _receive_block_offset(
+    num_blocks: int,
+    num_source_blocks: int,
+    cached: int,
+    source_skip_factor: int,
+    chunked: bool,
+) -> int:
+    """The same prefix slice for scheduler admission and worker dispatch."""
+    if (
+        cached < 0
+        or cached >= num_blocks
+        or (not chunked and cached * source_skip_factor >= num_source_blocks)
+    ):
+        return 0
+    return cached
+
+
 class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config: Config) -> None:
         kv_transfer_config = config.kv_transfer_config
@@ -488,10 +505,47 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # for legacy relay. Chunked mode claims at allocation because the peer
         # can read after the first forward; it must not be preempted meanwhile.
         self._awaiting_send: set[str] = set()
+        # Producer state each undispatched allocation replaced, by request id:
+        # what `cancel_preadmission` restores.
+        self._producer_admission_undo: dict[ReqId, tuple] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+
+    @property
+    def supports_pd_admission(self) -> bool:
+        return not self.is_producer
+
+    def _receive_prefix(
+        self, seq, num_cached_blocks: int, geometry: tuple[int, int] | None
+    ) -> tuple[int, int]:
+        if geometry is None or seq.has_per_req_cache:
+            return 0, 1
+        return num_cached_blocks, self.dcp_size // geometry[1]
+
+    def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):
+        params = seq.kv_transfer_params or {}
+        if self.is_producer or not params.get("do_remote_prefill"):
+            return None
+        if seq.has_per_req_cache:
+            # Lifting this also needs `PdAdmissionController.commit` to
+            # re-measure the receive after `allocate` instead of charging the
+            # pre-allocation probe.
+            raise ValueError("PD admission supports paged KV receives only")
+        cached, factor = self._receive_prefix(
+            seq, num_cached_blocks, self._remote_page_geometry(params)
+        )
+        # Chunked P has not allocated its source table when D reserves the
+        # full prompt destination. Match worker dispatch: a missing source
+        # table does not invalidate a compatible local prefix in this mode.
+        return _receive_block_offset(
+            num_blocks,
+            len(params.get("remote_block_ids") or []),
+            cached,
+            factor,
+            bool(params.get("chunked_transfer")),
+        )
 
     def _remote_page_geometry(self, params: dict[str, Any]) -> tuple[int, int] | None:
         """Return ``(producer_block_size, producer_dcp_size)`` when incremental
@@ -580,9 +634,40 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
+        # Those allocations are now dispatched. Cancellation must drain the
+        # worker's source claim, never apply preadmission rollback to them.
+        self._producer_admission_undo.clear()
         return meta
 
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo only producer state installed by an undispatched allocation."""
+        undo = self._producer_admission_undo.pop(seq.id, None)
+        if undo is None or undo[0] is not seq:
+            return
+        _, previous_save, already_claimed, previous_waiting, was_ready = undo
+        if previous_save is None:
+            self._reqs_need_save.pop(seq.id, None)
+        else:
+            self._reqs_need_save[seq.id] = previous_save
+        if not already_claimed:
+            self._awaiting_send.discard(str(seq.id))
+        if previous_waiting is not None:
+            self._chunked_waiting[seq.id] = previous_waiting
+        if was_ready:
+            self._chunked_ready.add(seq.id)
+
     def update_state_after_alloc(self, seq: Sequence) -> None:
+        if self.is_producer:
+            self._producer_admission_undo.setdefault(
+                seq.id,
+                (
+                    seq,
+                    self._reqs_need_save.get(seq.id),
+                    str(seq.id) in self._awaiting_send,
+                    self._chunked_waiting.get(seq.id),
+                    seq.id in self._chunked_ready,
+                ),
+            )
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)
         params = seq.kv_transfer_params or {}
@@ -614,7 +699,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "state_slot", -1)
+        slot_index = seq.state_slot
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -632,10 +717,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # PD incremental: skip leading blocks already in the decode node's
             # prefix cache. Per-request state (including the SWA ring slot) is
             # not covered by a block-only delta, so it takes a full transfer.
-            num_computed_blocks = 0
-            # Number of producer source blocks represented by one consumer block.
-            src_block_skip_factor = 1
             remote_geometry = self._remote_page_geometry(params)
+            num_computed_blocks, src_block_skip_factor = self._receive_prefix(
+                seq, seq.num_cached_tokens // self.hash_block_size, remote_geometry
+            )
             if remote_geometry is None:
                 logger.warning(
                     "PD incremental transfer disabled for req %s: producer "
@@ -648,10 +733,6 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     self.block_size,
                     self.dcp_size,
                 )
-            elif not seq.has_per_req_cache and self.hash_block_size > 0:
-                _, remote_dcp_size = remote_geometry
-                num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
-                src_block_skip_factor = self.dcp_size // remote_dcp_size
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
             logger.debug(
@@ -669,7 +750,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
         # Producer side: queue block_ids for the write listener to look up
-        if params.get("do_remote_decode"):
+        if params.get("do_remote_decode") and params.get("chunked_transfer"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
             self._reqs_need_save[seq.id] = (seq, list(seq.block_table), slot_index)
             logger.debug(
@@ -702,7 +783,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self._reqs_need_save[seq.id] = (
                     seq,
                     list(seq.block_table),
-                    getattr(seq, "state_slot", -1),
+                    seq.state_slot,
                 )
             seq.kv_transfer_params_output = None
             return
@@ -719,13 +800,22 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_decode"
         ):
             self._awaiting_send.add(str(seq.id))
+            # A non-chunked source is published only after prefill finishes.
+            # Allocation may dispatch Store loads before the P forward; caching
+            # those addresses then would leave them in the worker after an
+            # aborted load releases the allocation.
+            self._reqs_need_save[seq.id] = (
+                seq,
+                list(seq.block_table),
+                seq.state_slot,
+            )
 
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
-        final_state_slot = getattr(seq, "state_slot", -1)
+        final_state_slot = seq.state_slot
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -1887,15 +1977,13 @@ class MooncakeConnector(KVConnectorBase):
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             src_block_skip_factor = max(1, meta.src_block_skip_factor)
-            if (
-                off < 0
-                or off >= len(meta.local_block_ids)
-                or (
-                    not meta.chunked_transfer
-                    and off * src_block_skip_factor >= len(remote_block_ids)
-                )
-            ):
-                off = 0
+            off = _receive_block_offset(
+                len(meta.local_block_ids),
+                len(remote_block_ids),
+                off,
+                src_block_skip_factor,
+                meta.chunked_transfer,
+            )
             dst_block_ids = meta.local_block_ids[off:]
             src_block_ids = remote_block_ids[off * src_block_skip_factor :]
 
