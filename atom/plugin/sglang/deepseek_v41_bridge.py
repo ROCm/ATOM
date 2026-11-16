@@ -44,6 +44,7 @@ Identities the translation relies on:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextlib import contextmanager
 from functools import wraps
@@ -63,6 +64,11 @@ ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE = 256
 # The metadata builder of this process, created right before SGLang profiles
 # the memory its KV pool may take (`_install_pool_sizing_patch`).
 _V41_BUILDER = None
+
+# Debug only: compare ATOM's staged step positions with SGLang's on every
+# eager forward. The comparison is a device sync per step, so it is off by
+# default; positions are derived from the same host lengths SGLang uses.
+_CHECK_POSITIONS = os.environ.get("ATOM_SGLANG_V41_CHECK_POSITIONS", "0") == "1"
 
 
 def is_deepseek_v41_config(config: Any) -> bool:
@@ -986,7 +992,20 @@ def _block_rows(req_to_token, req_pool_indices, ends, block_size: int):
         req_to_token[req_pool_indices, : widest * block_size : block_size] // block_size
     ).to(torch.int32)
     table = table.cpu().numpy()
-    return [table[i, : widths[i]].copy() for i in range(len(widths))]
+    rows = [table[i, : widths[i]].copy() for i in range(len(widths))]
+    _refuse_padding_page(rows)
+    return rows
+
+
+def _refuse_padding_page(rows) -> None:
+    # SGLang's paged allocator never hands out page 0 (its padding page, also
+    # where decode-graph capture rows point), so a live row naming it read a
+    # req_to_token entry that was never written.
+    if any(np.any(row <= 0) for row in rows):
+        raise ValueError(
+            "DeepSeek-V4.1 block table names SGLang's padding page 0 in a live "
+            "request's row"
+        )
 
 
 def build_v41_scheduled_batch(forward_batch, block_size: int):
@@ -1111,13 +1130,12 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
         if join is not None:
             join()
     metadata.staged_outside_forward = True
-    n = batch.total_tokens_num
-    # Bring-up check (one device sync per step): ATOM's step positions must be
-    # the ones SGLang scheduled.
-    if not torch.equal(step_positions[:n], positions[:n].to(step_positions.dtype)):
-        raise ValueError(
-            "DeepSeek-V4.1 staged positions disagree with SGLang's positions"
-        )
+    if _CHECK_POSITIONS:
+        n = batch.total_tokens_num
+        if not torch.equal(step_positions[:n], positions[:n].to(step_positions.dtype)):
+            raise ValueError(
+                "DeepSeek-V4.1 staged positions disagree with SGLang's positions"
+            )
     return metadata
 
 
@@ -1258,11 +1276,7 @@ def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int):
         )
     widths = -(-ends // block_size)
     rows = [table[i, : widths[i]].copy() for i in range(raw_bs)]
-    if any(np.any(row <= 0) for row in rows):
-        raise ValueError(
-            "DeepSeek-V4.1 decode replay names SGLang's padding page 0 in a live "
-            "request's block table"
-        )
+    _refuse_padding_page(rows)
     slot_list = [int(slot) for slot in slots]
     return SimpleNamespace(
         is_dummy_run=False,

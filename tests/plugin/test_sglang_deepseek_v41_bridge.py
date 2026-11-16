@@ -733,6 +733,20 @@ class TestScheduledBatch:
         with pytest.raises(ValueError, match="missing a length field"):
             build_v41_scheduled_batch(fb, PAGE)
 
+    @pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
+    def test_unwritten_page_is_refused(self, req_to_token, mode):
+        # Row 2 holds one PAGE; a length past it reads a req_to_token entry
+        # SGLang never wrote (page 0, its padding page), as the replay path
+        # already refuses.
+        lengths = {}
+        if mode == ForwardMode.EXTEND:
+            lengths = {"extend_seq_lens": [5, PAGE + 1], "extend_prefix_lens": [0, 0]}
+        fb = _forward_batch(
+            mode, req_pool_indices=[1, 2], seq_lens=[5, PAGE + 1], **lengths
+        )
+        with pytest.raises(ValueError, match="padding page 0"):
+            build_v41_scheduled_batch(fb, PAGE)
+
     @pytest.mark.parametrize("slots", [[1, 1], [0, 2]])
     def test_slots_must_be_live_and_unique(self, req_to_token, slots):
         fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=slots, seq_lens=[3, 4])
@@ -830,12 +844,33 @@ class TestForwardMetadata:
         assert builder.calls[0] == ("decode", 2, 2, 1)
 
     def test_positions_must_match_sglang(self, monkeypatch, req_to_token):
+        monkeypatch.setattr(bridge, "_CHECK_POSITIONS", True)
         builder = _RecordingBuilder(positions=torch.tensor([4, 9]))
         fb = _forward_batch(
             ForwardMode.DECODE, req_pool_indices=[1, 2], seq_lens=[5, 11]
         )
         with pytest.raises(ValueError, match="positions disagree"):
             _staged(monkeypatch, builder, fb, torch.tensor([4, 10]))
+
+    def test_positions_check_is_debug_only(self, monkeypatch, req_to_token):
+        # The comparison is a device sync on every eager step, so it runs
+        # only under ATOM_SGLANG_V41_CHECK_POSITIONS=1.
+        assert bridge._CHECK_POSITIONS is (
+            os.environ.get("ATOM_SGLANG_V41_CHECK_POSITIONS", "0") == "1"
+        )
+        monkeypatch.setattr(bridge, "_CHECK_POSITIONS", False)
+
+        builder = _RecordingBuilder(positions=torch.tensor([4, 9]))
+        fb = _forward_batch(
+            ForwardMode.DECODE, req_pool_indices=[1, 2], seq_lens=[5, 11]
+        )
+        monkeypatch.setattr(
+            bridge.torch,
+            "equal",
+            lambda *a: (_ for _ in ()).throw(AssertionError("synced")),
+        )
+        metadata = _staged(monkeypatch, builder, fb, torch.tensor([4, 10]))
+        assert metadata.staged_outside_forward is True
 
     def test_step_over_builder_capacity_is_refused(self, monkeypatch, req_to_token):
         builder = _RecordingBuilder(max_bs=1)
