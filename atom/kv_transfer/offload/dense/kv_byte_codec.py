@@ -200,6 +200,9 @@ class DenseKVByteCodec:
     def has_fused_chunk_major_staging(self) -> bool:
         return self._fused_kv_staging is not None
 
+    # A Store slot run is restored through the contiguous view only.
+    supports_strided_restore = False
+
     # -- helpers ----------------------------------------------------------
     def _device_ctx(self):
         if self._device.type == "cuda":

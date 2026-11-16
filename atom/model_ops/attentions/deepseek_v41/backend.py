@@ -528,9 +528,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
         states = self.cache.state_regions
-        p_d = (
-            KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
-            == "mooncake"
+        p_d = any(
+            name == "mooncake"
+            for name, _ in (KVConnectorFactory.leaf_connectors(runner.config) or [])
         )
         return KVTransferTensors(
             pages=pages,

@@ -6,7 +6,7 @@
 
 use rmpv::Value;
 
-use super::model::{DropReason, EngineHash, KvEvent};
+use super::model::{DropReason, EngineHash, KvEvent, StoredBlock};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedBatch {
@@ -93,11 +93,29 @@ fn stored(fields: &Fields, block_size: u32) -> Result<KvEvent, DropReason> {
         return Err(DropReason::BlockSize);
     }
     let hashes = hashes(fields)?;
-    let tokens = fields.get("token_ids").and_then(Value::as_array);
-    if tokens.ok_or(DropReason::Decode)?.len() != hashes.len() * block_size as usize {
+    let parent = fields
+        .get("parent_block_hash")
+        .map(|hash| engine_hash(hash).ok_or(DropReason::Decode))
+        .transpose()?;
+    let tokens = fields
+        .get("token_ids")
+        .and_then(Value::as_array)
+        .ok_or(DropReason::Decode)?
+        .iter()
+        .map(|token| as_u32(token).ok_or(DropReason::Decode))
+        .collect::<Result<Vec<_>, _>>()?;
+    if tokens.len() != hashes.len() * block_size as usize {
         return Err(DropReason::Decode);
     }
-    Ok(KvEvent::Stored { hashes })
+    let blocks = hashes
+        .into_iter()
+        .zip(tokens.chunks_exact(block_size as usize))
+        .map(|(hash, tokens)| StoredBlock {
+            hash,
+            tokens: tokens.into(),
+        })
+        .collect();
+    Ok(KvEvent::Stored { parent, blocks })
 }
 
 /// The device tier is `GPU`, or no medium at all.
