@@ -904,6 +904,42 @@ class TestForwardMetadata:
         with pytest.raises(NotImplementedError, match="IDLE"):
             build_deepseek_v41_forward_metadata(fb, torch.zeros(0))
 
+    def test_extend_carries_the_replay_verdict(self, monkeypatch, req_to_token):
+        builder = _RecordingBuilder(positions=torch.arange(5))
+        builder._decoder_replays = True
+        builder.geometry = SimpleNamespace(window_size=128)
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1, 2],
+            seq_lens=[PAGE + 3, 2],
+            extend_seq_lens=[3, 2],
+            extend_prefix_lens=[PAGE, 0],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(5))
+        # A resumed request of 3 < 128 rows: every row runs.
+        assert builder.batch.decoder_replays is False
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1],
+            seq_lens=[PAGE + 200],
+            extend_seq_lens=[200],
+            extend_prefix_lens=[PAGE],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(200))
+        assert builder.batch.decoder_replays is True
+
+    def test_no_verdict_without_replay(self, monkeypatch, req_to_token):
+        builder = _RecordingBuilder(positions=torch.arange(2))
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1],
+            seq_lens=[2],
+            extend_seq_lens=[2],
+            extend_prefix_lens=[0],
+        )
+        _staged(monkeypatch, builder, fb, torch.arange(2))
+        assert not hasattr(builder.batch, "decoder_replays")
+
     def test_uninitialized_builder_or_pool_is_refused(self, monkeypatch):
         fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=[1], seq_lens=[5])
         with pytest.raises(RuntimeError, match="not initialized"):
@@ -1852,3 +1888,44 @@ def test_candidate_graph_variants_are_off_for_v41(real_sglang, monkeypatch):
     assert patched(v41, "DECODE", 0) is None
     assert patched(v4, "DECODE", 0) == "variants"
     assert calls == [v4]
+
+
+# ---------------------------------------------------------------------------
+# Decoder SWA bounded replay per EXTEND
+# ---------------------------------------------------------------------------
+
+
+def _replays(lengths, prefix, window=128, **fields):
+    fb = SimpleNamespace(**fields)
+    batch = SimpleNamespace(
+        num_scheduled_tokens=np.asarray(lengths, np.int32),
+        context_lens=np.asarray(prefix, np.int64) + np.asarray(lengths, np.int64),
+    )
+    return bridge.v41_extend_replays(fb, batch, window)
+
+
+class TestExtendReplays:
+    def test_fresh_and_long_resumed_prefills_replay(self):
+        assert _replays([8192], [0])
+        assert _replays([5, 8192], [0, 8192])  # a short fresh prompt is whole
+        assert _replays([128], [8192])  # exactly a window
+
+    def test_short_resumed_chunk_runs_every_row(self):
+        assert not _replays([127], [8192])
+        assert not _replays([4096, 1], [0, 300])  # MIXED: a decode row
+
+    def test_rows_sglang_reads_beyond_the_last_refuse(self):
+        full = SimpleNamespace(is_full=lambda: True)
+        last = SimpleNamespace(is_full=lambda: False)
+        assert not _replays([4096], [0], capture_hidden_mode=full)
+        assert _replays([4096], [0], capture_hidden_mode=last)
+        assert not _replays([4096], [0], is_prefill_only=True)
+        # Input logprobs on any row before the last.
+        assert not _replays(
+            [4096], [0], return_logprob=True, extend_logprob_start_lens_cpu=[0]
+        )
+        # Output logprobs only (start == length): the last row alone.
+        assert _replays(
+            [4096], [0], return_logprob=True, extend_logprob_start_lens_cpu=[4096]
+        )
+        assert not _replays([4096], [0], return_logprob=True)

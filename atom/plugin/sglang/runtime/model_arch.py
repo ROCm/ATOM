@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -106,10 +107,16 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
-    # Bounded replay re-enters the model with a tail of the rows, which the
-    # step staged outside the forward no longer describes. Off before the
-    # runtime model decides whether to build its replay stages.
-    atom_config.enable_decoder_swa_bounded_replay = False
+    # Decoder SWA bounded replay, on as natively unless
+    # ATOM_SGLANG_V41_DECODER_REPLAY=0. The builder publishes a prefill's tail
+    # (`_publish_decoder`) inside the same `_prepare` the bridge runs outside
+    # the forward, and the eager forward that follows has exactly the rows
+    # that step declares, so the staged step describes the replay. A step the
+    # tail cannot serve computes every row
+    # (`deepseek_v41_bridge.v41_extend_replays`). Decided before the runtime
+    # model decides whether to build its replay stages.
+    if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
+        atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds state below a prefix hit; radix cache is refused.
     atom_config.enable_encoder_swa_bounded_replay = False
     # The remap every other adapter gets from prepare_model, as native's
@@ -138,10 +145,6 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
 def _install_deepseek_v41_adapters(model: Any) -> None:
     from atom.plugin.sglang.deepseek_v41_bridge import log_deepseek_v41_runtime_once
 
-    if getattr(model, "replay", False):
-        raise RuntimeError(
-            "DeepSeek-V4.1 decoder SWA bounded replay must be off on the SGLang plugin"
-        )
     log_deepseek_v41_runtime_once(model)
 
 

@@ -338,6 +338,11 @@ def _make_builder_cls():
             with _v41_publication_epoch(cache._sglang_h2d_owner):
                 super().prepare_model_inputs(input_ids, metadata)
 
+        # Whether the prefill being staged gets a decoder tail: the bridge's
+        # verdict on its ForwardBatch (`v41_extend_replays`), carried on the
+        # scheduled batch as ``decoder_replays``.
+        _sglang_decoder_replays = True
+
         @_publish_v41_metadata
         def _prepare(self, batch, running_bs, running_tokens, **kwargs):
             # No runner token inputs carry the query metadata on this path.
@@ -346,7 +351,18 @@ def _make_builder_cls():
                 running_bs,
                 running_tokens,
             )
-            return super()._prepare(batch, running_bs, running_tokens, **kwargs)
+            self._sglang_decoder_replays = bool(getattr(batch, "decoder_replays", True))
+            try:
+                return super()._prepare(batch, running_bs, running_tokens, **kwargs)
+            finally:
+                self._sglang_decoder_replays = True
+
+        def _publish_decoder(self, step, rows, cache, running_bs):
+            if not self._sglang_decoder_replays:
+                # `step.decoder` stays None, so the runtime model's
+                # `replayable` is False and every row runs every layer.
+                return None
+            return super()._publish_decoder(step, rows, cache, running_bs)
 
         def build_for_sglang_capture(self, bs, *, input_ids, slots):
             """The step a decode graph of ``bs`` requests is recorded on.
@@ -1068,7 +1084,11 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         req_ids=list(forward_batch.rids[:bs]),
         num_scheduled_tokens=lengths.astype(np.int32),
         context_lens=ends,
-        # Prefix caching and bounded replay are off on this path.
+        # SGLang's ForwardBatch does not say whether a chunk finishes its
+        # prompt, so every request counts as finishing (None): under decoder
+        # bounded replay a chunk SGLang continues runs the decoder on its last
+        # window rows too, whose ring the next chunk then reads if it is
+        # shorter than the window (`v41_extend_replays`).
         is_final_chunk=None,
         replaying={},
         state_slots_committed=[int(s) for s in slots],
@@ -1076,6 +1096,39 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         total_seqs_num=bs,
         total_tokens_num=int(lengths.sum()),
     )
+
+
+def v41_extend_replays(forward_batch, batch, window: int) -> bool:
+    """Whether this EXTEND may run V4.1's decoder on each request's last
+    ``window`` rows only (decoder SWA bounded replay), which leaves every
+    output row but each request's last zero.
+
+    No where SGLang reads other rows than each request's last -- input
+    logprobs, a FULL hidden-state capture, a prefill-only (scoring) batch --
+    and where a request resumes its prompt (a prefix) with fewer than
+    ``window`` rows: native backs such a forward off to start ``window`` rows
+    before its end (`BlockManager.replay_start`), which SGLang's chunk cannot,
+    and a tail of fewer rows would truncate their window at the chunk start.
+    That covers a MIXED batch's decode rows too. Such a step computes every
+    row, reading the decoder rings the previous chunk's tail wrote (every
+    chunk counts as finishing, `build_v41_scheduled_batch`)."""
+    if getattr(forward_batch, "is_prefill_only", False):
+        return False
+    capture = getattr(forward_batch, "capture_hidden_mode", None)
+    is_full = getattr(capture, "is_full", None)
+    if is_full is not None and is_full():
+        return False
+    if getattr(forward_batch, "return_logprob", False):
+        # As SGLang's `LogitsMetadata.from_forward_batch` decides it.
+        starts = getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
+        if starts is None:
+            return False
+        lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
+        if np.any(lengths - np.asarray(starts[: len(lengths)], np.int64) > 0):
+            return False
+    lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
+    prefix = np.asarray(batch.context_lens, np.int64) - lengths
+    return not bool(np.any((prefix > 0) & (lengths < int(window))))
 
 
 def build_deepseek_v41_forward_metadata(forward_batch, positions):
@@ -1116,6 +1169,10 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
             batch, running_bs, running_tokens, 1
         )
     else:
+        if getattr(builder, "_decoder_replays", False):
+            batch.decoder_replays = v41_extend_replays(
+                forward_batch, batch, builder.geometry.window_size
+            )
         metadata, step_positions = builder.prepare_prefill(
             batch, running_bs, running_tokens
         )
