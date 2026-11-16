@@ -140,16 +140,28 @@ class TestTheAiterDependencyIsDeferred:
     """
 
     def test_the_symbols_are_not_imported_at_module_scope(self):
+        # Walk the module's own top-level statements: a text filter on lines cannot see
+        # a black-formatted `from aiter.ops.flydsl import (` whose names sit on the lines
+        # after it.
+        import ast
         import inspect
 
-        body = inspect.getsource(m)
+        def names_flydsl(node):
+            if isinstance(node, ast.Import):
+                return any(a.name.startswith("aiter.ops.flydsl") for a in node.names)
+            module = node.module or ""  # ast.ImportFrom
+            return module.startswith("aiter.ops.flydsl") or (
+                module == "aiter.ops" and any(a.name == "flydsl" for a in node.names)
+            )
+
         offenders = [
-            line
-            for line in body.splitlines()
-            if line.startswith(("from aiter", "import aiter"))
-            and "minimax_m3_index_score" in line
+            ast.unparse(node)
+            for node in ast.parse(inspect.getsource(m)).body
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and names_flydsl(node)
         ]
-        assert not offenders, f"module-scope aiter M3 import reintroduced: {offenders}"
+        assert (
+            not offenders
+        ), f"module-scope aiter FlyDSL import reintroduced: {offenders}"
 
 
 # The shape the non-monotonicity shows up at: at max_block 256 a batch of 8
