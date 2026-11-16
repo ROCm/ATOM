@@ -33,7 +33,7 @@ def test_e8m0_block_scales_are_exact_powers_of_two(monkeypatch, device, top):
         block[0, 0] = a
         # halfway between the E4M3 values 1 and 1.125: an exact scale rounds it to
         # even (1); a scale one ulp low pushes it past the midpoint (1.125)
-        block[1, 0] = 1.0625 * 2.0**EXPONENTS[i]
+        block[1, 0] = 1.0625 * 2.0 ** EXPONENTS[i]
     with atom_without_aiter() as load:
         utils = load("atom.quantization.quark.utils")
         from aiter import dtypes
