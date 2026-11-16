@@ -17,7 +17,9 @@ Here: which layers fold (``_bind_mla_post`` / ``_bind_mla_prep``, static
 refusals every rank shares), their K2 build-key fields (``_fold_key``) and
 launch arguments (``_fold_args``), the prep stages' buffers, and the
 production seam's pool allocations replayed (``_seam_mirror``), so a folded
-step's CUDA-graph pool layout stays the unfused one's. A layer or width a fold
+step's CUDA-graph pool layout matches the unfused one's outside the production
+attention internals the stages replace (the q_a / kv_a / q_b temporaries it
+skips). A layer or width a fold
 cannot serve keeps the unfused path; with both flags ``0`` every key, launch
 and argument is the unfused path's.
 """
@@ -219,9 +221,11 @@ class MlaFolds:
         """The prep stage's outputs, allocated once here -- outside every CUDA
         graph's memory pool -- and used as ``[:rows]`` views by every width.
 
-        A step's pool allocations then stay exactly the flag-off ones:
-        ``_prep_args`` takes nothing from the pool, and ``_prepped_seam``
-        replays the production seam's own allocations (``_seam_mirror``).
+        A step's pool allocations then match the flag-off ones outside the
+        production attention internals the stages replace (the q_a / kv_a /
+        q_b temporaries a folded step skips): ``_prep_args`` takes nothing from
+        the pool, and ``_prepped_seam`` replays the production seam's own
+        allocations (``_seam_mirror``).
 
         ``pref`` alternates between two buffers by the MLA layer's ordinal:
         K2(M-1) reads prefix(M-1) -- the previous MLA layer's ``pref``, updated
