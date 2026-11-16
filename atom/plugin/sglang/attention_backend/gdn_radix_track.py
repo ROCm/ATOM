@@ -107,13 +107,9 @@ def _radix_track_snapshot_kernel(
         tl.store(ssm + slot * stride_s_s + dst_off, sv, mask=smask)
 
 
-def fused_track_supported(metadata, h: torch.Tensor | None) -> bool:
-    """Whether ``write_radix_track_snapshots`` covers this metadata exactly.
-
-    Recompute rows (Mamba2 only) are not a GDN path; they, metadata without the
-    SSM index tensors, and an ``h`` that is not a 4-D chunk state after the
-    batch squeeze stay on SGLang's eager helper.
-    """
+def fused_track_metadata_supported(metadata) -> bool:
+    """The metadata half of ``fused_track_supported``: no recompute rows and
+    all four SSM index tensors present. The same for every layer of a forward."""
     recompute = getattr(metadata, "track_ssm_recompute_dst", None)
     if recompute is not None and recompute.numel() > 0:
         return False
@@ -125,9 +121,135 @@ def fused_track_supported(metadata, h: torch.Tensor | None) -> bool:
     ):
         if getattr(metadata, name, None) is None:
             return False
+    return True
+
+
+def fused_track_supported(metadata, h: torch.Tensor | None) -> bool:
+    """Whether ``write_radix_track_snapshots`` covers this metadata exactly.
+
+    Recompute rows (Mamba2 only) are not a GDN path; they, metadata without the
+    SSM index tensors, and an ``h`` that is not a 4-D chunk state after the
+    batch squeeze stay on SGLang's eager helper.
+    """
+    if not fused_track_metadata_supported(metadata):
+        return False
     if metadata.track_ssm_h_src.numel() == 0:
         return True
     return h is not None and h.squeeze(0).dim() == 4
+
+
+class RadixTrackPlan:
+    """The layer-invariant half of ``write_radix_track_snapshots``.
+
+    The track rows, their slots and the grid's row count come from SGLang's
+    forward metadata and are the same for every GDN layer of a forward, so the
+    plugin builds this once per forward. ``write`` takes the layer's conv
+    input, pools and chunk states.
+    """
+
+    __slots__ = (
+        "conv_idx",
+        "conv_slots",
+        "final_slots",
+        "final_src",
+        "h_slots",
+        "h_src",
+        "n_conv",
+        "n_f",
+        "n_h",
+        "state_len",
+    )
+
+    def __init__(
+        self,
+        conv_idx: torch.Tensor | None,
+        conv_slots: torch.Tensor | None,
+        h_src: torch.Tensor,
+        h_slots: torch.Tensor,
+        final_src: torch.Tensor,
+        final_slots: torch.Tensor,
+    ) -> None:
+        n_conv = 0 if conv_idx is None else conv_idx.shape[0]
+        if n_conv:
+            state_len = conv_idx.shape[1]
+            conv_idx = conv_idx.contiguous()
+        else:
+            state_len = 1
+            conv_idx = conv_slots = h_src
+        self.conv_idx = conv_idx
+        self.conv_slots = conv_slots
+        self.h_src = h_src
+        self.h_slots = h_slots
+        self.final_src = final_src
+        self.final_slots = final_slots
+        self.n_conv = n_conv
+        self.n_h = h_src.numel()
+        self.n_f = final_src.numel()
+        self.state_len = state_len
+
+    def write(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        h: torch.Tensor | None,
+        ssm_state: torch.Tensor,
+    ) -> None:
+        n_conv, n_h, n_f = self.n_conv, self.n_h, self.n_f
+        rows = n_conv + n_h + n_f
+        if rows == 0:
+            return
+        d = conv_state.shape[1]
+        if n_conv:
+            assert (
+                conv_state.shape[2] == self.state_len
+            ), "conv window must fill the pool"
+            assert x.stride(-1) == 1, "conv input must be contiguous along features"
+        _, n_heads, k, v = ssm_state.shape
+        hkv = n_heads * k * v
+        if n_h:
+            h = h.squeeze(0)
+            assert tuple(h.shape[1:]) == (
+                n_heads,
+                k,
+                v,
+            ), "h and pool state shapes differ"
+        else:
+            h = ssm_state
+        # FlyDSL's `h` and its decode pool both store VK: walk that storage
+        # order so both sides are contiguous. Otherwise walk logical KV order.
+        vk_order = bool(n_h) and h.stride(-2) == 1 and ssm_state.stride(-2) == 1
+        nblk = max(
+            triton.cdiv(d, _BLOCK) if n_conv else 0,
+            triton.cdiv(hkv, _BLOCK) if n_h + n_f else 0,
+        )
+        cs = conv_state.stride()
+        _radix_track_snapshot_kernel[(rows, nblk)](
+            x,
+            self.conv_idx,
+            self.conv_slots,
+            conv_state,
+            h,
+            self.h_src,
+            self.h_slots,
+            self.final_src,
+            self.final_slots,
+            ssm_state,
+            x.stride(0),
+            cs[0],
+            cs[1],
+            cs[2],
+            *h.stride(),
+            *ssm_state.stride(),
+            n_conv,
+            n_h,
+            D=d,
+            STATE_LEN=self.state_len,
+            K=k,
+            V=v,
+            HKV=hkv,
+            BLOCK=_BLOCK,
+            VK_ORDER=vk_order,
+        )
 
 
 def write_radix_track_snapshots(
@@ -152,61 +274,6 @@ def write_radix_track_snapshots(
     batch), so the window positions are taken as given. ``conv_state`` must be
     exactly ``STATE_LEN`` wide, as the eager assignment requires.
     """
-    n_conv = 0 if conv_idx is None else conv_idx.shape[0]
-    n_h = h_src.numel()
-    n_f = final_src.numel()
-    if n_conv + n_h + n_f == 0:
-        return
-    d = conv_state.shape[1]
-    if n_conv:
-        state_len = conv_idx.shape[1]
-        assert conv_state.shape[2] == state_len, "conv window must fill the pool"
-        assert x.stride(-1) == 1, "conv input must be contiguous along features"
-        conv_idx = conv_idx.contiguous()
-    else:
-        state_len = 1
-        conv_idx = conv_slots = h_src
-    hkv = ssm_state[0].numel()
-    _, n_heads, k, v = ssm_state.shape
-    if n_h:
-        h = h.squeeze(0)
-        assert tuple(h.shape[1:]) == (n_heads, k, v), "h and pool state shapes differ"
-        h_strides = h.stride()
-    else:
-        h = ssm_state
-        h_strides = ssm_state.stride()
-    # FlyDSL's `h` and its decode pool both store VK: walk that storage order
-    # so both sides are contiguous. Otherwise walk logical KV order.
-    vk_order = bool(n_h) and h_strides[-2] == 1 and ssm_state.stride(-2) == 1
-    nblk = max(
-        triton.cdiv(d, _BLOCK) if n_conv else 0,
-        triton.cdiv(hkv, _BLOCK) if n_h + n_f else 0,
-    )
-    grid = (n_conv + n_h + n_f, nblk)
-    _radix_track_snapshot_kernel[grid](
-        x,
-        conv_idx,
-        conv_slots,
-        conv_state,
-        h,
-        h_src,
-        h_slots,
-        final_src,
-        final_slots,
-        ssm_state,
-        x.stride(0),
-        conv_state.stride(0),
-        conv_state.stride(1),
-        conv_state.stride(2),
-        *h_strides,
-        *ssm_state.stride(),
-        n_conv,
-        n_h,
-        D=d,
-        STATE_LEN=state_len,
-        K=k,
-        V=v,
-        HKV=hkv,
-        BLOCK=_BLOCK,
-        VK_ORDER=vk_order,
+    RadixTrackPlan(conv_idx, conv_slots, h_src, h_slots, final_src, final_slots).write(
+        x, conv_state, h, ssm_state
     )
