@@ -675,3 +675,68 @@ def test_qsa_scoring_and_attention_match_plain_triton_bitwise(
     torch.cuda.synchronize()
     assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
     assert any(launcher._kernels for launcher in cached.values())
+
+
+# --- fused Q/K RMSNorm (QSA attention's q_norm / k_norm) --------------------
+
+
+@pytest.fixture
+def layernorm():
+    pytest.importorskip("aiter.ops.triton.fused_add_rmsnorm_pad", exc_type=ImportError)
+    from atom.model_ops import layernorm
+
+    return layernorm
+
+
+def _qk_norm_inputs(tokens, offset=0, device="cuda"):
+    qkvg = _randn(tokens, 2 * 3072 + 512, offset=offset, seed=tokens, device=device)
+    weights = [
+        torch.nn.Parameter(_randn(256, seed=s, device=device), False) for s in (19, 20)
+    ]
+    q = qkvg[:, 3072:6144].view(tokens, 12, 256)
+    k = qkvg[:, 6144:6400].view(tokens, 1, 256)
+    return q, k, *weights, 1e-6
+
+
+@pytest.mark.parametrize("weightless_q", [False, True])
+@pytest.mark.parametrize("tokens", [300, 700])  # one row a program, then two
+@pytest.mark.parametrize("buffer_ops", ["1", "0"])
+def test_fused_qk_norm_keys_tell_apart_what_triton_tells_apart(
+    monkeypatch, layernorm, buffer_ops, tokens, weightless_q
+):
+    _on_cpu(monkeypatch)
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
+    q, k, q_weight, k_weight, eps = _qk_norm_inputs(tokens, 1, device="cpu")
+    q_weight = None if weightless_q else q_weight
+    _check_keys(
+        *_record(
+            monkeypatch,
+            layernorm,
+            "_fused_qk_norm_single",
+            lambda: layernorm.fused_qk_norm(
+                q, k, q_weight, k_weight, eps, add_unit_offset=not weightless_q
+            ),
+        )
+    )
+
+
+@gpu
+@pytest.mark.parametrize("weightless_q", [False, True])
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("tokens", [2112, 2096, 683, 682, 16, 3, 1])
+@torch.inference_mode()
+def test_fused_qk_norm_matches_plain_triton_bitwise(
+    monkeypatch, layernorm, tokens, offset, weightless_q
+):
+    """683 tokens are the first past the 8192-row switch to two rows a program."""
+    q, k, q_weight, k_weight, eps = _qk_norm_inputs(tokens, offset)
+    q_weight = None if weightless_q else q_weight
+    _plain_vs_cached(
+        monkeypatch,
+        [(layernorm, "_fused_qk_norm_single")],
+        lambda: list(
+            layernorm.fused_qk_norm(
+                q, k, q_weight, k_weight, eps, add_unit_offset=not weightless_q
+            )
+        ),
+    )
