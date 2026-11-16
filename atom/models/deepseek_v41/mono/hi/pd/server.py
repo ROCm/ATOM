@@ -588,6 +588,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--dist-port", type=int, default=29561, help="tk: the workers' gloo group"
     )
+    ap.add_argument(
+        "--accept",
+        choices=["real", "recorded"],
+        default="real",
+        help="tk: real acceptance, or the recorded plan's simulated 3.51 (as TileRT's D ran with TILERT_SIMULATE_ACC_LEN)",
+    )
+    ap.add_argument(
+        "--kv-share",
+        choices=["gloo", "ipc"],
+        default="gloo",
+        help="tk: the landed KV to ranks 1..7: rank 0's converted planes over gloo, or its buffer mapped over HIP IPC",
+    )
+    ap.add_argument("--progress-dir", help="tk: each worker's startup phase, rank<r>.progress (a hang names its phase)")  # fmt: skip
     return ap
 
 
@@ -608,7 +621,11 @@ def build_engine(args):
         "swap": args.swap,
         "dist_addr": f"127.0.0.1:{args.dist_port}",
         "mooncake_host": W.local_ip(),
+        "accept": args.accept,
+        "kv_share": args.kv_share,
+        "progress_dir": args.progress_dir,
     }
+    logger.info("decode host: starting 8 TkRank workers (%s)", kw)
     group = F.RankGroup(
         8, "atom.models.deepseek_v41.mono.hi.pd.tkworker:TkRankWorker", kw
     )

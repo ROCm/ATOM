@@ -63,6 +63,52 @@ def load_planes_file(path: str, seq_len: int | None = None) -> dict:
     return snap
 
 
+def _pack(o):
+    """Tensors as (dtype name, shape, uint8 bytes): ``broadcast_object_list``'s pickling cannot carry float8."""
+    import torch
+
+    if isinstance(o, torch.Tensor):
+        t = o.detach().contiguous().cpu()
+        return (
+            "tensor",
+            str(t.dtype).rsplit(".", 1)[-1],
+            tuple(t.shape),
+            t.reshape(-1).view(torch.uint8),
+        )
+    if isinstance(o, dict):
+        return {k: _pack(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(_pack(v) for v in o)
+    return o
+
+
+def _unpack(o):
+    import torch
+
+    if (
+        isinstance(o, tuple)
+        and len(o) == 4
+        and o[0] == "tensor"
+        and isinstance(o[3], torch.Tensor)
+    ):
+        return o[3].view(getattr(torch, o[1])).reshape(o[2])
+    if isinstance(o, dict):
+        return {k: _unpack(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return type(o)(_unpack(v) for v in o)
+    return o
+
+
+def share_planes(planes, src: int = 0, group=None):
+    """Rank ``src``'s converted planes on every rank of ``group`` (CPU tensors through gloo's
+    ``broadcast_object_list``, as bytes; about 0.36 GB at a 400K request)."""
+    import torch.distributed as dist
+
+    box = [_pack(planes) if dist.get_rank(group) == src else None]
+    dist.broadcast_object_list(box, src=src, group=group)
+    return _unpack(box[0])
+
+
 def _to_device(o, device):
     import torch
 
@@ -105,6 +151,8 @@ class TkRankWorker:
         receive: bool = True,
         planes: str | None = None,
         progress_dir: str | None = None,
+        accept: str = "real",
+        kv_share: str = "gloo",
     ):
         import torch
         import torch.distributed as dist
@@ -124,7 +172,12 @@ class TkRankWorker:
         )
         self.max_seq_len = alloc.MAX_SEQ_LEN
         self.device_timeout_s = device_timeout_s
-        self.tk = host.TkRank(rank, None, device=self.device, cached_sym=cached_sym)
+        if kv_share not in ("gloo", "ipc"):
+            raise ValueError(f"kv_share: gloo | ipc, not {kv_share!r}")
+        self.accept, self.kv_share = accept, kv_share
+        self.tk = host.TkRank(
+            rank, None, device=self.device, cached_sym=cached_sym, accept=accept
+        )
         self._progress("params")
         consts = CK.compute_engram_consts(ckpt)
         self.tk.load_params(ckpt, consts)
@@ -184,18 +237,13 @@ class TkRankWorker:
             self.transport.init(mooncake_host or W.local_ip())
             self.transport.register(self.buffer.data_ptr(), nbytes)
             ptr = self.buffer.data_ptr()
-            base = hip_ipc.get_allocation_base(ptr)
-            info = [
-                {
-                    "handle": hip_ipc.get_ipc_handle(base),
-                    "offset": ptr - base,
-                    "base_ptr": ptr,
-                    "session_id": self.transport.session_id,
-                }
-            ]
+            info = [{"base_ptr": ptr, "session_id": self.transport.session_id}]
+            if self.kv_share == "ipc":
+                base = hip_ipc.get_allocation_base(ptr)
+                info[0].update(handle=hip_ipc.get_ipc_handle(base), offset=ptr - base)
         dist.broadcast_object_list(info, src=0)
         self.receive_info = {k: v for k, v in info[0].items() if k != "handle"}
-        if self.rank != 0:
+        if self.rank != 0 and self.kv_share == "ipc":
             mapped = hip_ipc.open_ipc_handle(info[0]["handle"]) + info[0]["offset"]
             self.buffer = torch.as_tensor(DeviceBytes(mapped, nbytes))
 
@@ -211,6 +259,8 @@ class TkRankWorker:
             "stop_token_ids": [S.EOS_ID],
             "greedy": False,
             "transport": "mooncake",
+            "accept": self.accept,
+            "kv_share": self.kv_share,
         }
         if self.rank == 0 and self.buffer is not None:
             out.update(self.receive_info)
@@ -256,6 +306,15 @@ class TkRankWorker:
                         f"load_kv({seq_len}): the planes file holds {self.planes_n} positions"
                     )
                 self.tk.import_planes(self.planes, seq_len)
+            elif self.kv_share == "gloo":  # rank 0 converts, every rank imports
+                snap = None
+                if self.rank == 0:
+                    if self.buffer is None:
+                        raise RuntimeError("load_kv: rank 0 has no receive buffer")
+                    conv = C.convert(self.buffer, self.max_seq_len, rec, self.token_map, device=self.device)  # fmt: skip
+                    snap = _to_device(conv.planes, "cpu")
+                planes = _to_device(share_planes(snap), self.device)
+                self.tk.import_planes(planes, seq_len)
             elif self.buffer is None:
                 raise RuntimeError(
                     "load_kv: this worker has neither a receive buffer nor a planes file"

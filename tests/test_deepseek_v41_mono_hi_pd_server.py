@@ -714,6 +714,62 @@ def test_load_planes_file():
             raise AssertionError("accepted a wrong length")
 
 
+def _share(rank, port, q):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
+    )
+    planes = None
+    if rank == 0:
+        win = (
+            torch.full((2, 4), 0.5).to(torch.float8_e4m3fn),
+            torch.ones(2, dtype=torch.uint8),
+        )
+        planes = {
+            "main_kv": {2: (torch.arange(6, dtype=torch.uint8).view(2, 3),)},
+            "win": [win],
+        }
+    got = TW.share_planes(planes)
+    w = got["win"][0]
+    q.put(
+        (
+            rank,
+            got["main_kv"][2][0].tolist(),
+            w[0].dtype == torch.float8_e4m3fn,
+            w[0].float().tolist(),
+            w[1].tolist(),
+        )
+    )
+    dist.destroy_process_group()
+
+
+def test_share_planes_over_gloo():
+    """``kv_share="gloo"``: rank 0's converted planes reach every rank, dtypes kept."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    ctx = torch.multiprocessing.get_context("spawn")
+    q = ctx.Queue()
+    ps = [ctx.Process(target=_share, args=(r, port, q)) for r in range(2)]
+    for p_ in ps:
+        p_.start()
+    got = sorted(q.get(timeout=120) for _ in ps)
+    for p_ in ps:
+        p_.join(30)
+    assert [g[0] for g in got] == [0, 1]
+    assert all(
+        g[1:] == ([[0, 1, 2], [3, 4, 5]], True, [[0.5] * 4] * 2, [1, 1]) for g in got
+    )
+
+
+def test_server_flags_for_a_real_run():
+    a = SV.build_parser().parse_args(["--engine", "tk", "--with-mtp", "--num-mtp", "5", "--accept", "recorded", "--kv-share", "ipc"])  # fmt: skip
+    assert (a.accept, a.kv_share, a.max_seq_len, a.ctrl_port, a.http_port) == ("recorded", "ipc", 1 << 20, 5556, 5557)  # fmt: skip
+    d = SV.build_parser().parse_args([])
+    assert (d.accept, d.kv_share) == ("real", "gloo")
+
+
 def test_imports_without_gpu_stack():
     code = (
         "import sys; import atom.models.deepseek_v41.mono.hi.pd.server, atom.models.deepseek_v41.mono.hi.pd.tkworker; "
