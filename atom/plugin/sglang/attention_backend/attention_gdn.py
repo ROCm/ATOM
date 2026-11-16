@@ -26,6 +26,10 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
+from atom.plugin.sglang.attention_backend.gdn_radix_track import (
+    fused_track_supported,
+    write_radix_track_snapshots,
+)
 from atom.plugin.sglang.attention_backend.gdn_replayssm import (
     note_full_state_write,
     prepare_layer,
@@ -455,10 +459,13 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         SGLang's HybridLinearAttnBackend owns the prefix cache and computes the
         track metadata, but the snapshot calls live inside its own GDN kernels,
         which the plugin replaces. They are made here, after the ATOM forward,
-        through SGLang's helpers so the snapshot semantics stay defined there.
-        Every source is final by now: the conv window is read from the pre-conv
-        input, the SSM state from the prefill kernel's chunk states `h` (Triton
-        or FlyDSL) or the runtime slot.
+        from SGLang's track metadata. On device the conv window, the unaligned
+        `h` rows and the aligned slot copies go out in one launch
+        (`write_radix_track_snapshots`, the same copies SGLang's eager code
+        makes); anything that kernel does not cover falls back to SGLang's
+        helper. Every source is final by now: the conv window is read from the
+        pre-conv input, the SSM state from the prefill kernel's chunk states
+        `h` (Triton or FlyDSL) or the runtime slot.
 
         Decode goes through `_track_mamba_radix_slots`, which also covers the
         replayed decode graph via the post-replay epilogue.
@@ -497,6 +504,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         if not metadata.has_mamba_track_mask:
             return
         track_conv_indices = metadata.track_conv_indices
+        dst = None
         if track_conv_indices is not None and track_conv_indices.numel() > 0:
             # Only SGLang's GDN backend caches the destination slots; indexing
             # the pool with a None would broadcast over every slot.
@@ -504,13 +512,30 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             if dst is None:
                 rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 dst = metadata.mamba_track_indices[rows]
-            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
-            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
+        else:
+            track_conv_indices = None
         if metadata.track_ssm_h_src.numel() > 0 and h is None:
             raise RuntimeError(
                 "SGLang mamba radix cache needs the GDN chunk kernel's "
                 "intermediate states, but this prefill kept none."
             )
+        if mixed_qkv.is_cuda and fused_track_supported(metadata, h):
+            write_radix_track_snapshots(
+                mixed_qkv,
+                track_conv_indices,
+                dst,
+                conv_states,
+                h,
+                metadata.track_ssm_h_src,
+                metadata.track_ssm_h_dst,
+                metadata.track_ssm_final_src,
+                metadata.track_ssm_final_dst,
+                ssm_states,
+            )
+            return
+        if track_conv_indices is not None:
+            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
+            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
         linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
 
     def _verify_replayssm(
