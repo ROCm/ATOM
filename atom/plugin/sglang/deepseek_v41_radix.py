@@ -117,6 +117,12 @@ trees that rewrite rows elsewhere), prefill CUDA graphs, a custom radix
 backend, ``--chunked-prefill-size`` below ``R``, and speculative decoding (the
 DSpark interplay is a later phase). With ``--disable-radix-cache`` nothing
 here is installed.
+
+On by default: whenever SGLang's radix cache is on (no
+``--disable-radix-cache``). A launch with speculative decoding, or with
+``ATOM_V41_RADIX=0``, gets SGLang's radix cache turned off at server-args
+resolution with one warning (``v41_radix_launch_override``), so it starts
+with radix off instead of failing.
 """
 
 from __future__ import annotations
@@ -213,6 +219,111 @@ def resolve_replay_mode() -> str:
             f"{REPLAY_MODE_ENV} must be one of {REPLAY_MODES}; got {mode!r}"
         )
     return mode
+
+
+# ---------------------------------------------------------------------------
+# Launch policy (SGLang server-args resolution)
+# ---------------------------------------------------------------------------
+# Radix is on whenever SGLang's radix cache is. Where the replay cannot run
+# (speculative decoding: the DSpark draft rings and the verify lifecycle are
+# not proved under a replay yet) or the operator turned it off
+# (ATOM_V41_RADIX=0), SGLang's radix cache is turned off with it, through
+# SGLang's own model-override registry: the declaration is resolved once in
+# the launching process, before the tokenizer manager and the schedulers are
+# spawned, so every reader of ``disable_radix_cache`` (the tokenizer's
+# input_embeds check, the scheduler's tree choice, the plugin's
+# ``sglang_radix_cache_enabled``) sees the same value. Flipping it later in
+# the scheduler would leave the tokenizer manager on the other side.
+
+# SGLang serves V4.1 under V4's architecture name
+# (``configs/deepseek_v41.normalize_deepseek_v41_config``); both are keyed,
+# the model type decides.
+_POLICY_ARCHES = ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+_V41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
+_POLICY_REGISTERED = False
+_POLICY_WARNED = False
+
+
+def speculation_name(value) -> str:
+    """SGLang's speculative algorithm (enum, string or None) as an upper-case
+    name, "" when speculation is off."""
+    if value is None:
+        return ""
+    name = str(getattr(value, "name", value)).strip().upper()
+    return "" if name in ("", "NONE", "NULL", "FALSE") else name
+
+
+def radix_off_reason(speculative_algorithm) -> str | None:
+    """Why the V4.1 radix path cannot serve a launch whose SGLang radix cache
+    is on, or None when it can."""
+    import os
+
+    from atom.plugin.sglang import deepseek_v41_envs as envs
+
+    algorithm = speculation_name(speculative_algorithm)
+    if algorithm:
+        pinned = os.environ.get("ATOM_V41_RADIX", "").strip()
+        return (
+            f"speculative decoding ({algorithm}) is not supported with the "
+            "DeepSeek-V4.1 radix cache yet"
+            + (f"; ATOM_V41_RADIX={pinned} is ignored" if pinned else "")
+        )
+    if not envs.ATOM_V41_RADIX:
+        return "ATOM_V41_RADIX is off"
+    return None
+
+
+def _resolving_view(server_args):
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    return resolving_view(server_args)
+
+
+def v41_radix_launch_override(server_args, hf_config) -> dict:
+    """SGLang model-override provider: ``disable_radix_cache=True`` for a
+    DeepSeek-V4.1 launch the radix path cannot serve (``radix_off_reason``),
+    with one warning; nothing otherwise, and nothing for other models."""
+    global _POLICY_WARNED
+    if getattr(hf_config, "model_type", None) not in _V41_MODEL_TYPES:
+        return {}
+    cfg = _resolving_view(server_args)
+    if getattr(cfg, "disable_radix_cache", False):
+        return {}
+    reason = radix_off_reason(getattr(cfg, "speculative_algorithm", None))
+    if reason is None:
+        return {}
+    if not _POLICY_WARNED:
+        _POLICY_WARNED = True
+        logger.warning(
+            "ATOM DeepSeek-V4.1: %s; turning SGLang's radix cache off for this "
+            "launch (same as --disable-radix-cache). Pass --disable-radix-cache "
+            "to silence this.",
+            reason,
+        )
+    return {"disable_radix_cache": True}
+
+
+def register_v41_radix_launch_policy() -> bool:
+    """Register ``v41_radix_launch_override`` with SGLang's model-override
+    registry. Runs from the plugin entry point, before SGLang resolves its
+    server args; idempotent. Without the registry (older SGLang) the launch
+    refusals in ``deepseek_v41_bridge`` stand in: they name
+    ``--disable-radix-cache``."""
+    global _POLICY_REGISTERED
+    if _POLICY_REGISTERED:
+        return True
+    try:
+        from sglang.srt.arg_groups.model_override_base import register_model_override
+    except ImportError:
+        logger.info(
+            "SGLang has no model-override registry; DeepSeek-V4.1 launches the "
+            "radix path cannot serve are refused instead"
+        )
+        return False
+    for arch in _POLICY_ARCHES:
+        register_model_override(arch)(v41_radix_launch_override)
+    _POLICY_REGISTERED = True
+    return True
 
 
 # ---------------------------------------------------------------------------

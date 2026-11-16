@@ -86,7 +86,8 @@ EXTEND, DECODE, MIXED = _Mode("EXTEND"), _Mode("DECODE"), _Mode("MIXED")
 
 @pytest.fixture(autouse=True)
 def _isolated_process_state(monkeypatch):
-    # Radix is opt-in; these tests exercise the opted-in launch.
+    # Radix is on by default; pinned so an operator's environment cannot
+    # turn it off under these tests.
     monkeypatch.setenv("ATOM_V41_RADIX", "1")
     # One builder and one replay length per process; no test may leak either.
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
@@ -969,6 +970,128 @@ class TestRefusals:
         launch.bags["exec"].features.enable_encoder_swa_bounded_replay = True
         with pytest.raises(ValueError, match="encoder SWA bounded replay"):
             refuse_unsupported_sglang_features()
+
+
+class TestLaunchPolicy:
+    """Radix on by default; SGLang's radix cache turned off at server-args
+    resolution, with one warning, where the replay cannot serve."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_policy(self, monkeypatch):
+        monkeypatch.setattr(radix, "_POLICY_WARNED", False)
+        monkeypatch.setattr(radix, "_POLICY_REGISTERED", False)
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+        # A plain record: SGLang's resolving view reads it the same way.
+        monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
+
+    @staticmethod
+    def _args(spec=None, disable_radix_cache=False):
+        return SimpleNamespace(
+            speculative_algorithm=spec, disable_radix_cache=disable_radix_cache
+        )
+
+    V41 = SimpleNamespace(model_type="deepseek_v41")
+
+    def test_default_launch_keeps_radix(self, caplog):
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self._args(), self.V41) == {}
+        assert not caplog.records
+
+    @pytest.mark.parametrize("pinned", [None, "1"])
+    def test_speculation_turns_radix_off_once(self, monkeypatch, caplog, pinned):
+        if pinned is not None:
+            monkeypatch.setenv("ATOM_V41_RADIX", pinned)
+        with caplog.at_level("WARNING", logger="atom"):
+            for _ in range(3):
+                assert radix.v41_radix_launch_override(
+                    self._args(spec="DSPARK"), self.V41
+                ) == {"disable_radix_cache": True}
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "speculative decoding (DSPARK)" in message
+        assert "--disable-radix-cache" in message
+        assert ("ATOM_V41_RADIX=1 is ignored" in message) is (pinned == "1")
+
+    def test_speculation_enum_name(self):
+        algorithm = SimpleNamespace(name="NONE")
+        assert (
+            radix.v41_radix_launch_override(self._args(spec=algorithm), self.V41) == {}
+        )
+        algorithm = SimpleNamespace(name="DSPARK")
+        assert radix.v41_radix_launch_override(
+            self._args(spec=algorithm), self.V41
+        ) == {"disable_radix_cache": True}
+
+    def test_kill_switch_turns_radix_off(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(self._args(), self.V41) == {
+                "disable_radix_cache": True
+            }
+        assert "ATOM_V41_RADIX is off" in caplog.records[0].getMessage()
+
+    def test_radix_already_off_declares_nothing(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            assert (
+                radix.v41_radix_launch_override(
+                    self._args(spec="DSPARK", disable_radix_cache=True), self.V41
+                )
+                == {}
+            )
+        assert not caplog.records
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen3", None])
+    def test_other_models_are_left_alone(self, monkeypatch, model_type):
+        monkeypatch.setenv("ATOM_V41_RADIX", "0")
+        config = SimpleNamespace(model_type=model_type)
+        assert radix.v41_radix_launch_override(self._args(spec="EAGLE"), config) == {}
+
+    def test_sglang_resolving_view_sees_earlier_declarations(self, monkeypatch):
+        base = pytest.importorskip("sglang.srt.arg_groups.model_override_base")
+        monkeypatch.setattr(radix, "_resolving_view", base.resolving_view)
+        args = self._args(spec="DSPARK")
+        args._resolved_overrides = [("earlier", {"disable_radix_cache": True})]
+        assert radix.v41_radix_launch_override(args, self.V41) == {}
+        args._resolved_overrides = []
+        assert radix.v41_radix_launch_override(args, self.V41) == {
+            "disable_radix_cache": True
+        }
+
+    def test_registers_under_both_architecture_names_once(self, monkeypatch):
+        registered = []
+        fake = SimpleNamespace(
+            register_model_override=lambda arch: (
+                lambda fn: registered.append((arch, fn)) or fn
+            )
+        )
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.arg_groups.model_override_base", fake
+        )
+        assert radix.register_v41_radix_launch_policy()
+        assert radix.register_v41_radix_launch_policy()
+        assert registered == [
+            ("DeepseekV4ForCausalLM", radix.v41_radix_launch_override),
+            ("DeepseekV41ForCausalLM", radix.v41_radix_launch_override),
+        ]
+
+    def test_without_the_registry_the_refusals_stand_in(self, monkeypatch, launch):
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.arg_groups.model_override_base", None
+        )
+        assert not radix.register_v41_radix_launch_policy()
+        launch.bags["spec"].speculative_algorithm = "DSPARK"
+        with pytest.raises(ValueError, match="speculative decoding.*--disable-radix"):
+            refuse_unsupported_sglang_features()
+
+    def test_plugin_entry_point_registers_the_policy(self):
+        import inspect
+
+        from atom.plugin.sglang import register
+
+        assert "register_v41_radix_launch_policy()" in inspect.getsource(
+            register.register_plugin
+        )
 
 
 def _v41_atom_config():

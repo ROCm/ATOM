@@ -460,17 +460,20 @@ class TestLaunchContract:
         with pytest.raises(ValueError, match="hierarchical cache"):
             refuse_unsupported_sglang_features()
 
-    def test_radix_cache_needs_the_opt_in(self, sglang_launch, monkeypatch):
-        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+    def test_radix_kill_switch_refuses_a_launch_left_on(
+        self, sglang_launch, monkeypatch
+    ):
+        # The launch policy turns SGLang's radix cache off for
+        # ATOM_V41_RADIX=0; a launch where it did not run is refused.
+        monkeypatch.setenv("ATOM_V41_RADIX", "0")
         sglang_launch.bags["memory"].disable_radix_cache = False
-        sglang_launch.args.disable_overlap_schedule = True
-        with pytest.raises(ValueError, match="ATOM_V41_RADIX=1"):
+        with pytest.raises(ValueError, match="ATOM_V41_RADIX=0.*--disable-radix"):
             bridge.refuse_unsupported_sglang_features()
 
-    def test_radix_cache_is_served_by_the_replay(self, sglang_launch, monkeypatch):
-        # Opted in, radix cache itself is not refused; what it cannot run
-        # beside is (`test_sglang_deepseek_v41_radix.py`).
-        monkeypatch.setenv("ATOM_V41_RADIX", "1")
+    def test_radix_cache_is_served_by_default(self, sglang_launch, monkeypatch):
+        # On by default, radix cache itself is not refused; what it cannot
+        # run beside is (`test_sglang_deepseek_v41_radix.py`).
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
         sglang_launch.bags["memory"].disable_radix_cache = False
         sglang_launch.args.disable_overlap_schedule = True
         refuse_unsupported_sglang_features()

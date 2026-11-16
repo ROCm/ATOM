@@ -250,6 +250,13 @@ def register_plugin() -> None:
     _install_loader_quant_patch()
     _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
+    # Before SGLang resolves its server args: whether a DeepSeek-V4.1 launch
+    # keeps SGLang's radix cache on.
+    from atom.plugin.sglang.deepseek_v41_radix import (
+        register_v41_radix_launch_policy,
+    )
+
+    register_v41_radix_launch_policy()
     apply_prefill_compile_only_patch()
     apply_triton_kernel_retention_patch()
     apply_xgrammar_hip_bitmask_patch()
