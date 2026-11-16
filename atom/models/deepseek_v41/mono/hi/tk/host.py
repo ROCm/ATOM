@@ -126,18 +126,46 @@ def _zero_junk(spec):
     return spec
 
 
+# head_seed_fold's AcceptArgs word at +0x310: the pad id (low half) and, high half, TileRT's simulated acceptance length
+# (f32, TILERT_SIMULATE_ACC_LEN, baked into the recorded graphs: 3.51); 0.0 = real acceptance (the kernel's accept
+# count from the draft / target probabilities: kernels/gfx950/head_seed_fold.py, both branches diffed bit-exact)
+ACCEPT_KERNEL = "head_seed_fold_kernel"
+SIM_ACC_OFF = 0x314
+
+
+def simulated_acceptance(blob: bytes) -> float:
+    """The simulated acceptance length a head_seed_fold blob carries (0.0: real acceptance)."""
+    return struct.unpack_from("<f", blob, SIM_ACC_OFF)[0]
+
+
+def with_acceptance(blob: bytes, acc_len: float = 0.0) -> bytes:
+    """A head_seed_fold blob with its simulated acceptance length set (0.0: real acceptance)."""
+    b = bytearray(blob)
+    struct.pack_into("<f", b, SIM_ACC_OFF, float(acc_len))
+    return bytes(b)
+
+
 def blobs(
-    plan: dict, rank: int, parity: int, addr: list[dict], junk: str = "recorded"
+    plan: dict,
+    rank: int,
+    parity: int,
+    addr: list[dict],
+    junk: str = "recorded",
+    accept: str = "recorded",
 ) -> list[bytes]:
     """Rank ``rank``'s kernarg bytes, launch by launch, for graph ``parity`` over ``addr`` (``address_map()``, or a
     recording's ``decode_launches.recorded_addr``). ``junk``: ``"recorded"`` keeps the bytes TileRT's host left
     uninitialized as recorded (byte-identical blobs), ``"zero"`` zeroes them (as does a parity past the recorded two:
-    the warmup's)."""
+    the warmup's). ``accept``: ``"recorded"`` (the recording's simulated acceptance, 3.51) or ``"real"``.
+    """
     out = []
     for launch in DL.rank_launches(plan, rank):
         if junk == "zero" or parity not in (0, 1):
             launch = {**launch, "words": [_zero_junk(w) for w in launch["words"]]}
-        out.append(DL.kernargs(launch, rank, parity, addr, plan["mode"]))
+        blob = DL.kernargs(launch, rank, parity, addr, plan["mode"])
+        if accept == "real" and ACCEPT_KERNEL in launch["kernel"]:
+            blob = with_acceptance(blob, 0.0)
+        out.append(blob)
     return out
 
 
@@ -145,9 +173,11 @@ class TkRank:
     """One rank (module docstring). Collective over ``group`` at construction (the ``sym:`` arena)."""
 
     def __init__(self, rank: int, group=None, device=None, plan: dict | None = None, cached_sym: bool = False,
-                 junk: str = "recorded"):  # fmt: skip
+                 junk: str = "recorded", accept: str = "recorded"):  # fmt: skip
         self.plan = plan or DL.load()
-        self.rank, self.junk = rank, junk
+        if accept not in ("recorded", "real"):
+            raise ValueError(f"accept: recorded | real, not {accept!r}")
+        self.rank, self.junk, self.accept = rank, junk, accept
         self.buffers = alloc.Buffers(rank, group, device, cached=cached_sym)
         self.device = self.buffers.device
         self.params: dict = {}
@@ -203,7 +233,9 @@ class TkRank:
         return self.buffers.address_map(self.params)
 
     def blobs(self, parity: int) -> list[bytes]:
-        return blobs(self.plan, self.rank, parity, self.address_map(), self.junk)
+        return blobs(
+            self.plan, self.rank, parity, self.address_map(), self.junk, self.accept
+        )
 
     # ---- launch
     def load_kernels(self, table, extra=()) -> None:

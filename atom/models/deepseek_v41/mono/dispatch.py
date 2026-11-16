@@ -166,6 +166,13 @@ def install_mono_decode(
         )
 
         return install_single_step(model, atom_config, drafter)
+    from atom.models.deepseek_v41.mono import tk_step
+
+    if tk_step.enabled():
+        # the TileRT-path step (ATOM_DSV41_TK_STEP=1): whole decode steps on TkRank, the production path otherwise
+        from atom.models.deepseek_v41.mono.tk_step.dispatch import install_tk_step
+
+        return install_tk_step(model, atom_config, drafter)
     why = config_refusal(atom_config)
     if why is not None:
         if hi_gate.mode() == "1":

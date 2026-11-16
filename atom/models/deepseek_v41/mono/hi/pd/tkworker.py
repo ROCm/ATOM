@@ -21,8 +21,13 @@ buffer is free when every rank answered); ``step(k, ticket)`` -> k graph replays
 TileRT's ring); ``wait_read`` -> the event polled up to ``device_timeout_s`` (TileRT ``TILERT_DEVICE_TIMEOUT_SECONDS``,
 120), then rank 0's ``read_logs``.
 
-Not run on a GPU yet (written against the TkRank API on the CPU): the IPC mapping of the receive buffer onto another
-device, and every op's device behaviour, are for the GPU check (m7/D_LIFECYCLE.md).
+Test options: ``receive=False`` (no receive buffer, no Mooncake), ``planes=<file>`` (``load_kv`` imports the planes of a
+``torch.save``d ``{"n", "first", "planes"}``, as TileRT's ``restore()`` re-imports its prefill's snapshot, instead of
+converting the receive buffer: ``load_planes_file``), ``progress_dir`` (``rank<r>.progress``: the startup phase
+running, for naming a hang).
+
+GPU status: admission and import reproduced TileRT's state on 049 (m7/RUN2.md, run_admit.py); this worker class itself
+(the fan-out, the IPC mapping of the receive buffer, Mooncake in a worker) is not yet run on a GPU.
 """
 
 from __future__ import annotations
@@ -37,6 +42,35 @@ def build_toktab(tk, rank: int):
         "the DSpark token tables are not built yet (TileRT: toktab.build_table, its embed / mHC / q-kv / kv-extract "
         "ops over the vocabulary); give the worker toktab_dir (TileRT's g.toktab[r] saved as rank<r>.pt)"
     )
+
+
+def load_planes_file(path: str, seq_len: int | None = None) -> dict:
+    """``torch.save``d ``{"n", "first", "planes"}`` (m7/x_tkdump2.py's ``snapshot.pt``: TileRT's ``g.kv_planes(n, 0)``),
+    on the CPU; ``seq_len`` must equal its ``n`` when given."""
+    import torch
+
+    snap = torch.load(path, map_location="cpu")
+    if not isinstance(snap, dict) or not {"n", "first", "planes"} <= set(snap):
+        raise ValueError(f"{path}: not a planes file (want n, first, planes)")
+    if seq_len is not None and int(snap["n"]) != int(seq_len):
+        raise ValueError(
+            f"{path}: planes of {snap['n']} positions, asked for {seq_len}"
+        )
+    planes = snap["planes"]
+    for name in ("main_kv", "index_k", "win", "state", "hist"):
+        if name not in planes:
+            raise ValueError(f"{path}: planes without {name}")
+    return snap
+
+
+def _to_device(o, device):
+    import torch
+
+    if isinstance(o, torch.Tensor):
+        return o.to(device)
+    if isinstance(o, dict):
+        return {k: _to_device(v, device) for k, v in o.items()}
+    return type(o)(_to_device(v, device) for v in o)
 
 
 def load_toktab(tk, rank: int, toktab_dir: str | None) -> None:
@@ -68,6 +102,9 @@ class TkRankWorker:
         mooncake_host: str | None = None,
         cached_sym: bool = False,
         device_timeout_s: float = 120.0,
+        receive: bool = True,
+        planes: str | None = None,
+        progress_dir: str | None = None,
     ):
         import torch
         import torch.distributed as dist
@@ -78,6 +115,8 @@ class TkRankWorker:
         if nranks != alloc.NPES:
             raise ValueError(f"the plan is TP{alloc.NPES}, got {nranks} ranks")
         self.rank, self.nranks = rank, nranks
+        self.progress_dir = progress_dir
+        self._progress("init")
         self.device = torch.device("cuda", rank)
         torch.cuda.set_device(self.device)
         dist.init_process_group(
@@ -86,22 +125,46 @@ class TkRankWorker:
         self.max_seq_len = alloc.MAX_SEQ_LEN
         self.device_timeout_s = device_timeout_s
         self.tk = host.TkRank(rank, None, device=self.device, cached_sym=cached_sym)
+        self._progress("params")
         consts = CK.compute_engram_consts(ckpt)
         self.tk.load_params(ckpt, consts)
         self.token_map = torch.as_tensor(consts["token_map"]).to(torch.int64)
+        self._progress("toktab")
         load_toktab(self.tk, rank, toktab_dir)
+        self._progress("kernels")
         table = codeobj.CodeTable.from_dir(co)
         if swap:
             table = table.swap(swap)
         self.tk.load_kernels(table, extra=(host.ADMIT_SYMBOL,))
         self.stream = torch.cuda.Stream(self.device)
+        dist.barrier()
+        self._progress("warmup")
         with torch.cuda.stream(self.stream):
             self.tk.warmup()
+        torch.cuda.synchronize(self.device)
+        self._progress("capture")
+        with torch.cuda.stream(self.stream):
             self.tk.capture()
         torch.cuda.synchronize(self.device)
-        self._map_receive_buffer(mooncake_host)
+        self.planes = None
+        if planes:
+            self._progress("planes")
+            snap = load_planes_file(planes)
+            self.planes_n = int(snap["n"])
+            self.planes = _to_device(snap["planes"], self.device)
+        self.buffer = None
+        if receive:
+            self._progress("receive")
+            self._map_receive_buffer(mooncake_host)
         self.events: dict = {}
         dist.barrier()
+        self._progress("ready")
+
+    def _progress(self, phase: str) -> None:
+        if self.progress_dir:
+            p = os.path.join(self.progress_dir, f"rank{self.rank}.progress")
+            with open(p, "w") as f:
+                f.write(f'{{"phase": "{phase}", "t": {time.time()}}}\n')
 
     def _map_receive_buffer(self, mooncake_host: str | None) -> None:
         import torch
@@ -149,7 +212,7 @@ class TkRankWorker:
             "greedy": False,
             "transport": "mooncake",
         }
-        if self.rank == 0:
+        if self.rank == 0 and self.buffer is not None:
             out.update(self.receive_info)
         return out
 
@@ -185,10 +248,27 @@ class TkRankWorker:
             generation=generation,
         )
         with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
-            conv = C.convert(
-                self.buffer, self.max_seq_len, rec, self.token_map, device=self.device
-            )
-            self.tk.import_planes(conv.planes, seq_len)
+            if (
+                self.planes is not None
+            ):  # the test source: the saved planes (TileRT's restore())
+                if seq_len != self.planes_n:
+                    raise ValueError(
+                        f"load_kv({seq_len}): the planes file holds {self.planes_n} positions"
+                    )
+                self.tk.import_planes(self.planes, seq_len)
+            elif self.buffer is None:
+                raise RuntimeError(
+                    "load_kv: this worker has neither a receive buffer nor a planes file"
+                )
+            else:
+                conv = C.convert(
+                    self.buffer,
+                    self.max_seq_len,
+                    rec,
+                    self.token_map,
+                    device=self.device,
+                )
+                self.tk.import_planes(conv.planes, seq_len)
         self.stream.synchronize()
 
     def step(self, k: int, ticket: int) -> None:

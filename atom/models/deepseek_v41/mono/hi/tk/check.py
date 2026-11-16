@@ -15,6 +15,8 @@ TileRT's code objects and our swap table; no GPU.
   parameter of its own, that parameter is declared ``void* const*`` (the demangled symbol, ``c++filt``).
 - ``code``: every plan kernel in TileRT's code objects, its explicit kernarg layout ending at the plan's blob size and
   equal to ``kargs.tsv``'s; every swap line's function in its code object, with the line's layout.
+- ``accept``: ``host.blobs(accept="real")``: the recorded head_seed_fold blobs carry the simulated acceptance 3.51,
+  the real ones 0.0, and nothing else differs.
 - ``admit``: ``host.admit_args`` over a recording's address maps rebuilds every recorded ``admit_kernel`` blob of every
   rank (tkserve's sequence a rank: ``_reset_streams``' admit, then one ``dsv41_e2e_begin`` a restore, the sampling
   counter at 1 after the one ``set_sampling``); exact apart from ``host.ADMIT_PAD`` (uninitialized struct padding).
@@ -59,6 +61,27 @@ def check_blobs(plan, steps, maps) -> dict:
                 for o in range(0, len(want), 8):
                     res[f"{junk}:words"] += 1
                     res[f"{junk}:words_exact"] += blob[o : o + 8] == want[o : o + 8]
+    return dict(res)
+
+
+def check_accept(plan, steps, maps) -> dict:
+    """``accept="real"`` against the recording: every recorded head_seed_fold blob carries TileRT's simulated
+    acceptance 3.51 at ``host.SIM_ACC_OFF``; the real blobs differ from the recorded ones there only, and carry 0.0.
+    """
+    addr = DL.recorded_addr(plan, steps, maps)
+    res = Counter()
+    for d, c in sorted(steps):
+        rec = host.blobs(plan, d, c, addr)
+        real = host.blobs(plan, d, c, addr, accept="real")
+        for launch, a, b in zip(DL.rank_launches(plan, d), rec, real):
+            if host.ACCEPT_KERNEL not in launch["kernel"]:
+                res["others_equal"] += a == b
+                continue
+            res["accept_launches"] += 1
+            res["recorded_3.51"] += abs(host.simulated_acceptance(a) - 3.51) < 1e-6
+            res["real_0"] += host.simulated_acceptance(b) == 0.0
+            o = host.SIM_ACC_OFF
+            res["differ_only_there"] += a[:o] == b[:o] and a[o + 4 :] == b[o + 4 :]
     return dict(res)
 
 
@@ -426,6 +449,7 @@ def main(argv=None) -> None:
     with gzip.open(runs / "m5/paramsum.json.gz", "rt") as f:
         paramsum = json.load(f)
     print("blobs:", check_blobs(plan, steps, maps))
+    print("accept:", check_accept(plan, steps, maps))
     print("sizes:", check_sizes(plan, maps, paramsum))
     table = None
     if a.co:

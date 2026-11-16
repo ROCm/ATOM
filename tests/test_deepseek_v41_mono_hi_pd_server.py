@@ -673,6 +673,47 @@ def test_tk_worker_stubs_and_greedy():
     eng.check_sampling(S.SamplingParams())
 
 
+def test_load_planes_file():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        planes = {
+            "main_kv": {2: (torch.zeros(3, 256, dtype=torch.uint8),)},
+            "index_k": {},
+            "win": [],
+            "state": {},
+        }
+        torch.save(
+            {
+                "n": 6,
+                "first": 9,
+                "planes": {**planes, "hist": torch.zeros(16, dtype=torch.int32)},
+            },
+            f"{d}/ok.pt",
+        )
+        snap = TW.load_planes_file(f"{d}/ok.pt", 6)
+        assert (snap["n"], snap["first"]) == (6, 9) and snap["planes"]["main_kv"][2][
+            0
+        ].shape == (3, 256)
+        for bad, args in (
+            ({"n": 6, "first": 9, "planes": planes}, (6,)),
+            ({"n": 6}, (None,)),
+        ):
+            torch.save(bad, f"{d}/bad.pt")
+            try:
+                TW.load_planes_file(f"{d}/bad.pt", *args)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted {sorted(bad)}")
+        try:
+            TW.load_planes_file(f"{d}/ok.pt", 7)
+        except ValueError as e:
+            assert "6 positions" in str(e)
+        else:
+            raise AssertionError("accepted a wrong length")
+
+
 def test_imports_without_gpu_stack():
     code = (
         "import sys; import atom.models.deepseek_v41.mono.hi.pd.server, atom.models.deepseek_v41.mono.hi.pd.tkworker; "
