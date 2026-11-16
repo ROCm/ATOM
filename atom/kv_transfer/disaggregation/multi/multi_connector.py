@@ -629,7 +629,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return (
             bool(self._connectors)
             and self._connectors[0].supports_pd_admission
-            and all(getattr(c, "is_offload", False) for c in self._connectors[1:])
+            and all(c.is_offload for c in self._connectors[1:])
         )
 
     def pd_receive_block_offset(self, seq, num_blocks, num_cached_blocks):

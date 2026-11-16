@@ -252,6 +252,10 @@ where it lands and the router balances purely by work:
   yet allocated counts the router's estimate. The CoreManager adds the
   charges of requests sent after the rank's last report.
 
+With a Mooncake Store, `share_cache` likewise refuses distinct per-NIC
+`mooncake_store.pools` pairs (see the `prefix_spread` section below); aliases
+that all name one master/metadata pair are accepted.
+
 It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
 mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. With a Mooncake Store
 `OFFLOAD_MIN_LOAD_TOKENS` defaults to 512. With `lmcache_mp` set
@@ -266,7 +270,7 @@ The compressed prefix index stores consecutive chained-hash intervals, retaining
 
 With one routable engine or pipeline parallelism, `prefix_spread` has no effect and its routing requirements are not enforced. LMCache MP requires the configured chunk to match the server when this router is active; PAGE-only single-engine runs use the server's chunk. Native-state transfers retain their own chunk-matching requirement.
 
-When `prefix_spread` is active, Mooncake Store must expose one shared `(master, metadata)` pair to all DP ranks. Per-NIC aliases in `mooncake_store.pools` are accepted only when every alias names that same pair. Distinct per-NIC pools are rejected at router startup because a worker can load only from its selected NIC's pool; a scheduler lookup across pools does not make those prefixes transferable. Distinct pools remain available with other routing policies, or when this router is inactive.
+When `prefix_spread` or `share_cache` is active, Mooncake Store must expose one shared `(master, metadata)` pair to all DP ranks. Per-NIC aliases in `mooncake_store.pools` are accepted only when every alias names that same pair. Distinct per-NIC pools are rejected at router startup because a worker can load only from its selected NIC's pool; a scheduler lookup across pools does not make those prefixes transferable. Distinct pools remain available with other routing policies, or when neither router is active.
 
 Choose `OFFLOAD_MIN_LOAD_TOKENS` for the model and backend. It measures the aligned missing prefix, so an owner with 16384 tokens and an idle target with 13312 tokens still sends the request to the target when the 3072-token difference is below the minimum; the target recomputes that difference. A warmed Qwen3-0.6B DP2/TP1 LMCache MP probe on MI355X, with a 512-token chunk and 13312 local tokens, favored recomputation at an 8192-token difference (median TTFT 102.2 ms versus 134.7 ms with loading), was near break-even at 12288, and favored loading at 16384 (150.6 ms versus 198.2 ms). Each arm used four samples. For that configuration, 16384 is a conservative minimum; it is not a measured default for other models, backends or decode load. Include restoration, replay and prefill scheduling in the comparison, rather than timing the copy alone.
 

@@ -281,7 +281,11 @@ def test_nonchunked_decode_waits_for_successful_publication(monkeypatch):
             from atom.model_engine.engine_core import EngineCore
         core = EngineCore.__new__(EngineCore)
         core.kv_transfer_enabled = True
-        core.scheduler = SimpleNamespace(kv_connector=sched)
+        core.scheduler = SimpleNamespace(
+            kv_connector=sched,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        )
         core.runner_mgr = SimpleNamespace(
             call_func=lambda name, meta: worker.start_load_kv(meta)
         )

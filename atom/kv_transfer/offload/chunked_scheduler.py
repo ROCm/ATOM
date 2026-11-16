@@ -334,8 +334,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         ):
             return False
         client = self._lookup_client
-        pending_ids = getattr(client, "pending_ids", None)
-        if callable(pending_ids) and sid in pending_ids():
+        if sid in client.pending_ids():
             return True
         supports_async = getattr(client, "supports_async", None)
         return (

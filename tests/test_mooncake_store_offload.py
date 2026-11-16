@@ -1745,6 +1745,21 @@ def test_a_prompt_too_short_to_load_is_not_looked_up(cluster):
     assert sum(1 for call in store.calls if call[0] == "exists") == 1
 
 
+def test_a_prompt_of_at_most_one_chunk_is_not_looked_up_with_min_load_zero(cluster):
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 0
+    _store_chunks(cluster, _hashes(40), range(5))
+    # At most one chunk: the longest loadable hit is 0, so nothing is asked.
+    for n in (1, CHUNK - 1, CHUNK):
+        assert not scheduler._lookup_wanted(_seq(n, n))
+        assert scheduler.get_num_new_matched_tokens(_seq(100 + n, n)) == (0, False)
+    assert cluster.stores == []
+    # A second chunk (and one token) makes a chunk loadable: asked.
+    for n in (CHUNK + 1, 2 * CHUNK):
+        assert scheduler._lookup_wanted(_seq(n, n))
+    assert _completed_match(scheduler, _seq(200, 2 * CHUNK))[1] is True
+
+
 def test_lookup_hashes_a_sequence_prompt_once(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     seq = _seq(4, 20)
