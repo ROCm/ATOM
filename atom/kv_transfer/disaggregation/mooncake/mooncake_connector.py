@@ -1145,9 +1145,9 @@ class MooncakeConnector(KVConnectorBase):
         # registers a single engine on multiple NICs. On rail-isolated fabrics,
         # matched-rail mode instead selects a single-HCA engine per request.
         _configure_mooncake_transport(self.protocol)
-        configured_ib_device = kv_transfer_config.get(
-            "ib_device", ""
-        ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
+        configured_ib_device = (
+            kv_transfer_config.get("ib_device", "") or envs.ATOM_MOONCAKE_IB_DEVICE
+        )
         enable_alternate_hca = bool(
             kv_transfer_config.get("ib_enable_alternate_hca", False)
         )

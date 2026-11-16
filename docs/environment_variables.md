@@ -745,6 +745,13 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
 
+## Mooncake devices and E/P/D image embeddings
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MOONCAKE_IB_DEVICE** | str | "" | Comma-separated HCAs every Mooncake engine of this server registers on: the KV connector's (when `kv_transfer_config` names no `ib_device`) and the E/P/D image embedding pool and reader's. Unset selects each GPU's local HCA (`rdmaN`, else `ionic_N`). |
+| **ATOM_EC_LEASE_S** | float | 60 | E/P/D encoder. Seconds an image embedding entry stays readable by P before its pool space may be reused. When every entry new embeddings would overwrite is inside its lease, the pool is full and the encode is refused; ATOMesh then sends the request to P without embeddings and P encodes. |
+
 ## Mooncake PD MLA staging
 
 | Variable | Type | Default | Description |
