@@ -63,7 +63,9 @@ def media_token_spans(
     MiniMax-M3): the prompt already holds one placeholder token per embedding
     row. Walk it and claim each item's run in turn, with the length its grid
     produces, so adjacent items without separator tokens split correctly too.
-    The result is the ``embedding_spans`` that let an image prefill be chunked.
+    The result is the ``embedding_spans`` that let the runner scatter only the
+    rows a forward holds; whether the prompt may be chunked is the builder's
+    call, through ``atomic_prefill``.
     """
     spans: list[tuple[int, int]] = []
     position = 0

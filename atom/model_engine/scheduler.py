@@ -2141,7 +2141,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(this model's multimodal prompts are never chunked)."
+                "(this prompt's media is never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
