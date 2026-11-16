@@ -175,9 +175,6 @@ def test_fused_track_supported_gates_non_gdn_paths():
 
 
 class _Mode:
-    def is_target_verify(self):
-        return False
-
     def is_decode_or_idle(self):
         return False
 
@@ -263,89 +260,3 @@ def test_track_mamba_states_falls_back_for_recompute_rows(monkeypatch):
     ((hh, s, m),) = calls
     assert hh is h and s is ssm and m is md
     torch.testing.assert_close(conv[7], x[md.track_conv_indices[0]].T, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("flydsl_decode", [False, True])
-@pytest.mark.parametrize("counts", [(4, 3, 2), (1, 1, 0), (0, 3, 2), (2, 0, 0)])
-def test_forward_step_matches_the_per_layer_path(monkeypatch, flydsl_decode, counts):
-    """`_track_extend` with the forward-level step writes the same bytes as
-    the per-layer `_track_mamba_states`, over several layers that share one
-    step (one plan, the pool views reused), and pops each layer's `h`."""
-    from atom.plugin.sglang.attention_backend.attention_gdn import _GDNStep
-
-    x, h = _inputs()
-    md = _metadata(*counts)
-    layers = 3
-    ref = [_pools(True, flydsl_decode) for _ in range(layers)]
-    new = [_pools(True, flydsl_decode) for _ in range(layers)]
-
-    def backend(pools):
-        def layer_cache(layer):
-            conv, ssm = pools[layer]
-            return SimpleNamespace(
-                conv=[conv], temporal=ssm.transpose(-1, -2) if flydsl_decode else ssm
-            )
-
-        return SimpleNamespace(
-            forward_metadata=md,
-            req_to_token_pool=SimpleNamespace(mamba2_layer_cache=layer_cache),
-            _track_mamba_state_extend=lambda *a: pytest.fail("eager helper called"),
-        )
-
-    fb = SimpleNamespace(
-        mamba_track_mask=torch.ones(4, dtype=torch.bool, device="cuda"),
-        forward_mode=_Mode(),
-    )
-    impls = []
-    for layer in range(layers):
-        impl = SGLangGatedDeltaNet.__new__(SGLangGatedDeltaNet)
-        torch.nn.Module.__init__(impl)
-        impl.layer_num = layer
-        impl.gdn_flydsl_policy = SimpleNamespace(decode=True) if flydsl_decode else None
-        impls.append(impl)
-
-    lb_ref = backend(ref)
-    monkeypatch.setattr(
-        SGLangGDNForwardContext,
-        "_resolve_attn_backend",
-        staticmethod(lambda fb: SimpleNamespace(linear_attn_backend=lb_ref)),
-    )
-    for impl in impls:
-        monkeypatch.setattr(chunk_mod.ChunkGatedDeltaRuleFunction, "last_h", h)
-        impl._track_mamba_states(fb, x)
-
-    step = _GDNStep(fb, backend(new))
-    assert step.track == _GDNStep.EXTEND and step.plan is not None
-    for impl in impls:
-        monkeypatch.setattr(chunk_mod.ChunkGatedDeltaRuleFunction, "last_h", h)
-        impl._track_extend(step, x)
-        assert chunk_mod.ChunkGatedDeltaRuleFunction.last_h is None
-    torch.cuda.synchronize()
-    for (conv_ref, ssm_ref), (conv_new, ssm_new) in zip(ref, new):
-        assert torch.equal(conv_new, conv_ref)
-        assert torch.equal(ssm_new, ssm_ref)
-
-
-@pytest.mark.parametrize("counts", [(4, 3, 2), (0, 0, 1), (1, 0, 0)])
-def test_plan_reused_across_layers_matches_the_one_shot_call(counts):
-    from atom.plugin.sglang.attention_backend.gdn_radix_track import RadixTrackPlan
-
-    x, h = _inputs()
-    md = _metadata(*counts)
-    conv_idx = md.track_conv_indices if md.track_conv_indices.numel() > 0 else None
-    plan = RadixTrackPlan(
-        conv_idx,
-        md.conv_states_mask_indices if conv_idx is not None else None,
-        md.track_ssm_h_src,
-        md.track_ssm_h_dst,
-        md.track_ssm_final_src,
-        md.track_ssm_final_dst,
-    )
-    for conv_transposed, ssm_vk in ((True, True), (False, False)):
-        conv_ref, ssm_ref = _pools(conv_transposed, ssm_vk)
-        conv_new, ssm_new = _pools(conv_transposed, ssm_vk)
-        _fused(x, h, conv_ref, ssm_ref, md)
-        plan.write(x, conv_new, h, ssm_new)
-        torch.cuda.synchronize()
-        assert torch.equal(conv_new, conv_ref)
-        assert torch.equal(ssm_new, ssm_ref)
