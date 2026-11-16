@@ -89,7 +89,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--date", required=True, help="session (test) date, YYYY-MM-DD")
     ap.add_argument(
-        "--scenario", choices=["endpoint", "8k1k"], help="default: what ran that day"
+        "--scenario",
+        choices=["endpoint", "8k1k"],
+        help="only for a one-scenario preview; leave it out for the result, which holds every scenario run that day",
     )
     ap.add_argument(
         "--data-dir",
