@@ -1119,7 +1119,7 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        from atom.distributed.parallel_mapping import bind_worker_parallel_mapping
+        from atom.distributed.worker_binding import bind_worker_parallel_mapping
         from atom.parallel_mapping import get_parallel_mapping
 
         mapping = get_parallel_mapping(config)

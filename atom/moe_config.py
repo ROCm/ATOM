@@ -11,7 +11,10 @@ or examine tensors.
 
 from dataclasses import dataclass
 from importlib.util import find_spec
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from atom.config import Config
 
 
 @dataclass(frozen=True)
@@ -59,21 +62,21 @@ class MoEBackendConfig:
             )
 
 
-def get_moe_backend_config(config) -> MoEBackendConfig:
+def get_moe_backend_config(config: "Config") -> MoEBackendConfig:
     """Normalize entry-point flags once, without capturing a rank topology.
 
-    Config carries this snapshot through spawn and plugin setup. Lightweight
-    callers can supply the same object instead of probing installed packages.
+    Config carries this snapshot through spawn and plugin setup. Runtime
+    decisions read the snapshot; the CLI request fields remain input values.
     """
-    cached = getattr(config, "moe_backend_config", None)
+    cached = config.moe_backend_config
     if cached is not None:
         return cached
     from atom.utils import envs
 
     result = MoEBackendConfig(
-        backend=getattr(config, "moe_backend", "standard"),
-        all2all_backend=getattr(config, "moe_all2all_backend", "auto"),
-        low_latency=getattr(config, "enable_low_latency", False),
+        backend=config.moe_backend,
+        all2all_backend=config.moe_all2all_backend,
+        low_latency=config.enable_low_latency,
         mori_available=find_spec("mori") is not None,
         disable_mori=envs.ATOM_DISABLE_MORI_EP,
         mori_v2=envs.ATOM_MORI_V2,
@@ -98,6 +101,7 @@ class MoEParallelMapping:
     dp_logical_ratio: int = 1
     pcp_merge: bool = False
     dp_is_sharded: bool = False
+    enable_dp_attention: bool = False
 
     @classmethod
     def make(
@@ -114,6 +118,7 @@ class MoEParallelMapping:
         pcp_size: int = 1,
         pcp_rank: int = 0,
         merge_pcp: bool = False,
+        enable_dp_attention: bool = False,
     ) -> "MoEParallelMapping":
         for name, size, rank in (
             ("TP", tp_size, tp_rank),
@@ -128,24 +133,19 @@ class MoEParallelMapping:
         if dp_logical < dp_size or dp_logical % dp_size:
             raise ValueError("dp_logical_size must be a multiple of physical DP size")
 
-        shard_size, shard_rank, local_shards = tp_size, tp_rank, tp_size
+        # Preserve the pre-mapping eligibility and per-node transport width.
+        use_ep = enable_ep and dp_logical * tp_size > 1
+        local_shards = local_dp_size * tp_size
+        shard_size, shard_rank = tp_size, tp_rank
         if flatten_dp:
             shard_size *= dp_logical
             shard_rank += dp_rank * tp_size
-            local_shards *= local_dp_size
         pcp_merge = merge_pcp and pcp_size > 1
         if pcp_merge:
-            # AITER's EP group is ordered DP x PCP x TP. Keep checkpoint
-            # ownership in the same rank space that dispatch destinations use.
-            shard_rank = (
-                (dp_rank * pcp_size + pcp_rank) * tp_size + tp_rank
-                if flatten_dp
-                else pcp_rank * tp_size + tp_rank
-            )
+            # Checkpoint ownership keeps the existing PCP x (DP x TP) order.
+            # The transport process group's order is validated separately.
+            shard_rank += pcp_rank * shard_size
             shard_size *= pcp_size
-            local_shards *= pcp_size
-        # EP eligibility follows the final sharding width, including PCP.
-        use_ep = enable_ep and shard_size > 1
         return cls(
             tp_size=1 if use_ep else shard_size,
             tp_rank=0 if use_ep else shard_rank,
@@ -158,6 +158,7 @@ class MoEParallelMapping:
             dp_logical_ratio=dp_logical // dp_size if flatten_dp and use_ep else 1,
             pcp_merge=pcp_merge,
             dp_is_sharded=flatten_dp,
+            enable_dp_attention=enable_dp_attention,
         )
 
 
@@ -166,12 +167,12 @@ class MoEExecutionPlan:
     mapping: MoEParallelMapping
     backend_config: MoEBackendConfig
     implementation: Literal["standard", "mega", "sp_mega"]
-    transport: Literal["local", "dp_gather_scatter", "mori", "mori_v2", "rccl", "mega"]
+    transport: Literal["local", "dp_gather_scatter", "mori", "mori_v2", "rccl"]
     reason: str
 
     @property
     def uses_routed_dispatch(self) -> bool:
-        return self.transport in {"mori", "mori_v2", "rccl", "mega"}
+        return self.transport in {"mori", "mori_v2", "rccl"}
 
     @property
     def needs_dp_gather_scatter(self) -> bool:
@@ -187,13 +188,11 @@ class MoEExecutionPlan:
 
     @property
     def needs_pcp_collectives(self) -> bool:
-        return self.mapping.pcp_merge and not self.uses_routed_dispatch
+        return self.mapping.pcp_merge
 
     @property
     def needs_tp_all_reduce(self) -> bool:
-        return not self.uses_routed_dispatch and (
-            self.mapping.tp_size > 1 or self.mapping.ep_size > 1
-        )
+        return self.mapping.tp_size > 1 or self.mapping.ep_size > 1
 
     @property
     def use_fp4_dispatch(self) -> bool:
@@ -201,13 +200,13 @@ class MoEExecutionPlan:
 
     @property
     def supports_tbo(self) -> bool:
-        return self.transport in {"mori", "mori_v2", "mega"} or (
+        return self.transport in {"mori", "mori_v2"} or (
             self.transport == "local" and self.mapping.dp_logical_ratio == 1
         )
 
     @property
     def selected_all2all_backend(self) -> str | None:
-        if self.transport in {"mori", "mori_v2", "mega"}:
+        if self.transport in {"mori", "mori_v2"}:
             return "mori"
         return "rccl" if self.transport == "rccl" else None
 
@@ -223,39 +222,19 @@ def resolve_moe_execution_plan(
     if implementation == "mega" and sequence_parallel_size > 1:
         # SP Mega uses native TP weights and decides per step whether it runs.
         implementation = "sp_mega"
-    if implementation == "mega":
-        if not mapping.use_ep:
-            raise ValueError(
-                "moe_backend='mega' requires a final EP size greater than 1; "
-                "enable DP-attention/DP flattening or use multiple TP ranks."
-            )
-        if mapping.dp_logical_ratio != 1:
-            raise ValueError(
-                "moe_backend='mega' requires real EP peers, not simulated DP"
-            )
-        if mapping.dp_size > 1 and not mapping.dp_is_sharded:
-            raise ValueError(
-                "moe_backend='mega' requires DP ranks in the final EP group; "
-                "enable DP-attention or moe_ep_flatten_tp_across_dp."
-            )
-        backend.validate_request(
-            enable_ep=mapping.use_ep, sequence_parallel_size=sequence_parallel_size
-        )
-        # ATOM_DISABLE_MORI_EP and --all2all-backend none control the standard
-        # prepare/finalize path. Mega owns its transport independently.
-        return MoEExecutionPlan(
-            mapping, backend, implementation, "mega", "Mega owns dispatch and combine"
-        )
+    # Config validates Mega's existing EP request and RCCL restrictions.
+    # Mega owns its kernels; surrounding row movement keeps the existing
+    # all2all request/availability decision, including singleton/simulated DP.
 
     fallback = (
         "dp_gather_scatter"
-        if mapping.dp_is_sharded and mapping.dp_size > 1
+        if mapping.enable_dp_attention and mapping.dp_size > 1
         else "local"
     )
     reason = (
         "DP-attention collective fallback" if fallback != "local" else "replicated rows"
     )
-    if mapping.dp_size <= 1 or not mapping.use_ep or not mapping.dp_is_sharded:
+    if mapping.dp_size <= 1 or not mapping.use_ep:
         reason = "no DP expert dispatch group"
     elif mapping.dp_logical_ratio != 1:
         reason = "simulated DP has no matching dispatch peers"
@@ -278,20 +257,20 @@ def resolve_moe_execution_plan(
     return MoEExecutionPlan(mapping, backend, implementation, fallback, reason)
 
 
-def get_moe_execution_plan(config) -> MoEExecutionPlan:
+def get_moe_execution_plan(config: "Config") -> MoEExecutionPlan:
     """Return the saved worker plan, or the saved rank-zero configuration plan."""
-    worker_plan = getattr(config, "worker_moe_execution_plan", None)
+    worker_plan = config.worker_moe_execution_plan
     if worker_plan is not None:
         return worker_plan
-    cached = getattr(config, "moe_execution_plan", None)
+    cached = config.moe_execution_plan
     if cached is not None:
         return cached
     from atom.parallel_mapping import get_parallel_mapping
 
     plan = resolve_moe_execution_plan(
-        get_parallel_mapping(config).for_rank(0).moe,
+        get_parallel_mapping(config).worker_topology().moe_for_rank(0),
         get_moe_backend_config(config),
-        sequence_parallel_size=getattr(config, "sequence_parallel_size", 1),
+        sequence_parallel_size=config.sequence_parallel_size,
     )
     config.moe_execution_plan = plan
     return plan

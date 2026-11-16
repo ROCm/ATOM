@@ -4,19 +4,25 @@
 
 import logging
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from atom.moe_config import get_moe_execution_plan
 from atom.parallel_mapping import get_parallel_mapping
 
+if TYPE_CHECKING:
+    from atom.config import Config
+
 logger = logging.getLogger("atom")
 
 
-def bind_worker_parallel_mapping(config, *, global_rank: int) -> None:
+def bind_worker_parallel_mapping(config: "Config", *, global_rank: int) -> None:
     from aiter.dist import parallel_state as groups
 
-    topology = get_parallel_mapping(config)
+    topology = get_parallel_mapping(config).worker_topology()
     rank = topology.for_rank(global_rank)
-    plan = replace(get_moe_execution_plan(config), mapping=rank.moe)
+    plan = replace(
+        get_moe_execution_plan(config), mapping=topology.moe_for_rank(global_rank)
+    )
     checks = [
         ("tp", groups.get_tp_group(), topology.tp_size, rank.tp_rank),
         ("dp", groups.get_dp_group(), topology.dp_size, rank.dp_rank),
@@ -32,7 +38,10 @@ def bind_worker_parallel_mapping(config, *, global_rank: int) -> None:
     if topology.pp_size > 1:
         checks.append(("pp", groups.get_pp_group(), topology.pp_size, rank.pp_rank))
     if plan.uses_routed_dispatch:
-        checks.append(("ep", groups.get_ep_group(), rank.moe.ep_size, rank.moe.ep_rank))
+        members = topology.group_ranks(global_rank, "ep")
+        checks.append(
+            ("ep", groups.get_ep_group(), len(members), members.index(global_rank))
+        )
     for dimension, group, size, index in checks:
         if (group.world_size, group.rank_in_group) != (size, index):
             raise ValueError(
@@ -45,10 +54,6 @@ def bind_worker_parallel_mapping(config, *, global_rank: int) -> None:
                 f"Resolved {dimension.upper()} group members/order must match the mapping: "
                 f"mapping={expected}, group={tuple(group.ranks)}"
             )
-    if getattr(config, "enable_tbo", False) and not plan.supports_tbo:
-        raise ValueError(
-            f"TBO is unsupported with resolved MoE transport {plan.transport!r}"
-        )
     config.worker_parallel_mapping = rank
     config.worker_moe_execution_plan = plan
     logger.info(
@@ -63,10 +68,10 @@ def bind_worker_parallel_mapping(config, *, global_rank: int) -> None:
         topology.pcp_size,
         rank.pp_rank,
         topology.pp_size,
-        rank.moe.tp_rank,
-        rank.moe.tp_size,
-        rank.moe.ep_rank,
-        rank.moe.ep_size,
+        plan.mapping.tp_rank,
+        plan.mapping.tp_size,
+        plan.mapping.ep_rank,
+        plan.mapping.ep_size,
         plan.implementation,
         plan.transport,
         plan.reason,

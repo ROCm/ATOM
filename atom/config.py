@@ -2417,7 +2417,7 @@ class Config:
         the saved runtime topology, including DP-attention's TP-to-DP fold.
         """
         tp = self.tensor_parallel_size
-        if getattr(self, "parallel_mapping", None) is not None:
+        if self.parallel_mapping is not None:
             return self.parallel_mapping.tp_world_size
         if not self.fake_eplb:
             return tp
@@ -3218,8 +3218,8 @@ class Config:
         """Turn TBO off where it cannot run (`_check_tbo_support` refuses what
         it cannot run with), before anything sizes itself off
         `enable_tbo_decode`."""
-        moe_plan = get_moe_execution_plan(self)
-        if moe_plan.transport == "rccl" and self.enable_tbo:
+        backend = get_moe_backend_config(self)
+        if backend.all2all_backend == "rccl" and self.enable_tbo:
             logger.warning(
                 "Disabling TBO for the experimental RCCL routed MoE backend; "
                 "the first implementation is synchronous."
@@ -3232,7 +3232,17 @@ class Config:
         # those streams can enter the collectives in opposite order and hang.
         # Keep the fallback usable by serializing it until it has dedicated
         # per-ubatch communicators, analogous to the PCP/TP guard below.
-        if self.enable_tbo and moe_plan.needs_dp_gather_scatter:
+        mori_ep_enabled = (
+            backend.all2all_backend in {"auto", "mori"}
+            and not backend.disable_mori
+            and backend.mori_available
+        )
+        if (
+            self.enable_dp_attention
+            and self.enable_expert_parallel
+            and self.enable_tbo
+            and not mori_ep_enabled
+        ):
             logger.warning(
                 "Disabling TBO for the DP MoE collective fallback: "
                 "concurrent all-gather/reduce-scatter ubatches can deadlock. "
@@ -3506,10 +3516,7 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(get_moe_backend_config(self))
-        factors.append(getattr(self, "parallel_mapping", None))
-        factors.append(getattr(self, "enable_expert_parallel", False))
-        factors.append(getattr(self, "moe_ep_flatten_tp_across_dp", False))
-        factors.append(getattr(self, "dp_logical_size", 0))
+        factors.append(self.parallel_mapping)
         factors.append(self.index_cache_dtype)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the

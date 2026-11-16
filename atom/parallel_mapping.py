@@ -7,9 +7,15 @@ ownership is a pure projection of DP x PP x PCP x TP; it never comes from a
 process group. Physical widths are explicit for simulated deployments.
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.moe_config import MoEParallelMapping, get_moe_backend_config
+
+if TYPE_CHECKING:
+    from atom.config import Config
 
 
 @dataclass(frozen=True)
@@ -19,7 +25,6 @@ class ParallelRankMapping:
     dp_rank: int
     pp_rank: int
     pcp_rank: int
-    moe: MoEParallelMapping
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,8 @@ class ParallelMapping:
     enable_ep: bool
     flatten_dp: bool
     merge_pcp: bool
+    enable_dp_attention: bool = False
+    dp_isolated: bool = False
 
     def __post_init__(self):
         for name in ("tp_size", "tp_world_size", "dp_size", "pp_size", "pcp_size"):
@@ -49,7 +56,20 @@ class ParallelMapping:
         if self.dp_rank_offset + self.local_dp_size > self.dp_size:
             raise ValueError("Local DP ranks must fit within the global DP width")
         # Validate logical expert widths even before a worker is launched.
-        self.for_rank(0)
+        self.moe_for_rank(0)
+
+    def worker_topology(self) -> "ParallelMapping":
+        """RLHF's launch DP ranks each own an independent TP-only world."""
+        if not self.dp_isolated:
+            return self
+        return replace(
+            self,
+            dp_size=1,
+            local_dp_size=1,
+            dp_rank_offset=0,
+            dp_logical_size=1,
+            dp_isolated=False,
+        )
 
     @property
     def stage_size(self) -> int:
@@ -72,21 +92,23 @@ class ParallelMapping:
         outer, tp_rank = divmod(global_rank, self.tp_world_size)
         outer, pcp_rank = divmod(outer, self.pcp_size)
         dp_rank, pp_rank = divmod(outer, self.pp_size)
-        moe = MoEParallelMapping.make(
+        return ParallelRankMapping(global_rank, tp_rank, dp_rank, pp_rank, pcp_rank)
+
+    def moe_for_rank(self, global_rank: int) -> MoEParallelMapping:
+        rank = self.for_rank(global_rank)
+        return MoEParallelMapping.make(
             tp_size=self.tp_size,
-            tp_rank=tp_rank,
+            tp_rank=rank.tp_rank,
             dp_size=self.dp_size,
-            dp_rank=dp_rank,
+            dp_rank=rank.dp_rank,
             local_dp_size=self.local_dp_size,
             dp_logical_size=self.dp_logical_size,
             enable_ep=self.enable_ep,
             flatten_dp=self.flatten_dp,
             pcp_size=self.pcp_size,
-            pcp_rank=pcp_rank,
+            pcp_rank=rank.pcp_rank,
             merge_pcp=self.merge_pcp,
-        )
-        return ParallelRankMapping(
-            global_rank, tp_rank, dp_rank, pp_rank, pcp_rank, moe
+            enable_dp_attention=self.enable_dp_attention,
         )
 
     def group_ranks(self, global_rank: int, dimension: str) -> tuple[int, ...]:
@@ -96,9 +118,9 @@ class ParallelMapping:
             "dp": {"dp"},
             "pp": {"pp"},
             "pcp": {"pcp"},
-            "ep": {"tp"}
-            | ({"dp"} if self.flatten_dp else set())
-            | ({"pcp"} if self.merge_pcp else set()),
+            # AITER's transport group spans DP x PCP x TP. Expert checkpoint
+            # sharding may have a different width/order; do not change either.
+            "ep": {"dp", "pcp", "tp"},
         }
         varied = dimensions[dimension]
         return tuple(
@@ -110,28 +132,25 @@ class ParallelMapping:
         )
 
 
-def resolve_parallel_mapping(config, *, visible_devices: int | None = None):
+def resolve_parallel_mapping(
+    config: "Config", *, visible_devices: int | None = None
+) -> ParallelMapping:
     """Normalize native DP-attention and already-translated plugin topology once."""
-    parallel = getattr(config, "parallel_config", None)
-    plugin = getattr(config, "plugin_config", None)
-    native = not getattr(plugin, "is_plugin_mode", False)
-    tp = getattr(config, "tensor_parallel_size", 1)
-    dp = getattr(parallel, "data_parallel_size", 1)
-    local_dp = getattr(parallel, "data_parallel_size_local", None) or dp
-    offset = (
-        getattr(parallel, "data_parallel_rank", 0)
-        if native and getattr(parallel, "is_multinode_dp", False)
-        else 0
-    )
-    dp_attention = getattr(config, "enable_dp_attention", False)
+    parallel = config.parallel_config
+    native = config.plugin_config is None or not config.plugin_config.is_plugin_mode
+    tp = config.tensor_parallel_size
+    dp = parallel.data_parallel_size
+    local_dp = parallel.data_parallel_size_local or dp
+    offset = parallel.data_parallel_rank if native and parallel.is_multinode_dp else 0
+    dp_attention = config.enable_dp_attention
     if native and dp_attention:
         dp *= tp
         local_dp *= tp
         offset *= tp
         tp = 1
-    logical_dp = getattr(config, "dp_logical_size", 0) or dp
+    logical_dp = config.dp_logical_size or dp
     physical_tp = tp
-    if native and getattr(config, "fake_eplb", False) and visible_devices:
+    if native and config.fake_eplb and visible_devices:
         if dp_attention and visible_devices < local_dp:
             if dp != local_dp:
                 raise ValueError(
@@ -144,33 +163,37 @@ def resolve_parallel_mapping(config, *, visible_devices: int | None = None):
             dp = local_dp = visible_devices
         elif not dp_attention:
             physical_tp = min(tp, visible_devices)
-    sp = getattr(config, "sequence_parallel_size", 1)
+    sp = config.sequence_parallel_size
     return ParallelMapping(
         tp_size=tp,
         tp_world_size=physical_tp,
         dp_size=dp,
         local_dp_size=local_dp,
-        pp_size=getattr(config, "pipeline_parallel_size", 1),
-        pcp_size=max(getattr(config, "prefill_context_parallel_size", 1), sp),
+        pp_size=config.pipeline_parallel_size,
+        pcp_size=pcp_group_size_of(config),
         dp_rank_offset=offset,
         dp_logical_size=logical_dp,
-        enable_ep=getattr(config, "enable_expert_parallel", False),
-        flatten_dp=dp_attention
-        or getattr(config, "moe_ep_flatten_tp_across_dp", False),
+        enable_ep=config.enable_expert_parallel,
+        flatten_dp=dp_attention or config.moe_ep_flatten_tp_across_dp,
         merge_pcp=get_moe_backend_config(config).pcp_merge or sp > 1,
+        enable_dp_attention=dp_attention,
+        dp_isolated=(
+            config.runner_qualname == "atom.rollout.model_runner_ext.RLHFModelRunner"
+            and (dp > 1 or "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER" in os.environ)
+        ),
     )
 
 
-def get_parallel_mapping(config) -> ParallelMapping:
-    """Saved topology; lightweight CPU callers may resolve it explicitly here."""
-    cached = getattr(config, "parallel_mapping", None)
+def get_parallel_mapping(config: "Config") -> ParallelMapping:
+    """Return Config's saved topology, resolving it once when first requested."""
+    cached = config.parallel_mapping
     if cached is None:
         cached = resolve_parallel_mapping(config)
         config.parallel_mapping = cached
     return cached
 
 
-def apply_parallel_mapping(config) -> None:
+def apply_parallel_mapping(config: "Config") -> None:
     """Populate legacy runtime fields from the saved mapping, without re-resolving."""
     mapping = get_parallel_mapping(config)
     config.tensor_parallel_size = mapping.tp_size

@@ -4,7 +4,7 @@
 import logging
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from functools import cache, lru_cache
 
@@ -91,9 +91,6 @@ from atom.model_ops.utils import (
 )
 from atom.moe_config import (
     MoEExecutionPlan,
-    MoEParallelMapping,
-    get_moe_backend_config,
-    resolve_moe_execution_plan,
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import (
@@ -214,48 +211,54 @@ def init_balance_router_logits(
 
 
 @dataclass(frozen=True)
-class FusedMoEParallelConfig(MoEParallelMapping):
-    """Compatibility facade over the resolved mapping and execution plan."""
+class FusedMoEParallelConfig:
+    """Read-only layer view of the saved worker execution plan."""
 
-    # Legacy direct constructors already described their EP/DP dispatch group.
-    # from_plan() supplies this flag from the resolved flattening decision.
-    dp_is_sharded: bool = True
-    requested_all2all_backend: str = "auto"
-    low_latency: bool = False
-    execution_plan: MoEExecutionPlan | None = field(default=None, repr=False)
+    execution_plan: MoEExecutionPlan
 
-    def __post_init__(self):
-        mapping = MoEParallelMapping(
-            **{
-                name: getattr(self, name)
-                for name in MoEParallelMapping.__dataclass_fields__
-            }
-        )
-        if self.execution_plan is None:
-            # Direct construction remains available to external callers. The
-            # normal worker path below supplies a plan from Config's snapshot.
-            from types import SimpleNamespace
+    @property
+    def tp_size(self) -> int:
+        return self.execution_plan.mapping.tp_size
 
-            backend = get_moe_backend_config(
-                SimpleNamespace(
-                    moe_all2all_backend=self.requested_all2all_backend,
-                    enable_low_latency=self.low_latency,
-                )
-            )
-            object.__setattr__(
-                self, "execution_plan", resolve_moe_execution_plan(mapping, backend)
-            )
-            object.__setattr__(
-                self, "requested_all2all_backend", backend.all2all_backend
-            )
-        elif mapping != self.execution_plan.mapping or (
-            self.requested_all2all_backend
-            != self.execution_plan.backend_config.all2all_backend
-            or self.low_latency != self.execution_plan.backend_config.low_latency
-        ):
-            raise ValueError(
-                "FusedMoEParallelConfig must agree with its execution plan"
-            )
+    @property
+    def dp_size(self) -> int:
+        return self.execution_plan.mapping.dp_size
+
+    @property
+    def ep_size(self) -> int:
+        return self.execution_plan.mapping.ep_size
+
+    @property
+    def tp_rank(self) -> int:
+        return self.execution_plan.mapping.tp_rank
+
+    @property
+    def dp_rank(self) -> int:
+        return self.execution_plan.mapping.dp_rank
+
+    @property
+    def ep_rank(self) -> int:
+        return self.execution_plan.mapping.ep_rank
+
+    @property
+    def use_ep(self) -> bool:
+        return self.execution_plan.mapping.use_ep
+
+    @property
+    def local_ep_size(self) -> int:
+        return self.execution_plan.mapping.local_ep_size
+
+    @property
+    def dp_logical_ratio(self) -> int:
+        return self.execution_plan.mapping.dp_logical_ratio
+
+    @property
+    def pcp_merge(self) -> bool:
+        return self.execution_plan.mapping.pcp_merge
+
+    @property
+    def low_latency(self) -> bool:
+        return self.execution_plan.backend_config.low_latency
 
     @property
     def selected_all2all_backend(self) -> str | None:
@@ -273,14 +276,9 @@ class FusedMoEParallelConfig(MoEParallelMapping):
     def use_rccl_kernels(self) -> bool:
         return self.execution_plan.transport == "rccl"
 
-    @staticmethod
-    def from_plan(plan: MoEExecutionPlan) -> "FusedMoEParallelConfig":
-        return FusedMoEParallelConfig(
-            **asdict(plan.mapping),
-            requested_all2all_backend=plan.backend_config.all2all_backend,
-            low_latency=plan.backend_config.low_latency,
-            execution_plan=plan,
-        )
+    @classmethod
+    def from_plan(cls, plan: MoEExecutionPlan) -> "FusedMoEParallelConfig":
+        return cls(plan)
 
 
 def pad_for_all_gather(
@@ -3575,7 +3573,7 @@ class FusedMoE(torch.nn.Module):
         self.has_bias = has_bias
 
         atom_config = get_current_atom_config()
-        topology = atom_config.parallel_mapping
+        topology = atom_config.parallel_mapping.worker_topology()
         tp_size = tp_size if tp_size is not None else topology.tp_size
         dp_size = dp_size if dp_size is not None else topology.dp_size
         plan = atom_config.worker_moe_execution_plan

@@ -9,6 +9,7 @@ runs per-token metadata a decode micro-batch does not build."""
 from types import SimpleNamespace
 
 import pytest
+from conftest import atom_config_double
 
 from atom.config import Config
 
@@ -94,7 +95,7 @@ def test_a_run_tbo_is_turned_off_for_is_not_refused(monkeypatch):
     import atom.config as config_module
 
     monkeypatch.setattr(config_module.envs, "ATOM_DISABLE_MORI_EP", True)
-    config = SimpleNamespace(
+    config = atom_config_double(
         enable_tbo=True,
         enable_tbo_decode=True,
         enable_dp_attention=True,

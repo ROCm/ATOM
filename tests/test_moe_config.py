@@ -2,12 +2,11 @@
 """CPU tests for topology and row-transport ownership across MoE entry points."""
 
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
 
 import pytest
 from conftest import atom_config_double
 
-from atom.config import Config
+from atom.config import Config, ParallelConfig
 from atom.moe_config import (
     MoEBackendConfig,
     MoEParallelMapping,
@@ -24,6 +23,7 @@ def _mapping(**kwargs):
         "local_dp_size": 8,
         "enable_ep": True,
         "flatten_dp": True,
+        "enable_dp_attention": True,
     }
     args.update(kwargs)
     return MoEParallelMapping.make(**args)
@@ -32,26 +32,26 @@ def _mapping(**kwargs):
 @pytest.mark.parametrize(
     "kwargs, tp, ep, rank, local_ep",
     [
-        ({"tp_size": 1, "flatten_dp": False}, 1, 1, 0, 1),
+        ({"tp_size": 1, "flatten_dp": False}, 1, 1, 0, 8),
         ({"tp_size": 4, "dp_rank": 1, "tp_rank": 2}, 1, 32, 6, 32),
-        ({"tp_size": 4, "flatten_dp": False, "tp_rank": 2}, 1, 4, 2, 4),
+        ({"tp_size": 4, "flatten_dp": False, "tp_rank": 2}, 1, 4, 2, 32),
         ({"tp_size": 4, "enable_ep": False, "dp_rank": 1, "tp_rank": 2}, 32, 1, 6, 1),
-        ({"pcp_size": 2, "pcp_rank": 1, "merge_pcp": True, "dp_rank": 3}, 1, 16, 7, 16),
+        ({"pcp_size": 2, "pcp_rank": 1, "merge_pcp": True, "dp_rank": 3}, 1, 16, 11, 8),
         (
             {"pcp_size": 2, "pcp_rank": 1, "merge_pcp": True, "flatten_dp": False},
             1,
             2,
             1,
-            2,
+            8,
         ),
     ],
 )
-def test_expert_ownership_uses_final_sharding_width(kwargs, tp, ep, rank, local_ep):
+def test_expert_ownership_preserves_existing_sharding(kwargs, tp, ep, rank, local_ep):
     mapping = _mapping(**kwargs)
     assert (mapping.tp_size, mapping.ep_size) == (tp, ep)
     assert (mapping.ep_rank if mapping.use_ep else mapping.tp_rank) == rank
     assert mapping.local_ep_size == local_ep
-    assert mapping.use_ep is (ep > 1)
+    assert mapping.use_ep is kwargs.get("enable_ep", True)
 
 
 @pytest.mark.parametrize(
@@ -97,14 +97,14 @@ def test_standard_transport_selection(requested, available, disabled, v2, transp
     assert plan.needs_dp_gather_scatter is (transport == "dp_gather_scatter")
 
 
-def test_pure_dp_keeps_expert_replicas_even_when_mori_is_installed():
+def test_non_dp_attention_preserves_existing_all2all_selection():
     for tp in (1, 4):
-        mapping = _mapping(tp_size=tp, flatten_dp=False)
+        mapping = _mapping(tp_size=tp, flatten_dp=False, enable_dp_attention=False)
         plan = resolve_moe_execution_plan(
             mapping, MoEBackendConfig(mori_available=True)
         )
-        assert plan.transport == "local"
-        assert not plan.uses_routed_dispatch
+        assert plan.transport == "mori"
+        assert plan.uses_routed_dispatch
         assert not plan.needs_dp_gather_scatter
 
 
@@ -119,7 +119,7 @@ def test_simulated_dp_cannot_use_real_alltoall_peers():
         assert not plan.supports_tbo
 
 
-def test_dp_pcp_tp_mapping_matches_dispatch_group_rank_order():
+def test_dp_pcp_tp_mapping_preserves_checkpoint_rank_order():
     ranks = []
     for dp_rank in range(2):
         for pcp_rank in range(2):
@@ -135,13 +135,13 @@ def test_dp_pcp_tp_mapping_matches_dispatch_group_rank_order():
                     merge_pcp=True,
                 )
                 assert mapping.ep_size == 16
-                assert mapping.local_ep_size == 8
+                assert mapping.local_ep_size == 4
                 ranks.append(mapping.ep_rank)
-    assert ranks == list(range(16))
+    assert ranks == [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12, 13, 14, 15]
 
 
 @pytest.mark.parametrize("requested", ["auto", "mori", "none"])
-def test_mega_owns_transport_independently_of_standard_mori_switches(requested):
+def test_mega_keeps_existing_outer_transport_switches(requested):
     plan = resolve_moe_execution_plan(
         _mapping(),
         MoEBackendConfig(
@@ -152,32 +152,41 @@ def test_mega_owns_transport_independently_of_standard_mori_switches(requested):
         ),
     )
     assert plan.implementation == "mega"
-    assert plan.owns_dispatch_combine and plan.uses_routed_dispatch
+    assert plan.owns_dispatch_combine
     assert not plan.needs_prepare_finalize
-    assert not plan.needs_dp_gather_scatter
+    assert plan.needs_dp_gather_scatter
     assert not plan.use_fp4_dispatch
 
 
 @pytest.mark.parametrize(
-    "mapping, backend, reason",
+    "mapping",
     [
-        (_mapping(flatten_dp=False), MoEBackendConfig(backend="mega"), "final EP"),
-        (
-            _mapping(dp_logical_size=16),
-            MoEBackendConfig(backend="mega"),
-            "real EP peers",
-        ),
-        (
-            _mapping(tp_size=4, flatten_dp=False),
-            MoEBackendConfig(backend="mega"),
-            "DP ranks",
-        ),
-        (_mapping(), MoEBackendConfig(backend="mega", all2all_backend="rccl"), "RCCL"),
+        _mapping(dp_size=1, local_dp_size=1),
+        _mapping(dp_logical_size=16),
     ],
 )
-def test_mega_refuses_incompatible_mapping(mapping, backend, reason):
+def test_mega_preserves_singleton_and_simulated_dp_transport(mapping):
+    backend = MoEBackendConfig(mori_available=True)
+    standard = resolve_moe_execution_plan(mapping, backend)
+    mega = resolve_moe_execution_plan(
+        mapping, MoEBackendConfig(backend="mega", mori_available=True)
+    )
+    assert mega.implementation == "mega"
+    assert mega.transport == standard.transport
+
+
+@pytest.mark.parametrize(
+    "enable_ep,requested,reason",
+    [(False, "auto", "expert parallelism"), (True, "rccl", "RCCL")],
+)
+def test_mega_preserves_existing_request_validation(enable_ep, requested, reason):
+    config = atom_config_double(
+        moe_backend="mega",
+        moe_all2all_backend=requested,
+        enable_expert_parallel=enable_ep,
+    )
     with pytest.raises(ValueError, match=reason):
-        resolve_moe_execution_plan(mapping, backend)
+        Config._init_moe_backend(config)
 
 
 def test_sp_mega_keeps_native_weight_mapping_and_local_fallback():
@@ -214,7 +223,7 @@ def test_backend_settings_are_a_snapshot_and_plans_are_immutable(monkeypatch):
 def test_saved_dp_attention_plan_survives_runtime_field_updates():
     config = atom_config_double(
         tensor_parallel_size=8,
-        parallel_config=SimpleNamespace(
+        parallel_config=ParallelConfig(
             data_parallel_size=1, data_parallel_size_local=1
         ),
         enable_dp_attention=True,
@@ -233,7 +242,7 @@ def test_saved_dp_attention_plan_survives_runtime_field_updates():
 @pytest.mark.parametrize("requested", ["auto", "none", "rccl"])
 def test_tbo_guard_consumes_same_transport_plan(requested):
     config = atom_config_double(
-        parallel_config=SimpleNamespace(
+        parallel_config=ParallelConfig(
             data_parallel_size=8, data_parallel_size_local=8
         ),
         enable_dp_attention=True,
@@ -251,9 +260,9 @@ def test_tbo_guard_consumes_same_transport_plan(requested):
 
 
 @pytest.mark.parametrize("ep, dp_attention", [(False, True), (True, False)])
-def test_collective_tbo_guard_also_covers_tp_and_plugin_flattening(ep, dp_attention):
+def test_tbo_guard_preserves_non_ep_and_plugin_flattening_behaviour(ep, dp_attention):
     config = atom_config_double(
-        parallel_config=SimpleNamespace(
+        parallel_config=ParallelConfig(
             data_parallel_size=8, data_parallel_size_local=8
         ),
         enable_dp_attention=dp_attention,
@@ -263,9 +272,9 @@ def test_collective_tbo_guard_also_covers_tp_and_plugin_flattening(ep, dp_attent
         enable_tbo_decode=True,
         moe_backend_config=MoEBackendConfig(all2all_backend="none"),
     )
-    assert get_moe_execution_plan(config).needs_dp_gather_scatter
+    assert get_moe_execution_plan(config).needs_dp_gather_scatter is dp_attention
     Config._resolve_tbo(config)
-    assert not config.enable_tbo and not config.enable_tbo_decode
+    assert config.enable_tbo and config.enable_tbo_decode
 
 
 @pytest.mark.parametrize(

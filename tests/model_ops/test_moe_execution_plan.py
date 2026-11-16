@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Exercise real MoE entry points with only the GPU/collective boundaries mocked."""
 
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,9 +16,25 @@ from atom.moe_config import (
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _initialize_compiler_before_gpu_stubs():
+    # AITER stubs provide only the Triton kernel boundary. Initialize Dynamo
+    # against real PyTorch first so its optional Triton imports see that the
+    # compiler package is absent instead of treating a kernel stub as JITFunction.
+    compiled = torch.compile(
+        lambda x: x + 1, backend=lambda graph, inputs: graph.forward
+    )
+    compiled(torch.zeros(1))
+
+
 def _plan(backend="standard", all2all="none"):
     mapping = MoEParallelMapping.make(
-        tp_size=1, dp_size=2, local_dp_size=2, enable_ep=True, flatten_dp=True
+        tp_size=1,
+        dp_size=2,
+        local_dp_size=2,
+        enable_ep=True,
+        flatten_dp=True,
+        enable_dp_attention=True,
     )
     return resolve_moe_execution_plan(
         mapping,
@@ -28,7 +44,7 @@ def _plan(backend="standard", all2all="none"):
 
 @pytest.mark.parametrize(
     "backend, all2all, gather",
-    [("standard", "none", True), ("standard", "auto", False), ("mega", "none", False)],
+    [("standard", "none", True), ("standard", "auto", False), ("mega", "none", True)],
 )
 def test_forward_uses_plan_for_dp_collectives(
     monkeypatch, atom_modules, backend, all2all, gather
@@ -47,8 +63,8 @@ def test_forward_uses_plan_for_dp_collectives(
         _run_experts=run,
         reduce_results=True,
     )
-    # A plugin may flatten DP without the native DP-attention flag. The plan
-    # must still gather; conversely Mega must always receive only local rows.
+    # The saved DP-attention setting determines the existing collective path;
+    # later runtime-field changes must not reinterpret it.
     monkeypatch.setattr(
         moe,
         "get_current_atom_config",
@@ -76,7 +92,7 @@ def test_forward_uses_plan_for_dp_collectives(
     assert run.call_args.args[0].shape[0] == (6 if gather else 3)
     assert run.call_args.args[-1] is gather
     assert gather_rows.call_count == scatter.call_count == int(gather)
-    assert tp_reduce.call_count == int(gather)
+    assert tp_reduce.call_count == 1
 
 
 def test_mega_skips_standard_prepare_finalize(monkeypatch, atom_modules):
@@ -96,16 +112,12 @@ def test_mega_skips_standard_prepare_finalize(monkeypatch, atom_modules):
 
 def test_parallel_facade_cannot_diverge_from_its_plan(atom_modules):
     plan = _plan()
-    parallel = atom_modules.moe.FusedMoEParallelConfig(
-        **asdict(plan.mapping), requested_all2all_backend="none", execution_plan=plan
-    )
-    for overrides in (
-        {"ep_rank": 1},
-        {"low_latency": True},
-        {"requested_all2all_backend": "rccl"},
-    ):
-        with pytest.raises(ValueError, match="must agree with its execution plan"):
-            replace(parallel, **overrides)
+    parallel = atom_modules.moe.FusedMoEParallelConfig.from_plan(plan)
+    for name, value in (("ep_rank", 1), ("low_latency", True)):
+        with pytest.raises(FrozenInstanceError):
+            setattr(parallel, name, value)
+    with pytest.raises(TypeError):
+        atom_modules.moe.FusedMoEParallelConfig()
 
 
 @pytest.mark.parametrize(
@@ -133,7 +145,9 @@ def test_parallel_facade_consumes_plan_without_runtime_resolution(
     moe = atom_modules.moe
     plan = _plan()
     refuse = Mock(side_effect=AssertionError("Layers must consume the saved plan"))
-    monkeypatch.setattr(moe, "resolve_moe_execution_plan", refuse)
+    from atom import moe_config
+
+    monkeypatch.setattr(moe_config, "resolve_moe_execution_plan", refuse)
     monkeypatch.setattr(moe, "get_tp_group", refuse)
     monkeypatch.setattr(moe, "get_dp_group", refuse)
     parallel = moe.FusedMoEParallelConfig.from_plan(plan)
@@ -143,7 +157,7 @@ def test_parallel_facade_consumes_plan_without_runtime_resolution(
 
 
 @pytest.mark.parametrize("transport", ["auto", "rccl"])
-def test_routed_combine_needs_no_outer_pcp_or_tp_reduction(
+def test_routed_combine_preserves_outer_pcp_and_tp_reduction(
     monkeypatch, atom_modules, transport
 ):
     moe = atom_modules.moe
@@ -160,7 +174,7 @@ def test_routed_combine_needs_no_outer_pcp_or_tp_reduction(
     plan = resolve_moe_execution_plan(
         mapping, MoEBackendConfig(all2all_backend=transport, mori_available=True)
     )
-    assert not plan.needs_pcp_collectives and not plan.needs_tp_all_reduce
+    assert plan.needs_pcp_collectives and plan.needs_tp_all_reduce
     x = torch.randn(3, 4)
     w, ids = torch.ones(3, 1), torch.zeros(3, 1, dtype=torch.int32)
     method = SimpleNamespace(
@@ -183,20 +197,20 @@ def test_routed_combine_needs_no_outer_pcp_or_tp_reduction(
         moe,
         "get_forward_context",
         lambda: SimpleNamespace(
-            context=SimpleNamespace(is_dummy_run=False, pcp_split=True)
+            context=SimpleNamespace(is_dummy_run=False, pcp_split=False)
         ),
     )
     monkeypatch.setattr(moe, "pass_scheduled_tokens_gpu", lambda _: None)
     gather = Mock(side_effect=AssertionError("dispatch already owns PCP rows"))
     monkeypatch.setattr(moe, "all_gatherv", gather)
-    scatter = Mock(side_effect=AssertionError("combine already returns local rows"))
+    scatter = Mock(side_effect=lambda out: out)
     monkeypatch.setattr(moe, "pcp_reduce_scatter", scatter)
     monkeypatch.setattr(moe, "pcp_all_reduce", scatter)
     out = moe.FusedMoE._run_experts(layer, x, w, ids)
     torch.testing.assert_close(out, x * 2)
     assert method.apply.call_args.kwargs["x"] is x
     gather.assert_not_called()
-    scatter.assert_not_called()
+    scatter.assert_called_once()
 
 
 def test_shared_expert_gate_uses_supplied_plan(monkeypatch, atom_modules):
@@ -219,3 +233,62 @@ def test_shared_expert_gate_uses_supplied_plan(monkeypatch, atom_modules):
     assert topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         quant, execution_plan=_plan(all2all="rccl")
     )
+
+
+@pytest.mark.parametrize("dp_attention", [False, True])
+def test_compiled_forward_preserves_dp_collectives_and_outer_tp_reduce(
+    monkeypatch, atom_modules, dp_attention
+):
+    moe = atom_modules.moe
+    mapping = MoEParallelMapping.make(
+        tp_size=1,
+        dp_size=2,
+        local_dp_size=2,
+        enable_ep=True,
+        flatten_dp=True,
+        enable_dp_attention=dp_attention,
+    )
+    plan = resolve_moe_execution_plan(mapping, MoEBackendConfig(all2all_backend="none"))
+    layer = SimpleNamespace(
+        moe_parallel_config=moe.FusedMoEParallelConfig.from_plan(plan),
+        quant_method=SimpleNamespace(
+            select_experts=lambda layer, rows, logits: (
+                torch.ones(rows.shape[0], 1),
+                torch.zeros(rows.shape[0], 1, dtype=torch.int32),
+            ),
+            routed_rows_wire=None,
+        ),
+        _run_experts=lambda rows, *args, **kwargs: rows * 2,
+        reduce_results=True,
+    )
+    context = SimpleNamespace(context=SimpleNamespace(running_tokens_are_unified=True))
+    monkeypatch.setattr(moe, "get_forward_context", lambda: context)
+    monkeypatch.setattr(moe, "get_dp_group", lambda: None)
+    monkeypatch.setattr(
+        moe,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            all_reduce=lambda rows, **kwargs: rows + 3,
+        ),
+    )
+    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args: fn(*args))
+    monkeypatch.setattr(
+        moe,
+        "dp_gather_routed_rows",
+        lambda rows, *args: (
+            tuple(t.repeat(2, 1) for t in rows),
+            3,
+            [3, 3],
+        ),
+    )
+    monkeypatch.setattr(
+        moe, "reduce_scatter_with_unpadding", lambda rows, count: rows[:count]
+    )
+    monkeypatch.setattr(moe, "reassign_gathered_shared_ids", lambda *args: None)
+    rows = torch.arange(12).reshape(3, 4).float()
+    compiled = torch.compile(
+        lambda x: moe.FusedMoE.forward_impl_graph(layer, x, torch.empty(3, 8)),
+        backend=lambda graph, inputs: graph.forward,
+        fullgraph=True,
+    )
+    torch.testing.assert_close(compiled(rows), rows * 2 + 3)

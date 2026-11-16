@@ -1255,7 +1255,7 @@ def init_aiter_dist(config: Config) -> None:
         "Initialize aiter dist for using aiter custom collective op for plugin mode"
     )
 
-    from atom.distributed.parallel_mapping import bind_worker_parallel_mapping
+    from atom.distributed.worker_binding import bind_worker_parallel_mapping
     from atom.parallel_mapping import get_parallel_mapping
 
     mapping = get_parallel_mapping(config)
@@ -1263,8 +1263,9 @@ def init_aiter_dist(config: Config) -> None:
     if getattr(config.plugin_config, "is_sglang", False):
         rank = getattr(config.plugin_config, "sglang_aiter_rank_id", rank)
     tensor_parallel_size = mapping.tp_size
+    pp_rank, stage_rank = divmod(rank, mapping.stage_size)
     global_rank = mapping.global_rank(
-        rank, config.parallel_config.data_parallel_rank or 0
+        stage_rank, config.parallel_config.data_parallel_rank or 0, pp_rank
     )
 
     assert (
@@ -1315,13 +1316,29 @@ def init_aiter_dist(config: Config) -> None:
     logger.info(
         f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
     )
-    init_dist_env(
-        tensor_model_parallel_size=tensor_parallel_size,
-        rankID=rank,
-        backend="nccl",
-        distributed_init_method=distributed_init_method,
-        data_parallel_size=mapping.dp_size,
-        data_parallel_rank=config.parallel_config.data_parallel_rank,
-        prefill_context_model_parallel_size=mapping.pcp_size,
-    )
+    if mapping.pp_size > 1:
+        # AITER's init_dist_env fixes PP to one. A failed vLLM group reuse
+        # must still create the requested pipeline topology.
+        from atom.distributed.pp_comm import init_pp_aware_dist_env
+
+        init_pp_aware_dist_env(
+            tensor_model_parallel_size=tensor_parallel_size,
+            pipeline_model_parallel_size=mapping.pp_size,
+            global_rank=global_rank,
+            world_size=mapping.world_size,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=mapping.dp_size,
+            prefill_context_model_parallel_size=mapping.pcp_size,
+        )
+    else:
+        init_dist_env(
+            tensor_model_parallel_size=tensor_parallel_size,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=mapping.dp_size,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+            prefill_context_model_parallel_size=mapping.pcp_size,
+        )
     bind_worker_parallel_mapping(config, global_rank=global_rank)

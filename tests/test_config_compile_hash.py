@@ -5,7 +5,8 @@
 
 from types import SimpleNamespace
 
-from atom.config import Config
+from conftest import atom_config_double
+
 from atom.moe_config import MoEBackendConfig
 
 
@@ -32,7 +33,16 @@ def _hash(**overrides):
         "speculative_config": None,
     }
     fields.update(overrides)
-    return Config.compute_hash(SimpleNamespace(**fields))
+    config = atom_config_double(**fields)
+    # Hash the same resolved sharding snapshot production saves at startup.
+    from atom.config import ParallelConfig
+    from atom.parallel_mapping import resolve_parallel_mapping
+
+    parallel = config.parallel_config
+    config.parallel_config = ParallelConfig()
+    config.parallel_mapping = resolve_parallel_mapping(config)
+    config.parallel_config = parallel
+    return config.compute_hash()
 
 
 def test_hash_is_stable():

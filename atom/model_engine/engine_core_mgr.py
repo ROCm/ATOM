@@ -471,8 +471,8 @@ class CoreManager:
         if config.enable_dp_attention:
             assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
             # One engine per assignment this node owns; on a single node that is
-            # the whole tp x dp grid. --fake-eplb may shrink it to the visible
-            # device count, taking the first N assignments.
+            # the whole tp x dp grid. The saved mapping already limits
+            # --fake-eplb assignments to the visible devices.
             local_engine_count = len(rank_assignments)
             logger.info(
                 f"Enable dp attention, using {local_engine_count} data parallel ranks"

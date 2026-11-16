@@ -9,8 +9,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 from conftest import atom_config_double
 
-from atom.config import Config
-from atom.distributed.parallel_mapping import bind_worker_parallel_mapping
+from atom.config import Config, ParallelConfig
+from atom.distributed.worker_binding import bind_worker_parallel_mapping
 from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
 from atom.moe_config import MoEBackendConfig, get_moe_execution_plan
 from atom.parallel_mapping import (
@@ -28,11 +28,10 @@ from atom.plugin.config import (
 def _config(tp=1, dp=1, local_dp=None, **overrides):
     return atom_config_double(
         tensor_parallel_size=tp,
-        parallel_config=SimpleNamespace(
+        parallel_config=ParallelConfig(
             data_parallel_size=dp,
             data_parallel_size_local=local_dp or dp,
             data_parallel_rank=0,
-            is_multinode_dp=False,
         ),
         moe_backend_config=MoEBackendConfig(mori_available=True, pcp_merge=True),
         **overrides,
@@ -47,7 +46,7 @@ def test_native_dp_attention_mapping_precedes_launch_and_survives_spawn_copy():
     assert (topology.tp_size, topology.dp_size) == (1, 8)
     assert config.tensor_parallel_size == 8
     assert plan.mapping.ep_size == 8 and plan.transport == "mori"
-    assert topology.for_rank(7).moe.ep_rank == 7
+    assert topology.moe_for_rank(7).ep_rank == 7
     assert iter_dp_rank_assignments(config) == [(rank, rank) for rank in range(8)]
 
     apply_parallel_mapping(config)
@@ -83,7 +82,7 @@ def test_translated_sglang_dp_attention_is_not_folded_twice(world):
         world,
         world,
     )
-    assert topology.for_rank(world - 1).moe.ep_rank == world - 1
+    assert topology.moe_for_rank(world - 1).ep_rank == world - 1
 
 
 @pytest.mark.parametrize("rank", range(8))
@@ -96,12 +95,11 @@ def test_sglang_worker_rank_is_not_a_native_node_slice_offset(rank):
     )
     topology = get_parallel_mapping(config)
     assert topology.dp_rank_offset == 0
-    assert topology.for_rank(rank).moe.ep_rank == rank
+    assert topology.moe_for_rank(rank).ep_rank == rank
 
 
 def test_multinode_launch_assignments_share_the_normalized_mapping():
     config = _config(tp=2, dp=8, local_dp=4, enable_dp_attention=True)
-    config.parallel_config.is_multinode_dp = True
     config.parallel_config.data_parallel_rank = 4
     topology = get_parallel_mapping(config)
     assert (topology.dp_size, topology.local_dp_size, topology.dp_rank_offset) == (
@@ -135,6 +133,7 @@ def test_global_layout_projects_dp_pp_pcp_tp_and_expert_groups():
                 for tp in range(4):
                     global_rank = ((dp * 2 + pp) * 2 + pcp) * 4 + tp
                     rank = topology.for_rank(global_rank)
+                    moe = topology.moe_for_rank(global_rank)
                     assert (
                         rank.dp_rank,
                         rank.pp_rank,
@@ -142,13 +141,13 @@ def test_global_layout_projects_dp_pp_pcp_tp_and_expert_groups():
                         rank.tp_rank,
                     ) == (dp, pp, pcp, tp)
                     assert (
-                        rank.moe.ep_size,
-                        rank.moe.ep_rank,
-                        rank.moe.local_ep_size,
-                    ) == (16, (dp * 2 + pcp) * 4 + tp, 8)
+                        moe.ep_size,
+                        moe.ep_rank,
+                        moe.local_ep_size,
+                    ) == (16, (pcp * 2 + dp) * 4 + tp, 4)
                     assert (
                         topology.group_ranks(global_rank, "ep").index(global_rank)
-                        == rank.moe.ep_rank
+                        == (dp * 2 + pcp) * 4 + tp
                     )
     assert topology.group_ranks(22, "tp") == (20, 21, 22, 23)
     assert topology.group_ranks(22, "dp") == (6, 22)
@@ -187,7 +186,7 @@ def test_simulated_tp_keeps_logical_shards_and_physical_group_members():
         _config(tp=8, fake_eplb=True), visible_devices=4
     )
     assert (topology.tp_size, topology.tp_world_size, topology.world_size) == (8, 4, 4)
-    assert topology.for_rank(3).moe.tp_size == 8
+    assert topology.moe_for_rank(3).tp_size == 8
     assert topology.group_ranks(3, "tp") == (0, 1, 2, 3)
     with pytest.raises(ValueError, match="Global rank"):
         topology.for_rank(4)
@@ -203,7 +202,11 @@ def _install_runtime_groups(
         ("dp", topology.dp_size, rank.dp_rank),
         ("pp", topology.pp_size, rank.pp_rank),
         ("pcp", topology.pcp_size, rank.pcp_rank),
-        ("ep", rank.moe.ep_size, rank.moe.ep_rank),
+        (
+            "ep",
+            len(topology.group_ranks(global_rank, "ep")),
+            topology.group_ranks(global_rank, "ep").index(global_rank),
+        ),
     ):
         runtime[dimension] = SimpleNamespace(
             world_size=size,
@@ -299,7 +302,7 @@ def test_pcp_merge_setting_is_saved_before_worker_environment_changes(monkeypatc
     topology = get_parallel_mapping(config)
     monkeypatch.setenv("ATOM_PCP_MOE_MERGE", "0")
     assert get_parallel_mapping(config) is topology
-    assert topology.for_rank(3).moe.tp_size == 4
+    assert topology.moe_for_rank(3).tp_size == 4
 
 
 @pytest.mark.parametrize(

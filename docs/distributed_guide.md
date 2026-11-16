@@ -342,26 +342,26 @@ Parallel topology is resolved at the end of configuration normalization,
 before workers or process groups are created:
 
 - `MoEBackendConfig` normalizes `moe_backend`, `moe_all2all_backend`, low-latency mode, and the MoRI environment settings once. `Config` carries this immutable snapshot into native workers and plugin execution.
-- `ParallelMapping` in `atom/parallel_mapping.py` stores the final attention TP/DP, PP, and PCP dimensions, physical launch widths, logical expert width, and group rank order. Native DP-attention folds TP into DP here; plugin configurations have already translated their framework topology and are not folded again. `mapping.for_rank(global_rank)` derives worker coordinates and its `MoEParallelMapping` without reading AITER groups.
+- `ParallelMapping` in `atom/parallel_mapping.py` stores the final attention TP/DP, PP, and PCP dimensions, physical launch widths, logical expert width, and group rank order. Native DP-attention folds TP into DP here; plugin configurations have already translated their framework topology and are not folded again. `mapping.for_rank(global_rank)` derives worker coordinates, and `mapping.moe_for_rank(global_rank)` derives expert ownership without reading AITER groups. RLHF DP-isolated workers use a DP=1 projection, with their MoE plan saved before launch.
 - `MoEExecutionPlan` selects the implementation and the owner of routed-row communication. Weight partitioning, shared-expert routing, prepare/finalize construction, and DP gather/scatter consume this same plan. Startup logs report the resolved mapping, transport, and selection reason once per worker mapping.
 
 `Config` saves both the mapping and the rank-zero MoE execution plan. CoreManager
 uses the mapping for engine assignments and populates legacy runtime fields from
 it, rather than independently rewriting topology. Native and plugin launchers
 create or reuse groups with the resolved dimensions, then
-`bind_worker_parallel_mapping()` validates their sizes, rank coordinates, and
+`bind_worker_parallel_mapping()` in `atom/distributed/worker_binding.py` validates their sizes, rank coordinates, and
 member order before model construction. It projects the saved execution plan onto
 the worker's launch rank; it does not select transport again. MoE layers consume
 that worker plan through `FusedMoEParallelConfig.from_plan()`.
 
-DP participates in expert sharding only with DP-attention or `moe_ep_flatten_tp_across_dp`. PCP merge (including Ulysses SP) folds PCP into the sharding width in AITER's `DP x PCP x TP` rank order. EP is enabled only when that final width exceeds one. With EP, each device owns whole experts and the MoE TP size becomes one. Pure DP keeps independent expert replicas; enabling EP with TP1 alone does not turn a DP replica into an EP shard.
+Expert sharding preserves the existing rules: DP participates with DP-attention or `moe_ep_flatten_tp_across_dp`, PCP merge uses the checkpoint's `PCP x (DP x TP)` ordering, and EP eligibility uses the pre-PCP `logical DP x TP` width. The transport process group retains AITER's `DP x PCP x TP` ordering. `local_ep_size` retains `local DP x TP`, independently of checkpoint shard order. With EP, each device owns whole experts and the MoE TP size becomes one.
 
-For the standard implementation, a real DP expert dispatch group uses explicit RCCL, or MoRI when available and enabled. `auto`/`mori` fall back when MoRI is unavailable or disabled; `none` disables routed all-to-all explicitly. A fallback gathers and scatters DP rows whenever DP participates in sharding, including plugin flattening. Simulated DP keeps the collective fallback because its logical expert map is wider than the real process group. TBO is disabled for concurrent DP gather/scatter or synchronous RCCL execution.
+Transport selection is unchanged: real DP peers with EP use explicit RCCL, or MoRI when available and enabled, including native TP+DP+EP without DP-attention. `auto`/`mori` fall back when MoRI is unavailable or disabled; `none` disables routed all-to-all. DP gather/scatter requires DP-attention, so vLLM flattening alone does not enable it. Simulated DP keeps the existing DP-attention fallback. The original TBO guards for RCCL and DP-attention+EP fallback are preserved.
 
-Mega owns dispatch, expert compute, and combine. Its plan therefore uses dispatch-space expert IDs but allocates no standard prepare/finalize kernel and performs no outer DP/PCP gather/scatter or TP reduction, including with `--all2all-backend none` or `ATOM_DISABLE_MORI_EP=1`. These switches control the standard transport. Mega refuses EP1, unflattened DP replicas, simulated DP, or RCCL before weight preparation. Under Ulysses SP, Mega instead retains the native TP weight mapping and the existing per-step SP Mega eligibility checks.
+Mega owns its expert kernels and allocates no standard prepare/finalize kernel. The surrounding row movement, PCP merge, and outer TP reduction retain their original conditions. Under Ulysses SP, Mega retains the native TP weight mapping and existing per-step SP Mega eligibility checks. This change moves resolution to startup without changing communication policy.
 
 The compile cache key includes the normalized MoE backend snapshot, resolved
-parallel mapping, and expert-sharding settings. PCP merge is also captured in the
+parallel mapping. PCP merge is also captured in the
 snapshot, so later environment changes do not alter worker ownership.
 
 ### Expert distribution

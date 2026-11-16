@@ -10,7 +10,7 @@ from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from atom.config import Config
+from atom.config import Config, ParallelConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
@@ -47,6 +47,13 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
+        # Every entry point supplies the full topology before Config resolves
+        # mapping. ParallelConfig remains authoritative when supplied directly.
+        if "parallel_config" not in config_kwargs:
+            parallel = ParallelConfig(data_parallel_size=data_parallel_size)
+            if data_parallel_master_port is not None:
+                parallel.data_parallel_master_port = data_parallel_master_port
+            config_kwargs["parallel_config"] = parallel
         config = Config(model, **config_kwargs)
         self.config = config
         self.tokenizer = tokenizer or load_tokenizer(
@@ -58,18 +65,7 @@ class LLMEngine:
         # separate eos_token_id from stop_token_ids
         stop_token_ids.discard(config.eos_token_id)
         config.stop_token_ids = list(stop_token_ids)
-        # Legacy path only: callers that pass DP topology as loose kwargs
-        # instead of a ParallelConfig. When a parallel_config was supplied it
-        # is already authoritative, and overwriting it here would reset a
-        # multi-node topology back to a single local rank.
-        if "parallel_config" not in config_kwargs:
-            config.parallel_config.data_parallel_size = data_parallel_size
-            if data_parallel_master_port is not None:
-                config.parallel_config.data_parallel_master_port = (
-                    data_parallel_master_port
-                )
         self.data_parallel_size = config.parallel_config.data_parallel_size
-        # Config validated SP before the legacy DP kwargs above landed.
         if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
             raise ValueError("Ulysses SP currently requires data_parallel_size=1")
         # PCP and DP-attention together are unverified. The refusal's original

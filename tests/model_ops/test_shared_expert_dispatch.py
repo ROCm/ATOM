@@ -16,6 +16,11 @@ from atom.model_ops.moe import FusedMoE, FusedMoEParallelConfig, Mxfp4MoEMethod
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
+from atom.moe_config import (
+    MoEParallelMapping,
+    get_moe_backend_config,
+    resolve_moe_execution_plan,
+)
 
 
 class _FakeMoELayer(SimpleNamespace):
@@ -162,7 +167,7 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
 def _parallel_config(
     *, dp_size: int, use_ep: bool, backend: str = "auto"
 ) -> FusedMoEParallelConfig:
-    return FusedMoEParallelConfig(
+    mapping = MoEParallelMapping(
         tp_size=8,
         dp_size=dp_size,
         ep_size=8 if use_ep else 1,
@@ -171,7 +176,10 @@ def _parallel_config(
         ep_rank=0,
         use_ep=use_ep,
         local_ep_size=8,
-        requested_all2all_backend=backend,
+    )
+    config = atom_config_double(moe_all2all_backend=backend)
+    return FusedMoEParallelConfig.from_plan(
+        resolve_moe_execution_plan(mapping, get_moe_backend_config(config))
     )
 
 

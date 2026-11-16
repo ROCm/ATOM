@@ -3,13 +3,11 @@
 
 from types import SimpleNamespace
 
-from atom.config import Config
+from conftest import atom_config_double
 
 
 def _hash(spec=None):
-    # Only the fields compute_hash reads; quant/compilation/parallel are falsy
-    # so their sub-hashes are skipped.
-    cfg = SimpleNamespace(
+    cfg = atom_config_double(
         quant_config=None,
         compilation_config=None,
         parallel_config=None,
@@ -28,7 +26,7 @@ def _hash(spec=None):
         kv_cache_dtype="fp8",
         speculative_config=spec,
     )
-    return Config.compute_hash(cfg)
+    return cfg.compute_hash()
 
 
 def _spec(method="dspark", k=3, **kw):

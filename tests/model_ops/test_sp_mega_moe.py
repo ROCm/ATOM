@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from conftest import atom_config_double
 
 from atom.model_ops.fused_moe import sp_mega_moe as fusion
 from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, local_token_tile
@@ -183,7 +184,7 @@ def _model(layer):
 
 
 def _config(backend="mega", mnbt=1024):
-    return SimpleNamespace(
+    return atom_config_double(
         moe_backend=backend, sequence_parallel_size=4, max_num_batched_tokens=mnbt
     )
 

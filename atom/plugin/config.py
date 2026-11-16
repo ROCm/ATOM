@@ -489,6 +489,7 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         max_model_len=max_model_len,
         gpu_memory_utilization=vllm_cache_config.gpu_memory_utilization,
         tensor_parallel_size=vllm_parallel_config.tensor_parallel_size,
+        pipeline_parallel_size=vllm_parallel_config.pipeline_parallel_size,
         enforce_eager=True,  # disable using atom cuda graph
         parallel_config=vllm_parallel_config,
         kv_cache_block_size=vllm_cache_config.block_size,

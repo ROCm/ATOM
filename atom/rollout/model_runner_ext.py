@@ -12,8 +12,10 @@ from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
 
+from atom.distributed.worker_binding import bind_worker_parallel_mapping
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.parallel_mapping import get_parallel_mapping
 from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
@@ -145,6 +147,7 @@ class RLHFModelRunner(
                 return super()._setup_device_and_distributed(rank, config)
 
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
+        mapping = get_parallel_mapping(config).worker_topology()
         local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
         dp_port = config.parallel_config.data_parallel_base_port + dp_rank_local * 100
         num_gpus = torch.cuda.device_count()
@@ -188,6 +191,8 @@ class RLHFModelRunner(
         # sync_dp_metadata) sees dp_size=1 and skips cross-DP collectives that
         # would fail on the isolated process group.
         config.parallel_config.data_parallel_size = 1
+        config.parallel_mapping = mapping
+        bind_worker_parallel_mapping(config, global_rank=rank)
 
         # aiter's init_dist_env creates a signal tensor on device=rankID
         # (TP rank). When DP isolation remaps devices, recreate it on
