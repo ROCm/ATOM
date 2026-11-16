@@ -705,8 +705,8 @@ def _score_tile_keys(
 # a process sees would fix the width for every later one. That lottery is not
 # academic -- the widths differ by more than 4x across these shapes.
 #
-# Decode's selector grid is only 50-200 CTAs, so it needs multiple warps per
-# program; the best single pair over the deployed shapes is (512, 8).
+# (512, 8) is the chosen pair; the warps are needed because decode's selector
+# grid is only 50-200 CTAs.
 DECODE_TOPK_BLOCK_SIZE_K = 512
 DECODE_TOPK_NUM_WARPS = 8
 

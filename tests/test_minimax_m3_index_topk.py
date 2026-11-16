@@ -954,6 +954,8 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
 
     monkeypatch.setattr(m, "_launch_parallel_prefill_selector", tracked_parallel_launch)
     new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    if qlens == [2858, 2331] and heads == 1:
+        assert parallel_launches
     expect_parallel = m._parallel_prefill_selector_wins(
         arch=arch,
         width=max_block,

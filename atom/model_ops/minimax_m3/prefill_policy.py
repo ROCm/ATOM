@@ -22,7 +22,7 @@ _GFX1250_GROUPED_MAX_CTAS_PER_CU = 12
 # Q256 reuses each page across more rows; two workgroups per CU keep that larger
 # tile resident without turning context length into a shape table.
 _GFX1250_WIDE_CTAS_PER_CU = 2
-# Multi-plane rows already supply occupancy. A short page chunk with two waves
+# Multi-plane rows already supply occupancy. A short block chunk with two waves
 # improves the long-query cases without the register cost of grouped stores.
 _GFX1250_MULTI_PLANE_CHUNK = 28
 
@@ -206,7 +206,7 @@ def prefill_score_config(
             max_block < 2 * compute_units and plane_tiles < compute_units
         ):
             return fallback
-        # At both long-Q and long-context, fixed 28-page chunks over-split the grid.
+        # At both long-Q and long-context, fixed 28-block chunks over-split the grid.
         if max_block > 4 * compute_units and plane_tiles > 4 * compute_units:
             return fallback
         return PrefillScoreConfig(
