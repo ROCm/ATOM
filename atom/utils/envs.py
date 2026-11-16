@@ -1128,6 +1128,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # = auto (MXFP8 below 256 rows, MXFP4 from 256, where production is a4w4 too) | a8 | a4. Unsupported configs are
     # refused in the log and keep the unfused path. Off by default.
     "ATOM_M3_FHMOE": lambda: os.getenv("ATOM_M3_FHMOE", "0") == "1",
+    # MiniMax-M3: the TP all-reduce + Gemma RMSNorm ahead of qkv_proj writes the MXFP8
+    # (E4M3 + E8M0 per 32) rows qkv_proj reads, instead of bf16 rows that qkv_proj
+    # quantizes in a separate launch (aiter custom all-reduce mx_scale mode). 0 disables.
+    "ATOM_M3_FUSE_MXFP8_QUANT": lambda: os.getenv("ATOM_M3_FUSE_MXFP8_QUANT", "1") == "1",
+    # ...also where the unquantized fused AR + RMSNorm takes its 2-stage kernel (above
+    # 458,752 B at TP4, i.e. > 37 rows): the production decode steps mono does not
+    # serve and prefill chunks within the custom all-reduce's size. Its RMSNorm sums
+    # the squares in the 2-stage order, so it is not bit-equal to the 1-stage one.
+    "ATOM_M3_FUSE_MXFP8_QUANT_2STAGE": lambda: os.getenv(
+        "ATOM_M3_FUSE_MXFP8_QUANT_2STAGE", "1"
+    )
+    == "1",
     "ATOM_M3_FHMOE_ACT": lambda: os.getenv("ATOM_M3_FHMOE_ACT", "auto").lower(),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.

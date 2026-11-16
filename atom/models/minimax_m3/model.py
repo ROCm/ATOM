@@ -31,6 +31,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8,
     fused_allreduce_gemma_rms_norm_quant,
 )
 from atom.model_ops.linear import (
@@ -156,6 +157,18 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
     return (
         quant_type_value == QuantType.per_Token.value
         and getattr(linear, "params_dtype", None) == dtypes.fp8
+    )
+
+
+def _linear_consumes_mxfp8(linear: nn.Module | None) -> bool:
+    """Whether ``linear`` reads E4M3 activations with E8M0 group32 scales -- a native
+    group32 A8 linear (MXFP8 or W4A8), which otherwise quantizes its bf16 input in a
+    separate launch -- so the op before it may write them (ATOM_M3_FUSE_MXFP8_QUANT)."""
+    return (
+        linear is not None
+        and envs.ATOM_M3_FUSE_MXFP8_QUANT
+        and getattr(linear, "native_a8_group_rows", None) is not None
+        and not getattr(linear, "_k_padded", False)
     )
 
 
@@ -696,12 +709,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
+        # The norm ahead of a native MXFP8 qkv_proj writes its E4M3 + E8M0 rows (the
+        # fused AR + RMSNorm + MXFP8 epilogue). The post-attention norm keeps bf16:
+        # the router reads bf16, and FHMoE quantizes the MoE input itself.
+        fuse_input_ar_rmsnorm_mxfp8 = _linear_consumes_mxfp8(self.self_attn.qkv_proj)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         elif fuse_input_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_quant(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
+        elif fuse_input_ar_rmsnorm_mxfp8:
+            hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
                     hidden_states, residual, self.input_layernorm
                 )
             )
