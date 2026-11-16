@@ -83,6 +83,7 @@ from atom.kv_transfer.disaggregation.staging_config import (
 from atom.kv_transfer.disaggregation.transfer_plan import (
     TOKEN_UNITS,
     RegionLayout,
+    TransferPlan,
     TransferTopology,
     build_transfer_plan,
 )
@@ -162,9 +163,9 @@ class _StagingWrite:
     uncertain: bool = False
 
 
-class _StagingRetired(Exception):
-    """A transfer wanted a staging slot after another transfer's uncertain
-    write retired the pool; it sends the rest without staging instead."""
+class _StagingUnavailable(Exception):
+    """Every KV staging slot is quarantined after a failed write; the transfer
+    sends the rest without staging instead."""
 
 
 class SlotPool:
@@ -178,6 +179,9 @@ class SlotPool:
     the consumer that reports it cannot run on (see
     ``MooncakeConnector._post_queued_write_requests``). The consumer staging
     rows, the DSA index staging slots and the KV staging slots each keep one.
+
+    A holder whose write may still land ``quarantine``s its slot instead of
+    releasing it: the slot comes back once the hold ends.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -187,6 +191,73 @@ class SlotPool:
         self._exhausted_warning = exhausted_warning
         self._cv = threading.Condition()
         self._failure: BaseException | None = None
+        # Slot -> time.monotonic() at which it may be handed out again.
+        self._quarantined: dict[int, float] = {}
+
+    def usable(self) -> int:
+        """Slots not quarantined: free or held by a write still running."""
+        with self._cv:
+            self._unquarantine_locked()
+            return self.size - len(self._quarantined)
+
+    def acquire_or_none(self) -> int | None:
+        """A free slot, or None when every slot is quarantined.
+
+        Waits only while a running write holds a slot, which it releases or
+        quarantines when it returns, or until a quarantined slot comes back.
+        """
+        with self._cv:
+            while True:
+                self._unquarantine_locked()
+                if self._failure is not None:
+                    raise RuntimeError(
+                        "staging row unavailable: a transfer holding one failed"
+                    ) from self._failure
+                if self.free:
+                    return self.free.pop()
+                if len(self._quarantined) == self.size:
+                    return None
+                self._cv.wait(
+                    min(self._quarantined.values()) - time.monotonic()
+                    if self._quarantined
+                    else None
+                )
+
+    def quarantine(self, idx: int, hold_s: float) -> None:
+        """Keep slot ``idx`` out of use for ``hold_s`` after its write failed.
+
+        Mooncake gives up on a sync write without cancelling the work it
+        posted, so the NIC may still read the slot; ``hold_s`` 0 frees it.
+        """
+        with self._cv:
+            if hold_s > 0:
+                self._quarantined[idx] = time.monotonic() + hold_s
+            else:
+                self.free.append(idx)
+            left = self.size - len(self._quarantined)
+            # Waiters re-check: with every slot quarantined they give up.
+            self._cv.notify_all()
+        if hold_s > 0:
+            logger.warning(
+                "[PRODUCER] KV staging slot %d is out of use for %.0fs after a "
+                "failed write; %d of %d slots left meanwhile",
+                idx,
+                hold_s,
+                left,
+                self.size,
+            )
+
+    def _unquarantine_locked(self) -> None:
+        now = time.monotonic()
+        back = [idx for idx, until in self._quarantined.items() if until <= now]
+        for idx in back:
+            del self._quarantined[idx]
+            self.free.append(idx)
+        if back:
+            logger.info(
+                "[PRODUCER] KV staging slots %s are back in use after a failed write",
+                back,
+            )
 
     def acquire(self) -> int:
         with self._cv:
@@ -1252,7 +1323,6 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging: torch.Tensor | None = None
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
-        self._kv_staging_failed = False
         self._kv_staging_reserve = staging_reserve_bytes(config)
         self._send_worker_streams = threading.local()
         self._landing: LandingReceiver | None = None
@@ -1392,7 +1462,6 @@ class MooncakeConnector(KVConnectorBase):
     # Class-level so a connector built without __init__ keeps the per-token
     # paths; register_kv_caches sets the instance values.
     _kv_staging: torch.Tensor | None = None
-    _kv_staging_failed = False
     _kv_staging_reserve = 0
     _landing: LandingReceiver | None = None
     _landing_spec = None
@@ -1437,7 +1506,7 @@ class MooncakeConnector(KVConnectorBase):
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config) -> int:
-        """The MLA staging pool (producer) and landing pool (DCP consumer).
+        """The KV staging pool (producer) and landing pool (consumer).
 
         ``register_kv_caches`` allocates both after the KV cache is sized.
         """
@@ -1779,8 +1848,9 @@ class MooncakeConnector(KVConnectorBase):
             table_segments=spec.table_segments,
         )
         logger.info(
-            "PD KV landing: %d slots x 8 MiB, %s, %d units/PAGE",
+            "PD KV landing: %d slots x %.1f MiB, %s, %d units/PAGE",
             LANDING_POOL_SLOTS,
+            LANDING_SLOT_BYTES / (1 << 20),
             spec.wire_layout,
             spec.units_per_page,
         )
@@ -2955,7 +3025,6 @@ class MooncakeConnector(KVConnectorBase):
                 chunk_dst_block_ids = dst_block_ids[
                     dst_block_offset : dst_block_offset + num_chunk_dst_blocks
                 ]
-                request_data["_transfer_dst_offset"] = dst_block_offset
                 if has_slots:
                     ok = self._execute_block_slot_transfer(
                         request_data,
@@ -3276,9 +3345,7 @@ class MooncakeConnector(KVConnectorBase):
             # Without the ready event the gather could read KV still being
             # written, so such a request keeps the per-token path.
             stages_token_units = (
-                self._kv_staging is not None
-                and not self._kv_staging_failed
-                and kv_cache_ready_event is not None
+                self._kv_staging is not None and kv_cache_ready_event is not None
             )
             stages_sharded_index = (
                 interleave < self.block_size
@@ -3300,17 +3367,17 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
-        staged_token_regions: list[tuple[int, int, int]] = []
+        staged_token_regions: list[int] = []
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
 
-        def add_token_runs(region_idx: int, dst_base: int, bpb: int) -> bool:
+        def add_token_runs(region_idx: int) -> bool:
             return batch.add(
                 *self._dcp_token_descriptors(
                     region_idx,
                     self.kv_caches_base_addr[region_idx],
-                    dst_base,
-                    bpb,
+                    consumer_base_addrs[cmap[region_idx]],
+                    self._per_block_bytes_list[region_idx],
                     sharded_runs,
                 )
             )
@@ -3353,9 +3420,9 @@ class MooncakeConnector(KVConnectorBase):
                 # Validate only: staging sends page runs, and per-token
                 # arrays for a long prompt would dominate the planning time.
                 self._dcp_token_unit(region_idx, bpb)
-                staged_token_regions.append((region_idx, dst_base, bpb))
+                staged_token_regions.append(region_idx)
                 continue
-            if not add_token_runs(region_idx, dst_base, bpb):
+            if not add_token_runs(region_idx):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
@@ -3378,7 +3445,7 @@ class MooncakeConnector(KVConnectorBase):
                 src_block_ids,
                 dst_block_ids,
                 cmap,
-                [i for i, _, _ in staged_token_regions],
+                staged_token_regions,
                 token_ownership=sharded_plan,
             )
             try:
@@ -3390,11 +3457,11 @@ class MooncakeConnector(KVConnectorBase):
                     kv_cache_ready_event,
                     engine=engine,
                 )
-            except _StagingRetired:
+            except _StagingUnavailable:
                 # Rows already landed are written again with the same bytes;
                 # the decode still scatters their slots, which is harmless.
                 staged = (
-                    all(add_token_runs(*region) for region in staged_token_regions)
+                    all(add_token_runs(i) for i in staged_token_regions)
                     and batch.flush()
                 )
             if not staged:
@@ -3434,8 +3501,15 @@ class MooncakeConnector(KVConnectorBase):
         return True
 
     def _make_staging_plan(
-        self, request, src_pages, dst_pages, cmap, regions, *, token_ownership=None
-    ):
+        self,
+        request: dict,
+        src_pages: list[int],
+        dst_pages: list[int],
+        cmap: list[int],
+        regions: list[int],
+        *,
+        token_ownership: DCPShardPlan | None = None,
+    ) -> TransferPlan:
         """Resolve rank ownership before byte addressing; no attention-family dispatch."""
         roles = request.get("consumer_region_roles")
         widths = request.get("consumer_block_bpb")
@@ -3460,9 +3534,9 @@ class MooncakeConnector(KVConnectorBase):
             )
         plan = build_transfer_plan(
             TransferTopology(
-                source_tp=getattr(self, "tp_size", 1),
+                source_tp=self.tp_size,
                 source_dcp=self.dcp_size,
-                target_tp=request.get("consumer_tp_size", getattr(self, "tp_size", 1)),
+                target_tp=request.get("consumer_tp_size", self.tp_size),
                 target_tp_rank=request.get("consumer_tp_rank", 0),
                 target_dcp=request.get("consumer_dcp_size", 1),
                 target_dcp_rank=request.get("consumer_dcp_rank", 0),
@@ -3474,26 +3548,28 @@ class MooncakeConnector(KVConnectorBase):
             self.block_size,
             token_ownership=token_ownership,
         )
+        last_source_unit = int(plan.source_units.max(initial=-1))
         for region in plan.regions:
             view = self._kv_source_views[region.source_region]
-            if (
-                plan.source_units.size
-                and int(plan.source_units.max())
-                >= view.numel() // region.gather.source_bytes
-            ):
+            if last_source_unit >= view.numel() // region.gather.source_bytes:
                 raise ValueError("KV staging source unit out of bounds")
-        offset = request.get("_transfer_dst_offset", 0)
-        full_pages = request.get("dst_block_ids")
-        if full_pages is not None and list(
-            full_pages[offset : offset + len(dst_pages)]
-        ) != list(dst_pages):
-            raise ValueError("KV staging destination cursor mismatch")
         return plan
 
     def _execute_staged_transfer(
-        self, request, target, plan, req_id, ready_event, *, engine=None
-    ):
-        """One gather/slot/RDMA/READY lifecycle for any supported transfer plan."""
+        self,
+        request: dict,
+        target: str,
+        plan: TransferPlan,
+        req_id: ReqId,
+        ready_event: torch.cuda.Event,
+        *,
+        engine=None,
+    ) -> bool:
+        """One gather/slot/RDMA/READY lifecycle for any supported transfer plan.
+
+        Raises ``_StagingUnavailable`` when every staging slot is quarantined;
+        the caller then writes the plan's regions directly.
+        """
         landing = request.get("mla_landing")  # Legacy wire key, shared by layouts.
         slot_bytes = self._kv_staging.shape[1]
         if landing is not None:
@@ -3566,10 +3642,7 @@ class MooncakeConnector(KVConnectorBase):
                                         "pp_rank": self.pp_rank,
                                         "seq": seq,
                                         "slot": credit,
-                                        "items": plan.ready_items(
-                                            items,
-                                            request.get("_transfer_dst_offset", 0),
-                                        ),
+                                        "items": plan.ready_items(items),
                                     }
                                 ),
                             ],
@@ -3592,34 +3665,40 @@ class MooncakeConnector(KVConnectorBase):
 
     def _write_staging_slot(
         self,
-        stream,
-        plan,
-        index,
-        items,
-        destination,
-        outcome,
-        target,
-        req_id,
-        label,
+        stream: torch.cuda.Stream,
+        plan: TransferPlan,
+        index: torch.Tensor,
+        items: list[tuple[int, int, int, int]],
+        destination: int | None,
+        outcome: _StagingWrite,
+        target: str,
+        req_id: ReqId,
+        label: str,
         *,
         engine=None,
-        deadline=None,
-    ):
-        """Retain source slots after uncertain writes; release unsubmitted/completed ones.
+        deadline: float | None = None,
+    ) -> bool | None:
+        """Gather ``items`` into a free staging slot, then RDMA the slot.
 
-        _rdma_write returns None only when no operation from that call remains
-        in flight. Exceptions after submission and False require retention.
+        ``destination`` is a landing slot address; None writes the units
+        straight to their destination pages. Returns True once the write
+        completed, False if it failed (it may still land: Mooncake does not
+        cancel work it gave up on), and None if the transfer deadline had
+        passed, so nothing was sent. Raises ``_StagingUnavailable`` when every
+        slot is quarantined.
+
+        A slot whose write may still land is quarantined for
+        ``ATOM_PD_FAILED_WRITE_HOLD_S``, since the NIC may still read it, and
+        ``outcome.uncertain`` tells the caller to quarantine the landing
+        credit too. Any other outcome returns the slot.
         """
-        if deadline is not None and time.monotonic() > deadline:
+        if self._passed_deadline(deadline, label, req_id):
             return None
+        pool_idx = self._kv_staging_slots.acquire_or_none()
+        if pool_idx is None:
+            raise _StagingUnavailable
         try:
-            pool_idx = self._kv_staging_slots.acquire()
-        except RuntimeError as e:  # only a retired pool raises
-            raise _StagingRetired from e
-        submitted = False
-        settled = False
-        try:
-            if deadline is not None and time.monotonic() > deadline:
+            if self._passed_deadline(deadline, label, req_id):
                 return None
             staging = self._kv_staging[pool_idx]
             used = 0
@@ -3643,7 +3722,9 @@ class MooncakeConnector(KVConnectorBase):
                 )
             else:
                 srcs, dsts, sizes = [staging.data_ptr()], [destination], [used]
-            submitted = True
+            # Uncertain from submission on, unless the write settles: True, or
+            # None (the deadline stopped it before anything was posted).
+            outcome.uncertain = True
             written = self._rdma_write(
                 target,
                 srcs,
@@ -3654,31 +3735,28 @@ class MooncakeConnector(KVConnectorBase):
                 engine=engine,
                 deadline=deadline,
             )
-            settled = written is True or written is None
+            outcome.uncertain = written is False
             return written
         finally:
-            if submitted and not settled:
-                outcome.uncertain = True
-                self._retire_kv_staging(req_id)
+            if outcome.uncertain:
+                self._kv_staging_slots.quarantine(
+                    pool_idx, envs.ATOM_PD_FAILED_WRITE_HOLD_S
+                )
             else:
                 self._kv_staging_slots.release(pool_idx)
 
-    def _retire_kv_staging(self, req_id) -> None:
-        """Take the staging pool out of use after a write that may still land.
-
-        The NIC may still read that write's slot, so it is never released.
-        Transfers waiting for a slot get ``_StagingRetired`` and send without
-        staging; later transfers do not stage at all.
-        """
-        if not self._kv_staging_failed:
-            self._kv_staging_failed = True
-            logger.warning(
-                "[PRODUCER] KV staged RDMA for req %s may still be in flight; "
-                "KV staging and landing are off on this connector for the rest "
-                "of the process, and transfers use direct writes",
-                req_id,
-            )
-        self._kv_staging_slots.fail(RuntimeError("KV staged RDMA failed"))
+    @staticmethod
+    def _passed_deadline(deadline: float | None, label: str, req_id: ReqId) -> bool:
+        if deadline is None or time.monotonic() <= deadline:
+            return False
+        logger.error(
+            "[PRODUCER] %s write for req %s passed its %.0fs transfer "
+            "deadline; failing it",
+            label,
+            req_id,
+            PD_TRANSFER_DEADLINE_S,
+        )
+        return True
 
     def _execute_staged_index_layer_chunk(
         self,
@@ -4229,7 +4307,7 @@ class MooncakeConnector(KVConnectorBase):
             request_data.get("write_nonce", 0),
             success=success,
             # None unless the consumer offered landing slots and this stage
-            # can land (it has an MLA staging pool), so the consumer can tell
+            # can land (it has a KV staging pool), so the consumer can tell
             # "landed none" from "cannot land" and take a partition back.
             landed_slots=(
                 request_data.get("_landed_slots", [])
