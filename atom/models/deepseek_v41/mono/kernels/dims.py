@@ -30,7 +30,9 @@ SHARED_INTER = 2304  # the shared expert's
 MOE_PAD = 128
 # the loader pads the shared expert's rank share (split over TP) to a multiple of
 # this, zero rows of gate_up and columns of w2 (``linear.fp8_group32_k_pad_align``,
-# gfx950's group32 FP8 GEMM: TP8's 288 -> 320)
+# gfx950's group32 FP8 GEMM: TP8's 288 -> 320). Must equal
+# ``linear.GROUP32_FP8_K_ALIGN`` (this module stays free of AITER;
+# tests/test_fp8_group32_k_pad_pair.py holds the two equal)
 SHARED_PAD = 64
 ROWS = 16  # GEMV rows a task
 WOA_ROWS = 32  # a wo_a task's rows: one FP8 group of y

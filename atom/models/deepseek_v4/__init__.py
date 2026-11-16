@@ -2780,7 +2780,8 @@ class Expert(nn.Module):
         # quant in one aiter triton kernel, and w2 takes its `x_scale` instead
         # of quantizing itself. The kernel needs this rank's intermediate
         # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
-        # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
+        # not 576 at TP4 or the padded 320 at TP8); other widths keep the
+        # unfused path.
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )

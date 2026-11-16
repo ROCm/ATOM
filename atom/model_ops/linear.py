@@ -1957,7 +1957,8 @@ class MergedColumnParallelLinear(LinearBase):
         **kwargs,
     ):
         # Pads each per-rank shard with zero rows (gate_up of a K-padded pair,
-        # see mxfp4_k_pad_align); the checkpoint keeps the real sizes.
+        # see mxfp4_k_pad_align and fp8_group32_k_pad_align); the checkpoint
+        # keeps the real sizes.
         self._ckpt_output_sizes = list(output_sizes)
         if output_pad_align:
             tp = get_tp_group().world_size
@@ -2877,19 +2878,17 @@ class RowParallelLinear(LinearBase):
                 param_data = param_data.narrow(self.tp_dim, 0, shard_size)
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
-            if self._k_padded:
-                param.weight_loader_process(param_data, loaded_weight)
-                _zero_pad_tail(
-                    param,
-                    self.tp_dim,
-                    shard_size,
-                    param.data.size(self.tp_dim) - shard_size,
-                )
-                return
         else:
             if self.tp_size > 0 and self.tp_rank != 0:
                 loaded_weight.zero_()
         param.weight_loader_process(param_data, loaded_weight)
+        if self._k_padded and param is not getattr(self, "bias", None):
+            _zero_pad_tail(
+                param,
+                self.tp_dim,
+                shard_size,
+                param.data.size(self.tp_dim) - shard_size,
+            )
 
 
 class MergedReplicatedLinear(ReplicatedLinear):

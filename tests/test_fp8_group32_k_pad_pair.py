@@ -102,6 +102,13 @@ def test_the_align_is_gfx950_group32_fp8_only(monkeypatch, gfx950):
     assert fp8_group32_k_pad_align(_qc(), "x") is None
 
 
+def test_the_mono_dims_pad_as_the_loader_does():
+    """V4.1 mono's ``SHARED_PAD`` (``kernels.dims``, free of AITER) is the loader's K step."""
+    from atom.models.deepseek_v41.mono.kernels.dims import SHARED_PAD
+
+    assert SHARED_PAD == GROUP32_FP8_K_ALIGN
+
+
 def test_the_pair_is_padded_at_tp8_only(gfx950, tp_rank):
     gate_up, down = _pair()
     assert gate_up.weight.shape == (2 * PADDED, HIDDEN)

@@ -272,7 +272,9 @@ def test_a_layer_packed_from_atoms_tensors_is_the_checkpoints(tp):
     # the shared expert as the loader holds it: the rank's share padded with zero rows of gate_up and columns of w2
     # to the group32 FP8 GEMM's K step on gfx950 (``fp8_group32_k_pad_align``: TP8's 288 -> 320), zero scale codes
     se, share = "ffn.shared_experts.", INTER // tp
-    pad = -(-share // 64) * 64 - share
+    from atom.model_ops.linear import GROUP32_FP8_K_ALIGN as K_STEP
+
+    pad = -(-share // K_STEP) * K_STEP - share
     rows = lambda t, n: torch.nn.functional.pad(t.view(torch.uint8), (0, 0, 0, n))
     cols = lambda t, n: torch.nn.functional.pad(t.view(torch.uint8), (0, n))
     gate_up = torch.cat(
