@@ -226,7 +226,9 @@ def stage_A(c):
             PUB = "pubflag" in c   # (fx-v3) x8 made once by the 32 publisher CTAs (stage_Apub): wait for them, read it from global
             if fx.const_expr(NEWA and PUB):
                 if c["newA"]:
-                    hx.wait_flags(c["pubflag"], 32, c["pubtag"], w, l, 9)
+                    # (seam) x8 / xs written by the TP2 owners themselves (ffn_post_owner, un-normalized): this K half's
+                    # 80 owners' apflags, no publisher hop
+                    hx.wait_flags(c["apflag"] + i64(kh * 80) * 8, 80, c["aptag"], w, l, 9)
                     gpu.barrier()
             if fx.const_expr(NEWA and not PUB):   # (v2) x1 from the TP2 column owners: wait for them, each row's rstd from 256 partials
                 if c["newA"]:
@@ -427,9 +429,10 @@ def stage_Apub(c):
                 am = fx.max(am, abs(vals[e]))
             code = e8m0_of(am)
             wds = q8words(vals, inv_pow2(code))
-            c["stx"](c["x8"] + i64(rr * HID + col), fx.Vector.from_elements(wds[:4], I32))
-            c["stx"](c["x8"] + i64(rr * HID + col + 16), fx.Vector.from_elements(wds[4:], I32))
-            c["stx"](c["xs"] + i64(rr * (HID // 32) + bc) * 4, code)   # (i32 codes: stage A reads the attention x8 scales as words)
+            if fx.const_expr("axn_only" not in c):   # (seam: the owners write stage A's x8 / xs; this publishes axn)
+                c["stx"](c["x8"] + i64(rr * HID + col), fx.Vector.from_elements(wds[:4], I32))
+                c["stx"](c["x8"] + i64(rr * HID + col + 16), fx.Vector.from_elements(wds[4:], I32))
+                c["stx"](c["xs"] + i64(rr * (HID // 32) + bc) * 4, code)   # (i32 codes: stage A reads the attention x8 scales as words)
             for h in range_constexpr(4):
                 c["stx"](c["axn"] + i64(rr * HID + col + 8 * h) * 2, fx.Vector.from_elements([nb[8 * h + e] for e in range(8)], BF16))
         hx.wait_storecnt0()

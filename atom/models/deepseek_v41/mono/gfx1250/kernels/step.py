@@ -341,7 +341,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
 # layers (indexer, compressor, Engram, tap layers, the last layer) are runtime-gated sub-stages of the same chain.
 # 
 # Chain of one layer Ly (every data edge an LL tile flag unless named a handoff):
-#   A      (newA: x from the TP2 owners' apflags) wqkv -> q latent / kv latent        [indexer / Engram-next: + ATTN_A]
+#   A      (newA: x8 from the TP2 owners, its K half's 80 apflags; no rstd) wqkv -> q latent / kv latent        [indexer / Engram-next: + ATTN_A]
 #   kv, C  on A2 flags -> kv rows / q -> o-ready flags (kvflag, cflag)               [indexer / Engram-next: + KV_C]
 #   (idx)  iq / iw / compressor / iquant / scorer / selection (handoffs: indexer layers only)
 #   D      attention, on cflag / kvflag -> dflag;   D-idle CTAs: the attention mix partials + Sinkhorn of this layer
@@ -350,7 +350,8 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
 #   post   FFN mHC post in the 160 owners -> pflag (x1, R')       mix partials -> MIX_POST / L1 / Sinkhorn (idle CTAs)
 #   router 128 CTAs (gate rows before the wait on pflag) -> LL scores;  shared UG (x8 self, on pflag)
 #   top-k  every CTA (own copy, LDS);  MoE UG -> down (LL per expert) -> combine (DN_BLK) -> TP3 (TP2) -> y2
-#   post   attention mHC post of layer Ly + 1 in the 160 owners -> apflag (next layer's A)   [last: xh]
+#   post   attention mHC post of layer Ly + 1 in the 160 owners -> x8 / xs (bf(x1 anw), no rstd) + apflag (next
+#          layer's A; indexer layers: + stage_Apub's normed axn)   [last: xh]
 #   end    LAYER_END handoff only after the last layer and the tap layers
 
 # SPDX-License-Identifier: MIT
@@ -369,6 +370,8 @@ DNF = 999424             # the MoE's LL flags (UG groups -> down, shared UG -> d
 # the v3 flag sites: (plog offset from V3F0, epoch32 site)
 F_D, F_E, F_A2, F_C, F_KV, F_P, F_X, F_AP, F_W, F_ENG = ((0, 4), (8192, 5), (16384, 6), (24576, 7), (32768, 8),
                                                          (40960, 9), (49152, 10), (57344, 11), (65536, 12), (73728, 13))
+Y2L = 7168               # (seam) LDS past FLO: the owner's y2 [TR][32] bf16, recv_owner -> the owner's attention post
+# (free then: the post's sums end at 6144 + 128; the MoE's LDS of the CTA is dead after its push_row)
 # layer counters (bytes from the layer's counter base)
 ATT_POST, AMIX_POST, AMIX_L1, ASINK = 440, 444, 448, 452
 
@@ -450,9 +453,11 @@ def target_layer(E, Ly):
     keepA = lfl(8 | 128)   # indexer / Engram-next layers: the KV_C handoff (iq / iw partials -> iquant: index-internal, contract 6.4)
     # (fx-v3) the attention input x8 made once: CTAs 224..255 publish it (global + 32 LL flags), A reads it from global
     pub = dict(pubflag=plog(DNF) + i64(par) * 40960 + i64(36864), pubtag=hx.epoch32(tep, Ly, 15))
-    if newA:
+    # (seam) stage A's x8 comes from the TP2 owners (un-normalized, ffn_post_owner): the publishers run only on the
+    # indexer layers, for the normed axn of iw / the compressor GEMM (their pubflag)
+    if newA & lfl(8):
         AS.stage_Apub(cwith(c, x1a=plog(X1A), part2=plog(P2A), anw=ltab(fp, Lp, "anw")(), apflag=apfl, aptag=aptg,
-                            axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, **pub))
+                            axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, axn_only=True, **pub))
     stage_A(cwith(c, newA=newA, **pub, **v3a, apflag=apfl, aptag=aptg, attpost=lc + i64(ATT_POST), part2=plog(P2A),
                   x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn")))
     pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
@@ -655,7 +660,7 @@ def target_layer(E, Ly):
             MS.dn_row(crr, ss_)
             MS.push_row(crr, ss_, par * 2 + 1, 2 * Ly + 2)
     if b < FS.NOWN:   # (J) the owner's 32 cols of y2 from the 4 ranks' row partials
-        MS.recv_owner(dict(t=t, b=b, rank=rank, recv=c["recv"], ytgt=fptr(fp, "y2")), par * 2 + 1, 2 * Ly + 2, TR)
+        MS.recv_owner(dict(t=t, b=b, rank=rank, recv=c["recv"], ytgt=fptr(fp, "y2"), ylds=sm + FLO + Y2L), par * 2 + 1, 2 * Ly + 2, TR)
     hx.wait_storecnt0()
     gpu.barrier()
 
@@ -665,10 +670,11 @@ def target_layer(E, Ly):
         if tq5 == 0:
             hx.wait_count(lc + i64(LY.SINK_DONE), 1, 15)
         gpu.barrier()
-        FS.ffn_post_owner(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, y=fptr(fp, "y2"),
+        FS.ffn_post_owner(dict(t=tq5, b=b, w=tq5 // 32, l=tq5 % 32, sm=sm + FLO, y=fptr(fp, "y2"), ylds=sm + FLO + Y2L,
                                R=fptr(fp, "Rout"), Rout=fptr(fp, "aRout"), x1g=plog(X1A),
                                pre=fptr(fp, "npre"), post=fptr(fp, "npost"), comb=fptr(fp, "ncomb"),
                                part2=plog(P2A), cnt=lc + i64(S.LCB + ATT_POST), pflag=apnfl, ptag=apntg,
+                               anw=ltab(fp, Ly, "anw")(), x8a=c["x8"], xsa=c["xs"],
                                engkv=fptr(fp, "engkv"), enggw=ltab(fp, Ly, "enggw")(), eng=lfl(128),
                                engp=plog(ENGP), engflag=engfl, engtag=engtg), TR)
         if lastL & (b < 16):

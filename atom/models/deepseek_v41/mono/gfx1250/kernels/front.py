@@ -963,11 +963,16 @@ def ffn_post_owner(c, TR):
     live = t < TR * OC
     r = fx.min(t // OC, I32(TR - 1))
     cc = col0 + t % OC
-    x = hx.gload(c["y"] + i64(r * H + cc) * 2, BF16).to(F32)
+    if fx.const_expr("ylds" in c):   # (seam) y2 from recv_owner's LDS copy (this CTA's 32 cols)
+        x = hx.lload(c["ylds"] + (r * OC + t % OC) * 2, BF16).to(F32)
+    else:
+        x = hx.gload(c["y"] + i64(r * H + cc) * 2, BF16).to(F32)
     f = [hx.gload(c["R"] + i64((r * 4 + h) * H + cc) * 2, BF16).to(F32) for h in range(4)]
     q = [hx.gload(c["pre"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
     pp = [hx.gload(c["post"] + i64(r * 4 + j) * 4, F32) for j in range(4)]
     cm = [[hx.gload(c["comb"] + i64(r * 16 + h * 4 + j) * 4, F32) for j in range(4)] for h in range(4)]
+    if fx.const_expr("x8a" in c):   # (seam) the next layer's attention norm weight of this col
+        anv = hx.gload(c["anw"] + i64(cc) * 2, BF16).to(F32)
     rq = [bf(fma(cm[3][j], f[3], fma(cm[2][j], f[2], fma(cm[1][j], f[1], fma(cm[0][j], f[0], pp[j] * x))))).to(F32) for j in range(4)]
     if fx.const_expr("engkv" in c):
         # (fx-v3) the Engram gate of the layer after (front_A's _engram_gate in the column owners): per (row, branch j)
@@ -1016,11 +1021,27 @@ def ffn_post_owner(c, TR):
         srs = fma(rq[j], rq[j], srs)
     x1 = bf(fma(q[3], rq[3], fma(q[2], rq[2], fma(q[1], rq[1], q[0] * rq[0]))))
     x1f = x1.to(F32)
+    if fx.const_expr("x8a" in c):
+        # (seam) the next layer's attention input straight from the owner (no publisher hop): the 32 cols of an owner
+        # are one MXFP8 block, wave w = row r, lane = col. bf(x1 nw) WITHOUT the row's rstd (TileRT tail_next): stage A
+        # is linear in x and its outputs only reach the q / kv RMSNorms (scale-free), so the next layer's A waits for
+        # its 80 owners' apflags only. The indexer / compressor's normed axn stays with stage_Apub (axn only).
+        xa = bf(x1f * anv).to(F32)
+        am = abs(xa)
+        for o in range_constexpr(5):
+            am = fx.max(am, am.shuffle_xor(16 >> o, 32))
+        acode = e8m0_of(am)
+        xq = q8words([xa, xa.shuffle_xor(1, 32), xa.shuffle_xor(2, 32), xa.shuffle_xor(3, 32)], inv_pow2(acode))[0]
     if live:
         for j in range_constexpr(4):
             hx.stx_dev(c["Rout"] + i64((r * 4 + j) * H + cc) * 2, rq[j].to(BF16))
             hx.lstore(sm + RQO + ((r * 4 + j) * OC + t % OC) * 4, rq[j])    # R'' for the mix (LDS [r][4][20] f32)
         hx.stx_dev(c["x1g"] + i64(r * H + cc) * 2, x1)
+        if fx.const_expr("x8a" in c):
+            if t % 4 == 0:
+                hx.stx_dev(c["x8a"] + i64(r * H + cc), xq)
+            if t % OC == 0:
+                hx.stx_dev(c["xsa"] + i64(r * (H // 32) + b) * 4, acode)   # (i32 codes, as stage_Apub wrote them)
         hx.lstore(sm + 4096 + t * 8, srs)
         hx.lstore(sm + 4096 + t * 8 + 4, x1f * x1f)
     gpu.barrier()

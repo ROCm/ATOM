@@ -1440,7 +1440,10 @@ def recv_owner(c, region, tag, TR):
                 sl = sl + (wv << 16).bitcast(F32)
                 sh = sh + (wv & I32(-65536)).bitcast(F32)
             wq = sl.to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (sh.to(BF16).bitcast(fx.Int16).to(I32) << 16)
-            hx.stx_dev(c["ytgt"] + (i64(r) * H + i64(b * 32 + 4 * q + 2 * h)) * 2, wq)
+            if fx.const_expr("ylds" in c):   # (seam) the owner's own post reads it: LDS [TR][32] bf16, no global round trip
+                hx.lstore(c["ylds"] + (r * 32 + 4 * q + 2 * h) * 2, wq)
+            else:
+                hx.stx_dev(c["ytgt"] + (i64(r) * H + i64(b * 32 + 4 * q + 2 * h)) * 2, wq)
 
 
 @ASTRewriter.transform
