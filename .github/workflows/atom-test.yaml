@@ -795,6 +795,16 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Summarize required ATOM model tests
+        continue-on-error: true
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 .github/scripts/required_model_summary.py catalog \
+            --title "Required ATOM accuracy model tests" \
+            --catalog .github/benchmark/models_accuracy.json \
+            --event-name "${EVENT_NAME}"
+
       - name: Evaluate ATOM test gate
         uses: ./.github/actions/evaluate-test-gate
         with:

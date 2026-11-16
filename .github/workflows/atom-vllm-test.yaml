@@ -334,6 +334,14 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Summarize required vLLM model tests
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/required_model_summary.py workflow-matrix \
+            --title "Required ATOM vLLM model tests" \
+            --workflow .github/workflows/atom-vllm-test.yaml \
+            --job atom-vllm-oot
+
       - name: Evaluate ATOM vLLM test gate
         uses: ./.github/actions/evaluate-test-gate
         with:

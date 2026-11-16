@@ -748,6 +748,14 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
         test_gate = config["jobs"][gate_expectation["job"]]
         assert test_gate["if"] == "always()"
         assert test_gate["needs"] == gate_expectation["needs"]
+        summary_step = next(
+            step
+            for step in test_gate["steps"]
+            if step.get("run", "").startswith(
+                "python3 .github/scripts/required_model_summary.py"
+            )
+        )
+        assert summary_step["continue-on-error"] is True
         evaluate_step = next(
             step
             for step in test_gate["steps"]

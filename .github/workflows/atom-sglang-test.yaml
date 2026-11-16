@@ -374,6 +374,14 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Summarize required SGLang model tests
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/required_model_summary.py workflow-matrix \
+            --title "Required ATOM SGLang model tests" \
+            --workflow .github/workflows/atom-sglang-test.yaml \
+            --job atom-sglang-accuracy
+
       - name: Evaluate ATOM SGLang test gate
         uses: ./.github/actions/evaluate-test-gate
         with:
