@@ -785,11 +785,8 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
     def _kda_snapshots(self, batch: ScheduledBatch) -> KdaSnapshots | None:
         """The midstep checkpoints this prefill writes (`kda_snapshots`)."""
-        saves = batch.state_save_all
-        if not saves or not any(saves):
-            return None
         return kda_snapshots(
-            saves,
+            batch.state_save_all,
             batch.state_rows,
             batch.num_cached_tokens,
             batch.num_scheduled_tokens,

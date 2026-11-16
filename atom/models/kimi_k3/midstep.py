@@ -110,10 +110,11 @@ class KdaSnapshots:
         Every interior target names its row of `snap_out` in `h_rows`, so the
         writer never reads `chunk_offsets` or `chunk_size`, which locate a chunk
         kernel's boundaries; they are passed only because it takes them."""
-        assert snap_out is None or snap_out.stride(0) == ssm_state.stride(0), (
-            "write_state_checkpoints reads row i of snap_out at i * "
-            "ssm_state.stride(0), so its rows must be as far apart as the slots"
-        )
+        if snap_out is not None and snap_out.stride(0) != ssm_state.stride(0):
+            raise ValueError(
+                "write_state_checkpoints reads row i of snap_out at i * "
+                "ssm_state.stride(0), so its rows must be as far apart as the slots"
+            )
         return {
             "h": ssm_state if snap_out is None else snap_out,
             "ssm_state": ssm_state,
@@ -171,9 +172,6 @@ def kda_snapshots(
     for n in num_scheduled_tokens:
         cu_seqlens.append(cu_seqlens[-1] + int(n))
 
-    def mk(col):
-        return torch.tensor(col, dtype=torch.int32, device=device)
-
     rows, slots, offs, is_end, runtime_slots = checkpoint_target_columns(
         ordered, device
     )
@@ -185,6 +183,10 @@ def kda_snapshots(
         offs=offs,
         is_end=is_end,
         runtime_slots=runtime_slots,
-        h_rows=mk(list(range(len(interior))) + [0] * (len(ordered) - len(interior))),
-        cu_seqlens=mk(cu_seqlens),
+        h_rows=torch.tensor(
+            list(range(len(interior))) + [0] * (len(ordered) - len(interior)),
+            dtype=torch.int32,
+            device=device,
+        ),
+        cu_seqlens=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
     )
