@@ -373,6 +373,19 @@ def test_qwen4_gfx950_bf16_hipblaslt_falls_back_to_torch():
     )
 
 
+def test_rocm_patch_leaves_the_ep_decode_moe_kernel_choice_to_aiter(monkeypatch):
+    """Flash EP decode MoE gets aiter's own pick, the one native ATOM runs."""
+    fused_moe = pytest.importorskip("aiter.fused_moe")
+    original = fused_moe.get_2stage_cfgs
+    monkeypatch.setattr(fused_moe, "get_2stage_cfgs", original)
+    monkeypatch.setattr(rocm_patch, "_patch_hip_topk1_tree_kernel", lambda: None)
+    monkeypatch.setattr(
+        rocm_patch, "_install_gfx950_bf16_hipblaslt_bypass", lambda: None
+    )
+    rocm_patch.apply_qwen4_exp_rocm_patch()
+    assert fused_moe.get_2stage_cfgs is original
+
+
 def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():
     calls = []
 
