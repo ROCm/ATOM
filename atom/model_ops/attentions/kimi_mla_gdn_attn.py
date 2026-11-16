@@ -560,9 +560,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
-        prefill alone."""
-        config = getattr(self.model_runner, "config", None)
-        return config is not None and config.parallel_config.data_parallel_size == 1
+        prefill alone. Nor while an MLA layer the model records cannot take
+        the prefill split (`MLAAttention.prefill_split_supported`: a sparse
+        layer, PCP, ``ATOM_USE_TRITON_GEMM``): its whole-layer region would cut
+        the step's rows out of an FP8 q scale whose bytes are column-major. A
+        drafter's layers do not count; the recording runs the target alone."""
+        config = self.model_runner.config
+        if config.parallel_config.data_parallel_size != 1:
+            return False
+        sfc = config.compilation_config.static_forward_context
+        return all(
+            impl.prefill_split_supported()
+            for module in sfc.values()
+            if isinstance(impl := getattr(module, "impl", None), MLAAttention)
+            and impl.split_prefill_recording
+        )
 
     def build_for_token_graph_capture(self, tokens: int):
         """A request-less prefill of ``tokens`` rows for recording that

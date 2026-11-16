@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Kimi-K3 prefill token graphs: when the dense MLA split is taken, and that a
-padded bucket's split writes the rows `forward_impl` computes, the same KV
-cache, and zeros past them. Kernels are replaced by references."""
+"""Kimi-K3 prefill token graphs: when the model records them, when the dense
+MLA split is taken, and that a padded bucket's MLA and KDA splits write the rows
+the eager forward computes, the same KV cache, and zeros past them. Kernels are
+replaced by references."""
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import pytest
 import torch
 import torch._dynamo  # before Triton may be faked below
 from aiter_stub import stubbed_aiter
+from conftest import gpu_stack_import
 from torch import nn
 
 # Without AITER (the CPU runner) attention_mla's AITER imports, and Triton where
@@ -66,39 +68,75 @@ with _imports():
 HEADS, NOPE, ROPE, V_DIM, LORA = 2, 8, 4, 8, 6
 
 
-def test_kimi_records_prefill_token_graphs_only_without_dp():
-    pytest.importorskip("einops", reason="the Kimi builder imports the GDN mixer")
-    with _imports():
-        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+def _mla_impl(**over):
+    """An `MLAAttention` with the fields the split's predicates read."""
+    impl = object.__new__(mla.MLAAttention)
+    fields = {
+        "split_prefill_recording": True,
+        "is_sparse_mla": False,
+        "o_proj": nn.Identity(),
+    }
+    impl.__dict__.update({**fields, **over})
+    return impl
 
-    def supports(runner):
-        builder = SimpleNamespace(model_runner=runner)
-        return _KimiMLAGDNCommon.supports_token_graph.fget(builder)
 
-    def runner(dp):
-        parallel = SimpleNamespace(data_parallel_size=dp)
-        return SimpleNamespace(config=SimpleNamespace(parallel_config=parallel))
+@pytest.fixture
+def step(monkeypatch):
+    """The forward context a test runs under; no PCP."""
+    ctx = SimpleNamespace(context=None, tr_graph=None, in_hipgraph=False)
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    monkeypatch.setattr(mla, "pcp_is_enabled", lambda: False)
+    return ctx
 
-    assert supports(runner(1))
-    assert not supports(runner(2))
-    assert not supports(runner(8))
-    assert not supports(SimpleNamespace())
+
+def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
+    step, monkeypatch
+):
+    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+
+    def supports(dp, *layers):
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=dp),
+            compilation_config=SimpleNamespace(
+                static_forward_context={f"l{i}": m for i, m in enumerate(layers)}
+            ),
+        )
+        builder = SimpleNamespace(model_runner=SimpleNamespace(config=config))
+        return kimi._KimiMLAGDNCommon.supports_token_graph.fget(builder)
+
+    def mla_layer(**over):
+        return SimpleNamespace(impl=_mla_impl(**over))
+
+    kda_layer = SimpleNamespace()
+    assert supports(1, mla_layer(), kda_layer)
+    assert not supports(2, mla_layer(), kda_layer)
+    assert not supports(8, mla_layer(), kda_layer)
+    # A recorded layer whose split stands down would run as one region.
+    assert not supports(1, mla_layer(), mla_layer(is_sparse_mla=True))
+    # A drafter's layer, which the recording does not run.
+    drafter = mla_layer(split_prefill_recording=False, o_proj=nn.Linear(2, 2))
+    assert supports(1, mla_layer(), drafter)
+    monkeypatch.setattr(mla, "use_triton_gemm", lambda: True)
+    assert not supports(1, mla_layer(), kda_layer)
 
 
 @pytest.mark.parametrize(
-    "use_mla, impl, taken",
+    "use_mla, tr_graph, taken",
     [
-        (True, SimpleNamespace(records_prefill_split=lambda: True), "split"),
-        (True, SimpleNamespace(records_prefill_split=lambda: False), "region"),
-        (True, SimpleNamespace(), "region"),  # an impl without the split
-        (False, SimpleNamespace(records_prefill_split=lambda: True), "region"),
+        (True, "record", "split"),
+        (True, None, "region"),  # an eager prefill
+        (False, "record", "region"),
     ],
 )
 def test_the_attention_op_takes_the_split_its_impl_asks_for(
-    monkeypatch, use_mla, impl, taken
+    monkeypatch, step, use_mla, tr_graph, taken
 ):
-    impl.forward_prefill_split = lambda *args: ("split", args)
-    layers = {"layer": SimpleNamespace(impl=impl)}
+    step.tr_graph = tr_graph
+    step.context = SimpleNamespace(is_prefill=True, is_dummy_run=False)
+    monkeypatch.setattr(
+        mla.MLAAttention, "forward_prefill_split", lambda self, *a: ("split", a)
+    )
+    layers = {"layer": SimpleNamespace(impl=_mla_impl())}
     compilation = SimpleNamespace(static_forward_context=layers)
     monkeypatch.setattr(
         base,
@@ -118,29 +156,6 @@ def test_the_attention_op_takes_the_split_its_impl_asks_for(
     assert all(a is e for a, e in zip(args, expected))
 
 
-def _bind(impl, *names):
-    for name in names:
-        setattr(impl, name, MethodType(getattr(mla.MLAAttention, name), impl))
-    return impl
-
-
-def _split_impl(**over):
-    impl = SimpleNamespace(
-        split_prefill_recording=True, is_sparse_mla=False, o_proj=nn.Identity()
-    )
-    impl.__dict__.update(over)
-    return _bind(impl, "records_prefill_split", "_prefill_split_supported")
-
-
-@pytest.fixture
-def step(monkeypatch):
-    """The forward context a test runs under; no PCP."""
-    ctx = SimpleNamespace(context=None, tr_graph=None, in_hipgraph=False)
-    monkeypatch.setattr(forward_context, "_forward_context", ctx)
-    monkeypatch.setattr(mla, "pcp_is_enabled", lambda: False)
-    return ctx
-
-
 @pytest.mark.parametrize(
     "tr_graph, in_hipgraph, prefill, dummy, split",
     [
@@ -158,7 +173,7 @@ def test_the_split_runs_on_a_prefill_token_graph_capture_alone(
 ):
     step.tr_graph, step.in_hipgraph = tr_graph, in_hipgraph
     step.context = SimpleNamespace(is_prefill=prefill, is_dummy_run=dummy)
-    assert _split_impl().records_prefill_split() is split
+    assert _mla_impl().records_prefill_split() is split
 
 
 @pytest.mark.parametrize(
@@ -172,8 +187,8 @@ def test_the_split_runs_on_a_prefill_token_graph_capture_alone(
 def test_the_split_needs_the_opt_in_and_a_dense_layer_without_o_proj(step, over):
     step.tr_graph = "record"
     step.context = SimpleNamespace(is_prefill=True, is_dummy_run=True)
-    assert _split_impl().records_prefill_split()
-    assert not _split_impl(**over).records_prefill_split()
+    assert _mla_impl().records_prefill_split()
+    assert not _mla_impl(**over).records_prefill_split()
 
 
 def test_the_split_is_off_under_pcp(step, monkeypatch):
@@ -181,7 +196,7 @@ def test_the_split_is_off_under_pcp(step, monkeypatch):
     step.context = SimpleNamespace(is_prefill=True, is_dummy_run=True)
     monkeypatch.setattr(mla, "pcp_is_enabled", lambda: True)
     monkeypatch.setattr(mla, "get_pcp_world_size", lambda: 2)
-    assert not _split_impl().records_prefill_split()
+    assert not _mla_impl().records_prefill_split()
 
 
 def test_the_split_is_off_under_triton_gemm(step, monkeypatch):
@@ -189,7 +204,7 @@ def test_the_split_is_off_under_triton_gemm(step, monkeypatch):
     step.tr_graph = "record"
     step.context = SimpleNamespace(is_prefill=True, is_dummy_run=True)
     monkeypatch.setattr(mla, "use_triton_gemm", lambda: True)
-    assert not _split_impl().records_prefill_split()
+    assert not _mla_impl().records_prefill_split()
 
 
 # ---- the split against forward_impl, with reference kernels ----------------
@@ -238,6 +253,12 @@ def kernels(monkeypatch):
     monkeypatch.setattr(mla, "concat_and_cache_mla", _cache_write)
     monkeypatch.setattr(mla, "use_triton_gemm", lambda: False)
     monkeypatch.setattr(mla, "pcp_is_enabled", lambda: False)
+
+
+def _bind(impl, *names):
+    for name in names:
+        setattr(impl, name, MethodType(getattr(mla.MLAAttention, name), impl))
+    return impl
 
 
 def _dense_impl(prefix_k, prefix_v):
@@ -423,3 +444,119 @@ def test_an_fp8_split_needs_the_steps_row_count(monkeypatch, kernels):
             torch.arange(8),
             "layer",
         )
+
+
+# ---- the KDA split against _forward_impl, with a reference recurrence -------
+
+KDA_HEADS, KDA_DIM, HIDDEN = 2, 4, 16
+
+
+def _kda_layer(model, calls):
+    """A KDA layer of linear projections whose recurrence (the one kernel,
+    `_prefill_recurrence`) is a causal reference that logs its inputs."""
+    torch.manual_seed(3)
+    width = KDA_HEADS * KDA_DIM
+    w_in = torch.randn(4 * width + KDA_HEADS + KDA_DIM, HIDDEN)
+    w_f, w_o = torch.randn(width, KDA_DIM), torch.randn(HIDDEN, width)
+
+    def recurrence(mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state):
+        calls.append((mixed_qkv.clone(), gate.clone(), beta.clone()))
+        x = mixed_qkv[:, :width].unflatten(-1, (KDA_HEADS, KDA_DIM))
+        return torch.cumsum(x * gate[0].sigmoid() * beta[0, ..., None], dim=0)
+
+    layer = object.__new__(model.KimiKDAAttention)
+    layer.__dict__.update(
+        layer_name="kda",
+        layer_num=0,
+        head_dim=KDA_DIM,
+        num_local_heads=KDA_HEADS,
+        local_proj_size=width,
+        fuse_f_a_quant=False,
+        conv_weight=None,
+        in_proj=lambda x, x_scale=None: nn.functional.linear(x, w_in),
+        f_b_proj=lambda x: nn.functional.linear(x, w_f),
+        o_norm=lambda out, gate, is_prefill: out * gate.sigmoid(),
+        o_proj=lambda x: nn.functional.linear(x, w_o),
+        _prefill_recurrence=recurrence,
+    )
+    return layer
+
+
+def _kda_step(monkeypatch, model, layer, rows, metadata):
+    """A prefill step of ``rows`` real tokens; ``metadata`` None is the
+    recording's dummy step, which has no KDA metadata."""
+    width = KDA_HEADS * KDA_DIM
+    attn_metadata = SimpleNamespace()
+    if metadata is not None:
+        attn_metadata.kda_metadata = metadata
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=True, scheduled_tokens=rows),
+        attn_metadata=attn_metadata,
+        kv_cache_data={
+            "layer_0": SimpleNamespace(
+                k_cache=torch.zeros(4, 3 * width, 4),
+                v_cache=torch.zeros(4, KDA_HEADS, KDA_DIM, KDA_DIM),
+            )
+        },
+        tr_graph=None,
+        in_hipgraph=False,
+        main_stream=None,
+    )
+    monkeypatch.setattr(forward_context, "_forward_context", ctx)
+    compilation = SimpleNamespace(static_forward_context={"kda": layer})
+    monkeypatch.setattr(
+        model,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(compilation_config=compilation),
+    )
+
+
+def _kda_metadata(rows):
+    """Prompts of 3 and 2 tokens."""
+    return SimpleNamespace(
+        num_actual_tokens=rows,
+        num_prefills=2,
+        num_decodes=0,
+        non_spec_state_indices_tensor=torch.tensor([0, 1]),
+        non_spec_state_indices_in_tensor=None,
+        non_spec_query_start_loc=torch.tensor([0, 3, 5]),
+        has_initial_state=torch.tensor([True, False]),
+    )
+
+
+@pytest.mark.parametrize("bucket", [5, 8])
+def test_a_padded_kda_split_writes_the_rows_forward_impl_computes(monkeypatch, bucket):
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    rows = 5
+    torch.manual_seed(4)
+    hidden = torch.randn(bucket, HIDDEN)
+
+    eager_calls, split_calls = [], []
+    layer = _kda_layer(model, eager_calls)
+    _kda_step(monkeypatch, model, layer, rows, _kda_metadata(rows))
+    eager = layer._forward_impl(hidden[:rows].clone(), None)
+
+    layer = _kda_layer(model, split_calls)
+    _kda_step(monkeypatch, model, layer, rows, _kda_metadata(rows))
+    hidden[rows:] = 1e4
+    split = layer._forward_prefill_split(hidden, None)
+
+    assert split.shape == (bucket, HIDDEN)
+    assert eager.abs().sum() > 0
+    torch.testing.assert_close(split[:rows], eager, rtol=1e-5, atol=1e-5)
+    assert torch.count_nonzero(split[rows:]) == 0
+    # One recurrence, on the eager step's rows.
+    assert len(split_calls) == len(eager_calls) == 1
+    for got, want in zip(split_calls[0], eager_calls[0]):
+        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+
+
+def test_the_kda_recordings_dummy_step_leaves_the_output_alone(monkeypatch):
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    calls = []
+    layer = _kda_layer(model, calls)
+    _kda_step(monkeypatch, model, layer, 8, None)
+    split = layer._forward_prefill_split(torch.randn(8, HIDDEN), None)
+    assert split.shape == (8, HIDDEN)
+    assert torch.count_nonzero(split) == 0
+    assert not calls

@@ -62,6 +62,7 @@ from atom.models.deepseek_v2 import (
     Indexer,
     indexer_projection_fusable,
 )
+from atom.models.kimi_k3.mono.plan import kda_metadata as step_kda_metadata
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -852,9 +853,8 @@ class KimiFullAttention(nn.Module):
         )
         # Prefill token graphs record the MLA head (`forward_prefill_split`);
         # ATOM's own graphs only, a plugin's host records its own way.
-        impl = getattr(self.attn, "impl", None)
-        if not is_plugin_mode() and hasattr(impl, "split_prefill_recording"):
-            impl.split_prefill_recording = True
+        if not is_plugin_mode():
+            self.attn.impl.split_prefill_recording = True
 
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
@@ -1020,8 +1020,8 @@ def kda_attention_with_output(
         layer_name
     ]
     fwd_ctx = get_forward_context()
-    context = getattr(fwd_ctx, "context", None)
-    recording = getattr(fwd_ctx, "tr_graph", None) == "record"
+    context = fwd_ctx.context
+    recording = fwd_ctx.tr_graph == "record"
     if recording and context is not None and context.is_prefill:
         return self._forward_prefill_split(hidden_states, hidden_states_scale)
     return _kda_mixer(hidden_states, hidden_states_scale, layer_name)
@@ -1349,11 +1349,7 @@ class KimiKDAAttention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
-        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
-        if kda_metadata is None:
-            # Native ATOM/SGLang integrations still expose the shared legacy
-            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
-            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        kda_metadata = step_kda_metadata(fwd_ctx)
         if kda_metadata is None:
             # Output is bf16 even when the input activation is fp8 (fused quant).
             return torch.zeros(
@@ -1401,7 +1397,7 @@ class KimiKDAAttention(nn.Module):
 
         if kda_metadata.num_prefills > 0:
             out = self._prefill_recurrence(
-                mixed_qkv, gate, beta, kda_metadata, cache, conv_state, ssm_state
+                mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
             )
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
@@ -1621,7 +1617,7 @@ class KimiKDAAttention(nn.Module):
         return mixed_qkv, out_gate, beta, gate
 
     def _prefill_recurrence(
-        self, mixed_qkv, gate, beta, kda_metadata, cache, conv_state, ssm_state
+        self, mixed_qkv, gate, beta, kda_metadata, conv_state, ssm_state
     ) -> torch.Tensor:
         """A prefill's causal conv and chunked recurrence, reading and writing
         each request's conv/ssm state slots: ``[T, heads, head_dim]``.
@@ -1674,8 +1670,8 @@ class KimiKDAAttention(nn.Module):
         # o_norm only reads this tensor, so keep the contiguous KDA output
         # instead of materializing an identical copy into `out`.
         assert kda_out.dtype == mixed_qkv.dtype, (
-            "KDA output dtype must match the former fused_in-backed output "
-            f"buffer: got {kda_out.dtype} vs {mixed_qkv.dtype}"
+            "o_norm reads the KDA output in the projections' dtype: got "
+            f"{kda_out.dtype} vs {mixed_qkv.dtype}"
         )
         assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
         return kda_out.squeeze(0)
@@ -1724,9 +1720,7 @@ class KimiKDAAttention(nn.Module):
         and the live step's state, into ``out``; the recording's dummy prefill
         (no KDA metadata) leaves it alone."""
         fwd_ctx = get_forward_context()
-        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
-        if kda_metadata is None:
-            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        kda_metadata = step_kda_metadata(fwd_ctx)
         if kda_metadata is None:
             return
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
@@ -1740,7 +1734,6 @@ class KimiKDAAttention(nn.Module):
                 rearrange(gate[:n], "t (h d) -> 1 t h d", d=self.head_dim),
                 beta[:n].unsqueeze(0),
                 kda_metadata,
-                cache,
                 conv_state,
                 ssm_state,
             )
