@@ -37,7 +37,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.plan.execution import THREADS, WAVES
-from atom.mono.polling import POLL_SLEEP_UNITS
+from atom.mono.polling import SPIN_PAUSE_ASM
 
 # gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
 # scope (past the per-XCD caches); SC0 | SC1 is system scope (peers over XGMI).
@@ -590,9 +590,9 @@ def uniform_f32(value):
 
 def spin_pause() -> None:
     """Keep tagged-mailbox polling loads inside the retry loop and sleep
-    ``POLL_SLEEP_UNITS`` between polls (see ``atom.mono.polling``)."""
+    ``POLL_SLEEP_UNITS`` between polls (``s_nop 0`` at 1; see ``atom.mono.polling``)."""
 
-    llvm.InlineAsmOp(None, [], f"s_sleep {POLL_SLEEP_UNITS}", "", has_side_effects=True)
+    llvm.InlineAsmOp(None, [], SPIN_PAUSE_ASM, "", has_side_effects=True)
 
 
 def read_lane_i32(value, lane):

@@ -59,7 +59,22 @@ SHARED_SOURCE_KEY = hashlib.sha256(
         Path(module.__file__).read_bytes() for module in (ops, bo, dpp_utils, polling)
     )
     + Path(__file__).read_bytes()
+    + polling.CACHE_TAG
 ).hexdigest()[:16]
+
+
+# The pause between two polls: main's ``s_nop 0`` when ATOM_MONO_POLL_SLEEP_UNITS
+# is 1, else the sleep. Picked here, so the traced loops see one plain call.
+if polling.MAIN_POLLING:
+
+    def _retry_pause():
+        rocdl.s_nop(0)
+
+else:
+
+    def _retry_pause():
+        rocdl.s_sleep(polling.POLL_SLEEP_UNITS)
+
 
 # Helpers with dynamic control flow need flydsl's AST rewriting (as a @flyc.kernel body gets), so that
 # their ``if`` / ``while`` / ``for range`` over traced values lower to scf ops. ASTRewriter is not part of
@@ -177,7 +192,7 @@ def poll(
         t0 = mem_realtime()
         stop = fx.Int32(0)
         while pending(v) & (stop == 0):
-            rocdl.s_sleep(polling.POLL_SLEEP_UNITS)
+            _retry_pause()
             v = load_all()
             flagged = (
                 uniform(
@@ -196,7 +211,7 @@ def poll(
             if const_expr(retry_spin_pause):
                 spin_pause()
             else:
-                rocdl.s_sleep(polling.POLL_SLEEP_UNITS)
+                _retry_pause()
             v = load_all()
     return unpack(v)
 

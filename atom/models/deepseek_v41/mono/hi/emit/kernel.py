@@ -108,6 +108,7 @@ def source_digest() -> str:
             h.update("/".join(parts).encode())
             with open(f, "rb") as fh:
                 h.update(fh.read())
+        h.update(polling.CACHE_TAG)  # its value is from the environment
         _SOURCE_DIGEST.clear()
         digest = _SOURCE_DIGEST[sig] = h.hexdigest()[:16]
     return digest
