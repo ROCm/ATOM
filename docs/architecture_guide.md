@@ -292,12 +292,11 @@ at most its weight group's ``timeout_s``, and the group is built to abort its
 communicator on a timeout rather than end the process. So a trainer that dies
 mid-stream fails the stream on every rank once that timeout has passed since
 the last frame each rank received, and the group has been torn down. The group
-then has to be joined again,
-and the engine stays fenced until a sync rewrites every parameter. A caller
-that stops waiting before the engine answers does not learn whether the stream
-was written, and the engine stays fenced the same way. A stream's version is
-used up only once FINISH commits it, so a sync the engine failed can be
-retried at the same version.
+then has to be joined again, and the engine stays fenced until a sync rewrites
+every parameter. A caller that stops waiting before the engine answers does
+not learn whether the stream was written, and the engine stays fenced the same
+way. A stream's version is used up only once FINISH commits it, so a sync the
+engine failed can be retried at the same version.
 
 ## Sequence lifecycle
 

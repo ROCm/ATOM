@@ -207,6 +207,7 @@ class _Embedding(HostTableHooks, torch.nn.Module):
 
 def _runner(model, device="cpu"):
     runner = MemoryManagerMixin()
+    runner._init_memory_manager()
     runner.model, runner.device, runner.label = model, torch.device(device), "ple"
     runner.enforce_eager = True
     return runner

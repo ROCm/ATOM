@@ -1496,9 +1496,7 @@ def test_a_group_joined_on_only_some_workers_is_not_reused(monkeypatch):
 def _world(monkeypatch, size):
     """aiter's world group as the vote finds it, and the groups voted over."""
     world = SimpleNamespace(world_size=size, cpu_group=object())
-    monkeypatch.setattr(
-        receiver.parallel_state, "get_world_group", lambda: world, raising=False
-    )
+    monkeypatch.setattr(receiver, "get_world_group", lambda: world)
     voted = []
 
     def vote(ballots, group):

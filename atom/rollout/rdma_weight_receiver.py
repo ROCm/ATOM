@@ -37,10 +37,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-
-# The module, not the name: where aiter is not built, what stands in for it
-# need not have get_world_group until a vote asks for it.
-from aiter.dist import parallel_state
+from aiter.dist.parallel_state import get_world_group
 
 from atom.distributed.group_agreement import group_min_each
 from atom.model_engine.collective_rpc import WeightReloadRefused
@@ -530,7 +527,7 @@ class RDMAWeightReceiverMixin:
         )
         if workers <= 1:
             return ballots
-        world = parallel_state.get_world_group()
+        world = get_world_group()
         if world.world_size != workers:
             raise RuntimeError(
                 f"cannot decide on the RDMA stream: the process world has "
