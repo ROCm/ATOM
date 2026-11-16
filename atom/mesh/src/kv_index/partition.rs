@@ -1,7 +1,8 @@
 //! A partition of the index: the ranks of one model, pool and block size, each on a lane,
 //! and the writer thread that alone applies their admitted batches, in order. The prompts
 //! routed to each worker are predictions on lanes of a second index, kept apart from the
-//! events, each block until a TTL after it was last routed.
+//! events. A predicted block matches until the first sweep after a TTL from its last
+//! routing, so for up to TTL + TTL/8.
 
 use std::{
     collections::HashMap,
