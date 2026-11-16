@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -1094,6 +1096,14 @@ class ParallelConfig:
     """CoreManager owns the store; every model runner connects as a client."""
 
     data_parallel_master_ip: str = "127.0.0.1"
+
+    tensor_parallel_size_local: int | None = None
+    """TP ranks (model-runner workers) this node runs. None means all of them,
+    the single-node case. Set it below tensor_parallel_size to spread one TP
+    group over several nodes; see atom/model_engine/tp_multinode.py."""
+    tensor_parallel_rank: int = 0
+    """First TP rank this node runs. The node that runs rank 0 also runs the
+    engine and the API server; the others run only their workers."""
 
     @property
     def is_multinode_dp(self) -> bool:
@@ -2320,6 +2330,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     # A frontend's own stable form of its speculative config, which the offload
     # PAGE namespace hashes in place of `speculative_config`: only the frontend
     # knows which of its fields differ between processes. None hashes
@@ -2404,6 +2415,61 @@ class Config:
     @property
     def pcp_group_size(self) -> int:
         return pcp_group_size_of(self)
+
+    @property
+    def tp_size_local(self) -> int:
+        """TP worker processes on this node: fewer than `tp_world_size` when
+        one TP group spans several nodes."""
+        local = self.parallel_config.tensor_parallel_size_local
+        return self.tp_world_size if local is None else local
+
+    @property
+    def tp_rank_start(self) -> int:
+        """First TP rank on this node; it runs `tp_size_local` ranks from here."""
+        return self.parallel_config.tensor_parallel_rank
+
+    @property
+    def is_multinode_tp(self) -> bool:
+        return self.tp_size_local < self.tp_world_size or self.tp_rank_start > 0
+
+    def _check_multinode_tp(self) -> None:
+        pc = self.parallel_config
+        if pc.tensor_parallel_size_local is None and pc.tensor_parallel_rank == 0:
+            return
+        local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
+        if local < 1 or tp % local or start % local or not 0 <= start < tp:
+            raise ValueError(
+                f"--tensor-parallel-size-local {local} and --tensor-parallel-rank "
+                f"{start} must cut -tp {tp} into whole, equal per-node slices"
+            )
+        if not self.is_multinode_tp:
+            return
+        unsupported = [
+            name
+            for name, used in (
+                ("data parallelism", pc.data_parallel_size > 1),
+                ("--enable-dp-attention", self.enable_dp_attention),
+                ("pipeline parallelism", self.pipeline_parallel_size > 1),
+                ("prefill context parallelism", self.prefill_context_parallel_size > 1),
+                ("--fake-eplb", self.fake_eplb),
+                ("RapidServe", self.enable_rapidserve),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                "tensor parallelism across nodes does not support "
+                + ", ".join(unsupported)
+            )
+        if pc.data_parallel_base_port == 0 or pc.data_parallel_master_ip in (
+            "127.0.0.1",
+            "localhost",
+        ):
+            raise ValueError(
+                "tensor parallelism across nodes needs --data-parallel-master-ip "
+                "set to the address of the node that runs TP rank 0, and the "
+                "same nonzero --data-parallel-base-port on every node"
+            )
 
     @property
     def capture_sizes(self) -> list[int]:
@@ -2669,6 +2735,7 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
+        self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
@@ -2758,6 +2825,14 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if (
+            isinstance(self.kv_transfer_config, dict)
+            and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
+            == "multi"
+        ):
+            # Refuse a composite the engine cannot run now, not when a worker
+            # builds it after the weights are loaded.
+            validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -2875,6 +2950,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
         self._resolve_tbo()
         self._check_pp_support()
@@ -3388,6 +3464,10 @@ class Config:
                 "supported with pipeline_parallel_size > 1."
             )
 
+    def _resolve_offload_min_load_tokens(self) -> None:
+        # Resolve once before spawning workers, identically for CLI and API.
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
+
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -3556,14 +3636,15 @@ def local_device_index(config: Config, rank: int) -> int:
 
     On a single node the physical GPU index equals the global distributed rank
     in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
-    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs. A TP group that
+    spans nodes has its ranks from `tp_rank_start` on this node.
     """
     pc = config.parallel_config
     engine_index = (
         pc.data_parallel_rank_local or 0
     ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
     stage_span = config.tp_world_size * config.pcp_group_size
-    return engine_index * stage_span + rank
+    return engine_index * stage_span + rank - config.tp_rank_start
 
 
 _current_atom_config: Config | None = None

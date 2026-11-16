@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -429,6 +430,15 @@ class KVTransferTensors:
         the producer published addresses only.
         """
         return tuple(page.view for page in self.pages if page.view is not None)
+
+    def without_slots(self) -> KVTransferTensors:
+        """A copy without the live request SLOTs a composite P/D connector
+        publishes, for an offload tier that rebuilds state by replay; the shared
+        descriptor stays intact for the other connector."""
+        pages = copy(self)
+        pages.num_slots = 0
+        pages.slot_regions = []
+        return pages
 
     def merge_pages(self, other: KVTransferTensors) -> None:
         """Append another contributor's PAGE units (a draft's own pool).

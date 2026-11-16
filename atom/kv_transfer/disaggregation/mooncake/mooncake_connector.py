@@ -505,6 +505,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         # for legacy relay. Chunked mode claims at allocation because the peer
         # can read after the first forward; it must not be preempted meanwhile.
         self._awaiting_send: set[str] = set()
+        # Producer state each undispatched allocation replaced, by request id:
+        # what `cancel_preadmission` restores.
+        self._producer_admission_undo: dict[ReqId, tuple] = {}
 
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -631,9 +634,40 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
         self._reqs_need_recv.clear()
         self._reqs_need_save.clear()
+        # Those allocations are now dispatched. Cancellation must drain the
+        # worker's source claim, never apply preadmission rollback to them.
+        self._producer_admission_undo.clear()
         return meta
 
+    def cancel_preadmission(self, seq: Sequence) -> None:
+        """Undo only producer state installed by an undispatched allocation."""
+        undo = self._producer_admission_undo.pop(seq.id, None)
+        if undo is None or undo[0] is not seq:
+            return
+        _, previous_save, already_claimed, previous_waiting, was_ready = undo
+        if previous_save is None:
+            self._reqs_need_save.pop(seq.id, None)
+        else:
+            self._reqs_need_save[seq.id] = previous_save
+        if not already_claimed:
+            self._awaiting_send.discard(str(seq.id))
+        if previous_waiting is not None:
+            self._chunked_waiting[seq.id] = previous_waiting
+        if was_ready:
+            self._chunked_ready.add(seq.id)
+
     def update_state_after_alloc(self, seq: Sequence) -> None:
+        if self.is_producer:
+            self._producer_admission_undo.setdefault(
+                seq.id,
+                (
+                    seq,
+                    self._reqs_need_save.get(seq.id),
+                    str(seq.id) in self._awaiting_send,
+                    self._chunked_waiting.get(seq.id),
+                    seq.id in self._chunked_ready,
+                ),
+            )
         self._chunked_waiting.pop(seq.id, None)
         self._chunked_ready.discard(seq.id)
         params = seq.kv_transfer_params or {}
@@ -665,7 +699,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "state_slot", -1)
+        slot_index = seq.state_slot
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -716,7 +750,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             )
 
         # Producer side: queue block_ids for the write listener to look up
-        if params.get("do_remote_decode"):
+        if params.get("do_remote_decode") and params.get("chunked_transfer"):
             assert self.is_producer, "Only the producer side handles do_remote_decode"
             self._reqs_need_save[seq.id] = (seq, list(seq.block_table), slot_index)
             logger.debug(
@@ -749,7 +783,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self._reqs_need_save[seq.id] = (
                     seq,
                     list(seq.block_table),
-                    getattr(seq, "state_slot", -1),
+                    seq.state_slot,
                 )
             seq.kv_transfer_params_output = None
             return
@@ -766,13 +800,22 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_decode"
         ):
             self._awaiting_send.add(str(seq.id))
+            # A non-chunked source is published only after prefill finishes.
+            # Allocation may dispatch Store loads before the P forward; caching
+            # those addresses then would leave them in the worker after an
+            # aborted load releases the allocation.
+            self._reqs_need_save[seq.id] = (
+                seq,
+                list(seq.block_table),
+                seq.state_slot,
+            )
 
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
-        final_state_slot = getattr(seq, "state_slot", -1)
+        final_state_slot = seq.state_slot
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
