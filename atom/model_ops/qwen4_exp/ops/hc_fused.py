@@ -26,6 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.triton_launch import CachedLauncher
+
 # Batches from which the multi-row combine+norm kernel is used (prefill).
 COMBINE_NORM_ROWS_MIN_M = 256
 
@@ -296,6 +298,9 @@ def _hc_gated_mean_tiled_kernel(
     )
 
 
+_hc_gated_mean_tiled = CachedLauncher(_hc_gated_mean_tiled_kernel, num_warps=4)
+
+
 def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Tensor:
     """Tiled `mix_gated_mean` for large batches (same rounding)."""
     m, width = normed.shape
@@ -303,7 +308,8 @@ def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Te
     out = torch.empty((m, hidden), dtype=normed.dtype, device=normed.device)
     rb, bh = 4, 512
     if m and hidden % bh == 0 and gate.stride(0) == normed.stride(0):
-        _hc_gated_mean_tiled_kernel[(triton.cdiv(m, rb), hidden // bh)](
+        _hc_gated_mean_tiled(
+            (triton.cdiv(m, rb), hidden // bh),
             normed,
             gate,
             out,
@@ -314,7 +320,6 @@ def hc_gated_mean(normed: torch.Tensor, gate: torch.Tensor, hc: int) -> torch.Te
             HC=hc,
             RB=rb,
             BH=bh,
-            num_warps=4,
         )
         return out
     from atom.model_ops.qwen4_exp.ops.gated import mix_gated_mean
@@ -359,6 +364,9 @@ def _hc_gated_mean_quant_kernel(
     tl.store(scale_ptr + rows, scale, mask=rows < M)
 
 
+_hc_gated_mean_quant = CachedLauncher(_hc_gated_mean_quant_kernel, num_warps=8)
+
+
 def hc_gated_mean_quant(
     normed: torch.Tensor, gate: torch.Tensor, hc: int, quant_dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -379,7 +387,8 @@ def hc_gated_mean_quant(
     scale = torch.empty((m, 1), dtype=torch.float32, device=normed.device)
     if m:
         rb = 1
-        _hc_gated_mean_quant_kernel[(triton.cdiv(m, rb),)](
+        _hc_gated_mean_quant(
+            (triton.cdiv(m, rb),),
             normed,
             gate,
             out,
@@ -392,7 +401,6 @@ def hc_gated_mean_quant(
             FP8_MAX=torch.finfo(quant_dtype).max,
             RB=rb,
             BH=triton.next_power_of_2(hidden),
-            num_warps=8,
         )
     return out, q, scale
 
@@ -497,6 +505,10 @@ def _hc_combine_norm_rows_kernel(
     tl.store(normed_ptr + oh + cb, (fb * rstd[:, None] * gb).to(dt), mask=rmask)
 
 
+_hc_combine_norm = CachedLauncher(_hc_combine_norm_kernel, num_warps=4)
+_hc_combine_norm_rows = CachedLauncher(_hc_combine_norm_rows_kernel, num_warps=4)
+
+
 def hc_rows(
     h: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -585,7 +597,8 @@ def hc_combine_norm(
     bb = hidden - ba
     if m >= COMBINE_NORM_ROWS_MIN_M and bb > 0 and bb & (bb - 1) == 0:
         rb = 2
-        _hc_combine_norm_rows_kernel[(triton.cdiv(m, rb), hc)](
+        _hc_combine_norm_rows(
+            (triton.cdiv(m, rb), hc),
             h,
             block_out if combine else h,
             raw if combine else h,
@@ -603,11 +616,11 @@ def hc_combine_norm(
             RB=rb,
             BA=ba,
             BB=bb,
-            num_warps=4,
         )
         return h_new, normed
     if m:
-        _hc_combine_norm_kernel[(m, hc)](
+        _hc_combine_norm(
+            (m, hc),
             h,
             block_out if combine else h,
             raw if combine else h,
@@ -622,6 +635,5 @@ def hc_combine_norm(
             HC=hc,
             COMBINE=combine,
             BLOCK=triton.next_power_of_2(hidden),
-            num_warps=4,
         )
     return h_new, normed

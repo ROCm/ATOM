@@ -17,6 +17,8 @@ import triton
 import triton.language as tl
 from aiter import QuantType
 
+from atom.utils.triton_launch import CachedLauncher
+
 
 def is_per_token_fp8_linear(linear: torch.nn.Module) -> bool:
     """Whether `linear` runs the dynamic per-token FP8 GEMM, so the kernel in
@@ -189,13 +191,19 @@ def _gated_pointwise_kernel(
     tl.store(out_ptr + row * WIDTH + cols, result, cols < WIDTH)
 
 
+_scaled_silu = CachedLauncher(
+    _gated_pointwise_kernel, num_warps=4, enable_fp_fusion=False
+)
+
+
 def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
     """SiLU(x / scale), retaining the intermediate activation dtype."""
     rows, width = x.shape
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _gated_pointwise_kernel[(rows, triton.cdiv(width, block))](
+        _scaled_silu(
+            (rows, triton.cdiv(width, block)),
             x,
             x,
             x,
@@ -209,8 +217,6 @@ def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
             True,
             False,
             block,
-            num_warps=4,
-            enable_fp_fusion=False,
         )
     return out
 
