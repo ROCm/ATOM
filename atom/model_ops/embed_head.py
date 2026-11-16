@@ -283,6 +283,27 @@ class ParallelLMHead(VocabParallelEmbedding):
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
 
+    def gather_recordable(self) -> bool:
+        """Whether a CUDA graph may record this head at TP > 1: `forward`'s
+        logits all-gather must take the custom kernel, which `graph_capture()`
+        arms like the forward's own collectives -- the RCCL fallback is what
+        kept the head out of the decode graph (0cad4aabe). The custom path
+        needs a kernel for the group's size and 16-byte rows
+        (`GroupCoordinator.all_gather`); Ulysses SP gathers otherwise."""
+        if self.tp_size <= 1:
+            return True
+        if is_plugin_mode() or sp_is_enabled() or not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+            return False
+        ca_comm = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        if (
+            ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm._has_gather_scatter_kernel()
+        ):
+            return False
+        row_bytes = self.num_embeddings_per_partition * self.weight.element_size()
+        return row_bytes % 16 == 0
+
     def compute_argmax_token(
         self, x: torch.Tensor, *, out: torch.Tensor
     ) -> torch.Tensor:

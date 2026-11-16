@@ -113,6 +113,7 @@ from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids,
 )
+from atom.model_ops.embed_head import ParallelLMHead
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
@@ -3429,6 +3430,23 @@ class ModelRunner:
 
         return logits, hidden_states
 
+    def _lm_head_recordable(self) -> bool:
+        """Whether a decode graph may record the logits at TP > 1
+        (``ATOM_LOGITS_IN_GRAPH``): every LM head of the model gathers them
+        with the custom all-gather (`ParallelLMHead.gather_recordable`).
+        Recorded, the head's all-gather reads the shard in place, and the
+        norm, GEMM and gather launch with the replay instead of after it.
+        TBO decode records micro-batches and PCP decodes redundantly: both
+        keep the head eager, as does a model with no `ParallelLMHead`."""
+        if (
+            not envs.ATOM_LOGITS_IN_GRAPH
+            or self.tbo_decode_graphs
+            or get_pcp_world_size() > 1
+        ):
+            return False
+        heads = [m for m in self.model.modules() if isinstance(m, ParallelLMHead)]
+        return bool(heads) and all(head.gather_recordable() for head in heads)
+
     def _head_output(self, hidden_states: torch.Tensor, logits: bool = True):
         """The head output of the forward that just ran, on its rows
         (`hidden_states`): the model's own where it gives one
@@ -4420,7 +4438,7 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        logits_in_graph = self.world_size == 1
+        logits_in_graph = self.world_size == 1 or self._lm_head_recordable()
 
         # start capture profiler
         self.start_capture_profiler()

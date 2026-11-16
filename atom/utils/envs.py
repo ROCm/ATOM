@@ -1025,6 +1025,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counters (modes, overridden steps, guard trips), one JSON file per
     # process, rewritten every step. Unset: off.
     "ATOM_V4_CG_INSTR_DIR": lambda: os.getenv("ATOM_V4_CG_INSTR_DIR") or None,
+    # Record the final norm, LM head and logits all-gather in the decode graph
+    # at TP > 1 where that all-gather is the custom kernel
+    # (`ParallelLMHead.gather_recordable`). 0 runs them eagerly after replay.
+    "ATOM_LOGITS_IN_GRAPH": lambda: os.getenv("ATOM_LOGITS_IN_GRAPH", "1") == "1",
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
