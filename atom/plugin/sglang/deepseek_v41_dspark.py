@@ -358,7 +358,8 @@ class _AuxDump:
     each request's last window rows of the aux block the draft context was
     written from (plus their positions), one file per forward and rank, the
     first ``ATOM_SGLANG_V41_DSPARK_AUX_DUMP_N`` (8) forwards. Under a replay
-    it also checks that the tail it wrote is exactly those rows. Reads the
+    it also checks that the tail it wrote is exactly those rows (a fused
+    radix hit's widened span counted, its ``replay_rows`` saved). Reads the
     device: debug only, eager prefills only. Compare a replay-on and a
     replay-off run of the same requests offline."""
 
@@ -385,9 +386,11 @@ class _AuxDump:
         from atom.plugin.sglang.deepseek_v41_radix import FUSED_ATTR
 
         fused = getattr(forward_batch, FUSED_ATTR, None)
+        replay_rows = np.zeros(bs, dtype=np.int64)
         if fused is not None:
             # A fused radix hit's forward span starts R rows below SGLang's.
-            lengths = lengths + fused.replay_rows(bs)
+            replay_rows = fused.replay_rows(bs)
+            lengths = lengths + replay_rows
         window = int(get_current_atom_config().hf_config.sliding_window)
         rows = torch.as_tensor(window_rows(lengths, window), device=aux.device)
         if plan is not None:
@@ -408,7 +411,10 @@ class _AuxDump:
         torch.save(
             {
                 "rids": list(forward_batch.rids[:bs]),
+                # Forward rows per request: SGLang's plus a fused radix hit's
+                # replay rows (``replay_rows``, 0 for a cold request).
                 "lengths": lengths.tolist(),
+                "replay_rows": replay_rows.tolist(),
                 "window": window,
                 "replay": plan is not None,
                 "positions": positions[rows].cpu(),

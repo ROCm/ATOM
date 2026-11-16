@@ -1920,6 +1920,35 @@ class TestTargetSurface:
         # The AUX dump's window check holds on the widened lengths.
         assert dspark.window_rows(widened, 4).tolist() == [3, 4, 5, 6, 7, 8]
 
+    def test_aux_dump_counts_a_fused_hit(self, monkeypatch, tmp_path):
+        """ATOM_SGLANG_V41_DSPARK_AUX_DUMP on a fused radix hit under a decoder
+        replay: the window check runs on the widened spans (it raised on
+        SGLang's own lengths) and the record keeps the replay rows."""
+        import atom.config as atom_config_module
+        from atom.plugin.sglang import deepseek_v41_dspark as dspark
+
+        monkeypatch.setattr(
+            atom_config_module,
+            "get_current_atom_config",
+            lambda: SimpleNamespace(hf_config=SimpleNamespace(sliding_window=4)),
+        )
+        monkeypatch.setenv(bridge.V41_DSPARK_AUX_DUMP_ENV, str(tmp_path))
+        dump = dspark._AuxDump()
+        fb, _, wide_positions, _ = self._hit_forward()
+        fb.rids = ["a", "c"]
+        plan = _plan([7, 2], window=4, running_bs=2)
+        aux = torch.arange(9.0).repeat_interleave(3).view(9, 3)
+        dump.record(aux, wide_positions, fb, plan)
+        (saved,) = list(tmp_path.iterdir())
+        record = torch.load(saved)
+        assert record["replay"] and record["lengths"] == [7, 2]
+        assert record["replay_rows"] == [4, 0]
+        assert record["positions"].tolist() == [7, 8, 9, 10, 0, 1]
+        # A plan whose tail is not the widened spans' last window rows raises.
+        bad = _plan([3, 2], window=4, running_bs=2)
+        with pytest.raises(RuntimeError, match="replay tail rows"):
+            dump.record(aux, wide_positions, fb, bad)
+
     def test_replay_taps_must_be_late_layers(self, monkeypatch):
         wrapper = _ToyWrapper()
         wrapper.model.replay = True
