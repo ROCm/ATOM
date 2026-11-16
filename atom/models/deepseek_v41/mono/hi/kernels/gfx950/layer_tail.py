@@ -1468,6 +1468,19 @@ def shared_g(tid, s2, sug, sug_s, ws_moe, mep, lds, pre=None):
     xr = h % 6
     t0 = s2 - 144
     nxt = pre
+    # v39: the x operand (B) and its scales do not depend on the tile: read from LDS once and kept in
+    # registers for the three tiles, as TileRT does (it re-read them before every MFMA of every tile)
+    bvs, sbs = [], []
+    for j in range_constexpr(5):
+        xo = xr * 5120 + (wv * 5 + j) * 128 + q * 16
+        b0 = _lds_ld(lds, xo, 4)
+        b1 = _lds_ld(lds, xo + 64, 4)
+        sbs.append(_u8_lds(lds, QX_SCALE_LDS + xr * 160 + wv * 20 + 4 * j + q))
+        bvs.append(
+            fx.Vector.from_elements(
+                [b0[d] for d in range(4)] + [b1[d] for d in range(4)], Int32
+            )
+        )
     for it in range_constexpr(3):
         tile = t0 + 16 * it
         cur = nxt if const_expr(nxt is not None) else g_fetch(tid, s2, sug, sug_s, it)
@@ -1477,14 +1490,7 @@ def shared_g(tid, s2, sug, sug_s, ws_moe, mep, lds, pre=None):
             acc = fx.Vector.filled(4, 0.0, F32)
             for j in range_constexpr(5):
                 av, sa = cur[j]
-                xo = xr * 5120 + (wv * 5 + j) * 128 + q * 16
-                b0 = _lds_ld(lds, xo, 4)
-                b1 = _lds_ld(lds, xo + 64, 4)
-                sbx = _u8_lds(lds, QX_SCALE_LDS + xr * 160 + wv * 20 + 4 * j + q)
-                bv = fx.Vector.from_elements(
-                    [b0[d] for d in range(4)] + [b1[d] for d in range(4)], Int32
-                )
-                acc = mfma_scaled(av, bv, acc, sa, sbx)
+                acc = mfma_scaled(av, bvs[j], acc, sa, sbs[j])
             if wv != 0:
                 for i in range_constexpr(4):
                     _lds_st(
@@ -2448,7 +2454,7 @@ def build():
     """(symbol, launcher) of the test kernel with the ported phases (A1 so far)."""
     name = kernel_symbol(
         "tk_mega_afm6" if _AFM6 else "tk_mega_tail",
-        phases="full_v37"
+        phases="full_v39"
         + ("" if _DLY == 100 else f"_d{_DLY}")
         + ("_pf1" if _PF else "")
         + ("_pf2" if _PF2 else "")
