@@ -172,8 +172,8 @@ def test_run_pa_decode_hands_flydsl_the_fp8_output_alone(monkeypatch):
     [(True, 4), (True, 16), (True, 72), (True, 128), (True, 320)] + [(False, 300)],
 )
 def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, rows):
-    """Bit for bit, on the plan the FP8 output runs; two pad rows past q's come
-    back zero with a unit descale."""
+    """Bit for bit, on the plan the FP8 output runs; two pad rows past q's (filled
+    with a sentinel) come back zero with a unit descale, for decode and prefill."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
     from aiter.ops.quant import dynamic_per_token_scaled_quant
 
@@ -196,9 +196,13 @@ def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, row
     fp8 = torch.full((rows + pad, 16, 128), 0x7F, device=dev, dtype=torch.uint8)
     fp8 = fp8.view(dtypes.fp8)
     scale = torch.full((rows + pad, 1), float("nan"), device=dev)
-    sparse_attn.sparse_pa_per_row(
-        *args, torch.empty_like(q), kv_scale, kv_scale, fp8, scale
-    )
+    # the FP8 output through the phase's entry point, as the impl calls it
+    phase = "decode" if decode else "prefill"
+    getattr(sparse_attn, f"minimax_m3_sparse_attn_{phase}_asm")(
+        q, k_cache, v_cache, *(None,) * (3 if decode else 5), 1, 128**-0.5,
+        torch.empty_like(q), fp8, scale, kv_scale, kv_scale,
+        sparse_bt=bt, sparse_ctx=lens,
+    )  # fmt: skip
 
     # the BF16 output of the same plan, then the quant o_proj would run
     run = base_attention.run_pa_decode

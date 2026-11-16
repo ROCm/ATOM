@@ -107,7 +107,9 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         seen["attend"] = q.shape[0]
         if fp8_out:
             seen["fp8 rows"] = kw["quantized_output"].shape[0]
-            kw["quantized_output"][: q.shape[0]].fill_(1)
+            out_q = kw["quantized_output"]  # q's rows, then the pad rows it zeroes
+            out_q[: q.shape[0]].fill_(1)
+            out_q[q.shape[0] :].zero_()
         else:
             (a[3] if phase == "decode" else a[5]).fill_(1)
 
@@ -146,7 +148,8 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
     q = v = torch.zeros(q_rows, 4, 8)
     fp8 = {}
     if fp8_out:
-        fp8 = {"quantized_output": torch.zeros_like(q), "output_scale": q[:, 0, :1]}
+        # a sentinel, so the zero pad rows below are the PA's own writes
+        fp8 = {"quantized_output": torch.full_like(q, 7), "output_scale": q[:, 0, :1]}
     run = getattr(layer, f"_sparse_{phase}")
     if fp8_out and kv == "fp4":  # the MXFP4 KV's PA writes no FP8 output
         with pytest.raises(NotImplementedError):

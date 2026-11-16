@@ -22,7 +22,7 @@ from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
-from .sp_attention import _attention_fp8_fake, gather_heads, ulysses_attention
+from .sp_attention import attention_fp8_fake, gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -1069,7 +1069,7 @@ def unified_attention_with_output_base(
         )
 
 
-@mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=["scale"])
+@mark_spliting_op(is_custom=True, gen_fake=attention_fp8_fake, mutates_args=["scale"])
 @eager_region()
 def unified_attention_fp8(
     q: torch.Tensor,

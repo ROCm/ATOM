@@ -1812,8 +1812,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        # one output, its rows past the metadata's zero, written in place (as decode);
-        # with the FP8 one the PA writes those rows of it inert and no BF16 at all
+        # one output, its rows past the metadata's zero, written in place (as decode).
+        # With an FP8 output, `output` only fixes the layout; pa_decode writes the FP8
+        # rows (pad rows inert), but on plans aiter cannot fuse it still writes a
+        # BF16 intermediate and then runs the standalone quant.
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
         if rows < q.shape[0] and quantized_output is None:
@@ -2063,8 +2065,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
         # one output, its pad rows (past the metadata's) zero, written in place; the
-        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead. With
-        # the FP8 output the PA writes those rows of it inert and no BF16 at all.
+        # MXFP4 KV's q is e4m3, so its output takes the value dtype instead. With an
+        # FP8 output, `output` only fixes the layout; pa_decode writes the FP8 rows
+        # (pad rows inert), but on plans aiter cannot fuse it still writes a BF16
+        # intermediate and then runs the standalone quant.
         fp4_kv = self.kv_cache_dtype == "fp4"
         output = torch.empty_like(q, dtype=v.dtype if fp4_kv else None)
         if rows < q.shape[0] and quantized_output is None:
