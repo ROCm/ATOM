@@ -821,6 +821,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
     ),
+    # Forced acceptance (--spec-decode-acceptance-length): draw the bonus
+    # token from a generator seeded alike on every TP rank, so the sampled ids
+    # agree without the per-step TP broadcast. 0 keeps the broadcast.
+    "ATOM_SEEDED_BONUS_SAMPLING": lambda: os.getenv("ATOM_SEEDED_BONUS_SAMPLING", "1")
+    == "1",
+    # Keep that broadcast anyway and log how many steps' local ids differed.
+    "ATOM_CHECK_ID_SYNC": lambda: os.getenv("ATOM_CHECK_ID_SYNC", "0") == "1",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: (
         os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
     ),

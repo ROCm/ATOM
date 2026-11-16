@@ -51,7 +51,7 @@ def _apply_greedy_tokens(
     )
 
 
-def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
+def get_per_token_exponential(vocab_size: int, device, generator=None) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
 
     A fresh row is drawn on every call.  The shared-noise temperature path
@@ -59,7 +59,7 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     same values.
     """
     return torch.empty((1, vocab_size), dtype=torch.float, device=device).exponential_(
-        1
+        1, generator=generator
     )
 
 
@@ -148,6 +148,7 @@ class Sampler(nn.Module):
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
         any_greedy: bool = True,  # False if no temperature is 0 (checked on CPU)
+        generator: torch.Generator | None = None,  # temperature path's noise source
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -187,7 +188,10 @@ class Sampler(nn.Module):
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             sampled = self._temperature_sample(
-                logits, temperatures, needs_independent_noise=needs_independent_noise
+                logits,
+                temperatures,
+                needs_independent_noise=needs_independent_noise,
+                generator=generator,
             )
             # With no greedy row the fallback's argmax and `where` keep every
             # sampled id: a host-known `any_greedy` skips both launches.
@@ -221,6 +225,7 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         temperatures: torch.Tensor,
         needs_independent_noise: bool = False,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Temperature-based Gumbel-max sampling.
 
@@ -245,9 +250,11 @@ class Sampler(nn.Module):
         if needs_independent_noise:
             exponential = torch.empty(
                 (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-            ).exponential_(1)
+            ).exponential_(1, generator=generator)
         else:
-            exponential = get_per_token_exponential(vocab_size, logits.device).expand(
+            exponential = get_per_token_exponential(
+                vocab_size, logits.device, generator
+            ).expand(
                 num_tokens, vocab_size
             )
         mixed_sample_outer_exponential(

@@ -162,6 +162,19 @@ from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
 logger = logging.getLogger("atom")
 
+# The forced-acceptance bonus draw (`postprocess`): a device generator re-seeded
+# from the verify's step counter draws the same noise on every TP rank.
+_BONUS_RNG_BASE_SEED = 0xB0B5
+_BONUS_GENERATORS: dict = {}
+
+
+def _bonus_generator(device) -> torch.Generator:
+    generator = _BONUS_GENERATORS.get(device)
+    if generator is None:
+        generator = _BONUS_GENERATORS[device] = torch.Generator(device=device)
+    return generator
+
+
 
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
@@ -3524,6 +3537,7 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        ids_rank_identical = False
         # Keep probability payloads available on every participating rank.
         need_logprobs = batch.any_logprobs
         logprob_snapshot = None
@@ -3613,6 +3627,22 @@ class ModelRunner:
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
                     target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
+            # Forced acceptance on unfiltered rows: every input of the verify
+            # is identical on the TP ranks but the bonus noise. Draw it from a
+            # generator seeded alike on every rank (as the synthetic verdict's
+            # uniforms are) and the ids agree without the broadcast below.
+            ids_rank_identical = (
+                self.rejection_sampler.synthetic_acceptance_rates is not None
+                and top_ks is None
+                and top_ps is None
+                and envs.ATOM_SEEDED_BONUS_SAMPLING
+            )
+            bonus_generator = None
+            if ids_rank_identical and not all_greedy:
+                bonus_generator = _bonus_generator(logits.device)
+                bonus_generator.manual_seed(
+                    _BONUS_RNG_BASE_SEED + self.rejection_sampler._synthetic_step
+                )
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
@@ -3621,6 +3651,7 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
                 any_greedy=bool((batch.temperatures[:bs] == 0).any()),
+                generator=bonus_generator,
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
@@ -3654,11 +3685,25 @@ class ModelRunner:
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and not (ids_rank_identical and not envs.ATOM_CHECK_ID_SYNC)
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
+            local_tokens = sampled_tokens
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            if ids_rank_identical:
+                # ATOM_CHECK_ID_SYNC: count the steps whose locally drawn ids
+                # differ from rank 0's; read back once every 1000 checks.
+                miss = (local_tokens != sampled_tokens).any().int()
+                self._id_sync_misses = getattr(self, "_id_sync_misses", 0) + miss
+                self._id_sync_checks = getattr(self, "_id_sync_checks", 0) + 1
+                if self._id_sync_checks % 1000 == 0:
+                    logger.info(
+                        "id sync check: %d of %d steps differ from rank 0",
+                        int(self._id_sync_misses),
+                        self._id_sync_checks,
+                    )
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
