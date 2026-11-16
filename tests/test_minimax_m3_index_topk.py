@@ -672,10 +672,34 @@ def test_plain_decode_reaches_the_aiter_selector_where_the_scorer_allocates_perm
         max_query_len=q,
         num_idx_heads=heads,
     )
-    served = []
+    served, fallback = [], []
     real = m2._select_with_aiter
+
+    def spy(*a, **k):
+        served.append(real(*a, **k))
+        return served[
+            -1
+        ]  # the selector's own answer: `_launch_select` falls back on False
+
+    monkeypatch.setattr(m2, "_select_with_aiter", spy)
+
+    class _CountedLaunch:
+        """The Triton selector's kernel, counted per launch."""
+
+        def __init__(self, kernel):
+            self.kernel = kernel
+
+        def __getitem__(self, grid):
+            launch = self.kernel[grid]
+
+            def counted(*a, **k):
+                fallback.append(grid)
+                return launch(*a, **k)
+
+            return counted
+
     monkeypatch.setattr(
-        m2, "_select_with_aiter", lambda *a, **k: served.append(real(*a, **k))
+        m2, "_topk_index_packed_kernel", _CountedLaunch(m2._topk_index_packed_kernel)
     )
 
     def run(bounds):
@@ -690,7 +714,9 @@ def test_plain_decode_reaches_the_aiter_selector_where_the_scorer_allocates_perm
 
     ait_idx, _, ait_ctx = run(md.n_valid_column_per_row)
     assert served == [True], "the aiter selector declined the plain decode's score"
+    assert not fallback, "the Triton selector ran after aiter's, and overwrote it"
     tri_idx, _, tri_ctx = run(None)
+    assert len(fallback) == 1, "without bounds the Triton selector is the one that runs"
     rows = heads * batch * q
     assert torch.equal(
         torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
