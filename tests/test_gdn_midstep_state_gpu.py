@@ -233,8 +233,8 @@ def test_varlen_resumed_rows_match_a_forward_stopped_there(pool_dtype):
         targets += [(r, off, 0) for off in range(CHUNK, n, CHUNK)]
         targets.append((r, n, 1))
     rows, offs = ix([r for r, _o, _e in targets]), ix([o for _r, o, _e in targets])
-    # As the layer does: a pool wider than `h` reads interior targets from
-    # snapshots, a pool of `h`'s dtype reads `h` itself.
+    # As the layer does: a pool at another dtype than `h` reads interior
+    # targets from snapshots; a pool of `h`'s dtype reads `h` itself.
     snap = {}
     snapshots = None
     if pool_dtype != DTYPE:

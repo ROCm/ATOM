@@ -465,9 +465,9 @@ class GatedDeltaNet(nn.Module):
         wrote_core_attn_out = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
-            # A pool wider than `h` takes its interior targets from snapshots
-            # the chunk kernel stores unnarrowed (`_checkpoint_targets`), which
-            # FlyDSL prefill does not produce.
+            # A pool at another dtype than `h` takes its interior targets from
+            # snapshots that `GDNStateMixin.finish_prefill` plans and the chunk
+            # kernel stores unnarrowed, which FlyDSL prefill does not produce.
             h_snap = None
             if ckpt is not None and "snap_idx" in ckpt:
                 h_snap = ssm_state.new_empty((ckpt["num_snaps"], *ssm_state.shape[1:]))
@@ -598,7 +598,6 @@ class GatedDeltaNet(nn.Module):
                 # [slot, conv_dim, state_len] by here (see the transpose
                 # above) and shares `slots` with the SSM half, so the two
                 # always describe the same token position.
-                snapshot_rows = {} if h_snap is None else {"h_rows": ckpt["h_rows"]}
                 write_state_checkpoints(
                     h if h_snap is None else h_snap,
                     ssm_state,
@@ -613,7 +612,7 @@ class GatedDeltaNet(nn.Module):
                     non_spec_query_start_loc,
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
-                    **snapshot_rows,
+                    h_rows=None if h_snap is None else ckpt["h_rows"],
                 )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes

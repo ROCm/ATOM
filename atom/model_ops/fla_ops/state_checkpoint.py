@@ -156,10 +156,12 @@ def write_state_checkpoints(
     Deriving either from the shape writes a correctly-shaped checkpoint out of
     the wrong bytes, which nothing downstream can detect.
 
-    ``h_rows`` names, per target, the row of ``h`` an interior target reads;
-    pass it with the ``h_snap`` of
-    `atom.model_ops.gdn_midstep_snapshots.interior_state_snapshots` as ``h``. Without
-    it the row is the chunk boundary, ``chunk_offsets[row] + off // chunk``.
+    ``h_rows`` names, per target, the row of ``h`` an interior target reads.
+    When snapshots are needed, ``interior_state_snapshots`` plans those rows
+    and the chunk kernel fills the ``h_snap`` buffer allocated by
+    ``GatedDeltaNet``; pass that buffer as ``h`` with the planned ``h_rows``.
+    Without it the row is the chunk boundary,
+    ``chunk_offsets[row] + off // chunk``.
     """
     n = rows.numel()
     if n == 0:
