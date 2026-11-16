@@ -375,6 +375,7 @@ def _manager(engine_count):
     mgr._weight_sync_context = threading.local()
     mgr._weight_sync_dispatch_token = object()
     mgr._rpc_ranks_per_engine = 1
+    mgr._weight_syncs_unavailable = {}
     return mgr
 
 
@@ -465,6 +466,34 @@ def test_a_sync_the_runners_cannot_reload_is_refused_before_it_writes():
     assert not any(e._weight_sync_fenced or e._rl_weights_inconsistent for e in engines)
     assert all(len(sched.running) == 2 for sched in schedulers)
     assert [cmd for r in runners for cmd, _ in r.calls] == [DISCARD_WEIGHT_SYNC_CMD] * 2
+
+
+def test_a_reload_one_pipeline_stage_cannot_take_is_refused_before_the_head_writes():
+    """Each stage refused only what its own runners could not take, and the
+    head runs an update first, so it had written when a later stage refused."""
+    reason = "1 parameter(s) are held in a format a full-precision write cannot produce"
+    schedulers = [_running(2)[0], _running(2)[0]]
+    runners = [_Runners(), _Runners({"weight_reload": reason})]
+    mgr, engines = _wired(schedulers, runners)
+    mgr.pp_size = 2
+    for runner in runners:  # as each stage's READY reports it
+        mgr._record_ready_payload({"weight_syncs_unavailable": runner.unavailable})
+
+    with pytest.raises(RuntimeError, match="refused before any engine ran it"):
+        _update(mgr)
+
+    assert [runner.calls for runner in runners] == [[], []]
+    assert not any(e._weight_sync_fenced or e._rl_weights_inconsistent for e in engines)
+
+
+def test_an_engine_says_what_its_runners_cannot_take_when_ready():
+    core = object.__new__(EngineCore)
+    core.scheduler = None
+    core._weight_syncs_unavailable = {"weight_reload": "MLA"}
+
+    assert core._ready_payload() == {
+        "weight_syncs_unavailable": {"weight_reload": "MLA"}
+    }
 
 
 def test_a_refusal_the_engines_were_not_told_of_fences_no_engine():

@@ -224,7 +224,6 @@ def test_the_mappings_reached_by_attribute_are_unaffected(wrap):
         ("gate_proj", "experts.w13_weight", 0, "w1")
     ]
     assert updater._get_packed_modules_mapping() == {"gate_proj": ("gate_up_proj", 0)}
-    assert updater._get_packed_shard_order() == {"gate_up_proj": [0]}
 
 
 def test_a_sync_that_matched_nothing_says_so_above_debug(caplog):

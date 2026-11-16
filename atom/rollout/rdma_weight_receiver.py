@@ -83,6 +83,16 @@ class RDMAStreamOutOfStep(RuntimeError):
     """
 
 
+class _OutOfStepBeforeWriting(RDMAStreamOutOfStep, WeightReloadRefused):
+    """Out of step on a rank that wrote none of the stream. Breaking off is
+    the ranks' decision, and the engine combines what each of them wrote."""
+
+
+def _out_of_step(got, message: str) -> RDMAStreamOutOfStep:
+    cls = RDMAStreamOutOfStep if got.may_have_written else _OutOfStepBeforeWriting
+    return cls(message)
+
+
 @contextlib.contextmanager
 def _aborted_not_ended_on_timeout():
     """Build a group under TORCH_NCCL_ASYNC_ERROR_HANDLING=2, which a
@@ -120,8 +130,11 @@ class _WeightGroup:
     # Each broadcast's bound: the group's collective timeout.
     timeout: timedelta
     # Versions rise within a group; a new group is a new sender, e.g. a
-    # restarted trainer counting from 1 again.
+    # restarted trainer counting from 1 again. One this rank wrote stays
+    # pending until its engine commits it: a sync the engine failed, though
+    # this rank's part succeeded, may be retried at the same version.
     last_version: int | None = None
+    pending_version: int | None = None
 
 
 def _frames_no_bucket(
@@ -245,7 +258,7 @@ class _Received:
     # Raised at the end marker; the rest of the stream is still received.
     failure: Exception | None
     opened: bool = False
-    applied: bool = False
+    may_have_written: bool = False
     ended: bool = False
     updated: int = 0
     buckets: int = 0
@@ -333,9 +346,10 @@ def _take_frames(
                 metadata_tensor = payload = None
                 reason = str(exc)
         if not votes.on_frame(reason is None):
-            raise RDMAStreamOutOfStep(
+            raise _out_of_step(
+                got,
                 f"RDMA weight frame cannot be received: {frame} "
-                f"({reason or 'not by every rank taking the stream'})"
+                f"({reason or 'not by every rank taking the stream'})",
             )
 
         _receive(metadata_tensor, group, timeout)
@@ -344,8 +358,14 @@ def _take_frames(
             continue
         try:
             weights = _decode_frame(metadata_tensor, payload)
-            got.applied = True
-            counts = runner._apply_named_tensors(weights)
+            try:
+                counts = runner._apply_named_tensors(weights)
+            except WeightReloadRefused:
+                raise  # this bucket wrote nothing
+            except Exception:
+                got.may_have_written = True
+                raise
+            got.may_have_written = True
             runner._refuse_unwritten(counts)
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
             # Kept until the end marker; its frames must not keep this bucket
@@ -425,24 +445,25 @@ def receive_weight_stream(
             except Exception as exc:  # noqa: BLE001 - raised after the vote
                 got.failure = exc
         if votes.at_end():
-            # Counts as written, so the engine stays fenced, as it should: the
-            # stream broke off, and what the other ranks wrote is unknown even
-            # where this one wrote nothing.
-            raise RDMAStreamOutOfStep(
-                f"RDMA weight stream v{version}: a rank taking it left its group"
+            raise _out_of_step(
+                got, f"RDMA weight stream v{version}: a rank taking it left its group"
             ) from got.failure
         if got.failure is not None:
-            if got.applied or isinstance(got.failure, WeightReloadRefused):
-                raise got.failure
-            raise WeightReloadRefused(str(got.failure)) from got.failure
+            # The stream is one update: whether it wrote is this rank's whole
+            # stream's, whatever the bucket that failed wrote.
+            refused = isinstance(got.failure, WeightReloadRefused)
+            if got.may_have_written and refused:
+                raise RuntimeError(str(got.failure)) from got.failure
+            if not got.may_have_written and not refused:
+                raise WeightReloadRefused(str(got.failure)) from got.failure
+            raise got.failure
     except Exception as exc:
         votes.break_off(leave, version)
         if got.opened:
             runner._discard_failed_weight_sync()
         if not isinstance(exc, RDMAStreamOutOfStep) and (not got.ended or votes.failed):
-            # Counts as written and keeps the engine fenced, as above.
-            raise RDMAStreamOutOfStep(
-                f"RDMA weight stream v{version} broke off: {exc}"
+            raise _out_of_step(
+                got, f"RDMA weight stream v{version} broke off: {exc}"
             ) from exc
         raise
     return got.stats(time.perf_counter() - started)
@@ -610,6 +631,7 @@ class RDMAWeightReceiverMixin:
         version: int,
         require_full: bool = False,
         refusal: str | None = None,
+        committed_version: int | None = None,
     ) -> int:
         """Receive one version of the weights into resident memory; the
         number of tensors written.
@@ -617,7 +639,8 @@ class RDMAWeightReceiverMixin:
         *refusal* is the engine's reason to refuse the stream, which is
         received and discarded all the same: refused before it began, it
         would leave the trainer in its first broadcast. *require_full*: see
-        ``_complete_sync``.
+        ``_complete_sync``. *committed_version* is the last version of this
+        group the engine committed, by FINISH.
         """
         version = int(version)
         weight_group = self._rdma_groups.get(group_name)
@@ -633,6 +656,12 @@ class RDMAWeightReceiverMixin:
                 f"worker of this engine; destroy it on every rank and join it "
                 f"again"
             )
+        if (
+            committed_version is not None
+            and weight_group.pending_version == committed_version
+        ):
+            weight_group.last_version = committed_version
+        weight_group.pending_version = None
         last = weight_group.last_version
         if refusal is None and last is not None and version <= last:
             refusal = (
@@ -660,9 +689,7 @@ class RDMAWeightReceiverMixin:
             )
             self.destroy_rdma_weight_group(group_name)
             raise
-        # Only a stream written and completed uses up its version: a retry of
-        # one that failed is the same version again.
-        weight_group.last_version = version
+        weight_group.pending_version = version
         logger.info(
             "%s: RDMA weight stream v%d written: %s", self.label, version, stats
         )

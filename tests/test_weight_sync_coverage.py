@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.weight_sync_record import WeightSyncRecord
 from atom.rollout.weight_updater import WeightUpdaterMixin
@@ -492,8 +493,149 @@ def test_a_prequantised_scale_is_refused_not_ignored(path):
     with its old scale."""
     runner = _Runner(_fp8_model())
     incoming = {"layer.weight_scale_inv": torch.ones(1, dtype=torch.bfloat16)}
-    with pytest.raises(ValueError, match="prequantised"):
+    with pytest.raises(WeightReloadRefused, match="prequantised"):
         _sync(runner, path, [incoming])
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_prequantised_scale_is_refused_before_its_batch_writes(path):
+    """Refused where the loop reached it, the weights ahead of it in the
+    batch were written with the old scale still in place."""
+    runner = _Runner(_dense_model())
+    incoming = {
+        "attn.o_proj.weight": torch.full((HIDDEN, 4), 2.0, dtype=torch.bfloat16),
+        "attn.o_proj.weight_scale_inv": torch.ones(1, dtype=torch.bfloat16),
+    }
+    with pytest.raises(WeightReloadRefused, match="prequantised"):
+        _sync(runner, path, [incoming])
+    assert runner.model.attn.o_proj.weight.eq(0).all()
+
+
+def _padded_gate_model():
+    """Qwen3-Next's router: the routed experts' rows and the shared expert's
+    gate in one parameter, padded past both, with a loader that needs the
+    shard."""
+    gate = nn.Module()
+    gate.output_sizes = [4, 1]
+    gate.weight = _param(8, HIDDEN)
+
+    def weight_loader(param, loaded, shard_id=None):
+        assert shard_id is not None
+        offset = sum(gate.output_sizes[:shard_id])
+        param.data[offset : offset + gate.output_sizes[shard_id]].copy_(loaded)
+
+    gate.weight_loader = weight_loader
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.gate = gate
+    model.packed_modules_mapping = {
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+    return model
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_router_padded_past_its_rows_takes_them_as_one_shard(path):
+    """Named like the parameter, the trainer's [4, H] router went to the
+    loader without a shard id and failed; the rest of the sync was written
+    and every later sync failed on the same tensor."""
+    runner = _Runner(_padded_gate_model())
+    _sync(
+        runner,
+        path,
+        [
+            {
+                "mlp.gate.weight": torch.full((4, HIDDEN), 2.0, dtype=torch.bfloat16),
+                "mlp.shared_expert_gate.weight": torch.full(
+                    (1, HIDDEN), 3.0, dtype=torch.bfloat16
+                ),
+            }
+        ],
+        require_full=True,
+    )
+    gate = runner.model.mlp.gate.weight
+    assert gate[:4].eq(2).all() and gate[4].eq(3).all() and gate[5:].eq(0).all()
+
+
+def test_one_shard_of_a_fused_parameter_does_not_make_it_whole():
+    """Its shards were looked up by the suffix the name matched, 'gate' for
+    the shared expert's alone, so that one shard passed for the whole gate
+    and the router rows stayed old under a full sync."""
+    runner = _Runner(_padded_gate_model())
+    shared = {"mlp.shared_expert_gate.weight": torch.ones(1, HIDDEN)}
+    with pytest.raises(RuntimeError, match=r"not whole.*'mlp\.gate\.weight'"):
+        _sync(runner, "direct", [shared], require_full=True)
+
+
+def _fused_shared_moe():
+    """The shared expert fused into the routed experts' buffer, in the slot
+    after theirs, as GLM4-MoE, Qwen3-Next and Qwen3.5 do in BF16."""
+    model = _moe_model()
+    model.mlp.experts.expert_layout = SimpleNamespace(
+        num_routed=EXPERTS - 1, num_fused_shared_experts=1
+    )
+    return model
+
+
+def test_a_shared_expert_fused_into_the_routed_buffer_is_written_there():
+    """No name mapped the trainer's shared expert onto its fused slot, so the
+    slot was never written, and after one failed sync no sync could make
+    the weights whole again."""
+    runner = _Runner(_fused_shared_moe())
+    ckpt = _expert_checkpoint(experts=range(EXPERTS - 1))
+    for leaf, shape in (
+        ("gate_proj", (INTERMEDIATE, HIDDEN)),
+        ("up_proj", (INTERMEDIATE, HIDDEN)),
+        ("down_proj", (HIDDEN, INTERMEDIATE)),
+    ):
+        ckpt[f"mlp.shared_expert.{leaf}.weight"] = torch.full(
+            shape, 3.0, dtype=torch.bfloat16
+        )
+
+    _sync(runner, "direct", [ckpt], require_full=True)
+
+    experts = runner.model.mlp.experts
+    assert experts.w13_weight[EXPERTS - 1].eq(3).all()
+    assert experts.w2_weight[EXPERTS - 1].eq(3).all()
+
+
+@pytest.mark.parametrize(
+    ("unreadable", "reason"),
+    [
+        ("no segment", "atom-no-such-segment"),
+        ("corrupt bucket", "out of bounds"),
+        ("ipc handle", "handle is gone"),
+    ],
+)
+def test_a_bucket_that_cannot_be_read_fences_no_engine(monkeypatch, unreadable, reason):
+    """Each fails before the bucket writes anything, yet raised a plain
+    exception, so a healthy engine was marked not whole by one bad bucket."""
+    from atom.rollout import weight_sync
+
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+    )
+    runner = _ReportingRunner(_dense_model(), config)
+    engine, send = _engine_with(runner)
+    flat, meta = _staged(_dense_checkpoint())
+    args = {"sync_id": "s1", "request_id": "a", "bucket_meta": meta, "is_last": True}
+    if unreadable == "ipc handle":
+
+        def gone(*_, **__):
+            raise RuntimeError("the sender's handle is gone")
+
+        monkeypatch.setattr(weight_sync, "rebuild_ipc_handle", gone)
+        reply = send("update_weights_ipc", ipc_handle=None, **args)
+    elif unreadable == "no segment":
+        reply = send("update_weights_shm", shm_name="atom-no-such-segment", **args)
+    else:
+        meta["attn.o_proj.weight"]["nbytes"] += 2
+        with _shm_segment(flat) as shm_name:
+            reply = send("update_weights_shm", shm_name=shm_name, **args)
+
+    assert reason in reply["error"]
+    assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
 
 
 def test_a_name_the_model_has_no_parameter_for_is_only_skipped():
@@ -514,7 +656,7 @@ def test_the_writes_land_before_the_sync_completes(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_apply_named_tensors",
-        lambda _: {"updated": 0, "skipped": 0, "ignored_scales": 0, "unwritten": []},
+        lambda *_: {"updated": 0, "skipped": 0, "ignored_scales": 0, "unwritten": []},
     )
 
     runner.update_weights([], clear_kv_cache=False)

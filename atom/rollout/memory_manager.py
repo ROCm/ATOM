@@ -183,8 +183,9 @@ class MemoryManagerMixin:
         logger.debug(f"{self.label}: KV cache cleared")
         return True
 
-    def release_memory(self, tags: list[str] | None = None) -> bool:
-
+    def release_memory(self, tags: list[str] | None = None) -> dict:
+        """Release the memory *tags* name; whether the weights' contents were
+        discarded, which no resume brings back."""
         if tags is None:
             tags = ["weights", "kv_cache"]
 
@@ -210,7 +211,7 @@ class MemoryManagerMixin:
         torch.cuda.empty_cache()
 
         logger.info(f"{self.label}: GPU memory released, tags={tags}")
-        return True
+        return {"weights_discarded": bool(getattr(self, "_weights_discarded", False))}
 
     def resume_memory(self, tags: list[str] | None = None) -> bool:
 

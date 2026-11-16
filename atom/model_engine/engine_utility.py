@@ -132,6 +132,18 @@ def ask_what_runners_take(runner_mgr, label: str) -> dict[str, str]:
     return unavailable
 
 
+def _wrote_nothing(reply) -> bool:
+    """Whether *reply*, a weight update's, says no rank wrote any of it."""
+    return isinstance(reply, dict) and reply.get("refused_before_writing") is True
+
+
+def _weights_discarded(reply) -> bool:
+    """Whether a release of the weights may have left any rank without them:
+    unless every rank said it kept them resident."""
+    result = reply.get("result") if isinstance(reply, dict) else None
+    return not (isinstance(result, dict) and result.get("weights_discarded") is False)
+
+
 class _ReplyQueue:
     """The EngineCore output queue, as the utility handlers see it.
 
@@ -228,8 +240,11 @@ class EngineUtilityHandler:
         # written nothing leaves the fence as it was.
         self._fenced_before_sync = False
         self._sync_wrote = False
-        # Whether the update being handled may have written on some rank.
-        self._update_wrote = True
+        # The (group, version) of the weight stream awaiting FINISH, and the
+        # last version of each group FINISH committed, which the runners count
+        # as used up; see RDMAWeightReceiverMixin.receive_weights_rdma.
+        self._awaiting_finish_stream: tuple[str, int] | None = None
+        self._committed_stream_versions: dict[str, int] = {}
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -273,6 +288,7 @@ class EngineUtilityHandler:
                     # can still fail this bucket. Stay fenced until CoreManager
                     # explicitly finishes a complete sync on every engine.
                     self._awaiting_finish = None
+                    self._awaiting_finish_stream = None
                     engine._weight_sync_fenced = True
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
@@ -280,14 +296,12 @@ class EngineUtilityHandler:
                         self._fenced_before_sync = fenced
                         self._sync_wrote = False
                     self._weight_sync_in_progress = True
-                    self._update_wrote = True
                 if refusal is None:
                     reply = self._execute_utility_command(cmd, args)
-                    if change is not None:
+                    if change is not None and not _wrote_nothing(reply):
                         self._forget_cached_prefixes()
                 else:
                     # Its sync wrote earlier buckets, so it fails as a sync.
-                    self._update_wrote = False
                     reply = self._refuse(cmd, args, refusal)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
@@ -296,6 +310,12 @@ class EngineUtilityHandler:
                         # before a peer reports failure. Conservatively stop
                         # serving until an all-rank resume succeeds.
                         engine._is_rl_weights_offloaded = True
+                        if _weights_discarded(reply):
+                            # Resumed, they are allocated, not written: only a
+                            # sync that rewrites every parameter makes them
+                            # whole, and nothing serves before it.
+                            engine._rl_weights_inconsistent = True
+                            engine._weight_sync_fenced = True
                         if isinstance(reply, dict) and reply.get("error"):
                             logger.error(
                                 f"{self.label}: partial weight release; engine "
@@ -317,7 +337,7 @@ class EngineUtilityHandler:
                             logger.info(f"{self.label}: engine exited sleep mode")
                 elif cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     failed = isinstance(reply, dict) and bool(reply.get("error"))
-                    self._sync_wrote = self._sync_wrote or self._update_wrote
+                    self._sync_wrote = self._sync_wrote or not _wrote_nothing(reply)
                     if failed:
                         self._weight_sync_in_progress = False
                         self._weight_sync_failure = self._weight_sync_failure or str(
@@ -328,8 +348,10 @@ class EngineUtilityHandler:
                         # what it held, so DISCARD leaves it so too.
                         engine._weight_sync_fenced = self._fenced_before_sync
                         logger.error(
-                            f"{self.label}: weight sync refused before it wrote; "
-                            f"serving is unchanged: {reply['error']}"
+                            f"{self.label}: weight sync refused before it wrote, "
+                            f"so the weights and the prefix cache are as they "
+                            f"were; what it preempted recomputes on them: "
+                            f"{reply['error']}"
                         )
                     elif failed:
                         engine._rl_weights_inconsistent = True
@@ -339,6 +361,11 @@ class EngineUtilityHandler:
                         )
                     elif completes_weight_sync(cmd, args):
                         self._awaiting_finish = args.get("request_id")
+                        if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
+                            self._awaiting_finish_stream = (
+                                args.get("group_name"),
+                                int(args.get("version")),
+                            )
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD and not engine._weight_sync_fenced:
                     # No update of it ran here (the fence goes up with the
                     # first), so this engine still holds the committed weights.
@@ -349,6 +376,7 @@ class EngineUtilityHandler:
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_in_progress = False
                     self._awaiting_finish = None
+                    self._awaiting_finish_stream = None
                     self._weight_sync_failure = self._weight_sync_failure or str(
                         args.get("error") or args.get("failed_cmd") or "aborted"
                     )
@@ -368,6 +396,9 @@ class EngineUtilityHandler:
                         self._weight_sync_in_progress = False
                         self._weight_sync_failure = None
                         self._awaiting_finish = None
+                        if self._awaiting_finish_stream is not None:
+                            group, version = self._awaiting_finish_stream
+                            self._committed_stream_versions[group] = version
                         engine._rl_weights_inconsistent = False
                         engine._weight_sync_fenced = False
                         engine._is_rl_weights_offloaded = False
@@ -436,7 +467,11 @@ class EngineUtilityHandler:
         """
         if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
             self._drain_refused_stream(args, reason)
-        reply = {"cmd": cmd, "error": f"refused: {reason}"}
+        reply = {
+            "cmd": cmd,
+            "error": f"refused: {reason}",
+            "refused_before_writing": True,
+        }
         logger.error(f"{self.label}: {cmd} refused: {reason}")
         self.output_queue.request_id = (
             args.get("request_id") if isinstance(args, dict) else None
@@ -579,6 +614,10 @@ class EngineUtilityHandler:
             return
 
         failures = [r for r in replies if not r.ok]
+        if method in ("init_rdma_weight_group", "destroy_rdma_weight_group"):
+            # A group joined or left anew counts its own versions on the
+            # runners; what was committed on the old one commits nothing there.
+            self._committed_stream_versions.clear()
         logger.info(
             f"{self.label}: collective_rpc {method} ranks={len(replies)} "
             f"failed={len(failures)}"
@@ -639,8 +678,10 @@ class EngineUtilityHandler:
         *call_args,
         barrier: bool = False,
         timeout: float | None = None,
+        call_kwargs: dict | None = None,
     ) -> dict:
-        """Run a direct weight update on every TP rank; the reply for all.
+        """Run a direct weight update on every TP rank; the reply for all,
+        marked ``refused_before_writing`` if no rank wrote any of it.
 
         ``call_func`` returns rank 0's result alone, so a rank that rejected a
         tensor still reported success and the caller went on with a partly
@@ -657,20 +698,22 @@ class EngineUtilityHandler:
         shared buffer.
         """
         if self._weight_sync_failure is not None:
-            self._update_wrote = False
             error = (
                 f"weight sync {self._sync_id!r} already failed, so this update "
                 f"cannot complete it: {self._weight_sync_failure}"
             )
             if cmd == RECEIVE_WEIGHTS_RDMA_CMD:
                 self._drain_refused_stream(args, error)
-            return {"cmd": cmd, "error": error}
+            return {"cmd": cmd, "error": error, "refused_before_writing": True}
         payload = RpcPayload(
             request_id=f"{cmd}-{uuid.uuid4().hex}",
             args=call_args,
             # The runners refuse to complete a partial sync where the weights
             # are not whole; see process_queue.
-            kwargs={"require_full": self.engine._rl_weights_inconsistent},
+            kwargs={
+                "require_full": self.engine._rl_weights_inconsistent,
+                **(call_kwargs or {}),
+            },
             barrier=barrier,
         )
         if timeout is None:
@@ -681,9 +724,6 @@ class EngineUtilityHandler:
             self._discard_failed_update_on_every_rank(cmd, timeout)
             return self._error_reply(cmd, exc)
         failed = [r for r in replies if not r.ok]
-        self._update_wrote = not all(
-            not r.ok and r.refused_before_writing for r in replies
-        )
         if failed:
             error = "; ".join(f"TP rank {r.tp_rank}: {r.error}" for r in failed)
         elif any(r.value != replies[0].value for r in replies[1:]):
@@ -698,7 +738,10 @@ class EngineUtilityHandler:
             return {"cmd": cmd, "result": result}
         self._discard_failed_update_on_every_rank(cmd, timeout)
         logger.error(f"{self.label}: {cmd} failed: {error}")
-        return {"cmd": cmd, "error": error}
+        reply = {"cmd": cmd, "error": error}
+        if all(not r.ok and r.refused_before_writing for r in replies):
+            reply["refused_before_writing"] = True
+        return reply
 
     def _discard_failed_update_on_every_rank(self, cmd: str, timeout: float) -> dict:
         """Keep no rank's scratch after this engine's update failed."""
@@ -849,6 +892,11 @@ class EngineUtilityHandler:
             args.get("group_name"),
             args.get("version"),
             timeout=WEIGHT_STREAM_TIMEOUT_S,
+            call_kwargs={
+                "committed_version": self._committed_stream_versions.get(
+                    args.get("group_name")
+                )
+            },
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply

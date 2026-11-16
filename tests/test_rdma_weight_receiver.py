@@ -901,8 +901,9 @@ def test_versions_rise_within_a_group(monkeypatch):
     worker = _joined_worker(monkeypatch, trainer)
     worker.receive_weights_rdma("g", 3)
 
+    # As the engine passes it once FINISH has committed v3.
     with pytest.raises(RuntimeError, match="must rise.*last=3, got=3"):
-        worker.receive_weights_rdma("g", 3)
+        worker.receive_weights_rdma("g", 3, committed_version=3)
 
     assert trainer.frames == [] and worker.model.w.item() == 5.0
 
@@ -936,7 +937,9 @@ def test_a_stream_refused_before_any_write_says_so(monkeypatch, case, reason):
         worker.receive_weights_rdma("g", 3)
 
     with pytest.raises(WeightReloadRefused, match=reason):
-        worker.receive_weights_rdma("g", 3)
+        worker.receive_weights_rdma(
+            "g", 3, committed_version=3 if case == "a version again" else None
+        )
 
     assert worker.model.w.item() in (0.0, 5.0)
 
@@ -994,6 +997,40 @@ def test_a_version_sent_again_fences_no_engine(monkeypatch):
     assert "must rise" in reply["error"]
     assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
     assert trainer.frames == [] and worker.model.w.item() == 5.0
+
+
+def test_a_version_the_engine_did_not_commit_can_be_sent_again(monkeypatch):
+    """Recorded as soon as this rank's part succeeded, it was used up though
+    the engine failed the sync -- another rank failed, or another DP engine --
+    and the trainer's retry was refused for good."""
+    from tests.test_weight_sync_coverage import _engine_with
+
+    trainer = _Trainer([*_stream_of_w(5.0, version=5), *_stream_of_w(9.0, version=5)])
+    worker = _joined_worker(monkeypatch, trainer)
+    _, send = _engine_with(worker)
+    args = {"group_name": "g", "version": 5}
+
+    send("receive_weights_rdma", sync_id="s1", request_id="a", **args)
+    send("discard_failed_weight_sync", failed_cmd="receive_weights_rdma", error="")
+    reply = send("receive_weights_rdma", sync_id="s2", request_id="b", **args)
+
+    assert "error" not in reply and worker.model.w.item() == 9.0
+
+
+@pytest.mark.parametrize(("frames_taken", "wrote"), [(0, False), (1, True)])
+def test_a_stream_broken_off_says_whether_this_rank_wrote(
+    monkeypatch, frames_taken, wrote
+):
+    """Every rank broke off at the first frame, none having written, yet each
+    counted as written, and a healthy engine was fenced."""
+    trainer = _Trainer(_frames(_three_buckets()))
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep) as raised:
+        _receive(
+            monkeypatch, trainer, _Runner(), agree=_peers(take_frames=frames_taken)
+        )
+
+    assert isinstance(raised.value, WeightReloadRefused) is not wrote
 
 
 def test_a_new_group_starts_its_own_version_count(monkeypatch):

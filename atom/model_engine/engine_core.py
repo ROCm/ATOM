@@ -277,6 +277,7 @@ class EngineCore:
             scheduler=self.scheduler,
             unavailable=unavailable,
         )
+        self._weight_syncs_unavailable = unavailable
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
         # process holds for its lifetime exists, and the next thing is traffic.
@@ -355,9 +356,14 @@ class EngineCore:
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
         """
-        if self.scheduler is None:
-            return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload = {}
+        if self.scheduler is not None:
+            payload["max_pool_tokens"] = self.scheduler.block_manager.max_pool_tokens
+        # So CoreManager refuses, before any engine runs it, a sync one of
+        # them cannot take: under PP, one stage's runners alone may refuse.
+        if self._weight_syncs_unavailable:
+            payload["weight_syncs_unavailable"] = self._weight_syncs_unavailable
+        return payload or None
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before

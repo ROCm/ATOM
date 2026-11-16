@@ -42,6 +42,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr._weight_sync_context = threading.local()
     mgr._weight_sync_dispatch_token = object()
     mgr._rpc_ranks_per_engine = tp
+    mgr._weight_syncs_unavailable = {}
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
     # What reaches one rank at a time, as a failed sync's cleanup does.

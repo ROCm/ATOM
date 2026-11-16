@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import wraps
 
 import torch
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
+from atom.model_loader.weight_names import have_shared_expert
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
@@ -39,6 +41,18 @@ _FUSED_EXPERT_LEAVES = {
 }
 
 _EXPERTS_PREFIX_SUFFIX = ".experts"
+
+
+@contextlib.contextmanager
+def _refused_if_it_raises(label: str):
+    """A failure inside comes before the update writes anything, so it is a
+    refusal (``WeightReloadRefused``), not a failed write."""
+    try:
+        yield
+    except WeightReloadRefused:
+        raise
+    except Exception as exc:
+        raise WeightReloadRefused(f"{label}: {exc}") from exc
 
 
 def _discard_sync_state_on_error(method):
@@ -224,18 +238,40 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             self._cached_packed_mapping_of = model
         return self._cached_packed_mapping
 
-    def _get_packed_shard_order(self) -> dict[str, list]:
-        """Build {target_suffix: [shard_id_0, shard_id_1, ...]} preserving declaration order."""
+    def _packed_shards_of(self, atom_name: str, param_to_module: dict) -> tuple:
+        """The shards that make packed parameter *atom_name* whole, in
+        declaration order: those of every mapping entry a trainer's name
+        resolves through onto it.
+
+        Asked of the parameter, not of the suffix one name matched: a fused
+        parameter can be reached through several, as Qwen3-Next's gate is
+        through '.gate.' for its router rows and 'shared_expert_gate' for the
+        shared expert's. Derived from the packed mapping, so stale exactly
+        when that is.
+        """
         packed = self._get_packed_modules_mapping()
-        # Derived from that mapping, so it is stale exactly when that is: keyed
-        # on the same object rather than on its own first call.
-        if getattr(self, "_cached_packed_shard_order_of", None) is not packed:
-            order: dict[str, list] = {}
-            for tgt, shard_id in packed.values():
-                order.setdefault(tgt, []).append(shard_id)
-            self._cached_packed_shard_order = order
-            self._cached_packed_shard_order_of = packed
-        return self._cached_packed_shard_order
+        if getattr(self, "_cached_packed_shards_of", None) is not packed:
+            self._cached_packed_shards = {}
+            self._cached_packed_shards_of = packed
+        shards = self._cached_packed_shards.get(atom_name)
+        if shards is None:
+            found = []
+            for src_suffix, (tgt_suffix, shard_id) in packed.items():
+                if tgt_suffix not in atom_name or shard_id in found:
+                    continue
+                sent = atom_name.replace(tgt_suffix, src_suffix)
+                if self._resolve_packed_name(sent, param_to_module) == (
+                    atom_name,
+                    shard_id,
+                    tgt_suffix,
+                ):
+                    found.append(shard_id)
+            shards = self._cached_packed_shards[atom_name] = tuple(found)
+        return shards
+
+    def _names_a_shard_of_itself(self, name: str, param_to_module: dict) -> bool:
+        resolved = self._resolve_packed_name(name, param_to_module)
+        return resolved is not None and resolved[0] == name
 
     def _resolve_packed_name(
         self, name: str, param_to_module: dict
@@ -276,12 +312,11 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         if resolved is None:
             return "skipped"
 
-        atom_name, shard_id, tgt_suffix = resolved
+        atom_name, shard_id, _ = resolved
         module, param_name, param = param_to_module[atom_name]
+        whole = self._packed_shards_of(atom_name, param_to_module)
         if self._synced_by_module(module, param_name, tensor, shard_id):
-            self._sync.credit_part(
-                param, shard_id, self._get_packed_shard_order().get(tgt_suffix, ())
-            )
+            self._sync.credit_part(param, shard_id, whole)
             return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
@@ -293,7 +328,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
 
             self._packed_weight_accum[atom_name]["shards"][shard_id] = tensor.clone()
 
-            expected = self._get_packed_shard_order().get(tgt_suffix, [])
+            expected = whole
             if set(self._packed_weight_accum[atom_name]["shards"].keys()) >= set(
                 expected
             ):
@@ -327,9 +362,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
 
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
-        self._sync.credit_part(
-            param, shard_id, self._get_packed_shard_order().get(tgt_suffix, ())
-        )
+        self._sync.credit_part(param, shard_id, whole)
         return "updated"
 
     def _synced_by_module(
@@ -366,10 +399,27 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
 
         Either one expert of a fused MoE, or one shard of a packed module.
         """
+        name = self._fused_shared_expert_name(name, param_to_module) or name
         result = self._apply_expert_weight(name, tensor, param_to_module)
         if result == "skipped":
             result = self._apply_packed_weight(name, tensor, param_to_module)
         return result
+
+    def _fused_shared_expert_name(self, name: str, param_to_module: dict) -> str | None:
+        """*name*, a shared expert's, rewritten onto the slot of the fused MoE
+        buffer the loader put it in, when its layer fuses its shared expert
+        (``CheckpointNameRewriter``); None otherwise. Unmapped, the trainer's
+        shared expert writes nothing, and that slot is never rewritten."""
+        matching = have_shared_expert(name)
+        if matching is None:
+            return None
+        layer_prefix = name.split(matching, 1)[0]
+        module_prefix = matching.split("shared_expert", 1)[0]
+        entry = param_to_module.get(f"{layer_prefix}{module_prefix}experts.w13_weight")
+        layout = getattr(entry[0], "expert_layout", None) if entry else None
+        if layout is None or not layout.num_fused_shared_experts:
+            return None
+        return name.replace(matching, f"{module_prefix}experts.{layout.num_routed}.")
 
     def _get_expert_params_mapping(self) -> list[tuple[str, str, int, str]]:
         """[(ckpt weight fragment, ATOM param fragment, expert_id, shard_id)].
@@ -1008,13 +1058,17 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         return self._sync
 
     def _apply_named_tensors(
-        self, named_tensors: Iterable[tuple[str, torch.Tensor]]
+        self,
+        named_tensors: Iterable[tuple[str, torch.Tensor]],
+        prepare: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> dict:
-        """Write one batch of named tensors into the sync open on this rank.
+        """Write one batch of named tensors into the sync open on this rank;
+        *prepare*, if given, makes each tensor what is written, one at a time.
 
         One loop for every path, so they cannot drift apart in what they write
         or count. What spans buckets -- the expert relayout, a fused FP8
-        parameter's shards -- is finished by ``_complete_sync``.
+        parameter's shards -- is finished by ``_complete_sync``. What can be
+        refused from the names alone is refused before anything is written.
 
         ``unwritten`` are the names that resolve to a parameter here which
         still holds its earlier value, unlike a name this model has no
@@ -1022,6 +1076,16 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         """
         sync = self._open_sync()
         param_to_module = self._get_param_to_module_mapping()
+        named_tensors = list(named_tensors)
+        with _refused_if_it_raises(self.label):
+            for name, _ in named_tensors:
+                if name not in param_to_module and name.endswith("weight_scale_inv"):
+                    raise ValueError(
+                        f"{name} is the scale of a prequantised weight, which "
+                        f"this model has no parameter for; send the weights "
+                        f"unquantised, and ATOM requantises them"
+                    )
+                sync.take(name)
 
         updated = 0
         skipped = 0
@@ -1029,14 +1093,9 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         unwritten: list[str] = []
 
         for name, tensor in named_tensors:
-            sync.take(name)
+            if prepare is not None:
+                tensor = prepare(tensor)
             if name not in param_to_module:
-                if name.endswith("weight_scale_inv"):
-                    raise ValueError(
-                        f"{self.label}: {name} is the scale of a prequantised "
-                        f"weight, which this model has no parameter for; send "
-                        f"the weights unquantised, and ATOM requantises them"
-                    )
                 result = self._apply_unmatched_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
@@ -1064,6 +1123,19 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             if self._synced_by_module(module, param_name, tensor):
                 updated += 1
                 sync.credit(param)
+                continue
+            if tensor.shape != param.shape and self._names_a_shard_of_itself(
+                name, param_to_module
+            ):
+                # One shard of the parameter it is named like, as Qwen3-Next's
+                # router rows ('.gate.' -> ('.gate.', 0)) of a gate padded
+                # past them; its loader takes the shard id.
+                result = self._apply_packed_weight(name, tensor, param_to_module)
+                if result == "updated":
+                    updated += 1
+                elif result != "accumulated":
+                    skipped += 1
+                    unwritten.append(name)
                 continue
             if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 wrote = self._requantize_fp8_weight(module, param_name, param, tensor)
@@ -1209,10 +1281,11 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         complete: bool,
         require_full: bool,
         clear_kv_cache: bool = True,
+        prepare: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> int:
         """Write one batch of a sync, completing the sync if it is the last;
         the number of parameters written. Every path ends here."""
-        counts = self._apply_named_tensors(named_tensors)
+        counts = self._apply_named_tensors(named_tensors, prepare)
         if complete:
             self._complete_sync(require_full, clear_kv_cache)
         logger.info(
@@ -1299,17 +1372,21 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         from unittest.mock import patch
 
         # Open the existing shared-memory segment (do NOT unlink – caller owns it)
-        with patch(
-            "multiprocessing.resource_tracker.register",
-            lambda *args, **kwargs: None,
+        with (
+            _refused_if_it_raises(self.label),
+            patch(
+                "multiprocessing.resource_tracker.register",
+                lambda *args, **kwargs: None,
+            ),
         ):
             shm = _shm_mod.SharedMemory(name=shm_name)
 
         try:
-            views = decode_bucket(
-                bucket_entries(bucket_meta),
-                torch.frombuffer(shm.buf, dtype=torch.uint8),
-            )
+            with _refused_if_it_raises(self.label):
+                views = decode_bucket(
+                    bucket_entries(bucket_meta),
+                    torch.frombuffer(shm.buf, dtype=torch.uint8),
+                )
             return self._write_batch(
                 "SHM", views, complete=is_last, require_full=require_full
             )
@@ -1361,44 +1438,51 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
             RuntimeError: a tensor named a parameter but could not be written
                 to it. Raised once the rest of the bucket is applied.
         """
-        # Cache the IPC buffer mapping: only open once per weight-update cycle.
-        if self._ipc_buffer is None:
-            from atom.rollout.weight_sync import rebuild_ipc_handle
+        with _refused_if_it_raises(self.label):
+            # Cache the IPC buffer mapping: only open once per weight-update cycle.
+            if self._ipc_buffer is None:
+                from atom.rollout.weight_sync import rebuild_ipc_handle
 
-            dp_rank_local = self.config.parallel_config.data_parallel_rank_local or 0
-            global_device_idx = dp_rank_local * self.world_size + self.rank
-            local_device_idx = self.device.index
-            if ipc_handles is not None and global_device_idx in ipc_handles:
-                self._ipc_buffer = rebuild_ipc_handle(
-                    ipc_handles[global_device_idx], device_id=local_device_idx
+                dp_rank_local = (
+                    self.config.parallel_config.data_parallel_rank_local or 0
                 )
-                logger.info(
-                    f"{self.label}: opened per-GPU IPC buffer mapping "
-                    f"(size={self._ipc_buffer.numel()} bytes, "
-                    f"global_device_idx={global_device_idx}, local_device_idx={local_device_idx}, "
-                    f"buffer_device={self._ipc_buffer.device}, "
-                    f"runner_device={self.device})"
-                )
-            else:
-                self._ipc_buffer = rebuild_ipc_handle(ipc_handle)
-                logger.info(
-                    f"{self.label}: opened IPC buffer mapping "
-                    f"(size={self._ipc_buffer.numel()} bytes, "
-                    f"buffer_device={self._ipc_buffer.device}, "
-                    f"runner_device={self.device})"
-                )
+                global_device_idx = dp_rank_local * self.world_size + self.rank
+                local_device_idx = self.device.index
+                if ipc_handles is not None and global_device_idx in ipc_handles:
+                    self._ipc_buffer = rebuild_ipc_handle(
+                        ipc_handles[global_device_idx], device_id=local_device_idx
+                    )
+                    logger.info(
+                        f"{self.label}: opened per-GPU IPC buffer mapping "
+                        f"(size={self._ipc_buffer.numel()} bytes, "
+                        f"global_device_idx={global_device_idx}, local_device_idx={local_device_idx}, "
+                        f"buffer_device={self._ipc_buffer.device}, "
+                        f"runner_device={self.device})"
+                    )
+                else:
+                    self._ipc_buffer = rebuild_ipc_handle(ipc_handle)
+                    logger.info(
+                        f"{self.label}: opened IPC buffer mapping "
+                        f"(size={self._ipc_buffer.numel()} bytes, "
+                        f"buffer_device={self._ipc_buffer.device}, "
+                        f"runner_device={self.device})"
+                    )
 
-        views = decode_bucket(bucket_entries(bucket_meta), self._ipc_buffer)
-        # Copied one at a time, so the sender can overwrite its buffer without
-        # this rank ever holding a copy of the whole bucket. .to() copies when
-        # the device differs; on the same device it would not.
-        copies = (
-            (name, src.clone() if src.device == self.device else src.to(self.device))
-            for name, src in views
-        )
+            views = decode_bucket(bucket_entries(bucket_meta), self._ipc_buffer)
+
+        def copy(src: torch.Tensor) -> torch.Tensor:
+            # One at a time, so the sender can overwrite its buffer without
+            # this rank ever holding a copy of the whole bucket. .to() copies
+            # when the device differs; on the same device it would not.
+            return src.clone() if src.device == self.device else src.to(self.device)
+
         try:
             return self._write_batch(
-                "IPC", copies, complete=is_last, require_full=require_full
+                "IPC",
+                views,
+                complete=is_last,
+                require_full=require_full,
+                prepare=copy,
             )
         finally:
             # The mapping is held for the whole sync, and released at its end.

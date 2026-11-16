@@ -335,6 +335,9 @@ class CoreManager:
         # ranks: a DP rank sizes its pool from its own free memory, so a prompt
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
+        # What some engine's runners cannot take, by feature, as each said at
+        # startup.
+        self._weight_syncs_unavailable: dict[str, str] = {}
         self.engine_core_processes = []
         self._distributed_stores = []
         self.input_sockets = []
@@ -767,6 +770,8 @@ class CoreManager:
         """Fold one rank's READY facts into the manager's view of capacity."""
         if not data:
             return
+        for feature, reason in (data.get("weight_syncs_unavailable") or {}).items():
+            self._weight_syncs_unavailable.setdefault(feature, reason)
         reported = data.get("max_pool_tokens")
         if reported is None:
             return
@@ -2278,11 +2283,31 @@ class CoreManager:
                 f"broadcast_utility_command instead."
             )
         if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            self._refuse_what_an_engine_cannot_take(cmd, owns_sync)
             # Re-entrant, so the weight_sync_session() a bucket belongs to
             # takes it again rather than waiting on itself.
             with self._weight_sync_lock:
                 return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
         return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _refuse_what_an_engine_cannot_take(self, cmd: str, in_session: bool) -> None:
+        """Refuse a reload some engine's runners cannot take, before any
+        engine runs it: each engine refuses only what its own cannot, so under
+        PP the head would have written by the time a later stage refused.
+
+        Not a weight stream: its trainer is already broadcasting, so each
+        engine takes it in and refuses it there.
+        """
+        reason = self._weight_syncs_unavailable.get("weight_reload")
+        if cmd == RECEIVE_WEIGHTS_RDMA_CMD or reason is None:
+            return
+        if in_session:
+            ctx = self._weight_sync_context
+            ctx.failure = ctx.failure or f"{cmd}: refused: {reason}"
+        raise RuntimeError(
+            f"{self.label}: utility command {cmd!r} refused before any engine "
+            f"ran it: {reason}"
+        )
 
     def _sync_weight_update(
         self, cmd: str, timeout: float, in_session: bool, kwargs: dict

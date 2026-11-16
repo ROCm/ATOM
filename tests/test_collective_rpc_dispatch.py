@@ -22,6 +22,7 @@ the wire types live in ``atom.model_engine.collective_rpc`` rather than in
 """
 
 import queue
+from types import SimpleNamespace
 
 import pytest
 
@@ -287,7 +288,10 @@ def test_a_direct_update_runs_on_every_rank(cmd, args):
     assert (method, payload.args) == _DIRECT_UPDATE_CALLS[cmd]
     # By name: appended to the arguments, it reached whichever parameter came
     # last in each runner method.
-    assert payload.call_kwargs() == {"require_full": False}
+    expected = {"require_full": False}
+    if cmd == "receive_weights_rdma":
+        expected["committed_version"] = None
+    assert payload.call_kwargs() == expected
     assert _responses(out) == [{"cmd": cmd, "result": 4}]
 
 
@@ -721,6 +725,54 @@ def test_a_weight_stream_its_sync_cannot_take_is_still_drained():
     method, payload, _ = mgr.calls[-1]
     assert (method, payload.args) == ("receive_weights_rdma", ("g", 7))
     assert "not cleared" in payload.kwargs["refusal"]
+
+
+@pytest.mark.parametrize(("discarded", "whole"), [(True, False), (False, True)])
+def test_released_weights_are_not_whole_until_a_full_sync(discarded, whole):
+    """Released, the weights' storage is dropped and resumed as unwritten
+    memory, yet the engine called them whole: a sync sending part of them
+    committed, and the rest served whatever the memory held."""
+    replies = [
+        RpcResult("u", r, value={"weights_discarded": discarded}) for r in (0, 1)
+    ]
+    h, _, out = _handler(replies=replies)
+    engine = _Engine()
+
+    _process_one(h, out, engine, "release_memory", {"tags": ["weights"]})
+
+    assert engine._rl_weights_inconsistent is not whole
+    assert engine._weight_sync_fenced is not whole
+
+
+@pytest.mark.parametrize(
+    ("replies", "drops"),
+    [
+        (
+            [
+                RpcResult(
+                    "u", r, error="WeightReloadRefused: no", refused_before_writing=True
+                )
+                for r in (0, 1)
+            ],
+            False,
+        ),
+        (_TWO_RANKS_OK, True),
+    ],
+    ids=["refused-before-writing", "written"],
+)
+def test_only_an_update_that_wrote_drops_the_prefix_cache(replies, drops):
+    """Refused before it wrote, the sync still emptied the prefix cache, and
+    the log said serving was unchanged."""
+    dropped = []
+    scheduler = SimpleNamespace(
+        block_manager=SimpleNamespace(clear_cache=lambda: dropped.append(True))
+    )
+    mgr, out = _RunnerMgr(replies=replies), queue.Queue()
+    h = EngineUtilityHandler(mgr, out, label="test", scheduler=scheduler)
+
+    _process_one(h, out, _Engine(), "update_weights_ipc", _bucket("u1", True))
+
+    assert bool(dropped) is drops
 
 
 def test_after_a_failed_sync_only_a_full_one_can_lift_the_fence():
