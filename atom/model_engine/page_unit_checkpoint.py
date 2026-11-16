@@ -1300,12 +1300,13 @@ class PagedStateCheckpointCoordinator:
         for seq, h, step in pending.values():
             # Safe to read now because `checkpoint` keeps at most one pending
             # boundary per seq: this slot holds the state as of that boundary
-            # and no other. See `_supersede`.
+            # (of its verify `step`, for a decode one) and no other. See
+            # `_supersede`.
             src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
             build = step >= 0 and self.decode_snapshot
-            if build and (self._scratch is None or not self._scratch.has_free()):
+            if build and not self._scratch.has_free():
                 self.checkpoints_dropped += 1
                 continue
             op = self.store.begin_store(h, src_slot)

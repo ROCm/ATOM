@@ -43,6 +43,7 @@ def builder(
     num_spec=0,
     pp=1,
     rapidserve=False,
+    replayssm=False,
 ):
     config = SimpleNamespace(
         pipeline_parallel_size=pp,
@@ -52,7 +53,7 @@ def builder(
         model_runner=SimpleNamespace(config=config),
         num_state_layers=lambda: layers,
         num_spec=num_spec,
-        replayssm=False,
+        replayssm=replayssm,
         _state_shape_for_runner=lambda: (shape_k, shape_v),
         _state_dtypes=lambda: (dt_k, dt_v),
     )
@@ -161,3 +162,8 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
         interior state to slice a checkpoint out of."""
         with tp_world(TP):
             assert not Builder.state_transfer(builder()).readable_midstep
+
+    def test_only_a_replayssm_copy_builds_decode_snapshots(self):
+        with tp_world(TP):
+            assert not Builder.state_transfer(builder()).decode_snapshot
+            assert Builder.state_transfer(builder(replayssm=True)).decode_snapshot

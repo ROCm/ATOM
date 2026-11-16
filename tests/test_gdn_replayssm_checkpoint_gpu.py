@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""A decode-time PAGE checkpoint is the image of its verify step.
-
-A decode leaves the live slot ahead of the boundary it files: the conv window
-sits `step` columns in, and under ReplaySSM the SSM plane lags the records
-since the last flush. The image is resumed by prefill, which reads the SSM
-plane and the first `kernel - 1` conv columns alone, so the store builds the
-step's image in a scratch slot. Runs the shipped store/restore path over the
-real ReplaySSM, conv, copy and chunk kernels.
-"""
+"""A decode-time PAGE checkpoint is the image of its verify step, as prefill
+resumes it. Runs the shipped store/restore path over the real kernels."""
 
 from types import SimpleNamespace
 
@@ -57,35 +50,10 @@ ROWS, BLOCK, ENTRY, UNITS = 2, 16, 1024, 32
 LAYOUT = "test-gdn-replayssm"
 
 
-class _Copier:
-    """What the store/restore path reads, with the shipped methods bound."""
+class _Copier(PageUnitGeometryMixin, GDNStateMixin):
+    """The shipped store/restore path, built without a model runner."""
 
-
-for _name in (
-    "execute_paged_state_copies",
-    "_build_decode_images",
-    "_materialize",
-    "_validate_paged_state_op",
-    "_checkpoint_copy_plan",
-    "_checkpoint_slot_bases",
-    "_checkpoint_plane_tensors",
-    "_checkpoint_plane_shapes",
-    "_checkpoint_layer_ranges",
-    "_checkpoint_segment_sizes",
-    "_checkpoint_num_slots",
-    "checkpoint_image_bytes",
-    "_checkpoint_descriptor_device",
-):
-    setattr(_Copier, _name, getattr(GDNStateMixin, _name))
-for _name in (
-    "_page_unit_index_cache",
-    "_page_unit_kv_cache",
-    "_page_unit_regions",
-    "_page_unit_bases",
-    "_page_unit_stream_sizes",
-):
-    setattr(_Copier, _name, getattr(PageUnitGeometryMixin, _name))
-_Copier._checkpoint_staging = AttentionMetadataBuilder._checkpoint_staging
+    _checkpoint_staging = AttentionMetadataBuilder._checkpoint_staging
 
 
 def _copier(kda=False) -> _Copier:
@@ -104,11 +72,13 @@ def _copier(kda=False) -> _Copier:
         ),
         # Every slot as a prefill leaves it.
         replayssm_write_pos=torch.full((SLOTS,), -1, dtype=torch.int32, device=DEV),
-        kv_cache=torch.zeros((ROWS, UNITS, BLOCK, ENTRY), dtype=torch.uint8, device=DEV),
+        kv_cache=torch.zeros(
+            (ROWS, UNITS, BLOCK, ENTRY), dtype=torch.uint8, device=DEV
+        ),
         block_size=BLOCK,
         config=SimpleNamespace(num_kvcache_blocks=UNITS, max_num_seqs=4),
     )
-    c = _Copier()
+    c = _Copier.__new__(_Copier)
     c.model_runner = runner
     c.kv_pool = SimpleNamespace(cache=SimpleNamespace(view=lambda _n: runner.kv_cache))
     c.replayssm = True
@@ -120,7 +90,9 @@ def _copier(kda=False) -> _Copier:
     c.conv_weight = torch.randn(CONV[1], WIDTH + 1, dtype=bf16, device=DEV) * 0.3
     image = c.checkpoint_image_bytes()
     runner.state_runtime = SimpleNamespace(
-        checkpoint_spec=PagedStateCheckpointSpec(ROWS * BLOCK * ENTRY, image, LAYOUT, image)
+        checkpoint_spec=PagedStateCheckpointSpec(
+            ROWS * BLOCK * ENTRY, image, LAYOUT, image
+        )
     )
     return c
 
@@ -191,7 +163,10 @@ def _decode(c, slot, accepted, windows, xs):
 def _step_inputs():
     return (
         [_window() for _ in range(LAYERS)],
-        [torch.randn(T, CONV[1], dtype=torch.bfloat16, device=DEV) for _ in range(LAYERS)],
+        [
+            torch.randn(T, CONV[1], dtype=torch.bfloat16, device=DEV)
+            for _ in range(LAYERS)
+        ],
     )
 
 
@@ -241,10 +216,10 @@ def _rel_l2(a, b):
 
 def _fold(s0, buf_k, buf_u, buf_g, n, kda):
     """The state after `n` records, the recurrence's closed form, `[HV, K, V]`."""
-    hv = s0.shape[0]
+    hv, k = s0.shape[0], buf_k.shape[-1]
     g = buf_g[:, :n].float()  # [HV, n] or [HV, n, K]
     if not kda:
-        g = g[..., None].expand(hv, n, K)
+        g = g[..., None].expand(hv, n, k)
     c = g.cumsum(1)
     kw = buf_k[:, :n].float() * torch.exp(c[:, -1:] - c)
     s = torch.einsum("hjk,hjv->hkv", kw, buf_u[:, :n].float())
@@ -284,6 +259,11 @@ def test_a_decode_image_resumes_as_its_verify_step(decodes, step):
 
     for before, after in zip(live, _slot(c, LIVE)):
         assert torch.equal(before, after), "the store changed the live slot"
+    cut = CONV[0] - step
+    assert torch.equal(
+        r.mamba_k_cache[:, DST],
+        torch.cat([live[0][:, step:], live[0][:, cut:]], dim=1),
+    ), "the conv image is not the step's window over the slot's own tail"
     for dst in (DST2, DST3):
         assert torch.equal(r.mamba_v_cache[:, dst], parked[1])
         assert torch.equal(r.mamba_k_cache[:, dst], parked[0])
@@ -346,18 +326,22 @@ def test_a_kda_decode_image_is_its_verify_step(h, step):
         assert _rel_l2(got, want) < 1e-2
 
 
+@pytest.mark.parametrize(
+    "k, v, dtype",
+    [(K, V, torch.bfloat16), (64, 128, torch.bfloat16), (K, V, torch.float32)],
+)
 @pytest.mark.parametrize("kda", [False, True])
 @pytest.mark.parametrize("h, step", [(5, 0), (5, 2), (10, 0), (10, 3)])
-def test_materialize_folds_exactly_the_step_s_records(kda, h, step):
+def test_materialize_folds_exactly_the_step_s_records(kda, h, step, k, v, dtype):
     """Against the closed form; h = 10 is a flushing forward."""
     torch.manual_seed(h + step)
     slots, hv = 3, 4
-    sk, su, sg = replayssm_buffer_shapes(CAP, hv, K, V, kda)
+    sk, su, sg = replayssm_buffer_shapes(CAP, hv, k, v, kda)
     buf_k = torch.randn((slots,) + sk, dtype=torch.bfloat16, device=DEV) * 0.1
     buf_u = torch.randn((slots,) + su, dtype=torch.bfloat16, device=DEV) * 0.1
     buf_g = -torch.rand((slots,) + sg, dtype=torch.float32, device=DEV) * 0.1
-    state = (hv, V, K) if kda else (hv, K, V)
-    ckpt = torch.randn((slots,) + state, dtype=torch.bfloat16, device=DEV) * 0.1
+    state = (hv, v, k) if kda else (hv, k, v)
+    ckpt = torch.randn((slots,) + state, dtype=dtype, device=DEV) * 0.1
     write_pos = torch.tensor([h, -1, -1], dtype=torch.int32, device=DEV)
     ix = torch.tensor([0], dtype=torch.int64, device=DEV)
     replayssm_materialize(

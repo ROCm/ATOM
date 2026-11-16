@@ -773,18 +773,6 @@ def _seq(slot):
     return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
 
 
-def test_a_decode_boundary_borrows_scratch_for_one_batch():
-    c, pool = _snapshot_coordinator(1)
-    c.checkpoint(_seq(5), 8, 101, step=2)
-    c.checkpoint(_seq(6), 6, 102)  # a prefill wrote that slot whole
-    stores, _ = c.take_checkpoint_ops()
-    got = {(op.src_slot, op.step, op.scratch_slot) for op in stores}
-    assert got == {(5, 2, 0), (6, -1, -1)}
-    assert not pool.has_free()
-    c.complete_previous_batch()
-    assert pool.has_free()
-
-
 def test_a_decode_boundary_with_no_scratch_free_is_dropped():
     c, _ = _snapshot_coordinator(0)
     c.checkpoint(_seq(5), 8, 101, step=0)
@@ -793,18 +781,11 @@ def test_a_decode_boundary_with_no_scratch_free_is_dropped():
     assert c.checkpoints_dropped == 1
 
 
-def test_a_backend_copying_its_slot_as_is_borrows_nothing():
-    c, pool = _snapshot_coordinator(1, decode_snapshot=False)
-    c.checkpoint(_seq(5), 8, 101, step=0)
+@pytest.mark.parametrize("decode_snapshot, step", [(False, 0), (True, -1)])
+def test_a_slot_copied_as_is_borrows_nothing(decode_snapshot, step):
+    """A backend keeping its slot as it stands, or a slot a prefill wrote whole."""
+    c, pool = _snapshot_coordinator(1, decode_snapshot)
+    c.checkpoint(_seq(5), 8, 101, step=step)
     stores, _ = c.take_checkpoint_ops()
     assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
-    assert pool.has_free()
-
-
-def test_a_staged_boundary_is_copied_as_is():
-    c, pool = _snapshot_coordinator(1)
-    c.checkpoint_when_scheduled(_seq(5), 101)
-    assert c.take_checkpoint_ops()[0] == ()  # held back from its own batch
-    stores, _ = c.take_checkpoint_ops()
-    assert [(op.step, op.scratch_slot) for op in stores] == [(-1, -1)]
     assert pool.has_free()

@@ -420,9 +420,10 @@ class BlockManager:
         self.midstep_grid = state_runtime.transfer.midstep_grid
         self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
         if self.paged_state_checkpoints is not None:
-            # A PAGE midstep checkpoint is copied into a scratch slot from
-            # this pool, then stored from there, within the copy budget the
-            # runner's descriptor staging is sized to: one definition for both.
+            # A PAGE midstep checkpoint or decode image is built in a scratch
+            # slot from this pool, then stored from there, within the copy
+            # budget the runner's descriptor staging is sized to: one
+            # definition for both.
             self.paged_state_checkpoints.attach_midstep_scratch(
                 self.state,
                 checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
@@ -3298,7 +3299,8 @@ class BlockManager:
         mid-generation, one that hands nothing over (a retaining SWA pool, 0)
         always does, one that cannot keep a checkpoint at all (`inf`) never
         does, and a request stopping on this step passes 0 and keeps nothing
-        that nothing will ever resume from.
+        that nothing will ever resume from. A decode boundary past verify step
+        0 (`snapshot_step`) is kept only by a class with `decode_snapshot`.
 
         The position must be exact. A checkpoint holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
@@ -3395,9 +3397,7 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
-            # A slot copied as it stands is trusted only at step 0: GDN's conv
-            # window and draft slots move past it (a position-addressed state
-            # such as V4's would serve any step, but is not told apart).
+            # A slot kept as it stands is trusted only at verify step 0.
             and (snapshot_step <= 0 or c.decode_snapshot)
         ]
 

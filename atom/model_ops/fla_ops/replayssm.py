@@ -194,8 +194,8 @@ def _replay_tiles(
         ).to(tl.float32)
     else:
         # Scalar gate: broadcast the per-record value across K so the cumsum
-        # and the weighting below stay one code path.  Only KDA callers reach
-        # this helper, and they always have a per-channel gate,
+        # and the weighting below stay one code path.  Only the fused-gating
+        # KDA kernel reaches this helper, and it always has a per-channel gate,
         # so in practice this branch is not instantiated -- the scalar-gate
         # callers go through `_replay_tiles_kmajor`, which keeps the gate a
         # [BH] vector instead of paying the broadcast.
@@ -552,49 +552,13 @@ def _replayssm_materialize_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
 
-    if IS_KDA:
-        # KDA keeps the state transposed as [V, K]: the KDA forward's flush.
-        mask_t = mask_v[:, None] & mask_k[None, :]
-        off_t = i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        b_s0t = tl.load(
-            ckpt + src * stride_ckpt_slot + off_t, mask=mask_t, other=0.0
-        ).to(tl.float32)
-        b_kw_t, b_ru_t, b_decay_t = _replay_tiles(
-            buf_k,
-            buf_u,
-            buf_g,
-            src,
-            n,
-            stride_bufk_slot,
-            stride_bufk_pos,
-            stride_bufk_hv,
-            stride_bufu_slot,
-            stride_bufu_pos,
-            stride_bufu_hv,
-            stride_bufg_slot,
-            stride_bufg_pos,
-            stride_bufg_hv,
-            i_hv,
-            o_k,
-            o_v,
-            mask_k,
-            mask_v,
-            K,
-            V,
-            BK,
-            BH,
-            True,
-        )
-        b_ht = b_s0t * b_decay_t[None, :] + _replay_dot(
-            tl.trans(b_ru_t), b_kw_t, False, DOT_MODE
-        )
-        p_dst_t = ckpt + dst * stride_ckpt_slot + off_t
-        tl.store(p_dst_t, b_ht.to(p_dst_t.dtype.element_ty), mask=mask_t)
-        return
-
     mask_h = mask_k[:, None] & mask_v[None, :]
-    p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
-    b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
+    # A [K, V] tile either way; KDA keeps the state transposed as [V, K].
+    if IS_KDA:
+        off = i_hv * K * V + o_k[:, None] + o_v[None, :] * K
+    else:
+        off = i_hv * K * V + o_k[:, None] * V + o_v[None, :]
+    b_s0 = tl.load(ckpt + src * stride_ckpt_slot + off, mask=mask_h, other=0.0).to(
         tl.float32
     )
     b_kw, b_ru, b_decay = _replay_tiles_kmajor(
@@ -621,15 +585,11 @@ def _replayssm_materialize_kernel(
         V,
         BK,
         BH,
-        False,
+        IS_KDA,
     )
     b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
-    p_dst = ckpt + dst * stride_ckpt_slot + i_hv * K * V
-    tl.store(
-        p_dst + o_k[:, None] * V + o_v[None, :],
-        b_h.to(p_dst.dtype.element_ty),
-        mask=mask_h,
-    )
+    p_dst = ckpt + dst * stride_ckpt_slot + off
+    tl.store(p_dst, b_h.to(p_dst.dtype.element_ty), mask=mask_h)
 
 
 def replayssm_materialize(

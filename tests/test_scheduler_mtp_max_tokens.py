@@ -335,14 +335,9 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     assert outputs[good.id].output_tokens == [11]
 
 
-class TestDecodeBoundaryStep:
-    """A decode boundary is named by the forward its slot holds when stored.
-
-    A deferred seq in the batch just run had its last sampled token forwarded
-    by it, so the boundary is that forward's first token (step 0). One that did
-    not run (a prefill-only batch, a DP dummy), or undeferred output, still
-    holds the window that sampled them, whose last token is not forwarded yet.
-    """
+class TestDecodeBoundaryFiling:
+    """A deferred seq that ran files step 0 of that forward; otherwise its slot
+    still holds the window that sampled, so it files that window's last token."""
 
     def _filed(self, seq_factory, ran, deferred=True):
         mtp = TestMTPMaxTokens()
@@ -381,12 +376,12 @@ class TestDecodeBoundaryStep:
 
     def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory):
         (filed,), n = self._filed(seq_factory, ran=True)
-        assert filed == (n, 0)
+        assert filed == (n, 0) == (8, 0)
 
     def test_a_seq_that_did_not_run_names_its_last_accepted_token(self, seq_factory):
         (filed,), n = self._filed(seq_factory, ran=False)
-        assert filed == (n - 1, 3)
+        assert filed == (n - 1, 3) == (7, 3)
 
     def test_undeferred_output_names_its_last_accepted_token(self, seq_factory):
         (filed,), n = self._filed(seq_factory, ran=True, deferred=False)
-        assert filed == (n - 1, 3)
+        assert filed == (n - 1, 3) == (10, 3)

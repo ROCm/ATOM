@@ -2306,6 +2306,9 @@ class TestDecodeBoundaryStep:
         (op,) = bm.take_state_maintenance_ops().checkpoint_stores
         assert (op.src_slot, op.step) == (seq.state_slot, 2)
         assert op.scratch_slot not in (-1, seq.state_slot)
+        assert not bm.state.is_free(op.scratch_slot)
+        bm.complete_previous_state_batch()
+        assert bm.state.is_free(op.scratch_slot), "the scratch is lent one batch"
 
     def test_a_slot_kept_as_it_stands_files_no_later_step(self):
         """Nor does it spend the spacing on one it cannot keep."""

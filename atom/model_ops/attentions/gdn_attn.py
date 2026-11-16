@@ -58,7 +58,7 @@ logger = logging.getLogger("atom")
 # both kinds cannot number them into the same space.
 LINEAR_STATE_ROWS = "linear_state"
 
-# Decode stores one step builds images for; past it a store is dropped.
+# Spare state slots, so a full batch still has scratch to build decode images in.
 DECODE_SNAPSHOT_SCRATCH_SLOTS = 4
 
 _GDN_SSM_DTYPES = {
@@ -659,7 +659,7 @@ class GDNStateMixin(PoolRowsMixin):
         prefix-reusing traffic. Decoupling the two is what the PAGE path does,
         by keeping the image in KV blocks instead of a slot; a flat cushion
         here would buy the same thing for `fork` at the cost of a knob nobody
-        can size without measuring, so it is not offered.
+        can size without measuring, so it is not offered for that.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()

@@ -3925,9 +3925,6 @@ class Scheduler:
           `min_fork_tokens` guarantees prompt is left over, and prompt always
           forwards down the non-spec path.
 
-        A class that checkpoints by copying is bound by none of that: the
-        destination is complete when the copy lands, so any decode step will do.
-
         Otherwise plain decode carries exactly one token, and whether that is
         enough to fill a fresh slot is the backend's `min_fork_tokens` to say.
         """
@@ -4844,8 +4841,7 @@ class Scheduler:
                     seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
-        # Every caller passes the batch just run (a DP dummy passes none); not
-        # every caller passes `batch`.
+        # `seqs` is the batch just run (empty for a DP dummy); `batch` may be None.
         ran_ids = {seq.id for seq in seqs}
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:

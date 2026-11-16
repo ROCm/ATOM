@@ -63,6 +63,7 @@ def _transfer(monkeypatch, **kwargs):
         "tp": 8,
         "num_spec": 0,
         "replayssm": False,
+        "midstep": False,
     }
     params.update(kwargs)
     builder_cls = _builder_cls()
@@ -70,9 +71,11 @@ def _transfer(monkeypatch, **kwargs):
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=params["tp"]),
     )
+    monkeypatch.setenv("ATOM_GDN_STATE_MIDSTEP", "1" if params["midstep"] else "0")
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
         replayssm=params["replayssm"],
+        _conv_state_len=lambda: params["shape_k"][0],
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
@@ -85,6 +88,14 @@ def _layout(monkeypatch, **kwargs):
     return _transfer(monkeypatch, **kwargs).paged_layout_id
 
 
+@pytest.mark.parametrize("midstep", [False, True])
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_only_a_replayssm_copy_builds_decode_snapshots(monkeypatch, replayssm, midstep):
+    transfer = _transfer(monkeypatch, replayssm=replayssm, midstep=midstep)
+    assert transfer.readable_midstep is midstep
+    assert transfer.decode_snapshot is replayssm
+
+
 @pytest.mark.parametrize(
     ("replayssm", "prefix_caching", "interval", "spare"),
     [
@@ -92,7 +103,6 @@ def _layout(monkeypatch, **kwargs):
         (False, True, 8192, False),
         (True, False, 8192, False),
         (True, True, 0, False),
-        (True, True, -1, False),
     ],
 )
 def test_decode_images_get_spare_slots_only_where_they_are_built(
@@ -102,7 +112,6 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
     from atom.model_ops.attentions.gdn_attn import DECODE_SNAPSHOT_SCRATCH_SLOTS
 
     transfer = _transfer(monkeypatch, replayssm=replayssm)
-    assert transfer.decode_snapshot is replayssm
     builder = SimpleNamespace(
         model_runner=SimpleNamespace(
             config=SimpleNamespace(

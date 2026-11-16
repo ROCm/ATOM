@@ -134,9 +134,9 @@ class TestPlanPools:
         with no `entries // entries_per_req` rounding to align to.
 
         GDN under decode snapshots passes a nonzero `extra_entries`. This pins
-        the arithmetic so a cushion stays flat rather
-        than `width x` what it asked for -- at `spr == 3` below, that is 32
-        slots against 96, with the difference staying in the paged pool.
+        the arithmetic so a cushion stays flat rather than `width x` what it
+        asked for -- at `spr == 3` below, that is 32 slots against 96, with the
+        difference staying in the paged pool.
         """
         spr = 3  # 1 + num_spec, the GDN width
         specs = [
