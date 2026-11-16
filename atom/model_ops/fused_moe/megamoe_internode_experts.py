@@ -5,13 +5,15 @@
 combine of an MXFP4 MoE layer with aiter's ``MegaMoEInternode`` (A4W4: the op
 quantizes the bf16 rows to MXFP4 itself and sends FP4 on dispatch).
 
-Capacities. The op accepts actual rows up to a fixed capacity (this
-adapter chunks prefill at 4096). Instances are shared by every shape-identical
-MoE layer (weights are bound per call):
+Capacities. EP ranks agree on the largest configured token budget at startup.
+The prefill capacity rounds that budget up to a power of two, between 32 and
+4096; larger steps are chunked. The scheduler budget also bounds captured
+token rows. Instances are shared by every shape-identical MoE layer (weights
+are bound per call):
 
-* decode: ``mtpr`` in ``_DECODE_MTPRS``, the smallest that fits the
-  group-agreed row count;
-* prefill: ``mtpr = _PREFILL_MTPR``; a larger step is split into chunks.
+* decode: ``mtpr`` in ``_DECODE_MTPRS`` below the prefill capacity, the
+  smallest that fits the group-agreed row count;
+* prefill: the budgeted capacity; a larger step is split into chunks.
 
 Every rank must issue the same sequence of collective forwards, so the chunk
 count comes from the DP group's agreed maximum (``dp_metadata``), never from
@@ -236,6 +238,24 @@ def _group_rows(local_rows: int) -> tuple[int, bool]:
     )
 
 
+def _group_max_tokens(max_tokens: int) -> int:
+    """Agree on the capacity budget before any symmetric operator allocations.
+
+    Runs during weight initialization, before warmup/capture. Even nodes with
+    different scheduler budgets must construct the same sequence of operators.
+    """
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_ep_group
+
+    group = get_ep_group()
+    budgets = [None] * group.world_size
+    with torch.inference_mode(False):
+        dist.all_gather_object(budgets, max_tokens, group=group.cpu_group)
+    if any(n <= 0 for n in budgets):
+        raise ValueError(f"internode MegaMoE token budgets must be positive: {budgets}")
+    return max(budgets)
+
+
 class MegaInternodeFusedExperts:
     """Whole-pipeline ``fused_experts`` backend (see MegaFusedExperts)."""
 
@@ -243,9 +263,16 @@ class MegaInternodeFusedExperts:
         self._layer = layer
         self._model_dim = model_dim
         self._inter_dim = inter_dim
-        self._prefill_mtpr = min(_PREFILL_MTPR, _OP_MAX_MTPR)
+        max_tokens = _group_max_tokens(max_tokens)
+        # AITER decodes source IDs with power-of-two shifts. Keep the existing
+        # minimum decode capacity; the larger capacities are needed only when
+        # a rank's budget can reach them. EP keeps rows local and the runner
+        # caps graph token rows at this same scheduler budget.
+        rounded_tokens = 1 << (max_tokens - 1).bit_length()
+        self._prefill_mtpr = min(
+            _PREFILL_MTPR, _OP_MAX_MTPR, max(_DECODE_MTPRS[0], rounded_tokens)
+        )
         self._decode_mtprs = tuple(m for m in _DECODE_MTPRS if m < self._prefill_mtpr)
-        del max_tokens  # any step is chunked to the prefill capacity
 
     def __call__(
         self,

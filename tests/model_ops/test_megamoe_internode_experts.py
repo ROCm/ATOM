@@ -20,6 +20,7 @@ def internode(atom_modules, monkeypatch):
     module = importlib.import_module(
         "atom.model_ops.fused_moe.megamoe_internode_experts"
     )
+    group_max_tokens = module._group_max_tokens
     built = []
 
     class Operator:
@@ -46,12 +47,18 @@ def internode(atom_modules, monkeypatch):
     monkeypatch.setattr(kernel, "MegaMoEInternode", Operator)
     monkeypatch.setattr(module, "_INSTANCES", {})
     monkeypatch.setattr(module, "_rank_world", lambda: (0, 16))
+    monkeypatch.setattr(module, "_group_max_tokens", lambda max_tokens: max_tokens)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.delenv("ATOM_TORCH_PROFILER_DIR", raising=False)
     monkeypatch.setattr(module, "_PREFILL_MTPR", 8)
     monkeypatch.setattr(module, "_DECODE_MTPRS", (2, 4))
-    yield SimpleNamespace(module=module, built=built, moe=atom_modules.moe)
+    yield SimpleNamespace(
+        module=module,
+        built=built,
+        moe=atom_modules.moe,
+        group_max_tokens=group_max_tokens,
+    )
     module.close_internode_instances()
 
 
@@ -88,6 +95,153 @@ def _instance(state, capacity=2, **overrides):
     }
     settings.update(overrides)
     return state.module._get_instance(capacity, **settings)
+
+
+def _production_capacities(internode, monkeypatch):
+    monkeypatch.setattr(internode.module, "_PREFILL_MTPR", 4096)
+    monkeypatch.setattr(
+        internode.module, "_DECODE_MTPRS", (32, 64, 128, 256, 512, 1024)
+    )
+
+
+@pytest.mark.parametrize(
+    "budget,expected",
+    [
+        (1, (32,)),
+        (32, (32,)),
+        (33, (64, 32)),
+        (128, (128, 32, 64)),
+        (129, (256, 32, 64, 128)),
+        (513, (1024, 32, 64, 128, 256, 512)),
+        (1025, (2048, 32, 64, 128, 256, 512, 1024)),
+        (4096, (4096, 32, 64, 128, 256, 512, 1024)),
+        (8192, (4096, 32, 64, 128, 256, 512, 1024)),
+    ],
+)
+def test_token_budget_limits_actual_operator_allocations(
+    internode, monkeypatch, budget, expected
+):
+    _production_capacities(internode, monkeypatch)
+    backend = internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=budget
+    )
+    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (budget, True))
+    x = torch.ones(1, 64, dtype=torch.bfloat16)
+    result = backend(
+        hidden_states=x,
+        topk_weights=torch.ones(1, 2),
+        topk_ids=torch.zeros(1, 2, dtype=torch.int32),
+        global_num_experts=256,
+    )
+    assert torch.equal(result, x)
+    assert tuple(op.mtpr for op in internode.built) == expected
+    assert all(
+        op.mtpr <= 4096 and op.mtpr & (op.mtpr - 1) == 0 for op in internode.built
+    )
+    active = [op for op in internode.built if op.calls]
+    assert len(active) == 1 and active[0].mtpr == expected[0]
+    assert len(active[0].calls) == (budget + expected[0] - 1) // expected[0]
+
+
+def _ep_budgets(internode, monkeypatch, budgets):
+    import torch.distributed as dist
+
+    ep = SimpleNamespace(world_size=len(budgets), cpu_group=object())
+    calls = []
+
+    def gather(out, local_budget, *, group):
+        assert group is ep.cpu_group and len(out) == ep.world_size
+        assert not torch.is_inference_mode_enabled()
+        calls.append(local_budget)
+        out[:] = budgets
+
+    state = importlib.import_module("aiter.dist.parallel_state")
+    monkeypatch.setattr(state, "get_ep_group", lambda: ep)
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    monkeypatch.setattr(
+        internode.module, "_group_max_tokens", internode.group_max_tokens
+    )
+    return calls
+
+
+def test_different_rank_budgets_produce_one_preallocation_sequence(
+    internode, monkeypatch
+):
+    _production_capacities(internode, monkeypatch)
+    calls = _ep_budgets(internode, monkeypatch, [129] + [128] * 15)
+    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
+    for local_budget in (128, 129):
+        with torch.inference_mode():
+            backend = internode.module.MegaInternodeFusedExperts(
+                _weights(), model_dim=64, inter_dim=32, max_tokens=local_budget
+            )
+            assert torch.is_inference_mode_enabled()
+        assert backend._prefill_mtpr == 256
+        assert backend._decode_mtprs == (32, 64, 128)
+        backend(
+            hidden_states=torch.zeros(1, 64, dtype=torch.bfloat16),
+            topk_weights=torch.ones(1, 2),
+            topk_ids=torch.zeros(1, 2, dtype=torch.int32),
+            global_num_experts=256,
+        )
+    assert calls == [128, 129]
+    assert [op.mtpr for op in internode.built] == [256, 32, 64, 128]
+
+
+@pytest.mark.parametrize("invalid", [0, -1])
+def test_invalid_rank_budget_is_rejected_before_operator_allocation(
+    internode, monkeypatch, invalid
+):
+    calls = _ep_budgets(internode, monkeypatch, [128] * 15 + [invalid])
+    with pytest.raises(ValueError, match="token budgets must be positive"):
+        internode.module.MegaInternodeFusedExperts(
+            _weights(), model_dim=64, inter_dim=32, max_tokens=128
+        )
+    assert calls == [128] and not internode.built
+
+
+def test_budgeted_capacities_are_ready_for_padded_and_idle_graph_steps(
+    internode, monkeypatch
+):
+    backend = internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=4
+    )
+    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
+
+    def run(rows, valid):
+        ids = torch.zeros(rows, 2, dtype=torch.int32)
+        ids[valid:] = -1
+        return backend(
+            hidden_states=torch.ones(rows, 64, dtype=torch.bfloat16),
+            topk_weights=torch.ones(rows, 2),
+            topk_ids=ids,
+            global_num_experts=256,
+        )
+
+    run(1, 1)  # Small startup forward must prebuild the wider reachable bucket.
+    assert [op.mtpr for op in internode.built] == [4, 2]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    run(4, 3)  # Speculative/graph padding at the configured token limit.
+    run(2, 0)  # An idle rank still participates at its graph's padded width.
+    assert [op.mtpr for op in internode.built] == [4, 2]
+    wider, smaller = internode.built
+    assert (wider.calls[-1][2][3:] == -1).all()
+    assert (smaller.calls[-1][2] == -1).all()
+
+
+def test_cold_graph_step_cannot_allocate_a_budgeted_operator(internode, monkeypatch):
+    backend = internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=4
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="was not built before graph capture"):
+        backend(
+            hidden_states=torch.zeros(4, 64, dtype=torch.bfloat16),
+            topk_weights=torch.ones(4, 2),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            global_num_experts=256,
+        )
+    assert not internode.built
 
 
 @pytest.mark.parametrize("profiler_dir", [None, ""])
