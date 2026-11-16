@@ -759,14 +759,16 @@ class KimiSparseMoeBlock(nn.Module):
         the sum to BF16 here, instead of folding it in FP32 in the next
         attn_res, can move MoE routing.
         """
+        from atom.model_ops.kimi_k3 import two_step_add
+
         router_logits = self.gate(hidden_states)
         routed_input = self.routed_expert_down_proj(hidden_states)
         routed_output = self.experts(routed_input, router_logits)
         routed_output = self._apply_routed_norm_and_up_proj(rows.scatter(routed_output))
-        output = routed_output + rows.scatter(self.shared_experts(hidden_states))
-        if prefix_rows is not None:
-            output += prefix_rows
-        return rows.gather(output)
+        shared_output = rows.scatter(self.shared_experts(hidden_states))
+        if prefix_rows is None:
+            return rows.gather(routed_output + shared_output)
+        return rows.gather(two_step_add(routed_output, shared_output, prefix_rows))
 
     @staticmethod
     def _split_op_pair(
