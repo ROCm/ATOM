@@ -94,6 +94,7 @@ def runtime_config(**overrides):
         "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
+    vars(fields["hf_config"]).setdefault("fp4ptpc", False)
     return SimpleNamespace(**fields)
 
 
@@ -782,9 +783,12 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
     ],
 )
 def test_fp4ptpc_needs_its_routed_experts_converted(online, ok):
+    from atom.config import QuantizationConfig
+
+    checkpoint = SimpleNamespace(torch_dtype=None, quantization_config=None)
     config = runtime_config(
         hf_config=SimpleNamespace(sliding_window=128, fp4ptpc=True),
-        online_quant_config=online,
+        quant_config=QuantizationConfig(checkpoint, online),
     )
     if ok:
         validate_runtime_config(config)

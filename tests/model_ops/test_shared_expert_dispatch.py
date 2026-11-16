@@ -340,9 +340,8 @@ def test_ptpc_shared_expert_stays_unfused_under_dp_expert_parallel(monkeypatch):
         topK_module,
         "get_current_atom_config",
         lambda: atom_config_double(
-            parallel_config=SimpleNamespace(
-                data_parallel_size=8, enable_expert_parallel=True
-            )
+            parallel_config=SimpleNamespace(data_parallel_size=8),
+            enable_expert_parallel=True,
         ),
     )
     assert not is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(

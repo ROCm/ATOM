@@ -474,22 +474,6 @@ def dequant_mxfp8(
     return y.reshape(M, K).to(out_dtype)
 
 
-def dequant_mxfp4(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 32
-) -> torch.Tensor:
-    """MXFP4 (packed E2M1, 1x32 E8M0 scales) -> the default float dtype."""
-    from aiter.utility import fp4_utils
-
-    assert x.dim() == 2 and s.dim() == 2, "Input tensors must have 2 dimensions"
-    M = x.shape[0]
-    K = x.shape[1] * 2
-    n_blocks = K // block_size
-    assert s.shape == (M, n_blocks), f"scale shape {tuple(s.shape)} != {(M, n_blocks)}"
-    y = fp4_utils.mxfp4_to_f32(x.view(torch.uint8)).reshape(M, n_blocks, block_size)
-    y = y * fp4_utils.e8m0_to_f32(s).unsqueeze(-1)
-    return y.reshape(M, K).to(torch.get_default_dtype())
-
-
 def dequant_per_channel_fp8(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """Dequantize a per-output-channel (per_Token / PTPC) FP8 weight to the
     default float dtype.
@@ -601,7 +585,13 @@ def dequant_weight_online(
         source_quant_type == QuantType.per_1x32
         and source_quant_dtype == torch.float4_e2m1fn_x2
     ):
-        return dequant_mxfp4(weight, weight_scale)
+        from atom.model_ops.quant_v4 import dequant_fp4_e2m1
+
+        return dequant_fp4_e2m1(
+            weight.view(torch.int8),
+            weight_scale.view(torch.float8_e8m0fnu),
+            out_dtype=torch.get_default_dtype(),
+        )
 
     # Every other source must be 8-bit FP8.
     if source_quant_dtype is not None and source_quant_dtype not in _FP8_SOURCE_DTYPES:

@@ -471,17 +471,12 @@ def validate_fp4ptpc_recipe(config):
     """FP4PTPC runs only with its FP4 routed experts converted to per-channel
     FP8; unconverted, its per-channel FP8 shared expert cannot take their
     fused slot."""
-    if not getattr(config.hf_config, "fp4ptpc", False):
+    if not config.hf_config.fp4ptpc:
         return
-    from atom.config import QuantizationConfig
+    from aiter import QuantType
 
-    online = getattr(config, "online_quant_config", None)
-    online = online if isinstance(online, dict) else {}
-    patterns = (online.get("layer_quant_config") or {}).items()
-    target = QuantizationConfig._pattern_spec(
-        "layers.0.ffn.experts", [(p, str(t).strip().lower()) for p, t in patterns]
-    )
-    if target != "ptpc_fp8":
+    routed = config.quant_config.online_pattern_spec("layers.0.ffn.experts")
+    if routed is None or routed.quant_type.value != QuantType.per_Token.value:
         raise ValueError(
             "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "
             'per-channel FP8: --online_quant_config \'{"layer_quant_config": '

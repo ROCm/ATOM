@@ -3032,7 +3032,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config (LayerQuantConfig).
     """
 
-    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        *,
+        fnuz_fixup: bool = True,
+    ):
         super().__init__(moe)
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
@@ -3042,8 +3048,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         self.channel_quant = self.quant_type == QuantType.per_Token
+        # False where the weights already hold target-dtype values (online requant).
         self.need_normalize_e4m3fn_to_e4m3fnuz = (
-            self.quant_dtype == torch.float8_e4m3fnuz
+            fnuz_fixup and self.quant_dtype == torch.float8_e4m3fnuz
         )
 
     def create_weights(
@@ -4173,8 +4180,7 @@ class FusedMoE(torch.nn.Module):
         # Its consumers keep an MXFP4 source's hidden padding (GPT-OSS pads the
         # input) and expert bias, which the target does not carry.
         if source_quant_dtype == dtypes.fp4x2 and (
-            getattr(self.quant_method, "hidden_pad", 0)
-            or getattr(self, "w13_bias", None) is not None
+            self.quant_method.hidden_pad or self.w13_bias is not None
         ):
             raise NotImplementedError(
                 f"{self.layer_name}: online quantization of MXFP4 experts with "
@@ -4280,9 +4286,10 @@ class FusedMoE(torch.nn.Module):
 
         # Switch quant_method and allocate target quantized-type buffers.
         if online_quant_dtype == dtypes.fp8:
-            self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
             # The quantizer emits target-dtype values: no FNUZ fixup.
-            self.quant_method.need_normalize_e4m3fn_to_e4m3fnuz = False
+            self.quant_method = Fp8MoEMethod(
+                online_quant_config, self.moe_config, fnuz_fixup=False
+            )
         elif online_quant_dtype == dtypes.fp4x2:
             self.quant_method = _make_mxfp4_moe_method(
                 online_quant_config, self.moe_config

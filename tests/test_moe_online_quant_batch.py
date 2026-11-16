@@ -444,3 +444,59 @@ def test_batched_path_preserves_target_padding(monkeypatch):
     )
     assert target_w2_bytes[:, hidden:].count_nonzero().item() == 0
     assert target_w2_bytes[:, :hidden, intermediate // 2 :].count_nonzero().item() == 0
+
+
+def test_batched_path_trims_the_source_intermediate_padding(monkeypatch):
+    """An MXFP4 source pads the intermediate rows; each converted half (and
+    w2's columns) is the unpadded rows' quantization."""
+    torch.manual_seed(12)
+    monkeypatch.setenv("ATOM_ONLINE_QUANT_MOE_EXPERT_BATCH_SIZE", "2")
+    experts, inter, padded, hidden = 3, 192, 256, 256
+    old_w13 = torch.randn(
+        experts, 2 * padded, hidden, dtype=torch.bfloat16, device="cuda"
+    )
+    old_w2 = torch.randn(experts, hidden, padded, dtype=torch.bfloat16, device="cuda")
+    w13 = torch.empty(experts, 2 * inter, hidden, dtype=dtypes.fp8, device="cuda")
+    w2 = torch.empty(experts, hidden, inter, dtype=dtypes.fp8, device="cuda")
+    w13_s = torch.zeros(experts, 2 * inter, dtype=torch.float32, device="cuda")
+    w2_s = torch.zeros(experts, hidden, dtype=torch.float32, device="cuda")
+    layer = SimpleNamespace(
+        local_num_experts=experts,
+        intermediate_size_per_partition=inter,
+        hidden_size=hidden,
+        w13_weight=SimpleNamespace(data=w13),
+        w2_weight=SimpleNamespace(data=w2),
+        w13_weight_scale=SimpleNamespace(data=w13_s),
+        w2_weight_scale=SimpleNamespace(data=w2_s),
+    )
+    FusedMoE._online_quant_row_local_batched(
+        layer,
+        old_w13_data=old_w13,
+        old_w2_data=old_w2,
+        old_w13_scale=None,
+        old_w2_scale=None,
+        source_quant_type=QuantType.No,
+        source_quant_dtype=torch.bfloat16,
+        online_quant_type=QuantType.per_Token,
+        online_quant_dtype=dtypes.fp8,
+    )
+
+    def quant(x):
+        q, s = quant_weight_online(
+            x.contiguous(),
+            online_quant_type=QuantType.per_Token,
+            online_quant_dtype=dtypes.fp8,
+        )
+        return q.view(torch.uint8), s.squeeze(-1)
+
+    for e in range(experts):
+        for rows, src in (
+            (slice(0, inter), old_w13[e, :inter]),
+            (slice(inter, 2 * inter), old_w13[e, padded : padded + inter]),
+        ):
+            q, s = quant(src)
+            assert torch.equal(w13[e, rows].view(torch.uint8), q)
+            assert torch.equal(w13_s[e, rows], s)
+        q, s = quant(old_w2[e, :, :inter])
+        assert torch.equal(w2[e].view(torch.uint8), q)
+        assert torch.equal(w2_s[e], s)

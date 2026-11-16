@@ -52,7 +52,6 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    native_group32_runs_bf16,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
@@ -311,7 +310,7 @@ class Attention(nn.Module):
             self.qk_norm = DualRMSNormPerToken(
                 self.q_norm, self.kv_norm, name, quant_dtype=self.wq_b.params_dtype
             )
-        elif native_group32_runs_bf16():
+        elif self.wq_b.runs_bf16:
             self.qk_norm = DualRMSNormBF16(self.q_norm, self.kv_norm, name)
         else:
             self.qk_norm = DualRMSNormMXFP8(
@@ -405,10 +404,10 @@ class Attention(nn.Module):
             self._fuse_woa_quant = False
             _log_woa_quant_path(False, "weight or scale empty", final=False)
             return
-        # The fused pair is the per-1x32 FP8 a native group32 wo_b reads.
-        if self.wo_b.native_a8_group_rows is None:
+        # The fused pair is the per-1x32 FP8 a native group32 FP8 wo_b reads.
+        if self.wo_b.native_a8_group_rows is None or self.wo_b.runs_bf16:
             self._fuse_woa_quant = False
-            _log_woa_quant_path(False, "wo_b is not native group32")
+            _log_woa_quant_path(False, "wo_b is not a group32 FP8 GEMM")
             return
         wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
         k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
@@ -428,7 +427,7 @@ class Attention(nn.Module):
         order of `output`'s leading dims.
         """
         rows = output.shape[:-2].numel()
-        if self.wo_a.weight.dtype == torch.bfloat16:
+        if self.wo_a.runs_bf16:
             # wo_a is BF16 here: BF16 inverse RoPE and bmm.
             x = output.reshape(rows, self.heads, self.head_dim)
             if not x.is_contiguous():

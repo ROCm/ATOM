@@ -123,6 +123,7 @@ class Block(nn.Module):
             self.hc_attn_fn_packed is not None
             and fuse_quant_supported()
             and self.attn.wqkv_a.native_a8_group_rows is not None
+            and not self.attn.wqkv_a.runs_bf16
         )
 
     def attention_forward(self, normed, cache, step, rope):

@@ -52,6 +52,10 @@ logger = logging.getLogger("atom")
 
 
 class DraftAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._wkv_shard = None  # built by `wkv_shard` on first use
+
     def context_keys(self, kv_normed, positions, rope, *, packed=False):
         """The context row alone, for a caller with no query to rotate with it.
 
@@ -66,17 +70,16 @@ class DraftAttention(Attention):
     @property
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
-        view = getattr(self, "_wkv_shard", None)
-        if view is None:
-            view = self._wkv_shard = self.wqkv_a.shard_view(1)
-        return view
+        if self._wkv_shard is None:
+            self._wkv_shard = self.wqkv_a.shard_view(1)
+        return self._wkv_shard
 
     def project_context(self, hidden, positions, rope, *, packed=False):
         """Target keys alone, only on the unfused path -- when the stages
         fuse, `write_context_kv` reads `wkv_shard`. A BF16 `wqkv_a` projects
         only the KV rows; an FP8 one computes the query half and drops it.
         """
-        if self.wqkv_a.weight.dtype == torch.bfloat16:
+        if self.wqkv_a.runs_bf16:
             kv_pre = self.wkv_shard(hidden)
         else:
             _, kv_pre = self.project_qkv(hidden)
@@ -495,7 +498,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         }
         (group_rows, _, width, preshuffled), *others = layouts
         # BF16 shards have no FP8 weights to fuse: per-stage path.
-        bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)
+        bf16 = any(s.runs_bf16 for s in shards)
         if (
             others
             or group_rows is None

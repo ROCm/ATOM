@@ -2813,7 +2813,7 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         # A BF16 w2 (no group32 FP8 GEMM here) takes no quantized input.
-        if self.use_fused_clamp_act_mul and self.w2.weight.dtype != torch.bfloat16:
+        if self.use_fused_clamp_act_mul and not self.w2.runs_bf16:
             native_mx = self.w2.native_a8_group_rows is not None
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,

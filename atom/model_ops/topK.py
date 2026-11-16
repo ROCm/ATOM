@@ -76,10 +76,7 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             or (
                 routed_expert_prefix is not None
                 # The FP8 online method has no all2all shared-expert dispatch.
-                and not (
-                    dp_size > 1
-                    and getattr(config.parallel_config, "enable_expert_parallel", False)
-                )
+                and not (dp_size > 1 and config.enable_expert_parallel)
                 and fuses_ptpc_shared_into_online_ptpc(
                     quant_config, routed_expert_prefix, shared_spec, routed_spec
                 )

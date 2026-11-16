@@ -860,6 +860,7 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype
         self.scale_dtype = _quant_scale_dtype(quant_type, quant_config)
         self.native_a8_group_rows = None
+        self.runs_bf16 = False
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
             (1, 32),
@@ -893,6 +894,10 @@ class LinearBase(nn.Module):
                     "Native group32 A8 requires dynamic activations and native weights"
                 )
             self.native_a8_group_rows = layer_quant_config.weight_block_size[0]
+            # No group32 FP8 GEMM here: dequantized to BF16 at load.
+            self.runs_bf16 = (
+                native_group32_runs_bf16() and params_dtype == torch.float8_e4m3fn
+            )
             if self.input_size % 32 or any(
                 size % self.native_a8_group_rows for size in self.output_partition_sizes
             ):
@@ -1348,10 +1353,11 @@ class LinearBase(nn.Module):
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
+            # Still FP8: a second call finds the BF16 weight and skips.
             if (
-                self.weight.numel()
+                self.runs_bf16
+                and self.weight.numel()
                 and self.weight.dtype == torch.float8_e4m3fn
-                and native_group32_runs_bf16()
             ):
                 from atom.model_ops.blockscale import dequantize_fp8_weight
 
@@ -1632,11 +1638,7 @@ class LinearBase(nn.Module):
             lead, x = x.shape[:-1], x.flatten(0, -2)
             if x_scale is not None:
                 x_scale = x_scale.flatten(0, -2)
-        if (
-            self.native_a8_group_rows is not None
-            and self.weight.dtype == torch.bfloat16
-        ):
-            # BF16 fallback (`native_group32_runs_bf16`).
+        if self.runs_bf16:
             assert x_scale is None, "the BF16 fallback takes unquantized input"
             y = tgemm.mm(x, self.weight, self.bias, otype=otype)
         elif self.native_a8_group_rows is not None:
