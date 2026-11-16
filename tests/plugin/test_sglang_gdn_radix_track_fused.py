@@ -296,15 +296,18 @@ def test_track_mamba_states_falls_back_for_recompute_rows(monkeypatch):
     torch.testing.assert_close(conv[7], x[md.track_conv_indices[0]].T, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("h_vk", [False, True])
 @pytest.mark.parametrize("flydsl_decode", [False, True])
 @pytest.mark.parametrize("counts", [(4, 3, 2), (1, 1, 0), (0, 3, 2), (2, 0, 0)])
-def test_forward_step_matches_the_per_layer_path(monkeypatch, flydsl_decode, counts):
+def test_forward_step_matches_the_per_layer_path(
+    monkeypatch, flydsl_decode, counts, h_vk
+):
     """`_track_extend` with the forward-level step writes the same bytes as
     the per-layer `_track_mamba_states`, over several layers that share one
     step (one plan, the pool views reused), and pops each layer's `h`."""
     from atom.plugin.sglang.attention_backend.attention_gdn import _GDNStep
 
-    x, h = _inputs()
+    x, h = _inputs(h_vk=h_vk)
     md = _metadata(*counts)
     layers = 3
     ref = [_pools(True, flydsl_decode) for _ in range(layers)]
@@ -357,11 +360,12 @@ def test_forward_step_matches_the_per_layer_path(monkeypatch, flydsl_decode, cou
         assert torch.equal(ssm_new, ssm_ref)
 
 
+@pytest.mark.parametrize("h_vk", [False, True])
 @pytest.mark.parametrize("counts", [(4, 3, 2), (0, 0, 1), (1, 0, 0)])
-def test_plan_reused_across_layers_matches_the_one_shot_call(counts):
+def test_plan_reused_across_layers_matches_the_one_shot_call(counts, h_vk):
     from atom.plugin.sglang.attention_backend.gdn_radix_track import RadixTrackPlan
 
-    x, h = _inputs()
+    x, h = _inputs(h_vk=h_vk)
     md = _metadata(*counts)
     conv_idx = md.track_conv_indices if md.track_conv_indices.numel() > 0 else None
     plan = RadixTrackPlan(
