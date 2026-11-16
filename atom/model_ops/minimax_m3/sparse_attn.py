@@ -102,8 +102,10 @@ class MiniMaxM3SparseMetadata:
     """
     index_score_work_map: torch.Tensor | None = None
     """[grid, 2] int32 GPU -- the decode index-score kernel's packed dispatch
-    order, built once per step (~120us a call). None on prefill and on an empty
-    batch; the scorer then builds its own, correctly but per layer.
+    order, built once per step (~120us a call). None on prefill, on an empty
+    batch, with an MXFP4 scorer (`index_scorer` carries its own map) and under
+    ``score_work_map=False`` (a split decode); the FP8 scorer then builds its
+    own, correctly but per layer.
     """
     index_score_max_block: int = 0
     """The bound `index_score_work_map` was built against, in 128-token blocks.
@@ -188,9 +190,10 @@ def make_sparse_decode_metadata(
     index_scorer: IndexScoreBuffers | None = None,
     score_work_map: bool = True,
 ) -> MiniMaxM3SparseMetadata:
-    """``score_work_map`` False skips the FP8 scorer's map (``index_score_work_map``),
-    for a builder whose cache is MXFP4 but whose step carries no ``index_scorer``
-    (a split decode); with an ``index_scorer`` the map is never built.
+    """``score_work_map`` False skips the FP8 scorer's map (``index_score_work_map``):
+    the builder passes it for a split decode, fp8 cache or not (the micro-batches
+    carry their own maps), and for an MXFP4 cache (its map is the ``index_scorer``'s);
+    with an ``index_scorer`` the map is never built.
 
     ``index_scorer`` is the builder's MXFP4 index scorer record (None for any other
     index cache): the step's work map is built into its capacity buffer here, once, at

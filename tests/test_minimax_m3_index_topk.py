@@ -1267,10 +1267,9 @@ class TestPrefillScorersAgree:
 
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
     def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes):
-        # The case `auto` actually dispatches, and the only one: `k_lds` -- with it
-        # any reason to run the flydsl prefill scorer at all -- is legal only on an
-        # fp8 cache, and bf16 is refused before it can reach either scorer. This is
-        # the test that can see a tie resolve to a different block.
+        # The fp8 cache is the only one either scorer serves (bf16 is refused before
+        # it can reach them). This is the test that can see a tie resolve to a
+        # different block.
         kw = _inputs(qlens, prefixes, 2, "cuda")
         picked = []
         real = m.prefill_index_score

@@ -439,10 +439,7 @@ def test_a_shard_that_runs_past_the_global_end_is_not_selectable(blocks):
     What makes that sound is that `local_candidate_keys` masks from the
     ``(rank, world_size, global_blocks)`` it is given, not from the length
     alone. That is the property under test, and it is worth pinning precisely
-    because it is invisible at the call site: the Triton kernel this path
-    replaced bought the same guarantee by storing -inf to every slot, empty
-    shards included, and dropping that store moved the guarantee somewhere
-    else without anything recording the move.
+    because it is invisible at the call site.
 
     Poison the dead slots three ways and demand one selection. A mask that
     went back to bounding by length alone fails here.
