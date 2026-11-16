@@ -1269,13 +1269,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
-    # Initial ramp, for either prefill admit policy: while every DP rank can fill
-    # a whole prefill chunk from waiting requests that fit its free seq slots,
-    # the interval policy skips that interval and the adaptive policy releases at
-    # once, so the batch fills with back-to-back full prefills; it ends for good
-    # when a rank cannot (or KV runs high) and re-arms when the group goes idle.
+    # Initial ramp (on by default, "0" disables), whatever the admit policy: while
+    # every DP rank can fill a whole prefill chunk from waiting requests that fit
+    # its free seq slots, prefill is released at once (ahead of that interval,
+    # the coalescer and the adaptive rule), so the batch fills with back-to-back
+    # full prefills; it ends for good when a rank cannot (or KV runs high) and
+    # re-arms when the group goes idle.
     "ATOM_PREFILL_INITIAL_RAMP": lambda: (
-        os.getenv("ATOM_PREFILL_INITIAL_RAMP", "0") == "1"
+        os.getenv("ATOM_PREFILL_INITIAL_RAMP", "1") == "1"
     ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).

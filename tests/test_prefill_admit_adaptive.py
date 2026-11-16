@@ -245,8 +245,6 @@ def test_initial_ramp_fires_before_min_ticks():
     assert d._stat_fire_ramp == _MIN_TICKS - 1
     assert d._stat_fire_adaptive == d._stat_fire_adaptcap == 0
     assert d._stat_adapt_hold_ticks == 0
-    # adaptive has no interval to skip
-    assert d._stat_ramp == 0
     # the fits still learn from the ramp's prefill steps
     assert d._adapt_pf_fit.n == _MIN_TICKS - 1
 
@@ -267,11 +265,13 @@ def test_initial_ramp_ends_when_a_rank_cannot_fill():
     _rent_or_buy_cycle(d, sibling=full)
     _rent_or_buy_cycle(d, running=0, sibling=full)
     assert d._stat_fire_ramp == 1 and d._stat_fire_adaptive == 3
-    # The whole group runs out of decode: the ramp re-arms for the next burst.
+    # The whole group runs out of decode: the ramp re-arms for the next burst
+    # and releases at once, ahead of the no-decode bound.
     assert _tick(d, running=0, sibling=_sibling(running=0))
-    assert d._stat_fire_nodecode == 1 and d.ramp_active
+    assert d._stat_fire_ramp == 2 and d.ramp_active
+    assert d._stat_fire_nodecode == 0
     assert _tick(d, sibling=full)
-    assert d._stat_fire_ramp == 2
+    assert d._stat_fire_ramp == 3
 
 
 def test_initial_ramp_ends_on_kv_high():

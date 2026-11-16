@@ -68,8 +68,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_prefill_ran:                              arm decode interval
   if G_running_dec == 0:                          re-arm the initial ramp
   elif n_full < dp_size or any_kv_high:           end the initial ramp
-  if post-prefill decode interval is active, decode exists and the
-     initial ramp is off or has ended:
+  # -- initial ramp, ahead of every admit policy --
+  if the initial ramp is on and n_full == dp_size: FIRE  # every rank fills a chunk
+  if post-prefill decode interval is active and decode exists:
       stall = 0 if the group's work changed;      HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
   # -- must-fire bounds (release even if unaligned / underfilled) --
@@ -78,7 +79,6 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
   # -- prefill_admit_policy adaptive (see below) --
-  if adaptive and the initial ramp is on:         FIRE   # every rank fills a chunk
   if adaptive:                                    rent-or-buy FIRE / HOLD
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
   # -- adaptive give-up: the group's work stopped changing --
@@ -309,7 +309,6 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
-        "_stat_ramp",
         "admit_policy",
         "cpu_group",
         "dp_size",
@@ -403,8 +402,8 @@ class PrefillDelayer:
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
         # Initial ramp (one-shot): while every rank can fill a whole prefill chunk
-        # from waiting requests that fit its free seq slots, the interval policy
-        # skips the interval and the adaptive policy releases at once.
+        # from waiting requests that fit its free seq slots, release at once,
+        # ahead of the decode interval, the coalescer and the adaptive rule.
         self.prefill_ramp = bool(prefill_ramp)
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
@@ -510,7 +509,6 @@ class PrefillDelayer:
         self._stat_fire_ramp = 0
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
-        self._stat_ramp = 0
         self._stat_log_every = int(
             os.environ.get("ATOM_PREFILL_DELAYER_LOG_EVERY", "1000")
         )
@@ -546,8 +544,8 @@ class PrefillDelayer:
 
     @property
     def ramp_active(self) -> bool:
-        """The initial ramp is on: the decode interval is skipped while every
-        rank can still fill a whole prefill chunk."""
+        """The initial ramp is on: prefill is released at once, whatever the
+        admit policy, while every rank can still fill a whole prefill chunk."""
         return self.prefill_ramp and not self._ramp_done
 
     def protects_decode(self, running_decode_batch: int) -> bool:
@@ -791,6 +789,13 @@ class PrefillDelayer:
         elif not self._ramp_done and (n_full < self.dp_size or any_kv_high):
             self._ramp_done = True
 
+        # Initial ramp, ahead of every admit policy: every rank fills a whole
+        # chunk from its free seq slots, so any wait (decode interval, coalescer,
+        # rent-or-buy) would only leave those slots empty. The decode interval
+        # armed by these prefills applies from the first decision after the ramp.
+        if self.ramp_active and n_full == self.dp_size:
+            return self._fire("ramp", g_pending)
+
         # Hard post-prefill decode protection. The countdown is identical on
         # all ranks because it is armed from the globally reduced execution
         # signal and schedule() calls this method in lockstep. Do not advance the
@@ -798,11 +803,7 @@ class PrefillDelayer:
         # invoking PrefillDelayer, so its delay budget starts afterwards.
         if self._decode_interval_remaining > 0:
             self._decode_interval_remaining -= 1
-            if self.ramp_active and n_prefillable > 0 and g_running_dec > 0:
-                # Ramp: every rank already fills a whole chunk, so the interval
-                # would only leave slots empty; the coalescer decides this tick.
-                self._stat_ramp += 1
-            elif n_prefillable > 0 and g_running_dec > 0:
+            if n_prefillable > 0 and g_running_dec > 0:
                 # Not a coalescer tick, so the stall count does not advance,
                 # but work that arrives in the window still restarts it.
                 if self._work_changed(g_pending, n_prefillable, g_arrived):
@@ -831,10 +832,6 @@ class PrefillDelayer:
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
         if self.admit_policy == "adaptive":
-            # Initial ramp: every rank fills a whole chunk from its free seq
-            # slots, so the rent-or-buy wait would only leave them empty.
-            if self.ramp_active:
-                return self._fire("ramp", g_pending)
             return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
@@ -1116,7 +1113,6 @@ class PrefillDelayer:
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
-                f"ramp={self._stat_ramp} "
                 f"fire_ramp={self._stat_fire_ramp} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
