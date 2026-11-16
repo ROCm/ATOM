@@ -28,7 +28,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
-| `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
+| `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
 
@@ -497,7 +497,22 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
-### Required channel (`required_channel.py`)
+### Shared token constraints
+
+`TokenConstraints` in `atom/model_engine/token_constraints.py` is the shared
+pre-sampling boundary for K3 required channels and JSON Schema: K3 keeps its GPU
+state machine, llguidance keeps its packed vocabulary masks.
+
+A request carries at most one of the two: request admission
+(`InputOutputProcessor.preprocess_fanout`, which `LLMEngine.add_request`, the
+API server and atomesh call) rejects a JSON Schema or strict tool grammar
+together with a required channel. Accepted tokens advance channel and grammar
+state after verification and broadcasts. Grammar input copies still overlap
+target forward, and channel state uses the existing GPU carry when deferred
+output means the host is one step behind. No constraints means no
+constraint-step allocation or new mask kernel.
+
+### Required channel (`triton_required_channel.py`)
 
 Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only
 Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
@@ -522,8 +537,9 @@ writing every 16th 1,024-column block of a forced row without reading it;
 `advance_states` runs one per request. On MI355X over K3's vocabulary a step
 with no forced row costs what one program per request did (5-7 us for a
 DSpark7 verify step at bs 1-64), and one with all seven draft rows forced
-15-52 us. A batch with no unopened channel launches neither kernel. `constrain_logits_reference` / `advance_states_reference` are
-the pure-torch twins the tests hold the kernels to.
+15-52 us. A batch with no unopened channel launches neither kernel.
+`constrain_logits_reference` / `advance_states_reference` (`required_channel.py`)
+are the pure-torch twins the tests hold the kernels to.
 
 ### `RejectionSampler` (`rejection_sampler.py`)
 
@@ -558,7 +574,7 @@ The flag arms both halves at once: the DSpark draft samples its block from `soft
 - **Which K**: any K is exact, as the draft samples only the stored entries; a smaller K gives up `q`'s tail mass, i.e. some acceptance. The stored set is every id within 19 nats of the max, cut to K by 1/8-nat level (lowest ids first in the boundary level), which likewise only moves acceptance. K = V stores everything, for acceptance studies rather than throughput (~200-400 us per draft position on MI355X, vs ~5-20 us at 1024).
 - **Large batch**: the select reads the fp32 score scratch twice (histogram, then compact). On MI355X (V=163840, K=1024) it takes 15.7/17.5/45.9/263.8 us per draft position at B=1/8/64/512 sampled rows, vs 46.4/50.3/56.7/141.1 us for `aiter.topk_select` plus the store: faster up to at least B=64, ~120 us per position slower at B=512, mostly the re-read.
   `topk_select` is not a drop-in: its stream backend at large B returns ids in a nondeterministic order, so TP ranks would store different rows, and the per-request top-k/top-p cut needs sorted output. Like K, the select moves acceptance only, not the law.
-- **Where it does not arm**: only a draft model with `supports_lossless_draft` (today Kimi-K3 DSpark); others keep the greedy pair and say so once. Where it would arm, `ATOM_ENABLE_RELAXED_MTP` and `synthetic_acceptance_rates` are refused. It warns and keeps the greedy pair where the Markov tables cannot run the fused sampled op (`markov_weights_unsupported`), where the draft block is narrower than the verify, under PP (`forward_vars` is ringed per in-flight step, and the draft binds one slot's filters), under PCP (draft ids are broadcast, their `q` is not), on a P/D producer (it drafts for handoff only), or without aiter's top-k/top-p ops. Read at drafter construction, so set it before the server starts.
+- **Where it does not arm**: only a draft model with `supports_lossless_draft` (today both Kimi-K3 DSpark drafts, MLA and GQA); others keep the greedy pair and say so once. Where it would arm, `ATOM_ENABLE_RELAXED_MTP` and `synthetic_acceptance_rates` are refused. It warns and keeps the greedy pair where the Markov tables cannot run the fused sampled op (`markov_weights_unsupported`), where the draft block is narrower than the verify, under PP (`forward_vars` is ringed per in-flight step, and the draft binds one slot's filters), under PCP (draft ids are broadcast, their `q` is not), on a P/D producer (it drafts for handoff only), or without aiter's top-k/top-p ops. Read at drafter construction, so set it before the server starts.
 
 ## Fused kernel chains
 
@@ -614,7 +630,8 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
 | `spec_sampling/softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
 | `spec_sampling/sampling_scratch.py` | `Region`, `scratch_buffer`, `carve` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) placed by the cache pools' `entry_arena.plan_regions` |
-| `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
+| `required_channel.py` | `DeviceChannel` and the pure-torch twins of the channel kernels — `tool_choice="required"` channel mask (Kimi-K3) |
+| `triton_required_channel.py` | `constrain_logits`, `advance_states` — the channel mask kernels |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 

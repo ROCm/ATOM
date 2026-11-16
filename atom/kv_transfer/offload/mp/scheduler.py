@@ -17,7 +17,10 @@ from atom.kv_transfer.disaggregation.types import (
     req_id_of,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload._offload_common import validated_kv_role
+from atom.kv_transfer.offload._offload_common import (
+    tier_lookup_kwargs,
+    validated_kv_role,
+)
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
@@ -146,7 +149,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         for seq in seqs:
             if self._lookup_len(seq) <= 0:
                 continue
-            client.offer(str(seq.id), functools.partial(self._offered_tokens, seq))
+            client.offer(
+                str(seq.id),
+                functools.partial(self._offered_tokens, seq),
+                **tier_lookup_kwargs(seq),
+            )
 
     def _offered_tokens(self, seq: Any) -> list[int] | None:
         """The prompt to look up, or None once `seq` stopped waiting for one.

@@ -4,6 +4,7 @@ mod discover_dp;
 mod discover_metadata;
 mod find_worker_to_update;
 mod find_workers_to_remove;
+mod follow_kv_events;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
@@ -27,6 +28,7 @@ pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
+pub use follow_kv_events::{FollowKvEventsStep, StopFollowingKvEventsStep};
 pub use remove_from_policy_registry::RemoveFromPolicyRegistryStep;
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use submit_tokenizer_job::SubmitTokenizerJobStep;
@@ -167,6 +169,20 @@ pub fn create_local_worker_workflow(
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&["register_workers"]),
         )
+        .add_step(
+            StepDefinition::new(
+                "follow_kv_events",
+                "Follow KV Events",
+                Arc::new(FollowKvEventsStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&["register_workers"]),
+        )
         // Step 5a: Update policies (parallel with activation)
         .add_step(
             StepDefinition::new(
@@ -195,12 +211,12 @@ pub fn create_local_worker_workflow(
 ///
 /// DAG structure:
 /// ```text
-///     find_workers_to_remove
-///              │
-///     remove_from_policy_registry
-///              │
+///               find_workers_to_remove
+///                 │                │
+///     remove_from_policy_registry  stop_following_kv_events
+///                 │
 ///     remove_from_worker_registry
-///              │
+///                 │
 ///     update_remaining_policies
 /// ```
 pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkflowData> {
@@ -255,6 +271,15 @@ pub fn create_worker_removal_workflow() -> WorkflowDefinition<WorkerRemovalWorkf
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(0)),
             })
             .depends_on(&["remove_from_worker_registry"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "stop_following_kv_events",
+                "Stop following the workers' KV events",
+                Arc::new(StopFollowingKvEventsStep),
+            )
+            .with_timeout(Duration::from_secs(10))
+            .depends_on(&["find_workers_to_remove"]),
         )
 }
 

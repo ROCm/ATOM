@@ -257,7 +257,11 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         kv_pools={"gqa4": pool},
         # Both layers' KV and the first one's indexer keys (128 FP8 a token).
         pool_rows={"gqa4": dict(zip(layers, range(2))), "index": {layers[0]: 0}},
-        _index_cache_spec=lambda: SimpleNamespace(dim=128, dtype=torch.float8_e4m3fnuz),
+        block_size=128,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: SimpleNamespace(
+            view_dtype=torch.float8_e4m3fnuz, view_shape=(-1, 128, 128)
+        ),
     )
 
     transfer = mha_export_method(builder)

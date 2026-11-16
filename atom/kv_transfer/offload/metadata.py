@@ -181,6 +181,8 @@ class LMCacheReqMeta:
     # A save covering KV this step's forward computes: the worker submits it
     # behind that forward (`after_forward`) instead of before it.
     after_forward: bool = False
+    # The prompt's media identity (`tier_cache_salt`), part of every key.
+    cache_salt: str = ""
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

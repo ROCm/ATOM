@@ -90,6 +90,7 @@ from .chat_encoders import (
     load_custom_message_encoder,
     render_probe_prompt,
     resolve_reasoning_toggle,
+    template_needs_tool_call_argument_strings,
 )
 from .fim import FimFormat, resolve_fim_format
 from .images import check_chat_images, load_chat_images
@@ -215,8 +216,8 @@ tokenizer: AutoTokenizer | None = None
 # delivered as plain text -- said out loud at startup, never discovered here.
 tool_call_parser_cls: type | None = None
 # Whether history tool-call argument strings reach the template as sent. Read
-# off the chat template at startup (Kimi-K3 renders them verbatim), not off
-# --tool-call-parser.
+# off the chat template at startup (Kimi-K3 renders them verbatim; DeepSeek-R1/V3
+# concatenate them), not off --tool-call-parser.
 preserve_tool_call_arguments: bool = False
 # The channel `tool_choice="required"` holds output to in that format, derived
 # with it at startup; None where the format defines none (all but Kimi-K3).
@@ -3637,6 +3638,13 @@ async def kv_transfer_info():
     return info
 
 
+@_engine_route("/kv_event_sources")
+async def kv_event_sources():
+    """Where each DP rank of this server publishes KV events, for the Atomesh
+    router to subscribe to the ranks it registers."""
+    return engine.core_mgr.kv_event_sources
+
+
 @_engine_route("/server_info")
 async def server_info():
     """Server metadata for the Atomesh router.
@@ -3883,7 +3891,16 @@ def _setup_reasoning_and_tools(args) -> None:
         model=args.model,
         rendered_probe=tools_probe,
     )
-    preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
+    keeps = template_keeps_tool_call_arguments(tools_probe)
+    needs_strings = not keeps and template_needs_tool_call_argument_strings(
+        tokenizer, custom_message_encoder
+    )
+    if needs_strings:
+        logger.info(
+            "The chat template renders history tool-call arguments as strings; "
+            "passing them as sent."
+        )
+    preserve_tool_call_arguments = keeps or needs_strings
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
 

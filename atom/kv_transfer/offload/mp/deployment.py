@@ -9,10 +9,11 @@ namespace, and the adapters both connector halves open to the server.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
@@ -167,7 +168,9 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     registering any cache memory.
     """
 
-    if _config_has_own_pool_draft(config):
+    from atom.spec_decode.draft_kv import draft_owns_kv_pool
+
+    if draft_owns_kv_pool(config):
         # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
         # PAGE regions (`draft_kv.py` declares factor 1), so the complete PAGE
         # object is not replicated even when the target's is.
@@ -185,22 +188,6 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if getattr(hf_config, "model_type", None) == "kimi_linear":
         return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
-
-
-def _config_has_own_pool_draft(config: Any) -> bool:
-    """Whether a speculative draft caches into a KV pool of its own.
-
-    Mirrors `spec_decode.draft_kv.draft_kv_builder`, which only DSpark calls:
-    the draft's own backend answers through `DRAFT_OWNS_KV_POOL`.
-    """
-
-    speculative = getattr(config, "speculative_config", None)
-    draft_hf = getattr(speculative, "draft_model_hf_config", None)
-    if getattr(speculative, "method", None) != "dspark" or draft_hf is None:
-        return False
-    from atom.utils.selector import attn_family, get_attn_backend
-
-    return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
 
 
 def _tp_replication_factor(config: Any) -> int:
@@ -343,15 +330,30 @@ def _make_scheduler_adapter(
 
     num_kv_readers = _tp_replication_factor(config)
 
-    class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
-        """Reserve one LMCache read lock for every collapsed TP consumer."""
+    class _SaltedSchedulerAdapter(AtomMPSchedulerAdapter):
+        """Salt a session's keys with its prompt's media, and reserve one
+        LMCache read lock for every collapsed TP consumer."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # session -> `tier_cache_salt`, for salted prompts only.
+            self.cache_salts: dict[str, str] = {}
 
         def _create_key(self, *args: Any, **kwargs: Any) -> Any:
             key = super()._create_key(*args, **kwargs)
-            return replace(key, num_kv_readers=num_kv_readers)
+            key = replace(key, num_kv_readers=num_kv_readers)
+            salt = self.cache_salts.get(key.request_id)
+            return replace(key, cache_salt=salt) if salt else key
+
+        def salt_session(self, request_id: str, salt: str) -> None:
+            self.cache_salts[request_id] = salt
+
+        def end_session(self, request_id: str) -> None:
+            self.cache_salts.pop(request_id, None)
+            super().end_session(request_id)
 
     extra = _extra_config(config)
-    return _ReaderAwareSchedulerAdapter(
+    return _SaltedSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
@@ -369,8 +371,15 @@ def _make_worker_adapter(
     import zmq
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
+    class _SaltedWorkerAdapter(AtomMPWorkerAdapter):
+        """Salt a transfer's keys with its prompt's media (`transfer_spec`)."""
+
+        def _create_key(self, request_id: str, spec: Any) -> Any:
+            key = super()._create_key(request_id, spec)
+            return replace(key, cache_salt=spec.cache_salt)
+
     extra = _extra_config(config)
-    return AtomMPWorkerAdapter(
+    return _SaltedWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
         model_name=_model_namespace(
@@ -382,6 +391,24 @@ def _make_worker_adapter(
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),
     )
+
+
+def transfer_spec(**fields: Any) -> Any:
+    """LMCache's `AtomMPTransferSpec` plus the prompt's media
+    (`LMCacheReqMeta.cache_salt`) for the key. Built on first use: LMCache is
+    imported only where a transfer is submitted."""
+    from lmcache.integration.atom import AtomMPTransferSpec
+
+    return _salted_transfer_spec(AtomMPTransferSpec)(**fields)
+
+
+@functools.cache
+def _salted_transfer_spec(base: type) -> type:
+    @dataclass
+    class TransferSpec(base):
+        cache_salt: str = ""
+
+    return TransferSpec
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:
