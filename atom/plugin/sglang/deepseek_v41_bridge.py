@@ -231,8 +231,10 @@ def _radix_refusals(memory, exec_, schedule, spec) -> tuple:
         # `UnifiedRadixCache.checkpoint_into_tree`, whose rewrites drop the
         # decode staging's host rows (`deepseek_v41_radix`).
         (
-            "a KV storage backend with radix cache (LMCache, FlexKV, external "
-            "cache linker)",
+            (
+                "a KV storage backend with radix cache (LMCache, FlexKV, "
+                "external cache linker)"
+            ),
             any(
                 bool(_sglang_setting(memory, name, False))
                 for name in (
@@ -1362,15 +1364,28 @@ def _radix_stamps():
     )
 
 
-def _check_radix_resumes(slots, prefix) -> None:
-    """With radix cache on, refuse an extend resuming a slot the replay seam
-    did not rebuild for its current tenant."""
+def _check_radix_resumes(slots, prefix, fused=None) -> None:
+    """With radix cache on, refuse an extend resuming a slot that is neither
+    stamped for its current tenant nor rebuilt by the fused record this
+    forward carries. Runs while the metadata is built, before any kernel."""
     from atom.plugin.sglang import deepseek_v41_radix as radix
 
     if radix.radix_replay_rows() is None or not np.any(prefix > 0):
         return
     state_gen, generation = _radix_stamps()
-    radix.check_state_stamps(state_gen, generation, slots, prefix)
+    carried = () if fused is None else fused.slots
+    radix.check_state_stamps(state_gen, generation, slots, prefix, carried)
+
+
+def _stamp_fused_hits(fused) -> None:
+    """Stamp on consume: this forward carries ``fused``, checked against its
+    ForwardBatch, so its hits' slots now belong to their tenants."""
+    from atom.plugin.sglang import deepseek_v41_radix as radix
+
+    if radix.radix_replay_rows() is None:
+        return
+    state_gen, generation = _radix_stamps()
+    radix.stamp_fused_hits(state_gen, generation, fused)
 
 
 def _replaying(forward_batch, prefix, ends, bs: int, block_size: int, history):
@@ -1537,17 +1552,17 @@ def build_v41_scheduled_batch(forward_batch, block_size: int, history=None):
         replaying = _replaying(forward_batch, prefix, ends, bs, block_size, history)
     else:
         replaying = {}
+        if fused is not None and getattr(mode, "name", None) != "EXTEND":
+            raise NotImplementedError(
+                f"DeepSeek-V4.1 fused radix replay rides on an EXTEND, not {mode}"
+            )
         if not mode.is_decode():
-            _check_radix_resumes(slots, prefix)
+            _check_radix_resumes(slots, prefix, fused)
         if fused is not None:
-            if getattr(mode, "name", None) != "EXTEND":
-                raise NotImplementedError(
-                    f"DeepSeek-V4.1 fused radix replay rides on an EXTEND, "
-                    f"not {mode}"
-                )
             replaying = _fused_replaying(
                 fused, prefix, slots, rids, block_size, history
             )
+            _stamp_fused_hits(fused)
             # Each hit's span now starts at P - R; context_lens stay.
             replay_rows = fused.replay_rows(bs)
             lengths = lengths + replay_rows

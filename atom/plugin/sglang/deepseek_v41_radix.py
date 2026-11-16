@@ -4,12 +4,20 @@
 A prefix hit starts a request's extend at ``P > 0``: SGLang's tree hands back
 the PAGEs below ``P`` (main rows and index planes, shared, read-only), but the
 request's STATE slot (window ring, compressor rings, Engram cursor) holds
-nothing at ``P``. Native ATOM and native SGLang rebuild it the same way, and so
-does this module: recompute the ``R`` rows ``[P - R, P)`` into the freshly
-reset slot, write no shared PAGE (ATOM's compress plan writes no group below
-``write_from = P``), and seed the Engram history from the tokens before
-``P - R``. The window rows below ``P - R + 127`` see a truncated window, the
-same bounded approximation native ATOM and SGLang default to.
+nothing at ``P``. Native ATOM rebuilds it by default, and SGLang's opt-in
+encoder replay the same way, and so does this module: recompute the ``R`` rows
+``[P - R, P)`` into the freshly reset slot, write no shared PAGE (ATOM's
+compress plan writes no group below ``write_from = P``), and seed the Engram
+history from the tokens before ``P - R``. The window rows below
+``P - R + 127`` see a truncated window: a bounded approximation, the one
+native ATOM defaults to (``Config.enable_encoder_swa_bounded_replay=True``,
+``R = 128``). SGLang's default is exact instead
+(``--enable-encoder-swa-bounded-replay`` is off: its SWA pool keeps the window
+behind a hit); this module has no such pool and always replays. Measured cost
+(radix EXPERIMENTS E8, 200 prompts, first-token logits): hit-vs-cold KL mean
+0.036, top-1 agreement 0.925, against a cold-vs-cold floor of 0.012 / 0.96 on
+the same server; GSM8K within 1 SE of radix off. Accepted as matching native
+ATOM, not as exact.
 
 Where the ``R`` rows run (``ATOM_V41_RADIX_REPLAY_MODE``):
 
@@ -54,9 +62,27 @@ Flow per prefill step (target worker, current batch only):
    ``ScheduledBatch.replaying`` (``Replay(until=P, rebuilds=True,
    history_ids, start)``); ATOM's ``_replay_layout`` / ``prepare_state``
    reset and seed the slot. No ATOM core change.
-3. The main forward's bridge guard refuses an extend row at ``P > 0`` whose
-   slot was not stamped for this tenant; a fused record is checked against
-   the ``ForwardBatch`` it rides on (rows, slots, request ids, ``P``).
+3. The main forward's bridge guard, before any kernel runs, refuses an extend
+   row at ``P > 0`` whose slot is neither stamped for this tenant nor
+   rebuilt by the fused record this forward carries; the record is checked
+   against the ``ForwardBatch`` it rides on (rows, slots, request ids, ``P``)
+   and only then stamps its hits' slots (stamp on consume). The seam stamps
+   every other row of the step, and a side replay's rows once their side
+   forward has run. A record lost on the way to the model therefore leaves
+   its hits unstamped, and the guard fails that forward before it extends
+   from ``P`` over the previous tenant's state.
+
+Admission: while the replay is installed, a request whose rows are not
+determined by its token ids -- ``input_embeds`` (SGLang matches it by
+placeholder ids ``[1] * n``), ``positional_embed_overrides`` or multimodal
+inputs -- is answered with a 400 at the scheduler's queue door
+(``Scheduler._add_request_to_queue``) and never reaches a batch, as SGLang's
+own encoder replay refuses it (``TokenizerManager._validate_one_request``,
+``ScheduleBatch.prepare_for_extend``). Its tree match would be a placeholder
+match, the replay recomputes rows from token ids, and a batch carrying any
+of them hands the model batch-wide ``input_embeds`` that a fused widening
+cannot extend. With radix cache off nothing here is installed and such
+requests are served as before.
 
 Ownership. Which rows replay is a function of current state alone: the step's
 ``prefix_lens`` and the proxy pool's per-slot stamp against SGLang's
@@ -113,18 +139,29 @@ REPLAY_MODES = ("fused", "side")
 # `forward_batch_generation` call it is planned for, the ForwardBatch
 # `init_new` builds from it, and the eager runner's view of that.
 FUSED_ATTR = "atom_v41_fused_replay"
+# Request fields whose rows the token ids do not determine (admission).
+_NON_TOKEN_INPUTS = (
+    ("input_embeds", "input_embeds"),
+    ("positional_embed_overrides", "positional_embed_overrides"),
+    ("multimodal inputs", "multimodal_inputs"),
+)
 
 # The installed replay length R and mode; None while radix cache is off.
 _REPLAY_ROWS: int | None = None
 _REPLAY_MODE: str | None = None
+# Test hook (ATOM_V41_RADIX_TEST_SIDE_STEPS): this many steps that would fuse
+# their replay take the side-forward fallback instead. 0 outside tests.
+_TEST_SIDE_STEPS = 0
 # Replays run by this process (logged, and read by the debug path).
 _STATS = {
     "side_forwards": 0,
     "fused_steps": 0,
     "fallbacks": 0,
+    "forced_fallbacks": 0,
     "hits": 0,
     "rows": 0,
     "steps": 0,
+    "refused_requests": 0,
 }
 
 
@@ -241,8 +278,84 @@ def replay_admission_rows(req, prefix_len: int, rows: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Admission: token-only requests
+# ---------------------------------------------------------------------------
+
+
+def _non_token_inputs(req) -> list[str]:
+    return [
+        name for name, attr in _NON_TOKEN_INPUTS if getattr(req, attr, None) is not None
+    ]
+
+
+def radix_request_refusal(req) -> str | None:
+    """Why ``req`` cannot be admitted while the replay is installed, else None.
+
+    Its rows must be determined by its token ids: the tree matches token ids
+    (an ``input_embeds`` request's are SGLang's placeholders), the replay
+    below a hit recomputes rows from them, and a batch carrying embeddings
+    hands the model batch-wide ``input_embeds`` that a fused widening cannot
+    extend. SGLang refuses the same requests under its own encoder replay."""
+    if _REPLAY_ROWS is None:
+        return None
+    carried = _non_token_inputs(req)
+    if not carried:
+        return None
+    return (
+        "DeepSeek-V4.1 with radix cache serves token-only requests; this "
+        f"request carries {', '.join(carried)} (launch with "
+        "--disable-radix-cache to serve it)"
+    )
+
+
+def reject_request(scheduler, req, error: str) -> None:
+    """Answer ``req`` with a 400 without queueing it or running the model, as
+    SGLang's ``Scheduler._reject_sampling_mask_request`` does."""
+    from http import HTTPStatus
+
+    from sglang.srt.disaggregation.utils import prepare_abort
+
+    logger.error("%s, rid=%s", error, getattr(req, "rid", None))
+    trace = getattr(getattr(req, "time_stats", None), "trace_ctx", None)
+    if trace is not None:
+        trace.abort(abort_info={"reason": error})
+    if getattr(req, "multimodal_inputs", None) is not None:
+        req.release_mm_inputs_on_abort()
+    prepare_abort(req, error, status_code=HTTPStatus.BAD_REQUEST)
+    scheduler.output_streamer.stream_output([req], req.return_logprob)
+    _STATS["refused_requests"] += 1
+
+
+def admit_or_reject(scheduler, req, is_retracted: bool) -> bool:
+    """``Scheduler._add_request_to_queue``'s addition: False (``req``
+    answered with a 400) for a new request ``radix_request_refusal``
+    refuses. A retracted request re-enters with what it already holds and is
+    left to SGLang (none of these requests is ever admitted, so none is ever
+    retracted)."""
+    if is_retracted or getattr(req, "is_retracted", False):
+        return True
+    error = radix_request_refusal(req)
+    if error is None:
+        return True
+    reject_request(scheduler, req, error)
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Token ids below a hit
 # ---------------------------------------------------------------------------
+
+
+def _check_token_only(req) -> None:
+    """Admission refuses these (``admit_or_reject``); a request that got past
+    it anyway must not have placeholder ids recomputed as its rows."""
+    carried = _non_token_inputs(req)
+    if carried:
+        raise ValueError(
+            "DeepSeek-V4.1 radix replay below a hit recomputes rows from token "
+            f"ids; request {getattr(req, 'rid', None)} carries "
+            f"{', '.join(carried)} (admission should have refused it)"
+        )
 
 
 def _check_no_cached_prompt_logprobs(req, hit: ReplayHit) -> None:
@@ -260,6 +373,7 @@ def _replay_tokens(req, hit: ReplayHit, history_tokens: int):
     """The ids of ``[start, P)`` and the left-padded Engram history before
     ``start``, from the request's own token record -- the one SGLang builds
     the step's ``input_ids`` (and its own encoder replay) from."""
+    _check_token_only(req)
     _check_no_cached_prompt_logprobs(req, hit)
     fill = req.full_untruncated_fill_ids
     if len(fill) < hit.end:
@@ -288,18 +402,21 @@ class FusedReplay:
     ``ids``, the token ids of every hit's ``[start, P)`` back to back;
     ``histories``, the ``[hits, h]`` Engram history before each ``start``.
     ``expanded`` is the widened forward input, filled once per forward by
-    ``expand_v41_forward_inputs`` for the bridge to stage.
+    ``expand_v41_forward_inputs`` for the bridge to stage; ``host``, the
+    pinned host tensor its one H2D copy reads, held here for the record's
+    lifetime (the forward's ``ForwardBatch``).
     """
 
     __slots__ = (
+        "ends",
+        "expanded",
+        "histories",
+        "host",
+        "ids",
+        "rids",
         "rows",
         "slots",
-        "rids",
         "starts",
-        "ends",
-        "ids",
-        "histories",
-        "expanded",
     )
 
     def __init__(self, rows, slots, rids, starts, ends, ids, histories):
@@ -311,6 +428,7 @@ class FusedReplay:
         self.ids = np.asarray(ids, dtype=np.int64)
         self.histories = np.asarray(histories, dtype=np.int64)
         self.expanded = None
+        self.host = None
         n = self.rows.size
         if not (
             self.slots.size == n == len(self.rids) == self.starts.size
@@ -427,8 +545,9 @@ def expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds=
     hit's ``[P - R, P)`` prepended to its rows) and the rows of the model's
     output that are SGLang's; None for every other forward.
 
-    One H2D of the host layout; the widened tensors are scattered on the
-    device from SGLang's own and are kept on the record for the bridge.
+    One asynchronous H2D of the host layout from a pinned tensor (no host
+    stall under overlap); the widened tensors are scattered on the device
+    from SGLang's own and are kept on the record for the bridge.
     """
     fused = getattr(forward_batch, FUSED_ATTR, None)
     if fused is None:
@@ -436,8 +555,11 @@ def expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds=
     if fused.expanded is not None:
         return fused.expanded
     if input_ids is None or input_embeds is not None:
+        # Admission refuses embedding requests while radix is on
+        # (`admit_or_reject`); a batch carrying one cannot be widened.
         raise NotImplementedError(
-            "DeepSeek-V4.1 fused radix replay needs token input_ids"
+            "DeepSeek-V4.1 fused radix replay needs token input_ids, not "
+            "input_embeds (admission should have refused the request)"
         )
     if positions is None or positions.ndim != 1:
         raise NotImplementedError(
@@ -453,13 +575,17 @@ def expand_v41_forward_inputs(forward_batch, input_ids, positions, input_embeds=
         )
     keep, replay_at = fused_layout(lengths, fused.replay_rows(bs))
     replayed = int(replay_at.size)
-    host = torch.from_numpy(
-        np.concatenate((keep, replay_at, fused.ids, fused.positions()))
-    )
-    device = host.to(input_ids.device, non_blocking=False)
-    keep_d, at_d, ids_d, pos_d = torch.split(
-        device, (rows, replayed, replayed, replayed)
-    )
+    sizes = (rows, replayed, replayed, replayed)
+    device = input_ids.device
+    # Pinned, so the copy below is asynchronous on the forward's stream.
+    # Lifetime: the record holds it as long as this forward's ForwardBatch,
+    # and the caching host allocator does not hand a freed pinned block out
+    # again before the copies recorded on it have completed.
+    host = torch.empty(sum(sizes), dtype=torch.int64, pin_memory=device.type != "cpu")
+    np.concatenate((keep, replay_at, fused.ids, fused.positions()), out=host.numpy())
+    fused.host = host
+    staged = host.to(device, non_blocking=True)
+    keep_d, at_d, ids_d, pos_d = torch.split(staged, sizes)
     total = rows + replayed
     wide_ids = input_ids.new_empty(total)
     wide_ids[keep_d] = input_ids
@@ -659,9 +785,11 @@ def _fits(batch, hits, builder) -> bool:
 
 
 def run_v41_prefix_replay(worker, batch, debug_checks=None):
-    """Plan the rows below every prefix hit of this step's batch, stamp every
-    row's slot for its tenant, and return the ``FusedReplay`` the step's
-    forward must carry -- or run the side forward(s) and return None.
+    """Plan the rows below every prefix hit of this step's batch and return
+    the ``FusedReplay`` the step's forward must carry -- or run the side
+    forward(s) and return None. Every row's slot is stamped for its tenant
+    here except a fused hit's, which the bridge stamps when the forward
+    consumes the record (``stamp_fused_hits``).
 
     ``debug_checks``: a list a fused step's page checks are appended to, for
     the caller to report after the forward (``ATOM_V41_RADIX_DEBUG``).
@@ -707,7 +835,19 @@ def run_v41_prefix_replay(worker, batch, debug_checks=None):
             )
     fused = None
     history = int(builder.geometry.history_size)
-    if hits and _REPLAY_MODE == "fused" and _fits(batch, hits, builder):
+    fuse = bool(hits) and _REPLAY_MODE == "fused" and _fits(batch, hits, builder)
+    forced = fuse and _STATS["forced_fallbacks"] < _TEST_SIDE_STEPS
+    if forced:
+        fuse = False
+        _STATS["forced_fallbacks"] += 1
+        logger.warning(
+            "V4.1 radix replay: test hook ATOM_V41_RADIX_TEST_SIDE_STEPS=%d sends "
+            "fused step %d (%d hits) to the side-forward fallback",
+            _TEST_SIDE_STEPS,
+            _STATS["forced_fallbacks"],
+            len(hits),
+        )
+    if fuse:
         fused = build_fused_replay(batch, hits, history)
         _STATS["fused_steps"] += 1
         _STATS["hits"] += len(hits)
@@ -732,7 +872,7 @@ def run_v41_prefix_replay(worker, batch, debug_checks=None):
     elif hits:
         if _REPLAY_MODE == "fused":
             _STATS["fallbacks"] += 1
-            if _STATS["fallbacks"] == 1:
+            if _STATS["fallbacks"] == 1 and not forced:
                 logger.warning(
                     "V4.1 radix replay: a step widened by its %d replay rows "
                     "exceeds the builder's %d tokens; replaying it in a side "
@@ -768,22 +908,32 @@ def run_v41_prefix_replay(worker, batch, debug_checks=None):
                     rows,
                 )
     # Every row of the step, P = 0 and continuations included, now belongs
-    # to its current tenant: its rebuild is staged (side) or rides in the
-    # forward about to run (fused).
-    pool.state_gen[slots] = generations
+    # to its current tenant: it needs no rebuild, or its side forward has
+    # been issued. A fused hit is stamped only when its forward consumes the
+    # record (`stamp_fused_hits`), so a forward that lost it fails the
+    # bridge's guard before any kernel runs.
+    stamped = np.ones(len(slots), dtype=bool)
+    if fused is not None:
+        stamped[fused.rows] = False
+    pool.state_gen[np.asarray(slots, dtype=np.int64)[stamped]] = np.asarray(
+        generations, dtype=np.int64
+    )[stamped]
     _STATS["steps"] += 1
     return fused
 
 
-def check_state_stamps(state_gen, req_generation, slots, prefix) -> None:
-    """The main forward's guard: an extend row resuming above 0 must sit on
-    a slot stamped for its current tenant, i.e. the replay seam ran for it.
+def check_state_stamps(state_gen, req_generation, slots, prefix, carried=()) -> None:
+    """The main forward's guard, before any kernel: an extend row resuming
+    above 0 must sit on a slot stamped for its current tenant, or one this
+    forward rebuilds (``carried``: the slots of the fused record it carries).
 
     Without this, a recycled slot whose last tenant's cursor happened to
-    equal ``P`` would pass ATOM's cursor check with the wrong state.
+    equal ``P`` would pass ATOM's cursor check with the wrong state, and a
+    fused record lost before the model would extend from ``P`` over it.
     """
     slots = np.asarray(slots, dtype=np.int64)
     resuming = slots[np.asarray(prefix) > 0]
+    resuming = resuming[~np.isin(resuming, np.asarray(carried, dtype=np.int64))]
     if not resuming.size:
         return
     if torch.is_tensor(req_generation):
@@ -799,6 +949,20 @@ def check_state_stamps(state_gen, req_generation, slots, prefix) -> None:
         )
 
 
+def stamp_fused_hits(state_gen, req_generation, fused) -> None:
+    """The bridge's stamp on consume: the forward about to run carries
+    ``fused``, checked against its ForwardBatch and widened, so its hits'
+    slots now belong to their tenants."""
+    if fused.expanded is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 fused radix replay reached the bridge without its "
+            "widened inputs"
+        )
+    if torch.is_tensor(req_generation):
+        req_generation = req_generation.numpy()
+    state_gen[fused.slots] = np.asarray(req_generation)[fused.slots]
+
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -808,9 +972,10 @@ def run_with_fused_replay(original, worker, batch, fused, args, kwargs):
     """``original(worker, batch, ...)`` with ``fused`` on the batch for this
     call alone; ``init_new`` copies it onto the call's ForwardBatch.
 
-    The call must have run the replay: the seam stamped the hits' slots for
-    their tenants, so a forward that lost the record on the way to the model
-    would extend from ``P`` over the previous tenant's state."""
+    The call must have run the replay. A forward that lost the record on the
+    way to the model already failed the bridge's guard before any kernel
+    (its hits stay unstamped until the bridge consumes the record); this is
+    the second line, for a call that returned without a forward at all."""
     setattr(batch, FUSED_ATTR, fused)
     try:
         result = original(worker, batch, *args, **kwargs)
@@ -963,12 +1128,36 @@ def _install_admission_accounting() -> None:
     PrefillAdder._account_prefill_cache_admission = account
 
 
+def _install_request_admission() -> None:
+    """Refuse non-token requests at the scheduler's queue door
+    (``admit_or_reject``): every new request -- generate, embedding, a
+    grammar request once compiled -- enters the waiting queue through
+    ``Scheduler._add_request_to_queue``."""
+    from sglang.srt.disaggregation.utils import prepare_abort  # noqa: F401
+    from sglang.srt.managers.scheduler import Scheduler
+
+    original = Scheduler._add_request_to_queue
+    if getattr(original, "_atom_v41_radix_patched", False):
+        return
+
+    @wraps(original)
+    def _add_request_to_queue(self, req, is_retracted=False, *args, **kwargs):
+        if not admit_or_reject(self, req, is_retracted):
+            return None
+        return original(self, req, is_retracted, *args, **kwargs)
+
+    _add_request_to_queue._atom_v41_radix_patched = True
+    Scheduler._add_request_to_queue = _add_request_to_queue
+
+
 def install_deepseek_v41_radix(window: int | None = None) -> tuple[int, str]:
     """Turn the replay on in this process: the worker seam, the ForwardBatch
     carriers (``init_new`` and the eager runner's view), the host-row
-    invalidation and the admission charge. Idempotent;
-    returns ``(R, mode)``. Called only with radix cache on."""
-    global _REPLAY_ROWS, _REPLAY_MODE
+    invalidation, the admission charge and the token-only admission.
+    Idempotent; returns ``(R, mode)``. Called only with radix cache on."""
+    global _REPLAY_ROWS, _REPLAY_MODE, _TEST_SIDE_STEPS
+    from atom.plugin.sglang import deepseek_v41_envs as envs
+
     rows = resolve_replay_rows(window)
     mode = resolve_replay_mode()
     _install_worker_seam()
@@ -976,13 +1165,23 @@ def install_deepseek_v41_radix(window: int | None = None) -> tuple[int, str]:
     _install_eager_view_carrier()
     _install_checkpoint_invalidation()
     _install_admission_accounting()
+    _install_request_admission()
     _REPLAY_ROWS, _REPLAY_MODE = rows, mode
+    _TEST_SIDE_STEPS = max(0, int(envs.ATOM_V41_RADIX_TEST_SIDE_STEPS))
+    if _TEST_SIDE_STEPS:
+        logger.warning(
+            "ATOM_V41_RADIX_TEST_SIDE_STEPS=%d: test hook on, the first %d fused "
+            "replay steps take the side-forward fallback",
+            _TEST_SIDE_STEPS,
+            _TEST_SIDE_STEPS,
+        )
     logger.info(
-        "ATOM DeepSeek-V4.1 radix cache: replay-first, R=%d rows below each "
-        "hit, %s",
+        "ATOM DeepSeek-V4.1 radix cache: replay-first, R=%d rows below each hit, %s",
         rows,
-        "fused into the step's forward"
-        if mode == "fused"
-        else "in a side forward before the step's",
+        (
+            "fused into the step's forward"
+            if mode == "fused"
+            else "in a side forward before the step's"
+        ),
     )
     return rows, mode

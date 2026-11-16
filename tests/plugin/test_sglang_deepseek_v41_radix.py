@@ -92,6 +92,7 @@ def _isolated_process_state(monkeypatch):
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
     monkeypatch.setattr(radix, "_REPLAY_ROWS", None)
     monkeypatch.setattr(radix, "_REPLAY_MODE", None)
+    monkeypatch.setattr(radix, "_TEST_SIDE_STEPS", 0)
     monkeypatch.setattr(radix, "_STATS", dict.fromkeys(radix._STATS, 0))
     monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
     monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", None)
@@ -559,8 +560,7 @@ class _World:
 
     def batch(self, prefix, slots, reqs=None, mode=EXTEND, lengths=None):
         reqs = reqs or [
-            _req(range(1000, 1000 + p + 300), rid=f"q{i}")
-            for i, p in enumerate(prefix)
+            _req(range(1000, 1000 + p + 300), rid=f"q{i}") for i, p in enumerate(prefix)
         ]
         lengths = list(lengths or [7] * len(prefix))
         return SimpleNamespace(
@@ -1082,8 +1082,9 @@ class TestFusedSeam:
             [1000 + start - 3, 1000 + start - 2, 1000 + start - 1]
         ]
         assert fused.expanded is None
-        # Stamped before the forward that rebuilds it runs.
-        assert world.pool.state_gen[3] == world.generation[3]
+        # Not stamped by the seam: the bridge stamps it when the forward
+        # consumes the record, so a lost record fails the guard first.
+        assert world.pool.state_gen[3] != world.generation[3]
         assert radix._STATS["fused_steps"] == 1 and radix._STATS["rows"] == R
 
     def test_only_new_tenants_above_zero_ride(self, monkeypatch, radix_fused):
@@ -1103,7 +1104,9 @@ class TestFusedSeam:
             + list(range(20000 + 2 * PAGE - R, 20000 + 2 * PAGE))
         )
         assert world.sides == []
-        assert world.pool.state_gen[[1, 2, 3, 4]].tolist() == [1, 1, 1, 1]
+        # The cold row and the continuation are stamped; the hits wait for
+        # their forward to consume the record.
+        assert world.pool.state_gen[[1, 2, 3, 4]].tolist() == [0, 1, 0, 1]
 
     @pytest.mark.parametrize("prefix,stamped", [([0], False), ([PAGE], True)])
     def test_no_hit_carries_nothing(self, monkeypatch, radix_fused, prefix, stamped):
@@ -1278,13 +1281,9 @@ class TestFusedBridge:
         "field,value",
         [("slots", [2, 3]), ("ends", [PAGE, PAGE]), ("rids", ["r0", "rX"])],
     )
-    def test_a_record_of_another_forward_is_refused(
-        self, req_to_token, field, value
-    ):
+    def test_a_record_of_another_forward_is_refused(self, req_to_token, field, value):
         fb, fused = self._fb()
-        setattr(
-            fused, field, value if field == "rids" else np.asarray(value, np.int64)
-        )
+        setattr(fused, field, value if field == "rids" else np.asarray(value, np.int64))
         with pytest.raises(ValueError, match="does not describe this forward"):
             build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
 
@@ -1318,16 +1317,25 @@ class TestFusedBridge:
     def test_the_stamp_guard_still_reads_sglang_prefix(
         self, monkeypatch, req_to_token, radix_fused
     ):
-        seen = []
+        seen, stamped = [], []
         monkeypatch.setattr(
             radix,
             "check_state_stamps",
-            lambda state_gen, generation, slots, prefix: seen.append(prefix.tolist()),
+            lambda state_gen, generation, slots, prefix, carried: seen.append(
+                (prefix.tolist(), carried.tolist())
+            ),
+        )
+        monkeypatch.setattr(
+            radix,
+            "stamp_fused_hits",
+            lambda state_gen, generation, fused: stamped.append(fused.slots.tolist()),
         )
         monkeypatch.setattr(bridge, "_radix_stamps", lambda: (None, None))
         fb, _ = self._fb()
         build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
-        assert seen == [[2 * PAGE, 0, PAGE]]
+        # SGLang's prefix, and the slots the carried record rebuilds.
+        assert seen == [([2 * PAGE, 0, PAGE], [1, 3])]
+        assert stamped == [[1, 3]]
 
     def test_a_short_suffix_still_replays_its_decoder(self, req_to_token):
         """The fused span is at least R >= window rows, so even a hit whose
@@ -1346,9 +1354,7 @@ class TestFusedBridge:
     @pytest.mark.parametrize(
         "starts,replays", [([5, 9, 300], True), ([4, 9, 300], False)]
     )
-    def test_input_logprobs_count_sglang_rows_only(
-        self, req_to_token, starts, replays
-    ):
+    def test_input_logprobs_count_sglang_rows_only(self, req_to_token, starts, replays):
         fb, _ = self._fb()
         fb.return_logprob = True
         fb.extend_logprob_start_lens_cpu = starts
@@ -1387,7 +1393,7 @@ class TestFusedMetadata:
     def test_atom_stages_the_widened_inputs(self, monkeypatch, req_to_token):
         captured = {}
         self._builder(monkeypatch, captured)
-        fb, fused = self._fb()
+        fb, _ = self._fb()
         positions = torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1])
         wide_ids, wide_pos, _ = expand_v41_forward_inputs(fb, fb.input_ids, positions)
         metadata = bridge.build_deepseek_v41_forward_metadata(fb, wide_pos)
@@ -1497,8 +1503,8 @@ class TestFusedCarrier:
         assert getattr(batch, FUSED_ATTR) is None
 
     def test_a_forward_that_never_ran_the_replay_raises(self):
-        # The seam stamped the hits' slots: a forward that lost the record
-        # would extend from P over the last tenant's state.
+        # The second line behind the bridge's guard: a call that returned
+        # without the model consuming the record.
         fused = _fused([0], [7], ["a"], [0], [4])
         batch = SimpleNamespace()
         with pytest.raises(RuntimeError, match=r"slots \[7\] never reached"):
@@ -1739,3 +1745,273 @@ def test_replay_layout_over_a_fused_step(req_to_token):
         None, mapping.compress_tokens(np.asarray([11, 12, 13][-width:], np.int64))
     )[0]
     assert histories[0].tolist() == np.asarray(expected).tolist()
+
+
+# ---------------------------------------------------------------------------
+# 9. Risk-audit fixes: token-only admission, the pinned H2D, the stamp guard
+#    before compute, the forced fused -> side fallback
+# ---------------------------------------------------------------------------
+
+
+def _text_req(**fields):
+    req = SimpleNamespace(
+        rid="t",
+        input_embeds=None,
+        positional_embed_overrides=None,
+        multimodal_inputs=None,
+        is_retracted=False,
+        return_logprob=False,
+    )
+    for name, value in fields.items():
+        setattr(req, name, value)
+    return req
+
+
+class TestTokenOnlyAdmission:
+    @pytest.mark.parametrize(
+        "field,name",
+        [
+            ("input_embeds", "input_embeds"),
+            ("positional_embed_overrides", "positional_embed_overrides"),
+            ("multimodal_inputs", "multimodal inputs"),
+        ],
+    )
+    def test_non_token_requests_are_refused_with_radix_on(
+        self, radix_fused, field, name
+    ):
+        error = radix.radix_request_refusal(_text_req(**{field: [[0.0]]}))
+        assert name in error and "--disable-radix-cache" in error
+        assert radix.radix_request_refusal(_text_req()) is None
+
+    def test_radix_off_refuses_nothing(self):
+        req = _text_req(input_embeds=[[0.0]], positional_embed_overrides="x")
+        assert radix.radix_request_refusal(req) is None
+
+    def test_admission_answers_new_requests_only(self, monkeypatch, radix_fused):
+        rejected = []
+        monkeypatch.setattr(
+            radix,
+            "reject_request",
+            lambda scheduler, req, error: rejected.append((scheduler, req.rid)),
+        )
+        embeds = _text_req(rid="e", input_embeds=[[0.0]])
+        assert not radix.admit_or_reject("sched", embeds, False)
+        assert rejected == [("sched", "e")]
+        # Text, and anything re-entering after a retraction, is SGLang's.
+        assert radix.admit_or_reject("sched", _text_req(), False)
+        assert radix.admit_or_reject("sched", embeds, True)
+        embeds.is_retracted = True
+        assert radix.admit_or_reject("sched", embeds, False)
+        assert len(rejected) == 1
+
+    def test_reject_answers_400_without_queueing(self, monkeypatch, radix_fused):
+        _sglang_module("sglang.srt.disaggregation.utils")
+        streamed, released, aborted = [], [], []
+        scheduler = SimpleNamespace(
+            output_streamer=SimpleNamespace(
+                stream_output=lambda reqs, return_logprob: streamed.append(
+                    ([r.rid for r in reqs], return_logprob)
+                )
+            )
+        )
+        req = _text_req(
+            rid="e",
+            multimodal_inputs="mm",
+            release_mm_inputs_on_abort=lambda: released.append(True),
+            time_stats=SimpleNamespace(
+                trace_ctx=SimpleNamespace(abort=lambda abort_info: aborted.append(1))
+            ),
+        )
+        error = radix.radix_request_refusal(req)
+        radix.reject_request(scheduler, req, error)
+        reason = req.finished_reason
+        assert type(reason).__name__ == "FINISH_ABORT"
+        assert reason.message == error and int(reason.status_code) == 400
+        assert streamed == [(["e"], False)]
+        assert released == [True] and aborted == [1]
+        assert radix._STATS["refused_requests"] == 1
+
+    def test_the_scheduler_queue_door_is_wrapped(self, monkeypatch, radix_fused):
+        Scheduler = _sglang_module("sglang.srt.managers.scheduler").Scheduler
+
+        queued, rejected = [], []
+
+        def original(self, req, is_retracted=False):
+            queued.append((req.rid, is_retracted))
+
+        monkeypatch.setattr(Scheduler, "_add_request_to_queue", original)
+        monkeypatch.setattr(
+            radix,
+            "reject_request",
+            lambda scheduler, req, error: rejected.append(req.rid),
+        )
+        radix._install_request_admission()
+        radix._install_request_admission()  # idempotent
+        door = Scheduler._add_request_to_queue
+        assert door._atom_v41_radix_patched
+        door("s", _text_req(rid="text"))
+        door("s", _text_req(rid="emb", input_embeds=[[0.0]]))
+        door("s", _text_req(rid="score", positional_embed_overrides="pe"))
+        door("s", _text_req(rid="back", input_embeds=[[0.0]]), is_retracted=True)
+        assert queued == [("text", False), ("back", True)]
+        assert rejected == ["emb", "score"]
+        # Radix off (not installed in this process): every request queues.
+        monkeypatch.setattr(radix, "_REPLAY_ROWS", None)
+        door("s", _text_req(rid="emb2", input_embeds=[[0.0]]))
+        assert queued[-1] == ("emb2", False) and rejected == ["emb", "score"]
+
+    @pytest.mark.parametrize("mode", ["fused", "side"])
+    def test_the_replay_never_recomputes_placeholder_ids(self, monkeypatch, mode):
+        monkeypatch.setattr(radix, "_REPLAY_ROWS", R)
+        monkeypatch.setattr(radix, "_REPLAY_MODE", mode)
+        world = _World(monkeypatch)
+        req = _req([1] * (PAGE + 44), rid="e")
+        req.input_embeds = [[0.0]] * (PAGE + 44)
+        with pytest.raises(ValueError, match="admission should have refused"):
+            run_v41_prefix_replay(world.worker, world.batch([PAGE], [1], [req]))
+        assert world.sides == []
+
+    def test_prepare_installs_admission_only_with_radix(self, launch, monkeypatch):
+        """The admission door is part of ``install_deepseek_v41_radix``, which
+        ``_prepare_deepseek_v41_config`` calls with radix cache on only
+        (``test_prepare_installs_the_replay_only_with_radix``)."""
+        installed = []
+        for name in (
+            "_install_worker_seam",
+            "_install_forward_batch_carrier",
+            "_install_eager_view_carrier",
+            "_install_checkpoint_invalidation",
+            "_install_admission_accounting",
+            "_install_request_admission",
+        ):
+            monkeypatch.setattr(radix, name, lambda name=name: installed.append(name))
+        monkeypatch.setenv("ATOM_V41_RADIX_TEST_SIDE_STEPS", "2")
+        assert radix.install_deepseek_v41_radix(window=128) == (R, "fused")
+        assert "_install_request_admission" in installed
+        assert radix._TEST_SIDE_STEPS == 2
+
+
+class TestPinnedStaging:
+    def test_the_host_layout_rides_on_the_record(self):
+        fused = _fused([1], [4], ["b"], [6], [10], ids=[60, 70, 80, 90])
+        fb = _fused_fb([3, 2], fused)
+        ids = torch.tensor([11, 12, 13, 21, 22])
+        positions = torch.tensor([0, 1, 2, 10, 11])
+        expand_v41_forward_inputs(fb, ids, positions)
+        # keep (5), replay_at (4), ids (4), positions (4), in that order.
+        assert fused.host.tolist() == (
+            [0, 1, 2, 7, 8] + [3, 4, 5, 6] + [60, 70, 80, 90] + [6, 7, 8, 9]
+        )
+        assert not fused.host.is_pinned()  # CPU forward: nothing to pin
+
+    def test_a_device_forward_copies_from_pinned_memory(self, monkeypatch):
+        if not torch.cuda.is_available():
+            pytest.skip("needs a visible GPU")
+        copies = []
+        original_to = torch.Tensor.to
+
+        def to(self, *args, **kwargs):
+            if self.device.type == "cpu":
+                copies.append((self.is_pinned(), kwargs.get("non_blocking")))
+            return original_to(self, *args, **kwargs)
+
+        fused = _fused([1], [4], ["b"], [6], [10], ids=[60, 70, 80, 90])
+        fb = _fused_fb([3, 2], fused)
+        ids = torch.tensor([11, 12, 13, 21, 22], device="cuda")
+        positions = torch.tensor([0, 1, 2, 10, 11], device="cuda")
+        monkeypatch.setattr(torch.Tensor, "to", to)
+        wide_ids, wide_pos, rows = expand_v41_forward_inputs(fb, ids, positions)
+        monkeypatch.undo()
+        assert copies == [(True, True)]
+        assert fused.host.is_pinned()
+        assert wide_ids.tolist() == [11, 12, 13, 60, 70, 80, 90, 21, 22]
+        assert wide_pos.tolist() == [0, 1, 2, 6, 7, 8, 9, 10, 11]
+        assert rows.tolist() == [0, 1, 2, 7, 8]
+
+
+class TestStampOnConsume:
+    """The seam leaves a fused hit unstamped; the bridge's guard accepts it
+    only on a forward carrying its record, and stamps it there."""
+
+    def _seam(self, monkeypatch):
+        world = _World(monkeypatch)
+        req = _req(range(1000, 1000 + 2 * PAGE + 7), rid="a")
+        batch = world.batch([2 * PAGE, 0], [3, 2], [req, _req(range(9), rid="c")])
+        fused = run_v41_prefix_replay(world.worker, batch)
+        monkeypatch.setattr(
+            bridge,
+            "_radix_stamps",
+            lambda: (world.pool.state_gen, world.generation),
+        )
+        table = _req_to_token(
+            rows=8, context_len=4 * PAGE, pages_by_row={3: [7, 3, 9], 2: [5]}
+        )
+        monkeypatch.setattr(bridge, "_req_to_token", lambda: table)
+        fb = _extend_fb([2 * PAGE, 0], [7, 9], [3, 2])
+        fb.rids = ["a", "c"]
+        return world, fused, fb
+
+    def test_a_forward_that_lost_the_record_fails_before_compute(
+        self, monkeypatch, radix_fused
+    ):
+        world, fused, fb = self._seam(monkeypatch)
+        assert fused is not None and world.pool.state_gen[3] == 0
+        # The ForwardBatch reached the bridge without the record.
+        with pytest.raises(RuntimeError, match=r"slots \[3\].*not rebuilt"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert world.pool.state_gen[3] == 0
+
+    def test_the_forward_carrying_the_record_stamps_its_hits(
+        self, monkeypatch, radix_fused
+    ):
+        world, fused, fb = self._seam(monkeypatch)
+        setattr(fb, FUSED_ATTR, fused)
+        ids = torch.arange(16)
+        expand_v41_forward_inputs(fb, ids, torch.arange(16))
+        batch = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert batch.replay_rows.tolist() == [R, 0]
+        assert world.pool.state_gen[3] == world.generation[3]
+        # The next chunk of the same tenant is a plain continuation.
+        setattr(fb, FUSED_ATTR, None)
+        build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+
+    def test_an_unexpanded_record_stamps_nothing(self, monkeypatch, radix_fused):
+        world, fused, fb = self._seam(monkeypatch)
+        setattr(fb, FUSED_ATTR, fused)
+        with pytest.raises(RuntimeError, match="widened inputs"):
+            build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        assert world.pool.state_gen[3] == 0
+
+    def test_carried_slots_pass_the_guard(self):
+        state_gen = np.array([0, 3, 5])
+        generation = torch.tensor([0, 3, 6])
+        prefix = np.array([PAGE, PAGE])
+        with pytest.raises(RuntimeError, match=r"slots \[2\]"):
+            check_state_stamps(state_gen, generation, [1, 2], prefix)
+        check_state_stamps(state_gen, generation, [1, 2], prefix, np.array([2]))
+        with pytest.raises(RuntimeError, match=r"slots \[2\]"):
+            check_state_stamps(state_gen, generation, [1, 2], prefix, np.array([1]))
+
+
+class TestForcedSideFallback:
+    def test_the_first_fused_steps_take_the_side_forward(
+        self, monkeypatch, radix_fused
+    ):
+        monkeypatch.setattr(radix, "_TEST_SIDE_STEPS", 1)
+        world = _World(monkeypatch)
+        assert run_v41_prefix_replay(world.worker, world.batch([PAGE], [1])) is None
+        (side,) = world.sides
+        assert side.prefix_lens == [PAGE - R]
+        # A side replay's slot is stamped once its side forward has run.
+        assert world.pool.state_gen[1] == world.generation[1]
+        assert radix._STATS["forced_fallbacks"] == 1
+        assert radix._STATS["fallbacks"] == 1
+        # The hook is spent: the next hit fuses.
+        fused = run_v41_prefix_replay(world.worker, world.batch([PAGE], [2]))
+        assert fused is not None and fused.slots.tolist() == [2]
+        assert len(world.sides) == 1 and radix._STATS["fused_steps"] == 1
+
+    def test_off_by_default(self, monkeypatch, radix_fused):
+        world = _World(monkeypatch)
+        assert run_v41_prefix_replay(world.worker, world.batch([PAGE], [1])) is not None
+        assert world.sides == [] and radix._STATS["forced_fallbacks"] == 0

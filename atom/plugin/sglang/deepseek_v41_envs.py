@@ -47,6 +47,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checksum of every shared PAGE below each hit before and after it, and a
     # TP check of the step's replay row count.
     "ATOM_V41_RADIX_DEBUG": lambda: _flag_env("ATOM_V41_RADIX_DEBUG"),
+    # Test hook for the same: the first N steps that would fuse their replay
+    # take the side-forward fallback (the path a step over the builder takes).
+    "ATOM_V41_RADIX_TEST_SIDE_STEPS": lambda: _int_env(
+        "ATOM_V41_RADIX_TEST_SIDE_STEPS", 0
+    ),
 }
 
 
