@@ -73,6 +73,7 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
     monkeypatch.setattr(engine_core, "time", timer)
     monkeypatch.setattr(pp_engine_core, "time", timer)
     proc = SimpleNamespace(
+        _report_backlog=False,
         label="test",
         utility_queue=None,
         kv_transfer_enabled=False,
@@ -88,6 +89,7 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
             is_finished=lambda: True,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
             # Both loops park the window while the weights are offloaded,
             # which is the state this test drives them through.
             engine_stats=SimpleNamespace(note_idle=lambda _: None),
