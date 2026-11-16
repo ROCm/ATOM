@@ -68,8 +68,11 @@ RBASE = 0x38000 if MERGED else (0xC0000 if XF else 0)
 # the compressor: 2 (merged), or TK_QKV_COMP=1 with xf_full: q_kv_xf_full<6,1,8,1,3,64>, the ratio-1 KV-source
 # layer's QKV kernel (layer 20: wkv only, every position its own entry; grid 621)
 COMP = 2 if MERGED else (int(os.environ.get("TK_QKV_COMP", "0")) if XF else 0)
+# TK_QKV_ROWS (the kg kernels): the draft-row count, 6 (q_kv_xf_kg<6, ..>) or 5 (<5, true, 8, 0>, the MTP
+# layers': grid 486, the kv-norm also writing the block kv / scales)
+QROWS = int(os.environ.get("TK_QKV_ROWS", "6"))
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
-GRID, THREADS = 487, 512
+GRID, THREADS = 481 + QROWS, 512
 if MERGED:
     GRID = 755
 elif COMP == 1:
@@ -254,17 +257,17 @@ def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds):
     for rnd in range_constexpr(4):
         c = tid | (rnd * 0x200)
         if rnd == 3:
-            c = fx.min(c, Int32(0x77F))
+            c = fx.min(c, Int32(QROWS * 320 - 1))
         ok = Int32(1) == 1
         if rnd == 2:
-            ok = c <= 0x77F
+            ok = c <= QROWS * 320 - 1
         if rnd == 3:
-            ok = tid < 0x180
+            ok = tid < QROWS * 320 - 1536
         row, col = c // 320, c % 320
         xc.append((row, col))
         xok.append(ok)
         xv.append(_ld(xq, (row * 0x1400 + col * 16) // 4, 4))
-    d = _ld(xs, fx.min(tid, Int32(239)))
+    d = _ld(xs, fx.min(tid, Int32(QROWS * 40 - 1)))
     mine = ((lane >> 3) & 1) == par
     # this CTA's half of the tile only, exec-masked as TileRT's (zeros on the other lanes). The join
     # costs a conservative vmcnt(4) before the X conversion (TileRT's hipcc emits vmcnt(10)), but every
@@ -292,11 +295,11 @@ def qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws, lds):
             hi = fp8x8_bf16_pk([v[2], v[3]]).bitcast(Int32)
             _lds_st(lds, row * X_ROW + col * 32, [lo[0], lo[1], lo[2], lo[3]])
             _lds_st(lds, row * X_ROW + col * 32 + 16, [hi[0], hi[1], hi[2], hi[3]])
-    if tid < 240:
+    if tid < QROWS * 40:
         f = [_e8m0_f32(d >> (8 * b)).bitcast(Int32) for b in range(4)]
         _lds_st(lds, XS_LDS + (tid // 40) * 0x280 + (tid % 40) * 16, f)
     sbytes = [_ld(sptr, ((tile // 2) * 0xA0 + w * 20) // 4 + q) for q in range(5)]
-    tok_ok = (lane % 16) < 6
+    tok_ok = (lane % 16) < QROWS
     tok = tok_ok.select(lane % 16, Int32(0))
     gpu.barrier()
     acc01 = acc23 = None
@@ -440,8 +443,13 @@ def qkv_qnorm(tid, s16, epoch, ws, gamma, qr, lat, lat_s, lds):
         leader = (s16 % 8) == 0
         if leader & (tid == 0):
             _st_i(ws, EPOCHS // 4 + 1016 + row, epoch)
-        if (s16 == 0) & ((tid & 0xFE) == 64):
-            _st_i(ws, EPOCHS // 4 + 958 + tid, epoch)
+        # the CTA of row 0 also bumps the slots of the unused rows up to 8 (1016 + QROWS .. 1023)
+        if const_expr(QROWS == 6):
+            if (s16 == 0) & ((tid & 0xFE) == 64):
+                _st_i(ws, EPOCHS // 4 + 958 + tid, epoch)
+        else:
+            if (s16 == 0) & (tid >= 64) & (tid < 72 - QROWS):
+                _st_i(ws, EPOCHS // 4 + 952 + QROWS + tid, epoch)
         w4 = _lds_ld(lds, WAVE_SUMS_LDS, 4)
         tot = (
             ((F32(0.0) + w4[0].bitcast(F32)) + w4[1].bitcast(F32)) + w4[2].bitcast(F32)
@@ -520,8 +528,10 @@ def _ll_packs4(addr, word):
     return fx.Vector.from_elements(vals, Int32)
 
 
-QB_X_LDS = 20480  # fp8 q -> bf16, 2560 B a row, swizzled for the MFMA B operand
-QB_XS_LDS = 35840  # q's ue8m0 scales as f32, 160 B a row
+QB_X_LDS = (
+    5120 + QROWS * 2560
+)  # fp8 q -> bf16, 2560 B a row, swizzled for the MFMA B operand
+QB_XS_LDS = QB_X_LDS + QROWS * 2560  # q's ue8m0 scales as f32, 160 B a row
 QB_RED_LDS = 35776  # wave w (1..3) partials at w * 1024 + lane * 4 + {0, 256, 512, 768}
 QB_EPOCH_SLOT, QB_PREP_SLOT = 224, 488
 
@@ -536,7 +546,7 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
         lane, w = tid % 64, tid // 64
         epoch = _ld(ws, EPOCHS // 4 + QB_EPOCH_SLOT + t) + 1
         sw = [_ld(qb_s, ((t // 2) * 40 + ((w * 10) & ~3)) // 4 + q) for q in range(3)]
-        tok_ok = (lane % 16) < 6
+        tok_ok = (lane % 16) < QROWS
         tok = tok_ok.select(lane % 16, Int32(0))
         pos = fx.max(_ld(vpos, tok), Int32(0))
         th = t % 32
@@ -554,7 +564,7 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
         cs = _ld(ropec, tw, 2)
         sn = _ld(ropec, tw + 32, 2)
         rep = (RBASE + _xcc_off()) // 4
-        idx = [tid, tid + 256, tid + 512, fx.min(tid | 0x300, Int32(0x3BF))]
+        idx = [tid, tid + 256, tid + 512, fx.min(tid | 0x300, Int32(QROWS * 160 - 1))]
         e24 = epoch & 0xFFFFFF
         ch = _q_chunks(ws, rep, idx)
         n_dbg = Int32(0)
@@ -568,7 +578,7 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
             ch = _q_chunks(ws, rep, idx)
         for k in range_constexpr(4):
             c = idx[k]
-            live = (tid | 0x300) < 0x3C0 if k == 3 else (Int32(1) == 1)
+            live = (tid | 0x300) < QROWS * 160 if k == 3 else (Int32(1) == 1)
             if live:
                 row, cc = c // 160, c % 160
                 lo = fp8x8_bf16_pk([ch[k][0], ch[k][2]]).bitcast(Int32)
@@ -1287,8 +1297,8 @@ def qkv_kvnorm(tid, s16, ws, vpos, kv_gamma, ropec, win_kv, win_s, alt_kv, alt_s
         gpu.barrier()
         if tid == 0:
             _st_i(ws, EPOCHS // 4 + s16, epoch)
-        if (row == 0) & (tid < 2):
-            _st_i(ws, EPOCHS // 4 + 486 + tid, epoch)
+        if (row == 0) & (tid < 8 - QROWS):  # the unused rows' slots up to 8
+            _st_i(ws, EPOCHS // 4 + 480 + QROWS + tid, epoch)
         if pos >= 0:
             g1 = _ldf(kv_gamma, tid)
             g2 = _ldf(kv_gamma, tid + 256)
@@ -1368,7 +1378,7 @@ def build_finalize_test():
     """Only CTA 0's finalize (when flagged): diff hcA against the original."""
     name = kernel_symbol(
         "tk_q_kv_xf_full_probe" if XF else "tk_q_kv_xf_kg",
-        rows=6,
+        rows=QROWS,
         full=1,
         kv=8,
         idx=IDX,
@@ -1454,11 +1464,11 @@ def _test_entry(
     s16 = flag.select(cta - 1, cta)
     if (s16 >= 0) & (s16 < 224) & ((cta != 0) | (~flag)):
         epoch = qkv_gemv(tid, s16, a00, a01, a02, a03, a04, a05, a06 & ~1, lds)
-        if s16 < 48:
+        if s16 < QROWS * 8:
             qkv_qnorm(tid, s16, epoch, a31, a32, a38, a44, a45, lds)
     if (s16 >= 224) & (s16 < 480):
         qkv_qb(tid, s16, a31, a33, a34, a36, a37, a39, a27, lds)
-    if (s16 >= 480) & (s16 < 486):
+    if (s16 >= 480) & (s16 < 480 + QROWS):
         qkv_kvnorm(tid, s16, a31, a37, a35, a36, a40, a41, a42, a43, lds)
 
 
