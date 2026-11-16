@@ -1,0 +1,2 @@
+model,baseline,source
+minimax-m3,0.9469,"recipes/MiniMax-M3.md on ATOM main: MXFP4 + EAGLE3 TP4 (fp4_eagle_tp4); GSM8K 5-shot local-chat-completions, multi-turn few-shot"

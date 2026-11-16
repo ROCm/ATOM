@@ -1,10 +1,10 @@
-"""Tests for the 455-CI report: highlights, summary table, details (ci455_report.py)."""
+"""Tests for the 455-CI report: lowlights, summary table, details (ci455_report.py)."""
 
 from ci455_data import AccCell, PerfCell
 from ci455_report import (
     ModelResult,
-    highlights,
-    highlights_md,
+    lowlights,
+    lowlights_md,
     missing_followups,
     report_md,
     summary_row,
@@ -61,31 +61,31 @@ FLAT = {
 
 
 def about(rows, name):
-    """The highlight rows of one model: [flag and model, what happened, cause, fix]."""
+    """The lowlight rows of one model: [flag and model, what happened, cause, fix, owner]."""
     return [row for row in rows if name in row[0]]
 
 
-def test_a_highlight_leads_with_the_short_model_name_and_leaves_out_the_scenario():
-    hl = highlights(
+def test_a_lowlight_leads_with_the_short_model_name_and_leaves_out_the_scenario():
+    hl = lowlights(
         [
             model(
                 "Kimi-K3 (2.8T)",
                 pc(4, 100.0, 100.0),
-                pc(64, 1040.0, 1000.0),
+                pc(64, 960.0, 1000.0),
                 ac(0.95, 0.95),
                 scenario="8k1k",
             )
         ]
     )
     (row,) = about(hl, "Kimi-K3")
-    assert row[0] == "🟢 Kimi-K3"
+    assert row[0] == "⚠️ Kimi-K3"
     assert not any(
         word in cell for cell in row for word in ("(2.8T)", "8K/1K", "MLPerf")
     )
 
 
 def test_a_failure_leads_with_the_failed_point_and_the_error():
-    hl = highlights(
+    hl = lowlights(
         [
             model("Alpha", pc(4, 100.0, 100.0), pc(64, 970.0, 1000.0), ac(0.95, 0.95)),
             model(
@@ -107,7 +107,7 @@ def test_a_failure_leads_with_the_failed_point_and_the_error():
 
 
 def test_a_throughput_drop_of_3_percent_is_a_regression_and_10_percent_is_severe():
-    hl = highlights(
+    hl = lowlights(
         [
             model("Alpha", pc(4, 100.0, 100.0), pc(64, 970.0, 1000.0), ac(0.95, 0.95)),
             model("Bravo", pc(4, 100.0, 100.0), pc(64, 890.0, 1000.0), ac(0.95, 0.95)),
@@ -123,7 +123,7 @@ def test_a_throughput_drop_of_3_percent_is_a_regression_and_10_percent_is_severe
 
 
 def test_a_change_only_at_low_concurrency_says_so():
-    hl = highlights(
+    hl = lowlights(
         [model("Alpha", pc(4, 95.0, 100.0), pc(64, 1000.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
@@ -131,7 +131,7 @@ def test_a_change_only_at_low_concurrency_says_so():
 
 
 def test_the_low_concurrency_is_mentioned_when_it_is_worse_than_c64():
-    hl = highlights(
+    hl = lowlights(
         [model("Alpha", pc(4, 88.0, 100.0), pc(64, 960.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
@@ -139,23 +139,22 @@ def test_the_low_concurrency_is_mentioned_when_it_is_worse_than_c64():
 
 
 def test_the_low_concurrency_is_left_out_when_c64_already_says_it():
-    hl = highlights(
+    hl = lowlights(
         [model("Alpha", pc(4, 96.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))]
     )
     (alpha,) = about(hl, "Alpha")
     assert alpha[1] == "throughput down 5.0%"
 
 
-def test_a_gain_of_3_percent_is_progress():
-    hl = highlights(
+def test_a_gain_is_not_a_lowlight():
+    hl = lowlights(
         [model("Alpha", pc(4, 100.0, 100.0), pc(64, 1040.0, 1000.0), ac(0.95, 0.95))]
     )
-    (alpha,) = about(hl, "Alpha")
-    assert alpha == ["🟢 Alpha", "throughput up 4.0%", "—", "—"]
+    assert hl == []
 
 
 def test_an_accuracy_drop_over_004_is_flagged_and_over_006_is_severe():
-    hl = highlights(
+    hl = lowlights(
         [
             model("Alpha", FLAT["c4"], FLAT["c64"], ac(0.905, 0.95)),
             model("Bravo", FLAT["c4"], FLAT["c64"], ac(0.88, 0.95)),
@@ -170,8 +169,8 @@ def test_an_accuracy_drop_over_004_is_flagged_and_over_006_is_severe():
     assert about(hl, "Charlie") == []
 
 
-def test_a_model_that_failed_last_time_and_runs_now_is_a_recovery():
-    hl = highlights(
+def test_a_recovery_is_not_a_lowlight():
+    hl = lowlights(
         [
             model(
                 "Alpha",
@@ -181,24 +180,23 @@ def test_a_model_that_failed_last_time_and_runs_now_is_a_recovery():
             )
         ]
     )
-    (alpha,) = about(hl, "Alpha")
-    assert alpha == ["✅ Alpha", "recovered from the previous failure", "—", "—"]
+    assert hl == []
 
 
 def test_flat_models_are_not_mentioned():
-    assert highlights([model(n, **FLAT) for n in ("Alpha", "Bravo", "Charlie")]) == []
+    assert lowlights([model(n, **FLAT) for n in ("Alpha", "Bravo", "Charlie")]) == []
 
 
-def test_without_news_the_highlights_are_one_line_not_an_empty_table():
+def test_without_problems_the_lowlights_are_one_line_not_an_empty_table():
     flat = [model("Alpha", **FLAT)]
-    assert highlights_md(flat) == ["No failures or major changes."]
+    assert lowlights_md(flat) == ["No failures or regressions."]
     text = report_md("2026-11-14", {}, flat, "c", "r")
-    assert "\n### Highlights\n\nNo failures or major changes.\n\n### Results\n" in text
+    assert "\n### Lowlights\n\nNo failures or regressions.\n\n### Results\n" in text
 
 
 def test_a_first_result_is_not_news():
     assert (
-        highlights(
+        lowlights(
             [model("Alpha", pc(4, 100.0, None), pc(64, 1000.0, None), ac(0.95, None))]
         )
         == []
@@ -248,12 +246,13 @@ def test_one_report_holds_the_summary_and_then_the_details():
     )
     order = [
         "\n## Summary\n",
-        "\n### Highlights\n",
-        "\n| Model | What happened | Cause | Fix |",
+        "\n### Lowlights\n",
+        "\n| Model | What happened | Cause | Fix | Owner |",
         "\n| Model | Scenario |",
+        "\n### Environment\n",
         "\n## Findings\n",
         "\n## Details\n",
-        "\n### Environment\n",
+        "\n### Environment details\n",
         "\n### Performance · MLPerf Endpoint\n",
         "\n### Failures\n",
         "\n#### Bravo (MLPerf Endpoint): c64\n",
@@ -275,16 +274,25 @@ GAINING = {
 }
 
 
-def test_the_highlights_tag_no_one():
-    # The owners are added where the highlights are posted, not in the result.
-    rows = highlights(
+def test_the_lowlights_tag_no_one_and_leave_the_owner_blank():
+    # The owner is filled in by hand (or in followups.csv), never guessed.
+    rows = lowlights(
         [model("Alpha", **GAINING), model("Bravo", **FAILING)],
         followups={"bravo": {"action": "repro", "link": "r.md"}},
     )
-    assert len(rows) == 2 and not any("@" in cell for row in rows for cell in row)
+    assert len(rows) == 1 and rows[0][4] == ""
+    assert not any("@" in cell for row in rows for cell in row)
 
 
-def test_the_highlights_are_a_table_in_the_summary():
+def test_an_owner_named_in_the_follow_up_fills_the_owner_column():
+    (row,) = lowlights(
+        [model("Bravo", **FAILING)],
+        followups={"bravo": {"action": "repro", "link": "r.md", "owner": "Alice"}},
+    )
+    assert row[4] == "Alice"
+
+
+def test_the_lowlights_are_a_table_of_problems_in_the_summary():
     text = report_md(
         "2026-11-14",
         {},
@@ -293,21 +301,20 @@ def test_the_highlights_are_a_table_in_the_summary():
         "r",
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
-    table = text.split("\n### Highlights\n\n")[1].split("\n\n")[0].splitlines()
+    table = text.split("\n### Lowlights\n\n")[1].split("\n\n")[0].splitlines()
     assert table == [
-        "| Model | What happened | Cause | Fix |",
-        "|---|---|---|---|",
-        f"| ❌ Bravo | c64 failed | `RuntimeError: x` | Needs [ROCm/aiter#1234]({PR_OPEN}) (open) |",
-        "| 🟢 Alpha | throughput up 4.0% | — | — |",
+        "| Model | What happened | Cause | Fix | Owner |",
+        "|---|---|---|---|---|",
+        f"| ❌ Bravo | c64 failed | `RuntimeError: x` | Needs [ROCm/aiter#1234]({PR_OPEN}) (open) |  |",
     ]
 
 
 def test_a_pipe_in_a_cause_does_not_break_the_table():
-    (line,) = highlights_md(
+    (line,) = lowlights_md(
         [model("Bravo", **FAILING)],
         followups={"bravo": {"problem": "a|b layout"}},
     )[2:]
-    assert line == "| ❌ Bravo | c64 failed | a\\|b layout | — |"
+    assert line == "| ❌ Bravo | c64 failed | a\\|b layout | — |  |"
 
 
 def test_summary_row_shows_c64_throughput_before_and_now_with_the_delta():
@@ -376,8 +383,8 @@ def test_summary_row_of_a_first_run_has_no_delta():
 
 
 def test_a_problem_without_a_follow_up_is_just_the_problem():
-    (row,) = highlights([model("Bravo", **FAILING)])
-    assert row == ["❌ Bravo", "c64 failed", "`RuntimeError: x`", "—"]
+    (row,) = lowlights([model("Bravo", **FAILING)])
+    assert row == ["❌ Bravo", "c64 failed", "`RuntimeError: x`", "—", ""]
 
 
 def test_only_the_previous_session_counts_not_an_older_best():
@@ -411,12 +418,12 @@ def test_only_the_previous_session_counts_not_an_older_best():
         perf_cells(rows, "endpoint", "alpha", "2026-11-14", (64,)),
         acc_cell([], "endpoint", "alpha", "2026-11-14"),
     )
-    assert highlights([result]) == []
+    assert lowlights([result]) == []
 
 
 def test_a_model_that_did_not_run_this_session_has_not_recovered():
     # e.g. its machine went down before it ran (455-CI-guide.md §3.6): no rows
-    hl = highlights(
+    hl = lowlights(
         [
             model(
                 "Alpha",
@@ -452,7 +459,7 @@ def follow(action, link, note=""):
 
 
 def test_a_failure_carries_the_open_pr_that_fixes_it():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
@@ -461,7 +468,7 @@ def test_a_failure_carries_the_open_pr_that_fixes_it():
 
 
 def test_a_regression_we_fixed_links_our_verified_pr():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Alpha", pc(4, 100.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))],
         followups={"alpha": follow("our_pr", PR_OURS)},
     )
@@ -470,11 +477,12 @@ def test_a_regression_we_fixed_links_our_verified_pr():
         "throughput down 5.0%",
         "—",
         f"Passes with [ROCm/ATOM#2601]({PR_OURS}) (verified)",
+        "",
     ]
 
 
 def test_a_regression_takes_its_cause_from_the_follow_up_problem():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Alpha", pc(4, 100.0, 100.0), pc(64, 950.0, 1000.0), ac(0.95, 0.95))],
         followups={
             "alpha": {**follow("open_pr", PR_OPEN), "problem": "MoE sorting default"}
@@ -484,19 +492,19 @@ def test_a_regression_takes_its_cause_from_the_follow_up_problem():
 
 
 def test_a_problem_with_only_a_repro_links_it():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("repro", "../runs/20261114/bravo/repro.md")},
     )
     assert row[3] == "No fix yet; [repro](../runs/20261114/bravo/repro.md)"
 
 
-def test_good_news_takes_no_follow_up():
-    (row,) = highlights(
+def test_good_news_is_not_a_lowlight_even_with_a_follow_up():
+    rows = lowlights(
         [model("Alpha", **GAINING)],
         followups={"alpha": {**follow("open_pr", PR_OPEN), "problem": "x"}},
     )
-    assert row[2:] == ["—", "—"]
+    assert rows == []
 
 
 def test_missing_followups_names_problems_without_a_usable_follow_up():
@@ -542,7 +550,7 @@ def test_a_fix_that_takes_two_prs_links_both():
     links = (
         "https://github.com/ROCm/ATOM/pull/3225 https://github.com/ROCm/aiter/pull/7847"
     )
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)], followups={"bravo": follow("open_pr", links)}
     )
     want = "Needs [ROCm/ATOM#3225](https://github.com/ROCm/ATOM/pull/3225) + [ROCm/aiter#7847](https://github.com/ROCm/aiter/pull/7847) (open)"
@@ -558,7 +566,7 @@ def test_the_findings_text_goes_into_its_own_section():
 
 
 def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)],
         followups={
             "bravo": {
@@ -573,11 +581,12 @@ def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
         "c64 failed",
         "no cross-node TP on main",
         f"Needs [ROCm/aiter#1234]({PR_OPEN}) (open)",
+        "",
     ]
 
 
 def test_a_fix_merged_after_the_image_was_built_says_main_has_it():
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)], followups={"bravo": follow("merged_pr", PR_OURS)}
     )
     assert row[3] == (
@@ -597,7 +606,7 @@ def test_prs_of_one_repo_name_the_repo_once():
         "https://github.com/ROCm/ATOM/pull/2760",
     )
     b1 = "https://github.com/ROCm/aiter/pull/7913"
-    (row,) = highlights(
+    (row,) = lowlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("our_pr", f"{a1} {a2} {b1}")},
     )
@@ -620,10 +629,10 @@ ENV = {
 }
 
 
-def test_the_result_opens_with_the_full_image_and_each_repo_branch_commit_and_date():
-    head = report_md("2026-11-14", ENV, [model("Alpha", **FLAT)], "c", "r").split(
-        "## Summary"
-    )[0]
+def test_the_environment_sits_after_the_results_and_before_the_findings():
+    text = report_md("2026-11-14", ENV, [model("Alpha", **FLAT)], "c", "r")
+    assert "- Image:" not in text.split("## Summary")[0]
+    head = text.split("\n### Environment\n")[1].split("\n## Findings\n")[0]
     assert "- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`" in head
     assert (
         "- ATOM: `main` @ `9fec99786b088168aec7729858c1176e99d818e6` (2026-11-13)"
@@ -659,3 +668,26 @@ def test_a_failure_shows_how_to_reproduce_it_and_the_shared_client_once():
     assert failures.index("#### Shared MLPerf Endpoint client") > failures.rindex(
         "Reproduce:"
     )
+
+
+def m3(acc, prev=None, baseline=0.9469):
+    r = model("MiniMax-M3 (428B)", pc(4, 2260.0, None), pc(64, 12389.0, None), acc)
+    r.baseline = baseline
+    return r
+
+
+def test_gsm8k_well_below_the_known_good_value_is_a_lowlight_without_history():
+    (row,) = lowlights([m3(ac(0.8726, None))])
+    assert row[:2] == [
+        "🔴 MiniMax-M3",
+        "GSM8K 87.3%, 7.4 points below the known-good 94.7%",
+    ]
+
+
+def test_gsm8k_within_4_points_of_the_known_good_value_is_fine():
+    assert lowlights([m3(ac(0.8726, None), baseline=0.91)]) == []
+
+
+def test_a_gsm8k_drop_already_flagged_against_the_last_session_is_not_repeated():
+    rows = lowlights([m3(ac(0.88, 0.95), baseline=0.95)])
+    assert [r[1] for r in rows] == ["GSM8K down 7.0 points to 88.0%"]

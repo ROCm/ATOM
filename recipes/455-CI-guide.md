@@ -415,11 +415,11 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 - 本场的模型里，列表上没有的都要测。挂掉时正在测的那个从头重测：重起 server，GSM8K 和两个并发都重来，不用挂之前的半截结果。测完照常按 §3.5 上传，`note` 注明是机器恢复后重测的。
 - 同一个模型重测时机器又挂了，可能是这个模型把机器弄挂的：停下来把两次的现象告诉 user，由 user 决定怎么记。不要自己记成跑挂，也不要测第三次。
-- 到场次结束时间还没恢复或没测完，问 user 是延后接着测，还是这场到此为止。没测成的模型不写任何行：报告里显示 —（没有结果），Highlights 里也不会出现，不算跑挂。
+- 到场次结束时间还没恢复或没测完，问 user 是延后接着测，还是这场到此为止。没测成的模型不写任何行：报告里显示 —（没有结果），Lowlights 里也不会出现，不算跑挂。
 
 ### 3.7 跑挂和大幅回退都要给出说法（重点）
 
-我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Highlights 表里每一行 ❌、🔴、⚠️（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Highlights 草稿，再对每个问题按下面的顺序找说法：
+我们做的虽然是 validation，但不能只报一个错误或回退。老板不想只看到问题，要看到下一步怎么办，或者我们已经修好了。所以 Lowlights 表里的每一行（§5.1）都要带一个说法。全部模型测完后，先按 §5.5 跑一遍 `make_report.py` 看 Lowlights 草稿，再对每个问题按下面的顺序找说法：
 
 1. **先查有没有人在修**：先看 `pending_fixes.csv` 里有没有登记这个模型在等的 PR（见本节末尾），例如 Qwen-3.8 Flash 在等 ROCm/ATOM#3225 + ROCm/aiter#7847。登记的 PR 还开着、这次的问题正是它们修的，就用它们。没有登记或对不上，再到 `ROCm/ATOM` 和 `ROCm/aiter` 的公开 PR 里找正在解决这个问题的。开着的 PR 算；镜像构建之后才合进 main 的也算，说明 main 上已经修了。用报错里的关键字、kernel 名、模型名搜，点开确认修的就是这个问题：
 
@@ -474,10 +474,11 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 | `model` | §1 的 slug |
 | `action` | `open_pr`、`merged_pr`、`our_pr` 或 `repro`，对应上面三步。我们的修复还要配合别人开着的 PR 才能跑通时，记 `our_pr`，`link` 把那些 PR 也写上 |
 | `link` | PR 的链接，多个用空格隔开；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
-| `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。它就是 Highlights 表的 Cause 列；不填时，跑挂的模型用一句话报错 |
+| `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。它就是 Lowlights 表的 Cause 列；不填时，跑挂的模型用一句话报错 |
 | `note` | 英文一句话：验证结果、怀疑的方向等 |
+| `owner` | 负责跟进的人，就是 Lowlights 表的 Owner 列。agent 不填，由 user 自己写 |
 
-`make_report.py` 把说法写进 Highlights 表那一行的 Fix 列，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
+`make_report.py` 把说法写进 Lowlights 表那一行的 Fix 列，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
 
 **已知还没合入的修复**登记在 `recipes/455-CI/pending_fixes.csv`。知道某个模型在 main 上要等一组 PR 合入才能跑通（或才有正常性能），就登记一行；PR 合入 main 后删掉这一行。这个模型出了问题又还没写说法时，`make_report.py` 会在 WARNING 下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。贴之前先用 `gh pr view` 确认 PR 还开着，并对一下这次的报错是不是它们修的。
 
@@ -559,7 +560,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 两个 CSV 都用 UTF-8、逗号分隔，含逗号的字段加双引号，表头按上表顺序。
 
-精度图上的 baseline 参考线来自可选的 `accuracy_baseline.csv`，两列：`model`（slug）和 `baseline`（分数，例如模型卡或 ATOM CI 的 baseline）。没有这个文件就不画。
+**已知正确的 GSM8K 精度**写在 `accuracy_baseline.csv`，三列：`model`（slug）、`baseline`（flexible-extract 分数）、`source`（出处和测法，例如 ATOM main 的 `recipes/MiniMax-M3.md`、5-shot chat）。它画成精度图上的参考线，也用来检查精度（§5.1）。测法和本 CI 不同时（本 CI 是 3-shot completions），在 `source` 里写明。
 
 ### 4.4 455-CI 分支的目录结构
 
@@ -576,7 +577,7 @@ recipes/
 └── 455-CI/
     ├── perf.csv           全部历史性能
     ├── accuracy.csv       全部历史 GSM8K 精度
-    ├── accuracy_baseline.csv   可选：精度图上的 baseline 参考线
+    ├── accuracy_baseline.csv   已知正确的 GSM8K 精度：精度图的参考线，也用来检查精度（§4.3）
     ├── followups.csv      每个问题的说法：已有 PR、我们的 PR 或复现文档（§3.7）
     ├── pending_fixes.csv  已知还没合入、某个模型在等的 PR（§3.7）
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
@@ -613,78 +614,70 @@ recipes/
 
 | 部分 | 给谁看 | 内容 |
 |---|---|---|
-| 简短 summary（`## Summary`） | 老板 | Highlights 和总表（§5.1、§5.2） |
+| 简短 summary（`## Summary`） | 老板 | Lowlights、总表和测试环境（§5.1、§5.2） |
 | 发现（`## Findings`） | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
 | 详细 summary（`## Details`） | 要看细节的人 | 测试镜像和环境、全部数字、趋势图、说法、跑挂 case 的核心 error log（§5.3、§5.4） |
 
-这个文件会原样贴到 Teams 发给老板们，所以：开头写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Highlights 是一张短表（§5.1）；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
+这个文件会原样贴到 Teams 发给老板们，所以：Lowlights 是一张短表（§5.1）；总表后面是测试环境，写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
 
 结果和图都用 §5.5 的脚本从 CSV 生成，不手填数字。唯一手写的是发现：写进 `runs/<YYYYMMDD>/findings.md`，英文，每条以 `- ` 开头，链接用完整 URL；脚本原样放进 Findings，没有这个文件就显示 `None recorded.`。跑挂或回退的线索、绕过的办法、异常的耗时（例如 server 启动特别慢）、和 recipe 对不上的地方，都算发现。样例见 [`result/example.md`](result/example.md)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
-### 5.1 Highlights
+### 5.1 Lowlights
 
-大老板只看 Highlights，所以只写本次出了大事或跑挂的模型。Highlights 是一张表，每件事一行，四列：
+大老板只看 Lowlights，所以这里只写问题：跑挂或回退的模型，每件事一行，五列：
 
 | 列 | 写什么 |
 |---|---|
 | Model | 标记加模型名，例如 `❌ Kimi-K3`；不写场景 |
-| What happened | 什么挂了，或变了多少（只给一个关键数字），例如 `all runs failed`、`throughput down 4.2%` |
+| What happened | 什么挂了，或掉了多少（只给一个关键数字），例如 `all runs failed`、`throughput down 4.2%` |
 | Cause | 原因，取自 `followups.csv` 的 `problem`（§3.7）；跑挂又没写 `problem` 时，用一句话报错 |
 | Fix | 说法（§3.7）：需要什么 PR，验证过没有 |
+| Owner | 负责跟进的人。agent 生成时留空，由 user 自己填；直接改 md 也行，但重新生成会被覆盖，要保留就写进 `followups.csv` 的 `owner` 列 |
 
-持平、变化不大或第一次有数据的模型都不提；一个都没有时不画表，只写 `No failures or major changes.`。
+提升（🟢）和恢复（✅）不是 lowlight，不进这张表，提升在总表的 Delta 列里能看到。持平、变化不大或第一次有数据的模型也不提。一个问题都没有时不画表，只写 `No failures or regressions.`。
 
-❌、🔴、⚠️ 这几行的 Fix 列要写上说法，不能只报问题。下面四行的 Fix 依次对应 `followups.csv` 的 `our_pr`、`merged_pr`、`open_pr`、`repro`：
+每一行的 Fix 列都要写上说法，不能只报问题。下面四行的 Fix 依次对应 `followups.csv` 的 `our_pr`、`merged_pr`、`open_pr`、`repro`：
 
-| Model | What happened | Cause | Fix |
-|---|---|---|---|
-| ❌ Kimi-K3 | all runs failed | no cross-node TP on main | Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified) |
-| ❌ Qwen-35B-A3B | all runs failed | gfx1250 fused-MoE layout check | Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built) |
-| ⚠️ MiniMax-M3 | GSM8K down 4.6 points to 88.1% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |
-| ❌ GLM-5.2 | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |
+| Model | What happened | Cause | Fix | Owner |
+|---|---|---|---|---|
+| ❌ Kimi-K3 | all runs failed | no cross-node TP on main | Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified) |  |
+| ❌ Qwen-35B-A3B | all runs failed | gfx1250 fused-MoE layout check | Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built) |  |
+| ⚠️ GLM-5.2 | throughput down 4.2% | MoE sorting default | Needs [ROCm/aiter#…](…) (open) |  |
+| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% | not known yet | No fix yet; [repro](…) |  |
 
-🟢 和 ✅ 不是问题，Cause 和 Fix 写 —。同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。
-
-结果里不 @ 任何人：负责人由 user 把 Highlights 贴到 Teams 给老板汇报时自己加上。
+同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。结果里不 @ 任何人，Owner 列留给 user 填。
 
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的行，也不能改数字。
 
-所有比较都对该模型最近一次成功的那一场（"上一场"），不和更早的最好成绩比。
+比较都对该模型最近一次成功的那一场（"上一场"），不和更早的最好成绩比。另外，有已知正确精度的模型（`accuracy_baseline.csv`，§4.3），在上一场没什么可说的时候（例如第一次跑），GSM8K 还要和已知正确的值比。
 
 | 标记 | 什么时候算 | What happened 列 |
 |---|---|---|
 | ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed`、`all runs failed`（原因写在 Cause 列） |
 | 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
 | ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
-| 🟢 | 吞吐比上一场高 3% 及以上 | `throughput up 6.9%` |
-| ✅ | 上一场跑挂，这一场跑通 | `recovered from the previous failure` |
+| 🔴 / ⚠️ | GSM8K 比已知正确的值低超过 0.06 / 0.04 | `GSM8K 87.3%, 7.4 points below the known-good 94.7%` |
 
 - throughput 指并发 64 的每卡吞吐，和总表一致。并发 4 按同样的门槛判断，但只在 c64 没变化、或并发 4 更严重时才写，例如 `c4 throughput down 5.0%`。
 - GSM8K 看 flexible-extract，差值按点算（0.01 = 1 point）。
 - 门槛的来由：吞吐跑到跑之间有 1% 到 2% 的波动；GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
 
-### 5.2 简短 summary：Highlights 和总表
+### 5.2 简短 summary：Lowlights、总表和测试环境
 
 结果开头的格式如下（取自 `result/example.md`：周六那场，数字是编的）：
 
 ```markdown
 # 455-CI result · <YYYY-MM-DD> · MLPerf Endpoint
 
-- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`
-- ATOM: `main` @ `<完整 commit>` (<commit 日期>)
-- aiter: `main` @ `<完整 commit>` (<commit 日期>)
-
 ## Summary
 
-### Highlights
+### Lowlights
 
-| Model | What happened | Cause | Fix |
-|---|---|---|---|
-| ❌ Qwen-35B-A3B | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |
-| ⚠️ DeepSeek R1 | throughput down 4.5% | a new MoE dispatch default | Passes with [ROCm/ATOM#…](…) (verified) |
-| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |
-| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% | — | — |
-| ✅ Kimi-K3 | recovered from the previous failure | — | — |
+| Model | What happened | Cause | Fix | Owner |
+|---|---|---|---|---|
+| ❌ Qwen-35B-A3B | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |  |
+| ⚠️ DeepSeek R1 | throughput down 4.5% | a new MoE dispatch default | Passes with [ROCm/ATOM#…](…) (verified) |  |
+| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |  |
 
 ### Results
 
@@ -694,6 +687,12 @@ recipes/
 | DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | ⚠️ −5.2 pts (now 88.9%) |
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
+
+### Environment
+
+- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`
+- ATOM: `main` @ `<完整 commit>` (<commit 日期>)
+- aiter: `main` @ `<完整 commit>` (<commit 日期>)
 
 ## Findings
 
@@ -708,6 +707,7 @@ recipes/
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
+- 测试环境（Environment）放在总表后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。详细 summary 里的 Environment details 另有 digest 和 commit 标题。
 
 ### 5.3 详细 summary
 
@@ -736,11 +736,11 @@ recipes/
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
 python3 make_charts.py --date <YYYY-MM-DD>          # 场次日期（周六或周三），写 runs/<YYYYMMDD>/charts/
-python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMMDD>-result.md，打印 Highlights 草稿，最后一行是它的路径
+python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMMDD>-result.md，打印 Lowlights 草稿，最后一行是它的路径
 ```
 
 - 每场测完跑一次，连同历史数据重新生成。
-- 生成后按 §5.1 审一遍 Highlights，再提交。
+- 生成后按 §5.1 审一遍 Lowlights，再提交。
 - 输出里有 `no follow-up` 的 WARNING，说明还有问题没写说法：按 §3.7 补上，再重新生成。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
@@ -751,7 +751,7 @@ python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMM
 ```bash
 cd "$CI_DIR"
 git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，结果才完整
-# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和结果，审过 Highlights，在 ../result/README.md 的索引最上面加一行（见下）
+# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和结果，审过 Lowlights，在 ../result/README.md 的索引最上面加一行（见下）
 git add followups.csv runs/<YYYYMMDD> ../result/<YYYYMMDD>-result.md ../result/README.md
 git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint result"    # 周三写 8K/1K result
 git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI

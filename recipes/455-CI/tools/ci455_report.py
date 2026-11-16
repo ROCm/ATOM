@@ -1,5 +1,5 @@
 """Build the 455-CI result of one session, in English and in one file: a short
-summary for the boss (the highlights table and the results table), the session's
+summary for the boss (the lowlights table and the results table), the session's
 findings, then the details (environment, every number, trend charts, follow-ups
 and each failure's core error log) (455-CI-guide.md §5)."""
 
@@ -8,14 +8,14 @@ from dataclasses import dataclass, field
 
 from ci455_data import LABEL
 
-# Highlight thresholds (455-CI-guide.md §5.1).
+# Lowlight thresholds (455-CI-guide.md §5.1).
 PERF_UP = 0.03  # throughput up by this much against the last success: progress
 PERF_DOWN = -0.03  # down by this much: regression
 PERF_SEVERE = -0.10  # down by this much: severe regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
 LOG_LINES = 60  # core error log lines shown in the details
-NONE = "No failures or major changes."
+NONE = "No failures or regressions."
 EXAMPLE = [
     (
         "> ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; "
@@ -35,6 +35,8 @@ class ModelResult:
     error_log: str = ""  # runs/<YYYYMMDD>/<slug>/error.log
     # (file name, text) of the commands run, runs/<YYYYMMDD>/<slug>/*_cmd*.sh
     commands: list = field(default_factory=list)
+    # The model's known-good GSM8K (flexible-extract), accuracy_baseline.csv
+    baseline: float | None = None
 
 
 def pct(x):
@@ -79,7 +81,7 @@ def acc_flag(delta):
 
 
 def short_name(name):
-    """ "Kimi-K3 (2.8T)" -> "Kimi-K3": highlights keep to the point."""
+    """ "Kimi-K3 (2.8T)" -> "Kimi-K3": lowlights keep to the point."""
     return re.sub(r"\s*\(.*\)\s*$", "", name)
 
 
@@ -153,6 +155,17 @@ def _news(results):
         if flag:
             what = f"GSM8K down {abs(r.acc.delta) * 100:.1f} points to {score(r.acc.value)}"
             items.append((1 if flag == "🔴" else 2, r.slug, flag, who, what, None))
+        elif r.baseline is not None and r.acc.value is not None:
+            # Nothing against the last session (say, the model's first run):
+            # hold GSM8K to its known-good value instead.
+            below = r.baseline - r.acc.value
+            flag = acc_flag(-below)
+            if flag:
+                what = (
+                    f"GSM8K {score(r.acc.value)}, {below * 100:.1f} points below "
+                    f"the known-good {score(r.baseline)}"
+                )
+                items.append((1 if flag == "🔴" else 2, r.slug, flag, who, what, None))
         up = [c for c in r.perf if perf_flag(c.delta) == "🟢"]
         if up:
             what = _phrase(up, top, lambda c: c.delta, "{subject} up {pct}")
@@ -169,7 +182,7 @@ def _news(results):
     )  # stable: model order within a category
 
 
-# Highlight categories of _news that are problems (failures, severe and plain
+# Categories of _news that are problems, the lowlights (failures, severe and plain
 # regressions). Each needs a follow-up in followups.csv (455-CI-guide.md §3.7).
 PROBLEM = (0, 1, 2)
 # open_pr: someone's open PR fixes it; our_pr: we fixed and verified it (the
@@ -203,7 +216,7 @@ def _prs(links):
 
 def _follow_text(f):
     """A problem's fix, from its followups.csv row: short, because the
-    highlights go to the boss as they are."""
+    lowlights go to the boss as they are."""
     action, link = (f or {}).get("action"), ((f or {}).get("link") or "").strip()
     if action == "open_pr":
         return f"Needs {_prs(link)} (open)"
@@ -216,35 +229,38 @@ def _follow_text(f):
     return ""
 
 
-HIGHLIGHT_COLUMNS = ("Model", "What happened", "Cause", "Fix")
+LOWLIGHT_COLUMNS = ("Model", "What happened", "Cause", "Fix", "Owner")
 
 
-def highlights(results, followups=None):
-    """The rows of the highlights table, one per piece of news: the flag and
-    the short model name, what happened, its cause and its fix. A problem (❌
-    🔴 ⚠️) takes its cause from followups.csv's `problem` (a failure without
-    one: its short error) and its fix from the follow-up's action and links.
-    Flat models and first results are not news."""
+def lowlights(results, followups=None):
+    """The rows of the lowlights table, one per problem (❌ 🔴 ⚠️): the flag
+    and the short model name, what happened, its cause, its fix and its owner.
+    The cause is followups.csv's `problem` (a failure without one: its short
+    error), the fix comes from the follow-up's action and links, and the owner
+    is the follow-up's `owner`, blank until someone fills it in. Gains and
+    recoveries are not lowlights; the results table shows them."""
     rows = []
     for category, slug, flag, who, what, err in _news(results):
+        if category not in PROBLEM:
+            continue
         f = (followups or {}).get(slug) or {}
-        cause, fix = "", ""
-        if category in PROBLEM:
-            code = (err or "").replace("`", "'")
-            cause = (f.get("problem") or "").strip() or (f"`{code}`" if code else "")
-            fix = _follow_text(f)
-        rows.append([f"{flag} {who}", what, cause or "—", fix or "—"])
+        code = (err or "").replace("`", "'")
+        cause = (f.get("problem") or "").strip() or (f"`{code}`" if code else "")
+        owner = (f.get("owner") or "").strip()
+        rows.append(
+            [f"{flag} {who}", what, cause or "—", _follow_text(f) or "—", owner]
+        )
     return rows
 
 
-def highlights_md(results, followups=None):
-    """The Highlights section: its table, or one line when nothing is news."""
-    rows = highlights(results, followups)
+def lowlights_md(results, followups=None):
+    """The Lowlights section: its table, or one line when nothing went wrong."""
+    rows = lowlights(results, followups)
     if not rows:
         return [NONE]
     return [
-        _md_row(HIGHLIGHT_COLUMNS),
-        "|" + "---|" * len(HIGHLIGHT_COLUMNS),
+        _md_row(LOWLIGHT_COLUMNS),
+        "|" + "---|" * len(LOWLIGHT_COLUMNS),
         *map(_md_row, rows),
     ]
 
@@ -255,7 +271,7 @@ def _md_row(cells):
 
 
 def missing_followups(results, followups):
-    """Models with a problem in the highlights but no usable follow-up: one of
+    """Models with a problem in the lowlights but no usable follow-up: one of
     the ACTIONS, with a link (455-CI-guide.md §3.7)."""
     problems = {slug for category, slug, *_ in _news(results) if category in PROBLEM}
     missing = []
@@ -362,22 +378,29 @@ def _labels(results):
     ]
 
 
-def _summary(date, results, followups):
-    """The short summary, for the boss: the highlights table, then each
-    model's c64 throughput against the previous session and its GSM8K change."""
+def _summary(date, env, results, followups):
+    """The short summary, for the boss: the lowlights table, each model's c64
+    throughput against the previous session and its GSM8K change, then the
+    image and the commits it was built from."""
     ref = previous_column(results)
     return [
         "## Summary",
         "",
-        "### Highlights",
+        "### Lowlights",
         "",
-        *highlights_md(results, followups),
+        *lowlights_md(results, followups),
         "",
         "### Results",
         "",
         f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
         "|---|---|---|---|---|---|",
         *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
+        "",
+        "### Environment",
+        "",
+        f"- Image: `{env.get('image') or '—'}`",
+        f"- ATOM: {_branch_commit(env, 'atom')}",
+        f"- aiter: {_branch_commit(env, 'aiter')}",
     ]
 
 
@@ -421,7 +444,7 @@ def _details(date, env, results, charts_dir, runs_dir, followups=None):
     """The detailed summary: environment, every number, trends and failures.
     Changes are against the previous session, whose date heads the column; a
     model whose last success is older says so in its cell."""
-    out = ["## Details", "", "### Environment", "", *_env_rows(env, date)]
+    out = ["## Details", "", "### Environment details", "", *_env_rows(env, date)]
     for scenario in ("endpoint", "8k1k"):
         mine = [r for r in results if r.scenario == scenario]
         if not mine:
@@ -605,7 +628,7 @@ def report_md(
     followups=None,
     findings=None,
 ):
-    """One session's result: the short summary (highlights and results tables), the
+    """One session's result: the short summary (lowlights, results, environment), the
     findings written down during the session, then the details. `charts_dir`
     and `runs_dir` are relative to the result file's directory."""
     out = [
@@ -613,11 +636,7 @@ def report_md(
         + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
-        f"- Image: `{env.get('image') or '—'}`",
-        f"- ATOM: {_branch_commit(env, 'atom')}",
-        f"- aiter: {_branch_commit(env, 'aiter')}",
-        "",
-        *_summary(date, results, followups),
+        *_summary(date, env, results, followups),
         "",
         "## Findings",
         "",

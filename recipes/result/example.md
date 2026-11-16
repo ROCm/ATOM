@@ -2,21 +2,15 @@
 
 > ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; they are not real test results.
 
-- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
-- ATOM: `main` @ `0000000000000000000000000000000000000000` (2026-11-14)
-- aiter: `main` @ `1111111111111111111111111111111111111111` (2026-11-14)
-
 ## Summary
 
-### Highlights
+### Lowlights
 
-| Model | What happened | Cause | Fix |
-|---|---|---|---|
-| ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |
-| ⚠️ DeepSeek R1 | throughput down 4.5% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |
-| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |
-| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% | — | — |
-| ✅ Kimi-K3 | recovered from the previous failure | — | — |
+| Model | What happened | Cause | Fix | Owner |
+|---|---|---|---|---|
+| ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |  |
+| ⚠️ DeepSeek R1 | throughput down 4.5% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |  |
+| ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |  |
 
 ### Results
 
@@ -26,6 +20,12 @@
 | DeepSeek-V4.1-Flash | MLPerf Endpoint | 2,655 | 2,838 | 🟢 +6.9% | ⚠️ −5.2 pts (now 88.9%) |
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
+
+### Environment
+
+- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
+- ATOM: `main` @ `0000000000000000000000000000000000000000` (2026-11-14)
+- aiter: `main` @ `1111111111111111111111111111111111111111` (2026-11-14)
 
 ## Findings
 
@@ -38,7 +38,7 @@
 
 ## Details
 
-### Environment
+### Environment details
 
 | Item | Value |
 |---|---|

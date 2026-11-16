@@ -5,9 +5,9 @@
 | 文件 | 作用 |
 |---|---|
 | `make_charts.py` | 入口：画一场的趋势图（一张性能、一张精度） |
-| `make_report.py` | 入口：写本场的结果 `../../result/<YYYYMMDD>-result.md`，打印 Highlights 草稿，最后一行是它的路径 |
+| `make_report.py` | 入口：写本场的结果 `../../result/<YYYYMMDD>-result.md`，打印 Lowlights 草稿，最后一行是它的路径 |
 | `ci455_data.py` | 从两个 CSV 里按场次取数据、和上一场成功的结果比较：重跑以最后一行为准，跑挂的点不算 |
-| `ci455_report.py` | Highlights 规则（门槛见 guide §5.1）和结果的 markdown |
+| `ci455_report.py` | Lowlights 规则（门槛见 guide §5.1）和结果的 markdown |
 | `ci455_charts.py` | 趋势图，照 ATOM benchmark dashboard 的样式 |
 | `endpoint_chart.py`、`fetch_fonts.py` | 原样取自 [LLM-Booster#246](https://github.com/wuhuikx/LLM-Booster/issues/246#issuecomment-6678717093)，提供字体和页面配色，不要改 |
 | `make_examples.py` | 用编出来的数据生成 `examples/` 和 `../../result/example.md` |
@@ -25,7 +25,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
 - 结果里不 @ 任何人：负责人在 Teams 里汇报时再加。
-- 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：Highlights 是一张表（Model、What happened、Cause、Fix），`problem` 填 Cause 列，`action`（`open_pr` / `merged_pr` / `our_pr` / `repro`）和 `link` 填 Fix 列，详细 summary 里还有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
+- 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：Lowlights 是一张表（Model、What happened、Cause、Fix、Owner），`problem` 填 Cause 列，`action`（`open_pr` / `merged_pr` / `our_pr` / `repro`）和 `link` 填 Fix 列，详细 summary 里还有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
 - 结果开头写全镜像名，以及 ATOM、aiter 的 branch、完整 commit 和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
 - `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。

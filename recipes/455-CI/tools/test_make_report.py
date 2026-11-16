@@ -129,9 +129,9 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
     report = result(ci, "20261114").read_text()
     summary, details = report.split("\n## Details\n")
     assert summary.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")
-    assert "## Summary" in summary and "### Highlights" in summary and "❌" in summary
+    assert "## Summary" in summary and "### Lowlights" in summary and "❌" in summary
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
-    assert "base" not in summary.split("### Highlights")[0].lower()
+    assert "base" not in summary.split("### Lowlights")[0].lower()
     assert "| Test date | 2026-11-14 |" in details and "sha256:abc" in details
     assert "Base image" not in details and "Dependency" not in details
     assert (
@@ -205,7 +205,7 @@ def test_a_model_left_untested_by_a_machine_failure_is_not_news(ci):
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | — | — | — |" in report
 
 
-def test_follow_ups_reach_the_highlights_and_a_problem_without_one_is_flagged(
+def test_follow_ups_reach_the_lowlights_and_a_problem_without_one_is_flagged(
     ci, capsys
 ):
     r1 = {"model": "deepseek-r1"}
@@ -354,3 +354,18 @@ def test_a_failure_lists_its_recorded_commands_servers_first_then_gsm8k_then_ben
         "gsm8k_cmd.sh",
         "bench_cmd.sh",
     ]
+
+
+def test_a_known_good_gsm8k_from_the_baseline_file_flags_a_low_first_result(ci, capsys):
+    q = {"scenario": "8k1k", "model": "minimax-m3"}
+    write_csv(ci / "perf.csv", PERF_COLUMNS, [perf("2026-11-14", 64, "12389", **q)])
+    write_csv(ci / "accuracy.csv", ACCURACY_COLUMNS, [acc("2026-11-14", "0.8726", **q)])
+    (ci / "accuracy_baseline.csv").write_text(
+        "model,baseline,source\nminimax-m3,0.9469,recipes/MiniMax-M3.md (main)\n"
+    )
+    main(["--date", "2026-11-14", "--data-dir", str(ci)])
+    text = result(ci, "20261114").read_text()
+    assert (
+        "| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% |" in text
+    )
+    assert "MiniMax-M3 (428B) is a problem in the lowlights" in capsys.readouterr().out
