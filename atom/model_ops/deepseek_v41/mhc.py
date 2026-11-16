@@ -82,6 +82,58 @@ def collapse_streams(residual, pre_mix):
     return out
 
 
+@triton.jit
+def _embed_state_kernel(
+    hidden_ptr,
+    residual_ptr,
+    pre_ptr,
+    hidden_size,
+    M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    # `from_embeddings` in one pass: each row's embedding copied to its M
+    # streams, and a pre-mix of (1, 0, ..., 0) beside it.
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = cols < hidden_size
+    x = tl.load(hidden_ptr + row * hidden_size + cols, mask=mask)
+    for m in tl.static_range(M):
+        tl.store(residual_ptr + (row * M + m) * hidden_size + cols, x, mask=mask)
+    if tl.program_id(1) == 0:
+        j = tl.arange(0, M)
+        tl.store(pre_ptr + row * M + j, tl.where(j == 0, 1.0, 0.0))
+
+
+def embed_state(hidden, hc_mult):
+    """(residual, pre_mix) of `from_embeddings`, bit for bit, in one launch;
+    None where the torch body has to serve (CPU, strided rows, odd hc_mult)."""
+    if torch.compiler.is_compiling() or not (
+        hidden.is_cuda
+        and hidden.is_contiguous()
+        and hidden.dim() >= 1
+        and hc_mult in (1, 2, 4, 8, 16)
+    ):
+        return None
+    *outer, hidden_size = hidden.shape
+    residual = torch.empty(
+        *outer, hc_mult, hidden_size, dtype=hidden.dtype, device=hidden.device
+    )
+    pre_mix = torch.empty(*outer, hc_mult, dtype=torch.float32, device=hidden.device)
+    rows = hidden.numel() // hidden_size if hidden_size else 0
+    if rows:
+        block = 2048
+        _embed_state_kernel[(rows, triton.cdiv(hidden_size, block))](
+            hidden,
+            residual,
+            pre_mix,
+            hidden_size,
+            M=hc_mult,
+            BLOCK_H=block,
+            num_warps=4,
+        )
+    return residual, pre_mix
+
+
 @dataclass(frozen=True)
 class SinglePassHCState:
     """The residual between two sublayers, and the post step one of them owes.
@@ -101,6 +153,9 @@ class SinglePassHCState:
 
     @classmethod
     def from_embeddings(cls, hidden: torch.Tensor, hc_mult: int):
+        fused = embed_state(hidden, hc_mult)
+        if fused is not None:
+            return cls(*fused)
         residual = (
             hidden.unsqueeze(-2)
             .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
