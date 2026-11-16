@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The 12-head MLA decode: where MLAAttention pads a query to, and that the
-metadata builder plans the step's one work plan at the same width."""
+metadata builder plans the step's one work plan at the same width.
+
+aiter's get_mla_decode_shape_support needs the device (or its JIT modules) to
+answer, so it is replaced by a fake that records ATOM's call and returns the
+MlaDecodeShapeSupport a test asks for."""
 
 import logging
 from types import SimpleNamespace
@@ -31,17 +35,56 @@ def _import_with_lent_arch(name):
 attention_mla = _import_with_lent_arch("atom.model_ops.attention_mla")
 aiter_mla = _import_with_lent_arch("atom.model_ops.attentions.aiter_mla")
 dtypes = attention_mla.dtypes
+aiter_attention = pytest.importorskip("aiter.ops.attention")
 
 FP8 = torch.float8_e4m3fn
 MLAAttention = attention_mla.MLAAttention
 
 
+class _AiterShapeSupport:
+    """Fake get_mla_decode_shape_support: answers ``native`` / ``supported``
+    for every shape and records each call."""
+
+    def __init__(self):
+        self.native = True
+        self.supported = True
+        self.calls = []
+
+    def __call__(self, num_heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs):
+        self.calls.append(((num_heads, max_seqlen_qo, q_dtype, kv_dtype), kwargs))
+        return aiter_attention.MlaDecodeShapeSupport(
+            arch="gfx950",
+            enable_experimental=False,
+            flydsl_ps1=False,
+            planner="v1_2",
+            planner_accepts=True,
+            natively_supported=self.native,
+            fold_factor=1 if self.native else 2,
+            seqlen_fold=1,
+            native=self.native,
+            kernel_num_heads=num_heads if self.native else 16,
+            reduce_supported=True,
+            backend=aiter_attention.MlaBackend.ASM,
+            asm_status=aiter_attention.MlaAsmStatus.OK,
+            asm_kernel="mla_a8w8_qh32_qseqlen4_gqaratio32_ps",
+            supported=self.supported,
+            reasons=(),
+        )
+
+
 @pytest.fixture
-def native(monkeypatch):
-    """Native ATOM on a gfx950 rank with 12 heads (96 at tp8), an fp8 KV
-    cache, no indexer, no DCP and the Kimi-K3 interactive band's DSpark 7 (an
-    8-token verify): the configuration the 12-head decode is for. Tests change
-    one thing each."""
+def aiter_shape(monkeypatch):
+    fake = _AiterShapeSupport()
+    monkeypatch.setattr(attention_mla, "get_mla_decode_shape_support", fake)
+    return fake
+
+
+@pytest.fixture
+def native(monkeypatch, aiter_shape):
+    """Native ATOM on a rank with 12 heads (96 at tp8), an fp8 KV cache, no
+    indexer, no DCP and the Kimi-K3 interactive band's DSpark 7 (an 8-token
+    verify), where aiter reports 12 heads native: the configuration the 12-head
+    decode is for. Tests change one thing each."""
     cfg = SimpleNamespace(
         kv_cache_dtype="fp8",
         speculative_config=SimpleNamespace(num_speculative_tokens=7),
@@ -59,7 +102,6 @@ def native(monkeypatch):
     )
     monkeypatch.setattr(atom_config_module, "_current_atom_config", cfg)
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "atom")
-    monkeypatch.setattr(attention_mla, "_gfx", lambda: "gfx950")
     monkeypatch.setattr(
         attention_mla, "get_dp_group", lambda: SimpleNamespace(world_size=1)
     )
@@ -122,30 +164,6 @@ def _builder_width(cfg, monkeypatch, num_heads=12):
 
 
 @pytest.mark.parametrize(
-    "arch, q_dtype, kv_dtype, qlen, persistent, expected",
-    [
-        ("gfx950", FP8, FP8, 1, True, 12),
-        ("gfx950", torch.float8_e4m3fnuz, torch.float8_e4m3fnuz, 1, True, 12),
-        ("gfx950", FP8, FP8, 10, True, 12),
-        ("gfx950", FP8, FP8, 11, True, 16),  # 12 * 11 > 128
-        ("gfx950", FP8, FP8, 1, False, 16),
-        ("gfx950", torch.bfloat16, FP8, 1, True, 16),
-        ("gfx950", FP8, torch.bfloat16, 1, True, 16),
-        # aiter serves 12 here too; ATOM mirrors only the fp8 branch.
-        ("gfx950", torch.bfloat16, torch.bfloat16, 8, True, 16),
-        ("gfx950", torch.uint8, torch.uint8, 1, True, 16),  # byte KV, not fp8
-        ("gfx942", FP8, FP8, 1, True, 16),
-        ("gfx1250", FP8, FP8, 1, True, 16),
-    ],
-)
-def test_aiter_gate(arch, q_dtype, kv_dtype, qlen, persistent, expected):
-    assert (
-        attention_mla.mla_decode_min_heads(q_dtype, kv_dtype, qlen, persistent, arch)
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
     "num_heads, floor, expected",
     [(12, 12, 12), (13, 12, 16), (12, 16, 16), (24, 12, 32), (96, 12, 96)],
 )
@@ -153,9 +171,16 @@ def test_kernel_width_takes_a_twelve_head_floor(num_heads, floor, expected):
     assert attention_mla.mla_kernel_num_heads(num_heads, floor) == expected
 
 
-def _set(monkeypatch, cfg, change):
-    if change == "gfx942":
-        monkeypatch.setattr(attention_mla, "_gfx", lambda: "gfx942")
+def _set(monkeypatch, cfg, change, aiter_shape=None):
+    if change == "aiter folds 12":
+        aiter_shape.native = False
+    elif change == "aiter has no kernel":
+        aiter_shape.supported = False
+    elif change == "aiter cannot tell":
+        aiter_shape.supported = None
+    elif change == "page size 64":
+        monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "64")
+        cfg.kv_cache_block_size = 64
     elif change == "bf16 kv":
         cfg.kv_cache_dtype = "bf16"
     elif change == "triton mla":
@@ -186,13 +211,19 @@ def _set(monkeypatch, cfg, change):
     "change, expected",
     [
         ("none", 12),
-        ("gfx942", 16),
+        # e.g. any arch but gfx950
+        ("aiter folds 12", 16),
+        ("aiter has no kernel", 16),
+        ("aiter cannot tell", 16),
+        # aiter serves 12 heads on bf16 too; ATOM measured fp8 only.
         ("bf16 kv", 16),
+        # aiter serves 12 heads there too; ATOM's decode is not persistent.
+        ("page size 64", 16),
         ("triton mla", 16),
         ("dp2", 12),
         ("dp2, no dpa persistent", 16),
         ("indexer", 16),
-        # aiter serves 12 up to qlen 10; ATOM takes it only at qlen 8.
+        # aiter serves 12 up to qlen 10; ATOM measured it faster at qlen 8 only.
         ("qlen 1", 16),
         ("qlen 4", 16),
         ("qlen 5", 16),
@@ -202,8 +233,10 @@ def _set(monkeypatch, cfg, change):
         ("vllm", 16),
     ],
 )
-def test_layer_and_builder_pad_alike(native, monkeypatch, change, expected):
-    _set(monkeypatch, native, change)
+def test_layer_and_builder_pad_alike(
+    native, aiter_shape, monkeypatch, change, expected
+):
+    _set(monkeypatch, native, change, aiter_shape)
     layer = _layer(native)
 
     assert layer.padded_num_heads == _builder_width(native, monkeypatch) == expected
@@ -258,3 +291,33 @@ def test_each_decode_width_logs_once(native, monkeypatch, caplog):
         "MLA decode query heads: 12 -> 12 (floor 12)",
         "MLA decode query heads: 8 -> 16 (floor 16)",
     ]
+
+
+def test_asks_aiter_about_the_decode_atom_runs(native, aiter_shape):
+    """The shape ATOM describes is the one _forward_decode hands mla_decode_fwd
+    on the persistent page_size=1 path, on the current device's arch."""
+    assert attention_mla.mla_dense_min_query_heads(native, 12, 1) == 12
+
+    assert aiter_shape.calls == [
+        (
+            (12, 8, FP8, FP8),
+            {
+                "num_heads_k": 1,
+                "v_head_dim": 512,
+                "return_lse": False,
+                "causal": True,
+                "persistent": True,
+                "cp_world_size": 1,
+                "page_size": 1,
+                "fast_mode": True,
+            },
+        )
+    ]
+
+
+def test_aiter_is_not_asked_outside_the_measured_choice(native, aiter_shape):
+    native.kv_cache_dtype = "bf16"
+    assert attention_mla.mla_dense_min_query_heads(native, 12, 1) == 16
+    assert attention_mla.mla_dense_min_query_heads(native, 16, 1) == 16
+
+    assert aiter_shape.calls == []

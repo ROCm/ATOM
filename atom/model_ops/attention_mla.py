@@ -33,6 +33,7 @@ except ImportError:
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.attention import get_mla_decode_shape_support
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -233,54 +234,14 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
-# The query-head width below 16 ATOM decodes at: aiter's gfx950 fp8 12-head
-# route (mla_decode_min_heads).
-_MLA_NARROW_MIN_HEADS = 12
-# The one verify width at which ATOM takes it (mla_dense_min_query_heads).
-# aiter mla_decode_fwd on MI355X (aiter 0dd2716), 12- vs 16-head time,
+# The one verify width at which ATOM decodes Kimi-K3's 12 heads a rank unpadded
+# (mla_dense_min_query_heads). A measured choice, not a kernel rule: aiter
+# mla_decode_fwd on MI355X (aiter 0dd2716), fp8 KV, 12- vs 16-head time,
 # median over ctx 4k/32k/128k: at qlen 8, -2.4% / -3.1% / -3.7% / -9.1% at
 # bs 1 / 2 / 4 / 8, with bit-identical output. At qlen 1-4 12 heads is slower
 # at every batch size, 10-43% (medians over ctx; 3.5-44% per shape). At qlen
 # 5-7 the medians run +6.4% to -5.0%, slower at bs 1.
 _MLA_NARROW_QLEN = 8
-_MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
-
-def mla_decode_min_heads(
-    q_dtype: torch.dtype | None,
-    kv_dtype: torch.dtype | None,
-    max_seqlen_q: int,
-    persistent: bool,
-    arch: str,
-) -> int:
-    """12 where aiter's fp8 MLA decode serves 12 query heads, else 16.
-
-    Hand mirror of aiter csrc/py_itfs_cu/asm_mla.cu:452-456 (aiter 7c2fa4d,
-    the ``gqa_ratio == 12`` branch of ``mla_asm_decode_remap``): on gfx950 an
-    fp8-Q, fp8-KV persistent decode with ``12 * qlen <= 128`` takes exactly 12
-    heads, remapped onto the gqa=32 qseqlen=4 kernel, and the fast-mode planner
-    treats 12 as native (csrc/include/mla_decode_shape.h:176-177). Only that
-    fp8 branch is mirrored: ATOM decodes 12 heads only from an fp8 KV cache,
-    so a bf16 decode reports 16 here even where aiter serves 12 (gfx950
-    persistent, ``12 * qlen >= 64``). ``max_seqlen_q`` is the widest decode
-    query, speculative tokens included. Head counts between the floor and 16
-    still pad to 16; see ``mla_kernel_num_heads``.
-    """
-    if (
-        arch == "gfx950"
-        and q_dtype in _MLA_FP8_DTYPES
-        and kv_dtype in _MLA_FP8_DTYPES
-        and persistent
-        and _MLA_NARROW_MIN_HEADS * max_seqlen_q <= 128
-    ):
-        return _MLA_NARROW_MIN_HEADS
-    return _MLA_MIN_HEADS
-
-
-def _gfx() -> str:
-    from aiter.jit.utils.chip_info import get_gfx
-
-    return get_gfx()
 
 
 def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) -> int:
@@ -288,33 +249,44 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
 
     The one model-level value MLAAttention pads its query to and
     AiterMLAMetadataBuilder plans the step's single ``work_*`` plan for, so
-    the two cannot disagree. 12 only for a rank with exactly 12 heads (Kimi-K3
-    at tp8), where it drops the padding altogether, and only where aiter
-    serves 12 and it is the faster width: an 8-token verify
-    (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's DSpark 7). 16
-    otherwise, including:
+    the two cannot disagree. ``num_heads`` (Kimi-K3's 12 at tp8, which then
+    decodes unpadded) where ATOM's measured choice and aiter's answer agree:
+
+    - 12 heads a rank is the faster width only on an fp8 KV cache at an
+      8-token verify (``_MLA_NARROW_QLEN``, the Kimi-K3 interactive band's
+      DSpark 7);
+    - aiter's ``get_mla_decode_shape_support``, from the same C++ rules its
+      planner and asm dispatch use, reports that decode native at 12 heads
+      (not folded) with a kernel for it.
+
+    16 otherwise, including:
 
     - a model with an indexer (``has_mla_indexer``): its sparse layers'
       plans and kernels are sized for 16, and its dense layers share that plan;
     - plugin mode: vLLM, SGLang and RTP-LLM plan the decode in their own
       builders, and vLLM runs it non-persistent under DP;
-    - DCP: its decode dispatches the gathered width.
+    - DCP: its decode dispatches the gathered width;
+    - a decode that is not aiter's persistent asm over the builder's plan.
     """
+    spec = getattr(atom_config, "speculative_config", None)
+    max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
+    # ATOM's measured choice (see _MLA_NARROW_QLEN). Measured on fp8 only, so a
+    # bf16 KV cache keeps 16 even at shapes where aiter serves 12 heads.
+    narrow_is_faster = (
+        num_heads == 12
+        and atom_config.kv_cache_dtype == "fp8"
+        and max_seqlen_q == _MLA_NARROW_QLEN
+    )
     if (
-        num_heads != _MLA_NARROW_MIN_HEADS
+        not narrow_is_faster
         or is_plugin_mode()
         or dcp_world_size > 1
         or has_mla_indexer(get_hf_text_config(atom_config.hf_config))
     ):
         return _MLA_MIN_HEADS
-    spec = atom_config.speculative_config
-    max_seqlen_q = 1 + (spec.num_speculative_tokens if spec else 0)
-    if max_seqlen_q != _MLA_NARROW_QLEN:
-        return _MLA_MIN_HEADS
     # The decode runs aiter's persistent kernel over the builder's plan only on
     # the plain page_size=1 asm path (see MLAAttention.decode_is_persistent).
     # The builder has no MLAModules; the DPA gate reads none today.
-    kv_cache_dtype = "fp8" if atom_config.kv_cache_dtype.startswith("fp8") else "auto"
     persistent = (
         not envs.ATOM_USE_TRITON_MLA
         and not envs.ATOM_MLA_KV_SHUFFLED
@@ -323,7 +295,7 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
             dpa_persistent_supported=supports_dpa_persistent_mode(
                 atom_config,
                 None,
-                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_dtype=atom_config.kv_cache_dtype,
                 num_heads=num_heads,
                 num_kv_heads=1,
             ),
@@ -332,9 +304,28 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
             dcp_persistent_supported=True,
         )
     )
-    # ATOM decodes with Q in the KV cache's dtype (the builder's dtype_q).
-    kv_dtype = dtypes.d_dtypes.get(str(atom_config.kv_cache_dtype))
-    return mla_decode_min_heads(kv_dtype, kv_dtype, max_seqlen_q, persistent, _gfx())
+    if not persistent:
+        return _MLA_MIN_HEADS
+    # Described as _forward_decode calls mla_decode_fwd on this path: Q in the
+    # KV cache's dtype (the builder's dtype_q), one KV head, a kv_lora_rank-wide
+    # output, causal, no LSE (only DCP asks for it), no CP, and the builder's
+    # fast_mode plan. arch is the current device's, as at launch.
+    kv_dtype = dtypes.d_dtypes[atom_config.kv_cache_dtype]
+    shape = get_mla_decode_shape_support(
+        num_heads,
+        max_seqlen_q,
+        kv_dtype,
+        kv_dtype,
+        num_heads_k=1,
+        v_head_dim=get_hf_text_config(atom_config.hf_config).kv_lora_rank,
+        return_lse=False,
+        causal=True,
+        persistent=True,
+        cp_world_size=1,
+        page_size=envs.ATOM_MLA_PAGE_SIZE,
+        fast_mode=True,
+    )
+    return num_heads if shape.native and shape.supported else _MLA_MIN_HEADS
 
 
 def check_kv_shuffled_supported(
@@ -389,10 +380,11 @@ def mla_kernel_num_heads(num_heads: int, min_heads: int = _MLA_MIN_HEADS) -> int
 
     aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
     folds those onto the 16-head kernel); any other value aborts the dispatch.
-    The narrower width ATOM uses is 12, on aiter's gfx950 fp8 persistent
-    decode (``mla_decode_min_heads``): pass it as ``min_heads`` and up to 12
-    heads pad to 12, 13 to 16 heads pad to 16. ``min_heads`` is the layer's floor
-    (``MLAAttention.min_query_heads``); a count at or below it pads to it.
+    The narrower width ATOM uses is 12, where aiter reports it native and ATOM
+    measured it faster (``mla_dense_min_query_heads``): pass it as
+    ``min_heads`` and up to 12 heads pad to 12, 13 to 16 heads pad to 16.
+    ``min_heads`` is the layer's floor (``MLAAttention.min_query_heads``); a
+    count at or below it pads to it.
     """
     if num_heads <= min_heads:
         return min_heads
@@ -770,9 +762,9 @@ class MLAAttention(nn.Module):
             self.min_query_heads = mla_dense_min_query_heads(
                 get_current_atom_config(), num_heads, get_dcp_world_size()
             )
-        # aiter MLA only serves multiples of 16 heads (and ATOM also takes 12 on
-        # its gfx950 fp8 persistent decode); round up so a per-rank count like
-        # 24 (K3 at tp4) does not abort in get_mla_metadata.
+        # aiter MLA serves multiples of 16 heads (and 12 where the floor is 12);
+        # round up so a per-rank count like 24 (K3 at tp4) does not abort in
+        # get_mla_metadata.
         self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
