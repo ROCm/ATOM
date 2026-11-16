@@ -1350,15 +1350,30 @@ def _owned_dcp_slots(
         vb   = pos % (PAGE*W)
     """
     owned = valid & _dcp_owns(pos, RANK, WORLD, INTERLEAVE)
+    return owned, _dcp_slots(
+        pos, owned, table_row, bt_stride_col, WORLD, INTERLEAVE, PAGE
+    )
+
+
+@triton.jit
+def _dcp_slots(
+    pos,
+    owned,
+    table_row,
+    bt_stride_col,
+    WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """`_owned_dcp_slots`'s slots on each position's owner, read where `owned`."""
     virtual_page = PAGE * WORLD
     within = pos % virtual_page
     page = tl.load(table_row + (pos // virtual_page) * bt_stride_col, owned, other=0)
-    slot = (
+    return (
         page * PAGE
         + (within // (WORLD * INTERLEAVE)) * INTERLEAVE
         + within % INTERLEAVE
     )
-    return owned, slot
 
 
 # ---------------------------------------------------------------------------
@@ -1808,7 +1823,8 @@ def _by_owner_dcp_prefill_kernel(
     batch_id_per_q_token,  # int32 [num_tokens]
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     counts,  # int32 [WORLD, 2, stride] -- per owner: owned, then slots written
-    send,  # int32 -- the slots, in owner-major runs
+    starts,  # int32 [WORLD * stride + 1] -- slots written again, from [1]
+    staged,  # int32 [stride, NUM_TOPK_TOKENS + WORLD] -- a row's owner runs
     first_token,
     num_tokens,
     stride,
@@ -1817,53 +1833,59 @@ def _by_owner_dcp_prefill_kernel(
     INTERLEAVE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     NUM_TOPK_TOKENS: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    starts,  # int32 [WORLD, stride] -- a row's first place in its owner's run
-    PACK: tl.constexpr,
 ):
-    """What each rank's filter makes of a row this rank scored: its owned
-    count and slots written (`max(owned, 1)` for a token of the step, none
-    past its last) into `counts`, or with PACK the slots themselves, in
-    column order, into the owner's run of `send` -- one slot 0 for none, as
+    """What each rank's filter makes of a row this rank scored, from one
+    read of the row: per owner, its owned count and slots written
+    (`max(owned, 1)` for a token of the step, none past its last) into
+    `counts` and `starts`, and the slots themselves, in column order, into
+    the owner's run of the row's `staged` -- one slot 0 for none, as
     `_compact_filter_dcp_prefill_kernel` writes them."""
     row = tl.program_id(0)
     live = first_token + row < num_tokens
     req_id = tl.load(batch_id_per_q_token + first_token + row, mask=live, other=-1)
-    valid_req = req_id >= 0
-    col_id = tl.arange(0, BLOCK_N)
-    for owner in tl.static_range(WORLD):
-        if PACK:
-            start = tl.load(starts + owner * stride + row)
-        written = 0
-        for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
-            indice = tl.load(
-                topk_indices + row * NUM_TOPK_TOKENS + tile_start + col_id,
-                mask=valid_req,
-                other=-1,
-            )
-            if PACK:
-                owned, slot = _owned_dcp_slots(
-                    indice,
-                    valid_req,
-                    block_table + req_id * bt_stride0,
-                    1,
-                    owner,
-                    WORLD,
-                    INTERLEAVE,
-                    PAGE_SIZE,
-                )
-                owned_i32 = owned.to(tl.int32)
-                dst = start + written + tl.cumsum(owned_i32, axis=0) - owned_i32
-                tl.store(send + dst, slot, mask=owned)
-            else:
-                owned = valid_req & _dcp_owns(indice, owner, WORLD, INTERLEAVE)
-            written += tl.sum(owned.to(tl.int32))
-        if PACK:
-            tl.store(send + start, 0, mask=live & (written == 0))
-        else:
-            at = counts + owner * 2 * stride + row
-            tl.store(at, written)
-            tl.store(at + stride, tl.where(live, tl.maximum(written, 1), 0))
+    pos = tl.load(
+        topk_indices + row * NUM_TOPK_TOKENS + tl.arange(0, NUM_TOPK_TOKENS),
+        mask=req_id >= 0,
+        other=-1,
+    )
+    valid = pos >= 0
+    owner = (pos // INTERLEAVE) % WORLD
+    table_row = block_table + req_id * bt_stride0
+    slot = _dcp_slots(pos, valid, table_row, 1, WORLD, INTERLEAVE, PAGE_SIZE)
+    out = staged + row * (NUM_TOPK_TOKENS + WORLD)
+    for rank in tl.static_range(WORLD):
+        owned = (valid & (owner == rank)).to(tl.int32)
+        count = tl.sum(owned)
+        tl.store(out + tl.cumsum(owned, axis=0) - owned, slot, mask=owned > 0)
+        tl.store(out, 0, mask=live & (count == 0))
+        written = tl.where(live, tl.maximum(count, 1), 0)
+        tl.store(counts + rank * 2 * stride + row, count)
+        tl.store(counts + (rank * 2 + 1) * stride + row, written)
+        tl.store(starts + 1 + rank * stride + row, written)
+        out += written
+
+
+@triton.jit
+def _send_by_owner_dcp_prefill_kernel(
+    staged,  # int32 [stride, NUM_TOPK_TOKENS + WORLD] -- a row's owner runs
+    counts,  # int32 [WORLD, 2, stride] -- per owner: owned, then slots written
+    starts,  # int32 [WORLD * stride + 1] -- each run's place in `send`
+    send,  # int32 -- the slots, in owner-major runs
+    stride,
+    WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Each of a row's runs in `staged`, moved to its owner's part of `send`."""
+    row = tl.program_id(0)
+    src = staged + row * (NUM_TOPK_TOKENS + WORLD)
+    for rank in tl.static_range(WORLD):
+        n = tl.load(counts + (rank * 2 + 1) * stride + row)
+        dst = send + tl.load(starts + rank * stride + row)
+        for i in range(0, n, BLOCK):
+            col = i + tl.arange(0, BLOCK)
+            tl.store(dst + col, tl.load(src + col, mask=col < n), mask=col < n)
+        src += n
 
 
 class PendingIndexExchange(NamedTuple):
@@ -1908,8 +1930,9 @@ def dcp_exchange_owned_index_prefill(
     """`triton_filter_and_convert_dcp_index_prefill`'s outputs on every DCP
     rank, bit for bit, from each rank's own rows of the top-k (`split`'s
     slot of `topk_indices`) rather than the gathered whole. On the current
-    stream it counts each row's slots by owner, exchanges the counts, packs
-    the slots and writes `owned_counts` and `out_kv_indptr`."""
+    stream it sorts each row's slots by owner, packs them into one run per
+    owner, exchanges the counts and writes `owned_counts` and
+    `out_kv_indptr`."""
     world, stride = split.world, split.stride
     num_tokens = dsa_kv_indptr.shape[0] - 1
     rows = topk_indices[split.slot : split.slot + stride]
@@ -1918,18 +1941,35 @@ def dcp_exchange_owned_index_prefill(
     assert not split.stripe and world == dcp_group.world_size
     block_table = block_table.contiguous()
     counts = torch.empty(world, 2, stride, dtype=torch.int32, device=rows.device)
+    starts = rows.new_empty(world * stride + 1)
     # A row sends each owner max(owned, 1) slots: at most top-k + world.
-    send = rows.new_empty(stride * (NUM_TOPK_TOKENS + world))
-    args = (rows, batch_id_per_q_token, block_table, counts, send, split.slot)
-    args += (num_tokens, stride, block_table.stride(0), world)
-    args += (cp_kv_cache_interleave_size, block_size, NUM_TOPK_TOKENS, 128)
-    _by_owner_dcp_prefill_kernel[(stride,)](*args, counts, PACK=False)
+    staged = rows.new_empty(stride, NUM_TOPK_TOKENS + world)
+    _by_owner_dcp_prefill_kernel[(stride,)](
+        rows,
+        batch_id_per_q_token,
+        block_table,
+        counts,
+        starts,
+        staged,
+        split.slot,
+        num_tokens,
+        stride,
+        block_table.stride(0),
+        world,
+        cp_kv_cache_interleave_size,
+        block_size,
+        NUM_TOPK_TOKENS,
+    )
+    _scan_dcp_metadata_counts_kernel[(1,)](
+        starts, world * stride, BLOCK=2048, num_warps=8
+    )
+    send = staged.new_empty(staged.numel())
+    _send_by_owner_dcp_prefill_kernel[(stride,)](
+        staged, counts, starts, send, stride, world, NUM_TOPK_TOKENS, BLOCK=256
+    )
     group = dcp_group.device_group
     received = torch.empty_like(counts)
     torch.distributed.all_to_all_single(received, counts, group=group)
-    sent = counts[:, 1].flatten()
-    starts = sent.cumsum(0, dtype=torch.int32) - sent
-    _by_owner_dcp_prefill_kernel[(stride,)](*args, starts, PACK=True)
     # Rank r's counts are its rows': token-major once flattened.
     owned_counts[:num_tokens] = received[:, 0].flatten()[:num_tokens]
     out_kv_indptr[1 : num_tokens + 1] = received[:, 1].flatten()[:num_tokens]
