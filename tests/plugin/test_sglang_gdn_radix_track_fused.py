@@ -175,6 +175,9 @@ def test_fused_track_supported_gates_non_gdn_paths():
 
 
 class _Mode:
+    def is_target_verify(self):
+        return False
+
     def is_decode_or_idle(self):
         return False
 
