@@ -549,7 +549,9 @@ def _fuse_rmsnorm_fp4_quant(
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
-@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake)
+# Its outputs are fresh tensors: as a mutating op, Inductor could not remove the
+# auto_functionalized_v2 around it once it returns an E8M0 scale.
+@torch_compile_guard(gen_fake=_fused_rms_fp8_quant_fake, mutates_args=[])
 def _fused_rms_fp8_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
