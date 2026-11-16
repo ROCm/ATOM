@@ -92,7 +92,7 @@ from atom.mono.device.sync import publish
 from atom.mono.plan.execution import THREADS, WAVES
 
 
-def _fmaxnum(a, b):
+def fmaxnum(a, b):
     """max that ignores a NaN operand (``arith.maxnumf``), as triton's
     ``tl.maximum`` / ``tl.max`` / ``tl.clamp`` do by default; ``fx.max`` propagates
     NaN (``arith.maximumf``)."""
@@ -103,8 +103,8 @@ def _fmaxnum(a, b):
     )
 
 
-def _fminnum(a, b):
-    """min that ignores a NaN operand (``arith.minnumf``); see ``_fmaxnum``."""
+def fminnum(a, b):
+    """min that ignores a NaN operand (``arith.minnumf``); see ``fmaxnum``."""
     return fx.Float32(
         farith.minnumf(
             farith.as_ir_value(fx.Float32(a)), farith.as_ir_value(fx.Float32(b))
@@ -278,15 +278,15 @@ def post_task(c, j):
                 vals += [bf_lo(w), bf_hi(w)]
         lm = abs(vals[0])
         for e in range_constexpr(1, 32):
-            lm = _fmaxnum(lm, abs(vals[e]))
-        am = butterfly(lm, (16, 32), _fmaxnum)
-        m = _fmaxnum(am, _f32(AMAX_FLOOR))
+            lm = fmaxnum(lm, abs(vals[e]))
+        am = butterfly(lm, (16, 32), fmaxnum)
+        m = fmaxnum(am, _f32(AMAX_FLOOR))
         sc = m * _f32(INV_FP8_MAX)
         rcp = _f32(1.0) / sc
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):
             qv = [
-                _fminnum(_fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
+                fminnum(fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
                 for e in range(8)
             ]
             d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])

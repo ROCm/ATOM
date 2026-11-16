@@ -627,6 +627,28 @@ def test_p4_absorb_rope(s):
     _check_p4(d, s, True)
 
 
+@pytest.mark.parametrize("s", [1, 16])
+def test_p4_ignores_nan_in_qb(s):
+    """The triton BMM's A prequant ignores a NaN in its amax and clamp, so one
+    NaN in a (token, head) group leaves the rest of that head's q_out finite.
+    P4 must do the same, or the NaN makes the group's scale, hence the head, NaN."""
+    d = _inputs(s, seed=3)
+    qb = d["qb"].view(s, pr.HEADS, pr.QH)
+    qb[:, :, 0] = float("nan")
+    qb[:, :, 77] = float("nan")
+    _run(s, "p4", d)
+    q_ref, _ = _rope_ref(d, True, d["kvc"].clone())
+    live = d["slots"] >= 0
+    got = d["qout"][live][:, : pr.HEADS, : pr.KVL]
+    ref = q_ref[live][:, : pr.HEADS, : pr.KVL]
+    gf, rf = got.float(), ref.float()
+    assert not rf.isnan().any(), "the triton absorb no longer ignores NaN"
+    assert not gf.isnan().any(), f"{int(gf.isnan().sum())} NaN values in q_out"
+    diff = (gf - rf).abs()
+    bad = (_fp8_steps(got, ref) > 1) & (diff > rf.abs().max() * 2**-8)
+    assert not bad.any(), f"{int(bad.sum())} values off: {diff[bad][:8].tolist()}"
+
+
 @pytest.mark.parametrize("build", ["p2p5", "p4"])
 def test_rope_not_neox(build):
     s = 4

@@ -417,17 +417,21 @@ def p4_task(c, j):
             for e in range_constexpr(4):
                 w = avals[q][e]
                 vals += [bf_lo(w), bf_hi(w)]
+        # The amax and the clamp ignore a NaN, as triton's prequant does (see
+        # mla_post's v-up): one NaN in the group must not make the head NaN.
         lm = abs(vals[0])
         for e in range_constexpr(1, 32):
-            lm = fx.max(lm, abs(vals[e]))
-        am = butterfly(lm, (16, 32), fx.max)
-        m = fx.max(am, _f32(mp.AMAX_FLOOR))
+            lm = mp.fmaxnum(lm, abs(vals[e]))
+        am = butterfly(lm, (16, 32), mp.fmaxnum)
+        m = mp.fmaxnum(am, _f32(mp.AMAX_FLOOR))
         sc = m * _f32(INV_FP8_MAX)
         rcp = _f32(1.0) / sc
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):
             qv = [
-                fx.min(fx.max(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
+                mp.fminnum(
+                    mp.fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX)
+                )
                 for e in range(8)
             ]
             d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
