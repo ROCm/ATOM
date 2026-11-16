@@ -141,7 +141,11 @@ through `indexer_qk_rope_quant_and_cache` with `scale_layout="opus"`
 ([ROCm/aiter#7798](https://github.com/ROCm/aiter/pull/7798)). The
 `b038a7dff` row and its GSM8K ran on AITER `342aa1dc1` plus ROCm/aiter#7798
 at `86719be77`, with the `Kimi-K3.1-Pro-DSpark-preview` draft at revision
-`6a2ef20a`.
+`6a2ef20a`. The `186e753c8` row and its GSM8K ran on AITER `whx/k31-aiter`
+at `639771696`, which adds
+[ROCm/aiter#7993](https://github.com/ROCm/aiter/pull/7993): the MXFP4 MoE
+reads its latent input as a row-strided view (an AITER without it warns and
+leaves its fast path for that view, still correct).
 
 Start the LMCache server, then ATOM:
 
@@ -168,7 +172,7 @@ python -m atom.entrypoints.openai_server \
   --tool-call-parser kimi_k3 -tp 8 --decode-context-parallel-size 8 \
   --kv_cache_dtype fp8 --index-cache-dtype fp4 --index-cache-layout mfma \
   --block-size 64 --enable_prefix_caching --max-num-seqs 16 \
-  --max-num-batched-tokens 16384 --gpu-memory-utilization 0.85 \
+  --max-num-batched-tokens 16384 --gpu-memory-utilization 0.88 \
   --state-checkpoint-interval-tokens -1 --level 3 --cudagraph-mode FULL \
   --cudagraph-capture-sizes "[$(seq -s, 1 128)]" \
   --method dspark --draft-model /data/Kimi-K3.1-Pro-DSpark-preview \
@@ -176,9 +180,19 @@ python -m atom.entrypoints.openai_server \
   --kv-transfer-config '{"kv_connector":"lmcache_mp","kv_role":"offload","kv_connector_extra_config":{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5585,"lmcache.mp.read_ttl_seconds":900,"lmcache.mp.transfer_deadline_s":300}}'
 ```
 
-- `--gpu-memory-utilization 0.85`, not 0.94: at 0.94 a two-request prefill
+- `--gpu-memory-utilization 0.88`, not 0.94: at 0.94 a two-request prefill
   near 317K tokens of context exhausts VRAM and hangs the server
   ([LLM-Booster#564](https://github.com/wuhuikx/LLM-Booster/issues/564)).
+  The `186e753c8` run at 0.88 kept at least 6.3 GiB free on every card.
+- The decode path needs no switch of its own: the fused KDA decode, the
+  column-sharded MoE tail and the once-a-step DCP decode plan are on by
+  default. `ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0` keeps decode on that
+  MoE tail; at the default threshold a decode step takes the dual-stream
+  MoE split, which skips it.
+- `AITER_CUSTOM_AR_DISABLE_LAMPORT=1` swaps AITER's lamport two-shot
+  all-reduce for `cross_device_reduce`: the lamport kernel now and then
+  holds every rank for 10 to 1900 ms at once
+  ([LLM-Booster#487](https://github.com/wuhuikx/LLM-Booster/issues/487)).
 - The prefill delayer stays off: holding prefills back raises TTFT at this
   concurrency.
 - `--spec-decode-acceptance-length` commits draft tokens unverified
@@ -205,9 +219,14 @@ per GPU is their input plus output tokens / 3600 / 8, P90 interactivity is
 
 | Run | Throughput / GPU | TTFT p50 / mean | ITL p50 | P90 interactivity | Requests |
 |---|---:|---:|---:|---:|---:|
-| ATOM `b038a7dff`, this launch, 2026-11-14 | 8225.0 | 0.87 / 1.37 s | 13.61 ms | 42.76 | 1869 |
+| ATOM `186e753c8`, this launch, 2026-11-16 | 8981.5 | 0.55 / 1.17 s | 12.05 ms | 50.18 | 2036 |
+| ATOM `b038a7dff`, this launch at utilization 0.85, 2026-11-14 | 8225.0 | 0.87 / 1.37 s | 13.61 ms | 42.76 | 1869 |
 | ATOM `2c946f623` (local build), 2026-11-12 | 7958.5 | 0.81 / 1.31 s | 14.82 ms | 40.36 | 1791 |
 | SGLang, InferenceX CI run 42324316724 | 9238.8 | 0.70 / 1.21 s | 11.62 ms | 62.67 | 2074 |
+
+GSM8K 5-shot at `186e753c8` without `--spec-decode-acceptance-length`, two
+runs of this launch: flexible-extract 96.89% and 97.12%, strict-match 96.82%
+and 97.12% (±0.48 and ±0.46).
 
 GSM8K 5-shot at `b038a7dff` without `--spec-decode-acceptance-length`:
 flexible-extract 97.73%, strict-match 97.65% (±0.42). That run set
