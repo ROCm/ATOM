@@ -1026,6 +1026,7 @@ class SGLangGDNForwardContext:
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            live_slots = idx
             num_query_tokens = None
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on

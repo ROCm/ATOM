@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.model_ops.attention_gdn import GatedDeltaNet
@@ -123,8 +122,10 @@ def test_park_is_a_no_op_before_the_ring_exists():
 
 
 def _batch(mode):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     return SimpleNamespace(
-        forward_mode=mode,
+        forward_mode=ForwardMode[mode],
         batch_size=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         extend_prefix_lens=torch.tensor([0, 64], dtype=torch.int32),
@@ -169,7 +170,7 @@ def test_extend_parks_the_cursor_once_per_forward(monkeypatch):
     calls = []
     monkeypatch.setattr(attention_gdn, "replayssm_enabled", lambda: True)
     monkeypatch.setattr(attention_gdn, "note_full_state_write", calls.append)
-    forward_batch = _batch(ForwardMode.EXTEND)
+    forward_batch = _batch("EXTEND")
     # The third row is past batch_size: not a slot of this batch.
     cache_indices = torch.tensor([6, 2, 0], dtype=torch.int32)
 
@@ -188,9 +189,9 @@ def test_extend_parks_the_cursor_once_per_forward(monkeypatch):
 @pytest.mark.parametrize(
     "mode, enabled",
     [
-        (ForwardMode.DECODE, True),
-        (ForwardMode.TARGET_VERIFY, True),
-        (ForwardMode.EXTEND, False),
+        ("DECODE", True),
+        ("TARGET_VERIFY", True),
+        ("EXTEND", False),
     ],
     ids=["decode", "target-verify", "replayssm-off"],
 )
@@ -212,8 +213,31 @@ def test_extend_metadata_parks_only_the_batch_slots(monkeypatch):
 
     # Row 1 is a pad row; row 2 is past batch_size.
     SGLangGDNForwardContext._build_gdn_metadata(
-        _batch(ForwardMode.EXTEND),
+        _batch("EXTEND"),
         _linear(torch.tensor([6, -1, 2], dtype=torch.int32)),
     )
 
     assert replay_runtime().write_pos.tolist() == [1, 2, 3, 4, 5, 6, 0, 8]
+
+
+def test_reconstructed_extend_metadata_parks_the_cursor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(attention_gdn, "replayssm_enabled", lambda: True)
+    monkeypatch.setattr(attention_gdn, "note_full_state_write", calls.append)
+    slots = torch.tensor([6, 2], dtype=torch.int32)
+    monkeypatch.setattr(
+        attention_gdn,
+        "reconstruct_linear_metadata",
+        lambda forward_batch, linear_backend: (
+            torch.tensor([0, 3, 5], dtype=torch.int32),
+            slots,
+        ),
+    )
+    # SGLang published no GDN metadata: the slots come from the mamba pool.
+    linear = SimpleNamespace(forward_metadata=None, req_to_token_pool=None)
+
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(_batch("EXTEND"), linear)
+
+    assert metadata is not None
+    assert len(calls) == 1
+    assert calls[0].tolist() == [6, 2]
