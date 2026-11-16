@@ -3720,9 +3720,7 @@ def make_in_place_worker(cluster, monkeypatch):
     """A worker whose windows take the in-place path over a host pool."""
     built = []
 
-    def build(
-        *, save_slots=8, load_slots=8, chunk_bytes=PAGE_CHUNK_BYTES, codec=None
-    ):
+    def build(*, save_slots=8, load_slots=8, chunk_bytes=PAGE_CHUNK_BYTES, codec=None):
         worker = MooncakeStoreOffloadConnector(_config())
         gpu = FakeGPUConnector(worker._source_group_safe)
         gpu.gpu_staging_chunk_bytes = chunk_bytes
@@ -3780,7 +3778,7 @@ def test_in_place_load_restores_padded_slots_without_staging(
     cluster, make_in_place_worker
 ):
     chunk_bytes = 2 * FakeStridedCodec.block_bytes
-    worker, gpu, codec, stream = make_in_place_worker(
+    worker, gpu, codec, _stream = make_in_place_worker(
         load_slots=8, chunk_bytes=chunk_bytes, codec=FakeStridedCodec()
     )
     worker._chunk_bytes = chunk_bytes
@@ -3795,9 +3793,7 @@ def test_in_place_load_restores_padded_slots_without_staging(
     # Two chunks per window, two blocks per chunk: the padded run is unpacked
     # where it lies, never through the staging path.
     assert gpu.calls == []
-    assert [c for c in codec.calls if c[0] == "strided"] == [
-        ("strided", 2, 4096)
-    ] * 2
+    assert [c for c in codec.calls if c[0] == "strided"] == [("strided", 2, 4096)] * 2
     for index, data in pattern.items():
         for item in range(2):
             block = 100 + 2 * index + item

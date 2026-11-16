@@ -925,9 +925,7 @@ class BlockGPUConnector:
                 # Only a recovery that fenced both streams proves no launched
                 # kernel still reads the lease; anything else (no recovery ran,
                 # or a fence failed) must quarantine it.
-                self.codec.finish_prepared_block_id_groups(
-                    block_id_owner, safe=fenced
-                )
+                self.codec.finish_prepared_block_id_groups(block_id_owner, safe=fenced)
             raise
         else:
             # run_staged_pipeline already performed its operation completion fence;
