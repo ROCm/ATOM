@@ -8,7 +8,7 @@ test_gdn_midstep_checkpoints.py pins that for any readable backend. What is
 Kimi-K3's own lives in `atom.models.kimi_k3.midstep`, which imports no AITER,
 so it is pinned here on the CPU:
 
-  * the switch, off by default, and its refusal without FlashKDA;
+  * the switch, off by default, and its refusal under pipeline parallelism;
   * the transfer it declares: readable, on FlashKDA's 32-token grid, at least
     `conv_kernel - 1` tokens into the forward;
   * the targets one prefill step yields -- several per forward, rows that hold
