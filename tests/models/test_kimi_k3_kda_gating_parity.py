@@ -56,7 +56,7 @@ def _inputs(seqs, per_seq, slots):
 def _run(kernel, inp, state, write, read, accepted):
     state = state.clone()
     out = inp["out"].clone()
-    o, _ = kernel(
+    result = kernel(
         A_log=inp["A_log"],
         a=inp["a"],
         b=inp["b"],
@@ -75,7 +75,9 @@ def _run(kernel, inp, state, write, read, accepted):
         is_kda=True,
         lower_bound=LOWER_BOUND,
     )
-    return o, state
+    # aiter's entry returns None for inputs that its kernel does not cover.
+    assert result is not None, "Kimi-K3's decode shapes must reach aiter's kernel"
+    return result[0], state
 
 
 def _compare(inp, write, read, accepted):

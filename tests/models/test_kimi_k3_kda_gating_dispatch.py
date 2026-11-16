@@ -4,8 +4,9 @@
 
 aiter's gfx1250 entry replaces ATOM's kernel only where it is verified: the
 lower-bound KDA gate, bf16 activations over an fp32 state, on gfx1250. Every
-other call must still reach ATOM's own kernel, so these tests pin the routing
-with the two kernels replaced by recorders.
+other call, and every call that the entry declines by returning None, must
+still reach ATOM's own kernel, so these tests pin the routing with the two
+kernels replaced by recorders.
 """
 
 import pytest
@@ -39,9 +40,11 @@ def recorders(monkeypatch):
 
     def aiter_kernel(**kwargs):
         calls["aiter"] += 1
+        return "aiter"
 
     def atom_kernel(**kwargs):
         calls["atom"] += 1
+        return "atom"
 
     monkeypatch.setattr(model, "_aiter_kda_gating_update", aiter_kernel)
     monkeypatch.setattr(model, "_atom_kda_gating_update", atom_kernel)
@@ -50,8 +53,17 @@ def recorders(monkeypatch):
 
 
 def test_gfx1250_kda_lower_bound_routes_to_aiter(recorders):
-    model.fused_sigmoid_gating_delta_rule_update(**_kwargs())
+    assert model.fused_sigmoid_gating_delta_rule_update(**_kwargs()) == "aiter"
     assert recorders == {"aiter": 1, "atom": 0}
+
+
+def test_inputs_declined_by_aiter_run_atom_kernel(recorders, monkeypatch):
+    def declining_kernel(**kwargs):
+        recorders["aiter"] += 1
+
+    monkeypatch.setattr(model, "_aiter_kda_gating_update", declining_kernel)
+    assert model.fused_sigmoid_gating_delta_rule_update(**_kwargs()) == "atom"
+    assert recorders == {"aiter": 1, "atom": 1}
 
 
 def test_other_arch_stays_on_atom_kernel(recorders, monkeypatch):

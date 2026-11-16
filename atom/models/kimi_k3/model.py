@@ -78,7 +78,8 @@ from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
 
 try:
-    # aiter's gfx1250 entry: same parameter names as the ATOM kernel above.
+    # aiter's gfx1250 entry: same parameter names as the ATOM kernel above. It
+    # returns None, without a launch, for inputs its kernel does not cover.
     from aiter.ops.triton.attention.kda_atom import (
         fused_sigmoid_gating_delta_rule_update as _aiter_kda_gating_update,
     )
@@ -112,9 +113,12 @@ def _use_aiter_kda_gating(kwargs) -> bool:
 
 
 def fused_sigmoid_gating_delta_rule_update(**kwargs):
-    """KDA gating update for decode and spec verify. Call sites pass keywords."""
+    """KDA gating update for decode and spec verify. Call sites pass keywords.
+    ATOM's kernel runs every call that aiter's entry declines."""
     if _use_aiter_kda_gating(kwargs):
-        return _aiter_kda_gating_update(**kwargs)
+        result = _aiter_kda_gating_update(**kwargs)
+        if result is not None:
+            return result
     return _atom_kda_gating_update(**kwargs)
 
 
