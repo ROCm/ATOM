@@ -32,7 +32,14 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
-from atom.mono.device.ops import bf2_f32, load_ptr64, rsrc, spin_pause, traced
+from atom.mono.device.ops import (
+    bf2_f32,
+    bf16_round,
+    load_ptr64,
+    rsrc,
+    spin_pause,
+    traced,
+)
 from atom.mono.runtime.abi import KernelAbi
 
 THREADS = 256
@@ -352,7 +359,7 @@ def build_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
     return K2AllReduceKernel(name, launch, (ctas,), (threads,), ctas)
 
 
-def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
+def _build_gather_allreduce6(tp: int, rows: int) -> K2AllReduceKernel:
     """``build_allreduce`` whose routed lines this rank computes itself: AITER's
     MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
     the routes' rows and weights (``[rows, TOPK]`` i32 and f32), bit for bit,
@@ -438,4 +445,226 @@ def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
     GATHER_ALLREDUCE_ABI.check(kernel, launch)
     return K2AllReduceKernel(
         name, launch, (ctas,), (threads,), ctas, GATHER_ALLREDUCE_ABI
+    )
+
+
+# Seven-element lines: seven BF16 and the epoch's low 16 bits. LATENT and
+# HIDDEN are multiples of seven, so a line never straddles a row and a routed
+# row is two CTAs' lines. A line's slot is rewritten every second launch, so a
+# stale copy's tag is two behind, never the current one modulo 2^16. A seventh
+# fewer lines than six-element ones keep a CU's pushes at a line a thread
+# further: past THREADS lines a CU, the cross-tray pushes slow down markedly.
+LINE7_ELEMENTS = 7
+LINE7_ROUTED = LATENT // LINE7_ELEMENTS
+assert LATENT % LINE7_ELEMENTS == 0 and HIDDEN % LINE7_ELEMENTS == 0
+assert LINE7_ROUTED % THREADS == 0
+
+
+def allreduce7_lines(rows: int) -> int:
+    return rows * REDUCE_WIDTH // LINE7_ELEMENTS
+
+
+def _seven(pointer, element):
+    """BF16 ``element .. element + 7`` of ``pointer`` as fp32: one 16 B load
+    from the BF16 pair at or before ``element``, shifted down one where the
+    line starts on an odd element. It never reads past the line's last pair."""
+    loaded = fx.Vector(
+        bo.buffer_load(pointer, element // 2, vec_width=LINE_WORDS, dtype=T.i32)
+    )
+    values = []
+    for w in range(LINE_WORDS):
+        values.extend(bf2_f32(fx.Int32(loaded[w])))
+    odd = element % 2 == 1
+    return [odd.select(values[j + 1], values[j]) for j in range(LINE7_ELEMENTS)]
+
+
+def _pack(low, high):
+    return fx.Int32(
+        fx.Vector.from_elements([low, high], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Int32)[0]
+    )
+
+
+def _stale7(words, sources, tag):
+    stale = None
+    for p in range(sources):
+        late = (fx.Int32(words[p * LINE_WORDS + 3]) >> 16) & fx.Int32(0xFFFF) != tag
+        stale = late if stale is None else stale | late
+    return stale
+
+
+@traced
+def _poll_lines7(mine, ats, tag):
+    """``_poll_lines`` of seven-element lines, tagged in their top 16 bits."""
+    words = _load_lines(mine, ats)
+    while _stale7(words, len(ats), tag):
+        spin_pause()
+        words = _load_lines(mine, ats)
+    return words
+
+
+@traced
+def _store_seven(local, element, values):
+    """Seven BF16 at ``element``: the whole pairs as words, the odd end alone."""
+    if element % 2 == 0:
+        for w in range_constexpr(3):
+            bo.buffer_store(
+                _pack(values[2 * w], values[2 * w + 1]), local, element // 2 + w
+            )
+        bo.buffer_store(
+            values[6].to(fx.BFloat16), local, element + 6, offset_is_bytes=False
+        )
+    else:
+        bo.buffer_store(
+            values[0].to(fx.BFloat16), local, element, offset_is_bytes=False
+        )
+        for w in range_constexpr(3):
+            bo.buffer_store(
+                _pack(values[2 * w + 1], values[2 * w + 2]),
+                local,
+                (element + 1) // 2 + w,
+            )
+
+
+@traced
+def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values):
+    """Line ``line``'s seven values pushed to every rank, then every rank's
+    copy reduced in rank order in fp32 and stored back as BF16."""
+    words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
+    words.append((_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (tag << 16))
+    out = fx.Vector.from_elements(words, fx.Int32)
+    at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
+    for base in bases:
+        _store_line_sys(base + at, out)
+    got = _poll_lines7(
+        mine, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)], tag
+    )
+    reduced = None
+    for p in range_constexpr(tp):
+        copy = []
+        for w in range_constexpr(3):
+            copy.extend(bf2_f32(fx.Int32(got[p * LINE_WORDS + w])))
+        copy.append(bf2_f32(fx.Int32(got[p * LINE_WORDS + 3]))[0])
+        reduced = copy if p == 0 else [a + b for a, b in zip(reduced, copy)]
+    _store_seven(local, line * LINE7_ELEMENTS, [bf16_round(v) for v in reduced])
+
+
+def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:
+    """``build_allreduce`` whose routed lines this rank computes itself: AITER's
+    MoE gather-reduce of ``grouped`` (the grouped MoE's gemm2 rows, BF16) by
+    the routes' rows and weights (``[rows, TOPK]`` i32 and f32), bit for bit,
+    in place of reading them -- one launch fewer. Seven-element lines, a line
+    a thread, while those fit MAX_CTAS CTAs; six-element ones past that."""
+    lines = allreduce7_lines(rows)
+    if lines > MAX_CTAS * THREADS:
+        return _build_gather_allreduce6(tp, rows)
+    ctas = -(-lines // THREADS)
+    routed_lines = rows * LINE7_ROUTED
+    bank_words = tp * lines * LINE_WORDS
+    name = f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
+
+    @fx.struct
+    class Lds:
+        routes: fx.Array[fx.Float32, 2 * TOPK, 16]
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        bid = fx.Int32(fx.block_idx.x)
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        epoch = (
+            fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
+        )
+        tag = epoch & fx.Int32(0xFFFF)
+        bank = (epoch & 1) * bank_words
+        bases = [load_ptr64(peers, p) for p in range(tp)]
+        mine = rsrc(load_ptr64(peers, rank))
+        local = rsrc(data)
+        line = bid * THREADS + tid
+        live = line < lines
+        # a CTA's routed lines are half of one token's row
+        routed = bid * THREADS < routed_lines
+        token = bid * THREADS // LINE7_ROUTED
+        if routed & (tid < TOPK):
+            at = token * TOPK + tid
+            route_row = bo.buffer_load(rsrc(route_rows), at, vec_width=1, dtype=T.i32)
+            route_weight = bo.buffer_load(
+                rsrc(route_weights), at, vec_width=1, dtype=T.f32
+            )
+            fx.ptr_store(
+                fx.Int32(route_row).bitcast(fx.Float32), lds.routes.ptr + 2 * tid
+            )
+            fx.ptr_store(fx.Float32(route_weight), lds.routes.ptr + 2 * tid + 1)
+        gpu.barrier()
+        v0 = v1 = v2 = v3 = v4 = v5 = v6 = fx.Float32(0.0)
+        if routed:
+            source = rsrc(grouped)
+            column = (line % LINE7_ROUTED) * LINE7_ELEMENTS
+            picks = [
+                _seven(
+                    source,
+                    fx.ptr_load(lds.routes.ptr + 2 * k).bitcast(fx.Int32) * LATENT
+                    + column,
+                )
+                for k in range(TOPK)
+            ]
+            weights = [fx.ptr_load(lds.routes.ptr + 2 * k + 1) for k in range(TOPK)]
+            sums = []
+            for j in range_constexpr(LINE7_ELEMENTS):
+                total = fx.Float32(0.0)
+                for pick, weight in zip(picks, weights):
+                    total = total + weight * (fx.Float32(0.0) + pick[j])
+                sums.append(bf16_round(total))
+            v0, v1, v2, v3, v4, v5, v6 = sums
+        else:
+            plain = _seven(local, fx.min(line, lines - 1) * LINE7_ELEMENTS)
+            v0, v1, v2, v3, v4, v5, v6 = plain
+        # every thread has its words before any pushes: a CU with remote
+        # stores in flight holds back the gathers' loads behind them
+        gpu.barrier()
+        if live:
+            _push_reduce7(
+                local,
+                mine,
+                bases,
+                rank,
+                tp,
+                lines,
+                bank,
+                tag,
+                line,
+                [v0, v1, v2, v3, v4, v5, v6],
+            )
+        gpu.barrier()
+        counter = bid + tid * ctas
+        if counter < MAX_CTAS:
+            bo.buffer_store(epoch, rsrc(epochs), counter)
+
+    @flyc.jit
+    def launch(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        kernel(data, grouped, route_rows, route_weights, peers, epochs, rank).launch(
+            grid=(ctas,), block=(THREADS,), stream=stream
+        )
+
+    GATHER_ALLREDUCE_ABI.check(kernel, launch)
+    return K2AllReduceKernel(
+        name, launch, (ctas,), (THREADS,), ctas, GATHER_ALLREDUCE_ABI
     )

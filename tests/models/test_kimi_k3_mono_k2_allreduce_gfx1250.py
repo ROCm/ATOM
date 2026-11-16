@@ -41,9 +41,19 @@ def test_o_proj_all_reduce_gives_each_rank_whole_ctas_of_columns():
 
 
 @pytest.mark.parametrize("rows", (1, 5, 16, 40, 48))
-def test_gathering_all_reduce_keeps_a_cta_within_two_tokens_rows(rows):
+def test_gathering_all_reduce_takes_a_line_a_thread(rows):
     kernel = ar.build_gather_allreduce(8, rows)
     assert kernel.abi is ar.GATHER_ALLREDUCE_ABI
-    assert kernel.grid == ar.build_allreduce(8, rows).grid
-    # a CTA's lines (one a thread) cover fewer words than a routed row
-    assert kernel.block[0] * ar.PAYLOAD_WORDS <= ar.ROUTED_WORDS
+    lines = ar.allreduce7_lines(rows)
+    if lines <= ar.MAX_CTAS * ar.THREADS:
+        # seven-element lines; a CTA's routed lines all of one token
+        assert lines * ar.LINE7_ELEMENTS == rows * (LATENT + HIDDEN)
+        assert kernel.block == (ar.THREADS,)
+        assert kernel.grid == (-(-lines // ar.THREADS),)
+        assert ar.LINE7_ROUTED % ar.THREADS == 0
+    else:
+        assert kernel.grid == ar.build_allreduce(8, rows).grid
+        # a CTA's lines (one a thread) cover fewer words than a routed row
+        assert kernel.block[0] * ar.PAYLOAD_WORDS <= ar.ROUTED_WORDS
+    # every epoch counter is in some thread's reach
+    assert kernel.grid[0] * kernel.block[0] >= ar.MAX_CTAS
