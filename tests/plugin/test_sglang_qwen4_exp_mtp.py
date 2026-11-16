@@ -373,17 +373,80 @@ def test_qwen4_gfx950_bf16_hipblaslt_falls_back_to_torch():
     )
 
 
-def test_rocm_patch_leaves_the_ep_decode_moe_kernel_choice_to_aiter(monkeypatch):
-    """Flash EP decode MoE gets aiter's own pick, the one native ATOM runs."""
+def _install_ep_decode_moe_with(monkeypatch, gfx):
+    """Install the EP decode MoE patch over a recording ``get_2stage_cfgs``."""
     fused_moe = pytest.importorskip("aiter.fused_moe")
-    original = fused_moe.get_2stage_cfgs
+    aiter = pytest.importorskip("aiter")
+    dtypes = aiter.dtypes
+    calls, gfx_queries = [], []
+
+    def original(token, model_dim, inter_dim, expert, topk, *args, **kwargs):
+        calls.append(token)
+        return SimpleNamespace(token=token, run_1stage=token > 16)
+
+    def live_gfx():
+        gfx_queries.append(gfx)
+        return gfx
+
     monkeypatch.setattr(fused_moe, "get_2stage_cfgs", original)
+    monkeypatch.setattr(fused_moe, "_atom_ep_decode_asm", False, raising=False)
+    monkeypatch.setattr(fused_moe, "_atom_ep_decode_asm_logged", False, raising=False)
+    monkeypatch.setattr(rocm_patch, "_ep_decode_moe_gfx", None)
+    monkeypatch.setattr(rocm_patch, "_live_gfx", live_gfx)
     monkeypatch.setattr(rocm_patch, "_patch_hip_topk1_tree_kernel", lambda: None)
     monkeypatch.setattr(
         rocm_patch, "_install_gfx950_bf16_hipblaslt_bypass", lambda: None
     )
     rocm_patch.apply_qwen4_exp_rocm_patch()
+    # Registration must not touch the GPU.
+    assert gfx_queries == []
+    assert not torch.cuda.is_initialized()
+    wrapper = fused_moe.get_2stage_cfgs
+    assert wrapper is not original
+
+    def flash(token, model_dim=2560):
+        return wrapper(
+            token,
+            model_dim,
+            640,
+            257,
+            12,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp8,
+            aiter.QuantType.per_Token,
+        )
+
+    return fused_moe, original, calls, gfx_queries, flash
+
+
+def test_ep_decode_moe_keeps_aiter_choice_on_gfx942(monkeypatch):
+    """gfx942 runs aiter's CK 2-stage pick, the one native ATOM runs."""
+    fused_moe, original, calls, gfx_queries, flash = _install_ep_decode_moe_with(
+        monkeypatch, "gfx942"
+    )
+    assert flash(4, model_dim=4096).token == 4
+    assert gfx_queries == []
+    assert flash(4).token == 4
     assert fused_moe.get_2stage_cfgs is original
+    assert flash(8).token == 8
+    assert gfx_queries == ["gfx942"]
+    assert calls == [4, 4, 8]
+
+
+@pytest.mark.parametrize("gfx", ["gfx950", ""])
+def test_ep_decode_moe_forces_asm_off_gfx942(monkeypatch, gfx):
+    """Other archs keep the token=17 re-query until CK is verified there."""
+    fused_moe, original, calls, gfx_queries, flash = _install_ep_decode_moe_with(
+        monkeypatch, gfx
+    )
+    assert flash(4).token == 17
+    assert flash(16).token == 17
+    assert flash(32).token == 32
+    assert flash(4, model_dim=4096).token == 4
+    assert calls == [4, 17, 16, 17, 32, 4]
+    assert gfx_queries == [gfx]
+    assert fused_moe.get_2stage_cfgs is not original
 
 
 def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():
