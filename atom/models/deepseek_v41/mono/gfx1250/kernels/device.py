@@ -228,6 +228,46 @@ def wmma_mx(a, sa, b, sb, c):
     return fx.Vector(r, (8,), fx.Float32)
 
 
+def wmma_f4f4(a, sa, b, sb, c):
+    """__builtin_amdgcn_wmma_scale_f32_16x16x128_f8f6f4(4, a, 4, b, 0, c, 0, 0, sa, 0, 0, sb): A and B FP4 E2M1
+    (8 dwords used of 16), sa / sb i32 E8M0 x4 (one code a 32-wide K block)."""
+    r = rocdl.wmma_scale_f32_16x16x128_f8f6f4(vty(8, T.f32), _v(a), _v(b), _v(c), _v(fx.Int32(sa)), _v(fx.Int32(sb)),
+                                              fmtA=4, fmtB=4)
+    return fx.Vector(r, (8,), fx.Float32)
+
+
+# ---- MXFP4 (the FP4 index plane / query: aiter _mxfp4_ceil_scale_from_amax + _mxfp4_pack_bits, bit for bit)
+FP4_MIN_AMAX = 6.0 * 2.0 ** -126
+
+
+def mxfp4_code(amax):
+    """E8M0 code of a 32-wide group: ceil_pow2(max(amax, 6 * 2^-126) * f32(1 / 6))."""
+    r = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+    return (r + fx.Int32(0x7FFFFF)) >> 23
+
+
+def mxfp4_mul(code):
+    """2^(127 - code) (exact): the value a group is multiplied by before E2M1."""
+    return ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
+
+
+def e2m1(x):
+    """E2M1 nibble of x (RNE, saturating at 6), the sign bit always x's (-0 and negatives rounded to 0 give 0x8)."""
+    ax = abs(x)
+    one, zero = fx.Int32(1), fx.Int32(0)
+    n = ((ax > fx.Float32(0.25)).select(one, zero) + (ax >= fx.Float32(0.75)).select(one, zero)
+         + (ax > fx.Float32(1.25)).select(one, zero) + (ax >= fx.Float32(1.75)).select(one, zero)
+         + (ax > fx.Float32(2.5)).select(one, zero) + (ax >= fx.Float32(3.5)).select(one, zero)
+         + (ax > fx.Float32(5.0)).select(one, zero))
+    return n | (((x.bitcast(fx.Int32) >> 31) & fx.Int32(1)) << 3)
+
+
+def fp4_lane4(v, mul):
+    """4 values (a lane's 4 adjacent dims, already scaled-ready) -> 16 bits: byte 0 = dims 0 (low) / 1, byte 1 = 2 / 3."""
+    nb = [e2m1(v[j] * mul) for j in range(4)]
+    return nb[0] | (nb[1] << 4) | (nb[2] << 8) | (nb[3] << 12)
+
+
 def wmma_bf16(a, b, c):
     """__builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, 0, c, false, false): a, b vector<16xbf16>."""
     r = rocdl.wmma_f32_16x16x32_bf16_(vty(8, T.f32), _v(a), _v(b), _v(c))

@@ -221,20 +221,34 @@ def stage_crow(c, r1):
                 ev, od = kn[jj], kn[jj + 1]
                 kr.append(isr2.select((ev * cs2 - od * sn2).to(BF16).to(F32), ev))
                 kr.append(isr2.select((od * cs2 + ev * sn2).to(BF16).to(F32), od))
-            am = _lane_max(fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3]))))
-            code = e8m0_of(am)
-            inv = inv_pow2(code)
-            cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
-            word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
             row = posc // ratio2
             phys2 = hx.gload(c["btab"] + (i64(fx.max(bat, I32(0))) * i64(c["bstride"]) + i64(row // c["crpp"])) * 4, I32)
             flat = i64(phys2) * i64(c["crpp"]) + i64(row % c["crpp"])
-            tile = flat // 8
-            tt = flat % 8
-            blk = c["cplane"] + tile * 1056
-            c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
-            if l == 0:
-                c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
+            a4 = fx.max(fx.max(abs(kr[0]), abs(kr[1])), fx.max(abs(kr[2]), abs(kr[3])))
+            if fx.const_expr(c["ifp4"]):   # FP4 natural plane: 64 B of E2M1 at flat * 64, an E8M0 a 32 dims at flat * 4
+                for o_ in range_constexpr(3):   # (a group = 8 lanes: lane l holds dims 4 l .. 4 l + 3)
+                    a4 = fx.max(a4, a4.shuffle_xor(1 << o_, 32))
+                code4 = hx.mxfp4_code(a4)
+                h16 = hx.fp4_lane4(kr, hx.mxfp4_mul(code4))
+                word4 = h16 | (I32(h16.shuffle_xor(1, 32)) << 16)   # (even lanes: their pair's 4 bytes)
+                sw = (hx.lane_gather(code4, I32(0)) | (hx.lane_gather(code4, I32(8)) << 8)
+                      | (hx.lane_gather(code4, I32(16)) << 16) | (hx.lane_gather(code4, I32(24)) << 24))
+                if l % 2 == 0:
+                    c["stx"](c["cplane"] + flat * 64 + i64((l // 2) * 4), word4)
+                if l == 0:
+                    c["stx"](c["cscale"] + flat * 4, sw)
+            else:
+                am = _lane_max(a4)
+                code = e8m0_of(am)
+                inv = inv_pow2(code)
+                cl = [fx.min(fx.max(kr[jj] * inv, F32(-448.0)), F32(448.0)) for jj in range(4)]
+                word = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[0], cl[1], False), cl[2], cl[3], True)
+                tile = flat // 8
+                tt = flat % 8
+                blk = c["cplane"] + tile * 1056
+                c["stx"](blk + i64((l // 4) * 128) + tt * 16 + i64((l % 4) * 4), word)
+                if l == 0:
+                    c["stx"](blk + 1024 + tt * 4, (code << 23).bitcast(F32))   # the fp32 scale 2^(code - 127)
 
 
 @ASTRewriter.transform

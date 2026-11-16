@@ -33,6 +33,61 @@ ONE4 = 0x7F7F7F7F                 # four E8M0 codes of 1.0
 FLT_MAX = 3.4028234663852886e38
 
 
+def fma(a, b, c):
+    return F32(hx.intrin(F32.ir_type, "llvm.fma.f32", [a, b, c]))
+
+
+# FP4 (index_fp4): a row's query slot in O_Q keeps its 4096 B: the 32 heads' 64 B E2M1 at +0, their E8M0 dwords at +2048
+QS_OFF = 2048
+
+
+@ASTRewriter.transform
+def stage_q_rows(c, sm, t, k, r_):
+    """Row r_'s query (and head weights) -> LDS slot k."""
+    if fx.const_expr(c["ifp4"]):
+        if t < HEADS * DIM // 32:   # 128 threads x 16 B of values
+            hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r_ * HEADS * DIM // 2) + i64(t) * 16, I32, 4))
+        if t < HEADS:
+            hx.lstore(sm + O_Q + k * (HEADS * DIM) + QS_OFF + t * 4, hx.gload(c["iqs_out"] + i64(r_ * HEADS + t) * 4, I32))
+    else:
+        hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r_ * HEADS * DIM) + i64(t) * 16, I32, 4))
+    if t < HEADS:
+        hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r_ * HEADS + t) * 4, F32))
+
+
+def fp4_key(c, flat, l):
+    """FP4 natural plane: key row flat's B operand (lane l: K blocks l // 16 and l // 16 + 2, 16 B each) and its
+    4 E8M0 codes (one dword)."""
+    row = c["iplane"] + flat * 64
+    k0 = hx.gload(row + i64((l // 16) * 16), I32, 4)
+    k1 = hx.gload(row + i64(32 + (l // 16) * 16), I32, 4)
+    z = I32(0)
+    kv = fx.Vector.from_elements([k0[e] for e in range(4)] + [k1[e] for e in range(4)] + [z] * 8, I32)
+    return kv, hx.gload(c["iscale"] + flat * 4, I32)
+
+
+def fp4_score(sm, k, l, kv, ksc):
+    """Row slot k's 32 heads against a lane's key tile: native gfx1250 order (pa_mqa_logits_mxfp4): even / odd fma
+    chains of relu(acc) * w over heads mi*16 + 8 (l // 16) + i, then (even + odd) + the lane 16 apart."""
+    se = F32(0.0)
+    so = F32(0.0)
+    for mi in range_constexpr(2):
+        qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * 64
+        q0 = hx.lload(qrow + (l // 16) * 16, I32, 4)
+        q1 = hx.lload(qrow + 32 + (l // 16) * 16, I32, 4)
+        z = I32(0)
+        qv = fx.Vector.from_elements([q0[e] for e in range(4)] + [q1[e] for e in range(4)] + [z] * 8, I32)
+        qsc = hx.lload(sm + O_Q + k * (HEADS * DIM) + QS_OFF + (mi * 16 + l % 16) * 4, I32)
+        hw = hx.lload(sm + O_W + k * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8)
+        acc = hx.wmma_f4f4(qv, qsc, kv, ksc, fx.Vector.filled(8, 0.0, F32))
+        for p_ in range_constexpr(4):
+            se = fma(fx.max(acc[2 * p_], F32(0.0)), hw[2 * p_], se)
+            so = fma(fx.max(acc[2 * p_ + 1], F32(0.0)), hw[2 * p_ + 1], so)
+    sc = se + so
+    return sc + sc.shuffle_xor(16, 32)
+
+
+
 def i64(x):
     return fx.Int64(x)
 
@@ -126,9 +181,7 @@ def stage_score_any(c, isrx):
         base_i = b + gb * (RB * CTAS)
         for k in range_constexpr(RB):
             r0_, ch0, cx0, bd0, q0 = tmap(fx.min(base_i + k * CTAS, nt - 1))
-            hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(r0_ * HEADS * DIM) + i64(t) * 16, I32, 4))
-            if t < HEADS:
-                hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(r0_ * HEADS + t) * 4, F32))
+            stage_q_rows(c, sm, t, k, r0_)
         if fx.const_expr("prewait" in c):
             if gb > 0:
                 pages_to_lds(base_i)
@@ -145,26 +198,36 @@ def stage_score_any(c, isrx):
             for u in range_constexpr(SUB_):
                 col = ch * TCOLS_ + u * CHUNK + w * 16 + l % 16
                 flat = hx.lload(sm + O_PF + ((k * SUB_ + u) * 256 + t) * 8, I64)
-                kbase = c["iplane"] + (flat // 8) * 1056
-                tt = flat % 8
-                kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
-                kbs.append(fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32))
-                kss.append(hx.gload(kbase + 1024 + tt * 4, F32))
+                if fx.const_expr(c["ifp4"]):
+                    kv4, ks4 = fp4_key(c, flat, l)
+                    kbs.append(kv4)
+                    kss.append(ks4)
+                else:
+                    kbase = c["iplane"] + (flat // 8) * 1056
+                    tt = flat % 8
+                    kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
+                    kbs.append(fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32))
+                    kss.append(hx.gload(kbase + 1024 + tt * 4, F32))
                 cols.append(col)
             qvs = []
-            for mi in range_constexpr(2):
-                qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
-                qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
-                qvs.append(fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32))
-            hwvs = [hx.lload(sm + O_W + k * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8) for mi in range(2)]
+            hwvs = []
+            if fx.const_expr(not c["ifp4"]):
+                for mi in range_constexpr(2):
+                    qrow = sm + O_Q + k * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
+                    qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
+                    qvs.append(fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32))
+                hwvs = [hx.lload(sm + O_W + k * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8) for mi in range(2)]
             for u in range_constexpr(SUB_):
                 col = cols[u]
-                tot = F32(0.0)
-                for mi in range_constexpr(2):
-                    acc = hx.wmma_mx(qvs[mi], ONE4, kbs[u], ONE4, fx.Vector.filled(8, 0.0, F32))
-                    for i_ in range_constexpr(8):
-                        tot = tot + fx.max(acc[i_] * kss[u], F32(0.0)) * hwvs[mi][i_]
-                sc = tot + tot.shuffle_xor(16, 32)
+                if fx.const_expr(c["ifp4"]):
+                    sc = fp4_score(sm, k, l, kbs[u], kss[u])
+                else:
+                    tot = F32(0.0)
+                    for mi in range_constexpr(2):
+                        acc = hx.wmma_mx(qvs[mi], ONE4, kbs[u], ONE4, fx.Vector.filled(8, 0.0, F32))
+                        for i_ in range_constexpr(8):
+                            tot = tot + fx.max(acc[i_] * kss[u], F32(0.0)) * hwvs[mi][i_]
+                    sc = tot + tot.shuffle_xor(16, 32)
                 v = (col < cx).select(sc, F32(float("-inf")))
                 if live & (l < 16) & (col < ((cx + (CHUNK - 1)) // CHUNK) * CHUNK):   # (as before: the context's whole 128-column chunks)
                     c["stx"](c["ilog"] + i64(r * c["ilw"] + col) * 4, v)
@@ -218,32 +281,36 @@ def stage_score_grouped(c):
     if fx.const_expr("prewait" in c):
         c["prewait"]()
     for k in range_constexpr(TR):   # every row's query and head weights -> LDS slots 0..TR-1
-        hx.lstore(sm + O_Q + k * (HEADS * DIM) + t * 16, hx.gload(c["iq_out"] + i64(k * HEADS * DIM) + i64(t) * 16, I32, 4))
-        if t < HEADS:
-            hx.lstore(sm + O_W + k * (HEADS * 4) + t * 4, hx.gload(c["iw_out"] + i64(k * HEADS + t) * 4, F32))
+        stage_q_rows(c, sm, t, k, k)
     gpu.barrier()
     for i in range(nme):
         task = b + i * CTAS
         col = task * CHUNK + w * 16 + l % 16
         flat = (i == I32(0)).select(flat0, page_row(task))
-        kbase = c["iplane"] + (flat // 8) * 1056
-        tt = flat % 8
-        kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
-        kb = fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32)
-        ks = hx.gload(kbase + 1024 + tt * 4, F32)
+        if fx.const_expr(c["ifp4"]):
+            kb, ks = fp4_key(c, flat, l)
+        else:
+            kbase = c["iplane"] + (flat // 8) * 1056
+            tt = flat % 8
+            kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
+            kb = fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32)
+            ks = hx.gload(kbase + 1024 + tt * 4, F32)
         for r in range_constexpr(TR):
             cx = hx.lload(osr + r * 4, I32)
             bd = hx.lload(osr + (64 + r) * 4, I32)
-            tot = F32(0.0)
-            for mi in range_constexpr(2):
-                qrow = sm + O_Q + r * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
-                qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
-                qv = fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32)
-                hw = hx.lload(sm + O_W + r * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8)
-                acc = hx.wmma_mx(qv, ONE4, kb, ONE4, fx.Vector.filled(8, 0.0, F32))
-                for i_ in range_constexpr(8):
-                    tot = tot + fx.max(acc[i_] * ks, F32(0.0)) * hw[i_]
-            sc = tot + tot.shuffle_xor(16, 32)
+            if fx.const_expr(c["ifp4"]):
+                sc = fp4_score(sm, r, l, kb, ks)
+            else:
+                tot = F32(0.0)
+                for mi in range_constexpr(2):
+                    qrow = sm + O_Q + r * (HEADS * DIM) + (mi * 16 + l % 16) * DIM
+                    qp = [hx.lload(qrow + (l // 16) * 16 + cc * 32, I32, 4) for cc in range(4)]
+                    qv = fx.Vector.from_elements([qp[cc][e] for cc in range(4) for e in range(4)], I32)
+                    hw = hx.lload(sm + O_W + r * (HEADS * 4) + (mi * 16 + (l // 16) * 8) * 4, F32, 8)
+                    acc = hx.wmma_mx(qv, ONE4, kb, ONE4, fx.Vector.filled(8, 0.0, F32))
+                    for i_ in range_constexpr(8):
+                        tot = tot + fx.max(acc[i_] * ks, F32(0.0)) * hw[i_]
+                sc = tot + tot.shuffle_xor(16, 32)
             v = (col < cx).select(sc, F32(float("-inf")))
             if (cx > I32(TOPK)) & (l < 16) & (col < ((cx + (CHUNK - 1)) // CHUNK) * CHUNK):
                 c["stx"](c["ilog"] + i64(r * c["ilw"] + col) * 4, v)

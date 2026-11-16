@@ -110,15 +110,30 @@ def stage_iquant(c):
         wv = ws.to(BF16).to(F32)
         xv = hx.gload(c["iq"] + i64(tok * IQ_ROWS + h * DIM + 4 * l) * 2, BF16, 4)
         x = [xv[e].to(F32) for e in range(4)]
-        am = fx.max(fx.max(fx.max(abs(x[0]), abs(x[1])), fx.max(abs(x[2]), abs(x[3]))), F32(AMAX_SEED))
-        for o in range_constexpr(5):
-            am = fx.max(am, am.shuffle_xor(16 >> o, 32))
-        scale = am * F32(1.0 / 448.0)
-        inv = F32(1.0) / scale
-        cl = [fx.min(fx.max(x[e] * inv, F32(-448.0)), F32(448.0)) for e in range(4)]
-        lo = hx.cvt_pk_fp8_w(0, cl[0], cl[1], False)
-        word = hx.cvt_pk_fp8_w(lo, cl[2], cl[3], True)
-        c["stx"](c["iq_out"] + i64((tok * HEADS + h) * DIM + 4 * l), word)
-        if l == 0:
-            c["stx"](c["iqs_out"] + i64(tok * HEADS + h) * 4, scale)
-            c["stx"](c["iw_out"] + i64(tok * HEADS + h) * 4, (wv * scale) * F32(WSCALE))
+        if fx.const_expr(c["ifp4"]):   # FP4 query (natural): [tok][h] 64 B E2M1 + 4 E8M0, a 32-dim group = 8 lanes
+            a4 = fx.max(fx.max(abs(x[0]), abs(x[1])), fx.max(abs(x[2]), abs(x[3])))
+            for o_ in range_constexpr(3):
+                a4 = fx.max(a4, a4.shuffle_xor(1 << o_, 32))
+            code4 = hx.mxfp4_code(a4)
+            h16 = hx.fp4_lane4(x, hx.mxfp4_mul(code4))
+            word4 = h16 | (fx.Int32(h16.shuffle_xor(1, 32)) << 16)
+            sw = (hx.lane_gather(code4, fx.Int32(0)) | (hx.lane_gather(code4, fx.Int32(8)) << 8)
+                  | (hx.lane_gather(code4, fx.Int32(16)) << 16) | (hx.lane_gather(code4, fx.Int32(24)) << 24))
+            if l % 2 == 0:
+                c["stx"](c["iq_out"] + i64((tok * HEADS + h) * (DIM // 2) + (l // 2) * 4), word4)
+            if l == 0:
+                c["stx"](c["iqs_out"] + i64(tok * HEADS + h) * 4, sw)
+                c["stx"](c["iw_out"] + i64(tok * HEADS + h) * 4, wv * F32(WSCALE))   # (the query scale not folded in)
+        else:
+            am = fx.max(fx.max(fx.max(abs(x[0]), abs(x[1])), fx.max(abs(x[2]), abs(x[3]))), F32(AMAX_SEED))
+            for o in range_constexpr(5):
+                am = fx.max(am, am.shuffle_xor(16 >> o, 32))
+            scale = am * F32(1.0 / 448.0)
+            inv = F32(1.0) / scale
+            cl = [fx.min(fx.max(x[e] * inv, F32(-448.0)), F32(448.0)) for e in range(4)]
+            lo = hx.cvt_pk_fp8_w(0, cl[0], cl[1], False)
+            word = hx.cvt_pk_fp8_w(lo, cl[2], cl[3], True)
+            c["stx"](c["iq_out"] + i64((tok * HEADS + h) * DIM + 4 * l), word)
+            if l == 0:
+                c["stx"](c["iqs_out"] + i64(tok * HEADS + h) * 4, scale)
+                c["stx"](c["iw_out"] + i64(tok * HEADS + h) * 4, (wv * scale) * F32(WSCALE))

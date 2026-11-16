@@ -60,7 +60,7 @@ FPTRS = ['R', 'y', 'pre', 'post', 'comb', 'fnh', 'fnl', 'hsc', 'hbs', 'nw', 'gat
 ATAB = ("x8 xs wqkv wqkv_s qnw kvnw wqb wqb_s kv sel sink rcos rsin woa woa_s wob wob_s qkv_part qkv ss qr8 qrs kvn q "
         "apart aml o8 os_ y8 ys ypart out opart tpout recv0 recv1 recv2 recv3").split()   # attention pointers (after FPTRS in fp)
 LKEYS = ("wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink fnh fnl hsc hbs nw gate gbias "
-         "afnh afnl ahsc ahbs anw mw13 ms13 mw2 ms2 rcos rsin shplane ksel knsel kring lflags iqw iqws iww cwkv cnw cape cwk cknw cplan wplan ccap wcap cmain crpp cprow cplane ckv cscore cstate btab bstride slots ibat ibound iplane irpp ilog ilw isel irow imain ibmax icand engw engws enggw engemb").split()   # ksel/knsel: the layer's topk owner's selection; kring: ring start row   # rcos/rsin: this layer's RoPE row table (window or global, by the layer's ratio)   # a*: the attention front at the END of layer Ly = layer Ly+1's weights (host fills)
+         "afnh afnl ahsc ahbs anw mw13 ms13 mw2 ms2 rcos rsin shplane ksel knsel kring lflags iqw iqws iww cwkv cnw cape cwk cknw cplan wplan ccap wcap cmain crpp cprow cplane ckv cscore cstate btab bstride slots ibat ibound iplane irpp ilog ilw isel irow imain ibmax icand engw engws enggw engemb iscale").split()   # ksel/knsel: the layer's topk owner's selection; kring: ring start row   # rcos/rsin: this layer's RoPE row table (window or global, by the layer's ratio)   # a*: the attention front at the END of layer Ly = layer Ly+1's weights (host fills)
 WAVES_PER_EU = 4      # the step body's occupancy hint (FlyDSL rocdl.waves_per_eu): caps its VGPRs at 256
 RECV_HALF = 16 * 40960 * 16 + (2 << 20)   # bytes a parity half of a receive buffer (TP regions + tail)
 STOP_OFF = 2 * RECV_HALF   # a receive buffer's STOP word, past the two halves (never zeroed a step: runner.STOP_OFF)
@@ -215,7 +215,8 @@ def iprefetch(kb):
 CODE_END_OFF = 131024   # cyc scratch: the target / draft launches' end PCs (hx.code_end)
 
 
-def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", moe_ids="ids", split=False):
+def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sources="", moe_ids="ids", split=False,
+          index_fp4=False):
     """The step kernel for TR target rows (TR // 6 requests) and trd draft rows (5 a request); NL target layers (NL < 40
     and ndr 0: a bring-up / shadow build of the first layers only). part: "all" (one launch), or the step as two launches
     on one stream: "target" (entry, target layers, head, sampling, verification) then "draft" (draft context, metadata,
@@ -224,7 +225,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
     parameter is in `keyed`, which the kernel and the launcher reference: all of them reach FlyDSL's JIT cache key (an edit to a helper
     the cache walk does not reach still rebuilds)."""
     assert part in ("all", "target", "draft")
-    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split))
+    keyed = (("TR", TR), ("rank", rank), ("NL", NL), ("ndr", ndr), ("trd", trd), ("part", part), ("sources", sources), ("moe_ids", moe_ids), ("split", split), ("index_fp4", index_fp4))
     L = smem_layout(TR)
     TPG = TR * 10 // 3
     stx = hx.stx_dev
@@ -297,7 +298,7 @@ def build(TR, rank, NL=D.LAYERS, ndr=D.DRAFT_LAYERS, trd=None, part="all", sourc
             for Ly in range((lo if split and not DRS else seg_lo), (hi if split and not DRS else seg_hi)):
                 # (fx-v3) every layer, target and draft: the contract-v3 body (layer_v3); the draft segment with its
                 # shape (TRD rows, 128 experts top-3, the draft metadata) and its head input dh
-                target_layer(dict(S=sys.modules[__name__], fp=fp, cnt=cnt, scale=scale, tep=tep, rank=rank,
+                target_layer(dict(S=sys.modules[__name__], fp=fp, cnt=cnt, scale=scale, tep=tep, rank=rank, ifp4=index_fp4,
                                      TR=TRD if DRS else TR, NL=NL, L0=seg_lo, LEND=seg_hi, DRS=DRS,
                                      moe_ids="ids" if DRS else moe_ids, dh=ST.tptr(tp, "dh") if DRS else None), Ly)
         if fx.const_expr(part == "target"):   # the step's first launch ends with the head, sampling and verification
@@ -432,7 +433,7 @@ def target_layer(E, Ly):
               recv=(lambda: [S.atab(fp, f"recv{o}")() + i64(tep & 1) * S.RECV_HALF for o in range(4)]))
     lz.update({k: ltab(fp, Ly, k) for k in "wqkv wqkv_s wqb wqb_s woa woa_s wob wob_s qnw kvnw sink rcos rsin".split()})
     Lx = smem_layout(TR)
-    c = S.LazyC(lz, **dict(Lx, t=t, b=b, w=w, l=l, sm=sm, scale=E["scale"], stx=hx.stx_dev, rank=rank, xcpol=0))
+    c = S.LazyC(lz, **dict(Lx, t=t, b=b, w=w, l=l, sm=sm, scale=E["scale"], stx=hx.stx_dev, rank=rank, xcpol=0, ifp4=E["ifp4"]))
     c["rpos"] = fptr(fp, "rpos" + DSUF)
     c._th.update(kmeta=lambda: fptr(fp, "kmeta" + DSUF), kvw=lambda: fptr(fp, "kvw" + DSUF),
                  ksel=ltab(fp, Ly, "ksel"), knsel=ltab(fp, Ly, "knsel"))
@@ -498,7 +499,7 @@ def target_layer(E, Ly):
                        cwk=ltab(fp, Ly, "cwk")(), cknw=ltab(fp, Ly, "cknw")(), cplan=ltab(fp, Ly, "cplan")(),
                        wplan=ltab(fp, Ly, "wplan")(), ccap=fx.Int32(ltab(fp, Ly, "ccap")()), wcap=fx.Int32(ltab(fp, Ly, "wcap")()),
                        cmain=fx.Int32(ltab(fp, Ly, "cmain")()), crpp=fx.Int32(ltab(fp, Ly, "crpp")()),
-                       cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), ckv=ltab(fp, Ly, "ckv")(),
+                       cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), cscale=ltab(fp, Ly, "iscale")(), ckv=ltab(fp, Ly, "ckv")(),
                        cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
                        bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
             CS.stage_crow(cc, r1b)
@@ -510,7 +511,8 @@ def target_layer(E, Ly):
                         irpp=fx.Int32(ltab(fp, Ly, "irpp")()), btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
                         ilog=ltab(fp, Ly, "ilog")(), ilw=fx.Int32(ltab(fp, Ly, "ilw")()), isel=ltab(fp, Ly, "isel")(),
                         irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
-                        iq_out=fptr(fp, "iq_out"), iw_out=fptr(fp, "iw_out"),
+                        iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
+                        iscale=ltab(fp, Ly, "iscale")(),
                         prewait=lambda: handoff(lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), True))
             lfl3 = ltab(fp, Ly, "lflags")()
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)

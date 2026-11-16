@@ -117,6 +117,10 @@ class SingleStepRunner(StepInputs):
             raise MonoUnsupported(
                 f"window ring {window.ring_slots} slots (the step kernel's: {AS.KG_RING})"
             )
+        # the index plane's format is compiled in (a build key parameter): FP8 tiles, or FP4 natural rows + scales
+        self.index_fp4 = bool(getattr(cache.geometry, "index_fp4", False))
+        if self.index_fp4 and getattr(cache.geometry, "index_layout", None) != "natural":
+            raise MonoUnsupported(f"FP4 index layout {getattr(cache.geometry, 'index_layout', None)} (natural only)")
         miss = buffers.check_catalog(self.K)
         if miss:
             raise MonoUnsupported(f"pointer catalog out of date: {miss[:4]}")
@@ -210,7 +214,7 @@ class SingleStepRunner(StepInputs):
             return False
         if rows not in self.builds:
             M = self.K["step"]
-            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5}
+            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5, "index_fp4": self.index_fp4}
             # two launches: target .. verification, then the draft (the host reads the verdict between)
             launch = tuple(
                 M.build(rows, self.rank, part=pt, sources=SOURCES, **kw)[0]

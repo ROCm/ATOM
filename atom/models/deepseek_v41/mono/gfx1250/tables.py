@@ -431,8 +431,19 @@ class StepTables:
                     raise MonoUnsupported(
                         "single-launch step: a packed pool (byte-addressed rows)"
                     )
+                units = cache.index_units[spec.kv_owner]
+                if units.fp4:   # natural FP4: values [units, 8, 64], scales [units, 8, 4]
+                    if (
+                        units.layout != "natural"
+                        or units.values.stride() != (512, 64, 1)
+                        or units.scales.stride() != (32, 4, 1)
+                    ):
+                        raise MonoUnsupported(
+                            f"FP4 index plane {units.layout} {units.values.stride()} {units.scales.stride()}"
+                        )
                 vals = {
-                    "iplane": cache.index_units[spec.kv_owner].values.data_ptr(),
+                    "iplane": units.values.data_ptr(),
+                    "iscale": units.scales.data_ptr() if units.fp4 else 0,
                     "irpp": g.rows_per_page(spec.ratio),
                     "imain": g.main_offset(spec.kv_owner),
                     "cprow": g.page_bytes // g.row_bytes,

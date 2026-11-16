@@ -229,7 +229,8 @@ DSpark proposer of a served step
 (`atom/models/deepseek_v41/mono/gfx1250/`).
 
 - **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
-  index cache, up to 8 requests (6 verify rows each), no DSpark confidence
+  or FP4 index cache (FP4: the gfx1250 natural layout, `--index-cache-dtype
+  fp4`; the step's long-context scoring reads half the bytes), up to 8 requests (6 verify rows each), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
   (`V4.1 single-launch step off: <why>`).
 - **Memory.** The kernel reads the routed experts in place, as the
