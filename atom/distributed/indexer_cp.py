@@ -29,6 +29,7 @@ import torch.distributed as dist
 
 from atom.config import get_current_atom_config
 from atom.distributed.group_agreement import group_agree
+from atom.mono.runtime.hip_ipc import check_hip_error, load_runtime
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 
@@ -98,7 +99,11 @@ _MAILBOX_ARCHES = ("gfx950", "gfx1250")
 
 
 def _mailbox_runtime():
-    """The private aiter IPC API used only while opening a mailbox.
+    """The aiter IPC API used only while opening a mailbox.
+
+    ``_should_use_vmm`` is private to aiter. ``CandidateMailbox`` imports these
+    outside its fallback, so a renamed symbol fails setup instead of silently
+    taking the collective path.
 
     Needs ROCm/aiter main at de06bd30b (#6974) or later, the first commit with
     every name used here (``IPCBufferPool.open_peer_buffers`` included).
@@ -109,11 +114,10 @@ def _mailbox_runtime():
     """
     from aiter.dist.device_communicators.custom_all_reduce import (
         IPCBufferPool,
-        _loaded_hip_runtime,
         _should_use_vmm,
     )
 
-    return IPCBufferPool, _loaded_hip_runtime, _should_use_vmm
+    return IPCBufferPool, _should_use_vmm
 
 
 class CandidateMailbox:
@@ -140,8 +144,8 @@ class CandidateMailbox:
         self.max_rows = max_rows
         nbytes = self.BANKS * world * max_rows * self.MAX_TOPK * 8
         failure, self._pool = None, None
+        IPCBufferPool, _should_use_vmm = _mailbox_runtime()
         try:
-            IPCBufferPool, _loaded_hip_runtime, _should_use_vmm = _mailbox_runtime()
             if _should_use_vmm(True):
                 raise RuntimeError("hipIpc of cached memory needs ROCm 7.14 or later")
             # All device allocations precede the first agreement. A rank-local
@@ -154,11 +158,10 @@ class CandidateMailbox:
             self.recv_calls = torch.zeros(max_rows, dtype=torch.int32, device=device)
             self._pool = IPCBufferPool(device, cpu_group)
             mailbox = self._pool.create("indexer_cp_mailbox", nbytes, raw_cached=True)
-            err = _loaded_hip_runtime().hipMemset(
+            err = load_runtime().hipMemset(
                 ctypes.c_void_p(mailbox.data_ptr), 0, ctypes.c_size_t(nbytes)
             )
-            if err:
-                raise RuntimeError(f"hipMemset failed: {err}")
+            check_hip_error(err, operation="hipMemset")
             torch.cuda.synchronize(device)
         except Exception as error:  # noqa: BLE001 - agree every rank-local failure
             failure = error

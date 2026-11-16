@@ -22,11 +22,6 @@ def _worker(rank, port, out):
     )
     state = {"open_calls": 0}
 
-    class HipRuntime:
-        @staticmethod
-        def hipMemset(*_args):
-            return 0
-
     class Pool:
         def __init__(self, _device, _group):
             pass
@@ -47,10 +42,8 @@ def _worker(rank, port, out):
 
     from atom.distributed import indexer_cp
 
-    def runtime():
-        return Pool, lambda: HipRuntime(), lambda _raw_cached: False
-
-    indexer_cp._mailbox_runtime = runtime
+    indexer_cp._mailbox_runtime = lambda: (Pool, lambda _raw_cached: False)
+    indexer_cp.load_runtime = lambda: SimpleNamespace(hipMemset=lambda *_args: 0)
     torch.cuda.synchronize = lambda *_args, **_kwargs: None
 
     def setup_failed():
@@ -73,20 +66,10 @@ def _worker(rank, port, out):
         return real_zeros(*args, **kwargs)
 
     torch.zeros = zeros
-    fallbacks = [setup_failed()]
+    fallback = setup_failed()
     torch.zeros = real_zeros
 
     dist.barrier()
-    if rank == 0:
-
-        def missing_runtime():
-            raise ImportError("injected missing private aiter symbol")
-
-        indexer_cp._mailbox_runtime = missing_runtime
-    fallbacks.append(setup_failed())
-
-    dist.barrier()
-    indexer_cp._mailbox_runtime = runtime
     mailbox = indexer_cp.CandidateMailbox(
         dist.group.WORLD, WORLD, max_rows=8, device=torch.device("cpu")
     )
@@ -98,7 +81,7 @@ def _worker(rank, port, out):
         not mailbox.fits(WORLD, 8, 0),
         not mailbox.fits(WORLD, 8, mailbox.MAX_TOPK + 1),
     )
-    out[rank] = (fallbacks, state["open_calls"], boundaries)
+    out[rank] = (fallback, state["open_calls"], boundaries)
     dist.barrier()
     dist.destroy_process_group()
 
@@ -109,6 +92,4 @@ def test_setup_failures_are_agreed_before_collective_fallback():
         port = sock.getsockname()[1]
     out = mp.Manager().dict()
     mp.spawn(_worker, args=(port, out), nprocs=WORLD, join=True)
-    assert [out[rank] for rank in range(WORLD)] == [
-        ([True, True], 1, (True,) * 6)
-    ] * WORLD
+    assert [out[rank] for rank in range(WORLD)] == [(True, 1, (True,) * 6)] * WORLD
