@@ -481,8 +481,6 @@ def validate_fp4ptpc_recipe(config):
     target = QuantizationConfig._pattern_spec(
         "layers.0.ffn.experts", [(p, str(t).strip().lower()) for p, t in patterns]
     )
-    if target is None:
-        target = str(online.get("global_quant_config") or "").strip().lower()
     if target != "ptpc_fp8":
         raise ValueError(
             "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "

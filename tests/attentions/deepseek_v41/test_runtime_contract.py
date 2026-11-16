@@ -777,7 +777,8 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
         (None, False),
         ({"layer_quant_config": {"*.attn.*": "ptpc_fp8"}}, False),
         ({"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}}, True),
-        ({"global_quant_config": "ptpc_fp8"}, True),
+        # A global spec leaves the routed experts in their source format.
+        ({"global_quant_config": "ptpc_fp8"}, False),
     ],
 )
 def test_fp4ptpc_needs_its_routed_experts_converted(online, ok):
