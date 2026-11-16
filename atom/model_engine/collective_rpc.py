@@ -35,7 +35,7 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "get_worker_capabilities",
         # Request admission; compilation only, no GPU work or collectives.
         "prepare_structured_output",
-        "release_structured_requests",
+        "release_constraints",
     }
 )
 
