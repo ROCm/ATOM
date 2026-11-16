@@ -2,7 +2,7 @@
 """Runner wiring only; storage and protocol tests do not require this import."""
 
 import weakref
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -103,6 +103,11 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         _served=None,
         structured_output=None,
     )
+    # The real gate; the drafter stub has no `prob_state`, so the ratio
+    # draft stays off.
+    runner._dspark_prob_state = MethodType(
+        runner_module.ModelRunner._dspark_prob_state, runner
+    )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
             runner,
@@ -176,6 +181,11 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         drafter=drafter,
         _served=None,
         structured_output=None,
+    )
+    # The real gate; the drafter stub has no `prob_state`, so the ratio
+    # draft stays off.
+    runner._dspark_prob_state = MethodType(
+        runner_module.ModelRunner._dspark_prob_state, runner
     )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)

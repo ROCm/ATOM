@@ -8,6 +8,9 @@ DSpark draft (`dspark_markov_argmax`) and the lossless sampling kernels
 import triton
 import triton.language as tl
 
+# `argmax_lowest_id`'s answer for a tile with no hit: past every real id.
+NO_HIT = tl.constexpr(2147483647)
+
 
 @triton.jit
 def argmax_lowest_id(key, ids, mask, sentinel):

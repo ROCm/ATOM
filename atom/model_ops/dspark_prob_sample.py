@@ -65,6 +65,7 @@ from atom.model_ops.dspark_markov_argmax import (
 )
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.tile_argmax import NO_HIT
 from atom.utils import envs
 
 _BLOCK_K = _markov_stage1.BLOCK_K
@@ -418,7 +419,7 @@ def _row_max_argmax(row_ptr, V, BLOCK: tl.constexpr):
         idxv = tl.where(take, offs, idxv)
         mxv = tl.where(take, x, mxv)
     best = tl.max(mxv, axis=0)
-    best_i = tl.min(tl.where(mxv == best, idxv, 2147483647), axis=0)
+    best_i = tl.min(tl.where(mxv == best, idxv, NO_HIT), axis=0)
     return best, best_i
 
 
@@ -454,7 +455,7 @@ def _row_online_stats(row_ptr, V, inv_t, BLOCK: tl.constexpr):
         mxv = new
     mx = tl.max(mxv, axis=0)
     s = tl.sum(tl.where(mxv == float("-inf"), 0.0, sv * tl.exp(mxv - mx)), axis=0)
-    best_i = tl.min(tl.where(mxv == mx, idxv, 2147483647), axis=0)
+    best_i = tl.min(tl.where(mxv == mx, idxv, NO_HIT), axis=0)
     return mx, s, best_i
 
 
@@ -943,9 +944,9 @@ def _prob_resample_kernel(
             bpiv = tl.where(t, gid, bpiv)
             bpv = tl.where(t, sp, bpv)
     best_r = tl.max(brv, axis=0)
-    best_ri = tl.min(tl.where(brv == best_r, briv, 2147483647), axis=0)
+    best_ri = tl.min(tl.where(brv == best_r, briv, NO_HIT), axis=0)
     best_p = tl.max(bpv, axis=0)
-    best_pi = tl.min(tl.where(bpv == best_p, bpiv, 2147483647), axis=0)
+    best_pi = tl.min(tl.where(bpv == best_p, bpiv, NO_HIT), axis=0)
     best_ri = tl.where(best_r > float("-inf"), best_ri, 0)
     best_pi = tl.where(best_p > float("-inf"), best_pi, 0)
     tl.store(res_ptr + req_idx * 4, best_r)
