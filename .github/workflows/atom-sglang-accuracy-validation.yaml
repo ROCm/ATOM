@@ -1,11 +1,16 @@
 name: ATOM SGLang Accuracy Validation
+# Scheduled MI355 and MI308 nights are separate runs; the title tells
+# atom-sglang-nightly-deadline.yaml which ones to stop at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled {1})', github.workflow, github.event.schedule == '0 16 * * *' && 'MI308' || 'MI355') || github.workflow }}"
 
 on:
   schedule:
     # Nightly at 00:00 Beijing time (16:00 UTC on the previous day), so the
-    # cron weekday is the Beijing evening the run belongs to. One cron a night:
-    # MI355_WEEKLY_SCHEDULE (prepare-sglang-image) runs each MI355 case on one
-    # night a week; MI308 runs every night.
+    # cron weekday is the Beijing evening the run belongs to. MI355 and MI308
+    # are separate runs: one MI355 cron a night (MI355_WEEKLY_SCHEDULE in
+    # prepare-sglang-image runs each MI355 case on one night a week) and
+    # MI308_NIGHTLY_CRON for MI308, every night.
+    - cron: '0 16 * * *'
     - cron: '0 16 * * 0'
     - cron: '0 16 * * 1'
     - cron: '0 16 * * 2'
@@ -26,6 +31,8 @@ on:
         options:
           - none
           - all
+          - DeepSeek-V4-Pro TP8
+          - DeepSeek-V4-Pro MTP3 TP8
           - DeepSeek-V4-Pro Prefix Cache TP8
           - Kimi-K2.6-MXFP4 TP4
           - Kimi-K2.6-MXFP4 TP8
@@ -67,7 +74,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ github.event.schedule && format('-{0}', github.event.schedule) || '' }}
   cancel-in-progress: false
 
 env:
@@ -319,7 +326,9 @@ jobs:
 
           # Each MI355 case runs on one night a week, keyed by the night's cron
           # (Beijing evening weekday); the benchmark workflow spreads its MI355
-          # cases over the same nights.
+          # cases over the same nights. MI308 has its own run every night,
+          # which the 09:00 deadline leaves alone.
+          MI308_NIGHTLY_CRON = "0 16 * * *"  # also in run-name
           MI355_WEEKLY_SCHEDULE = {
               "0 16 * * 1": ["GLM-5.2-FP8 TP4", "GLM-5.2-MXFP4 TP4"],
               "0 16 * * 2": ["MiniMax-M3-MXFP4 TP4", "MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3"],
@@ -329,18 +338,18 @@ jobs:
               "0 16 * * 6": ["Qwen3.5-35B-A3B-FP8 TP2"],
               "0 16 * * 0": ["Qwen3.5-35B-A3B TP2"],
           }
-          tonight_mi355 = set(MI355_WEEKLY_SCHEDULE.get(os.environ.get("SCHEDULE_CRON", ""), []))
+          schedule_cron = os.environ.get("SCHEDULE_CRON", "")
+          tonight_mi355 = set(MI355_WEEKLY_SCHEDULE.get(schedule_cron, []))
 
           selected = []
           for model in models:
               toggle = model.get("toggle_env")
               if toggle is None:
-                  # MI308-only rows: all cases on nightly schedule; manual runs select one case or all cases.
-                  enabled = (
-                      event != "workflow_dispatch"
-                      or model_mi308 == "all"
-                      or model["model_name"] == model_mi308
-                  )
+                  # MI308-only rows: all cases on the MI308 nightly run; manual runs select one case or all cases.
+                  if event != "workflow_dispatch":
+                      enabled = schedule_cron == MI308_NIGHTLY_CRON
+                  else:
+                      enabled = model_mi308 == "all" or model["model_name"] == model_mi308
               elif event != "workflow_dispatch":
                   enabled = model["model_name"] in tonight_mi355
               else:

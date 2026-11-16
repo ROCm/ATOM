@@ -1,14 +1,19 @@
 name: ATOM SGLang Benchmark
+# Scheduled MI355 and MI308 nights are separate runs; the title tells
+# atom-sglang-nightly-deadline.yaml which ones to stop at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled {1})', github.workflow, github.event.schedule == '0 15 * * 1-6' && 'MI308' || 'MI355') || github.workflow }}"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}${{ github.event.schedule && format('-{0}', github.event.schedule) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
   schedule:
     # Nightly at 23:00 Beijing time (15:00 UTC), so the cron weekday is the
-    # Beijing weekday. One cron a night: MI355_WEEKLY_SCHEDULE (load-models)
-    # runs each MI355 case on one night a week; MI308 runs Mon-Sat.
+    # Beijing weekday. MI355 and MI308 are separate runs: one MI355 cron a
+    # night (MI355_WEEKLY_SCHEDULE in load-models runs each MI355 case on one
+    # night a week) and MI308_NIGHTLY_CRON for MI308, Mon-Sat.
+    - cron: '0 15 * * 1-6'
     - cron: '0 15 * * 0'
     - cron: '0 15 * * 1'
     - cron: '0 15 * * 2'
@@ -390,7 +395,7 @@ jobs:
           WORKLOAD_LABEL="SGLang-OOB"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 15 * * "[0-6]) WORKLOAD_LABEL="SGLang-OOB" ;;
+              "0 15 * * "[0-6]|"0 15 * * 1-6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -721,9 +726,10 @@ jobs:
               return by_prefix
 
           # Each MI355 OOB_P0 / OOB_P1 case runs on one night a week, keyed by
-          # the night's cron (23:00 Beijing time, Beijing weekday); MI308 runs
-          # every night but Sunday. The accuracy workflow spreads its MI355
-          # cases over the same nights.
+          # the night's cron (23:00 Beijing time, Beijing weekday). MI308 has
+          # its own run, every night but Sunday, which the 09:00 deadline
+          # leaves alone. The accuracy workflow spreads its MI355 cases over
+          # the same nights.
           MI355_WEEKLY_SCHEDULE = {
               "0 15 * * 1": ("Mon", ["deepseek-v4-pro-tp8"]),
               "0 15 * * 2": ("Tue", ["deepseek-v4-pro-mtp3-tp8"]),
@@ -733,15 +739,15 @@ jobs:
               "0 15 * * 6": ("Sat", ["minimax-m3-mxfp4-tp4"]),
               "0 15 * * 0": ("Sun", ["minimax-m3-mxfp8-eagle3-tp4-mtp3"]),
           }
-          MI308_NIGHTS = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+          MI308_NIGHTLY_CRON = "0 15 * * 1-6"  # also in run-name
 
           def scheduled_oob_selection(schedule_cron):
+              if schedule_cron == MI308_NIGHTLY_CRON:
+                  return "MI308 nightly", select_oob_models([], include_mi308=True)
               if schedule_cron not in MI355_WEEKLY_SCHEDULE:
                   return "SKIP-UNKNOWN-DAY", []
               night, mi355_prefixes = MI355_WEEKLY_SCHEDULE[schedule_cron]
-              include_mi308 = night in MI308_NIGHTS
-              selected_group = f"{night}: MI355 weekly" + (" + MI308" if include_mi308 else "")
-              return selected_group, select_oob_models([mi355_prefixes], include_mi308=include_mi308)
+              return f"{night}: MI355 weekly", select_oob_models([mi355_prefixes], include_mi308=False)
 
           def select_oob_models(tier_orders, include_mi308):
               by_prefix = first_model_by_prefix(models)

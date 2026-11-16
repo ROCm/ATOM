@@ -1,8 +1,9 @@
 name: ATOM SGLang Nightly Deadline
 
-# Stops the scheduled SGLang benchmark / accuracy runs that are still going at
-# 09:00 Beijing time, so a nightly that overruns does not hold the GPU runners
-# into the working day. Manually dispatched runs are left alone.
+# Stops the scheduled MI355 SGLang benchmark / accuracy runs that are still
+# going at 09:00 Beijing time, so a nightly that overruns does not hold the
+# MI355 runners into the working day. Scheduled MI308 runs (their own runs,
+# titled "(scheduled MI308)") and manually dispatched runs are left alone.
 on:
   schedule:
     - cron: '0 1 * * *'  # 09:00 Beijing time (01:00 UTC)
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   stop-overrunning-nightly-runs:
-    name: Stop scheduled SGLang runs still in progress
+    name: Stop scheduled MI355 SGLang runs still in progress
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -31,13 +32,13 @@ jobs:
           unfinished_runs() {
             for workflow in ${WORKFLOWS}; do
               gh api "repos/${GH_REPO}/actions/workflows/${workflow}/runs?event=schedule&per_page=50" \
-                --jq '.workflow_runs[] | select(.status != "completed") | .id'
+                --jq '.workflow_runs[] | select(.status != "completed" and (.display_title | endswith("(scheduled MI355)"))) | .id'
             done
           }
 
           runs="$(unfinished_runs)"
           if [ -z "${runs}" ]; then
-            echo "No scheduled SGLang run is still in progress."
+            echo "No scheduled MI355 SGLang run is still in progress."
             exit 0
           fi
 
