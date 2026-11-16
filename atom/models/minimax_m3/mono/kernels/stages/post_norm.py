@@ -119,7 +119,6 @@ def post_norm_defs(k4ctx):
                         for h in range(RE // 4)
                     ]
                 )
-            stamp(25)
             v = [
                 f + fx.Float32(hres[4 * h + 2 * qq + i])
                 for h in range(RE // 4)
