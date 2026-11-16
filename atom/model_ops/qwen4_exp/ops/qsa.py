@@ -23,8 +23,6 @@ Source provenance:
   without changing the other model's implementation.
 """
 
-import functools
-
 import torch
 import triton
 import triton.language as tl
@@ -344,7 +342,6 @@ def qsa_store_quantized_rows(
     )
 
 
-@functools.lru_cache(maxsize=1)
 def _is_gfx1250() -> bool:
     return get_gfx_runtime() == "gfx1250"
 

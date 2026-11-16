@@ -431,6 +431,7 @@ def qsa_gfx1250_launch_config(tokens: int, kv_heads: int, topk: int, num_cu: int
     Measured on MI450 at the AgentX shapes with a 2-deep ring and one wave
     per CTA: deeper rings and 64-row tiles lose, because LDS (~34 KB per CTA
     at 16 rows, ~68 KB at 32) already caps the CTAs a CU holds.
+    * Selections narrower than 512 use 32-row tiles without splitting.
     * Large launches (16K-token prefill) need no split and run 32-row tiles.
     * Decode is latency bound and wants more CTAs in flight: 16-row tiles
       split to about 8 CTAs per CU (T=64 -> 16 splits).

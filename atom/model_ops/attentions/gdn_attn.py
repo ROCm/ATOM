@@ -421,11 +421,11 @@ class GDNStateMixin(PoolRowsMixin):
             gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
                 gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
             )
-            # `h` holds the state narrowed to the activation dtype. A wider
-            # pool (Qwen4Exp's fp32) takes its interior targets from snapshots
-            # the chunk kernel stores unnarrowed.
+            # `h` holds the state narrowed to the activation dtype. A pool at
+            # another dtype (Qwen4Exp's fp32) takes its interior targets from
+            # snapshots the chunk kernel stores unnarrowed.
             if (
-                ckpt["interior"]
+                any(ckpt["interior_host"])
                 and self._state_dtypes()[1] != self.model_runner.config.torch_dtype
             ):
                 lens = batch.num_scheduled_tokens
@@ -1302,7 +1302,6 @@ class GDNStateMixin(PoolRowsMixin):
             "is_end": mk(is_end),
             "runtime": mk(runtime),
             # Host-side, so nothing downstream waits on the device for them.
-            "interior": not all(is_end),
             "interior_host": [not e for e in is_end],
         }
 
