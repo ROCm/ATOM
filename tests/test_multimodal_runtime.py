@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from aiter_stub import stubbed_aiter
+from aiter_stub import atom_without_aiter, stubbed_aiter
 from conftest import MockConfig
 
 # `engine_core` reaches `async_proc`, which needs a real AITER build at import
@@ -257,3 +257,180 @@ def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
             batch=batch,
         )
     assert chunks == [6, 6, 6]
+
+
+class CountingTower(VisionModel):
+    def __init__(self):
+        self.calls = 0
+
+    def get_vision_embeddings(self, values, grids):
+        self.calls += 1
+        return super().get_vision_embeddings(values, grids)
+
+
+EC_PARAMS = {"session": "192.0.2.7:17000", "cache_seed": 9, "rows": 9}
+
+
+def run_chunks(model, cache, data, read, width=4):
+    """Prefill one 19-token request in chunks; the scattered rows."""
+    ids = torch.full((19,), 77)
+    rows = []
+    for start in range(0, len(ids), width):
+        length = min(width, len(ids) - start)
+        descriptor = (
+            data
+            if start == 0
+            else {k: v for k, v in data.items() if k != "pixel_values"}
+        )
+        batch = SimpleNamespace(
+            req_ids=[5],
+            num_scheduled_tokens=[length],
+            context_lens=[start + length],
+            multimodal_data={5: descriptor},
+        )
+        rows.append(
+            embed_multimodal_batch(
+                model,
+                cache,
+                ids[start : start + length],
+                batch,
+                "cpu",
+                torch.float32,
+                read,
+            )
+        )
+    return torch.cat(rows)
+
+
+def test_encoder_rows_replace_the_tower():
+    stored = -torch.arange(18).view(9, 2).float()
+    reads = []
+
+    def read(params, cache_seed, dtype):
+        reads.append((params, cache_seed, dtype))
+        return stored.clone()
+
+    model = CountingTower()
+    data = {**payload(), "ec_transfer_params": EC_PARAMS}
+    actual = run_chunks(model, VisionEmbeddingCache(), data, read)
+
+    assert model.calls == 0
+    assert reads == [(EC_PARAMS, 9, torch.float32)]
+    torch.testing.assert_close(actual[3:8], stored[:5], rtol=0, atol=0)
+    torch.testing.assert_close(actual[12:16], stored[5:], rtol=0, atol=0)
+    assert torch.equal(actual[:3, 0], torch.full((3,), 77.0))
+
+
+def test_failed_read_runs_the_tower_once():
+    reads = []
+    model = CountingTower()
+    data = {**payload(), "ec_transfer_params": EC_PARAMS}
+    actual = run_chunks(
+        model, VisionEmbeddingCache(), data, lambda *args: reads.append(args)
+    )
+
+    assert model.calls == 1 and len(reads) == 1
+    torch.testing.assert_close(actual[3:8], data["pixel_values"][:5] + 100)
+    torch.testing.assert_close(actual[12:16], data["pixel_values"][5:] + 100)
+
+
+def test_request_without_ec_params_never_reads():
+    def read(*_args):
+        raise AssertionError("read without ec_transfer_params")
+
+    model = CountingTower()
+    data = payload()
+    actual = run_chunks(model, VisionEmbeddingCache(), data, read)
+
+    assert model.calls == 1
+    torch.testing.assert_close(actual[3:8], data["pixel_values"][:5] + 100)
+
+
+def test_read_rows_get_the_span_row_check():
+    model = CountingTower()
+    data = {**payload(), "ec_transfer_params": EC_PARAMS}
+    with pytest.raises(ValueError, match="disagree with explicit image spans"):
+        run_chunks(
+            model, VisionEmbeddingCache(), data, lambda *_args: torch.zeros(8, 2)
+        )
+    assert model.calls == 0
+
+
+def test_runner_builds_one_reader_for_its_longest_prompt(monkeypatch):
+    built = []
+
+    class FakeReader:
+        def __init__(self, size_bytes, device):
+            built.append((size_bytes, device))
+            self.answers = [torch.ones(2, 3), None]
+
+        def read(self, params, cache_seed, dtype):
+            assert (params, cache_seed, dtype) == (EC_PARAMS, 9, torch.bfloat16)
+            return self.answers.pop(0)
+
+    runner = SimpleNamespace(
+        ec_reader=None,
+        device="cuda:3",
+        config=SimpleNamespace(
+            max_model_len=1000, hf_config=SimpleNamespace(hidden_size=6)
+        ),
+    )
+    with atom_without_aiter() as load:
+        ec_transport = load("atom.kv_transfer.disaggregation.mooncake.ec_transport")
+        monkeypatch.setattr(ec_transport, "EcReader", FakeReader)
+        read = load("atom.model_engine.model_runner").ModelRunner.read_image_embeddings
+        first = read(runner, EC_PARAMS, 9, torch.bfloat16)
+        second = read(runner, EC_PARAMS, 9, torch.bfloat16)
+
+    assert torch.equal(first, torch.ones(2, 3)) and second is None
+    # Rows of `hidden_size` bf16 values, one per token of the longest prompt.
+    assert built == [(1000 * 6 * 2, "cuda:3")]
+
+
+@pytest.mark.parametrize("ec_params", [None, EC_PARAMS])
+def test_chat_request_puts_ec_params_into_multimodal_data(monkeypatch, ec_params):
+    import asyncio
+
+    import httpx
+
+    from atom.entrypoints.openai import api_server
+
+    seen = []
+
+    async def generate(ids, data, _sampling, _request_id, **_kwargs):
+        seen.append(data)
+        yield {
+            "text": "red",
+            "finish_reason": "stop",
+            "num_tokens_input": 3,
+            "num_tokens_output": 1,
+        }
+
+    for name, value in {
+        "model_name": "m",
+        "_request_logger": None,
+        "default_chat_template_kwargs": {},
+        "reasoning_toggle": None,
+        "custom_message_encoder": None,
+        "tool_call_parser_cls": None,
+        "tokenizer": SimpleNamespace(decode=lambda _ids, **_kw: ""),
+        "_get_multimodal_processor": lambda: object(),
+        "_prepare_multimodal_inputs": lambda *_args: ([1, 2, 3], payload()),
+        "generate_async_multimodal": generate,
+    }.items():
+        monkeypatch.setattr(api_server, name, value)
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": [image]}],
+        "ec_transfer_params": ec_params,
+    }
+
+    async def post():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.post("/v1/chat/completions", json=body)
+
+    assert asyncio.run(post()).status_code == 200
+    assert seen[0].get("ec_transfer_params") == ec_params
