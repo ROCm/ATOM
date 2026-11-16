@@ -279,6 +279,12 @@ _RMS_FUSABLE_QUANT_TYPES = (
 # tuned asm kernel serves the tile-aligned [q | k | v | g] rows (its M=8192 row).
 _KDA_IN_PROJ_SPLIT_MIN_TOKENS = 8192
 
+# gfx1250: aiter's BF16 GEMM (no tuned rows for the fused in_proj) writes N = 6284
+# output rows (12568 B, not 16-byte aligned) 1.3-2.6x slower than N = 6288 with the
+# same kernel, so the fused in_proj weight gets zero rows up to a multiple of this.
+_KDA_IN_PROJ_ROW_ALIGN = int(
+    __import__("os").environ.get("K3_KDA_IN_PROJ_ROW_ALIGN", "8")
+)
 # The latent MoE's merged front GEMM (ATOM#3320) up to this many tokens: on gfx1250
 # it wins up to 3072 rows (48% at 640, 11.5% at 3072) and loses from 3584 (-15% to
 # -19% at 8192 / 16384) in the front-merge GEMM UT; larger batches run the three.
@@ -1569,7 +1575,15 @@ class KimiKDAAttention(nn.Module):
         )
         fused = torch.cat(
             [self.in_proj.weight.data, *[m.weight.data for m in tails]], dim=0
-        ).contiguous()
+        )
+        # Zero rows past f_a pad N to a multiple of _KDA_IN_PROJ_ROW_ALIGN (16-byte
+        # output rows); their output columns are never read -- every consumer
+        # slices columns ([q | k | v | g], b, f_a).
+        if _KDA_IN_PROJ_ROW_ALIGN > 1:
+            pad = -fused.shape[0] % _KDA_IN_PROJ_ROW_ALIGN
+            if pad:
+                fused = torch.cat([fused, fused.new_zeros(pad, fused.shape[1])])
+        fused = fused.contiguous()
         # Grow in_proj's weight in place so the existing module (and its
         # unquantized tgemm.mm path) produces the wide fused output directly.
         self.in_proj.weight = nn.Parameter(fused, requires_grad=False)
