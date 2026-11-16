@@ -4977,8 +4977,10 @@ class RapidServeModelRunner(ModelRunner):
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Decode runs the model forward on a dynamically selected (optionally
         # CU-masked) stream so it doesn't contend with prefill on the shared
-        # GPU; postprocess (sampling + async CPU copy) stays on the default
-        # stream. The stream pool is created by DecodeEngineCore via
+        # GPU; postprocess (sampling + async CPU copy) stays on this thread's
+        # current stream, which is the High-priority compute stream when
+        # ATOM_HIGH_PRIORITY_COMPUTE_STREAM moved the thread onto it. The
+        # stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
         stream = self._decode_streams[batch.cu_stream_fraction]
         self._done_event.record()
