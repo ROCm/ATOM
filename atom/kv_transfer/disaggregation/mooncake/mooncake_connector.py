@@ -3508,6 +3508,7 @@ class MooncakeConnector(KVConnectorBase):
                     )
                     if credit is None:
                         land = False
+                label = "landed-kv" if credit is not None else "staged-kv"
                 written = None
                 try:
                     destination = (
@@ -3523,7 +3524,7 @@ class MooncakeConnector(KVConnectorBase):
                         destination,
                         target,
                         req_id,
-                        "landed-kv" if credit is not None else "staged-kv",
+                        label,
                         engine=engine,
                         deadline=request.get("_deadline"),
                     )
@@ -3563,6 +3564,9 @@ class MooncakeConnector(KVConnectorBase):
                             target, int(landing["epoch"]), credit
                         )
                 if not written:
+                    logger.error(
+                        "[PRODUCER] %s transfer failed for req %s", label, req_id
+                    )
                     return False
         finally:
             stream.synchronize()

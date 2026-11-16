@@ -11,6 +11,7 @@ for the NIC, so every destination byte is compared, not just the plan.
 """
 
 import ctypes
+import logging
 import threading
 from contextlib import nullcontext
 
@@ -605,7 +606,9 @@ def _per_token_reference(mc, regions):
     return expected
 
 
-def test_a_failed_write_returns_its_slot_and_the_next_transfer_stages(monkeypatch):
+def test_a_failed_write_returns_its_slot_and_the_next_transfer_stages(
+    monkeypatch, caplog
+):
     """The NIC only reads a staging slot, so a failed write gives it back at
     once; its late bytes can land only where the failed request was going."""
     mc = _mooncake()
@@ -615,7 +618,11 @@ def test_a_failed_write_returns_its_slot_and_the_next_transfer_stages(monkeypatc
     new = _producer(mc, regions, pool_size=1, slot_pages=4)
     new._rdma_write = lambda *_a, **_k: False
     failed = [torch.zeros_like(t) for t in expected]
-    assert not _run(mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object())
+    with caplog.at_level(logging.ERROR, logger="atom"):
+        assert not _run(
+            mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object()
+        )
+    assert any("staged-kv transfer failed for req" in r.message for r in caplog.records)
     assert new._kv_staging_slots.free == [0]
     new._rdma_write = new._nic.write
     actual = [torch.zeros_like(t) for t in expected]
