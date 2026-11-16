@@ -149,6 +149,14 @@ def load_toktab(
         grp = (
             (group if group is not None else dist.group.WORLD) if distributed else None
         )
+        if hw != "device" and rank == 0:
+            import logging
+
+            logging.getLogger("atom").warning(
+                "dsv41 tk: token tables built on the CPU (hw=cpu) are not bit-exact to TileRT's: the hardware's "
+                "v_rsq_f32 / v_exp_f32 / v_rcp_f32 round differently (hi/tk/toktab.py); pass a toktab dir built "
+                "on the GPU for bit-exact decoding"
+            )
         provider = toktab.DeviceHw(tk.device) if hw == "device" else toktab.CpuHw()
         tabs = toktab.build_rank_tables(ckpt, rank, group=grp, log=log, hw=provider)
         if path is not None:
