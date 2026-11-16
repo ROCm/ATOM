@@ -58,6 +58,7 @@ KARG_WORDS = 47  # 376 B of explicit kernarg as 47 i64
 XF = os.environ.get("TK_QKV_XF", "0") == "1"
 if XF:
     KARG_WORDS = 58
+RBASE = 0xC0000 if XF else 0  # the q latent's per-XCD replicas: xf_full keeps them at ws + 0xc0000
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
 GRID, THREADS = 487, 512
 MIX, KSLICES = 24, 160
@@ -428,7 +429,7 @@ def qkv_qnorm(tid, s16, epoch, ws, gamma, qr, lat, lat_s, lds):
             d0 = (q23 << 16) | (q01 & 0xFFFF)
             d1 = (q67 << 16) | (q45 & 0xFFFF)
             tag = (epoch & 0xFFFFFF) | (e << 24)
-            rep = (((_xcc_id() << 14) & 0x1C000) + row * 0xA00 + tid * 16) // 4
+            rep = (RBASE + ((_xcc_id() << 14) & 0x1C000) + row * 0xA00 + tid * 16) // 4
             bo.buffer_store(
                 fx.Vector.from_elements([d0, tag, d1, tag], Int32), rsrc(ws), rep
             )
@@ -504,7 +505,7 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
         tw = (pos * 256 + pair * 4) // 4
         cs = _ld(ropec, tw, 2)
         sn = _ld(ropec, tw + 32, 2)
-        rep = ((_xcc_id() << 14) & 0x1C000) // 4
+        rep = (RBASE + ((_xcc_id() << 14) & 0x1C000)) // 4
         idx = [tid, tid + 256, tid + 512, fx.min(tid | 0x300, Int32(0x3BF))]
         e24 = epoch & 0xFFFFFF
         ch = _q_chunks(ws, rep, idx)
@@ -588,6 +589,181 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
             word = (tok * 8192 + (t // 32) * 1024 + feat * 2) // 4
             vals = [pack_bf2(y0, y1), pack_bf2(y2, y3)]
             bo.buffer_store(fx.Vector.from_elements(vals, Int32), rsrc(q_out), word)
+
+
+
+# ---- the indexer's query prep (q_kv_xf_full: the layers whose indexer runs next) -----------------------------
+IX_SCALE_OFF, IX_WEIGHT_OFF = 0x4000, 0x4400  # ws_ix: [tok][128] e8m0 bytes (head*4 + group), [tok][32] f32 weights
+IW_SUM_LDS = 20480  # wave w's six row sums at + w*24 + r*4
+IQ_X_LDS = 20480  # bf16 q latent x scale products [tok][1280], 0xa00 B a row
+IQ_RED_LDS = 35840  # K-half 1's MFMA results: row half rh at + rh*1024 + lane*16
+IQ_AMAX_LDS = 37888  # [rh][tok] f32 amax at + rh*64 + tok*4
+
+
+@traced
+def qkv_iw(tid, s16, xn, wproj, ix, lds):
+    """Logical CTA 128 + h (h < 32): head h's indexer weight for the 6 tokens: Xn[r] . wproj[h] (bf16, 5120),
+    a lane's fma chain over elements 8t..8t+7, 2048+8t.., (t < 128) 4096+8t.. in order, the wave's sum by
+    xor-32..1 butterflies, waves (0+1)+(2+3), bf16 RNE x 1/64 -> f32 at ws_ix + 0x4400 + (r*32 + h)*4."""
+    h = s16 - 128
+    if tid < 256:
+        lane, w = tid % 64, tid // 64
+        offs = [tid * 16, 0x1000 + tid * 16]
+        wv = [_ld(wproj, (h * 0x2800 + o) // 4, 4) for o in offs]
+        xv = [[_ld(xn, (r * 0x2800 + o) // 4, 4) for o in offs] for r in range(6)]
+        third = tid < 128
+        w3 = fx.Vector.filled(4, 0, Int32)
+        x3 = [fx.Vector.filled(4, 0, Int32) for _ in range(6)]
+        if third:
+            w3 = _ld(wproj, (h * 0x2800 + 0x2000 + tid * 16) // 4, 4)
+            for r in range_constexpr(6):
+                x3[r] = _ld(xn, (r * 0x2800 + 0x2000 + tid * 16) // 4, 4)
+        acc = []
+        for r in range_constexpr(6):
+            a = F32(0.0)
+            first = True
+            for c in range_constexpr(2):
+                for d in range_constexpr(4):
+                    for hi in range_constexpr(2):
+                        xe = bf_hi(xv[r][c][d]) if hi else bf_lo(xv[r][c][d])
+                        we = bf_hi(wv[c][d]) if hi else bf_lo(wv[c][d])
+                        a = fmath.fma(xe, we, F32(0.0) if first else a)
+                        first = False
+            acc.append(a)
+        a3 = []
+        for r in range_constexpr(6):
+            a = acc[r]
+            for d in range_constexpr(4):
+                for hi in range_constexpr(2):
+                    xe = bf_hi(x3[r][d]) if hi else bf_lo(x3[r][d])
+                    we = bf_hi(w3[d]) if hi else bf_lo(w3[d])
+                    a = fmath.fma(xe, we, a)
+            a3.append(third.select(a, acc[r]))
+        for r in range_constexpr(6):
+            v = a3[r]
+            for k in (32, 16, 8, 4, 2, 1):
+                v = v + _bperm(v, lane ^ k)
+            if lane == 0:
+                _lds_st(lds, IW_SUM_LDS + w * 24 + r * 4, [v.bitcast(Int32)])
+        gpu.barrier()
+        if tid < 6:
+            p = [_lds_ld(lds, IW_SUM_LDS + q * 24 + tid * 4, 1).bitcast(F32) for q in range(4)]
+            t = (p[0] + p[1]) + (p[2] + p[3])
+            _stf(ix, IX_WEIGHT_OFF // 4 + tid * 32 + h, bf_round(t) * _c(0x3C800000))
+
+
+def _e2m1(v):
+    """A clamped value's E2M1 code (RNE at the midpoints, sign from its bits)."""
+    a = abs(v)
+    n = (a > _c(0x3E800000)).select(Int32(1), Int32(0))
+    n = n + (a >= _c(0x3F400000)).select(Int32(1), Int32(0))
+    n = n + (a > _c(0x3FA00000)).select(Int32(1), Int32(0))
+    n = n + (a >= _c(0x3FE00000)).select(Int32(1), Int32(0))
+    n = n + (a > _c(0x40200000)).select(Int32(1), Int32(0))
+    n = n + (a >= _c(0x40600000)).select(Int32(1), Int32(0))
+    n = n + (a > _c(0x40A00000)).select(Int32(1), Int32(0))
+    return n | ((v.bitcast(Int32) >> 28) & 8)
+
+
+@traced
+def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
+    """Logical CTA t < 128: the indexer query's rows 32t..32t+31 (head t/4, dims (t%4)*32..) for the 6 tokens:
+    i_wq_b (fp8) . (this XCD's fp8 q latent x 2^(e_q + e_w - 254), bf16 RNE) in 20 chained bf16 MFMAs a wave
+    (wave w: rows (w&1)*16.., K half w>>1), the K halves summed, bf16 RNE, GPT-J RoPE on dims 64..127 (bf16 RNE),
+    FP4 E2M1 with the group's power-of-two scale (amax/6 rounded up): ws_ix[tok][head*64 + dim/2] and the scale
+    byte at + 0x4000 + tok*128 + head*4 + t%4; epoch slot QB_PREP_SLOT + t."""
+    t = s16
+    if tid < 256:
+        lane, w = tid % 64, tid // 64
+        rh, kh, g, h16 = w & 1, w >> 1, lane >> 4, lane & 15
+        epoch = _ld(ws, EPOCHS // 4 + QB_PREP_SLOT + t) + 1
+        row = t * 32 + rh * 16 + h16
+        wb = row * 1280 + kh * 640 + g * 16
+        wv = [_ld(wq, (wb + 64 * i) // 4, 4) for i in range(10)]
+        tok_ok = h16 < 6
+        tok = tok_ok.select(h16, Int32(0))
+        pos = _ld(vpos, tok)
+        pos_c = (pos > -1).select(fx.min(pos, Int32(rope_n) - 1), Int32(0))
+        rq = fx.max(t % 4 - 2, Int32(0))
+        pair = rq * 16 + rh * 8 + g * 2
+        cs = _ld(ropec, pos_c * 64 + pair, 2)
+        sn = _ld(ropec, pos_c * 64 + 32 + pair, 2)
+        idx = [tid, tid + 256, tid + 512, fx.min(tid | 0x300, Int32(0x3BF))]
+        wsb = []
+        for k in range_constexpr(4):
+            cc = idx[k] % 160
+            wsb.append(Int32(bo.buffer_load(rsrc(wq_s), t * 40 + (cc >> 2), vec_width=1, dtype=T.i8)).to(Int32) & 0xFF)
+        rep = (RBASE + ((_xcc_id() << 14) & 0x1C000)) // 4
+        e24 = epoch & 0xFFFFFF
+        ch = _q_chunks(ws, rep, idx)
+        while ~_tags_ok(ch, e24):
+            spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
+            rocdl.s_sleep(2)
+            ch = _q_chunks(ws, rep, idx)
+        for k in range_constexpr(4):
+            c = idx[k]
+            live = (tid | 0x300) < 0x3C0 if k == 3 else (Int32(1) == 1)
+            if live:
+                r_, cc = c // 160, c % 160
+                ssum = ((ch[k][1] >> 24) & 0xFF) + wsb[k]
+                sc = ((ssum << 23) + Int32(-1065353216)).bitcast(F32)  # + 0xc0800000 (-4.0): 2^(sum-254)
+                b = fp8x8_bf16_pk([ch[k][0], ch[k][2]]).bitcast(Int32)
+                outw = []
+                for q in range_constexpr(4):
+                    lo = (b[q] << 16).bitcast(F32) * sc
+                    hi = (b[q] & Int32(-65536)).bitcast(F32) * sc
+                    outw.append(pack_bf2(lo, hi))
+                _lds_st(lds, IQ_X_LDS + r_ * 0xA00 + cc * 16, outw)
+        gpu.barrier()
+        if tid == 0:
+            _st_i(ws, EPOCHS // 4 + QB_PREP_SLOT + t, epoch)
+        xb = IQ_X_LDS + fx.min(h16, Int32(5)) * 0xA00 + kh * 0x500 + g * 32
+        zero4 = fx.Vector.filled(4, 0, Int32)
+        acc = fx.Vector.filled(4, 0.0, F32)
+        for i in range_constexpr(10):
+            for j in range_constexpr(2):
+                a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
+                bx = _lds_ld(lds, xb + 128 * i + 16 * j, 4)
+                bx = fx.Vector.from_elements([tok_ok.select(bx[q], Int32(0)) for q in range(4)], Int32)
+                acc = mfma_bf16(a, bx.bitcast(fx.BFloat16), acc)
+        if kh == 1:
+            _lds_st(lds, IQ_RED_LDS + rh * 1024 + lane * 16, [acc[q].bitcast(Int32) for q in range(4)])
+        gpu.barrier()
+        y = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
+        if kh == 0:
+            o = _lds_ld(lds, IQ_RED_LDS + rh * 1024 + lane * 16, 4)
+            x = [bf_round(acc[q] + o[q].bitcast(F32)) for q in range(4)]
+            c0, c1 = cs[0].bitcast(F32), cs[1].bitcast(F32)
+            s0, s1 = sn[0].bitcast(F32), sn[1].bitcast(F32)
+            rope = (t % 4) >= 2
+            y0 = rope.select(bf_round(fmath.fma(c0, x[0], -(s0 * x[1]))), x[0])
+            y1 = rope.select(bf_round(fmath.fma(c0, x[1], s0 * x[0])), x[1])
+            y2 = rope.select(bf_round(fmath.fma(c1, x[2], -(s1 * x[3]))), x[2])
+            y3 = rope.select(bf_round(fmath.fma(c1, x[3], s1 * x[2])), x[3])
+            y = [y0, y1, y2, y3]
+            m = fx.max(fx.max(fx.max(abs(y0), F32(0.0)), abs(y1)), fx.max(abs(y2), abs(y3)))
+            m = fx.max(m, _bperm(m, lane ^ 16))
+            m = fx.max(m, _bperm(m, lane ^ 32))
+            if g == 0:
+                _lds_st(lds, IQ_AMAX_LDS + rh * 64 + h16 * 4, [m.bitcast(Int32)])
+        gpu.barrier()
+        if (kh == 0) & tok_ok:
+            a0 = _lds_ld(lds, IQ_AMAX_LDS + tok * 4, 1).bitcast(F32)
+            a1 = _lds_ld(lds, IQ_AMAX_LDS + 64 + tok * 4, 1).bitcast(F32)
+            amax = fx.max(fx.max(a0, a1), _c(0x01C00000))
+            qb = (amax * _c(0x3E2AAAAB)).bitcast(Int32)
+            v4 = qb + 0x7FFFFF
+            inv = (qb < 0x7E800001).select(Int32(0x7F000000) - (v4 & Int32(-8388608)), Int32(0x400000)).bitcast(F32)
+            nib = [_e2m1(fx.min(fx.max(y[q] * inv, F32(-6.0)), F32(6.0))) for q in range(4)]
+            word = nib[0] | (nib[1] << 4) | (nib[2] << 8) | (nib[3] << 12)
+            head = t >> 2
+            byte = tok * 2048 + head * 64 + (t % 4) * 16 + rh * 8 + g * 2
+            bo.buffer_store(word.to(fx.Int16), rsrc(ix), byte, offset_is_bytes=True)
+            if (rh == 0) & (g == 0):
+                bo.buffer_store(
+                    ((v4 >> 23) & 0xFF).to(fx.Int8), rsrc(ix), IX_SCALE_OFF + tok * 128 + head * 4 + t % 4,
+                    offset_is_bytes=True,
+                )  # fmt: skip
 
 
 def _pick_byte(words, b):
@@ -865,17 +1041,17 @@ def _fin_entry(tid, cta, a06, a07, a08, a09, a10, a11):
         mhc_finalize(tid, a07, a08, a09, a10, Int32(a11))
 
 
-def build_xf_probe():
-    """q_kv_xf_full's 58 argument words onto the kg roles (TK_QKV_XF=1)."""
+def build_xf():
+    """q_kv_xf_full<6, true, 8, 0, 3, 0> (TK_QKV_XF=1, TK_QKV_IDX=0): its 58 argument words."""
     assert XF
-    name = kernel_symbol("tk_q_kv_xf_full_probe", rows=6, full=1, kv=8, idx=IDX, v=1)
+    name = kernel_symbol("tk_q_kv_xf_full", rows=6, full=1, kv=8, idx=IDX, v=1)
 
     @fx.struct
     class Smem:
         w: fx.Array[fx.Int32, LDS_BYTES // 4, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def xfp(
+    def xff(
         a00: Int64, a01: Int64, a02: Int64, a03: Int64, a04: Int64, a05: Int64, a06: Int64, a07: Int64,
         a08: Int64, a09: Int64, a10: Int64, a11: Int64, a12: Int64, a13: Int64, a14: Int64, a15: Int64,
         a16: Int64, a17: Int64, a18: Int64, a19: Int64, a20: Int64, a21: Int64, a22: Int64, a23: Int64,
@@ -886,10 +1062,9 @@ def build_xf_probe():
         a56: Int64, a57: Int64,
     ):  # fmt: skip
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
-        flagged = a06 | (Int32(a12) >= 1).select(Int64(1), Int64(0))
-        _test_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, flagged,
-                    a08, a09, a10, a11, a12, a28, a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53,
-                    a54, a55, a56)  # fmt: skip
+        _xf_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06,
+                  a08, a09, a10, a11, a12, a16, a20, a21, a22, a25, a28, a30, a32,
+                  a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56)  # fmt: skip
 
     @launcher(name)
     def launch(
@@ -903,7 +1078,7 @@ def build_xf_probe():
         a56: Int64, a57: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
-        xfp(
+        xff(
             a00, a01, a02, a03, a04, a05, a06, a07, a08, a09, a10, a11, a12, a13, a14, a15,
             a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31,
             a32, a33, a34, a35, a36, a37, a38, a39, a40, a41, a42, a43, a44, a45, a46, a47,
@@ -911,6 +1086,34 @@ def build_xf_probe():
         ).launch(grid=(GRID,), block=(THREADS,), stream=stream)  # fmt: skip
 
     return name, launch
+
+
+@traced
+def _xf_entry(
+    tid, cta, lds, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, mws, mscale, mbase, hca, nrows, xn, iwq, iwq_s, iwp,
+    ropec_i, ix, rope_n, qn_base, ws, qn_g, qb_w, qb_s, kv_g, ropec, vpos, qr, q_out, win_kv, win_s, alt_kv,
+    alt_s, lat, lat_s,
+):  # fmt: skip
+    """q_kv_xf_full's roles: CTA 0 the mHC finalize when the row count (0x60) is >= 1 (the rest then logical
+    CTA wgid - 1); GEMV 0..223, then q-norm on [base, base + 48) (base = int@0x100 rounded up to 8) and the
+    indexer prep on 0..159 (iq 0..127, iw 128..159); q_b + RoPE 224..479; kv-norm + window 480..485."""
+    flag = Int32(nrows) >= 1
+    if flag & (cta == 0):
+        mhc_finalize(tid, mws, mscale, mbase, hca, Int32(nrows))
+    s16 = flag.select(cta - 1, cta)
+    qn0 = (Int32(qn_base) + 7) & -8
+    if (s16 >= 0) & (s16 < 224) & ((cta != 0) | (~flag)):
+        epoch = qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, lds)
+        if (s16 >= qn0) & (s16 < qn0 + 48):
+            qkv_qnorm(tid, s16 - qn0, epoch, ws, qn_g, qr, lat, lat_s, lds)
+        if s16 < 128:
+            qkv_iq(tid, s16, ws, iwq, iwq_s, ropec_i, rope_n, vpos, ix, lds)
+        if (s16 >= 128) & (s16 < 160):
+            qkv_iw(tid, s16, xn, iwp, ix, lds)
+    if (s16 >= 224) & (s16 < 480):
+        qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, ix, lds)
+    if (s16 >= 480) & (s16 < 486):
+        qkv_kvnorm(tid, s16, ws, vpos, kv_g, ropec, win_kv, win_s, alt_kv, alt_s, lds)
 
 
 build = build_finalize_test
