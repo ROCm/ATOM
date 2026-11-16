@@ -4,7 +4,9 @@
 (`LinearBase.splitk_consumer_max_m`) must leave every output bit as the GEMM's
 own reduce kernel would: the MiniMax-M3 dense layer's fused q/k norm + RoPE +
 cache kernel and its SwiGLU-OAI reading the fp32 partials, against the same
-kernels reading the reduced bf16 output."""
+kernels reading the reduced bf16 output, and the partials reaching their
+consumer through a compiled graph (the hand-off is host state keyed by the GEMM
+output's address)."""
 
 from types import SimpleNamespace
 
@@ -32,6 +34,17 @@ def _aiter_or_skip():
     ):
         pytest.skip("needs gfx1250 and aiter's consumer-side split-K reduction")
     return aiter
+
+
+def _gemm_inputs(aiter, rows, n=N):
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(rows)
+    x = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, K, device="cuda", dtype=torch.bfloat16)
+    xq, xs = aiter.pertoken_quant(x, quant_dtype=aiter.dtypes.fp8)
+    wq, ws = aiter.pertoken_quant(w, quant_dtype=aiter.dtypes.fp8)
+    return xq, shuffle_weight(wq, layout=(16, 16)), xs, ws
 
 
 def _bitwise(a, b):
@@ -115,6 +128,86 @@ def _consume(qkv, common, cache, qkv_partials=None):
         qkv_partials=qkv_partials,
         **common,
     )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("rows", [1, 4, 16, 64])
+def test_fused_norm_rope_cache_reduces_partials_bitwise(rows, kv_cache_dtype):
+    aiter = _aiter_or_skip()
+    from atom.model_ops.linear import claim_splitk_partials
+
+    xq, wq, xs, ws = _gemm_inputs(aiter, rows)
+    common, caches = _layer_state(rows, kv_cache_dtype, aiter.dtypes.fp8)
+
+    qkv_ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, xs, ws)
+    cache_ref = caches()
+    q_ref, k_ref = _consume(qkv_ref, common, cache_ref)
+
+    qkv = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(xq, wq, xs, ws, max_m=64)
+    partials = claim_splitk_partials(qkv)
+    # The tuned M3 dense QKV GEMM splits K at every decode size.
+    assert partials is not None and partials.shape[0] in (4, 8)
+    assert claim_splitk_partials(qkv) is None  # claimed once
+    cache = caches()
+    q_out, k_out = _consume(qkv, common, cache, partials)
+
+    assert _bitwise(q_out, q_ref) and _bitwise(k_out, k_ref)
+    assert _bitwise(qkv, qkv_ref)  # q, k and v written back reduced
+    for name in cache:
+        assert _bitwise(cache[name], cache_ref[name]), name
+
+
+def test_partials_reach_a_consumer_through_a_compiled_graph():
+    aiter = _aiter_or_skip()
+    from aiter.jit.utils.torch_guard import torch_compile_guard
+
+    from atom.model_ops.linear import (
+        claim_splitk_partials,
+        gemm_a8w8_bpreshuffle_splitk_deferred_impl,
+    )
+
+    def finish_fake(qkv: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(qkv)
+
+    @torch_compile_guard(gen_fake=finish_fake, mutates_args=[])
+    def splitk_test_finish(qkv: torch.Tensor) -> torch.Tensor:
+        # A consumer op, as attention is one: claims and reduces in place.
+        partials = claim_splitk_partials(qkv)
+        assert partials is not None, "the GEMM output reached the consumer copied"
+        aiter.reduce_splitk_partials(qkv, partials)
+        return qkv.clone()
+
+    def forward(x, w, x_scale, w_scale):
+        qkv = gemm_a8w8_bpreshuffle_splitk_deferred_impl(
+            x, w, x_scale, w_scale, dtype=torch.bfloat16, max_m=64
+        )
+        return splitk_test_finish(qkv)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(forward, fullgraph=True, dynamic=True)
+    for rows in (16, 4):
+        xq, wq, xs, ws = _gemm_inputs(aiter, rows)
+        ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, xs, ws)
+        assert _bitwise(compiled(xq, wq, xs, ws), ref)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 16, 64])
+def test_swiglu_reduces_gate_up_partials_bitwise(rows):
+    aiter = _aiter_or_skip()
+    from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_reducing
+
+    # MiniMax-M3 TP4 dense MLP: gate/up 2 x 12288 / 4 wide, alpha 1.702, limit 7.
+    xq, wq, xs, ws = _gemm_inputs(aiter, rows, n=6144)
+    gate_up_ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, xs, ws)
+    ref = swiglu_oai_split(gate_up_ref, 1.702, 1.0, 7.0)
+
+    gate_up = aiter.gemm_a8w8_bpreshuffle_splitk_deferred(xq, wq, xs, ws, max_m=64)
+    assert aiter.ops.gemm_op_a8w8._SPLITK_DEFERRED.get(gate_up.data_ptr())
+    out = swiglu_oai_split_reducing(gate_up, 1.702, 1.0, 7.0)
+    assert _bitwise(out, ref)
+    assert _bitwise(gate_up, gate_up_ref)  # written back reduced
+    # Not a deferred output: the same op is plain swiglu_oai_split.
+    assert _bitwise(swiglu_oai_split_reducing(gate_up_ref, 1.702, 1.0, 7.0), ref)
 
 
 @pytest.mark.parametrize("split_k", [2, 4, 8])

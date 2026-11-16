@@ -10,11 +10,17 @@ MiniMax-M3 stores dense and expert gate/up activations in split layout:
 
 with optional clamping.  ATOM only supports this path on AMD GPU, so the
 implementation is Triton-only.
+
+``swiglu_oai_split_reducing`` takes the output of a gate/up GEMM that left its
+split-K reduction to its consumer (aiter.gemm_a8w8_bpreshuffle_splitk_deferred):
+the kernel sums the fp32 partials as aiter's split-K reduce does, writes the
+reduced gate/up back and activates it, all in one launch.
 """
 
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 @triton.jit
@@ -160,3 +166,23 @@ def swiglu_oai_split(
     )
     return out.reshape(*orig_shape[:-1], n_inter)
 
+
+def _swiglu_oai_split_reducing_fake(
+    gate_up: torch.Tensor, alpha: float, beta: float, limit: float
+) -> torch.Tensor:
+    return gate_up.new_empty((*gate_up.shape[:-1], gate_up.shape[-1] // 2))
+
+
+@torch_compile_guard(gen_fake=_swiglu_oai_split_reducing_fake, mutates_args=[])
+def swiglu_oai_split_reducing(
+    gate_up: torch.Tensor, alpha: float, beta: float, limit: float
+) -> torch.Tensor:
+    """``swiglu_oai_split`` of a gate/up GEMM output that may still carry its
+    split-K partials (`LinearBase.splitk_consumer_max_m`). An opaque op: the
+    partials are claimed at run time by the output's address, which a traced
+    graph cannot see."""
+    from atom.model_ops.linear import claim_splitk_partials
+
+    return swiglu_oai_split(
+        gate_up, alpha, beta, limit, gate_up_partials=claim_splitk_partials(gate_up)
+    )
