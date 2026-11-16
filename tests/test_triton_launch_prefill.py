@@ -278,3 +278,84 @@ def test_gating_and_l2norm_replay_in_a_cuda_graph(gdn):
     graph.replay()
     torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
+
+
+# --- sigmoid RMSNorm + FP8 quant (GDN output), sigmoid gate + FP8 quant (QSA)
+
+
+@pytest.fixture
+def gated():
+    pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+    from atom.model_ops.qwen4_exp.ops import gated
+
+    return gated
+
+
+# GDN output per rank at TP2 (24 value heads x 128), QSA output (12 x 256).
+_GDN_OUT, _QSA_OUT = (24, 128), 12 * 256
+_FP8 = torch.float8_e4m3fnuz
+
+
+def _rmsnorm_quant_inputs(tokens, offset=0, device="cuda"):
+    heads, dim = _GDN_OUT
+    x = _randn(tokens, heads, dim, offset=offset, seed=tokens, device=device)
+    # The gate is a slice of the in_proj_qkvz output: strided tokens.
+    z = _randn(tokens, 2 * heads * dim, seed=1, device=device)[:, heads * dim :]
+    weight = torch.nn.Parameter(_randn(dim, seed=2, device=device), False)
+    return x, z.view(tokens, heads, dim), weight, 1e-6, _FP8
+
+
+def _mul_quant_inputs(tokens, offset=0, device="cuda"):
+    x = _randn(tokens, _QSA_OUT, offset=offset, seed=tokens, device=device)
+    # The gate is a slice of the fused QKVG projection.
+    gate = _randn(tokens, _QSA_OUT + 1024, seed=3, device=device)[:, :_QSA_OUT]
+    return x, gate, _FP8
+
+
+@pytest.mark.parametrize("buffer_ops", ["1", "0"])
+def test_gated_quant_keys_tell_apart_what_triton_tells_apart(
+    monkeypatch, gated, buffer_ops
+):
+    _on_cpu(monkeypatch)
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
+    inputs = _rmsnorm_quant_inputs(300, offset=1, device="cpu")
+    _check_keys(
+        *_record(
+            monkeypatch,
+            gated,
+            "_sigmoid_rmsnorm_quant",
+            lambda: gated.sigmoid_rmsnorm_quant(*inputs),
+        )
+    )
+    cached = gated._sigmoid_mul_quant
+    recorders = {warps: _Recorder(launcher) for warps, launcher in cached.items()}
+    monkeypatch.setattr(gated, "_sigmoid_mul_quant", recorders)
+    for tokens in (300, 1100):  # 4 warps up to 1024 rows, 2 beyond
+        gated.sigmoid_mul_quant(*_mul_quant_inputs(tokens, offset=1, device="cpu"))
+    for warps, recorder in recorders.items():
+        assert recorder.launcher.options["num_warps"] == warps
+        _check_keys(recorder.launcher, recorder.calls)
+
+
+@gpu
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("tokens", [2112, 1056, 1024, 1025, 16, 3, 1])
+@torch.inference_mode()
+def test_gated_quant_match_plain_triton_bitwise(monkeypatch, gated, tokens, offset):
+    inputs = _rmsnorm_quant_inputs(tokens, offset)
+    _plain_vs_cached(
+        monkeypatch,
+        [(gated, "_sigmoid_rmsnorm_quant")],
+        lambda: list(gated.sigmoid_rmsnorm_quant(*inputs)),
+    )
+    warps = 4 if tokens <= 1024 else 2
+    inputs = _mul_quant_inputs(tokens, offset)
+    cached = gated._sigmoid_mul_quant[warps]
+    monkeypatch.setattr(gated, "_sigmoid_mul_quant", {warps: _Plain(cached)})
+    ref = [t.clone() for t in gated.sigmoid_mul_quant(*inputs)]
+    monkeypatch.undo()
+    first = [t.clone() for t in gated.sigmoid_mul_quant(*inputs)]
+    second = gated.sigmoid_mul_quant(*inputs)
+    torch.cuda.synchronize()
+    assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
+    assert cached._kernels
