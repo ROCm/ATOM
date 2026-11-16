@@ -134,11 +134,27 @@ class Answer:
 
 
 class _Slot:
+    """One rank's mailbox. The two sequence numbers (``_CMD``, ``_DONE``) are read and written through a ``uint32``
+    view of the buffer, one aligned 4-byte load / store each: ``struct.pack_into`` zeroes its whole target before it
+    writes the fields, so a number written with it reads 0 for a moment, and a worker polling the command number took
+    that 0 for a new command and ran the payload twice (2026-11-16, ``wait_read`` of one chunk twice on rank 0, the
+    second finding its ticket gone)."""
+
     def __init__(self, buf, rank: int):
         self.b, self.o = buf, rank * SLOT
+        self.w = buf.cast("B").cast(
+            "I"
+        )  # native uint32 view: x86-64 is little-endian, as the payload's "<" formats
 
     def _u32(self, off: int) -> int:
-        return struct.unpack_from("<I", self.b, self.o + off)[0]
+        return self.w[(self.o + off) >> 2]
+
+    def _set_u32(self, off: int, v: int) -> None:
+        self.w[(self.o + off) >> 2] = v
+
+    def release(self) -> None:
+        """Drop the uint32 view, so the shared memory can close (an exported view would block ``mmap.close``)."""
+        self.w.release()
 
     def _stable(self, off: int) -> int:
         v = self._u32(off)
@@ -160,7 +176,7 @@ class _Slot:
         struct.pack_into(
             f"<III{len(args)}q", self.b, self.o + _OP, op, len(args), 0, *args
         )
-        struct.pack_into("<I", self.b, self.o + _CMD, seq)
+        self._set_u32(_CMD, seq)
 
     def request(self) -> tuple[int, int, list[int]]:
         seq = self._stable(_CMD)
@@ -182,7 +198,7 @@ class _Slot:
             *res,
         )
         self.b[self.o + _TEXT : self.o + _TEXT + len(tb)] = tb
-        struct.pack_into("<I", self.b, self.o + _DONE, seq)
+        self._set_u32(_DONE, seq)
 
     def result(self) -> Answer:
         status, n, nt = struct.unpack_from("<iII", self.b, self.o + _STATUS)
@@ -242,9 +258,11 @@ def _worker_main(
     """A rank's loop: build the backend, then answer commands until ``stop`` or the parent's death."""
     os.environ.update(env)
     shm = shared_memory.SharedMemory(name=shm_name)
+    slot = _Slot(shm.buf, rank)
     try:
-        _serve(rank, nranks, _Slot(shm.buf, rank), factory, kwargs, spin_s)
+        _serve(rank, nranks, slot, factory, kwargs, spin_s)
     finally:
+        slot.release()
         shm.close()
 
 
@@ -268,6 +286,10 @@ def _serve(rank, nranks, slot: _Slot, factory, kwargs, spin_s) -> None:
                 time.sleep(2e-4)
             continue
         seq, op_id, args = slot.request()
+        if (
+            seq == 0
+        ):  # never a command (the server numbers from 1); belt and braces over _Slot's stores
+            continue
         op = _OP_NAMES.get(op_id, f"op{op_id}")
         if err:
             slot.answer(seq, 1, [], err)
@@ -406,6 +428,8 @@ class RankGroup:
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=5)
+        for s in self.slots:
+            s.release()
         self.slots = []
         try:
             self.shm.close()

@@ -1061,3 +1061,51 @@ if __name__ == "__main__":
             t = time.time()
             fn()
             print(f"{name}: ok ({time.time() - t:.2f}s)")
+
+
+def _watch_cmd(shm_name, n, out):
+    """Another process polling slot 0's command number, as a worker does: every value it reads, counted."""
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(name=shm_name)
+    slot = F._Slot(shm.buf, 0)
+    zeros, seen = 0, 0
+    try:
+        while seen < n:
+            v = slot.cmd()
+            if v == 0 and seen:
+                zeros += 1
+            seen = max(seen, v)
+    finally:
+        slot.release()
+        shm.close()
+    out.put(zeros)
+
+
+def test_mailbox_sequence_number_never_reads_zero():
+    """A posted command number is one aligned store: a reader in another process never sees the 0 that
+    ``struct.pack_into`` wrote first (it zeroes its target before the fields), which ran a payload twice.
+    """
+    import multiprocessing as mp
+    from multiprocessing import shared_memory
+
+    n = 200_000
+    shm = shared_memory.SharedMemory(create=True, size=F.SLOT)
+    shm.buf[: F.SLOT] = bytes(F.SLOT)
+    slot = F._Slot(shm.buf, 0)
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    p = ctx.Process(target=_watch_cmd, args=(shm.name, n, out))
+    try:
+        p.start()
+        time.sleep(0.5)
+        for seq in range(1, n + 1):
+            slot.post(seq, F.OPS["step"], [8, seq])
+        assert out.get(timeout=60) == 0
+        p.join(timeout=10)
+    finally:
+        if p.is_alive():
+            p.terminate()
+        slot.release()
+        shm.close()
+        shm.unlink()
