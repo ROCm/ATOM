@@ -10,7 +10,7 @@ historical padded-slot diagnostic. No model checkpoint,
 Store service, profiler, sampling change, or synthetic mailbox replacement.
 
 Run from the checkout with matching ROCm PyTorch/FlyDSL/AITER dependencies:
-  timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py
+  PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py
 Use separate fresh processes/caches at the PR head and its parent to verify a
 revert; do not monkeypatch `_spin` or free owners after a pending GPU operation.
 A hang is probabilistic: one completed run is not proof that it cannot recur.
@@ -204,13 +204,11 @@ def run_fixture(args):
         }
     )
     key = k1.AttnPreBuild(tokens=6, fold=False, tp=4, feeds_index=False)
-    inspect.signature(k1.build_attn_pre).bind(key)
     launch = k1.build_attn_pre(key)
     emit(
         {
             "stage": "actual_native_factory",
             "launch_api": "ordinary production factory",
-            "actual_factory": str(inspect.signature(k1.build_attn_pre)),
             "StepBegin": "ordinary actual StepMailboxes.begin_step",
             "real_tensor_shim_run_compiled": True,
         }

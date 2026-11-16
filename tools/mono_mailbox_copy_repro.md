@@ -22,8 +22,10 @@ its prior process/KFD ownership has actually gone away.
 ```
 # First validate the actual pool allocation, prepared ID upload and GPU pack/unpack:
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py --setup-only
-# Install/run from a full checkout so Python imports its atom package.
-# Use PYTHONPATH only for this checkout; the tool asserts module path ownership.
+# Run from the checkout root. PYTHONPATH="$PWD" makes Python import this
+# checkout's atom package, which the tool's ownership check requires.
+# --deadline SECONDS (default 15) is how long a round may take on the GPU before
+# the tool reports pending_deadline and waits for the external timeout.
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode side --repeats 128
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode mono-alone --repeats 3
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode copy-alone --repeats 3
