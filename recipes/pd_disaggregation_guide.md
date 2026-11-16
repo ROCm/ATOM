@@ -44,7 +44,8 @@ Whole-prompt and chunked receives share the budget. A request holds its credit
 until its first local forward; preemption, a failed receive and a cancelled one
 (once its writes drain) return it. With nothing pending, one request may exceed
 the budget, so long prompts are not starved. D must have PP=1, DCP=1, PCP=1,
-SP=1 and a single paged KV pool.
+SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
+in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
 ## Prerequisites
 

@@ -297,6 +297,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_bs=self.max_bs,
                 max_qlen=max_qlen,
                 num_idx_heads=self._num_idx_heads,
+                cp=self._index_cp_shard(),
             )
             if self._has_sparse_attention
             else {}
@@ -650,6 +651,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         return self.model_runner.forward_vars[
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
+
+    @staticmethod
+    def _index_cp_shard() -> tuple[int, int]:
+        """This rank's indexer-CP ``(world, rank)``, ``(1, 0)`` without CP: under it the
+        MXFP4 decode scorer runs every index head over the rank's 1/P of the blocks."""
+        from atom.distributed.indexer_cp import (
+            get_indexer_cp_rank,
+            get_indexer_cp_world_size,
+            indexer_cp_enabled,
+        )
+
+        if not indexer_cp_enabled():
+            return 1, 0
+        return get_indexer_cp_world_size(), get_indexer_cp_rank()
 
     def _get_sparse_attention_block_tables(
         self,
