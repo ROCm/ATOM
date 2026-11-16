@@ -1343,12 +1343,11 @@ class MLAAttention(nn.Module):
 
     def _prepare_dcp_mailbox(self):
         """Map the mailbox merge's peer buffer while every rank builds the same
-        layer (collective, and before the KV cache is sized); plugin mode
-        rebinds its DCP group later, so it keeps all-to-all."""
+        layer (collective, and before the KV cache is sized). Plugin mode never
+        gets here: Config resolves it to all-to-all."""
         from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
-        from atom.plugin.prepare import is_plugin_mode
 
-        if is_plugin_mode() or not prepare_dcp_mailbox(
+        if not prepare_dcp_mailbox(
             self.dcp_group,
             self.num_heads,
             self.v_head_dim if self.pbm_enabled else self.kv_lora_rank,

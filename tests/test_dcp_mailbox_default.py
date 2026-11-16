@@ -61,6 +61,13 @@ def test_an_explicit_backend_is_kept(monkeypatch, backend):
     assert _resolve(monkeypatch, backend, gfx="gfx942") == backend
 
 
+def test_an_explicit_mailbox_takes_all_to_all_in_plugin_mode(monkeypatch):
+    """Plugin mode rebinds its DCP group after the model is built."""
+    assert _resolve(monkeypatch, "mailbox", plugin=True) == "a2a"
+    assert _resolve(monkeypatch, "mailbox", plugin=True, dcp=1) == "mailbox"
+    assert _resolve(monkeypatch, "ag_rs", plugin=True) == "ag_rs"
+
+
 def test_an_explicit_mailbox_is_refused_next_to_decode_tbo(monkeypatch):
     """Not quietly swapped like `auto`. Checked after `_resolve_tbo`, so a TBO
     it turned off (tbo=False here) no longer refuses the mailbox."""
@@ -75,6 +82,7 @@ def _peer_vote(peer_count):
 
     def all_reduce(t, op, group):
         assert op == torch.distributed.ReduceOp.MIN
+        assert group == "gloo", "the vote must cross the workspace's CPU group"
         t.copy_(torch.minimum(t, torch.tensor([peer_count, -peer_count])))
 
     return all_reduce
@@ -86,8 +94,11 @@ def test_ranks_that_captured_different_mailbox_merges_refuse_to_serve(
     monkeypatch, peer, ok
 ):
     key = ("g", 4, 128)
+    other = ("g", 4, 512)  # a layout whose mapping fell back: not voted on
     monkeypatch.setattr(
-        dcp_ops, "_MAILBOX_GROUPS", {key: SimpleNamespace(cpu_group="gloo")}
+        dcp_ops,
+        "_MAILBOX_WORKSPACES",
+        {key: SimpleNamespace(group="gloo"), other: None},
     )
     monkeypatch.setattr(dcp_ops, "_MAILBOX_LAUNCHES", {key: 5})
     monkeypatch.setattr(torch.distributed, "all_reduce", _peer_vote(peer))

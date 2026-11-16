@@ -34,6 +34,8 @@ from atom.distributed.dcp_layout import (  # noqa: F401
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
+logger = logging.getLogger("atom")
+
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
 # it without importing Triton. Re-exported here for existing attention callers.
 
@@ -893,14 +895,12 @@ _MAILBOX_WORKSPACES: dict = {}
 # Mailbox merges taken, per workspace. A merge can only take the mailbox inside
 # a graph capture, so after capture this is every launch a replay makes.
 _MAILBOX_LAUNCHES: dict = {}
-_MAILBOX_GROUPS: dict = {}
 # Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
 # system-scope stores beat pack -> RCCL -> combine while the merge is latency
 # bound and lose once it is bandwidth bound. On MI355X (token tiling,
 # row_counts) GLM-5.2 DCP4 16 x 256 leads through 1.18e6 elements and loses
 # from 1.31e6; Kimi-K3 DCP8 12 x 128 still leads at 1.57e6.
 _MAILBOX_MAX_ELEMS = 1 << 20
-logger = logging.getLogger("atom")
 
 
 def _mailbox_key(cp_group, heads, dim):
@@ -952,7 +952,6 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         logger.warning("DCP mailbox peer memory: %s", error)
         return False
     _MAILBOX_WORKSPACES[key] = ws
-    _MAILBOX_GROUPS[key] = cp_group
     logger.info(
         "DCP mailbox merge ready: %d heads a rank x %d, up to %d decode tokens, "
         "%.1f MiB of peer memory",
@@ -1000,11 +999,14 @@ def check_dcp_mailbox_launches() -> None:
     of mailbox merges. A launch pairs with the same launch on every peer, so a
     rank that took one more would pair each later merge with the wrong call and
     hang at the last one. Collective: call on every rank after graph capture."""
-    for key, group in _MAILBOX_GROUPS.items():
+    for key, ws in _MAILBOX_WORKSPACES.items():
+        if ws is None:
+            continue
         n = _MAILBOX_LAUNCHES.get(key, 0)
         t = torch.tensor([n, -n], dtype=torch.int64, device="cpu")
+        # aiter's workspace keeps the DCP group's CPU (gloo) group
         torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            t, op=torch.distributed.ReduceOp.MIN, group=ws.group
         )
         lo, hi = t[0].item(), -t[1].item()
         if lo != hi:

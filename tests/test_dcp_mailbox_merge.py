@@ -183,7 +183,6 @@ def test_the_workspace_is_sized_for_merges_the_mailbox_can_take(
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
-    monkeypatch.setattr(dcp_ops, "_MAILBOX_GROUPS", {})
     group = SimpleNamespace(world_size=ranks, rank_in_group=0, cpu_group="gloo")
     assert dcp_ops.prepare_dcp_mailbox(group, heads, dim, widest)
     assert built == [sized]

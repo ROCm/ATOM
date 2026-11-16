@@ -2504,9 +2504,21 @@ class Config:
     def _resolve_dcp_comm_backend(self) -> None:
         """``dcp.comm_backend="auto"``: the mailbox combine where it has been
         validated (gfx950, DCP > 1, no decode TBO, not plugin mode), else
-        all-to-all. An explicit backend is kept as given. Runs after
-        ``_resolve_tbo``, so ``enable_tbo_decode`` is final here."""
+        all-to-all. An explicit backend is kept as given, except an explicit
+        ``mailbox`` in plugin mode, which rebinds its DCP group after the model
+        is built and so takes all-to-all. Runs after ``_resolve_tbo``, so
+        ``enable_tbo_decode`` is final here."""
         dcp = self.dcp_config
+        if (
+            dcp.comm_backend == "mailbox"
+            and self.decode_context_parallel_size > 1
+            and is_plugin_mode()
+        ):
+            logger.warning(
+                "DCP comm_backend 'mailbox' is unavailable in plugin mode; "
+                "merging with 'a2a'"
+            )
+            dcp.comm_backend = "a2a"
         if dcp.comm_backend != "auto":
             # The mailbox combine spins in-kernel on its peers; next to decode
             # TBO's comm-stream collectives that is unverified.
