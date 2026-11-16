@@ -8,6 +8,7 @@ import importlib.util
 import logging
 import os
 import re
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -15,6 +16,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+from atom.kv_transfer.disaggregation.multi.multi_connector import validate_multi_config
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
@@ -1094,6 +1097,14 @@ class ParallelConfig:
 
     data_parallel_master_ip: str = "127.0.0.1"
 
+    tensor_parallel_size_local: int | None = None
+    """TP ranks (model-runner workers) this node runs. None means all of them,
+    the single-node case. Set it below tensor_parallel_size to spread one TP
+    group over several nodes; see atom/model_engine/tp_multinode.py."""
+    tensor_parallel_rank: int = 0
+    """First TP rank this node runs. The node that runs rank 0 also runs the
+    engine and the API server; the others run only their workers."""
+
     @property
     def is_multinode_dp(self) -> bool:
         """Whether this node owns only part of the global DP group.
@@ -1703,8 +1714,13 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
+    # auto retains the existing BF16 path, independently of target CSA precision.
+    draft_kv_dtype: str = "auto"
 
     def __post_init__(self):
+        if self.draft_kv_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1713,6 +1729,26 @@ class DSparkConfig:
             raise ValueError(
                 "DSpark calibration_profile requires a path and confidence_schedule=True"
             )
+
+    def validate_draft_kv(self, config):
+        if self.draft_kv_dtype == "auto":
+            return
+        spec = config.speculative_config
+        target_dtypes = ("fp8", "fp4")
+        if (
+            config.hf_config.model_type != "deepseek_v41_text"
+            or config.kv_cache_dtype not in target_dtypes
+            or spec is None
+            or spec.method != "dspark"
+            or config.plugin_config is not None
+        ):
+            raise ValueError(
+                f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
+                f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
+            )
+        from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
+
+        validate_fp8_draft_support(config)
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "DSparkConfig":
@@ -1978,7 +2014,6 @@ def indexer_cp_unsupported_reason(
     dcp_size: int,
     enable_tbo: bool,
     plugin_mode: bool = False,
-    mxfp4_caches: bool = False,
 ) -> str | None:
     """Why MiniMax-M3 indexer-only context parallelism cannot run here, or None.
 
@@ -2006,8 +2041,6 @@ def indexer_cp_unsupported_reason(
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
         # flag so nothing downstream (log line, compile hash) disagrees.
         return "plugin mode (the vLLM/SGLang bridges keep the TP indexer path)"
-    if mxfp4_caches:
-        return "the MXFP4 caches are not wired to the CP scorer"
     if dcp_size > 1:
         return (
             "decode_context_parallel_size > 1 (KV-cache DCP owns the context "
@@ -2045,6 +2078,95 @@ def indexer_cp_unsupported_reason(
         # discipline deadlock.
         return "TBO (two-batch overlap)"
     return None
+
+
+_HF_SCALAR_TYPES = (bool, int, float, str, type(None))
+# A value that does not key the cache. The sentinel itself is never hashed,
+# so its identity (not its repr) is all that matters.
+_HF_UNKEYED = object()
+
+
+def _hf_keyable(value):
+    """``value``'s cache-key form, or ``_HF_UNKEYED`` if it does not key.
+
+    A scalar keys by value, and a flat list / tuple of scalars by its ordered
+    contents. Anything else -- a nested object, a dict, a list of non-scalars
+    -- keys nothing on its own.
+    """
+    if isinstance(value, _HF_SCALAR_TYPES):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, _HF_SCALAR_TYPES) for item in value
+    ):
+        return tuple(value)
+    return _HF_UNKEYED
+
+
+def _hf_dict_entries(mapping) -> tuple:
+    """A dict-valued config field's sorted scalar entries, one level deep.
+
+    ``rope_parameters`` / ``rope_scaling`` is what this is for: it holds the
+    YaRN ``factor`` and ``mscale_all_dim`` that ``deepseek_v2`` folds into
+    ``self.scaling``, a Python float the traced graph bakes in as a constant,
+    so two checkpoints that differ only there must not share an artifact.
+    Entries whose value is itself a dict or a list of non-scalars key nothing,
+    and sorting by key keeps the factor independent of insertion order.
+    """
+    return tuple(
+        (str(key), keyed)
+        for key, item in sorted(mapping.items(), key=lambda kv: str(kv[0]))
+        if (keyed := _hf_keyable(item)) is not _HF_UNKEYED
+    )
+
+
+def _hf_config_fields(config) -> tuple:
+    """A config's public keyable fields, sorted by name.
+
+    ``config`` is a config object, or a plain mapping: ``PretrainedConfig.from_dict``
+    can leave ``text_config`` as the raw mapping, which
+    ``_normalize_minimax_m3_text_config`` converts only for the MiniMax-M3
+    exports. Any other type raises through ``vars`` rather than silently
+    keying nothing.
+    """
+    items = config.items() if isinstance(config, Mapping) else vars(config).items()
+    out = []
+    for name, value in sorted(items, key=lambda kv: str(kv[0])):
+        name = str(name)
+        if name.startswith("_"):
+            continue
+        if isinstance(value, Mapping):
+            out.append((name, _hf_dict_entries(value)))
+        else:
+            keyed = _hf_keyable(value)
+            if keyed is not _HF_UNKEYED:
+                out.append((name, keyed))
+    return tuple(out)
+
+
+def _hf_architecture_factor(hf_config) -> tuple:
+    """The HF model-config values that key the compile cache.
+
+    Every public scalar (and flat list / tuple of scalars, and the scalar
+    entries of dict-valued fields) of the backbone's text config, plus the
+    top-level config when that is a separate object. ``num_hidden_layers``,
+    widths, head and expert counts and per-layer patterns decide how many
+    weights the traced graph takes and their shapes; scalars such as the norm
+    eps or the routing scale are baked into it as constants. Two checkpoints of
+    one architecture run the same model code, so without them two that differ
+    only in such values (e.g. the layer count) can hash identically.
+
+    The rule is deliberately conservative: metadata such as
+    ``transformers_version`` keys too, which costs at most a cold compile when
+    it changes. Private attributes (``_name_or_path``, ``_commit_hash``) are
+    skipped so the key does not move with where the checkpoint is mounted, as
+    are nested objects (sub-configs, dtypes); ``quantization_config`` is keyed
+    by ``quant_config.compute_hash()`` and, as a dict on the HF config, by the
+    one-level rule as well.
+    """
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or text_config is hf_config:
+        return (_hf_config_fields(hf_config),)
+    return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
 def check_return_routed_experts(config: "Config") -> None:
@@ -2263,6 +2385,7 @@ class Config:
     torch_dtype: torch.dtype = field(init=False)
     speculative_config: SpeculativeConfig | None = None
     kv_transfer_config: dict = field(default_factory=dict)
+    offload_min_load_tokens: int | None = field(default=None, init=False)
     # A frontend's own stable form of its speculative config, which the offload
     # PAGE namespace hashes in place of `speculative_config`: only the frontend
     # knows which of its fields differ between processes. None hashes
@@ -2347,6 +2470,61 @@ class Config:
     @property
     def pcp_group_size(self) -> int:
         return pcp_group_size_of(self)
+
+    @property
+    def tp_size_local(self) -> int:
+        """TP worker processes on this node: fewer than `tp_world_size` when
+        one TP group spans several nodes."""
+        local = self.parallel_config.tensor_parallel_size_local
+        return self.tp_world_size if local is None else local
+
+    @property
+    def tp_rank_start(self) -> int:
+        """First TP rank on this node; it runs `tp_size_local` ranks from here."""
+        return self.parallel_config.tensor_parallel_rank
+
+    @property
+    def is_multinode_tp(self) -> bool:
+        return self.tp_size_local < self.tp_world_size or self.tp_rank_start > 0
+
+    def _check_multinode_tp(self) -> None:
+        pc = self.parallel_config
+        if pc.tensor_parallel_size_local is None and pc.tensor_parallel_rank == 0:
+            return
+        local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
+        if local < 1 or tp % local or start % local or not 0 <= start < tp:
+            raise ValueError(
+                f"--tensor-parallel-size-local {local} and --tensor-parallel-rank "
+                f"{start} must cut -tp {tp} into whole, equal per-node slices"
+            )
+        if not self.is_multinode_tp:
+            return
+        unsupported = [
+            name
+            for name, used in (
+                ("data parallelism", pc.data_parallel_size > 1),
+                ("--enable-dp-attention", self.enable_dp_attention),
+                ("pipeline parallelism", self.pipeline_parallel_size > 1),
+                ("prefill context parallelism", self.prefill_context_parallel_size > 1),
+                ("--fake-eplb", self.fake_eplb),
+                ("RapidServe", self.enable_rapidserve),
+            )
+            if used
+        ]
+        if unsupported:
+            raise ValueError(
+                "tensor parallelism across nodes does not support "
+                + ", ".join(unsupported)
+            )
+        if pc.data_parallel_base_port == 0 or pc.data_parallel_master_ip in (
+            "127.0.0.1",
+            "localhost",
+        ):
+            raise ValueError(
+                "tensor parallelism across nodes needs --data-parallel-master-ip "
+                "set to the address of the node that runs TP rank 0, and the "
+                "same nonzero --data-parallel-base-port on every node"
+            )
 
     @property
     def capture_sizes(self) -> list[int]:
@@ -2536,6 +2714,8 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
+        if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
+            raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2610,6 +2790,7 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
+        self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
@@ -2686,6 +2867,8 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        self._check_kv_cache_dtype()
+        self.dspark.validate_draft_kv(self)
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
@@ -2697,6 +2880,14 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if (
+            isinstance(self.kv_transfer_config, dict)
+            and str(self.kv_transfer_config.get("kv_connector", "")).strip().casefold()
+            == "multi"
+        ):
+            # Refuse a composite the engine cannot run now, not when a worker
+            # builds it after the weights are loaded.
+            validate_multi_config(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
@@ -2814,6 +3005,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_offload_min_load_tokens()
         self._resolve_dynamic_chunking()
         self._resolve_tbo()
         self._check_pp_support()
@@ -2984,7 +3176,6 @@ class Config:
                 self.decode_context_parallel_size,
                 self.enable_tbo or self.enable_tbo_decode,
                 is_plugin_mode(),
-                "fp4" in (self.index_cache_dtype, self.kv_cache_dtype),
             )
             if indexer_cp_off is not None:
                 logger.warning(
@@ -3075,6 +3266,29 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_kv_cache_dtype(self) -> None:
+        """Validate FP4 support and report performance guidance before sizing."""
+        if self.kv_cache_dtype != "fp4":
+            return
+        from atom.utils.selector import Family, attn_family
+
+        if _is_minimax_m3_config(self.hf_config):
+            # MiniMax's model-specific restrictions are checked later in startup.
+            return
+        if attn_family(self.hf_config) is not Family.CSA2:
+            raise ValueError(
+                "--kv_cache_dtype=fp4 is only supported by MiniMax-M3.1 and "
+                "DeepSeek-V4.1 (CSA2); use bf16 or fp8 for this model."
+            )
+        from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
+
+        warn_fp4_performance(
+            num_heads=self.hf_config.num_attention_heads,
+            attention_tp_size=(
+                1 if self.enable_dp_attention else self.tensor_parallel_size
+            ),
+        )
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None
@@ -3307,6 +3521,10 @@ class Config:
                 "supported with pipeline_parallel_size > 1."
             )
 
+    def _resolve_offload_min_load_tokens(self) -> None:
+        # Resolve once before spawning workers, identically for CLI and API.
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
+
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -3398,7 +3616,7 @@ class Config:
         # This reads the field AFTER __post_init__, which is the only correct
         # value: it already folds in the ATOM_M3_INDEXER_CP override AND every
         # indexer_cp_unsupported_reason fallback (plugin mode, TP != kv heads,
-        # block != 128, DCP, TBO, an MXFP4 KV or index cache). Two topologies that both fall back therefore
+        # block != 128, DCP, TBO). Two topologies that both fall back therefore
         # share one artifact, as they should.
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
@@ -3411,31 +3629,6 @@ class Config:
         # writes in both V4 and V4.1. Hash the same snapshot their caches use.
         if self.index_cache_layout is not None:
             factors.append(("index_cache_layout", self.index_cache_layout))
-        text_config = getattr(self.hf_config, "text_config", self.hf_config)
-        factors.append(
-            (
-                getattr(
-                    text_config,
-                    "use_index_cache",
-                    getattr(self.hf_config, "use_index_cache", False),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_freq",
-                    getattr(self.hf_config, "index_topk_freq", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_topk_pattern",
-                    getattr(self.hf_config, "index_topk_pattern", None),
-                ),
-                getattr(
-                    text_config,
-                    "index_skip_topk_offset",
-                    getattr(self.hf_config, "index_skip_topk_offset", None),
-                ),
-            )
-        )
         # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
         # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
         # F.embedding vs masked-embedding + all-reduce), so it alters the compiled
@@ -3481,6 +3674,13 @@ class Config:
                 spec.draft_kv_dtype,
             )
         )
+        architecture_factor = _hf_architecture_factor(self.hf_config)
+        factors.append(architecture_factor)
+        # hf_config also carries values ATOM writes itself (rope_parameters,
+        # dspark_*, an expert_dtype probed from disk), so a value that moved
+        # between runs would otherwise show up only as a cold compile, with no
+        # error; logged at debug so two runs can be diffed.
+        logger.debug("Compile cache HF architecture factor: %s", architecture_factor)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
@@ -3493,14 +3693,15 @@ def local_device_index(config: Config, rank: int) -> int:
 
     On a single node the physical GPU index equals the global distributed rank
     in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp) stage) owns a
-    contiguous slice of `tp_world_size * pcp_group_size` GPUs.
+    contiguous slice of `tp_world_size * pcp_group_size` GPUs. A TP group that
+    spans nodes has its ranks from `tp_rank_start` on this node.
     """
     pc = config.parallel_config
     engine_index = (
         pc.data_parallel_rank_local or 0
     ) * config.pipeline_parallel_size + pc.pipeline_parallel_rank
     stage_span = config.tp_world_size * config.pcp_group_size
-    return engine_index * stage_span + rank
+    return engine_index * stage_span + rank - config.tp_rank_start
 
 
 _current_atom_config: Config | None = None

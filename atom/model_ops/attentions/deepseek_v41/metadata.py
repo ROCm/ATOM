@@ -73,9 +73,17 @@ class BatchStep:
     candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
-    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    group_indices: dict[int | tuple[int, str], tuple[torch.Tensor, ...]] = field(
+        default_factory=dict
+    )
     # A split decode's window rows (`indices.build_window_rows`), every layer's.
     window_rows: torch.Tensor | None = None
+    # One layer's live Q/KV preparation, consumed after the side-stream join.
+    attention_inputs: tuple | None = None
+    # Reusable raw storage for one layer's live SWA history/current-KV source.
+    # The serving cache binds the parent's; TBO gives each child its own.
+    # Keep this across begin_forward: only its live views depend on the step.
+    prefill_window_staging: torch.Tensor | None = None
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the
@@ -86,6 +94,9 @@ class BatchStep:
     # addresses for every such step. None where no replay can run.
     decoder: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
+    # A8W4 separates CSA/SWA even when the same step also uses the BF16
+    # adapter (for example, an ASM query shape outside its supported range).
+    a8w4_indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
     # own, so this adds no second source of truth.
@@ -156,10 +167,12 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.indptrs = {}
+        self.a8w4_indptrs = {}
         self.tiles.clear()
         self.candidate_blocks.clear()
         self.group_indices.clear()
         self.window_rows = None
+        self.attention_inputs = None
         self.replay = None
 
     @property
