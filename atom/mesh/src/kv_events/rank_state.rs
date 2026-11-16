@@ -1,14 +1,13 @@
 //! Admission of a rank's batches by sequence number. Ranks are independent: a broken
-//! stream affects only its own rank. A batch that does not follow the last one, or the
+//! stream affects only its own holder. A batch that does not follow the last one, or the
 //! first one after the socket lost its connection, means batches may have been lost or
-//! the engine restarted, so the caller drops what it kept of the rank's earlier batches.
-//! What it keeps is then a lower bound of the engine's cache, unless the stream starts
-//! over from its first batch, until the next `AllBlocksCleared`.
+//! the engine restarted, so the holder is cleared. It then holds a lower bound of the
+//! engine's cache, unless it starts over from the stream's first batch, until the next
+//! `AllBlocksCleared`.
 
 use serde::Serialize;
 
-/// Whether what the caller keeps of a rank's batches matches its engine's cache (`Exact`)
-/// or is a lower bound of it.
+/// Whether a holder matches its engine's cache (`Exact`) or is a lower bound of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
@@ -20,7 +19,7 @@ pub enum Trust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit {
     Apply,
-    /// Drop what was kept of the rank's earlier batches, then apply.
+    /// Clear the holder, then apply.
     ClearAndApply,
 }
 
@@ -28,7 +27,7 @@ pub enum Admit {
 pub struct RankState {
     next: Option<u64>,
     trust: Trust,
-    /// What was kept came from an earlier connection.
+    /// The holder keeps what an earlier connection carried.
     stale: bool,
 }
 
@@ -38,8 +37,8 @@ impl RankState {
     }
 
     /// The socket lost its connection: an engine that restarted meanwhile may go on at the
-    /// very seq that would follow, so the next batch starts over, and batches may be lost
-    /// until then.
+    /// very seq that would follow, so the next batch starts the holder over, and batches
+    /// may be lost until then.
     pub fn disconnected(&mut self) {
         if self.next.take().is_some() {
             self.stale = true;
