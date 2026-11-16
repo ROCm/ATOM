@@ -2806,6 +2806,15 @@ class MLAAttention(nn.Module):
                 # Shared IndexShare layers reuse the preceding full layer's
                 # indices, compact indptr, and so its patched plan.
                 patch_work_kv_ranges(work_info_set, work_indptr, paged_kv_indptr, B)
+            # A row owning no keys on this rank gets an empty work item, and the
+            # asm kernel ends a CU's work at its first empty item. With no more
+            # rows than CUs, aiter's plan gives a CU one row, so none follows.
+            empty_work_items = (
+                use_persistent_mode
+                and self.is_sparse_mla
+                and self.dcp_world_size > 1
+                and B > torch.cuda.get_device_properties().multi_processor_count
+            )
 
             # persistent lets metadata (reduce_partial_map) drive the split, so
             # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs
@@ -2867,6 +2876,7 @@ class MLAAttention(nn.Module):
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
                 causal=causal,
+                empty_work_items=empty_work_items,
             )
 
         o = self._restore_decode_query_heads(o, num_heads_q)
