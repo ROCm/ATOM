@@ -233,13 +233,15 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
-# The one width below 16 aiter's MLA decode dispatches; see mla_decode_min_heads.
+# The query-head width below 16 ATOM decodes at: aiter's gfx950 fp8 12-head
+# route (mla_decode_min_heads).
 _MLA_NARROW_MIN_HEADS = 12
 # The one verify width at which ATOM takes it (mla_dense_min_query_heads).
 # aiter mla_decode_fwd on MI355X (aiter 0dd2716), 12- vs 16-head time,
 # median over ctx 4k/32k/128k: at qlen 8, -2.4% / -3.1% / -3.7% / -9.1% at
 # bs 1 / 2 / 4 / 8, with bit-identical output. At qlen 1-4 12 heads is slower
-# at every shape (3.5-44%), and at qlen 5 and 7 slower at bs 1.
+# at every batch size, 10-43% (medians over ctx; 3.5-44% per shape). At qlen
+# 5-7 the medians run +6.4% to -5.0%, slower at bs 1.
 _MLA_NARROW_QLEN = 8
 _MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
@@ -251,18 +253,18 @@ def mla_decode_min_heads(
     persistent: bool,
     arch: str,
 ) -> int:
-    """Fewest query heads aiter's MLA decode dispatches for this shape: 12 or 16.
+    """12 where aiter's fp8 MLA decode serves 12 query heads, else 16.
 
-    Mirrors aiter's gate (csrc/py_itfs_cu/asm_mla.cu, mla_asm_decode_remap):
-    on gfx950 an fp8-Q, fp8-KV persistent decode with ``12 * qlen <= 128``
-    takes exactly 12 heads, remapped onto the gqa=32 qseqlen=4 kernel, and the
-    fast-mode planner treats 12 as native (csrc/include/mla_decode_shape.h).
-    Everything else needs 16. ``max_seqlen_q`` is the widest decode query,
-    speculative tokens included. Head counts between the floor and 16 still pad
-    to 16; see ``mla_kernel_num_heads``.
-
-    Kept in step with aiter by hand until aiter exposes the same answer as
-    ``aiter.mla.mla_decode_min_heads``; ATOM calls that once it lands.
+    Hand mirror of aiter csrc/py_itfs_cu/asm_mla.cu:452-456 (aiter 7c2fa4d,
+    the ``gqa_ratio == 12`` branch of ``mla_asm_decode_remap``): on gfx950 an
+    fp8-Q, fp8-KV persistent decode with ``12 * qlen <= 128`` takes exactly 12
+    heads, remapped onto the gqa=32 qseqlen=4 kernel, and the fast-mode planner
+    treats 12 as native (csrc/include/mla_decode_shape.h:176-177). Only that
+    fp8 branch is mirrored: ATOM decodes 12 heads only from an fp8 KV cache,
+    so a bf16 decode reports 16 here even where aiter serves 12 (gfx950
+    persistent, ``12 * qlen >= 64``). ``max_seqlen_q`` is the widest decode
+    query, speculative tokens included. Head counts between the floor and 16
+    still pad to 16; see ``mla_kernel_num_heads``.
     """
     if (
         arch == "gfx950"
@@ -387,9 +389,9 @@ def mla_kernel_num_heads(num_heads: int, min_heads: int = _MLA_MIN_HEADS) -> int
 
     aiter accepts nhead 16, and above that only multiples of 16 up to 128 (it
     folds those onto the 16-head kernel); any other value aborts the dispatch.
-    The one narrower width is 12, which only a gfx950 fp8 persistent decode
-    takes (``mla_decode_min_heads``): pass it as ``min_heads`` and up to 12
-    heads pad to 12, 13 to 16 to 16. ``min_heads`` is the layer's floor
+    The narrower width ATOM uses is 12, on aiter's gfx950 fp8 persistent
+    decode (``mla_decode_min_heads``): pass it as ``min_heads`` and up to 12
+    heads pad to 12, 13 to 16 heads pad to 16. ``min_heads`` is the layer's floor
     (``MLAAttention.min_query_heads``); a count at or below it pads to it.
     """
     if num_heads <= min_heads:
@@ -765,9 +767,9 @@ class MLAAttention(nn.Module):
             self.min_query_heads = mla_dense_min_query_heads(
                 get_current_atom_config(), num_heads, get_dcp_world_size()
             )
-        # aiter MLA only serves multiples of 16 heads (and 12 on its gfx950 fp8
-        # persistent decode); round up so a per-rank count like 24 (K3 at tp4)
-        # does not abort in get_mla_metadata.
+        # aiter MLA only serves multiples of 16 heads (and ATOM also takes 12 on
+        # its gfx950 fp8 persistent decode); round up so a per-rank count like
+        # 24 (K3 at tp4) does not abort in get_mla_metadata.
         self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than

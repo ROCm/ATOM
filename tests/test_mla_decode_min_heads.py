@@ -130,6 +130,8 @@ def _builder_width(cfg, monkeypatch, num_heads=12):
         ("gfx950", FP8, FP8, 1, False, 16),
         ("gfx950", torch.bfloat16, FP8, 1, True, 16),
         ("gfx950", FP8, torch.bfloat16, 1, True, 16),
+        # aiter serves 12 here too; ATOM mirrors only the fp8 branch.
+        ("gfx950", torch.bfloat16, torch.bfloat16, 8, True, 16),
         ("gfx950", torch.uint8, torch.uint8, 1, True, 16),  # byte KV, not fp8
         ("gfx942", FP8, FP8, 1, True, 16),
         ("gfx1250", FP8, FP8, 1, True, 16),
@@ -237,3 +239,4 @@ def test_fewer_heads_keep_sixteen(native, monkeypatch):
 def test_explicit_floor_wins(native):
     """A DSpark draft passes its own floor and plans its own work."""
     assert _layer(native, min_query_heads=32).padded_num_heads == 32
+
