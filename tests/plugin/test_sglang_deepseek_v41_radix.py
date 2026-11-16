@@ -18,7 +18,9 @@ Covered here:
 7. the refusal matrix, and that nothing is installed with radix off;
 8. the fused replay: the seam's record, the widened inputs and the output
    rows, the bridge's widened spans, the runtime hook, ATOM's cache over a
-   fused span, and the host-row invalidation that lets overlap run.
+   fused span, and the host-row invalidation that lets overlap run;
+9. DSpark under the replay: launch policy and refusals with the kill switch,
+   a hit on a speculative pool, verify rounds that never carry a replay.
 """
 
 import sys
@@ -89,6 +91,7 @@ def _isolated_process_state(monkeypatch):
     # Radix is on by default; pinned so an operator's environment cannot
     # turn it off under these tests.
     monkeypatch.setenv("ATOM_V41_RADIX", "1")
+    monkeypatch.delenv("ATOM_V41_RADIX_DSPARK", raising=False)
     # One builder and one replay length per process; no test may leak either.
     monkeypatch.setattr(bridge, "_V41_BUILDER", None)
     monkeypatch.setattr(radix, "_REPLAY_ROWS", None)
@@ -895,7 +898,7 @@ class TestRefusals:
                 "KV storage backend",
             ),
             ("schedule", "chunked_prefill_size", 64, "--chunked-prefill-size 64"),
-            ("spec", "speculative_algorithm", "DSPARK", "speculative decoding with"),
+            ("spec", "speculative_algorithm", "EAGLE", "speculative decoding with"),
         ],
     )
     def test_radix_refusals(self, launch, bag, path, value, match):
@@ -998,26 +1001,56 @@ class TestLaunchPolicy:
         assert not caplog.records
 
     @pytest.mark.parametrize("pinned", [None, "1"])
-    def test_speculation_turns_radix_off_once(self, monkeypatch, caplog, pinned):
+    def test_dspark_keeps_radix(self, monkeypatch, caplog, pinned):
+        monkeypatch.delenv(radix.DSPARK_ENV, raising=False)
         if pinned is not None:
-            monkeypatch.setenv("ATOM_V41_RADIX", pinned)
+            monkeypatch.setenv(radix.DSPARK_ENV, pinned)
+        with caplog.at_level("WARNING", logger="atom"):
+            assert (
+                radix.v41_radix_launch_override(self._args(spec="DSPARK"), self.V41)
+                == {}
+            )
+        assert not caplog.records
+
+    def test_dspark_kill_switch_turns_radix_off_once(self, monkeypatch, caplog):
+        monkeypatch.setenv(radix.DSPARK_ENV, "0")
         with caplog.at_level("WARNING", logger="atom"):
             for _ in range(3):
                 assert radix.v41_radix_launch_override(
                     self._args(spec="DSPARK"), self.V41
                 ) == {"disable_radix_cache": True}
+            # Only speculation is affected: a plain launch keeps radix.
+            assert radix.v41_radix_launch_override(self._args(), self.V41) == {}
         assert len(caplog.records) == 1
         message = caplog.records[0].getMessage()
-        assert "speculative decoding (DSPARK)" in message
+        assert f"{radix.DSPARK_ENV} is off" in message
         assert "--disable-radix-cache" in message
-        assert ("ATOM_V41_RADIX=1 is ignored" in message) is (pinned == "1")
 
-    def test_speculation_enum_name(self):
+    def test_other_speculation_turns_radix_off(self, caplog):
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(
+                self._args(spec="EAGLE"), self.V41
+            ) == {"disable_radix_cache": True}
+        assert "speculative decoding (EAGLE)" in caplog.records[0].getMessage()
+
+    def test_radix_off_wins_over_dspark(self, monkeypatch, caplog):
+        monkeypatch.setenv("ATOM_V41_RADIX", "0")
+        with caplog.at_level("WARNING", logger="atom"):
+            assert radix.v41_radix_launch_override(
+                self._args(spec="DSPARK"), self.V41
+            ) == {"disable_radix_cache": True}
+        assert "ATOM_V41_RADIX is off" in caplog.records[0].getMessage()
+
+    def test_speculation_enum_name(self, monkeypatch):
         algorithm = SimpleNamespace(name="NONE")
         assert (
             radix.v41_radix_launch_override(self._args(spec=algorithm), self.V41) == {}
         )
         algorithm = SimpleNamespace(name="DSPARK")
+        assert (
+            radix.v41_radix_launch_override(self._args(spec=algorithm), self.V41) == {}
+        )
+        monkeypatch.setenv(radix.DSPARK_ENV, "0")
         assert radix.v41_radix_launch_override(
             self._args(spec=algorithm), self.V41
         ) == {"disable_radix_cache": True}
@@ -1050,7 +1083,7 @@ class TestLaunchPolicy:
     def test_sglang_resolving_view_sees_earlier_declarations(self, monkeypatch):
         base = pytest.importorskip("sglang.srt.arg_groups.model_override_base")
         monkeypatch.setattr(radix, "_resolving_view", base.resolving_view)
-        args = self._args(spec="DSPARK")
+        args = self._args(spec="EAGLE")
         args._resolved_overrides = [("earlier", {"disable_radix_cache": True})]
         assert radix.v41_radix_launch_override(args, self.V41) == {}
         args._resolved_overrides = []
@@ -1081,7 +1114,12 @@ class TestLaunchPolicy:
         )
         assert not radix.register_v41_radix_launch_policy()
         launch.bags["spec"].speculative_algorithm = "DSPARK"
-        with pytest.raises(ValueError, match="speculative decoding.*--disable-radix"):
+        monkeypatch.setenv(radix.DSPARK_ENV, "0")
+        with pytest.raises(
+            ValueError,
+            match="speculative decoding with radix cache: ATOM_V41_RADIX_DSPARK "
+            r"is off.*\(launch with --disable-radix-cache\)",
+        ):
             refuse_unsupported_sglang_features()
 
     def test_plugin_entry_point_registers_the_policy(self):
@@ -2140,3 +2178,130 @@ class TestForcedSideFallback:
         world = _World(monkeypatch)
         assert run_v41_prefix_replay(world.worker, world.batch([PAGE], [1])) is not None
         assert world.sides == [] and radix._STATS["forced_fallbacks"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 9. DSpark under the replay
+# ---------------------------------------------------------------------------
+
+
+class _VerifyMode(_Mode):
+    def __init__(self):
+        super().__init__("TARGET_VERIFY")
+
+    def is_target_verify(self):
+        return True
+
+    def is_context_parallel_extend(self, include_draft_extend_v2=False):
+        return False
+
+    def is_extend_without_speculative(self):
+        return False
+
+
+VERIFY = _VerifyMode()
+DSPARK_WIDTH = bridge.V41_DSPARK_VERIFY_TOKENS
+
+
+def _verify_fb(prefix, slots):
+    ends = [p + DSPARK_WIDTH for p in prefix]
+    return SimpleNamespace(
+        forward_mode=VERIFY,
+        rids=[f"v{i}" for i in range(len(slots))],
+        batch_size=len(slots),
+        seq_lens=torch.tensor(ends, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+        req_pool_indices=torch.tensor(slots, dtype=torch.int64),
+        req_pool_indices_cpu=None,
+        spec_info=SimpleNamespace(
+            draft_token_num=DSPARK_WIDTH,
+            live_seq_lens_cpu=torch.tensor(prefix, dtype=torch.int64),
+        ),
+    )
+
+
+class TestDSparkUnderTheReplay:
+    def _bags(self, launch, algorithm="DSPARK"):
+        launch.bags["spec"].speculative_algorithm = algorithm
+        bags = launch.bags
+        return bridge._radix_refusals(
+            bags["memory"], bags["exec"], bags["schedule"], bags["spec"]
+        )
+
+    def test_dspark_is_not_a_radix_refusal(self, launch):
+        assert [name for name, on in self._bags(launch) if on] == []
+
+    def test_kill_switch_and_other_algorithms_are(self, launch, monkeypatch):
+        (name,) = [name for name, on in self._bags(launch, "EAGLE") if on]
+        assert "speculative decoding (EAGLE)" in name
+        monkeypatch.setenv(radix.DSPARK_ENV, "0")
+        (name,) = [name for name, on in self._bags(launch) if on]
+        assert f"{radix.DSPARK_ENV} is off" in name
+        assert "--disable-radix-cache" in name
+
+    def test_speculation_refusal_is_pure(self, monkeypatch):
+        refusal = radix.radix_speculation_refusal
+        assert refusal(None) is None and refusal("") is None
+        assert refusal("DSPARK") is None
+        assert refusal(SimpleNamespace(name="DSPARK")) is None
+        assert "EAGLE3" in refusal("EAGLE3")
+        monkeypatch.setenv(radix.DSPARK_ENV, "off")
+        assert radix.DSPARK_ENV in refusal("DSPARK")
+        assert refusal(None) is None
+
+    def test_a_hit_on_a_speculative_pool_is_scheduled_as_without(self, req_to_token):
+        """DSpark's prefill is a plain EXTEND: the hit's span and ``Replay``
+        are the same on a DSpark pool, so the same forward rebuilds the
+        target's and the draft's windows below ``P``."""
+        fb = _extend_fb([2 * PAGE, 0], [5, 9], [1, 2])
+        fused = _fused([0], [1], ["r0"], [2 * PAGE - R], [2 * PAGE])
+        setattr(fb, FUSED_ATTR, fused)
+        plain = build_v41_scheduled_batch(fb, PAGE, history=HISTORY)
+        spec = build_v41_scheduled_batch(
+            fb, PAGE, speculative_tokens=bridge.V41_DSPARK_DRAFT_TOKENS, history=HISTORY
+        )
+        assert spec.replaying == plain.replaying and set(spec.replaying) == {0}
+        assert spec.replay_rows.tolist() == plain.replay_rows.tolist() == [R, 0]
+        assert spec.num_scheduled_tokens.tolist() == [5 + R, 9]
+        assert spec.context_lens.tolist() == [2 * PAGE + 5, 9]
+
+    def test_verify_rounds_read_no_stamps(self, monkeypatch, req_to_token, radix_fused):
+        monkeypatch.setattr(
+            bridge, "_radix_stamps", lambda: pytest.fail("verify read stamps")
+        )
+        batch = build_v41_scheduled_batch(
+            _verify_fb([PAGE + 3, 40], [1, 2]),
+            PAGE,
+            speculative_tokens=bridge.V41_DSPARK_DRAFT_TOKENS,
+        )
+        assert batch.replaying == {}
+        assert batch.replay_rows.tolist() == [0, 0]
+        assert batch.num_scheduled_tokens.tolist() == [DSPARK_WIDTH] * 2
+
+    def test_a_verify_carrying_a_replay_is_refused(self, req_to_token, radix_fused):
+        fb = _verify_fb([PAGE + 3], [1])
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["v0"], [PAGE - R], [PAGE]))
+        with pytest.raises(NotImplementedError, match="rides on an EXTEND"):
+            build_v41_scheduled_batch(
+                fb, PAGE, speculative_tokens=bridge.V41_DSPARK_DRAFT_TOKENS
+            )
+
+    def test_the_seam_leaves_verify_batches_alone(self, monkeypatch, radix_fused):
+        world = _World(monkeypatch)
+        batch = world.batch([PAGE], [1], mode=VERIFY)
+        assert run_v41_prefix_replay(world.worker, batch) is None
+        assert world.sides == [] and not world.pool.state_gen.any()
+        assert radix._STATS["steps"] == 0
+
+    def test_dspark_prefill_hit_rides_in_its_step(self, monkeypatch, radix_fused):
+        """SGLang's ``DSparkWorkerV2._forward_prefill`` hands the target
+        worker the EXTEND ``ScheduleBatch`` (FULL capture): the seam plans the
+        same record as without speculation."""
+        world = _World(monkeypatch)
+        req = _req(range(500, 500 + 2 * PAGE + 9), rid="d")
+        batch = world.batch([2 * PAGE], [3], [req])
+        batch.spec_algorithm = "DSPARK"
+        fused = run_v41_prefix_replay(world.worker, batch)
+        assert fused.starts.tolist() == [2 * PAGE - R]
+        assert fused.ends.tolist() == [2 * PAGE]
+        assert world.sides == []

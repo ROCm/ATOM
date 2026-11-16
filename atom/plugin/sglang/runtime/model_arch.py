@@ -164,6 +164,18 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
             # hit's R to the budget after admitting it, so a step can run R
             # rows past its chunk.
             atom_config.max_num_batched_tokens += radix_rows
+        from atom.plugin.sglang.deepseek_v41_bridge import is_v41_dspark_atom_config
+
+        if is_v41_dspark_atom_config(atom_config):
+            # The launch policy let DSpark through (ATOM_V41_RADIX_DSPARK on):
+            # the replay's forward writes the draft's context windows below
+            # each hit with the target's (`deepseek_v41_radix`, "DSpark").
+            logger.info(
+                "DeepSeek-V4.1 DSpark with radix cache: a hit's replay rows "
+                "rebuild the draft context windows (R=%d, %s)",
+                radix_rows,
+                radix_mode,
+            )
     # The remap every other adapter gets from prepare_model, as native's
     # ModelRunner and the vLLM wrapper apply it. (gfx942's FP4PTPC routed-
     # expert ptpc_fp8 default is already in the quant config: it is set

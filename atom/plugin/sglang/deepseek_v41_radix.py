@@ -3,8 +3,8 @@
 
 A prefix hit starts a request's extend at ``P > 0``: SGLang's tree hands back
 the PAGEs below ``P`` (main rows and index planes, shared, read-only), but the
-request's STATE slot (window ring, compressor rings, Engram cursor) holds
-nothing at ``P``. Native ATOM rebuilds it by default, and SGLang's opt-in
+request's STATE slot (window ring, compressor rings, Engram cursor, and under
+DSpark the draft's context windows) holds nothing at ``P``. Native ATOM rebuilds it by default, and SGLang's opt-in
 encoder replay the same way, and so does this module: recompute the ``R`` rows
 ``[P - R, P)`` into the freshly reset slot, write no shared PAGE (ATOM's
 compress plan writes no group below ``write_from = P``), and seed the Engram
@@ -114,15 +114,48 @@ Refused while radix is on (``deepseek_v41_bridge``): mixed chunk (a MIXED
 batch skips the replay), session radix cache, unified memory (the only KV
 relocation), KV storage backends (LMCache, FlexKV, the external cache linker:
 trees that rewrite rows elsewhere), prefill CUDA graphs, a custom radix
-backend, ``--chunked-prefill-size`` below ``R``, and speculative decoding (the
-DSpark interplay is a later phase). With ``--disable-radix-cache`` nothing
-here is installed.
+backend, ``--chunked-prefill-size`` below ``R``, and speculative decoding
+other than DSpark. With ``--disable-radix-cache`` nothing here is installed.
+
+DSpark (SGLang's ``DSparkWorkerV2`` over the V4.1 target, the one speculative
+deployment the bridge serves) runs under the replay unchanged, as native ATOM
+runs DSpark under its prefix cache:
+
+- The draft's per-request state is its three context windows (draft layers
+  40-42), rings in the request's own STATE slot beside the target's 40 (native
+  ``docs/deepseek_v41_dspark.md``: "43 request-owned windows"). The Markov
+  head carries nothing across rounds (its bias is ``W1[x_{k-1}]`` inside a
+  block), SGLang's next draft input is the prefill's bonus token and
+  ``seq_lens``, and the verify's tentative state is committed inside its own
+  round, before any prefill is staged (``require_committed``). So a hit
+  needs exactly what the target needs: the slot rebuilt below ``P``.
+- The rebuild is the replay's own forward. The target wrapper writes the
+  draft's context rows from every row its forward ran
+  (``V41DSparkTargetSurface.finish_forward``, native ``compute_draft_kv``'s
+  "every scheduled row is written"): fused, the widened forward's rows,
+  ``[P - R, P)`` included; side, the side forward's ``[P - R, P)``. Native
+  does the same: ``BlockManager.replay_start`` starts a hit's forward a hash
+  block (128 rows) below it and ``compute_draft_kv`` runs on that forward's
+  positions. ``R >= window`` (128, the draft's window too) covers the first
+  draft block's context ``[L - 128, L)``.
+- SGLang's DSpark injection (``write_target_hidden_kv``) still sees only
+  SGLang's rows ``[P, L)``: the wrapper gathers them out of the widened aux.
+  SGLang keeps its own draft KV for ``[0, P)`` in the tree's token slots;
+  this draft has none outside the slot's windows, so there is nothing to
+  reuse and nothing stale.
+- Verify and draft-block graphs never see a hit: the replay runs only on an
+  EXTEND (``is_extend_without_speculative``), and the first verify after it
+  stages off a committed slot like any other.
+
+``ATOM_V41_RADIX_DSPARK=0`` is the kill switch: a DSpark launch then gets
+SGLang's radix cache turned off, as before this composed.
 
 On by default: whenever SGLang's radix cache is on (no
-``--disable-radix-cache``). A launch with speculative decoding, or with
-``ATOM_V41_RADIX=0``, gets SGLang's radix cache turned off at server-args
-resolution with one warning (``v41_radix_launch_override``), so it starts
-with radix off instead of failing.
+``--disable-radix-cache``). A launch with ``ATOM_V41_RADIX=0``, a DSpark
+launch with ``ATOM_V41_RADIX_DSPARK=0``, or one with another speculative
+algorithm, gets SGLang's radix cache turned off at server-args resolution with
+one warning (``v41_radix_launch_override``), so it starts with radix off
+instead of failing.
 """
 
 from __future__ import annotations
@@ -224,10 +257,11 @@ def resolve_replay_mode() -> str:
 # ---------------------------------------------------------------------------
 # Launch policy (SGLang server-args resolution)
 # ---------------------------------------------------------------------------
-# Radix is on whenever SGLang's radix cache is. Where the replay cannot run
-# (speculative decoding: the DSpark draft rings and the verify lifecycle are
-# not proved under a replay yet) or the operator turned it off
-# (ATOM_V41_RADIX=0), SGLang's radix cache is turned off with it, through
+# Radix is on whenever SGLang's radix cache is, DSpark speculative decoding
+# included (see "DSpark" in the module docstring). Where the replay cannot run
+# (a speculative algorithm other than DSpark, which the bridge refuses anyway)
+# or the operator turned it off (ATOM_V41_RADIX=0, or ATOM_V41_RADIX_DSPARK=0
+# for a DSpark launch), SGLang's radix cache is turned off with it, through
 # SGLang's own model-override registry: the declaration is resolved once in
 # the launching process, before the tokenizer manager and the schedulers are
 # spawned, so every reader of ``disable_radix_cache`` (the tokenizer's
@@ -244,25 +278,43 @@ _POLICY_REGISTERED = False
 _POLICY_WARNED = False
 
 
+DSPARK_ENV = "ATOM_V41_RADIX_DSPARK"
+
+
+def radix_speculation_refusal(speculative_algorithm) -> str | None:
+    """Why the V4.1 radix path cannot serve this speculative algorithm, or
+    None when it can (no speculation, or DSpark with ``ATOM_V41_RADIX_DSPARK``
+    on). DSpark's per-request draft state is three context windows in the
+    request's own STATE slot, rebuilt by the replay below a hit together with
+    the target's (module docstring, "DSpark"); no other algorithm is served
+    on V4.1 at all."""
+    from atom.plugin.sglang import deepseek_v41_envs as envs
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        V41_DSPARK_ALGORITHM,
+        speculative_algorithm_name,
+    )
+
+    algorithm = speculative_algorithm_name(speculative_algorithm)
+    if not algorithm:
+        return None
+    if algorithm != V41_DSPARK_ALGORITHM:
+        return (
+            f"speculative decoding ({algorithm}) is not supported with the "
+            "DeepSeek-V4.1 radix cache"
+        )
+    if not envs.ATOM_V41_RADIX_DSPARK:
+        return f"{DSPARK_ENV} is off (DSpark with the DeepSeek-V4.1 radix cache)"
+    return None
+
+
 def radix_off_reason(speculative_algorithm) -> str | None:
     """Why the V4.1 radix path cannot serve a launch whose SGLang radix cache
     is on, or None when it can."""
-    import os
-
     from atom.plugin.sglang import deepseek_v41_envs as envs
-    from atom.plugin.sglang.deepseek_v41_bridge import speculative_algorithm_name
 
-    algorithm = speculative_algorithm_name(speculative_algorithm)
-    if algorithm:
-        pinned = os.environ.get("ATOM_V41_RADIX", "").strip()
-        return (
-            f"speculative decoding ({algorithm}) is not supported with the "
-            "DeepSeek-V4.1 radix cache yet"
-            + (f"; ATOM_V41_RADIX={pinned} is ignored" if pinned else "")
-        )
     if not envs.ATOM_V41_RADIX:
         return "ATOM_V41_RADIX is off"
-    return None
+    return radix_speculation_refusal(speculative_algorithm)
 
 
 def _resolving_view(server_args):

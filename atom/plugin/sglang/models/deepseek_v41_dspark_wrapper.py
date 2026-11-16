@@ -447,8 +447,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         produced them wrote them (`V41DSparkTargetSurface.finish_forward`),
         under its own step, before the verdict -- native's order. Rejected
         verify rows sit above the next anchor, masked by the block's indices,
-        in ring slots no committed row of the window shares. So this only
-        checks the contract and writes nothing."""
+        in ring slots no committed row of the window shares. After a radix
+        hit at ``P`` SGLang injects ``[P, L)`` only; the rows below ``P`` the
+        window needs were written by the same forward's replay rows
+        (``deepseek_v41_radix``). So this only checks the contract and writes
+        nothing."""
         del cache_loc, cache_loc_2d, commit_lens
         if not getattr(pool, "is_atom_v41_draft_proxy", False):
             raise RuntimeError(

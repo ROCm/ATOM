@@ -212,7 +212,15 @@ class V41DSparkTargetSurface:
     def finish_forward(self, hidden_states, positions, forward_batch) -> torch.Tensor:
         """After the target model, inside its ATOM forward context: write the
         draft's context KV for every row this forward ran and hand the aux
-        block to SGLang's logits processor (``aux_hidden_states``)."""
+        block to SGLang's logits processor (``aux_hidden_states``).
+
+        Every row, as native ``compute_draft_kv`` writes every scheduled row:
+        a radix hit's replay rows ``[P - R, P)`` included, whether they ride
+        in this forward (fused: ``hidden_states`` / ``positions`` are the
+        widened rows, and the wrapper gathers SGLang's rows out of the
+        returned aux afterwards) or are its own side forward. That is what
+        rebuilds the draft's windows below the hit."""
+        from atom.plugin.sglang.deepseek_v41_radix import FUSED_ATTR
         from atom.utils.forward_context import get_forward_context
 
         forward = get_forward_context()
@@ -229,6 +237,22 @@ class V41DSparkTargetSurface:
                 )
         elif mode.is_decode():
             raise RuntimeError("DeepSeek-V4.1 DSpark runs no plain DECODE")
+        fused = getattr(forward_batch, FUSED_ATTR, None)
+        if fused is not None:
+            # The widened forward: SGLang's rows plus each hit's replay rows,
+            # all of which the draft's windows take.
+            expanded = fused.expanded
+            if expanded is None or _is_target_verify(mode):
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark forward carries a radix replay it "
+                    "did not run (widened inputs missing, or not an EXTEND)"
+                )
+            own = int(expanded.output_rows.numel())
+            if rows != own + fused.num_rows:
+                raise RuntimeError(
+                    f"DeepSeek-V4.1 DSpark forward of {rows} rows under a radix "
+                    f"replay of {fused.num_rows} rows over {own} extend rows"
+                )
         if int(step.running_tokens) != rows or int(positions.shape[0]) != rows:
             raise RuntimeError(
                 f"DeepSeek-V4.1 DSpark forward of {rows} rows, step "

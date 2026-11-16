@@ -32,9 +32,13 @@ def _int_env(name: str, default: int) -> int:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Radix (prefix) cache for DeepSeek-V4.1 on the SGLang plugin: on whenever
     # SGLang's radix cache is. 0 turns SGLang's radix cache off at launch
-    # (`deepseek_v41_radix.v41_radix_launch_override`), as speculative
-    # decoding does until DSpark is proved under the replay.
+    # (`deepseek_v41_radix.v41_radix_launch_override`).
     "ATOM_V41_RADIX": lambda: _flag_env("ATOM_V41_RADIX", "1"),
+    # The same with DSpark speculative decoding: on by default (the replay
+    # below a hit rebuilds the draft's context windows with the target's);
+    # 0 is the kill switch, turning SGLang's radix cache off for a DSpark
+    # launch only, as before DSpark ran under the replay.
+    "ATOM_V41_RADIX_DSPARK": lambda: _flag_env("ATOM_V41_RADIX_DSPARK", "1"),
     # DeepSeek-V4.1 on the SGLang plugin with radix cache on: the rows below a
     # prefix hit recomputed into the request's fresh STATE slot before its
     # extend (`deepseek_v41_radix`). Even, at least the sliding window.

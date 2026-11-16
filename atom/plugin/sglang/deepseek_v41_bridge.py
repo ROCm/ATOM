@@ -55,6 +55,9 @@ schedule):
   written by the target forward that produced the rows, under that forward's
   own step, exactly as native ATOM's ``compute_draft_kv`` does. The draft
   runner's proxy pool owns no bytes: it is a role view of the target arena.
+- With radix cache on, a prefix hit's EXTEND replays ``[P - R, P)`` like any
+  other (``deepseek_v41_radix``), and that forward writes the draft windows'
+  rows below ``P`` too; verify rounds never carry a replay.
 - There is no DRAFT_EXTEND and no draft DECODE: the draft block runs as a
   TARGET_VERIFY of width 5 on the draft runner.
 - With ``--cuda-graph-backend-decode full`` both runners capture TARGET_VERIFY
@@ -426,12 +429,16 @@ def _radix_refusals(memory, exec_, schedule, spec) -> tuple:
     """What radix cache cannot run beside (``deepseek_v41_radix``)."""
     from atom.plugin.sglang.deepseek_v41_radix import (
         REPLAY_ROWS_ENV,
+        radix_speculation_refusal,
         resolve_replay_mode,
         resolve_replay_rows,
     )
 
     rows = resolve_replay_rows()
     resolve_replay_mode()
+    spec_reason = radix_speculation_refusal(
+        _sglang_setting(spec, "speculative_algorithm", None)
+    )
     chunk = _sglang_setting(schedule, "chunked_prefill_size", None)
     return (
         # A MIXED batch skips the replay seam.
@@ -474,15 +481,15 @@ def _radix_refusals(memory, exec_, schedule, spec) -> tuple:
             f"--chunked-prefill-size {chunk} below {REPLAY_ROWS_ENV}={rows}",
             chunk is not None and 0 < int(chunk) < rows,
         ),
-        # The DSpark draft rings and the verify lifecycle are not proved
-        # under a replay yet.
+        # DSpark runs under the replay (its draft windows are rebuilt with the
+        # target's, `deepseek_v41_radix`); ATOM_V41_RADIX_DSPARK=0 turns that
+        # off. Any other algorithm is refused below in any case.
         (
-            "speculative decoding with radix cache (launch with --disable-radix-cache)",
-            bool(
-                speculative_algorithm_name(
-                    _sglang_setting(spec, "speculative_algorithm", None)
-                )
+            (
+                f"speculative decoding with radix cache: {spec_reason} "
+                "(launch with --disable-radix-cache)"
             ),
+            spec_reason is not None,
         ),
     )
 
@@ -1796,10 +1803,12 @@ class HostPageRows:
     checkpoint repoints a live row at the tree's pages in place, which drops
     that slot's copy (``forget``, called from the radix seam's
     ``checkpoint_into_tree`` hook; ``host_page_rows_supported``). Under
-    DSpark (radix cache off: ``deepseek_v41_radix.v41_radix_launch_override``)
-    the pages a verify's draft rows enter are SGLang's spec-v2
+    DSpark the pages a verify's draft rows enter are SGLang's spec-v2
     over-allocation, reserved whole and kept until the request's KV is
-    released (never per rejection), so they too only grow. An EXTEND (every
+    released (never per rejection), so they too only grow; with radix cache
+    on, a checkpoint inserts only page-aligned committed rows
+    (``[cache_protected_len, extend_end)``), never those, and drops the copy
+    like any other. An EXTEND (every
     request's first forward, and again after a retraction) reads the row back
     anyway and records it here; a decode or verify reads it again only when a
     request has entered a page its copy does not hold, the slot's request

@@ -488,31 +488,50 @@ class TestLaunchRefusals:
         dspark_launch.args.disable_overlap_schedule = False
         refuse_unsupported_sglang_features()
 
-    def test_radix_and_dp_stay_refused(self, dspark_launch):
-        # The launch policy turns SGLang's radix cache off under speculation
-        # (`deepseek_v41_radix.v41_radix_launch_override`); a launch where it
-        # did not run is still refused, naming --disable-radix-cache.
+    def test_radix_is_served_and_dp_stays_refused(self, dspark_launch, monkeypatch):
+        # DSpark runs under the radix replay (`deepseek_v41_radix`, "DSpark").
+        monkeypatch.delenv("ATOM_V41_RADIX_DSPARK", raising=False)
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
         dspark_launch.bags["memory"].disable_radix_cache = False
+        refuse_unsupported_sglang_features()
         dspark_launch.args.enable_dp_attention = True
+        with pytest.raises(ValueError, match="DP attention"):
+            refuse_unsupported_sglang_features()
+
+    def test_radix_kill_switch_is_refused_where_the_policy_did_not_run(
+        self, dspark_launch, monkeypatch
+    ):
+        # The launch policy turns SGLang's radix cache off under
+        # ATOM_V41_RADIX_DSPARK=0; a launch where it did not run is refused,
+        # naming --disable-radix-cache.
+        monkeypatch.setenv("ATOM_V41_RADIX_DSPARK", "0")
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+        dspark_launch.bags["memory"].disable_radix_cache = False
         with pytest.raises(
             ValueError,
-            match="DP attention.*speculative decoding with radix cache "
-            r"\(launch with --disable-radix-cache\)",
+            match="speculative decoding with radix cache: ATOM_V41_RADIX_DSPARK "
+            r"is off.*\(launch with --disable-radix-cache\)",
         ):
             refuse_unsupported_sglang_features()
 
-    def test_launch_policy_turns_radix_off_under_dspark(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("switch", "off"), [(None, False), ("1", False), ("0", True)]
+    )
+    def test_launch_policy_under_dspark(self, monkeypatch, switch, off):
         from atom.plugin.sglang import deepseek_v41_radix as radix
 
         monkeypatch.setattr(radix, "_POLICY_WARNED", False)
         monkeypatch.setattr(radix, "_resolving_view", lambda server_args: server_args)
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+        monkeypatch.delenv("ATOM_V41_RADIX_DSPARK", raising=False)
+        if switch is not None:
+            monkeypatch.setenv("ATOM_V41_RADIX_DSPARK", switch)
         args = SimpleNamespace(
             speculative_algorithm="DSPARK", disable_radix_cache=False
         )
         config = SimpleNamespace(model_type="deepseek_v41")
-        assert radix.v41_radix_launch_override(args, config) == {
-            "disable_radix_cache": True
-        }
+        expected = {"disable_radix_cache": True} if off else {}
+        assert radix.v41_radix_launch_override(args, config) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +1546,82 @@ class TestTargetSurface:
         assert aux.shape == (rows, 12)
         assert len(writes) == 1 and writes[0][0] is aux
         assert writes[0][1].tolist() == list(range(rows))
+
+    def _finish_fused(self, monkeypatch, surface, fb, rows, positions):
+        import atom.utils.forward_context as fc
+
+        metadata = SimpleNamespace(
+            step=SimpleNamespace(running_tokens=rows, replay=None),
+            served_by_round=0,
+        )
+        monkeypatch.setattr(
+            fc, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+        )
+        return surface.finish_forward(torch.zeros(rows, 4), positions, fb)
+
+    @staticmethod
+    def _hit_forward():
+        """A hit at P = 8 replaying [4, 8) (R = 4) with three own rows, beside
+        a cold request of two: SGLang's five rows, ATOM's nine."""
+        from atom.plugin.sglang.deepseek_v41_radix import (
+            FUSED_ATTR,
+            FusedReplay,
+            expand_v41_forward_inputs,
+        )
+
+        fused = FusedReplay([0], [5], ["a"], [4], [8], [40, 50, 60, 70], [[1, 2, 3]])
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            extend_seq_lens_cpu=[3, 2],
+            spec_info=None,
+        )
+        setattr(fb, FUSED_ATTR, fused)
+        ids = torch.tensor([11, 12, 13, 21, 22])
+        positions = torch.tensor([8, 9, 10, 0, 1])
+        _, wide_positions, keep = expand_v41_forward_inputs(fb, ids, positions)
+        return fb, fused, wide_positions, keep
+
+    def test_finish_writes_a_radix_hit_replay_rows(self, monkeypatch, target_forward):
+        """The draft's windows below a hit are written by the forward that
+        replays it, as native ``compute_draft_kv`` writes every row of a
+        forward starting a hash block below the hit; SGLang's injection then
+        sees its own rows only."""
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        fb, _, wide_positions, keep = self._hit_forward()
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 9, 2, 4)))
+        aux = self._finish_fused(monkeypatch, surface, fb, 9, wide_positions)
+        assert aux.shape == (9, 12)
+        ((written, positions),) = writes
+        assert written is aux
+        assert positions.tolist() == [4, 5, 6, 7, 8, 9, 10, 0, 1]
+        # The wrapper's trim (`SGLangPluginRuntime.trim_output`): SGLang's rows.
+        assert keep.tolist() == [4, 5, 6, 7, 8]
+        assert positions.index_select(0, keep).tolist() == [8, 9, 10, 0, 1]
+
+    def test_finish_refuses_a_radix_replay_it_did_not_run(
+        self, monkeypatch, target_forward
+    ):
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        surface.attach_draft(SimpleNamespace(write_context_kv=lambda a, p: None))
+        fb, fused, wide_positions, _ = self._hit_forward()
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 5, 2, 4)))
+        # SGLang's rows only: the replay rows never ran.
+        with pytest.raises(RuntimeError, match="radix replay of 4 rows over 5"):
+            self._finish_fused(monkeypatch, surface, fb, 5, wide_positions[:5])
+        fused.expanded = None
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 9, 2, 4)))
+        with pytest.raises(RuntimeError, match="did not run"):
+            self._finish_fused(monkeypatch, surface, fb, 9, wide_positions)
 
     def test_finish_refusals(self, monkeypatch, target_forward):
         wrapper, surface = self._surface(monkeypatch)
