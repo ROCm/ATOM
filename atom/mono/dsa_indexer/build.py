@@ -32,7 +32,7 @@ class IxBuild:
     # every rank stores every key (no DCP): the ranks score 128-key runs each
     # (``plan.REPLICA_INTERLEAVE``) and every rank writes the whole selection
     replicated: bool = field(default=False, metadata={"sym": "rep"})
-    # per-CTA stamps (``TL_POINTS``) to plain "tl"
+    # per-CTA stamps (``timeline_points``) to plain "tl"
     timeline: bool = field(default=False, metadata={"sym": "t"})
     # query rows a request: 1 a plain decode, a speculative verify's otherwise
     # (row i of a request sees its context less the qlen - 1 - i drafts past it)
@@ -43,7 +43,7 @@ class IxBuild:
     delay_rank: int = field(default=-1, metadata={"sym": "dr"})
     delay_ticks: int = field(default=0, metadata={"sym": "dt"})
     # 512 requires two resident CTAs per gfx950 CU. Wide buckets split Q too.
-    score_blocks: int = BLOCKS
+    score_blocks: int = field(default=BLOCKS, metadata={"sym": "sb"})
     # gfx950 short verify: BF16 prepacked Q projection and local MQA scheduling.
     short_gemm: bool = field(default=False, metadata={"sym": "sq"})
 

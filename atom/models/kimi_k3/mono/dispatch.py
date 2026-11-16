@@ -136,7 +136,10 @@ def install_mono_decode(
     inner = getattr(getattr(model, "language_model", model), "model", None)
     if inner is not None:
         indexers = indexer_modules(inner)
-        if not routing_refusal(atom_config, indexers):
+        why = routing_refusal(atom_config, indexers)
+        if why:
+            logger.info("Kimi-K3 mono indexer off: %s", why)
+        else:
             prepare_weights(indexers)
     logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
     return MonoDecodeModel(model, drafter, metadata_builder)

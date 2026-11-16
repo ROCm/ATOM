@@ -36,6 +36,8 @@ from atom.mono.dsa_indexer.selection_plan import (
     short_flag_count,
     split_request_keys,
 )
+from atom.mono.plan.build_key import symbol_params
+from atom.mono.plan.execution import BLOCKS
 
 CTXS = [0, 1, 7, 127, 128, 129, 1023, 1024, 1025, 2049, 5000, 33333, 131073]
 
@@ -251,6 +253,13 @@ def test_dual_grid_rejects_unsupported_launches(q_lora):
         {"shape": _shape(q_lora, "fp4")},
     ):
         assert unfit(replace(key, **changes))
+
+
+def test_score_grid_builds_have_distinct_symbol_parameters():
+    single = IxBuild(_shape(1536), 256, 8, 163840)
+    dual = replace(single, score_blocks=2 * BLOCKS)
+    assert not unfit(single) and not unfit(dual)
+    assert symbol_params(single) != symbol_params(dual)
 
 
 @pytest.mark.parametrize(

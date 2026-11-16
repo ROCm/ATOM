@@ -1363,7 +1363,7 @@ def dcp_decode_candidate_exchange_fused(
             local_ctx,
             max_qlen=1,
             max_seq_len=l_max,
-            page_size=runner_block_size,
+            block_size=runner_block_size,
             weight_scale=weights_scale,
             out=local_logits,
         )

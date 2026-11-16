@@ -49,6 +49,7 @@ from atom.mono.device.ops import (
     hw_exp2,
     hw_log2,
     hw_rsq,
+    launcher,
     ld_f32,
     load_ptr64,
     row_sum,
@@ -80,7 +81,7 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.layout import byte_layout, pair_layout
 from atom.mono.runtime.abi import KernelAbi
 
-# Preserve the original module API for runners and callers.
+# Expose the shared CPU planner's row limits and grid admission to callers.
 MAX_TOKENS = build_plan.MAX_TOKENS
 MAX_VERIFY_TOKENS = build_plan.MAX_VERIFY_TOKENS
 dual_score_shape = build_plan.dual_score_shape
@@ -89,11 +90,6 @@ SOURCES = source_digest("mono")
 Q_AMAX_SEED = 1e-10
 K_AMAX_SEED = 1e-4
 LN_EPS = 1e-6
-# timeline points: start, qgemv, iquant, score, a segment's scores all in, its
-# threshold, its slots out; then a pass each: counted, pushed, every rank's in;
-# then a CTA's (last) score task: entered, its flags in, scored, published
-TL_SCORE0 = TL_PASS0 + 3 * isel.PASSES
-TL_POINTS = TL_SCORE0 + 4
 # The original planner handles one row per lane. Plain decode also serves
 # up to four 64-row tiles; the q GEMV stages gemv.ROWS rows at a time.
 # One resident CTA per row is required for key writes and row emission.
@@ -924,7 +920,7 @@ def build(key: IxBuild):
                 on, tls, plain + fx.Int64(plain_lay["tl"][0]), tid, bid, tl_points
             )
 
-    @flyc.jit
+    @launcher(key.name)
     def launch(
         qr: Int64,
         qr_ld: Int32,

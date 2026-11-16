@@ -80,27 +80,11 @@ SPLIT_MIN = isel_plan.SPLIT_MIN
 WIDE_RADIX = isel_plan.WIDE_RADIX
 Radix = isel_plan.Radix
 
-# radix passes over the 32-bit key, most significant first; a pass is a round
-# trip to every rank whose cost grows with the bins pushed and polled
-
-
-DIGIT_BITS = DEFAULT_RADIX.bits
-PASSES = len(DIGIT_BITS)
-SHIFTS = tuple(32 - sum(DIGIT_BITS[: p + 1]) for p in range(PASSES))
-BINS = 1 << max(DIGIT_BITS)
-# thread t holds bins t + k THREADS; fewer bins than threads leave the last
-# threads none (their polls repeat the last bin: nothing assigned under a
-# traced branch)
-BINS_A_THREAD = max(1, BINS // THREADS)
+BINS = DEFAULT_RADIX.bins
 
 
 def _bin(tid, k, bins=BINS):
     return fx.min(tid + k * THREADS, bins - 1)
-
-
-# the digit's choice (``_decide``): a lane's bins, over the first DEC_WAVES
-DEC_WAVES = min(WAVES, BINS // 64)
-DEC_A_LANE = BINS // (64 * DEC_WAVES)
 
 
 # a selection chunk: the keys a CTA counts at once, 8 a thread in registers;
@@ -1277,8 +1261,8 @@ def _decide(c, r, p, nseg, split):
     nothing waits on the leader but the counts themselves. Own rows: no
     rank's push, the row's counts are this CTA's LDS ``hist`` (one segment)
     or its ``nseg`` segments' added (``_row_counts``)."""
-    # the bins from the top, DEC_A_LANE a lane, over the first DEC_WAVES
-    # waves: one poll batch a lane, a wave scan, one exchange of the waves'
+    # The bins from the top, radix.bins_per_lane a lane, over radix.waves:
+    # one poll batch a lane, a wave scan, one exchange of the waves'
     # totals. The waves past them poll the last wave's bins again and decide
     # nothing (no value assigned under a traced branch).
     radix = c["radix"]

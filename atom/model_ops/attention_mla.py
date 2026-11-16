@@ -123,14 +123,11 @@ def indexer_qk_rope_quant_and_cache(
 ) -> None:
     """Run AITER's fused HIP indexer writer with ATOM's DCP query semantics.
 
-    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs,
-    and are forwarded only when given so that an aiter predating them still
-    accepts the FP8 call -- the same version tolerance the seg-variant import
-    above keeps. One without the other would fall back to FP8 and write that
-    layout into FP4-shaped buffers, so it is refused here rather than passed on.
-    OPUS requires AITER's HIP extension (PR 7798), accepts NoPE and always
-    publishes all Q rows. Legacy calls omit the new layout keywords so that
-    existing FP8/FlyDSL deployments still work.
+    The two scale buffers together switch the op to packed E2M1 + e8m0 outputs.
+    Supplying only one is refused before it can write FP8 into FP4 buffers.
+    OPUS requires AITER's HIP extension (PR 7798), accepts NoPE and publishes
+    all Q rows. Explicit FP4 layout calls forward scale_layout and rope_dim;
+    forwarding them on default FP8/FlyDSL calls awaits that extension's merge.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(

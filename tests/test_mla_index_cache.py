@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from atom.model_ops.indexer.layout import PRESHUFFLE
 from atom.models.utils import get_pp_indices
 from atom.utils.tbo.ubatch_splitting import cut_decode_ubatches
 
@@ -224,6 +225,7 @@ def _builder(
         config=SimpleNamespace(
             hf_config=hf_config,
             kv_cache_dtype="fp8",
+            index_cache_layout=PRESHUFFLE,
             speculative_config=SimpleNamespace(
                 # an MTP draft of a sparse target: the target's indexer fields
                 draft_model_hf_config=SimpleNamespace(

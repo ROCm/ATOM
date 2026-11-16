@@ -76,7 +76,6 @@ from atom.model_ops.indexer import (
     fp4_rows,
     fp8_rows,
 )
-from atom.model_ops.indexer.layout import PRESHUFFLE
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
@@ -1503,8 +1502,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "index_dtype": dtypes.fp8,
                 "index_head_dim": hf_config.index_head_dim,
                 "index_fp4": self._indexer_fp4,
-                "index_layout": getattr(runner.config, "index_cache_layout", None)
-                or PRESHUFFLE,
+                "index_layout": runner.config.index_cache_layout,
             }
             if runner.has_mla_indexer
             else {}
@@ -2834,8 +2832,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             storage=self._fp4_launches[ubatch],
-            layout=getattr(self.model_runner.config, "index_cache_layout", None)
-            or PRESHUFFLE,
+            layout=self.model_runner.config.index_cache_layout,
         )
 
     def _mtp_index_rows(
@@ -2964,8 +2961,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             heads=self.index_n_heads,
             page_size=self.model_runner.block_size,
             split=split,
-            layout=getattr(self.model_runner.config, "index_cache_layout", None)
-            or PRESHUFFLE,
+            layout=self.model_runner.config.index_cache_layout,
         )
 
     @staticmethod

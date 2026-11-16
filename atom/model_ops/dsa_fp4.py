@@ -15,12 +15,12 @@ def opus_logits(
     *,
     max_qlen,
     max_seq_len,
-    page_size=64,
+    block_size=64,
     weight_scale=1.0,
     out=None,
     out_offsets=None,
 ):
-    """The PR 6952 API, imported only for the explicitly selected new layout."""
+    """Score an OPUS cache with 64-row pages inside each logical KV block."""
     from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
         mqa_logits_mxfp4,
         mqa_logits_mxfp4_config,
@@ -30,7 +30,7 @@ def opus_logits(
         q.device,
         heads=q.shape[-2],
         page_size=64,
-        pages_per_block=page_size // 64,
+        pages_per_block=block_size // 64,
         max_rows=q.shape[0],
         max_seqs=query_start_loc.numel() - 1,
         max_qlen=max_qlen,

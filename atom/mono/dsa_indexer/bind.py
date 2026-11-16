@@ -356,7 +356,7 @@ def _routed_forward(module):
             weights,
             module.prefix,
             module.k_cache.kv_cache[0],
-            getattr(module.k_cache, "kv_cache_scale", None),
+            module.k_cache.kv_cache_scale,
             module.sparse_kv_indices_buffer,
             module.dcp_sparse_kv_indptr_buffer,
             module.dcp_owned_counts_buffer,
