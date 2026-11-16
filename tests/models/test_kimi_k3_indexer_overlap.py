@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""A Kimi-K3 DSA layer's DCP prefill: the indexer runs its top-k all-gather and
-owner filter on the model's side stream while the q path runs, and the sparse
-MLA waits for them before its query gather. Graph capture, TBO and an indexer
-given no stream keep the serial order."""
+"""A Kimi-K3 DSA layer's DCP prefill: the indexer runs its top-k exchange on
+the model's side stream while the q path runs, and the sparse MLA waits for
+it before its query gather. Graph capture, TBO and an indexer given no stream
+keep the serial order: the all-gather, then the owner filter."""
 
 from inspect import signature
 from types import MethodType, SimpleNamespace
@@ -17,6 +17,7 @@ from atom.model_ops.indexer import indexer_forward
 from atom.utils.forward_context import AttentionMetaData
 
 PREFIX = "layers.0.self_attn.indexer"
+EXCHANGE = SimpleNamespace(wait=None)  # the pending exchange MLA's join finishes
 
 
 @pytest.fixture
@@ -33,9 +34,8 @@ def dcp_prefill(monkeypatch):
     monkeypatch.setattr(indexer_forward, "score_topk", score_topk)
     monkeypatch.setattr(
         indexer_forward,
-        "_gather_split",
-        lambda out, split: calls.append(("gather", current())),
-        raising=False,
+        "dcp_exchange_owned_index_prefill",
+        lambda *a, **k: calls.append(("exchange", current())) or EXCHANGE,
     )
     monkeypatch.setattr(
         indexer_forward,
@@ -87,12 +87,12 @@ def dcp_prefill(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
-def test_exchange_runs_on_the_side_stream_and_hands_its_event_to_mla(dcp_prefill):
+def test_exchange_runs_on_the_side_stream_and_hands_itself_to_mla(dcp_prefill):
     side = torch.cuda.Stream()
     calls, md = dcp_prefill(side)
     main = torch.cuda.current_stream()
-    assert calls == [("score", main, False), ("gather", side), ("filter", side)]
-    assert isinstance(md.index_exchange_done, torch.cuda.Event)
+    assert calls == [("score", main, False), ("exchange", side)]
+    assert md.index_exchange_done is EXCHANGE
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")

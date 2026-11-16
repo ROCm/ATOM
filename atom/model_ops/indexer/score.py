@@ -67,8 +67,8 @@ def score_topk(
     `request_local=False` leaves FP8 concat rows' ids as places in the
     gathered run, for a consumer that subtracts `rows.concat.row_starts`
     itself (MLA's prefill slot conversion). `gather=False` leaves a split's
-    other slots unfilled for the caller to all-gather (`_gather_split`) on a
-    stream of its own.
+    other slots unfilled, for a caller that exchanges only what each rank
+    needs (`dcp_exchange_owned_index_prefill`) on a stream of its own.
 
     FP8: `query` [rows, heads, dim] e4m3 and `weights` [rows, heads] fp32 with
     the query scale folded in. FP4: `query` is `(values, scales)`, each

@@ -24,6 +24,7 @@ from atom.model_ops.attention_mla import (
 )
 from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
+    dcp_exchange_owned_index_prefill,
     triton_filter_and_convert_dcp_index_prefill,
 )
 from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE, fp4_q_scale_shape
@@ -34,7 +35,7 @@ from atom.utils.tbo.ubatching import tbo_active
 
 from .nope import indexer_nope_quant_and_cache
 from .rows import IndexCache
-from .score import _gather_split, score_topk
+from .score import score_topk
 
 
 def _dcp_gather_indexer_k_prefill(
@@ -453,13 +454,7 @@ def sparse_attn_indexer(
         # WHOLE selection: the filter `.contiguous()`s what it gets, so a row
         # slice would copy what the in-place gather avoided moving, and its
         # grid follows `sparse_kv_indptr`, so the gather's tail is never read.
-        if exchange is not None:
-            exchange.wait_stream(torch.cuda.current_stream())
-            # The op drops its last reference while the exchange still runs.
-            topk_indices.record_stream(exchange)
-        with torch.cuda.stream(exchange):
-            if exchange is not None:
-                _gather_split(topk_indices, rows.split)
+        if exchange is None:
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,
@@ -474,8 +469,26 @@ def sparse_attn_indexer(
                 out=attn_metadata.sparse_kv_indices,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
-        if exchange is not None:
-            attn_metadata.index_exchange_done = exchange.record_event()
+            return
+        exchange.wait_stream(torch.cuda.current_stream())
+        # The op drops its last reference while the exchange still runs.
+        topk_indices.record_stream(exchange)
+        with torch.cuda.stream(exchange):
+            # Ungathered: each rank sends every rank the filter's output for
+            # its own rows, and sparse MLA's join finishes the exchange.
+            attn_metadata.index_exchange_done = dcp_exchange_owned_index_prefill(
+                topk_indices,
+                rows.split,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.batch_id_per_q_token,
+                attn_metadata.block_tables,
+                runner_block_size,
+                out_kv_indptr=attn_metadata.dcp_sparse_kv_indptr,
+                owned_counts=attn_metadata.dcp_owned_counts,
+                NUM_TOPK_TOKENS=topk_tokens,
+                out=attn_metadata.sparse_kv_indices,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            )
     else:
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -492,9 +505,10 @@ def sparse_attn_indexer(
 
 
 def _exchange_stream(indexer, is_prefill):
-    """The stream a DCP prefill's top-k exchange (the all-gather and the owner
-    filter) runs on, beside the q path, or None to run it in order: an indexer
-    the model gave no stream, decode, graph capture and TBO."""
+    """The stream a DCP prefill's top-k exchange runs on beside the q path
+    (`dcp_exchange_owned_index_prefill`), or None to gather the top-k and
+    filter it in order: an indexer the model gave no stream, decode, graph
+    capture and TBO."""
     stream = getattr(indexer, "exchange_stream", None)
     if (
         stream is None
