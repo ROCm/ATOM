@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The FP4 (MXFP4 / NVFP4) index scorer's persistent state as one record, and its
-allocation, in a module that imports no aiter or triton at the top: the kernels' modules
-(`sparse_attn`, `index_topk`) import aiter, and the non-GPU test suite has to be able to
-build the record."""
+"""The index scorers' persistent state (the FP4 (MXFP4 / NVFP4) record, the bf16 / FP8
+prefill scores) and its allocation, in a module that imports no aiter or triton at the
+top: the kernels' modules (`sparse_attn`, `index_topk`) import aiter, and the non-GPU test
+suite has to be able to build the record."""
 
 from dataclasses import dataclass, replace
 
@@ -48,6 +48,28 @@ def _shard(cp_world: int, cp_rank: int) -> dict:
     if cp_world == 1:
         return {}
     return {"cp_world": cp_world, "cp_rank": cp_rank}
+
+
+def prefill_score_capacity(
+    config, *, max_bs: int, max_qlen: int, num_idx_heads: int
+) -> int:
+    """fp32 block scores of the widest prefill step: one row per (index head, query
+    token) of a chunk or a verify step, over the model length's blocks."""
+    rows = max(max_bs * max_qlen, config.max_num_batched_tokens)
+    return num_idx_heads * rows * -(-config.max_model_len // SPARSE_BLOCK_SIZE)
+
+
+def allocate_prefill_scores(
+    config, device, *, max_bs: int, max_qlen: int, num_idx_heads: int
+) -> LogitsWorkspace | None:
+    """The bf16 / FP8 index caches' prefill score workspace, sized from the
+    configuration; None on an FP4 index cache, whose record holds its own."""
+    if config.index_cache_dtype in FP4_CACHE_DTYPES:
+        return None
+    capacity = prefill_score_capacity(
+        config, max_bs=max_bs, max_qlen=max_qlen, num_idx_heads=num_idx_heads
+    )
+    return LogitsWorkspace(capacity, device)
 
 
 def allocate_index_scorers(
@@ -103,9 +125,10 @@ def allocate_index_scorers(
             )
         return torch.empty((rows, 2), dtype=torch.int32, device=device)
 
-    rows = max(max_bs * max_qlen, config.max_num_batched_tokens)
     capacity = max(
-        num_idx_heads * rows * max_block,
+        prefill_score_capacity(
+            config, max_bs=max_bs, max_qlen=max_qlen, num_idx_heads=num_idx_heads
+        ),
         decode_heads * max_bs * max_qlen * decode_block,
     )
     scorers = {

@@ -127,7 +127,7 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         prefill=types.SimpleNamespace(
             cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * mq,
             seq_lens=seq, context_lens=seq, block_table=table, max_query_len=mq,
-            max_seq_len=100, qo_indptr=cover,
+            max_seq_len=100, qo_indptr=cover, score_workspace=None,
         ),
     )  # fmt: skip
     ctx = types.SimpleNamespace(
