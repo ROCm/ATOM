@@ -82,6 +82,36 @@ def collapse_streams(residual, pre_mix):
     return out
 
 
+# The embeddings' pre-mix is the constant (1, 0, ..., 0) a token: one table a
+# (device, hc_mult), sliced to the step's tokens instead of a zero fill and a
+# column fill each forward. Nothing writes a pre-mix in place (every seam
+# returns a new one), so the rows can be shared. A table outgrown keeps living
+# here: a captured graph may have baked its address.
+_PRE_MIX_TABLES: dict[tuple[torch.device, int], list[torch.Tensor]] = {}
+
+
+def _embedding_pre_mix(shape, device) -> torch.Tensor:
+    """The (1, 0, ..., 0) pre-mix of ``shape`` = (*tokens, hc_mult), float32."""
+    *outer, hc_mult = shape
+    rows = 1
+    for n in outer:
+        rows *= n
+    if torch.compiler.is_compiling():
+        tables = None
+    else:
+        tables = _PRE_MIX_TABLES.setdefault((torch.device(device), hc_mult), [])
+        if tables and tables[-1].shape[0] >= rows:
+            return tables[-1][:rows].view(shape)
+    pre_mix = torch.zeros(shape, dtype=torch.float32, device=device)
+    pre_mix[..., 0] = 1
+    # Grown outside a recording only, where an allocation is not the pool's.
+    if tables is not None and not (
+        pre_mix.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
+        tables.append(pre_mix.view(rows, hc_mult))
+    return pre_mix
+
+
 @dataclass(frozen=True)
 class SinglePassHCState:
     """The residual between two sublayers, and the post step one of them owes.
@@ -106,10 +136,7 @@ class SinglePassHCState:
             .expand(*hidden.shape[:-1], hc_mult, hidden.shape[-1])
             .contiguous()
         )
-        pre_mix = torch.zeros(
-            (*hidden.shape[:-1], hc_mult), dtype=torch.float32, device=hidden.device
-        )
-        pre_mix[..., 0] = 1
+        pre_mix = _embedding_pre_mix((*hidden.shape[:-1], hc_mult), hidden.device)
         return cls(residual, pre_mix)
 
     def settle(self):
