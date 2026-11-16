@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from threading import Lock
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
@@ -38,13 +39,13 @@ from atom.kv_transfer.offload.umbp_store.config import (
 logger = logging.getLogger("atom")
 
 # Seconds lookups do not ask a server the scheduler could not reach.
-# Connecting blocks the scheduler thread for up to the startup timeout, so a
+# Connecting occupies the lookup worker for up to the startup timeout, so a
 # missing server must not cost that on every step.
 _RECONNECT_INTERVAL_S = 30.0
 # The same for a server whose lookup raised.
 _LOOKUP_BACKOFF_S = 10.0
 # Either pause lasts at least this many times as long as the failed call
-# blocked the scheduler thread (`_ServerLookup._pause`).
+# occupied the lookup worker (`_ServerLookup._pause`).
 _LOOKUP_BACKOFF_FACTOR = 10.0
 # Seconds between two warnings about failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
@@ -75,7 +76,7 @@ class _ServerLookup(StoreLookupBase):
 
     The client is opened on the first lookup, not at construction: every PP
     stage builds a scheduler, and only the head ever schedules. A lookup
-    blocks the scheduler thread, so a server the scheduler cannot reach, or
+    runs on the asynchronous lookup worker, so a server the scheduler cannot reach, or
     whose lookup raised, is not asked for a while (``_RECONNECT_INTERVAL_S``,
     ``_LOOKUP_BACKOFF_S``).
     """
@@ -93,6 +94,9 @@ class _ServerLookup(StoreLookupBase):
         self.client: UMBPStoreClient | None = None
         self.paused_until = 0.0
         self._next_warning_at = 0.0
+        self._closed = False
+        self._client_lock = Lock()
+        self._active_calls = 0
 
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the server holds on every rank.
@@ -111,6 +115,10 @@ class _ServerLookup(StoreLookupBase):
         if client is None:
             return None
         keys = self._rank_keys(hashes, 0, chunks)
+        with self._client_lock:
+            if self._closed:
+                return None
+            self._active_calls += 1
         asked_at = time.monotonic()
         try:
             present = client.exists(keys)
@@ -124,6 +132,17 @@ class _ServerLookup(StoreLookupBase):
                 exc_info=exc,
             )
             return None
+        finally:
+            # close() must not destroy a native client still inside an RPC.
+            with self._client_lock:
+                self._active_calls -= 1
+                retired = (
+                    self.client if self._closed and not self._active_calls else None
+                )
+                if retired is not None:
+                    self.client = None
+            if retired is not None:
+                retired.close()
         # Per rank, the run of chunks from chunk 0 the server holds. Every key
         # is answered, so `held` is the whole answer.
         held, _ = self._rank_prefixes(present, chunks)
@@ -143,20 +162,34 @@ class _ServerLookup(StoreLookupBase):
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a UMBP lookup holds nothing."""
 
+    def close(self) -> None:
+        with self._client_lock:
+            self._closed = True
+            client = self.client if not self._active_calls else None
+            if client is not None:
+                self.client = None
+        if client is not None:
+            client.close()
+
     def _client_to_ask(self) -> UMBPStoreClient | None:
         """The client, connecting it if needed; None while paused or when it
         cannot connect (which pauses it)."""
-        if time.monotonic() < self.paused_until:
+        if self._closed or time.monotonic() < self.paused_until:
             return None
         if self.client is not None:
             return self.client
         started = time.monotonic()
         try:
             # Lookups only: no memory is registered.
-            self.client = UMBPStoreClient(
+            client = UMBPStoreClient(
                 address=self._cfg.address,
                 startup_timeout_ms=self._cfg.startup_timeout_ms,
             )
+            with self._client_lock:
+                if self._closed:
+                    client.close()
+                    return None
+                self.client = client
         except Exception:
             pause = self._pause(_RECONNECT_INTERVAL_S, started)
             logger.warning(

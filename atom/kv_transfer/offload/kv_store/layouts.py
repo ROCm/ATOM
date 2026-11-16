@@ -83,7 +83,7 @@ def _build_replay_pages(
     """V4.1 PAGE bytes. The replay contract is what rebuilds request state."""
     if not replays_state(transfer_tensors):
         raise ValueError("V4.1 in a KV store requires the PAGE replay contract")
-    return pure_page_codec(transfer_tensors, num_blocks)
+    return pure_page_codec(transfer_tensors.without_slots(), num_blocks)
 
 
 STORE_LAYOUTS: dict[str, StoreLayout] = {

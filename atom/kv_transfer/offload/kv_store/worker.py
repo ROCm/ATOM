@@ -56,6 +56,7 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
     BlockGPUConnector,
@@ -168,6 +169,12 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     LABEL = "KV store offload"
     # The backend's transfer pool (a `TransferSlotPool` naming the backend).
     POOL_CLASS: type[TransferSlotPool] = TransferSlotPool
+    STAGE_ON_FORWARD_STREAM = False
+    _forward_stream: Any = None
+
+    def set_forward_stream(self, stream: Any) -> None:
+        if self.STAGE_ON_FORWARD_STREAM and stream is not None:
+            self._forward_stream = stream
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -359,6 +366,8 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
+        if self.STAGE_ON_FORWARD_STREAM and torch.cuda.is_available():
+            self.set_forward_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
@@ -379,6 +388,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             source_safe_callback=self._source_group_safe,
             max_staging_bytes=_staging_buffer_bound(),
             stream_priority=_copy_stream_priority(torch.device(device)),
+            compute_stream_provider=(
+                (lambda: self._forward_stream) if self.STAGE_ON_FORWARD_STREAM else None
+            ),
         )
         client = pool = None
         try:
@@ -572,6 +584,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
+        self._pin_in_place_stream()
         t_total0 = time.perf_counter()
         chunk = self.chunk_size
         end = len(req.chunk_hashes or b"") // DIGEST_BYTES
@@ -741,6 +754,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
+        self._pin_in_place_stream()
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
@@ -889,6 +903,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
         """This copy thread's stream for in-place packs and unpacks."""
+        shared = getattr(self._in_place_tls, "pinned", None)
+        if shared is not None:
+            return shared
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
             device = torch.device(self._codec.device)
@@ -897,6 +914,9 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             )
             self._in_place_tls.stream = stream
         return stream
+
+    def _pin_in_place_stream(self) -> None:
+        self._in_place_tls.pinned = self._forward_stream
 
     def _copy_in_place(
         self,
@@ -937,7 +957,7 @@ class KVStoreOffloadConnector(DenseOffloadConnector):
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
         copy(run, owner, 0, stream=stream)
-        stream.synchronize()
+        atom_lmcache_staging.fence_submitted_work(stream)
 
     # -- distrust -----------------------------------------------------------
     def _refuse_loads(self, why: str) -> bool:

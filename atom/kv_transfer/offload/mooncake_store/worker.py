@@ -100,6 +100,7 @@ class MooncakeStoreOffloadConnector(KVStoreOffloadConnector):
 
     LABEL = "Mooncake Store offload"
     POOL_CLASS = TransferSlotPool
+    STAGE_ON_FORWARD_STREAM = True
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)

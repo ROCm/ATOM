@@ -21,9 +21,11 @@ import logging
 import time
 from typing import Any
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+from atom.kv_transfer.offload.kv_store.async_lookup import AsyncStoreLookup
 from atom.kv_transfer.offload.kv_store.keys import (
     DIGEST_BYTES,
     chain_seed,
@@ -31,13 +33,16 @@ from atom.kv_transfer.offload.kv_store.keys import (
     chunk_hash_chain,
     rank_key_prefix,
 )
+from atom.kv_transfer.offload.lookup_client import LookupClient
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
+from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 # Seconds between two `[OFFLOAD-LOOKUP-STATS]` lines.
 _LOOKUP_STATS_INTERVAL_S = 60.0
+_MAX_OFFERS_PER_BATCH = 64
 # After a failed save the base retries, no save is emitted for this long,
 # doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
 # stored save ends the pause and starts the doubling over, whenever it reports.
@@ -108,7 +113,7 @@ def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
     return hashes
 
 
-class StoreLookupBase:
+class StoreLookupBase(LookupClient):
     """What every backend's lookup client shares.
 
     A hit is the prefix every rank holds: per rank, the run of chunks present
@@ -183,6 +188,7 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     # Workers publish one source-safe group per chunk once its GPU pack is
     # done (the block GPU connector), separately from the store terminal.
     _supports_early_block_release = True
+    supports_early_load = True
     # How logs name the backend.
     LABEL = "KV store offload"
 
@@ -195,6 +201,7 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         world: int,
         lookup_client: Any,
         endpoint: str,
+        renew_leases: bool = False,
     ) -> None:
         """``store_cfg`` is the backend's parsed settings, ``endpoint`` how the
         startup log names the store it asks (``"server=..."``)."""
@@ -207,7 +214,10 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         super().__init__(
             config,
             chunk_size=store_cfg.chunk_tokens,
-            lookup_client=lookup_client,
+            lookup_client=AsyncStoreLookup(lookup_client, renew_leases=renew_leases),
+        )
+        self.lowers_hbm_hit_to_chunk = KVConnectorFactory.lowers_hbm_hit_to_chunk(
+            kvc.get("kv_connector", "")
         )
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
         # Unbounded unless asked for, in the connector config or through
@@ -239,13 +249,32 @@ class KVStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         """
         return seq
 
+    def _tier_lookup_kwargs(self, seq: Any) -> dict:
+        return {}
+
+    def _lookup_wanted(self, seq: Any) -> bool:
+        num_prompt = int(seq.num_prompt_tokens)
+        hit = self._loadable_hit(num_prompt, num_prompt)
+        return hit > 0 and hit >= self._min_load_tokens
+
+    def offer_lookups(self, seqs):
+        if not self._do_load:
+            return
+        offered = 0
+        for seq in seqs:
+            if offered >= _MAX_OFFERS_PER_BATCH:
+                break
+            if self._lookup_wanted(seq) and self._lookup_client.submit_if(
+                seq, str(seq.id), lambda seq=seq: seq.status == SequenceStatus.WAITING
+            ):
+                offered += 1
+
     def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
         # A prompt too short to load from the store, whatever it holds, is not
         # asked about: no hit is longer than the prompt less a token, floored
         # to a chunk (`_loadable_hit`), and no shorter one reaches the load
-        # threshold. The lookup would block the scheduler thread for nothing.
-        num_prompt = int(seq.num_prompt_tokens)
-        if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
+        # threshold. The lookup would occupy the query worker for nothing.
+        if not self._lookup_wanted(seq):
             return 0
         self._lookup_starting(sid)
         return super()._fresh_tier_lookup(seq, sid)

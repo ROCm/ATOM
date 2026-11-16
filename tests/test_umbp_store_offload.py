@@ -23,12 +23,15 @@ import array
 import ctypes
 import logging
 import sys
+import time
 import types
 from contextlib import contextmanager
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import with_min_load
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
@@ -300,7 +303,7 @@ def _config(role="offload", *, pp=1, tp=1, layers=4, extra=None, **fields):
     )
     for name, value in fields.items():
         setattr(config, name, value)
-    return config
+    return with_min_load(config)
 
 
 def _seq(req_id, num_prompt_tokens, *, offset=0):
@@ -902,6 +905,15 @@ def test_m3_registration_packs_every_page_plane(server, monkeypatch):
 # --- the scheduler -----------------------------------------------------------
 
 
+def _completed_lookup(lookup, seq):
+    lookup.submit(seq, str(seq.id))
+    deadline = time.monotonic() + 2
+    while not lookup.poll(str(seq.id)):
+        assert time.monotonic() < deadline, "lookup did not complete"
+        time.sleep(0.001)
+    return lookup.lookup(seq)
+
+
 def test_scheduler_lookups_ask_the_server(server):
     scheduler = UMBPStoreOffloadScheduler(_config(pp=2))
     lookup = scheduler._lookup_client
@@ -913,31 +925,31 @@ def test_scheduler_lookups_ask_the_server(server):
             server.at()[
                 _key(hashes, index, rank=rank, world=2, namespace=namespace)
             ] = b""
-    assert lookup.lookup(_seq(0, 48)) == 2 * CHUNK  # rank 1 lacks chunk 2
+    assert _completed_lookup(lookup, _seq(0, 48)) == 2 * CHUNK  # rank 1 lacks chunk 2
     [fake] = server.clients
     assert fake.address == ADDRESS and fake.regions == {}
     [asked] = [call[1] for call in fake.calls if call[0] == "exists"]
     assert len(asked) == 12  # no marker key asked for
-    assert (lookup.uneven_lookups, lookup.stranded_objects) == (1, 4)
+    assert (lookup.backend.uneven_lookups, lookup.backend.stranded_objects) == (1, 4)
 
 
 def test_a_lookup_that_raises_answers_nothing_and_pauses(server):
     scheduler = UMBPStoreOffloadScheduler(_config())
     lookup = scheduler._lookup_client
     server.raise_on = "exists"
-    assert lookup.lookup(_seq(0, 16)) is None
-    assert lookup.paused_until > 0
+    assert _completed_lookup(lookup, _seq(0, 16)) is None
+    assert lookup.backend.paused_until > 0
     server.raise_on = None
-    assert lookup.lookup(_seq(0, 16)) is None  # still paused
-    lookup.paused_until = 0.0
-    assert lookup.lookup(_seq(0, 16)) == 0
+    assert _completed_lookup(lookup, _seq(0, 16)) is None  # still paused
+    lookup.backend.paused_until = 0.0
+    assert _completed_lookup(lookup, _seq(0, 16)) == 0
 
 
 def test_an_unreachable_server_answers_nothing(server):
     scheduler = UMBPStoreOffloadScheduler(_config())
     server.connect_error = RuntimeError("no server")
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) is None
-    assert scheduler._lookup_client.client is None
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) is None
+    assert scheduler._lookup_client.backend.client is None
 
 
 def test_lookups_in_a_process_that_marked_the_server_hold_nothing(server):
@@ -946,9 +958,9 @@ def test_lookups_in_a_process_that_marked_the_server_hold_nothing(server):
     namespace = store_namespace(_config(), CHUNK)
     for index in range(2):
         server.at()[_key(hashes, index, namespace=namespace)] = b""
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) == 2 * CHUNK
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) == 2 * CHUNK
     taint.mark(ADDRESS, "a put raised")
-    assert scheduler._lookup_client.lookup(_seq(0, 16)) == 0
+    assert _completed_lookup(scheduler._lookup_client, _seq(0, 16)) == 0
 
 
 def test_a_load_is_dispatched_without_asking_again(server):
@@ -968,3 +980,79 @@ class _AnyKey:
 
     def __contains__(self, key):
         return True
+
+
+def test_save_only_scheduler_does_not_start_lookup_workers(server):
+    scheduler = UMBPStoreOffloadScheduler(_config("kv_producer"))
+    try:
+        scheduler.offer_lookups([_seq(0, 16)])
+        assert server.clients == []
+        assert scheduler._lookup_client.executor is None
+        assert scheduler._lookup_client.renew_executor is None
+    finally:
+        scheduler.close()
+
+
+def test_pending_umbp_lookup_does_not_block_and_close_waits_for_rpc(
+    server, monkeypatch
+):
+    from atom.model_engine.sequence import SequenceStatus
+
+    entered, release, finished = Event(), Event(), Event()
+    scheduler = UMBPStoreOffloadScheduler(_config())
+    backend = scheduler._lookup_client.backend
+    original = umbp_client.UMBPStoreClient.exists
+
+    def blocked(client, keys):
+        entered.set()
+        assert release.wait(2), "test RPC was not released"
+        try:
+            assert hasattr(client, "_client")
+            return original(client, keys)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(umbp_client.UMBPStoreClient, "exists", blocked)
+    seq = _seq(0, 16)
+    seq.status = SequenceStatus.WAITING
+    try:
+        scheduler.offer_lookups([seq])
+        assert entered.wait(2)
+        assert scheduler._lookup_client.lookup(seq) is None
+        assert scheduler._lookup_client.is_pending("0")
+        client = backend.client
+        scheduler._lookup_client.clear_lookup_status("0")
+        scheduler.close()
+        assert hasattr(client, "_client")  # native RPC still owns it
+        assert backend.client is client
+        release.set()
+        assert finished.wait(2)
+        deadline = time.monotonic() + 2
+        while hasattr(client, "_client"):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert backend.client is None
+        assert not scheduler._lookup_client.pending_ids()
+    finally:
+        release.set()
+        scheduler.close()
+
+
+def test_umbp_async_lookup_lifecycle_reuse_and_no_leases(server):
+    scheduler = UMBPStoreOffloadScheduler(_config())
+    try:
+        lookup = scheduler._lookup_client
+        seq = _seq(12, 16)
+        assert _completed_lookup(lookup, seq) == 0
+        hashes = _hashes(16)
+        namespace = store_namespace(_config(), CHUNK)
+        for index in range(2):
+            server.at()[_key(hashes, index, namespace=namespace)] = b""
+        lookup.clear_lookup_status("12")
+        assert _completed_lookup(lookup, _seq(12, 16)) == 16
+        assert scheduler.supports_early_load
+        assert scheduler.lowers_hbm_hit_to_chunk
+        assert lookup.renew(seq, 0, 16) == 0
+        assert lookup.renew_executor is None
+    finally:
+        scheduler.close()

@@ -16,6 +16,7 @@ class _PipelineHarness:
         self.pack = self.Stream()
         self.copy = self.Stream()
         self.state = SimpleNamespace(
+            begin_transfer=lambda: None,
             pack_stream=self.pack,
             copy_stream=self.copy,
             stream_ctx=self.stream_ctx,
@@ -40,6 +41,9 @@ class _PipelineHarness:
 
     class Event:
         def record(self, _stream):
+            pass
+
+        def synchronize(self):
             pass
 
 
@@ -164,3 +168,19 @@ def test_copy_thread_streams_take_the_connector_priority(monkeypatch, priority):
     # Pack and copy stream alike; the default keeps torch's default priority.
     expected = {} if priority is None else {"priority": priority}
     assert made == [expected, expected]
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stream_operation_completion(monkeypatch):
+    # Synthetic CPU streams model completion via synchronize(). Real streams
+    # keep the actual event fence; its ordering has dedicated contract tests.
+    from atom.kv_transfer.offload import atom_lmcache_staging as staging
+
+    original = staging.fence_submitted_work
+
+    def complete(stream):
+        if hasattr(stream, "cuda_stream"):
+            return original(stream)
+        return stream.synchronize()
+
+    monkeypatch.setattr(staging, "fence_submitted_work", complete)

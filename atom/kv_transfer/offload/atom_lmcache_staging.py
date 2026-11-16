@@ -66,6 +66,7 @@ class _ThreadTransferState:
         device: torch.device,
         use_cuda: bool,
         priority: int | None = None,
+        compute_stream_provider: Callable[[], Any] | None = None,
     ) -> None:
         """One copy thread's pack and copy streams, and its staging buffer.
 
@@ -73,14 +74,31 @@ class _ThreadTransferState:
         keeps the default.
         """
         self.device = device
-        self.pack_stream = None
-        self.copy_stream = None
-        if use_cuda:
+        self._pack_stream = None
+        self._copy_stream = None
+        self._provider = compute_stream_provider
+        self._pinned_stream = (
+            compute_stream_provider() if use_cuda and compute_stream_provider else None
+        )
+        if use_cuda and self._pinned_stream is None:
             kwargs = {} if priority is None else {"priority": int(priority)}
             with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream(**kwargs)
-                self.copy_stream = torch.cuda.Stream(**kwargs)
+                self._pack_stream = torch.cuda.Stream(**kwargs)
+                self._copy_stream = torch.cuda.Stream(**kwargs)
         self.staging_buffer = _StagingBuffer(use_cuda)
+
+    def begin_transfer(self) -> None:
+        """Pin one compute stream for every stage of this transfer."""
+        if self._pinned_stream is not None:
+            self._pinned_stream = self._provider() or self._pinned_stream
+
+    @property
+    def pack_stream(self):
+        return self._pack_stream if self._pinned_stream is None else self._pinned_stream
+
+    @property
+    def copy_stream(self):
+        return self._copy_stream if self._pinned_stream is None else self._pinned_stream
 
     def stream_ctx(self, stream):
         if stream is None:
@@ -94,6 +112,17 @@ class _PipelineStage:
 
     stream: Any
     run: Callable[[Any, torch.Tensor], None]
+
+
+def fence_submitted_work(stream) -> None:
+    """Wait for this submission point without draining later forward work.
+
+    Keep the host wait: a device wait on a side stream can deadlock with
+    persistent compute kernels. Recovery still fences whole affected streams.
+    """
+    completion = torch.cuda.Event(blocking=False)
+    completion.record(stream)
+    completion.synchronize()
 
 
 def run_staged_pipeline(
@@ -152,7 +181,7 @@ def run_staged_pipeline(
                 staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
-        stage_b.stream.synchronize()
+        fence_submitted_work(stage_b.stream)
     except Exception:
         buffer_safe_to_release = bool(
             recover_buffer is not None

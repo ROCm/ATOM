@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.kv_store import scheduler as _store_scheduler
+from atom.kv_transfer.offload.kv_store.async_lookup import DaemonExecutor
 from atom.kv_transfer.offload.kv_store.scheduler import (  # noqa: F401  # re-exported
     _LOOKUP_STATS_INTERVAL_S,
     KVStoreOffloadScheduler,
@@ -80,11 +80,12 @@ class _PoolLookups:
     and holds nothing for the lookups from then on.
     """
 
-    __slots__ = ("client", "paused_until", "pool", "tainted")
+    __slots__ = ("client", "executor", "paused_until", "pool", "tainted")
 
     def __init__(self, pool: StorePool) -> None:
         self.pool = pool
         self.client: store_client.MooncakeStoreClient | None = None
+        self.executor: DaemonExecutor | None = None
         self.paused_until = 0.0
         self.tainted = False
 
@@ -133,14 +134,9 @@ class _StoreLookup(StoreLookupBase):
         self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
         # Several pools are asked at once; the executor starts no thread until
         # the first lookup.
-        self._executor = (
-            ThreadPoolExecutor(
-                max_workers=len(self._pools),
-                thread_name_prefix="mooncake-store-lookup",
-            )
-            if len(self._pools) > 1
-            else None
-        )
+        if len(self._pools) > 1:
+            for index, pool in enumerate(self._pools):
+                pool.executor = DaemonExecutor(f"mooncake-store-lookup-{index}")
         # Per pool master: when its next warning may be logged.
         self._next_warning_at: dict[str, float] = {}
 
@@ -209,6 +205,11 @@ class _StoreLookup(StoreLookupBase):
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
+    def close(self) -> None:
+        for pool in self._pools:
+            if pool.executor is not None:
+                pool.executor.shutdown()
+
     def _ask(self, keys: list[str]) -> list[int | None] | None:
         """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
         it, None if no pool answered. None when no pool answered any key.
@@ -259,8 +260,8 @@ class _StoreLookup(StoreLookupBase):
         asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
         futures = (
-            [self._executor.submit(pool.client.exists, asked) for pool in pools]
-            if self._executor is not None
+            [pool.executor.submit(pool.client.exists, asked) for pool in pools]
+            if pools and pools[0].executor is not None
             else None
         )
         answers: list[list[int] | None] = []
@@ -390,11 +391,19 @@ class MooncakeStoreOffloadScheduler(KVStoreOffloadScheduler):
                 cfg, namespace=namespace, world=world, chunk_tokens=cfg.chunk_tokens
             ),
             endpoint="masters=" + ",".join(pool.master for pool in cfg.store_masters()),
+            renew_leases=True,
         )
 
     def _lookup_starting(self, sid: str) -> None:
         # Stamped before asking: the lease runs from the master's answer.
         self._looked_up_at[sid] = time.monotonic()
+
+    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+        hit = super()._fresh_tier_lookup(seq, sid)
+        started = self._lookup_client.query_started(sid)
+        if started is not None and started < self._looked_up_at.get(sid, started):
+            self._looked_up_at[sid] = started
+        return hit
 
     def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
         """Renew the read leases of what a load reads; the load always goes ahead.

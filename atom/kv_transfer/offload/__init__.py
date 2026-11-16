@@ -87,9 +87,11 @@ def register_backends(factory) -> None:
         scheduler_class="MooncakeStoreOffloadScheduler",
         requires_pd_staging=False,
         offload=True,
+        min_load_tokens=512,
         # One Mooncake Store for every DP rank.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.mooncake_store.config:store_chunk_tokens",
+        lowers_hbm_hit_to_chunk=True,
         # Same predicate as lmcache_offload: dense ignores the region map, and
         # M3 and V4.1 PAGE layouts read it. Other layouts are refused at
         # startup; see `check_engine_compatibility`.
@@ -109,6 +111,7 @@ def register_backends(factory) -> None:
         # One UMBP standalone server per node, shared by every DP rank there.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.umbp_store.config:store_chunk_tokens",
+        lowers_hbm_hit_to_chunk=True,
         # Dense ignores the region map, the M3 PAGE layout reads it (its NSA
         # index cache included). Other layouts are refused at startup; see
         # `check_engine_compatibility`.
