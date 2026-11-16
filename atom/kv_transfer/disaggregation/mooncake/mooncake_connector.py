@@ -3175,10 +3175,8 @@ class MooncakeConnector(KVConnectorBase):
             dst_pages=len(dst_block_ids),
         )
 
-    def _dcp_token_descriptors(
-        self, region_idx: int, src_base: int, dst_base: int, bpb: int, token_runs
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """One PAGE region's share of a DCP token relayout, as RDMA descriptors."""
+    def _dcp_token_unit(self, region_idx: int, bpb: int) -> int:
+        """Bytes per token of a PAGE region a DCP token relayout may address."""
         role = self._block_region_roles[region_idx]
         if role != MLA_KV_ROLE:
             raise RuntimeError(
@@ -3197,7 +3195,13 @@ class MooncakeConnector(KVConnectorBase):
                 "a single token needs its bytes contiguous, which holds for "
                 "the MLA layout the token-unit relayout is built on."
             )
-        unit = bpb // self.block_size
+        return bpb // self.block_size
+
+    def _dcp_token_descriptors(
+        self, region_idx: int, src_base: int, dst_base: int, bpb: int, token_runs
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """One PAGE region's share of a DCP token relayout, as RDMA descriptors."""
+        unit = self._dcp_token_unit(region_idx, bpb)
         run_src, run_dst, run_len = token_runs
         return src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
 
@@ -3311,13 +3315,17 @@ class MooncakeConnector(KVConnectorBase):
                     logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                     return False
                 continue
-            descriptors = self._dcp_token_descriptors(
-                region_idx, src_base, dst_base, bpb, sharded_runs
-            )
             if stages_sharded_mla and region_idx in self._mla_token_views:
+                # Validate only: staging sends page runs, and per-token
+                # arrays for a long prompt would dominate the planning time.
+                self._dcp_token_unit(region_idx, bpb)
                 staged_mla_regions.append((region_idx, dst_base, bpb))
                 continue
-            if not batch.add(*descriptors):
+            if not batch.add(
+                *self._dcp_token_descriptors(
+                    region_idx, src_base, dst_base, bpb, sharded_runs
+                )
+            ):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
