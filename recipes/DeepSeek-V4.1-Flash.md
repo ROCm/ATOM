@@ -1,9 +1,12 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. The KV cache is FP8 (`--kv_cache_dtype fp8`, MXFP8 rows attended by
-AITER's `mla_sparse_prefill_v41`); on the BF16 or FP4 pool the original V4
-BF16 attention and inverse RoPE kernels are reused.
+usable. With `--kv_cache_dtype fp8`, AITER's `mla_sparse_prefill_v41`
+attends over contiguous MXFP8 data and scale planes. With FP4 KV,
+`ATOM_DSV41_A8W4_ATTN=auto` (the default) uses native A8W4 on supported
+gfx950 configurations, as selected by AITER's V4.1 capability API. Setting
+`ATOM_DSV41_A8W4_ATTN=off`, or using a query/backend that cannot run A8W4,
+selects the BF16 adapter. BF16 KV uses the original V4 BF16 attention.
 Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 

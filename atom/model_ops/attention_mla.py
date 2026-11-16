@@ -62,7 +62,7 @@ from atom.distributed.dcp_utils import (
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_is_enabled,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
@@ -3141,9 +3141,12 @@ class MLAAttention(nn.Module):
             if pcp:
                 pcp_ws = get_pcp_world_size()
                 n_real = attn_metadata.slot_mapping.shape[0]
-                k_nope_full = pcp_allgather_rerange(k_nope, pcp_ws)[:n_real]
-                k_rope_full = pcp_allgather_rerange(k_rope, pcp_ws)[:n_real]
-                positions_full = pcp_allgather_rerange(positions, pcp_ws)[:n_real]
+                k_nope_full, k_rope_full, positions_full = (
+                    g[:n_real]
+                    for g in pcp_allgather_rerange_many(
+                        [k_nope, k_rope, positions], pcp_ws
+                    )
+                )
                 write_slot_mapping = attn_metadata.slot_mapping_owned
             else:
                 write_slot_mapping = attn_metadata.slot_mapping

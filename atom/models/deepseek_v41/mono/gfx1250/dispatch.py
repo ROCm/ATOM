@@ -12,6 +12,7 @@ import logging
 
 from torch import nn
 
+from atom.model_engine.token_constraints import has_constraints
 from atom.models.deepseek_v41.mono.gfx1250 import refusal
 from atom.models.deepseek_v41.mono.gfx1250.config import MAX_ROWS, ROWS_PER_REQ
 from atom.mono.runtime.route import LazyRunner
@@ -112,7 +113,7 @@ class SingleStepModel(StepOverrideModel, nn.Module):
         channel (it returns ids and the verdict, not logits), and request shapes the kernel takes (``precheck``).
         """
         if batch is not None and (
-            getattr(batch, "structured_requests", None)
+            has_constraints(batch)
             or batch.any_logprobs
             or getattr(batch, "required_channel", None) is not None
         ):

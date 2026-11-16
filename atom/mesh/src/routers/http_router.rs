@@ -147,6 +147,7 @@ impl Router {
             Some(&request.headers),
             &worker,
         );
+        crate::observability::route_trace::record_dispatch(metrics_labels::WORKER_REGULAR, &worker);
         events::RequestSentEvent { url: worker.url() }.emit();
         let upstream = builder.send().await;
         events::RequestReceivedEvent {}.emit();
@@ -459,6 +460,7 @@ impl RouterTrait for Router {
             tokens: tokens.as_deref(),
             headers: Some(&request.headers),
             stream: metadata.stream,
+            carries_media: metadata.carries_media,
         };
         let policy = self.policies.regular_policy(metadata.model.as_deref());
         let observation = crate::observability::request::RequestMetrics::new(

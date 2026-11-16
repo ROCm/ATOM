@@ -284,6 +284,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<&'a str>,
     tokens: Option<&'a [u32]>,
+    carries_media: bool,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -297,6 +298,7 @@ impl<'a> PDRequestContext<'a> {
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
             tokens: None,
+            carries_media: metadata.carries_media,
             model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
@@ -789,6 +791,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
+            carries_media: context.carries_media,
         };
         let plan = planner
             .plan(&descriptor)
@@ -912,12 +915,16 @@ impl PDRouter {
         };
         let prefill_url_for_log = prefill.url().to_string();
         let prefill_worker = prefill.clone();
-        let prefill_policy = self.dispatch(&prefill, headers);
+        let prefill_router = self.clone();
+        let prefill_headers = headers.cloned();
         let correlation_for_log = correlation_id.unwrap_or_else(|| "unknown".to_string());
         let mut canceled = placement.canceled.subscribe();
         let work = async move {
             let _prefill_guard = prefill_guard;
-            match Self::send(prefill_post, prefill_worker, prefill_policy).await {
+            match prefill_router
+                .send_worker(prefill_post, prefill_worker, prefill_headers.as_ref())
+                .await
+            {
                 Ok(res) => {
                     let status = res.status();
                     if status.is_success() {
@@ -944,6 +951,7 @@ impl PDRouter {
                 }
             }
         };
+        let work = crate::observability::route_trace::carry(work);
         let prefill_task = PrefillTask(Some(tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -1822,8 +1830,8 @@ impl PDRouter {
         Self::send(request, worker, policy).await
     }
 
-    /// Runs the dispatch hooks on the request task, right before the request
-    /// is sent to `worker`, and returns the policy that owns it.
+    /// Runs the dispatch hooks right before the request is sent to `worker`,
+    /// and returns the policy that owns it.
     fn dispatch(
         &self,
         worker: &Arc<dyn Worker>,
@@ -1841,6 +1849,7 @@ impl PDRouter {
         };
         // Only a request that is actually sent moves the session.
         policy.on_dispatch(pool, headers, worker);
+        crate::observability::route_trace::record_dispatch(pool, worker);
         policy
     }
 
@@ -2297,6 +2306,7 @@ mod tests {
                 return_logprob: false,
                 request_text: None,
                 tokens: None,
+                carries_media: false,
                 model_id: None,
                 headers: None,
             };
@@ -2948,6 +2958,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             tokens: None,
+            carries_media: false,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

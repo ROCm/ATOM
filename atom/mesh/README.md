@@ -248,6 +248,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `GET` / `PUT` / `DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
+| `GET` | `/kv_events/sources` | With `--kv-events`: each followed worker rank's KV event stream and what it carried. A worker not followed, as with the engine's KV events off (`ATOM_KV_EVENTS_ENABLE`) or sources that cannot be read, has no row, as if not registered; the log says why |
 
 ## Load balancing
 
@@ -255,7 +256,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
@@ -325,6 +326,12 @@ queries.
 ### Logging
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
+
+`--route-log-sample-rate` (0 to 1, default 0 = off) logs the routing decisions of
+that fraction of inference requests at info level under target `mesh::route`.
+While it is above 0, a request carrying the `x-mesh-route-trace` header is always
+logged. HTTP routers only: gRPC workers and Envoy external processing do not
+emit these logs.
 
 ## Security
 

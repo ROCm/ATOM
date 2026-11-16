@@ -321,8 +321,8 @@ def validate_speculative_config(config):
 
         if Path(speculative.model).resolve() != Path(config.model).resolve():
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
-    if config.kv_cache_dtype not in ("bf16", "fp8"):
-        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 or FP8 KV cache")
+    if config.kv_cache_dtype not in ("bf16", "fp8", "fp4"):
+        raise ValueError("DeepSeek-V4.1 DSpark requires a BF16, FP8 or FP4 KV cache")
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
