@@ -619,3 +619,46 @@ def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
     assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
     # a runner that calls the extract itself takes any
     assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
+
+
+@pytest.mark.parametrize("before", [None, "7"])
+def test_srcloc_scoped_keeps_depth_frames_then_flydsls_own_setting(monkeypatch, before):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    if before is None:
+        monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    else:
+        monkeypatch.setenv(srcloc._DEPTH_ENV, before)
+    with srcloc.scoped():
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert os.environ.get(srcloc._DEPTH_ENV) == before
+
+
+def test_srcloc_unlocated_captures_no_location_in_any_holder(monkeypatch):
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.delenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    # restored on an error too
+    with pytest.raises(KeyError), srcloc.unlocated():
+        for mod in srcloc._HOLDERS:
+            assert mod.capture_user_location is srcloc._unknown_location
+        raise KeyError
+    assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+
+
+def test_srcloc_unlocated_keeps_locations_when_debug_info_is_on(monkeypatch):
+    """With debug info the locations are in the binary: ``scoped()``'s
+    locations, not none."""
+    pytest.importorskip("flydsl")
+    from atom.mono.runtime import srcloc
+
+    monkeypatch.setenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", "1")
+    monkeypatch.delenv(srcloc._DEPTH_ENV, raising=False)
+    before = [mod.capture_user_location for mod in srcloc._HOLDERS]
+    with srcloc.unlocated():
+        assert [mod.capture_user_location for mod in srcloc._HOLDERS] == before
+        assert os.environ[srcloc._DEPTH_ENV] == str(srcloc.DEPTH)
+    assert srcloc._DEPTH_ENV not in os.environ
