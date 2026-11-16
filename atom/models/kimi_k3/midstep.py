@@ -11,8 +11,6 @@ and how a KDA layer writes them into their slots. The backend
 reaches it.
 """
 
-import inspect
-import os
 from dataclasses import dataclass
 
 import torch
@@ -24,40 +22,12 @@ from atom.utils import envs
 #: counted from each forward's first token.
 FLASH_KDA_CHUNK = 32
 
-#: The `chunk_kimi_delta_attn` keywords a snapshot step passes (ROCm/aiter#7413).
-SNAPSHOT_KWARGS = ("snapshot_targets", "snapshot_out")
-
 
 def kda_midstep_enabled() -> bool:
-    """ATOM_K3_KDA_STATE_MIDSTEP=1, which needs aiter's FlashKDA recurrence:
-    only it can hand back the state at an interior chunk boundary."""
-    if not envs.ATOM_K3_KDA_STATE_MIDSTEP:
-        return False
-    if os.getenv("AITER_FDA_ENABLE", "1").lower() not in ("1", "true", "yes", "on"):
-        raise ValueError(
-            "ATOM_K3_KDA_STATE_MIDSTEP=1 needs AITER_FDA_ENABLE on: only the "
-            "FlashKDA recurrence snapshots the state inside the forward"
-        )
-    return True
-
-
-def require_flash_kda_snapshots(chunk_kimi_delta_attn) -> None:
-    """Refuse the switch at startup on an aiter that cannot take snapshots.
-
-    Without this, an older aiter fails at the first prefill that has a snapshot
-    target, with a `TypeError` from inside the forward. Takes the function
-    rather than importing it, so this module stays importable without AITER.
-    Named parameters only: a `**kwargs` catch-all would accept the keywords
-    and still not store anything.
-    """
-    params = inspect.signature(chunk_kimi_delta_attn).parameters
-    missing = [name for name in SNAPSHOT_KWARGS if name not in params]
-    if missing:
-        raise RuntimeError(
-            "ATOM_K3_KDA_STATE_MIDSTEP=1 needs an aiter whose "
-            "chunk_kimi_delta_attn takes snapshot_targets and snapshot_out "
-            f"(ROCm/aiter#7413); the installed one has no {', '.join(missing)}"
-        )
+    """ATOM_K3_KDA_STATE_MIDSTEP=1. It needs an aiter with ROCm/aiter#7413,
+    whose FlashKDA recurrence hands back the state at an interior chunk
+    boundary; aiter refuses `snapshot_targets` on any other route."""
+    return envs.ATOM_K3_KDA_STATE_MIDSTEP
 
 
 def refuse_midstep_under_pipeline(pipeline_parallel_size: int) -> None:

@@ -6,7 +6,6 @@ import math
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
@@ -26,7 +25,6 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_transfer,
     kda_snapshots,
     refuse_midstep_under_pipeline,
-    require_flash_kda_snapshots,
 )
 from atom.utils import CpuGpuBuffer, envs
 
@@ -401,7 +399,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             refuse_midstep_under_pipeline(
                 self.model_runner.config.pipeline_parallel_size
             )
-            require_flash_kda_snapshots(chunk_kimi_delta_attn)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         # Everything a reader needs to reassemble the image at the same byte
