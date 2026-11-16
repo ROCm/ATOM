@@ -126,3 +126,73 @@ def test_ragged_chunks_keep_the_dispatch_width_and_restore_context(
     assert quantizer.call_count == (
         sum(n > 0 for n in expected_rows) if not prepacked and wire.quant_type else 0
     )
+
+
+@pytest.mark.parametrize(
+    "value,expected,warn",
+    [
+        (None, 0, False),
+        ("", 0, False),
+        ("0", 0, False),
+        ("4", 4, False),
+        ("invalid", 0, True),
+        ("-1", 0, True),
+    ],
+)
+def test_chunk_size_uses_central_env_parser(
+    atom_modules, monkeypatch, caplog, value, expected, warn
+):
+    chunked = importlib.import_module("atom.model_ops.fused_moe.mori_chunked_experts")
+    if value is None:
+        monkeypatch.delenv("ATOM_BENCH_MOE_CHUNK_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_BENCH_MOE_CHUNK_SIZE", value)
+    with caplog.at_level("WARNING", logger="atom"):
+        assert chunked.benchmark_chunk_size() == expected
+    assert ("ATOM_BENCH_MOE_CHUNK_SIZE" in caplog.text) is warn
+
+
+def test_first_call_geometry_uses_logger_once(
+    atom_modules, monkeypatch, caplog, capsys
+):
+    import json
+
+    chunked = importlib.import_module("atom.model_ops.fused_moe.mori_chunked_experts")
+    internode = importlib.import_module(
+        "atom.model_ops.fused_moe.megamoe_internode_experts"
+    )
+    monkeypatch.setattr(internode, "_group_rows", lambda rows: (rows, False))
+    handle = SimpleNamespace(
+        config=SimpleNamespace(rank=3, max_num_inp_token_per_rank=4),
+        _cpp_config=SimpleNamespace(max_num_tokens_to_recv=lambda: 64),
+    )
+
+    class Experts(torch.nn.Module):
+        shared_experts = None
+        prepare_finalize = SimpleNamespace(
+            supports_async=lambda: False, _mori_ops=[handle]
+        )
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    backend = chunked.MoriChunkedExperts(Experts(), 4)
+    x = torch.ones(2, 64, dtype=torch.bfloat16)
+    with caplog.at_level("INFO", logger="atom"):
+        assert torch.equal(backend(hidden_states=x), x)
+        assert torch.equal(backend(hidden_states=x), x)
+    records = [
+        r.getMessage() for r in caplog.records if "[MORI-CHUNK]" in r.getMessage()
+    ]
+    assert len(records) == 1
+    payload = json.loads(records[0].removeprefix("[MORI-CHUNK] "))
+    assert payload == {
+        "rank": 3,
+        "input_rows": 2,
+        "input_dtype": "torch.bfloat16",
+        "agreed_rows": 2,
+        "chunk": 4,
+        "send_capacity": 4,
+        "recv_capacity": 64,
+    }
+    assert capsys.readouterr().out == ""

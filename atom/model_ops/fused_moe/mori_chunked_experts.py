@@ -1,13 +1,17 @@
 """MoE-only chunking for the isolated EP16 serving comparison."""
 
 import json
-import os
+import logging
 
 import torch
 
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
+
 
 def benchmark_chunk_size():
-    return int(os.environ.get("ATOM_BENCH_MOE_CHUNK_SIZE", "0"))
+    return envs.ATOM_BENCH_MOE_CHUNK_SIZE
 
 
 class MoriChunkedExperts(torch.nn.Module):
@@ -32,9 +36,9 @@ class MoriChunkedExperts(torch.nn.Module):
         cap = self.chunk_size
         if self._first_call:
             handles = self.experts.prepare_finalize._mori_ops
-            print(
-                "[MORI-CHUNK] "
-                + json.dumps(
+            logger.info(
+                "[MORI-CHUNK] %s",
+                json.dumps(
                     {
                         "rank": handles[0].config.rank,
                         "input_rows": x.shape[0],
@@ -47,7 +51,6 @@ class MoriChunkedExperts(torch.nn.Module):
                         ]._cpp_config.max_num_tokens_to_recv(),
                     }
                 ),
-                flush=True,
             )
             self._first_call = False
         if group_rows <= cap:

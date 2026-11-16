@@ -2,11 +2,40 @@
 """Prepare request-selected GEMM variants during model warmup."""
 
 import csv
+import importlib
 import logging
 
 import torch
 
 logger = logging.getLogger("atom")
+
+
+def _warmup_symbol(module, symbol):
+    """Extra startup warmup is optional on older AITER builds."""
+    try:
+        value = importlib.import_module(module)
+        for name in symbol.split("."):
+            value = getattr(value, name)
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            "Skipping extra GEMM warmup: %s.%s unavailable: %s", module, symbol, exc
+        )
+        return None
+    if value is None:
+        logger.warning("Skipping extra GEMM warmup: %s.%s unavailable", module, symbol)
+    return value
+
+
+def _warmup_table(symbol):
+    path = _warmup_symbol("aiter.jit.core", symbol)
+    if path is None:
+        return None
+    try:
+        with open(path, newline="") as stream:
+            return list(csv.DictReader(stream))
+    except FileNotFoundError:
+        logger.warning("Skipping extra GEMM warmup: tune table %s is missing", path)
+        return None
 
 
 def _variant_rows(table, n, k, scale_block, max_tokens, lookup):
@@ -68,14 +97,17 @@ def warmup_native_fp8_gemms(model, max_tokens):
     if not layers:
         return 0
 
-    from aiter.jit.core import AITER_CONFIGS
-    from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config
+    lookup = _warmup_symbol("aiter.ops.gemm_op_a8w8", "get_mxscale_bpreshuffle_config")
+    if lookup is None:
+        return 0
+    table = _warmup_table(
+        "AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE"
+    )
+    if table is None:
+        return 0
 
     from atom.model_ops.blockscale import native_quant_linear
 
-    path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
-    with open(path, newline="") as stream:
-        table = list(csv.DictReader(stream))
     count = 0
     for weight, scale, group in layers:
         n, k = weight.shape
@@ -86,7 +118,7 @@ def warmup_native_fp8_gemms(model, max_tokens):
                 k,
                 f"{group}x32",
                 max_tokens,
-                get_mxscale_bpreshuffle_config,
+                lookup,
             )
         )
         if not variants:
@@ -112,7 +144,9 @@ def warmup_native_fp8_gemms(model, max_tokens):
     return count
 
 
-def _a16_variant_rows(table, weight, bias, max_tokens, lookup):
+def _a16_variant_rows(
+    table, weight, bias, max_tokens, lookup, output_dtype=torch.bfloat16
+):
     n, k = weight.shape
     candidates = {1, max_tokens}
     candidates.update(
@@ -128,10 +162,12 @@ def _a16_variant_rows(table, weight, bias, max_tokens, lookup):
             k,
             bias is not None,
             str(weight.dtype),
-            str(torch.bfloat16),
+            str(output_dtype),
             False,
             getattr(weight, "is_shuffled", False),
         )
+        if config is None:
+            continue  # Model/graph warmup still covers the serving fallback.
         key = tuple(
             config.get(name) for name in ("libtype", "solidx", "kernelName", "splitK")
         )
@@ -142,13 +178,22 @@ def _a16_variant_rows(table, weight, bias, max_tokens, lookup):
 
 @torch.no_grad()
 def warmup_a16_gemms(model, max_tokens):
-    """Prepare tuned BF16/FP16 projections omitted by max-batch warmup."""
+    """Prepare A16 variants at each projection's serving output dtype."""
     from aiter import QuantType
 
     from atom.model_ops.linear import LinearBase
 
+    modules = list(model.modules())
+    # CSA2 ratio > 1 keeps the compressor's fused KV/gate projection in FP32.
+    # Other LinearBase calls use their default BF16 output.
+    fp32_projections = {
+        id(layer.wkv_gate)
+        for layer in modules
+        if getattr(layer, "wkv_gate", None) is not None
+        and getattr(layer, "ratio", 1) > 1
+    }
     layers, seen = [], set()
-    for layer in model.modules():
+    for layer in modules:
         if (
             not isinstance(layer, LinearBase)
             or layer.quant_type.value != QuantType.No.value
@@ -157,36 +202,49 @@ def warmup_a16_gemms(model, max_tokens):
         weight, bias = layer.weight, layer.bias
         if weight.ndim != 2 or weight.dtype not in (torch.bfloat16, torch.float16):
             continue
+        output_dtype = (
+            torch.float32 if id(layer) in fp32_projections else torch.bfloat16
+        )
         key = (
             weight.device,
             tuple(weight.shape),
             weight.dtype,
             bias is not None,
             getattr(weight, "is_shuffled", False),
+            output_dtype,
         )
         if key not in seen:
             seen.add(key)
-            layers.append((weight, bias))
+            layers.append((weight, bias, output_dtype))
     if not layers:
         return 0
 
-    from aiter.jit.core import AITER_CONFIGS
-    from aiter.tuned_gemm import get_GEMM_A16W16_config, tgemm
-
-    with open(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE, newline="") as stream:
-        table = list(csv.DictReader(stream))
+    lookup = _warmup_symbol("aiter.tuned_gemm", "get_GEMM_A16W16_config")
+    mm = _warmup_symbol("aiter.tuned_gemm", "tgemm.mm")
+    if lookup is None or mm is None:
+        return 0
+    table = _warmup_table("AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE")
+    if table is None:
+        return 0
     count = 0
-    for weight, bias in layers:
+    for weight, bias, output_dtype in layers:
         variants = list(
-            _a16_variant_rows(table, weight, bias, max_tokens, get_GEMM_A16W16_config)
+            _a16_variant_rows(table, weight, bias, max_tokens, lookup, output_dtype)
         )
+        if not variants:
+            continue
         x = torch.zeros(
             (max(variants), weight.shape[1]), dtype=weight.dtype, device=weight.device
         )
         for m in variants:
-            tgemm.mm(x[:m], weight, bias, otype=torch.bfloat16)
+            mm(x[:m], weight, bias, otype=output_dtype)
             count += 1
-            logger.info("A16 GEMM warmup M=%d N=%d K=%d", m, *weight.shape)
+            logger.info(
+                "A16 GEMM warmup M=%d N=%d K=%d output=%s",
+                m,
+                *weight.shape,
+                output_dtype,
+            )
         torch.cuda.synchronize(weight.device)
         del x
     return count
@@ -237,15 +295,20 @@ def warmup_v41_bmms(model, max_tokens):
     if not layers:
         return 0
 
-    from aiter.jit.utils.chip_info import get_gfx
-
-    if get_gfx() != "gfx950":
+    get_gfx = _warmup_symbol("aiter.jit.utils.chip_info", "get_gfx")
+    if get_gfx is None or get_gfx() != "gfx950":
         return 0
-    from aiter.ops.batched_gemm_op_a8w8 import (
-        batched_gemm_a8w8_mxscale_bpreshuffle,
-        lookup_mxscale_bmm_config,
+    gemm = _warmup_symbol(
+        "aiter.ops.batched_gemm_op_a8w8", "batched_gemm_a8w8_mxscale_bpreshuffle"
     )
-    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import pick_bmm_kernel_name
+    lookup = _warmup_symbol(
+        "aiter.ops.batched_gemm_op_a8w8", "lookup_mxscale_bmm_config"
+    )
+    heuristic = _warmup_symbol(
+        "aiter.ops.flydsl.batched_gemm_a8w8_gfx950", "pick_bmm_kernel_name"
+    )
+    if gemm is None or lookup is None or heuristic is None:
+        return 0
 
     count = 0
     for groups, n, weight, scale in layers:
@@ -256,8 +319,8 @@ def warmup_v41_bmms(model, max_tokens):
                 n,
                 k,
                 max_tokens,
-                lookup_mxscale_bmm_config,
-                pick_bmm_kernel_name,
+                lookup,
+                heuristic,
             )
         )
         rows = max(variants)
@@ -266,7 +329,7 @@ def warmup_v41_bmms(model, max_tokens):
             (rows, groups, k // 32), 127, dtype=torch.uint8, device=weight.device
         )
         for m in variants:
-            batched_gemm_a8w8_mxscale_bpreshuffle(
+            gemm(
                 x[:m],
                 weight.view(groups, n, k),
                 xs[:m],
