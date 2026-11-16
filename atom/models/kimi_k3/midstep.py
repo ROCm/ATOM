@@ -5,10 +5,11 @@
 
 The part of the midstep path that needs no kernel: the switch, the
 `StateTransfer` the backend declares, the snapshot targets of one prefill step,
-and how a KDA layer writes them into their slots. The backend
-(`atom.model_ops.attentions.kimi_mla_gdn_attn`) and the KDA layer
-(`atom.models.kimi_k3.model`) call it; it imports no AITER, so the CPU test gate
-reaches it.
+and the writer's arguments for them. The backend
+(`atom.model_ops.attentions.kimi_mla_gdn_attn`) calls it and hands each KDA layer
+the step's `KdaSnapshots` through the GDN metadata; the layer
+(`atom.models.kimi_k3.model`) does not import it. It imports no AITER, so the CPU
+test gate reaches it.
 """
 
 from dataclasses import dataclass
@@ -50,9 +51,11 @@ def kda_midstep_transfer(layout_id: str, conv_kernel_dim: int) -> StateTransfer:
     """The PAGE transfer of a midstep-readable Kimi-K3 state, for `layout_id`.
 
     Every checkpoint position inside a prefill forward (rung, demand and anchor
-    alike) is snapshotted from the FlashKDA recurrence into a scratch slot and
-    stored from there, so the chunk is no longer cut onto them. Grid: the
-    recurrence's chunk; offset: the conv window this forward has to supply.
+    alike) is written into a scratch slot and stored from there, so the chunk is
+    no longer cut onto them: an interior position from the FlashKDA recurrence's
+    snapshot, one at the forward's end from the runtime slot (`KdaSnapshots`).
+    Grid: the recurrence's chunk; offset: the conv window this forward has to
+    supply.
     """
     return StateTransfer.copy(
         layout_id,

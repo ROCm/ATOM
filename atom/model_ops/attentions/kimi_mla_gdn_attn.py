@@ -775,11 +775,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             attn_metadata.gdn_metadata.kda_snapshots = self._kda_snapshots(batch)
 
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
-        """None: KDA writes its midstep checkpoints through `kda_snapshots`.
+        """Always None: no layer of this backend reads `ssm_checkpoints`.
 
-        `GDNStateMixin`'s targets are for the GDN chunk kernel's `h`, on its
-        64-token grid, which FlashKDA's 32-token positions can miss, and no
-        layer of this backend reads `ssm_checkpoints`.
+        KDA's midstep checkpoints go through `kda_snapshots` instead.
+        `GDNStateMixin`'s targets would sit on the GDN chunk kernel's 64-token
+        grid, which FlashKDA's 32-token positions can miss.
         """
         return None
 
