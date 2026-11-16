@@ -1018,11 +1018,15 @@ class SGLangGDNForwardContext:
         query_start_loc = getattr(fm, "query_start_loc", None)
         idx = getattr(fm, "mamba_cache_indices", None)
         live_slots = idx
+        # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value of
+        # query_start_loc[-1].
+        num_query_tokens = getattr(fm, "logical_num_tokens", None)
         if query_start_loc is None or idx is None:
             reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            num_query_tokens = None
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
         # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
@@ -1086,7 +1090,9 @@ class SGLangGDNForwardContext:
                 note_full_state_write(None if live_slots is None else live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
-            seq_sum = int(query_start_loc[-1].item())
+            if num_query_tokens is None:
+                num_query_tokens = query_start_loc[-1].item()
+            seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
