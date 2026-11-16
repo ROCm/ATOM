@@ -11,6 +11,7 @@ q-norm with XCC-local replicas, q_b + RoPE, kv-norm + window ring. Ported one ro
 each diffed bit-exact against the original by ``m2/x_replay.py``.
 """
 
+# ruff: noqa: SIM102  (nested traced / const_expr ifs are separate scf.if regions)
 import os
 
 import flydsl.compiler as flyc
@@ -26,6 +27,7 @@ from atom.models.deepseek_v41.mono.hi.kernels.gfx950.common import (
     EPS6,
     bf_hi,
     bf_lo,
+    bf_rne_hi,
     bf_round,
     pack_bf2,
 )
@@ -58,9 +60,20 @@ KARG_WORDS = 47  # 376 B of explicit kernarg as 47 i64
 XF = os.environ.get("TK_QKV_XF", "0") == "1"
 if XF:
     KARG_WORDS = 58
-RBASE = 0xC0000 if XF else 0  # the q latent's per-XCD replicas: xf_full keeps them at ws + 0xc0000
+# TK_QKV_MERGED=1 (with the xf_full argument layout): q_kv_merged<6, true, 0, 2, true, 8, true, 64, false, 3>,
+# the ratio-2 KV-source layers' QKV kernel with the compressor (grid 755)
+MERGED = XF and os.environ.get("TK_QKV_MERGED", "0") == "1"
+# the q latent for q_b / iq: per-XCD replicas at ws + XCC * 0x4000 (xf_full: + 0xc0000); merged: one copy at 0x38000
+RBASE = 0x38000 if MERGED else (0xC0000 if XF else 0)
+# the compressor: 2 (merged), or TK_QKV_COMP=1 with xf_full: q_kv_xf_full<6,1,8,1,3,64>, the ratio-1 KV-source
+# layer's QKV kernel (layer 20: wkv only, every position its own entry; grid 621)
+COMP = 2 if MERGED else (int(os.environ.get("TK_QKV_COMP", "0")) if XF else 0)
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
 GRID, THREADS = 487, 512
+if MERGED:
+    GRID = 755
+elif COMP == 1:
+    GRID = 621
 MIX, KSLICES = 24, 160
 # TileRT template idx: 16 (layers fed by mhc_kg: 64 sums of squares a K slice) or 0 (10 already reduced
 # sums a row at 0x1e000 + row * 128 B)
@@ -329,6 +342,24 @@ WAVE_SUMS_LDS = 0x11B60
 ROW_SHR = 0x110
 
 
+QKV_DBG = os.environ.get("TK_QKV_DBG", "0") == "1"  # bounded polls (debug builds only)
+POLL_LIMIT = 1 << 20
+
+
+def _more(cond, n):
+    """A poll loop's condition; the debug build also stops after POLL_LIMIT reloads."""
+    if const_expr(QKV_DBG):
+        return cond & (n < POLL_LIMIT)
+    return cond
+
+
+def _xcc_off():
+    """This XCD's q-latent replica offset (none in the merged kernel: one copy)."""
+    if const_expr(MERGED):
+        return Int32(0)
+    return (_xcc_id() << 14) & 0x1C000
+
+
 def _xcc_id():
     return Int32(
         llvm.InlineAsmOp(
@@ -373,7 +404,15 @@ def qkv_qnorm(tid, s16, epoch, ws, gamma, qr, lat, lat_s, lds):
         if tid < 160:
             word = (LL_QA + row * 0x1C00 + tid * 32) // 4
             v = _ll_packs4(ws, word)
-            while (v[1] != epoch) | (v[3] != epoch) | (v[5] != epoch) | (v[7] != epoch):
+            n_dbg = Int32(0)
+            while _more(
+                (v[1] != epoch) | (v[3] != epoch) | (v[5] != epoch) | (v[7] != epoch),
+                n_dbg,
+            ):
+                n_dbg = n_dbg + 1
+                if const_expr(QKV_DBG):
+                    if n_dbg == POLL_LIMIT:
+                        _st_i(ws, (0xD8000 + 3 * 0x400) // 4 + (tid & 255), Int32(3))
                 spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
                 rocdl.s_sleep(1)
                 v = _ll_packs4(ws, word)
@@ -429,10 +468,12 @@ def qkv_qnorm(tid, s16, epoch, ws, gamma, qr, lat, lat_s, lds):
             d0 = (q23 << 16) | (q01 & 0xFFFF)
             d1 = (q67 << 16) | (q45 & 0xFFFF)
             tag = (epoch & 0xFFFFFF) | (e << 24)
-            rep = (RBASE + ((_xcc_id() << 14) & 0x1C000) + row * 0xA00 + tid * 16) // 4
+            rep = (RBASE + _xcc_off() + row * 0xA00 + tid * 16) // 4
+            # merged: one copy read by every XCD -> sc1 (an XCD's own replica stays in its L2: plain)
             bo.buffer_store(
-                fx.Vector.from_elements([d0, tag, d1, tag], Int32), rsrc(ws), rep
-            )
+                fx.Vector.from_elements([d0, tag, d1, tag], Int32), rsrc(ws), rep,
+                cache_modifier=CM_DEV if const_expr(MERGED) else 0,
+            )  # fmt: skip
             if leader:
                 if lat != 0:
                     bo.buffer_store(
@@ -505,11 +546,16 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
         tw = (pos * 256 + pair * 4) // 4
         cs = _ld(ropec, tw, 2)
         sn = _ld(ropec, tw + 32, 2)
-        rep = (RBASE + ((_xcc_id() << 14) & 0x1C000)) // 4
+        rep = (RBASE + _xcc_off()) // 4
         idx = [tid, tid + 256, tid + 512, fx.min(tid | 0x300, Int32(0x3BF))]
         e24 = epoch & 0xFFFFFF
         ch = _q_chunks(ws, rep, idx)
-        while ~_tags_ok(ch, e24):
+        n_dbg = Int32(0)
+        while _more(~_tags_ok(ch, e24), n_dbg):
+            n_dbg = n_dbg + 1
+            if const_expr(QKV_DBG):
+                if n_dbg == POLL_LIMIT:
+                    _st_i(ws, (0xD8000 + 2 * 0x400) // 4 + (tid & 255), Int32(2))
             spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
             rocdl.s_sleep(2)
             ch = _q_chunks(ws, rep, idx)
@@ -591,9 +637,11 @@ def qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, prep_d8, lds):
             bo.buffer_store(fx.Vector.from_elements(vals, Int32), rsrc(q_out), word)
 
 
-
 # ---- the indexer's query prep (q_kv_xf_full: the layers whose indexer runs next) -----------------------------
-IX_SCALE_OFF, IX_WEIGHT_OFF = 0x4000, 0x4400  # ws_ix: [tok][128] e8m0 bytes (head*4 + group), [tok][32] f32 weights
+IX_SCALE_OFF, IX_WEIGHT_OFF = (
+    0x4000,
+    0x4400,
+)  # ws_ix: [tok][128] e8m0 bytes (head*4 + group), [tok][32] f32 weights
 IW_SUM_LDS = 20480  # wave w's six row sums at + w*24 + r*4
 IQ_X_LDS = 20480  # bf16 q latent x scale products [tok][1280], 0xa00 B a row
 IQ_RED_LDS = 35840  # K-half 1's MFMA results: row half rh at + rh*1024 + lane*16
@@ -604,7 +652,8 @@ IQ_AMAX_LDS = 37888  # [rh][tok] f32 amax at + rh*64 + tok*4
 def qkv_iw(tid, s16, xn, wproj, ix, lds):
     """Logical CTA 128 + h (h < 32): head h's indexer weight for the 6 tokens: Xn[r] . wproj[h] (bf16, 5120),
     a lane's fma chain over elements 8t..8t+7, 2048+8t.., (t < 128) 4096+8t.. in order, the wave's sum by
-    xor-32..1 butterflies, waves (0+1)+(2+3), bf16 RNE x 1/64 -> f32 at ws_ix + 0x4400 + (r*32 + h)*4."""
+    xor-32..1 butterflies, waves (0+1)+(2+3), bf16 RNE x 1/64 -> f32 at ws_ix + 0x4400 + (r*32 + h)*4.
+    """
     h = s16 - 128
     if tid < 256:
         lane, w = tid % 64, tid // 64
@@ -647,7 +696,10 @@ def qkv_iw(tid, s16, xn, wproj, ix, lds):
                 _lds_st(lds, IW_SUM_LDS + w * 24 + r * 4, [v.bitcast(Int32)])
         gpu.barrier()
         if tid < 6:
-            p = [_lds_ld(lds, IW_SUM_LDS + q * 24 + tid * 4, 1).bitcast(F32) for q in range(4)]
+            p = [
+                _lds_ld(lds, IW_SUM_LDS + q * 24 + tid * 4, 1).bitcast(F32)
+                for q in range(4)
+            ]
             t = (p[0] + p[1]) + (p[2] + p[3])
             _stf(ix, IX_WEIGHT_OFF // 4 + tid * 32 + h, bf_round(t) * _c(0x3C800000))
 
@@ -692,11 +744,23 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
         wsb = []
         for k in range_constexpr(4):
             cc = idx[k] % 160
-            wsb.append(Int32(bo.buffer_load(rsrc(wq_s), t * 40 + (cc >> 2), vec_width=1, dtype=T.i8)).to(Int32) & 0xFF)
-        rep = (RBASE + ((_xcc_id() << 14) & 0x1C000)) // 4
+            wsb.append(
+                Int32(
+                    bo.buffer_load(
+                        rsrc(wq_s), t * 40 + (cc >> 2), vec_width=1, dtype=T.i8
+                    )
+                ).to(Int32)
+                & 0xFF
+            )
+        rep = (RBASE + _xcc_off()) // 4
         e24 = epoch & 0xFFFFFF
         ch = _q_chunks(ws, rep, idx)
-        while ~_tags_ok(ch, e24):
+        n_dbg = Int32(0)
+        while _more(~_tags_ok(ch, e24), n_dbg):
+            n_dbg = n_dbg + 1
+            if const_expr(QKV_DBG):
+                if n_dbg == POLL_LIMIT:
+                    _st_i(ws, (0xD8000 + 1 * 0x400) // 4 + (tid & 255), Int32(1))
             spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
             rocdl.s_sleep(2)
             ch = _q_chunks(ws, rep, idx)
@@ -706,7 +770,9 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
             if live:
                 r_, cc = c // 160, c % 160
                 ssum = ((ch[k][1] >> 24) & 0xFF) + wsb[k]
-                sc = ((ssum << 23) + Int32(-1065353216)).bitcast(F32)  # + 0xc0800000 (-4.0): 2^(sum-254)
+                sc = ((ssum << 23) + Int32(-1065353216)).bitcast(
+                    F32
+                )  # + 0xc0800000 (-4.0): 2^(sum-254)
                 b = fp8x8_bf16_pk([ch[k][0], ch[k][2]]).bitcast(Int32)
                 outw = []
                 for q in range_constexpr(4):
@@ -718,16 +784,21 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
         if tid == 0:
             _st_i(ws, EPOCHS // 4 + QB_PREP_SLOT + t, epoch)
         xb = IQ_X_LDS + fx.min(h16, Int32(5)) * 0xA00 + kh * 0x500 + g * 32
-        zero4 = fx.Vector.filled(4, 0, Int32)
         acc = fx.Vector.filled(4, 0.0, F32)
         for i in range_constexpr(10):
             for j in range_constexpr(2):
                 a = fp8x8_bf16_pk([wv[i][2 * j], wv[i][2 * j + 1]])
                 bx = _lds_ld(lds, xb + 128 * i + 16 * j, 4)
-                bx = fx.Vector.from_elements([tok_ok.select(bx[q], Int32(0)) for q in range(4)], Int32)
+                bx = fx.Vector.from_elements(
+                    [tok_ok.select(bx[q], Int32(0)) for q in range(4)], Int32
+                )
                 acc = mfma_bf16(a, bx.bitcast(fx.BFloat16), acc)
         if kh == 1:
-            _lds_st(lds, IQ_RED_LDS + rh * 1024 + lane * 16, [acc[q].bitcast(Int32) for q in range(4)])
+            _lds_st(
+                lds,
+                IQ_RED_LDS + rh * 1024 + lane * 16,
+                [acc[q].bitcast(Int32) for q in range(4)],
+            )
         gpu.barrier()
         y = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
         if kh == 0:
@@ -741,7 +812,9 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
             y2 = rope.select(bf_round(fmath.fma(c1, x[2], -(s1 * x[3]))), x[2])
             y3 = rope.select(bf_round(fmath.fma(c1, x[3], s1 * x[2])), x[3])
             y = [y0, y1, y2, y3]
-            m = fx.max(fx.max(fx.max(abs(y0), F32(0.0)), abs(y1)), fx.max(abs(y2), abs(y3)))
+            m = fx.max(
+                fx.max(fx.max(abs(y0), F32(0.0)), abs(y1)), fx.max(abs(y2), abs(y3))
+            )
             m = fx.max(m, _bperm(m, lane ^ 16))
             m = fx.max(m, _bperm(m, lane ^ 32))
             if g == 0:
@@ -753,8 +826,14 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
             amax = fx.max(fx.max(a0, a1), _c(0x01C00000))
             qb = (amax * _c(0x3E2AAAAB)).bitcast(Int32)
             v4 = qb + 0x7FFFFF
-            inv = (qb < 0x7E800001).select(Int32(0x7F000000) - (v4 & Int32(-8388608)), Int32(0x400000)).bitcast(F32)
-            nib = [_e2m1(fx.min(fx.max(y[q] * inv, F32(-6.0)), F32(6.0))) for q in range(4)]
+            inv = (
+                (qb < 0x7E800001)
+                .select(Int32(0x7F000000) - (v4 & Int32(-8388608)), Int32(0x400000))
+                .bitcast(F32)
+            )
+            nib = [
+                _e2m1(fx.min(fx.max(y[q] * inv, F32(-6.0)), F32(6.0))) for q in range(4)
+            ]
             word = nib[0] | (nib[1] << 4) | (nib[2] << 8) | (nib[3] << 12)
             head = t >> 2
             byte = tok * 2048 + head * 64 + (t % 4) * 16 + rh * 8 + g * 2
@@ -764,6 +843,341 @@ def qkv_iq(tid, s16, ws, wq, wq_s, ropec, rope_n, vpos, ix, lds):
                     ((v4 >> 23) & 0xFF).to(fx.Int8), rsrc(ix), IX_SCALE_OFF + tok * 128 + head * 4 + t % 4,
                     offset_is_bytes=True,
                 )  # fmt: skip
+
+
+# ---- the KV compressor (q_kv_merged: ratio 2; xf_full<..,1,3,64>: ratio 1) -----------------------------------
+COMP_LL = 0x80000  # ws_qkv: GEMV partials {f32, epoch} [K quarter 4][token 6][rows], rows * 8 B a (q, token)
+COMP_ROWS = 512 if COMP == 1 else 1024  # wkv (ratio 1) or [wkv; wgate]
+COMP_PACK = COMP_ROWS * 8
+# epoch slots: GEMV CTA t, finalize row r (and fin + 6.. by row 0)
+COMP_GEMV_SLOT, COMP_FIN_SLOT = (880, 1008) if COMP == 1 else (616, 872)
+COMP_RED_LDS = 0  # waves 1..7: [w-1][4][64] f32
+COMP_SUM_LDS = WAVE_SUMS_LDS  # the finalize's four wave sums of squares
+
+
+@traced
+def qkv_comp_gemv(tid, t, ws, c_w, xn, lds):
+    """Compressor CTA t (0..255; ratio 1: 0..127): rows 16(t>>2).. of [wkv; wgate] (1024 x 5120; ratio 1: wkv,
+    512 rows; bf16, MFMA-tile packed) over K quarter t&3, the 6 tokens of Xn: wave w chains 5 bf16 MFMAs (K steps
+    w*5..), waves summed 0 + 1 + .. + 7; LL {f32, epoch} to ws_qkv + 0x80000."""
+    lane, w = tid % 64, tid // 64
+    rb, kq = t >> 2, t & 3
+    g, h16 = lane >> 4, lane & 15
+    epoch = _ld(ws, EPOCHS // 4 + COMP_GEMV_SLOT + t) + 1
+    tok_ok = h16 < 6
+    tok = tok_ok.select(h16, Int32(0))
+    z4 = fx.Vector.filled(4, 0, Int32)
+    xb = [z4, z4, z4, z4, z4]
+    if tok_ok:
+        for i in range_constexpr(5):
+            xb[i] = _ld(
+                xn, (tok * 10240 + (kq * 40 + w * 5) * 64 + i * 64 + g * 16) // 4, 4
+            )
+    wt = [
+        _ld(c_w, (((rb * 160 + kq * 40 + w * 5 + i) << 10) + lane * 16) // 4, 4) for i in range(5)
+    ]  # fmt: skip
+    acc = fx.Vector.filled(4, 0.0, F32)
+    for i in range_constexpr(5):
+        acc = mfma_bf16(wt[i].bitcast(fx.BFloat16), xb[i].bitcast(fx.BFloat16), acc)
+    if w != 0:
+        for e in range_constexpr(4):
+            _lds_st(
+                lds,
+                COMP_RED_LDS + (w - 1) * 1024 + e * 256 + lane * 4,
+                [acc[e].bitcast(Int32)],
+            )
+    gpu.barrier()
+    if w == 0:
+        if lane == 0:
+            _st_i(ws, EPOCHS // 4 + COMP_GEMV_SLOT + t, epoch)
+        if tok_ok:
+            r = [acc[e] for e in range(4)]
+            for src in range_constexpr(1, 8):
+                r = [
+                    r[e]
+                    + _lds_ld(
+                        lds, COMP_RED_LDS + (src - 1) * 1024 + e * 256 + lane * 4, 1
+                    ).bitcast(F32)
+                    for e in range(4)
+                ]
+            at = (COMP_LL + (kq * 6 + tok) * COMP_PACK + rb * 128 + g * 32) // 4
+            bo.buffer_store(fx.Vector.from_elements([r[0].bitcast(Int32), epoch, r[1].bitcast(Int32), epoch], Int32),
+                            rsrc(ws), at, cache_modifier=CM_DEV)  # fmt: skip
+            bo.buffer_store(fx.Vector.from_elements([r[2].bitcast(Int32), epoch, r[3].bitcast(Int32), epoch], Int32),
+                            rsrc(ws), at + 4, cache_modifier=CM_DEV)  # fmt: skip
+
+
+def _comp_parts(ws, row, tid):
+    """Token row's 4 quarters x (kv c, kv c+256, score c, score c+256) {f32, tag} words (c = tid; ratio 1: kv
+    only)."""
+    out = []
+    for q in range(4):
+        b = (COMP_LL + (q * 6 + row) * COMP_PACK + tid * 8) // 4
+        out += [_ld_sc1(ws, b + o, 2) for o in (0, 512, 1024, 1536)[: COMP_ROWS // 256]]
+    return out
+
+
+def _comp_sums(p):
+    """(((0 + q0) + q1) + q2) + q3 of each value."""
+    n = len(p) // 4
+    return [(((F32(0.0) + p[k][0].bitcast(F32)) + p[n + k][0].bitcast(F32)) + p[2 * n + k][0].bitcast(F32))
+            + p[3 * n + k][0].bitcast(F32) for k in range(n)]  # fmt: skip
+
+
+def _comp_ok(p, epoch):
+    ok = p[0][1] == epoch
+    for k in range(1, len(p)):
+        ok = ok & (p[k][1] == epoch)
+    return ok
+
+
+def _e4m3_val(s8):
+    """The E4M3 byte's value (TileRT's decode: normal (e << 23 | m << 20) + 0x3c000000, subnormal m 2^-9)."""
+    e = (s8 >> 3) & 15
+    m = s8 & 7
+    nrm = (((e << 23) | (m << 20)) + 0x3C000000).bitcast(F32)
+    sub = Int32(m).to(F32) * _c(0x3B000000)
+    f = (e != 0).select(nrm, sub)
+    return ((s8 & 0x80) != 0).select(-f, f)
+
+
+@traced
+def _comp_fp4(yv, lane, tid, ch, entry, store, kv0, kv1):
+    """FP4 QAT of channel ch's value (group 16: E4M3 scale e4m3(max(amax, 6/512) / 6)) -> main_kv.0 / .1."""
+    a = abs(yv)
+    m = fx.max(a, _bperm(a, lane ^ 8))
+    m = fx.max(m, _bperm(m, lane ^ 4))
+    m = fx.max(m, _bperm(m, lane ^ 2))
+    m = fx.max(fx.max(m, _bperm(m, lane ^ 1)), _c(0x3C400000))
+    s8 = Int32(_fp8x2_scaled(m / F32(6.0), F32(0.0), F32(1.0))) & 0xFF
+    q = yv / _e4m3_val(s8)
+    nib = _e2m1(q)
+    other = Int32(_bperm(nib.bitcast(F32), lane ^ 1).bitcast(Int32))
+    if store & ((tid & 1) == 0):
+        bo.buffer_store(
+            (nib | (other << 4)).to(fx.Int8),
+            rsrc(kv0),
+            entry * 256 + (ch >> 1),
+            offset_is_bytes=True,
+        )
+    if store & ((tid & 15) == 0):
+        bo.buffer_store(
+            s8.to(fx.Int8), rsrc(kv1), entry * 32 + (ch >> 4), offset_is_bytes=True
+        )
+
+
+@traced
+def qkv_comp_fin(
+    tid, r, ws, cnorm, state, kv0, kv1, maxent, latent, lat_idx, ropec, vpos, lds
+):
+    """Compressor finalize, token row r (ratio 2): the quarters summed; the row's (kv, score) into its state
+    slot P & 15; an odd P pools with position P - 1 (the previous row of the step when it is that position,
+    polled again, else its state slot): per channel softmax of the two scores (OCML exp, IEEE divides),
+    kv_prev w_prev + kv w (fma), bf16; RMSNorm (eps 1e-20) x c_norm -> the latent (bf16, pre-RoPE) and its
+    entry P >> 1; GPT-J RoPE (mul, mul, sub / add) on channels 448..511 at P - 1; FP4 with E4M3 group-16
+    scales -> main_kv.0[entry] (256 B) / main_kv.1[entry] (32 B)."""
+    if tid < 256:
+        lane, w = tid % 64, tid // 64
+        P = _ld(vpos, r)
+        pprev = (r > 0).select(_ld(vpos, fx.max(r - 1, Int32(0))), Int32(-2))
+        epoch = _ld(ws, EPOCHS // 4 + COMP_FIN_SLOT + r) + 1
+        cn0 = _ldf(cnorm, tid)
+        cn1 = _ldf(cnorm, tid + 256)
+        live = P >= 0
+        z2 = fx.Vector.filled(2, 0, Int32)
+        p = [z2 for _ in range(16)]
+        if live:
+            p = _comp_parts(ws, r, tid)
+            n_dbg = Int32(0)
+            while _more(~_comp_ok(p, epoch), n_dbg):
+                n_dbg = n_dbg + 1
+                if const_expr(QKV_DBG):
+                    if n_dbg == POLL_LIMIT:
+                        _st_i(ws, (0xD8000 + 5 * 0x400) // 4 + (tid & 255), Int32(5))
+                spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
+                rocdl.s_sleep(2)
+                p = _comp_parts(ws, r, tid)
+        cur = _comp_sums(p)
+        gpu.barrier()
+        if tid == 0:
+            _st_i(ws, EPOCHS // 4 + COMP_FIN_SLOT + r, epoch)
+        if (r == 0) & (tid < 2):
+            _st_i(ws, EPOCHS // 4 + COMP_FIN_SLOT + 6 + tid, epoch)
+        odd = live & ((P & 1) == 1)
+        lat0 = F32(0.0)
+        lat1 = F32(0.0)
+        if live:
+            sw = (P & 15) * 1024 + tid
+            for k in range_constexpr(4):
+                _stf(state, sw + k * 256, cur[k])
+        if odd:
+            inrow = pprev == P - 1
+            prv = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
+            if inrow:
+                pp = _comp_parts(ws, fx.max(r - 1, Int32(0)), tid)
+                n_dbg = Int32(0)
+                while _more(~_comp_ok(pp, epoch), n_dbg):
+                    n_dbg = n_dbg + 1
+                    if const_expr(QKV_DBG):
+                        if n_dbg == POLL_LIMIT:
+                            _st_i(
+                                ws, (0xD8000 + 6 * 0x400) // 4 + (tid & 255), Int32(6)
+                            )
+                    spin_pause()
+                    rocdl.s_sleep(2)
+                    pp = _comp_parts(ws, fx.max(r - 1, Int32(0)), tid)
+                prv = _comp_sums(pp)
+            else:
+                sp = ((P - 1) & 15) * 1024 + tid
+                prv = [_ldf(state, sp + k * 256) for k in range(4)]
+            lat = []
+            for k in range_constexpr(2):
+                sprev, scur = prv[2 + k], cur[2 + k]
+                mx = fx.max(sprev, scur)
+                ep = _exp_ocml(sprev - mx, False)
+                ec = _exp_ocml(scur - mx, False)
+                sm = ep + ec
+                wp = ep / sm
+                wc = ec / sm
+                lat.append(bf_round(fmath.fma(prv[k], wp, cur[k] * wc)))
+            lat0, lat1 = lat[0], lat[1]
+        if live & ~odd:
+            if tid == 0:
+                _st_i(lat_idx, r, Int32(-1))
+        if ~live:
+            if tid == 0:
+                _st_i(lat_idx, r, Int32(-1))
+        if odd:
+            v = lat0 * lat0 + lat1 * lat1
+            # every lane takes all six steps: a bpermute under a lane-0 branch reads lanes whose earlier
+            # steps the compiler then sinks into that branch (lane 0 saw a stale partner: ~3/4 of the sum)
+            for k in (32, 16, 8, 4, 2, 1):
+                v = v + _bperm(v, lane ^ k)
+            if lane == 0:
+                _lds_st(lds, COMP_SUM_LDS + w * 4, [v.bitcast(Int32)])
+        gpu.barrier()
+        if odd:
+            entry = P >> 1
+            if tid == 0:
+                _st_i(lat_idx, r, entry)
+            w4 = _lds_ld(lds, COMP_SUM_LDS, 4)
+            tot = (
+                ((F32(0.0) + w4[0].bitcast(F32)) + w4[1].bitcast(F32))
+                + w4[2].bitcast(F32)
+            ) + w4[3].bitcast(F32)
+            ms = fmath.fma(tot, _c(0x3B000000), _c(0x1E3CE508))
+            rstd = F32(1.0) / fmath.sqrt(ms)
+            y0 = bf_round((lat0 * rstd) * cn0)
+            y1 = bf_round((lat1 * rstd) * cn1)
+            bo.buffer_store(
+                (bf_rne_hi(y0) >> 16).to(fx.Int16),
+                rsrc(latent),
+                r * 1024 + tid * 2,
+                offset_is_bytes=True,
+            )
+            bo.buffer_store((bf_rne_hi(y1) >> 16).to(fx.Int16), rsrc(latent), r * 1024 + 512 + tid * 2,
+                            offset_is_bytes=True)  # fmt: skip
+            prow = (entry > -1).select(P & -2, Int32(0))
+            pair = (tid >= 192).select((tid - 192) >> 1, Int32(0))
+            cs = _ldf(ropec, prow * 64 + pair)
+            sn = _ldf(ropec, prow * 64 + 32 + pair)
+            oth = _bperm(y1, lane ^ 1)
+            even = (tid & 1) == 0
+            ye = even.select(y1, oth)
+            yo = even.select(oth, y1)
+            rot = even.select(cs * ye - sn * yo, sn * ye + cs * yo)
+            y1r = (tid >= 192).select(bf_round(rot), y1)
+            store = entry < Int32(maxent)
+            _comp_fp4(y0, lane, tid, tid, entry, store, kv0, kv1)
+            _comp_fp4(y1r, lane, tid, tid + 256, entry, store, kv0, kv1)
+
+
+@traced
+def qkv_comp_fin1(
+    tid, r, ws, cnorm, kv0, kv1, maxent, latent, lat_idx, ropec, vpos, lds
+):
+    """Compressor finalize, token row r (ratio 1: every position P its own entry P): the quarters summed, bf16;
+    RMSNorm (eps 1e-20) x c_norm -> the latent (bf16, pre-RoPE), latent_idx = P; GPT-J RoPE on channels 448..511
+    at P; FP4 with E4M3 group-16 scales -> main_kv.0[P] (256 B) / main_kv.1[P] (32 B). A dead row (P < 0):
+    latent_idx -1."""
+    if tid < 256:
+        lane, w = tid % 64, tid // 64
+        P = _ld(vpos, r)
+        epoch = _ld(ws, EPOCHS // 4 + COMP_FIN_SLOT + r) + 1
+        cn0 = _ldf(cnorm, tid)
+        cn1 = _ldf(cnorm, tid + 256)
+        live = P >= 0
+        z2 = fx.Vector.filled(2, 0, Int32)
+        p = [z2 for _ in range(8)]
+        if live:
+            p = _comp_parts(ws, r, tid)
+            n_dbg = Int32(0)
+            while _more(~_comp_ok(p, epoch), n_dbg):
+                n_dbg = n_dbg + 1
+                if const_expr(QKV_DBG):
+                    if n_dbg == POLL_LIMIT:
+                        _st_i(ws, (0xD8000 + 5 * 0x400) // 4 + (tid & 255), Int32(5))
+                spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
+                rocdl.s_sleep(2)
+                p = _comp_parts(ws, r, tid)
+        cur = _comp_sums(p)
+        prow = live.select(P, Int32(0))
+        pair = (tid >= 192).select((tid - 192) >> 1, Int32(0))
+        cs = _ldf(ropec, prow * 64 + pair)
+        sn = _ldf(ropec, prow * 64 + 32 + pair)
+        gpu.barrier()
+        if tid == 0:
+            _st_i(ws, EPOCHS // 4 + COMP_FIN_SLOT + r, epoch)
+        if (r == 0) & (tid < 2):
+            _st_i(ws, EPOCHS // 4 + COMP_FIN_SLOT + 6 + tid, epoch)
+        if ~live:
+            if tid == 0:
+                _st_i(lat_idx, r, Int32(-1))
+        lat0 = bf_round(cur[0])
+        lat1 = bf_round(cur[1])
+        if live:
+            v = fmath.fma(lat1, lat1, lat0 * lat0)
+            for k in (
+                32,
+                16,
+                8,
+                4,
+                2,
+                1,
+            ):  # every lane takes all six steps (see qkv_comp_fin)
+                v = v + _bperm(v, lane ^ k)
+            if lane == 0:
+                _lds_st(lds, COMP_SUM_LDS + w * 4, [v.bitcast(Int32)])
+        gpu.barrier()
+        if live:
+            if tid == 0:
+                _st_i(lat_idx, r, P)
+            w4 = _lds_ld(lds, COMP_SUM_LDS, 4)
+            tot = (
+                ((F32(0.0) + w4[0].bitcast(F32)) + w4[1].bitcast(F32))
+                + w4[2].bitcast(F32)
+            ) + w4[3].bitcast(F32)
+            ms = fmath.fma(tot, _c(0x3B000000), _c(0x1E3CE508))
+            rstd = F32(1.0) / fmath.sqrt(ms)
+            y0 = bf_round((lat0 * rstd) * cn0)
+            y1 = bf_round((lat1 * rstd) * cn1)
+            bo.buffer_store(
+                (bf_rne_hi(y0) >> 16).to(fx.Int16),
+                rsrc(latent),
+                r * 1024 + tid * 2,
+                offset_is_bytes=True,
+            )
+            bo.buffer_store((bf_rne_hi(y1) >> 16).to(fx.Int16), rsrc(latent), r * 1024 + 512 + tid * 2,
+                            offset_is_bytes=True)  # fmt: skip
+            oth = _bperm(y1, lane ^ 1)
+            even = (tid & 1) == 0
+            ye = even.select(y1, oth)
+            yo = even.select(oth, y1)
+            rot = even.select(cs * ye - sn * yo, sn * ye + cs * yo)
+            y1r = (tid >= 192).select(bf_round(rot), y1)
+            store = P < Int32(maxent)
+            _comp_fp4(y0, lane, tid, tid, P, store, kv0, kv1)
+            _comp_fp4(y1r, lane, tid, tid + 256, P, store, kv0, kv1)
 
 
 def _pick_byte(words, b):
@@ -847,7 +1261,12 @@ def qkv_kvnorm(tid, s16, ws, vpos, kv_gamma, ropec, win_kv, win_s, alt_kv, alt_s
             pw = (LL_QA + row * 0x1C00 + KV_LL + (tid // 2) * 8) // 4
             pa = _ld_sc1(ws, pw, 2)
             pb = _ld_sc1(ws, pw + 256, 2)
-            while (pa[1] != epoch) | (pb[1] != epoch):
+            n_dbg = Int32(0)
+            while _more((pa[1] != epoch) | (pb[1] != epoch), n_dbg):
+                n_dbg = n_dbg + 1
+                if const_expr(QKV_DBG):
+                    if n_dbg == POLL_LIMIT:
+                        _st_i(ws, (0xD8000 + 4 * 0x400) // 4 + (tid & 255), Int32(4))
                 spin_pause()  # s_sleep is IntrNoMem: alone it lets LLVM hoist the reload
                 rocdl.s_sleep(1)
                 pa = _ld_sc1(ws, pw, 2)
@@ -1044,7 +1463,16 @@ def _fin_entry(tid, cta, a06, a07, a08, a09, a10, a11):
 def build_xf():
     """q_kv_xf_full<6, true, 8, 0, 3, 0> (TK_QKV_XF=1, TK_QKV_IDX=0): its 58 argument words."""
     assert XF
-    name = kernel_symbol("tk_q_kv_xf_full", rows=6, full=1, kv=8, idx=IDX, v=1)
+    extra = {"comp": COMP} if COMP == 1 else {}
+    name = kernel_symbol(
+        "tk_q_kv_merged" if MERGED else "tk_q_kv_xf_full",
+        rows=6,
+        full=1,
+        kv=8,
+        idx=IDX,
+        **extra,
+        v=1,
+    )
 
     @fx.struct
     class Smem:
@@ -1062,9 +1490,20 @@ def build_xf():
         a56: Int64, a57: Int64,
     ):  # fmt: skip
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
-        _xf_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06,
-                  a08, a09, a10, a11, a12, a16, a20, a21, a22, a25, a28, a30, a32,
-                  a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56)  # fmt: skip
+        if const_expr(COMP == 1):
+            _xf1_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06,
+                       a08, a09, a10, a11, a12, a16, a20, a21, a22, a25, a28, a30, a32,
+                       a33, a34, a35, a37, a38, a39, a40, a41,
+                       a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56)  # fmt: skip
+        elif const_expr(MERGED):
+            _merged_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06,
+                          a08, a09, a10, a11, a12, a16, a20, a21, a22, a25, a28, a30,
+                          a33, a34, a35, a36, a37, a38, a39, a40, a41,
+                          a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56)  # fmt: skip
+        else:
+            _xf_entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06,
+                      a08, a09, a10, a11, a12, a16, a20, a21, a22, a25, a28, a30, a32,
+                      a42, a43, a44, a45, a46, a47, a48, a49, a50, a51, a52, a53, a54, a55, a56)  # fmt: skip
 
     @launcher(name)
     def launch(
@@ -1096,7 +1535,8 @@ def _xf_entry(
 ):  # fmt: skip
     """q_kv_xf_full's roles: CTA 0 the mHC finalize when the row count (0x60) is >= 1 (the rest then logical
     CTA wgid - 1); GEMV 0..223, then q-norm on [base, base + 48) (base = int@0x100 rounded up to 8) and the
-    indexer prep on 0..159 (iq 0..127, iw 128..159); q_b + RoPE 224..479; kv-norm + window 480..485."""
+    indexer prep on 0..159 (iq 0..127, iw 128..159); q_b + RoPE 224..479; kv-norm + window 480..485.
+    """
     flag = Int32(nrows) >= 1
     if flag & (cta == 0):
         mhc_finalize(tid, mws, mscale, mbase, hca, Int32(nrows))
@@ -1114,6 +1554,103 @@ def _xf_entry(
         qkv_qb(tid, s16, ws, qb_w, qb_s, ropec, vpos, q_out, ix, lds)
     if (s16 >= 480) & (s16 < 486):
         qkv_kvnorm(tid, s16, ws, vpos, kv_g, ropec, win_kv, win_s, alt_kv, alt_s, lds)
+
+
+@traced
+def _xf1_entry(
+    tid, cta, lds, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, mws, mscale, mbase, hca, nrows, xn, iwq, iwq_s, iwp,
+    ropec_i, ix, rope_n, qn_base, cx, c_w, c_norm, kv0, kv1, maxent, latent, lat_idx, ws, qn_g, qb_w, qb_s, kv_g,
+    ropec, vpos, qr, q_out, win_kv, win_s, alt_kv, alt_s, lat, lat_s,
+):  # fmt: skip
+    """q_kv_xf_full<6,1,8,1,3,64>'s roles: xf_full's (GEMV 0..223 with q-norm and the indexer prep) plus the
+    ratio-1 compressor GEMV 224..351; q_b + RoPE 352..607; kv-norm + window 608..613; compressor finalize
+    614..619."""
+    flag = Int32(nrows) >= 1
+    if flag & (cta == 0):
+        mhc_finalize(tid, mws, mscale, mbase, hca, Int32(nrows))
+    s16 = flag.select(cta - 1, cta)
+    qn0 = (Int32(qn_base) + 7) & -8
+    if (s16 >= 0) & (s16 < 224) & ((cta != 0) | (~flag)):
+        epoch = qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, lds)
+        if (s16 >= qn0) & (s16 < qn0 + 48):
+            qkv_qnorm(tid, s16 - qn0, epoch, ws, qn_g, qr, lat, lat_s, lds)
+        if s16 < 128:
+            qkv_iq(tid, s16, ws, iwq, iwq_s, ropec_i, rope_n, vpos, ix, lds)
+        if (s16 >= 128) & (s16 < 160):
+            qkv_iw(tid, s16, xn, iwp, ix, lds)
+    if (s16 >= 224) & (s16 < 352):
+        qkv_comp_gemv(tid, s16 - 224, ws, c_w, cx, lds)
+    if (s16 >= 352) & (s16 < 608):
+        qkv_qb(tid, s16 - 128, ws, qb_w, qb_s, ropec, vpos, q_out, ix, lds)
+    if (s16 >= 608) & (s16 < 614):
+        qkv_kvnorm(
+            tid, s16 - 128, ws, vpos, kv_g, ropec, win_kv, win_s, alt_kv, alt_s, lds
+        )
+    if (s16 >= 614) & (s16 < 620):
+        qkv_comp_fin1(
+            tid,
+            s16 - 614,
+            ws,
+            c_norm,
+            kv0,
+            kv1,
+            maxent,
+            latent,
+            lat_idx,
+            ropec,
+            vpos,
+            lds,
+        )
+
+
+@traced
+def _merged_entry(
+    tid, cta, lds, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, mws, mscale, mbase, hca, nrows, xn, iwq, iwq_s, iwp,
+    ropec_i, ix, rope_n, cx, c_w, c_norm, state, kv0, kv1, maxent, latent, lat_idx, ws, qn_g, qb_w, qb_s, kv_g,
+    ropec, vpos, qr, q_out, win_kv, win_s, alt_kv, alt_s, lat, lat_s,
+):  # fmt: skip
+    """q_kv_merged's roles: CTA 0 the mHC finalize (row count >= 1, the rest logical wgid - 1); GEMV 0..223
+    (then the indexer prep: iq 0..127, iw 128..159); compressor GEMV 224..479; q-norm 480..485 (a CTA a row,
+    one latent copy at 0x38000); q_b + RoPE 486..741; kv-norm + window 742..747; compressor finalize 748..753.
+    """
+    flag = Int32(nrows) >= 1
+    if flag & (cta == 0):
+        mhc_finalize(tid, mws, mscale, mbase, hca, Int32(nrows))
+    s16 = flag.select(cta - 1, cta)
+    if (s16 >= 0) & (s16 < 224) & ((cta != 0) | (~flag)):
+        qkv_gemv(tid, s16, xq, xs, qa_w, qa_s, kv_w, kv_s, ws0, lds)
+        if s16 < 128:
+            qkv_iq(tid, s16, ws, iwq, iwq_s, ropec_i, rope_n, vpos, ix, lds)
+        if (s16 >= 128) & (s16 < 160):
+            qkv_iw(tid, s16, xn, iwp, ix, lds)
+    if (s16 >= 224) & (s16 < 480):
+        qkv_comp_gemv(tid, s16 - 224, ws, c_w, cx, lds)
+    if (s16 >= 480) & (s16 < 486):
+        row = s16 - 480
+        epoch = _ld(ws, EPOCHS // 4 + 1016 + row) + 1
+        qkv_qnorm(tid, row * 8, epoch, ws, qn_g, qr, lat, lat_s, lds)
+    if (s16 >= 486) & (s16 < 742):
+        qkv_qb(tid, s16 - 262, ws, qb_w, qb_s, ropec, vpos, q_out, ix, lds)
+    if (s16 >= 742) & (s16 < 748):
+        qkv_kvnorm(
+            tid, s16 - 262, ws, vpos, kv_g, ropec, win_kv, win_s, alt_kv, alt_s, lds
+        )
+    if (s16 >= 748) & (s16 < 754):
+        qkv_comp_fin(
+            tid,
+            s16 - 748,
+            ws,
+            c_norm,
+            state,
+            kv0,
+            kv1,
+            maxent,
+            latent,
+            lat_idx,
+            ropec,
+            vpos,
+            lds,
+        )
 
 
 build = build_finalize_test
