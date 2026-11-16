@@ -108,7 +108,7 @@ LDS_BYTES_ENG = 120480
 ENG_LDS = (
     0x18E20  # the engram GEMV's [half 2][wave 8][lane 64] f32x4 partials, 8 KiB a half
 )
-VERSION = "v31"
+VERSION = "v40"
 
 # byte offsets from ``slots`` (ws + C(M))
 FLAG_OFF = 0x100600  # CTA71's "new keys written" flag (dword = epoch)
@@ -764,13 +764,32 @@ def _top512(tid, lds, keys, ids, lane, wv, k=TOPK, out_lds=SEL_OUT, ne=None):
 
 
 @traced
+def _fs_block(src, n_items, forced, i):
+    """sel_fullscan: items i .. i + 15 (16-aligned) as sortable keys (0 past n_items; ``forced`` -> 0xff800000),
+    four 16-byte loads issued together (sc1; past the end out of the buffer bound, not loaded)."""
+    ks = []
+    for q in range_constexpr(4):
+        v4 = _ld_live(src, 0x40000000, i + 4 * q, 4, i + 4 * q < n_items)
+        for u in range_constexpr(4):
+            ii = i + 4 * q + u
+            kv = (ii == forced).select(Int32(-8388608), _sortable(v4[u]))
+            ks.append((ii < n_items).select(kv, Int32(0)))
+    return ks
+
+
+@traced
 def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
     """The merge's fallback (TileRT's slow path when a chunk overflowed, total < kk or total > 8192; semantic
     port, the slow path's workspace spills are not reproduced): the exact top kk of all n_items items
     (key = sortable(src[i]) (sc1), item ``forced`` -> 0xff800000), ties to the smaller index, written in
-    index order to out_lds. Thread t scans items [t per, (t + 1) per). -> the count."""
+    index order to out_lds. Thread t scans items [t per, (t + 1) per), per a multiple of 16, in blocks of 16
+    (four 16-byte loads in flight; the old one-item loop waited on every load). Each radix pass counts the
+    keys equal to the thread's pivot digit (its first key's) in a register, one LDS atomic for them, atomics
+    only for the others (the path runs on heavily tied keys, where one bin takes nearly all). In-step this
+    runs about once a step on some ranks and sits on the step's critical path: TileRT ~400 us there, the old
+    loop ~600 us, this one ~180 us (n0, forced, standalone). -> the count."""
     lane, wv = tid & 63, tid >> 6
-    per = (n_items + 1023) >> 10
+    per = (((n_items + 1023) >> 10) + 15) & -16
     i0 = fx.min(tid * per, n_items)
     i1 = fx.min(i0 + per, n_items)
     pre = Int32(0)
@@ -784,16 +803,23 @@ def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
         if tid < 256:
             _lds_st(lds, SEL_HIST + tid * 4, [Int32(0)])
         gpu.barrier()
+        piv = Int32(-1)
+        pc = Int32(0)
         i = i0
         while i < i1:
-            kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
-            if (kv != 0) & ((kv & msk) == pre):
-                fx.llvm.atomic_add(
-                    lds + (SEL_HIST // 4 + ((kv >> sh) & 255)),
-                    Int32(1),
-                    syncscope="workgroup",
-                )
-            i = i + 1
+            ks = _fs_block(src, n_items, forced, i)
+            if i == i0:
+                piv = (ks[0] >> sh) & 255
+            for u in range_constexpr(16):
+                kv = ks[u]
+                d = (kv >> sh) & 255
+                part = (kv != 0) & ((kv & msk) == pre) & (i + u < i1)
+                pc = pc + (part & (d == piv)).select(Int32(1), Int32(0))
+                if part & (d != piv):
+                    fx.llvm.atomic_add(lds + (SEL_HIST // 4 + d), Int32(1), syncscope="workgroup")
+            i = i + 16
+        if pc > 0:
+            fx.llvm.atomic_add(lds + (SEL_HIST // 4 + piv), pc, syncscope="workgroup")
         gpu.barrier()
         hc = Int32(0)
         if tid < 256:
@@ -816,10 +842,13 @@ def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
     ngt = Int32(0)
     i = i0
     while i < i1:
-        kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
-        neq = neq + ((kv == thr) & (thr != 0)).select(Int32(1), Int32(0))
-        ngt = ngt + ((kv != 0) & u32_gt(kv, thr)).select(Int32(1), Int32(0))
-        i = i + 1
+        ks = _fs_block(src, n_items, forced, i)
+        for u in range_constexpr(16):
+            kv = ks[u]
+            inr = i + u < i1
+            neq = neq + ((kv == thr) & (thr != 0) & inr).select(Int32(1), Int32(0))
+            ngt = ngt + ((kv != 0) & u32_gt(kv, thr) & inr).select(Int32(1), Int32(0))
+        i = i + 16
     eqb, _eqt = _block_excl(lds, SEL_WSUM, neq, lane, wv)
     take = fx.min(
         fx.max(rest - eqb, Int32(0)), neq
@@ -828,15 +857,18 @@ def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
     r = eqb
     i = i0
     while i < i1:
-        kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
-        gt = (kv != 0) & u32_gt(kv, thr)
-        eq = (kv == thr) & (thr != 0)
-        pick = gt | (eq & (r < rest))
-        if pick & (pos < kk):
-            _lds_st(lds, out_lds + pos * 4, [i])
-        pos = pos + pick.select(Int32(1), Int32(0))
-        r = r + eq.select(Int32(1), Int32(0))
-        i = i + 1
+        ks = _fs_block(src, n_items, forced, i)
+        for u in range_constexpr(16):
+            kv = ks[u]
+            inr = i + u < i1
+            gt = (kv != 0) & u32_gt(kv, thr) & inr
+            eq = (kv == thr) & (thr != 0) & inr
+            pick = gt | (eq & (r < rest))
+            if pick & (pos < kk):
+                _lds_st(lds, out_lds + pos * 4, [i + u])
+            pos = pos + pick.select(Int32(1), Int32(0))
+            r = r + eq.select(Int32(1), Int32(0))
+        i = i + 16
     gpu.barrier()
     return tot
 
