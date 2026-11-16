@@ -67,10 +67,12 @@ _KIMI_K3_QUANT_EXCLUDE_NAME_MAPPING: dict[str, str] = {
 
 
 def _adapt_kda_metadata_for_atom(kda_metadata: KimiK3KDAMetadata) -> None:
-    """Provide the state-read index field expected by native ATOM KDA."""
+    """Provide the fields native ATOM KDA reads: the state-read indices, and
+    `kda_snapshots`, None because vLLM's scheduler places no midstep checkpoints."""
     kda_metadata.non_spec_state_indices_in_tensor = (  # type: ignore[attr-defined]
         kda_metadata.non_spec_state_indices_tensor
     )
+    kda_metadata.kda_snapshots = None  # type: ignore[attr-defined]
 
 
 def _get_k3_state_shape(
