@@ -39,6 +39,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono.hi.kernels.gfx950.common import (
+    _call,
     bf_rne_hi,
     bperm,
     f32c,
@@ -88,7 +89,7 @@ LDS_BYTES_ENG = 120480
 ENG_LDS = (
     0x18E20  # the engram GEMV's [half 2][wave 8][lane 64] f32x4 partials, 8 KiB a half
 )
-VERSION = "v7"
+VERSION = "v13"
 
 # byte offsets from ``slots`` (ws + C(M))
 FLAG_OFF = 0x100600  # CTA71's "new keys written" flag (dword = epoch)
@@ -102,8 +103,8 @@ SAMPLE_OFF = 1536  # slots + this: the 4096 threshold samples, LL {f32 or -inf, 
 Q_LDS, QS_LDS, QW_LDS = 16384, 18432, 18560
 # LDS (selector, small path)
 SEL_HIST = 0  # 256 radix bins
-SEL_WSUM = 1024  # [wave 16] per-wave totals (2 scans: 1024, 1088)
-SEL_PICK = 1152  # (bin, rest) of a radix pass
+SEL_WSUM = 1024  # [wave 16] per-wave totals of the radix scans (1024, 1088, 1152)
+SEL_PICK = 1280  # (bin, rest) of a radix pass
 SEL_OUT = 0x18E20  # the 512 output indices (TileRT's LDS slot)
 TOPK = 512
 CNT_SMALL = (
@@ -259,8 +260,10 @@ def select_small(tid, lds, a, slots, epoch, kc, cand, n62, nwait, pub8):
     ``pub8`` also PrepArgs' 4: KR 4027 / 499; 2747 / 243 publish 4), tid 0 the flag and the hit counter.
     """
     lane, wv = tid & 63, tid >> 6
-    if tid < nwait:
-        _wait_flag(slots, tid, epoch)
+    if (
+        tid < 31
+    ):  # TileRT: the small-path scorer CTAs 8 j (j < 31) published their slot (nwait unused)
+        _wait_flag(slots, tid * 8, epoch)
     gpu.barrier()
     keys = []
     ids = []
@@ -279,36 +282,262 @@ def select_small(tid, lds, a, slots, epoch, kc, cand, n62, nwait, pub8):
         ok = (i < kc) & (uk < n62)
         keys.append(ok.select(_sortable(sc), Int32(0)))
         ids.append(uk)
-    # radix select of the 512-th largest key (u32, 4 passes of 8 bits); keys 0 are the dead ones
+    tot = _top512(tid, lds, keys, ids, lane, wv)
+    _publish(tid, lds, a, slots, epoch, tot, pub8, CNT_SMALL)
+
+
+# ---- large-n selector (wide layout: one CTA a 16 K-key chunk, CTA 248 - nch + c handles chunk c) ----
+LIST_OFF = 0x2806A00  # ws + this + 0x8000 c: chunk c's list {u32 key, i32 index} (M = 0x100000; TODO formula)
+CNT_OFF = -0x2000  # slots + this + 8 c: chunk c's count LL {count, epoch}
+HIST_LDS = 17152  # 4096 u32 threshold buckets
+MM_LDS = 0  # [wave 16] (min, max) u32, 16 B a wave; scan scratch at + 256 / 512 / 768, offsets at + 1024
+TB_LDS = 0x14300  # the threshold bucket
+CNT_SEL = 0x102908  # slots + this: the hit counter the large-n merge adds 1 to (block level + 0x20)
+CAND_LDS = 8960  # the block-level merge's 2048 output block indices
+
+
+def _u32_lt(a, b):
+    return (a ^ Int32(-2147483648)) < (b ^ Int32(-2147483648))
+
+
+def _u32_ge(a, b):
+    return _u32_lt(b, a) | (a == b)
+
+
+def _umin(a, b):
+    return _u32_lt(a, b).select(a, b)
+
+
+def _umax(a, b):
+    return _u32_lt(a, b).select(b, a)
+
+
+def _lshr(x, s):
+    """x >> s, logical (u32)."""
+    return Int32((Int64(x) & Int64(0xFFFFFFFF)) >> Int64(s))
+
+
+def _clz(x):
+    from flydsl._mlir.dialects import llvm
+    from flydsl.expr.typing import as_ir_value
+
+    return Int32(
+        llvm.call_intrinsic(
+            T.i32,
+            "llvm.ctlz.i32",
+            [as_ir_value(Int32(x)), as_ir_value(fx.Boolean(False))],
+            [],
+            [],
+        )
+    )
+
+
+def ws_layout(m):
+    """TileRT's workspace offsets for key capacity M (i64; SelectArgs+0x98 / ScoreArgs+0x30):
+    (a: 8-key block maxima, LB: chunk lists, LB2: block-chunk lists, Qm, C: slots). M = 1 M: 0x2006a00,
+    0x2806a00, 0x3806a00, 0x3a07a00, 0x3a0ba00. The count LLs are at Qm + 128 mx (token chunks) and
+    Qm + 192 mx (block chunks), mx = max(nch, nbc)."""
+    mc = (m > Int64(0x4000)).select(m, Int64(0x4000))
+    nb = (((m + 7) // 8) + 3) & Int64(-4)
+    nch = (mc + 0x3FFF) >> 14
+    nbc = (m > Int64(0)).select((nb + 0x3FFF) // 16384, Int64(1))
+    mx = (nch > nbc).select(nch, nbc)
+    a = (mc * 32 + 0x6AE0) & Int64(-256)
+    b = (nb * 32 + a + 0x80 + nch * 32768 + nbc * 131072) & Int64(-256)
+    lb = b + 0x100000
+    lb2 = lb + (nch << 18)
+    q = lb2 + (nbc << 18) + (mx << 6) + 0xFF
+    return a, lb, lb2, q & Int64(-256), (q + (mx << 8)) & Int64(-256), mx
+
+
+def _isqrt_f32(r):
+    """trunc of TileRT's correctly-rounded f32 sqrt of the i32 r (v_sqrt_f32 + LLVM's fma fixup)."""
+    x = r.to(F32)
+    scl = x < f32c(0x0F800000)
+    x = scl.select(x * f32c(0x4F800000), x)
+    sq = F32(_call("llvm.amdgcn.sqrt.f32", T.f32, x))
+    sm = (sq.bitcast(Int32) - 1).bitcast(F32)
+    sp = (sq.bitcast(Int32) + 1).bitcast(F32)
+    rm = fmath.fma(-sm, sq, x)
+    rp = fmath.fma(-sp, sq, x)
+    s1 = (rm <= F32(0.0)).select(sm, sq)
+    s1 = (rp > F32(0.0)).select(sp, s1)
+    s1 = scl.select(s1 * f32c(0x37800000), s1)
+    s1 = ((x == F32(0.0)) | (x == f32c(0x7F800000))).select(x, s1)
+    return s1.to(Int32)
+
+
+@traced
+def sel_samples(tid, eslots, epoch, nsamp):
+    """This thread's 4 sample keys (samples 4 tid + j < nsamp at slots + 1536, each re-read until its tag
+    is the epoch, no sleep; 0 = no sample; sortable(-inf) = 0x007fffff counts)."""
+    keys = []
+    for q in range_constexpr(4):
+        i = tid * 4 + q
+        kq = Int32(0)
+        if i < nsamp:
+            kq = _sortable(_wait_tag(eslots, (SAMPLE_OFF + i * 8) // 4, epoch))
+        keys.append(kq)
+    return keys
+
+
+@traced
+def sel_threshold(tid, lds, keys, n_smp, nsamp, kk, block=False):
+    """The threshold key T (TileRT L21000..L21460): R = (N + nsamp kk - 1) / N; tgt = R + 2 isqrt(R) + 12;
+    over the non-zero sample keys: min / max, shift = d > 0xfff ? 20 - clz(d) : 0 (d = max - min), 4096
+    buckets of (key - min) >> shift, b = the highest bucket whose count from the top reaches tgt (0 when
+    none), T = min + (b << shift); no sample at all: T = 0xffffffff."""
+    lane, wv = tid & 63, tid >> 6
+    mn = Int32(-1)
+    mx = Int32(0)
+    for q in range_constexpr(4):
+        nz = keys[q] != 0
+        mn = nz.select(_umin(mn, keys[q]), mn)
+        mx = _umax(mx, keys[q])
+    for o in (1, 2, 4, 8, 16, 32):
+        mn = _umin(mn, Int32(bperm(mn.bitcast(F32), lane ^ o).bitcast(Int32)))
+        mx = _umax(mx, Int32(bperm(mx.bitcast(F32), lane ^ o).bitcast(Int32)))
+    if lane == 0:
+        _lds_st(lds, MM_LDS + wv * 16, [mn, mx])
+    _lds_st(lds, HIST_LDS + tid * 16, [Int32(0), Int32(0), Int32(0), Int32(0)])
+    if tid == 0:
+        _lds_st(lds, TB_LDS, [Int32(0)])
+    gpu.barrier()
+    for w in range_constexpr(16):
+        mm = _lds_ld(lds, MM_LDS + w * 16, 2)
+        mn = _umin(mn, mm[0])
+        mx = _umax(mx, mm[1])
+    none = _u32_lt(mx, mn)
+    d = mx - mn
+    sh = _u32_lt(Int32(0xFFF), d).select(Int32(20) - _clz(d), Int32(0))
+    for q in range_constexpr(4):
+        if keys[q] != 0:
+            fx.llvm.atomic_add(
+                lds + (HIST_LDS // 4 + _lshr(keys[q] - mn, sh)),
+                Int32(1),
+                syncscope="workgroup",
+            )
+    gpu.barrier()
+    h = _lds_ld(lds, HIST_LDS + tid * 16, 4)
+    hs = h[0] + h[1] + h[2] + h[3]
+    pre, tot = _block_excl(lds, MM_LDS + 256, hs, lane, wv)
+    above = tot - pre - hs  # samples in the buckets above this thread's 4
+    num = Int64(n_smp) + Int64(nsamp) * Int64(kk) - 1  # block level: nsamp = 4096
+    r = Int32(num // Int64(fx.max(n_smp, Int32(1))))
+    tg = r + _isqrt_f32(r) * 5 + 16 if block else r + (_isqrt_f32(r) << 1) + 12
+    c3 = above + h[3]
+    c2 = c3 + h[2]
+    c1 = c2 + h[1]
+    c0 = c1 + h[0]
+    a3 = _u32_lt(above, tg) & _u32_ge(c3, tg)
+    a2 = _u32_lt(c3, tg) & _u32_ge(c2, tg)
+    a1 = _u32_lt(c2, tg) & _u32_ge(c1, tg)
+    a0 = _u32_lt(c1, tg) & _u32_ge(c0, tg)
+    if a0 | a1 | a2 | a3:
+        _lds_st(
+            lds,
+            TB_LDS,
+            [
+                tid * 4
+                + a0.select(
+                    Int32(0), a1.select(Int32(1), a2.select(Int32(2), Int32(3)))
+                )
+            ],
+        )
+    gpu.barrier()
+    bb = _lds_ld(lds, TB_LDS)
+    gpu.barrier()
+    return none.select(Int32(-1), mn + (bb << sh))
+
+
+@traced
+def sel_chunk(tid, lds, ws, eslots, epoch, ck, n_smp, thr, sv, lo_n, hi_n, key_lo, lbase, cbase, cnt_ok,
+              block=False, src=0, s94=0):  # fmt: skip
+    """One chunk (TileRT L21639..L24953) of items 16384 ck + 16 tid + j. Token level: sv = the preloaded
+    scores; a chunk overlapping the new keys [lo_n, hi_n) waits for CTA71's flag (tid 0, sleep 1) and the
+    threads whose 16 items overlap re-read theirs. Block level (``block``): no preload; the flag wait
+    (same window rule) comes before the load of the block maxima at ws + src; block s94 - key_lo is forced
+    to 0xff800000. Item j passes when its key (sortable, 0 past n_smp) >= thr (u32); at most 4096
+    entries {key, key_lo + item} (sc1) in thread / j order at ws + lbase + 0x8000 ck; the count LL
+    {cnt, tag} (sc1) at ws + cbase + 8 ck after vmcnt(0) + barrier."""
+    lane, wv = tid & 63, tid >> 6
+    base = ck * 16384
+    ln = fx.min(n_smp - base, Int32(0x4000))
+    ovl = (hi_n > lo_n) & (lo_n < base + ln) & (hi_n > base)
+    if ovl:
+        if tid == 0:
+            _wait_flag(eslots, FLAG_OFF // 4, epoch)
+        gpu.barrier()
+        if not block:  # noqa: SIM102 (kept as the validated build)
+            if (lo_n < base + tid * 16 + 16) & (hi_n > (base | (tid * 16))):
+                sv = [
+                    _ld_sc1(ws, SCORE_OFF // 4 + base + tid * 16 + 4 * q, 4)
+                    for q in range(4)
+                ]
+    if block:
+        sv = [_ld_sc1(ws + src, base + tid * 16 + 4 * q, 4) for q in range(4)]
+    keys = []
+    sel = []
+    cnt = Int32(0)
+    for j in range_constexpr(16):
+        kj = _sortable(sv[j // 4][j % 4])
+        if block:
+            kj = (base + tid * 16 + j + key_lo == s94).select(Int32(-8388608), kj)
+        kj = (tid * 16 + j < ln).select(kj, Int32(0))
+        sj = _u32_ge(kj, thr)
+        keys.append(kj)
+        sel.append(sj)
+        cnt = cnt + sj.select(Int32(1), Int32(0))
+    pos, tot = _block_excl(lds, MM_LDS + 512, cnt, lane, wv)
+    lb = ws + lbase + Int64(ck) * 0x8000
+    if tot <= 0x1000:
+        for j in range_constexpr(16):
+            if sel[j]:
+                bo.buffer_store(fx.Vector.from_elements([keys[j], key_lo + base + tid * 16 + j], Int32), rsrc(lb),
+                                pos * 2, cache_modifier=CM_DEV)  # fmt: skip
+            pos = pos + sel[j].select(Int32(1), Int32(0))
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        _st2(ws + cbase, ck * 2, cnt_ok.select(tot, Int32(0)), epoch)
+    return tot
+
+
+@traced
+def _top512(tid, lds, keys, ids, lane, wv, k=TOPK, out_lds=SEL_OUT):
+    """The top k of the CTA's u32 keys (16 a thread, 0 = dead) by a 4 x 8-bit radix select, ties at the
+    k-th key taken in thread / slot order (TileRT's rule); their ids in that order -> LDS out_lds. -> the count.
+    """
     pre = Int32(0)
     msk = Int32(0)
-    rest = Int32(TOPK)
+    rest = Int32(k)
+    for h in range_constexpr((k + 1023) // 1024):
+        if tid + h * 1024 < k:
+            _lds_st(lds, out_lds + (tid + h * 1024) * 4, [Int32(-1)])
     for p in range_constexpr(4):
         sh = 24 - 8 * p
         if tid < 256:
             _lds_st(lds, SEL_HIST + tid * 4, [Int32(0)])
         gpu.barrier()
         for j in range_constexpr(16):
-            k = keys[j]
-            if (k != 0) & ((k & msk) == pre):
+            kv = keys[j]
+            if (kv != 0) & ((kv & msk) == pre):
                 fx.llvm.atomic_add(
-                    lds + (SEL_HIST // 4 + ((k >> sh) & 255)),
+                    lds + (SEL_HIST // 4 + ((kv >> sh) & 255)),
                     Int32(1),
                     syncscope="workgroup",
                 )
         gpu.barrier()
+        # the bin holding the rest-th largest: bins from the top in thread order (thread t: bin 255 - t), an
+        # exclusive scan of their counts; the one thread with excl < rest <= excl + count names it
+        hc = Int32(0)
+        if tid < 256:
+            hc = _lds_ld(lds, SEL_HIST + (255 - tid) * 4)
         if tid == 0:
-            acc = Int32(0)
-            b = Int32(255)
-            go = Int32(1)
-            while (go != 0) & (b >= 0):
-                c = _lds_ld(lds, SEL_HIST + b * 4)
-                if acc + c >= rest:
-                    go = Int32(0)
-                else:
-                    acc = acc + c
-                    b = b - 1
-            _lds_st(lds, SEL_PICK, [b, rest - acc])
+            _lds_st(lds, SEL_PICK, [Int32(-1), rest])
+        hx, _ = _block_excl(lds, SEL_WSUM + 128, hc, lane, wv)
+        if (tid < 256) & (hx < rest) & (hx + hc >= rest):
+            _lds_st(lds, SEL_PICK, [255 - tid, rest - hx])
         gpu.barrier()
         pk = _lds_ld(lds, SEL_PICK, 2)
         gpu.barrier()
@@ -327,20 +556,107 @@ def select_small(tid, lds, a, slots, epoch, kc, cand, n62, nwait, pub8):
     picks = []
     r = eqb
     for j in range_constexpr(16):
-        k = keys[j]
-        gt = (k != 0) & u32_gt(k, thr)
-        eq = (k == thr) & (thr != 0)
+        kv = keys[j]
+        gt = (kv != 0) & u32_gt(kv, thr)
+        eq = (kv == thr) & (thr != 0)
         pick = gt | (eq & (r < rest))
         r = r + eq.select(Int32(1), Int32(0))
         picks.append(pick)
         ngt = ngt + pick.select(Int32(1), Int32(0))
     pos, tot = _block_excl(lds, SEL_WSUM + 64, ngt, lane, wv)
     for j in range_constexpr(16):
-        if picks[j]:  # noqa: SIM102 (kept as the validated build)
-            if pos < TOPK:
-                _lds_st(lds, SEL_OUT + pos * 4, [ids[j]])
+        if picks[j]:  # noqa: SIM102
+            if pos < k:
+                _lds_st(lds, out_lds + pos * 4, [ids[j]])
         pos = pos + picks[j].select(Int32(1), Int32(0))
     gpu.barrier()
+    return tot
+
+
+@traced
+def sel_fullscan(tid, lds, src, n_items, kk, forced, out_lds):
+    """The merge's fallback (TileRT's slow path when a chunk overflowed, total < kk or total > 8192; semantic
+    port, the slow path's workspace spills are not reproduced): the exact top kk of all n_items items
+    (key = sortable(src[i]) (sc1), item ``forced`` -> 0xff800000), ties to the smaller index, written in
+    index order to out_lds. Thread t scans items [t per, (t + 1) per). -> the count."""
+    lane, wv = tid & 63, tid >> 6
+    per = (n_items + 1023) >> 10
+    i0 = fx.min(tid * per, n_items)
+    i1 = fx.min(i0 + per, n_items)
+    pre = Int32(0)
+    msk = Int32(0)
+    rest = kk
+    for h in range_constexpr(2):
+        if tid + h * 1024 < kk:
+            _lds_st(lds, out_lds + (tid + h * 1024) * 4, [Int32(-1)])
+    for p in range_constexpr(4):
+        sh = 24 - 8 * p
+        if tid < 256:
+            _lds_st(lds, SEL_HIST + tid * 4, [Int32(0)])
+        gpu.barrier()
+        i = i0
+        while i < i1:
+            kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
+            if (kv != 0) & ((kv & msk) == pre):
+                fx.llvm.atomic_add(
+                    lds + (SEL_HIST // 4 + ((kv >> sh) & 255)),
+                    Int32(1),
+                    syncscope="workgroup",
+                )
+            i = i + 1
+        gpu.barrier()
+        hc = Int32(0)
+        if tid < 256:
+            hc = _lds_ld(lds, SEL_HIST + (255 - tid) * 4)
+        if tid == 0:
+            _lds_st(lds, SEL_PICK, [Int32(-1), rest])
+        hx, _ = _block_excl(lds, SEL_WSUM + 128, hc, lane, wv)
+        if (tid < 256) & (hx < rest) & (hx + hc >= rest):
+            _lds_st(lds, SEL_PICK, [255 - tid, rest - hx])
+        gpu.barrier()
+        pk = _lds_ld(lds, SEL_PICK, 2)
+        gpu.barrier()
+        bsel = fx.max(pk[0], Int32(0))
+        rest = (pk[0] < 0).select(rest, pk[1])
+        pre = pre | (bsel << sh)
+        msk = msk | Int32((255 << sh) - (1 << 32 if sh == 24 else 0))
+        pre = (pk[0] < 0).select(Int32(0), pre)
+    thr = pre
+    neq = Int32(0)
+    ngt = Int32(0)
+    i = i0
+    while i < i1:
+        kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
+        neq = neq + ((kv == thr) & (thr != 0)).select(Int32(1), Int32(0))
+        ngt = ngt + ((kv != 0) & u32_gt(kv, thr)).select(Int32(1), Int32(0))
+        i = i + 1
+    eqb, _eqt = _block_excl(lds, SEL_WSUM, neq, lane, wv)
+    take = fx.min(
+        fx.max(rest - eqb, Int32(0)), neq
+    )  # this thread's equal keys taken, in index order
+    pos, tot = _block_excl(lds, SEL_WSUM + 64, ngt + take, lane, wv)
+    r = eqb
+    i = i0
+    while i < i1:
+        kv = (i == forced).select(Int32(-8388608), _sortable(_ld_sc1(src, i)))
+        gt = (kv != 0) & u32_gt(kv, thr)
+        eq = (kv == thr) & (thr != 0)
+        pick = gt | (eq & (r < rest))
+        if pick & (pos < kk):
+            _lds_st(lds, out_lds + pos * 4, [i])
+        pos = pos + pick.select(Int32(1), Int32(0))
+        r = r + eq.select(Int32(1), Int32(0))
+        i = i + 1
+    gpu.barrier()
+    return tot
+
+
+@traced
+def _publish(tid, lds, a, slots, epoch, tot, pub8, cnt_off):
+    """LDS SEL_OUT[0..tot) (-1 past it) -> topk row (plain) and {idx, tag} to the LL targets (sc0 sc1);
+    tid 0: the flag (sc1) and + 1 to the hit counter at slots + cnt_off."""
+    if tid == 0:
+        fx.llvm.atomic_add(_gword(slots + Int64(cnt_off)), Int32(1), syncscope="agent")
     if tid < TOPK:
         v = (tid < tot).select(_lds_ld(lds, SEL_OUT + tid * 4), Int32(-1))
         bo.buffer_store(v, rsrc(a[17]), tid)
@@ -349,7 +665,174 @@ def select_small(tid, lds, a, slots, epoch, kc, cand, n62, nwait, pub8):
                             cache_modifier=CM_SYS)  # fmt: skip
     if tid == 0:
         _st(a[30], 0, epoch)
-        fx.llvm.atomic_add(_gword(slots + CNT_SMALL), Int32(1), syncscope="agent")
+
+
+@traced
+def sel_merge(
+    tid,
+    lds,
+    a,
+    ws,
+    eslots,
+    epoch,
+    nch,
+    pub8,
+    lbase,
+    cbase,
+    hit_off,
+    k,
+    src,
+    n_items,
+    forced,
+    id_off,
+):
+    """The merge (TileRT L24961..L58451; c = 0 token level k = 512, c = s83 block level k = 2048): wave 0
+    polls the nch count LLs at ws + cbase. Normal path (no count > 4096, min(n_items, k) <= total <= 8192):
+    the candidates gathered in chunk / list order (position p), the top k by key with ties to the smaller
+    p, in p order (= ascending index), hit counter + 1 at slots + hit_off. Otherwise TileRT's slow path:
+    here the exact top k of all n_items items rescanned from src (``sel_fullscan``; TileRT's own radix and
+    its workspace spills are not reproduced), counter + 1 at slots + hit_off + 4. Token level: LDS
+    0x18e20 -> topk / LL targets / flag; block level: temp:cand = {2, cnt, blocks.., -1 past cnt}.
+    """
+    lane, wv = tid & 63, tid >> 6
+    cv = Int32(0)
+    if tid < nch:
+        cv = _wait_tag(ws + cbase, tid * 2, epoch)
+    off, tot = _block_excl(lds, MM_LDS + 768, cv, lane, wv)
+    _, novf = _block_excl(
+        lds, MM_LDS + 832, (cv > 0x1000).select(Int32(1), Int32(0)), lane, wv
+    )
+    if tid < nch:
+        _lds_st(lds, MM_LDS + 1024 + tid * 4, [off])
+    gpu.barrier()
+    slow = (novf > 0) | (tot < fx.min(n_items, Int32(k))) | (tot > 0x2000)
+    out_lds = SEL_OUT if k == TOPK else CAND_LDS
+    n_out = Int32(0)
+    if slow:
+        n_out = sel_fullscan(tid, lds, src, n_items, Int32(k), forced, out_lds)
+        if id_off != 0:
+            for h in range_constexpr((k + 1023) // 1024):
+                if tid + h * 1024 < fx.min(n_out, Int32(k)):
+                    _lds_st(lds, out_lds + (tid + h * 1024) * 4,
+                            [_lds_ld(lds, out_lds + (tid + h * 1024) * 4) + id_off])  # fmt: skip
+            gpu.barrier()
+    else:
+        keys = []
+        ids = []
+        for j in range_constexpr(16):
+            e = tid * 16 + j
+            live = e < fx.min(tot, Int32(16384))
+            c = Int32(0)
+            while (c + 1 < nch) & (_lds_ld(lds, MM_LDS + 1024 + (c + 1) * 4) <= e):
+                c = c + 1
+            kk = Int32(0)
+            ii = Int32(-1)
+            if live:
+                ent = _ld_sc1(
+                    ws + lbase + Int64(c) * 0x8000,
+                    2 * (e - _lds_ld(lds, MM_LDS + 1024 + c * 4)),
+                    2,
+                )
+                kk = ent[0]
+                ii = ent[1]
+            keys.append(live.select(kk, Int32(0)))
+            ids.append(ii)
+        n_out = _top512(tid, lds, keys, ids, lane, wv, k, out_lds)
+    hit = slow.select(Int32(hit_off + 4), Int32(hit_off))
+    if k == TOPK:
+        _publish(tid, lds, a, eslots, epoch, n_out, pub8, hit)
+    else:
+        if tid == 0:
+            fx.llvm.atomic_add(
+                _gword(eslots + hit.to(Int64)), Int32(1), syncscope="agent"
+            )
+        for h in range_constexpr(2):
+            i = tid + h * 1024
+            bo.buffer_store(
+                (i < n_out).select(_lds_ld(lds, CAND_LDS + i * 4), Int32(-1)),
+                rsrc(a[16]),
+                2 + i,
+            )
+        if tid == 0:
+            bo.buffer_store(
+                fx.Vector.from_elements([Int32(2), n_out], Int32), rsrc(a[16]), 0
+            )
+
+
+@traced
+def sel_token_level(
+    tid, lds, a, eslots, epoch, c, pos0, n93, k_lo, k_hi, nloc, lo, hi, pub8
+):
+    """Token-level selector CTA c (TileRT L19822..L24953, dec_mode0_chunk): samples, slot poll, chunk c's
+    scores preloaded, the threshold, chunk c's list + count; c = 0 then merges (top 512 -> topk / LL).
+    """
+    nmin = fx.min((pos0 < 0).select(Int32(0), n93), k_hi)
+    n_s = (nmin > k_lo).select(nmin - k_lo, Int32(0))  # s84 (mode 0 / 1)
+    nck = (n_s < 1).select(Int32(1), _lshr(n_s + 0x3FFF, Int32(14)))
+    div = (n_s < 1).select(Int32(1), (n_s + 0xFFF) >> 12)
+    nsamp = (n_s + div - 1) // div
+    nwait = fx.min((((nloc + 15) >> 4) + 15) >> 4, Int32(256))
+    tkeys = [Int32(0), Int32(0), Int32(0), Int32(0)]
+    if (n_s >= 1) & (nck >= 2):
+        tkeys = sel_samples(tid, eslots, epoch, nsamp)
+    if tid < nwait:
+        _wait_flag(eslots, tid, epoch)
+    gpu.barrier()
+    tpre = [fx.Vector.filled(4, 0, Int32) for _ in range(4)]
+    if (c < nck) & (nck >= 2):
+        tpre = [
+            _ld_sc1(a[4], SCORE_OFF // 4 + c * 16384 + tid * 16 + 4 * q, 4)
+            for q in range(4)
+        ]
+    tthr = sel_threshold(tid, lds, tkeys, n_s, nsamp, fx.min(n_s, Int32(TOPK)))
+    lo_n = (hi <= lo).select(Int32(0), lo - k_lo)
+    hi_n = (hi <= lo).select(Int32(0), hi - k_lo)
+    _wa, wlb, _wlb2, wq, _wc, wmx = ws_layout(a[6])
+    cb = wq + wmx * 128  # token count LLs (ws + C - 0x2000 for M = 1 M)
+    if (nck >= 2) & (c < nck):
+        sel_chunk(tid, lds, a[4], eslots, epoch, c, n_s, tthr, tpre, lo_n, hi_n, k_lo, wlb, cb,
+                  (n_s > 0) & (nck > 1))  # fmt: skip
+        if c == 0:
+            sel_merge(tid, lds, a, a[4], eslots, epoch, nck, pub8, wlb, cb, 0x102908, TOPK,
+                      a[4] + SCORE_OFF + Int64(k_lo) * 4, n_s, Int32(-1), k_lo)  # fmt: skip
+
+
+@traced
+def sel_block_level(
+    tid, lds, a, eslots, epoch, bc, pos0, n93, k_lo, k_hi, nloc, lo, hi, pub8
+):
+    """Block-level selector (mode 1) CTA s83 + bc (TileRT L20292..L20566 sampling, L21857.. chunks;
+    dec_mode1 3.2..3.6): chunk bc (stride 8) of the 8-key block maxima, its own 1024 x 4 samples of them,
+    the block-target threshold; bc = 0 merges the top 2048 blocks into temp:cand."""
+    s93v = (pos0 < 0).select(Int32(0), n93)
+    n_b = fx.min(_lshr(s93v + 7, Int32(3)), (k_hi + 7) // 8) - k_lo // 8
+    s6b = k_lo // 8
+    nckb = (n_b < 1).select(Int32(1), _lshr(n_b + 0x3FFF, Int32(14)))
+    s94 = _lshr(s93v - 1, Int32(3))
+    nwait = fx.min((((nloc + 15) >> 4) + 15) >> 4, Int32(256))
+    if tid < nwait:
+        _wait_flag(eslots, tid, epoch)
+    gpu.barrier()
+    wa, _wlb, wlb2, wq, _wc, wmx = ws_layout(a[6])
+    if (bc < nckb) & (nckb >= 2):
+        p4 = Int32((Int64(n_b) * Int64(tid)) >> 10) & -4
+        xs = _ld_sc1(a[4] + wa, p4, 4)
+        bkeys = []
+        for q in range_constexpr(4):
+            kq = (p4 + q + s6b == s94).select(Int32(-8388608), _sortable(xs[q]))
+            bkeys.append((p4 + q < n_b).select(kq, Int32(0)))
+        bthr = sel_threshold(
+            tid, lds, bkeys, n_b, Int32(4096), fx.min(n_b, Int32(2048)), True
+        )
+        lo_b = (hi <= lo).select(Int32(0), (lo >> 3) - s6b)
+        hi_b = (hi <= lo).select(Int32(0), (hi >> 3) - s6b)
+        cbb = wq + wmx * 192  # block count LLs (ws + C - 0x1000 for M = 1 M)
+        bpre = [fx.Vector.filled(4, 0, Int32) for _ in range(4)]
+        sel_chunk(tid, lds, a[4], eslots, epoch, bc, n_b, bthr, bpre, lo_b, hi_b, s6b, wlb2, cbb,
+                  (n_b > 0) & (nckb > 1), True, wa, s94)  # fmt: skip
+        if bc == 0:
+            sel_merge(tid, lds, a, a[4], eslots, epoch, nckb, pub8, wlb2, cbb, 0x102928, 2048,
+                      a[4] + wa + Int64(s6b) * 4, n_b, s94 - s6b, s6b)  # fmt: skip
 
 
 def _gword(addr):
@@ -738,6 +1221,34 @@ def _entry(tid, s2, lds, a, rows, pub8):
             fx.min((tl + 15) >> 4, Int32(256)),
             pub8,
         )
+    # the large-n selector, TileRT's wide layout (L3636..L3732): s83 = min(ceil(n_local / 16384), 64)
+    # selector CTAs s2 >= 248 - s83, c = s2 - (248 - s83); c < s83 the token chunks (c = 0 merges), mode 1:
+    # c - s83 < 8 the block-max chunks (c = s83 merges into temp:cand)
+    nloc = k_hi - k_lo
+    if nosplit & (mode != 2) & (n >= 0x4001) & (nloc > 0x20000):
+        s83 = fx.min(_lshr(nloc + 0x3FFF, Int32(14)), Int32(64))
+        c = s2 - (248 - s83)
+        if (c >= 0) & (c < s83):
+            sel_token_level(
+                tid, lds, a, eslots, epoch, c, pos0, n93, k_lo, k_hi, nloc, lo, hi, pub8
+            )
+        if (mode == 1) & (c >= s83) & (c < s83 + 8):
+            sel_block_level(
+                tid,
+                lds,
+                a,
+                eslots,
+                epoch,
+                c - s83,
+                pos0,
+                n93,
+                k_lo,
+                k_hi,
+                nloc,
+                lo,
+                hi,
+                pub8,
+            )
     if prep & (hi > lo):
         if s2 < 64:
             k_gemv(tid, s2, slots, a[35], a[41], epoch, rows)
