@@ -180,8 +180,12 @@ def _post_pre_core(
     ep_word = (0x1E400 // 4) + cta
     old = _ld(ws, ep_word, 1)
     fp32_gamma = gflag == 0
-    g32a = _ld(gamma, col, 4)
-    g32b = _ld(gamma, col + 4, 4)
+    # a bf16 gamma (10240 B) read as f32 at col would run up to 10 KB past its end: that faults when the
+    # tensor ends a pool page (the draft layers' mtp.*.mhc.attn_gamma in the graph), so the unused f32 read
+    # takes elements 0..7
+    c32 = fp32_gamma.select(col, Int32(0))
+    g32a = _ld(gamma, c32, 4)
+    g32b = _ld(gamma, c32 + 4, 4)
     gbf = _ld(gamma, col // 2, 4)
     if mean_out != 0:
         m = [((xs[0][e] + xs[1][e]) + xs[2][e]) + xs[3][e] for e in range(8)]

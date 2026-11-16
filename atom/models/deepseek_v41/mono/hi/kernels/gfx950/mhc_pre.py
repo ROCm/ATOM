@@ -331,8 +331,12 @@ def _pre(lane, cta, X, mixp, stride, gamma, gflag, y_out, q8_out, sc_out, mean_o
     xw = (row * 0xA000 + col * 2) // 4
     x = [_ld(X, xw + off // 4, 4) for off in HC_OFF]
     fp32_gamma = gflag == 0
-    g32a = _ld(gamma, col, 4)
-    g32b = _ld(gamma, col + 4, 4)
+    # a bf16 gamma (10240 B) read as f32 at col would run up to 10 KB past its end: that faults when the
+    # tensor ends a pool page (the draft layers' mtp.*.mhc.attn_gamma in the graph), so the unused f32 read
+    # takes elements 0..7
+    c32 = fp32_gamma.select(col, Int32(0))
+    g32a = _ld(gamma, c32, 4)
+    g32b = _ld(gamma, c32 + 4, 4)
     gbf = _ld(gamma, col // 2, 4)
     pre = _ld(mixp, row * stride, 4).bitcast(F32)
     xs = [[None] * 8 for _ in range(4)]
