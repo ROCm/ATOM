@@ -25,7 +25,10 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_commit,
     replayssm_materialize,
 )
-from atom.model_ops.gdn_midstep_snapshots import interior_state_snapshots
+from atom.model_ops.gdn_midstep_snapshots import (
+    checkpoint_target_columns,
+    interior_state_snapshots,
+)
 from atom.model_ops.mamba_ops.causal_conv1d import (
     PAD_SLOT_ID,
     compute_causal_conv1d_metadata,
@@ -1422,18 +1425,17 @@ class GDNStateMixin(PoolRowsMixin):
         if not found:
             return None
 
-        def mk(col):
-            return torch.tensor(col, dtype=torch.int32, device=self.device)
-
-        rows, slots, offs, is_end, runtime = zip(*found)
+        rows, slots, offs, is_end, runtime = checkpoint_target_columns(
+            found, self.device
+        )
         return {
-            "rows": mk(rows),
-            "slots": mk(slots),
-            "offs": mk(offs),
-            "is_end": mk(is_end),
-            "runtime": mk(runtime),
+            "rows": rows,
+            "slots": slots,
+            "offs": offs,
+            "is_end": is_end,
+            "runtime": runtime,
             # Host-side, so nothing downstream waits on the device for them.
-            "interior_host": [not e for e in is_end],
+            "interior_host": [not target[3] for target in found],
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
