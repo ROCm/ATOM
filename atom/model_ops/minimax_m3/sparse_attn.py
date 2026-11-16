@@ -1439,6 +1439,22 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+@functools.cache
+def _fp8_output_plan_budget(device) -> int:
+    """The FlyDSL plan's workgroup budget for a sparse PA writing FP8: six per CU.
+
+    With aiter's default, two per CU, a call whose rows x split pass it gets
+    fewer partitions than the split asks for and a slower merge, which for an
+    FP8 output also quantizes in a launch of its own. One MI455X (256 CUs),
+    FP8 KV, 2048-token windows, us per call, default -> six per CU (median of
+    7, interleaved, CUDA graphs): decode rows 72 9.12 -> 6.08, 96 9.85 -> 8.12,
+    160 11.43 -> 8.35, 192 13.53 -> 10.52, 240 14.45 -> 11.11, 256 13.39 ->
+    12.73, 320 21.28 -> 14.23, 384 22.16 -> 14.84; prefill 300 rows 16.31 ->
+    15.61; within 1% at 1-64, 128 and 512 decode rows and 600 prefill rows.
+    """
+    return 6 * torch.cuda.get_device_properties(device).multi_processor_count
+
+
 @torch.no_grad()
 def sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1509,6 +1525,9 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    plan_workgroup_budget = None
+    if quantized_output is not None:
+        plan_workgroup_budget = _fp8_output_plan_budget(q.device)
     context_partition_size = 256
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
@@ -1545,6 +1564,7 @@ def sparse_pa_per_row(
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
+        plan_workgroup_budget=plan_workgroup_budget,
     )
 
 

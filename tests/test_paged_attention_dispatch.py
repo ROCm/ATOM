@@ -1126,6 +1126,7 @@ class TestExplicitPlan:
         cap=8,
         head_dim=128,
         segment=0,
+        budget=None,
     ):
         import torch
 
@@ -1142,6 +1143,7 @@ class TestExplicitPlan:
             plan_step_owner=owner,
             plan_cache_owner=cache_owner,
             plan_segment=segment,
+            plan_workgroup_budget=budget,
         )
 
     def test_segments_of_one_call_keep_their_own_plans(self, monkeypatch):
@@ -1252,6 +1254,16 @@ class TestExplicitPlan:
         uncapped = self._call(ba, cap=64, head_dim=128)
         assert capped is not uncapped
         assert [kw.get("workgroup_budget") for kw in built] == [256, None], built
+
+    def test_a_caller_budget_is_the_plans(self, monkeypatch):
+        """The sparse PA writing FP8 asks for a larger budget than aiter's."""
+        ba, built = self._setup(monkeypatch)
+        self._call(ba, cap=8, budget=128, head_dim=256)
+        assert built[-1] == {
+            "max_partitions": 8,
+            "query_length": 1,
+            "workgroup_budget": 128,
+        }, built[-1]
 
     @staticmethod
     def _call_kwargs(relpath, func):

@@ -451,12 +451,13 @@ def _flydsl_prepare_explicit_plan(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_segment: int = 0,
+    plan_workgroup_budget: int | None = None,
 ):
     """Return the explicit plan aiter #5809 requires.
 
     ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
     defaults except at head_dim 256; a caller's cap is kept, with aiter's
-    default budget.
+    default budget. ``plan_workgroup_budget``, when given, is the budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
     ``plan_segment``: which slice of one call's rows this is, for a caller that
@@ -479,6 +480,8 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
+    if plan_workgroup_budget is not None:
+        workgroup_budget = plan_workgroup_budget
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -605,6 +608,7 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
+    plan_workgroup_budget: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -723,6 +727,7 @@ def run_pa_decode(
             num_seqs=n,
             query_length=max_seqlen_q,
             plan_partition_cap=plan_partition_cap,
+            plan_workgroup_budget=plan_workgroup_budget,
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,

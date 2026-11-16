@@ -110,6 +110,7 @@ def test_sparse_rows_hand_the_pa_the_fp8_output(monkeypatch, fp8):
     seen = {}
     monkeypatch.setattr(base_attention, "run_pa_decode", lambda **kw: seen.update(kw))
     monkeypatch.setattr(sparse_attn, "_sparse_pa_ran_on_asm", lambda *a: False)
+    monkeypatch.setattr(sparse_attn, "_fp8_output_plan_budget", lambda _: 1536)
     rows, bucket = 72, 75  # a padded batch: the PA writes the last three inert
     q = torch.randn(rows, 16, 128, dtype=torch.bfloat16)
     out = torch.empty((bucket, 16, 128), dtype=torch.uint8)
@@ -121,6 +122,7 @@ def test_sparse_rows_hand_the_pa_the_fp8_output(monkeypatch, fp8):
         *(1, 1.0, torch.empty_like(q), None, None),
         **(quant if fp8 else {}),
     )
+    assert seen["plan_workgroup_budget"] == (1536 if fp8 else None)
     assert seen["plan_partition_cap"] == seen["max_context_partition_num"]
     if fp8:
         assert seen["quantized_output"].shape == (bucket, 16, 128)
@@ -199,6 +201,13 @@ def test_fp8_output_is_bf16_pa_then_the_per_token_quant(monkeypatch, decode, row
     )
 
     # the BF16 output of the same plan, then the quant o_proj would run
+    run = base_attention.run_pa_decode
+    budget = sparse_attn._fp8_output_plan_budget(q.device)
+    monkeypatch.setattr(
+        base_attention,
+        "run_pa_decode",
+        lambda **kw: run(**{**kw, "plan_workgroup_budget": budget}),
+    )
     bf16 = torch.empty_like(q)
     sparse_attn.sparse_pa_per_row(*args, bf16, kv_scale, kv_scale)
     ref, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(scale[:rows])
