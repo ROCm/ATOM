@@ -333,8 +333,7 @@ class _SeamKernel:
 
 
 AR._attn_res_fused_kernel = _SeamKernel()
-if not hasattr(AR, "triton"):
-    AR.triton = NS(next_power_of_2=lambda n: 1 << (int(n) - 1).bit_length())
+AR.triton = NS(next_power_of_2=lambda n: 1 << (int(n) - 1).bit_length())
 
 
 class SeamModule:

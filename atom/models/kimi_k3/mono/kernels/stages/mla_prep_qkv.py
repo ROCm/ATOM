@@ -12,20 +12,20 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
-from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import LORA as KVL
 from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (
+    FP8_MAX,
+    INV_FP8_MAX,
     QH,
     QK_NOPE,
     QKV_A,
     QL,
     ROPE,
 )
+from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import LORA as KVL
 from atom.models.kimi_k3.mono.kernels.stages.mla_prep import (
     AMAX_FLOOR,
     ENTRY,
     FLT_MIN,
-    FP8_MAX,
-    INV_FP8_MAX,
     L_BLK,
     P1_Q,
     P1_TASKS,
@@ -422,7 +422,7 @@ def p4_task(c, j):
             lm = fx.max(lm, abs(vals[e]))
         am = butterfly(lm, (16, 32), fx.max)
         m = fx.max(am, _f32(mp.AMAX_FLOOR))
-        sc = m * _f32(mp.INV_FP8_MAX)
+        sc = m * _f32(INV_FP8_MAX)
         rcp = _f32(1.0) / sc
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         for q in range_constexpr(4):

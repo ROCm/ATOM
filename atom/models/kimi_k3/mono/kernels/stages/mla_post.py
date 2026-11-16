@@ -50,10 +50,12 @@ from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (  # noqa: F401
     CTA_RANGES,
+    FP8_MAX,
     G_GROUPS,
     GROUP_COLS,
     HEADS,
     HIDDEN,
+    INV_FP8_MAX,
     KCH,
     LORA,
     MAX_ROWS,
@@ -120,8 +122,6 @@ def _bf16_rne(x: float) -> float:
 assert (ROWS, KCH, GROUP_COLS) == (gemv.ROWS, gemv.KCH, gemv.KGROUP)
 GCH = HIDDEN // gemv.KCH  # 56 g_proj K chunks
 G_PER = GCH // WAVES  # 7 a wave
-FP8_MAX = 448.0
-INV_FP8_MAX = 1.0 / FP8_MAX  # the triton kernel's one_over_DTYPE_MAX (f32-rounded)
 # tl.maximum(bf16 amax, 1e-10): the floor rounded to bf16 as triton promotes it
 AMAX_FLOOR = _bf16_rne(1e-10)
 

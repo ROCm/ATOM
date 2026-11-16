@@ -8,9 +8,10 @@ here, with the stages' constants, arguments and mailbox regions; P2 .. P5 are
 in ``mla_prep_qkv``.
 
 Without it, between K2(M-1) and layer M's ``fused_qkv_a_proj`` the production
-path runs a copy of ``blocks[:, :before]`` and the triton
-``_attn_res_fused_kernel`` (prefix + add, the AttnRes mix, input_layernorm, the
-per-token FP8 activation ``x8`` / ``xs``). P0 makes the same three outputs --
+path runs the triton ``_attn_res_fused_kernel`` (prefix + add, the AttnRes mix,
+input_layernorm, the per-token FP8 activation ``x8`` / ``xs``) on
+``blocks[:, :before]``, read in place (copied first only if the bank is strided
+along H). P0 makes the same three outputs --
 ``pref`` (prefix(M)), ``x8``, ``xs`` -- from what K2(M-1) already holds:
 
     CTA j < 56   after K2's final reduce: layer M-1's output, column slice j,
@@ -91,7 +92,9 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
 from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (  # noqa: F401
+    FP8_MAX,
     HEADS,
+    INV_FP8_MAX,
     QH,
     QK_NOPE,
     QKV_A,
@@ -117,8 +120,6 @@ from atom.mono.device.ops import (
 from atom.mono.device.sync import publish
 from atom.mono.plan.execution import THREADS, WAVES
 
-FP8_MAX = 448.0
-INV_FP8_MAX = 1.0 / FP8_MAX  # f32: 0x3b124925, as triton's constant
 MSQ0 = 128  # P0's MSQ sums in ``red``, past the gate weights (``kda.stage_mix``)
 AMX0 = 1024  # P0's AMX sums in ``red``, past the MSQ sums
 MAX_ROWS = 16  # one token group: the AttnRes CTAs wrote prefix(M-1) themselves
