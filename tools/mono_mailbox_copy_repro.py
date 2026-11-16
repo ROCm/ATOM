@@ -220,7 +220,8 @@ def run_fixture(args):
         return t
 
     # Explicit ABI fields; unused index and peer pointers are 0 in this non-token-
-    # parallel K1. The FP8 weights are filled with 0x38 below.
+    # parallel K1; ring_scale is 0 for the bf16 ring, as in the runner. The FP8
+    # weights are filled with 0x38 below.
     vals = {
         name: 0
         for name in (
@@ -243,6 +244,7 @@ def run_fixture(args):
             "sin",
             "pos",
             "ring",
+            "ring_scale",
             "ring_rows",
             "ring_off",
             "res_out",
