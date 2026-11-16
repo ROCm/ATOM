@@ -32,7 +32,8 @@ from .triton_mla import TritonMLAMetadataBuilder
 # A scratch slot is held from scheduling until the batch after its forward has
 # issued the store, so two steps' checkpoints are out at once.
 # shortcut: covers two prefills a step; a step with more drops the rest
-# (`checkpoints_dropped`). Size from max prefills a step if c16 shows drops.
+# (`checkpoints_dropped`). Grow it once those drops cost more prefix reuse
+# than the paged blocks the extra slots would take.
 MIDSTEP_SCRATCH_SLOTS = 4
 
 
