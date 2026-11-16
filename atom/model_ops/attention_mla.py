@@ -1495,15 +1495,14 @@ class MLAAttention(nn.Module):
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
         # x = torch.bmm(x, self.W_UV).transpose(0, 1)
         # Convert from (B, N, L) to (N, B, L)
-        use_fp4 = is_rocm_aiter_fp4bmm_enabled()
         output = torch.empty(
             x.shape[1],
             x.shape[0],
             W_V.shape[1],
             device=x.device,
-            dtype=x.dtype if not use_fp4 and W_V_scale is None else torch.bfloat16,
+            dtype=x.dtype,
         )
-        if use_fp4:
+        if is_rocm_aiter_fp4bmm_enabled():
             batched_gemm_a16wfp4(
                 x,
                 W_V,
