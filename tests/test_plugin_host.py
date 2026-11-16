@@ -434,6 +434,8 @@ def test_select_reads_only_what_the_key_holds():
             "kv_indptr_extend",
         ),
         "v41.draft.ctx": (),
+        # once per process: model, config and drafter are the runner's own
+        "v41.mono.install": ("model", "atom_config", "drafter"),
     }
 
 
@@ -1483,3 +1485,111 @@ def test_a_bound_module_call_traces_like_the_module():
     compiled = torch.compile(toy, backend="eager", fullgraph=True)
     assert torch.allclose(compiled(x), toy.ffn(x))
     torch._dynamo.reset()
+
+
+# -- boot-only seam: the V4.1 whole-step decode installer ----------------------------
+
+MONO = "v41.mono.install"
+
+
+def _installers(log):
+    def native(model, atom_config, drafter, *, metadata_builder=None):
+        log.append(("native", model, atom_config, drafter, metadata_builder))
+        return "mono", model
+
+    def plugin(model, atom_config, drafter, *, capability, valid_rows, **kw):
+        log.append(("plugin", model, atom_config, drafter, kw, capability))
+        return "hi", model
+
+    return native, plugin
+
+
+def test_the_mono_installer_is_atoms_without_an_owner():
+    log = []
+    native, _ = _installers(log)
+    host.configure(None)
+    got = host.call(MONO, native, "m", "cfg", None, metadata_builder="mb")
+    assert got == ("mono", "m")
+    assert log == [("native", "m", "cfg", None, "mb")]
+    assert host.BOOT_ONLY == {MONO} and host.SEAMS[MONO].boot_only
+
+
+def test_a_planned_mono_installer_replaces_atoms(monkeypatch):
+    log = []
+    native, plugin = _installers(log)
+    _plugins(monkeypatch, hi=_offer(MONO, "hi", impl=plugin, graph="eager"))
+    host.configure(recipes.resolve([_recipe({MONO: ["hi"]})]), kill_switch=False)
+    got = host.call(MONO, native, "m", "cfg", "draft", metadata_builder="mb")
+    assert got == ("hi", "m")
+    assert log == [
+        (
+            "plugin",
+            "m",
+            "cfg",
+            "draft",
+            {"metadata_builder": "mb"},
+            host.Capability(MONO),
+        )
+    ]
+    assert host.last_decision() == host.Decision(MONO, "plugin", "selected", "hi")
+
+
+def test_a_declining_mono_installer_leaves_atoms_mono(monkeypatch):
+    log = []
+    native, plugin = _installers(log)
+
+    def tp4_only(cap, model, atom_config, drafter, **kw):
+        return atom_config == "tp4"
+
+    _plugins(
+        monkeypatch,
+        hi=_offer(MONO, "hi", impl=plugin, graph="eager", select=tp4_only),
+    )
+    host.configure(["hi"], kill_switch=False)
+    assert host.call(MONO, native, "m", "tp8", None) == ("mono", "m")
+    assert host.last_decision().reason == "declined"
+
+
+def test_a_hotplug_may_not_add_a_mono_installer(monkeypatch):
+    log = []
+    native, plugin = _installers(log)
+    _plugins(
+        monkeypatch,
+        hi=_offer(MONO, "hi", impl=plugin, graph="eager"),
+        bmm=_offer(OUT, "bmm"),
+    )
+    host.configure(None, hotplug=True, kill_switch=False)
+    slot = host.bind(OUT, _native)  # the model build
+    assert host.call(MONO, native, "m", "cfg", None) == ("mono", "m")
+
+    with pytest.raises(recipes.RecipeRefused) as refused:
+        host.hotplug_plan(recipes.resolve([_recipe({MONO: ["hi"], OUT: ["bmm"]})]))
+    assert refused.value.reason == "recipe-boot-only"
+    assert host.status()["plan_id"] is None and host.owners(MONO, "any") == ()
+
+    # A plan that leaves the installer alone still hot-plugs.
+    host.hotplug_plan(recipes.resolve([_recipe({OUT: ["bmm"]})]))
+    assert slot(x, x, x, x) == ("y", "scale")
+
+
+def test_a_hotplug_must_keep_the_boot_mono_installer(monkeypatch):
+    log = []
+    native, plugin = _installers(log)
+    _plugins(
+        monkeypatch,
+        hi=_offer(MONO, "hi", impl=plugin, graph="eager"),
+        bmm=_offer(OUT, "bmm"),
+    )
+    boot = recipes.resolve([_recipe({MONO: ["hi"]})])
+    host.configure(boot, hotplug=True, kill_switch=False)
+    host.bind(OUT, _native)
+    assert host.call(MONO, native, "m", "cfg", None) == ("hi", "m")
+
+    for plan in (None, recipes.resolve([_recipe({OUT: ["bmm"]})])):
+        with pytest.raises(recipes.RecipeRefused) as refused:
+            host.hotplug_plan(plan)
+        assert refused.value.reason == "recipe-boot-only"
+        assert host.status()["plan_id"] == boot.plan_id
+        assert host.owners(MONO, "any") == ("hi",)
+    kept = recipes.resolve([_recipe({MONO: ["hi"], OUT: ["bmm"]})])
+    assert host.hotplug_plan(kept)["plan_id"] == kept.plan_id
