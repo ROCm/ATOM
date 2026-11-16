@@ -181,6 +181,7 @@ fn dispatch_with_policy(
                     decode,
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
+                    prefill_tokens: 7,
                 },
                 headers.as_ref(),
             )
@@ -507,10 +508,13 @@ async fn check_streaming_lifecycle(kind: DispatchKind, end: StreamEnd) {
         "{kind:?}: P must count before response headers"
     );
     assert_eq!(d.worker.load(), 1, "{kind:?}: selected D must be reserved");
+    assert_eq!(p.worker.prefill_tokens(), 7, "{kind:?}: P holds the prompt");
+    assert_eq!(d.worker.prefill_tokens(), 0, "{kind:?}: D has no prefill");
 
     p.respond(prefill_response());
     d.wait_entered().await;
     wait_load(&p.worker, 0).await;
+    assert_eq!(p.worker.prefill_tokens(), 0, "{kind:?}: prefill done");
     assert_eq!(d.worker.load(), 1, "D must count while waiting for headers");
 
     let (response, tx) = stream_response(StatusCode::OK);
@@ -684,6 +688,7 @@ async fn dispatch_hooks_wait_until_the_new_decode_receives_a_request() {
             decode: b.worker.clone(),
             prefill_policy: "round_robin",
             decode_policy: "dp_sticky",
+            prefill_tokens: 0,
         },
         Some(&headers),
     );
