@@ -21,6 +21,7 @@ with (
         "aiter.jit.utils.torch_guard",
         "aiter.ops.flydsl.moe_common",
         "aiter.ops.shuffle",
+        "aiter.ops.topk",
         "aiter.ops.triton.quant",
         "aiter.utility.fp4_utils",
         "triton",
