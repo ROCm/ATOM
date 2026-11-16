@@ -11,7 +11,6 @@ import torch
 
 pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton")
 
-from atom.model_ops.attentions.deepseek_v41 import planes
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.indices import (
@@ -26,8 +25,6 @@ from atom.model_ops.attentions.deepseek_v41.planes import (
     split_source,
 )
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
-from atom.model_ops.deepseek_v41 import rope_window
 
 
 def geometry(dtype, slack=0):
@@ -459,9 +456,6 @@ def test_a8w4_prefill_reuses_mxfp8_window_and_keeps_history(monkeypatch):
     emitted = []
 
     def produce(*args, **kwargs):
-        from tests.attentions.deepseek_v41.plane_reference import stage_window
-
-        stage_window(*kwargs["staging"])
         emitted.append(kwargs)
         kwargs["values"].view(torch.uint8).fill_(42)
         kwargs["scales"].view(torch.uint8).fill_(127)
@@ -909,112 +903,3 @@ def test_a8w4_indptrs_replay_live_rows_in_disjoint_microbatch_buffers(monkeypatc
         pair[0].data_ptr() == cache.a8w4_indptr_buffers[r][0].data_ptr()
         for r, pair in actual.items()
     )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-@pytest.mark.parametrize("dtype", ["fp8", "fp4"])
-@pytest.mark.parametrize("heads", [0, 64])
-@pytest.mark.parametrize("tokens", [4, 128])
-def test_prefill_fuses_history_and_replays_live_slot_mapping(
-    dtype, heads, tokens, monkeypatch
-):
-    torch.manual_seed(20261115)
-    cache = PagedAttentionCache(
-        geometry(dtype, 5), 7, 4, "cuda", max_tokens=tokens, a8w4_attention=True
-    )
-    ring, dim = cache.geometry.ring_slots, cache.geometry.head_dim
-    length = tokens // 2
-    step = cache.begin_step(
-        (RequestSpan(0, 8, 0, length, 3), RequestSpan(1, 8, length, length, 1)),
-        block_tables=[list(range((8 + length + 31) // 32))] * 2,
-        is_prefill=True,
-    )
-    history = cache.ring_view(1)
-    for plane in history:
-        plane.copy_(
-            torch.randint(0, 255, plane.shape, device="cuda", dtype=torch.uint8)
-        )
-    old = tuple(p.clone() for p in history)
-    kv = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16)
-    query = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
-    theta = torch.randn(256, 32, device="cuda")
-    rope = SimpleNamespace(
-        rope_dim=64, cos_cache=theta.cos().bfloat16(), sin_cache=theta.sin().bfloat16()
-    )
-    q8 = cache.query_fp8(query, a8w4=True) if heads else None
-    expected_q = tuple(torch.empty_like(p) for p in q8) if q8 else None
-    expected_source = torch.full_like(step.prefill_window_staging, 211)
-    expected_planes = split_source(expected_source, dim)
-    tail = 2 * ring
-
-    def reference():
-        expected_source.fill_(211)
-        for batch, slot in enumerate(step.slots.tolist()):
-            if slot < 0 or step.cu_seqlens_q[batch] == step.cu_seqlens_q[batch + 1]:
-                continue
-            for output, source in zip(expected_planes, old):
-                output[batch * ring : (batch + 1) * ring].copy_(
-                    source[slot * ring : (slot + 1) * ring]
-                )
-        rope_window.rope_quant_window(
-            query,
-            kv,
-            rope.cos_cache,
-            rope.sin_cache,
-            step.positions,
-            rope_dim=64,
-            values=expected_planes[0][tail:].view(FP8_DTYPE),
-            scales=expected_planes[1][tail:].view(torch.float8_e8m0fnu),
-            query_fp8=expected_q,
-        )
-
-    real_kernel = rope_window._rope_window_kernel
-    launches = []
-
-    class Spy:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                launches.append(kwargs["STAGE"])
-                return real_kernel[grid](*args, **kwargs)
-
-            return launch
-
-    monkeypatch.setattr(rope_window, "_rope_window_kernel", Spy())
-
-    def separate_stage_forbidden(*args, **kwargs):
-        raise AssertionError("production prefill launched a separate history copy")
-
-    monkeypatch.setattr(planes, "_stage_window", separate_stage_forbidden)
-
-    def fused():
-        return cache.rope_quant_window(
-            1, query if heads else None, kv, rope, step, q8, a8w4=dtype == "fp4"
-        )
-
-    step.prefill_window_staging.fill_(211)
-    output, pending = fused()
-    assert launches == [True]
-    assert pending[0].data_ptr() == output[0][tail:].data_ptr()
-    assert pending[1].data_ptr() == output[1][tail:].data_ptr()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fused()
-    for ids, cu in (
-        ([3, 1], [0, length, tokens]),
-        ([0, 2], [0, length, tokens]),
-        ([-1, 2], [0, length, length]),
-    ):
-        step.slots.copy_(torch.tensor(ids, device="cuda", dtype=step.slots.dtype))
-        step.cu_seqlens_q.copy_(
-            torch.tensor(cu, device="cuda", dtype=step.cu_seqlens_q.dtype)
-        )
-        step.prefill_window_staging.fill_(211)
-        reference()
-        graph.replay()
-        torch.testing.assert_close(
-            step.prefill_window_staging, expected_source, rtol=0, atol=0
-        )
-        for actual, expected in zip(q8 or (), expected_q or ()):
-            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-        for actual, saved in zip(history, old):
-            assert torch.equal(actual, saved)

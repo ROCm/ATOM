@@ -32,8 +32,6 @@ from atom.model_ops.v4_kernels.pool_index import window_row
 # token up, with the same bytes out. False only for the tests' per-head
 # reference.
 _HEAD_BLOCK = True
-# Keep the copy tile below the query quantizer's register footprint.
-_STAGE_ROWS = 4
 
 # The MXFP8 query's heads quantized by one program rather than one each, with
 # the same bytes out. 8 heads on 2 warps, 64 heads at 1344 / 16384 tokens:
@@ -50,48 +48,6 @@ _FP8_HEADS_MIN_PROGRAMS_PER_CU = 2
 @functools.lru_cache
 def _cu_count(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-@triton.jit
-def _stage_window_rows(
-    data,
-    scale,
-    output,
-    output_scale,
-    slots,
-    cu,
-    block,
-    batch,
-    RING: tl.constexpr,
-    D: tl.constexpr,
-    ROWS: tl.constexpr,
-):
-    # Graph padding has no slot to read. All live requests use batch-local
-    # rows, so the temporary source never scales with cache.num_slots.
-    if tl.load(cu + batch + 1) == tl.load(cu + batch):
-        return
-    slot = tl.load(slots + batch).to(tl.int64)
-    if slot < 0:  # a dummy query prefix may be live without a cache request
-        return
-    row = block * ROWS + tl.arange(0, ROWS)
-    d = tl.arange(0, D)
-    g = tl.arange(0, D // 32)
-    old = slot * RING + row
-    new = batch.to(tl.int64) * RING + row
-    tl.store(
-        output + new[:, None] * D + d[None, :],
-        tl.load(data + old[:, None] * D + d[None, :], (row < RING)[:, None], other=0),
-        (row < RING)[:, None],
-    )
-    tl.store(
-        output_scale + new[:, None] * (D // 32) + g[None, :],
-        tl.load(
-            scale + old[:, None] * (D // 32) + g[None, :],
-            (row < RING)[:, None],
-            other=0,
-        ),
-        (row < RING)[:, None],
-    )
 
 
 @triton.jit
@@ -231,15 +187,6 @@ def _rope_window_kernel(
     ring_start,
     kv_stride,
     tokens,
-    history,
-    history_scale,
-    staged,
-    staged_scale,
-    stage_slots,
-    stage_cu,
-    STAGE_RING: tl.constexpr,
-    STAGE_ROWS: tl.constexpr,
-    STAGE: tl.constexpr,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     ROPE: tl.constexpr,
@@ -275,25 +222,6 @@ def _rope_window_kernel(
     # groups its heads with `FP8_HEADS` instead.
     tl.static_assert(not (HEAD_BLOCK and EMIT_QUERY_FP8))
     pid = tl.program_id(0)
-    if STAGE:
-        stage_block = pid - tokens * (QUERY_PROGRAMS + 1)
-        if stage_block >= 0:
-            tiles: tl.constexpr = triton.cdiv(STAGE_RING, STAGE_ROWS)
-            batch = stage_block // tiles
-            _stage_window_rows(
-                history,
-                history_scale,
-                staged,
-                staged_scale,
-                stage_slots,
-                stage_cu,
-                stage_block % tiles,
-                batch,
-                STAGE_RING,
-                D,
-                STAGE_ROWS,
-            )
-            return
     query_rows = tokens * QUERY_PROGRAMS
     is_query = pid < query_rows
     token = tl.where(is_query, pid // max(QUERY_PROGRAMS, 1), pid - query_rows)
@@ -384,7 +312,6 @@ def rope_quant_window(
     scales=None,
     ring=None,
     query_fp8=None,
-    staging=None,
 ):
     """Rotate `query` in place and run the KV row to whichever sinks are given.
 
@@ -394,11 +321,6 @@ def rope_quant_window(
     stores straight into. With none of them there is no KV half, and `kv` may
     be None. `query_fp8`: `(values, scales)` the rotated query is quantized
     into instead of being rotated in place.
-
-    `staging`: `(history_planes, source_planes, step, ring_slots)` stages
-    each live request's history in independent programs of the same launch.
-    `values/scales` must point to the source's current-KV tail, disjoint from
-    its history. The persistent ring is read-only until attention finishes.
 
     `ring`'s pool is either `(data, scale)` with contiguous uint8 planes or a
     `[rows, head_dim]` BF16 tensor. `window_row` returns a row index in both
@@ -434,21 +356,7 @@ def rope_quant_window(
     ):
         fp8_heads = 1
     query_programs = 1 if head_block else heads // fp8_heads
-    old, output, stage_step, stage_ring = staging or (
-        (None, None),
-        (None, None),
-        None,
-        1,
-    )
-    stage_programs = (
-        0
-        if staging is None
-        else (stage_step.cu_seqlens_q.numel() - 1)
-        * triton.cdiv(stage_ring, _STAGE_ROWS)
-    )
-    if staging is not None and (values is None or scales is None or ring is not None):
-        raise ValueError("Prefill staging requires current KV planes and no ring write")
-    _rope_window_kernel[(tokens * (query_programs + kv_half) + stage_programs,)](
+    _rope_window_kernel[(tokens * (query_programs + kv_half),)](
         query,
         kv if kv_half else query,
         cos,
@@ -469,13 +377,6 @@ def rope_quant_window(
         0 if window is None else window.ring_start,
         kv.stride(0) if kv_half else 0,
         tokens,
-        *old,
-        *output,
-        None if stage_step is None else stage_step.slots,
-        None if stage_step is None else stage_step.cu_seqlens_q,
-        STAGE_RING=stage_ring,
-        STAGE_ROWS=_STAGE_ROWS,
-        STAGE=staging is not None,
         HEADS=heads,
         D=dim,
         ROPE=rope_dim,

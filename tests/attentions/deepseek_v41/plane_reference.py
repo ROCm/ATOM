@@ -7,7 +7,7 @@ from atom.model_ops.attentions.deepseek_v41.planes import split_source
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 
 
-def prefill_window(history, step, geometry, *, stage=True):
+def prefill_window(history, step, geometry):
     batches = step.cu_seqlens_q.numel() - 1
     ring = geometry.ring_slots
     size = geometry.prefill_staging(batches, step.running_tokens).nbytes
@@ -17,13 +17,7 @@ def prefill_window(history, step, geometry, *, stage=True):
     if source.numel() < size:
         raise ValueError("Prefill window staging is smaller than the live step")
     planes = split_source(source[:size], geometry.head_dim)
-    if stage:
-        stage_window(history, planes, step, ring)
-    return planes, tuple(p[batches * ring :] for p in planes)
-
-
-def stage_window(history, planes, step, ring):
-    for batch in range(step.cu_seqlens_q.numel() - 1):
+    for batch in range(batches):
         if step.cu_seqlens_q[batch + 1] == step.cu_seqlens_q[batch]:
             continue
         slot = int(step.slots[batch])
@@ -33,6 +27,7 @@ def stage_window(history, planes, step, ring):
             dst[batch * ring : (batch + 1) * ring].copy_(
                 old[slot * ring : (slot + 1) * ring]
             )
+    return planes, tuple(p[batches * ring :] for p in planes)
 
 
 def reset_windows(sources, ptrs, slots, ring, dim):

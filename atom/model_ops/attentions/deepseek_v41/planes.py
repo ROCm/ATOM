@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.deepseek_v41.rope_window import _stage_window_rows
 from atom.model_ops.v4_kernels.state_writes import swa_write
 
 from .packed_rows import _read_plane
@@ -28,26 +27,38 @@ def split_source(source, dim, fp4=False):
 def _stage_window(
     data, scale, output, output_scale, slots, cu, RING: tl.constexpr, D: tl.constexpr
 ):
-    _stage_window_rows(
-        data,
-        scale,
-        output,
-        output_scale,
-        slots,
-        cu,
-        tl.program_id(0),
-        tl.program_id(1),
-        RING,
-        D,
-        16,
+    batch = tl.program_id(1)
+    # Graph padding has no slot to read. All live requests use batch-local
+    # rows, so the temporary source never scales with cache.num_slots.
+    if tl.load(cu + batch + 1) == tl.load(cu + batch):
+        return
+    slot = tl.load(slots + batch).to(tl.int64)
+    if slot < 0:  # a dummy query prefix may be live without a cache request
+        return
+    row = tl.program_id(0) * 16 + tl.arange(0, 16)
+    d = tl.arange(0, D)
+    g = tl.arange(0, D // 32)
+    old = slot * RING + row
+    new = batch.to(tl.int64) * RING + row
+    tl.store(
+        output + new[:, None] * D + d[None, :],
+        tl.load(data + old[:, None] * D + d[None, :], (row < RING)[:, None], other=0),
+        (row < RING)[:, None],
+    )
+    tl.store(
+        output_scale + new[:, None] * (D // 32) + g[None, :],
+        tl.load(
+            scale + old[:, None] * (D // 32) + g[None, :],
+            (row < RING)[:, None],
+            other=0,
+        ),
+        (row < RING)[:, None],
     )
 
 
-def prefill_window(history, step, geometry, *, stage=True):
+def prefill_window(history, step, geometry):
     """One SWA source: this batch's rings followed by space for current KV.
 
-    With `stage=False`, the producer copies history in its RoPE/quantization
-    launch. Otherwise this function stages history before returning.
     The producer writes current KV directly to the tail views. The persistent
     rings remain unchanged until attention completes and write_window commits.
     Reuse the step's reserved storage, but derive plane and tail offsets from
@@ -63,7 +74,7 @@ def prefill_window(history, step, geometry, *, stage=True):
     if source.numel() < size:
         raise ValueError("Prefill window staging is smaller than the live step")
     planes = split_source(source[:size], dim)
-    if stage and batches:
+    if batches:
         _stage_window[(triton.cdiv(ring, 16), batches)](
             *history, *planes, step.slots, step.cu_seqlens_q, ring, dim
         )

@@ -1033,14 +1033,11 @@ class PagedAttentionCache:
         qat = None if quantized_attn else torch.empty_like(kv)
         values = scales = None
         attention_source = qat
-        staging = None
         if window_fp8:
             if quantized_attn:
-                history = self.ring_view(layer)
                 attention_source, current = prefill_window(
-                    history, step, self.geometry, stage=False
+                    self.ring_view(layer), step, self.geometry
                 )
-                staging = (history, attention_source, step, self.geometry.ring_slots)
             else:
                 size = self.geometry.prefill_staging(0, step.running_tokens).nbytes
                 source = step.prefill_window_staging[:size]
@@ -1056,7 +1053,6 @@ class PagedAttentionCache:
             values=values,
             scales=scales,
             query_fp8=query_fp8,
-            staging=staging,
         )
         return attention_source, (values, scales) if window_fp8 else qat
 
