@@ -52,7 +52,8 @@ from atom.models.deepseek_v4.mono.kernels.primitives import (
 )
 
 # A kernel's JIT disk-cache key covers only the sources in its own directory. A kernel that binds these
-# helpers captures this digest of the shared device sources, so editing this file or ops.py recompiles it.
+# helpers captures this digest of the shared device sources, so editing this file, ops.py or mono/polling.py
+# recompiles it.
 SHARED_SOURCE_KEY = hashlib.sha256(
     b"".join(
         Path(module.__file__).read_bytes() for module in (ops, bo, dpp_utils, polling)

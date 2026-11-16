@@ -24,6 +24,8 @@ its prior process/KFD ownership has actually gone away.
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py --setup-only
 # Run from the checkout root. PYTHONPATH="$PWD" makes Python import this
 # checkout's atom package, which the tool's ownership check requires.
+# 128 rounds is a smoke run. To change POLL_SLEEP_UNITS use --repeats 1024
+# (see "Before lowering" below).
 # --deadline SECONDS (default 15) is how long a round may take on the GPU before
 # the tool reports pending_deadline and waits for the external timeout.
 PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono_mailbox_copy_repro.py --mode side --repeats 128
@@ -32,12 +34,23 @@ PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s   python tools/mono
 ```
 
 For a rollback control, make a separate clean checkout of the same revision and
-revert only the backoff there: set `POLL_SLEEP_UNITS = 1` in
-`atom/mono/polling.py` and make the three `spin_pause` definitions
-(`atom/mono/device/ops.py`, `atom/models/deepseek_v4/mono/kernels/primitives.py`,
-`atom/models/deepseek_v41/mono/hi/device/gfx950/ops.py`) emit `"s_nop 0"`
-instead of `f"s_sleep {POLL_SLEEP_UNITS}"`. That restores the pre-backoff polling
-instructions. Repeat the commands above in that checkout with its own fresh JIT
+revert only the backoff there. Every site this PR changed must go back:
+
+1. `atom/mono/polling.py`: set `POLL_SLEEP_UNITS = 1`. That restores the
+   `s_sleep(1)` that main had at `atom/mono/device/sync.py` (two polls) and
+   `atom/mono/runtime/step_begin.py` (three polls), which now use
+   `POLL_SLEEP_UNITS`.
+2. The three `spin_pause` definitions (`atom/mono/device/ops.py`,
+   `atom/models/deepseek_v4/mono/kernels/primitives.py`,
+   `atom/models/deepseek_v41/mono/hi/device/gfx950/ops.py`): emit `"s_nop 0"`
+   instead of `f"s_sleep {POLL_SLEEP_UNITS}"`.
+3. `atom/models/deepseek_v4/mono/kernels/helpers.py` (two polls, `rocdl.s_sleep(polling.POLL_SLEEP_UNITS)`
+   at lines 179 and 198): change both back to `rocdl.s_nop(0)`.
+
+`sync.py::sleep_ticks` keeps `s_sleep(1)` (harness delay injection, unchanged by
+this PR). The V4.1 K1 that this tool
+exercises does not go through item 3, but the full recipe is what restores the
+pre-backoff polling instructions. Repeat the commands above in that checkout with its own fresh JIT
 cache and the same dependencies, GPU, masks and inputs. Do not monkeypatch the current wait functions or overwrite
 the candidate checkout. Save both source identities, logs, process exit codes,
 per-round busy preconditions and post-process KFD/VRAM ownership checks. The tool
@@ -57,6 +70,13 @@ when Mono runs, restored bytes when the copy runs, so both in `--mode side`),
 then emits complete and must also exit normally. Completion is still only
 a sampled liveness result; a rare hang remains possible and the hardware root
 cause and Store/Mono residency/ordering restrictions are not solved by backoff.
+
+Before lowering `POLL_SLEEP_UNITS` (currently 16), 128-round runs are not enough:
+8 passed 44/44 such runs but hung once in four 1024-round runs, while 16 passed
+12/12 1024-round runs. Use `--mode side --repeats 1024` with `timeout` of at
+least 300s, on several GPUs, at least 12 runs for the candidate and for 16 in the
+same batch; any hang rejects the candidate. Passing is still only a sampled
+liveness result on this synthetic workload, not a proof of safety.
 
 Historical larger fixture: original sleep1 backcheck repeated the hang; sleep16
 passed 544 concurrent mini cases and three private Store/native smoke cases.
