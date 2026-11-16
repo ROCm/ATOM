@@ -1,5 +1,6 @@
 """Thread-owned bounded reuse of metadata; uncertain GPU work stays retained."""
 
+import contextlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,6 +11,9 @@ METADATA_GPU_RESERVE_BYTES = MAX_METADATA_ELEMENTS * 8  # int64 IDs
 # Executor thread-local state can disappear when the worker closes. Unsafe
 # storage must survive that teardown, not merely remain in its thread's pool.
 _QUARANTINED_STORAGE: list[Any] = []
+# Pending leases of a pool that was collected (its worker exited) before their
+# completion event fired. Held strongly until the event confirms completion.
+_ORPHANED_PENDING: list["MetadataLease"] = []
 
 
 class MetadataPoolExhausted(RuntimeError):
@@ -28,6 +32,22 @@ class MetadataLease:
     launched: bool = False
 
 
+def _sweep_orphaned_pending() -> None:
+    """Release orphaned storage once its event completed; quarantine unknowns."""
+    for _ in range(len(_ORPHANED_PENDING)):
+        try:
+            lease = _ORPHANED_PENDING.pop()
+        except IndexError:
+            return
+        try:
+            if lease.completion.query():
+                continue
+            _ORPHANED_PENDING.append(lease)
+        except Exception:  # noqa: BLE001
+            lease.state = "quarantined"
+            _QUARANTINED_STORAGE.append(lease.buffer)
+
+
 class MetadataLeasePool:
     def __init__(
         self,
@@ -43,6 +63,16 @@ class MetadataLeasePool:
         self.max_leases, self.max_elements = max_leases, max_elements
         self.thread_id = threading.get_ident()
 
+    def __del__(self):
+        # The owning thread is gone. A free buffer is device-safe to drop, but a
+        # pending one may still be written by its upload/kernel: keep it alive.
+        with contextlib.suppress(Exception):  # interpreter teardown
+            pending = [x for x in self.leases if x.state == "pending"]
+            for lease in pending:
+                lease.pool = None  # do not keep the dead pool's free buffers
+            self.leases = []
+            _ORPHANED_PENDING.extend(pending)
+
     def assert_thread(self):
         if threading.get_ident() != self.thread_id:
             raise RuntimeError("metadata pool belongs to its construction thread")
@@ -51,6 +81,8 @@ class MetadataLeasePool:
         self.assert_thread()
         if count <= 0:
             raise ValueError("positive metadata count required")
+        if _ORPHANED_PENDING:
+            _sweep_orphaned_pending()
         for lease in self.leases:
             if lease.state == "pending":
                 try:

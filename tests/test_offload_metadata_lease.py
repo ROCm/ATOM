@@ -1,7 +1,10 @@
+import gc
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from atom.kv_transfer.offload import metadata_lease as ml
 from atom.kv_transfer.offload.metadata_lease import (
     MetadataLeasePool,
     MetadataPoolExhausted,
@@ -75,3 +78,57 @@ def test_repeated_transfers_reuse_one_bounded_allocation():
     larger = pool.acquire(65)
     assert larger.capacity == 128
     assert len(pool.leases) == 1
+
+
+class Storage:
+    """Stand-in for a pinned CPU + GPU ID buffer."""
+
+
+def live_storage():
+    # gc clears weakrefs to cyclic garbage even when a finalizer resurrects it,
+    # so count the objects the collector still tracks instead.
+    gc.collect()
+    return sum(isinstance(x, Storage) for x in gc.get_objects())
+
+
+class ThreadPools(threading.local):
+    pool = None
+
+
+def _worker_with_pending_lease_exits(event):
+    """A worker's ID upload fails (no owner returned), then the worker exits."""
+    tls = ThreadPools()
+
+    def worker():
+        tls.pool = MetadataLeasePool(lambda n: Storage())
+        lease = tls.pool.acquire(8)
+        tls.pool.retire(lease, completion=event, safe=True)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+
+
+def test_pending_storage_outlives_its_exited_worker_until_completion():
+    assert live_storage() == 0
+    event = Event()
+    _worker_with_pending_lease_exits(event)
+    assert live_storage() == 1, "storage freed while its upload may be in flight"
+    # Another worker's next acquire polls the orphan; still incomplete: kept.
+    other = MetadataLeasePool(lambda n: Storage())
+    other.acquire(1)
+    assert live_storage() == 2 and len(ml._ORPHANED_PENDING) == 1
+    event.done = True
+    other.acquire(1)  # the orphan completed: released (other now holds 2 buffers)
+    assert live_storage() == 2 and not ml._ORPHANED_PENDING
+
+
+def test_orphaned_pending_storage_is_quarantined_if_completion_is_unknown():
+    ml._QUARANTINED_STORAGE.clear()
+    assert live_storage() == 0
+    _worker_with_pending_lease_exits(Event(error=True))
+    gc.collect()
+    MetadataLeasePool(lambda n: Storage()).acquire(1)
+    assert live_storage() == 1  # the orphan; the polling pool's buffer is gone
+    assert not ml._ORPHANED_PENDING and len(ml._QUARANTINED_STORAGE) == 1
+    ml._QUARANTINED_STORAGE.clear()
