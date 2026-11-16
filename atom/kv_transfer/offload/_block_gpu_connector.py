@@ -889,8 +889,12 @@ class BlockGPUConnector:
         """
         self._assert_fused_chunk_major_available()
 
+        fenced = False
+
         def recover(staging_buffer, failed_a, failed_b) -> bool:
+            nonlocal fenced
             if self._fence_pipeline_streams(failed_a, failed_b):
+                fenced = True
                 return True
             self._quarantine_staging_buffer(staging_buffer)
             if block_id_owner is not None:
@@ -918,7 +922,12 @@ class BlockGPUConnector:
             )
         except BaseException:
             if block_id_owner is not None:
-                self.codec.finish_prepared_block_id_groups(block_id_owner, safe=False)
+                # Only a recovery that fenced both streams proves no launched
+                # kernel still reads the lease; anything else (no recovery ran,
+                # or a fence failed) must quarantine it.
+                self.codec.finish_prepared_block_id_groups(
+                    block_id_owner, safe=fenced
+                )
             raise
         else:
             # run_staged_pipeline already performed its operation completion fence;

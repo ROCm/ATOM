@@ -3720,11 +3720,13 @@ def make_in_place_worker(cluster, monkeypatch):
     """A worker whose windows take the in-place path over a host pool."""
     built = []
 
-    def build(*, save_slots=8, load_slots=8):
+    def build(
+        *, save_slots=8, load_slots=8, chunk_bytes=PAGE_CHUNK_BYTES, codec=None
+    ):
         worker = MooncakeStoreOffloadConnector(_config())
         gpu = FakeGPUConnector(worker._source_group_safe)
-        gpu.gpu_staging_chunk_bytes = PAGE_CHUNK_BYTES
-        codec = FakeInPlaceCodec()
+        gpu.gpu_staging_chunk_bytes = chunk_bytes
+        codec = FakeInPlaceCodec() if codec is None else codec
         stream = FakeStream()
         client = store_client.MooncakeStoreClient(
             local_hostname="10.0.0.2",
@@ -3735,9 +3737,9 @@ def make_in_place_worker(cluster, monkeypatch):
         )
         pool = TransferSlotPool(
             device="cpu",
-            chunk_bytes=PAGE_CHUNK_BYTES,
-            save_bytes=save_slots * PAGE_CHUNK_BYTES,
-            load_bytes=load_slots * PAGE_CHUNK_BYTES,
+            chunk_bytes=chunk_bytes,
+            save_bytes=save_slots * -(-chunk_bytes // SLOT) * SLOT,
+            load_bytes=load_slots * -(-chunk_bytes // SLOT) * SLOT,
             client=client,
         )
         worker._gpu_connector, worker._client, worker._pool = gpu, client, pool
@@ -3753,6 +3755,55 @@ def make_in_place_worker(cluster, monkeypatch):
     yield build
     for worker in built:
         worker.close()
+
+
+class FakeStridedCodec(FakeInPlaceCodec):
+    """Adds the strided restore: Store slots read in place, padding skipped."""
+
+    supports_strided_restore = True
+    block_bytes = 1536  # two blocks make a 3072-byte chunk in a 4096-byte slot
+
+    def chunk_major_strided_buffer_to_gpu_prepared(
+        self, buf, owner, index, *, stream, items_per_chunk, chunk_stride_bytes
+    ):
+        assert stream is owner.stream
+        data = buf.numpy().tobytes()
+        for chunk, blocks in enumerate(owner.groups[index]):
+            assert len(blocks) == items_per_chunk
+            for item, block in enumerate(blocks):
+                start = chunk * chunk_stride_bytes + item * self.block_bytes
+                self.kv[block] = data[start : start + self.block_bytes]
+        self.calls.append(("strided", items_per_chunk, chunk_stride_bytes))
+
+
+def test_in_place_load_restores_padded_slots_without_staging(
+    cluster, make_in_place_worker
+):
+    chunk_bytes = 2 * FakeStridedCodec.block_bytes
+    worker, gpu, codec, stream = make_in_place_worker(
+        load_slots=8, chunk_bytes=chunk_bytes, codec=FakeStridedCodec()
+    )
+    worker._chunk_bytes = chunk_bytes
+    request = _load_req(43, hbm=8, lmc=40, block_ids=list(range(100, 110)))
+    pattern = {}
+    for index in range(1, 5):
+        data = bytes((index * 37 + i) % 251 for i in range(chunk_bytes))
+        cluster.objects[MASTER][_key(request.chunk_hashes, index)] = data
+        pattern[index] = data
+    worker._do_load_req(request)
+
+    # Two chunks per window, two blocks per chunk: the padded run is unpacked
+    # where it lies, never through the staging path.
+    assert gpu.calls == []
+    assert [c for c in codec.calls if c[0] == "strided"] == [
+        ("strided", 2, 4096)
+    ] * 2
+    for index, data in pattern.items():
+        for item in range(2):
+            block = 100 + 2 * index + item
+            width = FakeStridedCodec.block_bytes
+            assert codec.kv[block] == data[item * width : (item + 1) * width]
+    assert worker.get_finished().finished_loading == {request.load_operation}
 
 
 def test_pool_hands_out_a_window_as_one_run(cluster):
