@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's attention forward/preparation helpers, comments and blank
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
-CORE_PREPARE_DIGEST = "1f897780d89a3205"
+CORE_PREPARE_DIGEST = "4372038408ee4177"
 CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
 
 

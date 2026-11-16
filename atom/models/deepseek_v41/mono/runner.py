@@ -723,13 +723,16 @@ class V41MonoDecodeRunner:
         meta = self.key_meta
         index = self._selection_args(spec, attn, cache, step)
         owner = spec.topk_owner if spec.ratio else None
+        pool, pool_scale, window, window_scale, ring_off = cache.mono_views(
+            layer_id, spec.kv_owner
+        )
         return {
             **index,
             "q": p(self.q),
-            "pool": p(cache.main_view(spec.kv_owner)[0]) if cache.kv_fp8 else p(cache.pool),
-            "pool_scale": p(cache.main_view(spec.kv_owner)[1]) if cache.kv_fp8 else 0,
-            "window": p(cache.ring_view(layer_id)[0]) if cache.kv_fp8 else 0,
-            "window_scale": p(cache.ring_view(layer_id)[1]) if cache.kv_fp8 else 0,
+            "pool": p(pool),
+            "pool_scale": p(pool_scale) if pool_scale is not None else 0,
+            "window": p(window) if window is not None else 0,
+            "window_scale": p(window_scale) if window_scale is not None else 0,
             # a layer without a selection reads a dummy row it never uses
             "sel": p(meta if owner is None else self.irow[owner]),
             "topk": 1 if owner is None else ip.TOPK,
@@ -740,7 +743,7 @@ class V41MonoDecodeRunner:
             "rows_per_page": geometry.rows_per_page(spec.ratio or 1),
             "page_rows": geometry.rows_per_page(spec.ratio or 1) if cache.kv_fp8 else geometry.page_bytes // geometry.row_bytes,
             "main_off": geometry.main_offset(spec.kv_owner) if spec.ratio else 0,
-            "ring_off": cache.main_view(spec.kv_owner)[0].shape[0] if cache.kv_fp8 else geometry.window(layer_id, cache.num_pages).ring_start,
+            "ring_off": ring_off,
             "ring_slots": geometry.window(layer_id, cache.num_pages).ring_slots,
             "sink": p(attn.attn_sink),
             "qk_scale": f32_bits(attn.softmax_scale * LOG2E),

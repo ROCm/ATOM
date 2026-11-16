@@ -60,7 +60,7 @@ def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
         layer_ratios=(0, 2),
         index_topk=4,
     )
-    cache = PagedAttentionCache(geo, 7, 4, "cuda", max_tokens=4)
+    cache = PagedAttentionCache(geo, 7, 4, "cuda", max_tokens=4, a8w4_attention=True)
     data, scale = cache.main_view(0)
     raw = torch.randn(data.shape[0], 512, device="cuda", dtype=torch.bfloat16)
     packed, scales = (
@@ -73,7 +73,10 @@ def make_case(heads, decode, ratio=2, *, cache_dtype="fp4"):
     values, scales = quantize_fp8(raw)
     data.copy_(values.view(torch.uint8))
     scale.copy_(scales.view(torch.uint8))
-    tensor = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
     step = BatchStep(
         (RequestSpan(0, 10, 0, 2, 2), RequestSpan(1, 31, 2, 2, 0)),
         tensor([10, 11, 31, 32]),
@@ -197,7 +200,7 @@ def test_gfx950_preserves_requested_cache_and_attention(
 ):
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    from atom.config import Config
+    from atom.config import _check_fp4_kv
     from atom.models.deepseek_v41 import attention as model_attention
     from atom.models.deepseek_v41.attention import Attention
     from atom.utils import forward_context
@@ -213,7 +216,7 @@ def test_gfx950_preserves_requested_cache_and_attention(
         tensor_parallel_size=4,
         enable_dp_attention=True,
     )
-    Config._check_kv_cache_dtype(cfg)
+    _check_fp4_kv(cfg.kv_cache_dtype, is_m3=False, is_v41=True)
     assert cfg.kv_cache_dtype == cache_dtype
     case = make_case(heads, decode, cache_dtype=cfg.kv_cache_dtype)
     cache, step = case.cache, case.step
@@ -336,7 +339,9 @@ def test_native_token_graph_replays_different_request_counts(
         layer_ratios=(0,),
         index_topk=4,
     )
-    cache = PagedAttentionCache(geo, 4, 3, "cuda", max_tokens=width)
+    cache = PagedAttentionCache(
+        geo, 4, 3, "cuda", max_tokens=width, a8w4_attention=a8w4
+    )
     if cache_dtype == "bf16":
         cache.pool.normal_()
         history = (cache.pool.clone(),)
@@ -486,7 +491,9 @@ def test_native_token_graph_replays_different_request_counts(
                 expected,
                 rtol=0.03,
                 atol=0.02,
-                msg=lambda message, requests=requests: f"{requests} requests: {message}",
+                msg=lambda message, requests=requests: (
+                    f"{requests} requests: {message}"
+                ),
             )
         assert len(graph.keys()) == 1
     finally:

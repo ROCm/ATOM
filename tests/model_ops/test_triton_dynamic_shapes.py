@@ -72,7 +72,7 @@ def test_mrope_position_stride_reuses_kernel(tiled):
     axes = torch.where(columns % 3 == 1, 1, torch.where(columns % 3 == 2, 2, 0))
     kernel = m._mrope_qk_tiled_kernel if tiled else m._mrope_qk_kernel
     with one_variant(kernel):
-        for n in ((128, 129, 255, 256, 257) if tiled else (1, 15, 16, 17, 127)):
+        for n in (128, 129, 255, 256, 257) if tiled else (1, 15, 16, 17, 127):
             q = torch.randn(n, 512, device="cuda", dtype=torch.bfloat16)
             k = torch.randn(n, 256, device="cuda", dtype=torch.bfloat16)
             positions = torch.randint(0, 64, (3, n), device="cuda")
@@ -277,10 +277,11 @@ def test_packed_gather_bounds_reuse_kernel():
 
     torch.manual_seed(44)
     x = torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)
-    pool = m.pack_rows(*quantize_fp8(x)).flatten()
+    window = tuple(v.view(torch.uint8) for v in quantize_fp8(x))
+    pool = ((window[0][:0, :16], window[1][:0]), window)
     ref = quantize_fp8(x, dequantize=True)
     order = torch.randperm(128, device="cuda")
-    addresses = ((order * 33 * 2) | 1).contiguous()
+    addresses = ((order * 2) | 1).contiguous()
     addresses[111:] = 2**60
     ptr = torch.tensor([0, 7, 23, 58, 111], device="cuda", dtype=torch.int32)
     with one_variant(m._gather_prefix):

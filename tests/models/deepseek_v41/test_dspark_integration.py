@@ -350,7 +350,7 @@ def test_draft_graph_replay_reads_serving_slots_after_reorder(monkeypatch, two_s
     draft.window_size = 4
     draft.draft_src_buffers = dspark_ops.DraftSrcBuffers(4, 5)
     monkeypatch.setattr(dspark_ops, "two_source_draft", lambda: two_source)
-    draft.draft_kv_dtype = "auto"
+    draft.draft_attention_dtype = "auto"
     layer = nn.Module()
     layer.attn = nn.Module()
     layer.attn.spec = SimpleNamespace(layer_id=0)

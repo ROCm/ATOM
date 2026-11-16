@@ -75,6 +75,27 @@ FP4_INDEX_PAGE_ROWS = 8
 
 
 @dataclass(frozen=True)
+class KVPlanes:
+    """One contiguous data plane followed by its contiguous scale plane."""
+
+    rows: int
+    data_width: int
+    scale_width: int
+
+    @property
+    def data_bytes(self):
+        return self.rows * self.data_width
+
+    @property
+    def scale_bytes(self):
+        return self.rows * self.scale_width
+
+    @property
+    def nbytes(self):
+        return self.data_bytes + self.scale_bytes
+
+
+@dataclass(frozen=True)
 class V41PoolGeometry:
     layers: int
     owners: tuple[tuple[int, int], ...]
@@ -174,15 +195,14 @@ class V41PoolGeometry:
 
     @property
     def window_fp8(self):
-        """Whether a window row is FP8 values then E8M0 scales (FP4 and FP8
-        pools both), rather than BF16."""
+        """Whether SWA uses MXFP8 data/scale planes (both FP4 and FP8 caches)."""
         return self.kv_dtype != "bf16"
 
     @property
     def row_bytes(self):
         """The unit a row index counts in a row-addressed pool."""
         if self.kv_dtype == "fp8":
-            return self.head_dim + self.head_dim // 32
+            return self.window_planes(1).nbytes
         return self.head_dim * 2
 
     @property
@@ -193,9 +213,7 @@ class V41PoolGeometry:
 
     @property
     def main_row_bytes(self):
-        if not self.packed:
-            return self.row_bytes
-        return self.head_dim // 2 + self.head_dim // MAIN_FP4["group_size"]
+        return self.main_planes(1).nbytes if self.window_fp8 else self.row_bytes
 
     @property
     def index_planes(self):
@@ -228,8 +246,49 @@ class V41PoolGeometry:
 
     @property
     def window_row_bytes(self):
+        return self.window_planes(1).nbytes if self.window_fp8 else self.row_bytes
+
+    def main_planes(self, rows):
+        """NVFP4 or MXFP8 CSA source layout, with source-local row IDs."""
+        return KVPlanes(
+            rows,
+            self.head_dim // 2 if self.packed else self.head_dim,
+            self.head_dim // (MAIN_FP4["group_size"] if self.packed else 32),
+        )
+
+    def window_planes(self, rows):
+        return KVPlanes(rows, self.head_dim, self.head_dim // 32)
+
+    def prefill_staging(self, batches, tokens, *, history=True):
+        """SWA scratch per execution owner: current KV, plus rings if read.
+
+        FP4's BF16 adapter needs only current quantized KV for its ring commit.
+        Quantized attention also reads batch-local copies of the old rings.
+        """
+        rows = tokens + (batches * self.ring_slots if history else 0)
+        return self.window_planes(rows)
+
+    @property
+    def auxiliary_state_fields(self):
+        return self.state_fields[1:]
+
+    @property
+    def auxiliary_state_bytes(self):
+        return self._aligned_bytes(self.auxiliary_state_fields)
+
+    @property
+    def page_padding_bytes(self):
+        return self.page_bytes - sum(
+            self.main_planes(self.rows_per_page(ratio)).nbytes
+            for _, ratio in self.owners
+        )
+
+    @property
+    def state_padding_bytes(self):
         return (
-            self.head_dim + self.head_dim // 32 if self.window_fp8 else self.row_bytes
+            self.state_bytes
+            - self.window_planes(self.layers * self.ring_slots).nbytes
+            - self.auxiliary_state_bytes
         )
 
     @property
@@ -392,8 +451,8 @@ class V41PoolGeometry:
         """`(offset, num_bytes)` of a STATE entry a checkpoint image holds."""
         if self.window_fp8:
             # Image order follows the source buffers, then the original cursor.
-            row = self.ring_slots * self.window_row_bytes
-            data = self.ring_slots * self.head_dim
+            planes = self.window_planes(self.ring_slots)
+            row, data = planes.nbytes, planes.data_bytes
             window = [
                 (layer * row + offset, size)
                 for layer in range(self.layers)
@@ -436,13 +495,6 @@ class V41PoolGeometry:
             ring_slots=self.ring_slots,
             ring_stride=self.ring_slots,
             run_rows=self.ring_slots,
-        )
-
-    def window_bytes(self, layer, pages):
-        """`layer`'s ring in bytes from the pool's base: where the FP8 window
-        writers and readers (`packed_rows`) address an FP8 window row."""
-        raise ValueError(
-            "Quantized windows use separate data/scale planes; use window()"
         )
 
     def _state_start(self, layer, pages):

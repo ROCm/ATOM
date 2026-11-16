@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 """Quantized KV planes: ownership, source construction, and exact state movement."""
 
+from dataclasses import replace
 from itertools import pairwise
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 pytest.importorskip("triton", reason="the V4.1 cache and CSR kernels need Triton")
 
+from atom.model_ops.attentions.deepseek_v41 import planes
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
 from atom.model_ops.attentions.deepseek_v41.indices import (
@@ -16,12 +19,15 @@ from atom.model_ops.attentions.deepseek_v41.indices import (
     build_window_rows,
     fill_step_indptrs,
 )
+from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.deepseek_v41.planes import (
     prefill_window,
     reset_windows,
     split_source,
 )
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+from atom.model_ops.deepseek_v41 import rope_window
 
 
 def geometry(dtype, slack=0):
@@ -48,7 +54,9 @@ def test_prefill_staging_reuses_storage_with_live_plane_offsets(
         pytest.skip("GPU required")
     from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 
-    cache = PagedAttentionCache(geometry(dtype), 7, 4, device, max_tokens=16)
+    cache = PagedAttentionCache(
+        geometry(dtype), 7, 4, device, max_tokens=16, a8w4_attention=True
+    )
     pointer = None
     for requests in (2, 2, 1, 2):
         length = 16 // requests
@@ -73,7 +81,7 @@ def test_prefill_staging_reuses_storage_with_live_plane_offsets(
                     pytest.fail("prefill_window allocated instead of reusing staging")
 
                 patch.setattr(torch, "empty", no_allocation)
-                source, tail = prefill_window(history, step, 8)
+                source, tail = prefill_window(history, step, cache.geometry)
             rows = requests * 8
             assert source[0].data_ptr() == pointer
             assert source[1].data_ptr() == pointer + (rows + 16) * 512
@@ -116,7 +124,9 @@ def test_prefill_staging_grows_at_step_boundary_and_skips_decode(dtype):
 def test_prefill_staging_permuted_slots_and_graph_replay(dtype, slack):
     from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 
-    cache = PagedAttentionCache(geometry(dtype, slack), 7, 4, "cuda", max_tokens=16)
+    cache = PagedAttentionCache(
+        geometry(dtype, slack), 7, 4, "cuda", max_tokens=16, a8w4_attention=True
+    )
     ring = cache.geometry.ring_slots
     step = cache.begin_step(
         (RequestSpan(0, 8, 0, 8, 3), RequestSpan(1, 8, 8, 8, 1)),
@@ -128,7 +138,7 @@ def test_prefill_staging_permuted_slots_and_graph_replay(dtype, slack):
         values = torch.arange(plane.numel(), device="cuda").view(plane.shape)
         plane.copy_((values + 31 * i) % 251)
     saved = [plane.clone() for plane in history]
-    source, tail = prefill_window(history, step, ring)
+    source, tail = prefill_window(history, step, cache.geometry)
 
     def check(ids):
         for output, old, current in zip(source, saved, tail):
@@ -146,7 +156,7 @@ def test_prefill_staging_permuted_slots_and_graph_replay(dtype, slack):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        prefill_window(history, step, ring)
+        prefill_window(history, step, cache.geometry)
     torch.cuda.current_stream().wait_stream(stream)
     for ids in ([1, 3], [2, 0]):
         step.slots.copy_(torch.tensor(ids, dtype=step.slots.dtype, device="cuda"))
@@ -200,7 +210,7 @@ def test_published_decoder_tail_reuses_reserved_staging(
                     "empty",
                     lambda *a, **k: pytest.fail("decoder tail allocated staging"),
                 )
-                source, current = prefill_window(history, tail, geo.ring_slots)
+                source, current = prefill_window(history, tail, geo)
             assert all(
                 p.untyped_storage().data_ptr() == reserved.data_ptr()
                 for p in (*source, *current)
@@ -217,7 +227,7 @@ def test_published_decoder_tail_reuses_reserved_staging(
                 lambda *a, **k: pytest.fail("capture allocated staging"),
             )
             for layer in range(3):
-                source, _ = prefill_window(cache.ring_view(layer), tail, geo.ring_slots)
+                source, _ = prefill_window(cache.ring_view(layer), tail, geo)
         for value in (41, 73):
             for plane in cache.ring_view(2):
                 plane.fill_(value)
@@ -304,7 +314,7 @@ def test_prefill_source_retains_history_until_ring_commit(dtype):
         swa_cached_until=torch.tensor([104, 0]),
     )
     step.prefill_window_staging = torch.empty((2 * 8 + 12) * 528, dtype=torch.uint8)
-    source, current = prefill_window(old, step, 8)
+    source, current = prefill_window(old, step, cache.geometry)
     assert source[0].data_ptr() == step.prefill_window_staging.data_ptr()
     assert source[0].shape == (2 * 8 + 12, 512)
     assert (
@@ -432,7 +442,7 @@ def test_prefill_scratch_depends_on_batch_capacity_and_keeps_slot_mapping(slots)
         cu_seqlens_q=torch.tensor([0, 3, 4, 7]),
     )
     step.prefill_window_staging = torch.empty((3 * 11 + 8) * 528, dtype=torch.uint8)
-    source, current = prefill_window((data, scale), step, 11)
+    source, current = prefill_window((data, scale), step, cache.geometry)
     assert source[0].data_ptr() == step.prefill_window_staging.data_ptr()
     assert source[0].shape == (3 * 11 + 8, 512)
     assert source[1].shape == (3 * 11 + 8, 16)
@@ -449,12 +459,17 @@ def test_a8w4_prefill_reuses_mxfp8_window_and_keeps_history(monkeypatch):
     emitted = []
 
     def produce(*args, **kwargs):
+        from tests.attentions.deepseek_v41.plane_reference import stage_window
+
+        stage_window(*kwargs["staging"])
         emitted.append(kwargs)
         kwargs["values"].view(torch.uint8).fill_(42)
         kwargs["scales"].view(torch.uint8).fill_(127)
 
     monkeypatch.setattr(module, "rope_quant_window", produce)
-    cache = PagedAttentionCache(geometry("fp4"), 7, 4, "cpu")
+    cache = PagedAttentionCache(
+        geometry("fp4"), 7, 4, "cpu", max_tokens=3, a8w4_attention=True
+    )
     old = cache.ring_view(1)
     old[0].copy_(torch.arange(32, dtype=torch.uint8)[:, None].expand(32, 512))
     old[1].fill_(128)
@@ -489,7 +504,7 @@ def test_a8w4_prefill_reuses_mxfp8_window_and_keeps_history(monkeypatch):
     assert cache.packed and not cache.kv_fp8
 
 
-def test_a8w4_indptrs_are_owned_by_each_step_and_separate_from_fallback(monkeypatch):
+def test_a8w4_indptrs_reuse_fixed_buffers_separate_from_fallback(monkeypatch):
     import atom.model_ops.attentions.deepseek_v41.cache as module
 
     built = []
@@ -500,12 +515,15 @@ def test_a8w4_indptrs_are_owned_by_each_step_and_separate_from_fallback(monkeypa
         return {r: (*pair, geo.batch_topk(r)) for r, pair in buffers.items()}
 
     monkeypatch.setattr(module, "fill_step_indptrs", fill)
-    cache = PagedAttentionCache(geometry("fp4"), 7, 4, "cpu")
+    cache = PagedAttentionCache(
+        geometry("fp4"), 7, 4, "cpu", max_tokens=3, a8w4_attention=True
+    )
     steps = [
         SimpleNamespace(
             running_tokens=3,
             positions=torch.arange(3),
             a8w4_indptrs={},
+            a8w4_indptr_buffers=None,
             indptrs={2: (torch.full((4,), 9), torch.full((4,), 7), 4)},
         )
         for _ in range(2)
@@ -515,7 +533,7 @@ def test_a8w4_indptrs_are_owned_by_each_step_and_separate_from_fallback(monkeypa
         assert cache.indptrs(step, a8w4=True) is first
         assert (step.indptrs[2][0] == 9).all() and (step.indptrs[2][1] == 7).all()
     assert len(built) == 2
-    assert built[0][2][0].data_ptr() != built[1][2][0].data_ptr()
+    assert built[0][2][0].data_ptr() == built[1][2][0].data_ptr()
     assert built[0][2][0].data_ptr() != steps[0].indptrs[2][0].data_ptr()
 
 
@@ -621,7 +639,10 @@ def test_csr_resolves_to_causal_main_and_window_rows(
         index_topk=4,
     )
     device = "cuda"
-    tensor = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
+
+    def tensor(x):
+        return torch.tensor(x, dtype=torch.int32, device=device)
+
     positions = [10, 11, 12, 13, 31, 32, 0]
     batches = [0, 0, 0, 0, 1, 1, -1]
     tables = [[2, 0, 1], [3, 4, 5]]
@@ -699,7 +720,10 @@ def test_prefill_request_counts_reuse_indices_kernel(dtype, monkeypatch):
         layer_ratios=(2,),
         index_topk=4,
     )
-    tensor = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    def tensor(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
     tokens = 16
     selected = tensor([[0, 1, 2, 3]] * tokens)
     positions = torch.empty(tokens, dtype=torch.int32, device="cuda")
@@ -774,4 +798,223 @@ def test_prefill_requires_a_sufficient_reserved_buffer(size):
         ),
     )
     with pytest.raises(ValueError, match="staging"):
-        prefill_window(cache.ring_view(0), step, 8)
+        prefill_window(cache.ring_view(0), step, cache.geometry)
+
+
+@pytest.mark.parametrize("a8w4", [False, True])
+def test_fp4_reserves_only_the_rows_its_attention_path_reads(a8w4, monkeypatch):
+    import atom.model_ops.attentions.deepseek_v41.cache as module
+
+    cache = PagedAttentionCache(geometry("fp4"), 7, 4, "cpu", a8w4_attention=a8w4)
+    step = cache.begin_step(
+        (RequestSpan(0, 8, 0, 3, 2),), block_tables=[[0]], is_prefill=True
+    )
+    assert step.prefill_window_staging.numel() == (3 + (8 if a8w4 else 0)) * 528
+    saved = step.prefill_window_staging
+
+    def produce(*args, **kwargs):
+        kwargs["values"].view(torch.uint8).fill_(17)
+        kwargs["scales"].view(torch.uint8).fill_(127)
+
+    monkeypatch.setattr(module, "rope_quant_window", produce)
+    kv = torch.zeros(1, 3, 512, dtype=torch.bfloat16)
+    query = torch.zeros(1, 3, 64, 512, dtype=torch.bfloat16)
+    rope = SimpleNamespace(
+        rope_dim=64, cos_cache=torch.empty(32, 32), sin_cache=torch.empty(32, 32)
+    )
+    monkeypatch.setattr(
+        torch, "empty", Mock(side_effect=AssertionError("per-layer scratch allocation"))
+    )
+    for layer in range(cache.geometry.layers):
+        _, pending = cache.rope_quant_window(layer, query, kv, rope, step, a8w4=a8w4)
+        assert pending[0].untyped_storage().data_ptr() == saved.data_ptr()
+        cache.write_window(layer, pending, step)
+        assert cache.ring_view(layer)[0][2 * 8 : 2 * 8 + 3].eq(17).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_a8w4_indptrs_replay_live_rows_in_disjoint_microbatch_buffers(monkeypatch):
+    cache = PagedAttentionCache(
+        geometry("fp4"), 7, 4, "cuda", max_tokens=4, a8w4_attention=True
+    )
+    parent = cache.begin_step(
+        (RequestSpan(0, 8, 0, 4, 0),), block_tables=[[0]], is_prefill=True
+    )
+    children = []
+    for _ in range(2):
+        children.append(
+            replace(
+                parent,
+                positions=parent.positions.clone(),
+                batch_ids=parent.batch_ids.clone(),
+                indptrs={},
+                a8w4_indptrs={},
+                a8w4_indptr_buffers=cache._make_indptr_buffers(),
+            )
+        )
+    addresses = {
+        p.data_ptr()
+        for buffers in [
+            cache.indptr_buffers,
+            cache.a8w4_indptr_buffers,
+            *(s.a8w4_indptr_buffers for s in children),
+        ]
+        for pair in buffers.values()
+        for p in pair
+    }
+    assert len(addresses) == 4 * 2 * len(cache.geometry.layer_ratios)
+    graphs, results = [], []
+    for step in children:
+        cache.indptrs(step, a8w4=True)  # Compile before capture.
+        step.begin_forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            results.append(cache.indptrs(step, a8w4=True))
+        graphs.append(graph)
+    for base in (0, 3, 15):
+        for i, step in enumerate(children):
+            positions = torch.arange(
+                base + i, base + i + 4, device="cuda", dtype=step.positions.dtype
+            )
+            step.positions.copy_(positions)
+            step.batch_ids.copy_(
+                torch.tensor([0, 0, 0, -1], device="cuda", dtype=step.batch_ids.dtype)
+            )
+            graphs[i].replay()
+            for ratio, (prefix, extend, _) in results[i].items():
+                expected_prefix, expected_extend = [0], [0]
+                for t in range(4):
+                    pos = base + i + t
+                    expected_prefix.append(
+                        expected_prefix[-1]
+                        + (min((pos + 1) // ratio, 4) if ratio and t < 3 else 0)
+                    )
+                    expected_extend.append(
+                        expected_extend[-1] + (min(pos + 1, 8) if t < 3 else 0)
+                    )
+                assert prefix.tolist() == expected_prefix
+                assert extend.tolist() == expected_extend
+            before = {r: (p.clone(), e.clone()) for r, (p, e, _) in results[i].items()}
+            graphs[1 - i].replay()
+            for r, (p, e, _) in results[i].items():
+                torch.testing.assert_close(p, before[r][0])
+                torch.testing.assert_close(e, before[r][1])
+    # Creating subsequent steps reuses the parent buffers without new allocations.
+    parent.begin_forward()
+    monkeypatch.setattr(
+        torch, "empty", Mock(side_effect=AssertionError("new indptr storage"))
+    )
+    actual = cache.indptrs(parent, a8w4=True)
+    assert all(
+        pair[0].data_ptr() == cache.a8w4_indptr_buffers[r][0].data_ptr()
+        for r, pair in actual.items()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("dtype", ["fp8", "fp4"])
+@pytest.mark.parametrize("heads", [0, 64])
+@pytest.mark.parametrize("tokens", [4, 128])
+def test_prefill_fuses_history_and_replays_live_slot_mapping(
+    dtype, heads, tokens, monkeypatch
+):
+    torch.manual_seed(20261115)
+    cache = PagedAttentionCache(
+        geometry(dtype, 5), 7, 4, "cuda", max_tokens=tokens, a8w4_attention=True
+    )
+    ring, dim = cache.geometry.ring_slots, cache.geometry.head_dim
+    length = tokens // 2
+    step = cache.begin_step(
+        (RequestSpan(0, 8, 0, length, 3), RequestSpan(1, 8, length, length, 1)),
+        block_tables=[list(range((8 + length + 31) // 32))] * 2,
+        is_prefill=True,
+    )
+    history = cache.ring_view(1)
+    for plane in history:
+        plane.copy_(
+            torch.randint(0, 255, plane.shape, device="cuda", dtype=torch.uint8)
+        )
+    old = tuple(p.clone() for p in history)
+    kv = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    theta = torch.randn(256, 32, device="cuda")
+    rope = SimpleNamespace(
+        rope_dim=64, cos_cache=theta.cos().bfloat16(), sin_cache=theta.sin().bfloat16()
+    )
+    q8 = cache.query_fp8(query, a8w4=True) if heads else None
+    expected_q = tuple(torch.empty_like(p) for p in q8) if q8 else None
+    expected_source = torch.full_like(step.prefill_window_staging, 211)
+    expected_planes = split_source(expected_source, dim)
+    tail = 2 * ring
+
+    def reference():
+        expected_source.fill_(211)
+        for batch, slot in enumerate(step.slots.tolist()):
+            if slot < 0 or step.cu_seqlens_q[batch] == step.cu_seqlens_q[batch + 1]:
+                continue
+            for output, source in zip(expected_planes, old):
+                output[batch * ring : (batch + 1) * ring].copy_(
+                    source[slot * ring : (slot + 1) * ring]
+                )
+        rope_window.rope_quant_window(
+            query,
+            kv,
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+            rope_dim=64,
+            values=expected_planes[0][tail:].view(FP8_DTYPE),
+            scales=expected_planes[1][tail:].view(torch.float8_e8m0fnu),
+            query_fp8=expected_q,
+        )
+
+    real_kernel = rope_window._rope_window_kernel
+    launches = []
+
+    class Spy:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs["STAGE"])
+                return real_kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(rope_window, "_rope_window_kernel", Spy())
+
+    def separate_stage_forbidden(*args, **kwargs):
+        raise AssertionError("production prefill launched a separate history copy")
+
+    monkeypatch.setattr(planes, "_stage_window", separate_stage_forbidden)
+
+    def fused():
+        return cache.rope_quant_window(
+            1, query if heads else None, kv, rope, step, q8, a8w4=dtype == "fp4"
+        )
+
+    step.prefill_window_staging.fill_(211)
+    output, pending = fused()
+    assert launches == [True]
+    assert pending[0].data_ptr() == output[0][tail:].data_ptr()
+    assert pending[1].data_ptr() == output[1][tail:].data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused()
+    for ids, cu in (
+        ([3, 1], [0, length, tokens]),
+        ([0, 2], [0, length, tokens]),
+        ([-1, 2], [0, length, length]),
+    ):
+        step.slots.copy_(torch.tensor(ids, device="cuda", dtype=step.slots.dtype))
+        step.cu_seqlens_q.copy_(
+            torch.tensor(cu, device="cuda", dtype=step.cu_seqlens_q.dtype)
+        )
+        step.prefill_window_staging.fill_(211)
+        reference()
+        graph.replay()
+        torch.testing.assert_close(
+            step.prefill_window_staging, expected_source, rtol=0, atol=0
+        )
+        for actual, expected in zip(q8 or (), expected_q or ()):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        for actual, saved in zip(history, old):
+            assert torch.equal(actual, saved)

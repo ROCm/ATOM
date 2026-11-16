@@ -269,3 +269,10 @@ and Reindex alike. The published implementation's `torch.topk` defines no tie
 rule at all; ATOM needs one because every tensor-parallel rank has to select
 the same KV set. The newest visible candidate block remains mandatory, and
 selected indices are returned in ascending position order.
+
+### FP4 attention performance
+
+For gfx950 with 64 or 128 attention heads per device (including native DP
+attention, where heads are not TP-sharded), benchmark FP8 KV with A8W8 as
+well as FP4 KV for your workload if memory allows. FP4 may save cache memory
+without providing higher throughput. The requested KV format is preserved.

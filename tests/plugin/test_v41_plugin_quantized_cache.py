@@ -86,6 +86,7 @@ def bound_cache(request, monkeypatch):
         device="cpu",
         score_workspace=None,
         _prefill_window_staging=reservation,
+        a8w4_attention=False,
     )
     model = SimpleNamespace(_atom_v41_slot_allocator=object())
     bridge = _load(

@@ -642,7 +642,7 @@ def fused_draft_kv_tail(
             and cache dtype come along unchanged instead of being recomputed.
         eps: the stages' shared ``kv_norm.eps``.
         packed: the cache layout. ``True`` returns ``(fp8 codes, ue8m0 scales)``
-            for ``write_packed_window``; ``False`` returns QAT activations in
+            for ``write_window_planes``; ``False`` returns QAT activations in
             ``kv.dtype``. This is ``quantize_fp8(..., dequantize=not packed)``.
 
     Returns:

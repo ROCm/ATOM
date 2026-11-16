@@ -204,9 +204,7 @@ def test_fused_seam_emits_the_rows_a_prefill_attends_to():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_fused_seam_writes_the_fp8_pools_query_and_rows():
     """The FP8 pool's prefill: the rotated query quantized by the KV row's rule
-    (`query_fp8`), and the rows into a `[tokens, 528]` buffer through strided
-    views -- the bytes `quantize_fp8` gives, packed values then scales."""
-    from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
+    (`query_fp8`), and the native KV planes written without requantization."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 
@@ -218,7 +216,8 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
     query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
 
     values, scales = quantize_fp8(rope(query.clone(), positions))
-    rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+    row_data = torch.empty(tokens, dim, device=device, dtype=torch.uint8)
+    row_scale = torch.empty(tokens, dim // 32, device=device, dtype=torch.uint8)
     query_values = torch.empty_like(values).view(tokens, heads, dim)
     query_scales = torch.empty_like(scales).view(tokens, heads, dim // 32)
     rope_quant_window(
@@ -228,13 +227,18 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
         rope.sin_cache,
         positions,
         rope_dim=rope_dim,
-        values=rows[:, :dim].view(values.dtype),
-        scales=rows[:, dim:].view(scales.dtype),
+        values=row_data.view(values.dtype),
+        scales=row_scale.view(scales.dtype),
         query_fp8=(query_values, query_scales),
     )
 
-    expected_rows = pack_rows(*quantize_fp8(rope(normed.clone(), positions)))
-    assert torch.equal(rows, expected_rows.view(tokens, -1))
+    expected_rows = torch.cat(
+        [p.view(torch.uint8) for p in quantize_fp8(rope(normed.clone(), positions))],
+        dim=-1,
+    )
+    assert torch.equal(
+        torch.cat((row_data, row_scale), dim=-1), expected_rows.view(tokens, -1)
+    )
     assert torch.equal(
         query_values.view(torch.uint8), values.view(torch.uint8).view_as(query_values)
     )
@@ -390,7 +394,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     (expected, default_launches), (actual, launches) = run(False), run(True)
     assert default_launches == [((tokens * (query_heads + kv_half),), False, 1)]
     assert launches == [(expected_grid, head_block, fp8_heads)]
-    if sink in ("packed_ring", "bf16_ring", "prefill", "query"):
+    if sink in ("planar_ring", "bf16_ring", "prefill", "query"):
         assert not torch.equal(expected["query"], query)
     for name, tensor in expected.items():
         assert torch.equal(actual[name].view(torch.uint8), tensor.view(torch.uint8))

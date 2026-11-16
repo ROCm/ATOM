@@ -27,19 +27,11 @@ def attach_ubatch_buffers(builder, max_tokens):
     for a builder assembled without it: the `ub{i}_` step buffers in the
     runner's forward_vars and each microbatch's indptrs."""
     builder.max_num_batched_tokens = max_tokens
+    builder.a8w4_attention = builder.geometry.packed
+    builder.max_bs = 4
     builder.model_runner.forward_vars.update(builder._ubatch_step_buffers())
     builder._ubatch_prefill_window_staging = [
-        (
-            torch.empty(
-                (4 * builder.geometry.ring_slots + max_tokens)
-                * builder.geometry.window_row_bytes,
-                dtype=torch.uint8,
-                device=builder.device,
-            )
-            if builder.geometry.window_fp8
-            else None
-        )
-        for _ in range(NUM_TBO_UBATCHES)
+        builder._window_staging((max_tokens + 1) // 2) for _ in range(NUM_TBO_UBATCHES)
     ]
     builder._ubatch_indptrs = [
         {
@@ -51,6 +43,14 @@ def attach_ubatch_buffers(builder, max_tokens):
         }
         for _ in range(NUM_TBO_UBATCHES)
     ]
+    builder._ubatch_a8w4_indptrs = [
+        {
+            ratio: tuple(torch.empty_like(p) for p in pair)
+            for ratio, pair in buffers.items()
+        }
+        for buffers in builder._ubatch_indptrs
+    ]
+    builder.a8w4_attention = builder.geometry.packed
 
 
 def make_builder(device, kv_dtype="bf16"):
@@ -65,7 +65,9 @@ def make_builder(device, kv_dtype="bf16"):
         index_topk=4,
         kv_dtype=kv_dtype,
     )
-    cache = PagedAttentionCache(geo, 8, 4, device, max_tokens=32)
+    cache = PagedAttentionCache(
+        geo, 8, 4, device, max_tokens=32, a8w4_attention=geo.packed
+    )
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.device, builder.geometry, builder.block_size = device, geo, 32
     builder.cache = cache
@@ -143,7 +145,7 @@ def test_prefill_children_keep_disjoint_staging_across_layers_and_forwards(
                 source, tail = prefill_window(
                     parent.cache.ring_view(layer),
                     child.step,
-                    builder.geometry.ring_slots,
+                    builder.geometry,
                 )
                 for plane in tail:
                     plane.fill_(17 + i + layer)
@@ -183,9 +185,12 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
     _, parent = make_parent(device, parts=parts, builder=builder)
     steps = []
     for part, child in zip(parts, parent.ubatches):
-        rs, (start, end) = part.request_slice, (
-            part.token_slice.start,
-            part.token_slice.stop,
+        rs, (start, end) = (
+            part.request_slice,
+            (
+                part.token_slice.start,
+                part.token_slice.stop,
+            ),
         )
         steps.append(child.step)
         assert child.cache is parent.cache
@@ -886,8 +891,8 @@ def test_dp_moe_original_schedule_preserves_outputs(
         quant_method=SimpleNamespace(
             select_experts=select_experts, routed_rows_wire=None
         ),
-        _run_experts=lambda hidden, weights, ids, x_scale, gathered: (
-            experts(x=hidden, topk_weights=weights, topk_ids=ids)
+        _run_experts=lambda hidden, weights, ids, x_scale, gathered, **kwargs: experts(
+            x=hidden, topk_weights=weights, topk_ids=ids
         ),
         reduce_results=False,
         # No prefilled shared columns to re-mark after the gather.
@@ -1186,6 +1191,8 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv
             enable_tbo=True,
             load_dummy=True,
             gpu_memory_utilization=0.75,
+            enable_dp_attention=False,
+            tensor_parallel_size=1,
         ),
     )
 
@@ -1224,10 +1231,13 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch, kv
                 assert staging == [None, None, None]
             else:
                 assert len({t.data_ptr() for t in staging}) == 3
-                expected = (
-                    2 * self.geometry.ring_slots + 16
-                ) * self.geometry.window_row_bytes
-                assert all(t.numel() == expected for t in staging)
+                expected = [
+                    self.geometry.prefill_staging(
+                        2, tokens, history=kv_dtype == "fp8"
+                    ).nbytes
+                    for tokens in (16, 8, 8)
+                ]
+                assert [t.numel() for t in staging] == expected
                 used += sum(t.numel() for t in staging)
             monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: used)
             total = self.geometry.paged_bytes * 100

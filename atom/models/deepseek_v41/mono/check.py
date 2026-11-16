@@ -10,7 +10,6 @@ from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import dequantize_rows
-from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
 from atom.model_ops.blockscale import quantize_fp8
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
@@ -174,20 +173,25 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
         runner.ring_rel.long()
         + cache.geometry.window(layer_id, cache.num_pages).ring_start
     )
-    ring = (
-        pack_rows(*(p[rows.clamp_min(0)] for p in cache.ring_view(layer_id)))
-        if cache.kv_fp8
-        else cache.pool[rows.clamp_min(0)]
-    )
     if cache.kv_fp8:
-        qat = pack_rows(values, scales)
+        ring_data, ring_scale = cache.ring_view(layer_id)
+        window_parts = [
+            _diff(
+                "window data", ring_data[rows.clamp_min(0)], values.view(torch.uint8)
+            ),
+            _diff(
+                "window scale", ring_scale[rows.clamp_min(0)], scales.view(torch.uint8)
+            ),
+        ]
+    else:
+        window_parts = [_diff("window", cache.pool[rows.clamp_min(0)], qat)]
     parts = [
         _diff("residual", res_out, residual),
         _diff("pre", gates[0], pre),
         _diff("post", gates[1], post),
         _diff("comb", gates[2], comb),
         _diff("q", runner.q, query),
-        _diff("window", ring, qat),
+        *window_parts,
     ]
     if attn.indexer is not None:
         parts.append(_diff("normed", runner.normed, normed))
@@ -202,11 +206,7 @@ def decode_keys(cache, spec, step):
     selection, then its window (``cache.attention_indices`` hands a BF16
     decode's window over as rows of the layer's ring, made pool rows here)."""
     prefix, pptr, window, wptr = cache.attention_indices(spec, step)
-    start = (
-        cache.main_view(spec.kv_owner)[0].shape[0]
-        if cache.kv_fp8
-        else cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
-    )
+    start = cache.mono_views(spec.layer_id, spec.kv_owner)[-1]
     pb, wb = pptr.tolist(), wptr.tolist()
     rows = [
         torch.cat([prefix[pb[t] : pb[t + 1]], window[wb[t] : wb[t + 1]] + start])
@@ -225,6 +225,7 @@ def _key_set_rows(runner, spec, keys, cache):
     meta = runner.key_meta.tolist()
     window = cache.geometry.window(spec.layer_id, cache.num_pages)
     owner = spec.topk_owner if spec.ratio else None
+    ring_off = cache.mono_views(spec.layer_id, spec.kv_owner)[-1]
     bad = []
     for t, (first, count, _, base) in enumerate(meta):
         rows = []
@@ -232,14 +233,7 @@ def _key_set_rows(runner, spec, keys, cache):
             n_sel = ip.selected(int(runner.bounds[owner][t]))
             rows = runner.irow[owner][t, :n_sel].tolist()
         rows += [
-            base
-            + (
-                cache.main_view(spec.kv_owner)[0].shape[0]
-                if cache.kv_fp8
-                else window.ring_start
-            )
-            + (first + k) % window.ring_slots
-            for k in range(count)
+            base + ring_off + (first + k) % window.ring_slots for k in range(count)
         ]
         if sorted(rows) != sorted(prefix[indptr[t] : indptr[t + 1]]):
             bad.append(t)
@@ -247,7 +241,7 @@ def _key_set_rows(runner, spec, keys, cache):
 
 
 def _gather_key_rows(main, window, ids):
-    """Pack only the selected rows, preserving interleaved source order."""
+    """Gather selected data and scales, preserving the requested row order."""
     is_main = ids < main[0].shape[0]
     main_ids = ids[is_main].long()
     window_ids = (ids[~is_main] - main[0].shape[0]).long()
@@ -257,7 +251,7 @@ def _gather_key_rows(main, window, ids):
         rows[is_main] = data[main_ids]
         rows[~is_main] = ring[window_ids]
         selected.append(rows)
-    return pack_rows(*selected)
+    return tuple(selected)
 
 
 def _attention_ref(runner, block, keys, cache):
@@ -290,13 +284,10 @@ def _attention_ref(runner, block, keys, cache):
         ptr = torch.tensor([0] + lens, device=indptr.device).cumsum(0)
         pool = cache.pool
         if cache.kv_fp8:
-            dim = q.shape[-1]
             main = cache.main_view(block.attn.spec.kv_owner)
             window = cache.ring_view(block.attn.spec.layer_id)
-            key_rows = _gather_key_rows(main, window, ids)
-            pool = dequantize_rows(
-                key_rows[:, :dim].view(FP8_DTYPE), key_rows[:, dim:]
-            ).bfloat16()
+            data, scale = _gather_key_rows(main, window, ids)
+            pool = dequantize_rows(data.view(FP8_DTYPE), scale).bfloat16()
             ids = torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
         call = [
             _sparse_attn_v4_paged_decode_triton(

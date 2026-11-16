@@ -92,13 +92,6 @@ class DraftAttention(Attention):
         if isinstance(context, tuple):
             if context[0].shape[-1] != self.head_dim:
                 raise ValueError("A8W8 draft history must contain MXFP8 rows")
-            if not getattr(self, "_draft_attention_announced", False):
-                logger.info(
-                    "V4.1 draft layer %d: MXFP8 history, MXFP8 current KV, "
-                    "opus A8W8 attention",
-                    self.spec.layer_id,
-                )
-                self._draft_attention_announced = True
             rows = kv_normed.shape[:-1].numel()
             keys = (
                 torch.empty_like(kv_normed, dtype=FP8_DTYPE),
@@ -214,7 +207,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 "V4.1 DSpark needs draft stages and a positive block width"
             )
         self.config = args
-        self.draft_kv_dtype = config.dspark.draft_kv_dtype
+        self.draft_attention_dtype = config.dspark.draft_attention_dtype
+        logger.info(
+            "V4.1 DSpark draft attention: %s",
+            (
+                "MXFP8 history/current KV with AITER A8W8"
+                if self.draft_attention_dtype == "fp8"
+                else "BF16"
+            ),
+        )
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
         # Sized at the engine's batch bound, as the backbone's index buffers are.
@@ -600,7 +601,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # in the layer, so indexing them one at a time spent a gather and a
         # `.long()` cast apiece. The slices below are views.
         layer_ids = self._context_layer_ids(slots.device)
-        if self.draft_kv_dtype == "fp8":
+        if self.draft_attention_dtype == "fp8":
             windows = cache.read_window_planes(layer_ids, slots)
             context = {
                 layer.spec.layer_id: tuple(p[i] for p in windows)
@@ -631,7 +632,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             self.window_size,
             width,
             self.draft_src_buffers,
-            fp8=self.draft_kv_dtype == "fp8",
+            fp8=self.draft_attention_dtype == "fp8",
         )
         return self.draft_hidden(
             input_ids,

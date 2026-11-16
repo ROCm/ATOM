@@ -36,7 +36,7 @@ def calibration_identity(config, device):
     if config.hf_config.model_type == "deepseek_v41_text":
         # Before this option existed, even FP8 windows were decoded to BF16.
         # Omit that default so already measured profiles keep matching.
-        if config.dspark.draft_kv_dtype == "fp8":
+        if config.dspark.draft_attention_dtype == "fp8":
             identity["draft_attention_dtype"] = "fp8"
         if config.kv_cache_dtype == "fp4":
             from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
@@ -57,8 +57,9 @@ def validate_calibration(profile, identity, *, width, max_batch):
         raise ValueError("DSpark calibration draft width mismatch")
     if max_batch > profile.get("max_num_seqs", 0):
         raise ValueError("DSpark calibration does not cover the configured batch size")
-    temperatures, sps = profile.get("sts_temperatures", []), profile.get(
-        "sps_table", []
+    temperatures, sps = (
+        profile.get("sts_temperatures", []),
+        profile.get("sps_table", []),
     )
     if len(temperatures) != width or len(sps) <= max_batch * (width + 1):
         raise ValueError("DSpark calibration table is incomplete")

@@ -52,6 +52,7 @@ from atom.utils.forward_context import (
 )
 from atom.utils.tbo import NUM_TBO_UBATCHES
 
+from .a8w4_attention import configured_a8w4_attention
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
@@ -191,24 +192,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # One SWA staging source per execution owner, not per attention layer.
         # Layers consume it serially; TBO children overlap and need disjoint
         # sources. Reserve before profiling so this scratch is in the budget.
-        self._prefill_window_staging = (
-            torch.empty(
-                (self.max_bs * self.geometry.ring_slots + self.max_num_batched_tokens)
-                * self.geometry.window_row_bytes,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            if self.geometry.window_fp8
-            else None
+        self.a8w4_attention = configured_a8w4_attention(
+            model_runner.config, self.device
         )
+        self._prefill_window_staging = self._window_staging(self.max_num_batched_tokens)
         if model_runner.config.enable_tbo:
+            # cut_prefill_ubatches bisects the token range, including padding.
+            child_tokens = (self.max_num_batched_tokens + 1) // 2
             self._ubatch_prefill_window_staging = [
-                (
-                    torch.empty_like(self._prefill_window_staging)
-                    if self._prefill_window_staging is not None
-                    else None
-                )
-                for _ in range(NUM_TBO_UBATCHES)
+                self._window_staging(child_tokens) for _ in range(NUM_TBO_UBATCHES)
             ]
             model_runner.forward_vars.update(self._ubatch_step_buffers())
             self._ubatch_indptrs = [
@@ -224,6 +216,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                     for ratio in self.geometry.layer_ratios
                 }
                 for _ in range(NUM_TBO_UBATCHES)
+            ]
+            self._ubatch_a8w4_indptrs = [
+                (
+                    {
+                        ratio: tuple(torch.empty_like(p) for p in pair)
+                        for ratio, pair in buffers.items()
+                    }
+                    if self.geometry.packed
+                    else {}
+                )
+                for buffers in self._ubatch_indptrs
             ]
         # A replaying prefill's decoder runs on rows of its own, the tail,
         # published as a step at addresses of its own (`_publish_decoder`), so
@@ -270,6 +273,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     # The model's decode round (`use_decode_round`), None for a model without
     # one.
     decode_round: DecodeRound | None = None
+
+    def _window_staging(self, tokens):
+        if not self.geometry.window_fp8:
+            return None
+        size = self.geometry.prefill_staging(
+            min(self.max_bs, tokens),
+            tokens,
+            history=self.geometry.kv_dtype == "fp8" or self.a8w4_attention,
+        ).nbytes
+        return torch.empty(size, dtype=torch.uint8, device=self.device)
 
     def use_decode_round(self, decode_round: DecodeRound) -> None:
         """Have a model's decode round (`model_hooks.DecodeRound`, from its
@@ -448,6 +461,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
             prefill_window_staging=self._prefill_window_staging,
+            a8w4_attention=self.a8w4_attention,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -634,6 +648,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
                 prefill_window_staging=self._prefill_window_staging,
+                a8w4_attention=self.a8w4_attention,
             )
             if batch.is_dummy_run
             else self.cache
@@ -1147,11 +1162,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """Micro-batch ``ub_slice``'s metadata over its uploaded ``step``, its
         rows of the parent ``metadata``'s."""
         ts, rs = ub_slice.token_slice, ub_slice.request_slice
+        step.indptr_buffers = self._ubatch_indptrs[ubatch_idx]
+        step.a8w4_indptr_buffers = self._ubatch_a8w4_indptrs[ubatch_idx]
         if step.positions.is_cuda:
             # Indexed by this microbatch's rows, not the parent's. Before the
             # indptrs, which count each row's window from its floor.
             metadata.cache.publish_replay_layout(step, ub_slice.running_bs)
-            step.indptr_buffers = self._ubatch_indptrs[ubatch_idx]
         child = self._assemble_metadata(
             metadata.cache,
             step,

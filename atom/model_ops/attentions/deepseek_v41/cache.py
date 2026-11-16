@@ -57,16 +57,13 @@ class PagedAttentionCache:
     def _allocate_quantized(self, device):
         g, pages, slots = self.geometry, self.num_pages, self.num_slots
         main_sizes = [
-            pages * g.rows_per_page(ratio) * g.main_row_bytes for _, ratio in g.owners
+            g.main_planes(pages * g.rows_per_page(ratio)).nbytes
+            for _, ratio in g.owners
         ]
-        window_size = slots * g.ring_slots * g.window_row_bytes
+        window_size = g.window_planes(slots * g.ring_slots).nbytes
         # Compressor rings and cursor retain the original entry-major layout.
-        fields = g.state_fields[1:]
-        state_size = g._aligned_bytes(fields)
-        page_pad = g.page_bytes - sum(size // pages for size in main_sizes)
-        state_pad = (
-            g.state_bytes - g.layers * g.ring_slots * g.window_row_bytes - state_size
-        )
+        fields, state_size = g.auxiliary_state_fields, g.auxiliary_state_bytes
+        page_pad, state_pad = g.page_padding_bytes, g.state_padding_bytes
         offsets, boundary = g.paged_extents(pages)
         index_bytes = boundary - pages * g.page_bytes
         auxiliary = (
@@ -150,6 +147,7 @@ class PagedAttentionCache:
         max_tokens=0,
         workspace=None,
         prefill_window_staging=None,
+        a8w4_attention=False,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
@@ -174,6 +172,7 @@ class PagedAttentionCache:
         self.window_fp8 = geometry.window_fp8
         # MXFP8 rows everywhere, read by `sparse_attn_v41_paged_2src`
         self.kv_fp8 = geometry.kv_dtype == "fp8"
+        self.quantized_attention = self.kv_fp8 or a8w4_attention
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         if self.window_fp8:
             self._allocate_quantized(device)
@@ -282,8 +281,7 @@ class PagedAttentionCache:
         # order: what a device-round step must continue.
         self._prepared_requests = None
         if self.window_fp8:
-            # Device/allocation handle only. Quantized readers use main_view/ring_view.
-            self.pool = self.backing
+            self.pool = None  # Quantized readers use main_view/ring_view.
         else:
             self.pool = self.backing.view(torch.bfloat16).view(-1, geometry.head_dim)
         # Owner -> its row in the compressor rings, which hold the raw
@@ -296,6 +294,20 @@ class PagedAttentionCache:
         # gigabytes, and taking them first moves the base every reader of the
         # pool computes its offsets from.
         self._reserve_indptrs(max_tokens)
+
+    def mono_views(self, layer, owner):
+        """Mono descriptors and the SWA origin in its combined logical row space."""
+        if self.kv_fp8:
+            pool, pool_scale = self.main_view(owner)
+            window, window_scale = self.ring_view(layer)
+            return pool, pool_scale, window, window_scale, pool.shape[0]
+        return (
+            self.pool,
+            None,
+            None,
+            None,
+            self.geometry.window(layer, self.num_pages).ring_start,
+        )
 
     def unit_regions(self):
         """`(base address, bytes)` of every region one PAGE unit owns.
@@ -358,7 +370,11 @@ class PagedAttentionCache:
         ):
             raise RuntimeError("Indptr buffers cannot be reallocated under capture")
         self.max_tokens = max(tokens, self.max_tokens)
-        self.indptr_buffers = {
+        self.indptr_buffers = self._make_indptr_buffers()
+        self.a8w4_indptr_buffers = self._make_indptr_buffers() if self.packed else {}
+
+    def _make_indptr_buffers(self):
+        return {
             ratio: tuple(
                 torch.empty(
                     self.max_tokens + 1, dtype=torch.int32, device=self.indptr_device
@@ -384,17 +400,17 @@ class PagedAttentionCache:
         if not self.window_fp8 or step.decode:
             return
         batches = step.cu_seqlens_q.numel() - 1
-        size = (batches * self.geometry.ring_slots + step.running_tokens) * (
-            self.geometry.window_row_bytes
-        )
+        size = self.geometry.prefill_staging(
+            batches, step.running_tokens, history=self.quantized_attention
+        ).nbytes
         source = self.prefill_window_staging
         if source is None or source.numel() < size:
-            if self.pool.is_cuda and torch.cuda.is_current_stream_capturing():
+            if self.backing.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Prefill window staging must be reserved before capture"
                 )
             source = self.prefill_window_staging = torch.empty(
-                size, dtype=torch.uint8, device=self.pool.device
+                size, dtype=torch.uint8, device=self.backing.device
             )
         step.prefill_window_staging = source
 
@@ -459,7 +475,7 @@ class PagedAttentionCache:
             offset += span.length
         step = prepare_batch_step(
             requests,
-            self.pool.device,
+            self.backing.device,
             block_tables=block_tables,
             page_limit=self.num_pages,
             tentative=tentative,
@@ -550,7 +566,7 @@ class PagedAttentionCache:
             return {}
         lengths = np.asarray([span.length for span in requests], dtype=np.int32)
         rows = max(int(lengths.sum()) + len(requests), 1)
-        device = self.pool.device
+        device = self.backing.device
 
         def buffer(*shape, dtype=torch.int32):
             return CpuGpuBuffer(
@@ -824,17 +840,7 @@ class PagedAttentionCache:
         no index (mono's) fills none."""
         if a8w4:
             if not step.a8w4_indptrs:
-                # Owned by this step, inside its attention capture region.
-                # A TBO child or bounded query step must not overwrite the
-                # parent's BF16 adapter indptrs or another child's buffers.
-                buffers = {
-                    ratio: torch.empty(
-                        (2, step.running_tokens + 1),
-                        dtype=torch.int32,
-                        device=step.positions.device,
-                    ).unbind()
-                    for ratio in self.geometry.layer_ratios
-                }
+                buffers = step.a8w4_indptr_buffers or self.a8w4_indptr_buffers
                 step.a8w4_indptrs = fill_step_indptrs(
                     step, self.geometry, buffers, split=True
                 )
@@ -1027,17 +1033,17 @@ class PagedAttentionCache:
         qat = None if quantized_attn else torch.empty_like(kv)
         values = scales = None
         attention_source = qat
+        staging = None
         if window_fp8:
             if quantized_attn:
+                history = self.ring_view(layer)
                 attention_source, current = prefill_window(
-                    self.ring_view(layer), step, self.geometry.ring_slots
+                    history, step, self.geometry, stage=False
                 )
+                staging = (history, attention_source, step, self.geometry.ring_slots)
             else:
-                source = torch.empty(
-                    step.running_tokens * self.geometry.window_row_bytes,
-                    dtype=torch.uint8,
-                    device=kv.device,
-                )
+                size = self.geometry.prefill_staging(0, step.running_tokens).nbytes
+                source = step.prefill_window_staging[:size]
                 current = split_source(source, dim)
             values = current[0].view(FP8_DTYPE).view_as(kv)
             scales = (
@@ -1050,6 +1056,7 @@ class PagedAttentionCache:
             values=values,
             scales=scales,
             query_fp8=query_fp8,
+            staging=staging,
         )
         return attention_source, (values, scales) if window_fp8 else qat
 

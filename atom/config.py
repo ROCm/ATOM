@@ -1706,11 +1706,11 @@ class DSparkConfig:
     calibration_profile: str | None = None
     # Native V4.1 draft attention: fp8 reads MXFP8 windows with OPUS A8W8;
     # auto retains the existing BF16 path, independently of target CSA precision.
-    draft_kv_dtype: str = "auto"
+    draft_attention_dtype: str = "auto"
 
     def __post_init__(self):
-        if self.draft_kv_dtype not in ("auto", "fp8"):
-            raise ValueError("DSpark draft_kv_dtype must be auto or fp8")
+        if self.draft_attention_dtype not in ("auto", "fp8"):
+            raise ValueError("DSpark draft_attention_dtype must be auto or fp8")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -1720,8 +1720,8 @@ class DSparkConfig:
                 "DSpark calibration_profile requires a path and confidence_schedule=True"
             )
 
-    def validate_draft_kv(self, config):
-        if self.draft_kv_dtype == "auto":
+    def validate_draft_attention(self, config):
+        if self.draft_attention_dtype == "auto":
             return
         spec = config.speculative_config
         target_dtypes = ("fp8", "fp4")
@@ -1733,10 +1733,10 @@ class DSparkConfig:
             or config.plugin_config is not None
         ):
             raise ValueError(
-                f"draft_kv_dtype={self.draft_kv_dtype} requires native DeepSeek-V4.1 "
+                f"draft_attention_dtype={self.draft_attention_dtype} requires native DeepSeek-V4.1 "
                 f"DSpark with {' or '.join(t.upper() for t in target_dtypes)} target KV"
             )
-        from atom.models.deepseek_v41.draft_kv import validate_fp8_draft_support
+        from atom.models.deepseek_v41.draft_attention import validate_fp8_draft_support
 
         validate_fp8_draft_support(config)
 
@@ -2745,8 +2745,12 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
-        self._check_kv_cache_dtype()
-        self.dspark.validate_draft_kv(self)
+        _check_fp4_kv(
+            self.kv_cache_dtype,
+            is_m3=_is_minimax_m3_config(self.hf_config),
+            is_v41=self.hf_config.model_type == "deepseek_v41_text",
+        )
+        self.dspark.validate_draft_attention(self)
         if hasattr(self, "kv_transfer_config") and isinstance(
             self.kv_transfer_config, str
         ):
@@ -2950,11 +2954,6 @@ class Config:
         # MXFP4 gate cannot disagree with them on an export that names itself
         # only in `text_config` or `model_type`.
         is_m3 = _is_minimax_m3_config(self.hf_config)
-        _check_fp4_kv(
-            self.kv_cache_dtype,
-            is_m3=is_m3,
-            is_v41=self.hf_config.model_type == "deepseek_v41_text",
-        )
         if is_deepseek_v4:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
@@ -3133,29 +3132,6 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
-
-    def _check_kv_cache_dtype(self) -> None:
-        """Validate FP4 support and report performance guidance before sizing."""
-        if self.kv_cache_dtype != "fp4":
-            return
-        from atom.utils.selector import Family, attn_family
-
-        if _is_minimax_m3_config(self.hf_config):
-            # MiniMax's model-specific restrictions are checked later in startup.
-            return
-        if attn_family(self.hf_config) is not Family.CSA2:
-            raise ValueError(
-                "--kv_cache_dtype=fp4 is only supported by MiniMax-M3.1 and "
-                "DeepSeek-V4.1 (CSA2); use bf16 or fp8 for this model."
-            )
-        from atom.models.deepseek_v41.kv_cache_policy import warn_fp4_performance
-
-        warn_fp4_performance(
-            num_heads=self.hf_config.num_attention_heads,
-            attention_tp_size=(
-                1 if self.enable_dp_attention else self.tensor_parallel_size
-            ),
-        )
 
     def _resolve_index_cache_layout(self) -> None:
         self.index_cache_layout = None
