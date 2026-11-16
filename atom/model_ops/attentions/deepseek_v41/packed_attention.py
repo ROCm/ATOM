@@ -14,6 +14,7 @@ from atom.model_ops.v4_kernels import (
     sparse_attn_v4_paged_decode,
 )
 
+from .packed_prefill_rows import prefill_mode, rows_prefill, tiled_prefill
 from .packed_rows import gather_prefix_rows
 
 
@@ -42,6 +43,11 @@ def packed_prefill(
         out = torch.empty_like(q)
     if tokens == 0:
         return out
+    planar = isinstance(pool, tuple) and not torch.cuda.is_current_stream_capturing()
+    mode = prefill_mode(tokens) if planar else "tile32"
+    if mode != "tile32":  # planar sources: one decode of the distinct rows, or wider tiles
+        args = (q, pool, indices, indptr, kv, extend, extend_indptr, sink, scale, out)
+        return rows_prefill(*args) if mode == "rows" else tiled_prefill(*args, 256)
     rows_per_query = indices.numel() // tokens
     if rows_per_query * tokens != indices.numel():
         raise ValueError("Packed CSR capacity must be declared per query")
