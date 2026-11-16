@@ -170,6 +170,7 @@ fn dispatch_with_policy(
             return_logprob: false,
             request_text: None,
             tokens: None,
+            carries_media: false,
             model_id: None,
             headers: headers.clone().map(Arc::new),
         };
