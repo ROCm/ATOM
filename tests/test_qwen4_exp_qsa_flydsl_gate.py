@@ -532,3 +532,67 @@ def test_in_place_reads_match_gathered_rows_bit_for_bit(monkeypatch, prefixes, e
         )
         assert reference is not None and in_place is not None
         assert torch.equal(in_place, reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "prefixes, extends",
+    [((6080,), (2112,)), ((6001, 0, 1234), (2111, 300, 517)), ((200,), (300,))],
+    ids=["8192-hit-6080", "mixed-unaligned", "short"],
+)
+def test_sharded_selection_written_in_place_matches_a_fresh_one(prefixes, extends):
+    """The sequence-parallel path expands the all-gathered groups itself; into
+    the kernel-width buffer it writes the same columns as into a fresh
+    tensor and leaves -1 past them."""
+    from atom.model_ops.qwen4_exp.ops.qsa import (
+        qsa_expand_block_indices,
+        qsa_select_paged_groups,
+    )
+
+    device, block, ratio, budget, pages = "cuda", 64, 4, 2048, 512
+    gen = torch.Generator(device=device).manual_seed(0)
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    width = max(-(-s // block) for s in seqs)
+    tables = (
+        torch.randperm(pages, device=device, generator=gen)[: len(seqs) * width]
+        .view(len(seqs), width)
+        .to(torch.int32)
+    )
+    positions = torch.cat(
+        [torch.arange(p, p + e, device=device) for p, e in zip(prefixes, extends)]
+    )
+    token_to_req = torch.cat(
+        [
+            torch.full((e,), r, dtype=torch.int32, device=device)
+            for r, e in enumerate(extends)
+        ]
+    )
+    seq_lens = torch.tensor(seqs, dtype=torch.int32, device=device)
+    groups, columns = qsa_select_paged_groups(
+        torch.randn(positions.numel(), 4, 128, device=device, generator=gen).to(
+            torch.bfloat16
+        ),
+        torch.randn(pages, block // ratio, 1, 128, device=device, generator=gen).to(
+            torch.bfloat16
+        ),
+        tables,
+        token_to_req,
+        positions,
+        seq_lens,
+        budget,
+        ratio,
+        max_seq_len=max(seqs),
+        allow_flydsl=True,
+    )
+    args = (groups, positions, seq_lens, token_to_req, ratio, budget)
+    fresh = qsa_expand_block_indices(*args, output_width=columns)
+    kernel_width = next(w for w in qsa_attention._FLYDSL_WIDTHS if w >= columns)
+    buffer = torch.full(
+        (positions.numel(), kernel_width), -1, dtype=torch.int32, device=device
+    )
+    in_place = qsa_expand_block_indices(
+        *args, buffer[:, :columns], output_width=columns
+    )
+    assert in_place.data_ptr() == buffer.data_ptr()
+    assert torch.equal(in_place, fresh)
+    assert bool((buffer[:, columns:] == -1).all())
