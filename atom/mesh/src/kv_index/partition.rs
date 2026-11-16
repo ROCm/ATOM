@@ -48,6 +48,8 @@ pub(crate) struct Partition {
     predicting: Mutex<u64>,
     /// Set once a worker found no prediction lane left.
     crowded: AtomicBool,
+    /// Set once a routed prompt was dropped as the writer was behind.
+    behind: AtomicBool,
     /// Apart from `writes`, so that routing never delays a rank's batches.
     predictions: mpsc::Sender<Write>,
     /// Tokens of the prompts queued in `predictions`.
@@ -86,6 +88,7 @@ impl Partition {
             predicted: PrefixIndex::default(),
             predicting: Mutex::new(0),
             crowded: AtomicBool::new(false),
+            behind: AtomicBool::new(false),
             predictions,
             queued_tokens: AtomicUsize::new(0),
         });
@@ -186,9 +189,14 @@ impl Predictor {
         (self.partition.clone(), self.id)
     }
 
+    pub(crate) fn is_in(&self, partition: &Arc<Partition>) -> bool {
+        Arc::ptr_eq(&self.partition, partition)
+    }
+
     /// Predicts the full blocks of a prompt routed to the worker, which the writer hashes;
-    /// dropped while the writer is behind, so that routing never waits for it.
-    pub(crate) fn record(&self, tokens: &[u32]) {
+    /// false, the prompt dropped, while the writer is behind, so that routing never waits
+    /// for it.
+    pub(crate) fn record(&self, tokens: &[u32]) -> bool {
         let partition = &self.partition;
         let queued = partition
             .queued_tokens
@@ -203,6 +211,12 @@ impl Predictor {
                 .queued_tokens
                 .fetch_sub(tokens.len(), Ordering::Relaxed);
         }
+        sent
+    }
+
+    /// Marks the partition as having dropped a prompt; true the first time.
+    pub(crate) fn first_drop(&self) -> bool {
+        !self.partition.behind.swap(true, Ordering::Relaxed)
     }
 }
 
@@ -391,5 +405,22 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// A prompt the writer has no room for is dropped, and gives its room back.
+    #[tokio::test]
+    async fn prompts_are_dropped_while_the_writer_is_behind() {
+        let partition = Partition::start(4, Duration::from_secs(3600), &Handle::current());
+        let predictor = partition.predict("w").unwrap();
+        let queued = || partition.queued_tokens.load(Ordering::Relaxed);
+        partition
+            .queued_tokens
+            .store(QUEUED_PREDICTION_TOKENS, Ordering::Relaxed);
+        assert!(!predictor.record(&[1, 2, 3, 4]));
+        assert_eq!(queued(), QUEUED_PREDICTION_TOKENS);
+        assert!(predictor.first_drop());
+        assert!(!predictor.first_drop());
+        partition.queued_tokens.store(0, Ordering::Relaxed);
+        assert!(predictor.record(&[1, 2, 3, 4]));
     }
 }

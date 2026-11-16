@@ -104,6 +104,7 @@ tempfile = "3.8"
 lazy_static = "1.4"
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
+tokio = { version = "1.42.0", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3       # Optimize for speed; parsing and tokenization are CPU-bound
