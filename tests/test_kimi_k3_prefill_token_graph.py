@@ -11,12 +11,13 @@ import contextlib
 import importlib.util
 import sys
 from itertools import pairwise
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch._dynamo  # before Triton may be faked below
-from aiter_stub import stubbed_aiter
+from aiter_stub import atom_without_aiter, stubbed_aiter
 from conftest import gpu_stack_import
 from torch import nn
 
@@ -68,9 +69,10 @@ with _imports():
 HEADS, NOPE, ROPE, V_DIM, LORA = 2, 8, 4, 8, 6
 
 
-def _mla_impl(**over):
-    """An `MLAAttention` with the fields the split's predicates read."""
-    impl = object.__new__(mla.MLAAttention)
+def _mla_impl(cls=None, **over):
+    """An `MLAAttention` (``cls``, default this module's) with the fields the
+    split's predicates read."""
+    impl = object.__new__(cls or mla.MLAAttention)
     fields = {
         "split_prefill_recording": True,
         "is_sparse_mla": False,
@@ -89,10 +91,31 @@ def step(monkeypatch):
     return ctx
 
 
+@contextlib.contextmanager
+def _einops():
+    """The Kimi builder imports the GDN mixer, which imports einops; the CPU
+    runner has none, and nothing here calls it."""
+    if importlib.util.find_spec("einops") is not None:
+        yield
+        return
+    einops = ModuleType("einops")
+    einops.__getattr__ = lambda name: MagicMock(name=f"einops.{name}")
+    sys.modules["einops"] = einops
+    try:
+        yield
+    finally:
+        sys.modules.pop("einops", None)
+
+
 def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
-    step, monkeypatch
+    monkeypatch,
 ):
-    kimi = gpu_stack_import("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    with _einops(), atom_without_aiter() as load:
+        kimi = load("atom.model_ops.attentions.kimi_mla_gdn_attn")
+        # The builder's attention_mla: without AITER, a stand-in import of its
+        # own, not this module's `mla`.
+        attn = load(kimi.MLAAttention.__module__)
+    monkeypatch.setattr(attn, "pcp_is_enabled", lambda: False)
 
     def supports(dp, *layers):
         config = SimpleNamespace(
@@ -105,7 +128,7 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
         return kimi._KimiMLAGDNCommon.supports_token_graph.fget(builder)
 
     def mla_layer(**over):
-        return SimpleNamespace(impl=_mla_impl(**over))
+        return SimpleNamespace(impl=_mla_impl(kimi.MLAAttention, **over))
 
     kda_layer = SimpleNamespace()
     assert supports(1, mla_layer(), kda_layer)
@@ -116,7 +139,7 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
     # A drafter's layer, which the recording does not run.
     drafter = mla_layer(split_prefill_recording=False, o_proj=nn.Linear(2, 2))
     assert supports(1, mla_layer(), drafter)
-    monkeypatch.setattr(mla, "use_triton_gemm", lambda: True)
+    monkeypatch.setattr(attn, "use_triton_gemm", lambda: True)
     assert not supports(1, mla_layer(), kda_layer)
 
 
