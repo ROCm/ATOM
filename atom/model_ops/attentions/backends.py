@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
@@ -63,12 +63,6 @@ PAD_SLOT_ID = -1
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    #: Whether a *draft* of this flavor caches into a pool of its own. False
-    #: means its rows are the target's -- an MLA draft's latent is the target's
-    #: latent -- and `make_kv_pool` below is never asked. A property of the
-    #: flavor, so a class answer and not a call.
-    DRAFT_OWNS_KV_POOL: ClassVar[bool] = False
-
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -96,11 +90,11 @@ class AttentionBackend(ABC):
     ):
         """A pool of `layers` rows at this config's geometry.
 
-        Asked of a *draft* model's backend, and only where `DRAFT_OWNS_KV_POOL`
-        — the target's layers are its builder's own business. Both counts are
-        told rather than read: `layers` only the walk knows, and the block only
-        the target builder, whose it is and not this backend's for the reason
-        in `DraftKvBuilder.kv_pool`.
+        Asked of a *draft* model's backend, and only for a family in
+        `selector.DRAFT_POOL_FAMILIES` — the target's layers are its builder's
+        own business. Both counts are told rather than read: `layers` only the
+        walk knows, and the block only the target builder, whose it is and not
+        this backend's for the reason in `DraftKvBuilder.kv_pool`.
 
         `blocks_per_entry` and `flash_layout` are what a draft's
         `DraftKvPoolSpec.pool_kwargs` adds: an entry spanning that many
@@ -272,6 +266,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         for buf in targets:
             buf.np[:] = PAD_SLOT_ID
             buf.copy_to_gpu()
+
+    def reset_cache_after_capture(self) -> None:
+        """Undo what the capture wrote into the cache, before any request runs.
+
+        `blank_cache_write_targets` keeps writes made through the slot mapping
+        off the cache. A backend whose capture writes through real slots or a
+        placeholder block (there is no null slot or block to point it at)
+        leaves that behind, and the next request given the slot or block
+        inherits it. Such a backend overrides this; the default has nothing to
+        undo.
+        """
 
     # ------------------------------------------------------------------ #
     # Cache sizing — one byte currency for every cache class.             #

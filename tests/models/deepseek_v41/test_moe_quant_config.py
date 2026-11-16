@@ -13,7 +13,7 @@ from atom.models.deepseek_v41 import dspark, model
 
 
 @pytest.mark.parametrize("online", [None, {"global_quant_config": "ptpc_fp8"}])
-@pytest.mark.parametrize("entrypoint", ["runtime", "offline", "draft", "draft_offline"])
+@pytest.mark.parametrize("entrypoint", ["runtime", "offline", "draft"])
 def test_model_owns_and_forwards_expert_quantization(
     monkeypatch, single_rank, unallocated_moe, build_v41, entrypoint, online
 ):
@@ -23,12 +23,11 @@ def test_model_owns_and_forwards_expert_quantization(
     monkeypatch.setattr(owner, "make_v4_quant_config", build)
     instance = build_v41(entrypoint, online)
 
-    expected_online = None if entrypoint == "draft_offline" else online
     build.assert_called_once()
-    assert build.call_args.kwargs == {"online_quant_config": expected_online}
+    assert build.call_args.kwargs == {"online_quant_config": online}
     config = instance.moe_quant_config
-    assert config.online_quant_config_raw is expected_online
-    assert config.online_quant == bool(expected_online)
+    assert config.online_quant_config_raw is online
+    assert config.online_quant == bool(online)
     draft = entrypoint.startswith("draft")
     blocks = instance.mtp if draft else instance.layers
     assert len(blocks) == (3 if draft else 40)
@@ -46,7 +45,7 @@ def test_model_owns_and_forwards_expert_quantization(
         assert config.get_layer_quant_config(routed, use_online_quant=True) == source
         shared = f"{moe.prefix}.shared_experts.gate_up_proj"
         assert config.get_layer_quant_config(shared).quant_type == QuantType.per_1x32
-        if expected_online:
+        if online:
             assert (
                 config.get_layer_quant_config(shared, use_online_quant=True).quant_type
                 == QuantType.per_Token

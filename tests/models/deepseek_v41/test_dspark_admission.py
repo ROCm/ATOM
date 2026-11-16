@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
-from types import SimpleNamespace
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 from atom.config import DSparkConfig
 from atom.models.deepseek_v41.config import (
@@ -18,7 +23,7 @@ def config():
         parallel_config=SimpleNamespace(data_parallel_size=1),
         kv_cache_dtype="bf16",
         index_cache_dtype="fp8",
-        hf_config=SimpleNamespace(),
+        hf_config=SimpleNamespace(num_attention_heads=64, head_dim=512),
         speculative_config=SimpleNamespace(
             method="dspark",
             num_speculative_tokens=5,
@@ -40,16 +45,17 @@ def test_static_and_explicitly_calibrated_native_dspark(tp_size):
     validate_speculative_config(value)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("kv_cache_dtype", "fp4"),
-    ],
-)
-def test_unvalidated_runtime_combinations_are_rejected(field, value):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_dspark_accepts_supported_target_kv_cache_dtypes(kv_dtype):
     cfg = config()
-    setattr(cfg, field, value)
-    with pytest.raises(ValueError):
+    cfg.kv_cache_dtype = kv_dtype
+    validate_speculative_config(cfg)
+
+
+def test_dspark_rejects_unsupported_kv_cache_dtype():
+    cfg = config()
+    cfg.kv_cache_dtype = "fp16"
+    with pytest.raises(ValueError, match="KV cache"):
         validate_speculative_config(cfg)
 
 
@@ -169,3 +175,102 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
                 SamplingParams(n=1 if entry == "preprocess" else 2),
                 multimodal_data={"image": 1},
             )
+
+
+@pytest.fixture
+def a8w8_runtime(monkeypatch):
+    """Load the real validator with only the external AITER query stubbed."""
+    query = Mock(return_value="opus")
+    api = ModuleType("aiter.ops.mla_sparse_prefill")
+    api.get_mla_sparse_prefill_v41_backend = query
+    name = "atom.models.deepseek_v41.draft_kv"
+    path = Path(__file__).resolve().parents[3] / "atom/models/deepseek_v41/draft_kv.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    draft_kv = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as imports:
+        imports.setitem(sys.modules, api.__name__, api)
+        spec.loader.exec_module(draft_kv)
+    monkeypatch.setitem(sys.modules, name, draft_kv)
+    return query
+
+
+@pytest.mark.parametrize("target_dtype", ["fp8", "fp4"])
+def test_quantized_draft_is_native_only(target_dtype, a8w8_runtime):
+    cfg = config()
+    cfg.hf_config.model_type = "deepseek_v41_text"
+    cfg.plugin_config = None
+    cfg.kv_cache_dtype = target_dtype
+    setting = DSparkConfig.from_dict({"draft_kv_dtype": "fp8"})
+    setting.validate_draft_kv(cfg)
+    invalid = [
+        ("kv_cache_dtype", "bf16"),
+        ("speculative_config", None),
+        ("plugin_config", object()),
+    ]
+    for field, value in invalid:
+        previous = getattr(cfg, field)
+        setattr(cfg, field, value)
+        with pytest.raises(ValueError, match="native DeepSeek-V4.1"):
+            setting.validate_draft_kv(cfg)
+        setattr(cfg, field, previous)
+    cfg.hf_config.model_type = "deepseek_v4"
+    with pytest.raises(ValueError, match="native DeepSeek-V4.1"):
+        setting.validate_draft_kv(cfg)
+
+
+@pytest.mark.parametrize("dtype", ["fp4", "fp16"])
+def test_quantized_draft_requires_an_explicit_supported_dtype(dtype):
+    assert DSparkConfig().draft_kv_dtype == "auto"
+    with pytest.raises(ValueError, match="draft_kv_dtype"):
+        DSparkConfig.from_dict({"draft_kv_dtype": dtype})
+
+
+@pytest.mark.parametrize("target_dtype", ["fp4", "fp8"])
+@pytest.mark.parametrize("tp,dpa", [(1, False), (4, False), (8, False), (4, True)])
+@pytest.mark.parametrize("backend", ["opus", "asm", None])
+def test_explicit_fp8_draft_uses_public_capability(
+    target_dtype, tp, dpa, backend, a8w8_runtime
+):
+    cfg = config()
+    cfg.hf_config.model_type = "deepseek_v41_text"
+    cfg.plugin_config = None
+    cfg.kv_cache_dtype = target_dtype
+    cfg.tensor_parallel_size = tp
+    cfg.enable_dp_attention = dpa
+    a8w8_runtime.return_value = backend
+    setting = DSparkConfig(draft_kv_dtype="fp8")
+    if backend is None:
+        with pytest.raises(ValueError, match="AITER V4.1 A8W8.*draft_kv_dtype=auto"):
+            setting.validate_draft_kv(cfg)
+    else:
+        setting.validate_draft_kv(cfg)
+    a8w8_runtime.assert_called_once_with(
+        torch.device("cuda"),
+        (1, 64 if dpa else 64 // tp, 512),
+        unified_kv_dtype=torch.float8_e4m3fn,
+        softmax_scale=512**-0.5,
+        q_dtype=torch.float8_e4m3fn,
+        q_scale_dtype=torch.float8_e8m0fnu,
+        unified_kv_scale_dtype=torch.float8_e8m0fnu,
+        kv_dtype=torch.float8_e4m3fn,
+        kv_scale_dtype=torch.float8_e8m0fnu,
+        layout="contiguous",
+    )
+    assert cfg.kv_cache_dtype == target_dtype
+
+
+def test_fp8_draft_capability_errors_are_not_hidden(a8w8_runtime):
+    cfg = config()
+    cfg.hf_config.model_type = "deepseek_v41_text"
+    cfg.plugin_config = None
+    cfg.kv_cache_dtype = "fp4"
+    a8w8_runtime.side_effect = RuntimeError("device query failed")
+    with pytest.raises(RuntimeError, match="device query failed"):
+        DSparkConfig(draft_kv_dtype="fp8").validate_draft_kv(cfg)
+
+
+def test_default_draft_needs_no_a8w8_capability_probe(a8w8_runtime):
+    setting = DSparkConfig()
+    setting.validate_draft_kv(config())
+    a8w8_runtime.assert_not_called()
+    assert setting.draft_kv_dtype == "auto"

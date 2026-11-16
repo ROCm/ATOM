@@ -33,6 +33,8 @@ from atom.mono.device.ops import (  # noqa: F401 - re-exported: the blocks impor
     bf2_f32,
     bf16_pair,
     bf16_round,
+    bf_hi,
+    bf_lo,
     fp8_pack4,
     fresh,
     hw_exp2,

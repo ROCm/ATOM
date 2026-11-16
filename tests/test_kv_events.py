@@ -9,7 +9,9 @@ Covers:
   * BlockManager emits BlockRemoved on lazy eviction
   * `take_events()` drain semantics
   * `clear_cache()` emits AllBlocksCleared
-  * `record_remote_store()` emits BlockStored(medium=REMOTE)
+  * `record_remote_store()` emits BlockStored(medium=GPU)
+  * a multimodal seq's blocks carry its seed in `extra_keys`
+  * the wire encoding and replay protocol are vLLM's
   * ZmqEventPublisher PUB→SUB round-trip
   * NullEventPublisher is a no-op
 """
@@ -27,7 +29,6 @@ from conftest import MockConfig
 from atom.config import KVEventsConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
-    MEDIUM_REMOTE,
     REPLAY_CHUNK,
     REPLAY_DONE,
     AllBlocksCleared,
@@ -83,7 +84,9 @@ class TestEventSchema:
             parent_block_hash=None,
             token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
             block_size=4,
+            lora_id=None,
             medium=MEDIUM_GPU,
+            lora_name=None,
         )
         enc = msgspec.msgpack.Encoder().encode(evt)
         dec = msgspec.msgpack.Decoder(BlockStored).decode(enc)
@@ -100,6 +103,9 @@ class TestEventSchema:
             parent_block_hash=None,
             token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
             block_size=4,
+            lora_id=None,
+            medium=MEDIUM_GPU,
+            lora_name=None,
             token_offset=16,
         )
         enc = msgspec.msgpack.Encoder().encode(evt)
@@ -112,6 +118,9 @@ class TestEventSchema:
             parent_block_hash=None,
             token_ids=[1, 2, 3, 4],
             block_size=4,
+            lora_id=None,
+            medium=MEDIUM_GPU,
+            lora_name=None,
         )
         dec = msgspec.msgpack.Decoder(BlockStored).decode(
             msgspec.msgpack.Encoder().encode(evt)
@@ -150,8 +159,11 @@ class TestEventSchema:
                     parent_block_hash=None,
                     token_ids=[1, 2, 3, 4],
                     block_size=4,
+                    lora_id=None,
+                    medium=MEDIUM_GPU,
+                    lora_name=None,
                 ),
-                BlockRemoved(block_hashes=[2]),
+                BlockRemoved(block_hashes=[2], medium=MEDIUM_GPU),
                 AllBlocksCleared(),
             ],
             data_parallel_rank=0,
@@ -292,6 +304,8 @@ class TestBlockManagerHooks:
         assert bm.kv.num_indexed == 0
 
     def test_record_remote_store(self, seq_factory):
+        # Received KV lives in this engine's HBM: reported on GPU, not as a
+        # remote tier a consumer would have to know about.
         bm = _bm_with_events()
         bm.record_remote_store(
             block_hashes=[42, 43],
@@ -301,8 +315,49 @@ class TestBlockManagerHooks:
         events = bm.take_events()
         assert len(events) == 1
         assert isinstance(events[0], BlockStored)
-        assert events[0].medium == MEDIUM_REMOTE
+        assert events[0].medium == MEDIUM_GPU
         assert events[0].block_hashes == [42, 43]
+        assert events[0].extra_keys is None
+
+    def test_multimodal_blocks_name_the_seed_in_extra_keys(self, seq_factory):
+        # The seed starts a multimodal seq's whole hash chain, so every block
+        # carries it, one `((seed, 0),)` entry per hash, the seed as 16 hex
+        # digits at a fixed offset 0.
+        import msgpack
+
+        bm = _bm_with_events()
+        seq = seq_factory(list(range(8)), multimodal_data={"cache_seed": 0x2A})
+        _admit(bm, seq)
+        (event,) = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert len(event.block_hashes) == 2
+        assert event.extra_keys == [(("000000000000002a", 0),)] * 2
+        wire = msgpack.unpackb(msgspec.msgpack.encode(event))
+        assert wire["extra_keys"] == [[["000000000000002a", 0]]] * 2
+
+        bm.record_remote_store(
+            block_hashes=[42, 43, 44],
+            token_ids=list(range(12)),
+            cache_seed=2**64 - 1,
+        )
+        (event,) = bm.take_events()
+        assert event.extra_keys == [(("ffffffffffffffff", 0),)] * 3
+
+    def test_multimodal_loaded_prefix_names_the_seed(self, seq_factory):
+        bm = _bm_with_events()
+        seq = seq_factory(list(range(8)), multimodal_data={"cache_seed": 7})
+        bm.allocate(seq)
+        assert bm.publish_loaded_prefix(seq, start_token=0, end_token=8) == 8
+        events = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert [e.extra_keys for e in events] == [[(("0000000000000007", 0),)]] * 2
+
+    def test_text_blocks_leave_extra_keys_off_the_wire(self, seq_factory):
+        import msgpack
+
+        bm = _bm_with_events()
+        _admit(bm, seq_factory(list(range(8))))
+        (event,) = [e for e in bm.take_events() if isinstance(e, BlockStored)]
+        assert event.extra_keys is None
+        assert "extra_keys" not in msgpack.unpackb(msgspec.msgpack.encode(event))
 
     def test_publish_loaded_prefix_offset_after_cached_prefix(self, seq_factory):
         # Blocks 0-1 hashed by the prefill path, blocks 2-3 restored by the
@@ -410,15 +465,15 @@ class TestDCPBlockStoredGranularity:
 
         event = self._only_stored_event(bm)
         self._assert_hash_block_aligned(event, expected_hashes=2)
-        assert event.medium == MEDIUM_REMOTE
+        assert event.medium == MEDIUM_GPU
 
 
-# ── Scheduler: BlockStored(REMOTE) on remote-KV completion ─────────────────
+# ── Scheduler: BlockStored on remote-KV completion ─────────────────────────
 
 
 class TestSchedulerRemoteStore:
     """`Scheduler._update_waiting_for_remote_kv` walks the block table and
-    emits one BlockStored(REMOTE) for the blocks that arrived from the
+    emits one BlockStored for the blocks that arrived from the
     producer. The stub block manager records the call so the test pins the
     offset/parent derivation without a real pool."""
 
@@ -456,7 +511,9 @@ class TestSchedulerRemoteStore:
             },
         )
         sched.finished_recving_kv_req_ids = ["7"]
-        seq = SimpleNamespace(id=7, block_table=[10, 11, 12, 13], num_cached_tokens=8)
+        seq = SimpleNamespace(
+            id=7, block_table=[10, 11, 12, 13], num_cached_tokens=8, cache_seed=-1
+        )
 
         assert sched._update_waiting_for_remote_kv(seq) is True
         assert calls == [
@@ -465,6 +522,7 @@ class TestSchedulerRemoteStore:
                 "token_ids": list(range(8, 16)),
                 "parent_block_hash": 101,
                 "token_offset": 8,
+                "cache_seed": -1,
             }
         ]
 
@@ -482,7 +540,9 @@ class TestSchedulerRemoteStore:
             },
         )
         sched.finished_recving_kv_req_ids = [8]
-        seq = SimpleNamespace(id=8, block_table=[10, 11, 12, 13], num_cached_tokens=8)
+        seq = SimpleNamespace(
+            id=8, block_table=[10, 11, 12, 13], num_cached_tokens=8, cache_seed=-1
+        )
 
         assert sched._update_waiting_for_remote_kv(seq) is True
         assert len(calls) == 1
@@ -502,7 +562,9 @@ class TestSchedulerRemoteStore:
             },
         )
         sched.finished_recving_kv_req_ids = ["9"]
-        seq = SimpleNamespace(id=9, block_table=[20, 21], num_cached_tokens=8)
+        seq = SimpleNamespace(
+            id=9, block_table=[20, 21], num_cached_tokens=8, cache_seed=-1
+        )
 
         assert sched._update_waiting_for_remote_kv(seq) is True
         assert calls == [
@@ -511,8 +573,19 @@ class TestSchedulerRemoteStore:
                 "token_ids": list(range(8, 16)),
                 "parent_block_hash": 200,
                 "token_offset": 8,
+                "cache_seed": -1,
             }
         ]
+
+    def test_multimodal_seed_reaches_the_event(self):
+        sched, calls = self._scheduler(
+            hash_block_size=4, blocks={10: (100, [0, 1, 2, 3])}
+        )
+        sched.finished_recving_kv_req_ids = ["5"]
+        seq = SimpleNamespace(id=5, block_table=[10], num_cached_tokens=0, cache_seed=9)
+
+        assert sched._update_waiting_for_remote_kv(seq) is True
+        assert [call["cache_seed"] for call in calls] == [9]
 
     def test_no_event_when_everything_was_cached(self):
         sched, calls = self._scheduler(
@@ -640,7 +713,7 @@ class TestEndpointOffset:
 class TestPublisher:
     def test_null_publisher_is_no_op(self):
         pub = NullEventPublisher()
-        pub.publish([BlockRemoved(block_hashes=[1])])
+        pub.publish([BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)])
         pub.shutdown()
 
     def test_make_publisher_disabled_returns_null(self):
@@ -728,7 +801,7 @@ class TestReplayEndpointWiring:
             decoder = msgspec.msgpack.Decoder(EventBatch)
             frames: list[bytes] | None = None
             for _ in range(10):
-                pub.publish([BlockRemoved(block_hashes=[7])])
+                pub.publish([BlockRemoved(block_hashes=[7], medium=MEDIUM_GPU)])
                 if sub.poll(timeout=200):
                     frames = sub.recv_multipart()
                     break
@@ -760,7 +833,7 @@ class TestReplayEndpointWiring:
             # receives one (subscription now live), then drain extras.
             warmed = False
             for _ in range(20):
-                pub.publish([BlockRemoved(block_hashes=[0])])
+                pub.publish([BlockRemoved(block_hashes=[0], medium=MEDIUM_GPU)])
                 if sub.poll(timeout=200):
                     sub.recv_multipart()
                     warmed = True
@@ -770,7 +843,7 @@ class TestReplayEndpointWiring:
                 sub.recv_multipart()
             # The next batches must arrive with strictly consecutive seqs.
             for i in range(5):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             seqs: list[int] = []
             polls = 50
             while len(seqs) < 5 and polls > 0:
@@ -796,7 +869,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(3):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 100
             while pub.stats["sent"] < 3 and polls > 0:
                 time.sleep(0.02)
@@ -808,7 +881,7 @@ class TestReplayEndpointWiring:
             dealer.send(b"\x00" * 8)  # start_seq = 0
             replayed_seqs: list[int] = []
             while len(replayed_seqs) < 3 and dealer.poll(timeout=1000):
-                seq_bytes, payload = dealer.recv_multipart()
+                _, seq_bytes, payload = dealer.recv_multipart()
                 replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
                 msgspec.msgpack.Decoder(EventBatch).decode(payload)
             dealer.close(linger=0)
@@ -826,7 +899,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(4):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 100
             while pub.stats["sent"] < 4 and polls > 0:
                 time.sleep(0.02)
@@ -838,7 +911,7 @@ class TestReplayEndpointWiring:
             dealer.send((2).to_bytes(8, "big"))  # start_seq = 2
             replayed_seqs: list[int] = []
             while len(replayed_seqs) < 2 and dealer.poll(timeout=1000):
-                seq_bytes, _ = dealer.recv_multipart()
+                _, seq_bytes, _ = dealer.recv_multipart()
                 replayed_seqs.append(int.from_bytes(seq_bytes, "big"))
             dealer.close(linger=0)
             assert replayed_seqs == [2, 3]
@@ -857,7 +930,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(3):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 100
             while pub.stats["sent"] < 3 and polls > 0:
                 time.sleep(0.02)
@@ -869,7 +942,7 @@ class TestReplayEndpointWiring:
             data: list[int] = []
             window = None
             while dealer.poll(timeout=1000):
-                seq_bytes, payload = dealer.recv_multipart()
+                _, seq_bytes, payload = dealer.recv_multipart()
                 if seq_bytes == REPLAY_DONE:
                     window = msgspec.msgpack.decode(payload)
                     break
@@ -892,7 +965,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(2):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 100
             while pub.stats["sent"] < 2 and polls > 0:
                 time.sleep(0.02)
@@ -904,7 +977,7 @@ class TestReplayEndpointWiring:
             data: list[int] = []
             got_terminal = False
             while dealer.poll(timeout=1000):
-                seq_bytes, _ = dealer.recv_multipart()
+                _, seq_bytes, _ = dealer.recv_multipart()
                 if seq_bytes == REPLAY_DONE:
                     got_terminal = True
                     break
@@ -928,7 +1001,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(3):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 200
             while pub.stats["sent"] < 3 and polls > 0:
                 time.sleep(0.02)
@@ -942,7 +1015,7 @@ class TestReplayEndpointWiring:
             got: list[int] = []
             dones = 0
             while dealer.poll(timeout=500):
-                seq_bytes, _ = dealer.recv_multipart()
+                _, seq_bytes, _ = dealer.recv_multipart()
                 if seq_bytes == REPLAY_DONE:
                     dones += 1
                 else:
@@ -968,7 +1041,7 @@ class TestReplayEndpointWiring:
         ctx = zmq.Context.instance()
         try:
             for i in range(n):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 500
             while pub.stats["sent"] < n and polls > 0:
                 time.sleep(0.02)
@@ -980,7 +1053,7 @@ class TestReplayEndpointWiring:
             got: list[int] = []
             window = None
             while dealer.poll(timeout=1000):
-                seq_bytes, payload = dealer.recv_multipart()
+                _, seq_bytes, payload = dealer.recv_multipart()
                 if seq_bytes == REPLAY_DONE:
                     window = msgspec.msgpack.decode(payload)
                     break
@@ -1007,7 +1080,7 @@ class TestReplayEndpointWiring:
         dealer = ctx.socket(zmq.DEALER)
         try:
             for i in range(20):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 200
             while pub.stats["sent"] < 20 and polls > 0:
                 time.sleep(0.02)
@@ -1034,7 +1107,7 @@ class TestReplayEndpointWiring:
             got: list[int] = []
             done = False
             while dealer.poll(timeout=1000):
-                seq_bytes, _ = dealer.recv_multipart()
+                _, seq_bytes, _ = dealer.recv_multipart()
                 if seq_bytes == REPLAY_DONE:
                     done = True
                     break
@@ -1071,7 +1144,7 @@ class TestReplayEndpointWiring:
         dealer.set_hwm(1)
         try:
             for i in range(n):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             polls = 500
             while pub.stats["sent"] < n and polls > 0:
                 time.sleep(0.02)
@@ -1089,7 +1162,7 @@ class TestReplayEndpointWiring:
             assert pub._sender.is_alive()
 
             # Live publication keeps flowing after the abandoned replay.
-            pub.publish([BlockRemoved(block_hashes=[n])])
+            pub.publish([BlockRemoved(block_hashes=[n], medium=MEDIUM_GPU)])
             polls = 200
             while pub.stats["sent"] < n + 1 and polls > 0:
                 time.sleep(0.02)
@@ -1118,7 +1191,7 @@ class TestReplayEndpointWiring:
         try:
             reserved = int.from_bytes(REPLAY_DONE, "big")  # 2**64 - 1
             pub._seq_gen = iter([reserved, reserved + 1, 5])
-            pub.publish([BlockRemoved(block_hashes=[1])])
+            pub.publish([BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)])
             item = next(it for it in list(pub._queue.queue) if it is not None)
             assert item[0] != reserved
             assert item[0] == 0  # reserved % (2**64 - 1)
@@ -1141,10 +1214,10 @@ class TestReplayEndpointWiring:
         try:
             good_encoder = pub._encoder
             pub._encoder = _BadEncoder()
-            pub.publish([BlockRemoved(block_hashes=[1])])
-            pub.publish([BlockRemoved(block_hashes=[2])])
+            pub.publish([BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)])
+            pub.publish([BlockRemoved(block_hashes=[2], medium=MEDIUM_GPU)])
             pub._encoder = good_encoder
-            pub.publish([BlockRemoved(block_hashes=[3])])
+            pub.publish([BlockRemoved(block_hashes=[3], medium=MEDIUM_GPU)])
             assert pub.stats["encode_errors"] == 2
             item = next(it for it in list(pub._queue.queue) if it is not None)
             assert item[0] == 2  # seqs 0 and 1 were consumed by the failures
@@ -1162,7 +1235,7 @@ class TestReplayEndpointWiring:
         pub._sender.join(timeout=2.0)
         try:
             for i in range(5):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             # buffer_steps=1 => 4 dropped, 1 remains; the survivor is the LAST
             # published batch (seq=4), proving seqs 0..3 were assigned to the
             # dropped batches and are now gaps.
@@ -1187,7 +1260,7 @@ class TestReplayEndpointWiring:
         pub._sender.join(timeout=2.0)
         try:
             for i in range(5):
-                pub.publish([BlockRemoved(block_hashes=[i])])
+                pub.publish([BlockRemoved(block_hashes=[i], medium=MEDIUM_GPU)])
             assert pub.stats["dropped"] >= 4
         finally:
             with contextlib.suppress(Exception):
@@ -1205,9 +1278,140 @@ class TestReplayEndpointWiring:
 
         pub._encoder = _BadEncoder()
         try:
-            pub.publish([BlockRemoved(block_hashes=[1])])
-            pub.publish([BlockRemoved(block_hashes=[2])])
+            pub.publish([BlockRemoved(block_hashes=[1], medium=MEDIUM_GPU)])
+            pub.publish([BlockRemoved(block_hashes=[2], medium=MEDIUM_GPU)])
             assert pub.stats["encode_errors"] == 2
             assert pub.stats["sent"] == 0
+        finally:
+            pub.shutdown()
+
+
+# ── A subscriber written to vLLM's protocol ────────────────────────────────
+
+
+def _wait_sent(pub, n: int) -> None:
+    polls = 200
+    while pub.stats["sent"] < n and polls > 0:
+        time.sleep(0.02)
+        polls -= 1
+    assert pub.stats["sent"] == n
+
+
+def _vllm_replay(zmq, endpoint: str, start_seq: int) -> list[list[bytes]]:
+    """Replay the way vLLM's subscribers ask for it: a DEALER sends an empty
+    delimiter and the 8-byte start seq, then reads frames up to and including
+    the one whose seq is REPLAY_DONE."""
+    dealer = zmq.Context.instance().socket(zmq.DEALER)
+    try:
+        dealer.connect(endpoint)
+        dealer.send_multipart([b"", start_seq.to_bytes(8, "big")])
+        frames: list[list[bytes]] = []
+        while dealer.poll(timeout=1000):
+            frames.append(dealer.recv_multipart())
+            if frames[-1][2:3] == [REPLAY_DONE]:
+                break
+        return frames
+    finally:
+        dealer.close(linger=0)
+
+
+class TestVllmSubscriber:
+    """SUB for the live stream, a DEALER for replay and schema-free msgpack for
+    the payloads, against the publisher the scheduler builds."""
+
+    @pytest.mark.parametrize("topic", ["", "kv-events"])
+    def test_clear_first_then_vllm_replay_and_live_frames(self, topic):
+        zmq = pytest.importorskip("zmq")
+        import msgpack
+
+        name = f"test-kv-vllm-sub-{topic or 'untopic'}"
+        pub = make_publisher(
+            enabled=True,
+            publisher_kind="zmq",
+            endpoint=f"inproc://{name}-pub",
+            topic=topic,
+            replay_endpoint=f"inproc://{name}-router",
+            data_parallel_rank=1,
+        )
+        sub = zmq.Context.instance().socket(zmq.SUB)
+        try:
+            pub.publish([BlockRemoved(block_hashes=[5], medium=MEDIUM_GPU)])
+            _wait_sent(pub, 2)
+
+            *data, end = _vllm_replay(zmq, pub.replay_endpoint, 0)
+            assert [len(frame) for frame in data] == [4, 4]
+            assert all(frame[:2] == [b"", topic.encode()] for frame in data)
+            assert [int.from_bytes(frame[2], "big") for frame in data] == [0, 1]
+            assert msgpack.unpackb(data[0][3])[1:] == [
+                [{"type": "AllBlocksCleared"}],
+                1,
+            ]
+            assert len(end) == 4 and end[:3] == [b"", b"", REPLAY_DONE]
+            assert msgpack.unpackb(end[3]) == [0, 1]
+
+            sub.setsockopt(zmq.SUBSCRIBE, topic.encode())
+            sub.connect(pub.endpoint)
+            live = None
+            for _ in range(20):
+                pub.publish([BlockRemoved(block_hashes=[6], medium=MEDIUM_GPU)])
+                if sub.poll(timeout=200):
+                    live = sub.recv_multipart()
+                    break
+            assert live is not None, "SUB did not receive any batch"
+            assert len(live) == 3 and live[0] == topic.encode()
+            assert int.from_bytes(live[1], "big") >= 2
+            assert msgpack.unpackb(live[2])[1] == [
+                {"type": "BlockRemoved", "block_hashes": [6], "medium": "GPU"}
+            ]
+        finally:
+            sub.close(linger=0)
+            pub.shutdown()
+
+    def test_payload_is_vllm_encoding_with_defaults_left_out(self):
+        zmq = pytest.importorskip("zmq")
+        import msgpack
+
+        pub = make_publisher(
+            enabled=True,
+            publisher_kind="zmq",
+            endpoint="inproc://test-kv-vllm-enc-pub",
+            replay_endpoint="inproc://test-kv-vllm-enc-router",
+        )
+        try:
+            pub.publish(
+                [
+                    BlockStored(
+                        block_hashes=[1, 2],
+                        parent_block_hash=None,
+                        token_ids=list(range(8)),
+                        block_size=4,
+                        lora_id=None,
+                        medium=MEDIUM_GPU,
+                        lora_name=None,
+                    ),
+                    BlockRemoved(block_hashes=[2], medium=MEDIUM_GPU),
+                    AllBlocksCleared(),
+                ]
+            )
+            _wait_sent(pub, 2)
+            (_, _, _, payload), _ = _vllm_replay(zmq, pub.replay_endpoint, 1)
+            # The batch is positional, so it keeps the unset rank; an event
+            # leaves its defaults out, but not the keys vLLM's decoder requires.
+            ts, events, rank = msgpack.unpackb(payload)
+            assert isinstance(ts, float) and rank is None
+            assert events == [
+                {
+                    "type": "BlockStored",
+                    "block_hashes": [1, 2],
+                    "parent_block_hash": None,
+                    "token_ids": list(range(8)),
+                    "block_size": 4,
+                    "lora_id": None,
+                    "medium": "GPU",
+                    "lora_name": None,
+                },
+                {"type": "BlockRemoved", "block_hashes": [2], "medium": "GPU"},
+                {"type": "AllBlocksCleared"},
+            ]
         finally:
             pub.shutdown()

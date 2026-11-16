@@ -12,10 +12,14 @@ from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.blockscale import native_quant_linear, quantize_fp8
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.draft_block import DraftStep, draft_step, rotate_rows
 from atom.model_ops.deepseek_v41.dspark import (
+    DraftSrcBuffers,
     build_block_state,
     draft_attention,
+    draft_attention_fp8,
+    draft_src_indices,
     draft_step_indices,
     fused_draft_kv_tail,
 )
@@ -84,6 +88,49 @@ class DraftAttention(Attention):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
+        context = context_kv[self.spec.layer_id]
+        if isinstance(context, tuple):
+            if context[0].shape[-1] != self.head_dim:
+                raise ValueError("A8W8 draft history must contain MXFP8 rows")
+            if not getattr(self, "_draft_attention_announced", False):
+                logger.info(
+                    "V4.1 draft layer %d: MXFP8 history, MXFP8 current KV, "
+                    "opus A8W8 attention",
+                    self.spec.layer_id,
+                )
+                self._draft_attention_announced = True
+            rows = kv_normed.shape[:-1].numel()
+            keys = (
+                torch.empty_like(kv_normed, dtype=FP8_DTYPE),
+                torch.empty(
+                    (*kv_normed.shape[:-1], self.head_dim // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=query.device,
+                ),
+            )
+            query_fp8 = (
+                torch.empty_like(query, dtype=FP8_DTYPE),
+                torch.empty(
+                    (*query.shape[:-1], self.head_dim // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=query.device,
+                ),
+            )
+            rope_quant_window(
+                query.view(rows, self.heads, self.head_dim),
+                kv_normed.view(rows, self.head_dim),
+                rope.cos_cache,
+                rope.sin_cache,
+                step.positions.flatten(),
+                rope_dim=rope.rope_dim,
+                values=keys[0].view(rows, self.head_dim),
+                scales=keys[1].view(rows, self.head_dim // 32),
+                query_fp8=query_fp8,
+            )
+            output = draft_attention_fp8(
+                query_fp8, context, keys, self.attn_sink, step, self.softmax_scale
+            )
+            return self._project_out(output, rope, step.positions)
         # Both rotations and the quantized row in one launch.
         keys = torch.empty_like(kv_normed)
         rows = kv_normed.shape[:-1].numel()
@@ -161,14 +208,17 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def __init__(self, config, *, max_length=None, alt_stream=None):
         super().__init__()
-        args = getattr(config, "hf_config", config)
+        args = config.hf_config
         if args.num_nextn_predict_layers < 1 or args.dspark_block_size < 1:
             raise ValueError(
                 "V4.1 DSpark needs draft stages and a positive block width"
             )
         self.config = args
+        self.draft_kv_dtype = config.dspark.draft_kv_dtype
         self.block_size = args.dspark_block_size
         self.window_size, self.vocab_size = args.sliding_window, args.vocab_size
+        # Sized at the engine's batch bound, as the backbone's index buffers are.
+        self.draft_src_buffers = DraftSrcBuffers(config.max_num_seqs, self.block_size)
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
@@ -550,18 +600,38 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # in the layer, so indexing them one at a time spent a gather and a
         # `.long()` cast apiece. The slices below are views.
         layer_ids = self._context_layer_ids(slots.device)
-        windows = cache.read_windows(layer_ids, slots)
-        context = {
-            layer.spec.layer_id: windows[i]
-            for i, layer in enumerate(self.context_layers)
-        }
+        if self.draft_kv_dtype == "fp8":
+            windows = cache.read_window_planes(layer_ids, slots)
+            context = {
+                layer.spec.layer_id: tuple(p[i] for p in windows)
+                for i, layer in enumerate(self.context_layers)
+            }
+        else:
+            windows = cache.read_windows(layer_ids, slots)
+            context = {
+                layer.spec.layer_id: windows[i]
+                for i, layer in enumerate(self.context_layers)
+            }
         # The slot -> position map and the block's index list are one closed
         # form over (positions, ring, window, width), so they come from a
         # single launch rather than the ~16 torch ops that spelled them out --
         # launch-floor work on [B, ring] rows, four of them an `arange`
         # rebuilding a constant.
+        ring = cache.geometry.ring_slots
         step_positions, indices, context_positions = draft_step_indices(
-            positions, cache.geometry.ring_slots, self.window_size, width
+            positions, ring, self.window_size, width
+        )
+        # One build for whichever draft runs: the FP8 draft always reads these
+        # lists (`DraftAttention.forward` picks it by the window's type); the
+        # BF16 one only where `two_source_draft()` says, None keeping its
+        # concatenating path.
+        src = draft_src_indices(
+            positions,
+            ring,
+            self.window_size,
+            width,
+            self.draft_src_buffers,
+            fp8=self.draft_kv_dtype == "fp8",
         )
         return self.draft_hidden(
             input_ids,
@@ -569,7 +639,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             context,
             context_positions,
             num_draft=num_draft,
-            step=DraftStep(step_positions, indices),
+            step=DraftStep(step_positions, indices, src_indices=src),
         )
 
     def forward_spec(self, input_ids, positions, num_draft=None):
@@ -591,7 +661,9 @@ class DeepseekV41DSpark(DSparkDraftModel):
         """Pure block math; the caller supplies a committed per-request window.
 
         `step` lets a caller that already built the block's positions and
-        indices hand them over -- `block_backbone` does, from one kernel.
+        indices hand them over -- `block_backbone` does, from one kernel. An
+        FP8 draft reads only the step's two source lists, so it needs a step
+        that carries them; `block_backbone` builds them once a round.
         """
         if self.embed is None or self.head is None:
             raise RuntimeError("DSpark must share the loaded target embedding and head")

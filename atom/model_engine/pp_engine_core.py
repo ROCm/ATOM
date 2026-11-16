@@ -15,7 +15,11 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
-from atom.model_engine.engine_core import HELD_POLL_S, EngineCore
+from atom.model_engine.engine_core import (
+    HELD_POLL_S,
+    EngineCore,
+    publish_idle_state_work,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
 from atom.utils import envs
@@ -318,12 +322,11 @@ class PPEngineCoreProc(EngineCore):
         ship it downstream too — otherwise the stages never save their layers
         and ``PPKVAggregator`` cannot reach a quorum.
 
-        ``dispatch_new`` exists only to match the base signature the shutdown
-        drain calls through: this override never publishes new state loads/
-        stores (the state tier refuses ``pp_size > 1`` outright, so there are
-        none), so it has nothing to gate and the flag is inert here.
+        ``dispatch_new`` gates publishing new state loads/stores exactly as in
+        the base: a request parked only on its state load would otherwise wait
+        for some unrelated batch to be scheduled, and the shutdown drain must
+        not hand out work that keeps it from converging.
         """
-        del dispatch_new
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
@@ -335,6 +338,8 @@ class PPEngineCoreProc(EngineCore):
             )
         ):
             return
+        if dispatch_new:
+            publish_idle_state_work(self.scheduler)
         self._dispatch_connector_only_batch(
             ScheduledBatch(
                 seqs={},

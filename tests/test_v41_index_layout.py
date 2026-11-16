@@ -30,7 +30,7 @@ from tests.test_deepseek_v4_transfer_regions import mooncake_page_writer  # noqa
 ROOT = Path(__file__).parents[1]
 
 
-def _geometry(layout, *, fp4=True):
+def _geometry(layout, *, fp4=True, kv_dtype="bf16"):
     return V41PoolGeometry(
         2,
         ((0, 2), (1, 1)),
@@ -38,6 +38,7 @@ def _geometry(layout, *, fp4=True):
         128,
         512,
         128,
+        kv_dtype=kv_dtype,
         index_fp4=fp4,
         index_block_rows=8,
         index_layout=layout,
@@ -100,14 +101,21 @@ def test_startup_snapshots_runtime_layout_for_scheduler_and_worker(
     assert worker.compute_hash() != compile_hash
 
 
-def test_equal_size_fp4_layouts_have_distinct_checkpoint_identities():
-    layouts = [_geometry(name) for name in ("preshuffle", "mfma", "natural")]
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_equal_size_fp4_layouts_have_distinct_checkpoint_identities(kv_dtype):
+    layouts = [
+        _geometry(name, kv_dtype=kv_dtype) for name in ("preshuffle", "mfma", "natural")
+    ]
+    assert all(
+        geo.layout_id.startswith("source-buffer-v1:") == (kv_dtype != "bf16")
+        for geo in layouts
+    )
     assert len({geo.paged_bytes for geo in layouts}) == 1
     assert len({geo.checkpoint_image_bytes for geo in layouts}) == 1
     assert len({geo.layout_id for geo in layouts}) == 3
     assert all(replace(geo).layout_id == geo.layout_id for geo in layouts)
-    assert _geometry(None).layout_id == layouts[0].layout_id
-    assert _geometry(None, fp4=False).layout_id not in {
+    assert _geometry(None, kv_dtype=kv_dtype).layout_id == layouts[0].layout_id
+    assert _geometry(None, fp4=False, kv_dtype=kv_dtype).layout_id not in {
         geo.layout_id for geo in layouts
     }
 
@@ -129,6 +137,18 @@ def cache_cls():
         "FP4_MFMA": FP4_MFMA,
         "IndexUnits": IndexUnits,
     }
+    # The quantized cache uses the production CPU view helper; load it without
+    # importing the GPU writers in the same module.
+    planes = ROOT / "atom/model_ops/attentions/deepseek_v41/planes.py"
+    split = next(
+        n
+        for n in ast.parse(planes.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "split_source"
+    )
+    exec(  # noqa: S102 -- executes the production view helper
+        compile(ast.Module(body=[split], type_ignores=[]), str(planes), "exec"),
+        namespace,
+    )
     exec(  # noqa: S102 -- executes the production allocation class
         compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"),
         namespace,
@@ -137,8 +157,11 @@ def cache_cls():
 
 
 @pytest.mark.parametrize("layout", ["preshuffle", "mfma", "natural"])
-def test_cache_uses_declared_layout_and_rejects_other_checkpoint(cache_cls, layout):
-    geo = _geometry(layout)
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_cache_uses_declared_layout_and_rejects_other_checkpoint(
+    cache_cls, layout, kv_dtype
+):
+    geo = _geometry(layout, kv_dtype=kv_dtype)
     cache = cache_cls(geo, 2, 1, "cpu")
     assert {units.layout for units in cache.index_units.values()} == {layout}
     spec = PagedStateCheckpointSpec(
@@ -148,17 +171,18 @@ def test_cache_uses_declared_layout_and_rejects_other_checkpoint(cache_cls, layo
         geo.checkpoint_image_bytes,
     )
     copies = StateCopies(cache, spec, 1)
-    other = _geometry("mfma" if layout != "mfma" else "preshuffle")
+    other = _geometry("mfma" if layout != "mfma" else "preshuffle", kv_dtype=kv_dtype)
     op = CheckpointRestoreOp(
         0,
         tuple(range(spec.units_per_checkpoint)),
         geo.checkpoint_image_bytes,
         other.layout_id,
     )
-    before = cache.backing.clone()
+    before = [allocation.clone() for allocation in cache.allocations]
     with pytest.raises(ValueError, match="Checkpoint layout or size mismatch"):
         copies.execute([], [op])
-    torch.testing.assert_close(cache.backing, before)
+    for allocation, saved in zip(cache.allocations, before):
+        torch.testing.assert_close(allocation, saved)
 
 
 @pytest.fixture
@@ -184,8 +208,8 @@ def v41_export():
     return namespace["get_kv_transfer_tensors"]
 
 
-def _export(layout, exporter, cache_cls):
-    geo = _geometry(layout)
+def _export(layout, exporter, cache_cls, kv_dtype):
+    geo = _geometry(layout, kv_dtype=kv_dtype)
     builder = SimpleNamespace(
         cache=cache_cls(geo, 2, 1, "cpu"),
         model_runner=SimpleNamespace(
@@ -199,11 +223,12 @@ def _export(layout, exporter, cache_cls):
 
 
 @pytest.mark.parametrize("consumer_layout", ["preshuffle", "mfma", "natural"])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
 def test_pd_checks_physical_layout_before_writing(
-    v41_export, cache_cls, mooncake_page_writer, consumer_layout  # noqa: F811
+    v41_export, cache_cls, mooncake_page_writer, consumer_layout, kv_dtype  # noqa: F811
 ):
-    producer = _export("mfma", v41_export, cache_cls)
-    consumer = _export(consumer_layout, v41_export, cache_cls)
+    producer = _export("mfma", v41_export, cache_cls, kv_dtype)
+    consumer = _export(consumer_layout, v41_export, cache_cls, kv_dtype)
     src, dst = producer.block_regions, consumer.block_regions
     assert [r.unit_bytes for r in src] == [r.unit_bytes for r in dst]
     writes = Mock(return_value=True)
