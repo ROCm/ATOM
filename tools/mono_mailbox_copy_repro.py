@@ -11,7 +11,7 @@ Store service, profiler, sampling change, or synthetic mailbox replacement.
 
 Run from the checkout with matching ROCm PyTorch/FlyDSL/AITER dependencies:
   PYTHONPATH="$PWD" timeout --signal=TERM --kill-after=5s 300s python tools/mono_mailbox_copy_repro.py
-For a revert control, use a separate checkout with the backoff reverted (see
+For a revert control, set ATOM_MONO_POLL_SLEEP_UNITS=1 (main's polling; see
 the .md); do not monkeypatch `_spin` or free owners after a pending GPU operation.
 A hang is probabilistic: one completed run is not proof that it cannot recur.
 On deadline or any other failure this tool retains the in-flight owners and
@@ -200,6 +200,8 @@ def run_fixture(args):
             "mode": args.mode,
             "k1": k1.__file__,
             "sync": sync.__file__,
+            # ATOM_MONO_POLL_SLEEP_UNITS as built (None: a checkout without it)
+            "poll_sleep_units": getattr(sync, "POLL_SLEEP_UNITS", None),
             "sync_sha256": hashlib.sha256(
                 pathlib.Path(sync.__file__).read_bytes()
             ).hexdigest(),
