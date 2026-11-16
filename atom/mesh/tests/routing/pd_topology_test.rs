@@ -3,13 +3,16 @@
 //! These tests verify complete request flows through the router using MockWorker
 //! backends — no real inference engine (ATOM/SGLang) is needed.
 
+use std::sync::{Arc, Mutex};
+
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, Method, StatusCode},
+    routing::get,
 };
 use http_body_util::BodyExt;
-use mesh::config::RouterConfig;
+use mesh::{config::RouterConfig, core::WorkerType};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -112,6 +115,27 @@ fn models_request() -> Request<Body> {
         .unwrap()
 }
 
+/// A stand-in encode server: healthy, and recording every POST it receives.
+async fn start_encode_stub() -> (String, Arc<Mutex<Vec<String>>>) {
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let recorder = posts.clone();
+    let app = axum::Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .fallback(move |req: Request<Body>| {
+            let recorder = recorder.clone();
+            async move {
+                if req.method() == Method::POST {
+                    recorder.lock().unwrap().push(req.uri().path().to_string());
+                }
+                StatusCode::NOT_FOUND
+            }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, posts)
+}
+
 // ==========================================================================
 // 1P1D Tests
 // ==========================================================================
@@ -162,6 +186,56 @@ mod test_1p1d {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("choices").is_some() || json.get("text").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_1p1d_with_encode_serves_text_chat_on_p_and_d() {
+        let pp = pick_port();
+        let dp = pick_port();
+        let (encode_url, encode_posts) = start_encode_stub().await;
+
+        let mut config = pd_config(&[pp], &[dp], "round_robin");
+        config.encode_urls = vec![encode_url.clone()];
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![TestWorkerConfig::prefill(pp), TestWorkerConfig::decode(dp)],
+        )
+        .await;
+
+        // Registration is a background job: wait for the encode worker.
+        let registry = &ctx.app_context.worker_registry;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        while !registry.get_encode_workers().iter().any(|w| w.is_healthy()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "encode worker never registered"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        let encode = registry.get_by_url(&encode_url).expect("encode worker");
+        assert_eq!(encode.worker_type(), &WorkerType::Encode);
+        assert_eq!(encode.worker_type().as_metric_label(), "encode");
+        assert_eq!(registry.stats().encode_workers, 1);
+
+        let app = ctx.create_app().await;
+        let resp = app
+            .oneshot(chat_request("What is Rust?", false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("choices").is_some());
+        // Connection detection may probe gRPC health; no inference POST reaches E.
+        let posts = encode_posts.lock().unwrap();
+        assert!(
+            !posts
+                .iter()
+                .any(|p| p.starts_with("/v1/") || p == "/generate"),
+            "encode worker received {posts:?}"
+        );
 
         ctx.shutdown().await;
     }
