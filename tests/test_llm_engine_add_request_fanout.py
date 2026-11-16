@@ -121,7 +121,7 @@ class _GeneratingEngine:
             offline_backpressure_batch=lambda: nullcontext(),
             add_request=self._submitted.extend,
             get_output=self._get_output,
-            is_alive=lambda: True,
+            is_healthy=lambda: True,
             is_rest=lambda: False,
         )
 
