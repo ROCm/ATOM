@@ -114,6 +114,8 @@ def test_bf16_triton_prefill_reuses_output_on_device(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
 @pytest.mark.parametrize("heads", [8, 128])
 def test_fp8_prefill_reuses_output_on_device(heads):
+    if paged_2src.get_gfx_runtime() not in ("gfx950", "gfx1250"):
+        pytest.skip("FP8 OPUS/ASM prefill requires gfx950 or gfx1250")
     from atom.model_ops.v4_kernels.v4_quant import quantize_bf16_to_v4_2buff
 
     torch.manual_seed(41)
@@ -155,6 +157,8 @@ def _output_slice(n, heads, dim, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
 @pytest.mark.parametrize("alias_query", [False, True])
 def test_bf16_opus_prefill_output_on_device(monkeypatch, alias_query):
+    if paged_2src.get_gfx_runtime() not in ("gfx950", "gfx1250"):
+        pytest.skip("BF16 OPUS prefill requires gfx950 or gfx1250")
     if not paged_2src._HAS_OPUS:
         pytest.skip("requires BF16 OPUS")
     monkeypatch.setattr(paged_2src.envs, "ATOM_FORCE_ATTN_TRITON", False)
