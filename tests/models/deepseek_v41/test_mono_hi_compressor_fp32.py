@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Compare hi pooling to ATOM's actual fused-compress Triton entry, same inputs."""
+
 import json
 from types import SimpleNamespace
 
@@ -8,12 +9,15 @@ import pytest
 import torch
 
 from atom.models.deepseek_v41.mono.hi.blocks.base import Channel, Fmt
+
+pytest.importorskip("flydsl", reason="the hi compressor emits FlyDSL programs")
+from atom.model_ops.v4_kernels.fused_compress import fused_compress_attn
 from atom.models.deepseek_v41.mono.hi.blocks.gfx950.compressor import Compressor
-from atom.models.deepseek_v41.mono.hi.device.gfx950 import mailbox as mb, paged
+from atom.models.deepseek_v41.mono.hi.device.gfx950 import mailbox as mb
+from atom.models.deepseek_v41.mono.hi.device.gfx950 import paged
 from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import ld_i32
 from atom.models.deepseek_v41.mono.hi.plan.program import Program, Scenario, Stage
 from atom.models.deepseek_v41.mono.hi.runtime.kernel import MonoKernel
-from atom.model_ops.v4_kernels.fused_compress import fused_compress_attn
 
 
 def decode(x):
@@ -24,17 +28,17 @@ def decode(x):
 
 def metrics(reference, value):
     a, b = decode(reference), decode(value)
-    return dict(
-        byte_equal=bool(torch.equal(reference, value)),
-        different_bytes=int((reference != value).sum()),
-        byte_match=float((reference == value).float().mean()),
-        scale_equal=bool(torch.equal(reference[..., 512:], value[..., 512:])),
-        finite=bool(torch.isfinite(a).all() and torch.isfinite(b).all()),
-        rel_l2=float((a - b).norm() / a.norm().clamp_min(1e-30)),
-        cos=float(
+    return {
+        "byte_equal": bool(torch.equal(reference, value)),
+        "different_bytes": int((reference != value).sum()),
+        "byte_match": float((reference == value).float().mean()),
+        "scale_equal": bool(torch.equal(reference[..., 512:], value[..., 512:])),
+        "finite": bool(torch.isfinite(a).all() and torch.isfinite(b).all()),
+        "rel_l2": float((a - b).norm() / a.norm().clamp_min(1e-30)),
+        "cos": float(
             torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0)
         ),
-    )
+    }
 
 
 def build(ratio, native_pool, sc):
@@ -165,7 +169,7 @@ def run_cases(out):
                 quant_mode="packed_fp8",
             )
             wanted = reference.view(-1, 528)[indices]
-            entry = dict(ratio=ratio, seed=seed, positions=pos.cpu().tolist())
+            entry = {"ratio": ratio, "seed": seed, "positions": pos.cpu().tolist()}
             for f, (kernel, plan) in built.items():
                 output = torch.full_like(reference, 173)
                 table = kernel.table(

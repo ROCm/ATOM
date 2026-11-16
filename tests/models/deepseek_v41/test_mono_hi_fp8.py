@@ -12,14 +12,14 @@ import pytest
 import torch
 
 triton = pytest.importorskip("triton")
-import triton.language as tl  # noqa: E402 - guarded by importorskip
+import triton.language as tl
 
-from atom.model_ops.blockscale_kernels.quantization import (  # noqa: E402
+from atom.model_ops.blockscale_kernels.quantization import (
     AMAX_FLOOR,
     FP8_DTYPE,
     quantize_fp8_kernel,
 )
-from atom.models.deepseek_v41.mono import hi_bridge as bridge  # noqa: E402
+from atom.models.deepseek_v41.mono import hi_bridge as bridge
 
 INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 
@@ -280,12 +280,14 @@ def test_kvprep_draft_writer_and_load_match_atom_quantizer(nb):
         pytest.skip("gfx950")
     pytest.importorskip("flydsl")
     import flydsl.expr as fx
+
     from atom.models.deepseek_v41.mono.hi.blocks.base import Channel, Fmt
     from atom.models.deepseek_v41.mono.hi.blocks.gfx950.attention.mla_window import (
         KVPrep,
     )
     from atom.models.deepseek_v41.mono.hi.device.gfx950 import buffer_ops as bo
-    from atom.models.deepseek_v41.mono.hi.device.gfx950 import kv, mailbox as mb
+    from atom.models.deepseek_v41.mono.hi.device.gfx950 import kv
+    from atom.models.deepseek_v41.mono.hi.device.gfx950 import mailbox as mb
     from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import ld_i32, rsrc, traced
     from atom.models.deepseek_v41.mono.hi.plan.program import Program, Scenario, Stage
     from atom.models.deepseek_v41.mono.hi.runtime.kernel import MonoKernel
@@ -406,7 +408,8 @@ def test_compressor_pool_quantizes_its_bf16_entry_once(ratio):
     from atom.models.deepseek_v41.mono.hi.blocks.base import Channel, Fmt
     from atom.models.deepseek_v41.mono.hi.blocks.gfx950.compressor import Compressor
     from atom.models.deepseek_v41.mono.hi.device.gfx950 import buffer_ops as bo
-    from atom.models.deepseek_v41.mono.hi.device.gfx950 import mailbox as mb, paged
+    from atom.models.deepseek_v41.mono.hi.device.gfx950 import mailbox as mb
+    from atom.models.deepseek_v41.mono.hi.device.gfx950 import paged
     from atom.models.deepseek_v41.mono.hi.device.gfx950.ops import ld_i32, rsrc, traced
     from atom.models.deepseek_v41.mono.hi.plan.program import Program, Scenario, Stage
     from atom.models.deepseek_v41.mono.hi.runtime.kernel import MonoKernel
@@ -500,18 +503,18 @@ def test_compressor_pool_quantizes_its_bf16_entry_once(ratio):
             else torch.zeros(nb * 128, 512, device="cuda", dtype=torch.bfloat16)
         )
         out = torch.empty(rows, 512, device="cuda", dtype=torch.bfloat16)
-        args = dict(
-            partial=partial,
-            scores=scores,
-            pos=pos,
-            rope=rope,
-            cache=cache,
-            req=req,
-            ptab=table_pages,
-            out=out,
-            kv_state=kv_state.clone(),
-            score_state=score_state.clone(),
-        )
+        args = {
+            "partial": partial,
+            "scores": scores,
+            "pos": pos,
+            "rope": rope,
+            "cache": cache,
+            "req": req,
+            "ptab": table_pages,
+            "out": out,
+            "kv_state": kv_state.clone(),
+            "score_state": score_state.clone(),
+        }
         args["rope.sin"] = sine
         args[plan.aux] = torch.ones(512, device="cuda", dtype=torch.bfloat16)
         tab = kernel.table(args)

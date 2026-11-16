@@ -60,8 +60,8 @@ from ..blocks.gfx950.norm import (
     put_row,
 )
 from ..device.gfx950 import buffer_ops as bo
-from ..device.gfx950 import mailbox as mb
 from ..device.gfx950 import kv as kv_format
+from ..device.gfx950 import mailbox as mb
 from ..device.gfx950.ops import ld_i32, rsrc, traced, uniform
 from ..device.gfx950.peer import from_rank, to_rank
 from ..plan.program import Program, Region, Scenario, Stage
