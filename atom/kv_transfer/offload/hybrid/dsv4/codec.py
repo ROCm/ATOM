@@ -680,7 +680,7 @@ class DSV4PageSlotCodec:
                         try:
                             event = torch.cuda.Event()
                             event.record(stream)
-                        except BaseException:
+                        except BaseException:  # noqa: BLE001
                             pool.retire(metadata_lease, safe=False)
                         else:
                             pool.retire(metadata_lease, completion=event, safe=True)
