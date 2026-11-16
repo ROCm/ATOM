@@ -244,23 +244,15 @@ _POLICY_REGISTERED = False
 _POLICY_WARNED = False
 
 
-def speculation_name(value) -> str:
-    """SGLang's speculative algorithm (enum, string or None) as an upper-case
-    name, "" when speculation is off."""
-    if value is None:
-        return ""
-    name = str(getattr(value, "name", value)).strip().upper()
-    return "" if name in ("", "NONE", "NULL", "FALSE") else name
-
-
 def radix_off_reason(speculative_algorithm) -> str | None:
     """Why the V4.1 radix path cannot serve a launch whose SGLang radix cache
     is on, or None when it can."""
     import os
 
     from atom.plugin.sglang import deepseek_v41_envs as envs
+    from atom.plugin.sglang.deepseek_v41_bridge import speculative_algorithm_name
 
-    algorithm = speculation_name(speculative_algorithm)
+    algorithm = speculative_algorithm_name(speculative_algorithm)
     if algorithm:
         pinned = os.environ.get("ATOM_V41_RADIX", "").strip()
         return (

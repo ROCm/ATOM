@@ -1494,7 +1494,9 @@ class TestFusedMetadata:
         builder = SimpleNamespace(
             cache=object(),
             block_size=PAGE,
-            geometry=SimpleNamespace(history_size=HISTORY, window_size=128),
+            geometry=SimpleNamespace(
+                history_size=HISTORY, window_size=128, speculative_tokens=0
+            ),
             max_bs=8,
             max_num_batched_tokens=4096,
             _decoder_replays=True,

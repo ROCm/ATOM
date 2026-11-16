@@ -104,6 +104,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if resolved_arch == DEEPSEEK_V41_ARCH:
             self.model_arch, self.model_arch_spec = resolved_arch, resolved_spec
         self.capture_aux_hidden_states = False
+        # V4.1 + DSpark only (`install_v41_dspark_target_surface`).
+        self._v41_dspark = None
         self.atom_tbo_wrapper: SGLangPluginUBatchWrapper | None = None
         self._tbo_fallback_reasons_logged: set[str] = set()
 
@@ -166,6 +168,18 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if self.model_arch_spec.install_adapters is not None:
             with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
                 self.model_arch_spec.install_adapters(self.model)
+
+        if self.model_arch == DEEPSEEK_V41_ARCH:
+            from atom.plugin.sglang.deepseek_v41_bridge import (
+                is_v41_dspark_atom_config,
+            )
+
+            if is_v41_dspark_atom_config(self.atom_config):
+                from atom.plugin.sglang.deepseek_v41_dspark import (
+                    install_v41_dspark_target_surface,
+                )
+
+                install_v41_dspark_target_surface(self)
 
         if self.atom_config.enable_tbo:
             if self.model_arch in ("DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"):
@@ -407,6 +421,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     "inputs_embeds": runtime.input_embeds,
                 }
 
+                v41_dspark_aux = None
                 with SGLangForwardBatchMetadata.bind(metadata):
                     if self.model_arch == "LlamaForCausalLMEagle3":
                         hidden_states = self._forward_eagle3_draft_model(
@@ -433,12 +448,22 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                                 get_embedding=get_embedding,
                                 pp_proxy_tensors=pp_proxy_tensors,
                             )
+                        if self._v41_dspark is not None:
+                            self._v41_dspark.begin_forward()
                         if tbo_output is None:
                             hidden_states = self.model(
                                 **self._filter_model_forward_kwargs(model_inputs)
                             )
                         else:
                             hidden_states = tbo_output
+                        if self._v41_dspark is not None:
+                            # Inside this forward's ATOM context: the draft's
+                            # context KV is written under the step that ran.
+                            v41_dspark_aux = self._v41_dspark.finish_forward(
+                                hidden_states,
+                                runtime.positions,
+                                runtime.forward_batch,
+                            )
                     else:
                         model_call_kwargs = dict(
                             model_inputs,
@@ -454,6 +479,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states, aux_hidden_states = self._split_aux_hidden_states(
                     hidden_states
                 )
+                if self._v41_dspark is not None:
+                    aux_hidden_states = v41_dspark_aux
                 hidden_states = runtime.trim_output(hidden_states)
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states

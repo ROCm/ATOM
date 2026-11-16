@@ -372,6 +372,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def _is_dsv4_or_glm52_runner(runner) -> bool:
         return _is_dsv4_runner(runner) or _is_glm52_runner(runner)
 
+    def _is_dsv41_runner(runner) -> bool:
+        from atom.plugin.sglang.deepseek_v41_bridge import is_deepseek_v41_config
+
+        model_config = getattr(runner, "model_config", None)
+        return is_deepseek_v41_config(getattr(model_config, "hf_config", None))
+
     def _uses_glm52_generic_draft_frontend(runner) -> bool:
         model = getattr(runner, "model", None)
         return bool(getattr(model, "_atom_glm52_uses_generic_draft_frontend", False))
@@ -469,7 +475,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         def can_run(self, forward_batch):
             try:
                 model_runner = getattr(self, "model_runner", None)
-                is_supported_model = _is_dsv4_or_glm52_runner(model_runner)
+                # DeepSeek-V4.1 shares V4's architecture name in SGLang but
+                # stages its own graphs (verify and DSpark draft block,
+                # `deepseek_v41_bridge`), gated by its own stage switch; the
+                # V4 verify-graph knobs below are not its.
+                is_supported_model = _is_dsv4_or_glm52_runner(
+                    model_runner
+                ) and not _is_dsv41_runner(model_runner)
                 mode = getattr(forward_batch, "forward_mode", None)
                 is_target_verify = bool(
                     getattr(mode, "is_target_verify", lambda: False)()

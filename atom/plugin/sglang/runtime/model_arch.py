@@ -14,6 +14,8 @@ logger = logging.getLogger("atom")
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 DEEPSEEK_V41_ARCH = "DeepseekV41ForCausalLM"
+# ATOM's V4.1 DSpark draft config (`SpeculativeConfig.hf_config_override`).
+DEEPSEEK_V41_DSPARK_DRAFT_ARCH = "DeepseekV41DSparkModel"
 
 MODEL_TYPE_ADAPTER_ARCHES = {
     GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
@@ -21,6 +23,7 @@ MODEL_TYPE_ADAPTER_ARCHES = {
     "deepseek_v4_mtp": "DeepseekV4ForCausalLM",
     "deepseek_v41": DEEPSEEK_V41_ARCH,
     "deepseek_v41_text": DEEPSEEK_V41_ARCH,
+    "deepseek_v41_dspark": DEEPSEEK_V41_DSPARK_DRAFT_ARCH,
     "kimi_k3": "KimiK3ForConditionalGeneration",
     "minimax_m3": "MiniMaxM3SparseForCausalLM",
     "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
@@ -101,6 +104,29 @@ def _build_glm52_dsa_forward_metadata(
     return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
 
 
+def _deepseek_v41_decoder_replays(atom_config: Any) -> bool:
+    """Whether V4.1 keeps decoder SWA bounded replay on the SGLang plugin.
+
+    On as natively unless ATOM_SGLANG_V41_DECODER_REPLAY=0. The builder
+    publishes a prefill's tail (`_publish_decoder`) inside the same
+    `_prepare` the bridge runs outside the forward, and the eager forward
+    that follows has exactly the rows that step declares, so the staged step
+    describes the replay. A step the tail cannot serve computes every row
+    (`deepseek_v41_bridge.v41_extend_replays`).
+
+    Off under DSpark: its aux taps and the in-forward draft context write
+    (`deepseek_v41_dspark.V41DSparkTargetSurface`) consume every row of the
+    plain backbone, and SGLang's DSpark prefill captures FULL hidden states,
+    which `v41_extend_replays` refuses anyway. A tail-only draft context
+    (native's `_late_on_tail`) is a follow-up.
+    """
+    from atom.plugin.sglang.deepseek_v41_bridge import is_v41_dspark_atom_config
+
+    if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
+        return False
+    return not is_v41_dspark_atom_config(atom_config)
+
+
 def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     del model_arch
     from atom.plugin.sglang.deepseek_v41_bridge import (
@@ -114,15 +140,9 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     align_atom_config_with_sglang(atom_config)
     # One V4.1 PAGE per SGLang page; Config picked native's 128.
     atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
-    # Decoder SWA bounded replay, on as natively unless
-    # ATOM_SGLANG_V41_DECODER_REPLAY=0. The builder publishes a prefill's tail
-    # (`_publish_decoder`) inside the same `_prepare` the bridge runs outside
-    # the forward, and the eager forward that follows has exactly the rows
-    # that step declares, so the staged step describes the replay. A step the
-    # tail cannot serve computes every row
-    # (`deepseek_v41_bridge.v41_extend_replays`). Decided before the runtime
-    # model decides whether to build its replay stages.
-    if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
+    # Decided before the runtime model decides whether to build its replay
+    # stages.
+    if not _deepseek_v41_decoder_replays(atom_config):
         atom_config.enable_decoder_swa_bounded_replay = False
     # Encoder replay rebuilds the state below a prefix hit: on exactly when
     # SGLang's radix cache is (`deepseek_v41_radix`, which it installs).
@@ -207,6 +227,20 @@ def _build_deepseek_v41_forward_metadata(
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("DeepSeek-V4.1 graph step was not staged before capture")
     return build_deepseek_v41_forward_metadata(forward_batch, positions)
+
+
+def _build_deepseek_v41_dspark_draft_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    # The draft config must never fall into the target's builder: that would
+    # stage a target step (reset STATE slots, advance cursors) for a draft
+    # block. The draft wrapper builds its own block metadata in its forward.
+    del atom_config, positions
+    raise RuntimeError(
+        "DeepSeek-V4.1 DSpark draft forwards build their metadata in "
+        "DeepseekV4ForCausalLMDSpark.forward, not through the generic plugin "
+        f"forward context (mode={getattr(forward_batch, 'forward_mode', None)})"
+    )
 
 
 def _build_deepseek_v4_forward_metadata(
@@ -661,6 +695,14 @@ MODEL_ADAPTER_SPECS = {
         install_adapters=_install_deepseek_v41_adapters,
         build_forward_metadata=_build_deepseek_v41_forward_metadata,
         expand_forward_inputs=_expand_deepseek_v41_forward_inputs,
+    ),
+    # The V4.1 DSpark draft (`deepseek_v41_dspark_wrapper`, a custom wrapper
+    # and so not in MODEL_ARCH_SPECS); explicit so its config cannot resolve
+    # to the target's spec.
+    DEEPSEEK_V41_DSPARK_DRAFT_ARCH: SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        load_weights_prefix="",
+        build_forward_metadata=_build_deepseek_v41_dspark_draft_metadata,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,

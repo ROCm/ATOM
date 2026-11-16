@@ -320,6 +320,15 @@ def _build_atom_speculative_config_from_sglang(server_args: Any, hf_config: Any)
     if name in {"", "NONE", "NULL", "FALSE"}:
         return None
 
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        build_v41_dspark_speculative_config,
+        is_deepseek_v41_config,
+    )
+
+    if is_deepseek_v41_config(hf_config):
+        # Native DSpark (`dspark`, five drafts, the target checkpoint).
+        return build_v41_dspark_speculative_config(server_args, hf_config)
+
     text = getattr(hf_config, "text_config", None) or hf_config
     if getattr(text, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:
         return None

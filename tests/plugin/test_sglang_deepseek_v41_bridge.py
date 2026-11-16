@@ -423,7 +423,7 @@ class TestLaunchContract:
         [
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
             ("memory", "enable_hisparse", True, "HiSparse"),
-            ("spec", "speculative_algorithm", "EAGLE", "speculative decoding"),
+            ("spec", "speculative_algorithm", "EAGLE", "speculative algorithm EAGLE"),
             ("disagg", "disaggregation_mode", "prefill", "PD disaggregation"),
             ("disagg", "language_model_only", False, "language-model-only"),
         ],
@@ -805,6 +805,7 @@ def test_req_to_token_comes_from_sglang_forward_context(real_sglang):
 class _RecordingBuilder:
     def __init__(self, max_bs=4, max_num_batched_tokens=1024, positions=None):
         self.block_size = PAGE
+        self.geometry = SimpleNamespace(speculative_tokens=0)
         self.max_bs = max_bs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.cache = object()
@@ -933,7 +934,7 @@ class TestForwardMetadata:
     def test_extend_carries_the_replay_verdict(self, monkeypatch, req_to_token):
         builder = _RecordingBuilder(positions=torch.arange(5))
         builder._decoder_replays = True
-        builder.geometry = SimpleNamespace(window_size=128)
+        builder.geometry = SimpleNamespace(window_size=128, speculative_tokens=0)
         fb = _forward_batch(
             ForwardMode.EXTEND,
             req_pool_indices=[1, 2],
@@ -1115,7 +1116,8 @@ class TestProxyPool:
 
     def test_refusals(self, real_sglang, monkeypatch):
         _install_builder(monkeypatch, _small_geometry())
-        with pytest.raises(NotImplementedError, match="draft"):
+        # The DSpark draft role binds the target's arena, so it needs one.
+        with pytest.raises(RuntimeError, match="draft pool built before"):
             _proxy(is_draft_worker=True)
         with pytest.raises(ValueError, match="page_size 64"):
             _proxy(page_size=64)
@@ -1855,6 +1857,9 @@ class TestHostPageRows:
             ),
             PAGE,
         )
+        # The extend itself reads its rows (and slots) from the device once.
+        assert device_reads == [2]
+        device_reads.clear()
         batch = self._replay(
             monkeypatch,
             req_to_token,
@@ -1862,6 +1867,19 @@ class TestHostPageRows:
         )
         assert device_reads == []
         assert _tables(batch) == [[2, 11, 4], [7, 3]]
+
+    def test_eager_host_slots_must_match_the_device(self, req_to_token):
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1, 3],
+            seq_lens=[5, 6],
+            extend_seq_lens=[5, 6],
+            extend_prefix_lens=[0, 0],
+            rids=["x", "y"],
+        )
+        fb.req_pool_indices_cpu = torch.tensor([3, 1])
+        with pytest.raises(RuntimeError, match="disagree with the device"):
+            build_v41_scheduled_batch(fb, PAGE)
 
     def test_a_new_page_or_tenant_reads_the_device(
         self, monkeypatch, replay_table, device_reads
@@ -1925,7 +1943,7 @@ class TestHostPageRows:
 
 
 @needs_sglang
-def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
+def test_host_mirror_patch_carries_v41_decode_and_verify_rows(real_sglang, monkeypatch):
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
     runner_module = pytest.importorskip(
@@ -1957,6 +1975,9 @@ def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
 
     decode = ForwardBatch.init_new(batch(ForwardMode.DECODE), v41)
     assert decode.atom_v41_req_pool_indices_cpu is slots
+    # DSpark's verify is built from the ScheduleBatch too (prepare_for_verify).
+    verify = ForwardBatch.init_new(batch(ForwardMode.TARGET_VERIFY), v41)
+    assert verify.atom_v41_req_pool_indices_cpu is slots
     extend = ForwardBatch.init_new(batch(ForwardMode.EXTEND), v41)
     assert not hasattr(extend, "atom_v41_req_pool_indices_cpu")
     other = ForwardBatch.init_new(batch(ForwardMode.DECODE), v4)
