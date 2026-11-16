@@ -1717,6 +1717,7 @@ class AtomStandaloneService:
             top_p=self._request_field(request, "top_p", DEFAULT_TOP_P),
             n=effective_n,
             required_channel=required_channel,
+            presence_penalty=self._request_field(request, "presence_penalty", 0.0),
         )
 
     @staticmethod

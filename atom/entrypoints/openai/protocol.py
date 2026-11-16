@@ -341,6 +341,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
+    presence_penalty: float | None = 0.0
     max_tokens: int | None = DEFAULT_MAX_TOKENS
     max_completion_tokens: int | None = None
     stop: list[str] | None = None

@@ -608,6 +608,7 @@ def _build_sampling_params(
     max_tokens_is_default: bool = False,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    presence_penalty: float = 0.0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -633,6 +634,7 @@ def _build_sampling_params(
         required_channel=required_channel,
         logprobs=logprobs,
         top_logprobs=top_logprobs,
+        presence_penalty=presence_penalty,
     )
 
 
@@ -2155,6 +2157,7 @@ async def _chat_completions(
             n=effective_n,
             logprobs=bool(request.logprobs),
             top_logprobs=request.top_logprobs or 0,
+            presence_penalty=request.presence_penalty or 0.0,
             required_channel=channel_for_request(
                 required_tool_channel, request.tool_choice, request_tools(request)
             ),
@@ -2618,6 +2621,7 @@ async def _completions(
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            presence_penalty=request.presence_penalty or 0.0,
         )
         echo, include_usage, usage_on_finish = "", False, False
         if beta:

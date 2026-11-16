@@ -15,7 +15,9 @@ from atom.model_engine import token_constraints as boundary
 
 def test_unconstrained_step_does_not_touch_backend_or_logits():
     runner = SimpleNamespace(structured_output=Mock())
-    batch = SimpleNamespace(required_channel=None, structured_requests=None)
+    batch = SimpleNamespace(
+        required_channel=None, structured_requests=None, presence_penalties=None
+    )
     assert boundary.TokenConstraints.apply(runner, batch, None, None) is None
     boundary.prepare_token_constraints(runner, batch, None)
     assert runner.structured_output.mock_calls == []
@@ -39,7 +41,10 @@ def test_masks_precede_sampling_and_commit_uses_final_ids(
     grammar.commit.side_effect = lambda *args: events.append("commit")
     runner = SimpleNamespace(structured_output=grammar)
     batch = SimpleNamespace(
-        required_channel=object(), structured_requests={0: object()}, total_seqs_num=2
+        required_channel=object(),
+        structured_requests={0: object()},
+        presence_penalties=None,
+        total_seqs_num=2,
     )
     metadata = (
         SimpleNamespace(

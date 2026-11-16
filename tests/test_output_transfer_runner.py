@@ -36,7 +36,12 @@ def sampling_group(buffers):
     `PublicationGroup` (CPU count scratch only; nothing is published)."""
     from atom.utils.h2d import PublicationGroup
 
-    names = [*buffers, "required_channel_states", "logprob_request_indices"]
+    names = [
+        *buffers,
+        "required_channel_states",
+        "presence_penalty_rows",
+        "logprob_request_indices",
+    ]
     return PublicationGroup(
         None, "sampling", [SimpleNamespace(name=n, buffer=n) for n in names]
     )
@@ -112,6 +117,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
                 any_logprobs=False,
                 required_channel=None,
                 structured_requests=None,
+                presence_penalties=None,
                 num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
@@ -189,6 +195,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
                 any_logprobs=False,
                 required_channel=None,
                 structured_requests=None,
+                presence_penalties=None,
                 num_spec_step=2 if verified else 0,
             ),
             torch.zeros(4, 8),
@@ -249,6 +256,7 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
         top_ps=np.array(ps, np.float32),
         required_channel=None,
         structured_requests=None,
+        presence_penalties=None,
     )
     _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(runner, batch, group)
     assert type(top_ks) is int and top_ks == ks[0]
@@ -286,6 +294,7 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         top_ps=np.array(ps, np.float32),
         required_channel=None,
         structured_requests=None,
+        presence_penalties=None,
         is_dummy_run=False,
         total_tokens_num_prefill=0,
     )
@@ -337,6 +346,7 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, prefill, verifies)
         top_ps=np.ones(bs, np.float32),
         required_channel=None,
         structured_requests=None,
+        presence_penalties=None,
         is_dummy_run=False,
         total_tokens_num_prefill=prefill,
     )
