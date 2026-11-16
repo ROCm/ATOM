@@ -204,6 +204,7 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
         is_finished=lambda: True,
         publish_kv_events=lambda: cleanup("publish"),
         shutdown_kv_events=lambda: cleanup("shutdown"),
+        close_kv_connector=lambda: None,
     )
     core.runner_mgr = SimpleNamespace(call_func=lambda *a, **k: None)
     core.is_head = engine_kind == "pp_head"

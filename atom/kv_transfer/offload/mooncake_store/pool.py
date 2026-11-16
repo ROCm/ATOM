@@ -227,8 +227,20 @@ class TransferSlotPool:
         if not slots or self.slot_stride != self.chunk_bytes:
             return None
         first = slots[0]
+        for slot in slots:
+            owned = self._slots.get(slot.region, ())
+            if (
+                slot.index < 0
+                or slot.index >= len(owned)
+                or owned[slot.index] is not slot
+            ):
+                return None
         for previous, slot in pairwise(slots):
-            if slot.region != first.region or slot.index != previous.index + 1:
+            if (
+                slot.region != first.region
+                or slot.index != previous.index + 1
+                or slot.ptr != previous.ptr + self.slot_stride
+            ):
                 return None
         offset = first.ptr - self.base_ptr
         return self._buffer[offset : offset + len(slots) * self.chunk_bytes]

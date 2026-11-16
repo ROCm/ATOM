@@ -14,6 +14,8 @@ vLLM installed.
 
 from typing import Any
 
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
 # vLLM spells its KV cache dtype in its own vocabulary; ATOM indexes
 # ``aiter.dtypes.d_dtypes`` with its own. Only the values a KV cache can
 # actually hold are mapped -- an unknown one must raise rather than silently
@@ -251,6 +253,9 @@ class OffloadConfigShim:
         # from the checkpoint image the transfer carries, so the MP layout
         # registers image groups (`stores_state_images`).
         self.state_replay_tokens = 0
+        # What `Config` settles for native ATOM: the env override, else the
+        # tier's own default.
+        self.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(self)
 
     @property
     def offload_speculative_config(self) -> Any:
