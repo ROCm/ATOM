@@ -90,6 +90,7 @@ def _make_aiter_kv_caches(
     for layer_id in range(2):
         base = layer_id * 47
         caches[f"layer-{layer_id}"] = SimpleNamespace(
+            extra_planes=(),
             # AITER x-packed K: (blocks, heads, head_dim/x, block_size, x).
             k_cache=_uint8_payload(
                 (num_blocks, num_heads, head_dim // pack, block_size, pack),

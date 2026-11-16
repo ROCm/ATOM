@@ -131,6 +131,7 @@ def _kv_caches(device):
     """Two GLM-5.2-like layers: 576-byte MLA rows and 144-byte indexer rows."""
     return {
         f"layer_{layer}": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.randint(
                 0, 256, (NUM_BLOCKS * BLOCK, 1, 576), dtype=torch.uint8, device=device
             ),

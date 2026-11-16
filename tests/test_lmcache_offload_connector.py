@@ -645,6 +645,7 @@ def test_dense_backend_registers_dense_kv_byte_codec(monkeypatch):
     connector = _dense_registration_connector()
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.zeros((3, 8), dtype=torch.uint8),
             v_cache=None,
             k_scale=None,
@@ -1010,6 +1011,7 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1051,6 +1053,7 @@ def test_dense_codec_rejects_per_request_state_by_default():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1105,6 +1108,7 @@ def _fp4_index_kv_caches(torch, num_blocks, *, with_scale=True):
     ).reshape(num_blocks, _FP4_K_TILES, _FP4_NTPW, _FP4_ROWS)
     return {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=kv,
             v_cache=None,
             k_scale=None,
@@ -1133,6 +1137,7 @@ def test_dense_codec_moves_the_fp4_index_scale_plane():
     original = _fp4_index_kv_caches(torch, num_blocks)
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=original["l0"].k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -1338,6 +1343,7 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             k_scale=None,
@@ -1742,6 +1748,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
             k_scale=None,
@@ -1750,6 +1757,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     }
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -1867,6 +1875,7 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1898,6 +1907,7 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -1928,6 +1938,7 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -1948,6 +1959,7 @@ def _tiny_staging_codec():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(2 * 2, dtype=torch.uint8).reshape(2, 2),
             v_cache=torch.arange(2 * 3, dtype=torch.uint8).reshape(2, 3),
             k_scale=None,
@@ -2043,6 +2055,7 @@ def test_codec_chunk_major_device_buffer_layout():
 
     original = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=(torch.arange(4 * 3, dtype=torch.uint8).reshape(4, 3) + 51),
             k_scale=None,
@@ -2051,6 +2064,7 @@ def test_codec_chunk_major_device_buffer_layout():
     }
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=original["l0"].k_cache.clone(),
             v_cache=original["l0"].v_cache.clone(),
             k_scale=None,
@@ -2094,12 +2108,14 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
 
     original = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 4, dtype=torch.uint8).reshape(6, 4) + 31),
             k_scale=(torch.arange(6, dtype=torch.uint8).reshape(6, 1) + 101),
             v_scale=None,
         ),
         "l1": SimpleNamespace(
+            extra_planes=(),
             k_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 151),
             v_cache=(torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2) + 201),
             k_scale=None,
@@ -2108,6 +2124,7 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
     }
     kv_caches = {
         name: SimpleNamespace(
+            extra_planes=(),
             k_cache=layer.k_cache.clone(),
             v_cache=layer.v_cache.clone(),
             k_scale=layer.k_scale.clone() if layer.k_scale is not None else None,
@@ -2149,6 +2166,7 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -2170,6 +2188,7 @@ def test_dense_prepared_ids_preserve_per_pipeline_group_validation():
 
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
             k_scale=None,
@@ -5556,6 +5575,7 @@ def test_codec_mla_token_major_block_accounting():
     # no V / scale tensors.
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.arange(
                 num_blocks * block_size * latent, dtype=torch.uint8
             ).reshape(num_blocks * block_size, 1, latent),
@@ -5576,6 +5596,7 @@ def test_codec_mla_token_major_block_accounting():
         DenseKVByteCodec(
             {
                 "l0": SimpleNamespace(
+                    extra_planes=(),
                     k_cache=torch.arange(7, dtype=torch.uint8),
                     v_cache=None,
                     k_scale=None,
@@ -5599,7 +5620,11 @@ def test_codec_mla_round_trip_byte_identical():
     )
     kv_caches = {
         "l0": SimpleNamespace(
-            k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
+            extra_planes=(),
+            k_cache=original.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
         )
     }
     codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
@@ -5638,6 +5663,7 @@ def test_codec_dsa_includes_index_cache_segment():
     ).reshape(num_blocks, block_size, index_dim)
     kv_caches = {
         "l0": SimpleNamespace(
+            extra_planes=(),
             k_cache=k_cache.clone(),
             v_cache=None,
             k_scale=None,
@@ -5732,6 +5758,7 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
     layers = {f"layer_{i}": _make_layer(i) for i in range(3)}
     kv_caches = {
         name: SimpleNamespace(
+            extra_planes=(),
             k_cache=k.clone(),
             v_cache=None,
             k_scale=None,

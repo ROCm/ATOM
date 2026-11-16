@@ -103,11 +103,16 @@ def test_ple_bytes_join_the_gdn_image():
 def test_ple_planes_are_all_allocated_or_none():
     builder, cls = _builder()
     assert cls._ple_tensors(builder) == []
-    builder.model_runner.ple_conv_state = torch.zeros(4, 16, 10, dtype=torch.bfloat16)
+    conv = builder.model_runner.ple_conv_state = torch.zeros(
+        4, 16, 10, dtype=torch.bfloat16
+    )
     with pytest.raises(RuntimeError, match=r"\['ple_ngram_state'\]"):
         cls._ple_tensors(builder)
-    builder.model_runner.ple_ngram_state = torch.zeros(4, 3, dtype=torch.int64)
-    assert len(cls._ple_tensors(builder)) == 2
+    ngram = builder.model_runner.ple_ngram_state = torch.zeros(4, 3, dtype=torch.int64)
+    assert [t.data_ptr() for t in cls._ple_tensors(builder)] == [
+        conv.data_ptr(),
+        ngram.data_ptr(),
+    ]
 
 
 def test_layout_id_names_ple_and_forks_under_pipeline_parallel(one_tp_rank):

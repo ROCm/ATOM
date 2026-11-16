@@ -3231,6 +3231,7 @@ def _kv_caches(num_blocks=8):
     # MLA-like: token-major rows, one plane per layer.
     return {
         f"layer_{i}": SimpleNamespace(
+            extra_planes=(),
             k_cache=torch.zeros((num_blocks * BLOCK, 1, 8), dtype=torch.uint8),
             index_cache=None,
         )
