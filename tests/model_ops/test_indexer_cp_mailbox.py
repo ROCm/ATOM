@@ -26,7 +26,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 WORLD, QLEN, TOPK, MAX_LEN = 4, 4, 16, 1 << 20
-CASES = [(1, 1000, 0, 1), (16, 60000, 1, 4), (64, 100000, 1, 4)]
+# 900000: shard rows past two narrow local top-k tiles take the wide one.
+CASES = [(1, 1000, 0, 1), (16, 60000, 1, 4), (64, 100000, 1, 4), (8, 900000, 1, 4)]
 # The first four calls cross both boundaries: 2**30 wraps the stored counter,
 # and 2**30 == 1 (mod 32767) crosses the 15-bit tag boundary too.
 COUNTER_START = (1 << 30) - 3

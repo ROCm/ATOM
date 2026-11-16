@@ -29,6 +29,9 @@ from atom.model_ops.minimax_m3.index_topk import (
 
 # Live blocks one _local_topk tile selects from; longer rows stream more tiles.
 LOCAL_TOPK_TILE = 512
+# The tile of rows longer than two narrow tiles: one 2048 tile covers a 1M row
+# at TP4, where walking narrow tiles costs more than one wide tile.
+LOCAL_TOPK_WIDE_TILE = 2048
 
 
 def _topk_block_t(topk: int) -> int:
@@ -36,15 +39,13 @@ def _topk_block_t(topk: int) -> int:
     return triton.next_power_of_2(topk)
 
 
-def _topk_tiles(topk: int, local_blocks: int) -> tuple[int, int]:
-    """The score tile and selection widths shared by both local-top-k paths."""
+def _topk_tiles(topk: int, local_blocks: int) -> tuple[int, int, int]:
+    """The narrow and wide score tiles and the selection width shared by both
+    local-top-k paths."""
     block_t = _topk_block_t(topk)
-    block_k = max(
-        16,
-        block_t,
-        min(triton.next_power_of_2(local_blocks), LOCAL_TOPK_TILE),
-    )
-    return block_k, block_t
+    width = triton.next_power_of_2(local_blocks)
+    block_k = max(16, block_t, min(width, LOCAL_TOPK_TILE))
+    return block_k, max(block_k, min(width, LOCAL_TOPK_WIDE_TILE)), block_t
 
 
 @triton.jit
@@ -56,6 +57,40 @@ def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
     """
     score = tl.where(valid & (block < INIT_BLOCKS), 1e30, score)
     return tl.where(valid & (block >= local_start), 1e29, score)
+
+
+@triton.jit
+def _walk_tiles(
+    s_row,
+    live_end,
+    causal_blocks,
+    local_start,
+    GLOBAL_BLOCKS,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    TILE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+):
+    """Top-BLOCK_SIZE_T packed keys of a score row's first live_end blocks,
+    TILE blocks at a time."""
+    off = tl.arange(0, TILE)
+    local_valid = off < live_end
+    block = off * WORLD + RANK
+    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+    score = _force(score, block, valid, local_start, INIT_BLOCKS)
+    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+    for start in tl.range(TILE, live_end, TILE):
+        off = start + tl.arange(0, TILE)
+        local_valid = off < live_end
+        block = off * WORLD + RANK
+        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+        score = _force(score, block, valid, local_start, INIT_BLOCKS)
+        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    return winners
 
 
 @triton.jit
@@ -73,6 +108,7 @@ def _shard_winners(
     INIT_BLOCKS: tl.constexpr,
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     """This shard's top-BLOCK_SIZE_T packed keys for one (head, query row)."""
@@ -92,22 +128,34 @@ def _shard_winners(
         ),
     )
 
-    off = tl.arange(0, BLOCK_SIZE_K)
-    local_valid = off < live_end
-    block = off * WORLD + RANK
-    valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-    score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-    score = _force(score, block, valid, local_start, INIT_BLOCKS)
-    winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-    for start in tl.range(BLOCK_SIZE_K, live_end, BLOCK_SIZE_K):
-        off = start + tl.arange(0, BLOCK_SIZE_K)
-        local_valid = off < live_end
-        block = off * WORLD + RANK
-        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-        score = _force(score, block, valid, local_start, INIT_BLOCKS)
-        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    # One wide tile costs about two narrow ones, so a long row takes the wide
+    # tile rather than walking many narrow ones.
+    if live_end > 2 * BLOCK_SIZE_K:
+        winners = _walk_tiles(
+            s_row,
+            live_end,
+            causal_blocks,
+            local_start,
+            GLOBAL_BLOCKS,
+            RANK,
+            WORLD,
+            INIT_BLOCKS,
+            BLOCK_SIZE_W,
+            BLOCK_SIZE_T,
+        )
+    else:
+        winners = _walk_tiles(
+            s_row,
+            live_end,
+            causal_blocks,
+            local_start,
+            GLOBAL_BLOCKS,
+            RANK,
+            WORLD,
+            INIT_BLOCKS,
+            BLOCK_SIZE_K,
+            BLOCK_SIZE_T,
+        )
     return winners
 
 
@@ -126,6 +174,7 @@ def _local_topk(
     INIT_BLOCKS: tl.constexpr,
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     """Pack this shard's [heads, tokens, local] scores down to its own top-k keys.
@@ -156,6 +205,7 @@ def _local_topk(
         INIT_BLOCKS=INIT_BLOCKS,
         LOCAL_KEEP=LOCAL_KEEP,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_W=BLOCK_SIZE_W,
         BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     off_t = tl.arange(0, BLOCK_SIZE_T)
@@ -406,7 +456,7 @@ def local_candidate_keys(
         # shipped config and costs it exactly nothing; it is here so the
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
-        block_k, block_t = _topk_tiles(topk, local)
+        block_k, block_w, block_t = _topk_tiles(topk, local)
         _local_topk[(tokens, heads)](
             scores,
             keys,
@@ -420,6 +470,7 @@ def local_candidate_keys(
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_W=block_w,
             BLOCK_SIZE_T=block_t,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
@@ -550,6 +601,7 @@ def _select_exchange_merge(
     INIT_BLOCKS: tl.constexpr,
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_W: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     CANDIDATES: tl.constexpr,
     MAX_ROWS: tl.constexpr,
@@ -589,6 +641,7 @@ def _select_exchange_merge(
         INIT_BLOCKS=INIT_BLOCKS,
         LOCAL_KEEP=LOCAL_KEEP,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_W=BLOCK_SIZE_W,
         BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     tl.debug_barrier()  # every wave has read the old call
@@ -704,7 +757,7 @@ def select_exchanged_candidates(
         tokens, 1, topk, block_table, True, scores.device, pages_per_block
     )
     if tokens:
-        block_k, block_t = _topk_tiles(topk, local)
+        block_k, block_w, block_t = _topk_tiles(topk, local)
         _select_exchange_merge[(tokens * heads,)](
             scores,
             seq_lens,
@@ -725,6 +778,7 @@ def select_exchanged_candidates(
             INIT_BLOCKS=init_blocks,
             LOCAL_KEEP=local_blocks,
             BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_W=block_w,
             BLOCK_SIZE_T=block_t,
             CANDIDATES=triton.next_power_of_2(world_size * topk),
             MAX_ROWS=mailbox.max_rows,
