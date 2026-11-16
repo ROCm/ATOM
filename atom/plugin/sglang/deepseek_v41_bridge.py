@@ -22,6 +22,10 @@ Ownership (Design A):
 - The plugin translates each ``ForwardBatch`` into ATOM's scheduled-batch
   protocol and runs ATOM's own ``DeepseekV41MetadataBuilder`` on it, outside
   the forward, exactly once per step.
+- Decode CUDA graphs (one per batch-size bucket) are staged by the backend
+  shim outside the captured region, on reserved capture STATE slots at
+  capture and into the same fixed addresses before every replay; Engram runs
+  inside the graph as natively (see "Decode CUDA graphs" below).
 
 Identities the translation relies on:
 
@@ -338,6 +342,78 @@ def _make_builder_cls():
             )
             return super()._prepare(batch, running_bs, running_tokens, **kwargs)
 
+        def build_for_sglang_capture(self, bs, *, input_ids, slots):
+            """The step a decode graph of ``bs`` requests is recorded on.
+
+            Core ``build_for_cudagraph_capture`` (decode, ``max_q_len=1``)
+            with two differences: the STATE slots are the caller's (the proxy
+            pool's reserved capture slots, never a live request's), and
+            ``input_ids`` is SGLang's graph buffer, the address every replay
+            of this bucket refills. Engram's stage, gather and cursor advance
+            stay inside the forward (``staged_outside_forward`` unset), gated
+            on a device live count of 0 here and of the real rows on replay.
+            """
+            from atom.utils.forward_context import RoundService
+
+            cache = self.cache
+            if cache is None:
+                raise RuntimeError("Allocate the serving cache before graph capture")
+            geometry = cache.geometry
+            if geometry.speculative_tokens:
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 SGLang decode graphs do not capture "
+                    "speculative steps"
+                )
+            bs = int(bs)
+            if bs < 1 or bs > self.max_bs or bs > self.max_num_batched_tokens:
+                raise ValueError(
+                    f"DeepSeek-V4.1 capture of {bs} requests exceeds the "
+                    f"builder's {self.max_bs} / {self.max_num_batched_tokens}"
+                )
+            slots = tuple(int(slot) for slot in slots)
+            if len(slots) != bs or len(set(slots)) != bs:
+                raise ValueError(
+                    f"DeepSeek-V4.1 capture needs {bs} distinct STATE slots; "
+                    f"got {slots}"
+                )
+            if int(input_ids.shape[0]) != bs:
+                raise ValueError(
+                    f"DeepSeek-V4.1 capture input_ids rows {int(input_ids.shape[0])} "
+                    f"!= {bs} requests"
+                )
+            # A full window in, as core does: at position 0 the compressor
+            # reads no history and records a cold branch replay never takes.
+            start = geometry.window_size
+            pages = -(-(start + 1) // self.block_size)
+            batch = SimpleNamespace(
+                is_dummy_run=False,
+                req_ids=slots,
+                num_scheduled_tokens=(1,) * bs,
+                context_lens=(start + 1,) * bs,
+                state_slots_committed=slots,
+                # SGLang's padding page for every entry: capture's compressed
+                # rows land there, and no request is ever handed page 0.
+                block_tables=((0,) * pages,) * bs,
+                total_seqs_num=bs,
+                total_tokens_num=bs,
+                is_final_chunk=None,
+                replaying={},
+            )
+            metadata, _ = self._prepare(
+                batch, bs, bs, max_q_len=1, tentative=False, engram_live=False
+            )
+            # No slot reset, host Engram lookup or cursor advance for it.
+            metadata.dummy = True
+            self.prepare_model_inputs(input_ids, metadata)
+            if metadata.cache is not cache:
+                raise RuntimeError("DeepSeek-V4.1 capture bound a scratch cache")
+            if metadata.served_by_round != RoundService.NONE:
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 SGLang decode graphs do not run a model "
+                    "decode round"
+                )
+            return metadata
+
     return SGLangDeepseekV41MetadataBuilder
 
 
@@ -444,6 +520,13 @@ def _arena_bytes(geometry, num_pages: int, num_slots: int) -> int:
         # Room to start every source buffer on its own boundary.
         size += _V41_SOURCE_ALIGN * _v41_source_buffers(geometry)
     return size
+
+
+def _capture_slot_count(builder) -> int:
+    """STATE slots reserved for decode-graph capture: one per request of the
+    widest step the builder stages. Reserved whether or not graphs are on
+    (64 x 5.3 MB on Flash bf16), so the pool layout never depends on it."""
+    return max(1, int(builder.max_bs))
 
 
 def _make_backed_cache_cls():
@@ -583,8 +666,11 @@ def _make_proxy_pool_cls():
             # Page 0 is SGLang's padding page, never handed to a request, but
             # it is still addressable: size the PAGE region to cover it.
             self.num_pages = self.size // self.page_size + 1
-            # One STATE slot per req_to_token row; row 0 is padding.
-            self.num_slots = max(
+            # One STATE slot per req_to_token row (row 0 is padding), then
+            # one reserved slot per request a decode graph captures: capture
+            # (at startup or a mid-serving recapture) never writes a live
+            # request's state, and no req_pool_idx can name a capture slot.
+            self.num_req_slots = max(
                 1,
                 (
                     int(num_req_slots)
@@ -592,6 +678,10 @@ def _make_proxy_pool_cls():
                     else self.max_num_reqs + 1
                 ),
             )
+            self.num_capture_slots = _capture_slot_count(builder)
+            self.capture_slot_base = self.num_req_slots
+            self.num_slots = self.num_req_slots + self.num_capture_slots
+            self.capture_slots = tuple(range(self.capture_slot_base, self.num_slots))
             total_bytes = _arena_bytes(geometry, self.num_pages, self.num_slots)
             self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
             # Reported by /get_internal_state and the scheduler metrics, in GiB.
@@ -615,10 +705,14 @@ def _make_proxy_pool_cls():
             )
             logger.info(
                 "ATOM DeepSeek-V4.1 proxy pool: %d PAGEs x %d B + %d STATE slots "
-                "x %d B = %.2f GiB (SGLang tokens %d)",
+                "(%d request rows + %d capture slots from %d) x %d B = %.2f GiB "
+                "(SGLang tokens %d)",
                 self.num_pages,
                 int(geometry.paged_bytes),
                 self.num_slots,
+                self.num_req_slots,
+                self.num_capture_slots,
+                self.capture_slot_base,
                 int(geometry.state_bytes),
                 self.mem_usage,
                 self.size,
@@ -689,13 +783,16 @@ def _make_pool_configurator_cls():
         SGLang's ``DSV4PoolConfigurator`` prices its own layout (FlashMLA KV
         rows of the KV-source layers plus a paged SWA pool). The arena is
         ``geometry.paged_bytes`` per 256-token PAGE, one STATE slot per
-        request row and the padding PAGE; ``req_to_token`` is charged here too
-        since nothing else budgets it.
+        request row plus the decode-graph capture slots, and the padding PAGE;
+        ``req_to_token`` is charged here too since nothing else budgets it.
         """
 
         def __init__(self, kvc) -> None:
-            geometry = get_deepseek_v41_builder().geometry
+            builder = get_deepseek_v41_builder()
+            geometry = builder.geometry
             self.geometry = geometry
+            # The proxy pool's reserved decode-graph capture slots.
+            self.capture_slots = _capture_slot_count(builder)
             self.page_size = int(kvc.page_size)
             self.context_len = int(kvc.model_config.context_len)
             schedule = _sglang_bag("schedule")
@@ -713,10 +810,11 @@ def _make_pool_configurator_cls():
             )
 
         def _pool_bytes(self, pages: int, slots: int) -> int:
-            # `pages` usable PAGEs plus the padding PAGE, the STATE slots and
-            # the int32 req_to_token rows SGLang allocates beside them.
+            # `pages` usable PAGEs plus the padding PAGE, the STATE slots of
+            # the request rows and of decode-graph capture, and the int32
+            # req_to_token rows SGLang allocates beside them.
             return (
-                _arena_bytes(self.geometry, pages + 1, slots)
+                _arena_bytes(self.geometry, pages + 1, slots + self.capture_slots)
                 + slots * self.context_len * 4
             )
 
@@ -748,10 +846,12 @@ def _make_pool_configurator_cls():
                 pages -= 1
             logger.info(
                 "ATOM DeepSeek-V4.1 pool sizing: available=%.2f GiB, "
-                "fixed=%.2f GiB (%d request slots), %d PAGEs x %d B -> %d tokens",
+                "fixed=%.2f GiB (%d request slots + %d capture slots), "
+                "%d PAGEs x %d B -> %d tokens",
                 available_bytes / (1 << 30),
                 fixed / (1 << 30),
                 slots,
+                self.capture_slots,
                 pages,
                 int(self.geometry.paged_bytes),
                 pages * self.page_size,
@@ -798,11 +898,43 @@ def _install_pool_sizing_patch() -> None:
     pool_configurator._atom_v41_sizing_patched = True
 
 
+def _install_graph_variants_patch() -> None:
+    """Keep SGLang's V4.1 candidate-indexer graph variants off this model.
+
+    SGLang (gfx95x / sm100+) would capture several decode graphs per bucket,
+    keyed on its own candidate-indexer kernels' limits; the ATOM model runs
+    none of them, and the backend stages one graph per bucket. Inert on gfx942.
+    """
+    try:
+        from sglang.srt.model_executor.runner import decode_cuda_graph_runner
+    except Exception:  # noqa: BLE001 - graphs are optional
+        return
+    original = getattr(
+        decode_cuda_graph_runner, "create_dsv41_candidate_graph_variants", None
+    )
+    if original is None or getattr(original, "_atom_v41_patched", False):
+        return
+
+    @wraps(original)
+    def create_dsv41_candidate_graph_variants(model_runner, *args, **kwargs):
+        model_config = getattr(model_runner, "model_config", None)
+        if is_deepseek_v41_config(getattr(model_config, "hf_config", None)):
+            return None
+        return original(model_runner, *args, **kwargs)
+
+    create_dsv41_candidate_graph_variants._atom_v41_patched = True
+    decode_cuda_graph_runner.create_dsv41_candidate_graph_variants = (
+        create_dsv41_candidate_graph_variants
+    )
+
+
 def install_deepseek_v41_proxy_pool_patch() -> None:
-    """Make SGLang size and build the V4.1 proxy pool instead of its DSV4 pool."""
+    """Make SGLang size and build the V4.1 proxy pool instead of its DSV4 pool,
+    and keep its own V4.1 decode-graph variants off the ATOM model."""
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
 
     _install_pool_sizing_patch()
+    _install_graph_variants_patch()
     original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
     if original_pool_cls is None:
         raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
@@ -985,6 +1117,205 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
     if not torch.equal(step_positions[:n], positions[:n].to(step_positions.dtype)):
         raise ValueError(
             "DeepSeek-V4.1 staged positions disagree with SGLang's positions"
+        )
+    return metadata
+
+
+# ---------------------------------------------------------------------------
+# Decode CUDA graphs
+# ---------------------------------------------------------------------------
+# SGLang captures one full decode graph per batch-size bucket and replays it
+# with no model Python. Every step's ATOM metadata is staged on the host by the
+# backend's `init_forward_metadata_out_graph`, outside the captured region, into
+# the builder's fixed-address buffers; Engram's stage / gather / cursor advance
+# are recorded inside the graph, as native ATOM records them. Prefill, mixed
+# and larger-than-bucket decode batches keep the eager path above.
+
+# The forward batch attribute a capture's metadata rides on into the forward.
+GRAPH_METADATA_ATTR = "atom_v41_graph_metadata"
+
+
+def _graph_builder():
+    builder = get_deepseek_v41_builder()
+    if builder.cache is None:
+        raise RuntimeError("DeepSeek-V4.1 proxy KV pool is not initialized")
+    return builder
+
+
+def check_deepseek_v41_graph_capacity(
+    pool, req_to_token: torch.Tensor, max_bs: int, max_num_tokens: int
+):
+    """Refuse a decode-graph runner the builder and pool cannot serve."""
+    builder = _graph_builder()
+    if builder.cache.backing.data_ptr() != pool.raw_arena.data_ptr():
+        raise RuntimeError(
+            "DeepSeek-V4.1 builder cache is not backed by the SGLang proxy pool"
+        )
+    engram = getattr(builder, "engram", None)
+    if engram is not None and engram.host.overlap is None:
+        # The host-lookup Engram path stages rows and advances the cursor on
+        # the host each step; only the device staging is recorded in a graph.
+        raise NotImplementedError(
+            "DeepSeek-V4.1 SGLang decode graphs need the device Engram "
+            "staging (UVA overlap); launch with --cuda-graph-backend-decode "
+            "disabled"
+        )
+    if getattr(builder.score_workspace, "packed", False):
+        # Packed logits plan a step in score bands on the host; a captured
+        # graph replays one band (native gates this with `step_needs_eager`).
+        raise NotImplementedError(
+            "DeepSeek-V4.1 SGLang decode graphs need the plane score "
+            "workspace (FP8 index cache); packed logits are not supported"
+        )
+    max_bs, max_num_tokens = int(max_bs), int(max_num_tokens)
+    if max_bs > builder.max_bs or max_num_tokens > builder.max_num_batched_tokens:
+        raise ValueError(
+            f"DeepSeek-V4.1 decode graphs of {max_bs} requests / {max_num_tokens} "
+            f"tokens exceed the builder's {builder.max_bs} / "
+            f"{builder.max_num_batched_tokens}; align --max-running-requests "
+            "with the cuda graph batch sizes"
+        )
+    if max_bs > int(pool.num_capture_slots):
+        raise ValueError(
+            f"DeepSeek-V4.1 decode graphs of {max_bs} requests exceed the pool's "
+            f"{pool.num_capture_slots} capture slots"
+        )
+    rows = int(req_to_token.shape[0])
+    if int(pool.capture_slot_base) < rows:
+        raise ValueError(
+            f"DeepSeek-V4.1 capture slots start at {pool.capture_slot_base}, "
+            f"inside the {rows} req_to_token rows a request may hold"
+        )
+    return builder
+
+
+def stage_deepseek_v41_graph_capture(forward_batch, pool):
+    """Stage the step a decode bucket is recorded on and hand it to the
+    forward on ``forward_batch`` (the object SGLang passes to both warmups and
+    the capture). Runs outside the captured region."""
+    mode = forward_batch.forward_mode
+    if not mode.is_decode():
+        raise NotImplementedError(
+            "DeepSeek-V4.1 SGLang graphs capture DECODE only, not "
+            f"{getattr(mode, 'name', mode)}"
+        )
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("DeepSeek-V4.1 graph step must be staged before capture")
+    bs = int(forward_batch.batch_size)
+    if bs > len(pool.capture_slots):
+        raise ValueError(
+            f"DeepSeek-V4.1 capture of {bs} requests exceeds the pool's "
+            f"{len(pool.capture_slots)} capture slots"
+        )
+    metadata = _graph_builder().build_for_sglang_capture(
+        bs, input_ids=forward_batch.input_ids, slots=pool.capture_slots[:bs]
+    )
+    setattr(forward_batch, GRAPH_METADATA_ATTR, metadata)
+    return metadata
+
+
+def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int):
+    """ATOM's scheduled batch for the live rows of a padded decode replay.
+
+    One D2H for the slots and block rows; the lengths come off SGLang's host
+    mirror. The padding rows (``req_pool_idx`` 0, ``seq_len`` 1) are not
+    requests: ATOM pads them itself up to the bucket width.
+    """
+    bs = int(fb_view.batch_size)
+    raw_bs = bs - int(getattr(fb_view, "num_padding", 0) or 0)
+    if not 1 <= raw_bs <= bs:
+        raise ValueError(f"DeepSeek-V4.1 replay of {raw_bs} live rows in {bs}")
+    lengths = fb_view.seq_lens_cpu
+    if lengths is None:
+        raise ValueError(
+            "DeepSeek-V4.1 decode replay needs SGLang's host seq_lens mirror"
+        )
+    if torch.is_tensor(lengths):
+        lengths = lengths[:raw_bs].numpy()
+    ends = np.asarray(lengths[:raw_bs], dtype=np.int64)
+    if np.any(ends < 1):
+        raise ValueError(f"DeepSeek-V4.1 decode replay lengths {ends.tolist()}")
+    width = -(-int(ends.max()) // block_size)
+    indices = fb_view.req_pool_indices[:raw_bs]
+    host = (
+        torch.cat(
+            (
+                indices[:, None].to(torch.int32),
+                (
+                    req_to_token[indices, : width * block_size : block_size]
+                    // block_size
+                ).to(torch.int32),
+            ),
+            dim=1,
+        )
+        .cpu()
+        .numpy()
+    )
+    slots, table = host[:, 0], host[:, 1:]
+    if np.unique(slots).size != raw_bs or np.any(slots <= 0):
+        raise ValueError(
+            f"DeepSeek-V4.1 needs one live req_pool_idx per request; got {slots}"
+        )
+    widths = -(-ends // block_size)
+    rows = [table[i, : widths[i]].copy() for i in range(raw_bs)]
+    if any(np.any(row <= 0) for row in rows):
+        raise ValueError(
+            "DeepSeek-V4.1 decode replay names SGLang's padding page 0 in a live "
+            "request's block table"
+        )
+    slot_list = [int(slot) for slot in slots]
+    return SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=slot_list,
+        num_scheduled_tokens=np.ones(raw_bs, dtype=np.int32),
+        context_lens=ends,
+        is_final_chunk=None,
+        replaying={},
+        state_slots_committed=slot_list,
+        block_tables=rows,
+        total_seqs_num=raw_bs,
+        total_tokens_num=raw_bs,
+    )
+
+
+def stage_deepseek_v41_graph_replay(fb_view, req_to_token):
+    """Stage one decode replay into the addresses its bucket recorded.
+
+    ``prepare_decode`` at the bucket width (capacity-shaped plans, padding
+    sentinels), then ``prepare_model_inputs`` over SGLang's graph
+    ``input_ids``: the deferred cursor probe and the Engram step, whose
+    lookup and cursor advance the graph runs. No Engram ``stage`` / ``join``
+    here and no ``staged_outside_forward``: no model Python runs on replay.
+    """
+    from atom.utils.forward_context import RoundService
+
+    mode = getattr(fb_view, "actual_forward_mode", None) or fb_view.forward_mode
+    if not mode.is_decode():
+        raise NotImplementedError(
+            "DeepSeek-V4.1 SGLang decode graphs do not replay "
+            f"{getattr(mode, 'name', mode)}"
+        )
+    builder = _graph_builder()
+    bs = int(fb_view.batch_size)
+    if bs > builder.max_bs or int(fb_view.input_ids.shape[0]) != bs:
+        raise ValueError(
+            f"DeepSeek-V4.1 replay of {bs} requests over "
+            f"{int(fb_view.input_ids.shape[0])} input rows does not fit the "
+            f"builder's {builder.max_bs}"
+        )
+    batch = build_v41_graph_replay_batch(fb_view, req_to_token, builder.block_size)
+    metadata, _ = builder.prepare_decode(batch, bs, bs, 1)
+    builder.prepare_model_inputs(fb_view.input_ids, metadata)
+    step = metadata.step
+    if (
+        step.running_tokens != bs
+        or not step.decode
+        or step.tentative
+        or metadata.cache is not builder.cache
+        or metadata.served_by_round != RoundService.NONE
+    ):
+        raise RuntimeError(
+            "DeepSeek-V4.1 decode replay staged a step its graph did not record"
         )
     return metadata
 

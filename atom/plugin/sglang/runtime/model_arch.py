@@ -149,10 +149,20 @@ def _build_deepseek_v41_forward_metadata(
     atom_config: Any, forward_batch: Any, positions: Any
 ) -> Any:
     del atom_config
+    import torch
+
     from atom.plugin.sglang.deepseek_v41_bridge import (
+        GRAPH_METADATA_ATTR,
         build_deepseek_v41_forward_metadata,
     )
 
+    # A decode-graph capture's step, staged by the backend outside the
+    # captured region (both warmups and the capture run on it).
+    metadata = getattr(forward_batch, GRAPH_METADATA_ATTR, None)
+    if metadata is not None:
+        return metadata
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("DeepSeek-V4.1 graph step was not staged before capture")
     return build_deepseek_v41_forward_metadata(forward_batch, positions)
 
 

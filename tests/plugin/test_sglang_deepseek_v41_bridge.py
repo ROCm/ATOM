@@ -885,11 +885,18 @@ class TestForwardMetadata:
 # ---------------------------------------------------------------------------
 
 
+# Decode-graph capture slots the small test builder reserves (its max_bs).
+CAPTURE_SLOTS = 2
+
+
 def _install_builder(monkeypatch, geometry, max_num_batched_tokens=32):
     builder = SimpleNamespace(
         geometry=geometry,
         device=torch.device("cpu"),
+        block_size=PAGE,
+        max_bs=CAPTURE_SLOTS,
         max_num_batched_tokens=max_num_batched_tokens,
+        engram=None,
         score_workspace=None,
         num_blocks=None,
         cache=None,
@@ -924,10 +931,13 @@ class TestProxyPool:
         builder = _install_builder(monkeypatch, geometry)
         pool = _proxy()
 
-        # 4 usable PAGEs and SGLang's padding page 0; one slot per req row.
+        # 4 usable PAGEs and SGLang's padding page 0; one slot per req row,
+        # then one reserved decode-graph capture slot per builder request.
         assert pool.num_pages == 5
-        assert pool.num_slots == 4
-        expected = geometry.paged_extents(5)[1] + 4 * geometry.state_bytes
+        assert pool.num_req_slots == 4
+        assert pool.num_slots == 4 + CAPTURE_SLOTS
+        slots = 4 + CAPTURE_SLOTS
+        expected = geometry.paged_extents(5)[1] + slots * geometry.state_bytes
         if kv_dtype == "fp8":
             # A quantized pool is separate source buffers (auxiliary, one
             # main per owner, one window per layer), each started on its own
@@ -944,7 +954,7 @@ class TestProxyPool:
         # ATOM's cache is handed the very bytes SGLang accounts for.
         cache = builder.cache
         assert builder.num_blocks == 5
-        assert (cache.num_pages, cache.num_slots) == (5, 4)
+        assert (cache.num_pages, cache.num_slots) == (5, slots)
         assert cache.backing.data_ptr() == pool.raw_arena.data_ptr()
         base, end = pool.raw_arena.data_ptr(), pool.raw_arena.data_ptr() + expected
         spans = sorted(
@@ -997,7 +1007,9 @@ class TestProxyPool:
 
     def test_default_slots_cover_padding_row(self, real_sglang, monkeypatch):
         _install_builder(monkeypatch, _small_geometry())
-        assert _proxy(num_req_slots=None).num_slots == 3 + 1
+        pool = _proxy(num_req_slots=None)
+        assert pool.num_req_slots == 3 + 1
+        assert pool.num_slots == 3 + 1 + CAPTURE_SLOTS
 
     def test_full_size_falls_back_to_swa_size(self, real_sglang, monkeypatch):
         _install_builder(monkeypatch, _small_geometry())
@@ -1074,7 +1086,7 @@ def sizing(real_sglang, monkeypatch):
 def _pool_cost(geometry, pages, slots, context_len):
     return (
         geometry.paged_extents(pages + 1)[1]
-        + slots * geometry.state_bytes
+        + (slots + CAPTURE_SLOTS) * geometry.state_bytes
         + slots * context_len * 4
     )
 
@@ -1250,17 +1262,558 @@ class TestBackendShim:
         assert backend.needs_cpu_seq_lens
         backend.init_forward_metadata(object())
         assert backend.forward_metadata is None
-        backend.init_forward_metadata_out_graph(object())
-        assert backend.forward_metadata is None
 
     @pytest.mark.parametrize("method", ["forward_decode", "forward_extend"])
     def test_attention_never_runs_in_the_shim(self, method):
         with pytest.raises(RuntimeError, match="executes inside the ATOM model"):
             getattr(self._backend(), method)(None, None, None, None, None)
 
-    def test_cuda_graphs_are_refused(self):
+    def test_graph_staging_needs_graph_state(self):
         backend = self._backend()
-        with pytest.raises(NotImplementedError, match="CUDA graphs"):
-            backend.init_cuda_graph_state(8, 8)
-        with pytest.raises(NotImplementedError, match="CUDA graphs"):
-            backend.init_forward_metadata_out_graph(object(), in_capture=True)
+        with pytest.raises(RuntimeError, match="before init_cuda_graph_state"):
+            backend.init_forward_metadata_out_graph(
+                SimpleNamespace(forward_mode=ForwardMode.DECODE), in_capture=True
+            )
+
+
+# ---------------------------------------------------------------------------
+# Decode CUDA graphs
+# ---------------------------------------------------------------------------
+
+
+class _Step(SimpleNamespace):
+    pass
+
+
+def _graph_metadata(builder, running_tokens, *, decode=True, tentative=False):
+    from atom.utils.forward_context import RoundService
+
+    return SimpleNamespace(
+        cache=builder.cache,
+        served_by_round=RoundService.NONE,
+        dummy=False,
+        step=_Step(running_tokens=running_tokens, decode=decode, tentative=tentative),
+    )
+
+
+class _CoreCaptureRecorder:
+    """Stands in for `_prepare` / `prepare_model_inputs` on a real builder
+    class, recording what a capture asks of them."""
+
+    def __init__(self, builder):
+        self.builder = builder
+        self.prepared = []
+        self.inputs = []
+
+    def prepare(self, batch, running_bs, running_tokens, **kwargs):
+        self.prepared.append((batch, running_bs, running_tokens, kwargs))
+        return _graph_metadata(self.builder, running_tokens), torch.zeros(
+            running_tokens, dtype=torch.int64
+        )
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        self.inputs.append((input_ids, metadata.dummy, metadata))
+
+
+@pytest.fixture
+def capture_builder():
+    """The SGLang builder class over a stub cache: everything a capture reads
+    off it, without a GPU."""
+    pytest.importorskip("aiter", reason="the V4.1 builder module reaches AITER")
+    cls = bridge._make_builder_cls()
+    builder = cls.__new__(cls)
+    builder.block_size = PAGE
+    builder.max_bs = 8
+    builder.max_num_batched_tokens = 64
+    builder.cache = SimpleNamespace(
+        geometry=SimpleNamespace(window_size=128, speculative_tokens=0)
+    )
+    builder.model_runner = SimpleNamespace(
+        forward_vars={"input_ids": SimpleNamespace(gpu=torch.arange(64))}
+    )
+    recorder = _CoreCaptureRecorder(builder)
+    builder._prepare = recorder.prepare
+    builder.prepare_model_inputs = recorder.prepare_model_inputs
+    return builder, recorder
+
+
+class TestGraphCaptureStep:
+    def test_matches_core_capture_but_slots_and_input_ids(self, capture_builder):
+        builder, recorder = capture_builder
+        bs, slots = 3, (10, 11, 12)
+        input_ids = torch.zeros(bs, dtype=torch.int64)
+        metadata = builder.build_for_sglang_capture(
+            bs, input_ids=input_ids, slots=slots
+        )
+        builder.build_for_cudagraph_capture(bs)
+        (ours, *ours_args), (core, *core_args) = recorder.prepared
+        # Same widths and options: a decode step, Engram live count 0.
+        assert ours_args == core_args
+        assert ours_args == [
+            bs,
+            bs,
+            {"max_q_len": 1, "tentative": False, "engram_live": False},
+        ]
+        for name in (
+            "is_dummy_run",
+            "num_scheduled_tokens",
+            "context_lens",
+            "block_tables",
+            "total_seqs_num",
+            "total_tokens_num",
+            "is_final_chunk",
+            "replaying",
+        ):
+            assert getattr(ours, name) == getattr(core, name), name
+        # A full window in, every entry SGLang's padding page 0.
+        assert ours.context_lens == (129,) * bs
+        assert ours.block_tables == ((0,),) * bs
+        # The caller's capture slots instead of core's 0..bs-1.
+        assert ours.state_slots_committed == slots
+        assert ours.req_ids == slots
+        assert core.state_slots_committed == (0, 1, 2)
+        # SGLang's input_ids buffer itself, not the shim's forward_vars.
+        (ours_ids, ours_dummy, ours_md), (core_ids, core_dummy, _) = recorder.inputs
+        assert ours_ids is input_ids
+        assert (
+            core_ids.data_ptr()
+            == builder.model_runner.forward_vars["input_ids"].gpu.data_ptr()
+        )
+        assert ours_dummy and core_dummy
+        assert ours_md is metadata
+        # The forward stages Engram itself: in the recorded graph.
+        assert not getattr(metadata, "staged_outside_forward", False)
+
+    def test_window_spanning_pages(self, capture_builder):
+        builder, recorder = capture_builder
+        builder.cache.geometry.window_size = PAGE
+        builder.build_for_sglang_capture(
+            1, input_ids=torch.zeros(1, dtype=torch.int64), slots=(5,)
+        )
+        assert recorder.prepared[0][0].block_tables == ((0, 0),)
+
+    @pytest.mark.parametrize(
+        ("bs", "slots", "rows", "match"),
+        [
+            (2, (5, 5), 2, "distinct STATE slots"),
+            (2, (5,), 2, "distinct STATE slots"),
+            (2, (5, 6), 3, "input_ids rows"),
+            (9, tuple(range(9)), 9, "exceeds"),
+            (0, (), 0, "exceeds"),
+        ],
+    )
+    def test_refusals(self, capture_builder, bs, slots, rows, match):
+        builder, recorder = capture_builder
+        with pytest.raises(ValueError, match=match):
+            builder.build_for_sglang_capture(
+                bs, input_ids=torch.zeros(rows, dtype=torch.int64), slots=slots
+            )
+        assert recorder.prepared == []
+
+    def test_speculative_and_unallocated_are_refused(self, capture_builder):
+        builder, _ = capture_builder
+        ids = torch.zeros(1, dtype=torch.int64)
+        builder.cache.geometry.speculative_tokens = 2
+        with pytest.raises(NotImplementedError, match="speculative"):
+            builder.build_for_sglang_capture(1, input_ids=ids, slots=(5,))
+        builder.cache = None
+        with pytest.raises(RuntimeError, match="serving cache"):
+            builder.build_for_sglang_capture(1, input_ids=ids, slots=(5,))
+
+    def test_a_decode_round_is_refused(self, capture_builder):
+        from atom.utils.forward_context import RoundService
+
+        builder, recorder = capture_builder
+
+        def served(*args, **kwargs):
+            metadata, positions = recorder.prepare(*args, **kwargs)
+            metadata.served_by_round = RoundService.FORWARD
+            return metadata, positions
+
+        builder._prepare = served
+        with pytest.raises(NotImplementedError, match="decode round"):
+            builder.build_for_sglang_capture(
+                1, input_ids=torch.zeros(1, dtype=torch.int64), slots=(5,)
+            )
+
+
+class _GraphBuilder:
+    """A builder that records the graph staging calls the bridge makes."""
+
+    def __init__(self, max_bs=8, cache=None):
+        self.block_size = PAGE
+        self.max_bs = max_bs
+        self.max_num_batched_tokens = 64
+        self.cache = cache if cache is not None else SimpleNamespace()
+        self.engram = None
+        self.calls = []
+        self.step_width = None
+
+    def build_for_sglang_capture(self, bs, *, input_ids, slots):
+        self.calls.append(("capture", bs, input_ids, tuple(slots)))
+        return _graph_metadata(self, bs)
+
+    def prepare_decode(self, batch, running_bs, running_tokens, max_seqlen_q):
+        self.calls.append(("decode", running_bs, running_tokens, max_seqlen_q))
+        self.batch = batch
+        width = running_tokens if self.step_width is None else self.step_width
+        metadata = _graph_metadata(self, width)
+        # Graph steps never stage Engram outside the forward.
+        metadata.engram_embeddings = SimpleNamespace(
+            stage=lambda: self.calls.append("stage"),
+            join=lambda: self.calls.append("join"),
+        )
+        return metadata, None
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        self.calls.append(("inputs", input_ids))
+
+
+@pytest.fixture
+def replay_table():
+    # Rows 1..6 hold live requests; row 0 is padding. Row 6 names page 0.
+    return _req_to_token(
+        rows=8,
+        context_len=4 * PAGE,
+        pages_by_row={
+            1: [7, 3, 9],
+            2: [5],
+            3: [2, 11, 4, 8],
+            4: [6],
+            5: [10, 12],
+            6: [13, 0],
+        },
+    )
+
+
+def _fb_view(
+    req_pool_indices,
+    seq_lens,
+    bs,
+    mode=ForwardMode.DECODE,
+    cpu_lengths=True,
+    input_ids=None,
+):
+    raw = len(req_pool_indices)
+    pad = bs - raw
+    lengths = torch.tensor(list(seq_lens) + [1] * pad, dtype=torch.int64)
+    return SimpleNamespace(
+        batch_size=bs,
+        num_padding=pad,
+        forward_mode=ForwardMode.DECODE,
+        actual_forward_mode=mode,
+        input_ids=(
+            input_ids if input_ids is not None else torch.zeros(bs, dtype=torch.int64)
+        ),
+        req_pool_indices=torch.tensor(
+            list(req_pool_indices) + [0] * pad, dtype=torch.int64
+        ),
+        seq_lens=lengths.clone(),
+        seq_lens_cpu=lengths if cpu_lengths else None,
+    )
+
+
+class TestGraphReplayStep:
+    def test_padded_replay_stages_live_rows_at_bucket_width(
+        self, monkeypatch, replay_table
+    ):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb = _fb_view([3, 1, 5, 2, 4], [3 * PAGE + 9, 2 * PAGE + 1, PAGE + 1, 7, 1], 8)
+        metadata = bridge.stage_deepseek_v41_graph_replay(fb, replay_table)
+
+        assert builder.calls == [("decode", 8, 8, 1), ("inputs", fb.input_ids)]
+        assert builder.calls[1][1] is fb.input_ids
+        batch = builder.batch
+        assert batch.total_seqs_num == batch.total_tokens_num == 5
+        assert batch.state_slots_committed == [3, 1, 5, 2, 4]
+        assert batch.req_ids == [3, 1, 5, 2, 4]
+        assert batch.context_lens.tolist() == [
+            3 * PAGE + 9,
+            2 * PAGE + 1,
+            PAGE + 1,
+            7,
+            1,
+        ]
+        assert batch.num_scheduled_tokens.tolist() == [1] * 5
+        assert _tables(batch) == [[2, 11, 4, 8], [7, 3, 9], [10, 12], [5], [6]]
+        assert batch.is_dummy_run is False and batch.replaying == {}
+        # No Engram stage/join and no outside-forward mark: the graph runs it.
+        assert not getattr(metadata, "staged_outside_forward", False)
+
+    def test_unpadded_replay(self, monkeypatch, replay_table):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb = _fb_view([2], [PAGE], 1)
+        bridge.stage_deepseek_v41_graph_replay(fb, replay_table)
+        assert builder.calls[0] == ("decode", 1, 1, 1)
+        assert _tables(builder.batch) == [[5]]
+
+    @pytest.mark.parametrize(
+        ("indices", "lengths", "match"),
+        [
+            ([1, 1], [5, 6], "req_pool_idx"),
+            ([0, 2], [5, 6], "req_pool_idx"),
+            ([6, 2], [PAGE + 1, 6], "padding page 0"),
+        ],
+    )
+    def test_bad_rows_are_refused(
+        self, monkeypatch, replay_table, indices, lengths, match
+    ):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        with pytest.raises(ValueError, match=match):
+            bridge.stage_deepseek_v41_graph_replay(
+                _fb_view(indices, lengths, 4), replay_table
+            )
+        assert builder.calls == []
+
+    def test_live_first_page_of_a_page0_row_is_fine(self, monkeypatch, replay_table):
+        # Row 6's second page is 0, but a request of PAGE tokens never reads it.
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        bridge.stage_deepseek_v41_graph_replay(_fb_view([6], [PAGE], 2), replay_table)
+        assert _tables(builder.batch) == [[13]]
+
+    def test_non_decode_and_missing_mirror_are_refused(self, monkeypatch, replay_table):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        with pytest.raises(NotImplementedError, match="IDLE"):
+            bridge.stage_deepseek_v41_graph_replay(
+                _fb_view([1], [5], 2, mode=ForwardMode.IDLE), replay_table
+            )
+        with pytest.raises(ValueError, match="host seq_lens mirror"):
+            bridge.stage_deepseek_v41_graph_replay(
+                _fb_view([1], [5], 2, cpu_lengths=False), replay_table
+            )
+        with pytest.raises(ValueError, match="input rows"):
+            bridge.stage_deepseek_v41_graph_replay(
+                _fb_view([1], [5], 2, input_ids=torch.zeros(3)), replay_table
+            )
+        assert builder.calls == []
+
+    def test_a_step_wider_than_the_graph_is_refused(self, monkeypatch, replay_table):
+        builder = _GraphBuilder()
+        builder.step_width = 4
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        with pytest.raises(RuntimeError, match="did not record"):
+            bridge.stage_deepseek_v41_graph_replay(_fb_view([1], [5], 2), replay_table)
+
+
+class TestGraphAdapter:
+    def _adapter(self):
+        return MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH].build_forward_metadata
+
+    def test_capture_stash_is_returned_untouched(self, monkeypatch):
+        monkeypatch.setattr(
+            bridge,
+            "build_deepseek_v41_forward_metadata",
+            lambda *a: pytest.fail("eager staging ran for a captured step"),
+        )
+        stash = object()
+        fb = SimpleNamespace(atom_v41_graph_metadata=stash)
+        assert self._adapter()(None, fb, torch.zeros(1)) is stash
+
+    def test_capture_without_a_stash_is_refused(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        monkeypatch.setattr(
+            bridge,
+            "build_deepseek_v41_forward_metadata",
+            lambda *a: pytest.fail("staged under capture"),
+        )
+        with pytest.raises(RuntimeError, match="not staged before capture"):
+            self._adapter()(None, SimpleNamespace(), torch.zeros(1))
+
+    def test_eager_still_stages_in_the_forward(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            bridge,
+            "build_deepseek_v41_forward_metadata",
+            lambda fb, positions: calls.append((fb, positions)) or "eager",
+        )
+        fb, positions = SimpleNamespace(), torch.zeros(1)
+        assert self._adapter()(None, fb, positions) == "eager"
+        assert calls == [(fb, positions)]
+
+
+@pytest.fixture
+def graph_backend(real_sglang, monkeypatch):
+    """The real backend over a real proxy pool (2 capture slots, 4 req rows)."""
+    builder = _install_builder(monkeypatch, _small_geometry())
+    pool = _proxy()
+    table = torch.zeros(4, 4 * PAGE, dtype=torch.int32)
+    runner = SimpleNamespace(
+        device="cpu",
+        token_to_kv_pool=pool,
+        req_to_token_pool=SimpleNamespace(req_to_token=table),
+    )
+    monkeypatch.delenv("SGLANG_ENABLE_METADATA_GLUE_GRAPH", raising=False)
+    return SimpleNamespace(
+        backend=ATOMDeepseekV41BackendForSgl(runner),
+        builder=builder,
+        pool=pool,
+        table=table,
+    )
+
+
+def _capture_fb(bs):
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=bs,
+        input_ids=torch.zeros(bs, dtype=torch.int64),
+    )
+
+
+@needs_sglang
+class TestGraphBackend:
+    def test_capture_slots_follow_the_request_rows(self, graph_backend):
+        pool = graph_backend.pool
+        assert pool.capture_slot_base == pool.num_req_slots == 4
+        assert pool.num_capture_slots == CAPTURE_SLOTS
+        assert pool.capture_slots == (4, 5)
+        assert pool.num_slots == 6
+
+    def test_graph_state_is_validated(self, graph_backend, monkeypatch):
+        backend = graph_backend.backend
+        with pytest.raises(ValueError, match="exceed the builder"):
+            backend.init_cuda_graph_state(CAPTURE_SLOTS + 1, CAPTURE_SLOTS + 1)
+        with pytest.raises(ValueError, match="exceed the builder"):
+            backend.init_cuda_graph_state(1, 64)
+        graph_backend.builder.max_bs = 8
+        with pytest.raises(ValueError, match="capture slots"):
+            backend.init_cuda_graph_state(4, 4)
+        graph_backend.builder.max_bs = CAPTURE_SLOTS
+        # A req_to_token row past the base would alias a capture slot.
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros(5, PAGE, dtype=torch.int32)
+        )
+        with pytest.raises(ValueError, match="inside the 5 req_to_token rows"):
+            backend.init_cuda_graph_state(2, 2)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=graph_backend.table)
+        backend.init_cuda_graph_state(2, 2)
+        assert backend._v41_graph_buckets == {}
+
+    def test_glue_graph_is_refused(self, graph_backend, monkeypatch):
+        monkeypatch.setenv("SGLANG_ENABLE_METADATA_GLUE_GRAPH", "1")
+        with pytest.raises(NotImplementedError, match="GLUE_GRAPH"):
+            graph_backend.backend.init_cuda_graph_state(2, 2)
+
+    def test_missing_or_foreign_cache_is_refused(self, graph_backend):
+        builder = graph_backend.builder
+        cache = builder.cache
+        builder.cache = SimpleNamespace(backing=torch.zeros(4, dtype=torch.uint8))
+        with pytest.raises(RuntimeError, match="not backed by the SGLang proxy"):
+            graph_backend.backend.init_cuda_graph_state(2, 2)
+        builder.cache = None
+        with pytest.raises(RuntimeError, match="not initialized"):
+            graph_backend.backend.init_cuda_graph_state(2, 2)
+        builder.cache = cache
+
+    def test_host_engram_lookup_is_refused(self, graph_backend):
+        graph_backend.builder.engram = SimpleNamespace(
+            host=SimpleNamespace(overlap=None)
+        )
+        with pytest.raises(NotImplementedError, match="device Engram"):
+            graph_backend.backend.init_cuda_graph_state(2, 2)
+
+    def _capture(self, graph_backend, bs):
+        builder = graph_backend.builder
+        builder.calls = []
+        builder.build_for_sglang_capture = (
+            lambda bs, *, input_ids, slots: builder.calls.append(
+                ("capture", bs, input_ids, tuple(slots))
+            )
+            or "captured-md"
+        )
+        fb = _capture_fb(bs)
+        graph_backend.backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        return fb
+
+    def test_capture_stages_on_reserved_slots(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = self._capture(graph_backend, 2)
+        ((kind, bs, input_ids, slots),) = graph_backend.builder.calls
+        assert (kind, bs, slots) == ("capture", 2, (4, 5))
+        assert input_ids is fb.input_ids
+        assert fb.atom_v41_graph_metadata == "captured-md"
+        assert backend._v41_graph_buckets == {
+            2: (fb.input_ids.data_ptr(), graph_backend.pool.raw_arena.data_ptr())
+        }
+        assert backend.forward_metadata is None
+
+    def test_capture_is_decode_only(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = _capture_fb(1)
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        with pytest.raises(NotImplementedError, match="plain decode only"):
+            backend.init_forward_metadata_out_graph(fb, in_capture=True)
+
+    def test_replay_stages_on_the_recorded_addresses(self, graph_backend, monkeypatch):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        fb = self._capture(graph_backend, 2)
+        staged = []
+        monkeypatch.setattr(
+            bridge,
+            "stage_deepseek_v41_graph_replay",
+            lambda view, table: staged.append((view, table)) or "replay-md",
+        )
+        decode = ForwardMode.DECODE
+        view = SimpleNamespace(
+            batch_size=2, num_padding=1, input_ids=fb.input_ids, forward_mode=decode
+        )
+        backend.init_forward_metadata_out_graph(view)
+        assert staged == [(view, graph_backend.table)]
+        assert backend._v41_last_replay_md == "replay-md"
+        assert backend._v41_replayed_buckets == {2}
+
+        # A bucket never captured, or one replaying elsewhere, is refused.
+        with pytest.raises(RuntimeError, match="was not captured"):
+            backend.init_forward_metadata_out_graph(
+                SimpleNamespace(
+                    batch_size=1, input_ids=fb.input_ids[:1], forward_mode=decode
+                )
+            )
+        with pytest.raises(RuntimeError, match="did not record"):
+            backend.init_forward_metadata_out_graph(
+                SimpleNamespace(
+                    batch_size=2, input_ids=torch.zeros(2), forward_mode=decode
+                )
+            )
+        assert len(staged) == 1
+
+    def test_eager_metadata_is_untouched(self, graph_backend):
+        backend = graph_backend.backend
+        backend.init_cuda_graph_state(2, 2)
+        backend.init_forward_metadata(object())
+        assert backend.forward_metadata is None
+        assert backend._v41_graph_buckets == {}
+
+
+@needs_sglang
+def test_candidate_graph_variants_are_off_for_v41(real_sglang, monkeypatch):
+    runner_module = pytest.importorskip(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+    )
+    calls = []
+
+    def original(model_runner, *args, **kwargs):
+        calls.append(model_runner)
+        return "variants"
+
+    monkeypatch.setattr(
+        runner_module, "create_dsv41_candidate_graph_variants", original
+    )
+    bridge._install_graph_variants_patch()
+    bridge._install_graph_variants_patch()  # idempotent
+    patched = runner_module.create_dsv41_candidate_graph_variants
+    v41 = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=_sglang_normalized_v41())
+    )
+    v4 = SimpleNamespace(model_config=SimpleNamespace(hf_config=_deepseek_v4()))
+    assert patched(v41, "DECODE", 0) is None
+    assert patched(v4, "DECODE", 0) == "variants"
+    assert calls == [v4]
