@@ -1352,12 +1352,7 @@ class MLAAttention(nn.Module):
             self.num_heads,
             self.v_head_dim if self.pbm_enabled else self.kv_lora_rank,
             dcp_mailbox_max_tokens(get_current_atom_config()),
-        ):
-            if not getattr(type(self), "_dcp_mailbox_off_logged", False):
-                type(self)._dcp_mailbox_off_logged = True
-                logger.warning(
-                    "DCP comm_backend 'mailbox' unavailable; merging with 'a2a'"
-                )
+        ):  # prepare_dcp_mailbox logged why, once
             self.dcp_comm_backend = "a2a"
 
     def _dcp_merge(

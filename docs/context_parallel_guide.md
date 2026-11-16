@@ -440,26 +440,30 @@ LSE through two 16-bit halves of a bf16 buffer).
 Byte counts are about the same; what `a2a` saves is one collective's launch and
 sync.
 
-`mailbox` needs aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972, in
-main from `d223b16cf`) and FlyDSL >= 0.5.0; without them startup fails (set
-`comm_backend` to `a2a`). When the peer memory cannot be allocated or mapped
-(e.g. a DCP group spanning nodes), and in plugin mode, the layer logs a
-warning and merges with `a2a`. Only graph-captured decode steps take it (each token count is its
-own kernel build, ~0.4-0.8 s on first use, so eager steps and prefill merge
-with `a2a`). An explicit `mailbox` is refused together with decode TBO
+`mailbox` needs aiter with `aiter.ops.flydsl.dcp_mailbox` (aiter PR #6972 and
+#7943, in main from `78a14ae5d`) and FlyDSL >= 0.5.0; without them startup
+fails (set `comm_backend` to `a2a`). When the peer memory cannot be allocated
+or mapped (e.g. a DCP group spanning nodes), it logs a warning once and merges
+with `a2a` on every rank. Plugin mode takes `a2a` at startup, for `auto` and an
+explicit `mailbox` alike. Only graph-captured decode steps take it: an eager
+call re-traces the FlyDSL kernel on the host every time (about 77 ms a call on
+Kimi-K3 at DCP8), which a capture pays once, so eager steps and prefill merge
+with `a2a`. An explicit `mailbox` is refused together with decode TBO
 (`--enable-tbo all`); `auto` takes `a2a` there. After graph capture the ranks
 check that they captured the same number of mailbox merges and refuse to serve
 otherwise, since a rank one launch ahead would pair every later merge with the
-wrong peer call. The first startup builds one kernel per captured decode width;
-set `comm_backend` to `a2a` to opt out.
-A merge larger than `2^20` elements (tokens x all heads x head dim; GLM-5.2
-at DCP4 has 16384 per token, so up to 64 tokens take the mailbox) takes `a2a`:
-past that the mailbox's tagged stores are bandwidth bound and lose to RCCL (on
-MI355X from about 1.3e6 elements on GLM-5.2). Its peer buffer, `2 x ranks x
-tokens x local heads x (4 x head dim + 8)` bytes with `tokens = min(max_num_seqs
-x (1 + num_speculative_tokens), 2^20 / (ranks x local heads x head dim))`, is
-mapped at model build, so it comes out of the KV budget. The combine does not quantize:
-with a per-token FP8 `o_proj` its output is quantized by `o_proj` itself.
+wrong peer call. The first startup builds a few kernels (one per token tile and
+row-mask variant); set `comm_backend` to `a2a` to opt out.
+A merge larger than `2^21` elements (tokens x all heads x head dim: 128 tokens
+on GLM-5.2 at DCP4, 170 on Kimi-K3 at DCP8) takes `a2a`. Measured on MI355X in
+a CUDA graph, the mailbox leads RCCL on GLM-5.2 up to 512 tokens and on
+Kimi-K3 through 160 tokens; at 192 tokens, where the combine's token tile
+steps from 4 to 8, Kimi-K3 falls behind. Its peer buffer, `2 x ranks x tokens
+x local heads x (2 x head dim + 4)` bytes with `tokens = min(max_num_seqs x (1
++ num_speculative_tokens), 2^21 / (ranks x local heads x head dim))`, at most
+about 8 MiB on both models, is mapped at model build, so it comes out of the
+KV budget. The combine does not quantize: with a per-token FP8 `o_proj` its
+output is quantized by `o_proj` itself.
 
 ## Launching server
 

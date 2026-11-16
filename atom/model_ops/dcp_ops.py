@@ -878,29 +878,30 @@ def mask_empty_dcp_lse(
 
 # ─────────────────────────────────────────── mailbox merge backend ──
 #
-# aiter's ``dcp_lse_combine`` (FlyDSL, aiter PR #6972): one launch in which
-# every rank stores each owner's head rows and LSEs straight into the owner's
-# IPC-mapped mailbox as (value, launch tag) pairs, then polls its own heads and
-# combines them. It replaces pack -> all_to_all_single -> combine. Decode only:
-# its peer buffer is sized for the widest decode step, capped at the widest
-# merge under _MAILBOX_MAX_ELEMS, and its launch epoch
+# aiter's ``dcp_lse_combine`` (FlyDSL, aiter #6972 / #7943, in main from
+# 78a14ae5d): one launch in which every rank stores each owner's head rows and
+# LSEs straight into the owner's IPC-mapped, sentinel-filled mailbox, then
+# polls its own heads and combines them. It replaces pack -> all_to_all_single
+# -> combine. Decode only: its peer buffer is sized for the widest decode step,
+# capped at the widest merge under _MAILBOX_MAX_ELEMS, and its launch epoch
 # lives on each rank, so every rank must launch it the same number of times in
-# the same order -- which a DCP group's lock-step decode does. Each token count
-# is its own kernel build (~0.4-0.8 s on first use), so only graph-captured
-# steps take it: the build lands in capture, and eager steps stay on a2a.
-# Sparse MLA's empty rows (owned_counts == 0) are masked inside the combine
-# through its ``row_counts``.
+# the same order -- which a DCP group's lock-step decode does, since every
+# condition below reads only shapes. Only graph-captured steps take it: an
+# eager call re-traces the FlyDSL kernel on the host every time (~77 ms a call
+# on Kimi-K3 DCP8), which a capture pays once. Sparse MLA's empty rows
+# (owned_counts == 0) are masked inside the combine through its ``row_counts``.
 
 _MAILBOX_WORKSPACES: dict = {}
 # Mailbox merges taken, per workspace. A merge can only take the mailbox inside
 # a graph capture, so after capture this is every launch a replay makes.
 _MAILBOX_LAUNCHES: dict = {}
-# Largest merge (tokens x all heads x head dim) the mailbox takes. Its tagged
-# system-scope stores beat pack -> RCCL -> combine while the merge is latency
-# bound and lose once it is bandwidth bound. On MI355X (token tiling,
-# row_counts) GLM-5.2 DCP4 16 x 256 leads through 1.18e6 elements and loses
-# from 1.31e6; Kimi-K3 DCP8 12 x 128 still leads at 1.57e6.
-_MAILBOX_MAX_ELEMS = 1 << 20
+# Largest merge (tokens x all heads x head dim) the mailbox takes. Measured on
+# MI355X in a CUDA graph against pack -> RCCL all-to-all -> combine: GLM-5.2
+# DCP4 (16 x 256) leads at every width up to 512 tokens (8.4e6); Kimi-K3 DCP8
+# (12 x 128) leads through 160 tokens (2.0e6), loses at 192, where the
+# combine's token tile steps from 4 to 8, and leads again from 384. 2^21 is
+# 128 tokens on GLM-5.2 and 170 on Kimi-K3.
+_MAILBOX_MAX_ELEMS = 1 << 21
 
 
 def _mailbox_key(cp_group, heads, dim):
@@ -934,6 +935,13 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
     )
     if max_tokens < 1:
+        logger.warning(
+            "DCP mailbox: one token of %d heads x %d already exceeds %d elements; "
+            "merging with 'a2a'",
+            cp_group.world_size * heads,
+            dim,
+            _MAILBOX_MAX_ELEMS,
+        )
         return False
     try:
         from aiter.ops.flydsl.dcp_mailbox import CombineWorkspace
@@ -949,7 +957,7 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
         # group before raising, so every rank falls back alike.
         ws = CombineWorkspace(cp_group, device, heads, dim, max_tokens)
     except RuntimeError as error:
-        logger.warning("DCP mailbox peer memory: %s", error)
+        logger.warning("DCP mailbox peer memory: %s; merging with 'a2a'", error)
         return False
     _MAILBOX_WORKSPACES[key] = ws
     logger.info(

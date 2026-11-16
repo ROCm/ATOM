@@ -106,8 +106,8 @@ def test_empty_rows_are_masked_by_the_combine(monkeypatch, capturing):
 
 @needs_dcp_ops
 def test_an_eager_step_is_all_to_all(monkeypatch, a2a_calls):
-    """Each token count is its own kernel build; outside a capture it would
-    compile mid-serving."""
+    """An eager call re-traces the FlyDSL kernel on the host every time (tens
+    of ms); a capture pays that once."""
     group = _group()
     key = dcp_ops._mailbox_key(group, 4, 128)
     monkeypatch.setitem(dcp_ops._MAILBOX_WORKSPACES, key, SimpleNamespace(max_tokens=8))
@@ -125,6 +125,21 @@ def test_an_aiter_without_the_mailbox_fails_startup_with_the_way_out(monkeypatch
     group = SimpleNamespace(world_size=4, rank_in_group=0, cpu_group="gloo")
     with pytest.raises(ImportError, match='"comm_backend": "a2a"'):
         dcp_ops.prepare_dcp_mailbox(group, 16, 256, 64)
+
+
+@needs_dcp_ops
+def test_a_layout_too_wide_for_one_token_falls_back_once_with_a_reason(monkeypatch):
+    """The layers share one attempt, and it says why it took a2a."""
+    warned = []
+    monkeypatch.setattr(
+        dcp_ops, "logger", SimpleNamespace(warning=lambda *a: warned.append(a))
+    )
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    group = SimpleNamespace(world_size=8, rank_in_group=0, cpu_group="gloo")
+    heads = dcp_ops._MAILBOX_MAX_ELEMS // (8 * 128) + 1  # one token > the limit
+    for _ in range(3):  # three MLA layers
+        assert not dcp_ops.prepare_dcp_mailbox(group, heads, 128, 64)
+    assert len(warned) == 1 and "exceeds" in warned[0][0]
 
 
 @needs_dcp_ops
@@ -155,10 +170,10 @@ def test_a_failed_mapping_falls_back_once(monkeypatch):
 @pytest.mark.parametrize(
     "ranks, heads, dim, widest, sized",
     [
-        (4, 16, 256, 1024, 64),  # GLM-5.2 DCP4, 256 seqs x MTP3: 2^20 caps it
+        (4, 16, 256, 1024, 128),  # GLM-5.2 DCP4, 256 seqs x MTP3: 2^21 caps it
         (4, 16, 256, 16, 16),
-        (8, 12, 128, 80, 80),  # Kimi-K3 DCP8, 80 seqs: under the cap (85)
-        (8, 12, 128, 2048, 85),
+        (8, 12, 128, 80, 80),  # Kimi-K3 DCP8, 80 seqs: under the cap (170)
+        (8, 12, 128, 2048, 170),
     ],
 )
 def test_the_workspace_is_sized_for_merges_the_mailbox_can_take(
@@ -332,7 +347,7 @@ def _check_mailbox_merge(rank, world, group, heads, dim, tokens):
     if rank == 1:
         owned[2] = 0
         out[2] = float("nan")
-    # captured the way decode is: a mailbox merge first built in the capture,
+    # captured the way decode is: a mailbox merge first traced in the capture,
     # three layers in one graph, replays with fresh inputs and an eager
     # (all-to-all) merge in between, over both mailbox parities
     graph, side = torch.cuda.CUDAGraph(), torch.cuda.Stream()
