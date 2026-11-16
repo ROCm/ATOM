@@ -467,11 +467,7 @@ class GatedDeltaNet(nn.Module):
             ckpt = gdn_metadata.ssm_checkpoints
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
-            if (
-                flydsl_policy is not None
-                and flydsl_policy.prefill
-                and not use_replayssm
-            ):
+            if flydsl_policy is not None and flydsl_policy.prefill:
                 from atom.model_ops.fla_ops.gdn_flydsl import (
                     prefill,
                     prefill_supported,

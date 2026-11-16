@@ -107,9 +107,8 @@ def _ensure_flydsl_policy(state: torch.Tensor):
         return policy
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
-    # ReplaySSM addresses the same contiguous checkpoint Triton prefill
-    # writes. FlyDSL's VK view is a different layout; Native keeps both
-    # stages off once the ring is on.
+    # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
+    # `select_policy` keeps decode (and its VK view) off; prefill still runs.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),
@@ -564,7 +563,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> None:
         """Verify the draft window through Native ReplaySSM.
 
-        The live checkpoint is the contiguous pool Triton prefill writes.
+        The live checkpoint is the contiguous pool the prefill writes.
         The kernel appends records and does not publish a per-step SSM
         snapshot; ``update_mamba_state_after_mtp_verify`` advances the cursor
         once the accept length is known, scatters the conv window, and
@@ -1121,8 +1120,8 @@ class SGLangGDNForwardContext:
             )
             # GatedDeltaNet's prefill reads these once-per-step fields (#2534)
             # instead of casting per layer. The native builder fills them; a
-            # None here makes the non-FlyDSL prefill (e.g. ReplaySSM under MTP)
-            # and the state write-back fail. Read and write slots are the same.
+            # None here makes the Triton prefill and the state write-back
+            # fail. Read and write slots are the same.
             idx_i64 = idx.long()
             no_initial_state = None if has_initial_state is None else ~has_initial_state
             return GDNAttentionMetadata(

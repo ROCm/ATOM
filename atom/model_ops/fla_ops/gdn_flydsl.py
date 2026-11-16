@@ -37,13 +37,16 @@ def decode_device_supported(device):
 
 
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
-    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
-    # VK even when K == V makes the shape identical. Keep both stages original.
-    if not allowed or replayssm:
+    if not allowed:
         return GDNFlyDSLPolicy()
+    # Prefill reads the initial state through the pool's strides and hands the
+    # final state back as a logical KV view, so it runs on any pool layout.
     prefill_enabled = backend("prefill") != "triton"
+    # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
+    # VK even when K == V makes the shape identical; keep decode original.
     decode_enabled = (
-        backend("decode") != "triton"
+        not replayssm
+        and backend("decode") != "triton"
         and not lossy_decode
         and state.ndim == 4
         and state.shape[-2:] == (128, 128)
