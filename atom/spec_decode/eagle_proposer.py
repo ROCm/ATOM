@@ -373,9 +373,10 @@ class EagleProposer(Drafter):
         assert anchor_ids is not None
         anchor_ids = anchor_ids[:scheduled_bs]
 
-        # `positions` is the padded forward buffer; the target's own output row
-        # count is this batch's real token count, and all three inputs below
-        # have to agree on it.
+        # `positions` is the padded forward buffer, and on a token-graph replay
+        # `hidden_states` is the whole bucket: its scheduled rows are this
+        # batch's real tokens, and all three inputs below have to agree on them.
+        hidden_states = hidden_states[: context.scheduled_tokens]
         num_tokens = hidden_states.shape[0]
         aux_hidden_states = self.aux_for(hidden_states)
         draft_hidden = (
