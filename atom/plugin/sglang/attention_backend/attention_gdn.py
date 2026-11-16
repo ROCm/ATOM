@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -123,11 +124,14 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     return policy
 
 
-# (lengths, cu_seqlens data_ptr, tensor version) -> schedule.
+# (lengths, cu_seqlens data_ptr, tensor version) -> schedule, oldest first.
 # AITER binds the schedule to that exact offset tensor. Reuse only when the
 # same buffer is unchanged (CUDA-graph replay). A new eager batch rebuilds
 # from the host length list and does not read query_start_loc back to the host.
-_PREFILL_SCHEDULES: dict[tuple, object] = {}
+# Every schedule pins its offset tensor and a fresh eager batch never hits, so
+# keep only the most recent few, like FLA's `tensor_cache`.
+_PREFILL_SCHEDULES: OrderedDict[tuple, object] = OrderedDict()
+_PREFILL_SCHEDULES_MAX = 8
 
 
 def _host_prefill_lengths(forward_batch: Any, num_seqs: int) -> tuple[int, ...] | None:
@@ -181,6 +185,7 @@ def _flydsl_prefill_metadata(
     key = (lengths, int(query_start_loc.data_ptr()), int(query_start_loc._version))
     cached = _PREFILL_SCHEDULES.get(key)
     if cached is not None:
+        _PREFILL_SCHEDULES.move_to_end(key)
         return cached
     if capturing:
         # AITER refuses to build a schedule on the capturing stream. The eager
@@ -191,6 +196,8 @@ def _flydsl_prefill_metadata(
     metadata = build_prefill_metadata(lengths, query_start_loc)
     if metadata is not None:
         _PREFILL_SCHEDULES[key] = metadata
+        while len(_PREFILL_SCHEDULES) > _PREFILL_SCHEDULES_MAX:
+            _PREFILL_SCHEDULES.popitem(last=False)
     return metadata
 
 
