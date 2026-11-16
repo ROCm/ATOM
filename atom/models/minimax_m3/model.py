@@ -45,7 +45,11 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import (
+    swiglu_oai_quant_supported,
+    swiglu_oai_split,
+    swiglu_oai_split_quant,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -271,11 +275,25 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # The activation kernel can also quantize per token for a per-token FP8
+        # down_proj (bitwise its own quant). Whether down_proj takes per-token FP8
+        # is only known after online quantization re-quantizes it at load time,
+        # so forward checks that part.
+        self.swiglu_quant_supported = swiglu_oai_quant_supported(
+            intermediate_size // get_tensor_model_parallel_world_size(), dtypes.fp8
+        )
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        if self.swiglu_quant_supported and _linear_consumes_per_token_fp8(
+            self.down_proj
+        ):
+            act, act_scale = swiglu_oai_split_quant(
+                gate_up, self.swiglu_alpha, self.swiglu_beta, self.swiglu_limit
+            )
+            return self.down_proj(act, x_scale=act_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
