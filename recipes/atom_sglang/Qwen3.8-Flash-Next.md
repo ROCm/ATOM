@@ -3,8 +3,10 @@
 Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
 compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
 adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
-It requires the Native Flash implementation in this tree and SGLang 0.5.17.
-The recognition patch supplies Flash config registration for that version.
+It requires the Native Flash implementation in this tree and SGLang 0.5.17 or
+newer; CI and the SGLang release image (`docker/sglang_release.dockerfile`)
+use v0.5.22. The recognition patch supplies Flash config registration for
+these versions.
 
 `Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
 (query-sparse, 2048-token budget) attention layers, 4-stream
@@ -131,105 +133,33 @@ message size, so decode all-reduces stay exact. It perturbs prefill
 activations (max ~3% of a tensor's range per reduction), so validate accuracy
 on the target workload before enabling it.
 
-## Bursty prefix-hit prefill (scheduler settings)
+## Optional: bursty prefill on an idle server
 
-This section targets a burst of requests that reaches an idle server at once
-and shares a long cached prefix (8192-token prompts, 6080 of them a radix
-hit), served with TP2/EP2 and MTP. With default scheduler settings the first
-request is admitted alone, and consecutive-prefill overlap makes that batch
-wait on the next one, so the whole burst finishes later. The settings below
-change only environment variables and launch flags.
+When several requests reach an idle server at once and their prefill takes
+more than one batch, overlap scheduling launches the next prefill batch before
+it processes the results of the previous one. The first batch's requests then
+get their first token only after the next batch has also run. To process each
+prefill batch's results before the next prefill batch launches, add one
+variable to the MTP command above and keep all of its flags:
 
 ```bash
-export MODEL_PATH=/models/Qwen3.8-Flash-Next-PTPC-FP8
-export CUDA_VISIBLE_DEVICES=0,1
-export HIP_VISIBLE_DEVICES=0,1
-export SGLANG_PLUGINS=atom_sglang
-export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
-export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
-export SGLANG_USE_AITER=1
-export SGLANG_AITER_KV_CACHE_LAYOUT=nhd
-export AITER_MOE_PADDING_SIZE=128
-
-# Scheduler settings for bursty prefill
 export SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1
-export SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE=1
-export SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT=50
-export SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE=50
-export SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY=50
-
-python -m sglang.launch_server \
-  --model-path "$MODEL_PATH" --trust-remote-code \
-  --host 127.0.0.1 --port 8000 \
-  --tp 2 --ep-size 2 --attention-backend aiter \
-  --kv-cache-dtype bf16 --page-size 64 \
-  --context-length 16384 --max-running-requests 16 \
-  --chunked-prefill-size 8192 --mem-fraction-static 0.82 \
-  --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 16 \
-  --cuda-graph-backend-prefill disabled \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --sampling-defaults openai \
-  --scheduler-recv-interval 50
 ```
 
-What each setting does:
-
-* `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1`: when two prefill batches
-  run back to back, the scheduler processes the first batch's results before
-  launching the second, so the first batch no longer waits for the second.
-  This is the largest single gain and can be used on its own.
-* `--scheduler-recv-interval 50` with the recv-skipper weights: each
-  scheduler iteration adds the weight of the previous batch's mode, and the
-  scheduler polls for new requests once the sum reaches 50. With the idle
-  weight at 1, an idle server polls about every 50 iterations, so requests of
-  one burst are collected into the same first batch. The other weights are
-  set to 50, so extend, decode and target-verify iterations still poll on
-  every iteration. On MI308X an idle iteration takes about 110-120 us, so the
-  window is about 6 ms: the delay until the scheduler sees the first request
-  averaged 4.1 ms (max 7.1 ms), against 1.2 ms by default.
-* `--chunked-prefill-size` stays at 8192.
-
-Median TTFT (ms), default vs recommended, 2x MI308X (gfx942), SGLang 0.5.22:
-
-| Concurrency | Default | Overlap off only | Recommended | Change |
-|---|---|---|---|---|
-| 1 | 233 | 228 | 235 | +1% |
-| 2 | 483 | 348 | 303 | -37% |
-| 4 | 620 | 621 | 512 | -17% |
-| 8 | 1118 | 919 | 786 | -30% |
-| 16 | 1893 | 1437 | 1366 | -28% |
-
-Measurement protocol: requests are sent as `input_ids`. Each wave first sends
-one `max_new_tokens=1` request with the 6080-token shared prefix, then after
-0.5 s (plus 0-50 ms jitter for the recommended runs) sends N concurrent
-8192-token requests, each with a distinct suffix, `temperature=0`,
-`ignore_eos` and `max_new_tokens=1`. Every request is checked for
-`meta_info.cached_tokens == 6080`. Numbers are from warm runs (3 waves for
-default, 6 for recommended; 10 waves at concurrency 1). P99 TTFT and the KV
-pool size are unchanged. With default settings the burst is split as `1+3`
-at concurrency 4, `1+4+4` at 8 and `1+4+5+5+4` at 16. Each prefill batch costs
-about 195 ms of fixed overhead, plus about 51 us per token above roughly
-4-5K tokens.
-
-Notes:
-
-* Unlike the MTP configuration above, this one keeps the radix cache on,
-  since the workload depends on prefix hits. The measurements cover TTFT
-  only; see Boundaries for what validation covers.
-* The collection window is counted in idle scheduler iterations, not in
-  time, so its length varies with the host and the load.
-* The gain applies only to requests that arrive together. Steady or spread
-  arrivals do not benefit.
-* A larger chunk does not help: `--chunked-prefill-size 16384` gave a
-  2026 ms median at concurrency 16 with 5.5 GiB more peak memory, and 32768
-  gave 1992 ms with 7.4 GiB more peak memory and a slightly smaller KV pool.
-* The prefill delayer and `--min-free-slots-delay` only act while requests
-  are running, so they do not trigger on an idle server.
-  `--disable-overlap-schedule` matches the overlap-off TTFT but also makes
-  decode synchronous. `--prefill-max-requests` limits batches by request
-  count, which depends on the load, and made P99 worse.
+* It only changes back-to-back prefill (extend) batches. Decode and
+  target-verify batches keep overlap scheduling. Unlike
+  `--disable-overlap-schedule`, decode stays asynchronous.
+* It helps only when prefill batches run back to back, for example a burst
+  that does not fit in one batch. A short request that arrives alone sees no
+  change.
+* SGLang notes that this setting may slightly hurt throughput. Every pair of
+  back-to-back prefill batches loses overlap, including the chunks of one
+  long prompt. Measure steady-load throughput on the target workload before
+  enabling it.
+* The recv-skipper settings (`--scheduler-recv-interval` with
+  `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_*`) can also gather a burst into one
+  batch. They are not recommended here: the window counts scheduler
+  iterations rather than time, so its length depends on the host and the load.
 
 ## Benchmark
 
@@ -255,4 +185,6 @@ python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30080 \
   parallel sizes and speculative horizons.
 - On a SGLang upgrade, review recognition and MTP EntryClass mapping separately.
   Upstream Flash recognition does not replace Native ATOM compute or the
-  plugin's graph padding and post-draft metadata refresh contracts.
+  plugin's graph padding and post-draft metadata refresh contracts. Also check
+  that `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP`, an internal SGLang
+  scheduler variable, still exists and keeps the same meaning.
