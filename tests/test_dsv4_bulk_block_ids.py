@@ -360,3 +360,28 @@ def test_failure_before_any_launch_frees_the_lease_and_after_one_keeps_it(
     assert [lease.state for lease in codec._metadata_tls.pool.leases][-1] == (
         "quarantined"
     )
+
+
+def test_failed_id_upload_frees_its_lease_once_the_upload_completes(
+    contract, monkeypatch
+):
+    import atom.kv_transfer.offload.hybrid.dsv4.codec as codec_module
+
+    class DoneEvent:
+        def record(self, stream):
+            assert stream is contract.stream
+
+        def query(self):
+            return True
+
+    class FailingUpload(codec_module.CpuGpuBuffer):
+        def copy_to_gpu(self, n):
+            raise RuntimeError("upload failed")
+
+    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
+    monkeypatch.setattr(codec_module, "CpuGpuBuffer", FailingUpload)
+    for _ in range(6):  # more than the pool holds: none may stay quarantined
+        with pytest.raises(RuntimeError, match="upload failed"):
+            _prepare(contract, [[[1], [2]]])
+    pool = contract.codec._metadata_tls.pool
+    assert [lease.state for lease in pool.leases] == ["pending"]

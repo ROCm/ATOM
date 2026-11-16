@@ -674,7 +674,16 @@ class DSV4PageSlotCodec:
                         metadata_lease.buffer.np[: len(ids)] = ids
                         device_ids = metadata_lease.buffer.copy_to_gpu(len(ids))
                     except BaseException:
-                        pool.retire(metadata_lease, safe=False)
+                        # No kernel reads the IDs yet: an event after the
+                        # (possibly part-enqueued) upload frees the lease once
+                        # it completes. Only a failed record quarantines it.
+                        try:
+                            event = torch.cuda.Event()
+                            event.record(stream)
+                        except BaseException:
+                            pool.retire(metadata_lease, safe=False)
+                        else:
+                            pool.retire(metadata_lease, completion=event, safe=True)
                         raise
         return _PreparedBlockIdGroups(
             self,

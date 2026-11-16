@@ -60,6 +60,9 @@ class MetadataLeasePool:
                     # Any uncertain GPU work stays retained.
                     lease.state = "quarantined"
                     _QUARANTINED_STORAGE.append(lease.buffer)
+        # The loop variable must not keep a dropped free buffer alive while its
+        # larger replacement is allocated.
+        lease = None
         reusable = [x for x in self.leases if x.state == "free" and x.capacity >= count]
         if reusable:
             lease = min(reusable, key=lambda x: x.capacity)
