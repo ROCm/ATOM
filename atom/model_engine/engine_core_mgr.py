@@ -785,6 +785,12 @@ class CoreManager:
                         )
                         continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
+                        self.outputs_queue.put_nowait(
+                            RuntimeError(
+                                f"{self.label}: the engine core of DP rank "
+                                f"{dp_rank} shut down"
+                            )
+                        )
                         self._engine_failed.set()
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"

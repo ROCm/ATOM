@@ -22,12 +22,15 @@ import pathlib
 import pickle
 import unittest
 import uuid
+from threading import Thread
 from types import SimpleNamespace
 
 import zmq
 
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.llm_engine import LLMEngine
+from atom.sampling_params import SamplingParams
 
 MODULE_PATH = pathlib.Path(CoreManager.__module__.replace(".", "/") + ".py")
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / MODULE_PATH
@@ -85,6 +88,36 @@ def _bare_manager(cls, **kwargs):
     return mgr
 
 
+class _GeneratingEngine:
+    """The real `LLMEngine.generate` over a manager, with one request pending."""
+
+    generate = LLMEngine.generate
+    step = LLMEngine.step
+    is_finished = LLMEngine.is_finished
+
+    def __init__(self, core_mgr):
+        self.core_mgr = core_mgr
+        self.io_processor = SimpleNamespace(has_pending_requests=lambda: True)
+
+    def add_request(self, *args, **kwargs):
+        pass
+
+
+def _start_generate(mgr):
+    """`generate` on a daemon thread, so a hang fails the test, not the run."""
+    errors = []
+
+    def run():
+        try:
+            _GeneratingEngine(mgr).generate(["a"], SamplingParams())
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    thread = Thread(target=run, daemon=True)
+    thread.start()
+    return thread, errors
+
+
 class OutputThreadStateTest(unittest.TestCase):
     """Fields the output thread reads must exist before the thread starts."""
 
@@ -132,6 +165,37 @@ class OutputThreadStateTest(unittest.TestCase):
         finally:
             sender.close(linger=0)
 
+    def test_generate_raises_when_the_engine_reports_failure(self):
+        mgr = self.managers[0]
+        # The engine core outlives the runners that died, as it did on GPU.
+        mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)]
+        mgr._shutdown_engine_core_rank = lambda rank: None
+        url = f"inproc://generate-{uuid.uuid4().hex}"
+        receiver = mgr.ctx.socket(zmq.PULL)
+        receiver.bind(url)
+        sender = mgr.ctx.socket(zmq.PUSH)
+        sender.connect(url)
+        mgr._create_output_thread(0, receiver, url + "-shutdown").start()
+        try:
+            thread, errors = _start_generate(mgr)
+            sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive(), "generate waits on a failed engine")
+            self.assertIn("DP rank 0", str(errors[0]))
+        finally:
+            sender.close(linger=0)
+
+    def test_generate_raises_when_a_core_dies_unreported(self):
+        mgr = self.managers[0]
+        mgr.engine_core_processes = [
+            SimpleNamespace(is_alive=lambda: True),
+            SimpleNamespace(is_alive=lambda: False),
+        ]
+        thread, errors = _start_generate(mgr)
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive(), "generate waits on a dead core")
+        self.assertIn("unfinished", str(errors[0]))
+
     def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
         # Off by default: online front ends take every output through the
         # callbacks, and a queued Sequence would stay for the process's life.
@@ -157,9 +221,9 @@ class OutputThreadStateTest(unittest.TestCase):
                 sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
-                self.assertEqual(
-                    mgr.outputs_queue.qsize(), 1 if keep or asyncio_mode else 0
-                )
+                queued = list(mgr.outputs_queue.queue)
+                self.assertEqual(queued[:-1], [seqs] if keep or asyncio_mode else [])
+                self.assertIsInstance(queued[-1], RuntimeError)
             finally:
                 sender.close(linger=0)
 

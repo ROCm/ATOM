@@ -277,9 +277,9 @@ class LLMEngine:
         with self.core_mgr.offline_backpressure_batch():
             self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
-        while not self.is_finished() and (
-            self.core_mgr.is_alive() or self.core_mgr.is_rest()
-        ):
+        while not self.is_finished():
+            if not (self.core_mgr.is_healthy() or self.core_mgr.is_rest()):
+                raise RuntimeError("the engine stopped with requests unfinished")
             seqs = self.step()
             outs = self.io_processor.postprocess(seqs)
             outputs.update(outs)
@@ -302,9 +302,9 @@ class LLMEngine:
                 multimodal_data_list=multimodal_data_list,
             )
         outputs = {}
-        while not self.is_finished() and (
-            self.core_mgr.is_alive() or self.core_mgr.is_rest()
-        ):
+        while not self.is_finished():
+            if not (self.core_mgr.is_healthy() or self.core_mgr.is_rest()):
+                raise RuntimeError("the engine stopped with requests unfinished")
             seqs = self.step()
             outs = self.io_processor.postprocess(seqs)
             outputs.update(outs)
