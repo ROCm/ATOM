@@ -13,11 +13,12 @@ where the same CTA sums the ranks' partials in rank order in fp32 -- AITER's
 custom all-reduce's arithmetic -- and pushes the sum to every rank, whose CTA
 ``b`` lands it in the output.
 
-Each push is an 8 B pair -- a BF16 pair and the launch's epoch -- stored at
-system scope, polled until the tag is current: no fence, no barrier between
-the CTAs. Epochs are ``k2_allreduce_gfx1250``'s counters, so a launch of
-either kernel takes the next epoch; regions of epoch ``e`` live in bank
-``e & 1``.
+Each push is a 16 B line -- one BF16 column pair of three consecutive tokens
+and the launch's epoch -- stored at system scope, polled until the tag is
+current: no fence, no barrier between the CTAs. A CTA stages its pairs in LDS
+to cut them into lines; the last token triple's spare tokens carry zeros.
+Epochs are ``k2_allreduce_gfx1250``'s counters, so a launch of either kernel
+takes the next epoch; regions of epoch ``e`` live in bank ``e & 1``.
 """
 
 from dataclasses import dataclass
@@ -25,9 +26,8 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
-from flydsl.expr.typing import Int32, Int64, T, as_ir_value
+from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
@@ -72,10 +72,19 @@ def own_pairs(tp: int) -> int:
     return HIDDEN // tp // 2
 
 
+# a line: three tokens' BF16 pair of one column pair, then the epoch
+LINE_TOKENS = 3
+LINE_WORDS = LINE_TOKENS + 1
+
+
+def triples(rows: int) -> int:
+    return -(-rows // LINE_TOKENS)
+
+
 def bank_words(tp: int, rows: int) -> int:
-    """A bank: the partials ``[source rank][row][owned pair]``, then the sums
-    ``[row][pair]``, two words a pair."""
-    return 2 * (tp * rows * own_pairs(tp) + rows * HIDDEN // 2)
+    """A bank: the partials ``[source rank][token triple][owned pair]``, then
+    the sums ``[token triple][pair]``, a line each."""
+    return LINE_WORDS * triples(rows) * (tp * own_pairs(tp) + HIDDEN // 2)
 
 
 def oproj_peer_bytes(tp: int, rows: int) -> int:
@@ -92,23 +101,13 @@ class K2OprojAllReduceKernel:
     launch_count: int = 1
 
 
-def _store_pair_sys(address, pair):
-    llvm.InlineAsmOp(
-        None,
-        [as_ir_value(fx.Int64(address)), as_ir_value(pair)],
-        "global_store_b64 $0, $1, off scope:SCOPE_SYS",
-        "v,v",
-        has_side_effects=True,
-    )
-
-
-def _load_pairs(mine, words):
+def _load_lines(mine, words):
     return [
         fx.Vector(
             bo.buffer_load(
                 mine,
                 word,
-                vec_width=2,
+                vec_width=LINE_WORDS,
                 dtype=T.i32,
                 cache_modifier=ar.SCOPE_SYS | ar.VOLATILE,
             )
@@ -117,23 +116,23 @@ def _load_pairs(mine, words):
     ]
 
 
-def _stale(pairs, epoch):
+def _stale(lines, epoch):
     stale = None
-    for pair in pairs:
-        late = fx.Int32(pair[1]) != epoch
+    for line in lines:
+        late = fx.Int32(line[LINE_TOKENS]) != epoch
         stale = late if stale is None else stale | late
     return stale
 
 
 @traced
-def _poll_pairs(mine, words, epoch):
-    """The pairs at ``words`` of this rank's region once all carry ``epoch``,
-    re-loaded together while any is stale."""
-    pairs = _load_pairs(mine, words)
-    while _stale(pairs, epoch):
+def _poll_lines(mine, words, epoch):
+    """The lines at ``words`` of this rank's region once all carry ``epoch``,
+    re-loaded together while any is stale, as their tokens' pair words."""
+    lines = _load_lines(mine, words)
+    while _stale(lines, epoch):
         spin_pause()
-        pairs = _load_pairs(mine, words)
-    return [fx.Int32(pair[0]) for pair in pairs]
+        lines = _load_lines(mine, words)
+    return [[fx.Int32(line[j]) for j in range(LINE_TOKENS)] for line in lines]
 
 
 def _sum_ranks(words):
@@ -147,68 +146,94 @@ def _sum_ranks(words):
     )
 
 
+def _sum_lines(lines):
+    """Every rank's line of the same pair, summed token by token."""
+    return [_sum_ranks([line[j] for line in lines]) for j in range(LINE_TOKENS)]
+
+
 @traced
-def _push_partial(live, address, pair):
+def _push_line(live, address, words, epoch):
     if live:
-        _store_pair_sys(address, pair)
+        ar._store_line_sys(address, fx.Vector.from_elements([*words, epoch], fx.Int32))
+
+
+@traced
+def _store_out(live, out, word, value):
+    if live:
+        bo.buffer_store(value, rsrc(out), word)
+
+
+def _land_line(live, out, rows, triple, column_pair, words):
+    for j in range(LINE_TOKENS):
+        token = triple * LINE_TOKENS + j
+        _store_out(
+            live & (token < rows), out, token * (HIDDEN // 2) + column_pair, words[j]
+        )
 
 
 @traced
 def _reduce_share(mine, bases, rank, rows, tp, own, bank, epoch, bid, tid):
-    """This CTA's share of the columns this rank owns, ``[row][owned pair]``
+    """This CTA's share of the lines this rank owns, ``[triple][owned pair]``
     dealt evenly to the grid: every rank's partials summed and pushed to every
     rank."""
-    items = rows * own
+    count = triples(rows)
+    items = count * own
     per_cta = -(-items // CTAS)
-    sums_base = bank + 2 * tp * rows * own
+    sums_base = bank + LINE_WORDS * tp * count * own
     picks = []
     for k in range_constexpr(-(-per_cta // SUM_THREADS)):
         index = tid + k * SUM_THREADS
         item = fx.min(bid * per_cta + index, items - 1)
         picks.append(((index < per_cta) & (bid * per_cta + index < items), item))
     words = [
-        bank + 2 * ((p * rows + item // own) * own + item % own)
+        bank + LINE_WORDS * ((p * count + item // own) * own + item % own)
         for _, item in picks
         for p in range(tp)
     ]
-    partials = _poll_pairs(mine, words, epoch)
+    partials = _poll_lines(mine, words, epoch)
     for k, (live, item) in enumerate(picks):
-        total = _sum_ranks(partials[k * tp : (k + 1) * tp])
-        token = item // own
+        totals = _sum_lines(partials[k * tp : (k + 1) * tp])
         column_pair = rank * own + item % own
-        at = fx.Int64(sums_base + 2 * (token * (HIDDEN // 2) + column_pair)) * 4
-        out_pair = fx.Vector.from_elements([total, epoch], fx.Int32)
+        at = (
+            fx.Int64(
+                sums_base + LINE_WORDS * (item // own * (HIDDEN // 2) + column_pair)
+            )
+            * 4
+        )
         for base in bases:
-            _push_partial(live, base + at, out_pair)
+            _push_line(live, base + at, totals, epoch)
 
 
 @traced
 def _reduce_owned(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
     """This CTA's own columns on the rank owning them: every rank's partials
     summed, pushed to every rank and landed here directly."""
-    rounds = -(-rows * CTA_PAIRS // THREADS)
+    count = triples(rows)
+    rounds = -(-count * CTA_PAIRS // THREADS)
     first = (bid * CTA_COLUMNS - rank * own * 2) // 2
-    sums_base = bank + 2 * tp * rows * own
+    sums_base = bank + LINE_WORDS * tp * count * own
     items = []
     for k in range_constexpr(rounds):
-        item = fx.min(tid + k * THREADS, rows * CTA_PAIRS - 1)
+        item = fx.min(tid + k * THREADS, count * CTA_PAIRS - 1)
         items.append(
-            (tid + k * THREADS < rows * CTA_PAIRS, item // CTA_PAIRS, item % CTA_PAIRS)
+            (tid + k * THREADS < count * CTA_PAIRS, item // CTA_PAIRS, item % CTA_PAIRS)
         )
     words = [
-        bank + 2 * ((p * rows + token) * own + first + pair)
-        for _, token, pair in items
+        bank + LINE_WORDS * ((p * count + triple) * own + first + pair)
+        for _, triple, pair in items
         for p in range(tp)
     ]
-    partials = _poll_pairs(mine, words, epoch)
-    for k, (live, token, pair) in enumerate(items):
-        total = _sum_ranks(partials[k * tp : (k + 1) * tp])
+    partials = _poll_lines(mine, words, epoch)
+    for k, (live, triple, pair) in enumerate(items):
+        totals = _sum_lines(partials[k * tp : (k + 1) * tp])
         column_pair = bid * CTA_PAIRS + pair
-        at = fx.Int64(sums_base + 2 * (token * (HIDDEN // 2) + column_pair)) * 4
-        out_pair = fx.Vector.from_elements([total, epoch], fx.Int32)
+        at = (
+            fx.Int64(sums_base + LINE_WORDS * (triple * (HIDDEN // 2) + column_pair))
+            * 4
+        )
         for base in bases:
-            _push_partial(live, base + at, out_pair)
-        _store_out(live, out, token * (HIDDEN // 2) + column_pair, total)
+            _push_line(live, base + at, totals, epoch)
+        _land_line(live, out, rows, triple, column_pair, totals)
 
 
 @traced
@@ -230,28 +255,37 @@ def _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid):
 
 
 @traced
-def _store_out(live, out, word, value):
-    if live:
-        bo.buffer_store(value, rsrc(out), word)
+def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads):
+    """This CTA's columns from their owner's sums, on ``threads`` lanes."""
+    count = triples(rows)
+    rounds = -(-count * CTA_PAIRS // threads)
+    sums_base = bank + LINE_WORDS * tp * count * own
+    items = []
+    for k in range_constexpr(rounds):
+        item = fx.min(tid + k * threads, count * CTA_PAIRS - 1)
+        items.append(
+            (
+                tid + k * threads < count * CTA_PAIRS,
+                item // CTA_PAIRS,
+                bid * CTA_PAIRS + item % CTA_PAIRS,
+            )
+        )
+    sums = _poll_lines(
+        mine,
+        [
+            sums_base + LINE_WORDS * (triple * (HIDDEN // 2) + column_pair)
+            for _, triple, column_pair in items
+        ],
+        epoch,
+    )
+    for (live, triple, column_pair), words in zip(items, sums):
+        _land_line(live, out, rows, triple, column_pair, words)
 
 
 @traced
-def _land_sums(mine, out, rows, tp, own, bank, epoch, bid, tid, threads):
-    """This CTA's columns from their owner's sums, on ``threads`` lanes."""
-    rounds = -(-rows * CTA_PAIRS // threads)
-    sums_base = bank + 2 * tp * rows * own
-    items = []
-    for k in range_constexpr(rounds):
-        item = fx.min(tid + k * threads, rows * CTA_PAIRS - 1)
-        items.append(
-            (
-                tid + k * threads < rows * CTA_PAIRS,
-                item // CTA_PAIRS * (HIDDEN // 2) + bid * CTA_PAIRS + item % CTA_PAIRS,
-            )
-        )
-    sums = _poll_pairs(mine, [sums_base + 2 * word for _, word in items], epoch)
-    for (live, word), value in zip(items, sums):
-        _store_out(live, out, word, value)
+def _store_stage(live, address, word):
+    if live:
+        fx.ptr_store(word, address)
 
 
 def build_oproj_allreduce(
@@ -266,6 +300,8 @@ def build_oproj_allreduce(
     if HIDDEN % (tp * CTA_COLUMNS):
         raise ValueError(f"a rank's columns must be whole CTAs at TP{tp}")
     rows = plan.tokens
+    if triples(rows) * CTA_PAIRS > THREADS:
+        raise ValueError(f"the o_proj all-reduce cuts {rows} rows into a line a thread")
     tiles = (rows + ROWS - 1) // ROWS
     own = own_pairs(tp)
     words_a_bank = bank_words(tp, rows)
@@ -278,6 +314,8 @@ def build_oproj_allreduce(
             16,
         ]
         red: fx.Array[fx.Float32, 2 * tiles * ACCUMULATOR_WORDS, 16]
+        # the CTA's pairs ``[token][pair]``, cut into lines once all are in
+        stage: fx.Array[fx.Int32, triples(rows) * LINE_TOKENS * CTA_PAIRS, 16]
 
     name = f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}"
     sources = SOURCES
@@ -349,12 +387,35 @@ def build_oproj_allreduce(
                 .to(fx.BFloat16)
                 .bitcast(fx.Int32)[0]
             )
-            pair = (row0 - owner * (2 * own)) // 2 + task * ROWS // 2 + row_pair
-            at = fx.Int64(bank + 2 * ((rank * rows + token) * own + pair)) * 4
-            _push_partial(
+            _store_stage(
                 local_token < min(ROWS, rows - tile * ROWS),
-                owner_base + at,
-                fx.Vector.from_elements([word, epoch], fx.Int32),
+                lds.stage.ptr + token * CTA_PAIRS + task * ROWS // 2 + row_pair,
+                word,
+            )
+        # the last triple's spare tokens carry zeros
+        spare = (triples(rows) * LINE_TOKENS - rows) * CTA_PAIRS
+        if const_expr(spare > 0):  # noqa: SIM102
+            if tid < spare:
+                fx.ptr_store(fx.Int32(0), lds.stage.ptr + rows * CTA_PAIRS + tid)
+        gpu.barrier()
+        if tid < triples(rows) * CTA_PAIRS:
+            triple = tid // CTA_PAIRS
+            pair = tid % CTA_PAIRS
+            words = [
+                fx.ptr_load(
+                    lds.stage.ptr + (triple * LINE_TOKENS + j) * CTA_PAIRS + pair
+                )
+                for j in range(LINE_TOKENS)
+            ]
+            owned = (row0 - owner * (2 * own)) // 2 + pair
+            at = (
+                fx.Int64(
+                    bank + LINE_WORDS * ((rank * triples(rows) + triple) * own + owned)
+                )
+                * 4
+            )
+            ar._store_line_sys(
+                owner_base + at, fx.Vector.from_elements([*words, epoch], fx.Int32)
             )
         if const_expr(rows > SPREAD_ROWS):
             _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid)
