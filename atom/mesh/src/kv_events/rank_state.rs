@@ -32,7 +32,8 @@ pub enum Admit {
 
 #[derive(Debug, Clone, Default)]
 pub struct RankState {
-    /// The seq after the last batch applied; None before a stream's first.
+    /// The seq after the last batch applied; None before a stream's first, and after a lost
+    /// connection or a restart.
     next: Option<u64>,
     /// `ts` of the last batch applied.
     ts: f64,
