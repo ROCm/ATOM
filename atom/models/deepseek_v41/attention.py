@@ -458,9 +458,9 @@ class Attention(nn.Module):
     def _use_fused_attention(self, activation, cache, rope):
         """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
         the layer qualifies (`fused_attn`), the pool holds unpacked MXFP8 rows
-        and the residual activation and the 64-dimension RoPE tables are
-        BF16. Native and vLLM callers pass `hidden`; optional `hidden_fp8`
-        feeds only the QKV GEMM, which produces BF16 latents.
+        and the residual activation and RoPE tables are BF16. Each table row
+        has 32 paired entries for 64 rotary dimensions. Native and vLLM
+        callers pass the residual `hidden` as `activation`.
         A BF16 or packed pool, and every other case, keeps
         the unfused path."""
         return (
@@ -476,6 +476,25 @@ class Attention(nn.Module):
     def _use_a8w4_attention(self, query, cache):
         """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
         return cache.packed and supports_a8w4_attention(query, self.softmax_scale)
+
+    def _fused_output_buffers(self, rows, device):
+        """Allocate the MXFP8 planes owned by the caller's captured graph."""
+        group_dim = 8 * self.head_dim
+        values = torch.empty(
+            (rows, self.groups, group_dim), dtype=FP8_DTYPE, device=device
+        )
+        scales = torch.empty(
+            (rows, self.groups, group_dim // 32),
+            dtype=torch.float8_e8m0fnu,
+            device=device,
+        )
+        return values, scales
+
+    @staticmethod
+    def _zero_mxfp8(values, scales):
+        """Initialize an idle graph's MXFP8 planes: zero values, unit scales."""
+        values.view(torch.uint8).zero_()
+        scales.view(torch.uint8).fill_(127)
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -561,17 +580,8 @@ class Attention(nn.Module):
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
         if fused:
-            rows = query.shape[:-2].numel()
-            group_dim = 8 * self.head_dim
-            x_fp8 = torch.empty(
-                (rows, self.groups, group_dim),
-                dtype=FP8_DTYPE,
-                device=query.device,
-            )
-            x_scale = torch.empty(
-                (rows, self.groups, group_dim // 32),
-                dtype=torch.float8_e8m0fnu,
-                device=query.device,
+            x_fp8, x_scale = self._fused_output_buffers(
+                query.shape[:-2].numel(), query.device
             )
             self._attend(
                 query,
@@ -579,6 +589,7 @@ class Attention(nn.Module):
                 step,
                 queries,
                 rope=rope,
+                fused=True,
                 out=x_fp8,
                 # The eager recorder weak-refs bytes; vLLM may reject E8M0.
                 out_scale=x_scale.view(torch.uint8),
@@ -605,9 +616,9 @@ class Attention(nn.Module):
     @eager_region(live=_live_step)
     def _prepare_fused_attention_live(self, q, kv, qr, qr_scale, cache, step, rope):
         if not step.requests:
-            qr.view(torch.uint8).zero_()
-            qr_scale.fill_(127)
+            self._zero_mxfp8(qr, qr_scale)
             return
+        # q_out is written in place; keep the caller's graph-owned Q views.
         _, _, source, window = cache.norm_rope_quant_window(
             self.spec.layer_id,
             self.qk_norm,
@@ -672,21 +683,24 @@ class Attention(nn.Module):
         prepared=None,
         *,
         rope=None,
+        fused=False,
         out=None,
         out_scale=None,
     ):
         """Consume live sources in one of two output modes.
 
-        With `out` and `out_scale`, fill the caller's MXFP8 planes (including
-        inverse RoPE) and return None. Both buffers belong to the caller's
-        graph. Without them, return BF16 attention for `_project_out`.
+        `fused=True` writes inverse-rotated MXFP8 into the caller's `out` and
+        `out_scale` graph buffers and returns None. Otherwise return BF16
+        attention for `_project_out`.
         """
-        if out_scale is not None:
+        if fused:
+            assert out is not None and out_scale is not None
             out_scale = out_scale.view(torch.float8_e8m0fnu)
+        else:
+            assert out is None and out_scale is None
         if not step.requests:  # a dummy prefill on a token graph
-            if out is not None:
-                out.view(torch.uint8).zero_()
-                out_scale.view(torch.uint8).fill_(127)
+            if fused:
+                self._zero_mxfp8(out, out_scale)
                 return None
             return query
         if prepared is None:
@@ -703,7 +717,7 @@ class Attention(nn.Module):
         if cache.packed and not a8w4:
             pool = (pool, cache.ring_view(self.spec.layer_id))
         kwargs = {"out": flat_query}
-        if out is not None:
+        if fused:
             attend = fused_sparse_attn_v41_paged_2src
             attending = flat_query
             kwargs = {
@@ -763,4 +777,4 @@ class Attention(nn.Module):
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        return None if out is not None else output
+        return None if fused else output

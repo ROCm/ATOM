@@ -36,7 +36,6 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
-from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
 from atom.model_ops.engram.device.uva import uva_gather_into
@@ -565,8 +564,7 @@ def _attend_block(
     step = getattr(cache, "current_step", None) or _step
     fused = attn_out_scale is not None
     if fused and not step.requests:
-        attn_out.view(torch.uint8).zero_()
-        attn_out_scale.fill_(127)
+        self._zero_mxfp8(attn_out, attn_out_scale)
         return
     compressed = self._fork_compress(hidden, cache, step, rope)
     # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
@@ -701,16 +699,8 @@ def _forward(
             if queries is None
             else torch.Size((*hidden.shape[:-2], queries.rows.numel()))
         )
-        group_dim = 8 * self.head_dim
-        attn_out = torch.empty(
-            (leading_shape.numel(), self.groups, group_dim),
-            dtype=FP8_DTYPE,
-            device=hidden.device,
-        )
-        attn_out_scale = torch.empty(
-            (leading_shape.numel(), self.groups, group_dim // 32),
-            dtype=torch.float8_e8m0fnu,
-            device=hidden.device,
+        attn_out, attn_out_scale = self._fused_output_buffers(
+            leading_shape.numel(), hidden.device
         )
         # E8M0 output scales obey the same weak-ref restriction as input scales.
         scale_view_kwargs["attn_out_scale"] = attn_out_scale.view(torch.uint8)

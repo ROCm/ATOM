@@ -153,6 +153,7 @@ def make_step(
     *,
     position=None,
     prefill=True,
+    tentative=False,
     running_tokens=None,
     buffers=None,
     bounded=False,
@@ -189,6 +190,7 @@ def make_step(
         case.cache,
         requests,
         is_prefill=prefill,
+        tentative=tentative,
         running_bs=case.cache.num_slots,
         running_tokens=width,
         buffers=buffers,
@@ -334,8 +336,14 @@ def test_fused_verify_is_causal(fused_factory, monkeypatch, ratio, record_proper
     ring = case.cache.geometry.ring_slots
     position = case.context + (-case.context % ring) + ring - 2
     step, _ = make_step(
-        case, (5, 3), prefill=False, position=position, slot_order=(1, 0)
+        case,
+        (5, 3),
+        prefill=False,
+        tentative=True,
+        position=position,
+        slot_order=(1, 0),
     )
+    assert step.tentative and step.decode
     hidden = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
     changed = hidden.clone()
     changed[:, 4] = torch.randn_like(changed[:, 4]) * 4
@@ -608,6 +616,7 @@ def test_fused_dummy_initializes_both_output_planes(fused_factory):
         step,
         None,
         rope=case.rope,
+        fused=True,
         out=out.view(torch.float8_e4m3fn),
         out_scale=scale.view(torch.float8_e8m0fnu),
     )

@@ -1074,6 +1074,8 @@ class PagedAttentionCache:
         Returns `(qr, qr_scale)` as `qk_norm` does, then the KV pair
         `rope_quant_window(layer, None, ...)` returns: a decode stores its row,
         a prefill gets the extend rows and the window's `(values, scales)`.
+        With `q_out`, write into those caller-owned planes and return views
+        of the same storage; the caller can retain its original graph buffers.
         """
         dim = self.geometry.head_dim
         seam = (

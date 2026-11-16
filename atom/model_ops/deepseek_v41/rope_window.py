@@ -500,8 +500,9 @@ def _norm_rope_window_kernel(
     `BLOCK_KQ` head and a power-of-two tail rather than one padded tile.
 
     This extends AITER's dual latent RMSNorm with ATOM's window addressing.
-    AITER also has a dual-norm KV epilogue; this Triton path is retained for
-    its large-prefill throughput (Q1280/KV512, gfx950). Quantization reuses
+    Compared with `DualRMSNormMXFP8` followed by `rope_quant_window`, it
+    removes one launch and the intermediate BF16 KV write/read, preserving
+    the BF16 rounding before RoPE. Quantization reuses
     `_mxfp8_quant_op`; the KV chain shares `_quantized_values` and `_store_ring`
     with the unfused attention path.
     """

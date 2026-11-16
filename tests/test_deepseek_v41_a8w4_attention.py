@@ -318,6 +318,7 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
         _fork_select=Mock(),
         wq_b=Mock(return_value=query.flatten(-2)),
         _use_a8w4_attention=Mock(return_value=a8w4),
+        _use_fused_attention=Mock(return_value=False),
         _project_out=Mock(side_effect=lambda value, *args: value),
     )
     queries = (

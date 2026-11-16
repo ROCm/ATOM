@@ -26,7 +26,7 @@ retrained into noise within a month.
 import ast
 import hashlib
 import pathlib
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -41,7 +41,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
 CORE_PREPARE_DIGEST = "1f897780d89a3205"
-CORE_FORWARD_DIGEST = "c8458d062cc2e62e"
+CORE_FORWARD_DIGEST = "5e0b7a6b4b987668"
 
 
 @pytest.fixture
@@ -231,12 +231,13 @@ def core_attention():
         for node in ast.parse(CORE.read_text()).body
         if isinstance(node, ast.ClassDef) and node.name == "Attention"
     )
+    names = {"forward", "_attend", "_fused_output_buffers", "_zero_mxfp8"}
     functions = [
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"forward", "_attend"}
+        if isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    assert len(functions) == 2
+    assert {node.name for node in functions} == names
     for node in functions:
         node.decorator_list = []
     scope = {
@@ -290,6 +291,10 @@ def test_core_fused_output_scale_crosses_break_without_copy(core_attention, stag
         _project_quantized_out=Mock(),
     )
     step.attention_inputs = (False, None, kv, None)
+    attention._fused_output_buffers = MethodType(
+        core_attention._fused_output_buffers, attention
+    )
+    attention._zero_mxfp8 = core_attention._zero_mxfp8
     addresses = []
 
     def byte_only_boundary(*args, **kwargs):
@@ -338,6 +343,8 @@ def _core_forward() -> str:
         line.rstrip()
         for name in (
             "forward",
+            "_fused_output_buffers",
+            "_zero_mxfp8",
             "_prepare_fused_attention",
             "_prepare_fused_attention_live",
             "_prepare_attention",
@@ -481,12 +488,15 @@ def test_copied_model_and_staging_sources_have_not_drifted(
 
 
 @pytest.mark.parametrize("bounded", [False, True])
-def test_plugin_fused_forward_owns_both_output_planes(plugin_attention, bounded):
+def test_plugin_fused_forward_owns_both_output_planes(
+    plugin_attention, core_attention, bounded
+):
     calls = []
 
     class Attention:
         heads, head_dim, groups = 16, 64, 2
         _use_fused_attention = staticmethod(lambda *args: True)
+        _fused_output_buffers = core_attention._fused_output_buffers
 
         def _atom_v41_attend_block(self, *args, **kwargs):
             calls.append((args, kwargs))
@@ -627,12 +637,14 @@ def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
     cache.rope_quant_window.assert_not_called()
 
 
-def test_plugin_fused_idle_replay_initializes_both_planes(plugin_attention):
+def test_plugin_fused_idle_replay_initializes_both_planes(
+    plugin_attention, core_attention
+):
     values = torch.full((2, 1, 32), 255, dtype=torch.uint8).view(torch.float8_e4m3fn)
     scales = torch.full((2, 1, 1), 255, dtype=torch.uint8)
     cache = SimpleNamespace(current_step=SimpleNamespace(requests=()))
     plugin_attention._attend_block(
-        object(),
+        SimpleNamespace(_zero_mxfp8=core_attention._zero_mxfp8),
         values,
         None,
         None,
