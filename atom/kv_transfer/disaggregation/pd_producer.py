@@ -14,7 +14,6 @@ from atom.kv_transfer.disaggregation.factory import (
     KVConnectorFactory,
 )
 from atom.kv_transfer.disaggregation.types import DEFAULT_SHARDED_STAGING_WORKERS
-from atom.utils import envs
 
 # Connectors that push KV across the P/D boundary. Offload backends are not
 # producers even when ``kv_role`` is omitted (they default to ``offload``).
@@ -117,7 +116,12 @@ def pd_producer_configured(config) -> bool:
 
 
 def mooncake_pd_producer_configured(config) -> bool:
-    return bool(_producer_connectors(config, _MOONCAKE_CONNECTORS))
+    return bool(mooncake_producer_connectors(config))
+
+
+def mooncake_producer_connectors(config) -> tuple[dict, ...]:
+    """Configured ``kv_producer`` entries of the Mooncake connector."""
+    return _producer_connectors(config, _MOONCAKE_CONNECTORS)
 
 
 def index_staging_pool_size(config) -> int:
@@ -165,55 +169,12 @@ def staging_pool_bytes(num_send_workers: int) -> int:
 
 
 def staging_slot_count(
-    num_send_workers: int, slot_bytes: int, *, reserve_bytes: int | None = None
+    num_send_workers: int, slot_bytes: int, *, reserve_bytes: int
 ) -> int:
     """KV staging slots for one producer: one per send worker, within its reserve.
 
-    ``reserve_bytes`` is the connector's actual KV budget reservation; callers
-    without an allocation use the configured worker-count budget. Wider slots
-    get fewer slots, or none, rather than outgrow the reserved memory.
+    ``reserve_bytes`` is the connector's actual KV budget reservation. Wider
+    slots get fewer slots, or none, rather than outgrow the reserved memory.
     """
 
-    if reserve_bytes is None:
-        reserve_bytes = staging_pool_bytes(num_send_workers)
     return min(num_send_workers, reserve_bytes // slot_bytes)
-
-
-def plain_mla_model(config) -> bool:
-    """Whether ``config``'s model keeps plain MLA KV, all MLA staging handles.
-
-    One latent row per token and no per-request state (``Family.MLA``), which
-    is what the producer stages and a DCP consumer lands. DeepSeek-V4 carries
-    a ``kv_lora_rank`` too (its V3 schema defaults one) but is its own family,
-    and the MLA hybrids register slot regions, which both paths skip, so
-    reserving for either would hold back HBM nothing uses.
-    """
-
-    hf_config = getattr(config, "hf_config", None)
-    if hf_config is None:
-        return False
-    # Local import: config-time callers must not import transformers early.
-    from atom.utils import get_hf_text_config
-    from atom.utils.selector import Family, attn_family
-
-    return attn_family(get_hf_text_config(hf_config)) == Family.MLA
-
-
-def mla_staging_reserve_bytes(config) -> int:
-    """HBM to hold back from the KV budget for Mooncake MLA staging pools.
-
-    An upper bound of what ``MooncakeConnector`` allocates after the KV cache
-    is sized: every Mooncake producer entry on a plain MLA model without
-    producer DCP gets ``staging_pool_bytes``, which its slots fit into.
-    """
-
-    if (
-        not envs.ATOM_PD_MLA_STAGING
-        or getattr(config, "decode_context_parallel_size", 1) > 1
-        or not plain_mla_model(config)
-    ):
-        return 0
-    return sum(
-        staging_pool_bytes(send_worker_count(connector))
-        for connector in _producer_connectors(config, _MOONCAKE_CONNECTORS)
-    )

@@ -15,11 +15,52 @@ from atom.kv_transfer.disaggregation.mooncake.landing import (
     LANDING_SLOT_BYTES,
 )
 from atom.kv_transfer.disaggregation.pd_producer import (
-    mla_staging_reserve_bytes,
-    plain_mla_model,
+    mooncake_producer_connectors,
+    send_worker_count,
+    staging_pool_bytes,
 )
 from atom.kv_transfer.disaggregation.transfer_plan import TOKEN_UNITS
 from atom.utils import envs, get_hf_text_config
+
+
+def plain_mla_model(config) -> bool:
+    """Whether ``config``'s model keeps plain MLA KV, all MLA staging handles.
+
+    One latent row per token and no per-request state (``Family.MLA``), which
+    is what the producer stages and a DCP consumer lands. DeepSeek-V4 carries
+    a ``kv_lora_rank`` too (its V3 schema defaults one) but is its own family,
+    and the MLA hybrids register slot regions, which both paths skip, so
+    reserving for either would hold back HBM nothing uses.
+    """
+
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is None:
+        return False
+    # Local import: config-time callers must not import transformers early.
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
+
+    return attn_family(get_hf_text_config(hf_config)) == Family.MLA
+
+
+def mla_staging_reserve_bytes(config) -> int:
+    """HBM to hold back from the KV budget for Mooncake MLA staging pools.
+
+    An upper bound of what ``MooncakeConnector`` allocates after the KV cache
+    is sized: every Mooncake producer entry on a plain MLA model without
+    producer DCP gets ``staging_pool_bytes``, which its slots fit into.
+    """
+
+    if (
+        not envs.ATOM_PD_MLA_STAGING
+        or getattr(config, "decode_context_parallel_size", 1) > 1
+        or not plain_mla_model(config)
+    ):
+        return 0
+    return sum(
+        staging_pool_bytes(send_worker_count(connector))
+        for connector in mooncake_producer_connectors(config)
+    )
 
 
 def mla_landing_configured(config) -> bool:
