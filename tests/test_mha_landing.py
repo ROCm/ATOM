@@ -306,11 +306,12 @@ def test_page_capacity_fallback_preserves_bytes_and_completion(
 
 
 @pytest.mark.parametrize("rank", range(4))
-def test_a_retired_pool_sends_the_head_slices_directly(rank):
-    """Another transfer's uncertain write retired the pool after this one chose
-    to stage: every head slice still arrives, through direct writes."""
+def test_a_quarantined_pool_sends_the_head_slices_directly(rank):
+    """Every staging slot sits out an uncertain write's hold after this transfer
+    chose to stage: every head slice still arrives, through direct writes."""
     h = Harness(LAST, rank)
-    h.c._kv_staging_slots.fail(RuntimeError("another transfer's write"))
+    pool = h.c._kv_staging_slots
+    pool.quarantine(pool.acquire_or_none(), 60)
     assert h.send([3, 1, 2], [2, 0, 3])
     h.check([3, 1, 2], [2, 0, 3])
     assert h.ready == []

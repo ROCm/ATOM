@@ -3357,7 +3357,7 @@ class MooncakeConnector(KVConnectorBase):
                         kv_cache_ready_event,
                         engine=engine,
                     )
-                except _StagingRetired:
+                except _StagingUnavailable:
                     # The direct descriptors below write every head slice;
                     # units already landed get the same bytes again.
                     pass
