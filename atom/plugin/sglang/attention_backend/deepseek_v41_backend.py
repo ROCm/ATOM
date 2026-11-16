@@ -202,19 +202,17 @@ class ATOMDeepseekV41BackendForSgl(AttentionBackend):
                 f"drafts, not a pool of {speculative}"
             )
         width = V41_DSPARK_VERIFY_TOKENS
-        builder = self._dspark_graph_preamble("verify", width, max_bs, max_num_tokens)
+        self._dspark_graph_preamble("verify", width, max_bs, max_num_tokens)
         # Arena identity, device Engram, plane score workspace, builder and
         # capture-slot capacity.
         check_deepseek_v41_graph_capacity(
             pool, self.req_to_token_pool.req_to_token, max_bs, max_num_tokens
         )
-        if getattr(builder, "_decoder_replays", False):
-            # A replaying step's draft context is its tail's; the verify's
-            # in-graph context write assumes every row ran.
-            raise NotImplementedError(
-                "DeepSeek-V4.1 DSpark verify graphs need decoder SWA bounded "
-                "replay off (ATOM_SGLANG_V41_DECODER_REPLAY)"
-            )
+        # Under decoder SWA bounded replay a verify still runs every row: only
+        # a prefill publishes a decoder tail (`_publish_decoder`), and a
+        # verify is staged as a tentative non-prefill step, so its in-graph
+        # draft context write takes every row it ran
+        # (`stage_deepseek_v41_verify_replay` refuses a replaying step).
         # The verify graph records the draft's context-KV write: build the
         # fused weights it reads outside any capture.
         self._require_not_capturing()

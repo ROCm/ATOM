@@ -2293,6 +2293,26 @@ class TestDSparkUnderTheReplay:
         assert world.sides == [] and not world.pool.state_gen.any()
         assert radix._STATS["steps"] == 0
 
+    def test_the_seam_leaves_a_deferred_decode_round_alone(
+        self, monkeypatch, radix_fused
+    ):
+        """`dspark_deferred_seq_lens_patch` leaves a DSpark decode round's
+        host ``seq_lens_cpu`` / ``seq_lens_sum`` None until its verify: the
+        seam decides on the mode alone and never reads them (a prefill keeps
+        upstream's resolve, so an EXTEND always has them)."""
+
+        class _Deferred(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name in ("seq_lens_cpu", "seq_lens_sum", "prefix_lens"):
+                    pytest.fail(f"the seam read {name} of a decode round")
+                return super().__getattribute__(name)
+
+        world = _World(monkeypatch)
+        for mode in (DECODE, VERIFY):
+            batch = _Deferred(forward_mode=mode, spec_algorithm="DSPARK")
+            assert run_v41_prefix_replay(world.worker, batch) is None
+        assert world.sides == [] and radix._STATS["steps"] == 0
+
     def test_dspark_prefill_hit_rides_in_its_step(self, monkeypatch, radix_fused):
         """SGLang's ``DSparkWorkerV2._forward_prefill`` hands the target
         worker the EXTEND ``ScheduleBatch`` (FULL capture): the seam plans the

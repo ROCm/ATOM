@@ -241,23 +241,30 @@ class TestAdapterRouting:
         )
         assert resolve_model_arch_spec(nextn)[0] == "DeepseekV4ForCausalLMNextN"
 
-    def test_decoder_replay_is_off_under_dspark(self, monkeypatch):
-        # DSpark's taps and draft context write read every row of the plain
-        # backbone; the no-spec target keeps replay on as natively.
+    def test_decoder_replay_is_on_under_dspark_with_a_kill_switch(self, monkeypatch):
+        # As natively: the draft context comes from the tail's rows
+        # (`finish_forward`). ATOM_SGLANG_V41_DSPARK_DECODER_REPLAY=0 turns it
+        # off for DSpark only; ATOM_SGLANG_V41_DECODER_REPLAY=0 everywhere.
         from atom.plugin.sglang.runtime.model_arch import (
             _deepseek_v41_decoder_replays,
         )
 
         monkeypatch.delenv("ATOM_SGLANG_V41_DECODER_REPLAY", raising=False)
+        monkeypatch.delenv(bridge.V41_DSPARK_DECODER_REPLAY_ENV, raising=False)
         plain = SimpleNamespace(speculative_config=None, hf_config=_atom_text_v41())
         dspark = SimpleNamespace(
             speculative_config=SimpleNamespace(method="dspark"),
             hf_config=_atom_text_v41(),
         )
         assert _deepseek_v41_decoder_replays(plain) is True
+        assert _deepseek_v41_decoder_replays(dspark) is True
+        monkeypatch.setenv(bridge.V41_DSPARK_DECODER_REPLAY_ENV, "0")
+        assert _deepseek_v41_decoder_replays(plain) is True
         assert _deepseek_v41_decoder_replays(dspark) is False
+        monkeypatch.delenv(bridge.V41_DSPARK_DECODER_REPLAY_ENV)
         monkeypatch.setenv("ATOM_SGLANG_V41_DECODER_REPLAY", "0")
         assert _deepseek_v41_decoder_replays(plain) is False
+        assert _deepseek_v41_decoder_replays(dspark) is False
 
     @pytest.mark.skipif(not HAVE_CHECKPOINT, reason="V4.1-Flash checkpoint absent")
     def test_real_checkpoint_configs(self):
@@ -1245,6 +1252,40 @@ def test_markov_adapter_matches_atom_head(monkeypatch):
     assert torch.equal((base + bias).argmax(-1), out)
 
 
+def test_markov_w2_cache_is_the_cast_and_refreshes_in_place():
+    from atom.models.dspark_draft import DSparkMarkovHead
+    from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+        ATOMV41MarkovHeadAdapter,
+    )
+
+    torch.manual_seed(0)
+    head = DSparkMarkovHead(50, 8)
+    with torch.no_grad():
+        head.markov_w1.weight.normal_()
+        head.markov_w2.weight.copy_(torch.randn(50, 8).bfloat16().float())
+    head.to(torch.bfloat16)
+    adapter = ATOMV41MarkovHeadAdapter(head)
+    cache = adapter.refresh_w2_cache()
+    assert cache.dtype == torch.float32 and cache.is_contiguous()
+    assert torch.equal(cache, head.markov_w2.weight.float())
+    prev = torch.tensor([3, 17, 42])
+    bias, _ = adapter.step_bias(prev, hidden_states=None, state=None)
+    # Bit-identical to ATOM's per-step cast.
+    assert torch.equal(bias, head(prev)[0])
+    # A reload in place (the loader copies into the parameter) refreshes the
+    # same storage: a captured draft graph keeps reading valid values.
+    with torch.no_grad():
+        head.markov_w2.weight.mul_(2)
+    again = adapter.refresh_w2_cache()
+    assert again is cache and torch.equal(again, head.markov_w2.weight.float())
+    # A replaced parameter is noticed on the next eager step.
+    head.markov_w2.weight = torch.nn.Parameter(torch.randn(50, 8).bfloat16())
+    bias, _ = adapter.step_bias(prev, hidden_states=None, state=None)
+    assert torch.equal(bias, head(prev)[0])
+    assert adapter.__dict__["_w2_src"] == head.markov_w2.weight.data_ptr()
+    assert list(adapter.parameters()) == []
+
+
 # ---------------------------------------------------------------------------
 # Draft wrapper contract (no model construction)
 # ---------------------------------------------------------------------------
@@ -1430,6 +1471,93 @@ def target_forward(monkeypatch):
         drafter, "get_forward_context", lambda: SimpleNamespace(context=context)
     )
     return context
+
+
+def _plan(lengths, *, window, running_bs):
+    """A `ReplayPlan`'s row fields, laid out by native's own
+    `tail_spans` / `lay_out_tail` for prompts of ``lengths`` rows (every
+    request finishing, as the plugin stages them)."""
+    from atom.models.deepseek_v41.bounded_replay import (
+        lay_out_tail,
+        tail_spans,
+        tail_width,
+    )
+
+    offsets = np.cumsum([0, *lengths[:-1]])
+    step = SimpleNamespace(
+        requests=[
+            SimpleNamespace(offset=int(o), length=int(n), end=int(n))
+            for o, n in zip(offsets, lengths)
+        ],
+        request_finals=[True] * len(lengths),
+    )
+    picks = tail_spans(step, window)
+    width = tail_width(running_bs, window, 1 << 20)
+    layout = lay_out_tail(picks, running_bs, width)
+    return SimpleNamespace(
+        tail=SimpleNamespace(running_tokens=width, requests=picks),
+        tail_rows=torch.as_tensor(layout.rows),
+        filled=layout.filled,
+    )
+
+
+class TestReplayRowSelection:
+    """Which forward rows a replayed DSpark prefill's draft context comes
+    from: each request's last window rows, at their own forward rows."""
+
+    @pytest.mark.parametrize(
+        ("lengths", "window", "running_bs"),
+        [
+            ([300], 128, 1),
+            ([5, 300, 128, 129], 128, 4),
+            ([5, 300], 128, 4),  # padding requests in the tail
+            ([1], 128, 1),
+        ],
+    )
+    def test_tail_is_each_requests_last_window(self, lengths, window, running_bs):
+        from atom.plugin.sglang.deepseek_v41_dspark import window_rows
+
+        plan = _plan(lengths, window=window, running_bs=running_bs)
+        expected = window_rows(lengths, window)
+        assert plan.tail_rows[: plan.filled].tolist() == expected.tolist()
+        assert plan.filled == sum(min(n, window) for n in lengths)
+
+    def test_tail_aux_lands_on_its_forward_rows(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import (
+            tail_aux_to_forward_rows,
+            window_rows,
+        )
+
+        lengths, window = [5, 300, 129], 128
+        plan = _plan(lengths, window=window, running_bs=4)
+        rows = sum(lengths)
+        # A replay-off forward computes every row; the tail computes the
+        # same rows (here: the same values) at tail positions.
+        full = torch.randn(rows, 6)
+        tail_aux = torch.zeros(plan.tail.running_tokens, 6)
+        tail_aux[: plan.filled] = full[plan.tail_rows[: plan.filled]]
+        aux = tail_aux_to_forward_rows(tail_aux, plan, rows)
+        wanted = torch.as_tensor(window_rows(lengths, window))
+        # The rows the draft reads match replay-off; nothing else is written.
+        assert torch.equal(aux[wanted], full[wanted])
+        others = torch.ones(rows, dtype=torch.bool)
+        others[wanted] = False
+        assert not aux[others].any()
+        assert torch.equal(aux[plan.tail_rows][: plan.filled], tail_aux[: plan.filled])
+
+    def test_tail_aux_shape_is_checked(self):
+        from atom.plugin.sglang.deepseek_v41_dspark import tail_aux_to_forward_rows
+
+        plan = _plan([300], window=128, running_bs=1)
+        with pytest.raises(RuntimeError, match="tail's 128 rows"):
+            tail_aux_to_forward_rows(torch.zeros(300, 6), plan, 300)
+        empty = SimpleNamespace(
+            tail=SimpleNamespace(running_tokens=4),
+            tail_rows=torch.zeros(4, dtype=torch.int64),
+            filled=0,
+        )
+        aux = tail_aux_to_forward_rows(torch.ones(4, 6), empty, 3)
+        assert aux.shape == (3, 6) and not aux.any()
 
 
 @needs_sglang
@@ -1639,27 +1767,166 @@ class TestTargetSurface:
         surface.attach_draft(SimpleNamespace(write_context_kv=lambda a, p: None))
         with pytest.raises(RuntimeError, match="already attached"):
             surface.attach_draft(SimpleNamespace())
-        with pytest.raises(RuntimeError, match="bounded replay"):
+        # A replay's taps ran on the tail: a forward-width tap is refused.
+        plan = _plan([6], window=4, running_bs=1)
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 6, 2, 4)))
+        with pytest.raises(RuntimeError, match="did not fire|has shape"):
             self._finish(
                 monkeypatch,
                 surface,
                 rows=6,
                 mode=ForwardMode.EXTEND,
                 bs=1,
-                step=SimpleNamespace(running_tokens=6, replay=object()),
+                step=SimpleNamespace(running_tokens=6, replay=plan),
             )
-        with pytest.raises(RuntimeError, match="bounded replay"):
-            # A decoder SWA tail (`_publish_decoder`) leaves rows uncomputed.
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 2 * W, 2, 4)))
+        with pytest.raises(RuntimeError, match="verify ran a bounded replay"):
             self._finish(
                 monkeypatch,
                 surface,
-                rows=6,
-                mode=ForwardMode.EXTEND,
-                bs=1,
-                step=SimpleNamespace(running_tokens=6, replay=None, decoder=object()),
+                rows=2 * W,
+                mode=ForwardMode.TARGET_VERIFY,
+                bs=2,
+                step=SimpleNamespace(running_tokens=2 * W, replay=plan),
             )
         with pytest.raises(RuntimeError, match="no plain DECODE"):
             self._finish(monkeypatch, surface, rows=1, mode=ForwardMode.DECODE, bs=1)
+
+    def test_published_but_unreplayed_decoder_writes_every_row(
+        self, monkeypatch, target_forward
+    ):
+        # `step.decoder` without `step.replay`: the model ran every row.
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        surface.begin_forward()
+        wrapper.model(_State(torch.randn(1, 6, 2, 4)))
+        aux = self._finish(
+            monkeypatch,
+            surface,
+            rows=6,
+            mode=ForwardMode.EXTEND,
+            bs=1,
+            step=SimpleNamespace(running_tokens=6, replay=None, decoder=object()),
+        )
+        assert aux.shape == (6, 12) and writes[0][0] is aux
+
+    def test_replay_writes_the_tail_rows_at_their_forward_rows(
+        self, monkeypatch, target_forward
+    ):
+        # Two prompts of 6 and 3 rows, window 4: the tail is rows 2..5 and
+        # 6..8, laid out for 2 requests (8 rows, the last one padding).
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        plan = _plan([6, 3], window=4, running_bs=2)
+        assert plan.tail.running_tokens == 8 and plan.filled == 7
+        residual = torch.randn(1, 8, 2, 4)  # the late layers ran on the tail
+        surface.begin_forward()
+        wrapper.model(_State(residual))
+        aux = self._finish(
+            monkeypatch,
+            surface,
+            rows=9,
+            mode=ForwardMode.EXTEND,
+            bs=2,
+            step=SimpleNamespace(running_tokens=9, replay=plan),
+        )
+        tail = torch.cat(
+            [(residual + k).mean(dim=-2).reshape(8, 4) for k in (1, 2, 3)], dim=-1
+        )
+        assert aux.shape == (9, 12)
+        assert plan.tail_rows.tolist() == [2, 3, 4, 5, 6, 7, 8, 8]
+        torch.testing.assert_close(aux[2:9], tail[:7])
+        assert not aux[:2].any()
+        # What native's write_context_kv reads under the plan: the tail, in
+        # tail order, every real row its own (padding repeats the last).
+        torch.testing.assert_close(aux[plan.tail_rows][:7], tail[:7])
+        assert len(writes) == 1 and writes[0][0] is aux
+        assert writes[0][1].tolist() == list(range(9))
+
+    def test_radix_hit_under_decoder_replay_writes_its_widened_tail(
+        self, monkeypatch, target_forward
+    ):
+        """DSpark + fused radix hit + decoder SWA bounded replay: the hit's
+        widened span [P - R, L) is >= the window, so the step replays; the
+        draft context is each request's last window rows of the widened
+        forward -- for the hit [L - window, L), reaching into the replay rows
+        [P - R, P) when L - P < window -- at their forward rows."""
+        from atom.plugin.sglang import deepseek_v41_bridge as bridge
+        from atom.plugin.sglang import deepseek_v41_dspark as dspark
+
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        fb, fused, wide_positions, keep = self._hit_forward()
+        # The bridge's verdict on this step (window 4 = R): the hit's span of
+        # 7 rows starts at P - R = 4 > 0 but reaches the window; FULL capture
+        # (SGLang's DSpark prefill) is allowed for a DSpark target.
+        fb.capture_hidden_mode = SimpleNamespace(is_full=lambda: True)
+        widened = np.array([7, 2])
+        batch = SimpleNamespace(
+            num_scheduled_tokens=widened,
+            context_lens=np.array([11, 2]),
+            replay_rows=fused.replay_rows(2),
+        )
+        assert bridge.v41_extend_replays(fb, batch, 4, dspark_context_in_forward=True)
+        assert not bridge.v41_extend_replays(fb, batch, 4)
+        plan = _plan(widened.tolist(), window=4, running_bs=2)
+        # Hit: forward rows 3..6 (positions 7..10, P - 1 = 7 a replay row);
+        # cold: rows 7, 8.
+        assert plan.tail_rows[: plan.filled].tolist() == [3, 4, 5, 6, 7, 8]
+        assert wide_positions[plan.tail_rows[: plan.filled]].tolist() == [
+            7,
+            8,
+            9,
+            10,
+            0,
+            1,
+        ]
+        residual = torch.randn(1, int(plan.tail.running_tokens), 2, 4)
+        surface.begin_forward()
+        wrapper.model(_State(residual))
+        import atom.utils.forward_context as fc
+
+        metadata = SimpleNamespace(
+            step=SimpleNamespace(running_tokens=9, replay=plan), served_by_round=0
+        )
+        monkeypatch.setattr(
+            fc, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+        )
+        aux = surface.finish_forward(torch.zeros(9, 4), wide_positions, fb)
+        tail = torch.cat(
+            [(residual + k).mean(dim=-2).reshape(-1, 4) for k in (1, 2, 3)], dim=-1
+        )
+        assert aux.shape == (9, 12)
+        torch.testing.assert_close(aux[3:9], tail[:6])
+        assert not aux[:3].any()
+        ((written, positions),) = writes
+        assert written is aux and positions.tolist() == wide_positions.tolist()
+        # SGLang's injection sees its own rows; their last is in the tail.
+        assert aux.index_select(0, keep)[[2, 4]].abs().sum(-1).gt(0).all()
+        # The AUX dump's window check holds on the widened lengths.
+        assert dspark.window_rows(widened, 4).tolist() == [3, 4, 5, 6, 7, 8]
+
+    def test_replay_taps_must_be_late_layers(self, monkeypatch):
+        wrapper = _ToyWrapper()
+        wrapper.model.replay = True
+        wrapper.model.late = SimpleNamespace(first=2)
+        _, surface = self._surface(monkeypatch, wrapper)
+        with pytest.raises(ValueError, match="DSPARK_DECODER_REPLAY=0"):
+            surface.set_layers_to_capture([1, 2, 3])
 
 
 # ---------------------------------------------------------------------------
@@ -2015,6 +2282,108 @@ class TestVerifyReplayStaging:
         reads, _ = self._host_rows_replay(monkeypatch, verify_table, view)
         assert reads == []
 
+    def _prefetch(self, monkeypatch, verify_table, slots, rids, bounds):
+        monkeypatch.setattr(bridge, "_VERIFY_PREFETCH", bridge.VerifyRowPrefetch())
+        monkeypatch.setattr(
+            bridge, "_device_module", lambda device: _FakeDeviceModule()
+        )
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", True)
+        batch = SimpleNamespace(
+            req_pool_indices_cpu=list(slots),
+            reqs=[SimpleNamespace(rid=rid) for rid in rids],
+            spec_info=SimpleNamespace(nxt_kv_lens_cpu=torch.tensor(bounds)),
+        )
+        return bridge.prefetch_v41_dspark_verify_rows(batch, verify_table, PAGE)
+
+    def test_verify_replay_takes_prefetched_rows_instead_of_reading_back(
+        self, monkeypatch, verify_table
+    ):
+        # Slot 3's copy lacks the page p = 254 enters (254..259); slot 1's
+        # copy covers its reservation. The prefetch copies slot 3's rows up to
+        # its reservation (3 pages) before the draft; the replay reads nothing.
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        bridge._HOST_ROWS.record(
+            [3, 1], ["a", "b"], [np.asarray([2], np.int32), np.asarray([7], np.int32)]
+        )
+        assert (
+            self._prefetch(
+                monkeypatch, verify_table, [3, 1], ["a", "b"], [3 * PAGE, PAGE]
+            )
+            == 1
+        )
+        view = self._mirrored_view([3, 1], [254, 10], 2, ["a", "b"])
+        reads, tables = self._host_rows_replay(monkeypatch, verify_table, view)
+        assert reads == []
+        assert tables == [[2, 11], [7]]
+        rows = bridge._HOST_ROWS.lookup([3], ["a"], [3])
+        assert [row.tolist() for row in rows] == [[2, 11, 4]]
+        assert bridge._VERIFY_PREFETCH.pending is None
+
+    def test_a_checkpoint_between_prefetch_and_verify_voids_the_copy(
+        self, monkeypatch, verify_table
+    ):
+        # Radix cache on (rows radix-safe): a checkpoint repoints slot 3's row
+        # after the prefetch read it and before the verify takes it. The
+        # prefetched (pre-checkpoint) copy must not enter HostPageRows; the
+        # verify reads the row back instead. Slot 1 is untouched.
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        assert (
+            self._prefetch(
+                monkeypatch, verify_table, [3, 1], ["a", "b"], [3 * PAGE, PAGE]
+            )
+            == 2
+        )
+        bridge.forget_host_page_rows(3)
+        assert bridge._VERIFY_PREFETCH.take()
+        assert bridge._HOST_ROWS.lookup([3], ["a"], [1]) is None
+        assert [r.tolist() for r in bridge._HOST_ROWS.lookup([1], ["b"], [1])] == [[7]]
+        # A copy read after the rewrite is recorded as usual.
+        gen = bridge._HOST_ROWS.generation(3)
+        bridge._HOST_ROWS.record([3], ["a"], [np.asarray([2, 11], np.int32)], [gen])
+        assert [r.tolist() for r in bridge._HOST_ROWS.lookup([3], ["a"], [2])] == [
+            [2, 11]
+        ]
+        # A stale generation drops even an existing copy.
+        bridge._HOST_ROWS.record([3], ["a"], [np.asarray([9], np.int32)], [gen - 1])
+        assert bridge._HOST_ROWS.lookup([3], ["a"], [1]) is None
+
+    def test_prefetched_rows_are_checked_against_the_device(
+        self, monkeypatch, verify_table
+    ):
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        self._prefetch(monkeypatch, verify_table, [3, 1], ["a", "b"], [PAGE * 2, PAGE])
+        view = self._mirrored_view([3, 1], [254, 10], 2, ["a", "b"])
+        reads, tables = self._host_rows_replay(
+            monkeypatch, verify_table, view, check=True
+        )
+        # Validation reads back every replay and finds the same rows.
+        assert reads == [2]
+        assert tables == [[2, 11], [7]]
+
+    def test_prefetch_skips_covered_rows_and_another_tenant_misses(
+        self, monkeypatch, verify_table
+    ):
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        bridge._HOST_ROWS.record([3], ["a"], [np.asarray([2, 11], np.int32)])
+        assert self._prefetch(monkeypatch, verify_table, [3], ["a"], [2 * PAGE]) == 0
+        assert bridge._VERIFY_PREFETCH.pending is None
+        # The slot's new tenant does not get "a"'s copy.
+        assert self._prefetch(monkeypatch, verify_table, [3], ["new"], [PAGE]) == 1
+        assert bridge._VERIFY_PREFETCH.take()
+        assert bridge._HOST_ROWS.lookup([3], ["a"], [1]) is None
+        assert bridge._HOST_ROWS.lookup([3], ["new"], [1])[0].tolist() == [2]
+
+    def test_prefetch_is_off_with_radix_cache(self, monkeypatch, verify_table):
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        monkeypatch.setattr(bridge, "_VERIFY_PREFETCH", bridge.VerifyRowPrefetch())
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", False)
+        batch = SimpleNamespace(
+            req_pool_indices_cpu=[3],
+            reqs=[SimpleNamespace(rid="a")],
+            spec_info=SimpleNamespace(nxt_kv_lens_cpu=torch.tensor([PAGE])),
+        )
+        assert bridge.prefetch_v41_dspark_verify_rows(batch, verify_table, PAGE) == 0
+
     def test_verify_host_rows_check_compares_with_the_device(
         self, monkeypatch, verify_table
     ):
@@ -2146,12 +2515,19 @@ class TestVerifyGraphBackend:
         assert calls == ["kv_fusion", "tail_fusion"]
         assert env.backend._v41_graph_buckets == {}
 
+    def test_verify_state_under_decoder_replay(self, monkeypatch):
+        # A verify publishes no decoder tail: it runs (and its graph records)
+        # every row, replay or not.
+        env = _graph_backend_for(monkeypatch, "target", model=_target_model([]))
+        env.builder._decoder_replays = True
+        env.backend.init_cuda_graph_state(4, 4 * W)
+        assert env.backend._v41_graph_kind == "verify"
+
     @pytest.mark.parametrize(
         ("case", "error", "match"),
         [
             ("tokens", ValueError, "6 rows a request"),
             ("max_bs", ValueError, "exceed the builder"),
-            ("replay", NotImplementedError, "bounded replay off"),
             ("no_draft", RuntimeError, "before the draft"),
             ("spec4", NotImplementedError, "a pool of 4"),
             ("foreign", RuntimeError, "not bound to the builder"),
@@ -2170,8 +2546,6 @@ class TestVerifyGraphBackend:
             tokens = 4 * W - 1
         elif case == "max_bs":
             bs, tokens = 16, 16 * W
-        elif case == "replay":
-            env.builder._decoder_replays = True
         elif case == "foreign":
             env.builder.cache = SimpleNamespace()
         with pytest.raises(error, match=match):
@@ -2500,7 +2874,9 @@ class TestDraftWrapperGraphs:
         backbone = SimpleNamespace(
             embed=object(), head=SimpleNamespace(num_embeddings=12, tp_size=1)
         )
-        wrapper.__dict__["model"] = SimpleNamespace(share_with_target=shared.append)
+        wrapper.__dict__["model"] = SimpleNamespace(
+            share_with_target=shared.append, modules=lambda: iter(())
+        )
         lm_head = SimpleNamespace(
             atom_backbone=backbone,
             atom_wrapper=SimpleNamespace(attach_dspark_draft=attached.append),
@@ -2557,6 +2933,7 @@ class TestDraftWrapperGraphs:
             head=object(),
             _context_layer_ids=lambda device: calls.append(("ids", device)),
             _noise_embedding=lambda: calls.append("noise"),
+            modules=lambda: iter(()),
         )
         wrapper.target_atom_config = None
         wrapper.prepare_v41_draft_graph()
@@ -2630,3 +3007,441 @@ def test_v4_verify_graph_knob_does_not_govern_v41(monkeypatch):
     assert DecodeCudaGraphRunner.can_run_graph(runner(_v41()), verify) is True
     draft = _v41(architectures=["DeepseekV4ForCausalLMDSpark"])
     assert DecodeCudaGraphRunner.can_run_graph(runner(draft), verify) is True
+
+
+# ---------------------------------------------------------------------------
+# Deferred host seq_lens (overlap): the draft launches before the host waits
+# ---------------------------------------------------------------------------
+
+
+class _Algo:
+    def __init__(self, dspark=True):
+        self._dspark = dspark
+
+    def is_dspark(self):
+        return self._dspark
+
+
+def _deferred_batch(*, mode=None, **overrides):
+    fields = {
+        "forward_mode": mode or ForwardMode.DECODE,
+        "is_extend_in_batch": False,
+        "spec_algorithm": _Algo(),
+        "spec_info": SimpleNamespace(
+            future_indices=torch.tensor([2, 1]),
+            nxt_kv_lens_cpu=torch.tensor([512, 256]),
+        ),
+        "req_pool_indices_cpu": [2, 1],
+        "seq_lens": None,
+        "seq_lens_cpu": torch.tensor([1, 1]),
+        "seq_lens_sum": 2,
+    }
+    fields.update(overrides)
+    return _ScheduleBatch(**fields)
+
+
+class _ScheduleBatch(SimpleNamespace):
+    """Weak-referenceable, as SGLang's ScheduleBatch dataclass is."""
+
+
+class _Event:
+    def __init__(self):
+        self.synced = 0
+
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        self.synced += 1
+
+
+class _FakeStream:
+    def __init__(self, device=None):
+        self.waits = []
+
+    def wait_event(self, event):
+        self.waits.append(event)
+
+    def wait_stream(self, stream):
+        self.waits.append(stream)
+
+
+class _FakeDeviceModule:
+    """torch.cuda's stream / event surface the deferred resolve uses."""
+
+    def __init__(self):
+        self.current = _FakeStream()
+
+    def current_stream(self):
+        return self.current
+
+    Stream = _FakeStream
+    Event = _Event
+
+    @staticmethod
+    def stream(stream):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
+def _deferred_future_map():
+    return SimpleNamespace(
+        needs_cpu_seq_lens=True,
+        publish_ready=_Event(),
+        new_seq_lens_buf=torch.tensor([0, 40, 300, 9]),
+        _publish_fresh=True,
+    )
+
+
+@needs_sglang
+class TestDeferredSeqLens:
+    @pytest.fixture(autouse=True)
+    def _state(self, monkeypatch):
+        from atom.plugin.sglang.patches import dspark_deferred_seq_lens_patch as p
+
+        monkeypatch.setattr(p, "_STATE", p._State())
+        self.device = _FakeDeviceModule()
+        monkeypatch.setattr(p, "_device_module", lambda device: self.device)
+        monkeypatch.setattr(bridge, "_V41_BUILDER", object())
+        monkeypatch.delenv(p.DEFERRED_SEQ_LENS_ENV, raising=False)
+        import sglang.srt.runtime_context as rc
+
+        monkeypatch.setattr(
+            rc,
+            "get_parallel",
+            lambda: SimpleNamespace(attn_dp_enabled=False, pp_size=1),
+        )
+        self.p = p
+
+    def test_imported_sglang_matches_the_patched_shape(self):
+        from sglang.srt.managers.overlap_utils import FutureMap
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            TargetVerifyExecutor,
+        )
+
+        assert self.p._upstream_shape_error(FutureMap, TargetVerifyExecutor) is None
+
+    def test_other_versions_keep_upstream(self, monkeypatch):
+        from sglang.srt.managers.overlap_utils import FutureMap
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            TargetVerifyExecutor,
+        )
+
+        monkeypatch.setattr(self.p, "_sglang_version", lambda: "0.5.23")
+        assert "0.5.23" in self.p._upstream_shape_error(FutureMap, TargetVerifyExecutor)
+
+    def test_only_v41_dspark_decode_rounds_are_deferred(self, monkeypatch):
+        fm = _deferred_future_map()
+        decide = self.p._is_v41_dspark_decode
+        assert decide(fm, _deferred_batch())
+        assert not decide(fm, _deferred_batch(mode=ForwardMode.EXTEND))
+        assert not decide(fm, _deferred_batch(mode=ForwardMode.IDLE))
+        assert not decide(fm, _deferred_batch(is_extend_in_batch=True))
+        assert not decide(fm, _deferred_batch(spec_algorithm=_Algo(False)))
+        assert not decide(fm, _deferred_batch(req_pool_indices_cpu=None))
+        no_bound = _deferred_batch()
+        no_bound.spec_info.nxt_kv_lens_cpu = None
+        assert not decide(fm, no_bound)
+        no_rows = _deferred_batch()
+        no_rows.spec_info.future_indices = torch.zeros(0, dtype=torch.int64)
+        assert not decide(fm, no_rows)
+        assert not decide(
+            SimpleNamespace(**{**vars(fm), "needs_cpu_seq_lens": False}),
+            _deferred_batch(),
+        )
+        assert not decide(
+            SimpleNamespace(**{**vars(fm), "publish_ready": None}), _deferred_batch()
+        )
+        monkeypatch.setenv(self.p.DEFERRED_SEQ_LENS_ENV, "0")
+        assert not decide(fm, _deferred_batch())
+        monkeypatch.delenv(self.p.DEFERRED_SEQ_LENS_ENV)
+        monkeypatch.setattr(bridge, "_V41_BUILDER", None)
+        assert not decide(fm, _deferred_batch())
+
+    def test_draft_sees_no_host_lengths_verify_sees_the_published_ones(self):
+        fm = _deferred_future_map()
+        batch = _deferred_batch()
+        self.p.resolve_seq_lens_deferred(fm, batch)
+        # The device gather is this round's published lengths ...
+        assert batch.seq_lens.tolist() == [300, 40]
+        # ... the host mirror is upstream's needs_cpu_seq_lens=False state
+        # until the verify, and no host wait happened on the publish.
+        assert batch.seq_lens_cpu is None and batch.seq_lens_sum is None
+        assert fm.publish_ready.synced == 0
+        assert self.device.current.waits == [fm.publish_ready]
+        assert self.p.materialize_seq_lens(batch)
+        assert batch.seq_lens_cpu.tolist() == [300, 40]
+        assert batch.seq_lens_sum == 340
+        # Consumed once.
+        assert not self.p.materialize_seq_lens(batch)
+
+    def test_a_deferred_round_must_be_consumed_by_its_own_batch(self):
+        fm = _deferred_future_map()
+        batch = _deferred_batch()
+        self.p.resolve_seq_lens_deferred(fm, batch)
+        with pytest.raises(RuntimeError, match="other than"):
+            self.p.materialize_seq_lens(_deferred_batch())
+        self.p._STATE.pending = None
+        self.p.resolve_seq_lens_deferred(fm, batch)
+        with pytest.raises(RuntimeError, match="never consumed"):
+            self.p.resolve_seq_lens_deferred(fm, _deferred_batch())
+
+    def test_installed_wrappers_route_and_materialize(self, monkeypatch):
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.speculative.dspark_components import dspark_verify
+
+        calls = []
+
+        class FakeFutureMap:
+            def resolve_seq_lens_cpu(self, batch):
+                calls.append("upstream")
+
+        class FakeExecutor:
+            def run_non_compact(self, *, batch, **kwargs):
+                calls.append(("verify", batch.seq_lens_cpu.tolist()))
+
+            def run_compact(self, *, batch, **kwargs):
+                calls.append(("compact", batch.seq_lens_cpu.tolist()))
+
+        monkeypatch.setattr(overlap_utils, "FutureMap", FakeFutureMap)
+        monkeypatch.setattr(dspark_verify, "TargetVerifyExecutor", FakeExecutor)
+        monkeypatch.setattr(self.p, "_upstream_shape_error", lambda *a: None)
+        assert self.p.install_dspark_deferred_seq_lens_patch()
+        assert self.p.install_dspark_deferred_seq_lens_patch()  # idempotent
+        fm = FakeFutureMap()
+        for name, value in vars(_deferred_future_map()).items():
+            setattr(fm, name, value)
+        fm.resolve_seq_lens_cpu(_deferred_batch(mode=ForwardMode.EXTEND))
+        assert calls == ["upstream"]
+        batch = _deferred_batch()
+        fm.resolve_seq_lens_cpu(batch)
+        assert batch.seq_lens_cpu is None
+        FakeExecutor().run_non_compact(batch=batch, sampling_info=None)
+        assert calls[-1] == ("verify", [300, 40])
+
+    def test_kill_switch_keeps_upstream(self, monkeypatch):
+        monkeypatch.setenv(self.p.DEFERRED_SEQ_LENS_ENV, "0")
+        assert not self.p.install_dspark_deferred_seq_lens_patch()
+
+
+@needs_sglang
+class TestVerifyRowsPrefetchPatch:
+    def test_imported_sglang_matches_the_patched_shape(self):
+        from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
+        from atom.plugin.sglang.patches import dspark_verify_rows_prefetch_patch as p
+
+        assert p._upstream_shape_error(dspark_worker_v2) is None
+
+    def test_wrapper_returns_the_window_and_prefetches_for_the_v41_target(
+        self, monkeypatch
+    ):
+        from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
+        from atom.plugin.sglang.patches import dspark_verify_rows_prefetch_patch as p
+
+        window = object()
+        monkeypatch.setattr(
+            dspark_worker_v2, "alloc_verify_window", lambda **kwargs: window
+        )
+        monkeypatch.setattr(p, "_upstream_shape_error", lambda module: None)
+        monkeypatch.setattr(
+            bridge, "_V41_BUILDER", SimpleNamespace(block_size=PAGE), raising=False
+        )
+        prefetched = []
+        monkeypatch.setattr(
+            bridge,
+            "prefetch_v41_dspark_verify_rows",
+            lambda batch, table, block: prefetched.append((batch, table, block)),
+        )
+        assert p.install_dspark_verify_rows_prefetch_patch()
+        assert p.install_dspark_verify_rows_prefetch_patch()  # idempotent
+        table = torch.zeros(2, 2)
+        target = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(is_atom_v41_proxy_pool=True),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        draft = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                is_atom_v41_proxy_pool=True, is_atom_v41_draft_proxy=True
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        batch = object()
+        assert (
+            dspark_worker_v2.alloc_verify_window(batch=batch, model_runner=draft)
+            is window
+        )
+        assert prefetched == []
+        assert (
+            dspark_worker_v2.alloc_verify_window(batch=batch, model_runner=target)
+            is window
+        )
+        assert prefetched == [(batch, table, PAGE)]
+
+    def test_kill_switch(self, monkeypatch):
+        from atom.plugin.sglang.patches import dspark_verify_rows_prefetch_patch as p
+
+        monkeypatch.setenv(bridge.V41_DSPARK_PREFETCH_ROWS_ENV, "0")
+        assert not p.install_dspark_verify_rows_prefetch_patch()
+
+
+# ---------------------------------------------------------------------------
+# Greedy draft: ATOM's sharded fused Markov argmax in SGLang's folded tail
+# ---------------------------------------------------------------------------
+
+
+class _TpSync:
+    def __init__(self):
+        self.calls = []
+
+    def sync(self, site, values):
+        self.calls.append((site, values.shape))
+        return values
+
+
+def _sampler(model, *, greedy=True, confidence=None, bs_max=4, gamma=5):
+    return SimpleNamespace(
+        model=model,
+        gamma=gamma,
+        query_token_num=gamma,
+        sample_from_anchor=True,
+        greedy_draft=greedy,
+        out=torch.full((bs_max * gamma,), -1, dtype=torch.int64),
+        confidence_out=confidence,
+        _tp_sync=_TpSync(),
+    )
+
+
+@needs_sglang
+class TestFusedGreedyDraft:
+    def test_imported_sglang_matches_the_patched_shape(self):
+        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+            DsparkDraftSampler,
+        )
+
+        from atom.plugin.sglang.patches import dspark_fused_greedy_draft_patch as p
+
+        assert p._upstream_shape_error(DsparkDraftSampler) is None
+
+    def test_greedy_tail_writes_the_hook_block_and_syncs_it_once(self):
+        from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+
+        from atom.plugin.sglang.patches.dspark_fused_greedy_draft_patch import (
+            fused_greedy_tail,
+        )
+
+        seen = {}
+
+        def block(hidden, anchor, gamma):
+            seen.update(rows=int(hidden.shape[0]), anchor=anchor.tolist(), gamma=gamma)
+            return torch.arange(10, dtype=torch.int64).view(2, 5) + 100
+
+        sampler = _sampler(SimpleNamespace(atom_v41_greedy_draft_block=block))
+        ids = torch.tensor([7, 9, 9, 9, 9, 8, 9, 9, 9, 9])
+        assert fused_greedy_tail(sampler, torch.zeros(10, 3), ids)
+        assert seen == {"rows": 10, "anchor": [7, 8], "gamma": 5}
+        assert sampler.out[:10].tolist() == list(range(100, 110))
+        assert sampler.out[10:].tolist() == [-1] * 10
+        assert sampler._tp_sync.calls == [(SpecTpSyncSite.DSPARK_DRAFT, (2, 5))]
+
+    @pytest.mark.parametrize(
+        "case", ["sampled_draft", "no_hook", "confidence", "hook_declines"]
+    )
+    def test_other_samplers_keep_sglang_chain(self, case):
+        from atom.plugin.sglang.patches.dspark_fused_greedy_draft_patch import (
+            fused_greedy_tail,
+        )
+
+        def block(hidden, anchor, gamma):
+            return None if case == "hook_declines" else torch.zeros(2, 5)
+
+        model = (
+            SimpleNamespace()
+            if case == "no_hook"
+            else SimpleNamespace(atom_v41_greedy_draft_block=block)
+        )
+        sampler = _sampler(
+            model,
+            greedy=case != "sampled_draft",
+            confidence=torch.zeros(4, 5) if case == "confidence" else None,
+        )
+        ids = torch.zeros(10, dtype=torch.int64)
+        assert not fused_greedy_tail(sampler, torch.zeros(10, 3), ids)
+        assert sampler.out.tolist() == [-1] * 20
+        assert sampler._tp_sync.calls == []
+
+    def test_patched_call_falls_back_to_the_original(self, monkeypatch):
+        from sglang.srt.speculative.dspark_components import dspark_draft_sampler
+
+        from atom.plugin.sglang.patches import dspark_fused_greedy_draft_patch as p
+
+        calls = []
+
+        class FakeSampler:
+            def __call__(self, hidden_states, input_ids):
+                calls.append("original")
+
+        monkeypatch.setattr(dspark_draft_sampler, "DsparkDraftSampler", FakeSampler)
+        monkeypatch.setattr(p, "_upstream_shape_error", lambda cls: None)
+        assert p.install_dspark_fused_greedy_draft_patch()
+        assert p.install_dspark_fused_greedy_draft_patch()  # idempotent
+        sampler = FakeSampler()
+        for name, value in vars(_sampler(SimpleNamespace(), greedy=False)).items():
+            setattr(sampler, name, value)
+        sampler(torch.zeros(10, 3), torch.zeros(10, dtype=torch.int64))
+        assert calls == ["original"]
+
+    def _gate_wrapper(self, monkeypatch, **head_overrides):
+        wrapper = _bare_wrapper()
+        markov = SimpleNamespace(
+            fused_sample=True,
+            vocab_size=12,
+            markov_w1=SimpleNamespace(weight=torch.zeros(12, 4)),
+            markov_w2=SimpleNamespace(weight=torch.zeros(12, 4)),
+        )
+        head = SimpleNamespace(tp_size=4, bias=None, num_embeddings_per_partition=3)
+        for name, value in head_overrides.items():
+            setattr(head, name, value)
+        wrapper.__dict__["model"] = SimpleNamespace(
+            head=head, mtp=[SimpleNamespace(markov_head=markov)]
+        )
+        wrapper._fused_greedy_reason = "not resolved"
+        import atom.model_ops.dspark_markov_argmax as ops
+
+        monkeypatch.setattr(ops, "markov_weights_unsupported", lambda w1, w2: None)
+        return wrapper
+
+    def test_gate_takes_native_conditions(self, monkeypatch):
+        from atom.plugin.sglang.models.deepseek_v41_dspark_wrapper import (
+            V41_DSPARK_FUSED_GREEDY_ENV,
+        )
+
+        assert self._gate_wrapper(monkeypatch)._resolve_fused_greedy() is None
+        assert (
+            "sharded"
+            in self._gate_wrapper(monkeypatch, tp_size=1)._resolve_fused_greedy()
+        )
+        assert (
+            "bias"
+            in self._gate_wrapper(
+                monkeypatch, bias=torch.zeros(3)
+            )._resolve_fused_greedy()
+        )
+        assert (
+            "exactly"
+            in self._gate_wrapper(
+                monkeypatch, num_embeddings_per_partition=4
+            )._resolve_fused_greedy()
+        )
+        monkeypatch.setenv(V41_DSPARK_FUSED_GREEDY_ENV, "0")
+        wrapper = self._gate_wrapper(monkeypatch)
+        assert V41_DSPARK_FUSED_GREEDY_ENV in wrapper._resolve_fused_greedy()
+        # A declined gate hands the block back to SGLang's chain.
+        assert (
+            wrapper.atom_v41_greedy_draft_block(
+                torch.zeros(10, 4), torch.zeros(2, dtype=torch.int64), 5
+            )
+            is None
+        )

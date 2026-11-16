@@ -46,15 +46,21 @@ from atom.plugin.sglang.runtime import plugin_runtime_scope
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
+# Kill switch: "0" keeps SGLang's Markov chain for a greedy draft
+# (SGLANG_DSPARK_USE_GREEDY_DRAFT=1) instead of ATOM's sharded fused argmax.
+V41_DSPARK_FUSED_GREEDY_ENV = "ATOM_SGLANG_V41_DSPARK_FUSED_GREEDY_DRAFT"
+
 
 class ATOMV41MarkovHeadAdapter(BaseDSparkMarkovHead):
     """SGLang's Markov-head interface over ATOM's ``DSparkMarkovHead``.
 
     The bias is ATOM's own forward: ``W1[x_{k-1}] @ W2^T`` in fp32
-    (``markov_w{1,2}`` are ``[V, r]``). The vocab is whole on every rank (ATOM
+    (``markov_w{1,2}`` are ``[V, r]``), with W2's fp32 cast held once
+    (`refresh_w2_cache`) instead of redone per block position. The vocab is whole on every rank (ATOM
     keeps both tables replicated), so ``vocab_shard`` stays None and SGLang
-    samples from the gathered base logits. No fused greedy weight: the fused
-    kernel is a separate, single-variable experiment.
+    samples from the gathered base logits. No fused greedy weight
+    (SGLang's one-row kernel): a greedy draft block runs ATOM's sharded fused
+    argmax instead (`DeepseekV4ForCausalLMDSpark.atom_v41_greedy_draft_block`).
 
     ATOM's head is held outside the module tree so its weights are not
     registered twice.
@@ -73,10 +79,53 @@ class ATOMV41MarkovHeadAdapter(BaseDSparkMarkovHead):
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.atom_markov_head.markov_w1(token_ids.long())
 
+    def refresh_w2_cache(self) -> torch.Tensor:
+        """``markov_w2`` as fp32, cast once instead of on every block position.
+
+        ``DSparkMarkovHead.forward`` casts the whole ``[V, r]`` table per
+        position (5 x 66 MB read + 132 MB write a round, ~0.35 ms on MI308X).
+        The copy is the same fp32 values in the same layout, so
+        ``emb.float() @ w2.t()`` is the identical GEMM; +V*r*4 B (132 MB) a
+        rank. Built at load (`load_weights`), inside the memory the KV profile
+        sees. A reload refreshes it in place: a captured draft graph reads its
+        address."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DSpark Markov W2 cache built under a graph capture")
+        weight = self.atom_markov_head.markov_w2.weight
+        cache = self.__dict__.get("_w2_f32")
+        if (
+            cache is not None
+            and cache.shape == weight.shape
+            and cache.device == weight.device
+        ):
+            cache.copy_(weight.detach())
+        else:
+            cache = weight.detach().float().contiguous()
+            self.__dict__["_w2_f32"] = cache
+        self.__dict__["_w2_src"] = weight.data_ptr()
+        return cache
+
+    def _w2_fp32(self) -> torch.Tensor | None:
+        """The fp32 cache of the live ``markov_w2``, or None to cast per step
+        (no cache yet, or the weight was replaced under a capture)."""
+        cache = self.__dict__.get("_w2_f32")
+        weight = self.atom_markov_head.markov_w2.weight
+        if cache is not None and self.__dict__.get("_w2_src") == weight.data_ptr():
+            return cache
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return None
+        return self.refresh_w2_cache()
+
     def step_bias(self, prev_tokens, *, hidden_states, state):
         del hidden_states
-        bias, _ = self.atom_markov_head(prev_tokens.long())
-        return bias, state
+        w2 = self._w2_fp32()
+        if w2 is None:
+            bias, _ = self.atom_markov_head(prev_tokens.long())
+            return bias, state
+        embed = self.atom_markov_head.markov_w1(prev_tokens.long())
+        # fp32 matmul, as `DSparkMarkovHead.forward`: the bias enters the
+        # softmax that gates acceptance.
+        return torch.matmul(embed.float(), w2.t()), state
 
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         del base_dtype
@@ -193,6 +242,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.vocab_size = int(draft_hf.vocab_size)
         self.markov_head = ATOMV41MarkovHeadAdapter(self.model.mtp[-1].markov_head)
         self.logits_mup_width_multiplier = None
+        # Why the fused sharded greedy block (`atom_v41_greedy_draft_block`)
+        # cannot run, or None once it can; resolved at its first call (the
+        # graph runner's eager warmup, before any capture). Host checks only.
+        self._fused_greedy_reason = "not resolved"
         self._check_mask_token(config)
         self._log_route()
 
@@ -247,6 +300,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 True,
             )
         self._report_coverage(loaded)
+        # The Markov tables are plain embeddings (no quant post-processing),
+        # final here; a reload refreshes the fp32 W2 in place.
+        self.markov_head.refresh_w2_cache()
         return loaded
 
     def _report_coverage(self, loaded) -> None:
@@ -311,6 +367,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise RuntimeError("DeepSeek-V4.1 DSpark draft and target vocab differ")
         self.model.share_with_target(backbone)
         lm_head.atom_wrapper.attach_dspark_draft(self.model)
+        from atom.plugin.sglang.patches.dspark_fused_greedy_draft_patch import (
+            install_dspark_fused_greedy_draft_patch,
+        )
+
+        install_dspark_fused_greedy_draft_patch()
         # SGLang's folded draft sampler sizes its step logits off the draft's
         # ``lm_head.org_vocab_size``. The target's head view, not a module:
         # nothing registers twice.
@@ -412,6 +473,98 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         ):
             self.model._context_layer_ids(embed.weight.device)
             self.model._noise_embedding()
+
+    # -- greedy draft: ATOM's sharded fused Markov argmax -------------------
+
+    def _resolve_fused_greedy(self) -> str | None:
+        """Whether native's sharded greedy block can run here (the gate of
+        ``DeepseekV41DSpark._sharded_markov_sample``, plus a vocab the TP
+        shards cover exactly), logged once a rank."""
+        resolved = getattr(self, "_fused_greedy_reason", "not resolved")
+        if resolved != "not resolved":
+            return resolved
+        from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
+
+        head = getattr(self.model, "head", None)
+        markov = self.model.mtp[-1].markov_head
+        if os.environ.get(V41_DSPARK_FUSED_GREEDY_ENV, "1") == "0":
+            reason = f"{V41_DSPARK_FUSED_GREEDY_ENV}=0"
+        elif head is None:
+            reason = "the target head is not attached"
+        elif int(head.tp_size) <= 1:
+            reason = "the head is not TP-sharded"
+        elif getattr(head, "bias", None) is not None:
+            reason = "the head has a bias"
+        elif not getattr(markov, "fused_sample", False):
+            reason = "ATOM_DSPARK_FUSED_MARKOV_SAMPLE=0"
+        elif int(head.num_embeddings_per_partition) * int(head.tp_size) != int(
+            markov.vocab_size
+        ):
+            reason = "the head's TP shards do not cover the Markov vocab exactly"
+        else:
+            reason = markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+        self._fused_greedy_reason = reason
+        logger.info(
+            "ATOM DeepSeek-V4.1 DSpark greedy draft block: %s",
+            (
+                "ATOM dspark_markov_argmax_tp on the vocab shard (no step logits, "
+                "no [B*T, V] all-gather)"
+                if reason is None
+                else f"SGLang's Markov chain ({reason})"
+            ),
+        )
+        return reason
+
+    def atom_v41_greedy_draft_block(
+        self, hidden: torch.Tensor, anchor_tokens: torch.Tensor, gamma: int
+    ) -> torch.Tensor | None:
+        """The greedy draft block ``[bs, gamma]`` from the draft's normed rows,
+        as native ``_head_and_sample_sharded`` drafts it: this rank's LM-head
+        shard ``[bs * gamma, V / tp]``, then per position ATOM's fused
+        ``W1[x_{k-1}] @ W2^T`` + argmax over the shard, the ranks exchanging
+        only each row's ``(max, id)``. The same argmax SGLang's greedy chain
+        takes over the gathered logits plus the fp32 bias (fp32 accumulation,
+        lowest id on ties), up to the GEMV's summation order; identical on
+        every rank by construction. None when the gate is off
+        (`_resolve_fused_greedy`): SGLang's chain runs instead."""
+        if self._resolve_fused_greedy() is not None:
+            return None
+        from aiter.dist.parallel_state import get_tp_group
+        from aiter.tuned_gemm import tgemm
+
+        from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax_tp
+        from atom.utils import envs
+
+        rows = int(hidden.shape[0])
+        if rows % gamma or int(anchor_tokens.numel()) * gamma != rows:
+            raise RuntimeError(
+                f"DeepSeek-V4.1 DSpark greedy block of {rows} rows for "
+                f"{int(anchor_tokens.numel())} anchors x {gamma}"
+            )
+        bs = rows // gamma
+        head = self.model.head
+        markov = self.model.mtp[-1].markov_head
+        with plugin_runtime_scope(
+            framework="sglang", atom_config=self.target_atom_config
+        ):
+            base_logits = tgemm.mm(hidden, head.weight).view(bs, gamma, -1)
+            out = torch.empty((bs, gamma), dtype=torch.int64, device=hidden.device)
+            tp_group = get_tp_group()
+            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+            for k in range(gamma):
+                dspark_markov_argmax_tp(
+                    base_logits[:, k],
+                    anchor_tokens if k == 0 else out[:, k - 1],
+                    markov.markov_w1.weight,
+                    markov.markov_w2.weight,
+                    out[:, k],
+                    int(head.vocab_start_idx),
+                    tp_group,
+                    use_custom=use_custom,
+                )
+        return out
 
     def compute_base_logits(self, x: torch.Tensor):
         """The shared target head over the draft's normed rows, full vocab

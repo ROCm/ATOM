@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from atom.plugin.sglang.deepseek_v41_bridge import (
+    V41_DSPARK_AUX_DUMP_ENV,
     V41_DSPARK_DRAFT_TOKENS,
     _cpu_ints,
     _is_target_verify,
@@ -132,6 +133,15 @@ class V41DSparkTargetSurface:
         engram = {int(i) for i in (getattr(hf, "engram_layer_ids", None) or ())}
         if engram.intersection(ids):
             raise ValueError("V4.1 DSpark input taps cannot precede Engram injection")
+        late = _replay_late_start(wrapper.model)
+        if late is not None and min(ids) < late:
+            # A replay runs layers before `late` on every row (and layer
+            # late - 1 outside its module): the taps would disagree on rows.
+            raise ValueError(
+                f"DeepSeek-V4.1 DSpark taps {ids} under decoder SWA bounded "
+                f"replay must all be decoder layers >= {late}; set "
+                "ATOM_SGLANG_V41_DSPARK_DECODER_REPLAY=0"
+            )
         from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
         from atom.spec_decode.drafter import AuxCaptureSpec, install_aux_taps
 
@@ -214,12 +224,21 @@ class V41DSparkTargetSurface:
         draft's context KV for every row this forward ran and hand the aux
         block to SGLang's logits processor (``aux_hidden_states``).
 
-        Every row, as native ``compute_draft_kv`` writes every scheduled row:
-        a radix hit's replay rows ``[P - R, P)`` included, whether they ride
-        in this forward (fused: ``hidden_states`` / ``positions`` are the
-        widened rows, and the wrapper gathers SGLang's rows out of the
-        returned aux afterwards) or are its own side forward. That is what
-        rebuilds the draft's windows below the hit."""
+        Every row the late layers ran, as native ``compute_draft_kv`` writes
+        every scheduled row: a radix hit's replay rows ``[P - R, P)``
+        included, whether they ride in this forward (fused: ``hidden_states``
+        / ``positions`` are the widened rows, and the wrapper gathers SGLang's
+        rows out of the returned aux afterwards) or are its own side forward.
+        That is what rebuilds the draft's windows below the hit.
+
+        Under decoder SWA bounded replay (``step.replay``) the late layers --
+        the taps' -- ran on each request's last ``window`` rows alone, and
+        ATOM's ``write_context_kv`` writes exactly those under the tail's
+        step. A fused hit's span ``[P - R, L)`` is at least ``R >= window``
+        rows (`deepseek_v41_bridge.v41_extend_replays`), so its tail is
+        ``[L - window, L)``: the first draft block's whole context, whether it
+        lies in SGLang's rows or reaches into the replay rows. A side forward
+        is prefill-only and never replays (every row of ``[P - R, P)``)."""
         from atom.plugin.sglang.deepseek_v41_radix import FUSED_ATTR
         from atom.utils.forward_context import get_forward_context
 
@@ -240,7 +259,8 @@ class V41DSparkTargetSurface:
         fused = getattr(forward_batch, FUSED_ATTR, None)
         if fused is not None:
             # The widened forward: SGLang's rows plus each hit's replay rows,
-            # all of which the draft's windows take.
+            # which the draft's windows take (the tail's, under a decoder
+            # replay).
             expanded = fused.expanded
             if expanded is None or _is_target_verify(mode):
                 raise RuntimeError(
@@ -258,22 +278,148 @@ class V41DSparkTargetSurface:
                 f"DeepSeek-V4.1 DSpark forward of {rows} rows, step "
                 f"{step.running_tokens}, positions {int(positions.shape[0])}"
             )
-        if (
-            metadata.served_by_round
-            or getattr(step, "replay", None) is not None
-            or getattr(step, "decoder", None) is not None
-        ):
+        if metadata.served_by_round:
             raise RuntimeError(
                 "DeepSeek-V4.1 DSpark on SGLang writes the draft context from "
-                "the plain forward only (no decode round, no bounded replay)"
+                "the plain forward only (no decode round)"
             )
-        aux = self.take_aux(rows)
         if self.draft is None:
             raise RuntimeError(
                 "DeepSeek-V4.1 DSpark target forward ran with no draft attached"
             )
+        plan = getattr(step, "replay", None)
+        if plan is None:
+            aux = self.take_aux(rows)
+        else:
+            if _is_target_verify(mode):
+                raise RuntimeError("DeepSeek-V4.1 DSpark verify ran a bounded replay")
+            aux = tail_aux_to_forward_rows(
+                self.take_aux(int(plan.tail.running_tokens)), plan, rows
+            )
+        # Native's drafter call: under a replay it takes `aux[plan.tail_rows]`
+        # and writes them under the tail's step, so only the rows above are
+        # read; the rest are zero (no draft block reads them).
         self.draft.write_context_kv(aux, positions)
+        if _AUX_DUMP.directory is not None and not _is_target_verify(mode):
+            _AUX_DUMP.record(aux, positions, forward_batch, plan)
         return aux
+
+
+def tail_aux_to_forward_rows(tail_aux, plan, rows: int) -> torch.Tensor:
+    """A replay's aux block ``[tail width, F]`` (the late-layer taps ran on
+    the tail alone) as the forward's ``[rows, F]``: each real tail row moved
+    to its forward row (``plan.tail_rows[:plan.filled]``), as native's
+    ``DeepseekV41RuntimeModel._move_aux_rows`` moves its capture buffers.
+    Every other row is zero: the forward computed no aux for it."""
+    width = int(plan.tail.running_tokens)
+    if tail_aux.dim() != 2 or int(tail_aux.shape[0]) != width:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 DSpark replay aux {tuple(tail_aux.shape)} is not the "
+            f"tail's {width} rows"
+        )
+    filled = int(plan.filled)
+    if filled > width or filled > rows:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 DSpark replay fills {filled} tail rows of {width} "
+            f"in a forward of {rows}"
+        )
+    aux = tail_aux.new_zeros(rows, tail_aux.shape[1])
+    if filled:
+        aux[plan.tail_rows[:filled]] = tail_aux[:filled]
+    return aux
+
+
+def _replay_late_start(model) -> int | None:
+    """The first layer a replay runs on the tail alone (`_LateLayers`), or
+    None where the runtime model does not replay."""
+    if not getattr(model, "replay", False):
+        return None
+    late = getattr(model, "late", None)
+    return None if late is None else int(late.first)
+
+
+def window_rows(lengths, window: int) -> np.ndarray:
+    """Each request's last ``window`` forward rows, in request order: what a
+    replay's tail holds (`bounded_replay.tail_spans`) and what the draft's
+    first block reads of a prompt this forward finishes."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    ends = np.cumsum(lengths)
+    return np.concatenate(
+        [
+            np.arange(end - min(int(n), int(window)), end, dtype=np.int64)
+            for n, end in zip(lengths, ends)
+        ]
+        or [np.zeros(0, dtype=np.int64)]
+    )
+
+
+class _AuxDump:
+    """``ATOM_SGLANG_V41_DSPARK_AUX_DUMP`` (a directory): per DSpark prefill,
+    each request's last window rows of the aux block the draft context was
+    written from (plus their positions), one file per forward and rank, the
+    first ``ATOM_SGLANG_V41_DSPARK_AUX_DUMP_N`` (8) forwards. Under a replay
+    it also checks that the tail it wrote is exactly those rows. Reads the
+    device: debug only, eager prefills only. Compare a replay-on and a
+    replay-off run of the same requests offline."""
+
+    def __init__(self) -> None:
+        import os
+
+        self.directory = os.environ.get(V41_DSPARK_AUX_DUMP_ENV) or None
+        self.limit = int(os.environ.get(f"{V41_DSPARK_AUX_DUMP_ENV}_N", "8"))
+        self.count = 0
+
+    def record(self, aux, positions, forward_batch, plan) -> None:
+        import os
+
+        if self.count >= self.limit or _in_graph_capture():
+            return
+        from atom.config import get_current_atom_config
+
+        bs = int(forward_batch.batch_size)
+        lengths = _cpu_ints(
+            getattr(forward_batch, "extend_seq_lens_cpu", None),
+            getattr(forward_batch, "extend_seq_lens", None),
+            bs,
+        )
+        from atom.plugin.sglang.deepseek_v41_radix import FUSED_ATTR
+
+        fused = getattr(forward_batch, FUSED_ATTR, None)
+        if fused is not None:
+            # A fused radix hit's forward span starts R rows below SGLang's.
+            lengths = lengths + fused.replay_rows(bs)
+        window = int(get_current_atom_config().hf_config.sliding_window)
+        rows = torch.as_tensor(window_rows(lengths, window), device=aux.device)
+        if plan is not None:
+            written = plan.tail_rows[: int(plan.filled)]
+            if not torch.equal(written.to(rows.dtype), rows):
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark replay tail rows "
+                    f"{written.tolist()[:8]}... are not each request's last "
+                    f"{window} rows {rows.tolist()[:8]}..."
+                )
+        try:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:  # noqa: BLE001 - a file name
+            rank = 0
+        os.makedirs(self.directory, exist_ok=True)
+        torch.save(
+            {
+                "rids": list(forward_batch.rids[:bs]),
+                "lengths": lengths.tolist(),
+                "window": window,
+                "replay": plan is not None,
+                "positions": positions[rows].cpu(),
+                "aux": aux[rows].cpu(),
+            },
+            os.path.join(self.directory, f"aux_tp{rank}_{self.count:03d}.pt"),
+        )
+        self.count += 1
+
+
+_AUX_DUMP = _AuxDump()
 
 
 def install_v41_dspark_target_surface(wrapper) -> V41DSparkTargetSurface:
@@ -289,6 +435,15 @@ def install_v41_dspark_target_surface(wrapper) -> V41DSparkTargetSurface:
     wrapper.set_dspark_layers_to_capture = surface.set_layers_to_capture
     wrapper.attach_dspark_draft = surface.attach_draft
     install_deepseek_v41_dspark_commit_patch()
+    from atom.plugin.sglang.patches.dspark_deferred_seq_lens_patch import (
+        install_dspark_deferred_seq_lens_patch,
+    )
+    from atom.plugin.sglang.patches.dspark_verify_rows_prefetch_patch import (
+        install_dspark_verify_rows_prefetch_patch,
+    )
+
+    install_dspark_deferred_seq_lens_patch()
+    install_dspark_verify_rows_prefetch_patch()
     logger.info(
         "ATOM DeepSeek-V4.1 DSpark target surface: lm_head view, input "
         "embeddings, capture layers, in-forward draft context write"

@@ -114,17 +114,24 @@ def _deepseek_v41_decoder_replays(atom_config: Any) -> bool:
     describes the replay. A step the tail cannot serve computes every row
     (`deepseek_v41_bridge.v41_extend_replays`).
 
-    Off under DSpark: its aux taps and the in-forward draft context write
-    (`deepseek_v41_dspark.V41DSparkTargetSurface`) consume every row of the
-    plain backbone, and SGLang's DSpark prefill captures FULL hidden states,
-    which `v41_extend_replays` refuses anyway. A tail-only draft context
-    (native's `_late_on_tail`) is a follow-up.
+    On under DSpark too, as natively, unless
+    ATOM_SGLANG_V41_DSPARK_DECODER_REPLAY=0: the draft taps target layers
+    37-39, which a replay runs on the tail alone, and the in-forward draft
+    context write takes the tail's rows to their forward rows and writes the
+    tail under its own step (`V41DSparkTargetSurface.finish_forward`, native's
+    `_move_aux_rows` + `DeepseekV41DSpark.write_context_kv`): exactly each
+    request's last window rows, the ones its first draft block reads.
     """
-    from atom.plugin.sglang.deepseek_v41_bridge import is_v41_dspark_atom_config
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        V41_DSPARK_DECODER_REPLAY_ENV,
+        is_v41_dspark_atom_config,
+    )
 
     if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
         return False
-    return not is_v41_dspark_atom_config(atom_config)
+    if is_v41_dspark_atom_config(atom_config):
+        return os.environ.get(V41_DSPARK_DECODER_REPLAY_ENV, "1") == "1"
+    return True
 
 
 def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:

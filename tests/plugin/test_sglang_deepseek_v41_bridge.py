@@ -2240,6 +2240,20 @@ class TestExtendReplays:
         last = SimpleNamespace(is_full=lambda: False)
         assert not _replays([4096], [0], capture_hidden_mode=full)
         assert _replays([4096], [0], capture_hidden_mode=last)
+        # DSpark's FULL capture feeds only the no-op injector: the draft
+        # context is written in the forward, from the tail.
+        fb = SimpleNamespace(capture_hidden_mode=full)
+        batch = SimpleNamespace(
+            num_scheduled_tokens=np.asarray([4096], np.int32),
+            context_lens=np.asarray([4096], np.int64),
+        )
+        assert bridge.v41_extend_replays(fb, batch, 128, dspark_context_in_forward=True)
+        assert not bridge.v41_extend_replays(
+            SimpleNamespace(capture_hidden_mode=full, is_prefill_only=True),
+            batch,
+            128,
+            dspark_context_in_forward=True,
+        )
         assert not _replays([4096], [0], is_prefill_only=True)
         # Input logprobs on any row before the last.
         assert not _replays(

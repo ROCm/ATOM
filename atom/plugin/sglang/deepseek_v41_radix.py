@@ -138,6 +138,14 @@ runs DSpark under its prefix cache:
   block (128 rows) below it and ``compute_draft_kv`` runs on that forward's
   positions. ``R >= window`` (128, the draft's window too) covers the first
   draft block's context ``[L - 128, L)``.
+- Decoder SWA bounded replay stays on under DSpark (as natively): a fused
+  hit's widened span ``[P - R, L)`` is at least the window long, so the step
+  replays, the late layers (and the draft taps on them) run on its last 128
+  rows ``[L - 128, L)`` alone and ``write_context_kv`` writes exactly those --
+  the first draft block's context, reaching into ``[P - R, P)`` when
+  ``L - P < 128``. A side forward is prefill-only and never replays (every
+  row of ``[P - R, P)``); its main extend replays only when its own rows
+  reach the window (``v41_extend_replays``), else it too runs every row.
 - SGLang's DSpark injection (``write_target_hidden_kv``) still sees only
   SGLang's rows ``[P, L)``: the wrapper gathers them out of the widened aux.
   SGLang keeps its own draft KV for ``[0, P)`` in the tree's token slots;

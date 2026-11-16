@@ -73,18 +73,23 @@ DSpark under the overlap schedule (SGLang 0.5.22 ``event_loop_overlap``):
   the hidden commit -- in one ``forward_batch_generation`` call on the
   scheduler thread under ``forward_stream``. What overlaps the GPU is the
   scheduler's own work: processing round t-1's result and forming round
-  t+1's batch. Round t+1's ``run_batch`` then waits for round t's publish
-  (``FutureMap.resolve_seq_lens_cpu``) before it stages anything, so a verify
-  is never staged over an uncommitted one (``require_committed`` and
-  ``begin_step`` refuse it if it ever were).
+  t+1's batch. Round t+1's verify is staged only after round t's publish
+  (upstream ``FutureMap.resolve_seq_lens_cpu`` waits for it at the top of
+  ``run_batch``; with `dspark_deferred_seq_lens_patch` the device gather is
+  stream-ordered after it, the draft block is launched, and the host waits
+  for the published lengths in ``run_non_compact``), so a verify is never
+  staged over an uncommitted one (``require_committed`` and ``begin_step``
+  refuse it if it ever were).
 - The tentative step's publication epoch is opened by the verify's staging
   and resumed by its commit on the same thread and stream
   (``PublicationOwner.resume`` checks both); the next ``begin`` waits on the
   commit's completion event before the pinned sources are rewritten.
 - Host lengths: the ScheduleBatch's ``seq_lens_cpu`` is seeded one round late
   by ``prepare_for_decode`` and overwritten with the published exact lengths
-  (this backend's ``needs_cpu_seq_lens``) before the forward, so
-  ``live_seq_lens_cpu`` is the committed prefix as without overlap.
+  (this backend's ``needs_cpu_seq_lens``) before the verify, so
+  ``live_seq_lens_cpu`` is the committed prefix as without overlap. Deferred,
+  the draft runs with ``seq_lens_cpu`` None as for a ``needs_cpu_seq_lens=False``
+  backend (host planning sized by ``spec_info.nxt_kv_lens_cpu``).
 - Slots and PAGE rows: the verify forward batch carries the ScheduleBatch's
   host ``req_pool_indices`` (`_install_host_mirror_patch`), and a verify
   replay stages its block tables off `HostPageRows` like a decode replay. A
@@ -136,6 +141,14 @@ V41_DSPARK_CHECKS_ENV = "ATOM_SGLANG_V41_DSPARK_CHECKS"
 # Perf runs only: allow SGLANG_SIMULATE_ACC_LEN > 1 (a fixed mean accept
 # length, the output text is then not the model's).
 V41_DSPARK_SIMULATED_ACC_ENV = "ATOM_SGLANG_V41_DSPARK_ALLOW_SIMULATED_ACC"
+# Kill switch: "0" turns decoder SWA bounded replay off under DSpark only
+# (every prefill row runs every layer, the draft context takes every row).
+# ATOM_SGLANG_V41_DECODER_REPLAY=0 turns it off everywhere.
+V41_DSPARK_DECODER_REPLAY_ENV = "ATOM_SGLANG_V41_DSPARK_DECODER_REPLAY"
+# Debug: a directory where replayed and plain DSpark prefills dump the aux
+# rows the draft's first block reads (each request's last window rows), to
+# compare replay on and off on the same request offline. Eager prefills only.
+V41_DSPARK_AUX_DUMP_ENV = "ATOM_SGLANG_V41_DSPARK_AUX_DUMP"
 
 # The metadata builder of this process, created right before SGLang profiles
 # the memory its KV pool may take (`_install_pool_sizing_patch`).
@@ -1822,14 +1835,30 @@ class HostPageRows:
 
     def __init__(self):
         self._rows = {}
+        # Per slot, how many times its row was rewritten in place (`forget`):
+        # a copy read before a rewrite and recorded after it (a prefetch,
+        # `VerifyRowPrefetch`) is refused by comparing this.
+        self._generations = {}
 
-    def record(self, slots, rids, rows):
-        for slot, rid, row in zip(slots, rids, rows):
+    def generation(self, slot) -> int:
+        return self._generations.get(int(slot), 0)
+
+    def record(self, slots, rids, rows, generations=None):
+        """Record each slot's row. ``generations``: the slot generations when
+        the rows were read; a slot rewritten since keeps no copy."""
+        if generations is None:
+            generations = [None] * len(slots)
+        for slot, rid, row, gen in zip(slots, rids, rows, generations):
+            if gen is not None and gen != self.generation(slot):
+                self._rows.pop(int(slot), None)
+                continue
             self._rows[int(slot)] = (rid, row)
 
     def forget(self, slot) -> None:
         """Drop ``slot``'s copy: its row was rewritten in place."""
-        self._rows.pop(int(slot), None)
+        slot = int(slot)
+        self._rows.pop(slot, None)
+        self._generations[slot] = self._generations.get(slot, 0) + 1
 
     def lookup(self, slots, rids, widths):
         """Each request's first ``widths[i]`` pages, or None if any request's
@@ -1885,6 +1914,166 @@ def host_page_rows_supported() -> bool:
 
 
 _CHECK_HOST_ROWS = os.environ.get("ATOM_SGLANG_V41_CHECK_HOST_ROWS", "0") == "1"
+
+# Kill switch: "0" stops prefetching a DSpark round's PAGE rows before its
+# draft launch (`VerifyRowPrefetch`); a verify that enters a page its host
+# copy does not hold then reads the rows back behind the draft block.
+V41_DSPARK_PREFETCH_ROWS_ENV = "ATOM_SGLANG_V41_DSPARK_PREFETCH_ROWS"
+
+
+class VerifyRowPrefetch:
+    """The PAGE rows a DSpark round's verify will miss in `HostPageRows`,
+    copied to the host before the round's draft block is launched.
+
+    A verify replay that finds a request's host copy shorter than the pages
+    of ``p..p+5`` reads the rows back with a blocking D2H. Staged after the
+    draft launch, that read waits for the whole draft block, then the rest of
+    the staging runs with the GPU idle. Which rows will miss is known before
+    the draft: SGLang's ``prepare_for_decode`` reserved every request's KV up
+    to ``spec_info.nxt_kv_lens_cpu`` (page-aligned, at least the round's
+    ``p + 6``; ``alloc_for_spec_decode`` wrote those ``req_to_token`` entries
+    and the forward stream is ordered after them), so a request whose host
+    copy does not cover ``nxt / 256`` pages gets those pages read on a side
+    stream into pinned memory, without waiting. The verify's staging takes
+    them (`take`, one event wait: the copy depends only on the allocation,
+    not on the draft) and records them in `HostPageRows`, which then holds
+    them the way an EXTEND or a read-back would: keyed by STATE slot and
+    request id, so a copy is never used for another tenant. Under
+    ``ATOM_SGLANG_V41_CHECK_HOST_ROWS=1`` the staging still reads every row
+    back and compares.
+
+    With radix cache on, a checkpoint (``checkpoint_into_tree``) repoints a
+    live row at the tree's pages and drops its copy (``forget``). It runs in
+    the scheduler's result processing (a chunk's or a release's), never
+    between this ``issue`` and the same round's ``take``, and a checkpoint
+    before ``issue`` makes the row a miss read afresh: the forward stream
+    the side copy waits on waits on the schedule stream that rewrote it. The
+    rows still carry their slots' rewrite generation from ``issue``, and
+    ``take`` records none whose slot was rewritten since, so a stale copy can
+    never enter `HostPageRows` whatever the order.
+    """
+
+    def __init__(self):
+        self.pending = None
+        self.stream = None
+        self.event = None
+        self.pinned = None
+
+    def _host(self, rows: int, pages: int) -> torch.Tensor:
+        """A contiguous pinned ``[rows, pages]`` (an async D2H needs one)."""
+        pinned = self.pinned
+        if pinned is None or pinned.numel() < rows * pages:
+            pinned = torch.empty(
+                (max(rows * pages, 64 * 64),),
+                dtype=torch.int32,
+                pin_memory=torch.cuda.is_available(),
+            )
+            self.pinned = pinned
+        return pinned[: rows * pages].view(rows, pages)
+
+    def issue(self, slots, rids, bounds, req_to_token, block_size: int) -> int:
+        """Start the copy of the rows `HostPageRows` does not cover up to
+        each request's reserved length ``bounds``; returns how many."""
+        self.drop()
+        # The table's columns bound a row (a reservation at the context cap).
+        widths = np.minimum(
+            -(-np.asarray(bounds, dtype=np.int64) // block_size),
+            -(-int(req_to_token.shape[1]) // block_size),
+        )
+        miss = [
+            i
+            for i, (slot, rid, width) in enumerate(zip(slots, rids, widths))
+            if _HOST_ROWS.lookup([slot], [rid], [width]) is None
+        ]
+        if not miss:
+            return 0
+        miss_slots = [int(slots[i]) for i in miss]
+        pages = int(max(widths[i] for i in miss))
+        device = req_to_token.device
+        module = _device_module(device)
+        current = module.current_stream()
+        if self.stream is None:
+            self.stream = module.Stream(device=device)
+            self.event = module.Event()
+        host = self._host(len(miss), pages)
+        index = torch.tensor(miss_slots, dtype=torch.int64)
+        self.stream.wait_stream(current)
+        with module.stream(self.stream):
+            index = index.to(device, non_blocking=True)
+            table = (
+                req_to_token[index, : pages * block_size : block_size] // block_size
+            ).to(torch.int32)
+            host.copy_(table, non_blocking=True)
+            self.event.record(self.stream)
+        self.pending = (
+            miss_slots,
+            [rids[i] for i in miss],
+            [int(widths[i]) for i in miss],
+            host,
+            # A radix checkpoint that rewrites one of these rows before
+            # `take` (`forget_host_page_rows`) voids that row's copy.
+            [_HOST_ROWS.generation(slot) for slot in miss_slots],
+        )
+        return len(miss)
+
+    def take(self) -> bool:
+        """Record the prefetched rows in `HostPageRows` (one event wait);
+        False if none are pending."""
+        if self.pending is None:
+            return False
+        slots, rids, widths, host, generations = self.pending
+        self.pending = None
+        self.event.synchronize()
+        rows = [host[i, :width].numpy().copy() for i, width in enumerate(widths)]
+        _refuse_padding_page(rows)
+        _HOST_ROWS.record(slots, rids, rows, generations)
+        return True
+
+    def drop(self) -> None:
+        """Forget a prefetch no verify took (an eager round, or one whose
+        copies already covered it): its pinned rows are reused next."""
+        if self.pending is not None:
+            self.pending = None
+            self.event.synchronize()
+
+
+_VERIFY_PREFETCH = VerifyRowPrefetch()
+
+
+def _device_module(device):
+    return torch.get_device_module(torch.device(device))
+
+
+def v41_dspark_prefetch_rows_enabled() -> bool:
+    return os.environ.get(V41_DSPARK_PREFETCH_ROWS_ENV, "1") != "0"
+
+
+def prefetch_v41_dspark_verify_rows(batch, req_to_token, block_size: int) -> int:
+    """Before a DSpark decode round's draft launch: prefetch the PAGE rows
+    its verify would otherwise read back behind the draft
+    (`VerifyRowPrefetch`). From the round's own ScheduleBatch: host slots,
+    request ids and SGLang's reservation ``spec_info.nxt_kv_lens_cpu``."""
+    if not host_page_rows_supported():
+        return 0
+    slots = getattr(batch, "req_pool_indices_cpu", None)
+    bounds = getattr(getattr(batch, "spec_info", None), "nxt_kv_lens_cpu", None)
+    reqs = getattr(batch, "reqs", None)
+    if slots is None or bounds is None or reqs is None:
+        return 0
+    bs = len(reqs)
+    if len(slots) != bs or len(bounds) < bs:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 DSpark row prefetch: {bs} requests, {len(slots)} host "
+            f"slots, {len(bounds)} reserved lengths"
+        )
+    slots = [int(slot) for slot in slots]
+    bounds = _cpu_ints(bounds, None, bs)
+    count = _VERIFY_PREFETCH.issue(
+        slots, [req.rid for req in reqs], bounds, req_to_token, block_size
+    )
+    if count:
+        count_v41_dspark("rows_prefetched", count)
+    return count
 
 
 def _refuse_padding_page(rows) -> None:
@@ -2206,7 +2395,9 @@ def build_v41_scheduled_batch(
     )
 
 
-def v41_extend_replays(forward_batch, batch, window: int) -> bool:
+def v41_extend_replays(
+    forward_batch, batch, window: int, *, dspark_context_in_forward: bool = False
+) -> bool:
     """Whether this EXTEND may run V4.1's decoder on each request's last
     ``window`` rows only (decoder SWA bounded replay), which leaves every
     output row but each request's last zero.
@@ -2223,12 +2414,24 @@ def v41_extend_replays(forward_batch, batch, window: int) -> bool:
 
     A fused radix replay's rows (``batch.replay_rows``) are ATOM's: they
     count toward the tail (the span ATOM runs starts at ``P - R``, at least
-    the window long) but not toward SGLang's logprob rows."""
+    the window long) but not toward SGLang's logprob rows.
+
+    ``dspark_context_in_forward``: a DSpark target, whose FULL capture feeds
+    only SGLang's context injection, a checked no-op on this path
+    (``write_target_hidden_kv``): the draft context is written inside the
+    forward, from the tail's rows under a replay
+    (`V41DSparkTargetSurface.finish_forward`), as native's drafter does.
+    With a fused radix hit the tail is the last ``window`` rows of the
+    widened span ``[P - R, L)`` (``R >= window``), i.e. ``[L - window, L)``,
+    exactly the context the first draft block reads; the replay rows below
+    it are not needed by any draft block. A radix side forward is
+    prefill-only, so it never replays and writes every row of ``[P - R, P)``,
+    and its main extend replays only when its own rows reach the window."""
     if getattr(forward_batch, "is_prefill_only", False):
         return False
     capture = getattr(forward_batch, "capture_hidden_mode", None)
     is_full = getattr(capture, "is_full", None)
-    if is_full is not None and is_full():
+    if is_full is not None and is_full() and not dspark_context_in_forward:
         return False
     lengths = np.asarray(batch.num_scheduled_tokens, np.int64)
     if getattr(forward_batch, "return_logprob", False):
@@ -2326,7 +2529,11 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
     else:
         if getattr(builder, "_decoder_replays", False):
             batch.decoder_replays = v41_extend_replays(
-                forward_batch, batch, builder.geometry.window_size
+                forward_batch,
+                batch,
+                builder.geometry.window_size,
+                # Only DSpark speculates on V4.1 here (`v41_dspark_capability_error`).
+                dspark_context_in_forward=speculative_tokens > 0,
             )
         metadata, step_positions = builder.prepare_prefill(
             batch, running_bs, running_tokens
@@ -2559,6 +2766,11 @@ def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int, width=1
         rids = list(rids)
         if host_page_rows_supported():
             rows = _HOST_ROWS.lookup(slots, rids, widths)
+            if rows is None and _VERIFY_PREFETCH.take():
+                rows = _HOST_ROWS.lookup(slots, rids, widths)
+            if rows is None and width > 1:
+                # A DSpark verify reading back behind its draft block.
+                count_v41_dspark("rows_read_sync")
     if rows is None or _CHECK_HOST_ROWS:
         read_slots, read_rows = _read_replay_rows(
             fb_view, req_to_token, raw_bs, widths, block_size
@@ -2757,6 +2969,10 @@ V41_DSPARK_COUNTER_NAMES = (
     # graph replays of a bucket wider than the batch (padding rows)
     "verify_padded",
     "draft_padded",
+    # PAGE rows copied before the draft launch (`VerifyRowPrefetch`), and
+    # verify replays that still read rows back behind the draft
+    "rows_prefetched",
+    "rows_read_sync",
 )
 V41_DSPARK_COUNTERS = dict.fromkeys(V41_DSPARK_COUNTER_NAMES, 0)
 _V41_DSPARK_COUNTERS_EXIT = False
@@ -2791,11 +3007,11 @@ def log_v41_dspark_counters(reason: str) -> None:
     )
 
 
-def count_v41_dspark(name: str) -> None:
-    """One more ``name`` event on this rank (eager-side: a graph replay is
-    counted where it is staged, never inside the graph)."""
+def count_v41_dspark(name: str, count: int = 1) -> None:
+    """``count`` more ``name`` events on this rank (eager-side: a graph
+    replay is counted where it is staged, never inside the graph)."""
     global _V41_DSPARK_COUNTERS_EXIT
-    V41_DSPARK_COUNTERS[name] += 1
+    V41_DSPARK_COUNTERS[name] += count
     if not _V41_DSPARK_COUNTERS_EXIT:
         import atexit
 
