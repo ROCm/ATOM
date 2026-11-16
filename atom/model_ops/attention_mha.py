@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 from functools import cache
 
 import aiter
@@ -42,6 +43,34 @@ def claim_qkv_splitk_partials(qkv: torch.Tensor | None) -> torch.Tensor | None:
     if qkv is None or splitk_partials is None:
         return None
     return splitk_partials(qkv)
+
+
+@cache
+def aiter_qknorm_takes_dense_layers() -> bool:
+    """Whether aiter fused_qknorm_idxrqknorm inserts a layer without index heads
+    into a per-token FP8 cache (earlier versions assert index operands there),
+    with the gfx1250 kernel the Gemma routes of PagedAttentionImpl.rope_cache
+    were measured on. Both came in the version that takes ``qkv_partials``."""
+    return "qkv_partials" in inspect.signature(aiter.fused_qknorm_idxrqknorm).parameters
+
+
+def aiter_qknorm_takes_partials(qkv: torch.Tensor, partials: torch.Tensor) -> bool:
+    """Whether fused_qknorm_idxrqknorm reduces these split-K partials itself
+    (it aborts on any it refuses)."""
+    row = qkv.shape[-1]
+    return (
+        qkv.dtype == torch.bfloat16
+        and partials.dtype == torch.float32
+        and partials.dim() == 3
+        and partials.shape[0] in (2, 4, 8)
+        and partials.shape[1] >= qkv.shape[0]
+        and partials.shape[2] == row
+        and partials.stride(2) == 1
+        and partials.stride(1) == row
+        and partials.stride(0) >= partials.shape[1] * row
+        and partials.stride(0) % 4 == 0
+        and partials.data_ptr() % 16 == 0
+    )
 
 
 @cache
@@ -326,20 +355,40 @@ class PagedAttentionImpl(nn.Module):
 
         from atom.model_ops.layernorm import GemmaRMSNorm
 
+        # aiter fused_qknorm_idxrqknorm takes the Gemma q/k norm + RoPE: with the
+        # cache insert for decode, before the cache write for long prefill.
+        aiter_norm_rope = (
+            isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+            and self.rotary_emb is not None
+            and qkv is not None
+            and self._aiter_gemma_norm_rope(qkv, position, k_cache, v_cache, k_scale)
+        )
+        aiter_insert = aiter_norm_rope and not fwd_ctx.context.is_prefill
         # Gemma q/k norm, RoPE and the cache write as separate kernels.
-        gemma_unfused = isinstance(self.q_norm, GemmaRMSNorm) and (
-            q.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
-            and self._use_asm_cache_layout(
-                k_cache, v_cache, use_triton_attn=use_triton_attn
+        gemma_unfused = (
+            not aiter_insert
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and (
+                q.shape[0]
+                > (
+                    envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS_AITER
+                    if aiter_norm_rope
+                    else envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
+                )
+                and self._use_asm_cache_layout(
+                    k_cache, v_cache, use_triton_attn=use_triton_attn
+                )
             )
         )
-        # Only the fused Gemma kernel reduces a deferred split-K QKV itself.
+        # Only the fused Gemma kernels reduce a deferred split-K QKV themselves.
         qkv_partials = claim_qkv_splitk_partials(qkv)
         if qkv_partials is not None and not (
             self.rotary_emb is not None
             and self.k_norm is not None
             and isinstance(self.q_norm, GemmaRMSNorm)
             and not gemma_unfused
+            and (not aiter_insert or aiter_qknorm_takes_partials(qkv, qkv_partials))
         ):
             reduce_splitk_partials(qkv, qkv_partials)
             qkv_partials = None
@@ -361,7 +410,20 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
-            if gemma_unfused:
+            if aiter_insert:
+                q, k, v = self._aiter_gemma_norm_rope_cache(
+                    qkv,
+                    k_raw,
+                    v_raw,
+                    position,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata,
+                    qkv_partials=qkv_partials,
+                )
+            elif gemma_unfused:
                 q, k, v = self._gemma_norm_rope_then_cache(
                     q_raw,
                     k_raw,
@@ -372,6 +434,7 @@ class PagedAttentionImpl(nn.Module):
                     k_scale,
                     v_scale,
                     attn_metadata,
+                    qkv=qkv if aiter_norm_rope else None,
                 )
             elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
@@ -517,8 +580,110 @@ class PagedAttentionImpl(nn.Module):
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
+    def _aiter_gemma_norm_rope(self, qkv, position, k_cache, v_cache, k_scale) -> bool:
+        """Whether aiter fused_qknorm_idxrqknorm can take the Gemma q/k norm +
+        RoPE off the Triton kernel: a contiguous ``[q | k | v]`` row, head_dim
+        128, a NeoX RoPE without MRoPE sections over 1-D int64 positions, and a
+        5-D SHUFFLE cache, unquantized or per-token FP8. gfx1250 only, the arch
+        it was measured on.
+
+        The op aborts on arguments it refuses instead of raising, so whatever
+        the KV pool does not already guarantee is checked here."""
+        rope = self.rotary_emb
+        if self.kv_cache_dtype == "fp8":
+            cache_dtype_ok = k_scale is not None
+        else:
+            cache_dtype_ok = (
+                self.kv_cache_dtype == "bf16" and k_cache.dtype == qkv.dtype
+            )
+        return (
+            get_gfx() == "gfx1250"
+            and aiter_qknorm_takes_dense_layers()
+            and qkv.is_contiguous()
+            and qkv.shape[-1]
+            == (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
+            and self.head_dim == 128
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and position is not None
+            and position.dim() == 1
+            and position.dtype == torch.int64
+            and position.is_contiguous()
+            and getattr(rope, "is_neox_style", False)
+            and getattr(rope, "mrope_section", None) is None
+            and hasattr(rope, "cos_cache")
+            and rope.rotary_dim % 8 == 0
+            and k_cache.dim() == 5
+            and v_cache.dim() == 5
+            and cache_dtype_ok
+        )
+
+    def _aiter_gemma_norm_rope_cache(
+        self,
+        qkv,
+        k,
+        v,
+        position,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        attn_metadata,
+        qkv_partials=None,
+    ):
+        """triton_fused_norm_rope_cache for decode, as one aiter
+        fused_qknorm_idxrqknorm insert: q into a new tensor, the normed and roped
+        K and V into the cache, with the SHUFFLE layout and per-token FP8 scales
+        the Triton kernel writes. ``k`` and ``v`` come back as they were: the
+        decode backends read the cache, not these. With ``qkv_partials`` the
+        kernel reduces the deferred split-K QKV first, back into ``qkv``."""
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        fp8 = self.kv_cache_dtype == "fp8"
+        q = torch.empty(
+            (qkv.shape[0], self.num_heads * self.head_dim),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            position,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            slot_mapping=attn_metadata.slot_mapping,
+            kv_cache_k=k_cache,
+            kv_cache_v=v_cache,
+            block_size=k_cache.shape[3],
+            q_out=q,
+            kv_cache_dtype="fp8" if fp8 else "auto",
+            k_scale=k_scale if fp8 else None,
+            v_scale=v_scale if fp8 else None,
+            asm_layout=True,
+            qkv_partials=qkv_partials,
+        )
+        return (
+            q.view(-1, self.num_heads, self.head_dim),
+            k.view(-1, self.num_kv_heads, self.head_dim),
+            v.view(-1, self.num_kv_heads, self.head_dim),
+        )
+
     def _gemma_norm_rope_then_cache(
-        self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        self,
+        q,
+        k,
+        v,
+        position,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        attn_metadata,
+        qkv=None,
     ):
         """Unfused twin of triton_fused_norm_rope_cache for long batches.
 
@@ -529,30 +694,56 @@ class PagedAttentionImpl(nn.Module):
         module's own rotary when that declines), then the cache write: per-token
         FP8 for an FP8 cache, unquantized otherwise. Same SHUFFLE layout and
         scales the fused kernel writes.
-        """
-        from atom.model_ops.layernorm import DualRMSNorm
-        from atom.model_ops.triton_mrope import try_mrope_qk_fused
 
-        if getattr(self, "_dual_qk_norm", None) is None:
-            self._dual_qk_norm = DualRMSNorm(
-                self.q_norm,
-                self.k_norm,
+        With ``qkv`` (``_aiter_gemma_norm_rope``), the norm and RoPE are one
+        aiter fused_qknorm_idxrqknorm launch instead, q into a new tensor and k
+        in place in ``qkv``, above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS_AITER.
+        """
+        if qkv is not None:
+            from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+            q_out = torch.empty(
+                (qkv.shape[0], self.num_heads * self.head_dim),
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            aiter.fused_qknorm_idxrqknorm(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+                position,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                q_out=q_out,
+            )
+            q = q_out
+        else:
+            from atom.model_ops.layernorm import DualRMSNorm
+            from atom.model_ops.triton_mrope import try_mrope_qk_fused
+
+            if getattr(self, "_dual_qk_norm", None) is None:
+                self._dual_qk_norm = DualRMSNorm(
+                    self.q_norm,
+                    self.k_norm,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    prefix=f"layer_{self.layer_num}.qk_norm",
+                )
+            q, k = self._dual_qk_norm(q, k)
+            roped = try_mrope_qk_fused(
+                self.rotary_emb,
+                position,
+                q,
+                k,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                prefix=f"layer_{self.layer_num}.qk_norm",
             )
-        q, k = self._dual_qk_norm(q, k)
-        roped = try_mrope_qk_fused(
-            self.rotary_emb,
-            position,
-            q,
-            k,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+            q, k = roped if roped is not None else self.rotary_emb(position, q, k)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)

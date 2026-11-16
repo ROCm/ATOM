@@ -443,6 +443,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
+    # The same split where aiter fused_qknorm_idxrqknorm takes the Gemma q/k
+    # norm + RoPE (gfx1250, plain NeoX RoPE, head_dim 128): prefill batches
+    # above this token count run it, then the cache write (crossover near 500
+    # tokens for the MiniMax-M3 dense layers, TP4 on MI455X, page 128).
+    # Decode batches take its cache insert at any size.
+    "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS_AITER": lambda: int(
+        os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS_AITER", "512")
+    ),
     # MiniMax-M3 on gfx1250: batches of at most this many tokens may leave the
     # split-K reduction of the per-token FP8 QKV GEMM to the q/k norm + RoPE +
     # cache kernel that consumes it; 0 keeps the standalone reduce kernel.
