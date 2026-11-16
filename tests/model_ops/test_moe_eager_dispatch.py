@@ -1,36 +1,119 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FusedMoE runs its two custom ops (moe_forward, rocm_aiter_fused_moe) without
-the torch.ops dispatch in eager mode, and through it wherever a tracer or a
-dispatch mode handles them as opaque calls.
+"""The caller returned by `direct_register_custom_op` runs the op's Python
+implementation directly in eager mode, and goes through torch.ops wherever a
+tracer or a dispatch mode handles the op as an opaque call. FusedMoE calls its
+two custom ops (moe_forward, rocm_aiter_fused_moe) through such callers.
 
-Which path ran is read off the profiler: it records an op only when the op is
-dispatched, and it is not a dispatch mode, so it does not change the path.
+Which path ran is read off the profiler: a dispatched op is recorded as an op,
+a direct call as a user annotation of the same name. The profiler is not a
+dispatch mode, so it does not change the path.
 """
 
 import importlib.util
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch.library import Library
 
+from atom.utils import custom_register
 from atom.utils.custom_register import direct_register_custom_op, eager_direct_call
 
 _LIB = Library("atom_moe_eager_test", "FRAGMENT")
+_PY_CALLS = []
 
 
-def _double(x: torch.Tensor) -> torch.Tensor:
-    return x * 2
+def _scale(x: torch.Tensor, factor: float = 2.0) -> torch.Tensor:
+    _PY_CALLS.append(factor)
+    return x * factor
 
 
-def test_register_reports_whether_it_registered():
-    kw = {"target_lib": _LIB, "dispatch_key": "CPU"}
-    assert direct_register_custom_op("double", _double, [], **kw)
-    assert not direct_register_custom_op("double", _double, [], **kw)
-    assert torch.equal(
-        torch.ops.atom_moe_eager_test.double(torch.ones(2)), torch.full((2,), 2.0)
+def _scale_fake(x: torch.Tensor, factor: float = 2.0) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+# Without a fake impl, Dynamo traces into the op's Python kernel.
+_scale_op = direct_register_custom_op(
+    "scale", _scale, [], fake_impl=_scale_fake, target_lib=_LIB, dispatch_key="CPU"
+)
+
+
+def _paths(fn, name):
+    """`fn()`'s result and how `name` ran: "op" (dispatched through torch.ops)
+    and/or "direct" (the user annotation of a direct call)."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        out = fn()
+    return out, {
+        "direct" if e.is_user_annotation else "op" for e in p.events() if e.name == name
+    }
+
+
+def test_caller_keeps_the_signature_and_registers_once():
+    assert inspect.signature(_scale_op) == inspect.signature(_scale)
+    again = direct_register_custom_op(
+        "scale", _scale, [], target_lib=_LIB, dispatch_key="CPU"
     )
+    x = torch.ones(2)
+    assert torch.equal(again(x, 3.0), torch.full((2,), 3.0))
+    assert torch.equal(torch.ops.atom_moe_eager_test.scale(x), torch.full((2,), 2.0))
+    with pytest.raises(TypeError):
+        _scale_op(x, 2.0, 1)
+
+
+def test_caller_runs_directly_in_eager_and_dispatches_otherwise(monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    x = torch.arange(4.0)
+    name = "atom_moe_eager_test::scale"
+    _PY_CALLS.clear()
+    out, ran = _paths(lambda: _scale_op(x, factor=3.0), name)
+    assert ran == {"direct"} and _PY_CALLS == [3.0]
+    assert torch.equal(out, x * 3)
+
+    _PY_CALLS.clear()
+    assert torch.equal(_scale_op(x, 3.0), x * 3) and _PY_CALLS == [3.0]
+
+    class Passthrough(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    with Passthrough():
+        ref, ran = _paths(lambda: _scale_op(x, factor=3.0), name)
+    assert ran == {"op"} and torch.equal(ref, out)
+
+    monkeypatch.setattr(custom_register, "eager_direct_call", lambda x: False)
+    ref, ran = _paths(lambda: _scale_op(x, factor=3.0), name)
+    assert ran == {"op"} and torch.equal(ref, out)
+
+
+def test_caller_dispatches_for_a_non_tensor_first_argument():
+    def first(xs: list[torch.Tensor]) -> torch.Tensor:
+        return xs[0].clone()
+
+    caller = direct_register_custom_op(
+        "first", first, [], target_lib=_LIB, dispatch_key="CPU"
+    )
+    out, ran = _paths(lambda: caller([torch.ones(2)]), "atom_moe_eager_test::first")
+    assert ran == {"op"} and torch.equal(out, torch.ones(2))
+
+
+def test_caller_stays_an_op_under_torch_compile():
+    targets = []
+
+    def recording_backend(gm, example_inputs):
+        targets.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
+        return gm.forward
+
+    x = torch.arange(4.0)
+    compiled = torch.compile(lambda t: _scale_op(t, 3.0), backend=recording_backend)
+    try:
+        out = compiled(x)
+    finally:
+        torch._dynamo.reset()
+    assert any("atom_moe_eager_test.scale" in t for t in targets), targets
+    assert torch.equal(out, x * 3)
 
 
 def test_eager_direct_call_only_for_real_eager_tensors(monkeypatch):
@@ -67,19 +150,12 @@ def moe_mod():
     return moe
 
 
-def _dispatched(fn):
-    """`fn()`'s result and the aiter ops it dispatched through torch.ops."""
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
-        out = fn()
-    names = {e.name for e in p.events()}
-    return out, {
-        n for n in ("aiter::moe_forward", "aiter::rocm_aiter_fused_moe") if n in names
-    }
-
-
 def _layer(moe_mod, monkeypatch, forward_impl):
     """A FusedMoE whose forward_impl is `forward_impl`, registered under its name."""
-    cls = moe_mod.FusedMoE.__mro__[1]  # the class under the plugin-mode lazy wrapper
+    # The plugin-mode lazy wrapper subclasses FusedMoE under the same name; take
+    # the class that defines forward.
+    cls = next(c for c in moe_mod.FusedMoE.__mro__ if "forward" in vars(c))
+    assert cls.__name__ == "FusedMoE"
     layer = cls.__new__(cls)
     torch.nn.Module.__init__(layer)
     layer.balance_router_logits = None
@@ -105,14 +181,14 @@ def test_fused_moe_forward_calls_moe_forward_directly(moe_mod, monkeypatch):
     layer = _layer(moe_mod, monkeypatch, forward_impl)
     x = torch.randn(4, 8, device="cuda")
     logits = torch.randn(4, 3, device="cuda")
-    out, ops = _dispatched(lambda: layer(x, logits))
-    assert ops == set()
+    out, ran = _paths(lambda: layer(x, logits), "aiter::moe_forward")
+    assert ran == {"direct"}
     assert len(calls) == 1 and calls[0] is logits
     torch.testing.assert_close(out, x + logits.sum(-1, keepdim=True), rtol=0, atol=0)
 
-    monkeypatch.setattr(moe_mod, "_MOE_FORWARD_IS_OURS", False)
-    ref, ops = _dispatched(lambda: layer(x, logits))
-    assert ops == {"aiter::moe_forward"}
+    monkeypatch.setattr(custom_register, "eager_direct_call", lambda x: False)
+    ref, ran = _paths(lambda: layer(x, logits), "aiter::moe_forward")
+    assert ran == {"op"}
     assert torch.equal(out, ref)
 
 
@@ -186,10 +262,10 @@ def test_rocm_aiter_fused_moe_direct_call_matches_the_op(moe_mod, monkeypatch):
             scheduled_tokens_gpu=None,
         )
 
-    out, ops = _dispatched(run)
-    assert "aiter::rocm_aiter_fused_moe" not in ops
-    monkeypatch.setattr(moe_mod, "_ROCM_AITER_FUSED_MOE_IS_OURS", False)
-    ref, ops = _dispatched(run)
-    assert "aiter::rocm_aiter_fused_moe" in ops
+    out, ran = _paths(run, "aiter::rocm_aiter_fused_moe")
+    assert ran == {"direct"}
+    monkeypatch.setattr(custom_register, "eager_direct_call", lambda x: False)
+    ref, ran = _paths(run, "aiter::rocm_aiter_fused_moe")
+    assert ran == {"op"}
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
