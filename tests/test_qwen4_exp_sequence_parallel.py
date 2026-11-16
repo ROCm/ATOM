@@ -30,7 +30,11 @@ class _Collectives:
         self.barrier.wait()
         return inputs
 
-    def group(self, rank: int):
+    def group(self, rank: int, backend: str = "c10d"):
+        """aiter's GroupCoordinator for `rank`. With `backend="pynccl"` its
+        device communicator has a PyNccl communicator, and the
+        torch.distributed collectives must not be called."""
+
         def all_gather(x, use_custom=False, dim=0):
             assert dim == 0
             return torch.cat(self._exchange(rank, x))
@@ -40,15 +44,52 @@ class _Collectives:
             total = torch.stack(self._exchange(rank, x)).sum(0)
             return total.chunk(self.world)[rank].clone()
 
+        if backend == "c10d":
+            return SimpleNamespace(
+                all_gather=all_gather, reduce_scatter_tensor=reduce_scatter_tensor
+            )
+
+        def torch_distributed(*args, **kwargs):
+            raise AssertionError("torch.distributed collective used beside PyNccl")
+
         return SimpleNamespace(
-            all_gather=all_gather, reduce_scatter_tensor=reduce_scatter_tensor
+            all_gather=torch_distributed,
+            reduce_scatter_tensor=torch_distributed,
+            device_communicator=SimpleNamespace(pynccl_comm=_PyNccl(self, rank)),
         )
 
 
-@pytest.fixture
-def ranks(monkeypatch):
+class _PyNccl:
+    """aiter's `PyNcclCommunicator` collectives (outputs preallocated by the
+    caller, NCCL element counts) over `_Collectives`."""
+
+    disabled = False
+
+    def __init__(self, collectives: _Collectives, rank: int) -> None:
+        self.collectives, self.rank = collectives, rank
+
+    def all_gather(self, output_tensor, input_tensor, stream=None):
+        assert input_tensor.is_contiguous() and output_tensor.is_contiguous()
+        world = self.collectives.world
+        assert output_tensor.numel() == world * input_tensor.numel()
+        assert output_tensor.dtype == input_tensor.dtype
+        gathered = torch.cat(self.collectives._exchange(self.rank, input_tensor))
+        output_tensor.view(-1).copy_(gathered.view(-1))
+
+    def reduce_scatter(self, output_tensor, input_tensor, op=None, stream=None):
+        assert input_tensor.is_contiguous() and output_tensor.is_contiguous()
+        world = self.collectives.world
+        assert input_tensor.numel() == world * output_tensor.numel()
+        assert output_tensor.dtype == input_tensor.dtype
+        total = torch.stack(self.collectives._exchange(self.rank, input_tensor)).sum(0)
+        output_tensor.view(-1).copy_(total.view(world, -1)[self.rank])
+
+
+@pytest.fixture(params=["c10d", "pynccl"])
+def ranks(monkeypatch, request):
     """`ranks(world, fn)` runs `fn(rank)` on `world` simulated TP ranks; outside
-    `ranks` the TP world size is 1."""
+    `ranks` the TP world size is 1. Runs once with torch.distributed and once
+    with PyNccl collectives."""
     local = threading.local()
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: local.group)
     monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: local.rank)
@@ -64,7 +105,7 @@ def ranks(monkeypatch):
 
         def on_rank(rank):
             local.rank, local.world = rank, world
-            local.group = collectives.group(rank)
+            local.group = collectives.group(rank, request.param)
             return fn(rank)
 
         with ThreadPoolExecutor(world) as pool:
@@ -113,6 +154,85 @@ def test_scatter_sums_partials_into_local_rows(ranks, world, tokens, trailing):
 
     for gathered in ranks(world, on_rank):
         torch.testing.assert_close(gathered, total)
+
+
+class _RecordingGroup:
+    """One TP rank of two whose peer holds the same rows; records which path
+    each collective took."""
+
+    def __init__(self, device_communicator=None):
+        self.calls = []
+        if device_communicator is not None:
+            self.device_communicator = device_communicator
+
+    def all_gather(self, x, use_custom=False, dim=0):
+        self.calls.append(("torch.distributed", "all_gather", use_custom, dim))
+        return torch.cat([x, x])
+
+    def reduce_scatter_tensor(self, x, use_custom=False, dim=0):
+        self.calls.append(("torch.distributed", "reduce_scatter", use_custom, dim))
+        return 2 * x[: x.shape[0] // 2]
+
+
+class _RecordingPyNccl:
+    def __init__(self, calls, disabled=False):
+        self.calls, self.disabled = calls, disabled
+
+    def all_gather(self, output_tensor, input_tensor, stream=None):
+        self.calls.append(("pynccl", "all_gather"))
+        output_tensor.copy_(torch.cat([input_tensor, input_tensor]))
+
+    def reduce_scatter(self, output_tensor, input_tensor, op=None, stream=None):
+        self.calls.append(("pynccl", "reduce_scatter"))
+        output_tensor.copy_(2 * input_tensor[: output_tensor.shape[0]])
+
+
+@pytest.mark.parametrize(
+    "communicator",
+    ["none", "no_pynccl", "pynccl_disabled"],
+)
+def test_collectives_fall_back_without_pynccl(monkeypatch, communicator):
+    """Without a usable PyNccl communicator (a group built without a device
+    communicator, a PyNccl init that failed, or one that is disabled) both
+    collectives keep the torch.distributed path, unchanged."""
+    calls = []
+    device_communicator = {
+        "none": None,
+        "no_pynccl": SimpleNamespace(pynccl_comm=None),
+        "pynccl_disabled": SimpleNamespace(
+            pynccl_comm=_RecordingPyNccl(calls, disabled=True)
+        ),
+    }[communicator]
+    group = _RecordingGroup(device_communicator)
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(7, 2, 0)
+    assert sp.pynccl is None
+    local = torch.randn(4, 3, dtype=torch.bfloat16)
+    assert torch.equal(sp.gather(local), torch.cat([local, local])[:7])
+    partial = torch.randn(7, 3, dtype=torch.bfloat16)
+    assert torch.equal(sp.scatter(partial), 2 * partial[:4])
+    assert calls == []
+    assert group.calls == [
+        ("torch.distributed", "all_gather", False, 0),
+        ("torch.distributed", "reduce_scatter", False, 0),
+    ]
+
+
+def test_collectives_keep_torch_distributed_for_dtypes_pynccl_cannot_send(
+    monkeypatch,
+):
+    calls = []
+    group = _RecordingGroup(SimpleNamespace(pynccl_comm=_RecordingPyNccl(calls)))
+    monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
+    sp = qwen4_exp._SequenceParallel(8, 2, 0)
+    assert sp.pynccl is not None
+    mask = torch.tensor([True, False, True, True])
+    assert torch.equal(sp.gather(mask), torch.cat([mask, mask]))
+    rows = torch.arange(4, dtype=torch.int32)
+    assert torch.equal(sp.gather(rows), torch.cat([rows, rows]))
+    assert torch.equal(sp.scatter(torch.ones(8, 2)), torch.full((4, 2), 2.0))
+    assert group.calls == [("torch.distributed", "all_gather", False, 0)]
+    assert calls == [("pynccl", "all_gather"), ("pynccl", "reduce_scatter")]
 
 
 class _Layer:
