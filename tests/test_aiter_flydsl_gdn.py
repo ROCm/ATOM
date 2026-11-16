@@ -285,6 +285,24 @@ def test_triton_decode_skips_padding_rows_with_tokens(monkeypatch):
     torch.testing.assert_close(storage[0], original[0], rtol=0, atol=0)
 
 
+class _GdnLayer:
+    base_linear_attention = None
+
+    def __init__(self, impl):
+        self.impl = impl
+
+
+def _with_one_gdn_layer(builder, layer, state):
+    """`_gdn_flydsl_policies` decides once from the runner's SSM slot, for
+    the GDN layers in the pool rows."""
+    from atom.model_ops.attentions.gdn_attn import LINEAR_STATE_ROWS
+
+    builder.device = state.device
+    builder._pool_rows = {LINEAR_STATE_ROWS: {layer: 0}}
+    builder._state_shape_for_runner = lambda: (None, tuple(state.shape[1:]))
+    builder._state_dtypes = lambda: (None, state.dtype)
+
+
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("supported_arch", [False, True])
 @pytest.mark.parametrize("decode_backend", ["auto", "triton", "flydsl"])
@@ -315,7 +333,8 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     monkeypatch.setattr(fly, "ops", lambda: object())
     monkeypatch.setattr(fly, "decode_device_supported", lambda device: supported_arch)
     attention = SimpleNamespace(allow_aiter_flydsl=allowed, dt_bias=raw)
-    layer = SimpleNamespace(base_linear_attention=None, impl=attention)
+    layer = _GdnLayer(attention)
+    _with_one_gdn_layer(builder, layer, raw)
     result = builder.build_kv_cache_tensor(layer)
     assert result.v_cache.data_ptr() == raw.data_ptr()
     expected = (
@@ -463,9 +482,9 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "build_kv_cache_tensor", lambda self, module: cache
     )
-    cache = builder.build_kv_cache_tensor(
-        SimpleNamespace(base_linear_attention=None, impl=attention)
-    )
+    layer = _GdnLayer(attention)
+    _with_one_gdn_layer(builder, layer, raw)
+    cache = builder.build_kv_cache_tensor(layer)
     # Production binds a zero-filled pool before prefill populates logical KV
     # states. Seed logical values after binding, not physical pre-bind storage.
     cache.v_cache.copy_(reference)
