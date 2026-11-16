@@ -64,7 +64,8 @@ def _assert_live_scores_equal(actual, expected, lengths, rank):
 
 
 @needs_gpu
-@pytest.mark.parametrize("batch,context", [(1, 1000), (3, 9000), (16, 40000)])
+# (2, 300): three blocks a row, so rank 3 owns none of them.
+@pytest.mark.parametrize("batch,context", [(2, 300), (1, 1000), (3, 9000), (16, 40000)])
 @pytest.mark.parametrize("rank", [0, 3])
 def test_wide_launch_matches_real_length(batch, context, rank):
     q, cache, table, lengths = _inputs(batch, context, seed=batch * 7 + rank)
@@ -72,10 +73,9 @@ def test_wide_launch_matches_real_length(batch, context, rank):
     narrow = _scores(q, cache, table, lengths, real_len, rank)
     wide = _scores(q, cache, table, lengths, WIDE, rank)
     _assert_live_scores_equal(wide, narrow, lengths, rank)
-    assert torch.equal(
-        _keys(wide, lengths, WIDE, rank),
-        _keys(narrow, lengths, real_len, rank),
-    )
+    keys = _keys(wide, lengths, WIDE, rank)
+    assert torch.equal(keys, _keys(narrow, lengths, real_len, rank))
+    assert bool(keys.any()) == (real_len > 128 * rank)
 
 
 @needs_gpu
