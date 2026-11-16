@@ -2211,9 +2211,9 @@ class Scheduler:
             return None
 
         # One fresh/partial prefill per rank only on a full-group align.
-        # Escapes and the 3/4 quorum keep the normal token budget: capping
-        # those at one sequence would drain a cold queue one request per tick.
-        # DP=1 never caps; the delayer does not enter sync mode there either.
+        # Escapes and the quorum keep the normal token budget: capping those at
+        # one sequence would drain a cold queue one request per tick. DP=1 never
+        # caps; the delayer does not enter sync mode there either.
         prefill_seq_limit = self.max_num_seqs
         delayer = self.prefill_delayer
         if (

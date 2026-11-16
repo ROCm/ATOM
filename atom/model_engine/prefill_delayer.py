@@ -123,8 +123,6 @@ from typing import NamedTuple
 
 import torch
 
-from atom.utils import envs
-
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "true")
@@ -336,6 +334,7 @@ class PrefillDelayer:
         cost_gate: bool = False,
         clock=time.perf_counter,
         admit_policy: str = "interval",
+        sync_prefill: bool = False,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -394,12 +393,12 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
-        # When set, a prefill wave is released only once every DP rank has
-        # prefill work (or a TTFT/KV escape fires). One rank prefilling alone
-        # clears ForwardMode.unified and forces every other rank's decode
-        # off its CUDA graph. Read here so the flag does not need a new
-        # constructor argument through EngineCore.
-        self.sync_prefill = envs.ATOM_DP_PREFILL_SYNC
+        # When set, a prefill wave is held until the DP ranks can prefill
+        # together (prefillable + blocked reach dp_size), or a quorum/escape
+        # releases it, so the group does not turn every lone arrival into a
+        # group prefill tick. Passed in from envs.ATOM_DP_PREFILL_SYNC by
+        # EngineCore, like every other delayer knob.
+        self.sync_prefill = sync_prefill
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -796,27 +795,40 @@ class PrefillDelayer:
 
         # Sync mode. With prefill token graphs a lone prefill already makes
         # idle ranks run a dummy prefill, so this is not what keeps peers off
-        # an eager decode. It holds a wave until enough ranks can prefill
-        # together, instead of turning every arrival into a group prefill tick.
-        # Full alignment is the only release that caps admission at one
-        # sequence. A 3/4 quorum releases when one rank has no work, so that
-        # rank cannot hold the group for ttft_max_ticks. Escapes still release
-        # a short wave (KV, queue age, partial, no decode, TTFT).
+        # an eager decode. It holds a wave until the ranks can prefill together,
+        # instead of turning every arrival into a group prefill tick. Alignment
+        # counts prefillable + blocked ranks exactly as the base gate below: a
+        # blocked rank admits none of its tokens but keeps its peers company
+        # with a dummy prefill, so it is aligned rather than a straggler to wait
+        # on. Only a full alignment caps admission at one sequence per rank.
         if self.sync_prefill and self.dp_size > 1:
-            if n_prefillable >= self.dp_size:
+            n_aligned = n_prefillable + n_blocked
+            if n_aligned >= self.dp_size:
                 return self._fire("align", g_pending)
-            if n_prefillable >= max(1, (self.dp_size * 3 + 3) // 4):
+            # Quorum: every rank that is not aligned is unreachable (no prefill,
+            # no waiting work, and no decode completes within the remaining TTFT
+            # budget), so holding for it only burns the bound -- it cannot align
+            # in time. Release once the reachable ranks are all aligned. This is
+            # reachable at dp_size 2 and 3, unlike a round-up fraction of
+            # dp_size. A reachable straggler (will decode-complete and take a
+            # new request in time) is none of these, so the group still holds
+            # for it up to the TTFT bound, as the base gate does.
+            if n_unreachable > 0 and n_aligned + n_unreachable >= self.dp_size:
                 return self._fire("quorum", g_pending)
+            # Escapes still release a short wave, matching the base must-fire
+            # order (no decode, KV high/low, queue age, TTFT, adaptive, partial).
             if g_running_dec == 0:
                 return self._fire("nodecode", g_pending)
-            if any_kv_high:
+            if any_kv_high or any_kv_low:
                 return self._fire("kv", g_pending)
             if any_queue_hot:
                 return self._fire("queue_ms", g_pending)
-            if any_partial and self._hold_ticks >= self.partial_max_ticks:
-                return self._fire("partial", g_pending)
             if self._hold_ticks >= self.ttft_max_ticks:
                 return self._fire("ttft", g_pending)
+            if self.admit_policy == "adaptive":
+                return self._adapt_decide(reduced, g_running_dec, g_pending)
+            if any_partial and self._hold_ticks >= self.partial_max_ticks:
+                return self._fire("partial", g_pending)
             return self._hold(g_pending)
 
         # ---- must-fire bounds (release even if unaligned / underfilled) ----
