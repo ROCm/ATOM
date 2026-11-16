@@ -347,8 +347,9 @@ def warmup_exchange(device, max_mailbox_rows: int) -> None:
     payload -- the warmup cannot pass for a transport production then skips.
 
     It then opens the one-launch exchange's mailbox, a collective that capture
-    must not see either. ``max_mailbox_rows`` comes from the runner's resolved
-    ``mtp_k + 1`` rather than the possibly unset speculative config field.
+    must not see either. ``max_mailbox_rows`` is the runner's
+    ``max_num_seqs * (mtp_k + 1)``, with the drafter's resolved ``mtp_k`` (0
+    without one) rather than the possibly unset speculative config field.
     """
     if not indexer_cp_enabled():
         return
