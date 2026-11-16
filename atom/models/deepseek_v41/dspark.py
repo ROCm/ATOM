@@ -30,7 +30,11 @@ from atom.model_ops.deepseek_v41.dspark import (
     draft_step_indices,
     fused_draft_kv_tail,
 )
-from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.model_ops.deepseek_v41.mhc import (
+    SinglePassHCState,
+    post_collapse_streams,
+    post_collapse_supported,
+)
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.dspark_markov_argmax import (
@@ -386,7 +390,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # this one leaves its FFN post owed, and `residual` is by definition
         # the value before it. The block pays the same post again into its own
         # pre, which is the one seam where the draft costs the target a kernel.
-        residual = inputs[0].settle().residual
+        # On the GPU that post and the mean run as one launch.
+        state = inputs[0]
+        if state.pending is not None and post_collapse_supported(
+            state.residual, state.pending
+        ):
+            hidden = state.residual.shape[-1]
+            return post_collapse_streams(
+                state.pending, state.residual, state.post_mix, state.combination
+            ).reshape(-1, hidden)
+        residual = state.settle().residual
         return residual.mean(dim=-2).reshape(-1, residual.shape[-1])
 
     def project_context(self, taps):
