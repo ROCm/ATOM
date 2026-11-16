@@ -43,8 +43,11 @@ Flow per prefill step (target worker, current batch only):
    and the token ids of ``[P - R - h, P)`` from each request's own
    ``full_untruncated_fill_ids``, the record SGLang builds the step's
    ``input_ids`` from -- which rides on the batch for the original call alone
-   (set, then removed in ``finally``) and on the one ``ForwardBatch``
-   ``init_new`` builds from it (``FUSED_ATTR``); a step whose widened rows
+   (set, then removed in ``finally``), on the one ``ForwardBatch``
+   ``init_new`` builds from it (``FUSED_ATTR``) and on the view of it the
+   eager runner hands the model (``EagerRunner.load_batch``, a
+   ``dataclasses.replace`` that keeps dataclass fields only); the call
+   raises if its forward never ran the replay. A step whose widened rows
    would not fit the builder falls back to the side forward. Side, it runs
    the side forward(s) there.
 2. ``deepseek_v41_bridge.build_v41_scheduled_batch`` turns either into ATOM's
@@ -107,8 +110,8 @@ REPLAY_MODE_ENV = "ATOM_V41_RADIX_REPLAY_MODE"
 DEFAULT_REPLAY_ROWS = 128
 REPLAY_MODES = ("fused", "side")
 # The attribute a fused replay rides on: the ScheduleBatch, for the one
-# `forward_batch_generation` call it is planned for, and the ForwardBatch
-# `init_new` builds from it.
+# `forward_batch_generation` call it is planned for, the ForwardBatch
+# `init_new` builds from it, and the eager runner's view of that.
 FUSED_ATTR = "atom_v41_fused_replay"
 
 # The installed replay length R and mode; None while radix cache is off.
@@ -803,12 +806,22 @@ def check_state_stamps(state_gen, req_generation, slots, prefix) -> None:
 
 def run_with_fused_replay(original, worker, batch, fused, args, kwargs):
     """``original(worker, batch, ...)`` with ``fused`` on the batch for this
-    call alone; ``init_new`` copies it onto the call's ForwardBatch."""
+    call alone; ``init_new`` copies it onto the call's ForwardBatch.
+
+    The call must have run the replay: the seam stamped the hits' slots for
+    their tenants, so a forward that lost the record on the way to the model
+    would extend from ``P`` over the previous tenant's state."""
     setattr(batch, FUSED_ATTR, fused)
     try:
-        return original(worker, batch, *args, **kwargs)
+        result = original(worker, batch, *args, **kwargs)
     finally:
         setattr(batch, FUSED_ATTR, None)
+    if fused.expanded is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 fused radix replay planned for slots "
+            f"{fused.slots.tolist()} never reached the model's forward"
+        )
+    return result
 
 
 def _install_worker_seam() -> None:
@@ -864,6 +877,34 @@ def _install_forward_batch_carrier() -> None:
 
     ForwardBatch.init_new = classmethod(init_new)
     ForwardBatch._atom_v41_radix_carrier_patched = True
+
+
+def carry_fused_view(forward_batch, view) -> None:
+    """``EagerRunner.load_batch``'s addition: the forward-batch view it hands
+    the model (``dataclasses.replace`` of the ForwardBatch over its static
+    input buffers, which keeps dataclass fields only) carries the fused
+    replay of the ForwardBatch it was made from."""
+    fused = getattr(forward_batch, FUSED_ATTR, None)
+    if fused is None or view is forward_batch:
+        return
+    setattr(view, FUSED_ATTR, fused)
+
+
+def _install_eager_view_carrier() -> None:
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+    original = EagerRunner.load_batch
+    if getattr(original, "_atom_v41_radix_patched", False):
+        return
+
+    @wraps(original)
+    def load_batch(self, forward_batch, *args, **kwargs):
+        view = original(self, forward_batch, *args, **kwargs)
+        carry_fused_view(forward_batch, view)
+        return view
+
+    load_batch._atom_v41_radix_patched = True
+    EagerRunner.load_batch = load_batch
 
 
 def _install_checkpoint_invalidation() -> None:
@@ -924,13 +965,15 @@ def _install_admission_accounting() -> None:
 
 def install_deepseek_v41_radix(window: int | None = None) -> tuple[int, str]:
     """Turn the replay on in this process: the worker seam, the ForwardBatch
-    carrier, the host-row invalidation and the admission charge. Idempotent;
+    carriers (``init_new`` and the eager runner's view), the host-row
+    invalidation and the admission charge. Idempotent;
     returns ``(R, mode)``. Called only with radix cache on."""
     global _REPLAY_ROWS, _REPLAY_MODE
     rows = resolve_replay_rows(window)
     mode = resolve_replay_mode()
     _install_worker_seam()
     _install_forward_batch_carrier()
+    _install_eager_view_carrier()
     _install_checkpoint_invalidation()
     _install_admission_accounting()
     _REPLAY_ROWS, _REPLAY_MODE = rows, mode

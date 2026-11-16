@@ -1482,6 +1482,7 @@ class TestFusedCarrier:
 
         def original(worker, batch, *args, **kwargs):
             seen.append((getattr(batch, FUSED_ATTR), args, kwargs))
+            getattr(batch, FUSED_ATTR).expanded = "widened"  # the model ran it
             return "result"
 
         out = run_with_fused_replay(original, "w", batch, fused, (1,), {"k": 2})
@@ -1494,6 +1495,49 @@ class TestFusedCarrier:
         with pytest.raises(RuntimeError, match="forward failed"):
             run_with_fused_replay(failing, "w", batch, fused, (), {})
         assert getattr(batch, FUSED_ATTR) is None
+
+    def test_a_forward_that_never_ran_the_replay_raises(self):
+        # The seam stamped the hits' slots: a forward that lost the record
+        # would extend from P over the last tenant's state.
+        fused = _fused([0], [7], ["a"], [0], [4])
+        batch = SimpleNamespace()
+        with pytest.raises(RuntimeError, match=r"slots \[7\] never reached"):
+            run_with_fused_replay(lambda *a, **k: "result", "w", batch, fused, (), {})
+        assert getattr(batch, FUSED_ATTR) is None
+
+    def test_the_eager_runners_view_carries_the_record(self, monkeypatch):
+        import dataclasses
+        import types
+
+        @dataclasses.dataclass
+        class ForwardBatch:
+            forward_mode: object
+            input_ids: object = None
+
+        class EagerRunner:
+            def load_batch(self, forward_batch, pp_proxy_tensors=None, **kwargs):
+                # SGLang's view over its static buffers: fields only.
+                return dataclasses.replace(forward_batch, input_ids="static")
+
+        module = types.ModuleType("sglang.srt.model_executor.runner.eager_runner")
+        module.EagerRunner = EagerRunner
+        monkeypatch.setitem(
+            sys.modules, "sglang.srt.model_executor.runner.eager_runner", module
+        )
+        radix._install_eager_view_carrier()
+        radix._install_eager_view_carrier()  # idempotent
+        fused = _fused([0], [1], ["a"], [0], [4])
+        fb = ForwardBatch(EXTEND)
+        setattr(fb, FUSED_ATTR, fused)
+        view = EagerRunner().load_batch(fb)
+        assert view is not fb and view.input_ids == "static"
+        assert getattr(view, FUSED_ATTR) is fused
+        # Every other forward's view stays without one.
+        other = EagerRunner().load_batch(ForwardBatch(EXTEND))
+        assert getattr(other, FUSED_ATTR, None) is None
+        same = ForwardBatch(EXTEND)
+        radix.carry_fused_view(same, same)
+        assert getattr(same, FUSED_ATTR, None) is None
 
     def test_the_side_batch_carries_none(self, monkeypatch, radix_on):
         world = _World(monkeypatch)
@@ -1512,7 +1556,10 @@ class TestFusedCarrier:
 
         class TpModelWorker:
             def forward_batch_generation(self, batch=None, *args, **kwargs):
-                calls.append(getattr(batch, FUSED_ATTR, None))
+                fused = getattr(batch, FUSED_ATTR, None)
+                calls.append(fused)
+                if fused is not None:
+                    fused.expanded = "widened"  # the model ran it
                 return "result"
 
         module = types.ModuleType("sglang.srt.managers.tp_worker")
