@@ -7,7 +7,7 @@ sampling, verify and the next drafts on TkRank) or returns None and the producti
 ATOM's sampler, rejection sampler and DSpark proposer: the drafter's ``compute_draft_kv`` / ``propose`` are wrapped to
 do nothing / return the runner's drafts.
 
-Served: one request (6 rows, a DSpark verify), sampled (temperature > 0, top_p 1, no top_k), no structured output,
+Served: one request (6 rows, a DSpark verify; not a warmup's dummy decode, not inside a graph capture), sampled (temperature > 0, top_p 1, no top_k), no structured output,
 no required channel, no logprobs, inside the plan's context. Sticky: a request TkRank admitted keeps its state there
 -- ATOM's caches do not get the KV it decodes -- so every later step of it must be served; one that cannot raises
 instead of falling back. A step of another request (the held one finished: ATOM sends no finish) re-admits.
@@ -15,6 +15,7 @@ instead of falling back. A step of another request (the held one finished: ATOM 
 
 import logging
 
+import torch
 from torch import nn
 
 from atom.model_engine.token_constraints import has_constraints
@@ -65,6 +66,12 @@ class TkStepModel(StepOverrideModel, nn.Module):
             return "ATOM_MONO_CHECK"
         if batch is None or running_bs != 1 or input_ids.numel() != ROWS:
             return f"{running_bs} requests, {input_ids.numel()} rows"
+        # a warmup's dummy decode (ModelRunner.dummy_execution), or a step inside a stream capture: TkRank would
+        # admit a request that is not one / replay its graphs inside another capture
+        if batch.is_dummy_run or (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        ):
+            return "dummy run / graph capture"
         if has_constraints(batch) or batch.any_logprobs:
             return "constraints / logprobs"
         if get_forward_context().spec_decode_metadata is None:

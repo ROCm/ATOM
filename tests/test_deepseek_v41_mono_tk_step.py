@@ -220,12 +220,15 @@ def test_dispatch_serves_and_holds(monkeypatch):
         "atom.models.deepseek_v41.mono.tk_step.kv.from_cache", lambda *a: "kv"
     )
 
-    def batch(rid, t=1.0, logprobs=False):
+    def batch(rid, t=1.0, logprobs=False, dummy=False):
         return SimpleNamespace(req_ids=[rid], total_seqs_num=1, temperatures=[t], top_ps=[1.0], top_ks=[-1],
-                               any_logprobs=logprobs, structured_requests={}, required_channel=None,
+                               any_logprobs=logprobs, structured_requests={}, required_channel=None, is_dummy_run=dummy,
                                context_lens=[506], state_slots_committed=[0], block_tables=[[0]])  # fmt: skip
 
     ids = torch.tensor([7, 1, 1, 1, 1, 1])
+    assert (
+        m.step_override(ids, 1, batch(9, dummy=True)) is None and not tk.calls
+    )  # a warmup's dummy decode
     assert m.step_override(ids, 1, batch(5)) is runner
     runner.verify_outputs(1)
     assert drafter.propose().shape == (1, 5) and drafter.compute_draft_kv() is None

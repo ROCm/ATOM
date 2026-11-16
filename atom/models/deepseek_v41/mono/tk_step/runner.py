@@ -151,6 +151,8 @@ class TkStepRunner:
         )
         self.dev.import_planes(planes, n)
         self.held, self.pos, self._verdict = req_id, n, None
+        if self.rank == 0:
+            logger.info("V4.1 TileRT-path step: admitted request %s at position %d (T %.3g)", req_id, n, temperature)  # fmt: skip
 
     # ---- the step
     def run_step(
