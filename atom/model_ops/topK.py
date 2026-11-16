@@ -33,12 +33,17 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    # Only the selected MoRI transport needs this switch; the TP fusion is a
-    # different mechanism, and an explicitly selected RCCL/none backend must
-    # not be inferred from the mere presence of the ``mori`` Python package.
+    # Preserve the existing MoRI request/availability gate, including when
+    # simulated DP or disabled EP selects the collective fallback. Explicit
+    # RCCL/none requests keep their own shared-expert behavior.
     # EPLB always fuses, otherwise the env decides.
     plan = execution_plan or get_moe_execution_plan(config)
-    mori_selected = plan.transport in {"mori", "mori_v2", "mega"}
+    backend = plan.backend_config
+    mori_selected = (
+        backend.all2all_backend in {"auto", "mori"}
+        and not backend.disable_mori
+        and backend.mori_available
+    )
     if (
         dp_size > 1
         and mori_selected

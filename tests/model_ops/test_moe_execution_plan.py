@@ -213,7 +213,10 @@ def test_routed_combine_preserves_outer_pcp_and_tp_reduction(
     scatter.assert_called_once()
 
 
-def test_shared_expert_gate_uses_supplied_plan(monkeypatch, atom_modules):
+@pytest.mark.parametrize("enable_ep,logical_dp", [(True, 0), (False, 0), (True, 4)])
+def test_shared_expert_gate_uses_supplied_plan(
+    monkeypatch, atom_modules, enable_ep, logical_dp
+):
     from atom.model_ops import topK
 
     quant = SimpleNamespace(exclude_layers=[], quant_dtype=None)
@@ -226,7 +229,16 @@ def test_shared_expert_gate_uses_supplied_plan(monkeypatch, atom_modules):
     monkeypatch.setattr(topK.envs, "ATOM_FUSE_SHARED_EXPERT", False)
     # The current request disagrees with the supplied, frozen layer plan.
     config.moe_all2all_backend = "rccl"
-    plan = _plan(all2all="auto")
+    mapping = MoEParallelMapping.make(
+        tp_size=1,
+        dp_size=2,
+        local_dp_size=2,
+        enable_ep=enable_ep,
+        dp_logical_size=logical_dp,
+        flatten_dp=True,
+        enable_dp_attention=True,
+    )
+    plan = resolve_moe_execution_plan(mapping, MoEBackendConfig(mori_available=True))
     assert not topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         quant, execution_plan=plan
     )
