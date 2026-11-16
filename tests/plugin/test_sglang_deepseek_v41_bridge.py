@@ -780,6 +780,225 @@ class TestScheduledBatch:
             build_v41_scheduled_batch(fb, PAGE)
 
 
+class _SyncedEvent:
+    def __init__(self):
+        self.synced = 0
+
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        self.synced += 1
+
+
+class TestExtendRowsAtAlloc:
+    """An EXTEND's PAGE rows, copied where `alloc_for_extend` wrote them and
+    taken by the staging of the same batch (`ExtendRowRead`)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch):
+        monkeypatch.setattr(bridge, "_EXTEND_ROWS", bridge.ExtendRowRead())
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        monkeypatch.setattr(
+            bridge, "_device_module", lambda device: SimpleNamespace(Event=_SyncedEvent)
+        )
+        monkeypatch.setattr(bridge, "_CHECK_HOST_ROWS", False)
+        monkeypatch.setattr(
+            bridge, "V41_DSPARK_COUNTERS", dict.fromkeys(bridge.V41_DSPARK_COUNTERS, 0)
+        )
+
+    def _alloc(self, monkeypatch, table, slots, rids, ends):
+        monkeypatch.setattr(
+            bridge, "_V41_BUILDER", SimpleNamespace(cache=object(), block_size=PAGE)
+        )
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(rid=rid) for rid in rids],
+            seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        slots_cpu = torch.tensor(slots, dtype=torch.int64)
+        return bridge.read_v41_extend_rows_at_alloc(batch, slots_cpu, slots_cpu)
+
+    def _extend(self, slots, ends, prefix=None, rids=("r0", "r1")):
+        prefix = prefix or [0] * len(slots)
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=slots,
+            seq_lens=ends,
+            extend_seq_lens=[e - p for e, p in zip(ends, prefix)],
+            extend_prefix_lens=prefix,
+            rids=list(rids[: len(slots)]),
+        )
+        fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+        return fb
+
+    def _no_read_back(self, monkeypatch):
+        reads = []
+        original = bridge._read_replay_rows
+
+        def counted(*args, **kwargs):
+            reads.append(args[2])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(bridge, "_read_replay_rows", counted)
+        return reads
+
+    def test_extend_takes_the_rows_its_allocation_copied(
+        self, monkeypatch, req_to_token
+    ):
+        assert self._alloc(monkeypatch, req_to_token, [1, 2], ["r0", "r1"], [600, 10])
+        reads = self._no_read_back(monkeypatch)
+        batch = build_v41_scheduled_batch(self._extend([1, 2], [600, 10]), PAGE)
+        assert reads == []
+        assert _tables(batch) == [[7, 3, 9], [5]]
+        assert all(row.dtype == np.int32 for row in batch.block_tables)
+        assert batch.state_slots_committed == [1, 2]
+        assert bridge._EXTEND_ROWS.pending is None
+        assert bridge.V41_DSPARK_COUNTERS["extend_rows_early"] == 1
+        assert bridge.V41_DSPARK_COUNTERS["extend_rows_read"] == 0
+        # Graph replays stage off the same copies afterwards.
+        rows = bridge._HOST_ROWS.lookup([1, 2], ["r0", "r1"], [3, 1])
+        assert [row.tolist() for row in rows] == [[7, 3, 9], [5]]
+
+    def test_chunk_with_a_prefix_takes_the_whole_row(self, monkeypatch, req_to_token):
+        assert self._alloc(monkeypatch, req_to_token, [3], ["r0"], [3 * PAGE + 1])
+        reads = self._no_read_back(monkeypatch)
+        batch = build_v41_scheduled_batch(
+            self._extend([3], [3 * PAGE + 1], prefix=[2 * PAGE]), PAGE
+        )
+        assert reads == []
+        assert _tables(batch) == [[2, 11, 4, 8]]
+
+    @pytest.mark.parametrize(
+        "other",
+        [
+            # another batch (a MIXED one carries more requests)
+            {"slots": [1, 2, 3], "ends": [600, 10, 30], "rids": ("r0", "r1", "r2")},
+            # same slots, another request
+            {"slots": [1, 2], "ends": [600, 10], "rids": ("r0", "x")},
+            # same requests, other order
+            {"slots": [2, 1], "ends": [10, 600], "rids": ("r1", "r0")},
+            # wider than the copy
+            {"slots": [1, 2], "ends": [700, 300], "rids": ("r0", "r1")},
+        ],
+    )
+    def test_any_other_batch_reads_back(self, monkeypatch, req_to_token, other):
+        req_to_token[2, PAGE : 2 * PAGE] = 6 * PAGE + torch.arange(PAGE)
+        req_to_token[3, :PAGE] = 12 * PAGE + torch.arange(PAGE)
+        assert self._alloc(monkeypatch, req_to_token, [1, 2], ["r0", "r1"], [600, 10])
+        reads = self._no_read_back(monkeypatch)
+        build_v41_scheduled_batch(
+            self._extend(other["slots"], other["ends"], rids=other["rids"]), PAGE
+        )
+        assert reads == [len(other["slots"])]
+        assert bridge._EXTEND_ROWS.pending is None
+        assert bridge.V41_DSPARK_COUNTERS["extend_rows_read"] == 1
+
+    def test_a_copy_is_taken_once(self, monkeypatch, req_to_token):
+        assert self._alloc(monkeypatch, req_to_token, [1], ["r0"], [600])
+        reads = self._no_read_back(monkeypatch)
+        build_v41_scheduled_batch(self._extend([1], [600]), PAGE)
+        build_v41_scheduled_batch(self._extend([1], [600]), PAGE)
+        assert reads == [1]
+
+    def test_decode_never_takes_it(self, monkeypatch, req_to_token):
+        assert self._alloc(monkeypatch, req_to_token, [1], ["r0"], [600])
+        reads = self._no_read_back(monkeypatch)
+        fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=[1], seq_lens=[600])
+        build_v41_scheduled_batch(fb, PAGE)
+        assert reads == [1]
+        assert bridge._EXTEND_ROWS.pending is not None
+
+    def test_check_mode_compares_with_the_device(self, monkeypatch, req_to_token):
+        monkeypatch.setattr(bridge, "_CHECK_HOST_ROWS", True)
+        assert self._alloc(monkeypatch, req_to_token, [1, 2], ["r0", "r1"], [600, 10])
+        reads = self._no_read_back(monkeypatch)
+        batch = build_v41_scheduled_batch(self._extend([1, 2], [600, 10]), PAGE)
+        assert reads == [2]
+        assert _tables(batch) == [[7, 3, 9], [5]]
+        # A copy that is not what the device holds is refused.
+        assert self._alloc(monkeypatch, req_to_token, [1, 2], ["r0", "r1"], [600, 10])
+        bridge._EXTEND_ROWS.pending[3][0, 1] = 99
+        with pytest.raises(RuntimeError, match="read at allocation disagree"):
+            build_v41_scheduled_batch(self._extend([1, 2], [600, 10]), PAGE)
+
+    def test_a_padding_page_in_the_copy_is_refused(self, monkeypatch, req_to_token):
+        # Row 2 holds one page: a length past it names the padding page 0.
+        assert self._alloc(monkeypatch, req_to_token, [2], ["r0"], [PAGE + 1])
+        with pytest.raises(ValueError, match="padding page 0"):
+            build_v41_scheduled_batch(self._extend([2], [PAGE + 1]), PAGE)
+
+    def test_no_builder_issues_nothing(self, monkeypatch, req_to_token):
+        monkeypatch.setattr(bridge, "_V41_BUILDER", None)
+        bridge._EXTEND_ROWS.pending = ("stale",)
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(rid="r0")],
+            seq_lens_cpu=torch.tensor([600]),
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        )
+        assert not bridge.read_v41_extend_rows_at_alloc(
+            batch, torch.tensor([1]), torch.tensor([1])
+        )
+        assert bridge._EXTEND_ROWS.pending is None
+
+
+@needs_sglang
+class TestExtendRowsAtAllocPatch:
+    def test_wraps_alloc_for_extend_once_and_copies_after_it(self, monkeypatch):
+        from sglang.srt.managers import schedule_batch
+
+        from atom.plugin.sglang.patches import v41_extend_rows_at_alloc_patch as patch
+
+        assert patch._upstream_shape_error(schedule_batch) is None
+        calls = []
+        original = schedule_batch.alloc_for_extend
+
+        def fake_alloc(batch):
+            calls.append("alloc")
+            return "loc", "dev", "cpu"
+
+        fake_alloc.__wrapped__ = original
+        monkeypatch.setattr(schedule_batch, "alloc_for_extend", fake_alloc)
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", True)
+        monkeypatch.setattr(
+            bridge,
+            "read_v41_extend_rows_at_alloc",
+            lambda batch, dev, cpu: calls.append(("read", batch, dev, cpu)),
+        )
+        assert patch.install_v41_extend_rows_at_alloc_patch()
+        wrapped = schedule_batch.alloc_for_extend
+        assert patch.install_v41_extend_rows_at_alloc_patch()
+        assert schedule_batch.alloc_for_extend is wrapped
+        assert wrapped("b") == ("loc", "dev", "cpu")
+        assert calls == ["alloc", ("read", "b", "dev", "cpu")]
+        # Radix cache: no copy.
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", False)
+        calls.clear()
+        wrapped("b")
+        assert calls == ["alloc"]
+
+    def test_kill_switch_and_version_guard(self, monkeypatch):
+        from sglang.srt.managers import schedule_batch
+
+        from atom.plugin.sglang.patches import v41_extend_rows_at_alloc_patch as patch
+
+        original = schedule_batch.alloc_for_extend
+        monkeypatch.setenv(bridge.V41_EXTEND_ROWS_AT_ALLOC_ENV, "0")
+        assert not patch.install_v41_extend_rows_at_alloc_patch()
+        assert schedule_batch.alloc_for_extend is original
+        monkeypatch.delenv(bridge.V41_EXTEND_ROWS_AT_ALLOC_ENV)
+        monkeypatch.setattr(patch, "_sglang_version", lambda: "0.5.99")
+        assert not patch.install_v41_extend_rows_at_alloc_patch()
+        assert schedule_batch.alloc_for_extend is original
+
+        def returns_two(batch):
+            return 1, 2
+
+        monkeypatch.setattr(patch, "_sglang_version", lambda: "0.5.22")
+        fake = SimpleNamespace(alloc_for_extend=returns_two)
+        assert "no longer returns" in patch._upstream_shape_error(fake)
+
+
 class _FakeAttnBackend:
     def __init__(self, table):
         self.req_to_token_pool = SimpleNamespace(req_to_token=table)
@@ -976,6 +1195,239 @@ class TestForwardMetadata:
         monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
         with pytest.raises(RuntimeError, match="proxy KV pool is not initialized"):
             build_deepseek_v41_forward_metadata(fb, torch.tensor([4]))
+
+
+class _PaddingBuilder(_RecordingBuilder):
+    """Publishes positions out to the rows it is asked to run, as the V4.1
+    builder does for a padded prefill."""
+
+    def prepare_prefill(self, batch, running_bs, running_tokens):
+        self.calls.append(("prefill", running_bs, running_tokens))
+        self.batch = batch
+        return self._metadata(), torch.arange(100, 100 + running_tokens)
+
+    def prepare_model_inputs(self, input_ids, metadata):
+        self.calls.append(("inputs", int(input_ids.shape[0])))
+        self.ids = input_ids.clone()
+
+
+class TestPrefillTokenGraphs:
+    """An EXTEND padded to a recorded token-graph bucket
+    (`prefill_token_graph_bucket`, `PaddedPrefillInputs`)."""
+
+    @pytest.fixture(autouse=True)
+    def _graphs(self, monkeypatch):
+        from atom.utils import region_graph
+
+        graphs = bridge._PrefillTokenGraphs()
+        graphs.sizes = (8, 16)
+        monkeypatch.setattr(bridge, "_PREFILL_GRAPHS", graphs)
+        monkeypatch.setattr(
+            region_graph.TokenGraph,
+            "bucket",
+            staticmethod(
+                lambda tokens, phase, multiple_of=1: next(
+                    (n for n in (8, 16, 32) if n >= tokens), None
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            bridge, "V41_DSPARK_COUNTERS", dict.fromkeys(bridge.V41_DSPARK_COUNTERS, 0)
+        )
+        return graphs
+
+    def test_bucket_is_a_recorded_one(self, _graphs):
+        assert bridge.prefill_token_graph_bucket(5) == 8
+        assert bridge.prefill_token_graph_bucket(16) == 16
+        # 32 exists in the class registry but was not recorded here.
+        assert bridge.prefill_token_graph_bucket(17) is None
+        _graphs.sizes = ()
+        assert bridge.prefill_token_graph_bucket(5) is None
+
+    def test_extend_is_padded_to_its_bucket(self, monkeypatch, req_to_token):
+        builder = _PaddingBuilder()
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[1, 2],
+            seq_lens=[PAGE + 3, 2],
+            extend_seq_lens=[3, 2],
+            extend_prefix_lens=[PAGE, 0],
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb.input_ids = torch.tensor([11, 12, 13, 14, 15])
+        bridge._PREFILL_GRAPHS.ids_buffer(16, "cpu").fill_(-1)
+        metadata = build_deepseek_v41_forward_metadata(
+            fb, torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1])
+        )
+        # Laid out at the bucket; ids and positions at its rows.
+        assert builder.calls[:2] == [("prefill", 2, 8), ("inputs", 8)]
+        padded = metadata.sglang_padded_inputs
+        assert padded.input_ids.tolist() == [11, 12, 13, 14, 15, 0, 0, 0]
+        assert builder.ids.tolist() == [11, 12, 13, 14, 15, 0, 0, 0]
+        assert padded.positions.tolist() == list(range(100, 108))
+        assert padded.scheduled_tokens == 5
+        assert padded.scheduled_tokens_gpu.tolist() == [5]
+        assert padded.scheduled_tokens_gpu.dtype == torch.int32
+        assert bridge.V41_DSPARK_COUNTERS["prefill_token_graph"] == 1
+
+    def test_no_bucket_runs_the_scheduled_rows(self, monkeypatch, req_to_token):
+        builder = _PaddingBuilder()
+        fb = _forward_batch(
+            ForwardMode.EXTEND,
+            req_pool_indices=[3],
+            seq_lens=[20],
+            extend_seq_lens=[20],
+            extend_prefix_lens=[0],
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb.input_ids = torch.arange(20)
+        metadata = build_deepseek_v41_forward_metadata(fb, torch.arange(20))
+        assert builder.calls[:2] == [("prefill", 1, 20), ("inputs", 20)]
+        assert getattr(metadata, "sglang_padded_inputs", None) is None
+
+    def test_decode_is_never_padded(self, monkeypatch, req_to_token):
+        builder = _PaddingBuilder(positions=torch.tensor([4]))
+        fb = _forward_batch(ForwardMode.DECODE, req_pool_indices=[1], seq_lens=[5])
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        fb.input_ids = torch.tensor([7])
+        metadata = build_deepseek_v41_forward_metadata(fb, torch.tensor([4]))
+        assert builder.calls[0] == ("decode", 1, 1, 1)
+        assert getattr(metadata, "sglang_padded_inputs", None) is None
+
+    def test_kill_switch(self, monkeypatch):
+        monkeypatch.setenv(bridge.V41_PREFILL_TOKEN_GRAPHS_ENV, "0")
+        assert not bridge.v41_prefill_token_graphs_enabled()
+        assert bridge.record_deepseek_v41_prefill_token_graphs(object()) == ()
+
+
+@needs_sglang
+class TestPrefillTokenGraphPatch:
+    def _scheduler(self, *, draft=False, graphs=True, pool=True):
+        return SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    is_draft_worker=draft,
+                    token_to_kv_pool=SimpleNamespace(
+                        is_atom_v41_proxy_pool=pool, is_atom_v41_draft_proxy=False
+                    ),
+                    decode_cuda_graph_runner=object() if graphs else None,
+                )
+            )
+        )
+
+    def test_records_after_sglang_captured_everything(self, monkeypatch):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        from atom.plugin.sglang.patches import v41_prefill_token_graph_patch as patch
+
+        cls = scheduler_module.Scheduler
+        original = cls.init_all_cuda_graphs
+        assert patch._upstream_shape_error(cls) is None
+        calls = []
+
+        def fake_init(self):
+            calls.append("sglang graphs")
+
+        fake_init.__wrapped__ = original
+        monkeypatch.setattr(cls, "init_all_cuda_graphs", fake_init)
+        monkeypatch.setattr(
+            bridge, "_V41_BUILDER", SimpleNamespace(cache=object(), block_size=PAGE)
+        )
+        monkeypatch.setattr(
+            bridge,
+            "record_deepseek_v41_prefill_token_graphs",
+            lambda runner: calls.append(("record", runner)),
+        )
+        assert patch.install_v41_prefill_token_graph_patch()
+        wrapped = cls.init_all_cuda_graphs
+        assert patch.install_v41_prefill_token_graph_patch()
+        assert cls.init_all_cuda_graphs is wrapped
+        scheduler = self._scheduler()
+        wrapped(scheduler)
+        assert calls == [
+            "sglang graphs",
+            ("record", scheduler.tp_worker.model_runner),
+        ]
+        # A draft runner, graphs off, or another pool: SGLang's graphs only.
+        for other in (
+            self._scheduler(draft=True),
+            self._scheduler(graphs=False),
+            self._scheduler(pool=False),
+        ):
+            calls.clear()
+            wrapped(other)
+            assert calls == ["sglang graphs"]
+
+    def test_kill_switch_and_version_guard(self, monkeypatch):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        from atom.plugin.sglang.patches import v41_prefill_token_graph_patch as patch
+
+        cls = scheduler_module.Scheduler
+        original = cls.init_all_cuda_graphs
+        monkeypatch.setenv(bridge.V41_PREFILL_TOKEN_GRAPHS_ENV, "0")
+        assert not patch.install_v41_prefill_token_graph_patch()
+        assert cls.init_all_cuda_graphs is original
+        monkeypatch.delenv(bridge.V41_PREFILL_TOKEN_GRAPHS_ENV)
+        monkeypatch.setattr(patch, "_sglang_version", lambda: "0.5.99")
+        assert not patch.install_v41_prefill_token_graph_patch()
+        assert cls.init_all_cuda_graphs is original
+
+
+@needs_sglang
+class TestPaddedPrefillRuntime:
+    """The plugin forward context runs a padded prefill's rows and hands
+    SGLang the scheduled ones."""
+
+    def test_forward_context_replays_and_trims(self, monkeypatch):
+        from atom.plugin.sglang.runtime import forward_context as plugin_fc
+        from atom.utils.forward_context import get_forward_context
+
+        padded = bridge.PaddedPrefillInputs(
+            input_ids=torch.arange(8),
+            positions=torch.arange(100, 108),
+            scheduled_tokens=5,
+            scheduled_tokens_gpu=torch.tensor([5], dtype=torch.int32),
+        )
+        spec = SimpleNamespace(
+            build_forward_metadata=lambda *a: SimpleNamespace(
+                sglang_padded_inputs=padded, max_seqlen_q=0
+            ),
+            expand_forward_inputs=None,
+        )
+        monkeypatch.setattr(
+            "atom.plugin.sglang.runtime.model_arch.resolve_model_arch_spec",
+            lambda config: (DEEPSEEK_V41_ARCH, spec),
+        )
+        atom_config = SimpleNamespace(
+            hf_config=None,
+            enable_dp_attention=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        monkeypatch.setattr(
+            plugin_fc, "_resolve_running_tokens_are_unified", lambda *a: True
+        )
+        fb = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=torch.arange(5),
+            positions=torch.arange(5),
+        )
+        with plugin_fc.SGLangPluginRuntime(
+            atom_config=atom_config,
+            forward_batch=fb,
+            positions=torch.arange(5),
+            input_ids=torch.arange(5),
+        ) as runtime:
+            forward = get_forward_context()
+            assert forward.tr_graph == "replay"
+            assert forward.context.running_tokens == 8
+            assert forward.context.scheduled_tokens == 5
+            assert forward.context.scheduled_tokens_gpu is padded.scheduled_tokens_gpu
+            assert runtime.input_ids is padded.input_ids
+            assert runtime.positions is padded.positions
+            assert runtime.trim_output(torch.zeros(8, 3)).shape == (5, 3)
 
 
 # ---------------------------------------------------------------------------

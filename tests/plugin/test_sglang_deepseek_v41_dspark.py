@@ -627,6 +627,52 @@ class TestVerifyBatch:
         assert batch.state_slots_committed == [1, 2]
         assert any(source is mirror for source in sources)
 
+    @pytest.mark.parametrize("mirror", [True, False])
+    def test_eager_verify_takes_late_lengths(self, monkeypatch, req_to_token, mirror):
+        # bs > the largest graph bucket: the eager verify of a late-mode round
+        # (SGLang's needs_cpu_seq_lens=False contract: no live prefix, the
+        # host mirror is the reservation bound).
+        from atom.plugin.sglang.patches import dspark_deferred_seq_lens_patch as p
+
+        state = p._State()
+        state.pending = p._Deferred(
+            batch=lambda: None,
+            bs=2,
+            host=torch.tensor([254, 10]),
+            done=SimpleNamespace(synchronize=lambda: None),
+            slots=(1, 2),
+            late=True,
+        )
+        monkeypatch.setattr(p, "_STATE", state)
+        fb = _verify_batch([254, 10], [1, 2], live=False, seq_lens=[512, 256])
+        if mirror:
+            fb.atom_v41_req_pool_indices_cpu = torch.tensor([1, 2])
+        batch = build_v41_scheduled_batch(fb, PAGE, speculative_tokens=5)
+        assert batch.context_lens.tolist() == [260, 16]
+        assert batch.state_slots_committed == [1, 2]
+        assert [row.tolist() for row in batch.block_tables] == [[7, 3], [5]]
+        assert state.pending is None
+
+    def test_eager_verify_late_lengths_of_other_slots_are_refused(
+        self, monkeypatch, req_to_token
+    ):
+        # No host mirror: the slots read off the device must be the copy's.
+        from atom.plugin.sglang.patches import dspark_deferred_seq_lens_patch as p
+
+        state = p._State()
+        state.pending = p._Deferred(
+            batch=lambda: None,
+            bs=2,
+            host=torch.tensor([254, 10]),
+            done=SimpleNamespace(synchronize=lambda: None),
+            slots=(2, 1),
+            late=True,
+        )
+        monkeypatch.setattr(p, "_STATE", state)
+        fb = _verify_batch([254, 10], [1, 2], live=False, seq_lens=[512, 256])
+        with pytest.raises(RuntimeError, match="late host lengths are those of"):
+            build_v41_scheduled_batch(fb, PAGE, speculative_tokens=5)
+
     def test_verify_without_live_lengths_is_refused(self, req_to_token):
         # seq_lens may be SGLang's over-allocated bound: no silent fallback.
         fb = _verify_batch([254, 10], [1, 2], live=False)
@@ -843,15 +889,37 @@ class _Owner:
 
 
 class TestCommit:
-    def test_commits_once_in_the_resumed_epoch(self):
+    @pytest.mark.parametrize(
+        "on_device, unsealed, epoch",
+        [
+            # A device-staged verify (every graph replay) reads no host source:
+            # its preparation's epoch stays sealed, so the cache's reuse event
+            # is not re-recorded after the verify.
+            (True, None, []),
+            # Host-staged Engram prefixes are copied by the commit, in the
+            # epoch the preparation sealed.
+            (False, None, ["resume", "finish"]),
+            # Kill switch: every commit in the resumed epoch.
+            (True, "0", ["resume", "finish"]),
+        ],
+    )
+    def test_commits_once(self, monkeypatch, on_device, unsealed, epoch):
+        if unsealed is None:
+            monkeypatch.delenv(bridge.V41_DSPARK_COMMIT_UNSEALED_ENV, raising=False)
+        else:
+            monkeypatch.setenv(bridge.V41_DSPARK_COMMIT_UNSEALED_ENV, unsealed)
         cache, _step, staging = _tentative_state([3, 1], [100, 7])
+        if not on_device:
+            cache.pending.staged_on_device = False
+            cache.pending.written = set(cache.pending.request_indices)
+            cache.tentative_staging.copy_to_gpu = lambda count: staging[:count]
         owner = cache._sglang_h2d_owner = _Owner()
         pool = _target_pool(cache)
         lens = torch.tensor([2, 4])
         commit_deepseek_v41_dspark_verify(
             pool, req_slots=[3, 1], commit_lens=lens, verify_width=W
         )
-        assert owner.calls == ["resume", "finish"]
+        assert owner.calls == epoch
         assert torch.equal(cache.cursor[3], staging[0, 1])
         assert torch.equal(cache.cursor[1], staging[1, 3])
         assert cache.pending is None
@@ -2241,6 +2309,53 @@ class TestVerifyReplayStaging:
         # Nothing staged outside the graph's own Engram step.
         assert not getattr(metadata, "staged_outside_forward", False)
 
+    def _late(self, monkeypatch, prefix, slots):
+        """A late-mode round's deferred copy, handed to its verify."""
+        from atom.plugin.sglang.patches import dspark_deferred_seq_lens_patch as p
+
+        state = p._State()
+        state.pending = p._Deferred(
+            batch=lambda: None,
+            bs=len(prefix),
+            host=torch.tensor(prefix, dtype=torch.int64),
+            done=SimpleNamespace(synchronize=lambda: None),
+            slots=tuple(slots),
+            late=True,
+        )
+        monkeypatch.setattr(p, "_STATE", state)
+        return state
+
+    def test_late_replay_takes_the_prefix_and_runs_its_exact_ends(
+        self, monkeypatch, verify_table
+    ):
+        # SGLang's needs_cpu_seq_lens=False verify: no live prefix, the host
+        # mirror is the reservation bound (512 / 256 here).
+        state = self._late(monkeypatch, [254, 10], [3, 1])
+        builder = _VerifyReplayBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        view = _verify_view([3, 1], [254, 10], 4, live=False, ends=[512, 256])
+        view.atom_v41_req_pool_indices_cpu = torch.tensor([3, 1])
+        view.atom_v41_rids = ["a", "b"]
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", True)
+        bridge.stage_deepseek_v41_verify_replay(view, verify_table)
+        assert state.pending is None and state.late_taken == 1
+        batch = builder.batch
+        assert batch.context_lens.tolist() == [260, 16]
+        assert [row.tolist() for row in batch.block_tables] == [[2, 11], [7]]
+
+    def test_late_prefix_past_the_reservation_is_refused(
+        self, monkeypatch, verify_table
+    ):
+        self._late(monkeypatch, [254, 10], [3, 1])
+        builder = _VerifyReplayBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        view = _verify_view([3, 1], [254, 10], 4, live=False, ends=[256, 256])
+        view.atom_v41_req_pool_indices_cpu = torch.tensor([3, 1])
+        with pytest.raises(ValueError, match="exceed SGLang's reservation"):
+            bridge.stage_deepseek_v41_verify_replay(view, verify_table)
+        assert builder.calls == []
+
     @pytest.mark.parametrize(
         ("view_kwargs", "error", "match"),
         [
@@ -2412,6 +2527,28 @@ class TestVerifyReplayStaging:
             spec_info=SimpleNamespace(nxt_kv_lens_cpu=torch.tensor([PAGE])),
         )
         assert bridge.prefetch_v41_dspark_verify_rows(batch, verify_table, PAGE) == 0
+
+    @pytest.mark.parametrize("early", ["radix", "no_bounds"])
+    def test_an_early_return_drops_the_pending_prefetch(
+        self, monkeypatch, verify_table, early
+    ):
+        # A round that prefetches nothing must not leave the previous round's
+        # copy for its own verify to take.
+        monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+        assert self._prefetch(monkeypatch, verify_table, [3], ["a"], [PAGE]) == 1
+        assert bridge._VERIFY_PREFETCH.pending is not None
+        batch = SimpleNamespace(
+            req_pool_indices_cpu=[3],
+            reqs=[SimpleNamespace(rid="a")],
+            spec_info=SimpleNamespace(
+                nxt_kv_lens_cpu=None if early == "no_bounds" else torch.tensor([PAGE])
+            ),
+        )
+        if early == "radix":
+            monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", False)
+        assert bridge.prefetch_v41_dspark_verify_rows(batch, verify_table, PAGE) == 0
+        assert bridge._VERIFY_PREFETCH.pending is None
+        assert not bridge._VERIFY_PREFETCH.take()
 
     def test_verify_host_rows_check_compares_with_the_device(
         self, monkeypatch, verify_table
@@ -3141,6 +3278,11 @@ class TestDeferredSeqLens:
             "get_parallel",
             lambda: SimpleNamespace(attn_dp_enabled=False, pp_size=1),
         )
+        monkeypatch.setattr(
+            rc,
+            "get_observability",
+            lambda: SimpleNamespace(enable_forward_pass_metrics=False),
+        )
         self.p = p
 
     def test_imported_sglang_matches_the_patched_shape(self):
@@ -3188,6 +3330,19 @@ class TestDeferredSeqLens:
         monkeypatch.setattr(bridge, "_V41_BUILDER", None)
         assert not decide(fm, _deferred_batch())
 
+    def test_forward_pass_metrics_keep_upstream(self, monkeypatch):
+        # FPM reads the batch's host lengths before the verify would set them.
+        import sglang.srt.runtime_context as rc
+
+        fm = _deferred_future_map()
+        assert self.p._is_v41_dspark_decode(fm, _deferred_batch())
+        monkeypatch.setattr(
+            rc,
+            "get_observability",
+            lambda: SimpleNamespace(enable_forward_pass_metrics=True),
+        )
+        assert not self.p._is_v41_dspark_decode(fm, _deferred_batch())
+
     def test_draft_sees_no_host_lengths_verify_sees_the_published_ones(self):
         fm = _deferred_future_map()
         batch = _deferred_batch()
@@ -3216,11 +3371,18 @@ class TestDeferredSeqLens:
         with pytest.raises(RuntimeError, match="never consumed"):
             self.p.resolve_seq_lens_deferred(fm, _deferred_batch())
 
-    def test_installed_wrappers_route_and_materialize(self, monkeypatch):
+    def _installed(self, monkeypatch, take=None):
+        """The patch over fake SGLang classes; the fake verify records the
+        host lengths it sees and, with ``take``, takes the late copy as the
+        staging does (the slots it names)."""
         from sglang.srt.managers import overlap_utils
         from sglang.srt.speculative.dspark_components import dspark_verify
 
         calls = []
+        p = self.p
+
+        def lens(batch):
+            return None if batch.seq_lens_cpu is None else batch.seq_lens_cpu.tolist()
 
         class FakeFutureMap:
             def resolve_seq_lens_cpu(self, batch):
@@ -3228,10 +3390,15 @@ class TestDeferredSeqLens:
 
         class FakeExecutor:
             def run_non_compact(self, *, batch, **kwargs):
-                calls.append(("verify", batch.seq_lens_cpu.tolist()))
+                calls.append(("verify", lens(batch)))
+                if take is not None:
+                    taken = p.take_late_seq_lens(len(take), take)
+                    calls.append(
+                        ("taken", None if taken is None else taken[0].tolist())
+                    )
 
             def run_compact(self, *, batch, **kwargs):
-                calls.append(("compact", batch.seq_lens_cpu.tolist()))
+                calls.append(("compact", lens(batch)))
 
         monkeypatch.setattr(overlap_utils, "FutureMap", FakeFutureMap)
         monkeypatch.setattr(dspark_verify, "TargetVerifyExecutor", FakeExecutor)
@@ -3241,13 +3408,64 @@ class TestDeferredSeqLens:
         fm = FakeFutureMap()
         for name, value in vars(_deferred_future_map()).items():
             setattr(fm, name, value)
+        return calls, fm, FakeExecutor()
+
+    def test_installed_wrappers_route_and_materialize(self, monkeypatch):
+        # Late host lengths off: the verify's caller waits at its entry.
+        monkeypatch.setenv(self.p.LATE_SEQ_LENS_ENV, "0")
+        calls, fm, executor = self._installed(monkeypatch)
         fm.resolve_seq_lens_cpu(_deferred_batch(mode=ForwardMode.EXTEND))
         assert calls == ["upstream"]
         batch = _deferred_batch()
         fm.resolve_seq_lens_cpu(batch)
         assert batch.seq_lens_cpu is None
-        FakeExecutor().run_non_compact(batch=batch, sampling_info=None)
+        executor.run_non_compact(batch=batch, sampling_info=None)
         assert calls[-1] == ("verify", [300, 40])
+
+    def test_late_lengths_are_taken_by_the_verify_staging(self, monkeypatch):
+        monkeypatch.delenv(self.p.LATE_SEQ_LENS_ENV, raising=False)
+        calls, fm, executor = self._installed(monkeypatch, take=[2, 1])
+        batch = _deferred_batch()
+        fm.resolve_seq_lens_cpu(batch)
+        executor.run_non_compact(batch=batch, sampling_info=None)
+        # SGLang's preparation ran without host lengths; the staging took
+        # the exact ones, once.
+        assert calls[-2:] == [("verify", None), ("taken", [300, 40])]
+        assert self.p._STATE.pending is None
+        assert self.p._STATE.late_taken == 1
+        assert self.p._STATE.late_unconsumed == 0
+        assert batch.seq_lens_cpu is None
+
+    def test_late_lengths_nobody_took_are_materialized_after(self, monkeypatch):
+        monkeypatch.delenv(self.p.LATE_SEQ_LENS_ENV, raising=False)
+        calls, fm, executor = self._installed(monkeypatch)
+        batch = _deferred_batch()
+        fm.resolve_seq_lens_cpu(batch)
+        executor.run_non_compact(batch=batch, sampling_info=None)
+        assert calls[-1] == ("verify", None)
+        assert self.p._STATE.pending is None
+        assert self.p._STATE.late_unconsumed == 1
+        assert batch.seq_lens_cpu.tolist() == [300, 40]
+
+    def test_late_lengths_of_another_batch_are_refused(self, monkeypatch):
+        monkeypatch.delenv(self.p.LATE_SEQ_LENS_ENV, raising=False)
+        _calls, fm, executor = self._installed(monkeypatch, take=[1, 2])
+        batch = _deferred_batch()
+        fm.resolve_seq_lens_cpu(batch)
+        with pytest.raises(RuntimeError, match="deferred host seq_lens are those"):
+            executor.run_non_compact(batch=batch, sampling_info=None)
+
+    def test_no_late_lengths_outside_a_late_verify(self, monkeypatch):
+        monkeypatch.delenv(self.p.LATE_SEQ_LENS_ENV, raising=False)
+        assert self.p.take_late_seq_lens(2, [2, 1]) is None
+        calls, fm, executor = self._installed(monkeypatch)
+        batch = _deferred_batch()
+        fm.resolve_seq_lens_cpu(batch)
+        # Pending but not handed to a verify: nothing to take yet.
+        assert self.p.take_late_seq_lens(2, [2, 1]) is None
+        # The compact verify keeps the wait at its entry.
+        executor.run_compact(batch=batch, sampling_info=None)
+        assert calls[-1] == ("compact", [300, 40])
 
     def test_kill_switch_keeps_upstream(self, monkeypatch):
         monkeypatch.setenv(self.p.DEFERRED_SEQ_LENS_ENV, "0")
@@ -3353,6 +3571,27 @@ class TestFusedGreedyDraft:
         from atom.plugin.sglang.patches import dspark_fused_greedy_draft_patch as p
 
         assert p._upstream_shape_error(DsparkDraftSampler) is None
+
+    def test_a_changed_tail_keeps_the_original(self):
+        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+            DsparkDraftSampler,
+        )
+
+        from atom.plugin.sglang.patches import dspark_fused_greedy_draft_patch as p
+
+        class ChangedCall(DsparkDraftSampler):
+            def __call__(self, hidden_states, input_ids):
+                return None
+
+        assert "__call__ no longer reads" in p._upstream_shape_error(ChangedCall)
+
+        def draft_markov_block(*, tp_sync, greedy_draft=False):
+            # A greedy chain that now samples: no early greedy return.
+            return tp_sync
+
+        assert "draft_markov_block no longer reads" in p._upstream_shape_error(
+            DsparkDraftSampler, draft_markov_block
+        )
 
     def test_greedy_tail_writes_the_hook_block_and_syncs_it_once(self):
         from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite

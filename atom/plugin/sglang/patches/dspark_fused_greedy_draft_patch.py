@@ -25,7 +25,9 @@ draft is not graph-folded (more requests than the captured buckets) keep
 SGLang's eager proposal.
 
 Version guard: SGLang 0.5.22 (`SUPPORTED_SGLANG_VERSIONS`) with the sampler
-attributes this reads; any other version keeps the original and logs why.
+attributes this reads and the source shape of the tail it replaces
+(``DsparkDraftSampler.__call__`` and ``draft_markov_block``); any other
+version keeps the original and logs why.
 """
 
 from __future__ import annotations
@@ -57,7 +59,36 @@ def _sglang_version() -> str:
         return "?"
 
 
-def _upstream_shape_error(sampler_cls) -> str | None:
+# What the replaced tail does, so the fused block stays its equivalent: the
+# anchor is each request's first query row, the chain goes through
+# ``draft_markov_block`` and lands in ``self.out``; a greedy chain syncs each
+# step's ids over the DSpark draft TP-sync site, keeps no step logits and
+# draws no noise (it returns before advancing the noise offset).
+_CALL_NEEDLES = (
+    "input_ids.view(bs, self.query_token_num)[:, 0]",
+    "draft_markov_block(",
+    "greedy_draft=self.greedy_draft",
+    "self.out[: draft_tokens.numel()].copy_(",
+    "self.confidence_out is not None",
+)
+_BLOCK_NEEDLES = (
+    "tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT",
+    "if greedy_draft:",
+    "return torch.stack(draft_tokens, dim=1), None",
+)
+
+
+def _missing_needles(function, needles) -> list[str] | None:
+    import inspect
+
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        return None
+    return [needle for needle in needles if needle not in source]
+
+
+def _upstream_shape_error(sampler_cls, block_fn=None) -> str | None:
     version = _sglang_version()
     if version not in SUPPORTED_SGLANG_VERSIONS:
         return f"sglang {version} not in {SUPPORTED_SGLANG_VERSIONS}"
@@ -69,6 +100,22 @@ def _upstream_shape_error(sampler_cls) -> str | None:
     missing = [name for name in _SAMPLER_ATTRS if f"self.{name} =" not in source]
     if missing:
         return f"DsparkDraftSampler no longer sets {missing}"
+    missing = _missing_needles(sampler_cls.__call__, _CALL_NEEDLES)
+    if missing is None:
+        return "DsparkDraftSampler.__call__ has no source"
+    if missing:
+        return f"DsparkDraftSampler.__call__ no longer reads {missing}"
+    if block_fn is None:
+        from sglang.srt.speculative.dspark_components import dspark_draft
+
+        block_fn = getattr(dspark_draft, "draft_markov_block", None)
+        if block_fn is None:
+            return "dspark_draft.draft_markov_block is missing"
+    missing = _missing_needles(block_fn, _BLOCK_NEEDLES)
+    if missing is None:
+        return "draft_markov_block has no source"
+    if missing:
+        return f"draft_markov_block no longer reads {missing}"
     return None
 
 

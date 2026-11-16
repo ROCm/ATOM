@@ -39,13 +39,28 @@ The deferred copy is a handle for this ``run_batch`` only: created by the
 resolve, consumed (and cleared) by the verify of the same batch, refused if a
 second resolve finds one unconsumed. Every other batch (prefill, mixed, idle,
 another speculative algorithm or model, SGLang's CI debug asserts, DP
-attention) takes upstream's resolve unchanged -- a radix prefix hit's
-EXTEND included: the radix seam (`deepseek_v41_radix.run_v41_prefix_replay`)
-and its fused or side replay run on EXTEND batches only, decide on the mode
-before reading any length, and so never see a deferred round. ``_forward_isolation`` restores
+attention, forward-pass metrics) takes upstream's resolve unchanged -- a
+radix prefix hit's EXTEND included: the radix seam
+(`deepseek_v41_radix.run_v41_prefix_replay`) and its fused or side replay run
+on EXTEND batches only, decide on the mode before reading any length, and so
+never see a deferred round. ``_forward_isolation`` restores
 the scheduler's ``seq_lens_cpu`` to the snapshot (None) after the forward, as
 for any ``needs_cpu_seq_lens=False`` backend; ``prepare_for_decode`` seeds it
 again before the next round.
+
+Late host lengths (default; ``ATOM_SGLANG_V41_DSPARK_LATE_SEQ_LENS=0`` turns it
+off): the patched ``run_non_compact`` does not wait at all. SGLang then runs
+the verify on its ``needs_cpu_seq_lens=False`` contract -- ``live_seq_lens_cpu``
+None, ``seq_lens_cpu`` the reservation ``nxt_kv_lens_cpu`` (an upper bound),
+``candidate_max_seq_len_upper_bound`` set for a DSV4 target -- through
+``prepare_for_verify``, ``ForwardBatch.init_new``, the graph runner's checks
+and its input fill, and this plugin's verify staging takes the exact
+committed prefix itself, as its first step (`take_late_seq_lens`): the host
+waits there, after all of SGLang's own preparation, instead of before it.
+The copy is the same one and is consumed exactly once, by the verify of the
+batch it was resolved for (same request count and STATE slots); a verify
+that never stages it (none known) gets it materialized after the forward.
+``run_compact`` keeps the wait at its entry.
 
 Kill switch: ``ATOM_SGLANG_V41_DSPARK_DEFERRED_SEQ_LENS=0``. Version guard:
 SGLang 0.5.22 (`SUPPORTED_SGLANG_VERSIONS`) with the function shapes checked
@@ -67,6 +82,7 @@ import torch
 logger = logging.getLogger("atom")
 
 DEFERRED_SEQ_LENS_ENV = "ATOM_SGLANG_V41_DSPARK_DEFERRED_SEQ_LENS"
+LATE_SEQ_LENS_ENV = "ATOM_SGLANG_V41_DSPARK_LATE_SEQ_LENS"
 SUPPORTED_SGLANG_VERSIONS = ("0.5.22",)
 
 
@@ -79,6 +95,11 @@ class _Deferred:
     bs: int
     host: torch.Tensor
     done: Any
+    # The batch's STATE slots, which its verify staging must name
+    # (`take_late_seq_lens`).
+    slots: tuple = ()
+    # Left for the verify staging to take (`run_non_compact`, late mode).
+    late: bool = False
 
 
 class _State:
@@ -88,6 +109,10 @@ class _State:
         self.event = None
         self.pinned: torch.Tensor | None = None
         self.deferred_rounds = 0
+        # late-mode rounds whose verify staging took the copy, and those
+        # whose forward finished without it (materialized after)
+        self.late_taken = 0
+        self.late_unconsumed = 0
 
 
 _STATE = _State()
@@ -95,6 +120,10 @@ _STATE = _State()
 
 def deferred_seq_lens_enabled() -> bool:
     return os.environ.get(DEFERRED_SEQ_LENS_ENV, "1") != "0"
+
+
+def late_seq_lens_enabled() -> bool:
+    return os.environ.get(LATE_SEQ_LENS_ENV, "1") != "0"
 
 
 def _sglang_version() -> str:
@@ -164,10 +193,14 @@ def _is_v41_dspark_decode(future_map, batch) -> bool:
         if overlap_utils._DEBUG_ASSERT:
             # CI's consume-once poison needs the copy to have landed.
             return False
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_observability, get_parallel
 
         parallel = get_parallel()
         if parallel.attn_dp_enabled or parallel.pp_size != 1:
+            return False
+        if getattr(get_observability(), "enable_forward_pass_metrics", False):
+            # Forward-pass metrics read the batch's host lengths at the
+            # forward, before the verify would materialize them.
             return False
     except Exception:  # noqa: BLE001 - unknown runtime: keep upstream
         return False
@@ -218,7 +251,8 @@ def resolve_seq_lens_deferred(future_map, batch) -> None:
     # planning off spec_info.nxt_kv_lens_cpu.
     batch.seq_lens_cpu = None
     batch.seq_lens_sum = None
-    _STATE.pending = _Deferred(weakref.ref(batch), bs, host, _STATE.event)
+    slots = tuple(int(slot) for slot in batch.req_pool_indices_cpu[:bs])
+    _STATE.pending = _Deferred(weakref.ref(batch), bs, host, _STATE.event, slots=slots)
     _STATE.deferred_rounds += 1
 
 
@@ -239,6 +273,47 @@ def materialize_seq_lens(batch) -> bool:
     batch.seq_lens_cpu = seq_lens_cpu
     batch.seq_lens_sum = int(seq_lens_cpu.sum())
     return True
+
+
+def take_late_seq_lens(bs: int, slots=None):
+    """For the verify staging of a late-mode round: ``(lens, slots)``, the
+    exact committed prefix of its ``bs`` requests and the STATE slots the
+    copy was resolved for (one event wait: the copy finished when the
+    previous round's accept did), or None when no late copy is pending. A
+    pending copy of another batch -- another request count, or other
+    ``slots`` when the staging knows them -- is refused; a staging that
+    learns its slots later (the eager verify reads them off the device)
+    compares them with the returned ones."""
+    pending = _STATE.pending
+    if pending is None or not pending.late:
+        return None
+    named = None if slots is None else tuple(int(slot) for slot in slots)
+    if pending.bs != int(bs) or (named is not None and pending.slots != named):
+        raise RuntimeError(
+            "DeepSeek-V4.1 DSpark: the verify staged "
+            f"{int(bs)} requests in slots {named} but the deferred host "
+            f"seq_lens are those of {list(pending.slots)}"
+        )
+    _STATE.pending = None
+    pending.done.synchronize()
+    _STATE.late_taken += 1
+    return pending.host[: pending.bs].clone(), pending.slots
+
+
+def deferred_state_summary() -> str:
+    """The pending deferred copy, for an error message."""
+    pending = _STATE.pending
+    if pending is None:
+        return (
+            f"no copy pending (deferred_rounds={_STATE.deferred_rounds} "
+            f"late_taken={_STATE.late_taken} "
+            f"late_unconsumed={_STATE.late_unconsumed})"
+        )
+    alive = pending.batch() is not None
+    return (
+        f"a copy pending for {pending.bs} requests in slots "
+        f"{list(pending.slots)} late={pending.late} batch_alive={alive}"
+    )
 
 
 def install_dspark_deferred_seq_lens_patch() -> bool:
@@ -275,22 +350,45 @@ def install_dspark_deferred_seq_lens_patch() -> bool:
             return resolve_seq_lens_deferred(self, batch)
         return original_resolve(self, batch)
 
-    def _materializing(original):
+    def _materializing(original, *, late_ok):
         @wraps(original)
         def run(self, *, batch, **kwargs):
-            materialize_seq_lens(batch)
-            return original(self, batch=batch, **kwargs)
+            pending = _STATE.pending
+            if not (
+                late_ok
+                and late_seq_lens_enabled()
+                and pending is not None
+                and pending.batch() is batch
+            ):
+                materialize_seq_lens(batch)
+                return original(self, batch=batch, **kwargs)
+            pending.late = True
+            try:
+                return original(self, batch=batch, **kwargs)
+            finally:
+                if _STATE.pending is pending:
+                    # No staging asked for it: settle it as upstream would.
+                    _STATE.late_unconsumed += 1
+                    pending.late = False
+                    materialize_seq_lens(batch)
 
         return run
 
     future_map_cls.resolve_seq_lens_cpu = resolve_seq_lens_cpu
-    executor_cls.run_non_compact = _materializing(executor_cls.run_non_compact)
-    executor_cls.run_compact = _materializing(executor_cls.run_compact)
+    executor_cls.run_non_compact = _materializing(
+        executor_cls.run_non_compact, late_ok=True
+    )
+    executor_cls.run_compact = _materializing(executor_cls.run_compact, late_ok=False)
     future_map_cls._atom_v41_deferred_seq_lens = True
     logger.info(
         "ATOM DeepSeek-V4.1 DSpark: decode rounds resolve host seq_lens after "
-        "the draft launch (FutureMap.resolve_seq_lens_cpu deferred to "
-        "TargetVerifyExecutor.run_non_compact; sglang %s; %s=0 to disable)",
+        "the draft launch (FutureMap.resolve_seq_lens_cpu deferred to %s; "
+        "sglang %s; %s=0 to disable)",
+        (
+            f"the verify staging (late; {LATE_SEQ_LENS_ENV}=0 for run_non_compact)"
+            if late_seq_lens_enabled()
+            else "TargetVerifyExecutor.run_non_compact"
+        ),
         _sglang_version(),
         DEFERRED_SEQ_LENS_ENV,
     )

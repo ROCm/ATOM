@@ -729,8 +729,12 @@ def _set_atom_forward_context(
     forward_batch: ForwardBatch,
     positions: torch.Tensor,
     save_kv_cache: bool | None = None,
-) -> None:
-    """Bridge SGLang batch metadata into ATOM's global forward context."""
+) -> Any:
+    """Bridge SGLang batch metadata into ATOM's global forward context.
+
+    Returns the padded inputs a model-specific builder laid the step out for
+    (``attn_metadata.sglang_padded_inputs``: a prefill padded to a recorded
+    token-graph bucket, which then replays), or None."""
 
     from atom.utils.forward_context import (
         Context,
@@ -794,6 +798,11 @@ def _set_atom_forward_context(
         and getattr(attn_metadata, "slot_mapping", None) is not None
     ):
         attn_metadata.slot_mapping = torch.full_like(attn_metadata.slot_mapping, -1)
+    # A prefill the builder padded to a token-graph bucket runs the bucket's
+    # rows (`deepseek_v41_bridge.PaddedPrefillInputs`).
+    padded = getattr(attn_metadata, "sglang_padded_inputs", None)
+    if padded is not None:
+        positions = padded.positions
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
@@ -840,10 +849,11 @@ def _set_atom_forward_context(
         is_prefill=is_prefill,
         is_dummy_run=is_dummy_run,
         scheduled_bs=batch_size,
-        scheduled_tokens=num_tokens,
+        scheduled_tokens=num_tokens if padded is None else padded.scheduled_tokens,
         running_bs=running_bs,
         running_tokens=running_tokens,
         running_tokens_are_unified=running_tokens_are_unified,
+        scheduled_tokens_gpu=(None if padded is None else padded.scheduled_tokens_gpu),
     )
     set_forward_context(
         attn_metadata=attn_metadata,
@@ -851,6 +861,12 @@ def _set_atom_forward_context(
         context=context,
         running_tokens_per_dp_rank=running_tokens_per_dp_rank,
     )
+    if padded is not None:
+        from atom.utils.forward_context import get_forward_context
+
+        # The bucket's recording replays (`region_graph._run_token_graph`).
+        get_forward_context().tr_graph = "replay"
+    return padded
 
 
 def _reset_atom_forward_context() -> None:
@@ -878,15 +894,20 @@ class SGLangPluginRuntime:
     save_kv_cache: bool | None = None
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)
-    _exit_stack: ExitStack = field(init=False, repr=False)
+    # The rows the model ran for SGLang's batch, when it ran more (a prefill
+    # padded to a token-graph bucket): the output's leading rows.
+    _output_rows: int | None = field(init=False, default=None)
     # SGLang's rows of the ATOM model's output, when the adapter widened this
-    # forward's inputs (`SGLangModelAdapterSpec.expand_forward_inputs`).
-    _output_rows: torch.Tensor | None = field(init=False, default=None)
+    # forward's inputs (`SGLangModelAdapterSpec.expand_forward_inputs`): rows
+    # of the widened layout, which a padded bucket keeps as its leading rows.
+    _output_select: torch.Tensor | None = field(init=False, default=None)
+    _exit_stack: ExitStack = field(init=False, repr=False)
 
     def __enter__(self) -> SGLangPluginRuntime:  # noqa: PYI034
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
         self._output_rows = None
+        self._output_select = None
 
         if self._is_dummy_run:
             (
@@ -906,13 +927,17 @@ class SGLangPluginRuntime:
         self._exit_stack = ExitStack()
         self._exit_stack.enter_context(bind_current_forward_batch(self.forward_batch))
         if self.set_forward_context:
-            _set_atom_forward_context(
+            padded = _set_atom_forward_context(
                 self.atom_config,
                 self.forward_batch,
                 self.positions,
                 save_kv_cache=self.save_kv_cache,
             )
             self._exit_stack.callback(_reset_atom_forward_context)
+            if padded is not None:
+                self.input_ids = padded.input_ids
+                self.positions = padded.positions
+                self._output_rows = int(padded.scheduled_tokens)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -933,13 +958,17 @@ class SGLangPluginRuntime:
         )
         if expanded is None:
             return
-        self.input_ids, self.positions, self._output_rows = expanded
+        self.input_ids, self.positions, self._output_select = expanded
 
     def trim_output(self, hidden_states):
         """Map ATOM-visible outputs back to SGLang-visible token count."""
 
         if self._is_dummy_run:
             return _trim_hidden_states_for_output(hidden_states, 0)
+        if self._output_select is not None:
+            # A widened forward's SGLang rows; padding past the widened rows
+            # (a token-graph bucket) is never selected.
+            return _select_rows_for_output(hidden_states, self._output_select)
         if self._output_rows is not None:
-            return _select_rows_for_output(hidden_states, self._output_rows)
+            return _trim_hidden_states_for_output(hidden_states, self._output_rows)
         return hidden_states
