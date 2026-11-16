@@ -339,7 +339,7 @@ def sample_once(lg, rec0, rec1, rec2, rec3, ids, cnt, t, b, sm, V, invT, topp, s
     for k in range(PT):
         z = zload(base, c0, CH, V, t, k, invT)
         j = c0 + t + k * 256
-        u = (F32(lshr(hash32(row, j + rank * V, seed), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+        u = (F32(lshr(hash32(row, j + rank * V, seed), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
         g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
         g = _greedy_noise(greedy, g)
         pk = fx.Int64(skey(z + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - (j + rank * V)) & fx.Int64(0xFFFFFFFF))

@@ -110,7 +110,7 @@ def markov_once(base, anchors, w1, w2s, ids_out, emb_out, best, cnt, recv, rank,
                 bp = I64MIN()
                 for i in range_constexpr(8):
                     gj = tile * 16 + (l // 16) * 8 + i + rank * VR
-                    u = (F32(lshr(hash32(rq * TB + k, gj, sd), 8)) + F32(0.5)) * F32(1.0 / 16777216.0)
+                    u = (F32(lshr(hash32(rq * TB + k, gj, sd), 9)) + F32(0.5)) * F32(1.0 / 8388608.0)   # (23 bits: u < 1 exactly; 24 bits + 0.5 rounded to 1.0 in fp32)
                     g = F32(-LN2) * log2f(F32(-LN2) * log2f(u))
                     bp = fx.max(bp, fx.Int64(skey(zs[i] * itd + g)) * fx.Int64(1 << 32) + (fx.Int64(c32(0xFFFFFFFF) - gj) & fx.Int64(0xFFFFFFFF)))
                 bl = gq.select(bl, bp)
