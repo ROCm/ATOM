@@ -1500,7 +1500,7 @@ class MLAAttention(nn.Module):
             x.shape[0],
             W_V.shape[1],
             device=x.device,
-            dtype=x.dtype,
+            dtype=torch.bfloat16,
         )
         if is_rocm_aiter_fp4bmm_enabled():
             batched_gemm_a16wfp4(
