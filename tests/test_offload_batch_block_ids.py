@@ -92,16 +92,11 @@ class _Case:
                 free_event_valid=False,
             ),
         )
-        self.finished = []
         codec = SimpleNamespace(
             device=torch.device("cpu"),
             num_blocks=8,
             bytes_per_block=4,
             has_fused_chunk_major_staging=True,
-            record_prepared_block_id_completion=lambda owner: None,
-            finish_prepared_block_id_groups=lambda owner, *, safe: (
-                self.finished.append(safe)
-            ),
             gpu_to_chunk_major_device_buffer=self.legacy_launch,
             chunk_major_device_buffer_to_gpu=self.legacy_launch,
         )
@@ -319,8 +314,6 @@ def test_owner_lifetime_covers_errors_and_uncertain_fences(
         else [("fence", "copy"), ("fence", "pack")]
     )
     owners = case.connector._quarantined_block_id_owners
-    # A lease is quarantined only when recovery could not fence both streams.
-    assert case.finished == [not uncertain]
     if uncertain:
         assert len(owners) == 1
         assert owners[0] is case.owner_ref()

@@ -119,22 +119,11 @@ def contract(monkeypatch):
     for api in ("synchronize", "current_stream", "current_device", "Stream", "Event"):
         monkeypatch.setattr(torch.cuda, api, forbidden)
     monkeypatch.setattr(codec, "_region_plan", lambda kind, *, stream: plan)
-
-    class FakeCpuGpuBuffer:
-        def __init__(self, n, *, dtype, device):
-            assert dtype == torch.int64 and device == codec.device
-            self.cpu = torch.zeros(n, dtype=dtype)
-            self.np = self.cpu.numpy()
-            self.gpu = self.cpu.clone().as_subclass(_CudaTensor)
-
-        def copy_to_gpu(self, n):
-            self.gpu[:n].copy_(upload(self.np[:n].tolist(), codec.device))
-            return self.gpu[:n]
-
-    monkeypatch.setattr(
-        "atom.kv_transfer.offload.hybrid.dsv4.codec.CpuGpuBuffer", FakeCpuGpuBuffer
-    )
     monkeypatch.setattr(module, "_static_device_i64", upload)
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.hybrid.dsv4.codec.upload_numpy",
+        lambda arr, device: upload(arr.tolist(), device),
+    )
     monkeypatch.setattr(module, "_device_i64", forbidden)
     monkeypatch.setattr(module, "_gather_region_items_kernel", Kernel("gather"))
     monkeypatch.setattr(module, "_scatter_region_items_kernel", Kernel("scatter"))
@@ -152,27 +141,6 @@ def _prepare(contract, groups):
     return contract.codec.prepare_block_id_groups(
         groups, device=contract.codec.device, stream=contract.stream
     )
-
-
-def test_retired_prepared_owner_cannot_read_reused_metadata(contract, monkeypatch):
-    class DoneEvent:
-        def record(self, stream):
-            assert stream is contract.stream
-
-        def query(self):
-            return True
-
-    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
-    owner = _prepare(contract, [[[1], [2]]])
-    contract.codec.record_prepared_block_id_completion(owner)
-    contract.codec.finish_prepared_block_id_groups(owner, safe=True)
-    next_owner = _prepare(contract, [[[3], [4]]])
-    assert next_owner._metadata_lease is owner._metadata_lease
-    assert next_owner._metadata_generation > owner._metadata_generation
-    with pytest.raises(ValueError, match="no longer active"):
-        contract.codec.chunk_major_device_buffer_to_gpu_prepared(
-            _buffer(8), owner, 0, stream=contract.stream
-        )
 
 
 @pytest.mark.parametrize(
@@ -324,64 +292,3 @@ def test_legacy_launch_still_uploads_each_group(contract, monkeypatch, method):
         getattr(contract.codec, method)(_buffer(), group, stream=contract.stream)
     assert contract.uploads == [(5, 1), (2,)]
     assert [call[2][1].tolist() for call in contract.launches] == [[5, 1], [2]]
-
-
-def test_failure_before_any_launch_frees_the_lease_and_after_one_keeps_it(
-    contract, monkeypatch
-):
-    class DoneEvent:
-        def record(self, stream):
-            pass
-
-        def query(self):
-            return True
-
-    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
-    codec = contract.codec
-    for _ in range(6):  # more than the pool holds: each failure must free its lease
-        owner = _prepare(contract, [[[1], [2]]])
-        with pytest.raises(ValueError, match="invalid strided"):
-            codec.chunk_major_strided_buffer_to_gpu_prepared(
-                _buffer(64),
-                owner,
-                0,
-                stream=contract.stream,
-                items_per_chunk=2,
-                chunk_stride_bytes=1,
-            )
-        codec.finish_prepared_block_id_groups(owner, safe=False)
-    assert contract.launches == []
-    assert len(codec._metadata_tls.pool.leases) == 1
-    owner = _prepare(contract, [[[1], [2]]])
-    codec.chunk_major_device_buffer_to_gpu_prepared(
-        _buffer(8), owner, 0, stream=contract.stream
-    )
-    codec.finish_prepared_block_id_groups(owner, safe=False)
-    assert [lease.state for lease in codec._metadata_tls.pool.leases][-1] == (
-        "quarantined"
-    )
-
-
-def test_failed_id_upload_frees_its_lease_once_the_upload_completes(
-    contract, monkeypatch
-):
-    import atom.kv_transfer.offload.hybrid.dsv4.codec as codec_module
-
-    class DoneEvent:
-        def record(self, stream):
-            assert stream is contract.stream
-
-        def query(self):
-            return True
-
-    class FailingUpload(codec_module.CpuGpuBuffer):
-        def copy_to_gpu(self, n):
-            raise RuntimeError("upload failed")
-
-    monkeypatch.setattr(torch.cuda, "Event", DoneEvent)
-    monkeypatch.setattr(codec_module, "CpuGpuBuffer", FailingUpload)
-    for _ in range(6):  # more than the pool holds: none may stay quarantined
-        with pytest.raises(RuntimeError, match="upload failed"):
-            _prepare(contract, [[[1], [2]]])
-    pool = contract.codec._metadata_tls.pool
-    assert [lease.state for lease in pool.leases] == ["pending"]

@@ -3439,21 +3439,6 @@ def test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread(
         worker.close()
 
 
-def test_page_layouts_hold_back_a_metadata_lease_per_copy_thread(monkeypatch):
-    from atom.kv_transfer.offload.metadata_lease import METADATA_GPU_RESERVE_BYTES
-
-    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "2")
-    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
-    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
-    config = _config(extra=_extra(save_pool_mib=3, load_pool_mib=5))
-    dense = KVConnectorFactory.kv_budget_reserve_bytes(config)
-    config.hf_config.model_type = "deepseek_v41"
-    assert (
-        KVConnectorFactory.kv_budget_reserve_bytes(config)
-        == dense + 5 * METADATA_GPU_RESERVE_BYTES
-    )
-
-
 def test_a_failed_probe_stops_startup_and_releases_the_pool(cluster, one_rank):
     cluster.silent_gets = True
     worker = MooncakeStoreOffloadConnector(_registering_config())
@@ -3679,12 +3664,6 @@ class FakeInPlaceCodec:
 
     has_fused_chunk_major_staging = True
     supports_strided_restore = False
-
-    def record_prepared_block_id_completion(self, owner):
-        pass
-
-    def finish_prepared_block_id_groups(self, owner, *, safe):
-        pass
 
     def __init__(self) -> None:
         self.device = torch.device("cpu")

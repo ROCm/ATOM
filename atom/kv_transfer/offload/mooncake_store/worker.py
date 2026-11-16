@@ -71,10 +71,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
-from atom.kv_transfer.offload.mooncake_store.layouts import (
-    build_mooncake_codec,
-    metadata_reserve_bytes,
-)
+from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -206,13 +203,14 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         The transfer slot pool, which `register_kv_caches` allocates, and a
         staging buffer per save and load thread (the widths
         `_init_worker_common` gives the executors), each at most
-        `_staging_buffer_bound`, plus the thread's PAGE metadata lease pool.
+        `_staging_buffer_bound`.
         """
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         cfg = parse_mooncake_store_config(kvc)
         threads = envs.OFFLOAD_COPY_WORKERS + envs.OFFLOAD_LOAD_WORKERS
-        return pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes) + (
-            threads * (_staging_buffer_bound() + metadata_reserve_bytes(config))
+        return (
+            pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
+            + threads * _staging_buffer_bound()
         )
 
     def close(self) -> None:
@@ -963,24 +961,18 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             if pack
             else codec.chunk_major_device_buffer_to_gpu_prepared
         )
-        try:
-            if chunk_stride_bytes is not None:
-                codec.chunk_major_strided_buffer_to_gpu_prepared(
-                    run,
-                    owner,
-                    0,
-                    stream=stream,
-                    items_per_chunk=per_chunk,
-                    chunk_stride_bytes=chunk_stride_bytes,
-                )
-            else:
-                copy(run, owner, 0, stream=stream)
-            codec.record_prepared_block_id_completion(owner)
-            atom_lmcache_staging.fence_submitted_work(stream)
-        except BaseException:
-            codec.finish_prepared_block_id_groups(owner, safe=False)
-            raise
-        codec.finish_prepared_block_id_groups(owner, safe=True)
+        if chunk_stride_bytes is not None:
+            codec.chunk_major_strided_buffer_to_gpu_prepared(
+                run,
+                owner,
+                0,
+                stream=stream,
+                items_per_chunk=per_chunk,
+                chunk_stride_bytes=chunk_stride_bytes,
+            )
+        else:
+            copy(run, owner, 0, stream=stream)
+        atom_lmcache_staging.fence_submitted_work(stream)
 
         # -- slot settlement -----------------------------------------------
 

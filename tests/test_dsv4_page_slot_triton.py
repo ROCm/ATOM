@@ -635,12 +635,8 @@ def test_strided_restore_matches_the_staged_path_byte_for_byte_on_gpu(
         for target, original in zip(gpu, tensors):
             target.copy_(original)
         owner = codec.prepare_block_id_groups(groups, device=device, stream=stream)
-        try:
-            copy(owner)
-            codec.record_prepared_block_id_completion(owner)
-            stream.synchronize()
-        finally:
-            codec.finish_prepared_block_id_groups(owner, safe=True)
+        copy(owner)
+        stream.synchronize()
         return [target.cpu() for target in gpu]
 
     staged = restore(
