@@ -44,8 +44,9 @@ revert only the backoff there. Every site this PR changed must go back:
    `atom/models/deepseek_v4/mono/kernels/primitives.py`,
    `atom/models/deepseek_v41/mono/hi/device/gfx950/ops.py`): emit `"s_nop 0"`
    instead of `f"s_sleep {POLL_SLEEP_UNITS}"`.
-3. `atom/models/deepseek_v4/mono/kernels/helpers.py` (two polls, `rocdl.s_sleep(polling.POLL_SLEEP_UNITS)`
-   at lines 179 and 198): change both back to `rocdl.s_nop(0)`.
+3. `atom/models/deepseek_v4/mono/kernels/helpers.py`, function `poll()` (two polls,
+   `rocdl.s_sleep(polling.POLL_SLEEP_UNITS)`: the bounded loop under `poll_timeout_ticks`
+   and the unbounded loop in the `else` branch): change both back to `rocdl.s_nop(0)`.
 
 `sync.py::sleep_ticks` keeps `s_sleep(1)` (harness delay injection, unchanged by
 this PR). The V4.1 K1 that this tool
