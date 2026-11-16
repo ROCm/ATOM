@@ -41,7 +41,8 @@ from atom.utils.forward_context import plugin_graph_is_piecewise
 #   - `dual_stream_moe_forward(hidden_states) -> Tensor`
 #
 # Per-token gating: decode benefits from dual-stream, prefill doesn't —
-# threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
+# threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`, or the module's
+# own `_dual_stream_token_threshold` where it sets one.
 
 
 def _dual_stream_is_active(self, num_tokens: int) -> bool:
@@ -57,7 +58,13 @@ def _dual_stream_is_active(self, num_tokens: int) -> bool:
     # plugin frontend's own PIECEWISE graphs are left single-stream.
     return (
         self._use_dual_stream
-        and 0 < num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        and 0
+        < num_tokens
+        <= getattr(
+            self,
+            "_dual_stream_token_threshold",
+            envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD,
+        )
         and not tbo_active()
         and not plugin_graph_is_piecewise()
     )

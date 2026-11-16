@@ -1065,3 +1065,30 @@ def test_mxfp4_apply_hands_the_shared_output_to_fused_experts(
         assert passed["shared_ready"] is ready
     else:
         assert "shared_add" not in passed and "shared_ready" not in passed
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [(None, 1536), ("1024", 1024), ("2048", 2048), ("0", 0)],
+)
+def test_dsv4_dual_stream_token_threshold(monkeypatch, atom_modules, env, expected):
+    """The V4 MoE's row bound: 1536 unless the variable is set, which wins."""
+    if env is None:
+        monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", env)
+    assert atom_modules.deepseek_v4.v4_dual_stream_token_threshold() == expected
+
+
+@pytest.mark.parametrize("rows", [1, 1024, 1152, 1536, 1537, 16384])
+def test_dual_stream_gate_reads_the_module_threshold(monkeypatch, atom_modules, rows):
+    dispatch = sys.modules["atom.model_ops.module_dispatch_ops"]
+    monkeypatch.setattr(dispatch, "plugin_graph_is_piecewise", lambda: False)
+    monkeypatch.setattr(
+        sys.modules["atom.utils.tbo.ubatching"], "tbo_active", lambda: False
+    )
+    monkeypatch.delenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", raising=False)
+    v4 = SimpleNamespace(_use_dual_stream=True, _dual_stream_token_threshold=1536)
+    other = SimpleNamespace(_use_dual_stream=True)
+    assert dispatch._dual_stream_is_active(v4, rows) == (rows <= 1536)
+    assert dispatch._dual_stream_is_active(other, rows) == (rows <= 1024)
