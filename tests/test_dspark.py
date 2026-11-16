@@ -2815,6 +2815,54 @@ def test_staged_anchors_clamp_the_id_and_zero_the_pad(scheduled_bs):
     assert anchor_positions.tolist() == [6, 15, 27, 39][:scheduled_bs] + pad
 
 
+@pytest.mark.parametrize(
+    "answer, scheduled_bs, launched",
+    [(True, 4, False), (False, 4, True), (None, 4, True), (True, 3, True)],
+)
+def test_stage_anchors_skips_the_kernel_for_anchors_the_draft_model_staged(
+    monkeypatch, answer, scheduled_bs, launched
+):
+    """`_stage_anchors` launches nothing when the draft model's `anchors_staged`
+    says the target forward already wrote this pass's anchor ids and positions;
+    a model that says no, has none, or a padded batch (not every row scheduled)
+    gets the kernel as before. Either way the pass stages its own buffers."""
+    import atom.spec_decode.dspark_proposer as dp
+
+    class Device:  # a device tensor as far as `_stage_anchors` looks before launching
+        is_cuda = True
+
+    running_bs = 4
+    ids, anchor_positions = Device(), Device()
+    bufs = {"anchor_ids": ids, "anchor_positions": anchor_positions}
+    pass_ = types.SimpleNamespace(
+        buffer=lambda name, bs: bufs[name],
+        stage=lambda bs, inputs: (bs, inputs),
+    )
+    launches, asked = [], []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kw: launches.append(grid)
+
+    monkeypatch.setattr(dp, "_stage_anchors_kernel", Kernel())
+    model = types.SimpleNamespace(vocab_size=100)
+    if answer is not None:
+        model.anchors_staged = lambda *args: asked.append(args) or answer
+    proposer = types.SimpleNamespace(model=model)
+    next_ids = torch.zeros(scheduled_bs, dtype=torch.int32)
+    positions = torch.zeros(8, dtype=torch.int64)
+    rows = torch.zeros(4, dtype=torch.int32)
+    staged = dp.DSparkProposer._stage_anchors(
+        proposer, pass_, running_bs, next_ids, positions, rows
+    )
+    assert staged == (running_bs, bufs)
+    assert launches == ([(running_bs,)] if launched else [])
+    if answer is not None and scheduled_bs == running_bs:
+        assert asked == [(ids, anchor_positions, next_ids, positions, rows)]
+    else:
+        assert asked == []
+
+
 def test_page16_table_expands_every_page_into_its_eight_sub_pages():
     """MiniMax-M3.1 DSpark block rows read a page-16 table built from the
     page-128 block table: page p -> 8p .. 8p+7, in column order."""
