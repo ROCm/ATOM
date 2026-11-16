@@ -231,3 +231,15 @@ def test_patch_stops_at_the_plans_last_item(cache_dtype, rows):
     planned = info[:items, 0].long()
     assert torch.equal(info[:items, 4], kvptr[planned])
     assert torch.equal(info[:items, 5], kvptr[planned + 1])
+
+
+def test_patch_rejects_a_work_info_width_it_does_not_write():
+    """The patch writes MlaWorkInfo fields by offset, so a resized aiter
+    struct fails before the kernel writes into the wrong fields."""
+    from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
+
+    info = torch.zeros(4, 9, dtype=torch.int32, device="cuda")
+    indptr = torch.arange(5, dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError, match="MlaWorkInfo layout changed"):
+        patch_work_kv_ranges(info, indptr, indptr, 4)
+    assert not info.any()

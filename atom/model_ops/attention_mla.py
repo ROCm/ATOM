@@ -313,7 +313,9 @@ _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
 # A separate tuple from decode's on purpose: aliasing the two would let a
 # decode-only change to _MLA_DCP_KERNEL_WIDTHS silently repoint sparse
 # prefill's gathered pad width too. 96 is aiter's native gqa96 kernel for fp8
-# and bf16, not a fold, so 12 heads x DCP8 runs unpadded.
+# and bf16, not a fold, so 12 heads x DCP8 runs unpadded: gfx950 fp8 at 96
+# heads plans unfolded from ROCm/aiter#4964, bf16 has its gqaratio96 persistent
+# kernels from ROCm/aiter#5582.
 _MLA_DCP_SPARSE_PREFILL_WIDTHS_PERSISTENT = (16, 32, 64, 96, 128)
 
 _dcp_kernel_width_warned = False

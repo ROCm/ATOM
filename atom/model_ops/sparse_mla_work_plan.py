@@ -17,7 +17,8 @@ BLOCK = 256
 
 @triton.jit
 def _patch_work_kv_ranges(work_info, items, kv_indptr, BLOCK: tl.constexpr):
-    # aiter's MlaWorkInfo is eight int32: the row at 0, KV start and end at 4, 5.
+    # aiter's MlaWorkInfo (csrc/include/mla.h) is eight int32: batch_idx (the
+    # row) at 0, kv_start and kv_end at 4, 5.
     item = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = item < tl.load(items)
     info = work_info + item * 8
@@ -43,6 +44,10 @@ def patch_work_kv_ranges(
     persistent MLA kernel takes a row's keys from its work item alone, not
     from the indptr it is passed.
     """
+    assert work_info_set.dtype == torch.int32 and work_info_set.shape[-1] == 8, (
+        "aiter's MlaWorkInfo layout changed: work_info_set is "
+        f"{tuple(work_info_set.shape)} {work_info_set.dtype}, the patch writes [*, 8] int32"
+    )
     _patch_work_kv_ranges[(triton.cdiv(rows, BLOCK),)](
         work_info_set, work_indptr[-1:], kv_indptr, BLOCK=BLOCK
     )

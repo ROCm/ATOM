@@ -1887,9 +1887,11 @@ class KimiLinearModel(nn.Module):
         # Shared second stream for dual-stream MoE (shared-expert GEMMs overlap the
         # routed path) and a DSA layer's top-k exchange (overlaps its q path).
         # Created once and threaded into every decoder layer; only created when
-        # the model has shared experts.
+        # the model has shared experts or DSA layers.
         self.alt_stream = None
-        if getattr(config, "num_shared_experts", 0):
+        if getattr(config, "num_shared_experts", 0) or getattr(
+            config, "dsa_layer_indices", ()
+        ):
             self.alt_stream = torch.cuda.Stream()
         _alt_stream = self.alt_stream
 
