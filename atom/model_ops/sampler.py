@@ -187,11 +187,14 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
+            # A caller's generator is passed only when given, so an override
+            # of `_temperature_sample` without the argument keeps working.
+            extra = {} if generator is None else {"generator": generator}
             sampled = self._temperature_sample(
                 logits,
                 temperatures,
                 needs_independent_noise=needs_independent_noise,
-                generator=generator,
+                **extra,
             )
             # With no greedy row the fallback's argmax and `where` keep every
             # sampled id: a host-known `any_greedy` skips both launches.
