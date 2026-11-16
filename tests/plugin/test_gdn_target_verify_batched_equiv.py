@@ -19,7 +19,8 @@ The negative-control tests exist so that a future refactor cannot make the
 equivalence tests pass vacuously: they assert that realistic adapter bugs are
 still detected. See section 17 of ``ATOM_Qwen3.5_DFLASH_TP8复现与实现报告.md``.
 
-Nothing here touches the plugin's production path.
+Apart from ``_conv_batched_live``, which repeats the plugin's production conv
+call (``_spec_conv_qkv``), nothing here touches the plugin's production path.
 """
 
 from __future__ import annotations
@@ -328,6 +329,122 @@ def test_conv_per_step_windows_match_wide_window_slices(bs: int, draft: int):
 
     torch.testing.assert_close(qkv_b, qkv_a, rtol=0, atol=0)
     torch.testing.assert_close(win_b, win_a, rtol=0, atol=0)
+
+
+def _conv_batched_live(inp: _Inputs, live_conv: torch.Tensor, fill: float):
+    """The production call (``_spec_conv_qkv``): the history is read in place
+    from the live pool by cache slot (``conv_state_in``), the wide window is
+    written by batch position, and nothing is seeded. Rows whose cache slot is
+    the pad slot (-1) have it only in the read table."""
+    shared_win = inp.draft + STATE_LEN - 1
+    window = torch.full(
+        (NUM_SLOTS, CONV_DIM, shared_win), fill, device="cuda", dtype=torch.bfloat16
+    )
+    query_start_loc = torch.arange(
+        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
+    )
+    query, key, value = causal_conv1d_update(
+        inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
+        window,
+        inp.conv_weight,
+        K_DIM,
+        V_DIM,
+        inp.conv_bias,
+        "silu",
+        conv_state_indices=torch.arange(inp.bs, device="cuda", dtype=torch.int32).view(
+            inp.bs, 1
+        ),
+        conv_state_indices_in=inp.cache_indices.view(inp.bs, 1),
+        conv_state_in=live_conv,
+        num_accepted_tokens=torch.ones(inp.bs, device="cuda", dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        max_query_len=inp.draft,
+        validate_data=False,
+    )
+    qkv = torch.cat([query, key, value], dim=-1).reshape(inp.bs, inp.draft, CONV_DIM)
+    windows = torch.stack(
+        [window[: inp.bs, :, t : t + STATE_LEN] for t in range(inp.draft)], dim=1
+    )
+    return qkv, windows, window
+
+
+def _live_conv_in_layout(live_conv: torch.Tensor, layout: str) -> torch.Tensor:
+    if layout == "slot_dim_tok":
+        return live_conv.clone()
+    # Same logical [slot, dim, K-1], dim axis contiguous (stride(-2) == 1).
+    relaid = torch.empty(
+        NUM_SLOTS, STATE_LEN, CONV_DIM, device="cuda", dtype=live_conv.dtype
+    ).transpose(1, 2)
+    relaid.copy_(live_conv)
+    return relaid
+
+
+@pytest.mark.parametrize("layout", ["slot_dim_tok", "dim_contiguous"])
+@pytest.mark.parametrize("pad_rows", [(), (1,), (1, 3)])
+@pytest.mark.parametrize("draft", [3, 4])
+def test_conv_reading_live_pool_in_place_matches_per_step_loop(
+    draft: int, pad_rows: tuple, layout: str
+):
+    """Reading the history straight from the live pool gives the same q/k/v
+    and per-step windows as the loop for every real row, skips padded rows
+    entirely, and never writes the live pool."""
+    bs = 4
+    inp = _Inputs(bs, draft)
+    for row in pad_rows:
+        inp.cache_indices[row] = -1
+    real = [i for i in range(bs) if i not in pad_rows]
+    qkv_a, win_a = _conv_per_step_loop(inp)
+
+    live = _live_conv_in_layout(inp.live_conv, layout)
+    live_before = live.clone()
+    fill = 7.0
+    qkv_b, win_b, window = _conv_batched_live(inp, live, fill)
+
+    torch.testing.assert_close(qkv_b[real], qkv_a[real], rtol=0, atol=0)
+    torch.testing.assert_close(win_b[real], win_a[real], rtol=0, atol=0)
+    assert torch.equal(live, live_before)
+    untouched = [i for i in range(NUM_SLOTS) if i not in real]
+    assert torch.all(window[untouched] == fill)
+
+
+def test_conv_state_in_width_check_counts_accepted_tokens():
+    """With validate_data, a separate read pool must hold the columns the
+    accepted-token offset reads: width - 1 is enough only when every row
+    accepted one token."""
+    inp = _Inputs(3, 4)
+    shared_win = inp.draft + STATE_LEN - 1
+    window = torch.zeros(
+        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
+    )
+    query_start_loc = torch.arange(
+        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
+    )
+
+    def call(accepted: int):
+        causal_conv1d_update(
+            inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
+            window,
+            inp.conv_weight,
+            K_DIM,
+            V_DIM,
+            inp.conv_bias,
+            "silu",
+            conv_state_indices=torch.arange(
+                inp.bs, device="cuda", dtype=torch.int32
+            ).view(inp.bs, 1),
+            conv_state_indices_in=inp.cache_indices.view(inp.bs, 1),
+            conv_state_in=inp.live_conv,
+            num_accepted_tokens=torch.full(
+                (inp.bs,), accepted, device="cuda", dtype=torch.int32
+            ),
+            query_start_loc=query_start_loc,
+            max_query_len=inp.draft,
+            validate_data=True,
+        )
+
+    call(1)
+    with pytest.raises(AssertionError, match="narrower than num_accepted_tokens"):
+        call(2)
 
 
 def test_conv_equivalence_detects_missing_history_seed():

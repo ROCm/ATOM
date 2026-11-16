@@ -845,11 +845,14 @@ def _causal_conv1d_update_kernel(
     # the live state and the rolled window in separate tensors.
     conv_state_in_ptr,
     conv_state_indices_ptr,
-    # Read side. The same tensor as `conv_state_indices_ptr` unless the caller
-    # forked the state — a request resuming from a checkpoint reads the
-    # published slot and writes a fresh one, for this forward only. The pad
-    # sentinel is read from here but gates the store below, so the two arrays
-    # must carry `pad_slot_id` at the same rows.
+    # Read side, same layout and stride as `conv_state_indices_ptr`. The same
+    # tensor unless the caller reads one slot and writes another: a native
+    # request resuming a checkpoint (reads the published slot, writes a fresh
+    # one), or the SGLang plugin's target verify (reads the live slot in
+    # `conv_state_in_ptr`, writes the window row). Only this table is checked
+    # for `pad_slot_id`, and that check returns before the store, so a row
+    # padded here writes nothing whatever its write slot holds. A row padded
+    # only in the write table is not skipped.
     conv_state_indices_in_ptr,
     num_accepted_tokens_ptr,
     query_start_loc_ptr,  # (batch + 1)
@@ -1253,9 +1256,13 @@ def causal_conv1d_update(
         Useful for a continuous batching scenario.
     conv_state_indices_in: (batch,), dtype int32
         Read-side counterpart of conv_state_indices, same shape and stride.
-        Differs from it only for a request resuming a state checkpoint, which
-        reads the published slot and writes a fresh one for this forward.
         Defaults to conv_state_indices, i.e. the ordinary in-place update.
+        Differs from it when a row reads one slot and writes another: a
+        request resuming a state checkpoint (reads the published slot, writes
+        a fresh one), or a read from conv_state_in. pad_slot_id is checked
+        here only and skips the whole row, store included, so a row padded
+        here may hold anything in conv_state_indices; every row padded in
+        conv_state_indices must also be padded here.
     conv_state_in: (..., dim, >= width - 1), same dtype as conv_state
         Pool conv_state_indices_in reads the history from. Defaults to
         conv_state. A separate pool must hold every column the kernel reads,
@@ -1308,6 +1315,7 @@ def causal_conv1d_update(
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     _, _, state_len = conv_state.size()
+    separate_in = conv_state_in is not None and conv_state_in is not conv_state
     if conv_state_in is None:
         conv_state_in = conv_state
     else:
@@ -1316,7 +1324,10 @@ def causal_conv1d_update(
             and conv_state_in.size(1) == conv_state.size(1)
             and conv_state_in.size(2) >= width - 1
         ), "conv_state_in must match conv_state in dtype and dim"
-    # Only the read side is bounds-checked against the pool size.
+    # num_cache_lines masks only the STEP-2 history load (read slot against
+    # conv_state_in's rows). The STEP-1 column loads and the store are not
+    # bounds-checked, so both index tables must hold valid slots or
+    # pad_slot_id.
     num_cache_lines = conv_state_in.size(0)
 
     if validate_data:
@@ -1342,6 +1353,11 @@ def causal_conv1d_update(
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
+        if separate_in and num_accepted_tokens is not None:
+            # Reads start at column num_accepted_tokens - 1 (syncs the host).
+            assert conv_state_in.size(2) >= width - 2 + int(
+                num_accepted_tokens.max()
+            ), "conv_state_in is narrower than num_accepted_tokens reads"
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
     num_tokens = x.shape[0]
