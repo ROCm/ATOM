@@ -1420,7 +1420,7 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
-            snaps = getattr(kda_metadata, "kda_snapshots", None)
+            snaps = kda_metadata.kda_snapshots
             snap_out = None
             if snaps is not None and snaps.targets:
                 # In the final state's dtype and layout, so a snapshot is the

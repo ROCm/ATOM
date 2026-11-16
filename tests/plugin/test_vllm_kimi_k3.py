@@ -280,6 +280,7 @@ def test_kimi_k3_vllm_metadata_adds_state_read_indices():
 
         _adapt_kda_metadata_for_atom(metadata)
         assert metadata.non_spec_state_indices_in_tensor is state_indices
+        assert metadata.kda_snapshots is None
         """)
 
 
