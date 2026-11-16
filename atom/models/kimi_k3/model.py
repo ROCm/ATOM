@@ -186,6 +186,13 @@ def _is_e8m0_blockscale(
     )
 
 
+# Whether aiter's fused_qk_rmsnorm (the MLA q/kv norm) emits E8M0 per-1x128
+# scales; an older build aborts on one, so the norm then leaves q unquantized.
+_QKNORM_E8M0_FUSABLE = getattr(
+    aiter, "FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE", False
+)
+
+
 class SituAndMul(nn.Module):
     def __init__(
         self,
@@ -849,11 +856,9 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        # An older aiter aborts on an E8M0 scale here; q_b_proj then quantizes q.
         self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2) and (
-            not self.qknorm_e8m0_scale
-            or getattr(aiter, "FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE", False)
+            not self.qknorm_e8m0_scale or _QKNORM_E8M0_FUSABLE
         )
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
