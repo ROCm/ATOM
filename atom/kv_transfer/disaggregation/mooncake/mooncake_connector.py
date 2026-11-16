@@ -3996,6 +3996,7 @@ class MooncakeConnector(KVConnectorBase):
                 dsts = dst_base + dst_ids * consumer_block_bpb[cidx]
                 lens = np.full(src_ids.size, bpb, dtype=np.int64)
             elif stages_sharded_mla and region_idx in self._mla_token_views:
+                self._dcp_token_unit(region_idx, bpb)
                 staged_mla_regions.append((region_idx, dst_base, bpb))
                 continue
             else:
