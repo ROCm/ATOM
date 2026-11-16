@@ -48,9 +48,13 @@ def scale_codes(amax: torch.Tensor, fmax: float) -> torch.Tensor:
 def code_values(codes: torch.Tensor) -> torch.Tensor:
     """The fp32 power of two each E8M0 code (uint8) stands for.
 
-    Read through the E8M0 dtype, which is exact for every code; ``torch.ldexp`` on the
-    device is not exact at every exponent, and a scale one ulp off makes the codecs
-    disagree with the bytes they produced."""
+    Read through the E8M0 dtype, which is exact for every code. An fp32 ``torch.ldexp``
+    is not: on gfx950 with torch 2.10 / ROCm 7.2.4 it is one ulp low at some exponents
+    (it is exact on the CPU), and a scale one ulp off makes the codecs disagree with the
+    bytes they produced."""
+    if codes.dtype != torch.uint8:
+        # a wider integer tensor would be reinterpreted byte by byte, not converted
+        raise TypeError(f"E8M0 scale codes must be uint8, got {codes.dtype}")
     return codes.view(torch.float8_e8m0fnu).float()
 
 

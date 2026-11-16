@@ -4,9 +4,9 @@
 
 ``code_values`` turns a scale code into its fp32 power of two. If that value is off by one
 ulp, a weight made of MXFP4 values does not survive its own round trip and
-``pack_mxfp4_exact`` rejects it. The scales below are the ones where the old
-``torch.ldexp`` build of the value was one ulp low on a GPU. The tests run on the CPU and,
-when there is one, on the GPU.
+``pack_mxfp4_exact`` rejects it. The scales below cover the ranges where the old fp32
+``torch.ldexp`` build of the value was one ulp low on gfx950 (torch 2.10 / ROCm 7.2.4),
+plus a few ordinary ones. The tests run on the CPU and, when there is one, on the GPU.
 """
 
 import math
@@ -80,3 +80,9 @@ def test_pack_mxfp4_exact_accepts_mxfp4_weights_at_every_scale(device):
     w = _mxfp4_weight(device)
     packed, codes = pack_mxfp4_exact(w)
     assert torch.equal(mx.dequantize_mxfp4(packed, codes), w.float())
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+def test_code_values_takes_uint8_codes_only(dtype):
+    with pytest.raises(TypeError, match="uint8"):
+        mx.code_values(torch.full((4,), 127, dtype=dtype))
