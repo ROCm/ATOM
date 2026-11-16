@@ -211,7 +211,7 @@ class TestPagedCheckpointsAreRefusedWhereSizingWouldRaise:
     def test_the_midstep_switch_is_refused_under_pipeline_parallelism(
         self, monkeypatch
     ):
-        """At startup, before the aiter signature probe."""
+        """At startup, in `state_transfer`."""
         monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
         with (
             tp_world(TP),
