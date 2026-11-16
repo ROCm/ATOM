@@ -2,8 +2,17 @@ name: ATOM SGLang Accuracy Validation
 
 on:
   schedule:
-    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day)
-    - cron: '0 16 * * *'
+    # Nightly at 00:00 Beijing time (16:00 UTC on the previous day), so the
+    # cron weekday is the Beijing evening the run belongs to. One cron a night:
+    # MI355_WEEKLY_SCHEDULE (prepare-sglang-image) runs each MI355 case on one
+    # night a week; MI308 runs every night.
+    - cron: '0 16 * * 0'
+    - cron: '0 16 * * 1'
+    - cron: '0 16 * * 2'
+    - cron: '0 16 * * 3'
+    - cron: '0 16 * * 4'
+    - cron: '0 16 * * 5'
+    - cron: '0 16 * * 6'
   workflow_dispatch:
     # Manual runs use GitHub Actions' built-in branch dropdown ("Use workflow
     # from") as the ATOM branch selector, so users do not need to type branch
@@ -101,6 +110,7 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
           MODEL_MI355: ${{ inputs.model_mi355 || 'none' }}
           MODEL_MI308: ${{ inputs.model_mi308 || 'none' }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
           REBUILD_ATOM_BASE_FROM_DOCKERFILE: ${{ inputs.rebuild_atom_base_from_dockerfile }}
           INPUT_DOCKER_IMAGE: ${{ inputs.docker_image || '' }}
         run: |
@@ -307,6 +317,20 @@ jobs:
           ]
           models.extend(mi308_models)
 
+          # Each MI355 case runs on one night a week, keyed by the night's cron
+          # (Beijing evening weekday); the benchmark workflow spreads its MI355
+          # cases over the same nights.
+          MI355_WEEKLY_SCHEDULE = {
+              "0 16 * * 1": ["GLM-5.2-FP8 TP4", "GLM-5.2-MXFP4 TP4"],
+              "0 16 * * 2": ["MiniMax-M3-MXFP4 TP4", "MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3"],
+              "0 16 * * 3": ["DeepSeek-V4-Pro TP8", "DeepSeek-V4-Pro MTP3 TP8"],
+              "0 16 * * 4": ["DeepSeek-V4-Pro Prefix Cache TP8", "Kimi-K3 TP8"],
+              "0 16 * * 5": ["Kimi-K2.6-MXFP4 TP4", "Kimi-K2.6-MXFP4 TP8"],
+              "0 16 * * 6": ["Qwen3.5-35B-A3B-FP8 TP2"],
+              "0 16 * * 0": ["Qwen3.5-35B-A3B TP2"],
+          }
+          tonight_mi355 = set(MI355_WEEKLY_SCHEDULE.get(os.environ.get("SCHEDULE_CRON", ""), []))
+
           selected = []
           for model in models:
               toggle = model.get("toggle_env")
@@ -317,12 +341,10 @@ jobs:
                       or model_mi308 == "all"
                       or model["model_name"] == model_mi308
                   )
+              elif event != "workflow_dispatch":
+                  enabled = model["model_name"] in tonight_mi355
               else:
-                  enabled = (
-                      event != "workflow_dispatch"
-                      or model_mi355 == "all"
-                      or model["model_name"] == model_mi355
-                  )
+                  enabled = model_mi355 == "all" or model["model_name"] == model_mi355
               if enabled:
                   selected.append({k: v for k, v in model.items() if k != "toggle_env"})
 
