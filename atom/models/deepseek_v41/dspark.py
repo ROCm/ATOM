@@ -696,6 +696,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
     # half it shares with this class cannot move into a common base.
     _head_and_sample = _DSparkInner.head_and_sample
     forward_head = _DSparkInner.forward_head
+    # Set False by a proposer that never reads the confidence head.
+    wants_confidence = True
 
     def head_and_sample(self, out, anchor_ids, num_draft):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
@@ -751,5 +753,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 use_custom=use_custom,
                 embed_out=markov_embeds[:, k],
             )
-        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        # Only confidence-scheduled verification reads it (the proposer clears
+        # `wants_confidence` otherwise): skip the head and its graph-output clone.
+        confidence = (
+            last.confidence_head(hc_hidden, markov_embeds)
+            if self.wants_confidence
+            else None
+        )
         return out_ids, confidence

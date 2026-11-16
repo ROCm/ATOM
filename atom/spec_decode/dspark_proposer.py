@@ -73,6 +73,8 @@ class DSparkProposer(Drafter):
         self._verify_scheduler = (
             VerifyScheduler(runner) if self._confidence_schedule else None
         )
+        if hasattr(self.model, "wants_confidence"):
+            self.model.wants_confidence = self._confidence_schedule
         # The draft rides the target's block tables. An MLA draft shares the
         # target's pool and so its DCP sharding, addressing in LOCAL (per-rank)
         # terms; a draft that declares a `kv_pool_spec` owns a pool outside
