@@ -703,6 +703,17 @@ class Scheduler:
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # SGLang DP phase lockstep (sgl-project/sglang#37273), only when prefill
+        # token graphs are off. When any rank can prefill, a rank with no
+        # prefill work idles (runs no batch, so the engine's dummy_execution
+        # joins the group's prefill phase) instead of decoding, keeping the
+        # group in one phase. Off by default; whether it helps is load-dependent
+        # (pending measurement). With token graphs, group_prefill_tick already
+        # does this and the flag is a no-op.
+        self.dp_phase_lockstep = envs.ATOM_DP_PHASE_LOCKSTEP
+        self._phase_lockstep_idles = 0
+        if self.dp_phase_lockstep:
+            logger.info("DP phase lockstep enabled")
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
         # batch budget; the ranks then aim at one cost target, a costlier rank
@@ -997,6 +1008,37 @@ class Scheduler:
             and decision.prefillable_ranks > 0
             and not self.prefill_delayer.is_local
         )
+
+    def _phase_lockstep_idle_needed(self, decision: PrefillDecision) -> bool:
+        """Whether this rank should idle instead of decode this tick.
+
+        Only when prefill token graphs are OFF: with them, ``group_prefill_tick``
+        already idles this rank through ``dummy_execution``. ``ATOM_DP_PHASE_LOCKSTEP``
+        then has a rank with no prefill of its own idle beside a peer's prefill
+        rather than decode. ``decision.prefillable_ranks`` is the delayer's
+        reduced count of ranks with admittable prefill (``could`` prefill, not
+        ``did`` admit -- a rank may still fail admission and decode).
+        """
+        if (
+            not self.dp_phase_lockstep
+            or self.prefill_token_graphs
+            or not decision.allow
+        ):
+            return False
+        delayer = self.prefill_delayer
+        if delayer is None or delayer.dp_size <= 1:
+            return False
+        return decision.prefillable_ranks > 0
+
+    def _note_phase_lockstep_idle(self) -> None:
+        """Count and periodically log idle-prefill ticks (no batch is built; the
+        engine runs ``dummy_execution`` for the step)."""
+        self._phase_lockstep_idles += 1
+        if self._phase_lockstep_idles == 1 or self._phase_lockstep_idles % 1000 == 0:
+            logger.info(
+                "DP phase lockstep idle prefill: count=%d",
+                self._phase_lockstep_idles,
+            )
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
@@ -2893,6 +2935,17 @@ class Scheduler:
             # The group's prefill step, with no prefill of this rank's own: it
             # keeps its peers company on an idle step rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
+            return None
+
+        # Token graphs are off (group_prefill_tick stays False without them),
+        # so nothing above idled this rank. With phase lockstep on, a rank that
+        # would otherwise decode beside a peer's prefill idles instead: schedule
+        # nothing, and the engine runs dummy_execution for this step. That path
+        # joins the group's prefill phase as padding and -- unlike a hand-built
+        # dummy batch -- keeps the drafter's cross-DP collective and does not
+        # notify_prefill_executed.
+        if self._phase_lockstep_idle_needed(decision):
+            self._note_phase_lockstep_idle()
             return None
 
         # --- Decode scheduling ---
