@@ -761,10 +761,12 @@ def test_a_raised_staged_slot_transfer_returns_its_slot(monkeypatch, raiser):
     """Whatever the gather or the RDMA write raises, the slot goes back.
 
     The NIC reads the staging row, so it is held across the write; one row
-    lost to a raise parks the next send worker on the pool for good.
+    lost to a raise parks the next send worker on the pool for good. The row
+    also has to be quiet before it goes back: the gather copies arena by
+    arena, so one that raised partway still has earlier copies in flight.
     """
     c, _state, req, _, dst = producer()
-    staged_slot_state(c, req, dst, monkeypatch)
+    *_, stream = staged_slot_state(c, req, dst, monkeypatch)
     c._gather_slot = MagicMock()
     ready = Event()
     c._kv_cache_ready_events[7] = ready
@@ -783,6 +785,7 @@ def test_a_raised_staged_slot_transfer_returns_its_slot(monkeypatch, raiser):
         )
 
     assert c._staging_slots.free == [0]
+    assert stream.synchronized == 1
 
 
 @pytest.mark.parametrize("reverse_indexed", [False, True])

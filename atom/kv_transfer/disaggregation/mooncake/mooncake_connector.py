@@ -4145,12 +4145,18 @@ class MooncakeConnector(KVConnectorBase):
                 # event before reading what the prefill wrote.
                 stream = self._send_worker_stream()
                 stream.wait_event(kv_cache_ready_event)
-                with torch.cuda.stream(stream):
-                    self._gather_slot(src_slot, producer_pool_idx)
-                # Synchronize on the gather kernel before NIC starts reading the
-                # staging buffer. Without this, the RDMA can race the still-in-flight
-                # gather kernel on TBO prefill (page fault under high concurrency).
-                stream.synchronize()
+                try:
+                    with torch.cuda.stream(stream):
+                        self._gather_slot(src_slot, producer_pool_idx)
+                finally:
+                    # Synchronize on the gather kernel before the NIC starts
+                    # reading the staging buffer. Without this, the RDMA can
+                    # race the still-in-flight gather kernel on TBO prefill
+                    # (page fault under high concurrency). As in
+                    # _gather_mla_rows, this also covers a gather that raised
+                    # partway: it copies arena by arena, and the slot goes back
+                    # to the pool below whatever happens here.
+                    stream.synchronize()
                 slot_src.append(
                     self._staging_base_addr
                     + producer_pool_idx * self._staging_slot_bytes
