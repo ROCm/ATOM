@@ -47,10 +47,12 @@ impl AtomAdapter {
             && !Self::has_media_parts(body)
     }
 
-    /// Chunked mode starts decode before prefill answers, so decode would
-    /// lack the prompt ids prefill expands from media and would preprocess
-    /// the media itself. Requests with media take the response relay.
-    fn has_media_parts(body: &Value) -> bool {
+    /// Whether a chat body has a non-text content part. Such a request goes
+    /// to an encode worker first when one is available, and takes the
+    /// response relay rather than chunked mode: chunked mode starts decode
+    /// before prefill answers, so decode would lack the prompt ids prefill
+    /// expands from media and would preprocess the media itself.
+    pub(crate) fn has_media_parts(body: &Value) -> bool {
         let Some(messages) = body.get("messages").and_then(Value::as_array) else {
             return false;
         };
