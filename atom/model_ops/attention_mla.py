@@ -737,6 +737,9 @@ def should_use_persistent_mode(
 
 
 class MLAAttention(nn.Module):
+    # (heads, padded heads, floor) already logged, so each decode width logs once.
+    _decode_widths_logged: ClassVar[set[tuple[int, int, int]]] = set()
+
     def __init__(
         self,
         num_heads: int,
@@ -778,10 +781,12 @@ class MLAAttention(nn.Module):
         # slice of an already-zeroed padded buffer, which a repeat could not do
         # (no producer kernel writes a head twice).
         self.head_pad = self.padded_num_heads - num_heads
-        if self.head_pad and not getattr(MLAAttention, "_head_pad_logged", False):
-            MLAAttention._head_pad_logged = True
+        decode_width = (num_heads, self.padded_num_heads, self.min_query_heads)
+        if decode_width not in MLAAttention._decode_widths_logged:
+            MLAAttention._decode_widths_logged.add(decode_width)
             logger.info(
-                f"MLA query-head padding: {num_heads} -> {self.padded_num_heads}"
+                f"MLA decode query heads: {num_heads} -> {self.padded_num_heads} "
+                f"(floor {self.min_query_heads})"
             )
 
         self.q_lora_rank = mla_modules.q_lora_rank

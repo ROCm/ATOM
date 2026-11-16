@@ -3,6 +3,7 @@
 """The 12-head MLA decode: where MLAAttention pads a query to, and that the
 metadata builder plans the step's one work plan at the same width."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -240,3 +241,20 @@ def test_explicit_floor_wins(native):
     """A DSpark draft passes its own floor and plans its own work."""
     assert _layer(native, min_query_heads=32).padded_num_heads == 32
 
+
+def test_each_decode_width_logs_once(native, monkeypatch, caplog):
+    """Logged unpadded too (12 -> 12), once per width."""
+    monkeypatch.setattr(MLAAttention, "_decode_widths_logged", set())
+    with caplog.at_level(logging.INFO, logger="atom"):
+        _layer(native)
+        _layer(native)
+        _layer(native, num_heads=8)
+
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("MLA decode query heads")
+    ] == [
+        "MLA decode query heads: 12 -> 12 (floor 12)",
+        "MLA decode query heads: 8 -> 16 (floor 16)",
+    ]
