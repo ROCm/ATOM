@@ -788,6 +788,7 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
     ],
 )
 def test_fp4ptpc_needs_its_routed_experts_converted(online, ok):
+    pytest.importorskip("aiter", reason="the quant specs are AITER enums")
     from atom.config import QuantizationConfig
 
     checkpoint = SimpleNamespace(torch_dtype=None, quantization_config=None)
