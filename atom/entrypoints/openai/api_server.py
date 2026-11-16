@@ -1038,6 +1038,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    kv_transfer_params: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
@@ -1053,8 +1054,13 @@ async def generate_async_multimodal(
     all_token_ids = new_token_ids()
     finish_reason: str | None = None
     seq = None
+    kv_transfer_output_meta_info = None
 
     def completion_callback(request_output: RequestOutput):
+        nonlocal kv_transfer_output_meta_info
+        kv_transfer_output_meta_info = getattr(
+            request_output, "kv_transfer_params_output", None
+        )
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -1071,6 +1077,7 @@ async def generate_async_multimodal(
             token_ids,
             sampling_params,
             stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
@@ -1132,6 +1139,13 @@ async def generate_async_multimodal(
         "tpot": tpot,
         "latency": finished_at - started_at,
     }
+    if kv_transfer_output_meta_info is not None:
+        # Decode has no media: it seeds its prefix cache and positions with these.
+        response["kv_transfer_output_meta_info"] = {
+            **kv_transfer_output_meta_info,
+            "cache_seed": seq.cache_seed,
+            "mrope_position_delta": seq.mrope_position_delta,
+        }
     if return_token_ids and seq is not None:
         response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
@@ -2203,12 +2217,15 @@ async def _chat_completions(
 
         _log_request_model("request", request_id, request)
 
-        is_multimodal = _has_multimodal_content(messages)
         multimodal_data = None
         kv_transfer_params = request.kv_transfer_params
-        if assistant_prefix is not None and (
-            is_multimodal or request.get_prompt_token_ids() is not None
-        ):
+        pretokenized = request.get_prompt_token_ids()
+        # A decode leg takes its prefill's expanded ids; its media went to P.
+        is_multimodal = _has_multimodal_content(messages) and not (
+            pretokenized is not None
+            and (kv_transfer_params or {}).get("do_remote_prefill")
+        )
+        if assistant_prefix is not None and (is_multimodal or pretokenized is not None):
             # Only rendered text can be continued.
             raise ValueError(
                 "an assistant prefix cannot be combined with image input or "
@@ -2228,7 +2245,7 @@ async def _chat_completions(
                 merged_kwargs,
                 request.tools,
             )
-        elif (pretokenized := request.get_prompt_token_ids()) is not None:
+        elif pretokenized is not None:
             # Reuse prefill IDs to skip template rendering and tokenization.
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
@@ -2374,6 +2391,7 @@ async def _chat_completions(
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    kv_transfer_params=kv_transfer_params,
                     return_token_ids=bool(request.return_token_ids),
                     **dp_routing,
                 ),

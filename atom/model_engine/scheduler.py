@@ -4178,6 +4178,15 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
+        if seq.multimodal_data is None and "cache_seed" in (
+            seq.kv_transfer_params or {}
+        ):
+            # A decode leg's image stayed with its prefill instance: a local
+            # recompute would read the image placeholders as text.
+            self._finish_rejected_waiting(
+                seq, reason="unschedulable: preempted image decode has no media"
+            )
+            return True
         pos = self._behind_settled_resumes()
         self.waiting.insert(pos, seq)
         if self.pd_admission is not None:
