@@ -1,7 +1,8 @@
 //! The wire framing, the launch spec and one Core's link: a message decodes
 //! back with its buffers and a malformed one is refused, `EngineSpec` parses
 //! a hand-written spec, and a `CoreLink` handshakes with a fake
-//! Core on real ipc sockets and routes input and control to it.
+//! Core on real ipc sockets and routes input and control to it, and gives up
+//! on a Core that stops before it is ready or exits, or when interrupted.
 
 use std::thread;
 
@@ -219,4 +220,31 @@ fn a_link_gives_up_on_a_core_that_exits() {
         .err()
         .unwrap();
     assert!(err.contains("exited"), "{err}");
+}
+
+#[test]
+fn a_link_refuses_a_core_that_stops_before_it_is_ready() {
+    let dir = TempDir::new().unwrap();
+    let spec = core_spec(&dir, std::process::id());
+    let core = fake_core(spec.clone(), pb::envelope::Body::Stopped(pb::Stopped {}));
+
+    let ctx = zmq::Context::new();
+    let err = CoreLink::connect(&ctx, spec, &never_interrupted)
+        .err()
+        .unwrap();
+    assert!(err.contains("stopped before it was ready"), "{err}");
+    // The link sent the Core nothing.
+    assert!(core.join().unwrap().is_none());
+}
+
+#[test]
+fn a_link_gives_up_when_interrupted() {
+    // The Core is this process, so it never counts as exited, and nothing
+    // connects: only the interruption ends the wait.
+    let dir = TempDir::new().unwrap();
+    let ctx = zmq::Context::new();
+    let err = CoreLink::connect(&ctx, core_spec(&dir, std::process::id()), &|| true)
+        .err()
+        .unwrap();
+    assert!(err.contains("interrupted"), "{err}");
 }

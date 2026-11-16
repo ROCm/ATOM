@@ -110,6 +110,16 @@ jobs:
             --target-dir atom/mesh/mocker/target/mesh \
             --profile ci --lib --features atom-engine
 
+      # Nothing else builds the optional ext-proc feature or its protox
+      # codegen; checking it, its tests included, keeps that path compiling.
+      - name: Check atomesh with ext-proc
+        run: |
+          set -euo pipefail
+          cargo check \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --profile ci --features ext-proc --tests
+
       # The mocker is its own cargo root: atom/mesh's profiles, ci included,
       # do not apply, and its release profile is cargo's default (no fat LTO).
       - name: Run Atomesh test harness

@@ -234,9 +234,9 @@ message RequiredChannel {
 }
 
 // Mirrors atom.SamplingParams field for field. An absent optional is None,
-// except `temperature`, `top_k` and `top_p`, which take SamplingParams'
-// defaults. `max_tokens` is the request's own and is not shared with the
-// request's other parameters on the Core.
+// except `temperature`, `top_k`, `top_p` and `max_tokens`, which take
+// SamplingParams' defaults. `max_tokens` is the request's own and is not
+// shared with the request's other parameters on the Core.
 message SamplingParams {
   optional double temperature = 1;
   optional int64 top_k = 2;
