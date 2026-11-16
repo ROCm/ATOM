@@ -8,7 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -117,45 +117,20 @@ def _require_contract(
         raise ValueError("resident K1 GEMV unit drifted from its declaration")
 
 
-@traced
-def _opening_generation(sync, ticket, blocks):
-    """Reusable all-resident rendezvous returning one tag per invocation."""
-
-    tid = fx.thread_idx.x
-    generation = fx.Int32(0)
-    if tid == 0:
-        previous = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-        arrival = gfx_backend.epoch_arrive_system_atomic(sync, fx.Int32(1))
-        if arrival == fx.Int32(blocks - 1):
-            gfx_backend.epoch_store_system_release(sync, fx.Int32(0))
-            generation = previous + fx.Int32(1)
-            gfx_backend.epoch_store_system_release(
-                sync + fx.Int64(4),
-                generation,
-            )
-        else:
-            generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-            while generation == previous:
-                rocdl.s_sleep(1)
-                generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-        fx.ptr_store(generation, ticket)
-    gpu.barrier()
-    generation = fx.ptr_load(ticket)
-    gpu.barrier()
-    return generation
-
-
-# The thread that arrives and later polls: the last wave's first lane, whose
-# first TDM copy in ``gemv_tdm.project``'s issue order is a weight slab several
-# slabs ahead, so the atomic's round trip holds up no copy slab 0 waits on.
+# The thread that arrives: the last wave's first lane, whose first TDM copy in
+# ``gemv_tdm.project``'s issue order is a weight slab several slabs ahead, so
+# the atomic's round trip holds up no copy slab 0 waits on.
 _ARRIVER = 7 * GFX1250.wave_size
 
 
 @traced
 def _arrive(sync, slots, blocks):
-    """``_opening_generation``'s arrival alone: one thread counts its CTA in
-    and keeps the generation it found in ``slots[0]``, the last arrival opens
-    the next one, and no thread waits. ``_await_generation`` collects it."""
+    """The launch's rendezvous without a wait: one thread counts its CTA in
+    and keeps the generation past the one it found in ``slots[1]``, and the
+    last arrival opens that one for the next launch. Every CTA reads before it
+    arrives and the last arrival writes after all have, so all find the same
+    one; the previous launch, stream-ordered, reads no pair any more, so the
+    launch may publish under its generation at once."""
 
     tid = fx.thread_idx.x
     if tid == _ARRIVER:
@@ -167,25 +142,15 @@ def _arrive(sync, slots, blocks):
                 sync + fx.Int64(4),
                 previous + fx.Int32(1),
             )
-        fx.ptr_store(fx.Int64(previous), slots)
-        fx.ptr_store(fx.Int64(-1), slots + 1)
+        fx.ptr_store(fx.Int64(previous + fx.Int32(1)), slots)
 
 
 @traced
-def _await_generation(sync, slots):
-    """The generation ``_arrive``'s last arrival opened, polled once a CTA."""
+def _generation(slots):
+    """The generation ``_arrive`` kept, once its thread has."""
 
-    tid = fx.thread_idx.x
-    if tid == _ARRIVER:  # noqa: SIM102
-        if fx.ptr_load(slots + 1) < fx.Int64(0):
-            previous = fx.Int32(fx.ptr_load(slots))
-            generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-            while generation == previous:
-                rocdl.s_sleep(1)
-                generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-            fx.ptr_store(fx.Int64(generation), slots + 1)
     gpu.barrier()
-    return fx.Int32(fx.ptr_load(slots + 1))
+    return fx.Int32(fx.ptr_load(slots))
 
 
 def _task_start(block, first, blocks):
@@ -424,19 +389,19 @@ def build_resident_k1(
                 )
         device["wait_vector_stores"]()
 
-    def open_generation(sync, slots, ticket):
-        """The launch's generation, or with an external seam (``x`` is the
-        previous launch's output, so only what this launch publishes carries
-        its generation) only the arrival, collected once a CTA needs it, so
-        the projection streams while the arrivals settle."""
+    def open_generation(sync, slots):
+        """The arrival, and without an external seam the generation the seam
+        publishes under from the start; with one (``x`` is the previous
+        launch's output), only what the launch publishes carries it, read once
+        a CTA needs it, so no barrier holds the first copies back."""
+        _arrive(sync, slots, declaration.blocks)
         if spec.external_seam:
-            _arrive(sync, slots, declaration.blocks)
             return None
-        return _opening_generation(sync, ticket, declaration.blocks)
+        return _generation(slots)
 
-    def collect_generation(sync, slots, generation):
+    def collect_generation(slots, generation):
         if spec.external_seam:
-            return _await_generation(sync, slots)
+            return _generation(slots)
         return generation
 
     @flyc.kernel(name=name, known_block_size=[declaration.threads, 1, 1])
@@ -481,7 +446,7 @@ def build_resident_k1(
         projection = role.gemv.peek()
         recurrence = role.kda.peek()
         sync = scratch + fx.Int64(layout["sync"][0])
-        generation = open_generation(sync, smem.tls.ptr, projection.xl.ptr)
+        generation = open_generation(sync, smem.tls.ptr)
         part = scratch + fx.Int64(layout["part"][0])
         weights = scratch + fx.Int64(layout["wgt"][0])
         mean_squares = scratch + fx.Int64(layout["msq"][0])
@@ -754,7 +719,7 @@ def build_resident_k1(
                         lane,
                     )
             gpu.barrier()
-            projected_tag = collect_generation(sync, smem.tls.ptr, generation)
+            projected_tag = collect_generation(smem.tls.ptr, generation)
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
@@ -786,7 +751,7 @@ def build_resident_k1(
             gpu.barrier()
             device["wait_vector_stores"]()
 
-        generation = collect_generation(sync, smem.tls.ptr, generation)
+        generation = collect_generation(smem.tls.ptr, generation)
 
         recurrence_context = {
             "S": s,

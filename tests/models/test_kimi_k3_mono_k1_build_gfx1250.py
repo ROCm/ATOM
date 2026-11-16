@@ -116,13 +116,11 @@ def test_resident_launch_pins_one_eight_wave_cta_per_cu():
         / "kda_resident_gfx1250.py"
     ).read_text()
     assert 'CompilationContext.compile_hints({"waves_per_eu": 2})' in source
-    generation = source[
-        source.index("def _opening_generation") : source.index("def _task_start")
-    ]
-    load = generation.index("generation = fx.ptr_load(ticket)")
-    barrier = generation.index("gpu.barrier()", load)
-    returned = generation.index("return generation", barrier)
-    assert load < barrier < returned
+    generation = source[source.index("def _arrive") : source.index("def _task_start")]
+    kept = generation.index("fx.ptr_store(fx.Int64(previous + fx.Int32(1)), slots)")
+    barrier = generation.index("gpu.barrier()", kept)
+    read = generation.index("fx.ptr_load(slots)", barrier)
+    assert kept < barrier < read
 
     projection = source.index("if bid >= ATTENTION_CTAS:")
     ready = source.index("mailbox_poll_device(", projection)
