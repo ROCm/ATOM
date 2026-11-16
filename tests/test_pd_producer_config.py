@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+from kv_staging_helpers import mla_producer_config
 
 from atom.kv_transfer.disaggregation.pd_producer import (
     disaggregated_kv_role,
@@ -151,30 +152,16 @@ def test_kv_staging_slots_are_capped_by_pool_bytes():
     assert staging_slot_count(16, slot, reserve_bytes=slot - 4) == 0
 
 
-def _mla_producer_config(workers, **overrides):
-    config = {
-        "kv_transfer_config": {
-            "kv_connector": "mooncake",
-            "kv_role": "kv_producer",
-            "num_worker_threads": workers,
-        },
-        "hf_config": SimpleNamespace(kv_lora_rank=512),
-        "decode_context_parallel_size": 1,
-    }
-    config.update(overrides)
-    return SimpleNamespace(**config)
-
-
 def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):
     monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
-    assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
-    assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
+    assert mla_staging_reserve_bytes(mla_producer_config(16)) == 128 << 20
+    assert mla_staging_reserve_bytes(mla_producer_config(128)) == 256 << 20
     # The connector sizes its pool from this reserve, rounding a slot down to
     # whole pages, so it never allocates more for any worker count.
     for page in (16 * 576, 12 << 20):
         slot = max(page, (8 << 20) // page * page)
         for workers in (1, 4, 16, 31, 32, 33, 128):
-            reserved = mla_staging_reserve_bytes(_mla_producer_config(workers))
+            reserved = mla_staging_reserve_bytes(mla_producer_config(workers))
             assert reserved == staging_pool_bytes(workers)
             allocated = staging_slot_count(workers, slot, reserve_bytes=reserved)
             assert allocated * slot <= reserved
@@ -216,7 +203,7 @@ def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):
 def test_kv_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    assert mla_staging_reserve_bytes(_mla_producer_config(16, **overrides)) == 0
+    assert mla_staging_reserve_bytes(mla_producer_config(16, **overrides)) == 0
 
 
 @pytest.mark.parametrize(

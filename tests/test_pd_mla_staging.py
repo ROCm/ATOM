@@ -10,16 +10,27 @@ Both drive `_execute_block_transfer` on CPU tensors with a memmove stand-in
 for the NIC, so every destination byte is compared, not just the plan.
 """
 
-import ctypes
 import logging
 import threading
-from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from kv_staging_helpers import (
+    BLOCK_SIZE,
+    PAGE_BYTES,
+    TOKEN_BYTES,
+    Nic,
+    Stream,
+    make_producer,
+    mla_producer_config,
+    mooncake,
+    run_transfer,
+    source_regions,
+    write_request,
+)
 
-from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     pack_slots,
@@ -30,16 +41,6 @@ from atom.kv_transfer.disaggregation.transfer_plan import (
     build_transfer_plan,
 )
 from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
-
-BLOCK_SIZE = 16
-TOKEN_BYTES = 576
-PAGE_BYTES = BLOCK_SIZE * TOKEN_BYTES
-
-
-def _mooncake():
-    return pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
 
 
 def _expand(starts, lengths):
@@ -104,7 +105,7 @@ def test_direct_descriptors_cover_exactly_the_token_runs(dcp_size, interleave, n
 
 def test_direct_descriptors_stop_at_destination_mr_boundaries():
     """Reviewer case: DCP4 rank 1, contiguous dst pages across a 2 GiB MR."""
-    mc = _mooncake()
+    mc = mooncake()
     conn = object.__new__(mc.MooncakeConnector)
     pages_per_mr = conn._rdma_chunk_units(PAGE_BYTES)
     assert pages_per_mr == 233009
@@ -143,14 +144,13 @@ def test_staged_mla_descriptors_stay_inside_one_destination_mr(
 
 
 def test_staged_index_descriptors_stay_inside_one_destination_mr(monkeypatch):
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    mc = mooncake(monkeypatch)
     conn = object.__new__(mc.MooncakeConnector)
     conn._MAX_RDMA_CHUNK_BYTES = 2 * 64 + 10  # two 64-byte pages per MR
     conn._index_staging_slots = mc.SlotPool(1)
-    conn._send_worker_stream = _Stream
+    conn._send_worker_stream = Stream
     conn._gather_sharded_index = lambda *_args: (10000, 5)
-    conn._nic = _Nic()
+    conn._nic = Nic()
     writes = []
     conn._rdma_write = lambda _t, src, dst, sizes, *_a, **_k: (
         writes.append((src, dst, sizes)) or True
@@ -196,100 +196,6 @@ def test_pack_slots_fills_and_splits_regions():
 # ---------------------------------------------------------------------------
 
 
-class _Nic:
-    """RDMA stand-in: memmove every descriptor and count them."""
-
-    def __init__(self):
-        self.descriptors = 0
-        self.labels = []
-        self.dst_spans = []
-
-    def write(
-        self, _target, src, dst, sizes, _req, label, *, engine=None, deadline=None
-    ):
-        assert len(src) == len(dst) == len(sizes)
-        for s, d, n in zip(src, dst, sizes):
-            ctypes.memmove(d, s, n)
-            self.dst_spans.append((d, n))
-        self.descriptors += len(src)
-        self.labels.append(label)
-        return True
-
-
-class _Stream:
-    def __init__(self):
-        self.waited = []
-        self.synchronized = 0
-
-    def wait_event(self, event):
-        self.waited.append(event)
-
-    def synchronize(self):
-        self.synchronized += 1
-
-
-def _source_regions(num_regions, num_blocks):
-    """MLA regions whose every token is distinct: (region, block, token) tag."""
-    gen = torch.Generator().manual_seed(num_regions * 1000 + num_blocks)
-    regions = []
-    for r in range(num_regions):
-        t = torch.randint(0, 256, (num_blocks, PAGE_BYTES), generator=gen).to(
-            torch.uint8
-        )
-        tag = t.view(num_blocks * BLOCK_SIZE, TOKEN_BYTES)[:, :4].view(torch.int32)
-        tag[:, 0] = torch.arange(num_blocks * BLOCK_SIZE, dtype=torch.int32) + (r << 20)
-        regions.append(t)
-    return regions
-
-
-def _producer(mc, regions, *, pool_size=0, slot_pages=0):
-    conn = object.__new__(mc.MooncakeConnector)
-    conn.tp_size = conn.dcp_size = 1
-    conn.block_size = BLOCK_SIZE
-    conn.kv_caches_base_addr = [t.data_ptr() for t in regions]
-    conn._per_block_bytes_list = [PAGE_BYTES] * len(regions)
-    conn._block_region_roles = [MLA_KV_ROLE] * len(regions)
-    conn._block_region_consumer_indices = None
-    conn._block_unit_specs = None
-    conn._block_head_major_runs = ()
-    conn._unit_layout = None
-    conn._consumer_region_map = lambda *_a, **_k: list(range(len(regions)))
-    conn._prepare_sharded_index = None
-    conn._gather_sharded_index = None
-    conn._index_staging_chunk_pages = 0
-    conn._nic = _Nic()
-    conn._rdma_write = conn._nic.write
-    if pool_size:
-        conn._kv_staging = torch.empty(
-            (pool_size, slot_pages * PAGE_BYTES), dtype=torch.uint8
-        )
-        conn._kv_staging_slots = mc.SlotPool(pool_size)
-        conn._stream = _Stream()
-        conn._send_worker_stream = lambda: conn._stream
-        conn._kv_source_views = {
-            i: t.view(-1, TOKEN_BYTES) for i, t in enumerate(regions)
-        }
-    return conn
-
-
-def _request(num_regions, dcp_size, dcp_rank, interleave, dst_bufs):
-    return {
-        "consumer_base_addrs": [t.data_ptr() for t in dst_bufs],
-        "consumer_num_layers": num_regions,
-        "consumer_region_roles": [MLA_KV_ROLE] * num_regions,
-        "consumer_block_bpb": [PAGE_BYTES] * num_regions,
-        "consumer_dcp_size": dcp_size,
-        "consumer_dcp_rank": dcp_rank,
-        "consumer_dcp_interleave": interleave,
-    }
-
-
-def _run(mc, conn, request, src_ids, dst_ids, event):
-    return mc.MooncakeConnector._execute_block_transfer(
-        conn, request, "consumer:1", list(src_ids), list(dst_ids), "req", event
-    )
-
-
 def _transfer_both(
     monkeypatch,
     *,
@@ -305,10 +211,9 @@ def _transfer_both(
     mr_chunk_bytes=None,
 ):
     """Run old and new paths into identically pre-filled destinations."""
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    mc = mooncake(monkeypatch)
     src_blocks = 40
-    regions = _source_regions(num_regions, src_blocks)
+    regions = source_regions(num_regions, src_blocks)
     rng = np.random.default_rng(dcp_size * 100 + dcp_rank + num_computed_blocks)
     full_src = rng.permutation(src_blocks)[:num_src_total]
     # The incremental slice _execute_transfer applies at skip == dcp_size.
@@ -328,23 +233,25 @@ def _transfer_both(
     dst_new = [t.clone() for t in dst_old]
     before = [t.clone() for t in dst_old]
 
-    old = _producer(mc, regions)
-    new = _producer(mc, regions, pool_size=pool_size, slot_pages=slot_pages)
+    old = make_producer(mc, regions)
+    new = make_producer(
+        mc, regions, slots=pool_size, slot_bytes=slot_pages * PAGE_BYTES
+    )
     if mr_chunk_bytes is not None:
         new._MAX_RDMA_CHUNK_BYTES = mr_chunk_bytes
     event = object()
-    assert _run(
+    assert run_transfer(
         mc,
         old,
-        _request(num_regions, dcp_size, dcp_rank, interleave, dst_old),
+        write_request(num_regions, dcp_size, dcp_rank, dst_old, interleave=interleave),
         src_ids,
         dst_ids,
         event,
     )
-    assert _run(
+    assert run_transfer(
         mc,
         new,
-        _request(num_regions, dcp_size, dcp_rank, interleave, dst_new),
+        write_request(num_regions, dcp_size, dcp_rank, dst_new, interleave=interleave),
         src_ids,
         dst_ids,
         event,
@@ -421,14 +328,13 @@ def test_staged_mla_slot_sizes(monkeypatch, slot_pages):
 
 def test_staged_mla_cuts_descriptors_at_least_16x(monkeypatch):
     """GLM-5.2-like stage: 20 MLA regions, 64K-token request, DCP4."""
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    mc = mooncake(monkeypatch)
     num_regions, src_blocks, dcp_size = 20, 4096, 4
     # One shared source keeps host memory small; only counts matter here.
     regions = [torch.zeros(src_blocks, PAGE_BYTES, dtype=torch.uint8)] * num_regions
     dst_pages = src_blocks // dcp_size
     dst = [torch.zeros(dst_pages * 2, PAGE_BYTES, dtype=torch.uint8)]
-    request = _request(num_regions, dcp_size, 1, 1, dst * num_regions)
+    request = write_request(num_regions, dcp_size, 1, dst * num_regions)
     rng = np.random.default_rng(0)
     src_ids = rng.permutation(src_blocks)
     counts = {}
@@ -436,10 +342,12 @@ def test_staged_mla_cuts_descriptors_at_least_16x(monkeypatch):
         "scattered": rng.permutation(dst_pages * 2)[:dst_pages],
         "contiguous": np.arange(dst_pages),
     }.items():
-        old = _producer(mc, regions)
-        new = _producer(mc, regions, pool_size=1, slot_pages=910)  # ~8 MiB slot
-        assert _run(mc, old, request, src_ids, dst_ids, object())
-        assert _run(mc, new, request, src_ids, dst_ids, object())
+        old = make_producer(mc, regions)
+        new = make_producer(
+            mc, regions, slots=1, slot_bytes=910 * PAGE_BYTES  # ~8 MiB slot
+        )
+        assert run_transfer(mc, old, request, src_ids, dst_ids, object())
+        assert run_transfer(mc, new, request, src_ids, dst_ids, object())
         counts[name] = (old._nic.descriptors, new._nic.descriptors)
     old_scattered, new_scattered = counts["scattered"]
     assert old_scattered == num_regions * dst_pages * BLOCK_SIZE
@@ -454,8 +362,8 @@ def test_staged_mla_cuts_descriptors_at_least_16x(monkeypatch):
 
 def test_staged_mla_workers_wait_for_a_shared_slot():
     """Fewer slots than workers: a worker blocks until a slot is released."""
-    mc = _mooncake()
-    conn = _producer(mc, _source_regions(1, 1), pool_size=1, slot_pages=1)
+    mc = mooncake()
+    conn = make_producer(mc, source_regions(1, 1), slots=1, slot_bytes=PAGE_BYTES)
     pool = conn._kv_staging_slots
     assert pool.acquire() == 0
     got = []
@@ -475,17 +383,15 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
     Another send worker may take the slot as soon as it is released, so a
     gather that raises still has its stream synchronized first.
     """
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    conn = _producer(mc, _source_regions(2, 8), pool_size=1, slot_pages=4)
+    mc = mooncake(monkeypatch)
+    conn = make_producer(mc, source_regions(2, 8), slots=1, slot_bytes=4 * PAGE_BYTES)
     dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in range(2)]
-    request = _request(2, 2, 0, 1, dst)
+    request = write_request(2, 2, 0, dst)
     if landing:
         monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
         offer = {"epoch": 1, "base": 0, "slot_bytes": 4 * PAGE_BYTES, "slots": [0]}
-        conn._landing_credits = LandingCredits()
         conn._landing_credits.sync("consumer:1", offer)
-        request.update(mla_landing=offer, notify_host="decode", notify_port=1)
+        request["mla_landing"] = offer
     events = []
     conn._stream.synchronize = lambda: events.append("sync")
     release = conn._kv_staging_slots.release
@@ -507,7 +413,7 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
 
     monkeypatch.setattr(mc.torch, "index_select", second_gather_fails)
     with pytest.raises(RuntimeError, match="gather failed"):
-        _run(mc, conn, request, range(4), [3, 5], object())
+        run_transfer(mc, conn, request, range(4), [3, 5], object())
     assert events[:2] == ["sync", "release"]
     assert events[-1] == "sync"  # the shared index upload lifetime also ends
     assert conn._kv_staging_slots.free == [0]
@@ -518,11 +424,10 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
 
 
 def test_a_failed_index_gather_ends_before_its_slot_is_released(monkeypatch):
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    mc = mooncake(monkeypatch)
     conn = object.__new__(mc.MooncakeConnector)
     events = []
-    stream = _Stream()
+    stream = Stream()
     stream.synchronize = lambda: events.append("sync")
     conn._send_worker_stream = lambda: stream
     conn._index_staging_slots = mc.SlotPool(1)
@@ -540,11 +445,11 @@ def test_a_failed_index_gather_ends_before_its_slot_is_released(monkeypatch):
 
 
 def test_staged_mla_needs_the_ready_event(monkeypatch):
-    mc = _mooncake()
-    regions = _source_regions(1, 8)
-    conn = _producer(mc, regions, pool_size=1, slot_pages=4)
+    mc = mooncake()
+    regions = source_regions(1, 8)
+    conn = make_producer(mc, regions, slots=1, slot_bytes=4 * PAGE_BYTES)
     dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)]
-    assert _run(mc, conn, _request(1, 2, 0, 1, dst), range(4), [3, 5], None)
+    assert run_transfer(mc, conn, write_request(1, 2, 0, dst), range(4), [3, 5], None)
     # No ready event: the request keeps the per-token path.
     assert conn._nic.labels == ["block"]
     assert conn._stream.waited == []
@@ -578,10 +483,10 @@ def test_staged_mla_still_refuses_a_non_mla_region(monkeypatch):
 
 
 def test_a_landing_offer_for_another_unit_layout_fails_before_any_rdma():
-    mc = _mooncake()
-    regions = _source_regions(1, 8)
-    conn = _producer(mc, regions, pool_size=1, slot_pages=4)
-    request = _request(1, 2, 1, 1, [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)])
+    mc = mooncake()
+    regions = source_regions(1, 8)
+    conn = make_producer(mc, regions, slots=1, slot_bytes=4 * PAGE_BYTES)
+    request = write_request(1, 2, 1, [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)])
     request["mla_landing"] = {
         "epoch": 1,
         "base": 0,
@@ -590,15 +495,17 @@ def test_a_landing_offer_for_another_unit_layout_fails_before_any_rdma():
         "layout": "mha_pages_v1",
     }
     with pytest.raises(ValueError, match="wire layout mismatch"):
-        _run(mc, conn, request, range(4), [3, 5], object())
+        run_transfer(mc, conn, request, range(4), [3, 5], object())
     assert conn._nic.labels == []
     assert conn._kv_staging_slots.free == [0]
 
 
 def _per_token_reference(mc, regions):
     expected = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in regions]
-    old = _producer(mc, regions)
-    assert _run(mc, old, _request(2, 2, 1, 1, expected), range(4), [3, 5], None)
+    old = make_producer(mc, regions)
+    assert run_transfer(
+        mc, old, write_request(2, 2, 1, expected), range(4), [3, 5], None
+    )
     return expected
 
 
@@ -607,46 +514,49 @@ def test_a_failed_write_returns_its_slot_and_the_next_transfer_stages(
 ):
     """The NIC only reads a staging slot, so a failed write gives it back at
     once; its late bytes can land only where the failed request was going."""
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    regions = _source_regions(2, 8)
+    mc = mooncake(monkeypatch)
+    regions = source_regions(2, 8)
     expected = _per_token_reference(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=4)
+    new = make_producer(mc, regions, slots=1, slot_bytes=4 * PAGE_BYTES)
     new._rdma_write = lambda *_a, **_k: False
     failed = [torch.zeros_like(t) for t in expected]
     with caplog.at_level(logging.ERROR, logger="atom"):
-        assert not _run(
-            mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object()
+        assert not run_transfer(
+            mc, new, write_request(2, 2, 1, failed), range(4), [3, 5], object()
         )
     assert any("staged-kv transfer failed for req" in r.message for r in caplog.records)
     assert new._kv_staging_slots.free == [0]
     new._rdma_write = new._nic.write
     actual = [torch.zeros_like(t) for t in expected]
-    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
+    assert run_transfer(
+        mc, new, write_request(2, 2, 1, actual), range(4), [3, 5], object()
+    )
     assert all(torch.equal(a, e) for a, e in zip(actual, expected))
     assert new._nic.labels == ["staged-kv"]
 
 
 def test_staged_chunks_write_the_bytes_of_the_whole_transfer(monkeypatch):
     """A chunked transfer stages each chunk's destination pages on their own."""
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    regions = _source_regions(2, 8)
+    mc = mooncake(monkeypatch)
+    regions = source_regions(2, 8)
     expected = _per_token_reference(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=4)
+    new = make_producer(mc, regions, slots=1, slot_bytes=4 * PAGE_BYTES)
     actual = [torch.zeros_like(t) for t in expected]
     # DCP2: destination page k takes source blocks 2k and 2k + 1.
-    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(2), [3], object())
-    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(2, 4), [5], object())
+    assert run_transfer(
+        mc, new, write_request(2, 2, 1, actual), range(2), [3], object()
+    )
+    assert run_transfer(
+        mc, new, write_request(2, 2, 1, actual), range(2, 4), [5], object()
+    )
     assert all(torch.equal(a, e) for a, e in zip(actual, expected))
     assert new._nic.labels == ["staged-kv", "staged-kv"]
 
 
 def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    regions = _source_regions(1, 8)
-    conn = _producer(mc, regions, pool_size=1, slot_pages=4)
+    mc = mooncake(monkeypatch)
+    regions = source_regions(1, 8)
+    conn = make_producer(mc, regions, slots=1, slot_bytes=4 * PAGE_BYTES)
     index = torch.zeros(8, BLOCK_SIZE * 144, dtype=torch.uint8)
     conn.kv_caches_base_addr.append(index.data_ptr())
     conn._per_block_bytes_list.append(BLOCK_SIZE * 144)
@@ -673,22 +583,31 @@ def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
         "consumer_dcp_interleave": 1,
     }
     event = object()
-    assert _run(mc, conn, request, range(4), [3, 5], event)
+    assert run_transfer(mc, conn, request, range(4), [3, 5], event)
     assert conn._nic.labels == ["staged-kv"]
     assert staged_index == [1]
     # Both staged paths order this worker's stream after the ready event.
     assert conn._stream.waited == [event, event]
 
 
+def _build_kv_staging(mc, region, view, *, workers, reserve):
+    """``register_kv_caches``'s KV staging pool for one PAGE region."""
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._has_slot_regions = False
+    conn._page_staging_enabled = False
+    conn._num_send_workers = workers
+    conn._kv_staging_reserve = reserve
+    tt = SimpleNamespace(block_regions=[region], block_tensor_views=[view])
+    return conn, conn._build_kv_staging(tt)
+
+
 def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
     # page_region publishes every PAGE view as a uint8 alias, so a bf16 KV
     # cache's rows are still one token's bytes; a view of another dtype would
     # be reshaped wrong, so it keeps the per-token path instead.
-    from types import SimpleNamespace
-
     from atom.kv_transfer.disaggregation.page_region import page_region
 
-    mc = _mooncake()
+    mc = mooncake()
     monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
     kv = torch.zeros((4, 16, 576), dtype=torch.bfloat16)
     published = page_region(kv, semantic_role=MLA_KV_ROLE)
@@ -702,31 +621,19 @@ def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
         def view(self, *_shape):
             raise AssertionError("a non-byte view must not be reshaped")
 
-    conn = object.__new__(mc.MooncakeConnector)
-    conn.is_producer = True
-    conn.dcp_size = 1
-    conn.block_size = 16
-    conn._has_slot_regions = False
-    conn._page_staging_enabled = False
-    conn._num_send_workers = 16
-    tt = SimpleNamespace(
-        block_regions=[published.region], block_tensor_views=[_Bf16View()]
+    conn, staging = _build_kv_staging(
+        mc, published.region, _Bf16View(), workers=16, reserve=16 * (8 << 20)
     )
-    conn._kv_staging_reserve = 16 * (8 << 20)
-    assert conn._build_kv_staging(tt) is None
+    assert staging is None
     assert conn._kv_staging is None
 
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_kv_staging_follows_the_env_through_its_reserve(monkeypatch, enabled):
-    from types import SimpleNamespace
-
-    from test_pd_producer_config import _mla_producer_config
-
     from atom.kv_transfer.disaggregation.staging_config import staging_reserve_bytes
     from atom.kv_transfer.disaggregation.types import KVTransferRegion
 
-    mc = _mooncake()
+    mc = mooncake()
     monkeypatch.setenv("ATOM_PD_MLA_STAGING", "1" if enabled else "0")
 
     class _DeviceView:
@@ -738,15 +645,15 @@ def test_kv_staging_follows_the_env_through_its_reserve(monkeypatch, enabled):
         def is_contiguous(self):
             return True
 
-    conn = object.__new__(mc.MooncakeConnector)
-    conn._has_slot_regions = False
-    conn._page_staging_enabled = False
-    conn._num_send_workers = 1
-    # What __init__ sets from the connector's config.
-    conn._kv_staging_reserve = staging_reserve_bytes(_mla_producer_config(1))
     region = KVTransferRegion(0, 8 * PAGE_BYTES, PAGE_BYTES, semantic_role=MLA_KV_ROLE)
-    tt = SimpleNamespace(block_regions=[region], block_tensor_views=[_DeviceView()])
-    staging = conn._build_kv_staging(tt)
+    # The reserve is what __init__ sets from the connector's config.
+    conn, staging = _build_kv_staging(
+        mc,
+        region,
+        _DeviceView(),
+        workers=1,
+        reserve=staging_reserve_bytes(mla_producer_config(1)),
+    )
     assert (staging is not None) is enabled
     assert (conn._kv_staging is not None) is enabled
 
@@ -780,17 +687,17 @@ class _DeviceNic:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("dcp_rank", [0, 3])
 def test_staged_mla_gathers_on_the_gpu(dcp_rank):
-    mc = _mooncake()
+    mc = mooncake()
     device = torch.device("cuda", torch.cuda.current_device())
     num_regions, src_blocks, dcp_size = 2, 24, 4
-    regions = [t.to(device) for t in _source_regions(num_regions, src_blocks)]
+    regions = [t.to(device) for t in source_regions(num_regions, src_blocks)]
     src_ids = list(range(src_blocks - 1, 0, -2))  # 12 blocks, reversed
     dst_ids = [5, 6, 1]
     dst_old = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8, device=device)]
     dst_old.append(torch.zeros_like(dst_old[0]))
     dst_new = [torch.zeros_like(t) for t in dst_old]
-    old = _producer(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=2)
+    old = make_producer(mc, regions)
+    new = make_producer(mc, regions, slots=1, slot_bytes=2 * PAGE_BYTES)
     new._kv_staging = new._kv_staging.to(device)
     new._cuda_device = device.index
     new._send_worker_streams = threading.local()
@@ -801,10 +708,10 @@ def test_staged_mla_gathers_on_the_gpu(dcp_rank):
     event = torch.cuda.Event()
     event.record()
     for conn, dst in ((old, dst_old), (new, dst_new)):
-        assert _run(
+        assert run_transfer(
             mc,
             conn,
-            _request(num_regions, dcp_size, dcp_rank, 1, dst),
+            write_request(num_regions, dcp_size, dcp_rank, dst),
             src_ids,
             dst_ids,
             event,
