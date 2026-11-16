@@ -841,6 +841,9 @@ def _causal_conv1d_update_kernel(
     w_ptr,  # (dim, width)
     bias_ptr,
     conv_state_ptr,
+    # Pool the history is read from: `conv_state_ptr` unless the caller keeps
+    # the live state and the rolled window in separate tensors.
+    conv_state_in_ptr,
     conv_state_indices_ptr,
     # Read side. The same tensor as `conv_state_indices_ptr` unless the caller
     # forked the state — a request resuming from a checkpoint reads the
@@ -872,6 +875,9 @@ def _causal_conv1d_update_kernel(
     stride_conv_state_seq: tl.constexpr,
     stride_conv_state_dim: tl.constexpr,
     stride_conv_state_tok: tl.constexpr,
+    stride_conv_state_in_seq: tl.constexpr,
+    stride_conv_state_in_dim: tl.constexpr,
+    stride_conv_state_in_tok: tl.constexpr,
     stride_state_indices: tl.constexpr,
     stride_q_seq: tl.constexpr,
     stride_q_token: tl.constexpr,
@@ -984,27 +990,27 @@ def _causal_conv1d_update_kernel(
 
     # STEP 1: READ init_state data
     conv_states_base = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + (idx_feats * stride_conv_state_dim)
+        conv_state_in_ptr
+        + (conv_states_input_coord * stride_conv_state_in_seq)
+        + (idx_feats * stride_conv_state_in_dim)
     )
     mask_w = idx_feats < dim
 
-    prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_tok
+    prior_tokens = conv_states_base + conv_state_token_offset * stride_conv_state_in_tok
     if KERNEL_WIDTH >= 2:
         conv_states_ptrs = prior_tokens  # [BLOCK_N]
         col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 3:
-        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 1 * stride_conv_state_in_tok  # [BLOCK_N]
         col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 4:
-        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 2 * stride_conv_state_in_tok  # [BLOCK_N]
         col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 5:
-        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 3 * stride_conv_state_in_tok  # [BLOCK_N]
         col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
     if KERNEL_WIDTH >= 6:
-        conv_states_ptrs = prior_tokens + 4 * stride_conv_state_tok  # [BLOCK_N]
+        conv_states_ptrs = prior_tokens + 4 * stride_conv_state_in_tok  # [BLOCK_N]
         col4 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
     # STEP 2: assume state_len > seqlen
@@ -1014,13 +1020,14 @@ def _causal_conv1d_update_kernel(
     # window manner, at each forward pass, the tokens are shift by 1, so we
     # load since idx_tokens + 1.
     conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
+        conv_state_in_ptr
+        + (conv_states_input_coord * stride_conv_state_in_seq)
+        + conv_state_token_offset * stride_conv_state_in_tok
+        + (idx_feats * stride_conv_state_in_dim)[None, :]
+        + (
+            (idx_tokens + (1 if IS_SPEC_DECODING else seqlen))
+            * stride_conv_state_in_tok
+        )[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (
         (conv_states_input_coord < num_cache_lines)
@@ -1227,6 +1234,7 @@ def causal_conv1d_update(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
+    conv_state_in: torch.Tensor | None = None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1248,6 +1256,11 @@ def causal_conv1d_update(
         Differs from it only for a request resuming a state checkpoint, which
         reads the published slot and writes a fresh one for this forward.
         Defaults to conv_state_indices, i.e. the ordinary in-place update.
+    conv_state_in: (..., dim, >= width - 1), same dtype as conv_state
+        Pool conv_state_indices_in reads the history from. Defaults to
+        conv_state. A separate pool must hold every column the kernel reads,
+        i.e. num_accepted_tokens - 1 + width - 1 of them; with
+        num_accepted_tokens of all ones that is the plain width - 1 state.
     block_idx_last_scheduled_token: (batch,), dtype int32
         The pointer into conv_state_indices, where the last cache block to be filled is located.
     initial_state_idx: (batch,), dtype int32
@@ -1294,7 +1307,17 @@ def causal_conv1d_update(
         seqlen = max_query_len
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
-    num_cache_lines, _, state_len = conv_state.size()
+    _, _, state_len = conv_state.size()
+    if conv_state_in is None:
+        conv_state_in = conv_state
+    else:
+        assert (
+            conv_state_in.dtype == conv_state.dtype
+            and conv_state_in.size(1) == conv_state.size(1)
+            and conv_state_in.size(2) >= width - 1
+        ), "conv_state_in must match conv_state in dtype and dim"
+    # Only the read side is bounds-checked against the pool size.
+    num_cache_lines = conv_state_in.size(0)
 
     if validate_data:
         assert dim == weight.size(0)
@@ -1341,6 +1364,7 @@ def causal_conv1d_update(
         stride_x_seq = 0
 
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
+    stride_in_seq, stride_in_dim, stride_in_token = conv_state_in.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
@@ -1373,6 +1397,7 @@ def causal_conv1d_update(
         weight,
         bias,
         conv_state,
+        conv_state_in,
         conv_state_indices,
         conv_state_indices_in,
         num_accepted_tokens,
@@ -1399,6 +1424,9 @@ def causal_conv1d_update(
         stride_istate_seq,
         stride_istate_dim,
         stride_istate_token,
+        stride_in_seq,
+        stride_in_dim,
+        stride_in_token,
         stride_state_indices,
         stride_q_seq,
         stride_q_token,

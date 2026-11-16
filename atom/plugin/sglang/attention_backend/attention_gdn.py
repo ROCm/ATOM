@@ -601,6 +601,14 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     "int32 view during CUDA graph capture."
                 )
             slot_idx = slot_idx.to(dtype=torch.int32).contiguous()
+        # Every verify row is a spec row, so the kernel can write the layer's
+        # output in place, as Native does for a pure spec-decode batch.
+        out = output_blocks.view(bs * draft_token_num, *output_blocks.shape[2:])
+        out_in_place = (
+            out.is_contiguous()
+            and out.dtype == query.dtype
+            and out.shape == value.shape[1:]
+        )
         block_output = replayssm_gated_delta_rule(
             q=query,
             k=key,
@@ -618,10 +626,12 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             use_qk_l2norm_in_kernel=True,
             is_kda=False,
             route=envs.ATOM_REPLAYSSM_ROUTE,
+            o=out if out_in_place else None,
         )
-        output_blocks.copy_(
-            block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
-        )
+        if not out_in_place:
+            output_blocks.copy_(
+                block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
+            )
 
     def _spec_ssm_slot_table(
         self, bs: int, draft_token_num: int, device: torch.device
@@ -754,12 +764,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         conv_phys = self._spec_conv_window_phys(
             layer_cache.intermediate_conv_window[0], draft_token_num
         )
-        # One wide-window spec call. ATOM writes
-        # [history2..historyM, draft1..draftN] -- exactly the physical row
-        # behind SGLang's dedup view, so every per-step window materialises
-        # for free and the live conv state is only read, never written.
-        state_len = conv_states.shape[-1]
-        conv_phys[:bs, :, :state_len] = conv_states[cache_indices]
+        # One wide-window spec call. It reads the history from the live conv
+        # state and writes [history2..historyM, draft1..draftN] -- exactly the
+        # physical row behind SGLang's dedup view, so every per-step window
+        # materialises for free and the live conv state is only read, never
+        # written.
         query_all, key_all, value_all = causal_conv1d_update(
             mixed_blocks.reshape(num_tokens, -1),
             conv_phys,
@@ -769,6 +778,8 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias,
             self.activation,
             conv_state_indices=self._spec_conv_slot_table(bs, mixed_blocks.device),
+            conv_state_indices_in=self._spec_conv_live_slots(cache_indices, bs),
+            conv_state_in=conv_states,
             num_accepted_tokens=self._spec_conv_accepted(bs, mixed_blocks.device),
             query_start_loc=self._spec_cu_seqlens(
                 bs, draft_token_num, mixed_blocks.device
@@ -853,6 +864,15 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             table = torch.arange(bs, device=device, dtype=torch.int32).reshape(bs, 1)
             cache[key] = table
         return table
+
+    @staticmethod
+    def _spec_conv_live_slots(cache_indices: torch.Tensor, bs: int) -> torch.Tensor:
+        """`[bs, 1]` live conv-state slots, laid out like `_spec_conv_slot_table`
+        (the conv kernel indexes both with one stride). Padded rows carry
+        SGLang's pad slot, which the kernel skips."""
+        if cache_indices.stride(0) != 1:
+            cache_indices = cache_indices.contiguous()
+        return cache_indices.view(bs, 1)
 
     def _spec_conv_accepted(self, bs: int, device: torch.device) -> torch.Tensor:
         """`num_accepted_tokens` of all ones: the conv kernel reads its initial
