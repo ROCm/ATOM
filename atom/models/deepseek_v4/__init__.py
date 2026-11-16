@@ -2806,6 +2806,70 @@ class Expert(nn.Module):
         self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
             self.w2.input_size
         )
+        # Decided on the first forward, once the weights are loaded and
+        # shuffled (`_gate_up_silu_applies`).
+        self._gate_up_silu = None
+
+    def _gate_up_silu_applies(self) -> bool:
+        """Whether gate_up can run with the SwiGLU and the MXFP8 quant for w2
+        in its epilogue: gfx1250, native MX (group 32) FP8 weights shuffled
+        for the FlyDSL GEMM, no bias, a clamped SwiGLU, and a native MX w2
+        that takes the quantized activation as it is."""
+        if self._gate_up_silu is None:
+            gate_up = self.gate_up_proj
+            self._gate_up_silu = (
+                get_gfx_runtime() == "gfx1250"
+                and not self.use_fused_clamp_act_mul
+                and self.swiglu_limit > 0
+                and gate_up.native_a8_group_rows == 32
+                and self.w2.native_a8_group_rows is not None
+                and getattr(gate_up.weight, "is_shuffled", False)
+                and gate_up.weight.dtype == torch.float8_e4m3fn
+                and gate_up.weight_scale.dtype == torch.float8_e8m0fnu
+                and getattr(gate_up, "bias", None) is None
+            )
+        return self._gate_up_silu
+
+    def _fused_gate_up_silu(self, x: torch.Tensor) -> torch.Tensor | None:
+        """gate_up GEMM with silu(min(g, L)) * clamp(u, -L, L) and its group-32
+        MXFP8 quant in the epilogue, feeding w2 directly: the codes and scales
+        of GEMM -> silu_and_mul -> quantize_fp8. None where it does not apply
+        (`_gate_up_silu_applies`, or a row count the AITER kernel table leaves
+        to the unfused path)."""
+        if x.dim() != 2 or x.dtype != torch.bfloat16:
+            return None
+        if not self._gate_up_silu_applies():
+            return None
+        # gfx1250 only, so imported here.
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+            gate_up_silu_kernel_for,
+            run_gate_up_silu_mxfp8_32_gfx1250,
+        )
+
+        from atom.model_ops.blockscale import quantize_fp8
+
+        weight = self.gate_up_proj.weight
+        m = x.shape[0]
+        n2, k = weight.shape
+        name = gate_up_silu_kernel_for(m, n2, k)
+        if name is None:
+            return None
+        x_fp8, x_scale = quantize_fp8(x)
+        act = torch.empty((m, n2 // 2), dtype=torch.float8_e4m3fn, device=x.device)
+        act_scale = torch.empty(
+            (m, n2 // 64), dtype=torch.float8_e8m0fnu, device=x.device
+        )
+        run_gate_up_silu_mxfp8_32_gfx1250(
+            x_fp8,
+            weight,
+            x_scale,
+            self.gate_up_proj.weight_scale,
+            act,
+            act_scale,
+            self.swiglu_limit,
+            kernel_name=name,
+        )
+        return self.w2(act, x_scale=act_scale)
 
     def forward(
         self,
@@ -2814,6 +2878,10 @@ class Expert(nn.Module):
     ) -> torch.Tensor:  # [num_tokens, dim]
 
         dtype = x.dtype
+        if weights is None:
+            fused = self._fused_gate_up_silu(x)
+            if fused is not None:
+                return fused
         # Single fused GEMM. Layout is [gate | up] concat on last dim — matches
         # aiter silu_and_mul's split([d, d], dim=-1) contract. The kernel does
         # silu/clamp/mul in fp32 internally regardless of input dtype, so we
