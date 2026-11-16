@@ -176,6 +176,13 @@ def _bonus_generator(device) -> torch.Generator:
     return generator
 
 
+def _any_greedy(batch, bs: int) -> bool:
+    """Whether a row of the step samples greedily (host temperature 0). A batch
+    that carries no host temperatures keeps the sampler's greedy fallback."""
+    temperatures = getattr(batch, "temperatures", None)
+    return temperatures is None or bool((temperatures[:bs] == 0).any())
+
+
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
 ) -> int:
@@ -3667,7 +3674,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
-                any_greedy=bool((batch.temperatures[:bs] == 0).any()),
+                any_greedy=_any_greedy(batch, bs),
                 generator=bonus_generator,
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(

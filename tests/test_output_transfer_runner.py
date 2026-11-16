@@ -96,6 +96,7 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         tokenID_processor=processor,
         sampler=mock.Mock(return_value=sampled[:, 0]),
         rejection_sampler=SimpleNamespace(
+            synthetic_acceptance_rates=None,
             forward=mock.Mock(return_value=(sampled, verdict)),
         ),
         drafter=SimpleNamespace(lossless=None),
@@ -172,7 +173,9 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
         sampler=mock.Mock(side_effect=None if verified else _Reached),
-        rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
+        rejection_sampler=SimpleNamespace(
+            forward=mock.Mock(side_effect=_Reached), synthetic_acceptance_rates=None
+        ),
         drafter=drafter,
         _served=None,
         structured_output=None,

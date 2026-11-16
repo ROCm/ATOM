@@ -432,7 +432,9 @@ def test_channel_constraint_preserves_raw_logprobs(monkeypatch, speculative, ena
             )
             return sampled, torch.tensor([[2, 2], [0, 0], [0, 0]])
 
-        runner.rejection_sampler = types.SimpleNamespace(forward=verify)
+        runner.rejection_sampler = types.SimpleNamespace(
+            forward=verify, synthetic_acceptance_rates=None
+        )
     seen = {}
 
     def transfer(_batch, ids, _event, payload, **kwargs):
