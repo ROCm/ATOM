@@ -95,9 +95,13 @@ def runtime(monkeypatch):
             return torch.full_like(x, self.capacity)
 
     class RoutedMegaMoEV2(FakeMegaMoEV2):
-        """An AITER build that picks its route from a max_tokens hint."""
+        """An AITER build that builds its fused routes on request and picks one per call
+        from a max_tokens hint."""
 
         small_m_mtpr = SMALL_M_MTPR
+
+        def __init__(self, *, routed=False, **kwargs):
+            super().__init__(routed=routed, **kwargs)
 
         @property
         def large_m_available(self):
@@ -389,7 +393,7 @@ def test_aiter_without_route_hints_keeps_the_staged_call(runtime):
     runtime.run(_context(256))
 
     assert all(
-        "large_m_state_slots" not in instance.kwargs
+        "large_m_state_slots" not in instance.kwargs and "routed" not in instance.kwargs
         for instance in runtime.instances.values()
     )
     assert _events(runtime, "hint") == _events(runtime, "slot") == []
@@ -476,7 +480,7 @@ def test_each_layer_selects_its_own_large_input_slot(runtime):
     runtime.run(_context(64), layer=layers[2])
 
     assert {
-        capacity: instance.kwargs["large_m_state_slots"]
+        capacity: (instance.kwargs["routed"], instance.kwargs["large_m_state_slots"])
         for (_, capacity), instance in runtime.instances.items()
-    } == {LARGE_CAPACITY: 69, 128: 69}
+    } == {LARGE_CAPACITY: (True, 69), 128: (True, 69)}
     assert _events(runtime, "slot") == [0, 1, 2, 0, 1, 2]
