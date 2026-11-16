@@ -1000,6 +1000,7 @@ def test_pending_umbp_lookup_does_not_block_and_close_waits_for_rpc(
 
     entered, release, finished = Event(), Event(), Event()
     scheduler = UMBPStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 0
     backend = scheduler._lookup_client.backend
     original = umbp_client.UMBPStoreClient.exists
 
