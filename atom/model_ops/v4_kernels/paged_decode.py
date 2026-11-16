@@ -1176,12 +1176,12 @@ def _sparse_attn_v4_paged_decode_asm(
         num_kv_splits=num_kv_splits,
         split_indptr=split_indptr,
     )
-    # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
-    # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
     if out is not None:
         if output is not out:
             out.copy_(output[:, :H_real])
         return out
+    # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
+    # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
     return output[:, :H_real].contiguous() if H_real != H else output
 
 

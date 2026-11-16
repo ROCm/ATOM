@@ -138,9 +138,7 @@ def test_fp8_prefill_reuses_output_on_device(heads):
         "k_rope": er,
     }
     expected = paged_2src.sparse_attn_v4_paged_2src(*args, **kwargs)
-    parent, out = _output_slice(n, heads, dim, q.dtype)
-    out.zero_()
-    untouched = parent == -99
+    parent, out, untouched = _output_slice(n, heads, dim, q.dtype)
     result = paged_2src.sparse_attn_v4_paged_2src(*args, **kwargs, out=out)
     assert result is out
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
@@ -149,7 +147,9 @@ def test_fp8_prefill_reuses_output_on_device(heads):
 
 def _output_slice(n, heads, dim, dtype):
     parent = torch.full((n + 2, heads, dim), -99.0, device="cuda", dtype=dtype)
-    return parent, parent[1:-1]
+    out = parent[1:-1]
+    out.zero_()
+    return parent, out, parent == -99
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm GPU")
@@ -183,9 +183,7 @@ def test_bf16_opus_prefill_output_on_device(monkeypatch, alias_query):
     sink = torch.randn(heads, device="cuda", dtype=torch.float32)
     args = (kv, indices, indptr, extend, ext_indices, ext_indptr, sink, dim**-0.5)
     expected = paged_2src.sparse_attn_v4_paged_2src(q.contiguous(), *args)
-    parent, out = _output_slice(n, heads, dim, q.dtype)
-    out.zero_()
-    untouched = parent == -99
+    parent, out, untouched = _output_slice(n, heads, dim, q.dtype)
     if alias_query:
         out.copy_(q)
         q = out
@@ -222,9 +220,7 @@ def test_native_triton_prefill_preserves_output_on_device(monkeypatch):
     sink = torch.randn(heads, device="cuda", dtype=torch.float32)
     args = (q, kv, indices, indptr, extend, ext_indices, ext_indptr, sink, dim**-0.5)
     expected = paged_2src.sparse_attn_v4_paged_2src(*args)
-    parent, out = _output_slice(n, heads, dim, q.dtype)
-    out.zero_()
-    untouched = parent == -99
+    parent, out, untouched = _output_slice(n, heads, dim, q.dtype)
     result = paged_2src.sparse_attn_v4_paged_2src(*args, out=out)
     assert result is out and len(seen) == 2 and seen[1] is out
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
