@@ -262,6 +262,54 @@ def e2m1(x):
     return n | (((x.bitcast(fx.Int32) >> 31) & fx.Int32(1)) << 3)
 
 
+# ---- FP4 KV (the main pool's compressed rows: fused_compress "planar_fp4" = quantization.fp4_groups(E4M3_SCALE=True),
+# read by packed_rows._read_plane): E2M1 values, an E4M3 scale a 16 dims
+FP4_KV_MIN_AMAX = 6.0 * 2.0 ** -9   # the scale's floor: 2^-9, E4M3's smallest subnormal
+
+
+def e4m3_f32(byte):
+    """An E4M3 byte (the low 8 bits of an i32) -> its exact f32."""
+    return fp8x2_to_f32(fx.Int32(byte) & fx.Int32(255), False)[0]
+
+
+def fp4kv_scale(amax):
+    """(E4M3 byte, its f32) of a 16-dim group's scale: e4m3(max(amax, 6 * 2^-9) * f32(1 / 6)), RNE (the cvt), clamped
+    to 448 first (an amax past 2688 saturates)."""
+    v = fx.min(fx.max(amax, fx.Float32(FP4_KV_MIN_AMAX)) * fx.Float32(1.0 / 6.0), fx.Float32(448.0))
+    byte = cvt_pk_fp8(v) & fx.Int32(255)
+    return byte, e4m3_f32(byte)
+
+
+def e2m1_f32(nib):
+    """An E2M1 nibble (the low 4 bits of an i32) -> its exact f32 (0x8: -0), packed_rows._e2m1's value."""
+    n = fx.Int32(nib)
+    e = (n >> 1) & fx.Int32(3)
+    m = n & fx.Int32(1)
+    mag = (e == fx.Int32(0)).select(m * fx.Int32(0x3F000000), ((e + fx.Int32(126)) << 23) | (m << 22))
+    return (mag | ((n & fx.Int32(8)) << 28)).bitcast(fx.Float32)
+
+
+def e8m0_f32(code):
+    """An E8M0 code -> 2^(code - 127) as packed_rows._e8m0 reads it (0: 2^-127, 255: NaN)."""
+    c = fx.Int32(code)
+    bits = (c == fx.Int32(0)).select(fx.Int32(0x00400000), (c == fx.Int32(255)).select(fx.Int32(0x7FC00000), c << 23))
+    return bits.bitcast(fx.Float32)
+
+
+def fp4x8_f32(word):
+    """8 E2M1 nibbles of an i32 (nibble k = element k) -> 8 exact f32: v_cvt_scale_pk8_f32_fp4 unscaled (the E8M0 2^0 in
+    every byte of the scale word: lanes 16..31 read another byte than lanes 0..15)."""
+    r = rocdl.cvt_scale_pk8_f32_fp4(vty(8, T.f32), _v(fx.Int32(word)), _v(fx.Int32(0x7F7F7F7F)), 0)
+    return fx.Vector(r, (8,), fx.Float32)
+
+
+def fp8x8_f32(words):
+    """8 E4M3 bytes (2 i32, byte k = element k) -> 8 exact f32: v_cvt_scale_pk8_f32_fp8 unscaled."""
+    r = rocdl.cvt_scale_pk8_f32_fp8(vty(8, T.f32), _v(fx.Vector.from_elements(list(words), fx.Int32)),
+                                    _v(fx.Int32(0x7F7F7F7F)), 0)
+    return fx.Vector(r, (8,), fx.Float32)
+
+
 def fp4_lane4(v, mul):
     """4 values (a lane's 4 adjacent dims, already scaled-ready) -> 16 bits: byte 0 = dims 0 (low) / 1, byte 1 = 2 / 3."""
     nb = [e2m1(v[j] * mul) for j in range(4)]
@@ -343,9 +391,9 @@ def fresh(v):
     return fx.Int32(llvm.inline_asm(i32(), [_v(fx.Int32(v))], "v_mov_b32 $0, $1", "=v,v", has_side_effects=True))
 
 
-def fp8x2_to_f32(word, hi):
+def fp8x2_to_f32(word, hi, signed_zero=False):
     """e4m3 bytes 0,1 (hi=False) or 2,3 (hi=True) of an i32 -> two exact f32 (integer decode: the packed cvt's
-    encoding is rejected on gfx1250)."""
+    encoding is rejected on gfx1250). signed_zero: 0x80 -> -0 (the cast's value; else +0)."""
     w = fx.Int32(word)
     out = []
     for k in (2, 3) if hi else (0, 1):
@@ -355,7 +403,10 @@ def fp8x2_to_f32(word, hi):
         sg = (b & 128) << 24
         normal = (sg | ((e + 120) << 23) | (m << 20)).bitcast(fx.Float32)
         sub = (m.to(fx.Float32) * fx.Float32(2.0 ** -9))
-        sub = ((b & 128) != 0).select(fx.Float32(0.0) - sub, sub)
+        if signed_zero:   # (the magnitude's bits with the sign bit: exact, -0 kept)
+            sub = (sub.bitcast(fx.Int32) | sg).bitcast(fx.Float32)
+        else:
+            sub = ((b & 128) != 0).select(fx.Float32(0.0) - sub, sub)
         out.append((e == 0).select(sub, normal))
     return out[0], out[1]
 

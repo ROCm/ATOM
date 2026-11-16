@@ -71,6 +71,19 @@ def test_the_supported_deployment_is_not_refused():
 
 
 @pytest.mark.parametrize(
+    "change",
+    [
+        {"kv_cache_dtype": "fp4"},
+        {"kv_cache_dtype": "fp4", "index_cache_dtype": "fp4", "index_cache_layout": "natural"},
+        {"index_cache_dtype": "fp4", "index_cache_layout": "natural"},
+    ],
+)
+def test_the_fp4_caches_are_served(change):
+    # FP4 KV: E2M1 main rows, MXFP8 window rings (planar sources); FP4 index: the natural layout
+    assert config.config_refusal(atom_config(**change), Dims) is None
+
+
+@pytest.mark.parametrize(
     "change, why",
     [
         ({"tensor_parallel_size": 8}, "TP 8"),

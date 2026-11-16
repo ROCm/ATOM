@@ -204,6 +204,13 @@ CTPTRS_ROLE = {
     "kvw": STEP,  # the context rows' ring rows (the accepted target positions)
     "ring": STEP,  # cache.pool
     "roff": STEP,  # the draft stages' ring starts (geometry.window(layer).ring_start)
+    # (FP4 KV) the draft stages' window ring planes, E4M3 data and E8M0 scales (cache.ring_view): 0 on a BF16 pool
+    "wd0": STEP,
+    "wd1": STEP,
+    "wd2": STEP,
+    "ws0": STEP,
+    "ws1": STEP,
+    "ws2": STEP,
 }
 
 

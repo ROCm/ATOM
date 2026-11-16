@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
@@ -38,6 +39,11 @@ KC = KEYS // CL
 KG_TOPK = 512    # sel row stride (index_plan TOPK)
 KG_RING = 133    # ring_slots (window 128 + 5): set by the build from the cache geometry (the runner checks it against the cache geometry)
 KG_ROW = 512     # pool row stride in bf16 elements (geometry.row_bytes / 2)
+# FP4 KV (geometry.packed: every source its own [rows, data] then [rows, scale] planes, cache.main_view / ring_view):
+# a main pool row is E2M1 x 512 + an E4M3 a 16 dims, a window ring row MXFP8 (E4M3 x 512 + an E8M0 a 32 dims)
+KG_MAIN_DATA, KG_MAIN_SCALE = 256, 32
+KG_WIN_DATA, KG_WIN_SCALE = 512, 16
+KG_MAIN_FP4_BYTES, KG_WIN_FP8_BYTES = KG_MAIN_DATA + KG_MAIN_SCALE, KG_WIN_DATA + KG_WIN_SCALE
 KMETA = 4   # kmeta words a token: first, count, (table offset), base
 WG = CL + 4   # LDS row of the merge weights (16 + 1/den, padded to 16 B)
 HP = HD + 8
@@ -68,6 +74,12 @@ def i64(x):
     return fx.Int64(x)
 
 
+def kv_fp4_of(c):
+    """Whether the stage context's build stores FP4 KV (trace-time; a plain call: a method call on `c` inside a runtime
+    if makes the AST rewriter carry `c` as the if's state)."""
+    return bool(c.get("kvfp4", False))
+
+
 V3_RPC1 = True
 
 
@@ -77,7 +89,8 @@ def smem_layout(TR):
     o, off = {}, 0
     for name, nbytes in (("k", RPC * 48 * HP * 2), ("q", QV * HP * 2), ("s", QV * 48 * 4), ("p", QV * KP * 2),
                          ("m", QV * 4), ("l", QV * 4), ("red", QV * 5 * 4), ("red2", QV * 5 * 4),
-                         ("wgt", QV * WG * 4), ("ids", RPC * KC * 4), ("kvl", 16)):
+                         ("wgt", QV * WG * 4), ("ids", RPC * KC * 4), ("kvl", 16),
+                         ("stg", RPC * KC * KG_WIN_FP8_BYTES)):   # (FP4 KV) the raw key rows, a 528 B slot a key
         o[name] = off
         off += nbytes
     return dict(TR=TR, MT=(TR + 15) // 16, RPC=RPC, QV=QV, o=o, SMEM=off, LDS=off + 512)
@@ -442,6 +455,21 @@ def stage_Apub(c):
 
 
 # ------------------------------------------------------------------ kv RMSNorm + RoPE + window write
+def kv_fp8_lane8(xr):
+    """A window row's MXFP8 (rope_window: fp8_groups of the BF16 row): a lane's 8 adjacent dims (f32 of BF16 values, 4
+    lanes a 32-dim group) -> (the group's E8M0 code, 2 words of E4M3 bytes: clamp(x * 2^(127 - code), +-448), RNE)."""
+    am = abs(xr[0])
+    for e in range(1, 8):
+        am = fx.max(am, abs(xr[e]))
+    am = fx.max(am, am.shuffle_xor(1, 32))
+    am = fx.max(am, am.shuffle_xor(2, 32))
+    code = e8m0_of(am)
+    inv = inv_pow2(code)
+    cl = [fx.min(fx.max(xr[e] * inv, F32(-448.0)), F32(448.0)) for e in range(8)]
+    return code, [hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+                  for h in range(2)]
+
+
 KV_CTA0 = 224   # the kv CTAs: the Apub publishers (no A GEMV), ceil(TR / 4) of them
 
 
@@ -482,24 +510,25 @@ def stage_kv(c):
                     rot.append(is_r.select(x0 * cs - x1 * sn, x0).to(BF16))
                     rot.append(is_r.select(x0 * sn + x1 * cs, x1).to(BF16))
                 # the product's window row: e4m3 QAT a 32-group (rope_window._quantized_row)
-                xr = [rot[e].to(F32) for e in range(8)]
-                am = abs(xr[0])
-                for e in range_constexpr(1, 8):
-                    am = fx.max(am, abs(xr[e]))
-                am = fx.max(am, am.shuffle_xor(1, 32))
-                am = fx.max(am, am.shuffle_xor(2, 32))
-                code = e8m0_of(am)
-                inv = inv_pow2(code)
+                code, wds = kv_fp8_lane8([rot[e].to(F32) for e in range(8)])
                 stp = (code << 23).bitcast(F32)
-                cl = [fx.min(fx.max(xr[e] * inv, F32(-448.0)), F32(448.0)) for e in range(8)]
                 rot = []
                 for h in range_constexpr(2):
-                    wd = hx.cvt_pk_fp8_w(hx.cvt_pk_fp8_w(0, cl[4 * h], cl[4 * h + 1], False), cl[4 * h + 2], cl[4 * h + 3], True)
+                    wd = wds[h]
                     a0, a1 = hx.fp8x2_to_f32(wd, False)
                     a2, a3 = hx.fp8x2_to_f32(wd, True)
                     rot += [(a0 * stp).to(BF16), (a1 * stp).to(BF16), (a2 * stp).to(BF16), (a3 * stp).to(BF16)]
-                if kw >= 0:
-                    c["stx"](c["kv"] + (i64(kw + c["kring_off"]) * KG_ROW + i64(c8)) * 2, fx.Vector.from_elements(rot, BF16))
+                if fx.const_expr(kv_fp4_of(c)):
+                    # FP4 KV: the window ring holds the MXFP8 row itself (rope_quant_window's): E4M3 bytes in the layer's
+                    # data plane (row kw: slot * ring_slots + pos % ring_slots), the E8M0 code a 32 dims in its scale plane
+                    kr = i64(kw + c["kring_off"])
+                    if kw >= 0:
+                        c["stx"](c["kwd"] + kr * KG_WIN_DATA + i64(c8), fx.Vector.from_elements(wds, I32))
+                    if (kw >= 0) & (c8 % 32 == 0):
+                        c["stx"](c["kws"] + kr * KG_WIN_SCALE + i64(c8 // 32), code.to(fx.Int8))
+                else:
+                    if kw >= 0:
+                        c["stx"](c["kv"] + (i64(kw + c["kring_off"]) * KG_ROW + i64(c8)) * 2, fx.Vector.from_elements(rot, BF16))
     if fx.const_expr("a2flag" in c):   # (v3 e4) this CTA's kv ring rows out
         if kvc:
             hx.wait_storecnt0()
@@ -624,9 +653,112 @@ def _kg_rows(c, t, r0, jj, sm, o, RPC, TR):
         picked = key < nsel
         selr = hx.gload(c["ksel"] + i64(tok * KG_TOPK + fx.min(key, I32(KG_TOPK - 1))) * 4, I32)
         win = base + c["kring_off"] + (first + key - nsel) % KG_RING
-        hx.lstore(sm + o["ids"] + t * 4, picked.select(selr, win))
+        if fx.const_expr(kv_fp4_of(c)):
+            # FP4 KV: a key is a row of one of two sources, tagged (packed_rows' tagged rows): 2 r a main pool row (E2M1),
+            # 2 r + 1 a window ring row (MXFP8); a row with no key (kv_len 0) reads ring row 0 (masked)
+            tag = picked.select(selr * 2, win * 2 + 1)
+            hx.lstore(sm + o["ids"] + t * 4, (kvl > I32(0)).select(tag, I32(1)))
+        else:
+            hx.lstore(sm + o["ids"] + t * 4, picked.select(selr, win))
         if t % KC == 0:
             hx.lstore(sm + o["kvl"] + rr * 4, kvl)
+
+
+KDQ_IT = KC * 32 // THREADS   # (FP4 KV) decode: a wave a key, a lane 16 dims -- the CTA's KC keys in KDQ_IT passes
+assert KC * 32 % THREADS == 0
+# (diagnostic) ATOM_MONO_DSTAMP=1: CTA 0 of D accumulates steady-counter deltas from D's entry at its phase points into
+# cyc[(layer * 8 + point) * 8] (int64; the runner logs their means). A build parameter (step.build keys it).
+DSTAMP = __import__("os").environ.get("ATOM_MONO_DSTAMP", "0") == "1"
+
+
+def _iprefetch(kb):
+    """Instruction prefetch of the next kb KB of code (s_prefetch_inst_pc_rel, 4 KB a request; step.iprefetch's)."""
+    for off in range(0, kb * 1024, 4096):
+        llvm.inline_asm(None, [], f"s_prefetch_inst_pc_rel {off}, null, 31", "", has_side_effects=True)
+
+
+@ASTRewriter.transform
+def _dstamp(c, p, t0):
+    if fx.const_expr(DSTAMP):
+        if (c["b"] == 0) & (c["t"] == 0):   # (point 0: the count of D passes; a non-returning atomic: no wait)
+            a = c["cycp"] + (i64(c["ly"]) * 8 + i64(p)) * 4
+            hx.atomic_add(a, I32(1) if p == 0 else I32(hx.clock() - t0))
+
+
+@ASTRewriter.transform
+def _kg_fetch(c, t, sm, o, rr):
+    """(FP4 KV) row rr's KC keys (tagged rows in LDS ids, _kg_rows): each key row's raw bytes -> its 528 B LDS slot by
+    async 16-byte copies, as the BF16 rows are fetched: a wave a key (its format wave-uniform), lane l chunk l -- a window
+    row 32 data chunks + lane 0 its 16 B of E8M0 codes; a main row 16 data chunks (lanes 0..15) + its 32 B of E4M3 scales
+    (lanes 16, 17)."""
+    w = t // 32
+    l = t % 32
+    kwd, kws, kmd, kms = c["kwd"], c["kws"], c["kmd"], c["kms"]
+    for it in range(hx.opaque_s(I32(KDQ_IT))):   # (a runtime loop: the D code runs cold each layer -- I-cache)
+        key = w + it * (THREADS // 32)
+        idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)
+        r = i64(idv >> 1)
+        slot = sm + o["stg"] + (rr * KC + key) * KG_WIN_FP8_BYTES
+        if (idv & I32(1)) != I32(0):
+            hx.async_to_lds_b128(kwd + r * KG_WIN_DATA + i64(l * 16), slot + l * 16, 0)
+            if l == 0:
+                hx.async_to_lds_b128(kws + r * KG_WIN_SCALE, slot + KG_WIN_DATA, 0)
+        if ((idv & I32(1)) == I32(0)) & (l < 18):
+            src = (l < 16).select(kmd + r * KG_MAIN_DATA + i64(l * 16), kms + r * KG_MAIN_SCALE + i64((l - 16) * 16))
+            hx.async_to_lds_b128(src, slot + l * 16, 0)
+
+
+def _fp8_row16(dst, d0, d1, sw, l):
+    """(FP4 KV) a window ring row's 16 dims 16 l .. (16 E4M3 bytes d0 / d1, the scale dword sw holding their E8M0 code)
+    -> 16 BF16 at LDS dst: e4m3 * 2^(code - 127), exact (packed_rows._read_plane, FP8)."""
+    stp = hx.e8m0_f32((sw >> (((l // 2) % 4) * 8)) & I32(255))
+    for h, d in enumerate((d0, d1)):
+        v = hx.fp8x8_f32((d[0], d[1]))
+        hx.lstore(dst + 16 * h, fx.Vector.from_elements([(v[e] * stp).to(BF16) for e in range(8)], BF16))
+
+
+def _fp4_row16(dst, d0, sw, l):
+    """(FP4 KV) a main pool row's 16 dims 16 l .. (8 bytes of E2M1 nibbles d0, even dim low; the scale dword sw holding
+    their group's E4M3) -> 16 BF16 at LDS dst: e2m1 * f32(e4m3), exact (packed_rows._read_plane, FP4)."""
+    sc = hx.e4m3_f32(sw >> ((l % 4) * 8))
+    for h in range(2):
+        v = hx.fp4x8_f32(d0[h])
+        hx.lstore(dst + 16 * h, fx.Vector.from_elements([(v[e] * sc).to(BF16) for e in range(8)], BF16))
+
+
+def _kg_load(sm, o, rr, key, l):
+    """(FP4 KV) a staged key row's bytes for lane l: (tag, data 8 + 8 B, scale dword) -- a window row's 16 bytes at 16 l,
+    a main row's 8 at 8 l (the next 8 unused)."""
+    idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)
+    slot = sm + o["stg"] + (rr * KC + key) * KG_WIN_FP8_BYTES
+    isw = (idv & I32(1)) != I32(0)
+    da = slot + isw.select(l * 16, l * 8)
+    sa = slot + isw.select(KG_WIN_DATA + (l // 8) * 4, KG_MAIN_DATA + (l // 4) * 4)
+    return idv, hx.lload(da, I32, 2), hx.lload(da + 8, I32, 2), hx.lload(sa, I32)
+
+
+@ASTRewriter.transform
+def _kg_store(sm, o, rr, key, l, ld, live):
+    """(FP4 KV) one staged key row's lane share -> 16 BF16 of LDS k (the format branch wave-uniform)."""
+    idv, d0, d1, sw = ld
+    dst = sm + o["k"] + ((rr * 48 + key) * HP + l * 16) * 2
+    if live & ((idv & I32(1)) != I32(0)):
+        _fp8_row16(dst, d0, d1, sw, l)
+    if live & ((idv & I32(1)) == I32(0)):
+        _fp4_row16(dst, d0, sw, l)
+
+
+@ASTRewriter.transform
+def _kg_decode(c, t, sm, o, rr):
+    """(FP4 KV) row rr's staged key rows (landed, after a barrier) -> BF16 rows of LDS k, as the BF16 pool's rows land
+    there: a wave a key (its format branch wave-uniform), a lane 16 dims, every wave busy. A runtime loop, one key an
+    iteration: the D code runs cold each layer -- fully unrolled (~8 KB of instructions) the decode took ~1.5 us more in
+    I-cache misses than in its loop latency, and two keys an iteration measured slower than one."""
+    w = t // 32
+    l = t % 32
+    for it in range(hx.opaque_s(I32(KDQ_IT))):
+        key = w + it * (THREADS // 32)
+        _kg_store(sm, o, rr, key, l, _kg_load(sm, o, rr, key, l), key < I32(KC))
 
 
 @ASTRewriter.transform
@@ -636,6 +768,10 @@ def stage_D(c):
     cl = b // CL
     jj = b % CL
     r0 = cl * RPC
+    t0s = hx.clock() if DSTAMP else None
+    _dstamp(c, 0, t0s)
+    if fx.const_expr(kv_fp4_of(c)):   # (FP4 KV) D's code -> the I-cache while the kv rows' flags are awaited
+        _iprefetch(12)
     # every row: ceil(TR / RPC) clusters (a draft width 5 B need not be a multiple of RPC)
     if fx.const_expr("cflag" in c):   # (v3 e4) the kv ring rows first: the key rows load while C still runs
         if cl < (TR + RPC - 1) // RPC:
@@ -652,14 +788,19 @@ def stage_D(c):
         rcv = hx.gload(c["rcos"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         rsv = hx.gload(c["rsin"] + (rpp * 32 + i64(rf0 + 2 * (t % 8))) * 2, BF16, 2)   # this lane's 2 pairs
         gpu.barrier()
-        for rr in range_constexpr(RPC):
-            for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
-                i = t + it * THREADS
-                key = i // (HD // 8)
-                cc = i % (HD // 8)
-                idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
-                hx.async_to_lds_b128(c["kv"] + (i64(idv) * KG_ROW + i64(cc * 8)) * 2,
-                                     sm + o["k"] + ((rr * 48 + key) * HP + cc * 8) * 2, 0)
+        _dstamp(c, 1, t0s)
+        if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the raw key rows staged by async copies (decoded below)
+            for rr in range_constexpr(RPC):
+                _kg_fetch(c, t, sm, o, rr)
+        else:
+            for rr in range_constexpr(RPC):
+                for it in range(KC * HD // 8 // THREADS):   # runtime loops in D: smaller code (I-cache, see icache-probe)
+                    i = t + it * THREADS
+                    key = i // (HD // 8)
+                    cc = i % (HD // 8)
+                    idv = hx.lload(sm + o["ids"] + (rr * KC + key) * 4, I32)   # absolute pool row
+                    hx.async_to_lds_b128(c["kv"] + (i64(idv) * KG_ROW + i64(cc * 8)) * 2,
+                                         sm + o["k"] + ((rr * 48 + key) * HP + cc * 8) * 2, 0)
         NZ = RPC * (48 - KC) * HD // 8
         for it in range(hx.opaque_s(I32((NZ + THREADS - 1) // THREADS))):
             i = t + it * THREADS
@@ -667,9 +808,17 @@ def stage_D(c):
                 bb = i // ((48 - KC) * HD // 8)
                 rem = i % ((48 - KC) * HD // 8)
                 hx.lstore(sm + o["k"] + ((bb * 48 + KC + rem // (HD // 8)) * HP + (rem % (HD // 8)) * 8) * 2, fx.Vector.filled(4, 0, I32))
+        _dstamp(c, 2, t0s)
+        if fx.const_expr(kv_fp4_of(c)):   # FP4 KV: the staged key rows -> BF16 key rows, while C still runs
+            hx.wait_asynccnt0()
+            gpu.barrier()
+            _dstamp(c, 3, t0s)
+            for rr in range_constexpr(RPC):
+                _kg_decode(c, t, sm, o, rr)
         if fx.const_expr("cflag" in c):   # every C CTA's q tiles: only the q copies wait for them
             hx.wait_flags(c["cflag"], CTAS, c["ctag"], w, l, 8)
             gpu.barrier()
+        _dstamp(c, 4, t0s)
         for it in range(QV * HD // 8 // THREADS):
             i = t + it * THREADS
             qv = i // (HD // 8)
@@ -682,6 +831,7 @@ def stage_D(c):
         pp = c["apart"] + i64(b * QV * HD) * 2
         hx.wait_asynccnt0()
         gpu.barrier()
+        _dstamp(c, 5, t0s)
         for tt in range(hx.opaque_s(I32(2))):   # (opaque trip count: kept a loop)
             tile = w + tt * 8
             if tile < RPC * 3:
@@ -759,6 +909,7 @@ def stage_D(c):
                 hx.gstore(pp + i64((nd * 16 + l % 16) * QV + rr * H + (l // 16) * 8) * 2,
                           fx.Vector.from_elements([acc[i].to(BF16) for i in range(8)], BF16))
         gpu.barrier()
+        _dstamp(c, 6, t0s)
         if t < QV:
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2) * 4, hx.lload(sm + o["m"] + t * 4, F32))
             hx.gstore(c["aml"] + i64(b * QV * 2 + t * 2 + 1) * 4, hx.lload(sm + o["l"] + t * 4, F32))
@@ -770,6 +921,7 @@ def stage_D(c):
         else:
             cluster_sync()
             _d_merge(c, cl, jj, rcv, rsv)
+            _dstamp(c, 7, t0s)
 
 
 @ASTRewriter.transform

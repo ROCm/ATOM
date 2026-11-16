@@ -122,6 +122,29 @@ class SingleStepRunner(StepInputs):
         self.index_fp4 = bool(getattr(cache.geometry, "index_fp4", False))
         if self.index_fp4 and getattr(cache.geometry, "index_layout", None) != "natural":
             raise MonoUnsupported(f"FP4 index layout {getattr(cache.geometry, 'index_layout', None)} (natural only)")
+        # the KV format is compiled in too: BF16 rows in the one pool, or (FP4) the main pool's E2M1 rows and the window
+        # rings' MXFP8 rows, each source its own data / scale planes (cache.main_view / ring_view), row-addressed
+        g = cache.geometry
+        self.kv_fp4 = g.kv_dtype == "fp4"
+        if g.kv_dtype not in ("bf16", "fp4"):
+            raise MonoUnsupported(f"kv cache {g.kv_dtype}")
+        if self.kv_fp4:
+            src = (getattr(cache, "main_sources", None), getattr(cache, "window_sources", None))
+            if not (
+                g.packed
+                and g.window_fp8
+                and g.main_row_bytes == AS.KG_MAIN_FP4_BYTES
+                and g.window_row_bytes == AS.KG_WIN_FP8_BYTES
+                and g.head_dim == AS.HD
+                and src[0] is not None
+                and src[1] is not None
+                and window.ring_start == 0
+                and window.slot_rows == window.ring_slots
+            ):
+                raise MonoUnsupported(
+                    f"FP4 KV geometry: main row {g.main_row_bytes} B, window row {g.window_row_bytes} B, "
+                    f"ring start {window.ring_start}, slot rows {window.slot_rows} (planar sources expected)"
+                )
         miss = buffers.check_catalog(self.K)
         if miss:
             raise MonoUnsupported(f"pointer catalog out of date: {miss[:4]}")
@@ -215,7 +238,7 @@ class SingleStepRunner(StepInputs):
             return False
         if rows not in self.builds:
             M = self.K["step"]
-            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5, "index_fp4": self.index_fp4}
+            kw = {"NL": NL, "ndr": NDR, "trd": rows // 6 * 5, "index_fp4": self.index_fp4, "kv_fp4": self.kv_fp4}
             # two launches: target .. verification, then the draft (the host reads the verdict between)
             launch = tuple(
                 M.build(rows, self.rank, part=pt, sources=SOURCES, **kw)[0]
@@ -346,7 +369,27 @@ class SingleStepRunner(StepInputs):
         launches[1](*args)
         if not torch.cuda.is_current_stream_capturing():
             self._step_ev.append(ev)
+            if self.K["attention"].DSTAMP:
+                self._log_dstamps()
         self._qrow = self._qrow_next
+
+    def _log_dstamps(self):
+        """(diagnostic, ATOM_MONO_DSTAMP=1) every 50 launches: D CTA 0's mean steady-counter time (us, 100 MHz) from D's
+        entry to each phase point, over the target layers and the draft layers (attention._dstamp)."""
+        self._dst_n = getattr(self, "_dst_n", 0) + 1
+        if self._dst_n % 50 or self.rank != 0:
+            return
+        torch.cuda.synchronize()
+        v = self.scratch["cyc"][: (NL + NDR) * 32].view(torch.int32).view(NL + NDR, 8).double().cpu()
+        for name, rows in (("target", v[:NL]), ("draft", v[NL:])):
+            n = rows[:, 0].clamp(min=1)
+            mean = (rows[:, 1:] / n[:, None]).mean(0) / 100.0
+            logger.info(
+                "V4.1 single-launch step D stamps (%s, %d passes): %s us",
+                name,
+                int(rows[:, 0].sum()),
+                " ".join(f"p{i + 1}={x:.2f}" for i, x in enumerate(mean.tolist())),
+            )
 
     def run_step(self, input_ids, running_bs: int, forward_context, batch) -> None:
         """The served step: one launch (target layers, head, sampling, verify, draft layers, Markov drafts)."""

@@ -57,12 +57,12 @@ def tptr(tp, name):
     return (fx.Int64(_ufl(v[1])) << 32) | (fx.Int64(_ufl(v[0])) & fx.Int64(0xFFFFFFFF))
 
 
-def _ctxp(ctx, t, b, T):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
-    return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536)
+def _ctxp(ctx, t, b, T, kv_fp4=False):   # (plain python) the draft context KV's 4 stages, run inside the sampling's exchanges
+    return None if ctx is None else CX.ctx_parts(ctx, t, b, T, 65536, kv_fp4)
 
 
 @ASTRewriter.transform
-def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None):
+def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None, kv_fp4=False):
     P = {k: tptr(tp, k) for k in ('xh', 'hw', 'logits', 's0', 's1', 's2', 's3', 'sids', 'dids', 'outtok', 'verdict', 'anc')}
     handoff(tc, t, False)   # LY.HEAD (offset 0)
     HF.head_once_r(P['xh'], P['hw'], P['logits'], t, t % 32, t // 32, sm, b, head_d, 2, 4)
@@ -71,7 +71,7 @@ def target(tp, t, b, sm, tc, recv, rank, head_d=4, ctx=None, T=None):
     SPF.sample_once_p(P['logits'], P['s0'], P['s1'], P['s2'], P['s3'], P['sids'], tc + i64(LY.SAMPLE), t, b, sm, HF.VR,
                       [r + i64(SOFF) for r in recv], rank, 1, tptr(tp, 'sparam'), tptr(tp, 'qlog'), P['dids'],
                       tptr(tp, 'prow'), P['outtok'], P['verdict'], P['anc'], tptr(tp, 'qids'),
-                      ctxp=_ctxp(ctx, t, b, T))
+                      ctxp=_ctxp(ctx, t, b, T, kv_fp4))
     handoff(tc + i64(LY.VERIFY_DONE), t, False)
 
 

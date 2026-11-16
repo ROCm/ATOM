@@ -32,7 +32,7 @@ from flydsl.expr import gpu, range_constexpr
 
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
-from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, rsq
+from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import HID, T, e8m0_of, expf, inv_pow2, kv_fp4_of, rsq
 
 F32, I32, I64, BF16 = fx.Float32, fx.Int32, fx.Int64, fx.BFloat16
 LAT = D.KV_DIM                  # the compressed latent (head dim)
@@ -112,6 +112,21 @@ def _projn(c, r1, row, d0, col0, n):
     return [r1.select(v[e].to(BF16).to(F32), v[e]) for e in range(n)]
 
 
+def fp4_main_lane4(rot):
+    """(FP4 KV) a lane's 4 adjacent dims of a main row (f32, 4 lanes a 16-dim group) -> (on even lanes: the pair's 4
+    bytes of E2M1 nibbles, even dim low; the group's E4M3 scale byte): fused_compress "planar_fp4" ==
+    quantization.fp4_groups(E4M3_SCALE=True) on the BF16-rounded row -- scale = e4m3(max(amax, 6 * 2^-9) * f32(1 / 6)),
+    E2M1(x / scale) with an IEEE divide, the sign bit x's."""
+    x = [rot[e].to(BF16).to(F32) for e in range(4)]
+    am = fx.max(fx.max(abs(x[0]), abs(x[1])), fx.max(abs(x[2]), abs(x[3])))
+    am = fx.max(am, am.shuffle_xor(1, 32))
+    am = fx.max(am, am.shuffle_xor(2, 32))
+    sbyte, scl = hx.fp4kv_scale(am)
+    nb = [hx.e2m1(x[e] / scl) for e in range(4)]
+    h16 = nb[0] | (nb[1] << 4) | (nb[2] << 8) | (nb[3] << 12)
+    return h16 | (I32(h16.shuffle_xor(1, 32)) << 16), sbyte
+
+
 @ASTRewriter.transform
 def stage_crow(c, r1):
     """A CTA a compress-plan row (CTAs CROW0 .. CROW0 + ccap - 1), its 8 waves splitting the 512 channels (2 a lane):
@@ -182,8 +197,19 @@ def stage_crow(c, r1):
             rot.append(isr.select(nrm[e] * cs - nrm[e + 1] * sn, nrm[e]))
             rot.append(isr.select(nrm[e + 1] * cs + nrm[e] * sn, nrm[e + 1]))
         mrow = i64(phys) * i64(c["cprow"]) + i64(c["cmain"] + ci % c["crpp"])
-        if live & (w < 4):
-            c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
+        if fx.const_expr(kv_fp4_of(c)):
+            # FP4 KV (fused_compress "planar_fp4"): the BF16 row quantized a 16 dims (4 lanes) at a time --
+            # scale = e4m3(max(amax, 6 * 2^-9) / 6), E2M1(x / scale) (an IEEE divide), sign kept; the owner's main
+            # source row mrow (page * rows_per_page + id % rows_per_page): 256 B of nibbles (even dim low), then an
+            # E4M3 byte a group in the scale plane
+            mword, msbyte = fp4_main_lane4(rot)
+            if live & (w < 4) & (l % 2 == 0):
+                c["stx"](c["kmd"] + mrow * 256 + i64(d0 // 2), mword)
+            if live & (w < 4) & (l % 4 == 0):
+                c["stx"](c["kms"] + mrow * 32 + i64(d0 // 16), msbyte.to(fx.Int8))
+        else:
+            if live & (w < 4):
+                c["stx"](c["kv"] + (mrow * LAT + i64(d0)) * 2, fx.Vector.from_elements([rot[e].to(BF16) for e in range(4)], BF16).bitcast(fx.Int64)[0])
         if w < 4:
             hx.lstore(lb + d0 * 2, fx.Vector.from_elements([live.select(nrm[e], F32(0.0)).to(BF16) for e in range(4)], BF16))
         # M padding rows 1..15 of lb: zero (15 x 1024 B, 16 B a thread x 4)
