@@ -35,18 +35,6 @@ def sampler():
         yield load("atom.model_ops.sampler")
 
 
-class _Seen(list):
-    """The noise each kernel call received, in order, and which kernel."""
-
-    def __init__(self):
-        super().__init__()
-        self.ops = []
-
-    def record(self, op, exponentials):
-        self.ops.append(op)
-        self.append(exponentials)
-
-
 @pytest.fixture
 def noise(sampler, monkeypatch):
     """Record the noise the sampler passes to the AITER kernels, and score it.
@@ -54,10 +42,10 @@ def noise(sampler, monkeypatch):
     Both kernels run the exponential race the real ones implement:
     ``argmax(p / (E + eps))``. ``fused_mixed_sample`` also takes the argmax of
     rows at or below ``greedy_eps``; ``topk_select`` keeps the greedy
-    correction of the shared-row path on the CPU. ``seen.ops`` names the
-    kernel each recorded noise went to.
+    correction of the shared-row path on the CPU. Yields two lists, in call
+    order: the noise each kernel call received, and the kernel it went to.
     """
-    seen = _Seen()
+    received, ops = [], []
 
     def race(logits, exponentials, temperatures, eps):
         probs = torch.softmax(logits.float() / temperatures.unsqueeze(-1), dim=-1)
@@ -66,11 +54,13 @@ def noise(sampler, monkeypatch):
     def mixed_sample_outer_exponential(
         out, logits, exponentials, temperatures, eps=1e-10
     ):
-        seen.record("shared", exponentials)
+        received.append(exponentials)
+        ops.append("shared")
         out.copy_(race(logits, exponentials, temperatures, eps).to(out.dtype))
 
     def fused_mixed_sample(input, exponentials, temperatures, *, eps, greedy_eps):
-        seen.record("fused", exponentials)
+        received.append(exponentials)
+        ops.append("fused")
         raced = race(input, exponentials, temperatures, eps)
         greedy = temperatures <= greedy_eps
         return torch.where(greedy, input.argmax(-1), raced).to(torch.int32)
@@ -86,7 +76,7 @@ def noise(sampler, monkeypatch):
     monkeypatch.setattr(sampler, "topk_select", topk_select)
     # Each test seeds and draws its own stream; restore the global one after.
     with torch.random.fork_rng(devices=[]):
-        yield seen
+        yield received, ops
 
 
 def _same_distribution_batch():
@@ -115,13 +105,14 @@ def test_default_broadcasts_one_noise_row(sampler, noise):
         sampler.Sampler(always_independent_noise=False),
         sampler.sampler_from_config(SimpleNamespace(sampler_independent_noise=False)),
     )
+    received, ops = noise
     torch.random.default_generator.manual_seed(0)
     for instance in instances:
         samples = _draw(instance, calls=200)
-        received = noise[-1]
-        assert noise.ops[-1] == "shared"
-        assert received.shape == (ROWS, PROBS.numel()) and received.stride(0) == 0
-        assert torch.equal(received, received[:1].expand_as(received))
+        last = received[-1]
+        assert ops[-1] == "shared"
+        assert last.shape == (ROWS, PROBS.numel()) and last.stride(0) == 0
+        assert torch.equal(last, last[:1].expand_as(last))
         # Every row of a call picks the same token, and the call-to-call draw
         # is fresh, so the tokens still move between calls.
         assert (samples == samples[:, :1]).all()
@@ -138,10 +129,11 @@ def test_default_broadcasts_one_noise_row(sampler, noise):
 def test_opt_in_draws_independent_rows(sampler, noise):
     torch.random.default_generator.manual_seed(0)
     samples = _draw(sampler.Sampler(always_independent_noise=True), calls=2000)
-    received = noise[-1]
-    assert set(noise.ops) == {"fused"}
-    assert received.shape == (ROWS, PROBS.numel()) and received.stride(0) > 0
-    assert not torch.equal(received[0], received[1])
+    received, ops = noise
+    last = received[-1]
+    assert set(ops) == {"fused"}
+    assert last.shape == (ROWS, PROBS.numel()) and last.stride(0) > 0
+    assert not torch.equal(last[0], last[1])
     # Independent rows with the same distribution coincide with probability
     # sum(p^2) = 0.30, not 1; each row's marginal is unchanged.
     assert _pair_coincidence(samples) == pytest.approx(
@@ -177,7 +169,8 @@ def test_independent_noise_is_one_exponential_draw(sampler, noise):
     after = torch.random.get_rng_state()
     torch.random.default_generator.manual_seed(5)
     expected = torch.empty(ROWS, PROBS.numel()).exponential_(1)
-    assert torch.equal(noise[-1], expected)
+    received, _ = noise
+    assert torch.equal(received[-1], expected)
     assert torch.equal(after, torch.random.get_rng_state())
 
 
@@ -222,11 +215,11 @@ def test_forward_resolves_the_policy_once_for_every_consumer(
     seen = []
 
     def temperature_sample(self, logits, temperatures):
-        seen.append(("temperature", False))
+        seen.append("temperature")
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     def independent_noise_sample(self, logits, temperatures):
-        seen.append(("temperature", True))
+        seen.append("independent")
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     def topk_topp_sample(
@@ -254,7 +247,8 @@ def test_forward_resolves_the_policy_once_for_every_consumer(
     temperatures = torch.ones(3)
     instance(logits, temperatures, None, None, needs_independent_noise=requested)
     instance(logits, temperatures, top_ps=0.9, needs_independent_noise=requested)
-    assert seen == [("temperature", expected), ("filtered", expected)]
+    unfiltered = "independent" if expected else "temperature"
+    assert seen == [unfiltered, ("filtered", expected)]
 
 
 @pytest.mark.parametrize("always", [False, True])
@@ -276,7 +270,8 @@ def test_all_greedy_does_not_draw_noise(sampler, noise, always):
         logits, torch.full((4,), sampler.SAMPLER_EPS), all_greedy=True
     )
     assert got.tolist() == [2, 2, 2, 2]
-    assert not noise
+    received, _ = noise
+    assert not received
 
 
 @pytest.mark.parametrize("always", [False, True])
@@ -294,7 +289,8 @@ def test_filtered_sampling_is_inert_whatever_the_option(
         logits, torch.ones(4), top_ps=0.5
     )
     assert got.tolist() == [3, 3, 3, 3]
-    assert not noise
+    received, _ = noise
+    assert not received
 
 
 # ---------------------------------------------------------------------------

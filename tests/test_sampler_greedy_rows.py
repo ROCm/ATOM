@@ -41,7 +41,7 @@ def test_greedy_correction_preserves_sampled_rows(
     assert (sampled == -1).all()  # Caller-owned sampled results are not mutated.
 
 
-def _noise_picks_the_high_tie(logits, temperatures, needs_independent_noise=False):
+def _noise_picks_the_high_tie(logits, temperatures):
     """Stand-in for the Gumbel draw: on an exact tie it may land on either id."""
     return torch.full((logits.shape[0],), 5, dtype=torch.int)
 
@@ -68,6 +68,59 @@ def test_mixed_batch_greedy_rows_take_the_low_tie(monkeypatch):
     temperatures = torch.tensor([sampler.SAMPLER_EPS, 0.7, sampler.SAMPLER_EPS, 1.0])
     got = instance(logits, temperatures, None, None, all_greedy=False)
     assert got.tolist() == [2, 5, 2, 5]
+
+
+def _fused_mixed_sample_reference(
+    input, exponentials, temperatures, *, eps, greedy_eps
+):
+    """CPU stand-in with the documented semantics of aiter's fused_mixed_sample.
+
+    A row at or below ``greedy_eps`` takes the lowest-id argmax of ``input``.
+    Any other row takes the race
+    ``argmax softmax(input / max(T, 1e-5)) / (E + eps)``.
+    """
+    scaled = input.float() / temperatures.clamp_min(1e-5).unsqueeze(-1)
+    race = (torch.softmax(scaled, dim=-1) / (exponentials + eps)).argmax(-1)
+    greedy = temperatures <= greedy_eps
+    return torch.where(greedy, input.float().argmax(-1), race).to(torch.int32)
+
+
+def test_independent_noise_batch_greedy_rows_take_the_low_tie(monkeypatch):
+    # The per-row-noise path leaves the greedy override to fused_mixed_sample.
+    # Pin what ATOM hands it (the logits, the temperatures and
+    # greedy_eps=SAMPLER_EPS) and that the greedy rows come back as the
+    # low-tie argmax, while the sampling rows keep the race.
+    calls = []
+
+    def fused_mixed_sample(input, exponentials, temperatures, *, eps, greedy_eps):
+        calls.append((input, exponentials, temperatures, eps, greedy_eps))
+        return _fused_mixed_sample_reference(
+            input, exponentials, temperatures, eps=eps, greedy_eps=greedy_eps
+        )
+
+    monkeypatch.setattr(sampler, "fused_mixed_sample", fused_mixed_sample)
+    instance = sampler.Sampler()
+    rows = 16
+    logits = torch.zeros(rows, 8)
+    logits[:, 2] = logits[:, 5] = 1.0
+    temperatures = torch.ones(rows)
+    temperatures[::2] = sampler.SAMPLER_EPS
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        got = instance(logits, temperatures, None, None, needs_independent_noise=True)
+    ((input, noise, temps, eps, greedy_eps),) = calls
+    assert input is logits and temps is temperatures
+    assert eps == instance.eps and greedy_eps == sampler.SAMPLER_EPS
+    assert noise.shape == logits.shape and noise.stride(0) > 0
+    assert got[::2].tolist() == [2] * (rows // 2)
+    # On this seed the race alone puts some greedy rows on the high tie, so
+    # the override is what makes them 2. Some sampling rows land there too, so
+    # an override that reached them would show.
+    race = _fused_mixed_sample_reference(
+        logits, noise, temperatures, eps=eps, greedy_eps=-1.0
+    )
+    assert (race[::2] == 5).any() and (got[1::2] == 5).any()
+    assert torch.equal(got[1::2], race[1::2])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

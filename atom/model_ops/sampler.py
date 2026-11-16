@@ -256,7 +256,7 @@ class Sampler(nn.Module):
         AITER's ``fused_mixed_sample`` runs the race of
         ``mixed_sample_outer_exponential`` on it and the greedy override of
         ``_apply_greedy_tokens`` (rows at or below ``SAMPLER_EPS`` take the
-        lowest-id argmax) in two vocab-tiled launches.
+        lowest-id argmax) in one aiter call.
         """
         num_tokens, vocab_size = logits.shape
         exponential = torch.empty(
