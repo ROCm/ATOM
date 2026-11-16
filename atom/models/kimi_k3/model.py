@@ -78,9 +78,7 @@ from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import (
     eager_region,
-    on_scheduled_rows,
     on_scheduled_rows_into,
-    padded_prefill_rows,
     token_graph,
 )
 
@@ -1040,14 +1038,7 @@ def _kda_mixer(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    # A prefill padded to a token-graph bucket runs the recurrence on its
-    # scheduled rows alone: the conv/ssm state reads each request's last rows.
-    return on_scheduled_rows(
-        self._forward_impl,
-        padded_prefill_rows(hidden_states.shape[0]),
-        hidden_states,
-        hidden_states_scale,
-    )
+    return self._forward_impl(hidden_states, hidden_states_scale)
 
 
 @eager_region()
