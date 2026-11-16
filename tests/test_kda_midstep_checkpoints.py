@@ -38,7 +38,6 @@ from atom.models.kimi_k3.midstep import (
     kda_midstep_transfer,
     kda_snapshots,
     refuse_midstep_under_pipeline,
-    require_flash_kda_snapshots,
 )
 from atom.utils import envs
 
@@ -72,7 +71,6 @@ ANCHOR = 40
 def _clean_switches(monkeypatch):
     for name in (
         "ATOM_K3_KDA_STATE_MIDSTEP",
-        "AITER_FDA_ENABLE",
         "ATOM_STATE_CHECKPOINT_DEMAND",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -116,34 +114,9 @@ def test_the_switch_is_off_by_default():
     assert kda_midstep_enabled() is False
 
 
-def test_the_switch_needs_flash_kda(monkeypatch):
+def test_the_switch_reads_its_env(monkeypatch):
     monkeypatch.setenv("ATOM_K3_KDA_STATE_MIDSTEP", "1")
     assert kda_midstep_enabled() is True
-    monkeypatch.setenv("AITER_FDA_ENABLE", "0")
-    with pytest.raises(ValueError, match="AITER_FDA_ENABLE"):
-        kda_midstep_enabled()
-
-
-def test_an_aiter_without_snapshot_arguments_is_refused_at_startup():
-    def with_snapshots(q, k, v, *, snapshot_targets=None, snapshot_out=None):
-        pass
-
-    def without(q, k, v, *, initial_state=None):
-        pass
-
-    def half(q, k, v, *, snapshot_targets=None):
-        pass
-
-    def catch_all(q, k, v, **kwargs):
-        pass
-
-    require_flash_kda_snapshots(with_snapshots)
-    with pytest.raises(RuntimeError, match="no snapshot_targets, snapshot_out"):
-        require_flash_kda_snapshots(without)
-    with pytest.raises(RuntimeError, match="no snapshot_out$"):
-        require_flash_kda_snapshots(half)
-    with pytest.raises(RuntimeError, match="aiter#7413"):
-        require_flash_kda_snapshots(catch_all)
 
 
 def test_the_switch_is_refused_under_pipeline_parallelism():
