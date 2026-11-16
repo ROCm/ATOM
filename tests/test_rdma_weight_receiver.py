@@ -1020,6 +1020,38 @@ def test_a_version_the_engine_did_not_commit_can_be_sent_again(monkeypatch):
     assert "error" not in reply and worker.model.w.item() == 9.0
 
 
+def test_a_refused_stream_keeps_the_version_the_engine_committed(monkeypatch):
+    """Drained without the committed version, a refused stream dropped the
+    pending one: v5, committed, never became the group's last, and an older
+    v4 was taken and written."""
+    from tests.test_weight_sync_coverage import _engine_with
+
+    trainer = _Trainer(
+        [
+            *_stream_of_w(5.0, version=5),
+            *_stream_of_w(6.0, version=6),
+            *_stream_of_w(4.0, version=4),
+        ]
+    )
+    worker = _joined_worker(monkeypatch, trainer)
+    engine, send = _engine_with(worker)
+    stream = {"cmd": "receive_weights_rdma", "group_name": "g"}
+
+    send(**stream, version=5, sync_id="s1", request_id="a")
+    send("finish_weight_sync", sync_id="s1", completed_request_id="a")
+
+    def busy(deadline):
+        raise RuntimeError("requests in flight")
+
+    engine.prepare_weight_sync = busy
+    refused = send(**stream, version=6, sync_id="s2", request_id="b")
+    del engine.prepare_weight_sync
+    reply = send(**stream, version=4, sync_id="s3", request_id="c")
+
+    assert "requests in flight" in refused["error"]
+    assert "must rise" in reply["error"] and worker.model.w.item() == 5.0
+
+
 @pytest.mark.parametrize(("frames_taken", "wrote"), [(0, False), (1, True)])
 def test_a_stream_broken_off_says_whether_this_rank_wrote(
     monkeypatch, frames_taken, wrote

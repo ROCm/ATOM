@@ -487,11 +487,16 @@ class EngineUtilityHandler:
     def _drain_refused_stream(self, args, reason: str) -> None:
         """Take in and discard the weight stream *args* names: its trainer is
         already broadcasting it, and would wait in its first broadcast until
-        its group timed out."""
+        its group timed out. The runners settle their pending version on every
+        stream, so this one carries the committed version too."""
+        group_name = args.get("group_name")
         payload = RpcPayload(
             request_id=f"{RECEIVE_WEIGHTS_RDMA_CMD}-refused-{uuid.uuid4().hex}",
-            args=(args.get("group_name"), args.get("version")),
-            kwargs={"refusal": reason},
+            args=(group_name, args.get("version")),
+            kwargs={
+                "refusal": reason,
+                "committed_version": self._committed_stream_versions.get(group_name),
+            },
         )
         try:
             self.runner_mgr.utility_rpc(

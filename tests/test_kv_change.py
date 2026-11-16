@@ -566,7 +566,10 @@ def test_a_weight_stream_the_runners_cannot_take_is_drained_and_fences_nothing()
     assert not (engine._weight_sync_fenced or engine._rl_weights_inconsistent)
     assert len(engine.scheduler.running) == 2
     (drain, drained), (discard, _) = runner.calls
-    assert (drain, drained.kwargs) == (RECEIVE_WEIGHTS_RDMA_CMD, {"refusal": reason})
+    assert (drain, drained.kwargs) == (
+        RECEIVE_WEIGHTS_RDMA_CMD,
+        {"refusal": reason, "committed_version": None},
+    )
     assert discard == DISCARD_WEIGHT_SYNC_CMD
 
 

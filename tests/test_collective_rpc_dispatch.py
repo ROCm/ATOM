@@ -695,7 +695,10 @@ def test_a_refused_weight_stream_is_still_drained_and_changes_nothing():
     assert reply["error"] == "refused: 1 batch(es) still in the pipeline"
     ((method, payload, _),) = mgr.calls
     assert (method, payload.args) == ("receive_weights_rdma", ("g", 7))
-    assert payload.kwargs == {"refusal": "1 batch(es) still in the pipeline"}
+    assert payload.kwargs == {
+        "refusal": "1 batch(es) still in the pipeline",
+        "committed_version": None,
+    }
     assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
 
 
