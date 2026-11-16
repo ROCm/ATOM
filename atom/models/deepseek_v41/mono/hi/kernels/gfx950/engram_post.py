@@ -24,7 +24,7 @@ computes it from the 8 waves' partials (same arithmetic, one barrier fewer).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 
 from atom.models.deepseek_v41.mono.hi.kernels.gfx950.common import (
@@ -79,21 +79,29 @@ def _halves(w):
 
 
 @traced
-def _entry(tid, s2, lds, X, X2, Y, hcf, qk, tab, word6):
+def _entry(tid, s2, lds, X, X2, Y, hcf, qk, tab, rank, ep, direct=False):
+    """Row r = s2 / 4, mHC copy c = s2 % 4. ``direct`` (engram_fused's apply CTAs): x is X[r 4 + c]
+    itself (bf16, no mix) and the result goes back to X2[r 4 + c]."""
     lane, wv = tid % 64, tid // 64
     r, c = s2 >> 2, s2 & 3
-    rank = Int32(word6)
-    ep = Int32(word6 >> 32)
-    # hcF[r]: [4 + c] scales Y, [8 + 4 h + c] scales X_h
-    cy = uniform(_ld(hcf, r * 24 + 4 + c)).bitcast(F32)
-    cx = [uniform(_ld(hcf, r * 24 + 8 + 4 * h + c)).bitcast(F32) for h in range(HC)]
     valid = [tid < 768, tid < 768, tid < 256]  # (t + 512 j) * 4 < 5120
     cols = [tid + 512 * j for j in range(3)]
-    xw = [
-        [_ldm(X, NB, (r * 0xA000 + h * 0x2800 + cols[j] * 8) >> 2, valid[j], 2) for h in range(HC)]
-        for j in range(3)
-    ]  # fmt: skip
-    yw = [_ldm(Y, NB, (r * 0x2800 + cols[j] * 8) >> 2, valid[j], 2) for j in range(3)]
+    if const_expr(direct):
+        xw = [
+            _ldm(X, NB, ((r * 4 + c) * 0x2800 + cols[j] * 8) >> 2, valid[j], 2)
+            for j in range(3)
+        ]
+    else:
+        # hcF[r]: [4 + c] scales Y, [8 + 4 h + c] scales X_h
+        cy = uniform(_ld(hcf, r * 24 + 4 + c)).bitcast(F32)
+        cx = [uniform(_ld(hcf, r * 24 + 8 + 4 * h + c)).bitcast(F32) for h in range(HC)]
+        xw = [
+            [_ldm(X, NB, (r * 0xA000 + h * 0x2800 + cols[j] * 8) >> 2, valid[j], 2) for h in range(HC)]
+            for j in range(3)
+        ]  # fmt: skip
+        yw = [
+            _ldm(Y, NB, (r * 0x2800 + cols[j] * 8) >> 2, valid[j], 2) for j in range(3)
+        ]
     qw = [_ldm(qk, NB, (c * 0x5000 + cols[j] * 16) >> 2, valid[j], 4) for j in range(3)]
     # the rank's own LL area
     bv = _ld(tab, rank * 2, 2)
@@ -130,16 +138,22 @@ def _entry(tid, s2, lds, X, X2, Y, hcf, qk, tab, word6):
     dot, sx, sk = F32(0.0), F32(0.0), F32(0.0)
     xs = []
     for j in range_constexpr(3):
-        xh = [_halves(xw[j][h][0]) + _halves(xw[j][h][1]) for h in range(HC)]
-        yh = _halves(yw[j][0]) + _halves(yw[j][1])
+        if const_expr(direct):
+            xd = _halves(xw[j][0]) + _halves(xw[j][1])
+        else:
+            xh = [_halves(xw[j][h][0]) + _halves(xw[j][h][1]) for h in range(HC)]
+            yh = _halves(yw[j][0]) + _halves(yw[j][1])
         kh = _halves(d[4 * j]) + _halves(d[4 * j + 1])
         xj = []
         ndot, nsx, nsk = dot, sx, sk
         for e in range_constexpr(4):
-            a = cx[0] * xh[0][e] + cx[1] * xh[1][e]
-            a = cx[2] * xh[2][e] + a
-            a = cx[3] * xh[3][e] + a
-            x = _bf_round(cy * yh[e] + a)
+            if const_expr(direct):
+                x = xd[e]
+            else:
+                a = cx[0] * xh[0][e] + cx[1] * xh[1][e]
+                a = cx[2] * xh[2][e] + a
+                a = cx[3] * xh[3][e] + a
+                x = _bf_round(cy * yh[e] + a)
             xj.append(x)
             ndot = ndot + (qw[j][e].bitcast(F32) * x) * kh[e]
             nsx = nsx + x * x
@@ -191,7 +205,19 @@ def build():
         a00: Int64, a01: Int64, a02: Int64, a03: Int64, a04: Int64, a05: Int64, a06: Int64,
     ):  # fmt: skip
         lds = fx.SharedAllocator().allocate(Smem).peek().w.ptr
-        _entry(fx.thread_idx.x, fx.block_idx.x, lds, a00, a01, a02, a03, a04, a05, a06)
+        _entry(
+            fx.thread_idx.x,
+            fx.block_idx.x,
+            lds,
+            a00,
+            a01,
+            a02,
+            a03,
+            a04,
+            a05,
+            Int32(a06),
+            Int32(a06 >> 32),
+        )
 
     @launcher(name)
     def launch(
