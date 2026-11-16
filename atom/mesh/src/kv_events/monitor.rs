@@ -36,6 +36,7 @@ use super::{
 use crate::{
     core::Worker,
     kv_index::{match_lanes, Holder, Lane, Partition, Predictor, PrefixMatchProvider},
+    observability::metrics::schema::names,
 };
 
 /// How long a routed prompt is predicted to stay cached: the TTL Dynamo gives the blocks
@@ -292,7 +293,7 @@ fn predict(predictor: &Predictor, tokens: &[u32], worker: &dyn Worker) {
     }
     let pool = worker.worker_type().as_metric_label();
     metrics::counter!(
-        "mesh_kv_events_dropped_predictions_total",
+        names::KV_EVENTS_DROPPED_PREDICTIONS_TOTAL,
         "model" => worker.model_id().to_string(),
         "pool" => pool,
     )
@@ -501,6 +502,7 @@ impl Rank {
             .map_err(|_| late())?
             .map_err(|e| e.to_string())?;
         let mut window_start = None;
+        let mut recv_failed = false;
         loop {
             tokio::select! {
                 // The live batches of a new connection follow its loss, and drain before replies.
@@ -512,7 +514,20 @@ impl Rank {
                     }
                 }
                 message = live.recv() => {
-                    let Some(batch) = message.ok().and_then(|m| self.decode(&m.into_vec())) else {
+                    let message = match message {
+                        Ok(message) => {
+                            recv_failed = false;
+                            message
+                        }
+                        Err(e) => {
+                            if !std::mem::replace(&mut recv_failed, true) {
+                                let status = self.status.lock();
+                                warn!(worker = %status.worker, error = %e, "Cannot receive KV events during a replay");
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(batch) = self.decode(&message.into_vec()) else {
                         continue;
                     };
                     if held.len() == HELD_BATCHES {
