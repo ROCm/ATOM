@@ -156,18 +156,6 @@ KV_CACHE_READY_EXPIRED_MAX = 1 << 16
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
-@dataclass
-class _StagingWrite:
-    # Per-operation state: another worker's failure must not quarantine a
-    # credit for an operation that never reached the NIC.
-    uncertain: bool = False
-
-
-class _StagingUnavailable(Exception):
-    """Every KV staging slot is quarantined after a failed write; the transfer
-    sends the rest without staging instead."""
-
-
 class SlotPool:
     """Free slot indices of one staging pool, shared across threads.
 
@@ -179,9 +167,6 @@ class SlotPool:
     the consumer that reports it cannot run on (see
     ``MooncakeConnector._post_queued_write_requests``). The consumer staging
     rows, the DSA index staging slots and the KV staging slots each keep one.
-
-    A holder whose write may still land ``quarantine``s its slot instead of
-    releasing it: the slot comes back once the hold ends.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -191,73 +176,6 @@ class SlotPool:
         self._exhausted_warning = exhausted_warning
         self._cv = threading.Condition()
         self._failure: BaseException | None = None
-        # Slot -> time.monotonic() at which it may be handed out again.
-        self._quarantined: dict[int, float] = {}
-
-    def usable(self) -> int:
-        """Slots not quarantined: free or held by a write still running."""
-        with self._cv:
-            self._unquarantine_locked()
-            return self.size - len(self._quarantined)
-
-    def acquire_or_none(self) -> int | None:
-        """A free slot, or None when every slot is quarantined.
-
-        Waits only while a running write holds a slot, which it releases or
-        quarantines when it returns, or until a quarantined slot comes back.
-        """
-        with self._cv:
-            while True:
-                self._unquarantine_locked()
-                if self._failure is not None:
-                    raise RuntimeError(
-                        "staging row unavailable: a transfer holding one failed"
-                    ) from self._failure
-                if self.free:
-                    return self.free.pop()
-                if len(self._quarantined) == self.size:
-                    return None
-                self._cv.wait(
-                    min(self._quarantined.values()) - time.monotonic()
-                    if self._quarantined
-                    else None
-                )
-
-    def quarantine(self, idx: int, hold_s: float) -> None:
-        """Keep slot ``idx`` out of use for ``hold_s`` after its write failed.
-
-        Mooncake gives up on a sync write without cancelling the work it
-        posted, so the NIC may still read the slot; ``hold_s`` 0 frees it.
-        """
-        with self._cv:
-            if hold_s > 0:
-                self._quarantined[idx] = time.monotonic() + hold_s
-            else:
-                self.free.append(idx)
-            left = self.size - len(self._quarantined)
-            # Waiters re-check: with every slot quarantined they give up.
-            self._cv.notify_all()
-        if hold_s > 0:
-            logger.warning(
-                "[PRODUCER] KV staging slot %d is out of use for %.0fs after a "
-                "failed write; %d of %d slots left meanwhile",
-                idx,
-                hold_s,
-                left,
-                self.size,
-            )
-
-    def _unquarantine_locked(self) -> None:
-        now = time.monotonic()
-        back = [idx for idx, until in self._quarantined.items() if until <= now]
-        for idx in back:
-            del self._quarantined[idx]
-            self.free.append(idx)
-        if back:
-            logger.info(
-                "[PRODUCER] KV staging slots %s are back in use after a failed write",
-                back,
-            )
 
     def acquire(self) -> int:
         with self._cv:
@@ -3341,23 +3259,14 @@ class MooncakeConnector(KVConnectorBase):
                 staged_token_regions,
                 token_ownership=sharded_plan,
             )
-            try:
-                staged = self._execute_staged_transfer(
-                    request_data,
-                    target,
-                    plan,
-                    req_id,
-                    kv_cache_ready_event,
-                    engine=engine,
-                )
-            except _StagingUnavailable:
-                # Rows already landed are written again with the same bytes;
-                # the decode still scatters their slots, which is harmless.
-                staged = (
-                    all(add_token_runs(i) for i in staged_token_regions)
-                    and batch.flush()
-                )
-            if not staged:
+            if not self._execute_staged_transfer(
+                request_data,
+                target,
+                plan,
+                req_id,
+                kv_cache_ready_event,
+                engine=engine,
+            ):
                 return False
         if staged_regions:
             if kv_cache_ready_event is None:
@@ -3458,11 +3367,7 @@ class MooncakeConnector(KVConnectorBase):
         *,
         engine=None,
     ) -> bool:
-        """One gather/slot/RDMA/READY lifecycle for any supported transfer plan.
-
-        Raises ``_StagingUnavailable`` when every staging slot is quarantined;
-        the caller then writes the plan's regions directly.
-        """
+        """One gather/slot/RDMA/READY lifecycle for any supported transfer plan."""
         landing = request.get("mla_landing")  # Legacy wire key, shared by layouts.
         slot_bytes = self._kv_staging.shape[1]
         if landing is not None:
@@ -3497,7 +3402,6 @@ class MooncakeConnector(KVConnectorBase):
                     if credit is None:
                         land = False
                 written = None
-                outcome = _StagingWrite()
                 try:
                     destination = (
                         (int(landing["base"]) + credit * int(landing["slot_bytes"]))
@@ -3510,7 +3414,6 @@ class MooncakeConnector(KVConnectorBase):
                         index,
                         items,
                         destination,
-                        outcome,
                         target,
                         req_id,
                         "landed-kv" if credit is not None else "staged-kv",
@@ -3541,15 +3444,17 @@ class MooncakeConnector(KVConnectorBase):
                             ],
                         )
                 finally:
-                    if credit is not None:
-                        if outcome.uncertain:
-                            self._landing_credits.quarantine(
-                                target, int(landing["epoch"]), credit
-                            )
-                        elif written is None:
-                            self._landing_credits.release(
-                                target, int(landing["epoch"]), [credit]
-                            )
+                    # Never announced, so the consumer will not return it.
+                    if credit is not None and written is None:
+                        # Nothing was sent to it: it can be used again.
+                        self._landing_credits.release(
+                            target, int(landing["epoch"]), [credit]
+                        )
+                    elif credit is not None and not written:
+                        # The failed write may still land in it.
+                        self._landing_credits.quarantine(
+                            target, int(landing["epoch"]), credit
+                        )
                 if not written:
                     return False
         finally:
@@ -3563,7 +3468,6 @@ class MooncakeConnector(KVConnectorBase):
         index: torch.Tensor,
         items: list[tuple[int, int, int, int]],
         destination: int | None,
-        outcome: _StagingWrite,
         target: str,
         req_id: ReqId,
         label: str,
@@ -3574,22 +3478,16 @@ class MooncakeConnector(KVConnectorBase):
         """Gather ``items`` into a free staging slot, then RDMA the slot.
 
         ``destination`` is a landing slot address; None writes the units
-        straight to their destination pages. Returns True once the write
-        completed, False if it failed (it may still land: Mooncake does not
-        cancel work it gave up on), and None if the transfer deadline had
-        passed, so nothing was sent. Raises ``_StagingUnavailable`` when every
-        slot is quarantined.
+        straight to their destination pages. The slot goes back to the pool
+        once the write returned.
 
-        A slot whose write may still land is quarantined for
-        ``ATOM_PD_FAILED_WRITE_HOLD_S``, since the NIC may still read it, and
-        ``outcome.uncertain`` tells the caller to quarantine the landing
-        credit too. Any other outcome returns the slot.
+        Returns True once the write completed, False if it failed (it may
+        still land: Mooncake does not cancel work it gave up on), and None if
+        the transfer deadline had passed, so nothing was sent.
         """
         if self._passed_deadline(deadline, label, req_id):
             return None
-        pool_idx = self._kv_staging_slots.acquire_or_none()
-        if pool_idx is None:
-            raise _StagingUnavailable
+        pool_idx = self._kv_staging_slots.acquire()
         try:
             if self._passed_deadline(deadline, label, req_id):
                 return None
@@ -3615,10 +3513,7 @@ class MooncakeConnector(KVConnectorBase):
                 )
             else:
                 srcs, dsts, sizes = [staging.data_ptr()], [destination], [used]
-            # Uncertain from submission on, unless the write settles: True, or
-            # None (the deadline stopped it before anything was posted).
-            outcome.uncertain = True
-            written = self._rdma_write(
+            return self._rdma_write(
                 target,
                 srcs,
                 dsts,
@@ -3628,15 +3523,8 @@ class MooncakeConnector(KVConnectorBase):
                 engine=engine,
                 deadline=deadline,
             )
-            outcome.uncertain = written is False
-            return written
         finally:
-            if outcome.uncertain:
-                self._kv_staging_slots.quarantine(
-                    pool_idx, envs.ATOM_PD_FAILED_WRITE_HOLD_S
-                )
-            else:
-                self._kv_staging_slots.release(pool_idx)
+            self._kv_staging_slots.release(pool_idx)
 
     @staticmethod
     def _passed_deadline(deadline: float | None, label: str, req_id: ReqId) -> bool:
