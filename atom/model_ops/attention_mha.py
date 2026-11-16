@@ -349,6 +349,7 @@ class PagedAttentionImpl(nn.Module):
                     k_scale,
                     v_scale,
                     attn_metadata,
+                    qkv=qkv if aiter_norm_rope else None,
                 )
             elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
@@ -535,10 +536,10 @@ class PagedAttentionImpl(nn.Module):
 
     def _aiter_gemma_norm_rope(self, qkv, position, **insert):
         """The Gemma q/k norm + RoPE of ``qkv`` in one aiter
-        fused_qknorm_idxrqknorm launch, returning q in a new tensor. The
-        ``insert`` arguments have it write the K/V cache (SHUFFLE layout,
-        per-token FP8 scales as the Triton kernel writes them) and leave
-        ``qkv`` as it was."""
+        fused_qknorm_idxrqknorm launch, returning q in a new tensor. With the
+        ``insert`` arguments it writes the K/V cache (SHUFFLE layout, per-token
+        FP8 scales as the Triton kernel writes them) and leaves ``qkv`` as it
+        was; without them it norms and ropes k in place in ``qkv``."""
         from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
         q = torch.empty(
@@ -562,7 +563,17 @@ class PagedAttentionImpl(nn.Module):
         return q.view(-1, self.num_heads, self.head_dim)
 
     def _gemma_norm_rope_then_cache(
-        self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        self,
+        q,
+        k,
+        v,
+        position,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        attn_metadata,
+        qkv=None,
     ):
         """Unfused twin of triton_fused_norm_rope_cache for long batches.
 
@@ -573,30 +584,37 @@ class PagedAttentionImpl(nn.Module):
         module's own rotary when that declines), then the cache write: per-token
         FP8 for an FP8 cache, unquantized otherwise. Same SHUFFLE layout and
         scales the fused kernel writes.
-        """
-        from atom.model_ops.layernorm import DualRMSNorm
-        from atom.model_ops.triton_mrope import try_mrope_qk_fused
 
-        if getattr(self, "_dual_qk_norm", None) is None:
-            self._dual_qk_norm = DualRMSNorm(
-                self.q_norm,
-                self.k_norm,
+        With ``qkv`` (``_takes_aiter_gemma_norm_rope``), the norm and RoPE
+        are one aiter fused_qknorm_idxrqknorm launch instead, k in place in
+        ``qkv``.
+        """
+        if qkv is not None:
+            q = self._aiter_gemma_norm_rope(qkv, position)
+        else:
+            from atom.model_ops.layernorm import DualRMSNorm
+            from atom.model_ops.triton_mrope import try_mrope_qk_fused
+
+            if getattr(self, "_dual_qk_norm", None) is None:
+                self._dual_qk_norm = DualRMSNorm(
+                    self.q_norm,
+                    self.k_norm,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    prefix=f"layer_{self.layer_num}.qk_norm",
+                )
+            q, k = self._dual_qk_norm(q, k)
+            roped = try_mrope_qk_fused(
+                self.rotary_emb,
+                position,
+                q,
+                k,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                prefix=f"layer_{self.layer_num}.qk_norm",
             )
-        q, k = self._dual_qk_norm(q, k)
-        roped = try_mrope_qk_fused(
-            self.rotary_emb,
-            position,
-            q,
-            k,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+            q, k = roped if roped is not None else self.rotary_emb(position, q, k)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)

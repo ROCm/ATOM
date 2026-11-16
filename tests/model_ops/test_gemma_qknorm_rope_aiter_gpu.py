@@ -3,9 +3,10 @@
 
 For a Gemma q/k norm layer with a plain NeoX RoPE and head_dim 128 (the
 MiniMax-M3 dense layers), `PagedAttentionImpl.rope_cache` hands the norm and
-RoPE of a decode batch to aiter `fused_qknorm_idxrqknorm`, as one insert into
-the cache. It must leave the attention the q and K/V cache of the Triton kernel;
-a prefill batch keeps the Triton kernel.
+RoPE to aiter `fused_qknorm_idxrqknorm`: a decode batch as one insert into the
+cache, a prefill batch above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS as the
+norm and RoPE (k in place in qkv) before the cache write. Either must leave the
+attention the q and K/V cache of the Triton kernel, and a prefill its k too.
 Not bitwise: the sum of squares is reduced in another order and aiter rounds k
 to bf16 before the per-token FP8 quantization, so a cache is compared
 dequantized, within one step at the row maximum (32 of the 448 an FP8 row
@@ -115,6 +116,7 @@ def run_rope_cache(impl, qkv, position, slots, cache, is_prefill):
         (False, 3000, ["insert"]),
         (True, 64, []),
         (True, FUSED_MAX, []),
+        (True, FUSED_MAX + 1, ["norm_rope"]),
     ],
 )
 def test_rope_cache_matches_the_triton_kernel(
