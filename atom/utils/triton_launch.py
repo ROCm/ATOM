@@ -25,12 +25,17 @@ compiled kernel's launcher directly. The key holds:
 * per float, bool or None: the type;
 * per constexpr: its type and value.
 
+A type annotation on a runtime parameter (`n: tl.int32`) fixes its type in
+Triton's key and keeps (ints, pointers) or drops (floats, bools) the value
+specialization above, so the same key still covers it.
+
 A launch this key cannot describe goes through `kernel[grid]` as before:
-launch, pre-run or stages-inspection hooks; a kernel with checked globals,
-with annotated or unspecialized parameters, or with a constexpr before a
-runtime parameter; torch.compile tracing; a callable grid; keyword arguments
-out of signature order; any other argument kind.
+launch, pre-run or stages-inspection hooks; a kernel with checked globals or
+unspecialized parameters; torch.compile tracing; a callable grid; keyword
+arguments out of signature order; any other argument kind.
 """
+
+from operator import itemgetter
 
 import torch
 from triton import knobs
@@ -52,6 +57,16 @@ def _hooked(hook) -> bool:
     return calls is None or len(calls) > 0
 
 
+def _picker(positions):
+    """`args -> tuple(args[i] for i in positions)`."""
+    if len(positions) > 1:
+        return itemgetter(*positions)
+    if positions:
+        (i,) = positions
+        return lambda args: (args[i],)
+    return lambda args: ()
+
+
 class CachedLauncher:
     """`kernel[grid](*args, **kwargs, **options)` without Triton's per-call
     dispatch once the specialization has been launched.
@@ -69,11 +84,15 @@ class CachedLauncher:
             (i for i, constexpr in enumerate(self._constexpr) if constexpr),
             len(params),
         )
+        # Constexprs ahead of a runtime parameter: pick both out by position.
+        self._split = None
+        if not all(self._constexpr[self._runtime :]):
+            self._split = (
+                _picker([i for i, c in enumerate(self._constexpr) if not c]),
+                _picker([i for i, c in enumerate(self._constexpr) if c]),
+            )
         self._enabled = bool(params) and not (
-            kernel.do_not_specialize
-            or kernel.do_not_specialize_on_alignment
-            or any(p.annotation for p in params if not p.is_constexpr)
-            or not all(self._constexpr[self._runtime :])
+            kernel.do_not_specialize or kernel.do_not_specialize_on_alignment
         )
         self._kernels = {}
         self._get_stream = None
@@ -130,7 +149,10 @@ class CachedLauncher:
         """Flat: a tensor adds (dtype, aligned, buffer-ops range), any other
         runtime argument one string or type, so the layout is unambiguous."""
         buffer_ops = knobs.amd.use_buffer_ops
-        constexprs = tuple(args[self._runtime :])
+        if self._split is None:
+            runtime, constexprs = args[: self._runtime], tuple(args[self._runtime :])
+        else:
+            runtime, constexprs = self._split[0](args), self._split[1](args)
         constexpr_types = tuple(map(type, constexprs))
         if not _CONSTEXPR_TYPES.issuperset(constexpr_types):
             return None
@@ -144,7 +166,7 @@ class CachedLauncher:
             constexpr_types,
         ]
         append = key.append
-        for arg in args[: self._runtime]:
+        for arg in runtime:
             cls = arg.__class__
             if cls is _Tensor or isinstance(arg, _Tensor):
                 append(arg.dtype)

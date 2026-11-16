@@ -41,6 +41,21 @@ def _probe_kernel(
     pass
 
 
+@triton.jit
+def _mixed_probe_kernel(
+    x_ptr,
+    n: tl.int32,
+    HEADS: tl.constexpr,
+    y_ptr: tl.pointer_type(tl.float32),
+    rows,
+    WIDTH: tl.constexpr,
+    scale: tl.float32,
+    out_ptr,
+    BLOCK: tl.constexpr,
+):
+    """Constexprs between runtime parameters, and annotated runtime ones."""
+
+
 def _triton_key(launcher, args):
     """`JITFunction.run`'s cache key for `args`, from Triton's own binder."""
     kernel = launcher.kernel
@@ -76,6 +91,11 @@ def _tensor(shape, dtype=torch.bfloat16, misaligned=False, big=False):
 def _probe_args():
     x = _tensor((64, 48))
     return [x, x, _tensor((64, 32)), 64, 48, 0.5, True, 32, 1, 2.0]
+
+
+def _mixed_probe_args():
+    x = _tensor((64, 48))
+    return [x, 64, 8, _tensor((64, 48), torch.float32), 48, 32, 0.5, x, 64]
 
 
 def _variants(launcher, base):
@@ -132,6 +152,21 @@ def test_key_tells_apart_what_triton_tells_apart(monkeypatch, buffer_ops):
     launcher = CachedLauncher(_probe_kernel, num_warps=4)
     distinct = _assert_key_is_at_least_tritons(launcher, _probe_args())
     assert len(distinct) > 20
+
+
+@pytest.mark.parametrize("buffer_ops", ["1", "0"])
+def test_key_covers_interleaved_constexprs_and_annotations(monkeypatch, buffer_ops):
+    """A constexpr ahead of a runtime parameter, and `tl.int32` / pointer /
+    `tl.float32` annotations, which fix the type in Triton's key."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
+    launcher = CachedLauncher(_mixed_probe_kernel, num_warps=4)
+    assert launcher._enabled and launcher._split is not None
+    distinct = _assert_key_is_at_least_tritons(launcher, _mixed_probe_args())
+    assert len(distinct) > 15
+    args = _mixed_probe_args()
+    key = launcher._key(args)
+    assert key[5] == (8, 32, 64)  # HEADS, WIDTH, BLOCK
 
 
 @pytest.mark.parametrize(
@@ -200,8 +235,8 @@ class _Compiled(CompiledKernel):
 class _Kernel:
     """A `JITFunction` stand-in with `_probe_kernel`'s parameters."""
 
-    def __init__(self):
-        self.params = _probe_kernel.params
+    def __init__(self, params=_probe_kernel.params):
+        self.params = params
         self.do_not_specialize = []
         self.do_not_specialize_on_alignment = []
         self.pre_run_hooks = []
@@ -256,6 +291,24 @@ def test_first_launch_compiles_then_the_launcher_is_called_directly(fake):
         assert call[:3] == grid
         assert call[3:9] == (73, "function-0", (0,), None, None, None)
         assert call[9:] == tuple(args)
+
+
+@pytest.mark.usefixtures("fake")
+def test_interleaved_constexprs_reach_the_launcher_in_signature_order():
+    kernel = _Kernel(_mixed_probe_kernel.params)
+    launcher = CachedLauncher(kernel, num_warps=4)
+    args = _mixed_probe_args()
+    launcher((3,), *args[:8], BLOCK=64)
+    launcher((3,), *args)
+    changed = list(args)
+    changed[5] = 16  # WIDTH, a constexpr between runtime parameters
+    launcher((3,), *changed)
+    launcher((3,), *changed)
+    assert _paths(kernel) == ["triton", "cached", "triton", "cached"]
+    assert kernel.launches[0][3] == {"BLOCK": 64, "num_warps": 4}
+    assert kernel.launches[1][2][9:] == tuple(args)
+    assert kernel.launches[3][2][9:] == tuple(changed)
+    assert len(launcher._kernels) == 2
 
 
 def test_each_specialization_compiles_once(fake):
