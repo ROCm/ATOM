@@ -20,15 +20,34 @@ if TYPE_CHECKING:
     from atom.config import Config
 
 
+_OUTSIDE_POOL = "_atom_outside_graph_pool"
+
+
+def outside_pool(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark ``tensor`` (a pass's output) as a view of storage the pass owns
+    outside the graph pool, so a replay hands it back without a copy
+    (`_owned`).
+
+    Only for storage allocated before the capture that nothing but the
+    pass's own next replay rewrites: whoever reads the output must be done
+    with it before that replay, as with a staged input.
+    """
+    setattr(tensor, _OUTSIDE_POOL, True)
+    return tensor
+
+
 def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
     """A copy the graph pool cannot re-issue.
 
-    Outputs that alias declared staged inputs already live outside the graph
-    pool and can be handed back directly. Clone every other tensor because the
-    pool may re-issue its storage on a later replay.
+    Outputs that alias declared staged inputs, or that the pass marked as its
+    own storage (`outside_pool`), already live outside the graph pool and can
+    be handed back directly. Clone every other tensor because the pool may
+    re-issue its storage on a later replay.
     """
     if isinstance(value, torch.Tensor):
-        if any(value.data_ptr() == tensor.data_ptr() for tensor in staged):
+        if getattr(value, _OUTSIDE_POOL, False) or any(
+            value.data_ptr() == tensor.data_ptr() for tensor in staged
+        ):
             return value
         return value.clone()
     if isinstance(value, tuple):
