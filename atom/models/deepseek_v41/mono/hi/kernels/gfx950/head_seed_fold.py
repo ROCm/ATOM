@@ -86,7 +86,7 @@ _CURRENT_STREAM = fx.Stream(None)
 KARG_WORDS = 99
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
 GRID, THREADS = 487, 512
-VERSION = "v11"
+VERSION = "v12"
 VOCAB = 0x1F900
 HIDDEN_B = 0x2800  # one bf16 hidden row (5120)
 X_ROW_B = 0xA000  # X: four mHC copies a row
@@ -1445,7 +1445,8 @@ def _fold_out(tid, lds, a, tag, nlive, vp, tok, mask, accepted, rsum, rkey):
         if (lane + 1) < nlive:
             mf = (Int32(nsum >> 32).to(fx.Uint32).to(fx.Float64) * fx.Float64(4294967296.0)
                   + Int32(nsum).to(fx.Uint32).to(fx.Float64)) * fx.Float64(2.0 ** -60)  # fmt: skip
-            mass = (((mask >> jn) & 2) != 0).select(mf.to(F32), F32(0.0))
+            # row j + 1's mass only when its mask bit j + 1 is set (TileRT: (mask >> lane) & 2)
+            mass = (((mask >> lane) & 2) != 0).select(mf.to(F32), F32(0.0))
         j5 = fx.min(lane, Int32(4))
         ej = _exp_isa(_lds_ld(lds, 0x12694 + 4 * j5).bitcast(F32))
         ratio = ej
