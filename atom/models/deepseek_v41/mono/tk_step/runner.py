@@ -231,8 +231,10 @@ class TkStepRunner:
 
         rank = get_tensor_model_parallel_rank()
         tk = host.TkRank(rank, get_tp_group().cpu_group, accept="real")
-        consts = CK.compute_engram_consts(ckpt)
-        tk.load_params(ckpt, consts)
+        # The packers run on the CPU; inside a ModelRunner the default device is the rank's GPU.
+        with torch.device("cpu"):
+            consts = CK.compute_engram_consts(ckpt)
+            tk.load_params(ckpt, consts)
         tkworker.load_toktab(tk, rank, toktab_dir)
         table = codeobj.CodeTable.from_dir(co)
         tk.load_kernels(table.swap(swap) if swap else table, extra=(host.ADMIT_SYMBOL,))

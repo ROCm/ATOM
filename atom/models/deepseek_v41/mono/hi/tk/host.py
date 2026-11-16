@@ -301,8 +301,13 @@ class TkRank:
 
         with torch.cuda.device(self.device):
             for parity in (0, 1):
+                self._prepared(
+                    parity
+                )  # the kernargs before the capture: nothing but the launches inside it
+            for parity in (0, 1):
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
+                # thread_local: a host process (ATOM's ModelRunner) may have other threads issuing work meanwhile
+                with torch.cuda.graph(g, capture_error_mode="thread_local"):
                     self.launch_step(parity)
                 self.graphs[parity] = g
 
