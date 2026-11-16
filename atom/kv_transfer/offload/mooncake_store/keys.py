@@ -4,7 +4,8 @@
 """Store keys for KV chunks: a layout namespace, a rank, and a prefix hash.
 
 One Store object holds one PP/TP rank's bytes of one ``chunk_tokens`` chunk of
-a prompt, exactly as the dense codec packs them. Its key is
+a prompt, packed by the dense codec, the M3 complete-PAGE codec, or the V4.1
+replay PAGE codec. Its key is
 
     ``{namespace}/w{rank}of{world}/{digest}``
 
@@ -37,14 +38,13 @@ from typing import Any
 import numpy as np
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.mooncake_store.layouts import mooncake_codec_id
 from atom.utils import envs
 
 DIGEST_BYTES = 16
 _CHAIN_PERSON = b"atom-kv-chain-v1"
 _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 _NAMESPACE_PREFIX = "atomkv1-"
-# Bumped when the dense codec's per-chunk byte layout changes.
-CODEC_ID = "dense-opaque-block-v1"
 
 
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
@@ -153,7 +153,7 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
             getattr(config, "hf_overrides", None), sort_keys=True, default=str
         ),
         "revision": str(getattr(hf, "_commit_hash", None)),
-        "codec": CODEC_ID,
+        "codec": mooncake_codec_id(config),
     }
     canonical = json.dumps(
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -190,13 +190,14 @@ def chunk_hash_chain(
 
     ``h_i = blake2b(h_{i-1} || int32-LE(tokens[i*C:(i+1)*C]))`` with a 16-byte
     digest, starting from ``seed`` (``chain_seed()`` by default). Any partial
-    chunk at the end is left out. An ``array("i")`` is read in place, without
-    a copy.
+    chunk at the end is left out.
     """
     chunk_tokens = int(chunk_tokens)
-    # The view must not outlive the call: an array exporting its buffer
-    # cannot grow, and the scheduler appends to `Sequence.token_ids`.
-    tokens = np.asarray(token_ids, dtype="<i4")[:num_tokens]
+    # Hashed from a copy, never a view of `token_ids`: an `array("i")` that
+    # exports its buffer cannot grow, and the scheduler thread appends to
+    # `Sequence.token_ids` while the asynchronous Store lookup hashes it on its
+    # worker (`AsyncStoreLookup`). Slicing copies under the GIL, in one step.
+    tokens = np.asarray(token_ids[:num_tokens], dtype="<i4")
     total = len(tokens) // chunk_tokens
     raw = memoryview(tokens[: total * chunk_tokens].tobytes())
     stride = chunk_tokens * 4

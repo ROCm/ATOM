@@ -148,6 +148,57 @@ def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     assert deployment.first_refusal(checks) == "decode CP"
 
 
+_MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
+
+
+def _with_transport(kv_transfer_config):
+    cfg = _atom_config()
+    cfg.kv_transfer_config = kv_transfer_config
+    return cfg
+
+
+@pytest.mark.parametrize("name", ["mooncake", "Mooncake", " mooncake "])
+def test_a_mooncake_pd_decode_is_served(servable, name):
+    # its receives are NIC writes; it queues no copy kernel beside mono's
+    decode = dict(_MOONCAKE_DECODE, kv_connector=name)
+    assert config_refusal(_with_transport(decode)) is None
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_role": "kv_producer", "kv_connector": "mooncake"},
+        {"kv_role": "kv_consumer", "kv_connector": "moriio"},
+        {"kv_connector": "lmcache_offload"},
+        {
+            "kv_role": "kv_consumer",
+            "kv_connector": "multi",
+            "connectors": [dict(_MOONCAKE_DECODE), {"kv_connector": "lmcache_offload"}],
+        },
+    ],
+    ids=["mooncake-producer", "moriio-consumer", "offload", "mooncake-plus-offload"],
+)
+def test_a_transport_that_may_copy_on_its_own_stream_is_refused(
+    servable, kv_transfer_config
+):
+    assert (
+        config_refusal(_with_transport(kv_transfer_config))
+        == f"KV connector {kv_transfer_config['kv_connector']}"
+    )
+
+
+def test_a_mooncake_pd_decode_with_decode_context_parallelism_is_refused(servable):
+    # mono serves decode CP on its own, but never behind a connector
+    atom_config = _with_transport(dict(_MOONCAKE_DECODE))
+    atom_config.decode_context_parallel_size = 8
+    assert config_refusal(atom_config) == "KV connector mooncake"
+
+
+def test_other_mono_models_still_refuse_a_mooncake_pd_decode(servable):
+    checks = deployment.resident_grid_refusals(_with_transport(dict(_MOONCAKE_DECODE)))
+    assert deployment.first_refusal(checks) == "KV connector mooncake"
+
+
 @pytest.mark.parametrize(
     ("override", "reason"),
     [
@@ -176,3 +227,16 @@ def test_the_query_cap_bounds_the_speculative_width(servable, draft_tokens, refu
         method="dspark", num_speculative_tokens=draft_tokens
     )
     assert (config_refusal(atom_config) is not None) is refused
+
+
+@pytest.mark.parametrize("arch", ["K3DSparkGQAModel", "K3DSparkModel"])
+def test_both_k3_drafts_are_served(servable, arch):
+    # Mono hands the drafter's own extract the step's bank, so the DSpark GQA
+    # draft's aggregate tap is formed on a mono step as on the regular path.
+    atom_config = _atom_config()
+    atom_config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=5,
+        draft_model_hf_config=SimpleNamespace(architectures=[arch]),
+    )
+    assert config_refusal(atom_config) is None

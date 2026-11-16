@@ -27,6 +27,7 @@ that is not optional.
 import array
 import importlib.util
 import pathlib
+import sys
 
 import numpy as np
 import pytest
@@ -42,6 +43,9 @@ def _load(name):
         f"_{name}_under_test", _DIR / f"{name}.py"
     )
     mod = importlib.util.module_from_spec(spec)
+    # Registered before it runs, as an import would: a dataclass resolves its
+    # annotations through its module's entry.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 

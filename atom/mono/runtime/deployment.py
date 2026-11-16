@@ -191,9 +191,15 @@ def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]
     and completion/restore fences before reuse. Its CTAs never wait on Mono;
     they release their CUs even if a resident-grid kernel is partially launched.
     """
+    from atom.kv_transfer.disaggregation import KVConnectorFactory
     cus = _cu_count()
     kv = getattr(atom_config, "kv_transfer_config", None)
     connector = kv.get("kv_connector") if isinstance(kv, dict) else None
+    # The name the factory builds: any casing or padding, or a registered alias.
+    try:
+        name = KVConnectorFactory.canonical_name(connector)
+    except (TypeError, ValueError):
+        name = None
     return [
         # a spin wait on another CTA only makes progress while that CTA runs
         (cus in (None, BLOCKS), f"{cus} CUs, the kernels need {BLOCKS}"),
@@ -201,7 +207,7 @@ def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]
         # which wedges a kernel that waits on every one of them. The field is a
         # dict that defaults to empty, so this is a truthiness test, as every
         # other reader of it in ATOM does: `is None` refuses every deployment.
-        (not kv or connector in connectors, f"KV connector {connector}"),
+        (not kv or name in connectors, f"KV connector {connector}"),
     ]
 
 

@@ -50,6 +50,7 @@ import zmq
 from atom.model_engine.engine_core_mgr import _add_frame
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.sequence import Sequence
+from atom.structured_output import is_structured
 from atom.utils import get_open_zmq_ipc_path, make_zmq_socket
 
 logger = logging.getLogger("atom")
@@ -420,7 +421,7 @@ class RemoteCoreManager:
     def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
         """``LLMEngine.prepare_structured_request``, answered by the hub's
         engine; its error, if any, is raised here as the engine raised it."""
-        if params.json_schema is None:
+        if not is_structured(params):
             return
         call_id = str(next(self._call_ids)).encode()
         reply: Future = Future()
