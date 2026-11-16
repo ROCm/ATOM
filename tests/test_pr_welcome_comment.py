@@ -17,6 +17,9 @@ def test_ci_guide_documents_heavy_gate_labels_and_path_scope():
     assert "`ci:mesh`" in script
     assert "native ATOM, vLLM, SGLang, and ATOMesh" in script
     assert "Gate checks are published on every PR" in script
-    assert "Without a matching label, expensive jobs also require a relevant path" in script
+    assert (
+        "Without a matching label, expensive jobs also require a relevant path"
+        in script
+    )
     assert "Relevant path alone does not start expensive jobs" in script
     assert "ATOMesh uses an include list" in script
