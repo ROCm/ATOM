@@ -20,6 +20,8 @@ from atom.utils.region_graph import (
     _weak,
     eager_region,
     join_stream,
+    on_scheduled_rows,
+    padded_prefill_rows,
     token_graph,
 )
 
@@ -425,3 +427,143 @@ def test_a_region_argument_keeps_its_named_tuple_type():
     assert type(weak) is Pair and weak.width == 64
     assert weak.values.data_ptr() == value.values.data_ptr()
     assert type(_weak((value.values, 1))) is tuple
+
+
+def _record_bucket(unit, context, x):
+    """``unit`` recorded at ``x``'s rows on a step of the bucket's own rows
+    (`context.context`), as the runner records it: a warmup, then a record."""
+    unit(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        context.main_stream = stream
+        context.in_hipgraph, context.tr_graph = True, "record"
+        unit(x)
+        context.in_hipgraph, context.tr_graph = False, None
+    torch.cuda.current_stream().wait_stream(stream)
+    context.main_stream = torch.cuda.current_stream()
+
+
+def _padded_prefill(scheduled, **step):
+    """A prefill of ``scheduled`` rows that `ForwardMode.decide` raised to a
+    recorded token-graph bucket."""
+    mode = SimpleNamespace(prefill_token_graph=True)
+    return SimpleNamespace(
+        is_prefill=True, scheduled_tokens=scheduled, forward_mode=mode, **step
+    )
+
+
+class PaddedPrefillUnit(torch.nn.Module):
+    """A unit whose region attends a prefill's scheduled rows alone: its
+    launch follows the step (every row less the rows' mean), as attention's
+    and a recurrence's do."""
+
+    def __init__(self, dim=64):
+        super().__init__()
+        self.a = torch.nn.Linear(dim, dim, device="cuda")
+        self.b = torch.nn.Linear(dim, dim, device="cuda")
+
+    @eager_region()
+    def attend(self, x: torch.Tensor):
+        return on_scheduled_rows(
+            lambda h: h - h.mean(0), padded_prefill_rows(x.shape[0]), x
+        )
+
+    def forward(self, x):
+        return self.b(self.attend(torch.relu(self.a(x))))
+
+
+PaddedPrefillGraph = token_graph(PaddedPrefillUnit)
+
+
+@torch.inference_mode()
+def test_a_padded_prefill_region_attends_its_scheduled_rows(context):
+    torch.manual_seed(5)
+    unit = PaddedPrefillGraph()
+    bucket, scheduled = 32, 20
+    # A capture step declares its shape: no step decision.
+    context.context = SimpleNamespace(
+        is_prefill=True, scheduled_tokens=bucket, forward_mode=None
+    )
+    _record_bucket(unit, context, torch.randn(bucket, 64, device="cuda"))
+
+    # Replayed on a prefill of fewer rows, padded with junk to the bucket.
+    x = torch.randn(scheduled, 64, device="cuda")
+    padded = torch.cat([x, torch.randn(bucket - scheduled, 64, device="cuda")])
+    context.context = _padded_prefill(scheduled)
+    context.attn_metadata = SimpleNamespace(slot_mapping=torch.arange(bucket))
+    context.tr_graph = "replay"
+    got = unit(padded).clone()
+    context.tr_graph = None
+
+    # The scheduled rows are the eager step's: no padded row reached the
+    # region's mean. The padded rows leave it as zeros.
+    torch.testing.assert_close(got[:scheduled], unit(x), rtol=1e-5, atol=1e-5)
+    bias = unit.b.bias.expand(bucket - scheduled, -1)
+    torch.testing.assert_close(got[scheduled:], bias, rtol=0, atol=0)
+    unit.__dict__["_token_graph"].release_graphs()
+
+
+class _LiveStep(Exception):
+    """The indexer read the metadata of the step a replay serves."""
+
+
+class IndexerUnit(torch.nn.Module):
+    """The DSA indexer op between two token-sized launches, as a sparse MLA
+    layer calls it inside a compiled piece."""
+
+    def __init__(self, dim=64):
+        super().__init__()
+        self.a = torch.nn.Linear(dim, dim, device="cuda")
+        self.b = torch.nn.Linear(dim, dim, device="cuda")
+        # The cache and the three selection buffers the op mutates, then the
+        # norm and rope tables it reads.
+        self.state = [torch.empty(0, device="cuda") for _ in range(8)]
+        self.positions = torch.zeros(1024, dtype=torch.int64, device="cuda")
+
+    def forward(self, x):
+        h = self.a(x)
+        cache, indices, indptr, owned, w, b, cos, sin = self.state
+        torch.ops.aiter.sparse_attn_indexer(
+            h, "layer.k_cache", cache, h, h, h, 128, None, 64, 64, 1024, 1024,
+            indices, indptr, owned, w, b, 1e-6, self.positions[: x.shape[0]],
+            cos, sin, 1.0, False, False, False,
+        )  # fmt: skip
+        return self.b(h)
+
+
+IndexerGraph = token_graph(IndexerUnit)
+
+
+@torch.inference_mode()
+def test_a_replay_runs_the_dsa_indexer_on_the_live_step(context, monkeypatch):
+    """The indexer returns early on the recording's dummy step, so a replay
+    must call it afresh: it writes the cache and the selection the step's
+    requests ask for."""
+    pytest.importorskip("aiter", reason="the indexer op is an AITER-side op")
+    from atom.model_ops.indexer import indexer_forward
+
+    monkeypatch.setattr(indexer_forward, "get_dcp_world_size", lambda: 1)
+
+    class LiveMetadata:
+        @property
+        def slot_mapping(self):
+            raise _LiveStep
+
+    unit = IndexerGraph()
+    bucket = 32
+    context.attn_metadata = SimpleNamespace(slot_mapping=None)
+    context.context = SimpleNamespace(
+        is_prefill=True, is_dummy_run=True, scheduled_tokens=bucket, forward_mode=None
+    )
+    _record_bucket(unit, context, torch.randn(bucket, 64, device="cuda"))
+
+    context.attn_metadata = LiveMetadata()
+    context.context = _padded_prefill(20, is_dummy_run=False)
+    context.tr_graph = "replay"
+    try:
+        with pytest.raises(_LiveStep):
+            unit(torch.randn(bucket, 64, device="cuda"))
+    finally:
+        context.tr_graph = None
+        unit.__dict__["_token_graph"].release_graphs()
