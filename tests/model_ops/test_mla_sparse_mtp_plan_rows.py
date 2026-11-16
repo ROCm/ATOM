@@ -155,3 +155,41 @@ def test_a_plan_within_q_reaches_the_kernel(monkeypatch, q_rows):
     cache = torch.zeros(8, RANK + ROPE)
     _layer()._forward_decode(q, cache, _metadata(39 * Q_LEN))
     assert seen == [(q_rows, q_rows)]
+
+
+@pytest.mark.parametrize(
+    "rows, dcp, owns_indexer, asked",
+    [
+        (100, True, True, False),
+        (101, True, True, True),
+        (101, True, False, True),
+        (101, False, True, False),
+    ],
+)
+def test_dcp_plan_past_the_cus_asks_the_kernel_to_take_empty_items(
+    monkeypatch, rows, dcp, owns_indexer, asked
+):
+    """A DCP row owning no keys gets an empty work item, which a live item
+    behind it on the same CU cannot follow. With no more rows than CUs no CU
+    holds two, so the kernel is asked to take empty items only past that, by
+    every layer running the step's plan."""
+    _stub_decode(monkeypatch, [])
+    monkeypatch.setattr(attention_mla, "patch_work_kv_ranges", lambda *args: None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *args: SimpleNamespace(multi_processor_count=100),
+    )
+    flags = []
+
+    def fake_mla_decode_fwd(q, kv, o, *args, **kwargs):
+        flags.append(kwargs["empty_work_items"])
+        return None, None
+
+    monkeypatch.setattr(attention_mla, "mla_decode_fwd", fake_mla_decode_fwd)
+    layer, metadata = _layer(), _metadata(rows)
+    if dcp:
+        layer, metadata = _dcp(layer, metadata, owns_indexer)
+    q = torch.zeros(rows, HEADS, RANK + ROPE)
+    layer._forward_decode(q, torch.zeros(8, RANK + ROPE), metadata)
+    assert flags == [asked]
