@@ -203,8 +203,8 @@ def _scatter_region_items_kernel(
     tile_valid_bytes,
     input_buffer_offset,
     bytes_per_item,
+    chunk_stride,
     ITEMS_PER_CHUNK: tl.constexpr,
-    CHUNK_STRIDE: tl.constexpr,
     REVERSE: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -226,7 +226,7 @@ def _scatter_region_items_kernel(
     source = (
         input
         + input_buffer_offset
-        + (item_pos.to(tl.int64) // ITEMS_PER_CHUNK) * CHUNK_STRIDE
+        + (item_pos.to(tl.int64) // ITEMS_PER_CHUNK) * chunk_stride
         + (item_pos.to(tl.int64) % ITEMS_PER_CHUNK) * bytes_per_item
         + tl.load(tile_output_offset + tile_id).to(tl.int64)
         + lanes
@@ -398,12 +398,8 @@ def _scatter_region_items_unchecked(
             plan.tile_valid_bytes,
             offset,
             plan.bytes_per_item,
+            (plan.bytes_per_item if chunk_stride_bytes is None else chunk_stride_bytes),
             ITEMS_PER_CHUNK=items_per_chunk,
-            CHUNK_STRIDE=(
-                plan.bytes_per_item
-                if chunk_stride_bytes is None
-                else chunk_stride_bytes
-            ),
             REVERSE=plan.reverse,
             TILE=TILE_BYTES,
             num_warps=8,

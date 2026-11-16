@@ -368,7 +368,7 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
     assert calls[4][0] == "kernel"
     assert calls[5] == ("stream-exit", stream)
     _, kernel_args, kernel_kwargs = calls[4]
-    assert kernel_args == (
+    expected_args = (
         buffer,
         "device-ids",
         "region-base",
@@ -387,7 +387,10 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
         "num_warps": 8,
     }
     if wrapper_name == "scatter_region_items":
-        expected_kwargs.update(ITEMS_PER_CHUNK=1, CHUNK_STRIDE=10)
+        # The chunk stride is a runtime argument, so no new specialization.
+        expected_args += (10,)
+        expected_kwargs.update(ITEMS_PER_CHUNK=1)
+    assert kernel_args == expected_args
     assert kernel_kwargs == expected_kwargs
 
 

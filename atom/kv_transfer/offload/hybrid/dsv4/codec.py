@@ -759,13 +759,13 @@ class DSV4PageSlotCodec:
 
     def chunk_major_strided_buffer_to_gpu_prepared(
         self,
-        device_buf,
-        owner,
-        group_index,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
         *,
-        items_per_chunk,
-        chunk_stride_bytes,
-        stream=None,
+        items_per_chunk: int,
+        chunk_stride_bytes: int,
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
         """Restore aligned Store slots without copying away their padding."""
         self._copy_prepared_block_id_group(

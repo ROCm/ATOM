@@ -357,10 +357,12 @@ class TransferSlotPool:
     def _take_locked(self, region: str, n: int) -> list[Slot]:
         """``n`` free slots of ``region`` in index order, one run if there is one.
 
-        The lowest run of ``n`` consecutive slots, so a window is one buffer
-        (``contiguous_view``); only a region that quarantine or other windows
-        have broken up hands out scattered slots, and those go through the
-        staging copy instead.
+        The lowest run of ``n`` consecutive slots, so a window is one buffer:
+        ``contiguous_view`` when slots are unpadded, or ``strided_view`` (the
+        run including inter-slot padding) for a codec that restores padded
+        slots in place. Only a region that quarantine or other windows have
+        broken up hands out scattered slots, and those go through the staging
+        copy instead.
         """
         free = self._free[region]
         ordered = sorted(free, key=lambda slot: slot.index)

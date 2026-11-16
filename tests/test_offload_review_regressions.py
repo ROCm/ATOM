@@ -94,7 +94,6 @@ def test_in_place_copy_waits_for_its_event_before_later_forward(monkeypatch):
     codec = SimpleNamespace(
         device="GPU",
         prepare_block_id_groups=lambda *_, **__: None,
-        supports_strided_restore=False,
         chunk_major_device_buffer_to_gpu_prepared=lambda *_, **__: calls.append(
             "scatter"
         ),
