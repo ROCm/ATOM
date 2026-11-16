@@ -147,7 +147,7 @@ def test_the_capture_step_is_a_request_less_dummy_prefill_of_the_bucket():
         config=SimpleNamespace(max_num_batched_tokens=8),
         forward_vars={"positions": SimpleNamespace(gpu=positions)},
     )
-    build = kimi._KimiMLAGDNCommon.build_for_token_graph_capture
+    build = kimi.KimiAiterMLAGDNMetadataBuilder.build_for_token_graph_capture
     builder = SimpleNamespace(model_runner=runner)
 
     attn_metadata, context = build(builder, 8)

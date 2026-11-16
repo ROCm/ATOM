@@ -1223,28 +1223,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             return True
         return super().step_needs_eager(batch)
 
-    def build_for_token_graph_capture(self, tokens: int):
-        """A request-less prefill of ``tokens`` rows for recording that
-        token-graph bucket. A dummy step: attention hands back its output
-        shape and writes no KV or index cache -- a replay runs it on the live
-        step."""
-        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
-            raise ValueError(
-                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
-            )
-        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
-        positions.zero_()
-        context = Context(
-            positions=positions,
-            is_prefill=True,
-            is_dummy_run=True,
-            scheduled_bs=1,
-            scheduled_tokens=tokens,
-            running_bs=1,
-            running_tokens=tokens,
-        )
-        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
-
     def build_for_cudagraph_capture(
         self, bs: int, *, decode_ubatch_slices=None
     ) -> AttentionMetaData:
