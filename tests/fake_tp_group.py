@@ -21,6 +21,16 @@ class FakeGroup:
         self.slots = [None] * world
         self.lock = threading.Lock()
 
+    def wait(self):
+        """Wait at the barrier without the launch lock; hold it again on the
+        way out, also when a rank that failed aborted the barrier (the
+        caller's ``finally`` releases it)."""
+        self.lock.release()
+        try:
+            self.bar.wait()
+        finally:
+            self.lock.acquire()
+
     def view(self, rank):
         g = self
 
@@ -30,13 +40,9 @@ class FakeGroup:
 
             def all_gather(self, t, dim=0, use_custom=True):
                 g.slots[rank] = t
-                g.lock.release()
-                g.bar.wait()
-                g.lock.acquire()
+                g.wait()
                 out = torch.cat(list(g.slots), dim=0)
-                g.lock.release()
-                g.bar.wait()
-                g.lock.acquire()
+                g.wait()
                 return out
 
         return _R()
