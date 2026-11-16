@@ -544,10 +544,14 @@ def target_layer(E, Ly):
                     nlev = (pi < sel_levels).select(sel_levels, blk_levels)
                     TK.stage_select_any(cwith(cs_, ts=None), plev, nlev, pmode)
                     handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
-            else:   # FULL / REINDEX: every row's top-512 by 8 CTAs a row (4 radix rounds, a group count each), one handoff
+            else:   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
                 mh = fptr(fp, "mchist")
+                # (MC_G CTAs a row once some row's n > MC_G_MIN_N: a radix round's keys over 4x the CTAs -- 83K -68,
+                # 30K -45 us a step; short rows keep MC_G_SHORT, where the round's group count over 32 CTAs costs
+                # more than their keys -- 2K +56 us with 32 CTAs always)
                 TK.select_mc(cwith(cs_, ts=None), mh + i64(Ly) * TK.MC_LAYER,
-                             mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx)
+                             mh + i64(Ly) * TK.MC_LAYER + i64(TK.MC_HIST), isrx,
+                             (nmax > fx.Int32(TK.MC_G_MIN_N)).select(fx.Int32(TK.MC_G), fx.Int32(TK.MC_G_SHORT)))
                 handoff(lc + i64(LY.SELECT0), t, False)
 
     # ---- D (on cflag / kvflag) -> dflag;  D-idle CTAs: this layer's attention mix partials + Sinkhorn

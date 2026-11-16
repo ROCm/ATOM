@@ -331,7 +331,9 @@ def stage_select_any(c, lev, nlev, mode):
 
 # ---- (c1) the FULL / REINDEX layers' top-KSEL by a grouped multi-CTA radix select -----------------------------------
 MC_ROWS = 8                       # row slots (TR <= 8)
-MC_G = 8                          # CTAs a row (CTAs MC_G r .. MC_G r + MC_G - 1; the rest skip to the stage's handoff)
+MC_G = 32                         # CTAs a row once the step's longest row has > MC_G_MIN_N keys (TR * MC_G <= 256)
+MC_G_SHORT = 8                    # CTAs a row otherwise
+MC_G_MIN_N = 4096                 # (CTAs G r .. G r + G - 1 take row r; the rest skip to the stage's handoff)
 MC_HIST = 4 * MC_ROWS * 256 * 4   # bytes a layer: [4 rounds][rows][256] i32
 MC_CTR = MC_ROWS * 8 * 4          # bytes a layer: [rows] (above, ties, round 0..3 group counts, -, -) i32
 MC_LAYER = MC_HIST + MC_CTR
@@ -340,10 +342,10 @@ O_MCH = O_MC + 16
 
 
 @ASTRewriter.transform
-def select_mc(c, hb, ctr, isrx):
+def select_mc(c, hb, ctr, isrx, G):
     """Every row's top KSEL of its n scores (FULL: n = bound, the ilog row; REINDEX: n = its compacted columns, lifted
-    at the emit) -> isel / irow (the tree's final emit), by MC_G CTAs a row: CTA g of row r takes keys
-    [g CH, (g + 1) CH), CH = ceil(n / MC_G); 4 radix rounds of 8 bits: its LDS histogram -> global atomics into
+    at the emit) -> isel / irow (the tree's final emit), by G CTAs a row (traced: MC_G or MC_G_SHORT): CTA g of row r takes keys
+    [g CH, (g + 1) CH), CH = ceil(n / G); 4 radix rounds of 8 bits: its LDS histogram -> global atomics into
     hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (release / acquire), every CTA of
     the group scans the 256 bins alike; then the winners: keys above the k-th key's value take positions from
     ctr[r][0], ties from ctr[r][1] (< need). n <= k: all, position = index; past min(n, k): -1 (the group's CTA 0)."""
@@ -352,9 +354,9 @@ def select_mc(c, hb, ctr, isrx):
     k = I32(KSEL)
     vals, vstride = c["ilog"], c["ilw"]
     mode = isrx.select(I32(MODE_RX), I32(MODE_SEL))
-    r = fx.min(b // MC_G, I32(TR - 1))
-    g = b % MC_G
-    if b < TR * MC_G:
+    r = fx.min(b // G, I32(TR - 1))
+    g = b % G
+    if b < TR * G:
         if t == 0:
             bd0 = hx.gload(c["ibound"] + i64(r) * 4, I32)
             bd = fx.max(bd0, I32(0))
@@ -363,7 +365,7 @@ def select_mc(c, hb, ctr, isrx):
             hx.lstore(sm + O_MC, fx.Vector.from_elements([I32(0), I32(0), k, bd], I32))
         gpu.barrier()
         n = hx.lload(sm + O_MC + 12, I32)
-        CH = (n + (MC_G - 1)) // MC_G
+        CH = (n + (G - 1)) // G
         i0 = g * CH
         i1 = fx.min(i0 + CH, n)
         rowp = vals + i64(r) * i64(vstride) * 4
@@ -385,7 +387,7 @@ def select_mc(c, hb, ctr, isrx):
                 if t == 0:
                     hx.fence_release("agent")
                     hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
-                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), MC_G, 8)
+                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
                     hx.fence_acquire("agent")
                 gpu.barrier()
                 if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
