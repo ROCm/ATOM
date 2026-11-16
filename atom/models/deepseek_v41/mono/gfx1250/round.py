@@ -18,7 +18,7 @@ were). So on a step the launch serves:
 shapes ``SingleStepModel.single_step_runner`` and ``StepInputs.precheck`` serve. A step decided here that the launch
 then declines raises (``SingleStepModel.step_override``): its layout has no plans for the production path.
 
-The launch reads Engram's staged rows (``looks_up_engram_rows`` False): the staging runs in full on its steps.
+The launch reads Engram's staged rows: its runner stages them in full on its steps (``SingleStepRunner.launch``).
 """
 
 from __future__ import annotations
@@ -61,8 +61,6 @@ class _Hook:
 
 
 class SingleStepRound(DecodeRound):
-    looks_up_engram_rows = False
-
     def __init__(self, model, metadata_builder) -> None:
         # (imported here: it imports Triton)
         from atom.models.deepseek_v41.mono.round import device_round

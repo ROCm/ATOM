@@ -15,6 +15,7 @@ the peer receive buffers (``SymmetricPeerBuffer``). The weight tables
 and the step metadata (``buffers``: WEIGHT / STEP) are not bound yet, so construction still refuses at its end and
 ``LazyRunner`` keeps the production path."""
 
+import dataclasses
 import importlib
 import logging
 import time
@@ -306,6 +307,11 @@ class SingleStepRunner(StepInputs):
 
         def first():  # the step's device preparation (the Engram stage first) and its first launch
             if er is not None:
+                # the launch reads the staged rows: a step the builder's round served stages in full anyway (the builder
+                # marks a served step's staging cursor-only, for models that look their rows up themselves)
+                st = er.staging
+                if st.step is not None and st.step.served_by_round:
+                    st.step = dataclasses.replace(st.step, served_by_round=False)
                 er.stage()
                 # join Engram's side stream BEFORE the launch: the step kernel occupies every WGP and spins on its peers,
                 # so a side-stream collective (the embedding all-gather) queued behind it on one GPU while its peers' step

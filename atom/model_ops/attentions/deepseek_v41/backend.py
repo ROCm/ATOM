@@ -1203,8 +1203,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cursor=cache.cursor,
             history_index=step.slots,
             candidates=cache.tentative_staging.gpu if step.tentative else None,
-            served_by_round=bool(served_by_round)
-            and self.decode_round.looks_up_engram_rows,
+            served_by_round=bool(served_by_round),
         )
 
     def _write_engram_cursor(self, step, cache, batch):
