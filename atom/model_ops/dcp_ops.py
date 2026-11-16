@@ -13,8 +13,11 @@ They are mathematically equivalent but not bitwise identical; see the A2A
 section below for why one collective can replace two.
 
 Also here: the sparse indexer's DCP support -- the decode candidate exchange
-(fused into one aiter op) and the sparse-prefill owned-slot filter.
+(fused into one aiter op), the sparse-prefill owned-slot filter and its
+owner exchange.
 """
+
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -1347,15 +1350,30 @@ def _owned_dcp_slots(
         vb   = pos % (PAGE*W)
     """
     owned = valid & _dcp_owns(pos, RANK, WORLD, INTERLEAVE)
+    return owned, _dcp_slots(
+        pos, owned, table_row, bt_stride_col, WORLD, INTERLEAVE, PAGE
+    )
+
+
+@triton.jit
+def _dcp_slots(
+    pos,
+    owned,
+    table_row,
+    bt_stride_col,
+    WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE: tl.constexpr,
+):
+    """`_owned_dcp_slots`'s slots on each position's owner, read where `owned`."""
     virtual_page = PAGE * WORLD
     within = pos % virtual_page
     page = tl.load(table_row + (pos // virtual_page) * bt_stride_col, owned, other=0)
-    slot = (
+    return (
         page * PAGE
         + (within // (WORLD * INTERLEAVE)) * INTERLEAVE
         + within % INTERLEAVE
     )
-    return owned, slot
 
 
 # ---------------------------------------------------------------------------
@@ -1787,3 +1805,176 @@ def triton_filter_and_convert_dcp_index_prefill(
         bt_stride1,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# DCP sparse-prefill owner exchange: the filter's outputs without gathering
+# the top-k. Each rank scores a contiguous run of the rows (`RowSplit.of`) and
+# sends each rank only the slots that rank's filter would write for them, in
+# the filter's order. Received from ranks 0..W-1 in turn, the runs land in
+# token order, so the all-to-all writes the compacted selection directly:
+# about 1/W of the all-gather's bytes.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _by_owner_dcp_prefill_kernel(
+    topk_indices,  # int32 [stride, NUM_TOPK_TOKENS] -- this rank's rows
+    batch_id_per_q_token,  # int32 [num_tokens]
+    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
+    counts,  # int32 [WORLD, 2, stride] -- per owner: owned, then slots written
+    starts,  # int32 [WORLD * stride + 1] -- slots written again, from [1]
+    staged,  # int32 [stride, NUM_TOPK_TOKENS + WORLD] -- a row's owner runs
+    first_token,
+    num_tokens,
+    stride,
+    bt_stride0: tl.int64,
+    WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+):
+    """What each rank's filter makes of a row this rank scored, from one
+    read of the row: per owner, its owned count and slots written
+    (`max(owned, 1)` for a token of the step, none past its last) into
+    `counts` and `starts`, and the slots themselves, in column order, into
+    the owner's run of the row's `staged` -- one slot 0 for none, as
+    `_compact_filter_dcp_prefill_kernel` writes them."""
+    row = tl.program_id(0)
+    live = first_token + row < num_tokens
+    req_id = tl.load(batch_id_per_q_token + first_token + row, mask=live, other=-1)
+    pos = tl.load(
+        topk_indices + row * NUM_TOPK_TOKENS + tl.arange(0, NUM_TOPK_TOKENS),
+        mask=req_id >= 0,
+        other=-1,
+    )
+    valid = pos >= 0
+    owner = (pos // INTERLEAVE) % WORLD
+    table_row = block_table + req_id * bt_stride0
+    slot = _dcp_slots(pos, valid, table_row, 1, WORLD, INTERLEAVE, PAGE_SIZE)
+    out = staged + row * (NUM_TOPK_TOKENS + WORLD)
+    for rank in tl.static_range(WORLD):
+        owned = (valid & (owner == rank)).to(tl.int32)
+        count = tl.sum(owned)
+        tl.store(out + tl.cumsum(owned, axis=0) - owned, slot, mask=owned > 0)
+        tl.store(out, 0, mask=live & (count == 0))
+        written = tl.where(live, tl.maximum(count, 1), 0)
+        tl.store(counts + rank * 2 * stride + row, count)
+        tl.store(counts + (rank * 2 + 1) * stride + row, written)
+        tl.store(starts + 1 + rank * stride + row, written)
+        out += written
+
+
+@triton.jit
+def _send_by_owner_dcp_prefill_kernel(
+    staged,  # int32 [stride, NUM_TOPK_TOKENS + WORLD] -- a row's owner runs
+    counts,  # int32 [WORLD, 2, stride] -- per owner: owned, then slots written
+    starts,  # int32 [WORLD * stride + 1] -- each run's place in `send`
+    send,  # int32 -- the slots, in owner-major runs
+    stride,
+    WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Each of a row's runs in `staged`, moved to its owner's part of `send`."""
+    row = tl.program_id(0)
+    src = staged + row * (NUM_TOPK_TOKENS + WORLD)
+    for rank in tl.static_range(WORLD):
+        n = tl.load(counts + (rank * 2 + 1) * stride + row)
+        dst = send + tl.load(starts + rank * stride + row)
+        for i in range(0, n, BLOCK):
+            col = i + tl.arange(0, BLOCK)
+            tl.store(dst + col, tl.load(src + col, mask=col < n), mask=col < n)
+        src += n
+
+
+class PendingIndexExchange(NamedTuple):
+    """The owner exchange's all-to-all, not yet launched: its sizes are on
+    the device, and reading them blocks the host until the exchange's stream
+    gets there. The consumer's join calls `wait()`, once its own stream has
+    work queued to overlap: it launches the all-to-all and orders the
+    current stream after it."""
+
+    stream: torch.cuda.Stream
+    sizes: torch.Tensor  # [2, world]: slots sent to, received from each rank
+    send: torch.Tensor
+    out: torch.Tensor
+    group: object
+
+    def wait(self) -> None:
+        with torch.cuda.stream(self.stream):
+            sent, received = self.sizes.tolist()
+            torch.distributed.all_to_all_single(
+                self.out[: sum(received)],
+                self.send[: sum(sent)],
+                received,
+                sent,
+                group=self.group,
+            )
+        torch.cuda.current_stream().wait_stream(self.stream)
+
+
+def dcp_exchange_owned_index_prefill(
+    topk_indices: torch.Tensor,  # int32 [>= slot + stride, NUM_TOPK_TOKENS]
+    split,  # RowSplit: this rank's contiguous rows, at its slot
+    dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
+    batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
+    block_size: int,  # runner (physical) block size == PAGE_SIZE
+    out_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_tokens], written here
+    out: torch.Tensor,  # int32 [>= out_kv_indptr[-1]], written by `wait()`
+    NUM_TOPK_TOKENS: int = 2048,
+    cp_kv_cache_interleave_size: int = 1,
+) -> PendingIndexExchange:
+    """`triton_filter_and_convert_dcp_index_prefill`'s outputs on every DCP
+    rank, bit for bit, from each rank's own rows of the top-k (`split`'s
+    slot of `topk_indices`) rather than the gathered whole. On the current
+    stream it sorts each row's slots by owner, packs them into one run per
+    owner, exchanges the counts and writes `owned_counts` and
+    `out_kv_indptr`."""
+    world, stride = split.world, split.stride
+    num_tokens = dsa_kv_indptr.shape[0] - 1
+    rows = topk_indices[split.slot : split.slot + stride]
+    dcp_group = get_dcp_group()
+    assert rows.is_contiguous() and rows.shape == (stride, NUM_TOPK_TOKENS)
+    assert not split.stripe and world == dcp_group.world_size
+    block_table = block_table.contiguous()
+    counts = torch.empty(world, 2, stride, dtype=torch.int32, device=rows.device)
+    starts = rows.new_empty(world * stride + 1)
+    # A row sends each owner max(owned, 1) slots: at most top-k + world.
+    staged = rows.new_empty(stride, NUM_TOPK_TOKENS + world)
+    _by_owner_dcp_prefill_kernel[(stride,)](
+        rows,
+        batch_id_per_q_token,
+        block_table,
+        counts,
+        starts,
+        staged,
+        split.slot,
+        num_tokens,
+        stride,
+        block_table.stride(0),
+        world,
+        cp_kv_cache_interleave_size,
+        block_size,
+        NUM_TOPK_TOKENS,
+    )
+    _scan_dcp_metadata_counts_kernel[(1,)](
+        starts, world * stride, BLOCK=2048, num_warps=8
+    )
+    send = staged.new_empty(staged.numel())
+    _send_by_owner_dcp_prefill_kernel[(stride,)](
+        staged, counts, starts, send, stride, world, NUM_TOPK_TOKENS, BLOCK=256
+    )
+    group = dcp_group.device_group
+    received = torch.empty_like(counts)
+    torch.distributed.all_to_all_single(received, counts, group=group)
+    # Rank r's counts are its rows': token-major once flattened.
+    owned_counts[:num_tokens] = received[:, 0].flatten()[:num_tokens]
+    out_kv_indptr[1 : num_tokens + 1] = received[:, 1].flatten()[:num_tokens]
+    _scan_dcp_metadata_counts_kernel[(1,)](
+        out_kv_indptr, num_tokens, BLOCK=2048, num_warps=8
+    )
+    sizes = torch.stack((counts[:, 1].sum(1), received[:, 1].sum(1)))
+    return PendingIndexExchange(torch.cuda.current_stream(), sizes, send, out, group)

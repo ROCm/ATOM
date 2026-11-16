@@ -21,6 +21,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 
 if TYPE_CHECKING:
     from atom.distributed.pcp_utils import PcpBalGroup
+    from atom.model_ops.dcp_ops import PendingIndexExchange
     from atom.model_ops.indexer import IndexRows
 
 
@@ -698,9 +699,9 @@ class AttentionMetaData:
     sparse_kv_indices: torch.Tensor | None = None
     dcp_sparse_kv_indptr: torch.Tensor | None = None
     dcp_owned_counts: torch.Tensor | None = None
-    # Recorded when a DCP prefill's indexer writes the three above on a side
+    # Set when a DCP prefill's indexer exchanges the three above on a side
     # stream; the layer's sparse MLA waits on it and clears it.
-    index_exchange_done: torch.cuda.Event | None = None
+    index_exchange_done: "PendingIndexExchange | None" = None
     # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
     # attention builder: the indexer, MLA and PCP all follow it.
     run_sparse: bool = False
