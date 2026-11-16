@@ -278,6 +278,8 @@ def _entry(tid, s2, lds, xn, head_w, w1, w2, blk_tok, nk, ws, tab, me, npes, ep,
     temp = _ld(samp, 2).bitcast(F32)
     h1 = _hstep(Int32(0), _kmix(_ld(samp, 0)))
     s1 = _ld(samp, 1)
+    # the five positions up front: read in the round they are a dependent load each (TileRT issues them with W1's)
+    vp = [_ld(vpos, kk) for kk in range(ROWS)]
     gpu.barrier()
     _gemv(tid, s2, cnt, head_w, lds, pre)
     tok = uniform(_ld(blk_tok, 0))
@@ -304,7 +306,7 @@ def _entry(tid, s2, lds, xn, head_w, w1, w2, blk_tok, nk, ws, tab, me, npes, ep,
             if valid:
                 h2 = _hstep(h1, _kmix(Int32(k) ^ s1))
                 # TileRT's position block: vpos[k] c1 + 0x40000000 before the rotation (s_add 2.0 in its ISA)
-                kv = _ld(vpos, k) * Int32(C1) + Int32(0x40000000)
+                kv = vp[k] * Int32(C1) + Int32(0x40000000)
                 h3 = _hstep(h2, _rotl(kv, 15) * Int32(C2))
                 score = _gumbel_score(logit, temp, h3, kid)
             kh, kl = _wave_kmax(_key_hi(score.bitcast(Int32)), klo)
