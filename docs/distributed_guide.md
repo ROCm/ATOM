@@ -245,10 +245,12 @@ where it lands and the router balances purely by work:
   tokens left)` when it changed, at most every 10 ms
   (`EngineCoreRequestType.PREFILL_BACKLOG`). The reuse reports above go on
   their own (`DP_REUSE`), queued ahead of the request's first output.
-  A started request counts `prompt - num_cached_tokens`, so HBM hits, tier
-  loads and finished chunks all shrink it as they happen; a request not yet
-  allocated counts the router's estimate. The CoreManager adds the charges of
-  requests sent after the rank's last report.
+  A started request counts `prompt - num_cached_tokens`, so HBM hits and
+  finished chunks shrink it as they happen. A tier load is credited at its
+  planned boundary as soon as the request parks, while the load is still in
+  flight; if the load fails, the credit reverts to the HBM hit. A request not
+  yet allocated counts the router's estimate. The CoreManager adds the
+  charges of requests sent after the rank's last report.
 
 It needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`, and is
 mutually exclusive with `ATOM_DP_SESSION_AFFINITY=1`. With a Mooncake Store
@@ -322,7 +324,7 @@ drained and warns if it is invoked while requests are still charged.
 - `Config.dp_load_balance` (str, default `"least_requests"`): DP routing strategy.
 - CLI: `--data-parallel-size N` or `-dp N`; `--dp-load-balance {round_robin,least_requests,least_tokens,prefix_spread,share_cache}`
 - Env: `ATOM_DP_LB_REQ_EQUIV` (int, default `512`): token-equivalent cost of one in-flight request for `least_tokens`.
-- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
+- Env: `ATOM_DP_DISPATCH_DEPTH` (int, default `0`): per-rank in-flight cap for lazy dispatch of an offline batch (`LLMEngine.generate` / `generate_multimodal`). Online API admission is unchanged. While it is positive, that offline routing balances on in-flight request count and ignores `round_robin` and `least_tokens`; init warns when `dp_load_balance` is not `least_requests`. Under `prefix_spread` and `share_cache` the depth is ignored (init warns). A failed send returns the requests to the pending pool. `abort_request` removes a request that has not been sent yet.
 - Env: `ATOM_DP_SESSION_AFFINITY` (bool, default `0`): load-place each new
   session once, then keep all later turns on its cache owner without spill.
 
