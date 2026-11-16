@@ -204,8 +204,9 @@ class Mxfp8SharedIntoMxfp4:
             )
 
     def _copy(self, layer, staged) -> None:
-        """The per-channel FP8 shared experts into their (unpadded) slots as
-        they are."""
+        """The per-channel FP8 shared experts into their (unpadded) slots: as
+        they are, or as FNUZ bytes with doubled scales where the routed experts
+        are FNUZ."""
         fnuz = layer.w13_weight.dtype == torch.float8_e4m3fnuz
         for i in range(self.num_shared):
             expert_id = self.shared_lo + i

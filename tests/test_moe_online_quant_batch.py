@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 aiter = pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 pytestmark = pytest.mark.skipif(
@@ -15,7 +16,9 @@ pytestmark = pytest.mark.skipif(
 
 from aiter import QuantType, dtypes
 
+import atom.model_ops.moe as moe_mod
 from atom.model_ops.moe import FusedMoE
+from atom.quant_spec import LayerQuantConfig
 from atom.quantization.quark.utils import (
     dequant_moe_weight_online,
     dequant_weight_online,
@@ -500,3 +503,77 @@ def test_batched_path_trims_the_source_intermediate_padding(monkeypatch):
         q, s = quant(old_w2[e, :, :inter])
         assert torch.equal(w2[e].view(torch.uint8), q)
         assert torch.equal(w2_s[e], s)
+
+
+def test_per_expert_path_trims_the_source_intermediate_padding(monkeypatch):
+    """A per-token target at TP 2 gathers w2, so the conversion runs the
+    per-expert loop: it quantizes an MXFP4 source's unpadded w1/w3 rows and w2
+    columns."""
+    torch.manual_seed(13)
+    experts, inter, padded, hidden = 2, 64, 128, 64
+    source = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2)
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+
+    def mxfp4(rows, cols):
+        bytes_ = torch.randint(0, 256, (experts, rows, cols // 2), dtype=torch.uint8)
+        scale = torch.randint(120, 131, (experts, rows, cols // 32), dtype=torch.uint8)
+        return bytes_.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
+
+    w13, w13_s = mxfp4(2 * padded, hidden)
+    w2, w2_s = mxfp4(hidden, padded)
+
+    class Target:
+        def create_weights(self, layer, **_kwargs):
+            pass  # the stubbed loaders below take the quantized tensors
+
+    monkeypatch.setattr(moe_mod, "Fp8MoEMethod", lambda *_a, **_k: Target())
+    quantized = []
+    monkeypatch.setattr(
+        moe_mod,
+        "quant_weight_online",
+        lambda w, **_k: quantized.append(w.clone()) or (w, None),
+    )
+    monkeypatch.setattr(
+        moe_mod, "get_tp_group", lambda: SimpleNamespace(all_gather=lambda x, dim: x)
+    )
+    layer = SimpleNamespace(
+        online_quant=True,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+        layer_name="model.layers.0.ffn.experts",
+        layer_quant_config=source,
+        source_is_nvfp4=False,
+        params_dtype=dtypes.fp4x2,
+        quant_method=SimpleNamespace(hidden_pad=0, intermediate_pad=padded - inter),
+        w13_bias=None,
+        has_bias=False,
+        moe_config=SimpleNamespace(),
+        moe_quant_params={"params_dtype": dtypes.fp4x2},
+        _stream_online_quant=False,
+        local_num_experts=experts,
+        intermediate_size_per_partition=inter,
+        hidden_size=hidden,
+        use_ep=False,
+        tp_size=2,
+        tp_rank=0,
+        w13_weight=nn.Parameter(w13, requires_grad=False),
+        w2_weight=nn.Parameter(w2, requires_grad=False),
+        w13_weight_scale=nn.Parameter(w13_s, requires_grad=False),
+        w2_weight_scale=nn.Parameter(w2_s, requires_grad=False),
+        _copy_quant_storage=FusedMoE._copy_quant_storage,
+        _load_model_weight_or_group_weight_scale=lambda **_k: None,
+        _load_quant_weight_scale=lambda **_k: None,
+    )
+    FusedMoE._online_quant(layer)
+
+    assert len(quantized) == 3 * experts
+    for e in range(experts):
+        full13 = dequant_weight_online(
+            w13[e], w13_s[e], source.quant_type, source.quant_dtype
+        )
+        full2 = dequant_weight_online(
+            w2[e], w2_s[e], source.quant_type, source.quant_dtype
+        )
+        w1, w3, w2_q = quantized[3 * e : 3 * e + 3]
+        assert torch.equal(w1, full13[:inter])
+        assert torch.equal(w3, full13[padded : padded + inter])
+        assert torch.equal(w2_q, full2[:, :inter])

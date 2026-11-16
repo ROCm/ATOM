@@ -316,11 +316,11 @@ class Attention(nn.Module):
             self.qk_norm = DualRMSNormMXFP8(
                 self.q_norm, self.kv_norm, name, amax_floor=AMAX_FLOOR.value
             )
-        # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
-        # quantized ColumnParallelLinear so both tensors load through the
-        # standard FP8 path; the grouped GEMM reads them in place, the weight
-        # in the 16x16 layout `LinearBase` shuffles it into, at load and after
-        # a weight sync alike.
+        # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale in the checkpoint.
+        # Allocated as a quantized ColumnParallelLinear so both tensors load
+        # through the standard FP8 path; the grouped GEMM reads them in place,
+        # the weight in the 16x16 layout `LinearBase` shuffles it into, at load
+        # and after a weight sync alike. With `runs_bf16` it is BF16 after load.
         self.wo_a = ColumnParallelLinear(
             config.num_attention_heads * self.head_dim // config.o_groups,
             config.o_groups * self.o_rank,

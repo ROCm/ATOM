@@ -1351,7 +1351,8 @@ class LinearBase(nn.Module):
         catch exactly that skipped along with the padding.
         """
         # A native group32 weight keeps its compact scales, and its bytes too
-        # unless it is one the preshuffled group32 GEMM reads.
+        # unless it is one the preshuffled group32 GEMM reads; with
+        # `runs_bf16` it becomes a BF16 weight without scales.
         if self.native_a8_group_rows is not None:
             # Still FP8: a second call finds the BF16 weight and skips.
             if (

@@ -33,7 +33,7 @@ def converted_linear_spec(config):
 
     Per-channel FP8 with dynamic per-token activations in an FP4PTPC
     checkpoint (`config.fp4ptpc`), native 32x32 FP8 otherwise. `wo_a`, the
-    engram tables and the draft keep the native format in both.
+    engram tables and the draft keep the native checkpoint format in both.
     """
     if config.fp4ptpc:
         return LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
