@@ -34,18 +34,20 @@ class MetadataLease:
 
 def _sweep_orphaned_pending() -> None:
     """Release orphaned storage once its event completed; quarantine unknowns."""
-    for _ in range(len(_ORPHANED_PENDING)):
+    waiting = []
+    while True:
         try:
             lease = _ORPHANED_PENDING.pop()
         except IndexError:
-            return
+            break
         try:
-            if lease.completion.query():
-                continue
-            _ORPHANED_PENDING.append(lease)
+            if not lease.completion.query():
+                waiting.append(lease)
         except Exception:  # noqa: BLE001
             lease.state = "quarantined"
             _QUARANTINED_STORAGE.append(lease.buffer)
+    # Reinsert only after the drain so one incomplete lease is never re-popped.
+    _ORPHANED_PENDING.extend(waiting)
 
 
 class MetadataLeasePool:

@@ -132,3 +132,19 @@ def test_orphaned_pending_storage_is_quarantined_if_completion_is_unknown():
     assert live_storage() == 1  # the orphan; the polling pool's buffer is gone
     assert not ml._ORPHANED_PENDING and len(ml._QUARANTINED_STORAGE) == 1
     ml._QUARANTINED_STORAGE.clear()
+
+
+def test_sweep_releases_completed_orphans_behind_an_incomplete_one():
+    done, waiting = Event(done=True), Event()
+    leases = [
+        ml.MetadataLease(Storage(), 1, "pending", completion=event)
+        for event in (done, waiting)
+    ]
+    ml._ORPHANED_PENDING[:] = leases  # [completed, incomplete]
+    del leases
+    assert live_storage() == 2
+    ml._sweep_orphaned_pending()
+    assert len(ml._ORPHANED_PENDING) == 1
+    assert ml._ORPHANED_PENDING[0].completion is waiting
+    assert live_storage() == 1
+    ml._ORPHANED_PENDING.clear()
