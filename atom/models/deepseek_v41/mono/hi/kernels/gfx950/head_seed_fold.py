@@ -13,9 +13,9 @@ tab_main_proj, + 0x40 epoch, + 0x50 / 0x68 / 0x80 the three MTP layers' window k
 + 0xf4 the placeholder token, + 0xf8 an optional {value, tag} list to wait for, + 0x100 its length | tag
 << 32); 0x1f8.. ``sampler::Args``; 0x2b8.. ``mtp_ctl::AcceptArgs``.
 
-Roles by CTA (all ported; the whole kernel diffed bit-exact on 8 ranks at the 400K state with simulated
-acceptance 3.51, the residual branch taken; the real-acceptance branch (kernarg 0x314 <= 0) follows the ISA
-but is not exercised by that state):
+Roles by CTA (all ported; the whole kernel diffed bit-exact on 8 ranks at the 400K state both with
+simulated acceptance 3.51 (TILERT_SIMULATE_ACC_LEN, the residual branch taken) and with real acceptance
+(kernarg 0x314 = 0)):
 - 0..255: head GEMV (logits, / T into LDS) and the per-CTA sampler partials (``_head``, ``_stats``); CTA 255
   folds them: the 17 entries a rank to every rank's sym:sample, the 8-rank merge, draft log ratios, Philox
   coins, the accept count, the bonus token or the residual mask (``_fold_*``); every CTA's residual pass
