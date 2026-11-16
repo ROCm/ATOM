@@ -845,13 +845,15 @@ def _prefetch(self, width):
             uva_gather_into(
                 table,
                 ids,
-                self.flat[layer][:width].view(width, host.local_heads, table.head_dim),
+                self._target(layer, width),
                 head_start=host.head_start,
                 local_heads=host.local_heads,
                 total_heads=host.total_heads,
                 cache=self.uva.row_cache.get(layer),
             )
-            if self.collective is not None:
+            if self._direct(layer):
+                pass  # the gather wrote the layer's buffer itself
+            elif self.collective is not None:
                 out = self.gathered[layer][:width]
                 self.collective.all_gather_unreg(
                     self.flat[layer][:width], out=out, dim=1

@@ -23,7 +23,11 @@ from atom.model_ops.engram.device.hashing import (
     engram_snapshot,
     engram_snapshot_indices,
 )
-from atom.model_ops.engram.device.uva import uva_gather_into
+from atom.model_ops.engram.device.uva import (
+    uva_gather_into,
+    uva_gather_pair_into,
+    uva_pair_fits,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,12 @@ class EngramStaging:
                 device=host.device,
             )
             for layer in host.layer_ids
+            if not self._direct(layer)
         }
+        # a second layer's row ids, for both layers' lookups in one go (`_gather_pair`)
+        self.pair_ids = (
+            torch.empty_like(uva.row_ids) if len(host.layer_ids) == 2 else None
+        )
 
         self.collective = None
         self.gathered = {}
@@ -202,27 +211,34 @@ class EngramStaging:
         self.stream.wait_stream(compute)
         # past the fork: the side stream reads the snapshot, not the cursor
         self._advance_cursor(width)
+        # Both layers' lookups in one go only while a graph is captured (the
+        # decode graphs): their replay runs the lookups in turn anyway. Eager
+        # forwards (prefill, mixed steps) keep one lookup per layer, so the
+        # first Engram layer waits on its own rows only.
+        capturing = torch.cuda.is_current_stream_capturing()
         with torch.cuda.stream(self.stream):
+            paired = capturing and self._gather_pair(width)
             for layer in host.layer_ids:
-                ids = engram_snapshot_indices(
-                    self.uva.hash_tables,
-                    layer,
-                    self.snapshot[:width],
-                    self.uva.row_ids[:width],
-                )
-                table = host.prefetcher._tables[layer]
-                uva_gather_into(
-                    table,
-                    ids,
-                    self.flat[layer][:width].view(
-                        width, host.local_heads, table.head_dim
-                    ),
-                    head_start=host.head_start,
-                    local_heads=host.local_heads,
-                    total_heads=host.total_heads,
-                    cache=self.uva.row_cache.get(layer),
-                )
-                if self.collective is not None:
+                if not paired:
+                    ids = engram_snapshot_indices(
+                        self.uva.hash_tables,
+                        layer,
+                        self.snapshot[:width],
+                        self.uva.row_ids[:width],
+                    )
+                    table = host.prefetcher._tables[layer]
+                    uva_gather_into(
+                        table,
+                        ids,
+                        self._target(layer, width),
+                        head_start=host.head_start,
+                        local_heads=host.local_heads,
+                        total_heads=host.total_heads,
+                        cache=self.uva.row_cache.get(layer),
+                    )
+                if self._direct(layer):
+                    pass  # the gather wrote the layer's buffer itself
+                elif self.collective is not None:
                     out = self.gathered[layer][:width]
                     # Use the communicator's pre-registered input pool. Direct
                     # external registration in AITER assumes a zero IPC offset,
@@ -238,6 +254,60 @@ class EngramStaging:
                     host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
                 # Ready means the complete embedding, including TP reassembly.
                 self.done[layer].record(self.stream)
+
+    def _direct(self, layer):
+        """Whether a layer's gather writes its buffer itself: no TP
+        reassembly follows, and the buffer is the gather's flat layout (then
+        the layer has no `flat` staging buffer)."""
+        host = self.host
+        buffer = host.buffers[layer].gpu
+        width = host.local_heads * host.prefetcher._tables[layer].head_dim
+        return (
+            host._tp_group is None
+            and buffer.is_contiguous()
+            and buffer.shape[-1] == width
+        )
+
+    def _target(self, layer, width):
+        """Where a layer's gather writes ([width, local_heads, head_dim])."""
+        host = self.host
+        rows = (host.buffers[layer].gpu if self._direct(layer) else self.flat[layer])[
+            :width
+        ]
+        return rows.view(
+            width, host.local_heads, host.prefetcher._tables[layer].head_dim
+        )
+
+    def _gather_pair(self, width):
+        """Both layers' lookups in one launch per pass, where they fit one row
+        space (a decode step's width, not a long prefill's): the layers' events
+        are recorded after both, which only a forward that ran the two lookups
+        beside its first layers could notice -- a decode graph runs them in
+        turn on one stream, and the second lookup is no longer than the first
+        layer it would hide behind."""
+        if self.pair_ids is None:
+            return False
+        host = self.host
+        layers = host.layer_ids
+        tables = [host.prefetcher._tables[layer] for layer in layers]
+        caches = [self.uva.row_cache.get(layer) for layer in layers]
+        if not uva_pair_fits(tables, caches, width, host.local_heads):
+            return False
+        ids = [
+            engram_snapshot_indices(
+                self.uva.hash_tables, layer, self.snapshot[:width], out[:width]
+            )
+            for layer, out in zip(layers, (self.uva.row_ids, self.pair_ids))
+        ]
+        return uva_gather_pair_into(
+            tables,
+            ids,
+            [self._target(layer, width) for layer in layers],
+            caches,
+            head_start=host.head_start,
+            local_heads=host.local_heads,
+            total_heads=host.total_heads,
+        )
 
     def consume(self, layer, width):
         host = self.host
