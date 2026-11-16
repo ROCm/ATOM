@@ -7,7 +7,8 @@ While it traces a kernel, FlyDSL gives every op the user call-site chain that bu
 
 ``scoped()`` (around a build's trace that keeps its locations: DeepSeek-V4.1's hi programs checked,
 ``hi.emit.compile.compile_traced``) keeps ``DEPTH`` frames a chain (only the locations change: the LLVM IR is the same
-at any depth). ``unlocated()`` (the engine's builds) captures none.
+at any depth). ``unlocated()`` (the engine's builds) captures none, unless debug info puts them in the binary
+(``FLYDSL_DEBUG_ENABLE_DEBUG_INFO``: then ``scoped()``).
 """
 
 from __future__ import annotations

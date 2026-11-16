@@ -19,7 +19,8 @@ A build traces its kernel and holds the trace to the hand-off contract and the m
 cached build is traced too, only not compiled again, and the ranks of a node share one compile of a program
 (FlyDSL's compile lock). Inside ``serving()`` (the engine's builds at load) those checks are left to the CPU checks of
 the served programs (every one of them traced and checked there): the traces record nothing and capture no source
-locations. The resource gate and the code's hazard scan read the built code object either way.
+locations (unless ``FLYDSL_DEBUG_ENABLE_DEBUG_INFO`` puts them in the binary: ``srcloc.unlocated``). The resource
+gate and the code's hazard scan read the built code object either way.
 """
 
 import functools
@@ -34,7 +35,7 @@ from atom.mono.runtime import srcloc
 
 from ..plan.check import check, check_memory
 from ..plan.program import Program
-from ..plan.trace import recording
+from ..plan.trace import Record, recording
 
 _RESOURCE_KEYS = {
     "vgpr": b".vgpr_count",
@@ -151,17 +152,18 @@ def serving():
         _SERVING.reset(token)
 
 
-def compile_traced(launcher, program: Program):
+def compile_traced(launcher, program: Program) -> Record | None:
     """Compile ``launcher`` (no launch) and hold its recorded hand-offs to the program's regions and its memory
     operations to the memory model (``plan.check.check_memory``; raises ContractError). Inside ``serving()``: nothing
-    recorded, no source locations and no checks (the CPU checks' part), None.
+    recorded, no source locations (unless ``FLYDSL_DEBUG_ENABLE_DEBUG_INFO`` is set) and no checks (the CPU checks'
+    part), None.
     """
     arch = program.target.mcpu
     serve = _SERVING.get()
     with (
         nullcontext() if serve else recording() as rec,
         _env(COMPILE_ONLY=1, ARCH=arch, FLYDSL_GPU_ARCH=arch),
-        # (the source locations one frame deep; serving: none)
+        # (the source locations one frame deep; serving: none, unless debug info is on)
         srcloc.unlocated() if serve else srcloc.scoped(),
     ):
         launcher(0, 0, 0, 0, 0)
