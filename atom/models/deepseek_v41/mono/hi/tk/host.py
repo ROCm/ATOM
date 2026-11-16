@@ -12,7 +12,8 @@
 - the packed parameters (``load_params``: ``weights.params.rank_params`` on the CPU, each copied once; the two Engram
   table shards streamed in row chunks);
 - each graph parity's kernarg blobs (``blobs``: ``decode_launches.kernargs`` over ``address_map()``) and the code
-  objects (``codeobj.Launcher``: TileRT's original ``.co`` files or our FlyDSL builds, ``codeobj.CodeTable``);
+  objects (``codeobj.Launcher`` over a ``codeobj.CodeTable``: our FlyDSL builds from source, ``from_source``; TileRT's
+  original ``.co`` files only as a dev reference, ``from_dir``);
 - ``launch_step(parity)``: the 118 launches, ``hipModuleLaunchKernel`` in params mode, on the current stream;
   ``capture()``: one ``torch.cuda.CUDAGraph`` a parity; ``step()``: the next graph (parity = steps so far & 1, as
   TileRT replays them, so every cross-rank flag word sees a new epoch each step); ``warmup()``: TileRT's prepare (one
@@ -23,11 +24,12 @@ Every rank of the TP group runs the same sequence: the kernels poll each other's
 A request's device work outside the step graphs, as TileRT's ``dsv41_e2e_set_sampling`` / ``dsv41_e2e_begin`` /
 ``dsv41_e2e_admit`` / ``DsV41Graph.import_kv`` do it (each on the current stream, stream-ordered after any step still
 in flight): ``set_sampling(params)`` (``temp:samp_params`` <- 4 x int64, ``sym:sample`` zeroed), ``admit_request``
-(``admit_kernel<<<64, 256>>>`` with ``admit_args``, the 176-byte ``AdmitArgs`` built from this rank's buffers),
+(``admit_kernel<<<64, 256>>>`` with ``admit_args``, the 176-byte ``AdmitArgs`` built from this rank's buffers: the
+kernel under ``ADMIT_SYMBOL`` in the code table, our FlyDSL port ``kernels/gfx950/admit.py`` by default),
 ``import_planes`` (a converted request's planes into the caches) and ``read_logs`` (``ar_num`` / ``ar_acc``).
 
-Not here: the token tables' build (TileRT ``toktab.build_table``: the scope's first block for every token);
-``Buffers.toktab`` takes tables built elsewhere.
+Not here: the token tables' build (``tk.toktab``: the scope's first block for every token); ``Buffers.toktab`` takes
+the tables.
 
 How to validate on GPU (the CPU checks: ``tk.check``):
 
@@ -36,7 +38,8 @@ How to validate on GPU (the CPU checks: ``tk.check``):
    / ``internal:`` / ``toktab:`` / ``sym:<family>``) on all 8 ranks before step k and after it, with the step's
    parity k & 1.
 2. Here, on the 8 ranks: ``TkRank(rank, group)``, ``load_params(ckpt, consts)`` (or the snapshot's ``param:``s, to
-   isolate the packers), ``Buffers.toktab`` from the snapshot, ``load_kernels(CodeTable.from_dir(<TileRT co>))``;
+   isolate the packers), ``Buffers.toktab`` from the snapshot, ``load_kernels(CodeTable.from_dir(<TileRT co>))`` (the
+   reference run; ``CodeTable.from_source()`` for ours);
    copy the before-step contents into the buffers by name (the ``sym:`` arena's families at ``Buffers.sym_offsets``);
    ``launch_step(k & 1)`` eagerly on every rank; synchronize.
 3. Compare with the after-step dump: ``tok_out``, ``ar_acc`` / ``ar_num`` / ``plain_acc``, ``logits``, ``draft_z``,
@@ -54,7 +57,8 @@ from ..plan import decode_launches as DL
 from . import alloc
 
 # ---------------------------------------------------------------------------------------------------------------
-# admit_kernel (outside the graphs; tkshim recording of 2026-11-16, m7/rec_admit.jsonl, checked by ``check.check_admit``)
+# admit_kernel (outside the graphs; tkshim recording of 2026-11-16, m7/rec_admit.jsonl, checked by ``check.check_admit``):
+# TileRT's symbol names the kernel's slot in a code table (our port: ``kernels/gfx950/admit.py``, ``flybuild``)
 
 ADMIT_SYMBOL = (
     "_ZN6tilert3lib13ds_v4_1_flash12_GLOBAL__N_112admit_kernelENS2_9AdmitArgsE"
@@ -116,6 +120,56 @@ def admit_args(
             "<Q4q", b, 0x88, addr["temp:samp_params"], *(int(p) for p in params)
         )
     return bytes(b)
+
+
+PAD_TOKEN = 128799  # admit_kernel's pad row token (0x1f71f)
+ROW_BYTES, X_ROW = 0x2800, 0xA000  # one bf16 embedding row; a row of X (4 mHC copies)
+
+
+def admit_reference(
+    blob: bytes, mem: dict, embed_row, grid: int = ADMIT_GRID[0]
+) -> None:
+    """``admit_kernel``'s effect on the CPU (``kernels/gfx950/admit.py``; TileRT's ISA): apply an ``AdmitArgs`` blob
+    to ``mem`` ({``plain_acc`` / ``ar_acc`` / ``ar_num`` / ``ctl`` / ``blk_tok`` / ``blk_pos`` / ``vtok`` / ``vpos``:
+    int lists, ``samp_params``: int64 list, ``X``: bytearray of at least rows x 0xa000}); ``embed_row(token)`` -> its
+    0x2800 bytes. A count larger than its list is cut to the list (the device writes the count).
+    """
+    n_plain, n_acc, n_num = (
+        struct.unpack_from("<i", blob, o)[0] for o in (0x08, 0x18, 0x28)
+    )
+    rows, vrows = (
+        struct.unpack_from("<i", blob, 0x48)[0],
+        struct.unpack_from("<i", blob, 0x60)[0],
+    )
+    pos, first, cap, mtp = struct.unpack_from("<iiii", blob, 0x78)
+    (samp,) = struct.unpack_from("<Q", blob, 0x88)
+    threads = grid * ADMIT_BLOCK[0]
+    for i in range(min(n_plain, len(mem["plain_acc"]))):
+        mem["plain_acc"][i] = 0
+    for i in range(min(n_acc, len(mem["ar_acc"]))):
+        mem["ar_acc"][i] = (1 if i == 0 else first if i == 1 else 0) if mtp else 0
+    for i in range(min(n_num, len(mem["ar_num"]))):
+        mem["ar_num"][i] = 1 if mtp and i < 2 else 0
+    for g in range(min(16, threads)):
+        v = cap if g == 3 else 0
+        if mtp:
+            v = {0: pos - 1, 1: first, 5: 1}.get(g, v)
+        mem["ctl"][g] = v
+    if samp:
+        mem["samp_params"][:4] = list(struct.unpack_from("<4q", blob, 0x90))
+    if not mtp:
+        return
+    for t in range(min(rows, 64)):
+        mem["blk_tok"][t] = first if t == 0 else PAD_TOKEN
+        mem["blk_pos"][t] = pos + t if t < 5 and pos + t < cap else -1
+    for t in range(min(vrows, 64)):
+        mem["vtok"][t] = first if t == 0 else PAD_TOKEN
+        mem["vpos"][t] = pos + t if pos + t < cap else -1
+    for b in range(min(rows, grid)):
+        tok = first if b == 0 else PAD_TOKEN
+        row = embed_row(tok) if 0 <= tok < alloc.VOCAB else bytes(ROW_BYTES)
+        for h in range(4):
+            mem["X"][b * X_ROW + h * ROW_BYTES : b * X_ROW + (h + 1) * ROW_BYTES] = row
 
 
 def _zero_junk(spec):

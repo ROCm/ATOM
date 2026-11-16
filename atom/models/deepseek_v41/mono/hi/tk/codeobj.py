@@ -5,11 +5,14 @@
 A table (``CodeTable``) maps a TileRT kernel symbol to a code object file, the function to load from it and that
 function's explicit kernarg layout (``(offset, size)`` per argument):
 
-- ``CodeTable.from_dir(dir)``: TileRT's original code objects (``*.co`` extracted from its .so, never shipped with
-  ATOM: a path at run time), each kernel under its own symbol, the layout read from the code object's AMDGPU metadata
-  note (``kernels``: a small msgpack reader, no dependency);
-- ``CodeTable.swap(tsv)``: replacement builds (our FlyDSL ``.hsaco``), one line a kernel as tkshim's ``TKSHIM_SWAP``
-  takes them: ``<TileRT symbol>\\t<code object>\\t<function>\\t<off:size,...>`` (``runs/.../pd/swap_fly20.tsv``),
+- ``CodeTable.from_source(cache)``: the default, our FlyDSL ports (``hi/kernels/gfx950``) of the step's 28 kernels and
+  ``admit_kernel``, built from source into a node-local cache (``flybuild``), each under the TileRT symbol it
+  replaces, the layout read from its code object;
+- ``CodeTable.from_dir(dir)`` (dev reference only): TileRT's original code objects (``*.co`` extracted from its .so,
+  never shipped with ATOM: a path at run time), each kernel under its own symbol, the layout read from the code
+  object's AMDGPU metadata note (``kernels``: a small msgpack reader, no dependency);
+- ``CodeTable.swap(tsv)`` (dev): replacement builds (``.hsaco``), one line a kernel as tkshim's ``TKSHIM_SWAP``
+  takes them: ``<TileRT symbol>\\t<code object>\\t<function>\\t<off:size,...>`` (``runs/.../m7/swap_fly28.tsv``),
   the layout the replacement's explicit arguments, laid over the same kernarg bytes.
 
 A launch (``Launcher.launch``) is ``hipModuleLaunchKernel`` in params mode: ``kernelParams[i]`` points at byte
@@ -126,6 +129,15 @@ class CodeTable:
 
     def __init__(self, entries: dict[str, Entry] | None = None):
         self.entries = dict(entries or {})
+
+    @classmethod
+    def from_source(
+        cls, cache_dir: str | Path | None = None, jobs: int | None = None, log=None
+    ) -> CodeTable:
+        """Our FlyDSL builds of every kernel the host launches (``flybuild.code_table``)."""
+        from . import flybuild
+
+        return flybuild.code_table(cache_dir, jobs=jobs, log=log)
 
     @classmethod
     def from_dir(cls, path: str | Path, pattern: str = "*.co") -> CodeTable:
