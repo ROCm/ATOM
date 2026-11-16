@@ -1644,6 +1644,18 @@ _STACKED_DECODE_TILES_GFX1250 = {_FMT_BF16: (4, 64, 2, None)}
 _STACKED_DECODE_PROGRAMS_PER_CU = 8
 
 
+_scorer_mfma = CachedLauncher(_qsa_paged_mqa_logits_mfma_kernel, num_warps=4)
+# One per warp count of the tables above, built here: a call traced by
+# torch.compile can look a launcher up but not construct one.
+_scorer_stacked = {
+    warps: CachedLauncher(_qsa_paged_mqa_logits_stacked_kernel, num_warps=warps)
+    for _, _, warps, _ in (
+        *_STACKED_DECODE_TILES.values(),
+        *_STACKED_DECODE_TILES_GFX1250.values(),
+    )
+}
+
+
 def _stacked_decode_tiles(key_fmt: int) -> tuple[int, int, int, int | None]:
     """(rows per program, column tile, warps, column programs or None)."""
     if _is_gfx1250() and key_fmt in _STACKED_DECODE_TILES_GFX1250:
@@ -1786,9 +1798,8 @@ def qsa_paged_mqa_logits(
         and head_dim & (head_dim - 1) == 0
         and head_dim >= 16
     ):
-        _qsa_paged_mqa_logits_stacked_kernel[
-            (row_programs, min(triton.cdiv(columns, bn), column_programs))
-        ](
+        _scorer_stacked[warps](
+            (row_programs, min(triton.cdiv(columns, bn), column_programs)),
             q,
             compressed_k_cache,
             scale,
@@ -1820,7 +1831,6 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
-            num_warps=warps,
         )
         return logits, visible_groups
     # Otherwise decode-sized batches keep the CUDA-core kernel: one row per
@@ -1856,9 +1866,8 @@ def qsa_paged_mqa_logits(
             )
             return logits, visible_groups
         bmt, bn = 16, 128
-        _qsa_paged_mqa_logits_mfma_kernel[
-            (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))
-        ](
+        _scorer_mfma(
+            (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn)),
             q,
             compressed_k_cache,
             scale,
@@ -1890,7 +1899,6 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
-            num_warps=4,
         )
         return logits, visible_groups
     column_programs = min(
@@ -2407,6 +2415,23 @@ def _qsa_sparse_paged_gqa_kernel(
 # issue's points (36 decode rows over 9 requests; one 16384-row prefill at
 # 98304 context).
 _GQA_TILES = {(True, False): (32, 4, 2, 0), (True, True): (32, 2, 2, 0)}
+# One per (num_warps, num_stages, waves_per_eu) that `_kernel_config` returns
+# or `_GQA_TILES` overrides it with, built here for the same reason as
+# `_scorer_stacked`.
+_sparse_paged_gqa = {
+    (warps, stages, waves): CachedLauncher(
+        _qsa_sparse_paged_gqa_kernel,
+        num_warps=warps,
+        num_stages=stages,
+        waves_per_eu=waves,
+    )
+    for warps, stages, waves in (
+        (4, 1, 0),
+        (2, 1, 0),
+        (4, 1, 3),
+        *(tile[1:] for tile in _GQA_TILES.values()),
+    )
+}
 
 
 def qsa_sparse_paged_gqa(
@@ -2510,7 +2535,8 @@ def qsa_sparse_paged_gqa(
         return out.zero_()
     target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
     grid_y = k_cache.shape[2] * num_head_groups
-    _qsa_sparse_paged_gqa_kernel[(q.shape[0], grid_y, kv_splits)](
+    _sparse_paged_gqa[num_warps, num_stages, waves_per_eu](
+        (q.shape[0], grid_y, kv_splits),
         q,
         k_cache,
         v_cache,
@@ -2558,9 +2584,6 @@ def qsa_sparse_paged_gqa(
         KV_SPLITS=kv_splits,
         SUB_GROUP=sub_group if sub_group < group_size else 0,
         KV_FP8=kv_fp8,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        waves_per_eu=waves_per_eu,
     )
     reduce_split_k(out, target, partial_max, partial_sum, widths, kv_splits, block_n)
     return out

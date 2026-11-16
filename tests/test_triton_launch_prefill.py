@@ -520,3 +520,158 @@ def test_qsa_helpers_replay_in_a_cuda_graph(qsa):
     graph.replay()
     torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
+
+
+# --- QSA scoring and sparse attention (Native: KV block 16, Triton kernels) --
+
+
+def _native_qsa_batch(tokens, context=8192, page=16, pool_pages=2400, device="cuda"):
+    gen = torch.Generator(device=device).manual_seed(tokens)
+    order = torch.randperm(pool_pages, generator=gen, device=device).to(torch.int32)
+    used = -(-context // page)
+    table = torch.full((1, 1024), -1, dtype=torch.int32, device=device)
+    table[0, :used] = order[:used]
+    positions = torch.arange(context - tokens, context, device=device)
+    picks = torch.randint(0, context, (tokens, 2051), generator=gen, device=device)
+    return SimpleNamespace(
+        table=table,
+        positions=positions,
+        token_to_req=torch.zeros(tokens, dtype=torch.int32, device=device),
+        seq_lens=torch.full((1,), context, dtype=torch.int32, device=device),
+        # Causal token picks, -1 padded, as `qsa_select_paged_tokens` hands over.
+        selected=torch.where(picks <= positions[:, None], picks, -1).to(torch.int32),
+        keys=_randn(pool_pages, page // 4, 1, 128, seed=14, device=device),
+        k_cache=_randn(pool_pages, page, 1, 256, seed=15, device=device),
+        v_cache=_randn(pool_pages, page, 1, 256, seed=16, device=device),
+    )
+
+
+def _score(qsa, b, q):
+    """Logits only up to each row's visible count: column tiles past every
+    row's horizon are never written, and top-k never reads them."""
+    row_starts = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    logits, visible = qsa.qsa_paged_mqa_logits(
+        q,
+        b.keys,
+        b.table,
+        b.token_to_req,
+        b.positions,
+        b.seq_lens,
+        4,
+        max_columns=2048,
+        row_starts=row_starts,
+    )
+    columns = torch.arange(logits.shape[1], device=q.device)
+    seen = torch.where(columns[None, :] < visible[:, None], logits, 0)
+    return [seen, visible, row_starts]
+
+
+def _attend(qsa, b, q):
+    out = qsa.qsa_sparse_paged_gqa(
+        q,
+        b.k_cache,
+        b.v_cache,
+        b.selected,
+        b.table,
+        b.token_to_req,
+        softmax_scale=256**-0.5,
+    )
+    return [out]
+
+
+def _stacked_warps(qsa):
+    return qsa._stacked_decode_tiles(qsa._FMT_BF16)[2]
+
+
+def test_every_scorer_and_attention_config_has_a_launcher(qsa):
+    """Built up front, one per launch option set the wrappers can pick."""
+    for tiles in (qsa._STACKED_DECODE_TILES, qsa._STACKED_DECODE_TILES_GFX1250):
+        for _, _, warps, _ in tiles.values():
+            assert qsa._scorer_stacked[warps].options == {"num_warps": warps}
+    configs = {
+        qsa._kernel_config(tokens, kv_heads, splits, group, num_cu=80)[1:4]
+        for tokens in (1, 4, 16, 64, 300, 2096, 16384)
+        for kv_heads in (1, 2)
+        for splits in (1, 4, 16, 64)
+        for group in (6, 12, 24)
+    }
+    configs |= {tile[1:] for tile in qsa._GQA_TILES.values()}
+    for warps, stages, waves in configs:
+        launcher = qsa._sparse_paged_gqa[warps, stages, waves]
+        assert launcher.options == {
+            "num_warps": warps,
+            "num_stages": stages,
+            "waves_per_eu": waves,
+        }
+
+
+@pytest.mark.parametrize("tokens", [300, 16], ids=["mfma", "stacked"])
+@pytest.mark.parametrize("buffer_ops", ["1", "0"])
+def test_qsa_scoring_keys_tell_apart_what_triton_tells_apart(
+    monkeypatch, qsa, buffer_ops, tokens
+):
+    _on_cpu(monkeypatch)
+    monkeypatch.setattr(qsa, "get_cu_num", lambda: 80)
+    monkeypatch.setattr(qsa, "reduce_split_k", lambda *args: None)
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
+    b = _native_qsa_batch(tokens, device="cpu")
+    recorders = {
+        "_scorer_mfma": _Recorder(qsa._scorer_mfma),
+        "_scorer_stacked": {
+            w: _Recorder(launcher) for w, launcher in qsa._scorer_stacked.items()
+        },
+        "_sparse_paged_gqa": {
+            o: _Recorder(launcher) for o, launcher in qsa._sparse_paged_gqa.items()
+        },
+    }
+    for name, recorder in recorders.items():
+        monkeypatch.setattr(qsa, name, recorder)
+    _score(qsa, b, _randn(tokens, 4, 128, offset=1, device="cpu"))
+    _attend(qsa, b, _randn(tokens, 12, 256, offset=1, device="cpu"))
+    called = [recorders["_scorer_mfma"]]
+    called += list(recorders["_scorer_stacked"].values())
+    called += list(recorders["_sparse_paged_gqa"].values())
+    called = [recorder for recorder in called if recorder.calls]
+    assert len(called) == 2  # one scorer, one attention
+    for recorder in called:
+        _check_keys(recorder.launcher, recorder.calls)
+
+
+@gpu
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("tokens", [2096, 1056, 2111, 300, 256, 16, 3, 1])
+@torch.inference_mode()
+def test_qsa_scoring_and_attention_match_plain_triton_bitwise(
+    monkeypatch, qsa, tokens, offset
+):
+    """Above 256 rows the MFMA scorer, up to 256 the stacked one; one
+    attention split for prefill-sized batches, split-K for small ones."""
+    b = _native_qsa_batch(tokens)
+    q = _randn(tokens, 4, 128, offset=offset, seed=17)
+    if tokens > 256:
+        _plain_vs_cached(
+            monkeypatch, [(qsa, "_scorer_mfma")], lambda: _score(qsa, b, q)
+        )
+    else:
+        scorer = qsa._scorer_stacked[_stacked_warps(qsa)]
+        plain = {**qsa._scorer_stacked, _stacked_warps(qsa): _Plain(scorer)}
+        monkeypatch.setattr(qsa, "_scorer_stacked", plain)
+        ref = [t.clone() for t in _score(qsa, b, q)]
+        monkeypatch.undo()
+        first = [t.clone() for t in _score(qsa, b, q)]
+        second = _score(qsa, b, q)
+        torch.cuda.synchronize()
+        assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
+        assert scorer._kernels
+
+    q = _randn(tokens, 12, 256, offset=offset, seed=18)
+    cached = qsa._sparse_paged_gqa
+    plain = {options: _Plain(launcher) for options, launcher in cached.items()}
+    monkeypatch.setattr(qsa, "_sparse_paged_gqa", plain)
+    ref = [t.clone() for t in _attend(qsa, b, q)]
+    monkeypatch.undo()
+    first = [t.clone() for t in _attend(qsa, b, q)]
+    second = _attend(qsa, b, q)
+    torch.cuda.synchronize()
+    assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
+    assert any(launcher._kernels for launcher in cached.values())
