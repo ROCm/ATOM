@@ -1524,7 +1524,7 @@ class MLAAttention(nn.Module):
             _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, YQ=output, transpose_bm=True
             )
-        return output.reshape(-1, num_heads, self.v_head_dim)
+        return output
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
