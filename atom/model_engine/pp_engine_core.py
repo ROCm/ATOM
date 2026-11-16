@@ -109,6 +109,7 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.scheduler.close_kv_connector()
 
     def pause_generation(self, deadline: float) -> None:
         """On the head, schedule nothing more and retire what is in flight.
@@ -331,11 +332,7 @@ class PPEngineCoreProc(EngineCore):
             return
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not (
-            getattr(connector, "is_offload", False)
-            or (
-                getattr(connector, "is_producer", False)
-                and getattr(connector, "enable_chunked_transfer", False)
-            )
+            connector.is_offload or getattr(connector, "is_producer", False)
         ):
             return
         if dispatch_new:
@@ -535,6 +532,7 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.scheduler.close_kv_connector()
 
     def _poll_and_send_kv_status(self):
         """Downstream: collect TP-aggregated KV status and send to head."""
