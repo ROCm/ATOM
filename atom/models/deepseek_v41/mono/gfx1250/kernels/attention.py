@@ -506,16 +506,30 @@ def stage_kv(c):
 
 
 # ------------------------------------------------------------------ C: wq_b (rstd after the GEMM, RoPE)
+# (C_WIDE) the q_b GEMM's NKQ K128 steps over the 4 K-quarter waves of a tile, interleaved: quarter kq takes steps
+# kq, kq + 4, ..; CQ_STEPS = ceil(NKQ / 4) a wave, and only the last one can run past NKQ (QL 1280: 10 steps -> 3/3/2/2;
+# a dead step re-reads the last valid K block and multiplies a zero A, so it adds nothing)
+NKQ = QL // 128
+CQ_STEPS = (NKQ + 3) // 4
+assert QL % 128 == 0
+
+
+def cq_step(kq, i):
+    """K128 step i of quarter kq, clamped into [0, NKQ) (the clamped ones are zeroed in faq)."""
+    if i < CQ_STEPS - 1 or NKQ % 4 == 0:
+        return kq + 4 * i
+    return fx.min(kq + 4 * i, I32(NKQ - 1))
+
+
 @ASTRewriter.transform
 def stage_C(c):
     t, b, w, l, MT = c["t"], c["b"], c["w"], c["l"], c["MT"]
     if fx.const_expr(MT == 1 and C_WIDE):   # (contract 6.5) this wave's wqb K steps issued before the wait
-        KQp = QL // 128 // 4
         n0p = (b + (w // 4) * CTAS) * 16
         brp = c["wqb"] + i64(n0p + l % 16) * QL
-        preQ = [(ld_op(brp, ((w % 4) * KQp + i) * 128, l),
-                 hx.gload(c["wqb_s"] + i64(((n0p + l % 16) // 32) * (QL // 32) + ((w % 4) * KQp + i) * 4), I32, align=4))
-                for i in range(KQp)]
+        preQ = [(ld_op(brp, cq_step(w % 4, i) * 128, l),
+                 hx.gload(c["wqb_s"] + i64(((n0p + l % 16) // 32) * (QL // 32) + cq_step(w % 4, i) * 4), I32, align=4))
+                for i in range(CQ_STEPS)]
     # the epilogue's RoPE cos / sin (position -> table row: two dependent loads a row) before the wait: they do not
     # depend on A2, and after it they were the epilogue's critical path (two serial round trips behind the GEMV)
     mi_p = fx.min(w % 3, I32(MT - 1))
@@ -529,22 +543,20 @@ def stage_C(c):
     ssv = [hx.gload(c["ss"] + i64(mi_p * 16 + (l // 16) * 8 + i) * 4, F32) for i in range(8)]
     if fx.const_expr(MT == 1 and C_WIDE):
         # (v2) the CTA's 2 tiles x 4 K quarters on the 8 waves (operands in flight), partials summed in LDS by waves 0 / 4
-        KQ = QL // 128 // 4
         jq = w // 4
         kq = w % 4
         n0q = (b + jq * CTAS) * 16
         arq = c["qr8"] + i64(fx.min(l % 16, I32(c["TR"] - 1))) * QL   # (rows past TR: the last row again, cached)
-        brq = c["wqb"] + i64(n0q + l % 16) * QL
 
         def faq(i):
-            kb = (kq * KQ + i) * 128
-            return ld_op(arq, kb, l), hx.gload(c["qrs"] + i64((l % 16) * (QL // 32) + kb // 32), I32, align=4)
+            kb = cq_step(kq, i) * 128
+            a = ld_op(arq, kb, l)
+            if fx.const_expr(i == CQ_STEPS - 1 and NKQ % 4 != 0):   # the ragged last step: zero A on the quarters past NKQ
+                live = kq < I32(NKQ - 4 * (CQ_STEPS - 1))
+                a = fx.Vector.from_elements([live.select(a[e], I32(0)) for e in range(16)], I32)
+            return a, hx.gload(c["qrs"] + i64((l % 16) * (QL // 32) + kb // 32), I32, align=4)
 
-        def fbq(i):
-            kb = (kq * KQ + i) * 128
-            return ld_op(brq, kb, l), hx.gload(c["wqb_s"] + i64(((n0q + l % 16) // 32) * (QL // 32) + kb // 32), I32, align=4)
-
-        accq = mx_loop(KQ, faq, lambda i: preQ[i])
+        accq = mx_loop(CQ_STEPS, faq, lambda i: preQ[i])
         hx.lstore(c["sm"] + ((w * 32 + l) * 8) * 4, accq)
         gpu.barrier()
     if (w < 6) & (w % 3 < MT):
