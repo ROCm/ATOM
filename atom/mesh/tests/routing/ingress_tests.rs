@@ -1083,6 +1083,188 @@ async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
     assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
 }
 
+/// With `--kv-events`, `cache_aware` wants tokens, and a request whose model the router
+/// cannot tokenize is still prepared, by its text, its model warned about once. Messages,
+/// which have no token-routing template, are not tokenized or warned about.
+#[tokio::test]
+async fn wanted_tokens_fall_back_to_the_text() {
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+        },
+        kv_events: true,
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    app.tokenizer_registry
+        .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let chat = json!({"model": "untokenized", "messages": [{"role": "user", "content": "hi"}]});
+    let messages = json!({"model": "messages", "messages": [{"role": "user", "content": "hi"}]});
+    for (path, body, model, tokenized, warned) in [
+        (
+            "/generate",
+            json!({"model": "m", "text": "hello world"}),
+            "m",
+            true,
+            false,
+        ),
+        ("/v1/chat/completions", chat, "untokenized", false, true),
+        ("/v1/messages", messages, "messages", false, false),
+    ] {
+        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let text = parsed.metadata_with_text(true).text;
+        let routing = IngressRouting::new(&app);
+        let (metadata, tokens) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.text, text);
+        assert_eq!(tokens.is_some(), tokenized, "{model}");
+        assert_eq!(UNTOKENIZED_MODELS.contains(model), warned, "{model}");
+    }
+}
+
+/// A P/D pair's policies share the request's tokens. With `--kv-events`, they carry the
+/// special tokens, as ATOM stores the blocks `cache_aware` matches, even with `prefix_hash`
+/// the other, which needs them.
+#[tokio::test]
+async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
+    use crate::policies::{CacheAwarePolicy, LoadBalancingPolicy, PrefixHashPolicy};
+    let prefix_hash =
+        || -> Arc<dyn LoadBalancingPolicy> { Arc::new(PrefixHashPolicy::new(Default::default())) };
+    let cache_aware = || -> Arc<dyn LoadBalancingPolicy> { Arc::new(CacheAwarePolicy::new()) };
+    // A tokenizer that, as Llama's, puts `<s>`, id 0, before the words.
+    let dir = tempfile::tempdir().unwrap();
+    let special = |id: u32, content: &str| {
+        json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true})
+    };
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [special(0, "<s>"), special(1, "<unk>")], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>",
+            "vocab": {"<s>": 0, "<unk>": 1, "a": 2, "b": 3}}});
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let config = json!({"add_bos_token": true, "bos_token": "<s>"});
+    std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+    for (kv_events, prefill, decode, want) in [
+        (true, prefix_hash(), cache_aware(), &[0, 2, 3][..]),
+        (true, cache_aware(), prefix_hash(), &[0, 2, 3]),
+        (false, prefix_hash(), cache_aware(), &[2, 3]),
+    ] {
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+        let config = crate::config::RouterConfig {
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            kv_events,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        app.policy_registry.set_prefill_policy(prefill);
+        app.policy_registry.set_decode_policy(decode);
+        let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(
+            crate::tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap(),
+        );
+        // Preparation workers encode with copies they load from the source.
+        app.tokenizer_registry
+            .load("bos-id", "m", path.to_str().unwrap(), || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+        // With media, `prefix_hash` keeps the tokens, and `cache_aware` leaves it to the tree.
+        for (body, media) in [
+            (json!({"model": "m", "text": "a b"}), false),
+            (
+                json!({"model": "m", "text": "a b", "image_data": "x.png"}),
+                true,
+            ),
+        ] {
+            let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
+            let routing = IngressRouting::new(&app);
+            let (metadata, tokens) = app
+                .prepare_pool
+                .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                    routing.prepare(&parsed, ctx)
+                })
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(tokens.as_deref(), Some(want), "kv_events: {kv_events}");
+            assert_eq!(metadata.carries_media, media);
+        }
+    }
+}
+
+/// The template and encode stages `--kv-events` adds to a chat request `cache_aware`
+/// places, with the tokenizer.json at `MESH_BENCH_TOKENIZER`.
+#[test]
+#[ignore = "bench: cargo test --release --lib wanted_tokens_cost -- --ignored --nocapture"]
+fn wanted_tokens_cost() {
+    use crate::{
+        protocols::chat::ChatCompletionRequest,
+        routers::prepare::chat_template::process_chat_messages,
+        tokenizer::{traits::Encoder, HuggingFaceTokenizer},
+    };
+    let path = std::env::var("MESH_BENCH_TOKENIZER").expect("MESH_BENCH_TOKENIZER");
+    let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+    let text = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).repeat(64);
+    let percentiles = |samples: &mut Vec<Duration>| {
+        samples.sort();
+        let at = |p: usize| samples[(samples.len() - 1) * p / 100];
+        format!("p50 {:.2?} p99 {:.2?}", at(50), at(99))
+    };
+    for chars in [4_000, 32_000, 128_000] {
+        let content: String = text.chars().take(chars).collect();
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({"model": "m",
+            "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": content}]}))
+        .unwrap();
+        let (mut template, mut encode, mut tokens) = (Vec::new(), Vec::new(), 0);
+        for _ in 0..100 {
+            let started = Instant::now();
+            let prompt = process_chat_messages(&chat, &tokenizer).unwrap().text;
+            template.push(started.elapsed());
+            let started = Instant::now();
+            tokens = tokenizer.encode(&prompt, true).unwrap().token_ids().len();
+            encode.push(started.elapsed());
+        }
+        println!(
+            "{tokens} tokens: template {}, encode {}",
+            percentiles(&mut template),
+            percentiles(&mut encode)
+        );
+    }
+}
+
 #[test]
 fn untyped_item_references_are_accepted_as_state_references() {
     for (input, state) in [
