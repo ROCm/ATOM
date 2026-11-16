@@ -34,8 +34,10 @@ Identities the translation relies on:
 - STATE slot == ``req_pool_idx``: stable for a request's lifetime and unique
   among live requests (row 0 of ``req_to_token`` is padding, never handed
   out). A request starting at position 0 resets its slot
-  (``PagedAttentionCache.prepare_state``); a prefix-cache hit would need
-  restored state, so radix cache must be disabled for now.
+  (``PagedAttentionCache.prepare_state``). With radix cache on, a prefix hit
+  at ``P`` first rebuilds its slot below ``P`` in a replay side forward
+  (``deepseek_v41_radix``), translated here into ATOM's
+  ``ScheduledBatch.replaying``.
 - V4.1's sliding window lives in the STATE ring, so the proxy asks SGLang for
   a plain paged allocator (``needs_paged_swa_allocator = False``): no SWA
   token bookkeeping, no SWA tree cache.
@@ -168,27 +170,90 @@ def _sglang_bag(name: str):
         return None
 
 
+def _sglang_setting(bag, name, default=None):
+    """A resolved SGLang setting off its config bag, else the raw ServerArgs."""
+    if bag is not None and hasattr(bag, name):
+        return getattr(bag, name)
+    from atom.plugin.config import get_sglang_server_args
+
+    return getattr(get_sglang_server_args(), name, default)
+
+
+def sglang_radix_cache_enabled() -> bool:
+    """Whether SGLang serves this launch with its radix (prefix) cache."""
+    return not _sglang_setting(_sglang_bag("memory"), "disable_radix_cache", False)
+
+
+def _prefill_graphs_enabled(exec_) -> bool:
+    graph_config = getattr(getattr(exec_, "graph", None), "cuda_graph_config", None)
+    prefill = getattr(graph_config, "prefill", None)
+    if prefill is not None:
+        backend = getattr(prefill, "backend", "disabled")
+    else:
+        from atom.plugin.config import get_sglang_server_args
+
+        backend = getattr(get_sglang_server_args(), "cuda_graph_backend_prefill", None)
+    return str(backend or "disabled").lower() in ("full", "breakable")
+
+
+def _radix_refusals(memory, exec_, schedule, spec) -> tuple:
+    """What radix cache cannot run beside (``deepseek_v41_radix``)."""
+    from atom.plugin.sglang.deepseek_v41_radix import (
+        REPLAY_ROWS_ENV,
+        resolve_replay_rows,
+    )
+
+    rows = resolve_replay_rows()
+    chunk = _sglang_setting(schedule, "chunked_prefill_size", None)
+    return (
+        # A MIXED batch skips the replay seam.
+        (
+            "mixed chunk with radix cache",
+            bool(_sglang_setting(schedule, "enable_mixed_chunk", False)),
+        ),
+        (
+            "overlap scheduling with radix cache (--disable-overlap-schedule)",
+            not _sglang_setting(schedule, "disable_overlap_schedule", False),
+        ),
+        (
+            "session radix cache",
+            bool(_sglang_setting(memory, "enable_session_radix_cache", False)),
+        ),
+        (
+            "a custom radix cache backend",
+            _sglang_setting(memory, "radix_cache_backend", None) is not None,
+        ),
+        # The only caller of `move_kv_cache`, which the proxy pool refuses.
+        (
+            "unified memory with radix cache",
+            bool(_sglang_setting(memory, "enable_unified_memory", False)),
+        ),
+        ("prefill CUDA graphs with radix cache", _prefill_graphs_enabled(exec_)),
+        (
+            f"--chunked-prefill-size {chunk} below {REPLAY_ROWS_ENV}={rows}",
+            chunk is not None and 0 < int(chunk) < rows,
+        ),
+        # The DSpark draft rings and the verify lifecycle are not proved
+        # under a replay yet.
+        (
+            "speculative decoding with radix cache",
+            _sglang_setting(spec, "speculative_algorithm", None) is not None,
+        ),
+    )
+
+
 def refuse_unsupported_sglang_features() -> None:
     """Fail before weights load on SGLang features this bridge cannot serve."""
     from atom.plugin.config import get_sglang_server_args
 
     args = get_sglang_server_args()
-    memory, exec_, spec, disagg = (
-        _sglang_bag(name) for name in ("memory", "exec", "spec", "disagg")
+    memory, exec_, spec, disagg, schedule = (
+        _sglang_bag(name) for name in ("memory", "exec", "spec", "disagg", "schedule")
     )
-
-    def setting(bag, name, default=None):
-        if bag is not None and hasattr(bag, name):
-            return getattr(bag, name)
-        return getattr(args, name, default)
+    setting = _sglang_setting
 
     features = getattr(exec_, "features", None)
     unsupported = (
-        # A prefix hit resumes a request whose STATE slot was never written.
-        (
-            "radix cache (launch with --disable-radix-cache)",
-            not setting(memory, "disable_radix_cache", False),
-        ),
         ("hierarchical cache", setting(memory, "enable_hierarchical_cache", False)),
         ("HiSparse", setting(memory, "enable_hisparse", False)),
         (
@@ -213,6 +278,25 @@ def refuse_unsupported_sglang_features() -> None:
             not setting(disagg, "language_model_only", False),
         ),
     )
+    if sglang_radix_cache_enabled():
+        from atom.plugin.sglang import deepseek_v41_envs as envs
+
+        unsupported += (
+            (
+                (
+                    "radix cache without ATOM_V41_RADIX=1 (opt-in: a prefix hit "
+                    "below ~4k tokens is slower than a cold prefill; or launch "
+                    "with --disable-radix-cache)"
+                ),
+                not envs.ATOM_V41_RADIX,
+            ),
+            # The replay side batch carries no sampling info.
+            (
+                "watermarking with radix cache",
+                setting(features, "enable_watermark", False),
+            ),
+        )
+        unsupported += _radix_refusals(memory, exec_, schedule, spec)
     refused = [name for name, enabled in unsupported if enabled]
     if refused:
         raise ValueError(
@@ -763,6 +847,12 @@ def _make_proxy_pool_cls():
             self.capture_slot_base = self.num_req_slots
             self.num_slots = self.num_req_slots + self.num_capture_slots
             self.capture_slots = tuple(range(self.capture_slot_base, self.num_slots))
+            # Per request-row STATE slot, the `req_to_token_pool.req_generation`
+            # of the tenant its state was last rebuilt or started for. Written
+            # only by the radix replay seam (`deepseek_v41_radix`), read by the
+            # extend guard; the generation SGLang bumps on every row allocation
+            # is how a new tenant is told from a chunked continuation.
+            self.state_gen = np.zeros(self.num_req_slots, dtype=np.int64)
             total_bytes = _arena_bytes(geometry, self.num_pages, self.num_slots)
             self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
             # Reported by /get_internal_state and the scheduler metrics, in GiB.
@@ -837,7 +927,7 @@ def _make_proxy_pool_cls():
         def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
             raise NotImplementedError(
                 "DeepSeek-V4.1 on the SGLang plugin does not support KV "
-                "relocation yet; launch with --disable-radix-cache"
+                "relocation (--enable-unified-memory) yet"
             )
 
     return ATOMDeepSeekV41ProxyKVPool
@@ -1223,11 +1313,84 @@ def _refuse_padding_page(rows) -> None:
         )
 
 
-def build_v41_scheduled_batch(forward_batch, block_size: int):
+def _radix_stamps():
+    """The proxy pool's per-slot tenant stamps and SGLang's row generations,
+    off the pools of the current forward context."""
+    from sglang.srt.model_executor.forward_context import (
+        get_req_to_token_pool,
+        get_token_to_kv_pool,
+    )
+
+    return (
+        get_token_to_kv_pool().state_gen,
+        get_req_to_token_pool().req_generation,
+    )
+
+
+def _check_radix_resumes(slots, prefix) -> None:
+    """With radix cache on, refuse an extend resuming a slot the replay seam
+    did not rebuild for its current tenant."""
+    from atom.plugin.sglang import deepseek_v41_radix as radix
+
+    if radix.radix_replay_rows() is None or not np.any(prefix > 0):
+        return
+    state_gen, generation = _radix_stamps()
+    radix.check_state_stamps(state_gen, generation, slots, prefix)
+
+
+def _replaying(forward_batch, prefix, ends, bs: int, block_size: int, history):
+    """``ScheduledBatch.replaying`` for a radix replay side forward: every row
+    rebuilds its fresh slot over ``[start, P)`` (``deepseek_v41_radix``)."""
+    from atom.model_engine.sequence import Replay
+
+    mode = forward_batch.forward_mode
+    if getattr(mode, "name", None) != "EXTEND":
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 radix replay runs as an EXTEND, not {mode}"
+        )
+    if getattr(forward_batch, "spec_info", None) is not None:
+        raise NotImplementedError("DeepSeek-V4.1 radix replay carries no spec_info")
+    ids = getattr(forward_batch, "engram_history", None)
+    if (
+        ids is None
+        or ids.dim() != 2
+        or int(ids.shape[0]) != bs
+        or (history is not None and int(ids.shape[1]) != int(history))
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 radix replay needs engram_history of "
+            f"[{bs}, {history}], got "
+            f"{None if ids is None else tuple(ids.shape)}"
+        )
+    if np.any(ends % block_size) or np.any(prefix % 2) or np.any(prefix >= ends):
+        raise ValueError(
+            "DeepSeek-V4.1 radix replay spans must start even and end on a "
+            f"PAGE boundary: starts={prefix.tolist()} ends={ends.tolist()}"
+        )
+    ids = ids.detach().cpu().numpy()
+    width = ids.shape[1]
+    replaying = {}
+    for i in range(bs):
+        start = int(prefix[i])
+        # SGLang left-pads a history shorter than its width; native ATOM
+        # carries only the tokens that exist (`Scheduler._resume_prefill`).
+        keep = min(width, start)
+        replaying[i] = Replay(
+            until=int(ends[i]),
+            rebuilds=True,
+            history_ids=tuple(int(t) for t in ids[i, width - keep :]),
+            start=start,
+        )
+    return replaying
+
+
+def build_v41_scheduled_batch(forward_batch, block_size: int, history=None):
     """ATOM's scheduled-batch protocol for one SGLang ``ForwardBatch``.
 
     Only ``DECODE`` and ``EXTEND`` (the eager runner turns ``MIXED`` into
-    ``EXTEND``) are translated; speculative and other modes are refused.
+    ``EXTEND``) are translated; speculative and other modes are refused. A
+    radix replay side forward (``encoder_swa_replay``) carries its rows'
+    ``replaying``; ``history``: the Engram history width it must carry.
     """
     mode = forward_batch.forward_mode
     if not (mode.is_decode() or mode.is_context_parallel_extend()):
@@ -1275,6 +1438,12 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         raise ValueError(
             f"DeepSeek-V4.1 needs one live req_pool_idx per request; got {slots}"
         )
+    if getattr(forward_batch, "encoder_swa_replay", False):
+        replaying = _replaying(forward_batch, prefix, ends, bs, block_size, history)
+    else:
+        replaying = {}
+        if not mode.is_decode():
+            _check_radix_resumes(slots, prefix)
     rows = _block_rows(
         _req_to_token(), forward_batch.req_pool_indices[:bs], ends, block_size
     )
@@ -1290,9 +1459,12 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
         # prompt, so every request counts as finishing (None): under decoder
         # bounded replay a chunk SGLang continues runs the decoder on its last
         # window rows too, whose ring the next chunk then reads if it is
-        # shorter than the window (`v41_extend_replays`).
+        # shorter than the window (`v41_extend_replays`). A radix replay side
+        # forward (``replaying``) is prefill-only, so its decoder computes
+        # every row of ``[start, P)``: the ring rows below the hit that a main
+        # extend shorter than the window reads, as the next chunk does above.
         is_final_chunk=None,
-        replaying={},
+        replaying=replaying,
         state_slots_committed=[int(s) for s in slots],
         block_tables=rows,
         total_seqs_num=bs,
@@ -1350,7 +1522,11 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
     builder = get_deepseek_v41_builder()
     if builder.cache is None:
         raise RuntimeError("DeepSeek-V4.1 proxy KV pool is not initialized")
-    batch = build_v41_scheduled_batch(forward_batch, builder.block_size)
+    batch = build_v41_scheduled_batch(
+        forward_batch,
+        builder.block_size,
+        history=getattr(getattr(builder, "geometry", None), "history_size", None),
+    )
     input_ids = forward_batch.input_ids
     running_tokens = int(input_ids.shape[0])
     if running_tokens != int(positions.shape[0]):

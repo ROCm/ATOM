@@ -101,6 +101,7 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
         ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
         align_atom_config_with_sglang,
         refuse_unsupported_sglang_features,
+        sglang_radix_cache_enabled,
     )
 
     refuse_unsupported_sglang_features()
@@ -117,8 +118,19 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     # model decides whether to build its replay stages.
     if os.environ.get("ATOM_SGLANG_V41_DECODER_REPLAY", "1") != "1":
         atom_config.enable_decoder_swa_bounded_replay = False
-    # Encoder replay rebuilds state below a prefix hit; radix cache is refused.
-    atom_config.enable_encoder_swa_bounded_replay = False
+    # Encoder replay rebuilds the state below a prefix hit: on exactly when
+    # SGLang's radix cache is (`deepseek_v41_radix`, which it installs). Its
+    # side forward is prefill-only, so the decoder replay above computes all
+    # of its rows (`v41_extend_replays`).
+    radix = sglang_radix_cache_enabled()
+    atom_config.enable_encoder_swa_bounded_replay = radix
+    radix_rows = None
+    if radix:
+        from atom.plugin.sglang.deepseek_v41_radix import install_deepseek_v41_radix
+
+        radix_rows = install_deepseek_v41_radix(
+            window=getattr(atom_config.hf_config, "sliding_window", None)
+        )
     # The remap every other adapter gets from prepare_model, as native's
     # ModelRunner and the vLLM wrapper apply it. (gfx942's FP4PTPC routed-
     # expert ptpc_fp8 default is already in the quant config: it is set
@@ -131,12 +143,13 @@ def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
     )
     logger.info(
         "DeepSeek-V4.1 SGLang config: kv_cache_dtype=%s index_cache_dtype=%s "
-        "online_quant_config=%s decoder_replay=%s max_num_seqs=%d "
-        "max_num_batched_tokens=%d",
+        "online_quant_config=%s decoder_replay=%s radix_replay_rows=%s "
+        "max_num_seqs=%d max_num_batched_tokens=%d",
         atom_config.kv_cache_dtype,
         atom_config.index_cache_dtype,
         atom_config.online_quant_config,
         atom_config.enable_decoder_swa_bounded_replay,
+        radix_rows,
         atom_config.max_num_seqs,
         atom_config.max_num_batched_tokens,
     )

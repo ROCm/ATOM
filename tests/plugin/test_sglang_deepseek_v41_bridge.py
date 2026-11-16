@@ -421,7 +421,6 @@ class TestLaunchContract:
     @pytest.mark.parametrize(
         ("bag", "field", "value", "match"),
         [
-            ("memory", "disable_radix_cache", False, "radix cache"),
             ("memory", "enable_hierarchical_cache", True, "hierarchical cache"),
             ("memory", "enable_hisparse", True, "HiSparse"),
             ("spec", "speculative_algorithm", "EAGLE", "speculative decoding"),
@@ -457,14 +456,34 @@ class TestLaunchContract:
         sglang_launch.args.disable_radix_cache = True
         sglang_launch.args.language_model_only = True
         refuse_unsupported_sglang_features()
-        sglang_launch.args.disable_radix_cache = False
-        with pytest.raises(ValueError, match="radix cache"):
+        sglang_launch.args.enable_hierarchical_cache = True
+        with pytest.raises(ValueError, match="hierarchical cache"):
+            refuse_unsupported_sglang_features()
+
+    def test_radix_cache_needs_the_opt_in(self, sglang_launch, monkeypatch):
+        monkeypatch.delenv("ATOM_V41_RADIX", raising=False)
+        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.args.disable_overlap_schedule = True
+        with pytest.raises(ValueError, match="ATOM_V41_RADIX=1"):
+            bridge.refuse_unsupported_sglang_features()
+
+    def test_radix_cache_is_served_by_the_replay(self, sglang_launch, monkeypatch):
+        # Opted in, radix cache itself is not refused; what it cannot run
+        # beside is (`test_sglang_deepseek_v41_radix.py`).
+        monkeypatch.setenv("ATOM_V41_RADIX", "1")
+        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.args.disable_overlap_schedule = True
+        refuse_unsupported_sglang_features()
+        sglang_launch.args.disable_overlap_schedule = False
+        with pytest.raises(ValueError, match="overlap scheduling with radix cache"):
             refuse_unsupported_sglang_features()
 
     def test_every_refusal_is_reported_at_once(self, sglang_launch):
-        sglang_launch.bags["memory"].disable_radix_cache = False
+        sglang_launch.bags["memory"].enable_hierarchical_cache = True
         sglang_launch.args.pp_size = 2
-        with pytest.raises(ValueError, match="radix cache.*pipeline parallelism"):
+        with pytest.raises(
+            ValueError, match="hierarchical cache.*pipeline parallelism"
+        ):
             refuse_unsupported_sglang_features()
 
     def test_atom_config_takes_sglang_resolved_schedule(self, sglang_launch):
@@ -1067,7 +1086,7 @@ class TestProxyPool:
         assert pool.store_dtype == torch.uint8
         assert pool.dtype == torch.bfloat16
         assert pool.get_state_buf_infos() == ([], [], [])
-        with pytest.raises(NotImplementedError, match="radix-cache"):
+        with pytest.raises(NotImplementedError, match="relocation"):
             pool.move_kv_cache(torch.zeros(1), torch.zeros(1))
         with pytest.raises(NotImplementedError):
             pool.get_kv_buffer(0)
