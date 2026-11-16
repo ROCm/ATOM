@@ -11,8 +11,10 @@ This kernel performs the same copies from the same SGLang track metadata in
 one launch. It addresses every tensor by its real strides, so the pool views
 the plugin hands over (a transposed conv pool, the VK view of the SSM pool, a
 column slice of the fused projection) are written byte for byte where the
-eager ``index_put`` would write them. The SSM value is read from ``h`` in its
-dtype and cast to the pool dtype, exactly as ``h[src].to(pool.dtype)`` does.
+eager ``index_put`` would write them, and FlyDSL's chunk states, a view over
+VK storage too, are read where ``h[src]`` reads them. The SSM value is read
+from ``h`` in its dtype and cast to the pool dtype, exactly as
+``h[src].to(pool.dtype)`` does.
 
 Grid axis 0 is the target list ``[conv rows | h rows | final rows]``; axis 1
 covers the feature dim (conv) or the flattened ``H*K*V`` state (SSM).
@@ -59,6 +61,7 @@ def _radix_track_snapshot_kernel(
     V: tl.constexpr,
     HKV: tl.constexpr,
     BLOCK: tl.constexpr,
+    VK_ORDER: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -77,8 +80,12 @@ def _radix_track_snapshot_kernel(
     else:
         smask = offs < HKV
         i_h = offs // (K * V)
-        i_k = (offs // V) % K
-        i_v = offs % V
+        if VK_ORDER:
+            i_v = (offs // K) % V
+            i_k = offs % K
+        else:
+            i_k = (offs // V) % K
+            i_v = offs % V
         dst_off = i_h * stride_s_h + i_k * stride_s_k + i_v * stride_s_v
         t = i_t - N_CONV
         if t < N_H:
@@ -168,6 +175,9 @@ def write_radix_track_snapshots(
     else:
         h = ssm_state
         h_strides = ssm_state.stride()
+    # FlyDSL's `h` and its decode pool both store VK: walk that storage order
+    # so both sides are contiguous. Otherwise walk logical KV order.
+    vk_order = bool(n_h) and h_strides[-2] == 1 and ssm_state.stride(-2) == 1
     nblk = max(
         triton.cdiv(d, _BLOCK) if n_conv else 0,
         triton.cdiv(hkv, _BLOCK) if n_h + n_f else 0,
@@ -198,4 +208,5 @@ def write_radix_track_snapshots(
         V=v,
         HKV=hkv,
         BLOCK=_BLOCK,
+        VK_ORDER=vk_order,
     )

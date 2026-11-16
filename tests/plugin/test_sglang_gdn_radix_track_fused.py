@@ -57,11 +57,15 @@ def _pools(conv_transposed: bool, ssm_vk: bool, dev="cuda"):
     return conv, ssm
 
 
-def _inputs(dev="cuda"):
+def _inputs(dev="cuda", h_vk=False):
     g = torch.Generator(device=dev).manual_seed(1)
     # Column slice of a wider fused projection: row stride != D.
     fused = torch.randn(T, D + 300, device=dev, generator=g, dtype=torch.bfloat16)
     x = fused[:, 100 : 100 + D]
+    if h_vk:
+        # FlyDSL's chunk states: the logical [K, V] view of VK storage.
+        h = torch.randn(1, NT, H, V, K, device=dev, generator=g, dtype=torch.bfloat16)
+        return x, h.transpose(-1, -2)
     h = torch.randn(1, NT, H, K, V, device=dev, generator=g, dtype=torch.bfloat16)
     return x, h
 
@@ -108,11 +112,12 @@ def _fused(x, h, conv, ssm, md):
 
 @pytest.mark.parametrize("conv_transposed", [False, True])
 @pytest.mark.parametrize("ssm_vk", [False, True])
+@pytest.mark.parametrize("h_vk", [False, True])
 @pytest.mark.parametrize(
     "counts", [(4, 3, 2), (4, 0, 2), (4, 3, 0), (0, 3, 2), (2, 1, 0), (0, 0, 1)]
 )
-def test_fused_matches_eager_bit_for_bit(conv_transposed, ssm_vk, counts):
-    x, h = _inputs()
+def test_fused_matches_eager_bit_for_bit(conv_transposed, ssm_vk, h_vk, counts):
+    x, h = _inputs(h_vk=h_vk)
     md = _metadata(*counts)
     conv_ref, ssm_ref = _pools(conv_transposed, ssm_vk)
     conv_new, ssm_new = _pools(conv_transposed, ssm_vk)
@@ -122,6 +127,30 @@ def test_fused_matches_eager_bit_for_bit(conv_transposed, ssm_vk, counts):
     # Compare whole pools so stray writes to untouched slots are caught too.
     assert torch.equal(conv_new, conv_ref)
     assert torch.equal(ssm_new, ssm_ref)
+
+
+@pytest.mark.parametrize("ssm_vk", [False, True])
+@pytest.mark.parametrize("h_vk", [False, True])
+def test_fused_keeps_k_and_v_apart(ssm_vk, h_vk):
+    """Unequal K and V catch an interchanged axis on either side."""
+    k, v = 64, 128
+    g = torch.Generator(device="cuda").manual_seed(2)
+    shape = (1, NT, H, v, k) if h_vk else (1, NT, H, k, v)
+    h = torch.randn(*shape, device="cuda", generator=g, dtype=torch.bfloat16)
+    if h_vk:
+        h = h.transpose(-1, -2)
+    if ssm_vk:
+        ssm = torch.randn(NUM_SLOTS, H, v, k, device="cuda", generator=g)
+        ssm = ssm.transpose(-1, -2)
+    else:
+        ssm = torch.randn(NUM_SLOTS, H, k, v, device="cuda", generator=g)
+    ssm_ref = ssm.clone()
+    x, _ = _inputs()
+    conv, _ = _pools(False, False)
+    md = _metadata(0, 3, 2)
+    _reference(x, h, conv, ssm_ref, md)
+    _fused(x, h, conv, ssm, md)
+    assert torch.equal(ssm, ssm_ref)
 
 
 def test_nothing_to_track_launches_nothing():
@@ -149,8 +178,9 @@ def _kernel_count(fn) -> int:
     )
 
 
-def test_one_launch_replaces_the_eager_chain():
-    x, h = _inputs()
+@pytest.mark.parametrize("h_vk", [False, True])
+def test_one_launch_replaces_the_eager_chain(h_vk):
+    x, h = _inputs(h_vk=h_vk)
     md = _metadata(4, 3, 2)
     conv, ssm = _pools(True, True)
     _fused(x, h, conv, ssm, md)  # compile outside the profiled window
@@ -183,10 +213,11 @@ class _Mode:
 
 
 @pytest.mark.parametrize("flydsl_decode", [False, True])
-def test_track_mamba_states_uses_one_launch_on_device(monkeypatch, flydsl_decode):
+@pytest.mark.parametrize("h_vk", [False, True])
+def test_track_mamba_states_uses_one_launch_on_device(monkeypatch, flydsl_decode, h_vk):
     """End to end through the layer: same pools as the eager path, and the
     SGLang helper is not called."""
-    x, h = _inputs()
+    x, h = _inputs(h_vk=h_vk)
     md = _metadata(4, 3, 2)
     # The plugin's FlyDSL-decode pool is stored VK and handed over transposed.
     conv_ref, ssm_ref = _pools(True, flydsl_decode)
