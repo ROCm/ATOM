@@ -266,6 +266,28 @@ def test_base_kernels_launch_in_order(
         assert all(torch.equal(a, b) for a, b in zip(out, want))
 
 
+@pytest.mark.parametrize("tokens", [8, 13, 1027])
+def test_prefix_rows_are_added_after_the_shared_rows(
+    ranks, monkeypatch, tokens  # noqa: F811
+):
+    """`row_sharded_moe` with `prefix_rows` is bitwise the call without them
+    then `+= rows.gather(prefix_rows)`."""
+    monkeypatch.setattr(kimi_k3_ops, "two_step_add", _torch_two_step_add)
+    w = _weights()
+    gen = torch.Generator().manual_seed(tokens)
+    x, prefix = torch.randn(2, tokens, HIDDEN, generator=gen).bfloat16()
+
+    def on_rank(rank):
+        block = _block(w, rank, [])
+        rows = qwen4_exp._SequenceParallel(tokens, WORLD, rank)
+        want = block.row_sharded_moe(x, rows)
+        want += rows.gather(rows.shard(prefix))
+        return block.row_sharded_moe(x, rows, rows.shard(prefix)), want
+
+    for got, want in ranks(on_rank):
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+
+
 @pytest.mark.parametrize("floor", [None, "14"], ids=["default-floor", "below-floor"])
 def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
     """At threshold 0 an eager step below the row floor runs the base layer."""
