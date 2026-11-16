@@ -13,8 +13,6 @@ from __future__ import annotations
 import logging
 import time
 
-import torch
-
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
@@ -28,6 +26,7 @@ from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     offload_save_abandon_timeout_s,
     pp_aware_rank_and_world,
+    record_save_fence,
 )
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
@@ -43,7 +42,10 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.model_engine.state_offload import state_tier_cpu_bytes
+from atom.model_engine.state_offload import (
+    state_tier_cpu_entries,
+    state_tier_spans_pipeline,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -142,8 +144,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         first lets an in-flight transfer finish against a pool that is still
         mapped; `shutdown` then joins the tier's own executors. Only after that
         does the base close its save/load pools. Guarded because the tier is
-        `None` until `register_kv_caches` builds it (and stays `None` under PP or
-        on a non-owning layout).
+        `None` until `register_kv_caches` builds it (and stays `None` on a
+        non-owning layout).
         """
         tier = getattr(self, "_state_tier", None)
         if tier is not None:
@@ -161,18 +163,23 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
     def _build_state_tier(self, transfer_tensors) -> None:
         from aiter.dist.parallel_state import get_tp_group
 
-        # PP breaks the tier: the CacheEngineKey has no PP component, so two
-        # stages at the same TP rank would overwrite each other. Refused rather
-        # than half-supported. Paged KV is unaffected.
+        # Refused before the spec is read: such a layout publishes no layout id
+        # under PP, and the warning below would blame a broken build for it.
         pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
-        if pp_size > 1:
-            logger.warning(
-                "kimi_k3 offload: the state tier is unsupported under pipeline "
-                "parallelism (pipeline_parallel_size=%d); paged KV is unaffected.",
+        layout = offcfg.select_offload_layout(self._config) if pp_size > 1 else None
+        if layout is not None and not state_tier_spans_pipeline(layout):
+            logger.info(
+                "kimi_k3 offload: layout %r keeps no state tier at "
+                "pipeline_parallel_size=%d; state tier off.",
+                layout,
                 pp_size,
             )
             return
 
+        # Under PP every stage builds its own tier over its own layers' image.
+        # The key's worker id is `pp_aware_rank_and_world`'s, so stages at one
+        # TP rank do not collide, and `PPKVAggregator` takes each store's and
+        # load's verdict across all of them.
         backend = getattr(transfer_tensors, "state_backend", None)
         if backend is None:
             logger.warning(
@@ -257,7 +264,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
             layout_id=layout_id,
-            max_cache_bytes=state_tier_cpu_bytes(),
+            max_cache_bytes=state_tier_cpu_entries(spec, self._config) * entry_bytes,
         )
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
@@ -472,8 +479,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 self._store_failed_no_tier.add(op)
             return
         try:
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream())
+            ready_event = record_save_fence()
         except Exception:
             logger.exception(
                 "kimi_k3 offload: state store fence creation failed; failing "
@@ -699,10 +705,16 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
-        # its worker queue with, read from the other end.
+        # its worker queue with, read from the other end. The default scales
+        # with the pipeline depth only for a layout whose state tier spans the
+        # stages; only that one has been run with the scaled default under PP.
+        pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+        if not state_tier_spans_pipeline(offcfg.select_offload_layout(config)):
+            pp_size = 1
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
             envs.OFFLOAD_COPY_WORKERS,
+            pp_size=pp_size,
         )
         self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False

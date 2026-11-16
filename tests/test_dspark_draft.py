@@ -129,27 +129,16 @@ def test_default_share_with_target_refuses_a_vocab_mismatch():
     assert draft.embed_tokens is None and draft.lm_head is None
 
 
-def test_default_share_with_target_keeps_a_drafts_own_embedding():
-    """A draft that loaded its own embedding (K3 DSpark past PP stage 0)
-    keeps it and still scores with the target's head."""
-    draft = _stub_draft(163840)
-    own = draft.embed_tokens = _target_base(163840).model.embed_tokens
-    target = _target_base(163840)
-    draft.share_with_target(target, set())
-    assert draft.embed_tokens is own
-    assert draft.lm_head is target.lm_head
-
-
 def test_default_share_with_target_reads_the_vocab_off_the_head_under_pp():
     """Under PP the drafter's stage holds a PPMissingLayer for the target's
     embedding; the vocab check reads the head the draft scores with."""
     from atom.models.utils import PPMissingLayer
 
     draft = _stub_draft(163840)
-    draft.embed_tokens = _target_base(163840).model.embed_tokens
     target = _target_base(163840)
     target.model.embed_tokens = PPMissingLayer()
     draft.share_with_target(target, set())
+    assert draft.embed_tokens is target.model.embed_tokens
     assert draft.lm_head is target.lm_head
     with pytest.raises(ValueError, match="target vocab 200064"):
         _stub_draft(163840).share_with_target(_target_base(200064), set())

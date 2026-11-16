@@ -6,12 +6,17 @@
 from pathlib import Path
 
 import yaml
+from atomesh_workflow_helpers import github_expressions
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
 def _jobs(filename):
     return yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"]
+
+
+def _workflow(filename):
+    return yaml.safe_load((WORKFLOWS / filename).read_text())
 
 
 def test_empty_accuracy_model_list_skips_the_job_only_on_pull_requests():
@@ -37,7 +42,7 @@ def test_atomesh_accuracy_uses_required_heavy_ci_gate():
         step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-accuracy-validation.yaml"
-    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh"
+    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:mesh"
     assert "atom/mesh/**" in gate_env["CI_GATE_PATHS_INCLUDE"]
     assert ".github/benchmark/models_accuracy.json" in gate_env["CI_GATE_PATHS_INCLUDE"]
 
@@ -88,13 +93,17 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         step["env"] for step in jobs["ci-gate"]["steps"] if step.get("id") == "gate"
     )
     assert gate_env["CI_GATE_WORKFLOW"] == "atomesh-benchmark.yaml"
-    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:atomesh"
+    assert gate_env["CI_GATE_LABELS"] == "ci:full,ci:mesh"
     assert "atom/mesh/**" in gate_env["CI_GATE_PATHS_INCLUDE"]
     assert ".github/benchmark/models_atomesh.yaml" in gate_env["CI_GATE_PATHS_INCLUDE"]
 
     assert jobs["load-config"]["needs"] == ["ci-gate"]
     assert jobs["rdma-smoke-test"]["needs"] == ["ci-gate", "load-config"]
     assert jobs["run-model-benchmark"]["needs"] == ["ci-gate", "load-config"]
+    assert (
+        "github.event.pull_request && !github.event.pull_request.head.repo.fork"
+        in jobs["run-model-benchmark"]["if"]
+    )
 
     test_gate = jobs["atomesh-benchmark-gate"]
     assert test_gate["if"] == "always()"
@@ -115,9 +124,49 @@ def test_atomesh_benchmark_uses_required_heavy_ci_gate():
         "load-config=${{ needs.load-config.result }}"
         in evaluate_inputs["required-results"]
     )
+    assert (
+        "run-model-benchmark=${{ (github.event_name == 'schedule'"
+        in evaluate_inputs["required-results"]
+    )
     assert "run-model-benchmark=${{ needs.run-model-benchmark.result }}" in (
         evaluate_inputs["optional-results"]
     )
+
+
+def test_atomesh_heavy_gate_concurrency_groups_separate_non_approval_reviews():
+    cases = [
+        ("atomesh-accuracy-validation.yaml", "Atomesh Accuracy Validation"),
+        ("atomesh-benchmark.yaml", "Atomesh Benchmark"),
+    ]
+
+    for filename, workflow_name in cases:
+        group = _workflow(filename)["concurrency"]["group"]
+        pull_request_group = github_expressions(
+            group,
+            "pull_request",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            run_id="100",
+        )
+        approval_group = github_expressions(
+            group,
+            "pull_request_review",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            review_state="approved",
+            run_id="200",
+        )
+        comment_group = github_expressions(
+            group,
+            "pull_request_review",
+            workflow=workflow_name,
+            pull_request_number="3313",
+            review_state="commented",
+            run_id="300",
+        )
+
+        assert approval_group == pull_request_group
+        assert comment_group == f"{pull_request_group}-review-300"
 
 
 def test_mocker_benchmark_stays_off_pull_requests():

@@ -13,7 +13,7 @@ from torch import nn
 from atom.config import Config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
-    pcp_allgather_rerange,
+    pcp_allgather_rerange_many,
     pcp_pad_len,
 )
 from atom.model_loader.loader import load_model
@@ -54,6 +54,32 @@ class AuxCaptureSpec:
     def __post_init__(self):
         if self.capture not in ("output", "input"):
             raise ValueError("Aux capture must select layer input or output")
+
+
+def pcp_aux_rows(n: int) -> int | None:
+    """The rows the base `arm_aux_capture`'s layer hooks hold after a PCP
+    row-split target prefill of `n` rows -- this rank's round-robin stripe --
+    or None when the target did not split. A drafter that strips aux off the
+    target's output instead (EAGLE3) holds whatever the target returns. Keyed on
+    the batch-global `target_pcp_split`, never on hook-side bookkeeping, which a
+    cudagraph replay skips."""
+    ctx = getattr(get_forward_context(), "context", None)
+    # `target_pcp_split` implies PCP is enabled (ws > 1); see
+    # `ModelRunner._settle_target_pcp_split`.
+    if n <= 0 or not getattr(ctx, "target_pcp_split", False):
+        return None
+    pcp_ws = get_pcp_world_size()
+    return pcp_pad_len(n, pcp_ws) // pcp_ws
+
+
+def aux_blocks(drafter: "Drafter") -> list[torch.Tensor]:
+    """The drafter's capture buffers, the leading ones replaced by the block
+    relayed from earlier PP stages (`take_relayed_aux`), if any."""
+    blocks = drafter._aux_buffers
+    if drafter._relayed_aux is not None:
+        relayed = drafter._relayed_aux.shape[-1] // blocks[0].shape[-1]
+        blocks = [drafter._relayed_aux, *blocks[relayed:]]
+    return blocks
 
 
 # Descent bound for the `.model` wrapper chain below — big enough for every
@@ -117,16 +143,22 @@ def _resolve_embedding(target_model: nn.Module) -> nn.Module:
     return embed
 
 
-def tap_is_resident(target_model: nn.Module, layers: nn.Module, lid: int) -> bool:
-    """Whether aux tap ``lid`` runs on this PP stage: a tap owned by another
-    stage sits on a ``PPMissingLayer``. Out-of-range ids are not resident."""
-    if lid == -1:
-        module = _resolve_embedding(target_model)
-    elif 0 <= lid < len(layers):
-        module = layers[lid]
-    else:
-        return False
-    return not isinstance(module, PPMissingLayer)
+def tap_is_resident(layers: nn.Module, lid: int) -> bool:
+    """Whether aux tap ``lid`` runs on this PP stage: a layer owned by another
+    stage is a ``PPMissingLayer``, and the embedding (``-1``) runs on the stage
+    that owns layer 0. Out-of-range ids are not resident."""
+    lid = 0 if lid == -1 else lid
+    return 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
+
+
+def check_shared_embedding(draft: nn.Module) -> None:
+    """Refuse a draft that shared a ``PPMissingLayer`` as its embedding."""
+    if isinstance(getattr(draft, "embed_tokens", None), PPMissingLayer):
+        raise TypeError(
+            "The draft shares the target's embedding, which this PP stage does "
+            "not build: declare the method in registry.pp_speculative_methods "
+            "and build the embedding with models.utils.pp_holds_embedding."
+        )
 
 
 def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
@@ -523,6 +555,14 @@ class Drafter(abc.ABC):
         """
         return False
 
+    @property
+    def context_kv_only(self) -> bool:
+        """This producer writes draft context K/V without ever proposing tokens."""
+        return (
+            self.runner.tokenID_processor.is_pd_producer
+            and not self.draft_kv_duplicates_propose
+        )
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per
@@ -536,9 +576,7 @@ class Drafter(abc.ABC):
         layers = _resolve_decoder_layers(target_model)
         # A tap on an earlier PP stage reaches `take_relayed_aux` instead, so it
         # gets no rows and no hook. install_aux_taps still rejects bad ids.
-        own = tuple(
-            lid for lid in spec.layer_ids if tap_is_resident(target_model, layers, lid)
-        )
+        own = tuple(lid for lid in spec.layer_ids if tap_is_resident(layers, lid))
         self._aux_buffers = [
             torch.zeros(
                 self.max_num_tokens if lid in own else 0,
@@ -570,6 +608,11 @@ class Drafter(abc.ABC):
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
 
+    @property
+    def captures_aux(self) -> bool:
+        """Did `arm_aux_capture` tap target layers for this drafter?"""
+        return self._captures_aux
+
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
 
@@ -587,21 +630,19 @@ class Drafter(abc.ABC):
         token counts.
 
         After a PCP row-split prefill the hooks hold only this rank's 1/pcp
-        stripe, so gather it. Keyed on the batch-global `target_pcp_split`, never
-        on hook-side bookkeeping, which a cudagraph replay skips.
+        stripe, so gather it (`pcp_aux_rows`).
         """
         if not self._captures_aux:
             return None
-        blocks = self._aux_buffers
-        if self._relayed_aux is not None:
-            relayed = self._relayed_aux.shape[-1] // blocks[0].shape[-1]
-            blocks = [self._relayed_aux, *blocks[relayed:]]
+        blocks = aux_blocks(self)
         n = target_hidden_states.shape[0]
-        pcp_ws = get_pcp_world_size()
-        ctx = getattr(get_forward_context(), "context", None)
-        if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
-            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
-            return [pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in blocks]
+        n_local = pcp_aux_rows(n)
+        if n_local is not None:
+            pcp_ws = get_pcp_world_size()
+            gathered = pcp_allgather_rerange_many(
+                [buf[:n_local] for buf in blocks], pcp_ws
+            )
+            return [g[:n] for g in gathered]
         return [buf[:n] for buf in blocks]
 
     def take_relayed_aux(self, block: torch.Tensor) -> None:
@@ -691,7 +732,11 @@ class Drafter(abc.ABC):
         # `model.head`) implement `share_with_target(target_base)` to do
         # their own setattr-rebinding and short-circuit the default path.
         if hasattr(self.model, "share_with_target"):
-            self.model.share_with_target(target_base, loaded)
+            # Context-only producers do not use the token embedding or output
+            # head; under PP the target embedding may live on an earlier stage.
+            if not self.context_kv_only:
+                self.model.share_with_target(target_base, loaded)
+                check_shared_embedding(self.model)
             if self.is_block_drafter and hasattr(self.model, "reset_kv_cache"):
                 # Allocate DSpark's private rolling target-KV window now that the
                 # device/dtype and max concurrency are known.

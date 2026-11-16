@@ -130,7 +130,9 @@ def test_heads_shard_or_replicate(heads, world, split):
 
 
 def test_sp_does_not_share_compiled_artifacts():
-    config = atom_config_double()
+    # A real Config always carries the checkpoint config by the time its hash is
+    # read (`__post_init__` sets it); give the double the same, empty here.
+    config = atom_config_double(hf_config=SimpleNamespace())
     native = Config.compute_hash(config)
     config.sequence_parallel_size = 4
     assert Config.compute_hash(config) == Config.compute_hash(config) != native

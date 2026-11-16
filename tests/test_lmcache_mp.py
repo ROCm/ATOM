@@ -288,11 +288,10 @@ def test_auto_rank_collapse_is_off_for_a_draft_with_its_own_pool(monkeypatch):
     from atom.utils import selector
 
     owns_pool = {"value": True}
-    monkeypatch.setattr(selector, "attn_family", lambda _hf: "draft-family")
     monkeypatch.setattr(
         selector,
-        "get_attn_backend",
-        lambda _family: SimpleNamespace(DRAFT_OWNS_KV_POOL=owns_pool["value"]),
+        "attn_family",
+        lambda _hf: selector.Family.MHA if owns_pool["value"] else selector.Family.MLA,
     )
     config = _config(tp=8, kv_lora_rank=512)
     assert deployment._tp_replication_factor(config) == 8

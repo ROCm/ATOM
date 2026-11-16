@@ -298,15 +298,17 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         scale: torch.Tensor | None,
     ) -> mk.ReceiverType:
+        # Not `tbo_on_comm`: dispatch / combine return views of this ubatch's
+        # own mori buffers, which the caching allocator never hands out.
         from atom.utils.tbo.ubatching import (
+            _tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
-            tbo_yield_and_switch_from_compute_to_comm,
         )
 
         block_num, warp_per_block = self._launch_geometry(a1.shape[0])
         mori_op = self._current_tbo_mori_op()
 
-        tbo_yield_and_switch_from_compute_to_comm()
+        _tbo_yield_and_switch_from_compute_to_comm()
 
         (
             dispatch_a1,
@@ -384,16 +386,18 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         fused_expert_output: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> Callable:
+        # Not `tbo_on_comm`: dispatch / combine return views of this ubatch's
+        # own mori buffers, which the caching allocator never hands out.
         from atom.utils.tbo.ubatching import (
+            _tbo_yield_and_switch_from_compute_to_comm,
             tbo_switch_to_compute_sync,
-            tbo_yield_and_switch_from_compute_to_comm,
         )
 
         block_num, warp_per_block = self._launch_geometry(num_token)
         mori_op = self._current_tbo_mori_op()
 
         # Yield to other thread FIRST, then switch to comm stream.
-        tbo_yield_and_switch_from_compute_to_comm()
+        _tbo_yield_and_switch_from_compute_to_comm()
 
         result = mori_op.combine(
             fused_expert_output,
