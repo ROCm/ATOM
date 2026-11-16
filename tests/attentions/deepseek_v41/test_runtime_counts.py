@@ -10,8 +10,8 @@ if not torch.cuda.is_available():
 from atom.model_ops.attentions.deepseek_v41 import planes
 from atom.model_ops.deepseek_v41 import dspark
 from tests.attentions.deepseek_v41.test_draft_fp8 import (
-    assert_csr_equal,
-    csr_oracle,
+    assert_sources_equal,
+    expected_sources,
     mxfp8,
 )
 
@@ -84,17 +84,18 @@ def test_window_counts_reuse_one_variant(operation):
         ), f"{operation} compiled again at count={count}"
 
 
-def test_draft_csr_counts_reuse_one_variant():
-    # All these counts share the same bounded scan tile (BLOCK_BATCH=16).
-    # Only the live request count changes, including its alignment.
+def test_draft_source_counts_reuse_one_variant():
+    # All these counts share the same anchor tile (BLOCK_B=32). Only the live
+    # request count changes, including its alignment.
     compiled = None
+    buffers = dspark.DraftSrcBuffers(32, 5)
     for count in (17, 19, 21, 23, 32):
         anchors = torch.arange(count, device="cuda") * 3 - 1
         _, indices, _ = dspark.draft_step_indices(anchors, 13, 8, 5)
-        actual = dspark.draft_attention_csr(indices, 13)
-        assert_csr_equal(actual, csr_oracle(indices, 13))
+        actual = dspark.draft_src_indices(anchors, 13, 8, 5, buffers, fp8=True)
+        assert_sources_equal(actual, expected_sources(indices, 13))
         if compiled is None:
-            compiled = variants(dspark._draft_csr)
+            compiled = variants(dspark._draft_src_kernel)
         assert (
-            variants(dspark._draft_csr) == compiled
-        ), f"CSR compiled again at count={count}"
+            variants(dspark._draft_src_kernel) == compiled
+        ), f"Draft source lists compiled again at count={count}"
