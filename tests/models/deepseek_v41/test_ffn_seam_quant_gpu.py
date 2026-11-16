@@ -76,9 +76,11 @@ def test_fused_seam_rows_are_quantize_fp8_of_its_bf16_rows(rows):
 class _GateUp(nn.Module):
     """Records what `Expert.forward` feeds its gate_up."""
 
-    def __init__(self, native):
+    def __init__(self, native, input_size):
         super().__init__()
         self.native_a8_group_rows = 32 if native else None
+        # `takes_quantized_shared_input` requires this to equal the model dim.
+        self.input_size = input_size
         self.calls = []
 
     def forward(self, x, x_scale=None):
@@ -92,7 +94,7 @@ def _moe(dim, native=True):
 
     shared = Expert.__new__(Expert)
     nn.Module.__init__(shared)
-    shared.gate_up_proj = _GateUp(native)
+    shared.gate_up_proj = _GateUp(native, dim)
     shared.w2 = lambda x: torch.zeros(x.shape[0], dim, dtype=x.dtype, device=x.device)
     shared.swiglu_limit = 0.0
     shared.use_fused_clamp_act_mul = False
@@ -181,6 +183,31 @@ def test_combine_accepts_shared_branch_gets_the_seam_pair():
     ((x, x_scale),) = moe.shared_experts.gate_up_proj.calls
     assert x.dtype == torch.float8_e4m3fn and x.data_ptr() == fp8.data_ptr()
     assert x_scale is not None and x_scale.data_ptr() == scale.data_ptr()
+
+
+def test_comm_fused_produce_shared_gets_the_seam_pair():
+    # The comm-fused branch does not call the shared expert itself. It hands
+    # `produce_shared` to `routed_expert_forward` as `before_stage2_for_rows`,
+    # and that callback is what must receive the seam pair.
+    dim = 128
+    moe = _moe(dim)
+
+    def routed_expert_forward(x, **kwargs):
+        moe.routed_inputs.append(x)
+        # The kernel produces the shared rows, then joins them. Joining first
+        # is the error `wait_for_shared` raises.
+        shared = kwargs["before_stage2_for_rows"](x.shape[0])
+        kwargs["before_shared_add"]()
+        return x + shared, True
+
+    moe.routed_expert_forward = routed_expert_forward
+    hidden, fp8, scale = _seam_rows(7, dim)
+    moe.dual_stream_moe_forward(hidden, (fp8, scale))
+    torch.cuda.synchronize()
+    ((x, x_scale),) = moe.shared_experts.gate_up_proj.calls
+    assert x.dtype == torch.float8_e4m3fn and x.data_ptr() == fp8.data_ptr()
+    assert x_scale is not None and x_scale.data_ptr() == scale.data_ptr()
+    assert moe.shared_experts.gate_up_proj.input_size == dim
 
 
 def test_bf16_rows_keep_the_shared_expert_quantizing_itself():

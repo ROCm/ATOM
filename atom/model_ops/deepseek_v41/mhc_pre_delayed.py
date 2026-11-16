@@ -11,10 +11,11 @@ and gfx1250; Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 The norm is the sublayer's own. Attention and the FFN seam can both request
 HIP's fused MXFP8 output alongside BF16 for its other readers: attention for
 wqkv_a, the FFN seam for the shared expert's gate_up (`Block.hc_ffn_fuse_quant`).
-Its consumers (wqkv_a's group32 GEMM, the bounded-replay row gather) read
-row-major (T, H/32) E8M0 scales. gfx950 writes those; gfx1250 writes its
-m32k4 GEMM A-scale layout unless asked for `scale_row_major`, so there the
-fused output needs an AITER with that option, else the GEMM quantizes.
+Its consumers (wqkv_a's group32 GEMM, the shared expert's gate_up, the
+bounded-replay row gather) read row-major (T, H/32) E8M0 scales. gfx950 writes
+those; gfx1250 writes its m32k4 GEMM A-scale layout unless asked for
+`scale_row_major`. The fused path asks for that option, and an AITER whose
+`mega_mhc` lacks it fails at the call.
 """
 
 from functools import cache
@@ -44,16 +45,14 @@ def _hip_ops():
 @cache
 def _row_major_scale_options():
     """The mega_mhc options that give fused MXFP8 row-major (T, H/32) scales,
-    or None when this arch/AITER cannot: gfx950 always writes them, gfx1250
-    only through `scale_row_major` (m32k4 otherwise)."""
+    or None when this arch has no HIP mega_mhc. gfx950 always writes them.
+    gfx1250 writes m32k4 unless `scale_row_major` is set, so the options ask
+    for it; an AITER without that parameter fails at the mega_mhc call."""
     arch, ops = get_gfx_runtime(), _hip_ops()
     if arch == "gfx950":
         return {}
     if arch == "gfx1250" and ops is not None:
-        # aiter main's mega_mhc takes `scale_row_major` (aiter/ops/mega_mhc.py)
-        # and ATOM CI installs aiter main, so ask for it directly. No
-        # inspect.signature probe: that pattern misread aiter and broke
-        # MiniMax-M3 on gfx1250 (#3162).
+        # gfx1250's default fused scales are m32k4.
         return {"scale_row_major": True}
     return None
 

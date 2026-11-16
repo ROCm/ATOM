@@ -146,7 +146,10 @@ class MoE(V4MoE):
             and shared.gate_up_proj.input_size == self.dim
         )
 
-    def forward(self, hidden):
+    def forward(
+        self,
+        hidden: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ):
         # The FFN seam's fused quant (`Block.hc_ffn_fuse_quant`): BF16 rows for
         # the router and the routed experts, MXFP8 ones for the shared expert.
         if not isinstance(hidden, tuple):

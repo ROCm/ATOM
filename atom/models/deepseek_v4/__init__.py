@@ -2795,14 +2795,14 @@ class Expert(nn.Module):
         # scales (V4.1's FFN seam quantizes them with its norm), so gate_up
         # skips quantizing the same bf16 rows itself.
         if quantized_input is not None:
-            x_fp8, x_scale = quantized_input
+            in_fp8, in_scale = quantized_input
             assert (
                 self.gate_up_proj.native_a8_group_rows is not None
             ), "quantized_input needs a native MX gate_up_proj"
             assert (
-                x_fp8.shape[0] == x.shape[0]
-            ), f"quantized_input has {x_fp8.shape[0]} rows, x has {x.shape[0]}"
-            combined = self.gate_up_proj(x_fp8, x_scale=x_scale)
+                in_fp8.shape[0] == x.shape[0]
+            ), f"quantized_input has {in_fp8.shape[0]} rows, x has {x.shape[0]}"
+            combined = self.gate_up_proj(in_fp8, x_scale=in_scale)
         else:
             combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
@@ -3193,7 +3193,10 @@ class MoE(nn.Module):
         ), f"MoE expects 2D [num_tokens, {self.dim}], got {tuple(x.shape)}"
         if self._use_dual_stream or self._use_comm_fused_dispatch:
             # Keep stream and comm-fused dispatch opaque to torch.compile.
-            shared_fp8, shared_scale = shared_quantized or (None, None)
+            if shared_quantized is not None:
+                shared_fp8, shared_scale = shared_quantized
+            else:
+                shared_fp8 = shared_scale = None
             return torch.ops.aiter.maybe_dual_stream_forward(
                 x, self.prefix, shared_fp8, shared_scale
             )
