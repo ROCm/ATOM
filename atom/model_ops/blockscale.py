@@ -12,6 +12,8 @@ import functools
 import torch
 import triton
 
+from atom import plugin_host
+
 from .blockscale_kernels.blockscale_gemm import (
     blockscale_gemm_fp4_kernel,
 )
@@ -51,6 +53,7 @@ def _check_quant_input(x, group):
     return x.contiguous()
 
 
+@plugin_host.site("v41.op.quant_fp8_g32")
 def quantize_fp8(x: torch.Tensor, *, dequantize: bool = False):
     """E4M3, group32 E8M0 ceil scales; optionally return QAT values in x.dtype."""
     x = _check_quant_input(x, 32)

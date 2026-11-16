@@ -53,6 +53,11 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _path_list_env(name: str) -> tuple[str, ...]:
+    """A path-separator list (``os.pathsep``: ``:`` on POSIX, ``;`` on Windows)."""
+    return tuple(part for part in os.getenv(name, "").split(os.pathsep) if part)
+
+
 def _weight_cache_mode() -> str:
     """off / client / daemon; ATOM_PRELOAD on its own means client."""
     mode = os.getenv("ATOM_WEIGHT_CACHE", "off").strip().lower() or "off"
@@ -667,6 +672,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "auto" (default): on for the deployment they serve (MI355X, TP4, BF16 KV,
     # DSpark, ...: `mono/hi_gate.py`), any other keeps ATOM's mono path; "1":
     # on, or an error naming why not; "0": off.
+    # Plugin host kill switch (atom/plugin_host.py): "0" serves every seam
+    # natively and passes AITER an empty enable list. It cannot enable a plugin;
+    # only --plugin-recipe / --plugin-enable do.
+    "ATOM_PLUGIN_HOST": lambda: os.getenv("ATOM_PLUGIN_HOST", "1") != "0",
+    # "1": ask every owner of a seam and raise when two accept one call (their
+    # cells overlap). Off by default; like the switch above it enables nothing.
+    "ATOM_PLUGIN_HOST_STRICT": lambda: os.getenv("ATOM_PLUGIN_HOST_STRICT", "0") == "1",
+    # Plugin hot-plug: "1" is the env fallback for --plugin-hotplug. It makes
+    # the host bind every seam at model build and exposes the internal
+    # POST /plugin/hotplug endpoint, which switches the plan/arm and recaptures
+    # the requested decode graphs in place. It enables no plugin and changes
+    # no routing by itself.
+    "ATOM_PLUGIN_HOTPLUG": lambda: os.getenv("ATOM_PLUGIN_HOTPLUG", "0") == "1",
+    # Plugin dev mode (atom/plugin_host.py): "1" is the env fallback for
+    # --plugin-dev. It only works on a --plugin-hotplug boot and needs at least
+    # one root in ATOM_PLUGIN_DEV_ROOTS: a `reload: true` POST /plugin/hotplug
+    # then re-imports the plugin Python modules under those allowlisted trees
+    # and re-runs every planned provider's prepare(device). Off by default; it
+    # leaks the previous native library versions and is not a production path.
+    "ATOM_PLUGIN_DEV": lambda: _flag_env("ATOM_PLUGIN_DEV", "0"),
+    # Path-separator list of absolute plugin source trees a dev reload may
+    # touch (the env fallback for repeated --plugin-dev-root).
+    "ATOM_PLUGIN_DEV_ROOTS": lambda: _path_list_env("ATOM_PLUGIN_DEV_ROOTS"),
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest

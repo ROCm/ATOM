@@ -50,6 +50,21 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 )
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import load_tokenizer
+from atom.model_engine.plugin_hotplug import (
+    HOTPLUG_ENDPOINT,
+    PLUGIN_ROUND_ENDPOINT,
+    PLUGIN_STATUS_ENDPOINT,
+    RELOAD_UNSUPPORTED_REASON,
+    HotplugPayloadError,
+    PluginRefusal,
+    RoundPayloadError,
+    hotplug_enabled,
+    parse_hotplug_payload,
+    parse_plugin_round_payload,
+    refusal_reason,
+    refusal_status,
+    topology_refusal,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
@@ -3678,6 +3693,255 @@ async def stop_profile():
     except Exception as e:
         logger.exception("Failed to stop profiling")
         raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
+
+
+def _plugin_refusal(status: int, error: BaseException) -> JSONResponse:
+    """A refusal envelope with its reason code; never a bare 500 for one.
+
+    Shared by the hot-plug and round endpoints: a caller polling a fleet needs
+    ``error.reason`` (``round-in-progress``, ``round-mismatch``, ...) to decide
+    whether to retry after a round or give up on the request.
+    """
+    return JSONResponse(
+        status_code=status,
+        content={
+            "status": "error",
+            "error": {
+                "reason": refusal_reason(error),
+                "message": str(error),
+            },
+        },
+    )
+
+
+@_engine_route(HOTPLUG_ENDPOINT, methods=["POST"], include_in_schema=False)
+async def plugin_hotplug(request: Request):
+    """Install a new plugin plan/arm and recapture decode graphs, in place.
+
+    Internal endpoint (deliberately absent from the OpenAI schema): the plugin
+    hot-plug client and the benchmark harness call it to change which planned
+    plugins serve while the server keeps running.  The body is::
+
+        {
+          "recipe": ["<recipe JSON text>" | "<path>" | {...recipe document}],
+          "enable": ["plugin-name", ...],   # optional, narrows the recipes
+          "arm": "plugin",                  # optional, one of the plan's arms
+          "rows": [8, 16, ...],             # optional padded running_tokens;
+                                            # omitted: rows the plan declares
+                                            # (else every recorded bucket)
+          "capture": true,                  # optional, default true
+          "reload": false,                  # optional, dev mode only: re-import
+                                            # the plugin code under the server's
+                                            # --plugin-dev-root trees from disk
+                                            # and re-run prepare(device) before
+                                            # installing the plan
+          "code_digest": "sha256:<hex>"     # optional with reload: the digest
+                                            # the caller read from the code; a
+                                            # rank whose local digest differs
+                                            # refuses the reload
+        }
+
+    The answer carries ``plan_id``, the rows and buckets actually recaptured,
+    ``capture_seconds``, and one report per rank; a dev reload additionally
+    lifts ``reloaded``, ``code_digest``, ``reload_seconds``, ``prepared`` and
+    ``native`` (provider -> prepare() result) to the top level.  Recipe/binding
+    errors are a 400 with the reason, a state or capture refusal a 409
+    (``reload-unsupported`` when the server did not boot with ``--plugin-dev``,
+    ``reload-digest-mismatch`` when the code on disk is not what the caller
+    hashed), and a rank that misses its deadline a 504; the server stays up for
+    all of them.
+
+    While a plugin round is active this answers 409 with reason
+    ``round-in-progress`` and changes nothing: the caller retries after
+    ``POST /plugin/round`` with ``{"action": "end", ...}``.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    config = _get_engine_config()
+    if config is None:
+        raise HTTPException(status_code=503, detail="Engine has no config yet")
+    if not hotplug_enabled(config):
+        return _plugin_refusal(
+            409,
+            RuntimeError(
+                "plugin hot-plug is off; start the server with --plugin-hotplug "
+                "or ATOM_PLUGIN_HOTPLUG=1"
+            ),
+        )
+    unsupported = topology_refusal(config)
+    if unsupported is not None:
+        error = RuntimeError(unsupported)
+        error.reason = "topology-unsupported"
+        return _plugin_refusal(409, error)
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - the body, not the server, is wrong
+        return _plugin_refusal(
+            400, HotplugPayloadError("payload-schema", "body is not valid JSON")
+        )
+    hf = getattr(config, "hf_config", None)
+    architectures = getattr(hf, "architectures", None) or [None]
+    try:
+        hotplug = parse_hotplug_payload(body, model_arch=architectures[0])
+    except Exception as exc:  # noqa: BLE001 - a validated refusal, not a crash
+        return _plugin_refusal(refusal_status(exc), exc)
+    if hotplug.reload and not getattr(config, "plugin_dev", False):
+        # Refuse before the manager round trip: this server cannot reload code,
+        # so a reload must not pause generation or touch a graph.
+        return _plugin_refusal(
+            409,
+            PluginRefusal(
+                RELOAD_UNSUPPORTED_REASON,
+                "reload hot-plug needs plugin dev mode: start the server with "
+                "--plugin-hotplug --plugin-dev --plugin-dev-root DIR",
+            ),
+        )
+
+    manager = getattr(engine, "core_mgr", None)
+    call = getattr(manager, "hotplug_plugin", None)
+    if not callable(call):
+        return _plugin_refusal(
+            409,
+            RuntimeError(
+                "this engine manager cannot hot-plug a plugin plan "
+                "(no hotplug_plugin method)"
+            ),
+        )
+
+    payload = {
+        "source": hotplug.source,
+        "arm": hotplug.arm,
+        "rows": list(hotplug.rows),
+        "capture": hotplug.capture,
+        "reload": hotplug.reload,
+        "code_digest": hotplug.code_digest,
+    }
+    try:
+        # In a thread: a capture takes seconds and this loop also delivers
+        # every open SSE stream.
+        result = await asyncio.to_thread(call, payload, hotplug.timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - answered as a refusal, not a crash
+        logger.exception("plugin hotplug failed")
+        return _plugin_refusal(refusal_status(exc), exc)
+    return JSONResponse(result)
+
+
+@_engine_route(PLUGIN_ROUND_ENDPOINT, methods=["POST"], include_in_schema=False)
+async def plugin_round(request: Request):
+    """Begin or end the plugin round that holds the plan for a benchmark run.
+
+    Internal endpoint (deliberately absent from the OpenAI schema): a
+    benchmark/evaluation harness brackets its measurement with ``begin`` and
+    ``end``.  While a round is active a ``POST /plugin/hotplug`` is refused
+    with 409 and reason ``round-in-progress`` and does not pause, install or
+    capture anything, so the run measures one plan; after ``end`` the same
+    hot-plug succeeds.  The body is::
+
+        {
+          "action": "begin" | "end",
+          "round_id": "run-42",     # non-empty; end must match the active one
+          "timeout": 30.0           # optional, seconds for the round trip
+        }
+
+    The answer echoes the round: ``{"status": "ok", "action": ..., "round_id":
+    ...}`` plus ``started_at`` (and, for end, ``ended_at``/``duration_s``).  A
+    malformed body is a 400 with the reason, a conflicting state (begin while
+    active, end of another round, end with none active) a 409 with the reason,
+    and an engine that is not ready a 503; the server stays up for all of them.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    config = _get_engine_config()
+    if config is None:
+        raise HTTPException(status_code=503, detail="Engine has no config yet")
+    if not hotplug_enabled(config):
+        # The round only exists to gate a hot-plug; without hot-plug it would
+        # hold a plan nobody can change anyway.
+        return _plugin_refusal(
+            409,
+            PluginRefusal(
+                "hotplug-disabled",
+                "plugin hot-plug is off; start the server with --plugin-hotplug "
+                "or ATOM_PLUGIN_HOTPLUG=1",
+            ),
+        )
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - the body, not the server, is wrong
+        return _plugin_refusal(
+            400, RoundPayloadError("payload-schema", "body is not valid JSON")
+        )
+    try:
+        round_request = parse_plugin_round_payload(body)
+    except Exception as exc:  # noqa: BLE001 - a validated refusal, not a crash
+        return _plugin_refusal(refusal_status(exc), exc)
+
+    manager = getattr(engine, "core_mgr", None)
+    method_name = (
+        "begin_plugin_round" if round_request.action == "begin" else "end_plugin_round"
+    )
+    call = getattr(manager, method_name, None)
+    if not callable(call):
+        return _plugin_refusal(
+            409,
+            PluginRefusal(
+                "round-unsupported",
+                f"this engine manager cannot {round_request.action} a plugin "
+                f"round (no {method_name} method)",
+            ),
+        )
+    try:
+        # State writes on every engine, but still round trips: keep them off
+        # the event loop exactly like the hot-plug call.
+        result = await asyncio.to_thread(
+            call, round_request.round_id, round_request.timeout
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - answered as a refusal, not a crash
+        logger.exception("plugin round %s failed", round_request.action)
+        return _plugin_refusal(refusal_status(exc), exc)
+    return JSONResponse(result)
+
+
+@_engine_route(PLUGIN_STATUS_ENDPOINT, methods=["GET"], include_in_schema=False)
+async def plugin_status():
+    """The cheap, advisory view of the plugin hot-plug state.
+
+    Internal endpoint (absent from the OpenAI schema): a recipe watcher polls
+    it to see whether a round is holding the plan before it tries a swap.  It
+    answers from the manager's cache -- no engine round trip -- so it is
+    advisory and a 409 ``round-in-progress`` on the hot-plug itself remains
+    the authoritative signal.
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    config = _get_engine_config()
+    if config is None:
+        raise HTTPException(status_code=503, detail="Engine has no config yet")
+    status: dict[str, Any] = {
+        "status": "ok",
+        "hotplug_enabled": hotplug_enabled(config),
+        # Advisory dev-mode view: a code watcher can refuse to send a reload to
+        # a server that would answer 409 reload-unsupported without a round trip
+        # that pauses generation first.
+        "dev_mode": bool(getattr(config, "plugin_dev", False)),
+        "dev_roots": list(getattr(config, "plugin_dev_roots", ()) or ()),
+        "active_round": None,
+        "engines": 0,
+    }
+    manager = getattr(engine, "core_mgr", None)
+    call = getattr(manager, "plugin_round_status", None)
+    if callable(call):
+        try:
+            status.update(call())
+        except Exception:  # noqa: BLE001 - an advisory view must not crash
+            logger.exception("plugin status failed")
+    return JSONResponse(status)
 
 
 # ============================================================================
