@@ -1637,6 +1637,7 @@ class LinearBase(nn.Module):
             and self.weight.dtype == torch.bfloat16
         ):
             # BF16 fallback (`native_group32_runs_bf16`).
+            assert x_scale is None, "the BF16 fallback takes unquantized input"
             y = tgemm.mm(x, self.weight, self.bias, otype=otype)
         elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear

@@ -464,6 +464,31 @@ def validate_runtime_config(config):
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     validate_speculative_config(config)
+    validate_fp4ptpc_recipe(config)
+
+
+def validate_fp4ptpc_recipe(config):
+    """FP4PTPC runs only with its FP4 routed experts converted to per-channel
+    FP8; unconverted, its per-channel FP8 shared expert cannot take their
+    fused slot."""
+    if not getattr(config.hf_config, "fp4ptpc", False):
+        return
+    from atom.config import QuantizationConfig
+
+    online = getattr(config, "online_quant_config", None)
+    online = online if isinstance(online, dict) else {}
+    patterns = (online.get("layer_quant_config") or {}).items()
+    target = QuantizationConfig._pattern_spec(
+        "layers.0.ffn.experts", [(p, str(t).strip().lower()) for p, t in patterns]
+    )
+    if target is None:
+        target = str(online.get("global_quant_config") or "").strip().lower()
+    if target != "ptpc_fp8":
+        raise ValueError(
+            "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "
+            'per-channel FP8: --online_quant_config \'{"layer_quant_config": '
+            '{"*.ffn.experts*": "ptpc_fp8"}}\''
+        )
 
 
 def validate_tbo_parallelism(config):

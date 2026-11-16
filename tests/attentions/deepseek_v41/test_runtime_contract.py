@@ -769,3 +769,24 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
         assert (
             out.shape[:-2].numel() == tokens
         ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
+
+
+@pytest.mark.parametrize(
+    "online,ok",
+    [
+        (None, False),
+        ({"layer_quant_config": {"*.attn.*": "ptpc_fp8"}}, False),
+        ({"layer_quant_config": {"*.ffn.experts*": "ptpc_fp8"}}, True),
+        ({"global_quant_config": "ptpc_fp8"}, True),
+    ],
+)
+def test_fp4ptpc_needs_its_routed_experts_converted(online, ok):
+    config = runtime_config(
+        hf_config=SimpleNamespace(sliding_window=128, fp4ptpc=True),
+        online_quant_config=online,
+    )
+    if ok:
+        validate_runtime_config(config)
+    else:
+        with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
+            validate_runtime_config(config)
