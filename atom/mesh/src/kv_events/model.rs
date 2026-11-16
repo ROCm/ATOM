@@ -1,5 +1,7 @@
 //! KV events as the router keeps them, whatever the engine's wire format.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 
 /// A block hash as the engine computes it: u64 as is, i64 bit-cast.
@@ -7,9 +9,22 @@ use serde::Serialize;
 pub struct EngineHash(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlock {
+    pub hash: EngineHash,
+    /// The block's `block_size` tokens.
+    pub tokens: Arc<[u32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvEvent {
-    Stored { hashes: Vec<EngineHash> },
-    Removed { hashes: Vec<EngineHash> },
+    /// `blocks` continue the chain that ends at `parent`, or start one.
+    Stored {
+        parent: Option<EngineHash>,
+        blocks: Vec<StoredBlock>,
+    },
+    Removed {
+        hashes: Vec<EngineHash>,
+    },
     Cleared,
 }
 
@@ -27,4 +42,9 @@ pub enum DropReason {
     Namespace,
     /// Another block size than the source reports.
     BlockSize,
+    /// A store whose parent block the rank's holder does not hold, as when the parent was
+    /// stored before the subscription.
+    UnknownParent,
+    /// A store past the blocks one holder may index.
+    Capacity,
 }
