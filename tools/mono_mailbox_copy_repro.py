@@ -220,8 +220,7 @@ def run_fixture(args):
         return t
 
     # Explicit ABI fields; unused index and peer pointers are 0 in this non-token-
-    # parallel K1; ring_scale is 0 for the bf16 ring, as in the runner. The FP8
-    # weights are filled with 0x38 below.
+    # parallel K1. The FP8 weights are filled with 0x38 below.
     vals = {
         name: 0
         for name in (
@@ -244,7 +243,6 @@ def run_fixture(args):
             "sin",
             "pos",
             "ring",
-            "ring_scale",
             "ring_rows",
             "ring_off",
             "res_out",
@@ -270,6 +268,9 @@ def run_fixture(args):
             "tl",
         )
     }
+    # ring_scale (#2989) is 0 for the bf16 ring, as in the runner; older ABIs lack it
+    if "ring_scale" in k1.ABI.names:
+        vals["ring_scale"] = 0
     for name, n, dtype, value in [
         ("res_in", (20480) * 6, torch.bfloat16, 1),
         ("pre_in", (4) * 6, torch.float32, 0.25),
