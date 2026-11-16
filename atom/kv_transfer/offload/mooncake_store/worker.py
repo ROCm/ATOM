@@ -329,10 +329,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._namespace = namespace
         self._chunk_bytes = gpu_connector.gpu_staging_chunk_bytes
         # A window whose slots are one run of the pool is a chunk-major buffer
-        # the dense codec fills or drains with one kernel; the block GPU
-        # connector instead stages it 48 MB at a time, with a copy per chunk
-        # and a stream handshake per group, each a GIL round trip against the
-        # forward thread. The fused kernel exists only on the GPU.
+        # the codec fills or drains with one kernel; the block GPU connector
+        # instead stages it 48 MB at a time, with a copy per chunk and a
+        # stream handshake per group, each a GIL round trip against the
+        # forward thread. A codec with ``supports_strided_restore`` (the
+        # DSV4/M3 PAGE codec) also restores a run of padded slots in place;
+        # saves into padded slots still stage. The fused kernel exists only on
+        # the GPU.
         self._in_place = self._codec.has_fused_chunk_major_staging
         self._next_stats_log_at = time.monotonic() + _STATS_LOG_INTERVAL_S
         logger.info(
@@ -818,10 +821,21 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             run = pool.contiguous_view(slots) if self._in_place else None
+            chunk_stride_bytes = None
+            if run is None and self._in_place and self._codec.supports_strided_restore:
+                run = pool.strided_view(slots)
+                if run is not None:
+                    chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
             try:
                 if run is not None:
-                    self._copy_in_place(run, window, req.block_ids, pack=False)
+                    self._copy_in_place(
+                        run,
+                        window,
+                        req.block_ids,
+                        pack=False,
+                        chunk_stride_bytes=chunk_stride_bytes,
+                    )
                     in_place_windows += 1
                 else:
                     gpu_connector.batched_to_gpu(
@@ -915,8 +929,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
+        With ``chunk_stride_bytes``, ``run`` holds padded Store slots and is
+        unpacked in place; each slot's padding is skipped, not read.
 
         Returns once the copy is done. A pack is ordered after
         ``producer_event`` like the staged pack, so the kernels that produced
@@ -942,12 +959,23 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         owner = codec.prepare_block_id_groups(
             [groups], device=codec.device, stream=stream
         )
-        copy = (
-            codec.gpu_to_chunk_major_device_buffer_prepared
-            if pack
-            else codec.chunk_major_device_buffer_to_gpu_prepared
-        )
-        copy(run, owner, 0, stream=stream)
+        if chunk_stride_bytes is not None:
+            codec.chunk_major_strided_buffer_to_gpu_prepared(
+                run,
+                owner,
+                0,
+                stream=stream,
+                items_per_chunk=per_chunk,
+                chunk_stride_bytes=chunk_stride_bytes,
+            )
+        elif pack:
+            codec.gpu_to_chunk_major_device_buffer_prepared(
+                run, owner, 0, stream=stream
+            )
+        else:
+            codec.chunk_major_device_buffer_to_gpu_prepared(
+                run, owner, 0, stream=stream
+            )
         atom_lmcache_staging.fence_submitted_work(stream)
 
         # -- slot settlement -----------------------------------------------
