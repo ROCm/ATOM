@@ -3365,7 +3365,9 @@ class ModelRunner:
         (`hidden_states`): the model's own where it gives one
         (`compute_head`: the logits, or a verify's output token ids
         [requests, num_spec_steps + 1] and verdict [3, requests] -- accepted,
-        rejected, anchor row -- as the rejection sampler lays them out, for
+        rejected, anchor row -- as the rejection sampler lays them out,
+        optionally with each request's next id [requests] (its id at the
+        accepted count, which `postprocess` would gather), for
         the forward's requests each verifying the full draft span); else,
         with `logits`, the logits. A decode graph's capture records it
         (`capture_cudagraph`), the logits at TP 1."""
@@ -3406,7 +3408,7 @@ class ModelRunner:
             or get_pcp_world_size() > 1
         ):
             return False
-        tokens, verdict = head
+        tokens, verdict = head[:2]
         bs, steps = batch.total_seqs_num, spec.num_spec_steps
         if (
             tokens.shape[0] < bs
@@ -3533,6 +3535,9 @@ class ModelRunner:
                     logits, batch, spec_decode_metadata, rows=logprob_rows
                 )
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
+        # The head output's next ids (each request's id at its accepted
+        # count), where it gives them: the gather below, done in the forward.
+        head_next = head_tokens = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per row the step FORWARDED, which a
             # decode keeps at `running_bs` for the draft pass that follows it
@@ -3576,8 +3581,11 @@ class ModelRunner:
             # the rejection sampler gives them. The next ids are gathered
             # below from the broadcast ids, as on the logits path.
             channel = None
-            sampled_tokens, verdict = logits
+            sampled_tokens, verdict, *head_next = logits
             sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
+            # (a third output: the next ids, valid while the ids stay the head's)
+            head_next = head_next[0][:bs] if head_next else None
+            head_tokens = sampled_tokens
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
@@ -3727,11 +3735,15 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
-            next_token_ids = torch.gather(
-                sampled_tokens.view(bs, batch.num_spec_step + 1),
-                1,
-                next_token_locs.view(-1, 1),
-            ).view(bs)
+            if head_next is not None and sampled_tokens is head_tokens:
+                # The head output's: the same ids, gathered in the forward.
+                next_token_ids = head_next
+            else:
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, batch.num_spec_step + 1),
+                    1,
+                    next_token_locs.view(-1, 1),
+                ).view(bs)
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num

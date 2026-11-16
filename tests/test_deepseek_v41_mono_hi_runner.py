@@ -238,18 +238,21 @@ def test_forced_acceptance_serves_as_without_it(runner_module, spec_step):
     assert runner._head_ids_serve(_head(), _batch((1.0,)))
 
 
+@pytest.mark.parametrize("head_next", [False, True])
 @pytest.mark.parametrize("identical", [True, False])
 @pytest.mark.parametrize("sync", ["1", "check", "0"])
 @pytest.mark.parametrize("bs, nb", [(2, 2), (2, 4)])
 def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
-    monkeypatch, runner_module, bs, nb, sync, identical
+    monkeypatch, runner_module, bs, nb, sync, identical, head_next
 ):
     """A step the head output stands for: its output ids and verdict (the step's requests: the first of a padded
     bucket's) in place of the samplers'; the ids are broadcast over TP and every id that feeds the next step (the
     next forward's ids, the drafter's anchors) is taken from the broadcast ids, at the verdict's accepted counts, as
     on every other step. A model that says its head's ids are the same on every rank (``identical_head_ids``) has
     them not broadcast by default (``ATOM_HEAD_IDS_SYNC`` 0); "check" broadcasts a copy and counts the steps whose
-    ids differed. Any other model's are broadcast in place, whatever the switch."""
+    ids differed. Any other model's are broadcast in place, whatever the switch. A head output's third tensor, each
+    request's next id, stands for the gather while the ids are still the head's, and is dropped once a broadcast
+    replaced them."""
     monkeypatch.setenv("ATOM_HEAD_IDS_SYNC", sync)
     spec = SimpleNamespace(
         bonus_logits_indices=torch.tensor([5, 11]),
@@ -276,6 +279,10 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     out = torch.zeros(nb, 6, dtype=torch.int32)  # this rank's own picks
     verdict = torch.zeros(3, nb, dtype=torch.int32)
     verdict[:, :bs] = torch.tensor([[3, 5], [2, 0], [3, 11]], dtype=torch.int32)
+    # the head's next ids (its gather, done in the forward): marked apart from this rank's zero picks
+    nxt = torch.zeros(nb, dtype=torch.int32)
+    nxt[:bs] = torch.tensor([42, 43], dtype=torch.int32)
+    head = (out, verdict, nxt) if head_next else (out, verdict)
     sent, proposed = [], []
 
     class Stop(Exception):
@@ -318,7 +325,7 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
         runner_module.ModelRunner.postprocess(
             runner,
             batch,
-            (out, verdict),
+            head,
             None,
             None,
             None,
@@ -329,7 +336,13 @@ def test_postprocess_takes_the_heads_verdict_and_the_broadcast_ids(
     assert runner.tokenID_processor.prev_token_ids is proposed[0]
     if identical and sync == "0":
         # this rank's own picks at each request's accepted count, no collective
-        assert broadcasts == [] and proposed[0].tolist() == [0, 0]
+        assert broadcasts == []
+        if head_next:
+            # the head's next ids themselves, no gather
+            assert proposed[0].data_ptr() == nxt.data_ptr()
+            assert proposed[0].tolist() == [42, 43]
+        else:
+            assert proposed[0].tolist() == [0, 0]
         return
     assert len(broadcasts) == 1 and broadcasts[0].shape == (bs, 6)
     # in place, except under "check" for ids the model says agree (a copy, compared with this rank's after)

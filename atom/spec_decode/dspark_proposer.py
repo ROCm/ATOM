@@ -219,7 +219,17 @@ class DSparkProposer(Drafter):
         anchor_positions = pass_.buffer("anchor_positions", running_bs)
         scheduled_bs = next_token_ids.shape[0]
         vocab_max = int(self.model.vocab_size) - 1
-        if ids.is_cuda:
+        staged_by_model = getattr(self.model, "anchors_staged", None)
+        if (
+            ids.is_cuda
+            and staged_by_model is not None
+            and scheduled_bs == running_bs
+            and staged_by_model(ids, anchor_positions, next_token_ids, positions, rows)
+        ):
+            # The target forward that just ran wrote these very values here
+            # (the V4.1 hi hook's in-graph post-verify): nothing to launch.
+            pass
+        elif ids.is_cuda:
             _stage_anchors_kernel[(running_bs,)](
                 ids,
                 anchor_positions,
