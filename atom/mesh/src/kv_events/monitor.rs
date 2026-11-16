@@ -295,6 +295,16 @@ impl PrefixMatchProvider for KvEventMonitor {
             predict(predictor, tokens, worker);
         }
     }
+
+    async fn cached_tokens(&self, worker: &dyn Worker, tokens: &[u32], device: u32) -> Option<u32> {
+        match self.stores.get() {
+            // A decode worker takes the prompt's KV from its prefill worker.
+            Some(stores) if !matches!(worker.worker_type(), WorkerType::Decode) => {
+                stores.cached_tokens(worker.url(), tokens, device).await
+            }
+            _ => Some(device),
+        }
+    }
 }
 
 /// Predicts that `worker` holds `tokens`; a prompt dropped as the writer is behind is
@@ -317,16 +327,6 @@ fn predict(predictor: &Predictor, tokens: &[u32], worker: &dyn Worker) {
             pool,
             "Dropping routed prompts from the KV index's predictions: its writer is behind"
         );
-    }
-
-    async fn cached_tokens(&self, worker: &dyn Worker, tokens: &[u32], device: u32) -> Option<u32> {
-        match self.stores.get() {
-            // A decode worker takes the prompt's KV from its prefill worker.
-            Some(stores) if !matches!(worker.worker_type(), WorkerType::Decode) => {
-                stores.cached_tokens(worker.url(), tokens, device).await
-            }
-            _ => Some(device),
-        }
     }
 }
 
