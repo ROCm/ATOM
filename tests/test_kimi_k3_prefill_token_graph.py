@@ -139,6 +139,10 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
     # A drafter's layer, which the recording does not run.
     drafter = mla_layer(split_prefill_recording=False, o_proj=nn.Linear(2, 2))
     assert supports(1, mla_layer(), drafter)
+    monkeypatch.setattr(attn, "pcp_is_enabled", lambda: True)
+    monkeypatch.setattr(attn, "get_pcp_world_size", lambda: 2)
+    assert not supports(1, mla_layer(), kda_layer)
+    monkeypatch.setattr(attn, "pcp_is_enabled", lambda: False)
     monkeypatch.setattr(attn, "use_triton_gemm", lambda: True)
     assert not supports(1, mla_layer(), kda_layer)
 

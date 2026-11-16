@@ -1350,11 +1350,7 @@ class KimiKDAAttention(nn.Module):
                 hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
             )
 
-        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-        conv_state = cache.k_cache
-        ssm_state = cache.v_cache
-        if conv_state.size(1) != self.local_proj_size * 3:
-            conv_state = conv_state.transpose(-1, -2)
+        cache, conv_state, ssm_state = self._state(fwd_ctx)
 
         num_actual_tokens = kda_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
@@ -1363,8 +1359,7 @@ class KimiKDAAttention(nn.Module):
         mixed_qkv, out_gate, beta, gate = self._project_in(
             hidden_states, hidden_states_scale
         )
-        beta = beta.unsqueeze(0)
-        gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
+        gate, beta = self._recurrence_gate_beta(gate, beta)
         # Prefill returns its own contiguous output. Allocate this buffer only
         # for decode/spec-decode, where the recurrence writes into it directly.
         if kda_metadata.num_prefills <= 0:
@@ -1559,6 +1554,23 @@ class KimiKDAAttention(nn.Module):
 
         return self._project_out(out, out_gate, kda_metadata.num_prefills > 0)
 
+    def _state(self, fwd_ctx):
+        """This layer's cache entry and its conv and SSM state, the conv state
+        channel-major as the causal conv reads it."""
+        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        conv_state = cache.k_cache
+        if conv_state.size(1) != self.local_proj_size * 3:
+            conv_state = conv_state.transpose(-1, -2)
+        return cache, conv_state, cache.v_cache
+
+    def _recurrence_gate_beta(self, gate: torch.Tensor, beta: torch.Tensor):
+        """``gate`` [T, heads * head_dim] and ``beta`` [T, heads] as the
+        recurrence takes them: [1, T, heads, head_dim] and [1, T, heads]."""
+        return (
+            rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim),
+            beta.unsqueeze(0),
+        )
+
     def _project_in(
         self,
         hidden_states: torch.Tensor,
@@ -1717,19 +1729,12 @@ class KimiKDAAttention(nn.Module):
         kda_metadata = step_kda_metadata(fwd_ctx)
         if kda_metadata is None:
             return
-        cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
-        conv_state, ssm_state = cache.k_cache, cache.v_cache
-        if conv_state.size(1) != self.local_proj_size * 3:
-            conv_state = conv_state.transpose(-1, -2)
+        _, conv_state, ssm_state = self._state(fwd_ctx)
         n = kda_metadata.num_actual_tokens
+        gate, beta = self._recurrence_gate_beta(gate[:n], beta[:n])
         out[:n].copy_(
             self._prefill_recurrence(
-                mixed_qkv[:n],
-                rearrange(gate[:n], "t (h d) -> 1 t h d", d=self.head_dim),
-                beta[:n].unsqueeze(0),
-                kda_metadata,
-                conv_state,
-                ssm_state,
+                mixed_qkv[:n], gate, beta, kda_metadata, conv_state, ssm_state
             )
         )
 
