@@ -1076,13 +1076,11 @@ def o_defs(k4ctx):
                             misc + (t0 * O_ROWS + tid),
                         )
                 gpu.barrier()
-            stamp(2)
             if const_expr(O_FLAG):
                 o_finish_flag(t)
             else:
                 push_rows("attn", t * O_ROWS, O_ROWS, t % W)
                 gpu.barrier()
-                stamp(6)
                 # the owner sums every peer's partials in rank order and gathers the sums to
                 # every rank's a_ag (the post-attention norm reads them)
                 if own_task(t, "attn"):
@@ -1100,13 +1098,11 @@ def o_defs(k4ctx):
                                 ),
                                 W,
                             )
-                            stamp(23)
                             for w in range_constexpr(W):
                                 mb_put_bf(
                                     preg(peer_addr(w, "attn"), SY["a_ag"], "a_ag"),
                                     ptk * HIDDEN + row,
                                     [t0_, t1_],
                                 )
-                stamp(24)
 
     return {"stage_o": stage_o, "stage_o_big": stage_o_big}
