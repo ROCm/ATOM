@@ -12,6 +12,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.kernels.stages import mla_post as mp
+from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import LORA as KVL
 from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (
     QH,
     QK_NOPE,
@@ -19,7 +20,6 @@ from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (
     QL,
     ROPE,
 )
-from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import LORA as KVL
 from atom.models.kimi_k3.mono.kernels.stages.mla_prep import (
     AMAX_FLOOR,
     ENTRY,
