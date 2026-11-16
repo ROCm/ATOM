@@ -400,8 +400,12 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     assert attention.gdn_flydsl_policy.decode == expected
     assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
-    # Prefill does not care about the pool layout, so ReplaySSM keeps it.
-    prefill = allowed and decode_backend != "triton"
+    # Prefill does not care about the pool layout; ReplaySSM keeps it on gfx942.
+    prefill = (
+        allowed
+        and decode_backend != "triton"
+        and (not replayssm or fly.replayssm_prefill_device_supported(raw.device))
+    )
     assert attention.gdn_flydsl_policy.prefill == prefill
     assert builder._flydsl_prefill_enabled == prefill
     if replayssm:
@@ -807,7 +811,9 @@ def test_replayssm_prefill_layer_dispatch_matches_triton(monkeypatch, keep):
             torch.empty_like(v[0]),
             "layer_0",
         )
-        flydsl = prefill_backend != "triton"
+        flydsl = prefill_backend != "triton" and fly.replayssm_prefill_device_supported(
+            pool.device
+        )
         assert prefill.call_count == int(flydsl)
         assert chunked.call_count == int(not flydsl)
         replay.assert_not_called()
