@@ -46,5 +46,10 @@ def refusal(atom_config) -> str | None:
             atom_config.max_model_len <= MAX_SEQ_LEN,
             f"max_len {atom_config.max_model_len}",
         ),
+        # the KV of the tokens it decodes never reaches ATOM's paged cache: a cached prefix over them would be
+        # read back by a later request
+        (not atom_config.enable_prefix_caching, "prefix caching"),
+        # the step override is offered on graph decode steps only (ModelRunner.run_model)
+        (not atom_config.enforce_eager, "enforce_eager"),
     ]
     return first_refusal(checks)

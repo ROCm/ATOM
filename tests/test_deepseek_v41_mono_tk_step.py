@@ -7,11 +7,17 @@
   what TileRT's own quantizers make of the request's rows in position order;
 - ``runner``: admission (sampling mode, TileRT's counter, admit, import) once a request, the verify outputs and
   verdict gathered from the logs a fake TkRank appends to, the next drafts;
-- ``dispatch``: which steps are served, and that a request TkRank served cannot fall back.
+- ``dispatch``: which steps are served (decided once, at the step's layout: ``TkRound``), that a request TkRank
+  served cannot fall back, and a served step's commit of ATOM's state cursor (as ATOM's own commit would).
 """
 
+import importlib.util
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -201,14 +207,15 @@ def test_sampling_refusals():
     assert RN.sampling_refusal(0.7, 1.0, -1) is None
 
 
-def test_dispatch_serves_and_holds(monkeypatch):
+def _served_model(monkeypatch):
+    """A ``TkStepModel`` over a fake TkRank, its ``TkRound`` on a builder whose ``step_needs_eager`` reads the
+    batch's ``eager``."""
     fc = SimpleNamespace(
         spec_decode_metadata=object(), attn_metadata=SimpleNamespace(cache=None)
     )
     monkeypatch.setattr(D, "get_forward_context", lambda: fc)
     monkeypatch.setattr(D.envs, "ATOM_MONO_CHECK", False, raising=False)
-    tk = FakeTk()
-    runner = RN.TkStepRunner(tk)
+    runner = RN.TkStepRunner(FakeTk())
     runner.output_stream = None
     drafter = SimpleNamespace(
         compute_draft_kv=lambda *a: "prod-kv", propose=lambda *a: "prod"
@@ -219,28 +226,58 @@ def test_dispatch_serves_and_holds(monkeypatch):
     monkeypatch.setattr(
         "atom.models.deepseek_v41.mono.tk_step.kv.from_cache", lambda *a: "kv"
     )
+    builder = SimpleNamespace(step_needs_eager=lambda b: b.eager)
+    return m, D.TkRound(m, builder), runner, drafter
 
-    def batch(rid, t=1.0, logprobs=False, dummy=False):
-        return SimpleNamespace(req_ids=[rid], total_seqs_num=1, temperatures=[t], top_ps=[1.0], top_ks=[-1],
-                               any_logprobs=logprobs, structured_requests={}, required_channel=None, is_dummy_run=dummy,
-                               context_lens=[506], state_slots_committed=[0], block_tables=[[0]])  # fmt: skip
 
-    ids = torch.tensor([7, 1, 1, 1, 1, 1])
+def _batch(rid, t=1.0, logprobs=False, dummy=False, eager=False):
+    return SimpleNamespace(req_ids=[rid], total_seqs_num=1, temperatures=[t], top_ps=[1.0], top_ks=[-1],
+                           any_logprobs=logprobs, structured_requests={}, required_channel=None, is_dummy_run=dummy,
+                           context_lens=[506], state_slots_committed=[0], block_tables=[[0]], eager=eager)  # fmt: skip
+
+
+def _layout(rnd, batch, bs=1, rows=6, decode=True):
+    """The builder's routing decision on ``batch`` (``_prepare_step``)."""
+    return rnd.service(batch, [], bs, bs * (rows or 6), max_q_len=rows, decode=decode, tentative=decode,
+                       is_prefill=not decode, resumes=None, image_rows=False)  # fmt: skip
+
+
+IDS = torch.tensor([7, 1, 1, 1, 1, 1])
+
+
+def test_dispatch_serves_and_holds(monkeypatch):
+    m, rnd, runner, drafter = _served_model(monkeypatch)
+    tk, LEAN, NONE = runner.dev, D.RoundService.LEAN, D.RoundService.NONE
+
+    def step(batch, **kw):
+        return _layout(rnd, batch, **kw), m.step_override(IDS, 1, batch)
+
     assert (
-        m.step_override(ids, 1, batch(9, dummy=True)) is None and not tk.calls
+        step(_batch(9, dummy=True)) == (NONE, None) and not tk.calls
     )  # a warmup's dummy decode
-    assert m.step_override(ids, 1, batch(5)) is runner
+    assert step(_batch(4, eager=True)) == (
+        NONE,
+        None,
+    )  # an eager step gets no step override
+    assert step(_batch(4), decode=False, rows=None) == (NONE, None)  # a prefill
+    assert step(_batch(5)) == (LEAN, runner)
     runner.verify_outputs(1)
     assert drafter.propose().shape == (1, 5) and drafter.compute_draft_kv() is None
-    with pytest.raises(
-        RuntimeError, match="cannot fall back"
+    for kw in (
+        {"bs": 2},
+        {"rows": 12},
+        {"decode": False},
     ):  # the held request in a step it cannot serve
-        m.step_override(torch.zeros(12), 2, batch(5))
-    assert (
-        m.step_override(ids, 1, batch(6, t=0.0)) is None
+        with pytest.raises(RuntimeError, match="cannot fall back"):
+            _layout(rnd, _batch(5), **kw)
+    with pytest.raises(RuntimeError, match="cannot fall back"):
+        _layout(rnd, _batch(5, eager=True))
+    assert step(_batch(6, t=0.0)) == (
+        NONE,
+        None,
     )  # another request, greedy: the production path
     assert drafter.propose() == "prod" and drafter.compute_draft_kv() == "prod-kv"
-    assert m.step_override(ids, 1, batch(7)) is runner and runner.holds(
+    assert step(_batch(7)) == (LEAN, runner) and runner.holds(
         7
     )  # served: admitted afresh
     assert [c[0] for c in tk.calls] == [
@@ -250,3 +287,144 @@ def test_dispatch_serves_and_holds(monkeypatch):
         "admit",
         "import",
     ]
+
+
+def test_dispatch_serves_exactly_the_steps_laid_out_for_it(monkeypatch):
+    m, rnd, _, _ = _served_model(monkeypatch)
+    assert (
+        m.step_override(IDS, 1, _batch(5)) is None
+    )  # no decision (a builder without the round): production
+    assert _layout(rnd, _batch(5)) == D.RoundService.LEAN
+    with pytest.raises(RuntimeError, match="laid out for it runs another batch"):
+        m.step_override(IDS, 1, _batch(5))  # not the batch laid out
+    assert _layout(rnd, _batch(5)) == D.RoundService.LEAN
+    with pytest.raises(RuntimeError, match="ran ATOM's forward"):
+        m(IDS, None)  # laid out LEAN, then run eagerly
+    b = _batch(5)
+    assert _layout(rnd, b) == D.RoundService.LEAN
+    meta = SimpleNamespace(served_by_round=D.RoundService.LEAN, cache=None, step=None)
+    with pytest.raises(RuntimeError, match="was not served"):
+        rnd.committed(meta, None)  # laid out, never offered
+    assert not rnd.committed(SimpleNamespace(served_by_round=D.RoundService.NONE), None)
+
+
+def _fake_step(positions, slots, length=6):
+    spans = [SimpleNamespace(request_id=i, position=p, length=length, end=p + length, slot=s)
+             for i, (p, s) in enumerate(zip(positions, slots))]  # fmt: skip
+    n = len(spans)
+    rows = [torch.arange(p, p + length) for p in positions] + [torch.zeros(5)]
+    return SimpleNamespace(
+        requests=spans,
+        positions=torch.cat(rows).to(torch.int32),
+        scheduled_bs=n,
+        cu_seqlens_q=torch.arange(n + 1, dtype=torch.int32) * length,
+        slots=torch.tensor(list(slots) + [0, 0], dtype=torch.int32),
+        request_positions=np.asarray(positions, dtype=np.int64),
+    )
+
+
+def _tentative_state_cls(monkeypatch):
+    """ATOM's ``TentativeState`` (its CPU commit), loaded alone; a stand-in Triton where none is installed (its
+    kernel is the GPU commit, not run here)."""
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        tl = types.ModuleType("triton.language")
+        tl.constexpr = object
+        tr = types.ModuleType("triton")
+        tr.jit, tr.language = (lambda f: f), tl
+        monkeypatch.setitem(sys.modules, "triton", tr)
+        monkeypatch.setitem(sys.modules, "triton.language", tl)
+    import atom
+
+    path = (
+        Path(atom.__file__).parent / "model_ops/attentions/deepseek_v41/speculative.py"
+    )
+    spec = importlib.util.spec_from_file_location("_v41_speculative", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.TentativeState
+
+
+def test_commit_served_matches_atoms_commit(monkeypatch):
+    """A served step's cursor (``commit_served``) where ATOM's own commit (``TentativeState.commit``) puts it, for
+    every anchor; its tentative state dropped."""
+    TentativeState = _tentative_state_cls(monkeypatch)
+    positions, slots = (4782, 200, 37), (3, 1, 6)
+    step = _fake_step(positions, slots)
+    for anchors in ([0, 6, 12], [1, 11, 17], [5, 8, 14]):
+        anchors = torch.tensor(anchors, dtype=torch.int64)
+        width = 4  # [end, 3 history ids], as ATOM's V4.1 cursor
+        staged = np.zeros((len(slots), 6, width), dtype=np.int64)
+        staging = SimpleNamespace(np=staged, copy_to_gpu=lambda n, s=staged: torch.from_numpy(s[:n]))  # fmt: skip
+        theirs = SimpleNamespace(cursor=torch.full((8, width), -7, dtype=torch.int64), tentative_staging=staging)  # fmt: skip
+        state = TentativeState(theirs, step, np.full((len(slots), width - 1), -1, dtype=np.int64))  # fmt: skip
+        for span in step.requests:
+            state.stage_history(span, list(range(span.length)))
+        state.commit(anchors)
+        ours = SimpleNamespace(cursor=torch.full((8, width), -7, dtype=torch.int64), pending=state)  # fmt: skip
+        D.commit_served(ours, step, anchors)
+        assert ours.pending is None
+        assert torch.equal(ours.cursor[:, 0], theirs.cursor[:, 0])
+        assert (ours.cursor[list(slots), 0] - torch.tensor(positions)).tolist() == (
+            anchors - step.cu_seqlens_q[:3] + 1
+        ).tolist()  # the next step starts past its accepted rows
+
+
+def test_dispatch_commits_a_served_step(monkeypatch):
+    """The served step's verdict, through ``TkRound.committed`` (``commit_speculative_state``), is where the next
+    step's state probe (``prepare_state``: cursor[slot, 0] == the step's start) looks.
+    """
+    m, rnd, runner, _ = _served_model(monkeypatch)
+    pos = 4782
+    for k, a in enumerate(runner.dev.accepts):
+        b = _batch(5)
+        assert (
+            _layout(rnd, b) == D.RoundService.LEAN
+            and m.step_override(IDS, 1, b) is runner
+        )
+        _, verdict = runner.verify_outputs(1)
+        cache = SimpleNamespace(
+            cursor=torch.zeros(4, 4, dtype=torch.int64), pending=object()
+        )
+        meta = SimpleNamespace(
+            served_by_round=D.RoundService.LEAN,
+            cache=cache,
+            step=_fake_step([pos], [2]),
+        )
+        assert rnd.committed(meta, verdict[2]) and cache.pending is None
+        pos += a
+        assert (
+            int(cache.cursor[2, 0]) == pos
+        )  # the next start: the step's accepted tokens past this one's
+
+
+def test_tk_step_refuses_prefix_caching_and_eager(monkeypatch):
+    from atom.models.deepseek_v41.mono import tk_step
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "common_refusals", lambda *a, **k: [])
+
+    def config(**kw):
+        base = {"speculative_config": SimpleNamespace(method="dspark", num_speculative_tokens=5),
+                "dspark": SimpleNamespace(confidence_schedule=False, ragged=False), "max_num_seqs": 1,
+                "max_model_len": 65536, "enable_prefix_caching": False, "enforce_eager": False}  # fmt: skip
+        return SimpleNamespace(**{**base, **kw})
+
+    assert tk_step.refusal(config()) is None
+    assert "prefix caching" in tk_step.refusal(config(enable_prefix_caching=True))
+    assert "enforce_eager" in tk_step.refusal(config(enforce_eager=True))
+
+
+def test_install_needs_the_v41_builder(monkeypatch):
+    monkeypatch.setattr(D, "refusal", lambda c: None)
+    monkeypatch.setattr(D.envs, "ATOM_DSV41_TK_CO", "/co", raising=False)
+    runner = RN.TkStepRunner(FakeTk())
+    monkeypatch.setattr(RN.TkStepRunner, "create", classmethod(lambda cls, *a: runner))
+    model, cfg = torch.nn.Identity(), SimpleNamespace(model="m")
+    assert (
+        D.install_tk_step(model, cfg, None) is model
+    )  # nothing to keep ATOM's state bookkeeping
+    builder = SimpleNamespace(use_decode_round=lambda r: setattr(builder, "round", r))
+    wrapped = D.install_tk_step(model, cfg, None, builder)
+    assert isinstance(wrapped, D.TkStepModel) and builder.round.model is wrapped
