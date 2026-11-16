@@ -608,7 +608,8 @@ def target_layer(E, Ly):
         FS.router_v2(dict(t=tq6, b=b, w=tq6 // 32, l=tq6 % 32, sm=sm + FLO, gate=ltab(fp, Ly, "gate")(), xn=fptr(fp, "xn"),
                           x8pub=lc + i64(LY.X8_PUB), x8n=FS.CL, x1g=plog(X1F), nw=ltab(fp, Ly, "nw")(),
                           postcnt=lc + i64(LY.FFN_POST), norm_eps=D.RMS_EPS, scores=fptr(fp, "plog"),
-                          tag=hx.epoch32(tep, Ly, 1), gate_pre=True, ne=RNE, **fpf), TR)
+                          tag=hx.epoch32(tep, Ly, 1), gate_pre=True, ne=RNE, **fpf,
+                          **(dict(rflag=plog(FS.RFL_OFF) + i64(par) * 1024) if FS.RFLAG else {})), TR)
     S.iprefetch(28)
     if b < FS.NOWN:   # every owner's mix partials: one copy of the code (it was inlined at 3 call sites, ~800
         # instructions each); the router CTAs' after their router (R'' kept in LDS past the router's)
@@ -650,11 +651,22 @@ def target_layer(E, Ly):
                 MS.f0_row(crr, rr_)          # read by nothing else; a router CTA's row: the shared CTA's)
                 MS.x8_pub(crr, rr_)
             MS.shdn_prefetch(crr, ss_)
-        # every row's top-k (wave r = row r) and the expert union (each (expert, group) of the UG once, its rows as N)
-        FS.topk_v2(dict(t=t, b=b, w=w, l=l, sm=sm + FLO, scores=fptr(fp, "plog"), gbias=ltab(fp, Ly, "gbias")(),
-                        tag=hx.epoch32(tep, Ly, 1), ne=RNE, ktop=RTOPK), TR, MS.O_PID, MS.O_WTS, moe_ids == "ids")
+        # every row's top-k (wave r = row r) and the expert union (each (expert, group) of the UG once, its rows as N):
+        # the union's lists initialized while the scores are on their way (the barrier: a router CTA's last reads of its
+        # partials share the LDS), each pick counted by its top-k lane (no reload, no barrier between)
+        tkb = [hx.gload(ltab(fp, Ly, "gbias")() + i64(l + 32 * i) * 4, fx.Float32) for i in range(RNE // 32)]   # (before the scores)
+        if fx.const_expr(moe_ids == "ids"):
+            gpu.barrier()
+            MS.union_init(crr)
+        if fx.const_expr(FS.RFLAG):   # every router CTA's scores landed (wave 0: the NRC flags)
+            hx.wait_flags(plog(FS.RFL_OFF) + i64(par) * 1024, FS.NRC, hx.epoch32(tep, Ly, 1), w, l, 12)
+        if fx.const_expr((moe_ids == "ids") or FS.RFLAG):
+            gpu.barrier()
+        FS.topk_v3(dict(t=t, b=b, w=w, l=l, sm=sm + FLO, scores=fptr(fp, "plog"), gbias=ltab(fp, Ly, "gbias")(),
+                        tag=hx.epoch32(tep, Ly, 1), ne=RNE, ktop=RTOPK, bias=tkb, **(dict(ucnt=1) if moe_ids == "ids" else {})),
+                   TR, MS.O_PID, MS.O_WTS, moe_ids == "ids")
         gpu.barrier()
-        MS.moe_union(crr)
+        MS.moe_union(crr, moe_ids == "ids")
         MS.ug_union(crr, rr_ * MS.NRC + ss_, TR)
         if rr_ < TR:
             MS.dn_row(crr, ss_)

@@ -34,7 +34,7 @@ from flydsl.expr import gpu, range_constexpr
 from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
 from atom.models.deepseek_v41.mono.gfx1250.kernels import dims as D
 from atom.models.deepseek_v41.mono.gfx1250.kernels.attention import q8words, bf, cluster_sync, e8m0_of, inv_pow2, pack4, rsq, to_e4m3
-from atom.models.deepseek_v41.mono.gfx1250.kernels.moe import sched_barrier
+from atom.models.deepseek_v41.mono.gfx1250.kernels.moe import sched_barrier, union_count
 
 T, H, NG, TG, CL, NE, TOPK = D.T_MAX, D.HID, 6, 8, D.CL, D.EXPERTS, D.TOPK
 
@@ -544,6 +544,9 @@ def front_any(c):
 
 RCTA0, NRC = 160, 96   # the 96 CTAs past the owners: a router CTA that is also an owner started its MoE ~7 us late
 TKPUB, TKCTA = False, 124
+RFLAG = True   # (r2ug) a router CTA's scores -> one LL flag after its stores land; the MoE CTAs' wave 0 polls the NRC
+               # flags (3 words a lane), then every top-k wave reads its row once (not 1440 waves x 384 words a poll round)
+RFL_OFF = 1175552   # plog: the router flags [parity][NRC] (past the Engram partials)
 SHE_TOPK_FIRST = False   # (v2) the shared-UG CTAs run their top-k while their UG weights load, before waiting for x8   # (v2) one top-k CTA (idle: no shared UG, no router) publishes the picks as LL words
 EPR = -(-NE // NRC)          # 4 experts a router CTA (the draft's 128: 2)
 NCHUNK = H // 8          # 640 16-byte chunks a row
@@ -748,6 +751,14 @@ def router_v2(c, TR):
         sc = _score(bf(s).to(F32))
         if e0 + e < NE_:   # (the draft's 128 experts: 2 a CTA, the CTAs past them none)
             hx.put(c["scores"] + i64(r_ * NE_ + e0 + e) * 8, sc.bitcast(I32), c["tag"])
+    if fx.const_expr("rflag" in c):   # (RFLAG) the CTA's scores landed -> its one LL flag (the top-k polls the 96 flags)
+        if fx.const_expr(TR * EPR_ > 32):
+            hx.wait_storecnt0()
+            gpu.barrier()
+        if w == 0:   # (the puts above: wave 0's lanes)
+            hx.wait_storecnt0()
+            if l == 0:
+                hx.put(c["rflag"] + i64(b - RCTA0) * 8, I32(0), c["tag"])
 
 
 @ASTRewriter.transform
@@ -840,6 +851,91 @@ def topk_v2(c, TR, pid_off, wts_off, write_ids):
             if fx.const_expr("tkpub" in c):   # (v2) the top-k CTA publishes ids / weights as LL words for every other CTA
                 hx.put(c["tkpub"] + i64((row * TOPK_ + l) * 2) * 8, sel, c["tktag"])
                 hx.put(c["tkpub"] + i64((row * TOPK_ + l) * 2 + 1) * 8, wfin.bitcast(I32), c["tktag"])
+
+
+def _k64(hi, lo):
+    """(hi, lo) i32 pair as one i64 (hi signed, lo >= 0): the signed i64 order is the pair's lexicographic order."""
+    return (I64(hi) << I64(32)) | (I64(lo) & I64(0xFFFFFFFF))
+
+
+def _gt64(b, a):
+    """(hi, lo) key b > key a (hi signed, lo >= 0): one 64-bit compare; the selects stay on the 32-bit halves."""
+    return _k64(b[0], b[1]) > _k64(a[0], a[1])
+
+
+def _sort_desc64(keys):
+    """_sort_desc on (hi, lo, score) triples whose (hi, lo) keys are unique: one v_cmp_*_i64 a comparator (no tie
+    compare, no SALU mask ops between the VALU compare and the selects)."""
+    k = list(keys)
+    for i, j in _oem_pairs(len(k)):
+        a, b = k[i], k[j]
+        gt = _gt64(b, a)
+        k[i] = tuple(gt.select(b[q], a[q]) for q in range(3))
+        k[j] = tuple(gt.select(a[q], b[q]) for q in range(3))
+    return k
+
+
+def _wmax64(v):
+    """the (hi, lo, score) triple of the wave's largest (hi, lo) key (keys unique), in every lane: the xor butterfly of
+    _wmax on the key's halves and the payload (DPP row_xmask 8 / 4 / 2 / 1, one permlanex16 for 16)."""
+    for o in (8, 4, 2, 1, 16):
+        hi, lo, sb = v[0], v[1], v[2].bitcast(I32)
+        if o < 16:
+            ov = (xdpp(hi, o), xdpp(lo, o), xdpp(sb, o).bitcast(F32))
+        else:
+            ov = (shx(hi, 16), shx(lo, 16), shx(sb, 16).bitcast(F32))
+        gt = _gt64(ov, v)
+        v = tuple(gt.select(ov[q], v[q]) for q in range(3))
+    return v
+
+
+@ASTRewriter.transform
+def topk_v3(c, TR, pid_off, wts_off, write_ids):
+    """topk_v2 with the same picks, weights and LDS outputs (bit for bit), a shorter dependent chain (r2ug: the top-k
+    2.2 -> 1.3 us): the (key, reversed id) pair compared as one unique i64 (one v_cmp_*_i64 a comparator, the selects
+    on the 32-bit halves: v_max_i64 / v_min_i64 selects made it 3.2 us), each pick's key AND raw score reduced over the
+    wave together (every lane gets both: no tie ballot / readlane / branch, no LDS round trip for the weights), the
+    lane's list shortened as the rounds go (round r needs only TOPK - r entries), ids and weights stored once at the
+    end; with c["ucnt"] each pick also counted into the union's lists (moe.union_count). c["bias"]: the bias loads,
+    issued by the caller before its wait."""
+    w, l, sm = c["w"], c["l"], c["sm"]
+    NE_ = c.get("ne", NE)
+    NI_ = NE_ // 32
+    TOPK_ = c.get("ktop", TOPK)
+    if w < TR:
+        row = w
+        bias = c["bias"] if "bias" in c else [hx.gload(c["gbias"] + i64(l + 32 * i) * 4, F32) for i in range(NI_)]
+        ipf(16)   # (the top-k and the union after it)
+        sw = scores_batch(c["scores"] + i64(row * NE_ + l) * 8, c["tag"], NI_)
+        ks = []
+        for i in range_constexpr(NI_):
+            sc = sw[i].bitcast(F32)
+            u = (sc + bias[i]).bitcast(I32)
+            ks.append((((u >> 31) != 0).select(u ^ I32(0x7FFFFFFF), u), I32(NE_ - 1) - (l + 32 * i), sc))
+        lst = _sort_desc64(ks)[:TOPK_]
+        wl = F32(0.0)
+        sel = I32(0)
+        psc = F32(0.0)
+        for r in range_constexpr(TOPK_):
+            h0 = lst[0]
+            bk = _wmax64(h0)
+            win = _k64(h0[0], h0[1]) == _k64(bk[0], bk[1])
+            wl = wl + win.select(h0[2], F32(0.0))   # (the lane's own picks in pick order: topk_v2's sum order)
+            sel = (l == r).select(I32(NE_ - 1) - bk[1], sel)
+            psc = (l == r).select(bk[2], psc)
+            n = TOPK_ - r - 1   # entries a lane may still need (TOPK_ <= NI_: 6 of 12, the draft's 3 of 4)
+            lst = [tuple(win.select(lst[j + 1][q], lst[j][q]) for q in range(3)) for j in range(n)]
+        for o in range_constexpr(5):
+            if fx.const_expr(o < 4):
+                wl = wl + xdpp(wl.bitcast(I32), 8 >> o).bitcast(F32)
+            else:
+                wl = wl + shx(wl.bitcast(I32), 16).bitcast(F32)
+        if l < TOPK_:
+            hx.lstore(sm + wts_off + (row * TOPK_ + l) * 4, psc * frcp(fx.max(wl, F32(1e-20))) * F32(1.5))
+            if fx.const_expr(write_ids):
+                hx.lstore(sm + pid_off + (row * TOPK_ + l) * 4, sel)
+            if fx.const_expr("ucnt" in c):   # (the union's lists initialized before: moe.union_init)
+                union_count(sm, row * TOPK_ + l, sel)
 
 
 @ASTRewriter.transform

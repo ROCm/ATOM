@@ -247,9 +247,9 @@ SORT8 = _sort_pairs(8)
 
 
 @ASTRewriter.transform
-def moe_union(c):
-    """Expert union (S.uni, nuni) and each expert's pick list in pick order (S.lst), in this CTA's LDS."""
-    t, w, l, sm, NP = c["t"], c["w"], c["l"], c["sm"], c["NP"]
+def union_init(c):
+    """The union's zeroed counters and 'big'-filled pick lists (moe_union's first step; c: t sm)."""
+    t, sm = c["t"], c["sm"]
     big = I32(0x7FFFFFFF)
     for k in range_constexpr(2):
         e = t + 256 * k
@@ -261,28 +261,42 @@ def moe_union(c):
             hx.lstore(sm + O_CNT2 + e * 4, I32(0))
     if t == 0:
         hx.lstore(sm + O_OVN, I32(0))
-    ids_g = "ids_lds" not in c or not c["ids_lds"]   # (v2: topk_v2 wrote ids / weights into this LDS)
-    wts_g = "wts_lds" not in c or not c["wts_lds"]
-    idp = c["ids"]
-    wtp = c["wts"]
-    for k in range_constexpr((NP + 255) // 256):
-        p = t + 256 * k
-        if p < NP:
-            if fx.const_expr(ids_g):
-                hx.lstore(sm + O_PID + p * 4, hx.gload(idp + i64(p) * 4, I32))
-            if fx.const_expr(wts_g):
-                hx.lstore(sm + O_WTS + p * 4, hx.gload(wtp + i64(p) * 4, F32))
-    gpu.barrier()
-    for k in range_constexpr((NP + 255) // 256):
-        p = t + 256 * k
-        if p < NP:
-            e = hx.lload(sm + O_PID + p * 4, I32)
-            s = latomic_add(sm + O_CNT + e * 4, 1)
-            if s < MAXTOK:
-                hx.lstore(sm + O_LST + (e * MAXTOK + s) * 4, p)
-            if s == MAXTOK:   # the 17th arrival: its expert overflows (listed once)
-                hx.lstore(sm + O_OVP + latomic_add(sm + O_OVN, 1) * 4, e)
-    gpu.barrier()
+
+
+@ASTRewriter.transform
+def union_count(sm, p, e):
+    """Pick p (expert e) into its expert's list: the arrival slot by an LDS atomic (moe_union sorts the lists after)."""
+    s = latomic_add(sm + O_CNT + e * 4, 1)
+    if s < MAXTOK:
+        hx.lstore(sm + O_LST + (e * MAXTOK + s) * 4, p)
+    if s == MAXTOK:   # the 17th arrival: its expert overflows (listed once)
+        hx.lstore(sm + O_OVP + latomic_add(sm + O_OVN, 1) * 4, e)
+
+
+@ASTRewriter.transform
+def moe_union(c, counted=False):
+    """Expert union (S.uni, nuni) and each expert's pick list in pick order (S.lst), in this CTA's LDS. counted: the
+    lists already initialized (union_init) and every pick counted (union_count, by the top-k), then a barrier."""
+    t, w, l, sm, NP = c["t"], c["w"], c["l"], c["sm"], c["NP"]
+    if fx.const_expr(not counted):
+        union_init(c)
+        ids_g = "ids_lds" not in c or not c["ids_lds"]   # (v2: topk_v2 wrote ids / weights into this LDS)
+        wts_g = "wts_lds" not in c or not c["wts_lds"]
+        idp = c["ids"]
+        wtp = c["wts"]
+        for k in range_constexpr((NP + 255) // 256):
+            p = t + 256 * k
+            if p < NP:
+                if fx.const_expr(ids_g):
+                    hx.lstore(sm + O_PID + p * 4, hx.gload(idp + i64(p) * 4, I32))
+                if fx.const_expr(wts_g):
+                    hx.lstore(sm + O_WTS + p * 4, hx.gload(wtp + i64(p) * 4, F32))
+        gpu.barrier()
+        for k in range_constexpr((NP + 255) // 256):
+            p = t + 256 * k
+            if p < NP:
+                union_count(sm, p, hx.lload(sm + O_PID + p * 4, I32))
+        gpu.barrier()
     # overflow chunks (hot experts: > 16 picks). The <= 16 overflowing experts (OVP[0 .. novf), arrival order) are put in
     # expert order by wave 0 (lane l holds one: its order = the listed experts with smaller ids; its chunks (1 or 2) and
     # chunk base = an exclusive prefix over them in that order). Then every overflowing expert's picks are re-placed by
@@ -338,37 +352,7 @@ def moe_union(c):
                 if inl | (vi < NOV):
                     hx.lstore(sm + O_LST + dst * 4, p)
         gpu.barrier()
-    for k in range_constexpr(2):
-        e = t + 256 * k
-        # a wave's lists: no sort if every count <= 1, the 8-wide network if every count <= 8 (the slots past the
-        # count hold the 'big' sentinel), else the 16-wide one
-        ok = e < NEX
-        ce = hx.lload(sm + O_CNT + fx.min(e, I32(NEX - 1)) * 4, I32)
-        m2 = ballot(ok & (ce > 1))
-        m9 = ballot(ok & (ce > 8))
-        if ok & (m2 != 0):
-            if m9 != 0:
-                vs = [hx.lload(sm + O_LST + (e * MAXTOK + 4 * q) * 4, I32, 4, align=16) for q in range(4)]
-                v = [vs[q][j] for q in range(4) for j in range(4)]
-                for (i0, i1) in SORT16:
-                    lo = fx.min(v[i0], v[i1])
-                    hi = fx.max(v[i0], v[i1])
-                    v[i0] = lo
-                    v[i1] = hi
-                for q in range_constexpr(4):
-                    hx.lstore(sm + O_LST + (e * MAXTOK + 4 * q) * 4, fx.Vector.from_elements(v[4 * q:4 * q + 4], I32),
-                              align=16)
-            else:
-                vs = [hx.lload(sm + O_LST + (e * MAXTOK + 4 * q) * 4, I32, 4, align=16) for q in range(2)]
-                v = [vs[q][j] for q in range(2) for j in range(4)]
-                for (i0, i1) in SORT8:
-                    lo = fx.min(v[i0], v[i1])
-                    hi = fx.max(v[i0], v[i1])
-                    v[i0] = lo
-                    v[i1] = hi
-                for q in range_constexpr(2):
-                    hx.lstore(sm + O_LST + (e * MAXTOK + 4 * q) * 4, fx.Vector.from_elements(v[4 * q:4 * q + 4], I32),
-                              align=16)
+    # the union (wave 0) first: it reads the counts only, not the sorted lists
     if w == 0:
         base = I32(0)
         cns = [hx.lload(sm + O_CNT + (cc * 32 + l) * 4, I32) for cc in range(NE // 32)]   # all issued first
@@ -397,6 +381,38 @@ def moe_union(c):
         base = base + (NP // c["topk"] + MAXTOK - 1) // MAXTOK
         if l == 0:
             hx.lstore(sm + O_NUNI, base)
+    SW = 32 if counted else 0   # (counted: wave 0 builds the union above, waves 1..7 sort the lists)
+    for k in range_constexpr(2):
+        e = t - SW + (256 - SW) * k
+        # a wave's lists: no sort if every count <= 1, the 8-wide network if every count <= 8 (the slots past the
+        # count hold the 'big' sentinel), else the 16-wide one
+        ok = (t >= SW) & (e < NEX) & ((e < NE) | (e >= V_OV0))   # (the shared pseudo-experts' lists: wave 0, in order)
+        ce = hx.lload(sm + O_CNT + fx.max(fx.min(e, I32(NEX - 1)), I32(0)) * 4, I32)
+        m2 = ballot(ok & (ce > 1))
+        m9 = ballot(ok & (ce > 8))
+        if ok & (m2 != 0):
+            if m9 != 0:
+                vs = [hx.lload(sm + O_LST + (e * MAXTOK + 4 * q) * 4, I32, 4, align=16) for q in range(4)]
+                v = [vs[q][j] for q in range(4) for j in range(4)]
+                for (i0, i1) in SORT16:
+                    lo = fx.min(v[i0], v[i1])
+                    hi = fx.max(v[i0], v[i1])
+                    v[i0] = lo
+                    v[i1] = hi
+                for q in range_constexpr(4):
+                    hx.lstore(sm + O_LST + (e * MAXTOK + 4 * q) * 4, fx.Vector.from_elements(v[4 * q:4 * q + 4], I32),
+                              align=16)
+            else:
+                vs = [hx.lload(sm + O_LST + (e * MAXTOK + 4 * q) * 4, I32, 4, align=16) for q in range(2)]
+                v = [vs[q][j] for q in range(2) for j in range(4)]
+                for (i0, i1) in SORT8:
+                    lo = fx.min(v[i0], v[i1])
+                    hi = fx.max(v[i0], v[i1])
+                    v[i0] = lo
+                    v[i1] = hi
+                for q in range_constexpr(2):
+                    hx.lstore(sm + O_LST + (e * MAXTOK + 4 * q) * 4, fx.Vector.from_elements(v[4 * q:4 * q + 4], I32),
+                              align=16)
     gpu.barrier()
 
 
