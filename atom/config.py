@@ -3239,19 +3239,6 @@ class Config:
             from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
             spec = self.speculative_config
-            if (
-                spec.kv_cache_dtype is not None
-                and spec.method == "dspark"
-                and self.hf_config.model_type == "deepseek_v41_text"
-            ):
-                # V4.1's draft reads windows from the target's pool and its attention
-                # takes its dtype from DSparkConfig, never from this flag.
-                raise ValueError(
-                    "--spec-decode-kv-cache-dtype does not apply to a DeepSeek-V4.1 "
-                    "DSpark draft, which caches in the target's KV pool. Its attention "
-                    'dtype is --dspark-config \'{"draft_kv_dtype":"fp8"}\' '
-                    "(default auto: BF16 drafting; fp8 needs an FP8 or FP4 target)"
-                )
             # The one place the draft's pool and dtype are settled: everything
             # downstream (the draft builder, the proposer, the calibration identity)
             # reads `spec.draft_kv_dtype`.

@@ -516,9 +516,6 @@ class EngineArgs:
             "(an MHA draft: MiniMax-M3.1's DSpark, an MHA EAGLE3 draft) takes "
             "either; omitted, --kv_cache_dtype's (bf16 under an fp4 target). A draft in the target's pool "
             "always has --kv_cache_dtype, and a different value here is an error. "
-            "A DeepSeek-V4.1 DSpark draft is not set by this flag (refused): use "
-            '--dspark-config \'{"draft_kv_dtype":"fp8"}\', a different setting '
-            "(how the draft reads the target's pool, not its own pages). "
             "Needs --method and --num-speculative-tokens > 0.",
         )
         parser.add_argument(
