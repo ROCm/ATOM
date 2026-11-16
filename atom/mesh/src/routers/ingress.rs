@@ -14,6 +14,7 @@ use axum::{
 use bytes::Bytes;
 use dashmap::DashSet;
 use http::{HeaderMap, Uri};
+use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
@@ -630,7 +631,7 @@ pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
-    chats_without_template: Arc<parking_lot::RwLock<HashSet<String>>>,
+    chats_without_template: Arc<RwLock<HashSet<String>>>,
     pd: bool,
     max_tokenize_bytes: usize,
 }
