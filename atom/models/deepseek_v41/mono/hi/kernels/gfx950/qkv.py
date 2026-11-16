@@ -144,52 +144,59 @@ def _quad_sum(v):
 
 @traced
 def mhc_finalize(tid, ws, scale, base, out, nent):
-    """CTA 0, wave w finalizes row e = w (nent <= 8 rows): hcA[e][0..3] = sigmoid + 1e-6 (pre),
-    [4..7] = 2 sigmoid (post), [8..23] = 20-round sinkhorn of the 4 x 4 comb logits.
-    ws: mHC's workspace (GEMV partials at 0, per-row sums of squares at 0x1e000)."""
+    """CTA 0, wave w finalizes row e = w (nent <= 8 rows)."""
     lane, e = tid % 64, tid // 64
     if e < nent:
-        m = (lane >= 24).select(lane - 24, lane)
-        pbase = (lane >= 24).select(Int32(0x780), Int32(0)) + m
-        part = F32(0.0)
-        if lane < 48:
-            acc = _ldf(ws, e * (KSLICES * MIX) + pbase)
-            for k in range_constexpr(1, 80):
-                acc = acc + _ldf(ws, e * (KSLICES * MIX) + pbase + k * MIX)
-            part = acc
-        if const_expr(IDX == 0):
-            sq = [_ldf(ws, (0x1E000 // 4) + e * 32 + k) for k in range(10)]
-            tot = sq[0] + sq[1]
-            for k in range_constexpr(2, 10):
-                tot = tot + sq[k]
-        else:
-            sq = [_ldf(ws, (0x1E000 // 4) + e * 640 + k * 64 + lane) for k in range(10)]
-            tot = _wave_sum(sq[0]) + _wave_sum(sq[1])
-            for k in range_constexpr(2, 10):
-                tot = tot + _wave_sum(sq[k])
-        ms = fmath.fma(tot, _c(0x384CCCCD), _c(0x1E3CE508))
-        tiny = ms < _c(0x00800000)
-        r = hw_rsq(tiny.select(ms * _c(0x4B800000), ms))
-        r = tiny.select(r * _c(0x45800000), r)
-        mixv = (part + _bperm(part, (lane + 24) % 64)) * r
-        comb_in = _bperm(mixv, (lane + 8) % 64)
-        if lane < 8:
-            post = lane >= 4
-            y = mixv * _ldf(scale, post.select(Int32(1), Int32(0))) + _ldf(base, lane)
-            sig = F32(1.0) / (F32(1.0) + _exp_ocml(y, True))
-            _stf(out, e * MIX + lane, post.select(sig + sig, sig + _c(EPS6)))
-        if lane < 16:
-            y = _ldf(scale, 2) * comb_in + _ldf(base, lane + 8)
-            mx = fx.max(y, _dpp(y, QP_1032))
-            mx = fx.max(mx, _dpp(mx, QP_2301))
-            ex = _exp_ocml(y - mx, False)
-            p = _div_nr(ex, _quad_sum(ex)) + _c(EPS6)
-            bit2_clear = (tid & 4) == 0
-            v = _div_nr(p, _col_sum(p, bit2_clear) + _c(EPS6))
-            for _ in range_constexpr(19):
-                q = _div_nr(v, _quad_sum(v) + _c(EPS6))
-                v = _div_nr(q, _col_sum(q, bit2_clear) + _c(EPS6))
-            _stf(out, e * MIX + 8 + lane, v)
+        mhc_finalize_row(lane, e, ws, scale, base, out, IDX == 0)
+
+
+@traced
+def mhc_finalize_row(lane, e, ws, scale, base, out, idx0):
+    """One wave finalizes mHC row e: hcA[e][0..3] = sigmoid + 1e-6 (pre), [4..7] = 2 sigmoid (post),
+    [8..23] = 20-round sinkhorn of the 4 x 4 comb logits. ws: mHC's workspace (GEMV partials at 0,
+    per-row sums of squares at 0x1e000: 10 already reduced a row when idx0, else 640).
+    """
+    m = (lane >= 24).select(lane - 24, lane)
+    pbase = (lane >= 24).select(Int32(0x780), Int32(0)) + m
+    part = F32(0.0)
+    if lane < 48:
+        acc = _ldf(ws, e * (KSLICES * MIX) + pbase)
+        for k in range_constexpr(1, 80):
+            acc = acc + _ldf(ws, e * (KSLICES * MIX) + pbase + k * MIX)
+        part = acc
+    if const_expr(idx0):
+        sq = [_ldf(ws, (0x1E000 // 4) + e * 32 + k) for k in range(10)]
+        tot = sq[0] + sq[1]
+        for k in range_constexpr(2, 10):
+            tot = tot + sq[k]
+    else:
+        sq = [_ldf(ws, (0x1E000 // 4) + e * 640 + k * 64 + lane) for k in range(10)]
+        tot = _wave_sum(sq[0]) + _wave_sum(sq[1])
+        for k in range_constexpr(2, 10):
+            tot = tot + _wave_sum(sq[k])
+    ms = fmath.fma(tot, _c(0x384CCCCD), _c(0x1E3CE508))
+    tiny = ms < _c(0x00800000)
+    r = hw_rsq(tiny.select(ms * _c(0x4B800000), ms))
+    r = tiny.select(r * _c(0x45800000), r)
+    mixv = (part + _bperm(part, (lane + 24) % 64)) * r
+    comb_in = _bperm(mixv, (lane + 8) % 64)
+    if lane < 8:
+        post = lane >= 4
+        y = mixv * _ldf(scale, post.select(Int32(1), Int32(0))) + _ldf(base, lane)
+        sig = F32(1.0) / (F32(1.0) + _exp_ocml(y, True))
+        _stf(out, e * MIX + lane, post.select(sig + sig, sig + _c(EPS6)))
+    if lane < 16:
+        y = _ldf(scale, 2) * comb_in + _ldf(base, lane + 8)
+        mx = fx.max(y, _dpp(y, QP_1032))
+        mx = fx.max(mx, _dpp(mx, QP_2301))
+        ex = _exp_ocml(y - mx, False)
+        p = _div_nr(ex, _quad_sum(ex)) + _c(EPS6)
+        bit2_clear = (lane & 4) == 0  # tid & 4
+        v = _div_nr(p, _col_sum(p, bit2_clear) + _c(EPS6))
+        for _ in range_constexpr(19):
+            q = _div_nr(v, _quad_sum(v) + _c(EPS6))
+            v = _div_nr(q, _col_sum(q, bit2_clear) + _c(EPS6))
+        _stf(out, e * MIX + 8 + lane, v)
 
 
 LDS_BYTES = 72560
@@ -873,8 +880,11 @@ def qkv_comp_gemv(tid, t, ws, c_w, xn, lds):
             xb[i] = _ld(
                 xn, (tok * 10240 + (kq * 40 + w * 5) * 64 + i * 64 + g * 16) // 4, 4
             )
+    # the weights stream once a step: non-temporal, as TileRT's
     wt = [
-        _ld(c_w, (((rb * 160 + kq * 40 + w * 5 + i) << 10) + lane * 16) // 4, 4) for i in range(5)
+        fx.Vector(bo.buffer_load(rsrc(c_w), (((rb * 160 + kq * 40 + w * 5 + i) << 10) + lane * 16) // 4, vec_width=4,
+                                 dtype=T.i32, cache_modifier=CM_NT))
+        for i in range(5)
     ]  # fmt: skip
     acc = fx.Vector.filled(4, 0.0, F32)
     for i in range_constexpr(5):
