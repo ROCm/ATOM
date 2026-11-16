@@ -97,6 +97,13 @@ class PdAdmissionController:
         reserve_tokens = _positive_int(
             "num_reserved_decode_tokens", options.get("num_reserved_decode_tokens")
         )
+        # `check` leaves a receive's draft lookahead to the reserve.
+        lookahead = block_manager.draft_lookahead
+        if reserve_tokens is not None and reserve_tokens < lookahead:
+            raise ValueError(
+                "pd_admission.num_reserved_decode_tokens must be at least the "
+                f"draft lookahead ({lookahead} tokens)"
+            )
         if fraction is not None:
             if byte_limit is not None:
                 raise ValueError("Set only one PD byte limit: bytes or fraction")
@@ -235,8 +242,8 @@ class PdAdmissionController:
     def _charged_hits(self, probe, offset: int) -> int:
         """Prefix hits inside the receive range that pending credits already hold.
 
-        Only a full transfer over a local hit (no usable page geometry) writes
-        into hit blocks; fresh and cached-but-free blocks hold no credit.
+        Only a full transfer (offset 0) over a local hit writes into hit
+        blocks; fresh and cached-but-free blocks hold no credit.
         """
         lookup = self._block_manager.kv.lookup
         return sum(

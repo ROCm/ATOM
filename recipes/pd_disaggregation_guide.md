@@ -43,11 +43,11 @@ rejected.
 | --- | --- |
 | `max_pending_kv_fraction` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
 | `max_pending_kv_bytes` | Bytes per D rank, instead of a fraction. |
-| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. Set it no lower than the draft lookahead (`num_speculative_tokens` with a block drafter such as DSpark, one less with serial MTP): a P/D receive takes that lookahead from the reserve at its first decode, and a smaller value leaves it unreserved. |
+| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. It must be at least the draft lookahead (`num_speculative_tokens` with a block drafter such as DSpark, one less with serial MTP), which a P/D receive takes from the reserve at its first decode; startup rejects a smaller value. |
 
 The byte budget charges the blocks Mooncake writes: a local prefix hit is
-charged only on a full transfer, when there is no usable page geometry to skip
-it. Whole-prompt and chunked receives share the budget. A request
+charged only on a full transfer (offset 0). Whole-prompt and chunked receives
+share the budget. A request
 holds its credit until its first local forward; preemption, a failed receive
 and a cancelled one (once its writes drain) return it. With nothing pending,
 one request may exceed the byte budget, so long prompts are not starved. The

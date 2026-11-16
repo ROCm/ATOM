@@ -373,6 +373,25 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
     assert sched.total_preemptions == 0
 
 
+@pytest.mark.parametrize("block_drafter, lookahead", [(True, 3), (False, 2)])
+def test_decode_reserve_below_the_draft_lookahead_rejected(
+    build, block_drafter, lookahead
+):
+    def reserve(tokens):
+        return build(
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=3, use_dspark=lambda: block_drafter
+            ),
+            options={"enabled": True, "num_reserved_decode_tokens": tokens},
+        )
+
+    with pytest.raises(ValueError, match="draft lookahead"):
+        reserve(lookahead - 1)
+    sched, _ = reserve(lookahead)
+    assert sched.block_manager.draft_lookahead == lookahead
+    assert sched.pd_admission.reserve_tokens == lookahead
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_decode_reserve_counts_claimed_prefix_hits(build, seq_factory, chunked):
     sched, request = build(
