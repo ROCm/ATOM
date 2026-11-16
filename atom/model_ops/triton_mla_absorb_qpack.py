@@ -14,6 +14,9 @@ cast, this one does not, and the fp32 reduction order differs. Both only move a
 value across an e4m3 rounding boundary, so the stored code differs by at most
 one e4m3 step. The clamp to the finite FP8 range is the HIP pack's; Triton's
 cast saturates by itself on gfx950 but not on gfx942.
+
+The rope half is the pack's cast of ``q_pe``, unrotated: callers must have no
+positional rotation (``NoPositionalRotaryEmbedding``).
 """
 
 import torch
@@ -23,13 +26,16 @@ import triton.language as tl
 _BLOCK_N = 64
 
 
-def mla_absorb_q_pack_supports(nope_head_dim: int, kv_lora_rank: int) -> bool:
-    """Whether the kernel takes these dims: ``tl.arange(0, P)`` compiles only
+def mla_absorb_q_pack_supports(
+    nope_head_dim: int, rope_head_dim: int, kv_lora_rank: int
+) -> bool:
+    """Whether the kernel takes these dims: ``tl.arange`` over P, R compiles only
     for a power of two, the 256-row tile of a P over 256 overruns gfx950's
     160 KiB of shared memory, and the loop over L has no tail mask."""
     return (
         nope_head_dim == triton.next_power_of_2(nope_head_dim)
         and nope_head_dim <= 256
+        and rope_head_dim == triton.next_power_of_2(rope_head_dim)
         and kv_lora_rank % _BLOCK_N == 0
     )
 
@@ -37,8 +43,9 @@ def mla_absorb_q_pack_supports(nope_head_dim: int, kv_lora_rank: int) -> bool:
 @triton.jit
 def _mla_absorb_q_pack_kernel(
     q_nope_ptr,  # [H, T, P], last dim contiguous
+    q_pe_ptr,  # [H, T, R], q_nope's strides
     w_k_ptr,  # [H, L, P], last dim contiguous
-    q_out_ptr,  # [T, H, >= L], last dim contiguous
+    q_out_ptr,  # [T, H, >= L + R], last dim contiguous
     q_scale_ptr,  # fp32 scalar
     num_tokens,
     stride_q_h,
@@ -48,6 +55,7 @@ def _mla_absorb_q_pack_kernel(
     stride_out_t,
     stride_out_h,
     P: tl.constexpr,
+    R: tl.constexpr,
     L: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -57,6 +65,7 @@ def _mla_absorb_q_pack_kernel(
     head = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_p = tl.arange(0, P)
+    offs_r = tl.arange(0, R)
     m_mask = offs_m < num_tokens
     rows = offs_m.to(tl.int64)[:, None]
 
@@ -68,44 +77,68 @@ def _mla_absorb_q_pack_kernel(
     inv_scale = 1.0 / tl.load(q_scale_ptr)
     w_base = w_k_ptr + head * stride_w_h
     out_base = q_out_ptr + head * stride_out_h + rows * stride_out_t
+    pe = tl.load(
+        q_pe_ptr + head * stride_q_h + rows * stride_q_t + offs_r[None, :],
+        mask=m_mask[:, None],
+        other=0.0,
+    )
+    pe = tl.clamp(pe.to(tl.float32) * inv_scale, -FP8_MAX, FP8_MAX)
+    tl.store(
+        out_base + L + offs_r[None, :],
+        pe.to(q_out_ptr.dtype.element_ty),
+        mask=m_mask[:, None],
+    )
+    # In the 16x16 MFMA layout a lane holds four columns of each 16-column
+    # tile. Loading W's rows in this order puts them on 16 adjacent output
+    # columns, so each lane stores 16 bytes at once, not four 4-byte words;
+    # the permute after the dot only relabels, so any layout stays correct.
+    c = tl.arange(0, BLOCK_N)
+    w_rows = c // 4 % 4 * 16 + c // 16 * 4 + c % 4
     for n in tl.range(0, L, BLOCK_N):
-        offs_n = n + tl.arange(0, BLOCK_N)
-        w = tl.load(w_base + offs_n[:, None] * stride_w_l + offs_p[None, :])
+        w = tl.load(w_base + (n + w_rows)[:, None] * stride_w_l + offs_p[None, :])
         acc = tl.dot(a, tl.trans(w))
         out = tl.clamp(acc * inv_scale, -FP8_MAX, FP8_MAX)
-        tl.store(
-            out_base + offs_n[None, :],
-            out.to(q_out_ptr.dtype.element_ty),
-            mask=m_mask[:, None],
-        )
+        out = tl.reshape(out.to(q_out_ptr.dtype.element_ty), [BLOCK_M, 4, 4, 4])
+        out = tl.reshape(tl.permute(out, (0, 2, 1, 3)), [BLOCK_M, BLOCK_N])
+        tl.store(out_base + n + c[None, :], out, mask=m_mask[:, None])
 
 
 def mla_absorb_q_pack(
     q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
     w_k: torch.Tensor,
     q_out: torch.Tensor,
     q_scale: torch.Tensor,
 ) -> None:
-    """``q_out[t, h, :L] = e4m3(q_nope[h, t] @ w_k[h].T / q_scale)``, in place.
+    """``q_out[t, h, :L] = e4m3(q_nope[h, t] @ w_k[h].T / q_scale)``, in place,
+    and ``q_out[t, h, L:L + R] = e4m3(q_pe[h, t] / q_scale)``.
 
     Args:
         q_nope: ``[H, T, P]`` bf16; the transposed nope slice of ``q_proj``'s
             output, so only the last dim need be contiguous.
+        q_pe: ``[H, T, R]`` bf16; the rope slice of the same output, so it
+            shares ``q_nope``'s strides.
         w_k: ``[H, L, P]`` bf16, the BF16 absorb weight (``W_K`` / ``W_K_qrep``).
-        q_out: ``[T, H, >= L]`` FP8; columns ``L:`` are not touched.
+        q_out: ``[T, H, >= L + R]`` FP8; columns ``L + R:`` are not touched.
         q_scale: fp32 per-tensor scale (``MLAAttention._q_scale``).
     """
     num_heads, num_tokens, p = q_nope.shape
+    r = q_pe.shape[2]
     l = w_k.shape[1]
     assert w_k.shape == (num_heads, l, p)
-    assert q_out.shape[:2] == (num_tokens, num_heads) and q_out.shape[2] >= l
-    assert mla_absorb_q_pack_supports(p, l), f"no absorb kernel for P={p}, L={l}"
+    assert q_pe.shape[:2] == (num_heads, num_tokens)
+    assert q_pe.stride() == q_nope.stride()
+    assert q_out.shape[:2] == (num_tokens, num_heads) and q_out.shape[2] >= l + r
+    assert mla_absorb_q_pack_supports(
+        p, r, l
+    ), f"no absorb kernel for P={p}, R={r}, L={l}"
     assert q_nope.stride(-1) == 1 and w_k.stride(-1) == 1 and q_out.stride(-1) == 1
     if num_tokens == 0:
         return
     block_m = 128 if num_tokens < 2048 else 256
     _mla_absorb_q_pack_kernel[(triton.cdiv(num_tokens, block_m), num_heads)](
         q_nope,
+        q_pe,
         w_k,
         q_out,
         q_scale,
@@ -117,10 +150,12 @@ def mla_absorb_q_pack(
         q_out.stride(0),
         q_out.stride(1),
         P=p,
+        R=r,
         L=l,
         BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         FP8_MAX=torch.finfo(q_out.dtype).max,
         num_warps=4,
         num_stages=2,
+        matrix_instr_nonkdim=16,
     )
