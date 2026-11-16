@@ -439,6 +439,65 @@ def _make_builder_cls():
     return SGLangDeepseekV41MetadataBuilder
 
 
+def compact_v41_moe_buffers(model: Any, role: str = "target") -> int:
+    """Re-materialize every MoE layer's expert tensors, one layer at a time,
+    once SGLang has post-processed the weights and before its memory profile.
+    Returns the layers compacted.
+
+    The load frees and reallocates multi-GiB expert buffers layer by layer
+    (ATOM's online FP4 -> FP8 quant, then SGLang's ``postprocess_weights``
+    shuffling each of them). The caching allocator serves later buffers out
+    of earlier, larger free blocks and leaves their tails split off inside
+    segments that still hold live weights; ``empty_cache`` cannot return
+    those (about 5 GiB a rank on DeepSeek-V4.1-Flash TP4), and the profile,
+    which reads the device's free bytes, takes them from the KV pool.
+    Copying each layer's tensors into fresh allocations and emptying the
+    cache after each layer hands back whole segments instead.
+
+    Values and Parameter objects are unchanged (``.data`` is swapped); no
+    graph or kernel has recorded their addresses yet. The fused-MoE quant
+    config ``init_prepare_finalize`` built during the load is rebuilt over
+    the layer's current tensors, so it keeps none of the old ones alive."""
+    import gc
+
+    def stranded() -> int:
+        stats = torch.cuda.memory_stats()
+        return int(stats.get("inactive_split_bytes.all.current", 0))
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("DeepSeek-V4.1 MoE buffers compacted under a capture")
+    gc.collect()
+    torch.cuda.empty_cache()
+    stranded_before = stranded()
+    layers = 0
+    for module in model.modules():
+        if not isinstance(getattr(module, "w13_weight", None), torch.nn.Parameter):
+            continue
+        for param in module.parameters(recurse=False):
+            fresh = torch.empty_like(param.data)
+            fresh.copy_(param.data)
+            param.data = fresh
+        quant_method = getattr(module, "quant_method", None)
+        if getattr(quant_method, "moe_quant_config", None) is not None:
+            quant_method.moe_quant_config = quant_method.get_fused_moe_quant_config(
+                module
+            )
+        layers += 1
+        torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(
+        "ATOM DeepSeek-V4.1 SGLang: %s MoE buffers compacted in %d layers "
+        "(reserved %.2f GiB, stranded %.2f -> %.2f GiB)",
+        role,
+        layers,
+        torch.cuda.memory_reserved() / (1 << 30),
+        stranded_before / (1 << 30),
+        stranded() / (1 << 30),
+    )
+    return layers
+
+
 def init_deepseek_v41_builder(atom_config: Any, device: Any = None):
     """Create this process's V4.1 metadata builder. Idempotent.
 
@@ -911,8 +970,11 @@ def _install_pool_sizing_patch() -> None:
     def profile_available_bytes(self, pre_model_load_memory):
         # SGLang post-processes the weights after `load_weights` returns, so
         # this is the first point where the builder sees the memory they
-        # leave; its buffers then come out of the profiled budget.
+        # leave; its buffers then come out of the profiled budget. The MoE
+        # buffers are compacted first, so the profile sees no stranded bytes.
         if _is_atom_v41_target(self):
+            if _V41_BUILDER is None:
+                compact_v41_moe_buffers(self.model)
             init_deepseek_v41_builder(self.model.atom_config)
         return original_profile(self, pre_model_load_memory)
 

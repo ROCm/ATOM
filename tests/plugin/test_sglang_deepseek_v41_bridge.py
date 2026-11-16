@@ -1312,6 +1312,100 @@ def test_flash_geometry_prices(kv_dtype, paged_bytes, state_bytes):
 # ---------------------------------------------------------------------------
 
 
+class TestMoeCompaction:
+    def _layer(self, rebuilt):
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.arange(12.0).view(3, 4), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(torch.ones(3, 2), requires_grad=False)
+        layer.w13_weight.is_shuffled = True
+        layer.quant_method = SimpleNamespace(
+            moe_quant_config="built during the load",
+            get_fused_moe_quant_config=lambda module: rebuilt.append(module)
+            or ("current", module),
+        )
+        return layer
+
+    def test_layers_get_fresh_storage_same_values_and_parameters(self, monkeypatch):
+        emptied, rebuilt = [], []
+        monkeypatch.setattr(torch.cuda, "memory_stats", dict)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(1))
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([self._layer(rebuilt) for _ in range(2)])
+        model.norm = torch.nn.LayerNorm(4)
+        before = [
+            (p, p.data.data_ptr(), p.data.clone())
+            for layer in model.layers
+            for p in (layer.w13_weight, layer.w2_weight)
+        ]
+        norm_ptr = model.norm.weight.data_ptr()
+
+        assert bridge.compact_v41_moe_buffers(model) == 2
+        for (param, ptr, values), now in zip(
+            before,
+            [p for layer in model.layers for p in (layer.w13_weight, layer.w2_weight)],
+        ):
+            assert now is param and now.data_ptr() != ptr
+            assert torch.equal(now.data, values)
+        assert model.layers[0].w13_weight.is_shuffled
+        # Only MoE layers are copied.
+        assert model.norm.weight.data_ptr() == norm_ptr
+        for layer in model.layers:
+            assert layer.quant_method.moe_quant_config == ("current", layer)
+        assert rebuilt == list(model.layers)
+        # Once before, once per layer, once at the end.
+        assert len(emptied) == 4
+
+    def test_refused_under_a_capture(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="under a capture"):
+            bridge.compact_v41_moe_buffers(torch.nn.Module())
+
+    @needs_sglang
+    def test_memory_profile_compacts_once_then_builds(self, monkeypatch):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor import pool_configurator
+
+        calls = []
+        monkeypatch.setattr(
+            bridge,
+            "compact_v41_moe_buffers",
+            lambda model, role="target": calls.append(("compact", model, role)),
+        )
+        monkeypatch.setattr(
+            bridge,
+            "init_deepseek_v41_builder",
+            lambda config: calls.append(("builder", config))
+            or monkeypatch.setattr(bridge, "_V41_BUILDER", object()),
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", None)
+        monkeypatch.setattr(bridge, "_is_atom_v41_target", lambda kvc: True)
+        monkeypatch.setattr(
+            KVCacheConfigurator, "_profile_available_bytes", lambda self, m: 7
+        )
+        monkeypatch.setattr(
+            pool_configurator, "_atom_v41_sizing_patched", False, raising=False
+        )
+        monkeypatch.setattr(
+            pool_configurator,
+            "create_memory_pool_configurator",
+            pool_configurator.create_memory_pool_configurator,
+        )
+        bridge._install_pool_sizing_patch()
+        config = object()
+        model = SimpleNamespace(atom_config=config)
+        kvc = SimpleNamespace(model=model)
+        assert KVCacheConfigurator._profile_available_bytes(kvc, 0) == 7
+        assert calls == [("compact", model, "target"), ("builder", config)]
+        # A second profile builds nothing new and compacts nothing.
+        calls.clear()
+        KVCacheConfigurator._profile_available_bytes(kvc, 0)
+        assert calls == [("builder", config)]
+
+
 @needs_sglang
 class TestBackendShim:
     def _runner(self, pool):
