@@ -23,6 +23,7 @@ Covered here:
    a hit on a speculative pool, verify rounds that never carry a replay.
 """
 
+import logging
 import sys
 from array import array
 from types import SimpleNamespace
@@ -1278,15 +1279,26 @@ class TestFusedSeam:
         assert world.sides == [] and radix._STATS["fused_steps"] == 0
 
     def test_a_step_past_the_builder_falls_back_to_a_side_forward(
-        self, monkeypatch, radix_fused
+        self, monkeypatch, radix_fused, caplog
     ):
         world = _World(monkeypatch, max_tokens=R + 6)
         batch = world.batch([PAGE], [1], lengths=[7])
-        assert run_v41_prefix_replay(world.worker, batch) is None
+        with caplog.at_level(logging.ERROR):
+            assert run_v41_prefix_replay(world.worker, batch) is None
         (side,) = world.sides
         assert side.prefix_lens == [PAGE - R]
         assert radix._STATS["fallbacks"] == 1 and radix._STATS["fused_steps"] == 0
+        assert radix._STATS["over_budget"] == 1
         assert world.pool.state_gen[1] == world.generation[1]
+        # Unreachable as shipped (the admission charge): an error, every time
+        # up to 8, with the widened size.
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert f"to {R + 7} exceeds the builder's {R + 6}" in errors[0].getMessage()
+        with caplog.at_level(logging.ERROR):
+            run_v41_prefix_replay(world.worker, world.batch([PAGE], [2], lengths=[7]))
+        assert radix._STATS["over_budget"] == 2
+        assert sum(r.levelno == logging.ERROR for r in caplog.records) == 2
 
     def test_short_hit_replays_from_zero(self, monkeypatch):
         monkeypatch.setattr(radix, "_REPLAY_ROWS", 512)
@@ -2158,11 +2170,15 @@ class TestStampOnConsume:
 
 class TestForcedSideFallback:
     def test_the_first_fused_steps_take_the_side_forward(
-        self, monkeypatch, radix_fused
+        self, monkeypatch, radix_fused, caplog
     ):
         monkeypatch.setattr(radix, "_TEST_SIDE_STEPS", 1)
         world = _World(monkeypatch)
-        assert run_v41_prefix_replay(world.worker, world.batch([PAGE], [1])) is None
+        with caplog.at_level(logging.WARNING):
+            assert run_v41_prefix_replay(world.worker, world.batch([PAGE], [1])) is None
+        # The hook's fallback fits: a warning, not the over-budget error.
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        assert radix._STATS["over_budget"] == 0
         (side,) = world.sides
         assert side.prefix_lens == [PAGE - R]
         # A side replay's slot is stamped once its side forward has run.

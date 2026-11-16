@@ -205,6 +205,8 @@ _STATS = {
     "fused_steps": 0,
     "fallbacks": 0,
     "forced_fallbacks": 0,
+    # Fallbacks of a step really past the builder (not the test hook).
+    "over_budget": 0,
     "hits": 0,
     "rows": 0,
     "steps": 0,
@@ -938,13 +940,17 @@ class _PageCheck:
 # ---------------------------------------------------------------------------
 
 
-def _fits(batch, hits, builder) -> bool:
-    """Whether the step widened by its replay rows fits the builder."""
+def _widened_rows(batch, hits) -> int:
+    """The step's rows widened by its hits' replay rows."""
     extend = getattr(batch, "extend_num_tokens", None)
     if extend is None:
         extend = sum(int(n) for n in batch.extend_lens)
-    widened = int(extend) + sum(int(hit.end - hit.start) for hit in hits)
-    return widened <= int(builder.max_num_batched_tokens)
+    return int(extend) + sum(int(hit.end - hit.start) for hit in hits)
+
+
+def _fits(batch, hits, builder) -> bool:
+    """Whether the step widened by its replay rows fits the builder."""
+    return _widened_rows(batch, hits) <= int(builder.max_num_batched_tokens)
 
 
 def run_v41_prefix_replay(worker, batch, debug_checks=None):
@@ -1035,14 +1041,25 @@ def run_v41_prefix_replay(worker, batch, debug_checks=None):
     elif hits:
         if _REPLAY_MODE == "fused":
             _STATS["fallbacks"] += 1
-            if _STATS["fallbacks"] == 1 and not forced:
-                logger.warning(
-                    "V4.1 radix replay: a step widened by its %d replay rows "
-                    "exceeds the builder's %d tokens; replaying it in a side "
-                    "forward (logged once)",
-                    sum(int(hit.end - hit.start) for hit in hits),
-                    int(builder.max_num_batched_tokens),
-                )
+            if not forced:
+                # Not the test hook: the step really is past the builder.
+                # SGLang's admission charges each hit's R to the chunk
+                # (`_install_admission_accounting`) and the builder holds
+                # chunk + R, so this is unreachable as shipped: an error,
+                # though the side forward below still serves the step.
+                _STATS["over_budget"] += 1
+                count = _STATS["over_budget"]
+                if count <= 8 or count % 1024 == 0:
+                    logger.error(
+                        "V4.1 radix replay: step widened by its %d replay rows "
+                        "to %d exceeds the builder's %d tokens despite the "
+                        "admission charge (over-budget step %d); replaying "
+                        "it in a side forward",
+                        sum(int(hit.end - hit.start) for hit in hits),
+                        _widened_rows(batch, hits),
+                        int(builder.max_num_batched_tokens),
+                        count,
+                    )
         for group in split_replay_groups(
             hits, int(builder.max_bs), int(builder.max_num_batched_tokens)
         ):
