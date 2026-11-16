@@ -40,7 +40,8 @@ def _paged_csr(tokens, cap, pages_total, slots_total, requests, gen, device="cpu
     ring = torch.tensor(slots)[req] * RING + torch.randint(0, RING, (n,), generator=gen)
     indices = torch.where(win, ring * 2 + 1, main * 2)
     indices[int(indptr[-1]) :] = -1
-    pages = BatchPages(tables.to(device), tuple(columns), tuple(slots), RPP, RING)
+    pages = BatchPages(tables.to(device), torch.tensor(slots, dtype=torch.int32).to(device), tuple(columns),
+                       tuple(slots), RPP, RING, {})
     return indices.to(device), indptr.to(device), pages
 
 
@@ -58,7 +59,7 @@ def test_page_rows_of_a_window_only_layer():
     indices, indptr, pages = _paged_csr(9, 8, 16, 4, 2, gen)
     keep = (indices & 1) == 1
     indices = torch.where(keep, indices, torch.full_like(indices, 1))   # window rows only
-    pages = BatchPages(pages.tables, pages.columns, pages.slots, 0, RING)
+    pages = BatchPages(pages.tables, pages.slot_ids, pages.columns, pages.slots, 0, RING, {})
     tagged, local = _page_rows(indices, indptr, 0, 4 * RING, pages)
     n = int(indptr[-1])
     assert tagged.numel() == 2 * RING and int(local.min()) >= 0

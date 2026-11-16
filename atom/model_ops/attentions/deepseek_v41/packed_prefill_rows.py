@@ -46,28 +46,37 @@ def prefill_mode(tokens=0, pages=False):
     return mode
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BatchPages:
     """A prefill's requests, in batch order: `tables` the step's block table
-    (`[bs, cols]` int32, on the device), `columns` the pages each request's
-    context spans and `slots` its STATE slot (host), `rows_per_page` main rows a
-    page at the layer's ratio (0: a window-only layer), `ring` ring slots."""
+    (`[bs, cols]` int32) and `slot_ids` its slots (`[bs]`), both on the device;
+    `columns` the pages each request's context spans and `slots` its STATE slot
+    (host); `rows_per_page` main rows a page at the layer's ratio (0: a
+    window-only layer), `ring` ring slots."""
 
     tables: torch.Tensor
+    slot_ids: torch.Tensor
     columns: tuple
     slots: tuple
     rows_per_page: int
     ring: int
+    layouts: dict   # the step's `_page_layout`s (kept on the step: a block table's content is the step's)
+
+    def key(self):
+        return (self.tables.data_ptr(), self.slot_ids.data_ptr(), self.columns, self.slots,
+                self.rows_per_page, self.ring)
 
 
 def batch_pages(step, ratio, geometry):
     """`BatchPages` of `step` for a layer at `ratio` (host spans only: no sync)."""
     return BatchPages(
         step.block_tables,
+        step.slots,
         tuple(-(-r.end // geometry.block_size) for r in step.requests),
         tuple(r.slot for r in step.requests),
         geometry.rows_per_page(ratio) if ratio else 0,
         geometry.ring_slots,
+        step.__dict__.setdefault("_packed_prefill_layouts", {}),
     )
 
 
@@ -81,35 +90,37 @@ def _remap_rows_torch(indices, indptr, inv_page, inv_slot, window0, rpp, ring):
     return torch.where(valid, torch.where(window, win, main), 0).clamp(min=0).to(torch.int32)
 
 
+def _page_layout(pages, main_rows, window_rows, dev):
+    """The shadow's rows by page (`tagged`) and the inverse maps a CSR row is
+    placed through, from device slices of the block table (no host copy)."""
+    key = (pages.key(), main_rows, window_rows)
+    hit = pages.layouts.get(key)
+    if hit is not None:
+        return hit
+    rpp, ring, bs = pages.rows_per_page, pages.ring, len(pages.slots)
+    parts = [pages.tables[b, :n] for b, n in enumerate(pages.columns) if n] if rpp else []
+    page_ids = torch.cat(parts).long() if parts else torch.zeros(0, dtype=torch.int64, device=dev)
+    nmain = page_ids.numel() * rpp
+    tagged = torch.empty(nmain + bs * ring, dtype=torch.int64, device=dev)
+    inv_page = torch.zeros(max(main_rows // max(rpp, 1), 1), dtype=torch.int32, device=dev)
+    if nmain:
+        inv_page[page_ids] = torch.arange(page_ids.numel(), dtype=torch.int32, device=dev)
+        tagged[:nmain] = ((page_ids[:, None] * rpp + torch.arange(rpp, device=dev)) << 1).flatten()
+    slots = pages.slot_ids[:bs].long()
+    inv_slot = torch.zeros(max(window_rows // ring, 1), dtype=torch.int32, device=dev)
+    inv_slot[slots] = torch.arange(bs, dtype=torch.int32, device=dev)
+    tagged[nmain:] = (((slots[:, None] * ring + torch.arange(ring, device=dev)) << 1) | 1).flatten()
+    pages.layouts[key] = (tagged, inv_page, inv_slot, nmain)
+    return pages.layouts[key]
+
+
 def _page_rows(indices, indptr, main_rows, window_rows, pages):
     """`(tagged, local)` as `distinct_rows`'s, the shadow laid out by page:
     each request's context pages (`rows_per_page` rows each), then each request's
-    ring. Built from the host spans and the block table (a gather of the batch's
-    page ids), then one pass over the CSR; nothing waits for the GPU."""
+    ring (`_page_layout`, once a step and ratio), then one pass over the CSR;
+    nothing waits for the GPU."""
     dev, rpp, ring = indices.device, pages.rows_per_page, pages.ring
-    if not rpp:
-        pairs = []
-    else:
-        pairs = [(b, c) for b, n in enumerate(pages.columns) for c in range(n)]
-    pinned = dev.type == "cuda"
-
-    def host(values):
-        t = torch.tensor(values, dtype=torch.int64)
-        return (t.pin_memory() if pinned else t).to(dev, non_blocking=True)
-
-    nmain = len(pairs) * rpp
-    tagged = torch.empty(nmain + len(pages.slots) * ring, dtype=torch.int64, device=dev)
-    inv_page = torch.zeros(max(main_rows // max(rpp, 1), 1), dtype=torch.int32, device=dev)
-    if pairs:
-        bc = host(pairs)
-        page_ids = pages.tables[bc[:, 0], bc[:, 1]].long()
-        inv_page[page_ids] = torch.arange(len(pairs), dtype=torch.int32, device=dev)
-        tagged[:nmain] = ((page_ids[:, None] * rpp + torch.arange(rpp, device=dev)) << 1).flatten()
-    inv_slot = torch.zeros(max(window_rows // ring, 1), dtype=torch.int32, device=dev)
-    if pages.slots:
-        slots = host(pages.slots)
-        inv_slot[slots] = torch.arange(len(pages.slots), dtype=torch.int32, device=dev)
-        tagged[nmain:] = (((slots[:, None] * ring + torch.arange(ring, device=dev)) << 1) | 1).flatten()
+    tagged, inv_page, inv_slot, nmain = _page_layout(pages, main_rows, window_rows, dev)
     if dev.type == "cuda" and indices.numel():
         import triton
 
@@ -187,9 +198,7 @@ _REMAPS = {}   # id(plane base) -> (weakref to it, signature, remap); entries go
 
 def _remap(indices, indptr, main_rows, window_rows, pages=None):
     base = indices if indices._base is None else indices._base
-    psig = None if pages is None else (
-        pages.tables.data_ptr(), pages.columns, pages.slots, pages.rows_per_page, pages.ring
-    )
+    psig = None if pages is None else pages.key()
     sig = (indices.data_ptr(), indices.numel(), indptr.data_ptr(), main_rows, window_rows, psig)
     hit = _REMAPS.get(id(base))
     if hit is not None and hit[0]() is base and hit[1] == sig:
