@@ -150,6 +150,18 @@ def _weights_discarded(reply) -> bool:
     return not (isinstance(result, dict) and result.get("weights_discarded") is False)
 
 
+# Where the runners' weight-group methods take the group's name, after self.
+_GROUP_NAME_POSITION = {"init_rdma_weight_group": 4, "destroy_rdma_weight_group": 0}
+
+
+def _named_group(method: str, payload) -> str | None:
+    """The weight group a collective_rpc of *method* names."""
+    if "group_name" in payload.kwargs:
+        return payload.kwargs["group_name"]
+    position = _GROUP_NAME_POSITION[method]
+    return payload.args[position] if len(payload.args) > position else None
+
+
 class _ReplyQueue:
     """The EngineCore output queue, as the utility handlers see it.
 
@@ -623,10 +635,15 @@ class EngineUtilityHandler:
             return
 
         failures = [r for r in replies if not r.ok]
-        if method in ("init_rdma_weight_group", "destroy_rdma_weight_group"):
-            # A group joined or left anew counts its own versions on the
-            # runners; what was committed on the old one commits nothing there.
-            self._committed_stream_versions.clear()
+        # A group the runners join anew counts its versions from nothing, so
+        # what the engine recorded for the old one commits nothing there. A
+        # retried join keeps the group, and leaving one drops it whatever its
+        # teardown raised.
+        if method == "destroy_rdma_weight_group" or (
+            method == "init_rdma_weight_group"
+            and any(r.ok and r.value is True for r in replies)
+        ):
+            self._committed_stream_versions.pop(_named_group(method, payload), None)
         logger.info(
             f"{self.label}: collective_rpc {method} ranks={len(replies)} "
             f"failed={len(failures)}"

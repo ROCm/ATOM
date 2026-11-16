@@ -554,7 +554,8 @@ class RDMAWeightReceiverMixin:
         the engine before any joins: one that cannot -- refused, its rank out
         of range, its earlier join a different one -- or that has joined where
         the others have not would leave them in the rendezvous waiting for it.
-        Idempotent for the same join, as the orchestrator may retry.
+        Idempotent for the same join, as the orchestrator may retry: whether
+        this call joined the group, False when it was joined already.
         """
         rank = int(base_rank) + int(self.rank)
         join = {
@@ -607,7 +608,7 @@ class RDMAWeightReceiverMixin:
                 self.label,
                 group_name,
             )
-            return True
+            return False
 
         timeout = timedelta(seconds=int(timeout_s))
         with _aborted_not_ended_on_timeout():

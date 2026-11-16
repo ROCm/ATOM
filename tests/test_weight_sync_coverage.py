@@ -790,6 +790,8 @@ class _InProcessRunners:
             ]
         return [RpcResult(payload.request_id, 0, value=value)]
 
+    collective_rpc = utility_rpc
+
 
 class _UnansweredQuery(_InProcessRunners):
     """The same, except that what the runner supports cannot be learnt: the

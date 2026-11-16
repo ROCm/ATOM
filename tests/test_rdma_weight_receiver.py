@@ -1056,6 +1056,82 @@ def test_a_refused_stream_keeps_the_version_the_engine_committed(monkeypatch):
     assert "must rise" in reply["error"] and worker.model.w.item() == 5.0
 
 
+def _join(send, group_name):
+    """``init_rdma_weight_group`` through the engine, as LumenRL calls it."""
+    return send(
+        "collective_rpc",
+        method="init_rdma_weight_group",
+        request_id=f"join-{group_name}",
+        kwargs={
+            "master_addr": "127.0.0.1",
+            "master_port": 29500,
+            "base_rank": 1,
+            "world_size": 2,
+            "group_name": group_name,
+        },
+    )
+
+
+@pytest.mark.parametrize("joined", ["g", "h"], ids=["g-again", "another-group"])
+def test_a_join_that_leaves_a_group_as_it_was_keeps_its_committed_version(
+    monkeypatch, joined
+):
+    """Any join or leave dropped every group's committed version, though the
+    runners keep g on a retried join of it and on a join of another group: v5,
+    committed, never became g's last, and an older v4 was taken and written."""
+    from tests.test_weight_sync_coverage import _engine_with
+
+    trainer = _Trainer([*_stream_of_w(5.0, version=5), *_stream_of_w(4.0, version=4)])
+    worker = _joined_worker(monkeypatch, trainer)
+    _, send = _engine_with(worker)
+    stream = {"cmd": "receive_weights_rdma", "group_name": "g"}
+
+    send(**stream, version=5, sync_id="s1", request_id="a")
+    send("finish_weight_sync", sync_id="s1", completed_request_id="a")
+    assert "error" not in _join(send, joined)
+    reply = send(**stream, version=4, sync_id="s2", request_id="b")
+
+    assert "must rise" in reply["error"] and worker.model.w.item() == 5.0
+
+
+@pytest.mark.parametrize("left_by", ["collective_rpc", "the stream"])
+def test_a_group_joined_anew_forgets_what_the_old_one_committed(monkeypatch, left_by):
+    """The runners count a new group's versions from nothing, however the old
+    one was left, so the engine's record of it commits nothing there: a v5
+    written on the new group, then discarded, can be sent again."""
+    from tests.test_weight_sync_coverage import _engine_with
+
+    trainer = _Trainer(
+        [
+            *_stream_of_w(5.0, version=5),
+            *_stream_of_w(6.0, version=5),
+            *_stream_of_w(9.0, version=5),
+        ]
+    )
+    worker = _joined_worker(monkeypatch, trainer)
+    _, send = _engine_with(worker)
+    stream = {"cmd": "receive_weights_rdma", "group_name": "g"}
+
+    send(**stream, version=5, sync_id="s1", request_id="a")
+    send("finish_weight_sync", sync_id="s1", completed_request_id="a")
+    if left_by == "collective_rpc":
+        send(
+            "collective_rpc",
+            method="destroy_rdma_weight_group",
+            request_id="leave",
+            kwargs={"group_name": "g"},
+        )
+    else:
+        # As a stream broken off leaves it, with no word to the engine.
+        worker.destroy_rdma_weight_group("g")
+    assert "error" not in _join(send, "g")
+    send(**stream, version=5, sync_id="s2", request_id="b")
+    send("discard_failed_weight_sync", failed_cmd="receive_weights_rdma", error="")
+    reply = send(**stream, version=5, sync_id="s3", request_id="c")
+
+    assert "error" not in reply and worker.model.w.item() == 9.0
+
+
 @pytest.mark.parametrize(("frames_taken", "wrote"), [(0, False), (1, True)])
 def test_a_stream_broken_off_says_whether_this_rank_wrote(
     monkeypatch, frames_taken, wrote
@@ -1324,12 +1400,12 @@ def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):
     worker = _Worker()
     join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
 
-    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)
-    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)  # a retry
+    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join) is True
+    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join) is False  # a retry
     with pytest.raises(RuntimeError, match="already joined"):
         worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
     worker.destroy_rdma_weight_group("g")
-    assert worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
+    assert worker.init_rdma_weight_group("10.0.0.2", 29500, **join) is True
     assert [j["master"] for j in joined] == ["10.0.0.1:29500", "10.0.0.2:29500"]
 
 
