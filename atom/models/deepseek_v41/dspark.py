@@ -45,7 +45,7 @@ from atom.utils import envs
 
 from .attention import Attention
 from .config import build_attention_topology
-from .layers import native_quant_config
+from .layers import converted_linear_spec, native_quant_config
 from .model import Block, DeepseekV41ForCausalLM
 
 logger = logging.getLogger("atom")
@@ -66,18 +66,20 @@ class DraftAttention(Attention):
     @property
     def wkv_shard(self):
         """`wqkv_a` narrowed to the KV rows, for the fused context-KV GEMM."""
-        view = self.__dict__.get("_wkv_shard")
+        view = getattr(self, "_wkv_shard", None)
         if view is None:
             view = self._wkv_shard = self.wqkv_a.shard_view(1)
         return view
 
     def project_context(self, hidden, positions, rope, *, packed=False):
-        """Target keys alone; the query half is computed and dropped.
-
-        As V4's draft does, and only on the unfused path -- when the stages
-        fuse, `write_context_kv` reads `wkv_shard` and no query is projected.
+        """Target keys alone, only on the unfused path -- when the stages
+        fuse, `write_context_kv` reads `wkv_shard`. A BF16 `wqkv_a` projects
+        only the KV rows; an FP8 one computes the query half and drops it.
         """
-        _, kv_pre = self.project_qkv(hidden)
+        if self.wqkv_a.weight.dtype == torch.bfloat16:
+            kv_pre = self.wkv_shard(hidden)
+        else:
+            _, kv_pre = self.project_qkv(hidden)
         return self.context_keys(self.kv_norm(kv_pre), positions, rope, packed=packed)
 
     def forward(self, hidden, hidden_scale, context_kv, step, rope, *, hidden_fp8=None):
@@ -222,8 +224,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
         draft = copy(args)
         draft.n_routed_experts = args.dspark_n_routed_experts
         draft.num_experts_per_tok = args.dspark_num_experts_per_tok
+        # An FP4PTPC checkpoint converts only the backbone's linears; the
+        # draft's stay native.
+        draft.fp4ptpc = False
+        # Same rules as the backbone.
         self.moe_quant_config = make_v4_quant_config(
-            draft, online_quant_config=getattr(config, "online_quant_config", None)
+            draft,
+            online_quant_config=getattr(config, "online_quant_config", None),
+            shared_expert_spec=converted_linear_spec(draft),
+            online_routed_experts=True,
         )
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a
@@ -485,7 +494,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for s in shards
         }
         (group_rows, _, width, preshuffled), *others = layouts
-        if others or group_rows is None or any(s.bias is not None for s in shards):
+        # BF16 shards have no FP8 weights to fuse: per-stage path.
+        bf16 = any(s.weight.dtype == torch.bfloat16 for s in shards)
+        if (
+            others
+            or group_rows is None
+            or bf16
+            or any(s.bias is not None for s in shards)
+        ):
             fused = None
         else:
             fused = (

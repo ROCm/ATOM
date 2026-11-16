@@ -4,6 +4,7 @@
 import logging
 
 import torch
+from aiter import QuantType
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 
@@ -40,20 +41,27 @@ from atom.model_ops.deepseek_v41.paged_scoring import (
     score_topk_quantized,
 )
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.layernorm import DualRMSNormMXFP8, RMSNorm
+from atom.model_ops.layernorm import (
+    DualRMSNormBF16,
+    DualRMSNormMXFP8,
+    DualRMSNormPerToken,
+    RMSNorm,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    native_group32_runs_bf16,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
+from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
 from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
-from .layers import native_quant_config
+from .layers import converted_linear_config, native_quant_config
 
 logger = logging.getLogger("atom")
 
@@ -97,7 +105,7 @@ class Indexer(nn.Module):
         self.wq_b = ReplicatedLinear(
             config.q_lora_rank,
             self.heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         self.weights_proj = ReplicatedLinear(config.hidden_size, self.heads, bias=False)
         if spec.mode == AttentionMode.FULL:
@@ -276,7 +284,7 @@ class Attention(nn.Module):
             config.hidden_size,
             [config.q_lora_rank, self.head_dim],
             bias=False,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         # Fused: the norm emits `(qr, qr_scale)` in the one launch, and both
         # readers of `qr` -- this layer's `wq_b` and the indexer's -- take that
@@ -290,17 +298,25 @@ class Attention(nn.Module):
         self.wq_b = ColumnParallelLinear(
             config.q_lora_rank,
             config.num_attention_heads * self.head_dim,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
         )
         self.kv_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
-        self.qk_norm = DualRMSNormMXFP8(
-            self.q_norm,
-            self.kv_norm,
-            f"layers.{spec.layer_id}.qk_norm",
-            amax_floor=AMAX_FLOOR.value,
-        )
+        # Q in the format wq_b and indexer.wq_b take, quantized once for both:
+        # per token for per-channel GEMMs; for native group32 ones MXFP8, or
+        # BF16 where those run in BF16.
+        name = f"layers.{spec.layer_id}.qk_norm"
+        if self.wq_b.quant_type.value == QuantType.per_Token.value:
+            self.qk_norm = DualRMSNormPerToken(
+                self.q_norm, self.kv_norm, name, quant_dtype=self.wq_b.params_dtype
+            )
+        elif native_group32_runs_bf16():
+            self.qk_norm = DualRMSNormBF16(self.q_norm, self.kv_norm, name)
+        else:
+            self.qk_norm = DualRMSNormMXFP8(
+                self.q_norm, self.kv_norm, name, amax_floor=AMAX_FLOOR.value
+            )
         # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
         # quantized ColumnParallelLinear so both tensors load through the
         # standard FP8 path; the grouped GEMM reads them in place, the weight
@@ -316,7 +332,7 @@ class Attention(nn.Module):
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
-            quant_config=native_quant_config(),
+            quant_config=converted_linear_config(config),
             reduce_results=True,
         )
         # Set in `process_weights_after_loading`, once wo_a's shape is known.
@@ -389,11 +405,13 @@ class Attention(nn.Module):
             self._fuse_woa_quant = False
             _log_woa_quant_path(False, "weight or scale empty", final=False)
             return
+        # The fused pair is the per-1x32 FP8 a native group32 wo_b reads.
+        if self.wo_b.native_a8_group_rows is None:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "wo_b is not native group32")
+            return
         wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
         k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
-        # The gate checks wo_a only. The fused pair is the per-1x32 FP8 that
-        # wo_b reads because wo_b is fixed to native_quant_config(); a
-        # configurable wo_b quant would make this output the wrong layout.
         self._fuse_woa_quant = (
             batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
                 tuple(wo_a_ws.shape), self.o_rank, k
@@ -410,6 +428,29 @@ class Attention(nn.Module):
         order of `output`'s leading dims.
         """
         rows = output.shape[:-2].numel()
+        if self.wo_a.weight.dtype == torch.bfloat16:
+            # wo_a is BF16 here: BF16 inverse RoPE and bmm.
+            x = output.reshape(rows, self.heads, self.head_dim)
+            if not x.is_contiguous():
+                x = x.contiguous()
+            pos = positions.flatten()
+            if pos.stride(0) != 1:
+                pos = pos.contiguous()
+            inverse_rope_inplace(
+                x,
+                rope.cos_cache[:, None, None, :],
+                rope.sin_cache[:, None, None, :],
+                pos,
+                rope.rope_dim,
+            )
+            # Written through a [G, M, N] view: wo_b needs no transpose copy.
+            w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+            x = x.view(rows, self.groups, -1)
+            y = torch.empty(
+                rows, self.groups, self.o_rank, dtype=output.dtype, device=output.device
+            )
+            torch.bmm(x.transpose(0, 1), w.transpose(1, 2), out=y.transpose(0, 1))
+            return self.wo_b(y.view(*output.shape[:-2], -1))
         x_fp8, x_scale = inverse_rope_group_quant(
             output.reshape(rows, self.heads, self.head_dim),
             positions.flatten(),
@@ -502,7 +543,10 @@ class Attention(nn.Module):
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
         if queries is not None:
-            qr, qr_scale = queries.take(qr, qr_scale)
+            if qr_scale is None:  # BF16 Q
+                (qr,) = queries.take(qr)
+            else:
+                qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )

@@ -160,6 +160,13 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
         )
 
 
+def native_group32_runs_bf16() -> bool:
+    """Whether native group32 FP8 linears run in BF16 (no MX MFMA, no A8 rounding)."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime().startswith("gfx94")
+
+
 def _is_mxfp4(quant_type, quant_dtype) -> bool:
     # By value: plugin-mode QuantType members do not compare equal under `==`.
     return (
@@ -1341,6 +1348,23 @@ class LinearBase(nn.Module):
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
+            if (
+                self.weight.numel()
+                and self.weight.dtype == torch.float8_e4m3fn
+                and native_group32_runs_bf16()
+            ):
+                from atom.model_ops.blockscale import dequantize_fp8_weight
+
+                # No group32 FP8 GEMM here: keep a BF16 weight.
+                self.weight = atom_parameter(
+                    dequantize_fp8_weight(
+                        self.weight.data,
+                        self.weight_scale.data,
+                        group_rows=self.native_a8_group_rows,
+                    )
+                )
+                self.weight_scale = None
+                return
             if self.weight.numel() and weight_is_stored_preshuffled(
                 self.quant_type,
                 self.params_dtype,
@@ -1601,7 +1625,20 @@ class LinearBase(nn.Module):
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )
-        if self.native_a8_group_rows is not None:
+        # The per-token quant and the a8w8 GEMMs take rows: flatten the leading
+        # dims here and restore them on the way out.
+        lead = None
+        if x.dim() > 2 and self.quant_type.value == QuantType.per_Token.value:
+            lead, x = x.shape[:-1], x.flatten(0, -2)
+            if x_scale is not None:
+                x_scale = x_scale.flatten(0, -2)
+        if (
+            self.native_a8_group_rows is not None
+            and self.weight.dtype == torch.bfloat16
+        ):
+            # BF16 fallback (`native_group32_runs_bf16`).
+            y = tgemm.mm(x, self.weight, self.bias, otype=otype)
+        elif self.native_a8_group_rows is not None:
             from atom.model_ops.blockscale import native_quant_linear
 
             y = native_quant_linear(
@@ -1758,6 +1795,8 @@ class LinearBase(nn.Module):
             y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
+        if lead is not None:
+            y = y.reshape(*lead, y.shape[-1])
         return y
 
     def make_row_view(self, start: int, length: int) -> "LinearBase":

@@ -21,6 +21,26 @@ def reference():
 
 
 @pytest.fixture
+def linear_modules(monkeypatch):
+    """ATOM's real linear module, on a fake 4-rank TP group a test resizes."""
+    pytest.importorskip("aiter")
+    from atom.model_ops import linear
+
+    group = SimpleNamespace(rank_in_group=0, world_size=4)
+    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
+    return linear, group
+
+
+@pytest.fixture
+def per_channel_config(linear_modules):
+    """The quant config of FP4PTPC's converted linears, through the
+    production spec (`layers.converted_linear_config`)."""
+    from atom.models.deepseek_v41.layers import converted_linear_config
+
+    return converted_linear_config(SimpleNamespace(fp4ptpc=True))
+
+
+@pytest.fixture
 def single_rank(monkeypatch):
     # Every module patched here reaches AITER, so a test that asks for this
     # fixture cannot run without it; say so as a skip rather than letting the

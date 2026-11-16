@@ -20,10 +20,9 @@ shapes keep the gate's own GEMM.
 tokens. Mixed image/text prefills use the shared fused two-bias router;
 expert dispatch, quantization, shared overlap and combination stay in V4.
 
-The shared expert stays its own module rather than taking a routed slot: both
-are scaled per 1x32, but the shared one is FP8 where the routed ones are FP4,
-and one buffer holds one dtype. V4's checkpoints are the same pair, so there is
-no fused variant to inherit.
+The shared expert is its own module unless it has the routed experts' format:
+an FP4PTPC checkpoint's per-channel FP8 one is fused into the routed experts
+that online quantization makes per-channel FP8 (FusedMoE's fused shared slot).
 """
 
 import torch
@@ -34,7 +33,7 @@ from atom.model_ops.deepseek_v41.router import (
 )
 from atom.model_ops.deepseek_v41.router import router_supported
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.topK import mm_topk
+from atom.model_ops.topK import mm_topk, topk_meta_rows
 from atom.model_ops.utils import atom_parameter
 from atom.models.deepseek_v4 import DeepseekV4Args
 from atom.models.deepseek_v4 import MoE as V4MoE
@@ -72,6 +71,7 @@ class MoE(V4MoE):
 
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
+        num_shared = self.experts.num_fused_shared_experts
         if image_mask is None:
             return FusedMoE.select_experts(
                 hidden_states=hidden_states,
@@ -81,13 +81,20 @@ class MoE(V4MoE):
                 renormalize=renormalize,
                 scoring_func="sqrtsoftplus",
                 e_score_correction_bias=self.gate.e_score_correction_bias,
+                num_fused_shared_experts=num_shared,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
         rows = gating_output.shape[0]
-        ids = torch.empty((rows, topk), dtype=torch.int32, device=gating_output.device)
-        weights = torch.empty(
-            (rows, topk), dtype=torch.float32, device=gating_output.device
-        )
+        if num_shared:
+            # Routed columns first; the shared ones are prefilled.
+            weights, ids = topk_meta_rows(rows)
+        else:
+            ids = torch.empty(
+                (rows, topk), dtype=torch.int32, device=gating_output.device
+            )
+            weights = torch.empty(
+                (rows, topk), dtype=torch.float32, device=gating_output.device
+            )
         mm_topk(
             ids=None,
             gating_output=gating_output,
@@ -97,8 +104,8 @@ class MoE(V4MoE):
             vocab_size=0,
             renormalize=renormalize,
             scaling=self.routed_scaling_factor,
-            out_ids=ids,
-            out_weights=weights,
+            out_ids=ids[:, :topk],
+            out_weights=weights[:, :topk],
             image_mask=image_mask.flatten(),
             num_valid_rows=pass_scheduled_tokens_gpu(rows),
         )

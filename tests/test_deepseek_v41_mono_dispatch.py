@@ -33,6 +33,7 @@ _HF = {
     "candidate_block_size": 8,
     "index_n_heads": 32,
     "index_head_dim": 128,
+    "fp4ptpc": False,
 }
 
 
@@ -158,6 +159,10 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         (
             {"hf_config": SimpleNamespace(**{**_HF, "index_n_heads": 64})},
             "indexer shape",
+        ),
+        (
+            {"hf_config": SimpleNamespace(**{**_HF, "fp4ptpc": True})},
+            "FP4PTPC checkpoint's per-channel FP8 linears",
         ),
     ],
 )

@@ -465,15 +465,26 @@ class QuantizationConfig:
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
+        spec = self._pattern_spec(layer_name, layer_pattern_specs)
+        if spec is not None:
+            return spec
+
+        # 3. Global default
+        return global_spec
+
+    def online_pattern_spec(self, layer_name: str) -> LayerQuantConfig | None:
+        """The spec of the online layer pattern that matches *layer_name*, if any."""
+        return self._pattern_spec(layer_name, self.online_layer_pattern_specs)
+
+    @staticmethod
+    def _pattern_spec(layer_name, layer_pattern_specs):
         for pattern, spec in layer_pattern_specs:
             if "*" not in pattern:
                 if layer_name in pattern:
                     return spec
             elif fnmatch.fnmatch(layer_name, pattern):
                 return spec
-
-        # 3. Global default
-        return global_spec
+        return None
 
     # -- convenience properties (delegate to global_spec) ---------------------
 
@@ -3492,6 +3503,14 @@ class Config:
         # writes in both V4 and V4.1. Hash the same snapshot their caches use.
         if self.index_cache_layout is not None:
             factors.append(("index_cache_layout", self.index_cache_layout))
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
+        # DeepSeek-V4.1's FP4PTPC checkpoint reads as the native one to the
+        # quant config (`deepseek_v41.config.normalize_hf_config`), but traces
+        # per-token FP8 GEMMs for the linears it converts, so the two checkpoints
+        # must not share artifacts. Keyed only when set, so no other model's
+        # cache key moves.
+        if getattr(text_config, "fp4ptpc", False):
+            factors.append("fp4ptpc")
         # Vocab-embedding replication (ATOM_REPLICATE_VOCAB_EMBED) changes both the
         # embed weight shape ([vocab] vs [vocab/tp]) and the embed op (local
         # F.embedding vs masked-embedding + all-reduce), so it alters the compiled

@@ -41,7 +41,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # lines stripped. vLLM keeps preparation inside its existing attention break;
 # native TokenGraph's fixed/live placement does not change the copied math.
 CORE_PREPARE_DIGEST = "1f897780d89a3205"
-CORE_FORWARD_DIGEST = "fbae6fa2bb0e58d0"
+CORE_FORWARD_DIGEST = "81c3e459f8d7a899"
 
 
 @pytest.fixture
@@ -219,6 +219,31 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
     attention._fork_select.assert_called_once_with(
         hidden, qr, qr_scale, cache, live_step, rope, compressed=True
     )
+
+
+def test_plugin_bounded_replay_takes_a_bf16_query_alone(plugin_attention):
+    """As core's forward does: a BF16 Q comes without a scale to take."""
+
+    class ReachedProjection(Exception):
+        pass
+
+    qr, taken = object(), object()
+    queries = SimpleNamespace(take=Mock(return_value=(taken,)))
+    attention = SimpleNamespace(
+        _fork_compress=Mock(return_value=False),
+        project_qkv=Mock(return_value=(object(), object())),
+        qk_norm=Mock(return_value=(qr, None, object())),
+        _fork_select=Mock(),
+        wq_b=Mock(side_effect=ReachedProjection),
+    )
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    cache = SimpleNamespace(current_step=object())
+    with pytest.raises(ReachedProjection):
+        plugin_attention._attend_block(
+            attention, None, hidden, None, cache, object(), object(), queries
+        )
+    queries.take.assert_called_once_with(qr)
+    attention.wq_b.assert_called_once_with(taken, x_scale=None)
 
 
 def _core_forward() -> str:

@@ -40,6 +40,8 @@ def config_refusal(atom_config) -> str | None:
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+        # the kernels read the native 32x32 FP8 dense weights
+        (not hf.fp4ptpc, "an FP4PTPC checkpoint's per-channel FP8 linears"),
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",
