@@ -46,8 +46,12 @@ def scale_codes(amax: torch.Tensor, fmax: float) -> torch.Tensor:
 
 
 def code_values(codes: torch.Tensor) -> torch.Tensor:
-    """The fp32 power of two each E8M0 code stands for."""
-    return torch.ldexp(torch.ones_like(codes, dtype=torch.float32), codes.int() - 127)
+    """The fp32 power of two each E8M0 code (uint8) stands for.
+
+    Read through the E8M0 dtype, which is exact for every code; ``torch.ldexp`` on the
+    device is not exact at every exponent, and a scale one ulp off makes the codecs
+    disagree with the bytes they produced."""
+    return codes.view(torch.float8_e8m0fnu).float()
 
 
 def quantize_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
