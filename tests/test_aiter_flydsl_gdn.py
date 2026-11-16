@@ -231,6 +231,59 @@ def test_vk_checkpoint_layout():
     torch.testing.assert_close(conv_vk, conv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("pool_vk", [False, True])
+@pytest.mark.parametrize("planned_rows", [False, True])
+@pytest.mark.parametrize("dims", [(128, 128), (64, 128)])
+def test_vk_snapshot_checkpoints_match_kv_snapshot(pool_vk, planned_rows, dims):
+    """FlyDSL's snapshot is a view over VK storage; it checkpoints the same
+    bytes as the KV copy it replaces, into either pool layout. Unequal K and V
+    catch an interchanged axis."""
+    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+
+    def index(values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    k, v = dims
+    torch.manual_seed(3)
+    vk_storage = torch.randn(1, 9, 24, v, k, device="cuda", dtype=torch.bfloat16)
+    snapshot = vk_storage.transpose(-1, -2)
+    copied = snapshot.contiguous()
+    original = torch.randn(8, 24, k, v, device="cuda", dtype=torch.float32)
+    x = torch.randn(520, 4, device="cuda", dtype=torch.bfloat16)
+    # Two sequences (5 and 4 chunks): interior targets on each one's own chunk
+    # grid, and one end target that reads the runtime slot instead.
+    args = [
+        index(values)
+        for values in (
+            [0, 1, 1, 0],
+            [4, 5, 6, 7],
+            [64, 64, 192, 300],
+            [0, 0, 0, 1],
+            [1, 2, 2, 1],
+            [0, 5, 9],
+            [0, 300, 520],
+        )
+    ]
+    h_rows = index([1, 5, 8, 0]) if planned_rows else None
+    pools = []
+    for source in (copied, snapshot):
+        pool = original.clone()
+        if pool_vk:
+            pool = original.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert (pool.stride(-2) == 1) == pool_vk
+        conv = torch.zeros(8, 4, 3, device="cuda", dtype=torch.bfloat16)
+        write_state_checkpoints(source, pool, x, conv, *args, 64, 3, h_rows=h_rows)
+        pools.append((pool, conv))
+    assert torch.equal(pools[1][0], pools[0][0])
+    assert torch.equal(pools[1][1], pools[0][1])
+    sources = [1, 5, 8] if planned_rows else [1, 6, 8]
+    for slot, row in zip((4, 5, 6), sources):
+        assert torch.equal(pools[1][0][slot], snapshot[0, row].float())
+    assert torch.equal(pools[1][0][7], original[1])
+    untouched = [0, 1, 2, 3]
+    assert torch.equal(pools[1][0][untouched], original[untouched])
+
+
 def test_triton_decode_vk_fallback():
     q, k, v, a, b, log, bias = inputs(3)
     state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
