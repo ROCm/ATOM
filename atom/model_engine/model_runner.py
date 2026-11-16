@@ -176,7 +176,6 @@ def _bonus_generator(device) -> torch.Generator:
     return generator
 
 
-
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
 ) -> int:

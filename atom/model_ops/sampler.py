@@ -257,9 +257,7 @@ class Sampler(nn.Module):
         else:
             exponential = get_per_token_exponential(
                 vocab_size, logits.device, generator
-            ).expand(
-                num_tokens, vocab_size
-            )
+            ).expand(num_tokens, vocab_size)
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
