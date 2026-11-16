@@ -3246,20 +3246,21 @@ class MLAAttention(nn.Module):
         if not self.split_prefill_recording:
             return False
         fwd_ctx = get_forward_context()
-        context = getattr(fwd_ctx, "context", None)
+        context = fwd_ctx.context
         if context is None or not context.is_prefill:
             return False
-        recording = getattr(fwd_ctx, "tr_graph", None) == "record"
+        recording = fwd_ctx.tr_graph == "record"
         # The warmup forward: the capture's synthetic dummy prefill, which
         # runs under `in_hipgraph` but is not recorded.
         warmup = fwd_ctx.in_hipgraph and context.is_dummy_run
-        return (recording or warmup) and self._prefill_split_supported()
+        return (recording or warmup) and self.prefill_split_supported()
 
-    def _prefill_split_supported(self) -> bool:
+    def prefill_split_supported(self) -> bool:
         """Dense, no ``o_proj`` inside, no PCP, and the plain ``kv_b_proj``
         the eager prefill uses: under ``ATOM_USE_TRITON_GEMM`` a prefill without
         a cached prefix takes the fused GEMM + split + cat instead, which the
-        recorded head would not."""
+        recorded head would not. Kimi records no token graphs without it
+        (`supports_token_graph`)."""
         return (
             not self.is_sparse_mla
             and isinstance(self.o_proj, nn.Identity)

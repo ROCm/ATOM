@@ -25,7 +25,7 @@ from atom.utils.region_graph import (
 )
 from atom.utils.selector import Family, get_attn_backend
 
-from .attention_mla import MLAModules, _mla_output_width
+from .attention_mla import MLAAttention, MLAModules, _mla_output_width
 from .sp_attention import attention_fp8_fake, gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
@@ -1027,8 +1027,7 @@ def unified_attention_with_output_base(
         atom_config = get_current_atom_config()
         bound = atom_config.compilation_config.static_forward_context[layer_name]
         impl = getattr(bound, "impl", bound)
-        records_split = getattr(impl, "records_prefill_split", None)
-        if records_split is not None and records_split():
+        if isinstance(impl, MLAAttention) and impl.records_prefill_split():
             return impl.forward_prefill_split(q, q_scale, k, v, positions, layer_name)
     return _attention_region(q, q_scale, k, v, positions, layer_name, use_mla, qkv)
 
