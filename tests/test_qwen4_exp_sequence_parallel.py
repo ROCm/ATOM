@@ -44,9 +44,13 @@ class _Collectives:
             total = torch.stack(self._exchange(rank, x)).sum(0)
             return total.chunk(self.world)[rank].clone()
 
+        device_group = _DeviceGroup(self.world)
         if backend == "c10d":
             return SimpleNamespace(
-                all_gather=all_gather, reduce_scatter_tensor=reduce_scatter_tensor
+                all_gather=all_gather,
+                reduce_scatter_tensor=reduce_scatter_tensor,
+                device_group=device_group,
+                device_communicator=SimpleNamespace(pynccl_comm=None),
             )
 
         def torch_distributed(*args, **kwargs):
@@ -55,8 +59,21 @@ class _Collectives:
         return SimpleNamespace(
             all_gather=torch_distributed,
             reduce_scatter_tensor=torch_distributed,
+            device_group=device_group,
             device_communicator=SimpleNamespace(pynccl_comm=_PyNccl(self, rank)),
         )
+
+
+class _DeviceGroup:
+    """A TP group's torch.distributed process group, as far as its size."""
+
+    def __init__(self, world: int) -> None:
+        self.world = world
+
+
+@pytest.fixture(autouse=True)
+def _device_group_size(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: group.world)
 
 
 class _PyNccl:
@@ -160,8 +177,9 @@ class _RecordingGroup:
     """One TP rank of two whose peer holds the same rows; records which path
     each collective took."""
 
-    def __init__(self, device_communicator=None):
+    def __init__(self, device_communicator, physical_world=2):
         self.calls = []
+        self.device_group = _DeviceGroup(physical_world)
         if device_communicator is not None:
             self.device_communicator = device_communicator
 
@@ -189,21 +207,28 @@ class _RecordingPyNccl:
 
 @pytest.mark.parametrize(
     "communicator",
-    ["none", "no_pynccl", "pynccl_disabled"],
+    ["no_pynccl", "pynccl_disabled", "simulated_tp", "simulated_tp_one_device"],
 )
 def test_collectives_fall_back_without_pynccl(monkeypatch, communicator):
-    """Without a usable PyNccl communicator (a group built without a device
-    communicator, a PyNccl init that failed, or one that is disabled) both
-    collectives keep the torch.distributed path, unchanged."""
+    """Without a usable PyNccl communicator (a PyNccl init that failed, or one
+    that is disabled) both collectives keep the group's own path, unchanged.
+    So does simulated TP, whose group patches those collectives to pad the
+    ranks it has no device for; on one device it has no device communicator
+    at all."""
     calls = []
-    device_communicator = {
-        "none": None,
-        "no_pynccl": SimpleNamespace(pynccl_comm=None),
-        "pynccl_disabled": SimpleNamespace(
-            pynccl_comm=_RecordingPyNccl(calls, disabled=True)
+    pynccl = _RecordingPyNccl(calls)
+    device_communicator, physical_world = {
+        "no_pynccl": (SimpleNamespace(pynccl_comm=None), 2),
+        "pynccl_disabled": (
+            SimpleNamespace(pynccl_comm=_RecordingPyNccl(calls, disabled=True)),
+            2,
         ),
+        # Fewer devices than TP ranks, with a communicator over the devices
+        # (as TP4 on two devices has).
+        "simulated_tp": (SimpleNamespace(pynccl_comm=pynccl), 1),
+        "simulated_tp_one_device": (None, 1),
     }[communicator]
-    group = _RecordingGroup(device_communicator)
+    group = _RecordingGroup(device_communicator, physical_world)
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
     sp = qwen4_exp._SequenceParallel(7, 2, 0)
     assert sp.pynccl is None
@@ -218,21 +243,25 @@ def test_collectives_fall_back_without_pynccl(monkeypatch, communicator):
     ]
 
 
-def test_collectives_keep_torch_distributed_for_dtypes_pynccl_cannot_send(
-    monkeypatch,
-):
+def test_collectives_take_pynccl_for_what_sequence_parallel_sends(monkeypatch):
+    """SP gathers BF16 streams and int32 QSA groups and scatters BF16 sums."""
     calls = []
     group = _RecordingGroup(SimpleNamespace(pynccl_comm=_RecordingPyNccl(calls)))
     monkeypatch.setattr(qwen4_exp, "get_tp_group", lambda: group)
     sp = qwen4_exp._SequenceParallel(8, 2, 0)
     assert sp.pynccl is not None
-    mask = torch.tensor([True, False, True, True])
-    assert torch.equal(sp.gather(mask), torch.cat([mask, mask]))
-    rows = torch.arange(4, dtype=torch.int32)
-    assert torch.equal(sp.gather(rows), torch.cat([rows, rows]))
-    assert torch.equal(sp.scatter(torch.ones(8, 2)), torch.full((4, 2), 2.0))
-    assert group.calls == [("torch.distributed", "all_gather", False, 0)]
-    assert calls == [("pynccl", "all_gather"), ("pynccl", "reduce_scatter")]
+    mixed = torch.randn(4, 3, dtype=torch.bfloat16)
+    assert torch.equal(sp.gather(mixed), torch.cat([mixed, mixed]))
+    groups = torch.arange(4, dtype=torch.int32)
+    assert torch.equal(sp.gather(groups), torch.cat([groups, groups]))
+    partial = torch.ones(8, 2, dtype=torch.bfloat16)
+    assert torch.equal(sp.scatter(partial), torch.full_like(partial[:4], 2.0))
+    assert group.calls == []
+    assert calls == [
+        ("pynccl", "all_gather"),
+        ("pynccl", "all_gather"),
+        ("pynccl", "reduce_scatter"),
+    ]
 
 
 class _Layer:

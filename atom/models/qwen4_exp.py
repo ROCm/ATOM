@@ -665,27 +665,16 @@ def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
     return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
 
 
-# The dtypes aiter's PyNccl maps to NCCL (`ncclDataTypeEnum.from_torch`).
-_PYNCCL_DTYPES = frozenset(
-    (
-        torch.int8,
-        torch.uint8,
-        torch.int32,
-        torch.int64,
-        torch.float16,
-        torch.float32,
-        torch.float64,
-        torch.bfloat16,
-    )
-)
+def _pynccl(group, tp_size: int):
+    """The TP group's PyNccl communicator, or None to use the group's own
+    collectives.
 
-
-def _pynccl(group):
-    """The TP group's PyNccl communicator, or None to use torch.distributed.
-
-    aiter keeps it on the group's device communicator; `GroupCoordinator`
-    only annotates a `pynccl_comm` it never sets."""
-    comm = getattr(getattr(group, "device_communicator", None), "pynccl_comm", None)
+    None under simulated TP (`atom/distributed/simulated_tp.py`): its group
+    reports more ranks than it has devices and pads the absent ones in the
+    collectives it patches, which a direct PyNccl call would skip."""
+    if torch.distributed.get_world_size(group.device_group) != tp_size:
+        return None
+    comm = group.device_communicator.pynccl_comm
     if comm is None or comm.disabled:
         return None
     return comm
@@ -704,8 +693,8 @@ class _SequenceParallel:
     zero streams and are dropped on gather.
 
     Both collectives use the group's PyNccl communicator when it has one: the
-    same NCCL collective on the current stream, at about half the host time
-    of a torch.distributed call.
+    same NCCL collective on the current stream, with less host time than the
+    torch.distributed call `GroupCoordinator` makes for `use_custom=False`.
     """
 
     def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
@@ -715,7 +704,7 @@ class _SequenceParallel:
         self.pad = self.chunk * tp_size - num_tokens
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
-        self.pynccl = _pynccl(self.group)
+        self.pynccl = _pynccl(self.group, tp_size)
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
@@ -727,7 +716,7 @@ class _SequenceParallel:
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
         x = x.contiguous()
-        if self.pynccl is None or x.dtype not in _PYNCCL_DTYPES:
+        if self.pynccl is None:
             out = self.group.all_gather(x, use_custom=False, dim=0)
         else:
             out = x.new_empty((x.shape[0] * self.tp_size, *x.shape[1:]))
@@ -737,7 +726,7 @@ class _SequenceParallel:
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         x = _pad_rows(x.contiguous(), self.pad)
-        if self.pynccl is None or x.dtype not in _PYNCCL_DTYPES:
+        if self.pynccl is None:
             return self.group.reduce_scatter_tensor(x, use_custom=False, dim=0)
         assert x.shape[0] == self.chunk * self.tp_size, (x.shape, self.chunk)
         out = x.new_empty((self.chunk, *x.shape[1:]))
