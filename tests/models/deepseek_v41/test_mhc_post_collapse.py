@@ -171,3 +171,50 @@ def test_traced_forward_takes_the_same_paths():
     traced = torch.compile(run, fullgraph=True)(residual, pending, post, comb, pre)
     for a, b in zip(eager, traced):
         assert torch.equal(a, b)
+
+
+def test_post_reduce_writes_the_given_rows():
+    mhc = _mhc()
+    residual, pending, post, comb, _ = _data(9, 5120, 11, True)
+    buffer = torch.full((16, 5120), float("nan"), device="cuda", dtype=torch.bfloat16)
+    rows = buffer[5:14]
+    out = mhc.post_reduce_streams(pending, residual, post, comb, out=rows)
+    assert out.data_ptr() == rows.data_ptr()
+    expected = mhc.expand_residual(pending, residual, post, comb).mean(dim=-2)
+    assert torch.equal(buffer[5:14], expected)
+    assert buffer[:5].isnan().all() and buffer[14:].isnan().all()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["short", "dtype", "strided"],
+)
+def test_post_reduce_refuses_an_out_it_cannot_write(bad):
+    """An unusable destination raises instead of being swapped for a new
+    tensor, which would bring back the copy `out=` exists to save."""
+    mhc = _mhc()
+    residual, pending, post, comb, _ = _data(9, 2048, 12, False)
+    buffer = torch.full((16, 4096), float("nan"), device="cuda", dtype=torch.bfloat16)
+    out = {
+        "short": buffer.view(-1)[: 4 * 2048].view(4, 2048),
+        "dtype": buffer[:9, :2048].float(),
+        "strided": buffer[:9, :2048],
+    }[bad]
+    with pytest.raises(ValueError, match="out must be"):
+        mhc.post_reduce_streams(pending, residual, post, comb, out=out)
+    assert buffer.isnan().all()
+
+
+def test_stream_mean_honours_out_on_the_settle_path():
+    mhc = _mhc()
+    # Hidden 768: mhc_post serves it, the fused reduce does not.
+    residual, pending, post, comb, pre = _data(6, 768, 13, False)
+    state = mhc.SinglePassHCState(residual, pre, pending, post, comb)
+    assert not mhc.post_reduce_supported(pending, residual)
+    buffer = torch.full((8, 768), float("nan"), device="cuda", dtype=torch.bfloat16)
+    result = state.stream_mean(out=buffer[1:7])
+    assert result.data_ptr() == buffer[1].data_ptr()
+    expected = mhc.expand_residual(pending, residual, post, comb).mean(dim=-2)
+    assert torch.equal(buffer[1:7], expected)
+    with pytest.raises(ValueError, match="out must be"):
+        state.stream_mean(out=buffer[:3])
