@@ -75,6 +75,22 @@ def _kda_hip_op():
     return _KDA_HIP or None
 
 
+_KDA_GLUONCONV = None
+
+
+def _kda_gluonconv_op():
+    """aiter's gfx1250 Gluon conv + ReplaySSM verify module, or None."""
+    global _KDA_GLUONCONV
+    if _KDA_GLUONCONV is None:
+        try:
+            from aiter.ops.triton.attention import kda_replayssm_conv
+
+            _KDA_GLUONCONV = kda_replayssm_conv
+        except ImportError:
+            _KDA_GLUONCONV = False
+    return _KDA_GLUONCONV or None
+
+
 #: `route="auto"` switches to the UT-transform kernel at or above this verify
 #: window.  See the measurement table in `replayssm_gated_delta_rule`.
 UT_MIN_QUERY_LEN = 12
@@ -2022,6 +2038,47 @@ def replayssm_kda_conv_hip(
     when the flag is off or the kernel does not cover the call: the caller
     then runs the two calls.
     """
+    if envs.ATOM_REPLAYSSM_KDA_GLUONCONV:
+        gc = _kda_gluonconv_op()
+        if gc is not None and gc.replayssm_kda_conv_gluon_supported(
+            mixed_qkv,
+            conv_state,
+            conv_weight,
+            a,
+            b,
+            ckpt,
+            buf_k,
+            buf_u,
+            buf_g,
+            max_query_len,
+            o,
+        ):
+            seed_forked_slots(ckpt, fork_slots)
+            gc.replayssm_kda_conv_gluon(
+                mixed_qkv,
+                conv_state,
+                conv_weight,
+                conv_state_indices,
+                num_accepted_tokens,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                ckpt,
+                buf_k,
+                buf_u,
+                buf_g,
+                write_pos,
+                slot_idx,
+                cu_seqlens,
+                max_query_len,
+                o.shape[-2],
+                conv_state_indices_in=conv_state_indices_in,
+                o=o,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                lower_bound=lower_bound,
+            )
+            return True
     if not envs.ATOM_REPLAYSSM_KDA_HIP:
         return False
     hip = _kda_hip_op()
