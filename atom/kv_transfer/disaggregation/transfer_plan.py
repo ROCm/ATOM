@@ -82,15 +82,10 @@ class TransferPlan:
         )
 
     def ready_items(
-        self, items: Sequence[tuple[int, int, int, int]], page_offset: int
+        self, items: Sequence[tuple[int, int, int, int]]
     ) -> list[list[int]]:
         return [
-            [
-                self.regions[pos].target_region,
-                page_offset * self.units_per_page + start,
-                stop - start,
-                offset,
-            ]
+            [self.regions[pos].target_region, start, stop - start, offset]
             for pos, start, stop, offset in items
         ]
 

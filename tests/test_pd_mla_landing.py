@@ -119,15 +119,6 @@ def test_pack_slots_rejects_a_slot_smaller_than_a_page():
         pack_slots([TOKEN_BYTES], 40, 15 * TOKEN_BYTES, BLOCK_SIZE)
 
 
-def test_pack_slots_can_start_regions_at_later_pages():
-    slots = pack_slots([PAGE_BYTES] * 3, 6, 4 * PAGE_BYTES, 1, [6, 2, 0])
-    pages = {r: [] for r in range(3)}
-    for items in slots:
-        for region, start, stop, _ in items:
-            pages[region].extend(range(start, stop))
-    assert pages == {0: [], 1: [2, 3, 4, 5], 2: [0, 1, 2, 3, 4, 5]}
-
-
 def test_landing_segments_match_a_row_by_row_reference():
     rng = np.random.default_rng(3)
     dst_blocks = rng.permutation(50)[:9]  # 144 rows
@@ -828,7 +819,7 @@ def _source_regions(num_regions, num_blocks):
 
 def _producer(mc, regions, *, staging_rows=None):
     conn = object.__new__(mc.MooncakeConnector)
-    conn.dcp_size = 1
+    conn.tp_size = conn.dcp_size = 1
     conn.block_size = BLOCK_SIZE
     conn.pp_rank = 0
     conn.tp_rank = 0
@@ -1137,13 +1128,13 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
         request["_deadline"] = time.monotonic() - 1
     else:
         request["_deadline"] = time.monotonic() + 0.05
-        acquire = new._kv_staging_slots.acquire
+        acquire = new._kv_staging_slots.acquire_or_none
 
         def acquire_late():
             time.sleep(0.1)  # the other send workers hold every staging slot
             return acquire()
 
-        new._kv_staging_slots.acquire = acquire_late
+        new._kv_staging_slots.acquire_or_none = acquire_late
         new._rdma_write = mc.MooncakeConnector._rdma_write.__get__(new)
         new.transfer_engine = None  # never reached: the deadline passed
     with (
@@ -1157,16 +1148,16 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     assert "_landed_slots" not in request  # nothing to announce
     credits = new._landing_credits
     got = {credits.acquire("consumer:1", landing["epoch"], 0) for _ in range(3)}
+    pool = new._kv_staging_slots
     if outcome in ("failed", "exception"):
         assert got == {landing["slots"][0], None}
-        assert new._kv_staging_failed
-        assert len(new._kv_staging_slots.free) == 1  # failed source slot is retained
-        with pytest.raises(RuntimeError, match="staging row unavailable"):
-            new._kv_staging_slots.acquire()
+        # Only the failed source slot is held back; the other keeps serving.
+        assert pool.usable() == 1
+        pool.quarantine(pool.acquire_or_none(), 60)
+        assert pool.acquire_or_none() is None  # nothing left to wait for
     else:
         assert got == set(landing["slots"]) | {None}
-        assert sorted(new._kv_staging_slots.free) == [0, 1]
-        assert not new._kv_staging_failed
+        assert sorted(pool.free) == [0, 1]
 
 
 def test_quarantined_credits_come_back_after_the_hold(monkeypatch):

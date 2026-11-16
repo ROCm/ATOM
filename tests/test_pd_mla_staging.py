@@ -13,6 +13,7 @@ for the NIC, so every destination byte is compared, not just the plan.
 import ctypes
 import logging
 import threading
+import time
 from contextlib import nullcontext
 
 import numpy as np
@@ -23,6 +24,11 @@ from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     pack_slots,
+)
+from atom.kv_transfer.disaggregation.transfer_plan import (
+    RegionLayout,
+    TransferTopology,
+    build_transfer_plan,
 )
 from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
 
@@ -48,52 +54,74 @@ def _expand(starts, lengths):
 # ---------------------------------------------------------------------------
 
 
+def _token_plan(src_ids, dst_ids, *, dcp_size, dcp_rank, interleave=1, token_bytes=4):
+    page_bytes = BLOCK_SIZE * token_bytes
+    return build_transfer_plan(
+        TransferTopology(
+            target_dcp=dcp_size, target_dcp_rank=dcp_rank, interleave=interleave
+        ),
+        [RegionLayout(0, 0, 0, page_bytes, page_bytes, token_contiguous=True)],
+        src_ids,
+        dst_ids,
+        BLOCK_SIZE,
+    )
+
+
 @pytest.mark.parametrize("dcp_size", [2, 4])
 @pytest.mark.parametrize("interleave", [1, 2, 4])
 @pytest.mark.parametrize("num_src", [1, 5, 13, 16])
-def test_staged_page_runs_cover_exactly_the_token_runs(dcp_size, interleave, num_src):
+def test_direct_descriptors_cover_exactly_the_token_runs(dcp_size, interleave, num_src):
     rng = np.random.default_rng(num_src)
     src_ids = rng.permutation(64)[:num_src]
     dst_pages = -(-num_src // dcp_size)
     dst_ids = rng.permutation(40)[:dst_pages]
     for rank in range(dcp_size):
-        plan = build_dcp_shard_plan(
+        sharded = build_dcp_shard_plan(
             src_ids,
             block_size=BLOCK_SIZE,
             dcp_size=dcp_size,
             dcp_rank=rank,
             interleave_size=interleave,
         )
-        run_src, run_dst, run_len = plan.token_runs(dst_ids)
-        # Token-unit descriptors; staging holds page p at token p*BLOCK_SIZE.
-        st_src, st_dst, st_len = plan.staged_page_runs(dst_ids, 0, 0, 1, 1 << 40)
-        expected_dst = _expand(run_dst, run_len)
-        np.testing.assert_array_equal(_expand(st_dst, st_len), expected_dst)
-        # Staged token k of the plan reads the source token the old run did.
+        run_src, run_dst, run_len = sharded.token_runs(dst_ids)
+        plan = _token_plan(
+            src_ids, dst_ids, dcp_size=dcp_size, dcp_rank=rank, interleave=interleave
+        )
+        # One slot holding every row from staging 0; 4-byte tokens to units.
+        (items,) = plan.pack(1 << 40)
+        st_src, st_dst, st_len = (
+            np.array(part) // 4
+            for part in plan.direct_descriptors(items, 0, lambda _: 1 << 40)
+        )
+        np.testing.assert_array_equal(
+            _expand(st_dst, st_len), _expand(run_dst, run_len)
+        )
+        # Staged row k carries the source token the per-token run did.
         staged_rows = _expand(st_src, st_len)
-        src_of_row = plan.source_token_per_dst_token()[staged_rows]
-        np.testing.assert_array_equal(src_of_row, _expand(run_src, run_len))
+        np.testing.assert_array_equal(
+            plan.source_units[staged_rows], _expand(run_src, run_len)
+        )
 
 
-def test_staged_page_runs_stop_at_destination_mr_boundaries():
+def test_direct_descriptors_stop_at_destination_mr_boundaries():
     """Reviewer case: DCP4 rank 1, contiguous dst pages across a 2 GiB MR."""
     mc = _mooncake()
     conn = object.__new__(mc.MooncakeConnector)
     pages_per_mr = conn._rdma_chunk_units(PAGE_BYTES)
     assert pages_per_mr == 233009
     mr_bytes = pages_per_mr * PAGE_BYTES
-    src_ids = np.arange(64)
     dst_ids = np.arange(233001, 233017)
-    plan = build_dcp_shard_plan(src_ids, block_size=BLOCK_SIZE, dcp_size=4, dcp_rank=1)
-    _, dst, length = plan.staged_page_runs(dst_ids, 0, 0, TOKEN_BYTES, pages_per_mr)
+    plan = _token_plan(
+        np.arange(64), dst_ids, dcp_size=4, dcp_rank=1, token_bytes=TOKEN_BYTES
+    )
+    (items,) = plan.pack(1 << 40)
+    _, dst, length = plan.direct_descriptors(items, 0, lambda _: pages_per_mr)
     assert len(dst) == 2  # split exactly once, at page 233009
     assert dst[1] == mr_bytes
     for d, n in zip(dst, length):
         assert d // mr_bytes == (d + n - 1) // mr_bytes
     # Same bytes as without the boundary, just one more descriptor.
-    _, merged_dst, merged_len = plan.staged_page_runs(
-        dst_ids, 0, 0, TOKEN_BYTES, 1 << 40
-    )
+    _, merged_dst, merged_len = plan.direct_descriptors(items, 0, lambda _: 1 << 40)
     np.testing.assert_array_equal(_expand(dst, length), _expand(merged_dst, merged_len))
     assert len(merged_dst) == 1
 
@@ -217,7 +245,7 @@ def _source_regions(num_regions, num_blocks):
 
 def _producer(mc, regions, *, pool_size=0, slot_pages=0):
     conn = object.__new__(mc.MooncakeConnector)
-    conn.dcp_size = 1
+    conn.tp_size = conn.dcp_size = 1
     conn.block_size = BLOCK_SIZE
     conn.kv_caches_base_addr = [t.data_ptr() for t in regions]
     conn._per_block_bytes_list = [PAGE_BYTES] * len(regions)
@@ -552,40 +580,97 @@ def _per_token_reference(mc, regions):
     return expected
 
 
-def test_a_pool_retired_mid_transfer_sends_the_rest_per_token(monkeypatch, caplog):
-    """Another transfer's uncertain write retires the pool after this one sent a
-    slot: the rest goes per token, staging stays off, and one warning says so."""
+def test_an_uncertain_write_holds_back_only_its_own_slot(monkeypatch, caplog):
+    """The NIC may still read a slot whose write failed, so that slot sits out
+    ATOM_PD_FAILED_WRITE_HOLD_S with a warning; the other one keeps staging."""
+    mc = _mooncake()
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    regions = _source_regions(2, 8)
+    expected = _per_token_reference(mc, regions)
+    new = _producer(mc, regions, pool_size=2, slot_pages=4)
+    new._rdma_write = lambda *_a, **_k: False
+    failed = [torch.zeros_like(t) for t in expected]
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert not _run(
+            mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object()
+        )
+    (held,) = [r for r in caplog.records if "out of use for 60s" in r.message]
+    assert "1 of 2 slots left" in held.message
+    pool = new._kv_staging_slots
+    assert pool.usable() == 1
+    new._rdma_write = new._nic.write
+    actual = [torch.zeros_like(t) for t in expected]
+    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+    assert new._nic.labels == ["staged-kv"]
+    assert pool.usable() == 1  # still held: the hold has not ended
+
+
+def test_a_quarantined_slot_comes_back_after_the_hold(caplog):
+    mc = _mooncake()
+    pool = mc.SlotPool(1)
+    pool.quarantine(pool.acquire_or_none(), 0.2)
+    assert pool.usable() == 0
+    assert pool.acquire_or_none() is None  # nothing running to wait for
+    time.sleep(0.25)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert pool.acquire_or_none() == 0
+    assert any("back in use" in r.message for r in caplog.records)
+    pool.quarantine(0, 0)  # no hold: free at once
+    assert pool.free == [0]
+
+
+def test_a_waiter_gets_a_slot_back_from_quarantine():
+    """With the other slot held by a running write, a waiter takes the
+    quarantined one as soon as its hold ends."""
+    mc = _mooncake()
+    pool = mc.SlotPool(2)
+    running = pool.acquire_or_none()
+    pool.quarantine(pool.acquire_or_none(), 0.2)
+    got = []
+    waiter = threading.Thread(target=lambda: got.append(pool.acquire_or_none()))
+    waiter.start()
+    waiter.join(0.1)
+    assert waiter.is_alive() and got == []
+    waiter.join(5)
+    assert got == [1 - running]
+
+
+def test_a_transfer_that_finds_no_usable_slot_sends_the_rest_per_token(
+    monkeypatch,
+):
+    """Every slot it could wait for is quarantined part-way through: the rest
+    goes per token, and the next transfer stages again."""
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     regions = _source_regions(2, 8)
     expected = _per_token_reference(mc, regions)
     new = _producer(mc, regions, pool_size=1, slot_pages=1)
-    write = new._nic.write
+    acquire = new._kv_staging_slots.acquire_or_none
+    calls = []
 
-    def retire_after_the_first_slot(*args, **kwargs):
-        ok = write(*args, **kwargs)
-        new._retire_kv_staging("other-req")
-        return ok
+    def none_after_the_first_slot():
+        calls.append(None)
+        return acquire() if len(calls) == 1 else None
 
-    new._rdma_write = retire_after_the_first_slot
+    new._kv_staging_slots.acquire_or_none = none_after_the_first_slot
     actual = [torch.zeros_like(t) for t in expected]
-    with caplog.at_level(logging.WARNING, logger="atom"):
-        assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
-        again = [torch.zeros_like(t) for t in expected]
-        assert _run(mc, new, _request(2, 2, 1, 1, again), range(4), [3, 5], object())
+    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
     assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+    assert new._nic.labels == ["staged-kv", "block"]
+    new._kv_staging_slots.acquire_or_none = acquire
+    again = [torch.zeros_like(t) for t in expected]
+    assert _run(mc, new, _request(2, 2, 1, 1, again), range(4), [3, 5], object())
     assert all(torch.equal(a, e) for a, e in zip(again, expected))
-    # One staged slot, then the per-token rest; the next transfer never stages.
-    assert new._nic.labels == ["staged-kv", "block", "block"]
-    assert new._kv_staging_failed
-    off = [r for r in caplog.records if "KV staging and landing are off" in r.message]
-    assert len(off) == 1
+    assert new._nic.labels[2:] == ["staged-kv"] * (len(new._nic.labels) - 2)
 
 
-def test_a_transfer_waiting_on_a_retired_pool_sends_per_token(monkeypatch):
-    """A worker blocked on the only slot is woken by the uncertain write that
-    holds it, and finishes per token instead of failing."""
+def test_a_transfer_waiting_on_a_quarantined_slot_sends_per_token(monkeypatch):
+    """A worker blocked on the only slot is woken when the write holding it
+    fails and quarantines it, and finishes per token instead of failing."""
     mc = _mooncake()
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     regions = _source_regions(2, 8)
     expected = _per_token_reference(mc, regions)
@@ -614,8 +699,23 @@ def test_a_transfer_waiting_on_a_retired_pool_sends_per_token(monkeypatch):
     assert waiting == [True]
     assert all(torch.equal(a, e) for a, e in zip(actual, expected))
     assert new._nic.labels == ["block"]
-    # The uncertain write's slot is never handed out again.
-    assert new._kv_staging_slots.free == []
+    # The uncertain write's slot is not handed out during its hold.
+    assert new._kv_staging_slots.usable() == 0
+
+
+def test_staged_chunks_write_the_bytes_of_the_whole_transfer(monkeypatch):
+    """A chunked transfer stages each chunk's destination pages on their own."""
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    regions = _source_regions(2, 8)
+    expected = _per_token_reference(mc, regions)
+    new = _producer(mc, regions, pool_size=1, slot_pages=4)
+    actual = [torch.zeros_like(t) for t in expected]
+    # DCP2: destination page k takes source blocks 2k and 2k + 1.
+    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(2), [3], object())
+    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(2, 4), [5], object())
+    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+    assert new._nic.labels == ["staged-kv", "staged-kv"]
 
 
 def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
