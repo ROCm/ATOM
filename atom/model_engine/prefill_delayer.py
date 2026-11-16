@@ -77,6 +77,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_kv_high or any_kv_low:                   FIRE   # KV pressure / starvation
   if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
+  # -- prefill_admit_policy adaptive (see below) --
+  if adaptive and the initial ramp is on:         FIRE   # every rank fills a chunk
+  if adaptive:                                    rent-or-buy FIRE / HOLD
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
   # -- adaptive give-up: the group's work stopped changing --
   if G_pending > prev_G_pending or n_prefillable != prev_n_prefillable
@@ -299,6 +302,7 @@ class PrefillDelayer:
         "_stat_fire_nodecode",
         "_stat_fire_partial",
         "_stat_fire_queue_ms",
+        "_stat_fire_ramp",
         "_stat_fire_stall",
         "_stat_fire_ttft",
         "_stat_fire_vacuous",
@@ -398,8 +402,9 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
-        # Initial ramp: skip the interval while every rank can fill a whole prefill
-        # chunk from waiting requests that fit its free seq slots (one-shot).
+        # Initial ramp (one-shot): while every rank can fill a whole prefill chunk
+        # from waiting requests that fit its free seq slots, the interval policy
+        # skips the interval and the adaptive policy releases at once.
         self.prefill_ramp = bool(prefill_ramp)
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
@@ -502,6 +507,7 @@ class PrefillDelayer:
         self._stat_fire_nodecode = 0
         self._stat_fire_queue_ms = 0
         self._stat_fire_vacuous = 0
+        self._stat_fire_ramp = 0
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
         self._stat_ramp = 0
@@ -825,6 +831,10 @@ class PrefillDelayer:
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
         if self.admit_policy == "adaptive":
+            # Initial ramp: every rank fills a whole chunk from its free seq
+            # slots, so the rent-or-buy wait would only leave them empty.
+            if self.ramp_active:
+                return self._fire("ramp", g_pending)
             return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
@@ -943,7 +953,8 @@ class PrefillDelayer:
             self._decode_tick_us = _ema(self._decode_tick_us, step_s * 1e6)
 
     def _fire(self, reason: str, g_pending: int) -> bool:
-        # reason ∈ {fill, stall, cost, ttft, kv, partial, nodecode, queue_ms};
+        # reason ∈ {fill, stall, cost, ttft, kv, partial, nodecode, queue_ms,
+        # adaptive, adaptcap, ramp};
         # each maps to a dedicated _stat_fire_<reason> slot so the log shows
         # what released.
         attr = f"_stat_fire_{reason}"
@@ -1085,6 +1096,7 @@ class PrefillDelayer:
             + self._stat_fire_nodecode
             + self._stat_fire_queue_ms
             + self._stat_fire_vacuous
+            + self._stat_fire_ramp
             + self._stat_fire_adaptive
             + self._stat_fire_adaptcap
             + self._stat_hold
@@ -1105,6 +1117,7 @@ class PrefillDelayer:
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
                 f"ramp={self._stat_ramp} "
+                f"fire_ramp={self._stat_fire_ramp} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )
