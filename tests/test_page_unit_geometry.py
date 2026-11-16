@@ -413,3 +413,56 @@ class TestLmcacheMpNativeLayoutReadsThePageUnitImage:
             ]
         )
         torch.testing.assert_close(read, image, rtol=0, atol=0)
+
+
+class TestPageUnitViewsCarryTheIndexLayers:
+    """The CPU-tier views name a unit's index layers after its MLA rows, as
+    `_page_unit_regions` does."""
+
+    H = TestPageUnitAddressesAreArithmetic
+    INDEX_LAYERS = 2
+    INDEX_ENTRY = 3
+
+    def build(self, image_bytes=None):
+        h = self.H()
+        index = (
+            torch.arange(self.INDEX_LAYERS * h.N_LOGICAL * self.INDEX_ENTRY)
+            .to(torch.uint8)
+            .reshape(self.INDEX_LAYERS, h.N_LOGICAL, self.INDEX_ENTRY)
+        )
+        region = h.LOGICAL_BS * h.ENTRY
+        unit_bytes = h.ROWS * region + self.INDEX_LAYERS * self.INDEX_ENTRY
+        stub, _ = h.build(spec_bytes=unit_bytes, image_bytes=image_bytes)
+        stub._page_unit_index_cache = lambda: index
+        stub.page_unit_views = PageUnitGeometryMixin.page_unit_views.__get__(
+            stub, type(stub)
+        )
+        return stub, unit_bytes
+
+    def test_every_region_of_the_unit_has_a_view_at_its_address(self):
+        stub, _ = self.build()
+        units = [4, 0, 2]
+        views = stub.page_unit_views(units)
+        addrs = stub._page_unit_bases([units])[0]
+        assert len(views) == (self.H.ROWS + self.INDEX_LAYERS) * len(units)
+        assert [v.data_ptr() for v in views] == addrs.tolist()
+
+    def test_the_views_add_up_to_whole_units(self):
+        stub, unit_bytes = self.build()
+        units = [1, 3]
+        views = stub.page_unit_views(units)
+        sizes = stub._page_unit_stream_sizes(len(units))
+        assert [v.numel() * v.element_size() for v in views] == sizes.tolist()
+        assert sum(sizes) == unit_bytes * len(units)
+
+    def test_an_image_spanning_the_index_layers_is_gathered_whole(self):
+        _, unit_bytes = self.build()
+        image = unit_bytes + unit_bytes // 2  # ends inside the second unit
+        stub, _ = self.build(image_bytes=image)
+        units = [2, 4]
+        views = stub.page_unit_views(units)
+        assert sum(v.numel() * v.element_size() for v in views) == image
+        # Byte count alone passes on a short gather that borrows the next
+        # unit's MLA rows; the addresses must be the region stream's, in order.
+        addrs = stub._page_unit_bases([units])[0]
+        assert [v.data_ptr() for v in views] == addrs[: len(views)].tolist()

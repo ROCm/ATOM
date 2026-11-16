@@ -173,7 +173,7 @@ class PageUnitGeometryMixin:
 
         `_page_unit_regions` gives raw addresses for the Triton descriptor; the
         LMCache packer takes `list[torch.Tensor]`, so the same bytes need naming
-        as views. Order is the contract: unit major, row minor, the same ravel
+        as views. Order is the contract: unit major, region minor, the same ravel
         as `_page_unit_bases` (cross-build safety is `layout_id` in
         `StateByteCodec.key`, not this order).
 
@@ -195,6 +195,14 @@ class PageUnitGeometryMixin:
         # that address past the end of the tensor.
         logical_blocks = (cache.shape[1] * cache.shape[2]) // block
         planes = [cache[row].view(-1, entry) for row in range(rows)]
+        # A sparse-indexer model's index layers follow the MLA rows in each unit
+        # (`_page_unit_regions`), and the HBM copy writes image bytes there too.
+        index_cache = self._page_unit_index_cache()
+        index_layers = (
+            []
+            if index_cache is None
+            else [index_cache[layer] for layer in range(index_cache.shape[0])]
+        )
         views: list[torch.Tensor] = []
         for unit in unit_ids:
             unit = int(unit)
@@ -205,6 +213,7 @@ class PageUnitGeometryMixin:
                 )
             lo = unit * block
             views.extend(plane[lo : lo + block] for plane in planes)
+            views.extend(layer[unit] for layer in index_layers)
 
         # ---- cut the padding tail off the final unit ----
         #
