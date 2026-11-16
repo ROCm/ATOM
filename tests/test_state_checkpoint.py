@@ -3247,7 +3247,7 @@ class TestPromptEndAnchorTemplateMargin:
         self._next_token = iter(range(1000, 10**7))
         self._monkeypatch = monkeypatch
 
-    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME):
+    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME, pp=1):
         if margin is not None:
             self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_MARGIN", str(margin))
         return make_block_manager(
@@ -3259,6 +3259,7 @@ class TestPromptEndAnchorTemplateMargin:
                 pool_entries={"state": 8},
                 state_checkpoint_interval_tokens=-1,
                 state_checkpoint_demand=False,
+                pipeline_parallel_size=pp,
             ),
             state_runtime=runtime,
         )
@@ -3372,6 +3373,33 @@ class TestPromptEndAnchorTemplateMargin:
             )
             bm.can_allocate(seq)
             assert seq.checkpoint_end_pos == 6 * self.BLOCK, margin  # (131-32)//16*16
+
+    # ── The LMCache chunk grid (demand rung on) ─────────────────────────────
+
+    CHUNK = 4 * BLOCK
+
+    def _grid_turns(self, pp):
+        """Two turns, the second resending the first and going on:
+        (anchor, resumed, chunks cut for a demand)."""
+        self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
+        bm = self._bm(pp=pp)
+        # As in `_joint_bm`: the LMCache config is not importable here.
+        bm._joint_chunk_tokens = self.CHUNK
+        t1 = self._prompt([], 7 * self.BLOCK + 5)
+        _, anchor = self._run_turn(bm, t1)
+        resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
+        return anchor, resumed, bm.checkpoint_funnel()["chunks_cut_for_demand"]
+
+    @pytest.mark.parametrize(
+        "pp, expected",
+        [(1, (7 * BLOCK, 7 * BLOCK, 0)), (2, (CHUNK, CHUNK, 1))],
+    )
+    def test_only_pp_floors_the_anchor_onto_the_chunk_grid(self, pp, expected):
+        """Under PP the anchor is floored so the joint load, which needs the
+        whole chunk covering it, can restore it from the CPU tier; the next
+        turn then resumes a chunk lower and cuts a demand at the unfloored
+        position. Without PP the anchor stays at the prompt end."""
+        assert self._grid_turns(pp) == expected
 
     # ── The margin's range (review of #2589) ────────────────────────────────
 
