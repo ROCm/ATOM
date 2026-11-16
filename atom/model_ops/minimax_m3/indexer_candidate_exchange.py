@@ -39,11 +39,11 @@ def _topk_block_t(topk: int) -> int:
     return triton.next_power_of_2(topk)
 
 
-def _topk_tiles(topk: int, local_blocks: int) -> tuple[int, int, int]:
+def _topk_tiles(topk: int, launch_blocks: int) -> tuple[int, int, int]:
     """The narrow and wide score tiles and the selection width shared by both
-    local-top-k paths."""
+    local-top-k paths, for a launch ``launch_blocks`` local blocks wide."""
     block_t = _topk_block_t(topk)
-    width = triton.next_power_of_2(local_blocks)
+    width = triton.next_power_of_2(launch_blocks)
     block_k = max(16, block_t, min(width, LOCAL_TOPK_TILE))
     return block_k, max(block_k, min(width, LOCAL_TOPK_WIDE_TILE)), block_t
 
@@ -456,9 +456,10 @@ def local_candidate_keys(
     )
     keys = torch.empty((heads, tokens, topk), dtype=torch.int64, device=scores.device)
     if tokens:
-        # The tile must be at least as wide as the top-k it selects: the
-        # kernel's FIRST `tl.topk(x[BLOCK_SIZE_K], BLOCK_SIZE_T)` runs before
-        # any `tl.cat`, so BLOCK_SIZE_K < BLOCK_SIZE_T cannot compile. A small
+        # Each tile must be at least as wide as the top-k it selects:
+        # `_walk_tiles` runs its FIRST `tl.topk(x[TILE], BLOCK_SIZE_T)` before
+        # any `tl.cat`, with TILE = BLOCK_SIZE_K or BLOCK_SIZE_W, so a tile
+        # narrower than BLOCK_SIZE_T cannot compile. A small
         # shard reaches that -- e.g. 8 local blocks with topk 32 gives a 16-wide
         # tile and a 32-wide selection. M3 ships sparse_topk_blocks=16, which
         # the max(16, ...) floor already covers, so this is unreachable on the
