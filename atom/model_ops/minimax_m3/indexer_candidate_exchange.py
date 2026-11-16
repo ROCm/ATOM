@@ -71,9 +71,10 @@ def _walk_tiles(
     INIT_BLOCKS: tl.constexpr,
     TILE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    LOOP: tl.constexpr,
 ):
     """Top-BLOCK_SIZE_T packed keys of a score row's first live_end blocks,
-    TILE blocks at a time."""
+    TILE blocks at a time; without LOOP, the launch fits in one tile."""
     off = tl.arange(0, TILE)
     local_valid = off < live_end
     block = off * WORLD + RANK
@@ -81,15 +82,16 @@ def _walk_tiles(
     score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
     score = _force(score, block, valid, local_start, INIT_BLOCKS)
     winners = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-    for start in tl.range(TILE, live_end, TILE):
-        off = start + tl.arange(0, TILE)
-        local_valid = off < live_end
-        block = off * WORLD + RANK
-        valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
-        score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
-        score = _force(score, block, valid, local_start, INIT_BLOCKS)
-        tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
-        winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
+    if LOOP:
+        for start in tl.range(TILE, live_end, TILE):
+            off = start + tl.arange(0, TILE)
+            local_valid = off < live_end
+            block = off * WORLD + RANK
+            valid = local_valid & (block < GLOBAL_BLOCKS) & (block < causal_blocks)
+            score = tl.load(s_row + off, mask=local_valid, other=-1e30).to(tl.float32)
+            score = _force(score, block, valid, local_start, INIT_BLOCKS)
+            tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
+            winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
     return winners
 
 
@@ -109,6 +111,7 @@ def _shard_winners(
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_W: tl.constexpr,
+    WIDE_LOOP: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     """This shard's top-BLOCK_SIZE_T packed keys for one (head, query row)."""
@@ -129,7 +132,9 @@ def _shard_winners(
     )
 
     # One wide tile costs about two narrow ones, so a long row takes the wide
-    # tile rather than walking many narrow ones.
+    # tile rather than walking many narrow ones. When the launch fits in one
+    # wide tile (up to 1M at TP4) its loop is not compiled: carrying the dead
+    # loop cost the wide path about 0.1 us against main's single tile.
     if live_end > 2 * BLOCK_SIZE_K:
         winners = _walk_tiles(
             s_row,
@@ -142,6 +147,7 @@ def _shard_winners(
             INIT_BLOCKS,
             BLOCK_SIZE_W,
             BLOCK_SIZE_T,
+            WIDE_LOOP,
         )
     else:
         winners = _walk_tiles(
@@ -155,6 +161,7 @@ def _shard_winners(
             INIT_BLOCKS,
             BLOCK_SIZE_K,
             BLOCK_SIZE_T,
+            True,
         )
     return winners
 
@@ -175,6 +182,7 @@ def _local_topk(
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_W: tl.constexpr,
+    WIDE_LOOP: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
     """Pack this shard's [heads, tokens, local] scores down to its own top-k keys.
@@ -206,6 +214,7 @@ def _local_topk(
         LOCAL_KEEP=LOCAL_KEEP,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_W=BLOCK_SIZE_W,
+        WIDE_LOOP=WIDE_LOOP,
         BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     off_t = tl.arange(0, BLOCK_SIZE_T)
@@ -471,6 +480,7 @@ def local_candidate_keys(
             LOCAL_KEEP=local_blocks,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_W=block_w,
+            WIDE_LOOP=local > block_w,
             BLOCK_SIZE_T=block_t,
             num_warps=DECODE_TOPK_NUM_WARPS,
         )
@@ -602,6 +612,7 @@ def _select_exchange_merge(
     LOCAL_KEEP: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_W: tl.constexpr,
+    WIDE_LOOP: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     CANDIDATES: tl.constexpr,
     MAX_ROWS: tl.constexpr,
@@ -642,6 +653,7 @@ def _select_exchange_merge(
         LOCAL_KEEP=LOCAL_KEEP,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_W=BLOCK_SIZE_W,
+        WIDE_LOOP=WIDE_LOOP,
         BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
     tl.debug_barrier()  # every wave has read the old call
@@ -779,6 +791,7 @@ def select_exchanged_candidates(
             LOCAL_KEEP=local_blocks,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_W=block_w,
+            WIDE_LOOP=local > block_w,
             BLOCK_SIZE_T=block_t,
             CANDIDATES=triton.next_power_of_2(world_size * topk),
             MAX_ROWS=mailbox.max_rows,
