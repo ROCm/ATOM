@@ -17336,6 +17336,26 @@ models:
               ATOMESH_M31_D_MAX_SEQS: "32"
               ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
               ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096 --gpu-memory-utilization 0.75'
+        # The C128 case with one D DEP8 (DP attention x8, EP MoE, TP1 per rank) on node 1 in place of the
+        # two D TP4; P unchanged. D max-num-seqs is per DP rank. The fork commit lets Mooncake re-shard
+        # P's TP4 NVFP4 KV into the TP1 ranks; batch-sharded sampling needs TP > 1, so D turns it off.
+        - <<: *m31_mc_1p2d_ax5035_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-ax5035-mc-dep8-c128-dcap16-cpu15-lpt4k-pmem75
+          topology: 1p1d
+          display_topology: 1P1D-TP4-DEP8
+          concurrency: [128]
+          decode:
+            workers: 1
+            tp: 8
+            enable_dp_attention: true
+          env:
+            common:
+              <<: *m31_ax5035_mc_env
+              ATOMESH_M31_VLLM_SHA: 8d998eaffdb81d92dbf25831bd065e2f9dbd27ea
+              ATOMESH_M31_D_MAX_SEQS: "16"
+              ATOMESH_M31_D_EXTRA_ARGS: --all2all-backend mori --no-enable-batch-sharded-sampling
+              ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1499000000000"
+              ATOMESH_M31_P_EXTRA_ARGS: '--compilation-config {"max_cudagraph_capture_size":2048} --long-prefill-token-threshold 4096 --gpu-memory-utilization 0.75'
         # The local 1P1D layout (P GPUs 0-3, D GPUs 4-7 of one node) with xgmi swapped for RDMA.
         - &m31_moriio_1p1d_sn_case
           <<: *m31_moriio_1p2d_case

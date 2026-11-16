@@ -175,10 +175,17 @@ start_vllm_server() {
     # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..max-num-seqs requests x 8
     # tokens. ATOMESH_M31_D_MAX_SEQS caps each D's decode batch (default CONC: no cap).
     local d_seqs="${ATOMESH_M31_D_MAX_SEQS:-${m31_conc}}"
-    role_args=(--tensor-parallel-size "${DECODE_TP_SIZE}" --max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
+    local -a d_parallel=(--tensor-parallel-size "${DECODE_TP_SIZE}") d_extra_args=()
+    # decode.enable_dp_attention: one DEP D over its tp GPUs (DP attention, EP MoE, TP1 per rank);
+    # max-num-seqs and the graph sizes are then per DP rank.
+    [[ "${DECODE_ENABLE_DP}" == true ]] &&
+      d_parallel=(--tensor-parallel-size 1 --data-parallel-size "${DECODE_TP_SIZE}" --enable-expert-parallel)
+    # Arguments for the decode servers only, after the shared ones so they win.
+    read -r -a d_extra_args <<< "${ATOMESH_M31_D_EXTRA_ARGS:-}"
+    role_args=("${d_parallel[@]}" --max-num-seqs "${d_seqs}" --port "${server_port}" --gpu-memory-utilization 0.85
       --max-num-batched-tokens 8192
       --compilation-config "{\"cudagraph_capture_sizes\":[$(seq -s, 8 8 $((8 * d_seqs)))],\"max_cudagraph_capture_size\":$((8 * d_seqs))}"
-      --kv-transfer-config "${xfer}")
+      "${d_extra_args[@]}" --kv-transfer-config "${xfer}")
   fi
   # GPUs 0-3 sit on NUMA node 0, GPUs 4-7 on node 1; a server spanning both (TP8) runs unpinned.
   if (( ${gpus%%,*} / 4 == ${gpus##*,} / 4 )); then
