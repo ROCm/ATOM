@@ -598,13 +598,11 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims) -> MlaPrep:
     blocks, write_idx = layer_block(layer_id)
     _need(blocks >= 1 and write_idx < 0, f"{name}: a block-write or block-less seam")
     _need(site.enabled, f"{name}: attention residuals off")
-    # (import triton / aiter: after the checks a CPU runner can make)
+    # (import aiter: after the checks a CPU runner can make)
     from aiter import QuantType
 
-    from atom.model_ops.attention_residual import _fused_quant_dtype
-
     _need(
-        _fused_quant_dtype(site.out_norm) == FP8,
+        site.out_quant_dtype == FP8,
         f"{name}: the attention seam does not fold the per-token FP8 input quant",
     )
     _need(sa.fuse_input_norm_quant, f"{name}: no fused input quant")

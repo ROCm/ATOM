@@ -53,7 +53,7 @@ class MlaFolds:
     # K2 layer M - 1 -> M; none until bound
     mla_prep: Mapping = MappingProxyType({})
     mla_prep_prev: Mapping = MappingProxyType({})
-    _prep_pending: dict = MappingProxyType({})
+    _prep_pending: Mapping = MappingProxyType({})
     _pref_hold_next = None
     _positions = None
 

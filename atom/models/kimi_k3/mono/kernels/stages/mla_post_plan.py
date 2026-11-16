@@ -3,8 +3,9 @@
 """The MLA post stage's geometry in plain integers (``stages.mla_post`` is the
 kernel): which core columns, weight rows and x slabs each task takes, and where
 the tasks sit; and the MLA layer's shapes both folds' stages and binders
-(``weights.bind_mla_post`` / ``bind_mla_prep``) are built for. Free of FlyDSL
-so it is testable on a CPU runner."""
+(``weights.bind_mla_post`` / ``bind_mla_prep``) are built for, with the FP8
+range their activation quant clamps to. Free of FlyDSL so it is testable on a
+CPU runner."""
 
 from atom.mono.plan.execution import WAVES
 
@@ -27,6 +28,9 @@ G_GROUPS = HIDDEN // GROUP_COLS  # 7
 V_CH = LORA // KCH  # 4 v-up chunks: waves 0 .. 3
 XPAD = 16  # bytes a padded fp8 x row
 MAX_ROWS = 16  # the widest step built with the stage (wider: the unfused path)
+# both folds' per-token FP8 activation quant (e4m3fn)
+FP8_MAX = 448.0
+INV_FP8_MAX = 1.0 / FP8_MAX  # f32: 0x3b124925, triton's one_over_DTYPE_MAX
 
 # Every K2 CTA runs o_proj, which reads every core column, so the 96 tasks gate
 # all of it; one task a CTA, where the least other work is queued behind it.

@@ -722,11 +722,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default; 0 turns it off. Anything but 0 / 1 raises.
     "ATOM_MONO_MLA_POST": lambda: _strict_flag_env("ATOM_MONO_MLA_POST", True),
     # Kimi-K3 mono: the NEXT MLA layer's prep as tail stages of the preceding
-    # layer's K2 (kernels/stages/mla_prep.py): the attention seam + per-token
-    # FP8 quant (P0), the fused q_a / kv_a projection and its two RMSNorms
-    # (P1 / P2), q_b, the absorb BMM, rope and the FP8 KV-cache write (P3 ..
-    # P5). Not bit-identical (row-reduction / GEMM order). On by default; 0
-    # turns it off. Anything but 0 / 1 raises.
+    # layer's K2 (kernels/stages/mla_prep.py: the attention seam + per-token
+    # FP8 quant (P0) and the fused q_a / kv_a projection (P1);
+    # kernels/stages/mla_prep_qkv.py: its two RMSNorms (P2), q_b, the absorb
+    # BMM, rope and the FP8 KV-cache write (P3 .. P5)). Not bit-identical
+    # (row-reduction / GEMM order). On by default; 0 turns it off. Anything but
+    # 0 / 1 raises.
     "ATOM_MONO_MLA_PREP": lambda: _strict_flag_env("ATOM_MONO_MLA_PREP", True),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
