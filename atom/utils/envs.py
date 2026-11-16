@@ -134,6 +134,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TRACE_VERSION": lambda: os.getenv("ATOM_TRACE_VERSION", "unknown"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Mooncake HCAs this server's engines register on, comma-separated. Unset =
+    # each GPU's local HCA (rdmaN, else ionic_N).
+    "ATOM_MOONCAKE_IB_DEVICE": lambda: os.getenv("ATOM_MOONCAKE_IB_DEVICE", ""),
+    # E/P/D encoder: seconds an image embedding entry stays readable before its
+    # pool space may be reused. A full pool with every entry inside its lease
+    # refuses the encode.
+    "ATOM_EC_LEASE_S": lambda: _positive_float_env("ATOM_EC_LEASE_S", "60"),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
