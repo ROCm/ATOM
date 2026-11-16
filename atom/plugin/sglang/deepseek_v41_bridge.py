@@ -3054,6 +3054,18 @@ def record_deepseek_v41_prefill_token_graphs(model_runner) -> tuple[int, ...]:
         # and a TBO prefill splits into micro-batches: neither is wired here.
         logger.info("ATOM DeepSeek-V4.1: no prefill token graphs under DP / TBO")
         return ()
+    surface = getattr(wrapper, "_v41_dspark", None)
+    if surface is not None and not getattr(wrapper.model, "replay", False):
+        # Without decoder bounded replay the recorded unit is `_Backbone`, the
+        # whole forward: the DSpark taps (Python forward hooks, not native's
+        # in-graph aux buffers) would fire only while recording, and a replay
+        # runs no model Python, so `take_aux` would find them missing. Under
+        # replay the unit is `_EarlyLayers`, below every tap.
+        logger.info(
+            "ATOM DeepSeek-V4.1: prefills run eagerly under DSpark without "
+            "decoder bounded replay (its aux taps sit inside the recorded unit)"
+        )
+        return ()
     pool = model_runner.token_to_kv_pool
     limit = min(
         int(builder.max_num_batched_tokens),
@@ -3068,7 +3080,6 @@ def record_deepseek_v41_prefill_token_graphs(model_runner) -> tuple[int, ...]:
         return ()
     device = builder.cache.backing.device
     ids = _PREFILL_GRAPHS.ids_buffer(sizes[0], device)
-    surface = getattr(wrapper, "_v41_dspark", None)
     parallel = atom_config.parallel_config
     start = time.perf_counter()
     with plugin_runtime_scope(framework="sglang", atom_config=atom_config):

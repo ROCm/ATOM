@@ -1299,6 +1299,42 @@ class TestPrefillTokenGraphs:
         assert not bridge.v41_prefill_token_graphs_enabled()
         assert bridge.record_deepseek_v41_prefill_token_graphs(object()) == ()
 
+    def _runner(self, *, dspark, replay):
+        wrapper = SimpleNamespace(
+            atom_config=SimpleNamespace(enable_dp_attention=False, enable_tbo=False),
+            model=SimpleNamespace(replay=replay),
+        )
+        if dspark:
+            wrapper._v41_dspark = SimpleNamespace(_rows={})
+        return SimpleNamespace(model=wrapper, token_to_kv_pool=object())
+
+    def test_dspark_without_decoder_replay_records_nothing(self, monkeypatch):
+        # Without replay the recorded unit is `_Backbone`, the DSpark taps'
+        # layers included: a replay would never fire them.
+        monkeypatch.delenv(bridge.V41_PREFILL_TOKEN_GRAPHS_ENV, raising=False)
+        monkeypatch.setattr(
+            bridge, "_graph_builder", lambda: SimpleNamespace(supports_token_graph=True)
+        )
+        runner = self._runner(dspark=True, replay=False)
+        assert bridge.record_deepseek_v41_prefill_token_graphs(runner) == ()
+        # The runtime model without a `replay` attribute: refused the same way.
+        runner.model.model = SimpleNamespace()
+        assert bridge.record_deepseek_v41_prefill_token_graphs(runner) == ()
+
+    @pytest.mark.parametrize("dspark,replay", [(True, True), (False, False)])
+    def test_records_past_the_dspark_guard(self, monkeypatch, dspark, replay):
+        # DSpark under replay, or no DSpark: the guard lets the recorder on to
+        # the pool (here a stub without the builder's limits, which stops it).
+        monkeypatch.delenv(bridge.V41_PREFILL_TOKEN_GRAPHS_ENV, raising=False)
+        monkeypatch.setattr(
+            bridge,
+            "_graph_builder",
+            lambda: SimpleNamespace(supports_token_graph=True),
+        )
+        runner = self._runner(dspark=dspark, replay=replay)
+        with pytest.raises(AttributeError, match="max_num_batched_tokens"):
+            bridge.record_deepseek_v41_prefill_token_graphs(runner)
+
 
 @needs_sglang
 class TestPrefillTokenGraphPatch:
