@@ -283,6 +283,69 @@ def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
         assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rope_dim", [16, 64])
+@pytest.mark.parametrize("tokens", [1, 7, 1344])
+def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
+    """Grouped heads rotate only the RoPE tail when it is whole quant groups;
+    the NoPE groups quantize as loaded. Same bytes as a program a head, on
+    rows of zeros, saturating, tiny and ordinary values."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(tokens + rope_dim)
+    device, heads, dim = "cuda", 64, 512
+    rope = RotaryEmbedding(rope_dim, 4096, base=10000).to(device)
+    positions = torch.randint(0, 4096, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
+    query[0, : heads // 4] = 0
+    if tokens > 1:
+        query[1, :, ::3] = 3e4
+        query[-1, heads // 2 :] = 1e-30
+    fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
+    monkeypatch.setattr(rope_window, "_FP8_HEADS_MIN_PROGRAMS_PER_CU", 0)
+
+    def run(n):
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
+        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
+        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
+        rope_window.rope_quant_window(
+            query.clone(),
+            normed,
+            rope.cos_cache,
+            rope.sin_cache,
+            positions,
+            rope_dim=rope_dim,
+            values=rows[:, :dim].view(fp8),
+            scales=rows[:, dim:].view(e8m0),
+            query_fp8=(qv, qs),
+        )
+        return rows, qv.view(torch.uint8), qs.view(torch.uint8)
+
+    reference = run(1)
+    for n in (8, 16):
+        for expected, actual in zip(reference, run(n)):
+            assert torch.equal(actual, expected)
+
+
+def test_fp8_query_heads_a_program_follow_the_arch(monkeypatch):
+    """16 heads a program on gfx1250, 8 elsewhere, unless `_FP8_HEADS` says."""
+    pytest.importorskip("aiter", reason="the arch is read through AITER")
+    from aiter.jit.utils import chip_info
+
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    for arch, heads in (("gfx1250", 16), ("gfx950", 8), ("gfx942", 8)):
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda arch=arch: arch)
+        rope_window._arch_fp8_heads.cache_clear()
+        assert rope_window._fp8_heads() == heads
+    monkeypatch.setattr(rope_window, "_FP8_HEADS", 4)
+    assert rope_window._fp8_heads() == 4
+    rope_window._arch_fp8_heads.cache_clear()
+
+
 class _GridSpy:
     """Wraps a Triton kernel to record each launch's grid, `HEAD_BLOCK` and
     `FP8_HEADS`."""
@@ -410,6 +473,7 @@ def test_fp8_query_groups_heads_from_two_programs_a_cu(
     from atom.model_ops.deepseek_v41 import rope_window
 
     monkeypatch.setattr(rope_window, "_cu_count", lambda device: cus)
+    monkeypatch.setattr(rope_window, "_FP8_HEADS", 8)
     device, heads, dim, rope_dim = "cuda", 64, 512, 64
     rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
     positions = torch.zeros(tokens, device=device, dtype=torch.int32)

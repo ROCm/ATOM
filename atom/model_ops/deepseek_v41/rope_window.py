@@ -36,8 +36,13 @@ _HEAD_BLOCK = True
 # The MXFP8 query's heads quantized by one program rather than one each, with
 # the same bytes out. 8 heads on 2 warps, 64 heads at 1344 / 16384 tokens:
 # MI455X 31.8 -> 16.2 / 422 -> 205 us (c1024 serving +4.1%), MI355X 22.4 ->
-# 21.6 / 322 -> 287 us. 1 only for the tests' per-head reference.
-_FP8_HEADS = 8
+# 21.6 / 322 -> 287 us. 1 only for the tests' per-head reference. None:
+# the architecture's own (`_fp8_heads`).
+_FP8_HEADS = None
+# gfx1250 groups 16 heads a program once only the RoPE tail is rotated
+# (`_quantize_heads_tail`); gfx950 measured no better past 8.
+_FP8_HEADS_BY_ARCH = {"gfx1250": 16}
+_FP8_HEADS_DEFAULT = 8
 # A program a head below this many grouped query programs a CU: measured on
 # MI455X and MI355X (256 CUs each), not derived. 64/32/16 heads cross over at
 # about this on MI455X and between 1x and 1.5x it on MI355X (at 1x up to 3%,
@@ -48,6 +53,18 @@ _FP8_HEADS_MIN_PROGRAMS_PER_CU = 2
 @functools.lru_cache
 def _cu_count(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+@functools.lru_cache
+def _arch_fp8_heads():
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return _FP8_HEADS_BY_ARCH.get(get_gfx_runtime(), _FP8_HEADS_DEFAULT)
+
+
+def _fp8_heads():
+    """MXFP8 query heads a program: `_FP8_HEADS` where set, else the arch's."""
+    return _arch_fp8_heads() if _FP8_HEADS is None else _FP8_HEADS
 
 
 @triton.jit
@@ -129,7 +146,79 @@ def _quantized_row(row, position, cos, sin, D, ROPE):
 
 
 @triton.jit
+def _quantize_heads_tail(
+    query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
+):
+    """`_quantize_heads` when the RoPE tail is whole groups: the NoPE groups
+    quantized as loaded, the tail's pairs rotated as `_quantized_row` does."""
+    G: tl.constexpr = D // 32
+    RG: tl.constexpr = ROPE // 32
+    half: tl.constexpr = ROPE // 2
+    activation = query.dtype.element_ty
+    rows = (row0 + tl.arange(0, HB))[:, None, None]
+    grp = tl.arange(0, G)[None, :, None]
+    col = tl.arange(0, 32)[None, None, :]
+    loaded = tl.load(query + rows * D + grp * 32 + col).to(tl.float32)
+    quantized, code, _ = fp8_groups(tl.reshape(loaded, (HB * G, 32)))
+    nope = grp < G - RG
+    tl.store(
+        query_values + rows * D + grp * 32 + col,
+        tl.reshape(quantized, (HB, G, 32)),
+        mask=nope,
+    )
+    row = (row0 + tl.arange(0, HB))[:, None]
+    scale_grp = tl.arange(0, G)[None, :]
+    tl.store(
+        query_scales + row * G + scale_grp,
+        tl.reshape(code, (HB, G)),
+        mask=scale_grp < G - RG,
+    )
+    pair = tl.arange(0, half)[None, :]
+    tail = query + row * D + (D - ROPE) + 2 * pair
+    even = tl.load(tail).to(tl.float32)
+    odd = tl.load(tail + 1).to(tl.float32)
+    cosine = tl.load(cos + position * half + pair).to(tl.float32)
+    sine = tl.load(sin + position * half + pair).to(tl.float32)
+    rotated = (
+        tl.reshape(
+            tl.join(even * cosine - odd * sine, even * sine + odd * cosine),
+            (HB * RG, 32),
+        )
+        .to(activation)
+        .to(tl.float32)
+    )
+    tail_q, tail_code, _ = fp8_groups(rotated)
+    tl.store(
+        query_values + row * D + (D - ROPE) + tl.arange(0, ROPE)[None, :],
+        tl.reshape(tail_q, (HB, ROPE)),
+    )
+    tl.store(
+        query_scales + row * G + (G - RG) + tl.arange(0, RG)[None, :],
+        tl.reshape(tail_code, (HB, RG)),
+    )
+
+
+@triton.jit
 def _quantize_heads(
+    query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
+):
+    """`_quantized_row` over query heads `row0 .. row0 + HB` as one `[HB, D]`
+    tile, stored as MXFP8: the same bytes. With whole RoPE groups only the
+    tail is rotated (`_quantize_heads_tail`): a NoPE pair's identity rotation
+    (cos 1, sin 0, each product and sum exact) and its BF16 round trip give
+    back the value it started from."""
+    if ROPE % 32 == 0:
+        _quantize_heads_tail(
+            query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
+        )
+    else:
+        _quantize_heads_full(
+            query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
+        )
+
+
+@triton.jit
+def _quantize_heads_full(
     query, query_values, query_scales, row0, position, cos, sin, HB, D, ROPE
 ):
     """`_quantized_row` over query heads `row0 .. row0 + HB` as one `[HB, D]`
@@ -345,7 +434,7 @@ def rope_quant_window(
         and rope_dim >= 2
         and (rope_dim & (rope_dim - 1)) == 0
     )
-    fp8_heads = _FP8_HEADS
+    fp8_heads = _fp8_heads()
     if not (
         query_fp8 is not None
         and fp8_heads > 1
