@@ -1184,6 +1184,30 @@ def test_pp_stage_drops_its_producer_entry_once_its_consumers_are_served(pp_rank
     assert conn.done_sending == set()
 
 
+@pytest.mark.parametrize(
+    ("producer_dcp", "consumer_dcp", "sent"),
+    [(1, 2, True), (1, 8, True), (2, 4, False)],
+    ids=["dcp1-to-dcp2", "dcp1-to-dcp8", "dcp2-to-dcp4"],
+)
+def test_slot_transfer_refuses_only_a_sharded_producer_of_another_dcp(
+    caplog, producer_dcp, consumer_dcp, sent
+):
+    captured = []
+    conn = _make_transfer_connector({}, captured)
+    conn.pp_size = 2
+    conn.dcp_size = producer_dcp
+
+    conn._execute_transfer(
+        _stateful_write_request(
+            src_block_ids=list(range(3, 3 + consumer_dcp)),
+            consumer_dcp_size=consumer_dcp,
+        )
+    )
+
+    assert len(captured) == int(sent)
+    assert ("does not support asymmetric DCP" in caplog.text) != sent
+
+
 def test_write_done_correct_nonce_accepted():
     conn = _make_connector()
     conn._pending_recv_expected["r1"] = 1
