@@ -32,7 +32,6 @@ on:
           - DeepSeek-V4-Pro TP8
           - DeepSeek-V4-Pro MTP3 TP8
           - DeepSeek-V4-Pro Prefix Cache TP8
-          - DeepSeek-V3.2 FP8 TP4
           - GLM-5.2 FP8 TP4
           - GLM-5.2 FP4 TP4
           - Kimi-K3 TP8
@@ -663,7 +662,6 @@ jobs:
               "DeepSeek-V4-Pro TP8": "deepseek-v4-pro-tp8",
               "DeepSeek-V4-Pro MTP3 TP8": "deepseek-v4-pro-mtp3-tp8",
               "DeepSeek-V4-Pro Prefix Cache TP8": "deepseek-v4-pro-prefix-cache-tp8",
-              "DeepSeek-V3.2 FP8 TP4": "deepseek-v3-2-fp8-tp4",
               "GLM-5.2 FP8 TP4": "glm-5-2-fp8-tp4",
               "GLM-5.2 FP4 TP4": "glm-5-2-fp4-tp4",
               "GLM-5.2 FP4 TP4 MTP3": "glm-5-2-fp4-tp4-mtp3",
@@ -699,7 +697,6 @@ jobs:
               "minimax-m3-mxfp4-tp4",
           ]
           OOB_P1_PREFIX_ORDER = [
-              "deepseek-v3-2-fp8-tp4",
               "minimax-m3-mxfp8-eagle3-tp4-mtp3",
           ]
 
