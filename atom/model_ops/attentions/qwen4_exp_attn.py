@@ -480,7 +480,15 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     def _ple_tensors(self) -> list[torch.Tensor]:
         """The runner's PLE tensors in `_ple_planes` order; empty before allocation."""
         states = [getattr(self.model_runner, p.name, None) for p in self._ple_planes]
-        return [] if all(state is None for state in states) else states
+        missing = [p.name for p, s in zip(self._ple_planes, states) if s is None]
+        if len(missing) == len(states):
+            return []
+        if missing:
+            raise RuntimeError(
+                f"PLE planes {missing} are not allocated but the others are; "
+                "the state image needs all of them or none"
+            )
+        return states
 
     def _checkpoint_plane_tensors(self) -> list[torch.Tensor]:
         # GDN planes are `(layers, slots, ...)`. PLE is allocated `(slots, ...)`.
