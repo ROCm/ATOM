@@ -424,9 +424,16 @@ class ProbDraftState:
     # A position-major packed maximum, reset by the chain's final kernel.
     # Allocate before graph capture; one ordered draft stream owns this state.
     markov_keys: torch.Tensor | None = None
+    # The verify's work buffers (`prob_verify_scratch`): allocated once with
+    # the state at the largest batch, carved per step, so no verify allocates.
+    verify_scratch: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, max_bs: int, width: int, vocab: int, device) -> "ProbDraftState":
+    def allocate(
+        cls, max_bs: int, width: int, vocab: int, device, target_vocab: int = 0
+    ) -> "ProbDraftState":
+        """``vocab``: q's columns on this rank; ``target_vocab`` (default
+        ``vocab``): the width of the target logits the verify reads."""
         st = cls(
             q=torch.zeros(max_bs, width, vocab, dtype=torch.float32, device=device),
             ids=torch.full((max_bs, width), -1, dtype=torch.int32, device=device),
@@ -444,6 +451,9 @@ class ProbDraftState:
             for _ in range(2)
         ]
         st.src_gpu = torch.empty(max_bs, dtype=torch.int32, device=device)
+        st.verify_scratch = prob_verify_scratch(
+            max_bs, width, vocab, target_vocab or vocab, device
+        )
         return st
 
     def set_layout(self, vocab_start: int, cols: int, tp: int) -> None:
@@ -1602,8 +1612,8 @@ def _prob_finish_kernel(
 
 
 class _TopPScratch(NamedTuple):
-    """The top-p search's per-step scratch, carved from one buffer
-    (`sampling_scratch.carve`): the compacted final-interval tokens ``cand``
+    """The top-p search's part of `_VerifyScratch`: the compacted
+    final-interval tokens ``cand``
     [N, 2, RB]; the two chunked levels' thresholds ``thr`` [2, N, K] and
     per-chunk mass / count records ``lm`` / ``lc`` [2, N, nch, K]; the final
     interval ``fin`` [N, 4] (a, b, mass at or above b, threshold spacing); and
@@ -1630,6 +1640,63 @@ def _topp_scratch(nrow: int, nch: int) -> _TopPScratch:
         Region((nrow, 4), f32),
         Region((nrow,), i32),
     )
+
+
+class _VerifyScratch(NamedTuple):
+    """One verify's work buffers, carved per step from the state's
+    ``verify_scratch`` (`sampling_scratch.carve`): per draft row the
+    statistics ``rs`` [N, 8], block residual masses ``rm`` [N, nch_q], q flag
+    ``hasq`` [N] and per-chunk target / q records ``tstat`` [N, nch, 2],
+    ``targ`` [N, nch], ``qstat`` [N, nch, 2]; per request the decisions
+    ``dec`` [3, bs] and per q chunk the residual draws ``res`` [bs * nch_q, 4];
+    and the top-p search's ``topp``."""
+
+    rs: torch.Tensor
+    rm: torch.Tensor
+    hasq: torch.Tensor
+    tstat: torch.Tensor
+    targ: torch.Tensor
+    qstat: torch.Tensor
+    dec: torch.Tensor
+    res: torch.Tensor
+    topp: _TopPScratch
+
+
+def _verify_scratch(
+    nrow: int, bs: int, nch_q: int, nch: int, topp: bool
+) -> _VerifyScratch:
+    """`_VerifyScratch`'s regions for ``nrow`` draft rows of ``bs`` requests,
+    ``nch_q`` q chunks and ``nch`` statistics chunks."""
+    f32, i32 = torch.float32, torch.int32
+    return _VerifyScratch(
+        Region((nrow, 8), f32),
+        Region((nrow, nch_q), f32),
+        Region((nrow,), i32),
+        Region((nrow, nch, 2), f32),
+        Region((nrow, nch), i32),
+        Region((nrow, nch, 2), f32),
+        Region((3, bs), f32),
+        Region((bs * nch_q, 4), f32),
+        _topp_scratch(nrow, nch if topp else 0),
+    )
+
+
+def _verify_chunks(q_cols: int, vocab: int) -> tuple[int, int]:
+    """Vocab chunks: of this rank's q columns for the residual passes, and of
+    the target row for the row statistics (which also span the q columns)."""
+    nch_q = max(1, triton.cdiv(q_cols, _CHUNK))
+    return nch_q, max(nch_q, triton.cdiv(vocab, _CHUNK))
+
+
+def prob_verify_scratch(
+    max_bs: int, width: int, q_cols: int, vocab: int, device
+) -> torch.Tensor:
+    """Scratch for any `prob_rejection_sample` of up to ``max_bs`` requests of
+    ``width`` drafts each, with up to ``q_cols`` q columns on this rank and
+    ``vocab``-wide target logits, top-p on or off; allocated once."""
+    nch_q, nch = _verify_chunks(q_cols, vocab)
+    spec = _verify_scratch(max_bs * width, max_bs, nch_q, nch, True)
+    return scratch_buffer(spec, device)
 
 
 def prob_rejection_sample(
@@ -1672,20 +1739,8 @@ def prob_rejection_sample(
     verdict = torch.empty((3, bs), dtype=torch.int32, device=device)
     if bs == 0:
         return output, verdict
-    f32 = {"dtype": torch.float32, "device": device}
     nrow = max(num_rows, 1)
-    # Vocab chunks: of the target row for the row statistics (which also span
-    # the q columns), of this rank's q columns for the residual passes.
-    nch_q = max(1, triton.cdiv(state.q_cols, _CHUNK))
-    nch_stats = max(nch_q, triton.cdiv(vocab, _CHUNK))
-    rs = torch.empty((nrow, 8), **f32)
-    rm = torch.empty((nrow, nch_q), **f32)
-    hasq = torch.empty(nrow, dtype=torch.int32, device=device)
-    tstat = torch.empty((nrow, nch_stats, 2), **f32)
-    targ = torch.empty((nrow, nch_stats), dtype=torch.int32, device=device)
-    qstat = torch.empty((nrow, nch_stats, 2), **f32)
-    dec = torch.empty((3, bs), **f32)
-    res = torch.empty((bs * nch_q, 4), **f32)
+    nch_q, nch_stats = _verify_chunks(state.q_cols, vocab)
     if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1:
         top_p_ptr, top_p_scalar, has_ptr = top_ps.to(torch.float32), 1.0, True
     else:
@@ -1695,8 +1750,13 @@ def prob_rejection_sample(
         top_p_scalar = 1.0 if top_ps is None else float(top_ps)
     temps = temperatures.to(torch.float32)
     topp = has_ptr or top_p_scalar < 1.0
-    ws_spec = _topp_scratch(nrow, nch_stats if topp else 0)
-    ws = carve(scratch_buffer(ws_spec, device), ws_spec)
+    assert (
+        state.verify_scratch is not None
+    ), "no verify scratch: ProbDraftState.allocate"
+    work = carve(
+        state.verify_scratch, _verify_scratch(nrow, bs, nch_q, nch_stats, topp)
+    )
+    rs, rm, hasq, tstat, targ, qstat, dec, res, ws = work
     gather = (
         (lambda t: tp_group.all_gather(t, dim=0, use_custom=use_custom))
         if qtp > 1

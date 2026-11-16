@@ -88,6 +88,7 @@ def _state(c, vocab_start=0, cols=V, tp=1):
         ids=c["drafts"].clone(),
         temps=c["temps"].clone(),
         seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+        verify_scratch=dps.prob_verify_scratch(R, N, cols, V, DEV),
     )
     state.set_layout(vocab_start, cols, tp)
     state.verify_step = 12345
@@ -154,6 +155,7 @@ def test_in_place_refuses_a_strided_source():
         ids=c["drafts"].clone(),
         temps=c["temps"].clone(),
         seed=torch.zeros(1, dtype=torch.int64, device=DEV),
+        verify_scratch=dps.prob_verify_scratch(R, N, V, V, DEV),
     )
     state.set_layout(0, V, 1)
     with pytest.raises(AssertionError):
@@ -171,6 +173,24 @@ def test_in_place_refuses_a_strided_source():
             state,
             in_place=True,
         )
+
+
+@pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES[:3])
+def test_scratch_sized_for_a_larger_batch_gives_the_same(
+    seed, top_p, use_block, greedy, no_q
+):
+    """The state's scratch is allocated once at the largest batch and carved
+    per step: a buffer sized for more requests and drafts verifies the same,
+    and a buffer too small for the batch is refused."""
+    c = _case(seed, greedy, no_q)
+    exact = _verify(c, top_p, use_block)
+    big = _state(c)
+    big.verify_scratch = dps.prob_verify_scratch(3 * R, N + 2, 2 * V, 2 * V, DEV)
+    _assert_same(exact, _verify(c, top_p, use_block, state=big))
+    small = _state(c)
+    small.verify_scratch = torch.empty(64, dtype=torch.uint8, device=DEV)
+    with pytest.raises(ValueError):
+        _verify(c, top_p, use_block, state=small)
 
 
 @pytest.mark.parametrize("seed,top_p,use_block,greedy,no_q", CASES)

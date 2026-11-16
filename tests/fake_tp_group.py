@@ -12,8 +12,9 @@ import torch
 
 
 class FakeGroup:
-    """All-gather across rank threads on one device; launches are serialized
-    by a global lock that all_gather releases while it waits."""
+    """All-gather across rank threads on one device; this group's rank
+    threads serialize their launches on its lock, which all_gather releases
+    while it waits."""
 
     def __init__(self, world):
         self.world_size = world

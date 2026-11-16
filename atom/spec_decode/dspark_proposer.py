@@ -118,6 +118,7 @@ class DSparkProposer(Drafter):
             int(self.draft_tokens_per_seq),
             cols,
             self.device,
+            target_vocab=int(self.model.vocab_size),
         )
         self.model._prob_draft = self._prob_state
         logger.info(
