@@ -34,6 +34,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation.pd_admission import PdAdmissionController
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -629,10 +630,10 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
-        structured_errors: dict[int, str] | None = None,
+        constraint_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
-        self.structured_errors = structured_errors or {}
+        self.constraint_errors = constraint_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
@@ -683,6 +684,10 @@ class Scheduler:
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
+    # A preempted sequence recomputes its prompt here, which a KV change relies
+    # on to keep what was running (see `preempt_running`).
+    can_recompute_prompts = True
+    pd_admission: PdAdmissionController | None = None
 
     def __init__(
         self,
@@ -889,6 +894,9 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        self.pd_admission = PdAdmissionController.from_config(
+            config, self.kv_connector, self.block_manager
+        )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
             bind_block_manager(self.block_manager)
@@ -1103,6 +1111,7 @@ class Scheduler:
             return prefillable, min(pending, budget)
         # A chunk counts the rows its forward computes, not the reused prefix.
         slots = self.max_num_seqs - len(self.running)
+        parked = self._num_parked_remote_kv
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
@@ -1116,7 +1125,7 @@ class Scheduler:
                 cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
-                if slots <= self._num_parked_remote_kv:
+                if slots <= parked:
                     # A connector query can pin remote KV, so leave it to
                     # admission. Do not count uncertain remote-slot fit as
                     # fill or mistake an individually fitting request for idle.
@@ -1151,6 +1160,10 @@ class Scheduler:
             prefillable = True
             pending += chunk
             slots -= 1
+            # The resume just consumed its virtual running slot; do not also
+            # reserve that same request in the fresh-admission parked count.
+            if offload_resume and getattr(seq, "_counted_as_inflight_load", False):
+                parked -= 1
             if pending >= budget:
                 return True, budget
             if slots == 0:
@@ -1776,6 +1789,8 @@ class Scheduler:
 
         self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
+        if self.pd_admission is not None:
+            self.pd_admission.release(seq)
         # After the free, not before: the connector may only forget the state
         # keyed on these blocks once nothing can read them again.
         self._connector_source_blocks_released(seq)
@@ -2061,6 +2076,10 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
+        if self.pd_admission is not None and result is not None:
+            batch, seqs = result
+            if not batch.is_dummy_run:
+                self.pd_admission.scheduled(seqs.values())
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -2086,11 +2105,11 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        self._promote_ready_remote_kv_requests()
+        self._prioritize_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
-            self._reject_aborted_waiting(self.waiting.popleft())
+            self._finish_rejected_waiting(self.waiting.popleft())
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
@@ -2257,7 +2276,7 @@ class Scheduler:
             # `can_allocate` refuses one outright with the pool empty.
             # `deallocate` is a no-op for a seq that really held nothing.
             if seq.status == SequenceStatus.ABORTED:
-                self._reject_aborted_waiting(seq)
+                self._finish_rejected_waiting(seq)
                 continue
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -2271,12 +2290,13 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
-                self._inflight_prefix_wait.pop(seq.id, None)
-                seq.status = SequenceStatus.FINISHED
-                seq.leave_reason = f"unschedulable: {unschedulable}"
-                seq.multimodal_data = None
-                tracing.finish(seq, reason=seq.leave_reason)
-                self._rejected.append(seq)
+                # Use the abort teardown for any blocks and pending transfers
+                # it holds. A P/D producer hands nothing off
+                # (`produced_no_handoff`), even for a preempted request whose
+                # prefill had completed.
+                self._finish_rejected_waiting(
+                    seq, reason=f"unschedulable: {unschedulable}"
+                )
                 continue
 
             if len(self.running) >= self.max_num_seqs:
@@ -2501,6 +2521,15 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
+            # Before `record_allocation`, which commits the probe's joint
+            # boundary: a request deferred here must leave nothing committed.
+            pd_plan = None
+            if self.pd_admission is not None and needs_remote_load:
+                admitted, pd_plan = self.pd_admission.check(seq, hbm_probe)
+                if not admitted:
+                    self.waiting.appendleft(seq)
+                    break
+
             if not self.block_manager.record_allocation(
                 seq, hbm_probe, defer_unverified=True
             ):
@@ -2558,6 +2587,8 @@ class Scheduler:
                 seq.prefix_cache_hit_tokens = recorded
 
             self._lookup_detach_declined.discard(seq.id)
+            if pd_plan is not None:
+                self.pd_admission.commit(seq, pd_plan)
             self._notify_connector_after_prefill_alloc(seq)
 
             # A replay that loads its KV first parks for that load whatever the
@@ -3017,15 +3048,24 @@ class Scheduler:
     def _resolve_waiting_remote_kv(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
     ) -> bool | None:
-        """Resolve a ``WAITING_FOR_REMOTE_KVS`` request before admission.
+        """Resolve a P/D consumer's ``WAITING_FOR_REMOTE_KVS`` request before
+        admission.
+
+        With an offload tier every receive is resolved once, at the top of the
+        tick (`_prioritize_ready_remote_kv_requests`): one still waiting here is in
+        flight and is requeued, never taken down the P/D first-decode path
+        (which would skip its suffix prefill).
 
         Returns:
           - ``None`` when the request is still blocked and has been requeued.
-          - ``True`` when a P/D consumer should jump to first decode.
+          - ``True`` when the request should jump to first decode.
           - ``False`` when normal prefill admission should continue.
         """
         if seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return False
+        if self._connector_flag("is_offload"):
+            skipped_waiting_requests.append(seq)
+            return None
 
         if self._consume_failed_remote_kv(seq):
             return False
@@ -3035,10 +3075,9 @@ class Scheduler:
             return None
 
         seq.status = SequenceStatus.WAITING
-        if self._connector_flag("is_offload"):
-            self._mark_offload_load_ready(seq)
-            return False
         self._uncount_inflight_load(seq)
+        # Its prompt was prefilled on the producer.
+        seq.prefill_completed = True
         return True
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
@@ -3087,6 +3126,11 @@ class Scheduler:
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
+        if self._connector_flag("is_offload") and not seq.block_table:
+            # A failed disown dropped the whole table: no resume runs for it
+            # (an offload request with blocks is counted until it does), so
+            # its parked count is released here.
+            self._uncount_inflight_load(seq)
         return True
 
     def _note_connector_scheduled_tokens(
@@ -3103,14 +3147,28 @@ class Scheduler:
         if callable(note):
             note(scheduled_seqs, num_scheduled_tokens)
 
-    def _reject_aborted_waiting(self, seq: Sequence) -> None:
+    @staticmethod
+    def _note_prefill_complete(seq: Sequence) -> None:
+        """A prefill this scheduler ran completed (the tracing span and the DP
+        router's `Sequence.prefill_completed`). A P/D consumer's prompt was
+        prefilled elsewhere and is marked where its receive resolves."""
+        seq.prefill_completed = True
+        tracing.prefill_complete(seq)
+
+    def _finish_rejected_waiting(self, seq: Sequence, reason: str = "aborted") -> None:
+        """Finish an aborted or unschedulable waiting request.
+
+        A preempted request may already have run before this rejection.
+        """
+        if self.pd_admission is not None:
+            self.pd_admission.cancel(seq)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
-        seq.leave_reason = "aborted"
+        seq.leave_reason = reason
         seq.multimodal_data = None
-        tracing.finish(seq, reason="aborted")
+        tracing.finish(seq, reason=reason)
         self._rejected.append(seq)
         if not has_inflight_load:
             # A lookup can pin CPU KV before HBM allocation succeeds.
@@ -3139,7 +3197,7 @@ class Scheduler:
             if seq.id == req_id:
                 self.waiting.remove(seq)
                 seq.status = SequenceStatus.ABORTED
-                self._reject_aborted_waiting(seq)
+                self._finish_rejected_waiting(seq)
                 return True
         for seq in self.running:
             if seq.id == req_id:
@@ -3176,7 +3234,7 @@ class Scheduler:
         logger.error("KV receive failed for request %s; aborting it", req_id)
         self.waiting.remove(seq)
         seq.status = SequenceStatus.ABORTED
-        self._reject_aborted_waiting(seq)
+        self._finish_rejected_waiting(seq)
         # This failure is the terminal report the abort waits for.
         self._finish_aborted_load_cleanup(seq.id)
 
@@ -3184,8 +3242,11 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        # The one path that never went through `postprocess`, so it finishes
-        # the request here rather than before the park.
+        if self.pd_admission is not None:
+            self.pd_admission.release(seq)
+        # This rejection does not go through forward postprocess, so finish
+        # the connector lifecycle here, including requests that ran before
+        # preemption and are now rejected during readmission.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
@@ -4027,6 +4088,39 @@ class Scheduler:
             self.running.insert(index, candidate)
         return False
 
+    def preempt_running(self) -> int:
+        """Preempt every running sequence ahead of a KV change; return how many.
+
+        Each recomputes its prompt and tokens once scheduled again. Raises,
+        preempting none, while one's blocks are still in use: remote KV loading
+        for a parked request, a KV connector holding the sequence, or its token
+        in flight through the pipeline. ``preempt()`` refuses nothing else, so
+        the loop does not stop part-way.
+        """
+        if self._num_parked_remote_kv:
+            raise RuntimeError(
+                f"cannot preempt while {self._num_parked_remote_kv} request(s) "
+                f"wait for remote KV"
+            )
+        held = [
+            seq.id
+            for seq in self.running
+            if not self._is_preemptable(seq) or seq.id in self._pp_inflight_token_block
+        ]
+        if held:
+            raise RuntimeError(
+                f"cannot preempt {len(held)} running sequence(s) whose KV a "
+                f"connector holds or whose token is in the pipeline: {held[:8]}"
+            )
+        preempted = 0
+        while self.running:
+            if not self._preempt_one_running():
+                raise RuntimeError(
+                    f"{len(self.running)} running sequence(s) could not be preempted"
+                )
+            preempted += 1
+        return preempted
+
     def preempt(self, seq: Sequence) -> bool:
         if not self._is_preemptable(seq):
             return False
@@ -4084,7 +4178,12 @@ class Scheduler:
         # surrendered blocks (the mutator half of `should_defer_free`'s escape).
         self._connector_release_stalled_save(seq)
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        pos = self._behind_settled_resumes()
+        self.waiting.insert(pos, seq)
+        if self.pd_admission is not None:
+            # A ready request preempted before its first batch has discarded
+            # its received KV; its subsequent replay is no longer a PD load.
+            self.pd_admission.release(seq)
         return True
 
     def _advance_prefill_on_schedule(
@@ -4269,7 +4368,7 @@ class Scheduler:
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
                 elif i >= batch.total_seqs_num_decode:
-                    tracing.prefill_complete(seq)
+                    self._note_prefill_complete(seq)
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -4305,7 +4404,7 @@ class Scheduler:
                     self._partial_prefill_count += 1 if now_partial else -1
                     seq.is_partial_prefill = now_partial
                 if not now_partial:
-                    tracing.prefill_complete(seq)
+                    self._note_prefill_complete(seq)
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -4327,7 +4426,7 @@ class Scheduler:
         num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
-            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            error = fwd_output.constraint_errors.get(seq.id)
             if error is not None:
                 logger.error(
                     "Structured decoding failed for request %s: %s", seq.id, error
@@ -4417,6 +4516,9 @@ class Scheduler:
                     if need_placeholder:
                         _num_new -= num_placeholder
                     self.block_manager.hash_blocks(seq, max(0, _num_new))
+                    # No batch, so no final-chunk fact: the first sampled
+                    # output is the only proof the prompt prefill completed.
+                    self._note_prefill_complete(seq)
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -4802,6 +4904,10 @@ class Scheduler:
                     self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
+            if self.pd_admission is not None:
+                # A request aborted after promotion but before its first batch
+                # never reaches `scheduled`, which would otherwise return this.
+                self.pd_admission.release(seq)
             self.running.remove(seq)
 
         self.engine_stats.update_throughput(
@@ -4946,8 +5052,8 @@ class Scheduler:
         if prefix_caching and not self._connector_flag("is_offload"):
             bm.register_received_prefix(seq)
 
-        # Emit BlockStored(REMOTE) for delta blocks so external consumers
-        # can track remote-resident KV.
+        # Emit BlockStored for the delta blocks so external consumers can track
+        # the KV that arrived from the producer.
         if kv_events:
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
@@ -4984,22 +5090,35 @@ class Scheduler:
                     # Block-table index -> global token position: under DCP
                     # each entry spans hash_block_size tokens, not block_size.
                     token_offset=first_remote_index * bm.hash_block_size,
+                    cache_seed=seq.cache_seed,
                 )
         return True
 
-    def _promote_ready_remote_kv_requests(self) -> None:
-        """Move completed remote-KV waiters ahead of fresh admissions.
-
-        Offload waiters already own allocated blocks. If a fresh request at the
-        head cannot allocate while a completed waiter sits behind it, the waiter
-        cannot finish and free blocks. Preserve FIFO order within the ready and
-        blocked slots.
-        """
-        if not self.waiting or not (
-            self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
-        ):
+    def _resolve_offload_load(self, seq: Sequence) -> None:
+        """Resolve an admitted tier load before the delayer sizes prefill work."""
+        if self._consume_failed_remote_kv(seq):
             return
+        if self._update_waiting_for_remote_kv(seq):
+            seq.status = SequenceStatus.WAITING
+            self._mark_offload_load_ready(seq)
 
+    def _prioritize_ready_remote_kv_requests(self) -> None:
+        """Prioritize completed remote requests before sizing prefill work.
+
+        Runs only when a load completed or failed. Offload completions are
+        resolved here, and every settled resume that keeps its blocks (not only
+        the ones that just completed) moves ahead of the other waiters in one
+        stable pass. Nothing is re-sorted on the ticks after: the ways a
+        blocker gets ahead of a resume are `preempt` and parking
+        (`_park_ready_offload_partial_prefills`), which both queue behind them.
+        A P/D-only receive is only reordered here; admission resolves it before
+        its first decode.
+        """
+        if not self.waiting:
+            return
+        if not (self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids):
+            return
+        resolve = self._connector_flag("is_offload")
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
         while self.waiting:
@@ -5008,15 +5127,42 @@ class Scheduler:
                 self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
                 or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
             ):
+                if not resolve:
+                    ready.append(seq)
+                    continue
+                self._resolve_offload_load(seq)
+            # With an offload tier only a resume that keeps its blocks goes
+            # ahead: a failed load that kept none is an ordinary waiter and
+            # must not sit in front of the resumes that hold the pool.
+            if seq.status == SequenceStatus.WAITING and (
+                self._is_offload_prefill_resume(seq)
+            ):
                 ready.append(seq)
             else:
                 blocked.append(seq)
+        self.waiting.extend(ready)
+        self.waiting.extend(blocked)
 
-        if ready:
-            self.waiting.extend(ready)
-            self.waiting.extend(blocked)
-        else:
-            self.waiting.extend(blocked)
+    def _behind_settled_resumes(self) -> int:
+        """Queue index behind the last settled offload resume of the leading run.
+
+        Settled resumes at the head hold blocks and are promoted once, when
+        their load ends. A preempted head that cannot allocate stops admission,
+        so in front of them it would starve the resume holding the blocks it
+        needs. In-flight loads inside that run are skipped by admission; they
+        stay in front only when a resume sits behind them, so a request put
+        back at the head never lands behind more in-flight loads than it must
+        (`_can_admit_head_prefill` reads only the first few queue entries).
+        """
+        pos = 0
+        if self._connector_flag("is_offload"):
+            for i, queued in enumerate(self.waiting):
+                if queued.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                    continue  # in flight, even if an earlier load left its flags
+                if not self._is_offload_prefill_resume(queued):
+                    break
+                pos = i + 1
+        return pos
 
     def _park_ready_offload_partial_prefills(self) -> None:
         if (
@@ -5043,7 +5189,11 @@ class Scheduler:
 
         self.running = keep_running
         if parked:
-            self.waiting.extendleft(reversed(parked))
+            # Not in front of a settled resume: event-free ticks never re-rank,
+            # so four parked loads there would hide it from admission probes.
+            pos = self._behind_settled_resumes()
+            for offset, seq in enumerate(parked):
+                self.waiting.insert(pos + offset, seq)
 
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """Reconcile scheduler state with completed KV transfers.
@@ -5070,6 +5220,8 @@ class Scheduler:
             logger.debug("Finished recving KV transfer for request %s", req_id)
             if self._finish_aborted_load_cleanup(req_id):
                 continue
+            if self.pd_admission is not None:
+                self.pd_admission.received(req_id)
             if metrics := getattr(self, "metrics", None):
                 metrics.finish_kv_wait(req_id, succeeded=True)
             self.finished_recving_kv_req_ids.append(req_id)
@@ -5292,6 +5444,8 @@ class PrefillScheduler:
     # in-flight prefill is not counted on both. See `_METRICS_ROLE` on
     # `Scheduler`.
     _METRICS_ROLE = "prefill"
+    # Its KV blocks are the decode engine's, assigned per request.
+    can_recompute_prompts = False
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
@@ -5508,6 +5662,9 @@ class DecodeScheduler(Scheduler):
 
     _ENGINE_LABEL = "Decode "
     _METRICS_ROLE = "decode"
+    # Its prompts are prefilled by the prefill engine: preempted, a request
+    # would wait for a PrefillDone that is not coming again.
+    can_recompute_prompts = False
 
     def abort_request(self, req_id: int) -> bool:
         # RapidServe does not drain the standard scheduler's rejection queue.

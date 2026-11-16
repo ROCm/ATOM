@@ -1,0 +1,118 @@
+name: Evaluate Test Gate
+description: Evaluate a required test gate from upstream job results.
+
+inputs:
+  gate-name:
+    description: Human-readable gate name for summaries and errors.
+    required: true
+  suite-name:
+    description: Human-readable test suite name.
+    required: true
+  should-run:
+    description: Whether the suite's required jobs should have run.
+    required: true
+  decidable:
+    description: Whether the upstream scope/CI gate could make a reliable decision.
+    required: true
+  reason:
+    description: Gate decision reason from the scope/CI gate job.
+    required: false
+    default: unknown
+  ci-gate-result:
+    description: Result of the upstream scope/CI gate job.
+    required: true
+  required-results:
+    description: Multiline job=result entries required when should-run is true.
+    required: false
+    default: ""
+  optional-results:
+    description: Multiline job=result entries that must be success or skipped.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Evaluate test gate
+      shell: bash
+      env:
+        GATE_NAME: ${{ inputs.gate-name }}
+        SUITE_NAME: ${{ inputs.suite-name }}
+        SHOULD_RUN: ${{ inputs.should-run }}
+        DECIDABLE: ${{ inputs.decidable }}
+        REASON: ${{ inputs.reason }}
+        CI_GATE_RESULT: ${{ inputs.ci-gate-result }}
+        REQUIRED_RESULTS: ${{ inputs.required-results }}
+        OPTIONAL_RESULTS: ${{ inputs.optional-results }}
+      run: |
+        set -euo pipefail
+
+        {
+          echo "## ${GATE_NAME}"
+          echo
+          echo "- CI gate: ${CI_GATE_RESULT}"
+          echo "- ${SUITE_NAME} required: ${SHOULD_RUN:-unknown}"
+          echo "- Scope decidable: ${DECIDABLE:-unknown}"
+          echo "- Reason: ${REASON:-unknown}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        failed=()
+
+        status_allowed() {
+          case " $1 " in
+            *" $2 "*) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        check_results() {
+          local label="$1"
+          local allowed_statuses="$2"
+          local results="$3"
+          local job status result
+
+          [ -n "${results}" ] || return 0
+
+          echo "- ${label}:" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r result; do
+            [ -n "${result}" ] || continue
+            job="${result%%=*}"
+            status="${result#*=}"
+            echo "  - ${job}: ${status}" >> "$GITHUB_STEP_SUMMARY"
+            if ! status_allowed "${allowed_statuses}" "${status}"; then
+              failed+=("${job}=${status}")
+            fi
+          done <<< "${results}"
+        }
+
+        check_results "Optional jobs" "success skipped" "${OPTIONAL_RESULTS}"
+
+        if [ "${CI_GATE_RESULT}" != "success" ]; then
+          echo "::error::${GATE_NAME} scope gate did not succeed: ${CI_GATE_RESULT}"
+          exit 1
+        fi
+
+        if [ "${DECIDABLE}" != "true" ]; then
+          echo "::error::${GATE_NAME} scope was undecidable: ${REASON:-unknown}"
+          exit 1
+        fi
+
+        if [ "${SHOULD_RUN}" != "true" ]; then
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf '%s failed because optional jobs did not pass:\n' "${GATE_NAME}" >&2
+            printf '  %s\n' "${failed[@]}" >&2
+            exit 1
+          fi
+          echo "${SUITE_NAME} are not required for this change." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        check_results "Required aggregate jobs" "success" "${REQUIRED_RESULTS}"
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+          printf '%s failed because required or optional jobs did not pass:\n' "${GATE_NAME}" >&2
+          printf '  %s\n' "${failed[@]}" >&2
+          exit 1
+        fi
+
+        echo "${GATE_NAME} passed." >> "$GITHUB_STEP_SUMMARY"

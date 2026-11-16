@@ -1,12 +1,29 @@
 # SPDX-License-Identifier: MIT
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
+import logging
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+
+try:
+    from aiter.ops.batched_gemm_op_a8w8 import (
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant,
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported,
+    )
+except ImportError:
+    # An aiter without the fused epilogue must still import. supported()
+    # cannot run in that case, so the unfused bf16 GEMM + quantize_fp8 path
+    # stays selected.
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant = None
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.a8w4_attention import (
+    supports_a8w4_attention,
+)
 from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
     sparse_attn_v41_paged_2src,
 )
@@ -32,11 +49,13 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.utils import forward_context
+from atom.utils import envs, forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
 from .layers import native_quant_config
+
+logger = logging.getLogger("atom")
 
 
 def _live_step():
@@ -50,6 +69,19 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
+    """Log the path once per process.
+
+    A module with no weight is not the decision `supported()` makes. That case
+    is logged once and does not hide a later module that does have weights.
+    """
+    state = getattr(_log_woa_quant_path, "state", None)
+    if state == "final" or (not final and state == "empty"):
+        return
+    _log_woa_quant_path.state = "final" if final else "empty"
+    logger.info("dsv41 wo_a quant: %s (%s)", "fused" if fused else "unfused", why)
 
 
 class Indexer(nn.Module):
@@ -287,6 +319,9 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
             reduce_results=True,
         )
+        # Set in `process_weights_after_loading`, once wo_a's shape is known.
+        # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
+        self._fuse_woa_quant = False
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -335,6 +370,40 @@ class Attention(nn.Module):
             dim=-1,
         )
 
+    def process_weights_after_loading(self):
+        """Turn on the fused wo_a quant epilogue when this shape supports it.
+
+        Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`.
+        `batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported` decides
+        whether this shape can take the fused entry. An aiter build that does
+        not ship those symbols leaves them unset. Either case stays on the
+        unfused path. The loader calls this hook; the parent block does not.
+        """
+        if batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported is None:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "aiter has no fused epilogue")
+            return
+        weight = getattr(self.wo_a, "weight", None)
+        scale = getattr(self.wo_a, "weight_scale", None)
+        if weight is None or scale is None or weight.numel() == 0 or scale.numel() == 0:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "weight or scale empty", final=False)
+            return
+        wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
+        k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
+        # The gate checks wo_a only. The fused pair is the per-1x32 FP8 that
+        # wo_b reads because wo_b is fixed to native_quant_config(); a
+        # configurable wo_b quant would make this output the wrong layout.
+        self._fuse_woa_quant = (
+            batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
+                tuple(wo_a_ws.shape), self.o_rank, k
+            )
+        )
+        _log_woa_quant_path(
+            self._fuse_woa_quant,
+            "mxfp8 epilogue" if self._fuse_woa_quant else "shape unsupported",
+        )
+
     def _project_out(self, output, rope, positions):
         """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
         `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
@@ -349,14 +418,30 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        if self._fuse_woa_quant:
+            # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
+            # standalone quantize_fp8 between wo_a and wo_b is removed.
+            y8, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
+                x_fp8, wo_a_w, x_scale, wo_a_ws
+            )
+            return self.wo_b(
+                y8.view(*output.shape[:-2], -1),
+                x_scale=y_scale.view(*output.shape[:-2], -1),
+            )
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
-            self.wo_a.weight.view(self.groups, self.o_rank, -1),
+            wo_a_w,
             x_scale,
-            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
+            wo_a_ws,
             dtype=output.dtype,
         )
         return self.wo_b(y.view(*output.shape[:-2], -1))
+
+    def _use_a8w4_attention(self, query, cache):
+        """The choice precedes RoPE: Q8 production does not rotate BF16 Q."""
+        return cache.packed and supports_a8w4_attention(query, self.softmax_scale)
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.
@@ -421,58 +506,94 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        # One launch for both rotations, the KV row's FP8 bytes and, where a
-        # decode allows it, the window write. `window_kv` is what is left for
-        # `write_window` below, which is nothing when that fold happened. The
-        # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
-        query_fp8 = cache.query_fp8(query)
-        if queries is None:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
-            )
-        else:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, None, kv_normed, rope, step
-            )
-            cache.rotate_query(query, rope, queries.positions, query_fp8)
+        prepared = self._prepare_attention(query, kv_normed, cache, step, rope, queries)
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
         # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
         # 1 forks the compressor alone).
         join_stream(self.index_stream, self.compress_stream)
-        output = self._attend(query, query_fp8, kv, window_kv, cache, step, queries)
+        output = self._attend(query, cache, step, queries, prepared)
         return self._project_out(
             output.view_as(query),
             rope,
             cache.rope_positions(step) if queries is None else queries.positions,
         )
 
+    def _prepare_attention(self, query, kv_normed, cache, step, rope, queries):
+        """Capture fixed-shape preparation; stage variable sources live.
+
+        A token bucket fixes ordinary BF16/fallback Q and current-KV buffers.
+        Quantized prefill also stages per-request SWA history, and bounded
+        replay may change the query rows, so those paths need live preparation.
+        """
+        if queries is not None or (
+            not step.decode
+            and (cache.kv_fp8 or (cache.packed and envs.ATOM_DSV41_A8W4_ATTN != "off"))
+        ):
+            # FP4 auto eligibility can change with live query dimensions.
+            # Query inside the live region, never in the captured caller too.
+            self._prepare_attention_live(query, kv_normed, cache, step, rope, queries)
+            return None
+        a8w4 = self._use_a8w4_attention(query, cache)
+        return self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+        )
+
     @eager_region(live=_live_rows)
-    def _attend(self, query, query_fp8, kv, window_kv, cache, step, queries):
-        """Indices, sparse attention and the window write: the TR-graph break
-        whose launches follow each request's query length and context. The
-        result is written over ``query`` in place wherever the kernel takes
-        ``out=``. The FP8 pool attends with ``query_fp8``, its MXFP8 copy."""
+    def _prepare_attention_live(self, query, kv_normed, cache, step, rope, queries):
+        """Keep request-dependent source addresses on the live step."""
+        if not step.requests:
+            return
+        a8w4 = self._use_a8w4_attention(query, cache)
+        step.attention_inputs = self._attention_inputs(
+            query, kv_normed, cache, step, rope, queries, a8w4=a8w4
+        )
+
+    def _attention_inputs(self, query, kv_normed, cache, step, rope, queries, *, a8w4):
+        query_fp8 = cache.query_fp8(query, a8w4=a8w4)
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8, a8w4=a8w4
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step, a8w4=a8w4
+            )
+            cache.rotate_query(query, rope, queries.positions, query_fp8)
+        return a8w4, query_fp8, kv, window_kv
+
+    @eager_region(live=_live_rows)
+    def _attend(self, query, cache, step, queries, prepared=None):
         if not step.requests:  # a dummy prefill on a token graph
             return query
+        if prepared is None:
+            prepared = step.attention_inputs
+        a8w4, query_fp8, kv, window_kv = prepared
+        step.attention_inputs = None
         prefix, prefix_indptr, second, second_indptr = (
-            cache.attention_indices(self.spec, step)
+            cache.attention_indices(self.spec, step, a8w4=a8w4)
             if queries is None
-            else queries.indices(cache, self.spec)
+            else queries.indices(cache, self.spec, a8w4=a8w4)
         )
         flat_query = query.flatten(0, 1)
-        if cache.kv_fp8:
+        pool = cache.main_view(self.spec.kv_owner)
+        if cache.packed and not a8w4:
+            pool = (pool, cache.ring_view(self.spec.layer_id))
+        kwargs = {"out": flat_query}
+        if a8w4 or cache.kv_fp8:
             attend = sparse_attn_v41_paged_2src
             attending = tuple(part.flatten(0, 1) for part in query_fp8)
+            if a8w4:
+                kwargs["pool_scale_dtype"] = torch.float8_e4m3fn
         else:
             attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             attending = flat_query
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
-            if cache.packed:
+            if cache.packed and not a8w4:
                 output = packed_decode(
                     flat_query,
-                    cache.pool,
+                    pool,
                     prefix,
                     prefix_indptr,
                     self.attn_sink,
@@ -483,7 +604,7 @@ class Attention(nn.Module):
                 # ring: the second source, beside the selection in the pool.
                 output = attend(
                     attending,
-                    cache.pool,
+                    pool,
                     prefix,
                     prefix_indptr,
                     cache.ring_view(self.spec.layer_id),
@@ -491,20 +612,20 @@ class Attention(nn.Module):
                     second_indptr,
                     self.attn_sink,
                     self.softmax_scale,
-                    out=flat_query,
+                    **kwargs,
                 )
         else:
             output = attend(
                 attending,
-                cache.pool,
+                pool,
                 prefix,
                 prefix_indptr,
-                kv.flatten(0, -2),
+                kv if cache.kv_fp8 or a8w4 else kv.flatten(0, -2),
                 second,
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query,
+                **kwargs,
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)

@@ -14,13 +14,13 @@ in place). Every hand-off inside the layer is a channel:
   this program.
 - **qsa**: ``h_in`` -> ``HCIn("attn_hc")`` -> ``xa`` -> ``qkv`` (q_proj per head [q, gate] | k | v, FP8 rows) ->
   ``proj``; ``xab`` -> ``idx_qk`` (the index projection, bf16 as ATOM keeps it) -> ``iqk``; ``QKNormRope`` (+ K / V
-  append) -> ``qn`` / ``kv``; ``Indexer`` (raw index key and block key appends) -> ``sel`` (I32); ``SparseAttnCore``
-  -> ``attn`` (MXFP8) -> ``o_proj`` Linear + ``HCWrite`` -> ``h1`` -> the MLP half as in delta.
+  append) -> ``qn`` / ``kv``; ``Indexer`` (raw index key, its RoPE position and block key appends) -> ``sel`` (I32);
+  ``SparseAttnCore`` -> ``attn`` (MXFP8) -> ``o_proj`` Linear + ``HCWrite`` -> ``h1`` -> the MLP half as in delta.
 - **mtp** (the MTP drafter's layer, ``mtp_bf16_blocks``): the qsa dataflow on BF16 weights and caches, bound to the
   drafter, with RoPE tables one row on (``rope_tables``).
 
 State args: GDN ``gdn.<conv_pool | ssm_pool | conv_slot | conv_off | ssm_read | ssm_write>``
-(``blocks.gdn``); QSA ``k_cache`` / ``v_cache`` (+ ``k_scale`` / ``v_scale``) /
+(``blocks.gdn``); QSA ``k_cache`` / ``v_cache`` (+ ``k_scale`` / ``v_scale``) / ``rope_positions`` /
 ``index_raw`` / ``index_cmp`` (paged on ``block_table``), ``seq_lens``. The routed experts are Mono's A8W4 tensors
 ``moe.w13`` / ``moe.w13_scale`` / ``moe.w2`` / ``moe.w2_scale`` (slot E = the shared expert), bound in place.
 
@@ -232,7 +232,8 @@ def mtp_bf16_blocks(geo: Geometry = G, knobs: dict | None = None, table_width: i
         _hc_in("attn", "h_in", ch, geo, knobs),
         Linear("qkv_idx", QSA_LINEARS, ch.xab, pw, BF16Out(ch.qsa_proj), **{**bf, **knobs.get("qkv_idx", {})}),
         QKNormRope(geo.attn, proj=ch.qsa_proj.name, proj_width=pw, kv_block=kvb, **tw),
-        Indexer(geo.indexer, iqk=ch.qsa_proj.name, iqk_width=pw, col=icol, rope="idx_rope", kv_block=kvb, **tw),
+        Indexer(geo.indexer, iqk=ch.qsa_proj.name, iqk_width=pw, col=icol, rope="idx_rope", kv_block=kvb,
+                rope_shift=ROPE_OFFSET["mtp"], **tw),
         SparseAttnCore(geo.attn, geo.indexer, proj=ch.qsa_proj.name, out=attn, proj_width=pw, kv_block=kvb, **tw),
         Linear("o_proj", ("self_attn.o_proj",), attn, geo.hidden,
                HCWrite(geo.hc_count, ch.inj_a, arg="h_in", publish=ch.h1), **{**bf, **knobs.get("o_proj", {})}),
@@ -245,7 +246,7 @@ def rope_tables(blocks, packed: dict, kind: str) -> dict:
     """``packed`` (the blocks' bound weights) with the QSA blocks' RoPE tables for ``kind``: as
     packed for qsa; for the MTP drafter (``config.ROPE_OFFSET``) row ``i`` holds position ``i +
     offset`` (the same builders, ``offset`` more rows, the first ``offset`` dropped: the same
-    shape, so the qsa binary and its bind checks apply unchanged)."""
+    shape, so the qsa bind checks apply unchanged)."""
     from atom.models.qwen38.mono.kernels.blocks import indexer, qknorm
 
     off = ROPE_OFFSET.get(kind, 0)

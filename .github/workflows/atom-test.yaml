@@ -6,20 +6,9 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'atom/plugin/**'
-      - 'atom/mesh/**'
-      - '.github/benchmark/models_atomesh.yaml'
-      - '.github/scripts/atomesh/**'
-      - '.github/workflows/atomesh-*.yaml'
-      - '.github/workflows/atom-vllm-*.yaml'
-      - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/oot_models_accuracy.json'
-      - '.github/benchmark/sglang_models_accuracy.json'
-      - 'LICENSE'
-      - '.gitignore'
+    # Do not use paths-ignore here. The required gate must be published for
+    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
+    # jobs.
   pull_request_review:
     types: [submitted]
   schedule:
@@ -64,6 +53,8 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
+      smoke_requested: ${{ steps.gate.outputs.smoke_requested }}
       pr_check_takeover: ${{ steps.gate.outputs.pr_check_takeover }}
     steps:
       - name: Checkout ATOM repo
@@ -78,9 +69,13 @@ jobs:
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
+            .claude/**
             atom/plugin/**
             atom/mesh/**
+            .github/benchmark/models_atomesh.yaml
+            .github/scripts/atomesh/**
             .github/workflows/atomesh-*.yaml
+            .github/workflows/atom-review-bot*.yml
             .github/scripts/atomesh_*.sh
             .github/dashboard/atomesh_*.html
             .github/workflows/atom-vllm-*.yaml
@@ -188,8 +183,8 @@ jobs:
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
     # Do not publish a same-named skipped check over a previous smoke failure.
-    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'Offline inference smoke test' || 'Offline smoke not requested' }}
-    runs-on: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
+    name: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'Offline inference smoke test' || 'Offline smoke not requested' }}
+    runs-on: ${{ needs.ci-gate.outputs.smoke_requested == 'true' && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       CONTAINER_NAME: atom_smoke_test
@@ -199,7 +194,7 @@ jobs:
       # the offline entrypoint completes, so it keeps the small model and its
       # settings regardless of what the accuracy matrix tracks.
       SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
-      SMOKE_REQUESTED: ${{ github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true' }}
+      SMOKE_REQUESTED: ${{ needs.ci-gate.outputs.smoke_requested }}
     steps:
       - name: Kill stale containers
         if: env.SMOKE_REQUESTED == 'true'
@@ -782,6 +777,40 @@ jobs:
           docker rm "$CONTAINER_NAME" || true
           # Remove the pre-built image to free disk space on the runner
           docker rmi "rocm/atom-dev:pre-build-${{ env.GITHUB_COMMIT_SHA }}" || true
+
+  atom-test-gate:
+    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'ATOM Test Gate' || 'ATOM Test Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - check-signal
+      - download_aiter_wheel
+      - load-test-models
+      - offline-smoke-test
+      - atom-test
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOM test gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOM Test Gate
+          suite-name: ATOM accuracy tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          optional-results: |
+            offline-smoke-test=${{ needs.offline-smoke-test.result }}
+          required-results: |
+            check-signal=${{ needs.check-signal.result }}
+            download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
+            load-test-models=${{ needs.load-test-models.result }}
+            atom-test=${{ needs.atom-test.result }}
 
   # ---------- Push accuracy data to benchmark dashboard ----------
   accuracy-dashboard:

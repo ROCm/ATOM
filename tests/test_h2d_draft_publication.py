@@ -37,6 +37,7 @@ def make_runner(
         pipeline_parallel_size=pp_size, hf_config=SimpleNamespace()
     )
     runner.enforce_eager = True
+    runner.num_spec_tokens = num_spec
     runner.tokenID_processor = SimpleNamespace(num_bonus=None)
     runner.drafter = SimpleNamespace(mtp_k=num_spec, runner=runner)
     runner.num_spec_tokens = num_spec

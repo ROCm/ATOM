@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from math import lcm
 from numbers import Integral
 
+from atom.model_engine.prefix_hash import chained_block_hashes
 from atom.utils import envs
 
 
@@ -305,23 +306,17 @@ def _committed_sidecar_capacity(kvc) -> int:
 def _chained_prefix_hashes(
     token_ids: array.array,
     hash_block_size: int,
+    seed: int,
 ) -> dict[int, int]:
-    """Return each full-block prefix hash using BlockManager's exact chain."""
+    """Return each full-block prefix hash using BlockManager's exact chain,
+    which starts from the request's ``cache_seed``."""
 
     if hash_block_size <= 0:
         raise ValueError("hash_block_size must be positive")
-
-    from atom.model_engine.block_manager import BlockManager
-
-    hashes: dict[int, int] = {}
-    parent = -1
-    for boundary in range(hash_block_size, len(token_ids) + 1, hash_block_size):
-        parent = BlockManager.compute_hash(
-            token_ids[boundary - hash_block_size : boundary],
-            parent,
-        )
-        hashes[boundary] = parent
-    return hashes
+    chain = chained_block_hashes(
+        token_ids, hash_block_size, 0, len(token_ids) // hash_block_size, seed
+    )
+    return {(i + 1) * hash_block_size: h for i, h in enumerate(chain)}
 
 
 def _compute_slot_fingerprint(

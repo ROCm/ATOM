@@ -9,16 +9,21 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::json;
 
 use crate::{
-    config::RoutingMode, core::WorkerType,
-    observability::metrics::engine_metrics::collect_engine_metrics, server::AppState,
+    config::RoutingMode,
+    core::WorkerType,
+    observability::metrics::{
+        engine_metrics::collect_engine_metrics, mesh_metrics::prometheus_handle,
+    },
+    server::AppState,
 };
 
 pub struct MetricsRouteFactory;
@@ -31,6 +36,7 @@ impl MetricsRouteFactory {
             .route("/health", get(health))
             .route("/health_generate", get(health_generate))
             .route("/engine_metrics", get(engine_metrics))
+            .route("/metrics", get(mesh_self_metrics))
     }
 }
 
@@ -111,6 +117,21 @@ async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
     collect_engine_metrics(&state.context.worker_registry, &state.context.client)
         .await
         .into_response()
+}
+
+async fn mesh_self_metrics() -> Response {
+    render_mesh_metrics(prometheus_handle())
+}
+
+fn render_mesh_metrics(handle: Option<&PrometheusHandle>) -> Response {
+    match handle {
+        Some(handle) => ([(header::CONTENT_TYPE, "text/plain")], handle.render()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Prometheus exporter is not running",
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +224,27 @@ mod tests {
             );
         }
         pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn router_port_metrics_render_the_prometheus_registry() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("mesh_route_branch_total", "pool" => "prefill").increment(2);
+        });
+        let response = render_mesh_metrics(Some(&recorder.handle()));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains(r#"mesh_route_branch_total{pool="prefill"} 2"#),
+            "{body}"
+        );
+        assert_eq!(
+            render_mesh_metrics(None).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

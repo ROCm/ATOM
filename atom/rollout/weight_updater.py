@@ -45,6 +45,18 @@ def _discard_sync_state_on_error(method):
     return guarded
 
 
+def _one_update(method):
+    """Each call is one update, with its own wait for the readers of the
+    weights modules write themselves (`_synced_by_module`)."""
+
+    @wraps(method)
+    def update(self, *args, **kwargs):
+        self._module_readers_awaited = False
+        return method(self, *args, **kwargs)
+
+    return update
+
+
 def _unwrap_once(module) -> torch.nn.Module | None:
     """The model inside one wrapper `ModelRunner` may have rebound onto itself,
     or None when *module* is not one. See `_sync_target_model`.
@@ -242,6 +254,8 @@ class WeightUpdaterMixin:
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
+        if self._synced_by_module(module, param_name, tensor, shard_id):
+            return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
             return "skipped"
@@ -287,6 +301,30 @@ class WeightUpdaterMixin:
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
         return "updated"
+
+    def _synced_by_module(
+        self,
+        module: torch.nn.Module,
+        param_name: str,
+        tensor: torch.Tensor,
+        shard_id=None,
+    ) -> bool:
+        """Whether the module wrote this weight itself (``sync_weight``), for
+        a parameter that is only a placeholder for where the values live; it
+        is asked before the FP8 branches, which would leave such a weight
+        unchanged and count it as updated.
+
+        The module may write from the host, which no stream orders after the
+        last step's reads, so the device is waited for once per update.
+        """
+        sync = getattr(module, "sync_weight", None)
+        if not callable(sync):
+            return False
+        if not self._module_readers_awaited:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self._module_readers_awaited = True
+        return sync(param_name, tensor, shard_id)
 
     def _apply_unmatched_weight(
         self,
@@ -970,6 +1008,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
@@ -1017,6 +1056,8 @@ class WeightUpdaterMixin:
 
             if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)
@@ -1070,6 +1111,7 @@ class WeightUpdaterMixin:
         self._warn_if_nothing_matched(updated, skipped)
         return updated
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
@@ -1146,6 +1188,8 @@ class WeightUpdaterMixin:
                         name, param_name, module, param, tensor
                     )
                     updated += 1
+                elif self._synced_by_module(module, param_name, tensor):
+                    updated += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                     self._requantize_fp8_weight(module, param_name, param, tensor)
                     updated += 1
@@ -1202,6 +1246,7 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,
@@ -1308,6 +1353,8 @@ class WeightUpdaterMixin:
 
             if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)

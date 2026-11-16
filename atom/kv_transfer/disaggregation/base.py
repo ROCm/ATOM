@@ -97,6 +97,14 @@ class KVConnectorSchedulerBase(ABC):
 
     is_producer: bool
 
+    supports_pd_admission = False
+
+    def pd_receive_block_offset(
+        self, seq: Any, num_blocks: int, num_cached_blocks: int
+    ) -> int | None:
+        """First destination block for this PD load; None for other loads."""
+        return None
+
     @abstractmethod
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """Check if *seq* needs remote KV prefill.
@@ -123,6 +131,17 @@ class KVConnectorSchedulerBase(ABC):
     def admission_ready(self, seq: Any) -> bool:
         """Whether the scheduler may allocate this request and start prefill."""
         return True
+
+    def drop_cached_kv(self) -> bool:
+        """Forget KV computed with weights that are about to change.
+
+        True if nothing this connector holds can be found afterwards. A
+        connector that only moves a request's KV between engines keeps none
+        past the request. An offload tier keeps KV for later requests; until it
+        can drop its store it answers False, and the engine refuses the weight
+        change rather than serve old-weight KV from it.
+        """
+        return not getattr(self, "is_offload", False)
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""

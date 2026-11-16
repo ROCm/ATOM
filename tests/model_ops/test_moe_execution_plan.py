@@ -38,7 +38,7 @@ def test_forward_uses_plan_for_dp_collectives(
     x = torch.arange(12).reshape(3, 4).float()
     w = torch.ones(3, 1)
     ids = torch.zeros(3, 1, dtype=torch.int32)
-    run = Mock(side_effect=lambda hidden, *_: hidden * 2)
+    run = Mock(side_effect=lambda hidden, *_, **kwargs: hidden * 2)
     layer = SimpleNamespace(
         moe_parallel_config=SimpleNamespace(execution_plan=plan, dp_logical_ratio=1),
         quant_method=SimpleNamespace(
@@ -61,7 +61,7 @@ def test_forward_uses_plan_for_dp_collectives(
     monkeypatch.setattr(
         moe, "get_tp_group", lambda: SimpleNamespace(all_reduce=tp_reduce)
     )
-    monkeypatch.setattr(moe, "tbo_active", lambda: False)
+    monkeypatch.setattr(moe, "tbo_on_comm", lambda fn, *args: fn(*args))
     gather_rows = Mock(
         side_effect=lambda rows, *_: (tuple(t.repeat(2, 1) for t in rows), 3, [3, 3])
     )

@@ -25,7 +25,6 @@ from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
-    _flydsl_explicit_plan_api,
     _flydsl_plan_max_batch,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -55,6 +54,7 @@ from atom.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    pp_holds_embedding,
 )
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
@@ -98,11 +98,6 @@ def _validate_sparse_flydsl_config(
         raise ValueError(
             "MiniMax-M3 sparse paged attention requires a GPU supported by "
             "aiter's FlyDSL paged decode because there is no gluon fallback"
-        )
-    if not _flydsl_explicit_plan_api():
-        raise ValueError(
-            "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
-            "explicit-plan API (#5809) because there is no gluon fallback"
         )
     local_kv_heads = local_num_kv_heads(int(config.num_key_value_heads))
     max_tokens = int(atom_config.max_num_batched_tokens)
@@ -768,7 +763,7 @@ class MiniMaxM3Model(nn.Module):
         index_cache_config = atom_config.index_cache_dtype
         quant_config = atom_config.quant_config
 
-        if get_pp_group().is_first_rank:
+        if pp_holds_embedding(atom_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

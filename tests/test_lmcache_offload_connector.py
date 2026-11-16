@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 import types
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -51,7 +51,11 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    SaveLifecycle,
+    wait_save_fence,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -86,12 +90,19 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
     StateByteCodec,
     TouchResult,
 )
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
-from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+    StateOffloadTier,
+    _JointPark,
+)
+from atom.kv_transfer.offload.hybrid.qwen.connector import (
+    QwenOffloadConnector,
+    QwenOffloadScheduler,
+)
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    SaveSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
@@ -226,6 +237,7 @@ def _stateful_seq(
         num_cached_tokens=num_cached_tokens,
         block_table=list(range((num_prompt_tokens + 255) // 256)),
         has_per_req_cache=True,
+        cache_seed=-1,
         state_slot=group,
         prefix_hashes_published=True,
         _state_initialized_after_alloc=True,
@@ -238,10 +250,9 @@ def _commit_sidecar(
     seq: SimpleNamespace,
     boundary: int,
 ) -> int:
-    boundary_hash = _chained_prefix_hashes(
-        seq.token_ids,
-        sched.hash_block_size,
-    )[boundary]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, sched.hash_block_size, -1)[
+        boundary
+    ]
     sched._committed_sidecar_hashes.add(boundary_hash)
     return boundary_hash
 
@@ -2439,7 +2450,11 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
 
     core = EngineCore.__new__(EngineCore)
     core.kv_transfer_enabled = True
-    core.scheduler = SimpleNamespace(kv_connector=_Connector())
+    core.scheduler = SimpleNamespace(
+        kv_connector=_Connector(),
+        _publish_state_loads=lambda: None,
+        _publish_state_stores=lambda: None,
+    )
     core.runner_mgr = SimpleNamespace(
         call_func=lambda name, value: dispatched.append((name, value))
     )
@@ -2458,7 +2473,7 @@ def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():
     block_manager = BlockManager(config)
     tokens = list(range(32))
 
-    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size)
+    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size, -1)
     expected = {}
     parent = -1
     for boundary in range(
@@ -2876,9 +2891,9 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     calls = []
     original = _chained_prefix_hashes
 
-    def counted(token_ids, hash_block_size):
+    def counted(token_ids, hash_block_size, **kwargs):
         calls.append(len(token_ids) // hash_block_size)
-        return original(token_ids, hash_block_size)
+        return original(token_ids, hash_block_size, **kwargs)
 
     monkeypatch.setattr(
         "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
@@ -2929,7 +2944,7 @@ def test_sidecar_save_emits_at_regular_checkpoint_boundary():
         group=2,
     )
     sched._save_tracker["706"] = [seq, 0]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     meta = sched.build_connector_meta()
 
@@ -2996,7 +3011,7 @@ def test_off_interval_terminal_saves_page_without_slot():
         group=2,
     )
     sched._save_tracker["707"] = [seq, 16_384]
-    regular_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    regular_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
     sched._committed_sidecar_hashes.add(regular_hash)
     meta = sched.build_connector_meta()
 
@@ -3032,7 +3047,7 @@ def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
         group=2,
     )
     sched._save_tracker["708"] = [seq, 8192]
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[8192]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[8192]
 
     meta = sched.build_connector_meta()
 
@@ -3775,7 +3790,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert host._rejected == [seq]
     assert host.deferred_free_blocks[seq.id] is seq
@@ -3843,7 +3858,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
     host._num_parked_remote_kv = 1
     host._rejected = []
 
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         ("request_finished", seq.id),
@@ -3920,13 +3935,13 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     host._rejected = []
 
     host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
-    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    host._resolve_offload_load(seq)
     assert getattr(seq, consumed_flag) is True
     assert host.finished_recving_kv_req_ids == []
     assert host.failed_recving_kv_req_ids == []
 
     seq.status = SequenceStatus.ABORTED
-    host._reject_aborted_waiting(seq)
+    host._finish_rejected_waiting(seq)
 
     assert events == [
         (terminal_callback, seq.id),
@@ -3945,6 +3960,7 @@ def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
     seq = SimpleNamespace(
         id=730,
         status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        block_table=[1],
         num_cached_tokens=4,
         offload_joint=OffloadJointRecord(),
     )
@@ -4278,7 +4294,7 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
         num_cached_tokens=12_288,
         group=2,
     )
-    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256, -1)[16_384]
 
     sched._committed_sidecar_hashes.add(boundary_hash)
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
@@ -4832,6 +4848,7 @@ def test_worker_save_uses_lmcache_engine_store():
 
     req = SimpleNamespace(
         req_id=987,
+        cache_salt="",
         token_ids=list(range(12)),
         block_ids=[3, 4, 5],
         is_last_prefill=True,
@@ -4879,6 +4896,7 @@ def test_worker_save_waits_for_forward_event_before_store():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt="",
         token_ids=list(range(8)),
         block_ids=[3, 4],
         is_last_prefill=True,
@@ -4892,7 +4910,10 @@ def test_worker_save_waits_for_forward_event_before_store():
     assert conn._done_save == {988}
 
 
-def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
+@pytest.mark.parametrize(
+    "cache_salt, configs", [("", None), ("11", {"lmcache.tag.cache_salt": "11"})]
+)
+def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done(cache_salt, configs):
     import torch
 
     if not hasattr(torch, "tensor"):
@@ -4922,6 +4943,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
 
     req = SimpleNamespace(
         req_id=988,
+        cache_salt=cache_salt,
         token_ids=list(range(16)),
         block_ids=[3, 4, 5, 6],
         load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=12),
@@ -4937,6 +4959,7 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     assert mask == [False, False, False, False] + [True] * 8
     assert kwargs["block_ids"] == [3, 4, 5, 6]
     assert kwargs["req_id"] == "988"
+    assert kwargs.get("request_configs") == configs
 
 
 def test_worker_load_partial_retrieve_marks_failed():
@@ -5728,6 +5751,27 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
+def _server_config(server_id, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.parallel_config.server_instance_id = server_id
+    return cfg
+
+
+def test_engine_id_splits_servers_on_one_host_and_their_replicas():
+    # One TP1 server per GPU: every one is DP rank 0 under one host directory.
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config("a", 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-a-dp3"}
+    servers = [_server_config(str(gpu)) for gpu in range(8)]
+    replicas = [_server_config("0", rank) for rank in range(1, 8)]
+    ids = {offcfg.lmcache_engine_id(cfg) for cfg in servers + replicas}
+    assert len(ids) == 15
+
+
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     # Worker ids index the replica-local PP x TP grid. Folding DP in would push
     # every replica but the first past lookup_server_worker_ids=[0], leaving
@@ -5794,7 +5838,11 @@ def _idle_engine(meta: LMCacheOffloadMetadata):
     )
     return SimpleNamespace(
         kv_transfer_enabled=True,
-        scheduler=SimpleNamespace(kv_connector=connector),
+        scheduler=SimpleNamespace(
+            kv_connector=connector,
+            _publish_state_loads=lambda: None,
+            _publish_state_stores=lambda: None,
+        ),
         runner_mgr=_RecordingRunnerMgr(),
         pp_transport=_RecordingPPTransport(),
     )
@@ -5844,6 +5892,22 @@ def test_dispatch_skips_metadata_with_no_work_at_all():
     assert engine.pp_transport.sent == []
 
 
+def test_pp_head_shutdown_drain_publishes_no_state_work():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    published = []
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    engine.scheduler._publish_state_loads = lambda: published.append("loads")
+    engine.scheduler._publish_state_stores = lambda: published.append("stores")
+    engine._dispatch_connector_only_batch = lambda batch: None
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine, dispatch_new=False)
+    assert published == []
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine)
+    assert published == ["loads", "stores"]
+
+
 def test_multi_metadata_exposes_sub_meta_unpins():
     # The prefill node runs offload inside a `multi` connector, so the idle
     # dispatch only ever sees the wrapper. Without this aggregate it reads as
@@ -5891,6 +5955,104 @@ def _k3_scheduler() -> KimiK3OffloadScheduler:
     s._do_save = True
     s._max_pending_saves = 4
     return s
+
+
+def test_only_k3_scales_the_default_pending_saves_with_pp(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES", raising=False)
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "1")
+    monkeypatch.setattr(DenseOffloadScheduler, "__init__", lambda self, config: None)
+    config = SimpleNamespace(kv_transfer_config={}, pipeline_parallel_size=8)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "kimi_k3")
+    assert KimiK3OffloadScheduler(config)._max_pending_saves == 16
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
+    assert QwenOffloadScheduler(config)._max_pending_saves == 2
+
+
+def _pp2_stage_tier(monkeypatch, cls, layout, stage, spec):
+    """`cls`'s worker tier for one stage of a PP2 x TP2 run, at TP rank 0."""
+    import torch
+
+    from atom.kv_transfer.offload.hybrid.kimi_k3 import connector as k3_connector
+
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: layout)
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _kvc: None)
+    monkeypatch.setattr(
+        offcfg, "build_lmcache_metadata", lambda *_: SimpleNamespace(model_name="m")
+    )
+    monkeypatch.setattr(k3_connector, "StagedTransfer", lambda *_a, **_k: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(
+            get_tp_group=lambda: SimpleNamespace(world_size=2, rank_in_group=0)
+        ),
+    )
+    image = spec.image_bytes if spec else 1 << 20
+    backend = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec)
+        ),
+        state_entry_views=lambda _slot: [torch.empty(image, dtype=torch.uint8)],
+        page_unit_views=lambda *_: [],
+    )
+    worker = cls.__new__(cls)
+    worker._config = SimpleNamespace(
+        kv_transfer_config={},
+        pipeline_parallel_size=2,
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=stage),
+    )
+    worker._engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            device="cpu", release_gpu_staging_after_transfer=False
+        ),
+        storage_manager=None,
+    )
+    worker._state_tier = None
+    worker._build_state_tier(SimpleNamespace(state_backend=backend))
+    return worker._state_tier
+
+
+def test_pp_stages_build_k3_tiers_that_key_apart_and_match_the_engine_cap(
+    monkeypatch,
+):
+    """The 2 MiB and 1 MiB stages pool 2 GiB over a 3 MiB joint image, so both
+    keep 682 images, the cap the engine's index mirrors for the same spec."""
+    from atom.model_engine.state_offload import state_tier_cpu_entries
+
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    tiers = []
+    for stage, image in ((0, 2 << 20), (1, 1 << 20)):
+        # what each stage's checkpoint spec gives the tier
+        spec = SimpleNamespace(
+            layout_id="pp2-joint:tier-test",
+            image_bytes=image,
+            pipeline_op_bytes=3 << 20,
+        )
+        tier = _pp2_stage_tier(
+            monkeypatch, KimiK3OffloadConnector, "kimi_k3", stage, spec
+        )
+        tiers.append(tier)
+        assert tier.codec._max_entries == state_tier_cpu_entries(
+            spec, SimpleNamespace(pipeline_parallel_size=2)
+        )
+    for tier in tiers:
+        tier.shutdown()
+    assert [t.codec._max_entries for t in tiers] == [682, 682]
+    # Stage 1's TP rank 0 is worker 2 of 4, not stage 0's worker 0.
+    assert [(t.codec._worker_id, t.codec._world_size) for t in tiers] == [
+        (0, 4),
+        (2, 4),
+    ]
+
+
+def test_a_qwen_pp_worker_logs_the_pipeline_refusal(monkeypatch, caplog):
+    with caplog.at_level(logging.INFO, logger="atom"):
+        tier = _pp2_stage_tier(monkeypatch, QwenOffloadConnector, "qwen", 0, None)
+    assert tier is None
+    assert "layout 'qwen' keeps no state tier at pipeline_parallel_size=2" in (
+        caplog.text
+    )
+    assert "layout id" not in caplog.text
 
 
 def _k3_seq(*, hbm: int, joint: int = 0, kv: int = 0, claimed: int = 0):
@@ -7624,6 +7786,8 @@ class TestConnectorTouches:
 
 # ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
 
+_COPY_DONE = SimpleNamespace(synchronize=lambda: None)
+
 
 class TestStateLoadsAndStoresRunInSeparateLanes:
     """A load is on the TTFT critical path and a store is not, but one serial
@@ -7660,7 +7824,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             for gen in range(4):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert codec.loaded.wait(
                 timeout=5
@@ -7682,7 +7846,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec, staging_lanes=1)
         try:
             for gen in range(3):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,), _COPY_DONE)
             tier.submit_load("r1", 77, 0)
             assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
             codec.gate.set()
@@ -7696,7 +7860,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         try:
             assert tier.oldest_store_age_s() == 0.0
-            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            tier.submit_store(StateStoreOperationId(1, 1), (0,), _COPY_DONE)
             assert tier.oldest_store_age_s() >= 0.0
             assert len(tier._store_submitted_at) == 1
         finally:
@@ -7733,7 +7897,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(codec)
         op = StateStoreOperationId(1, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             assert codec.released.wait(timeout=5), "the D2H callback never fired"
             # Early: units handed back while the CPU put is still running.
             assert tier.take_source_releases() == {op}
@@ -7761,7 +7925,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_RefuseCodec())
         op = StateStoreOperationId(2, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
@@ -7783,9 +7947,327 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         tier = self._tier(_ThrowCodec())
         op = StateStoreOperationId(3, 1)
         try:
-            tier.submit_store(op, (0,))
+            tier.submit_store(op, (0,), _COPY_DONE)
             tier.drain()
             assert tier.take_source_releases() == {op}
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+@pytest.mark.parametrize("cache_seed, salt", [(11, "11"), (12, "12"), (-1, "")])
+def test_a_dsv4_prompt_carries_its_media_salt_to_lookup_save_and_load(cache_seed, salt):
+    asked = []
+
+    class _SaltLookupClient(_LookupClient):
+        def lookup(self, token_ids, lookup_id, **kwargs):
+            asked.append(kwargs)
+            return self.hit
+
+    sched = _scheduler()
+    sched._lookup_client = _SaltLookupClient(hit=12)
+    loader, saver = _consumer_seq(950), _consumer_seq(951)
+    loader.cache_seed = saver.cache_seed = cache_seed
+    saver.num_cached_tokens = 16
+    sched._save_tracker["951"] = [saver, 0]
+
+    sched.get_num_new_matched_tokens(loader)
+    sched.update_state_after_alloc(loader)
+    load, save = sched.build_connector_meta().requests
+
+    expected = {"request_configs": {"lmcache.tag.cache_salt": salt}} if salt else {}
+    assert asked and all(kwargs == expected for kwargs in asked)
+    assert (load.load_spec is not None, load.cache_salt) == (True, salt)
+    assert (save.save_spec is not None, save.cache_salt) == (True, salt)
+
+
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_a_dsv4_slot_boundary_hash_chains_from_the_cache_seed(cache_seed):
+    """The SLOT boundary hash is the one `BlockManager` chains from the same
+    `cache_seed`."""
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=730, num_prompt_tokens=16_384, num_cached_tokens=8192, group=2
+    )
+    seq.cache_seed = cache_seed
+    sched._save_tracker["730"] = [seq, 0]
+
+    request = sched.build_connector_meta().requests[0]
+
+    parent = cache_seed
+    for start in range(0, 8192, 256):
+        parent = BlockManager.compute_hash(seq.token_ids[start : start + 256], parent)
+    assert request.slot_save_spec.boundary_block_hash == parent
+
+
+class TestAStateStoreWaitsForTheCopyThatFillsItsUnits:
+    """A checkpoint is READY once the batch carrying its slot->PAGE copy is
+    issued, not once the copy has run, and its store rides a later step's
+    metadata. The gather runs on the packer's own stream, so without a fence it
+    could read the PAGE units before the copy lands and file their previous
+    occupant's bytes under a valid prefix hash. The connector records one event
+    on the current stream per step and the tier waits on it before `put`."""
+
+    class _Event:
+        def __init__(self, log, fail=False):
+            self.log, self.fail, self.stream = log, fail, None
+
+        def record(self, stream):
+            self.stream = stream
+            self.log.append("record")
+
+        def synchronize(self):
+            self.log.append("synchronize")
+            if self.fail:
+                raise RuntimeError("HIP error: an illegal memory access")
+
+    class _Codec:
+        def __init__(self, log):
+            self.log = log
+
+        def put(self, h, unit_ids, on_source_released):
+            self.log.append("put")
+            on_source_released()
+            return True
+
+    def test_the_tier_waits_on_the_fence_before_it_gathers(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log))
+            tier.drain()
+            assert log == ["synchronize", "put"]
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            tier.shutdown()
+
+    def test_a_fence_that_raises_fails_the_store_and_releases_its_units(self):
+        log = []
+        tier = StateOffloadTier(self._Codec(log))
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,), self._Event(log, fail=True))
+            tier.drain()
+            assert "put" not in log
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def _worker(self, log):
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit")
+                submitted.append(args)
+
+        worker = _k3_worker()
+        worker._state_tier = _Tier()
+        worker._store_failed_no_tier = set()
+        return worker, submitted
+
+    def test_one_fence_on_the_current_stream_rides_every_store(self, monkeypatch):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, submitted = self._worker(log)
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(
+            SimpleNamespace(state_stores=[(a, [3, 4]), (b, [5])])
+        )
+        assert len(events) == 1 and events[0].stream is stream
+        assert log == ["record", "submit", "submit"]
+        assert submitted == [(a, (3, 4), events[0]), (b, (5,), events[0])]
+        assert worker._store_failed_no_tier == set()
+
+    def test_no_fence_fails_the_step_stores_instead_of_gathering(self, monkeypatch):
+        class _BrokenEvent:
+            @staticmethod
+            def record(_stream):
+                raise RuntimeError("sticky HIP error")
+
+        monkeypatch.setattr(torch.cuda, "Event", _BrokenEvent)
+        monkeypatch.setattr(torch.cuda, "current_stream", object)
+        worker, submitted = self._worker([])
+        a, b = StateStoreOperationId(1, 1), StateStoreOperationId(2, 1)
+        worker._start_state_stores(SimpleNamespace(state_stores=[(a, [3]), (b, [5])]))
+        assert submitted == []
+        assert worker._store_failed_no_tier == {a, b}
+
+
+class TestBothSavePathsKeepTheAsyncSaveContract:
+    """The dense KV save and the Kimi-K3 state store keep the contract written
+    out in `_offload_common.py`: one fence per step on the current stream,
+    carried into the save thread and waited on before the source is read, and
+    per save at most one source release and exactly one terminal. The state
+    store's release and failure paths are covered in the two classes above."""
+
+    _Event = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Event
+
+    @staticmethod
+    def _worker(log):
+        worker = KimiK3OffloadConnector(
+            SimpleNamespace(
+                kv_transfer_config={"kv_role": "offload"},
+                kv_cache_block_size=4,
+                decode_context_parallel_size=1,
+                tensor_parallel_size=1,
+            )
+        )
+        worker.chunk_size = 8
+        stored = []
+
+        class _Engine:
+            gpu_connector = object()
+
+            @staticmethod
+            def store(_tokens, **kwargs):
+                log.append("store")
+                stored.append(kwargs["producer_event"])
+
+        worker._engine = _Engine()
+        terminals = []
+        record = worker._record_store_terminal
+
+        def _record_store_terminal(req, succeeded):
+            terminals.append(succeeded)
+            record(req, succeeded)
+
+        worker._record_store_terminal = _record_store_terminal
+        return worker, stored, terminals
+
+    @staticmethod
+    def _save(req_id=51):
+        return LMCacheReqMeta(
+            req_id=req_id,
+            token_ids=list(range(8)),
+            block_ids=[3],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=req_id, generation=1),
+        )
+
+    @staticmethod
+    def _join(worker):
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+    def test_each_path_fences_before_it_submits_and_waits_before_it_reads(
+        self, monkeypatch
+    ):
+        log, events, stream = [], [], object()
+
+        def _event():
+            events.append(self._Event(log))
+            return events[-1]
+
+        monkeypatch.setattr(torch.cuda, "Event", _event)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        worker, stored, terminals = self._worker(log)
+        submitted = []
+
+        class _Tier:
+            def submit_store(self, *args):
+                log.append("submit_store")
+                submitted.append(args)
+
+        worker._state_tier = _Tier()
+        op = StateStoreOperationId(7, 1)
+        metadata = LMCacheOffloadMetadata()
+        metadata.requests.append(self._save())
+        metadata.state_stores.append((op, [4, 5]))
+        try:
+            worker.start_load_kv(metadata)
+        finally:
+            self._join(worker)
+        state_fence, kv_fence = events
+        assert state_fence.stream is stream and kv_fence.stream is stream
+        assert submitted == [(op, (4, 5), state_fence)]
+        assert stored == [kv_fence]
+        assert log == ["record", "submit_store", "record", "synchronize", "store"]
+        assert terminals == [True]
+
+    def test_a_kv_fence_that_raises_fails_the_save_once_before_it_reads(self):
+        log = []
+        worker, stored, terminals = self._worker(log)
+        req = self._save()
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                req,
+                producer_event=self._Event(log, fail=True),
+            )
+            assert worker.get_finished().finished_saving == {req.save_operation}
+            assert worker.get_finished().finished_saving == set()
+        finally:
+            self._join(worker)
+        assert log == ["synchronize"] and stored == []
+        assert terminals == [False]
+
+    def test_a_kv_store_that_raises_reports_one_failed_terminal(self):
+        log = []
+        worker, _stored, terminals = self._worker(log)
+
+        def _store(_tokens, **_kwargs):
+            log.append("store")
+            raise RuntimeError("LocalCPU allocation failed")
+
+        worker._engine.store = _store
+        try:
+            worker._guard(
+                "save",
+                worker._do_save_req,
+                self._save(),
+                producer_event=self._Event(log),
+            )
+        finally:
+            self._join(worker)
+        assert log == ["synchronize", "store"]
+        assert terminals == [False]
+
+    def test_a_state_store_handed_no_fence_fails_before_it_reads(self):
+        with pytest.raises(ValueError):
+            wait_save_fence(None)
+        log = []
+        codec = TestAStateStoreWaitsForTheCopyThatFillsItsUnits._Codec(log)
+        tier = StateOffloadTier(codec)
+        op = StateStoreOperationId(8, 1)
+        try:
+            tier.submit_store(op, (0,), None)
+            tier.drain()
+        finally:
+            tier.shutdown()
+        assert log == []
+        assert tier.take_source_releases() == {op}
+        assert tier.take_store_reports() == (set(), {op})
+
+    @staticmethod
+    def _lifecycle(log):
+        return SaveLifecycle(
+            threading.Lock(),
+            release_source=lambda: log.append("release"),
+            report_terminal=lambda ok: log.append(("terminal", ok)),
+        )
+
+    def test_a_lifecycle_releases_once_and_reports_one_terminal(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.release_source()
+        lifecycle.release_source()
+        lifecycle.finish(True)
+        lifecycle.finish(False)
+        assert log == ["release", ("terminal", True)]
+
+    def test_a_terminal_with_no_earlier_release_releases_first(self):
+        log = []
+        lifecycle = self._lifecycle(log)
+        lifecycle.finish(False)
+        lifecycle.release_source()
+        assert log == ["release", ("terminal", False)]
