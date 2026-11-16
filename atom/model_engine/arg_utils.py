@@ -19,6 +19,7 @@ from atom.config import (
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
+from atom.model_ops.indexer.layout import MFMA, NATURAL, PRESHUFFLE
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -341,7 +342,7 @@ class EngineArgs:
         )
         parser.add_argument(
             "--index-cache-layout",
-            choices=["preshuffle", "mfma", "natural"],
+            choices=[PRESHUFFLE, MFMA, NATURAL],
             default=None,
             help="FP4 index cache layout. DSA defaults to preshuffle; use mfma "
             "for OPUS. V4/V4.1 must match the configured scorer backend.",

@@ -131,7 +131,6 @@ def test_opus_constructor_admits_only_standalone_mp(
         raise PastGate
 
     monkeypatch.setattr(deepseek_v2, "sparse_indexer_fp4_enabled", lambda *a: True)
-    monkeypatch.setattr(deepseek_v2, "require_opus_api", lambda: None)
     monkeypatch.setattr(deepseek_v2, "ReplicatedLinear", allocate)
     config = SimpleNamespace(
         index_cache_dtype="fp4",

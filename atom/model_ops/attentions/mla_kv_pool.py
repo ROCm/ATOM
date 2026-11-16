@@ -31,6 +31,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     carve_layer_major,
     entry_bytes_for,
 )
+from atom.model_ops.indexer.layout import PRESHUFFLE
 from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
 
 
@@ -58,7 +59,7 @@ class MlaKvPool:
         index_dtype: torch.dtype | None = None,
         index_head_dim: int = 0,
         index_fp4: bool = False,
-        index_layout: str = "preshuffle",
+        index_layout: str = PRESHUFFLE,
     ):
         self.layers = layers
         self.block_size = block_size

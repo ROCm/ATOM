@@ -98,7 +98,8 @@ def _module(**fields):
     return SimpleNamespace(**{
         "n_head": _SHAPE.heads, "head_dim": _SHAPE.head_dim,
         "topk_tokens": _SHAPE.topk, "q_lora_rank": _SHAPE.q_lora,
-        "_indexer_fp4": False, "rope_dim": 0, "external_k_weights": True,
+        "_indexer_fp4": False, "_index_cache_layout": "preshuffle",
+        "rope_dim": 0, "external_k_weights": True,
         "quantized_q": False, "use_qk_rope_cache_fusion": False,
         "wq_b": SimpleNamespace(
             weight=torch.empty(_SHAPE.qrows, _SHAPE.q_lora, dtype=torch.bfloat16),
@@ -159,12 +160,9 @@ def test_a_layer_is_refused_on_its_own_flags_and_no_model_attribute():
 
 @pytest.mark.parametrize("model_kind,q_lora", [("glm", 2048), ("k3", 1536)])
 @pytest.mark.parametrize("dcp", [1, 8])
-@pytest.mark.parametrize("preshuffle_available", [False, True])
 def test_install_prepares_shared_weight_before_warmup(
-    monkeypatch, model_kind, q_lora, dcp, preshuffle_available
+    monkeypatch, model_kind, q_lora, dcp
 ):
-    from aiter.ops.flydsl import gemm_kernels
-
     from atom.models.kimi_k3.mono import dispatch as k3_dispatch
 
     installer = dispatch if model_kind == "glm" else k3_dispatch
@@ -173,8 +171,6 @@ def test_install_prepares_shared_weight_before_warmup(
     monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(bind, "get_dcp_rank", lambda: 0)
-    if not preshuffle_available:
-        monkeypatch.setattr(gemm_kernels, "flydsl_hgemm", lambda a, b: None)
     indexer = _module(q_lora_rank=q_lora)
     weight = torch.nn.Parameter(
         torch.randn(_SHAPE.qrows, q_lora, dtype=torch.bfloat16), requires_grad=False
@@ -194,24 +190,20 @@ def test_install_prepares_shared_weight_before_warmup(
     cfg.tensor_parallel_size = 8
     cfg.dcp_config = SimpleNamespace(interleave_size=1)
     wrapped = installer.install_mono_decode(model, cfg, None)
-    assert getattr(weight, "is_shuffled", False) == preshuffle_available
+    assert weight.is_shuffled
     assert indexer.wq_b.weight is weight and weight.data_ptr() == address
     assert not hasattr(indexer, "_mono_indexer_wq_packed")
-    if preshuffle_available:
-        restored = (
-            weight.view(256, q_lora // 32, 4, 16, 8)
-            .permute(0, 3, 1, 2, 4)
-            .reshape_as(weight)
-        )
-        assert torch.equal(restored, original)
-        assert wrapped is not model
-        shuffled = weight.clone()
-        bind.prepare_weights({0: indexer})
-        assert indexer.wq_b.weight is weight and weight.data_ptr() == address
-        assert torch.equal(weight, shuffled)
-    else:
-        assert torch.equal(weight, original)
-        assert "forward" not in indexer.__dict__
+    restored = (
+        weight.view(256, q_lora // 32, 4, 16, 8)
+        .permute(0, 3, 1, 2, 4)
+        .reshape_as(weight)
+    )
+    assert torch.equal(restored, original)
+    assert wrapped is not model
+    shuffled = weight.clone()
+    bind.prepare_weights({0: indexer})
+    assert indexer.wq_b.weight is weight and weight.data_ptr() == address
+    assert torch.equal(weight, shuffled)
 
 
 def test_weight_updates_refuse_before_changing_storage(monkeypatch):

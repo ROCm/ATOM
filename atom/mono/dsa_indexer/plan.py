@@ -16,8 +16,14 @@ by 128-key runs (``REPLICA_INTERLEAVE``: a score unit's keys stay one run).
 
 from dataclasses import dataclass
 
+from atom.model_ops.indexer import layout as index_layout
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.mono.plan.arith import sel
 from atom.mono.plan.execution import BLOCKS, WAVES
+
+# Preserve the original module API for runners and callers.
+fp4_cache_byte = index_layout.fp4_cache_byte
+fp4_scale_byte = index_layout.fp4_scale_byte
 
 TILE = 16  # the preshuffled layout's and the MFMA's 16 x 16 tile
 SCALE_BYTES = 4  # a key's fp32 scale
@@ -49,7 +55,7 @@ class IndexerShape:
     rope_neox: bool = False  # the rotation's pairs: (d, d + half), else (2i, 2i + 1)
     # FP4 must explicitly name OPUS's layout; the old FlyDSL plane has the
     # same byte count but a different permutation.
-    cache_layout: str = "preshuffle"
+    cache_layout: str = PRESHUFFLE
 
     @property
     def qrows(self) -> int:
@@ -112,22 +118,6 @@ def scale_byte(shape: IndexerShape, row):
     return shape.block_rows * shape.head_dim + SCALE_BYTES * row
 
 
-def fp4_cache_byte(row, packed_col):
-    """OPUS gfx950: [group, 32-dim chunk, row, 16 packed bytes]."""
-    return row // 64 * 4096 + (packed_col // 16 * 64 + row % 64) * 16 + packed_col % 16
-
-
-def fp4_scale_byte(row, chunk):
-    """OPUS gfx950: [group, chunk % 2, row % 32, chunk // 2, row // 32]."""
-    return (
-        row // 64 * 256
-        + chunk % 2 * 128
-        + row % 32 * 4
-        + chunk // 2 * 2
-        + row % 64 // 32
-    )
-
-
 def unsupported(shape: IndexerShape) -> str:
     """Why the kernel cannot run an indexer of this shape, or ''. Each is a
     piece of the kernel written for one value, not a measured limit."""
@@ -136,7 +126,7 @@ def unsupported(shape: IndexerShape) -> str:
     if shape.kv_dtype not in ("fp8", "fp4"):
         return f"{shape.kv_dtype} index cache: expected FP8 or MXFP4"
     if shape.kv_dtype == "fp4" and (
-        shape.cache_layout != "mfma" or shape.block_rows % 64
+        shape.cache_layout != MFMA or shape.block_rows % 64
     ):
         return "FP4 requires OPUS gfx950 mfma layout and complete 64-row groups"
     if shape.rope_dim not in (0, ROPE_DIM):

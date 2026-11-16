@@ -80,6 +80,7 @@ from atom.model_ops.embed_head import (
 # Side-effect import: registers `torch.ops.aiter.sparse_attn_indexer`, the op
 # `Indexer.forward_impl` runs.
 from atom.model_ops.indexer import indexer_forward as _indexer_forward  # noqa: F401
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -96,7 +97,6 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_fp4 import (
     assert_fp4_indexer_supported,
-    require_opus_api,
     sparse_indexer_fp4_enabled,
 )
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
@@ -1529,18 +1529,17 @@ class Indexer(nn.Module):
             atom_config.index_cache_dtype, config
         )
         self._index_cache_layout = (
-            (atom_config.index_cache_layout or "preshuffle")
+            (atom_config.index_cache_layout or PRESHUFFLE)
             if self._indexer_fp4
-            else "preshuffle"
+            else PRESHUFFLE
         )
-        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == "mfma"
+        self._indexer_opus = self._indexer_fp4 and self._index_cache_layout == MFMA
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
         self.n_head = config.index_n_heads  # 64
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = getattr(config, "index_rope_dim", config.qk_rope_head_dim)
         if self._indexer_opus:
-            require_opus_api()
             if self.n_head not in (32, 64) or self.rope_dim not in (0, 64):
                 raise ValueError("OPUS DSA FP4 requires 32/64 heads and RoPE 0/64")
             from atom.kv_transfer.disaggregation.factory import KVConnectorFactory

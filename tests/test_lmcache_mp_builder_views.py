@@ -20,6 +20,7 @@ from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
+from atom.utils.tbo import NUM_TBO_UBATCHES, UBatchSlice
 
 _MISSING = object()
 _REPO_ROOT = Path(__file__).parents[1]
@@ -186,7 +187,9 @@ def mla_builder_cls():
         "atom.utils.block_tables": _module(
             "atom.utils.block_tables", block_table_state=noop
         ),
-        "atom.utils.tbo": _module("atom.utils.tbo", decode_ubatch_request_ranges=noop),
+        "atom.utils.tbo": _module(
+            "atom.utils.tbo", NUM_TBO_UBATCHES=NUM_TBO_UBATCHES, UBatchSlice=UBatchSlice
+        ),
         "atom.utils.forward_context": _module(
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),

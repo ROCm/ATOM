@@ -15,8 +15,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.mono.device.ops import CM_DEV, CM_SYS, ballot, load_ptr64, rsrc
 from atom.mono.dsa_indexer.kernel import scratch_layout
-from atom.mono.dsa_indexer.plan import SCORE_KEYS
-from atom.mono.dsa_indexer.select import SHORT_VERIFY_CTX
+from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX, short_flag_count
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.step_begin import (
     ARRIVED,
@@ -81,7 +80,7 @@ def build(rows, qlen, world, debug=False, compact=()):
             _zero(scratch, fx.Int64(prefix), first, stride)
             _zero(scratch + fx.Int64(suffix), fx.Int64(total - suffix), first, stride)
             # Only score units in the runtime short-context window are polled.
-            short_flags = min(-(-SHORT_VERIFY_CTX // SCORE_KEYS), flag_stride // 8)
+            short_flags = short_flag_count(flag_stride)
             for i in range(first, rows * short_flags, stride):
                 flag_row, chunk = i // short_flags, i % short_flags
                 at = prefix + flag_row * flag_stride + chunk * 8

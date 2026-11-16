@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
+
 logger = logging.getLogger("atom")
 
 
@@ -29,26 +31,6 @@ FP4_QUANT_BLOCK_SIZE = 32
 FP4_KV_BLOCK_SIZE = 64
 _MFMA_M = 16
 _K_TILE = 128
-
-
-def require_opus_api() -> None:
-    import inspect
-
-    from aiter import indexer_qk_rope_quant_and_cache
-    from aiter.ops.opus import pa_mqa_logits_mxfp4 as opus
-
-    if not hasattr(opus, "mqa_logits_mxfp4_config"):
-        raise RuntimeError(
-            "The mfma index layout requires the mqa_logits_mxfp4 API from AITER"
-        )
-    if not {"scale_layout", "rope_dim"}.issubset(
-        inspect.signature(indexer_qk_rope_quant_and_cache).parameters
-    ):
-        raise RuntimeError(
-            "The mfma index layout requires AITER's HIP OPUS indexer cache "
-            "writer with scale_layout and rope_dim support (ROCm/aiter#7798); "
-            "upgrade AITER and rebuild module_cache before enabling it"
-        )
 
 
 def _gfx() -> str:
@@ -101,7 +83,7 @@ def sparse_indexer_fp4_enabled(
 
 
 def assert_fp4_indexer_supported(
-    *, packed_writer: bool, prefill_context_parallel: bool, prefill_ubatching: bool
+    *, packed_writer: bool, prefill_context_parallel: bool
 ) -> None:
     """Reject the FP4 requests this build cannot serve.
 
@@ -126,18 +108,18 @@ def assert_fp4_indexer_supported(
 
 
 def fp4_q_scale_shape(
-    tokens: int, heads: int, head_dim: int, *, layout: str = "preshuffle"
+    tokens: int, heads: int, head_dim: int, *, layout: str = PRESHUFFLE
 ) -> tuple:
     """`q_scale_out`'s shape: `[T, k_tiles, 4, 16, round_up(H // 16, 4)]`.
 
     The trailing pad is the dword a lane loads its four M-tile scale bytes with,
     so it is four even where the head count needs two.
     """
-    if layout == "mfma":
+    if layout == MFMA:
         if head_dim != 128 or heads not in (32, 64):
             raise ValueError("OPUS DSA FP4 requires H=32/64 and D=128")
         return (tokens, 2, 32, heads // 16)
-    if layout != "preshuffle":
+    if layout != PRESHUFFLE:
         raise ValueError(f"Unsupported DSA FP4 layout: {layout}")
     m_tiles = heads // _MFMA_M
     return (tokens, head_dim // _K_TILE, 4, _MFMA_M, -(-m_tiles // 4) * 4)
@@ -167,7 +149,7 @@ def fp4_index_scale_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
 
 
 def fp4_index_block_shapes(
-    rows: int, head_dim: int, *, layout: str = "preshuffle"
+    rows: int, head_dim: int, *, layout: str = PRESHUFFLE
 ) -> tuple[tuple, tuple]:
     """One block's packed-E2M1 and e8m0 shapes, for one indexer layer."""
     if rows != FP4_KV_BLOCK_SIZE:
@@ -176,10 +158,10 @@ def fp4_index_block_shapes(
             f"got {rows}"
         )
     k_tiles = head_dim // _K_TILE
-    if layout == "mfma":
+    if layout == MFMA:
         if head_dim != 128:
             raise ValueError("OPUS DSA FP4 requires head_dim=128")
         return (4, rows, 16), (2, 32, 4)
-    if layout != "preshuffle":
+    if layout != PRESHUFFLE:
         raise ValueError(f"Unsupported DSA FP4 layout: {layout}")
     return (k_tiles, 4, rows, 16), (k_tiles, 4, rows)

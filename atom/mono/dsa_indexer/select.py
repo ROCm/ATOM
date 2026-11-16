@@ -26,8 +26,6 @@ A short row (``plan.short``) skips score and select: every key the
 rank holds, in local order (the original merge's answer whenever ctx <= K).
 """
 
-from dataclasses import dataclass
-
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -53,6 +51,7 @@ from atom.mono.device.queue import word
 from atom.mono.device.select import INT_MIN, f32_key, u32_gt
 from atom.mono.device.sync import preg, publish, sleep_ticks
 from atom.mono.dsa_indexer import fp4
+from atom.mono.dsa_indexer import selection_plan as isel_plan
 from atom.mono.dsa_indexer.plan import (
     SCORE_KEYS,
     TILE,
@@ -62,58 +61,29 @@ from atom.mono.dsa_indexer.plan import (
     scale_byte,
     short,
 )
+from atom.mono.dsa_indexer.selection_plan import (
+    ARRIVED,
+    COUNT_BITS,
+    DEFAULT_RADIX,
+    LOCAL_RADIX,
+    SHORT_VERIFY_CTX,
+    prefix_row,
+    request_owner,
+    split_request_keys,
+)
 from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
+# Preserve the original module API for runners and callers.
+SHORT_WIDE_RADIX = isel_plan.SHORT_WIDE_RADIX
+SPLIT_MIN = isel_plan.SPLIT_MIN
+WIDE_RADIX = isel_plan.WIDE_RADIX
+Radix = isel_plan.Radix
 
 # radix passes over the 32-bit key, most significant first; a pass is a round
 # trip to every rank whose cost grows with the bins pushed and polled
-@dataclass(frozen=True)
-class Radix:
-    bits: tuple[int, ...]
-    # Wider local digits never participate in the distributed mailbox ABI.
-    local: bool = False
-
-    def __post_init__(self):
-        limit = 11 if self.local else 8
-        if (
-            sum(self.bits) != 32
-            or not all(1 <= b <= limit for b in self.bits)
-            or max(self.bits) < 6
-        ):
-            raise ValueError(
-                f"radix requires 32 total bits and a 64..{1 << limit}-bin histogram"
-            )
-
-    @property
-    def passes(self):
-        return len(self.bits)
-
-    @property
-    def shifts(self):
-        return tuple(32 - sum(self.bits[: p + 1]) for p in range(self.passes))
-
-    @property
-    def bins(self):
-        return 1 << max(self.bits)
-
-    @property
-    def bins_per_thread(self):
-        return max(1, self.bins // THREADS)
-
-    @property
-    def waves(self):
-        return min(WAVES, self.bins // 64)
-
-    @property
-    def bins_per_lane(self):
-        return self.bins // (64 * self.waves)
 
 
-DEFAULT_RADIX = Radix((8, 8, 8, 8))
-LOCAL_RADIX = Radix((11, 11, 10), local=True)
-WIDE_RADIX = Radix((7, 7, 7, 7, 4))
-SHORT_WIDE_RADIX = Radix((6, 6, 6, 6, 6, 2))
 DIGIT_BITS = DEFAULT_RADIX.bits
 PASSES = len(DIGIT_BITS)
 SHIFTS = tuple(32 - sum(DIGIT_BITS[: p + 1]) for p in range(PASSES))
@@ -145,18 +115,14 @@ CPS_LG_MAX = 8
 BEFORE_WAVES = BLOCKS // 64
 # a row histogram word (``_row_add``): its count in the low COUNT_BITS (a
 # row's keys at most, ``kernel.unfit``), the segments added in above
-COUNT_BITS = 22
-ARRIVED = 1 << COUNT_BITS
 # a row histogram's copies: segment g adds into copy g % ROW_COPIES (a word
 # takes fewer atomics), its readers sum them
 ROW_COPIES = 4
 # LDS ``rows`` words a row: context, keys here, long | split << 1 |
 # short-verify-step << 2. The last flag is uniform over rows and ranks.
 ROW_WORDS = 3
-SHORT_VERIFY_CTX = 8192
 # ``own_rows``: a request's keys split over the ranks only past this many
 # (``split_keys``)
-SPLIT_MIN = 262144
 # a piece's rows at most (``piece_rows``)
 RG_MAX = 8
 TASK_UNITS_LG = 3
@@ -528,8 +494,8 @@ def split_keys(c, rctx, total):
     if const_expr(
         c.get("short_owned_verify", False) and c["S"] // c["qlen"] < c["world"]
     ):
-        return rctx > SHORT_VERIFY_CTX
-    return (rctx > SPLIT_MIN) & (2 * c["world"] * rctx > total)
+        return split_request_keys(rctx, total, c["world"], low_requests=True)
+    return split_request_keys(rctx, total, c["world"])
 
 
 def short_verify_step(c):
@@ -545,7 +511,7 @@ def owner(c, r):
     """``own_rows``: the rank that scores and selects row r -- its request's,
     the requests dealt over the ranks in turn (a request's rows share their
     key loads, ``piece``)."""
-    return (r // c["qlen"]) % c["world"]
+    return request_owner(r, c["qlen"], c["world"])
 
 
 def stored_at(c, j, split):
@@ -1721,7 +1687,7 @@ def rows_before(c, r):
         # Each wave reduces all row tiles instead of every lane serially
         # loading the whole prefix. Counts are integers, so the sum is exact.
         for tile in range_constexpr(-(-s // 64)):
-            q = c["lane"] + 64 * tile
+            q = prefix_row(c["lane"], tile)
             count = fx.ptr_load(sel + SEL_ROWS + fx.min(q, fx.Int32(s - 1)))
             off = off + (q < r).select(count, fx.Int32(0))
         off = wave_sum(off)

@@ -27,6 +27,7 @@ from atom.distributed.dcp_layout import (  # noqa: F401
     dcp_owner_rank,
 )
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_world_size
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.utils.forward_context import get_published_dcp_local_context_lens
 
 # Token-ownership arithmetic lives in ``dcp_layout`` so P/D relayout can share
@@ -1279,7 +1280,7 @@ def dcp_decode_candidate_exchange_fused(
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     weights_scale: float = 1.0,
-    cache_layout: str = "preshuffle",
+    cache_layout: str = PRESHUFFLE,
 ) -> None:
     """Score the local shard, exchange scores, emit this rank's owned KV slots.
 
@@ -1348,7 +1349,7 @@ def dcp_decode_candidate_exchange_fused(
             KVBlockSize=runner_block_size,
             Preshuffle=True,
         )
-    elif cache_layout == "mfma":
+    elif cache_layout == MFMA:
         from atom.model_ops.dsa_fp4 import opus_logits
 
         opus_logits(

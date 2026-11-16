@@ -192,6 +192,7 @@ def resident_grid_refusals(atom_config, connectors=()) -> list[tuple[bool, str]]
     they release their CUs even if a resident-grid kernel is partially launched.
     """
     from atom.kv_transfer.disaggregation import KVConnectorFactory
+
     cus = _cu_count()
     kv = getattr(atom_config, "kv_transfer_config", None)
     connector = kv.get("kv_connector") if isinstance(kv, dict) else None

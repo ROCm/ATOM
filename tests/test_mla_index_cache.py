@@ -650,7 +650,9 @@ def test_kimi_offload_includes_index_bytes(builder_cls_name, has_indexer):
     module = _MlaLayer(
         layer_num=5,
         indexer=(
-            SimpleNamespace(k_cache=SimpleNamespace(kv_cache=[None]))
+            SimpleNamespace(
+                k_cache=SimpleNamespace(kv_cache=[None]), _indexer_fp4=False
+            )
             if has_indexer
             else None
         ),

@@ -14,7 +14,6 @@ request, each row its own causal window); every other step -- prefill, a dummy
 run -- calls the indexer's own forward on every rank alike.
 """
 
-import inspect
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from atom.mono.dsa_indexer.plan import (
     IndexerShape,
     unsupported,
 )
+from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.deployment import _takes_weight_updates
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import (
@@ -42,6 +42,7 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+DUAL_SCORE_ROWS = (160, 192, 224, 256)
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,7 @@ class IndexerBinding:
             and qlen == 1
             and (
                 (rows == 128 and (self.max_ctx >= 65536 or self.shape.q_lora == 2048))
-                or rows in (160, 192, 224, 256)
+                or rows in DUAL_SCORE_ROWS
             )
         )
         return kix.IxBuild(
@@ -73,7 +74,7 @@ class IndexerBinding:
             self.max_ctx,
             self.replicated,
             qlen=qlen,
-            score_blocks=512 if dual else 256,
+            score_blocks=2 * BLOCKS if dual else BLOCKS,
             short_gemm=self.short_gemm,
         )
 
@@ -110,7 +111,7 @@ def shape_of(module, block_rows: int) -> IndexerShape:
         block_rows=block_rows,
         rope_dim=module.rope_dim,
         rope_neox=bool(module.rope_dim and module.rotary_emb.is_neox_style),
-        cache_layout=getattr(module, "_index_cache_layout", "preshuffle"),
+        cache_layout=module._index_cache_layout,
     )
 
 
@@ -165,12 +166,6 @@ def _static_refusal(cfg, tp: int, rank: int, indexers: dict) -> str:
         why = _operand_refusal(m, shape)
         if why:
             return f"layer {layer_id}: {why}"
-    try:
-        from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
-    except ImportError:
-        return "AITER BF16 preshuffle GEMM unavailable"
-    if "bpreshuffle" not in inspect.signature(flydsl_hgemm).parameters:
-        return "AITER BF16 preshuffle GEMM unavailable; upgrade AITER"
     return ""
 
 
@@ -198,7 +193,7 @@ def _operand_refusal(m, shape: IndexerShape) -> str:
 def _cache_refusal(m, shape: IndexerShape) -> str:
     cache = m.k_cache.kv_cache[0]
     if shape.kv_dtype == "fp4":
-        scales = getattr(m.k_cache, "kv_cache_scale", None)
+        scales = m.k_cache.kv_cache_scale
         if (
             cache.dtype != torch.uint8
             or cache.ndim != 4

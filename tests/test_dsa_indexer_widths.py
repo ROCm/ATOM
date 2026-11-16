@@ -8,10 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("flydsl")
-
-from atom.mono.dsa_indexer import kernel, runner
-from atom.mono.dsa_indexer.bind import IndexerBinding
+from atom.mono.dsa_indexer import build as kernel
 from atom.mono.dsa_indexer.plan import IndexerShape
 
 
@@ -77,6 +74,10 @@ def test_short_projection_requires_supported_shapes_and_replicated_cache():
 def test_runner_buffers_cover_every_reachable_layout(
     monkeypatch, q_lora, cache, replicated, context, scheduled, cap, expected
 ):
+    pytest.importorskip("flydsl")
+    from atom.mono.dsa_indexer import kernel, runner
+    from atom.mono.dsa_indexer.bind import IndexerBinding
+
     module = SimpleNamespace(wq_b=SimpleNamespace(weight=torch.empty(1)))
     binding = IndexerBinding(
         {0: module},
@@ -170,6 +171,9 @@ def test_dual_cta_resource_limits(vgpr, lds, scratch, expected):
     ],
 )
 def test_dual_grid_device_guard(monkeypatch, arch, cus, expected):
+    pytest.importorskip("flydsl")
+    from atom.mono.dsa_indexer import kernel
+
     for name in ("ROC_GLOBAL_CU_MASK", "HSA_CU_MASK", "HIP_CU_MASK"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

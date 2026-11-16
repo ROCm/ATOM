@@ -108,6 +108,7 @@ def make_scheduler(
             kv_cache_block_size=4,
             tensor_parallel_size=8,
             decode_context_parallel_size=dcp,
+            speculative_config=None,
             hf_config=SimpleNamespace(model_type="kimi_linear"),
             kv_transfer_config={
                 "kv_role": role,

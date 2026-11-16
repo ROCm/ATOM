@@ -11,6 +11,7 @@ from flydsl.expr.typing import T
 
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import CM_DEV, butterfly, rsrc, traced, xshfl
+from atom.mono.dsa_indexer.fp4_plan import e2m1_magnitude
 from atom.mono.dsa_indexer.plan import fp4_cache_byte, fp4_scale_byte
 
 MIN_AMAX = 6.0 * 2.0**-126
@@ -18,19 +19,7 @@ MIN_AMAX = 6.0 * 2.0**-126
 
 def e2m1(x):
     """Saturating nearest-even conversion, including signed zero."""
-    m = abs(x)
-    code = fx.Int32(0)
-    for edge, value, inclusive in (
-        (0.25, 1, False),
-        (0.75, 2, True),
-        (1.25, 3, False),
-        (1.75, 4, True),
-        (2.5, 5, False),
-        (3.5, 6, True),
-        (5.0, 7, False),
-    ):
-        past = m >= fx.Float32(edge) if inclusive else m > fx.Float32(edge)
-        code = fx.Int32(past.select(fx.Int32(value), code))
+    code = fx.Int32(e2m1_magnitude(abs(x), fx.Float32))
     return code | ((x.bitcast(fx.Int32) >> 28) & 8)
 
 

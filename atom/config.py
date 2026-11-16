@@ -29,6 +29,7 @@ from atom.model_loader.weight_utils import (
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
 )
+from atom.model_ops.indexer.layout import MFMA, PRESHUFFLE
 from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.config import PluginConfig
 from atom.quant_spec import (
@@ -3170,7 +3171,7 @@ class Config:
         )
 
     def _resolve_index_cache_layout(self) -> None:
-        requested = getattr(self, "index_cache_layout", None)
+        requested = self.index_cache_layout
         self.index_cache_layout = None
         if self.index_cache_dtype != "fp4":
             if requested is not None:
@@ -3189,9 +3190,9 @@ class Config:
             if getattr(hf, "index_topk", None):
                 # DSA OPUS and legacy FP4 have equal byte widths but different
                 # permutations. Keep their prefix/offload namespaces apart.
-                if requested not in (None, "preshuffle", "mfma"):
+                if requested not in (None, PRESHUFFLE, MFMA):
                     raise ValueError("DSA FP4 index layout must be preshuffle or mfma")
-                self.index_cache_layout = requested or "preshuffle"
+                self.index_cache_layout = requested or PRESHUFFLE
             elif requested is not None:
                 raise ValueError("--index-cache-layout requires a supported indexer")
             return
