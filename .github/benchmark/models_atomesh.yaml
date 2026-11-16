@@ -1265,6 +1265,7 @@ models:
             decode: &kimi_k3_pd_opus_decode_env
               AITER_MLA_USE_OPUS: "1"
           run_eval: true
+          eval_only: true
           eval_concurrency: [72]
 
         # The prefill saturates at CONC 88, so its PP head keeps 16 batches in
@@ -1303,6 +1304,7 @@ models:
         - <<: *kimi_k3_1p1d_pp8_dcp8_c72
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus-torch-profile
           run_eval: false
+          eval_only: false
           env:
             common:
               <<: *kimi_k3_pp8_reuse_env

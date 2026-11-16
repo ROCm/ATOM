@@ -28,6 +28,14 @@ print(next(iter(s.submodule_search_locations or ()), "") if s else "")')"
 atom_version="$(python3 -c \
   'import importlib.metadata as m; print(m.version("atom"))' 2>/dev/null || echo unknown)"
 echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_dir:-<missing>} image_dist=${atom_version}"
+# Images built before jsonschema joined the image do not ship it, and their
+# /opt/venv is read-only to the container user.
+if ! python3 -c 'import jsonschema' 2>/dev/null; then
+  python3 -m pip install --quiet --upgrade --no-deps --target /tmp/atomesh-pydeps \
+    'jsonschema>=4.25,<5' jsonschema-specifications referencing rpds-py
+  export PYTHONPATH="/tmp/atomesh-pydeps${PYTHONPATH:+:${PYTHONPATH}}"
+  python3 -c 'import jsonschema, importlib.metadata as m; print("[atom] jsonschema", m.version("jsonschema"))'
+fi
 if [[ -z "${atom_dir}" ]] \
   || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_dir}" != "${PWD}"/* ]]; } \
   || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_dir}" == "${PWD}"/* ]]; }; then
