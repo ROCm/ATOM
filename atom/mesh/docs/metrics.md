@@ -71,6 +71,7 @@ skipped after a failed prefill adds none.
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
 | `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
 | `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. |
+| `mesh_kv_events_dropped_predictions_total` | Counter, prompts | `model`, `pool` | `--kv-events`: a prompt routed to a worker is left out of the KV index's predictions, as the writer of its partition is behind. The first drop in a partition also logs a warning. |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
 
 Histogram buckets:
@@ -203,10 +204,14 @@ the policy chose, such as another DP rank under
 `kind="actual"` repeats the engine count for exactly those requests, so
 `estimated` and `actual` compare like for like.
 
-The two differ because the ratio counts characters while the engine counts
-tokens in blocks, and the tree does not see engine eviction, chat templates or
-KV offload. A positive error means the router overestimated; a negative one
-means the engine reused more than predicted.
+On the tree's branches, the two differ because the ratio counts characters
+while the engine counts tokens in blocks, and the tree does not see engine
+eviction, chat templates or KV offload. `kv_affinity` counts tokens: the
+blocks the index matches, short of the last token's block, over the prompt's
+tokens. It differs where the index is not the engine's cache at that moment:
+batches not applied yet, blocks evicted since, and predictions for a worker
+without exact events. A positive error means the router overestimated; a
+negative one means the engine reused more than predicted.
 
 ## Example queries
 

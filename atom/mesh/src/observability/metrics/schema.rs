@@ -274,6 +274,8 @@ pub mod names {
     pub const ROUTE_CACHE_TOKENS_TOTAL: &str = "mesh_route_cache_tokens_total";
     pub const ROUTE_CACHE_ESTIMATE_TOKENS_TOTAL: &str = "mesh_route_cache_estimate_tokens_total";
     pub const ROUTE_CACHE_ESTIMATE_ERROR_RATIO: &str = "mesh_route_cache_estimate_error_ratio";
+    pub const KV_EVENTS_DROPPED_PREDICTIONS_TOTAL: &str =
+        "mesh_kv_events_dropped_predictions_total";
 
     pub const WORKER_CB_STATE: &str = "mesh_worker_cb_state";
     pub const WORKER_CB_TRANSITIONS_TOTAL: &str = "mesh_worker_cb_transitions_total";
@@ -520,6 +522,12 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
         name: names::ROUTE_CACHE_ESTIMATE_ERROR_RATIO,
         kind: MetricKind::Histogram,
         help: "Per-request (estimated - actual) cached tokens over prompt tokens by pool",
+        status: MetricStatus::Active,
+    },
+    MetricSpec {
+        name: names::KV_EVENTS_DROPPED_PREDICTIONS_TOTAL,
+        kind: MetricKind::Counter,
+        help: "Routed prompts left out of the KV index's predictions as its writer was behind, by model, pool",
         status: MetricStatus::Active,
     },
     MetricSpec {
