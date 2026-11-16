@@ -323,8 +323,17 @@ class DSparkConfidenceHead(nn.Module):
         # casting both operands to FP32 first would compute, minus the casts.
         # aiter is imported here, not at module load: this module imports
         # without it.
-        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         weight, bias = self.proj.weight, self.proj.bias
+        if hidden_states.is_cuda:
+            from atom.model_ops.dspark_confidence import (
+                can_fuse_confidence,
+                fused_confidence,
+            )
+
+            if can_fuse_confidence(hidden_states, markov_embeds, weight, bias):
+                # Same FP32 accumulation, without the concatenated copy.
+                return fused_confidence(hidden_states, markov_embeds, weight)
+        x = torch.cat([hidden_states, markov_embeds], dim=-1)
         if not x.is_cuda:
             logit = torch.nn.functional.linear(
                 x.float(), weight.float(), None if bias is None else bias.float()
