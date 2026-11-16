@@ -284,6 +284,33 @@ def test_vk_snapshot_checkpoints_match_kv_snapshot(pool_vk, planned_rows, dims):
     assert torch.equal(pools[1][0][untouched], original[untouched])
 
 
+def test_flydsl_kv_snapshot_is_a_view_of_the_vk_snapshot():
+    lengths = (1000, 129)
+    q, k, v, a, b, log, bias = inputs(sum(lengths))
+    g, beta = fused_gdn_gating(log, a, b, bias)
+    cu = torch.tensor([0, 1000, 1129], device="cuda", dtype=torch.int32)
+    state = torch.randn(2, 24, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    metadata = fly.build_prefill_metadata(lengths, cu)
+    args = (q, k, v, g, beta, state, cu, metadata, True)
+    peaks = {}
+    snapshots = {}
+    for layout in ("vk", "kv", "vk", "kv"):
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out, final, snapshots[layout] = fly.prefill(*args, snapshot_layout=layout)
+        torch.cuda.synchronize()
+        peaks[layout] = torch.cuda.max_memory_allocated() - base
+        del out, final
+    kv, vk = snapshots["kv"], snapshots["vk"]
+    chunks = sum((n + 63) // 64 for n in lengths)
+    assert kv.shape == (1, chunks, 24, 128, 128) and vk.is_contiguous()
+    assert kv.transpose(-1, -2).is_contiguous()
+    assert torch.equal(kv, vk.transpose(-1, -2))
+    # No copy for the KV contract: the same allocations as the VK snapshot.
+    assert peaks["kv"] == peaks["vk"]
+
+
 def test_triton_decode_vk_fallback():
     q, k, v, a, b, log, bias = inputs(3)
     state = torch.randn(6, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1

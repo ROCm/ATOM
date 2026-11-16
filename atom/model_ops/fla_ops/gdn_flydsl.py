@@ -222,8 +222,10 @@ def prefill(
 ):
     """Return token-major output, FP32 final KV state and optional BF16 h.
 
-    The default KV snapshot preserves the existing public contract. A caller
-    that writes native FlyDSL checkpoints may request its VK layout instead.
+    The default KV snapshot keeps the public contract -- ``[B, NT, H, K, V]``,
+    one row per chunk boundary -- as a view over the kernel's VK storage, like
+    the final state; consumers address it by its strides. A caller that writes
+    native FlyDSL checkpoints may request the VK tensor itself instead.
     """
     if snapshot_layout not in ("kv", "vk"):
         raise ValueError(f"Unsupported GDN snapshot layout: {snapshot_layout}")
@@ -265,7 +267,7 @@ def prefill(
     )
     snapshots = None
     if keep_intermediate_states:
-        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2).contiguous()
+        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2)
     return output, ht.transpose(-1, -2), snapshots
 
 
