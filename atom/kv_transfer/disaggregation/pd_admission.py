@@ -155,10 +155,10 @@ class PdAdmissionController:
     def check(self, seq, probe, *, running) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
 
-        Takes no credit and publishes nothing, so a caller that does not reach
-        `commit` (allocation or detach declined) just drops the result. The
-        plan is `None` when this is not a PD receive. `running` is the
-        scheduler's running requests on this D rank.
+        Takes no credit and publishes no receive; it only records a deferral.
+        A caller that does not reach `commit` (allocation or detach declined)
+        just drops the result. The plan is `None` when this is not a PD
+        receive. `running` is the scheduler's running requests on this D rank.
         """
         num_blocks = self._block_manager.num_pool_blocks(len(seq))
         offset = self._connector.pd_receive_block_offset(
