@@ -13,16 +13,17 @@ tab_main_proj, + 0x40 epoch, + 0x50 / 0x68 / 0x80 the three MTP layers' window k
 + 0xf4 the placeholder token, + 0xf8 an optional {value, tag} list to wait for, + 0x100 its length | tag
 << 32); 0x1f8.. ``sampler::Args``; 0x2b8.. ``mtp_ctl::AcceptArgs``.
 
-Roles by CTA (ported so far: marked):
-- 0..255: head GEMV over the rank's 16160 vocab rows, per-CTA softmax / Gumbel partials; 255 also the fold
-  (8-rank merge, acceptance, tok_out / mtp_ctl write-back).
-- 256..455 (ported): main_proj of the six captured rows (``_main_proj``); 256..447 then the 3 MTP layers'
-  window-kv projection.
-- 456..461 (ported): main_norm of the all-gathered seed rows, quantized for the window-kv GEMV (``_main_norm``).
-- 256..447 (ported) after main_proj: the window-kv GEMV of the quantized seed (``_window_kv``); 462..479
-  (ported): its RMSNorm / RoPE / E4M3 into win.40..42 (``_window_norm``).
-- 480..486 (ported): X[r] (r = cta - 479, all four mHC copies) = embed[placeholder token] (zeros when the
-  token is >= 129280), after waiting for the optional {value, tag} list (CTAs 480..484, wave 0).
+Roles by CTA (all ported; the whole kernel diffed bit-exact on 8 ranks at the 400K state with simulated
+acceptance 3.51, the residual branch taken; the real-acceptance branch (kernarg 0x314 <= 0) follows the ISA
+but is not exercised by that state):
+- 0..255: head GEMV (logits, / T into LDS) and the per-CTA sampler partials (``_head``, ``_stats``); CTA 255
+  folds them: the 17 entries a rank to every rank's sym:sample, the 8-rank merge, draft log ratios, Philox
+  coins, the accept count, the bonus token or the residual mask (``_fold_*``); every CTA's residual pass
+  (``_residual``) and CTA 255's residual merge across CTAs and ranks, tok_out / mtp_ctl write-back and X row
+  0 (``_fold_residual``, ``_fold_out``).
+- 256..455: main_proj of the six captured rows (``_main_proj``); 256..447 then the 3 MTP layers' window-kv
+  GEMV (``_window_kv``); 456..461 main_norm (``_main_norm``); 462..479 window kv RMSNorm / RoPE / E4M3 into
+  win.40..42 (``_window_norm``); 480..486 X rows 1..7 = embed[placeholder token] (``_embed_rows``).
 """
 
 import flydsl.compiler as flyc
@@ -85,7 +86,7 @@ _CURRENT_STREAM = fx.Stream(None)
 KARG_WORDS = 99
 LAYOUT = ",".join(f"{8 * i}:8" for i in range(KARG_WORDS))
 GRID, THREADS = 487, 512
-VERSION = "v9"
+VERSION = "v11"
 VOCAB = 0x1F900
 HIDDEN_B = 0x2800  # one bf16 hidden row (5120)
 X_ROW_B = 0xA000  # X: four mHC copies a row
@@ -123,6 +124,8 @@ RSUM_LDS, RKEY_LDS = (
     0x12630,
 )  # per residual row: the CTA's u64 fixed-point sum / max Gumbel key
 RPART_OFF = 0xD600  # ws_sample: per-CTA residual partials, {half, tag} at + 2048 (4 row + 2 kind + half) + 8 s2
+RX2_OFF = 0xC6000  # sym:sample: the ranks' residual row totals, {sum lo, sum hi, key lo, key hi} x {v, tag}
+RSCR_LDS = 0x12700  # CTA 255: the 4 waves' residual partials of a row group (scratch)
 VPOS_LDS = (
     0x12660  # not used by the port (kernarg reads); TileRT's LDS copy of vpos / vtok
 )
@@ -1080,7 +1083,7 @@ def _fold_accept(tid, lds, a, tag, nlive, vp):
         if need:
             _lds_st(lds, RX_LDS + 136 * r + 8 * slot, [e[0], e[2]])
     gpu.barrier()
-    tok, mask = Int32(-1), Int32(0)
+    tok, mask, accepted = Int32(-1), Int32(0), Int32(-1)
     if w0:
         jj = (lane < 11).select(lane, Int32(0))
         it = _lds_ld(lds, RX_LDS + 8 * jj, 2)
@@ -1121,7 +1124,6 @@ def _fold_accept(tid, lds, a, tag, nlive, vp):
         last = fx.max(nlive - 1, Int32(0))
         u_last, e_last = bperm(u, last), bperm(ea, last)
         acc_len = Int32(_w(a, 0x310) >> 32).bitcast(F32)
-        accepted = Int32(-1)
         if f32c(0) < acc_len:
             ctl = _w(a, 0x2B8)
             cnt = vp[0]
@@ -1186,7 +1188,7 @@ def _fold_accept(tid, lds, a, tag, nlive, vp):
                             cache_modifier=CM_DEV)  # fmt: skip
             _lds_st(lds, MASK_LDS, [mask])
     gpu.barrier()
-    return tok, mask
+    return tok, mask, accepted
 
 
 def _fixed60(r):
@@ -1305,18 +1307,268 @@ def _residual(tid, s2, lds, a, tag, vp, cnt):
                                 (RPART_OFF + 2048 * tid + 8 * s2) >> 2, cache_modifier=CM_DEV)  # fmt: skip
 
 
+def _u64(lo, hi):
+    return (Int64(hi) << 32) | Int64(fx.Uint32(lo))
+
+
+def _u64_gt(a, b):
+    return _k_gt(Int32(a >> 32), Int32(a), Int32(b >> 32), Int32(b))
+
+
+@traced
+def _fold_residual(tid, lds, a, tag, mask):
+    """CTA 255, mask set: the 255 other CTAs' residual partials (+0xd600) folded into its own LDS row totals
+    (u64 sum, u64 max key: order-free), then wave 0 pushes the rank's flagged rows to every rank's sym:sample
+    + 0xc6000 and folds the ranks' -> per row (sum, key) at lanes j. Returns (sum lo, sum hi, key lo, key hi)
+    of row = lane (wave 0)."""
+    lane, w = tid % 64, tid // 64
+    ws, tab = _w(a, 0x250), _w(a, 0x238)
+    rk = _w(a, 0x240)
+    rank, npes = Int32(rk), Int32(rk >> 32)
+    par = Int32(_w(a, 0x248)) & 1
+    c = tid & 255
+    h = tid >> 8
+    for q in range_constexpr(3):
+        row = h + 2 * q
+        sm, ky = Int64(0), Int64(0)
+        if (row < 6) & (c != 255) & (((mask >> fx.min(row, Int32(5))) & 1) == 1):
+            base = RPART_OFF + 8 * c + 2048 * (4 * row)
+            v = [_ld(ws, (base + 2048 * k) >> 2, 2, CM_DEV) for k in range(4)]
+            got = (
+                (Int32(v[0][1]) == tag)
+                & (Int32(v[1][1]) == tag)
+                & (Int32(v[2][1]) == tag)
+                & (Int32(v[3][1]) == tag)
+            )
+            while ~got:
+                spin_pause()
+                rocdl.s_sleep(1)
+                v = [_ld(ws, (base + 2048 * k) >> 2, 2, CM_DEV) for k in range(4)]
+                got = (
+                    (Int32(v[0][1]) == tag)
+                    & (Int32(v[1][1]) == tag)
+                    & (Int32(v[2][1]) == tag)
+                    & (Int32(v[3][1]) == tag)
+                )
+            sm = _u64(Int32(v[0][0]), Int32(v[1][0]))
+            ky = _u64(Int32(v[2][0]), Int32(v[3][0]))
+        for kk in (1, 2, 4, 8, 16, 32):
+            sm = sm + _bperm64(sm, lane ^ kk)
+            o = _bperm64(ky, lane ^ kk)
+            ky = _u64_gt(o, ky).select(o, ky)
+        if lane == 0:
+            _lds_st(
+                lds,
+                RSCR_LDS + 16 * (4 * (2 * q + h) + (w & 3)),
+                [Int32(sm), Int32(sm >> 32), Int32(ky), Int32(ky >> 32)],
+            )
+    gpu.barrier()
+    if tid < 6:
+        own_s = _lds_ld(lds, RSUM_LDS + 8 * tid, 2)
+        own_k = _lds_ld(lds, RKEY_LDS + 8 * tid, 2)
+        sm, ky = _u64(Int32(own_s[0]), Int32(own_s[1])), _u64(
+            Int32(own_k[0]), Int32(own_k[1])
+        )
+        g = (tid & 1) + 2 * (tid >> 1)  # row tid = h + 2 q -> scratch group 2 q + h
+        for k in range_constexpr(4):
+            p4 = _lds_ld(lds, RSCR_LDS + 16 * (4 * g + k), 4)
+            sm = sm + _u64(Int32(p4[0]), Int32(p4[1]))
+            o = _u64(Int32(p4[2]), Int32(p4[3]))
+            ky = _u64_gt(o, ky).select(o, ky)
+        _lds_st(lds, RSUM_LDS + 8 * tid, [Int32(sm), Int32(sm >> 32)])
+        _lds_st(lds, RKEY_LDS + 8 * tid, [Int32(ky), Int32(ky >> 32)])
+    gpu.barrier()
+    pv = [_ldm(tab, 64, 2 * p, npes > p, 2) for p in range(8)]
+    peers = [
+        rsrc((Int64(uniform(v[1])) << 32) | Int64(fx.Uint32(uniform(v[0])))) for v in pv
+    ]
+    ov = _ld(tab, rank * 2, 2)
+    own = (Int64(uniform(ov[1])) << 32) | Int64(fx.Uint32(uniform(ov[0])))
+    if (tid < 6) & (((mask >> fx.min(tid, Int32(5))) & 1) == 1):
+        s2v = _lds_ld(lds, RSUM_LDS + 8 * tid, 2)
+        k2v = _lds_ld(lds, RKEY_LDS + 8 * tid, 2)
+        d1 = fx.Vector.from_elements([Int32(s2v[0]), tag, Int32(s2v[1]), tag], Int32)
+        d2 = fx.Vector.from_elements([Int32(k2v[0]), tag, Int32(k2v[1]), tag], Int32)
+        word = (RX2_OFF + ((par * 8 + rank) * 6 + tid) * 32) >> 2
+        for pp in range_constexpr(8):
+            if pp < npes:
+                bo.buffer_store(d1, peers[pp], word, cache_modifier=CM_SYS)
+                bo.buffer_store(d2, peers[pp], word + 4, cache_modifier=CM_SYS)
+    r8, j8 = lane >> 3, lane & 7
+    need = (
+        (tid < 64)
+        & (r8 < npes)
+        & (j8 < 6)
+        & (((mask >> fx.min(j8, Int32(5))) & 1) == 1)
+    )
+    word = (RX2_OFF + ((par * 8 + r8) * 6 + j8) * 32) >> 2
+    e1 = _ldm(own, NB, word, need, 4, CM_SYS)
+    e2 = _ldm(own, NB, word + 4, need, 4, CM_SYS)
+    while need & (
+        (Int32(e1[1]) != tag)
+        | (Int32(e1[3]) != tag)
+        | (Int32(e2[1]) != tag)
+        | (Int32(e2[3]) != tag)
+    ):
+        spin_pause()
+        e1 = _ldm(own, NB, word, need, 4, CM_SYS)
+        e2 = _ldm(own, NB, word + 4, need, 4, CM_SYS)
+    sm = need.select(_u64(Int32(e1[0]), Int32(e1[2])), Int64(0))
+    ky = need.select(_u64(Int32(e2[0]), Int32(e2[2])), Int64(0))
+    for kk in (8, 16, 32):
+        sm = sm + _bperm64(sm, lane ^ kk)
+        o = _bperm64(ky, lane ^ kk)
+        ky = _u64_gt(o, ky).select(o, ky)
+    return sm, ky
+
+
+@traced
+def _fold_out(tid, lds, a, tag, nlive, vp, tok, mask, accepted, rsum, rkey):
+    """CTA 255 wave 0: the step's accept count n and token (residual rows: TileRT's ratio test on the ranks'
+    residual masses), tok_out, the mtp_ctl write-back (dsp_pos, blk_tok / blk_pos, vtok / vpos, ar_acc /
+    ar_num, ctl) and X row 0 = embed[token]."""
+    lane = tid % 64
+    w0 = tid < 64
+    vtok = _w(a, 0x210)
+    rk = _w(a, 0x240)
+    npes = Int32(rk >> 32)
+    dr = [_ld(vtok, 1 + j) for j in range(5)]
+    n = nlive
+    token = tok
+    if vp[0] < 0:
+        n = Int32(0)
+    if mask != 0:
+        # ratio test of row j + 1's residual mass against e_j = exp(acc_j)
+        jn = fx.min(lane + 1, Int32(63))
+        nsum = _bperm64(rsum, jn)
+        mass = F32(0.0)
+        if (lane + 1) < nlive:
+            mf = (Int32(nsum >> 32).to(fx.Uint32).to(fx.Float64) * fx.Float64(4294967296.0)
+                  + Int32(nsum).to(fx.Uint32).to(fx.Float64)) * fx.Float64(2.0 ** -60)  # fmt: skip
+            mass = (((mask >> jn) & 2) != 0).select(mf.to(F32), F32(0.0))
+        j5 = fx.min(lane, Int32(4))
+        ej = _exp_isa(_lds_ld(lds, 0x12694 + 4 * j5).bitcast(F32))
+        ratio = ej
+        if (lane + 1) < nlive:
+            den = (F32(1.0) + mass) - ej
+            ratio = (F32(0.0) < den).select(mass / den, F32(1.0))
+        flag = (lane < nlive) & (_lds_ld(lds, 0x126AC + 4 * j5).bitcast(F32) <= ratio)
+        cnt = Int32(0)
+        for i in range_constexpr(
+            6
+        ):  # 64 - clz64(ballot(flag)): flags only on lanes < s33 <= 5
+            fi = bperm(flag.select(Int32(1), Int32(0)).bitcast(F32), i).bitcast(Int32)
+            cnt = (fi != 0).select(Int32(i + 1), cnt)
+        n = (accepted < 0).select(cnt, accepted)
+        rowkey = _bperm64(rkey, n & 63)
+        klo = (nlive != accepted).select(Int32(rowkey), Int32(0))
+        if (nlive == accepted) & (npes >= 1):
+            kh, kl = Int32(0), Int32(0)
+            for r in range_constexpr(8):
+                if r < npes:
+                    kv = _lds_ld(lds, RX_LDS + 136 * r + 88, 2)
+                    g = _k_gt(Int32(kv[1]), Int32(kv[0]), kh, kl)
+                    kh, kl = g.select(Int32(kv[1]), kh), g.select(Int32(kv[0]), kl)
+            klo = kl
+        token = ~klo
+        if ((accepted | klo) > -1) & (n < nlive):
+            token = _sel6([Int32(0)] + dr, n + 1)
+    # tok_out: drafts below n, the token at n, -1 above
+    outs = [
+        (Int32(i) < n).select(
+            dr[i] if i < 5 else Int32(-1), (Int32(i) == n).select(token, Int32(-1))
+        )
+        for i in range(6)
+    ]
+    tok_out, rec = _w(a, 0x258), _w(a, 0x260)
+    if (tid == 0) & (tok_out != 0):
+        bo.buffer_store(fx.Vector.from_elements(outs[:4], Int32), rsrc(tok_out), 0)
+        bo.buffer_store(fx.Vector.from_elements(outs[4:], Int32), rsrc(tok_out), 4)
+    if (tid == 0) & (rec != 0):
+        bo.buffer_store(
+            fx.Vector.from_elements([n, Int32(0), mask, Int32(0)], Int32), rsrc(rec), 0
+        )
+        bo.buffer_store(token, rsrc(rec), 4)
+    ctl, avtok, avpos, dsp = _w(a, 0x2B8), _w(a, 0x2C0), _w(a, 0x2C8), _w(a, 0x2D0)
+    rows, blk_tok, blk_pos = Int32(_w(a, 0x2D8)), _w(a, 0x2E0), _w(a, 0x2E8)
+    nblk = Int32(_w(a, 0x2F0))
+    ar_acc, ar_num, caps = _w(a, 0x2F8), _w(a, 0x300), _w(a, 0x308)
+    pad = Int32(_w(a, 0x310))
+    live0 = vp[0] >= 0
+    tokx = token
+    if ctl != 0:
+        c01 = _ld(ctl, 0, 2)
+        c35 = [_ld(ctl, 3 + k) for k in range(3)]
+        c0, c1 = Int32(c01[0]), Int32(c01[1])
+        old_vpos = (w0 & (lane < 6)).select(
+            _ldm(avpos, NB, lane, w0 & (lane < 6), 1), Int32(-1)
+        )
+        gpu.barrier()
+        if w0 & (lane < rows):
+            ok = (lane < 6) & (lane <= n) & live0
+            bo.buffer_store(ok.select(Int32(old_vpos), Int32(-1)), rsrc(dsp), lane)
+        tokv = ((n < 6) & live0).select(token, c1)
+        tokx = live0.select(token, tokv)
+        base = live0.select(c0 + n + 1, c0)
+        posv = lane + base + 1
+        if w0 & (lane < nblk):
+            bo.buffer_store((lane == 0).select(tokv, pad), rsrc(blk_tok), lane)
+            bo.buffer_store(
+                ((lane < 5) & (posv < c35[0])).select(posv, Int32(-1)),
+                rsrc(blk_pos),
+                lane,
+            )
+        if w0 & (lane < 6):
+            bo.buffer_store((lane == 0).select(tokv, pad), rsrc(avtok), lane)
+            bo.buffer_store((posv < c35[0]).select(posv, Int32(-1)), rsrc(avpos), lane)
+        if tid == 0:
+            if live0:
+                cap_a, cap_n = Int32(caps), Int32(caps >> 32)
+                cnt_a = _ld(ar_acc, 0)
+                for i in range_constexpr(6):
+                    if (cnt_a + 1 + i < cap_a) & (Int32(i) <= n):
+                        bo.buffer_store(outs[i], rsrc(ar_acc), cnt_a + 1 + i)
+                bo.buffer_store(fx.min(cnt_a + n + 1, cap_a - 1), rsrc(ar_acc), 0)
+                cnt_n = _ld(ar_num, 0)
+                if cnt_n + 1 < cap_n:
+                    bo.buffer_store(n + 1, rsrc(ar_num), cnt_n + 1)
+                bo.buffer_store(fx.min(cnt_n + 1, cap_n - 1), rsrc(ar_num), 0)
+                bo.buffer_store(
+                    fx.Vector.from_elements([c0 + n + 1, tokv], Int32), rsrc(ctl), 0
+                )
+                bo.buffer_store(c35[2] + n + 1, rsrc(ctl), 5)
+            bo.buffer_store(n, rsrc(ctl), 2)
+            bo.buffer_store(c35[1] + 1, rsrc(ctl), 4)
+    # X row 0 = embed[token] (zeros past the vocabulary), wave 0, 10 x 16 B a lane
+    if w0:
+        tk = uniform(bperm(tokx.bitcast(F32), 0).bitcast(Int32))
+        live = _u_lt(tk, Int32(VOCAB))
+        src = _w(a, 0xE8 + 0xD8) + live.select(tk, Int32(0)).to(Int64) * HIDDEN_B
+        dst = _w(a, 0xE8 + 0xE8)
+        zero = fx.Vector.from_elements([Int32(0)] * 4, Int32)
+        for k in range_constexpr(10):
+            idx = lane + 64 * k
+            v = live.select(
+                fx.Vector(bo.buffer_load(rsrc(src), idx * 4, vec_width=4, dtype=T.i32)),
+                zero,
+            )
+            for hc in range_constexpr(4):
+                bo.buffer_store(v, rsrc(dst), (hc * HIDDEN_B) // 4 + idx * 4)
+
+
 @traced
 def _entry(tid, cta, lds, a):
     if cta < HEAD_CTAS:
         _head(tid, cta, lds, a)
         cnt = (1009 - cta) // 256 + 1
         tag, nlive, vp = _stats(tid, cta, lds, a, cnt)
+        tok, accepted = Int32(-1), Int32(-1)
         if cta == HEAD_CTAS - 1:
             if vp[0] >= 0:
                 _fold_gather(tid, lds, a, tag)
                 gpu.barrier()
                 _fold_publish(tid, lds, a, tag, nlive)
-                _fold_accept(tid, lds, a, tag, nlive, vp)
+                tok, mask, accepted = _fold_accept(tid, lds, a, tag, nlive, vp)
             else:
                 if tid == 0:
                     bo.buffer_store(fx.Vector.from_elements([Int32(0x10000), tag], Int32), rsrc(_w(a, 0x250)),
@@ -1327,6 +1579,12 @@ def _entry(tid, cta, lds, a):
             _residual_rows(tid, cta, lds, a)
             gpu.barrier()
         _residual(tid, cta, lds, a, tag, vp, cnt)
+        if cta == HEAD_CTAS - 1:
+            mask = uniform(_lds_ld(lds, MASK_LDS))
+            rsum, rkey = Int64(0), Int64(0)
+            if mask != 0:
+                rsum, rkey = _fold_residual(tid, lds, a, tag, mask)
+            _fold_out(tid, lds, a, tag, nlive, vp, tok, mask, accepted, rsum, rkey)
     elif cta >= EMBED_CTA0:
         _embed_rows(tid, cta, a)
     elif (cta >= MP_CTA0) & (cta < MP_CTA0 + 40 * MP_SUBS):
