@@ -62,7 +62,7 @@ def _row_major_scale_options():
     return None
 
 
-def use_asm_seam(hc_mult, hidden) -> bool:
+def use_asm_seam(hc_mult: int, hidden: int) -> bool:
     """Whether a seam with a post passes the FP32 weight to mega_mhc for AITER's
     gfx942 ASM seam: wherever AITER supports it, unless
     ATOM_DSV41_MHC_BACKEND=triton."""

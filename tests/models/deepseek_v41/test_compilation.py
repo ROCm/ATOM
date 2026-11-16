@@ -237,9 +237,14 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
 @pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant", "asm"])
-def test_mhc_guard_outputs_and_input_alias(mode, backend):
+def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
+    # Pin the backend: on gfx942 `auto` sends post seams to the ASM seam, so
+    # `triton` must force Triton, and an exported `triton` must not skip `asm`.
+    monkeypatch.setenv(
+        "ATOM_DSV41_MHC_BACKEND", "triton" if backend == "triton" else "auto"
+    )
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)
@@ -316,11 +321,11 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
                 fn,
                 scale,
                 base,
-                1e-6,
-                1e-6,
-                1e-6,
-                2.0,
-                20,
+                kwargs["rms_eps"],
+                kwargs["hc_eps"],
+                kwargs["hc_eps"],
+                kwargs["post_mult"],
+                kwargs["sinkhorn_iters"],
                 pre[0],
                 r,
                 post_mix,
@@ -328,7 +333,7 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
             )
             expected = (
                 seam[0],
-                aiter.rms_norm(seam[3], norm, 1e-6),
+                aiter.rms_norm(seam[3], norm, kwargs["norm_eps"]),
                 seam[4],
                 seam[1].view(rows, hc),
                 seam[2],
