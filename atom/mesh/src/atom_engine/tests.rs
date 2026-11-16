@@ -140,8 +140,9 @@ fn fake_core(
         let ctx = zmq::Context::new();
         let dealer = |address: &str| {
             let socket = ctx.socket(zmq::DEALER).unwrap();
-            // A message the link sent elsewhere fails the test, not hangs it.
-            socket.set_rcvtimeo(5000).unwrap();
+            // A message the link sent elsewhere fails the test, not hangs it;
+            // short, since a test the link sends nothing to waits it out.
+            socket.set_rcvtimeo(1000).unwrap();
             socket.connect(address).unwrap();
             socket.send(Vec::<u8>::new(), 0).unwrap();
             socket

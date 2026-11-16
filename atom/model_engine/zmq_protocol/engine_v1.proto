@@ -234,7 +234,7 @@ message RequiredChannel {
 }
 
 // Mirrors atom.SamplingParams field for field. An absent optional is None,
-// except `temperature`, `top_k`, `top_p` and `max_tokens`, which take
+// except `temperature`, `top_k`, `top_p`, `max_tokens` and `n`, which take
 // SamplingParams' defaults. `max_tokens` is the request's own and is not
 // shared with the request's other parameters on the Core.
 message SamplingParams {
@@ -244,7 +244,7 @@ message SamplingParams {
   optional int64 max_tokens = 4;
   bool ignore_eos = 5;
   StopStrings stop_strings = 6;  // absent: None
-  uint32 n = 7;
+  optional uint32 n = 7;
   oneof logprobs {               // absent: None
     bool logprobs_flag = 8;
     int64 logprobs_count = 9;
