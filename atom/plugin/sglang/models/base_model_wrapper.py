@@ -26,7 +26,9 @@ from atom.plugin.sglang.runtime import (
     get_current_forward_batch,
     get_model_arch_spec,
     plugin_runtime_scope,
+    resolve_model_arch_spec,
 )
+from atom.plugin.sglang.runtime.model_arch import DEEPSEEK_V41_ARCH
 from atom.plugin.sglang.tbo import (
     SGLangPluginUBatchWrapper,
     prepare_sglang_tbo_forward_inputs,
@@ -96,6 +98,11 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.unpadded_vocab_size = vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
+        # SGLang renames DeepSeek-V4.1 to DeepseekV4ForCausalLM; its adapter is
+        # resolved by model_type instead.
+        resolved_arch, resolved_spec = resolve_model_arch_spec(config)
+        if resolved_arch == DEEPSEEK_V41_ARCH:
+            self.model_arch, self.model_arch_spec = resolved_arch, resolved_spec
         self.capture_aux_hidden_states = False
         self.atom_tbo_wrapper: SGLangPluginUBatchWrapper | None = None
         self._tbo_fallback_reasons_logged: set[str] = set()
@@ -239,7 +246,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         if hasattr(self.model, "get_embed_and_head"):
             return self.model.get_embed_and_head()
 
-        if self.model_arch == "DeepseekV4ForCausalLM":
+        if self.model_arch in ("DeepseekV4ForCausalLM", DEEPSEEK_V41_ARCH):
+            # V4.1's `model` is a property returning the backbone itself.
             return self.model.model.embed.weight, self.model.model.head.weight
 
         embed_owner, head_owner = self._embed_and_head_owners()

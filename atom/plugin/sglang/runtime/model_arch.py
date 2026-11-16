@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
+logger = logging.getLogger("atom")
+
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
+DEEPSEEK_V41_ARCH = "DeepseekV41ForCausalLM"
 
 MODEL_TYPE_ADAPTER_ARCHES = {
     GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
     "deepseek_v4": "DeepseekV4ForCausalLM",
     "deepseek_v4_mtp": "DeepseekV4ForCausalLM",
+    "deepseek_v41": DEEPSEEK_V41_ARCH,
+    "deepseek_v41_text": DEEPSEEK_V41_ARCH,
     "kimi_k3": "KimiK3ForConditionalGeneration",
     "minimax_m3": "MiniMaxM3SparseForCausalLM",
     "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
@@ -86,6 +92,68 @@ def _build_glm52_dsa_forward_metadata(
     from atom.plugin.sglang.runtime.forward_context import _build_glm52_dsa_metadata
 
     return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
+
+
+def _prepare_deepseek_v41_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE,
+        align_atom_config_with_sglang,
+        refuse_unsupported_sglang_features,
+    )
+
+    refuse_unsupported_sglang_features()
+    align_atom_config_with_sglang(atom_config)
+    # One V4.1 PAGE per SGLang page; Config picked native's 128.
+    atom_config.kv_cache_block_size = ATOM_DEEPSEEK_V41_SGLANG_BLOCK_SIZE
+    # Bounded replay re-enters the model with a tail of the rows, which the
+    # step staged outside the forward no longer describes. Off before the
+    # runtime model decides whether to build its replay stages.
+    atom_config.enable_decoder_swa_bounded_replay = False
+    # Encoder replay rebuilds state below a prefix hit; radix cache is refused.
+    atom_config.enable_encoder_swa_bounded_replay = False
+    # The remap every other adapter gets from prepare_model, as native's
+    # ModelRunner and the vLLM wrapper apply it. (gfx942's FP4PTPC routed-
+    # expert ptpc_fp8 default is already in the quant config: it is set
+    # before `Config` is built, `v41_default_online_quant_config`.)
+    from atom.plugin.register import _ATOM_SUPPORTED_MODELS
+    from atom.plugin.sglang.prepare import _remap_quant_config_for_sglang_plugin
+
+    _remap_quant_config_for_sglang_plugin(
+        atom_config, _ATOM_SUPPORTED_MODELS[DEEPSEEK_V41_ARCH]
+    )
+    logger.info(
+        "DeepSeek-V4.1 SGLang config: kv_cache_dtype=%s index_cache_dtype=%s "
+        "online_quant_config=%s decoder_replay=%s max_num_seqs=%d "
+        "max_num_batched_tokens=%d",
+        atom_config.kv_cache_dtype,
+        atom_config.index_cache_dtype,
+        atom_config.online_quant_config,
+        atom_config.enable_decoder_swa_bounded_replay,
+        atom_config.max_num_seqs,
+        atom_config.max_num_batched_tokens,
+    )
+
+
+def _install_deepseek_v41_adapters(model: Any) -> None:
+    from atom.plugin.sglang.deepseek_v41_bridge import log_deepseek_v41_runtime_once
+
+    if getattr(model, "replay", False):
+        raise RuntimeError(
+            "DeepSeek-V4.1 decoder SWA bounded replay must be off on the SGLang plugin"
+        )
+    log_deepseek_v41_runtime_once(model)
+
+
+def _build_deepseek_v41_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    del atom_config
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        build_deepseek_v41_forward_metadata,
+    )
+
+    return build_deepseek_v41_forward_metadata(forward_batch, positions)
 
 
 def _build_deepseek_v4_forward_metadata(
@@ -532,6 +600,14 @@ MODEL_ADAPTER_SPECS = {
         bind_cache_views=_bind_deepseek_v4_cache_views,
         build_forward_metadata=_build_deepseek_v4_forward_metadata,
     ),
+    # SGLang rewrites V4.1's architecture to DeepseekV4ForCausalLM; it is
+    # resolved here by model_type first (`resolve_model_arch_spec`).
+    DEEPSEEK_V41_ARCH: SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        prepare_config=_prepare_deepseek_v41_config,
+        install_adapters=_install_deepseek_v41_adapters,
+        build_forward_metadata=_build_deepseek_v41_forward_metadata,
+    ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_config=_prepare_minimax_m3_config,
@@ -577,6 +653,7 @@ MODEL_ARCH_SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         "LlamaForCausalLMEagle3",
         "DeepseekV4ForCausalLM",
+        DEEPSEEK_V41_ARCH,
     )
 }
 
@@ -587,6 +664,13 @@ def get_model_arch_spec(model_arch: str) -> SGLangModelAdapterSpec:
 
 def resolve_model_arch_spec(config: Any) -> tuple[str, SGLangModelAdapterSpec]:
     """Resolve an adapter by exact architecture, then stable model family."""
+
+    # Before the architecture: SGLang's config normalization renames V4.1 to
+    # DeepseekV4ForCausalLM, which would otherwise select the V4 adapter.
+    from atom.plugin.sglang.deepseek_v41_bridge import is_deepseek_v41_config
+
+    if is_deepseek_v41_config(config):
+        return DEEPSEEK_V41_ARCH, MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH]
 
     architectures = getattr(config, "architectures", None) or []
     for architecture in architectures:

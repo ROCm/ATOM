@@ -734,6 +734,32 @@ def _generate_atom_config_from_sglang_config(config: Any):
     atom_kv_cache_dtype = server_args.kv_cache_dtype
     if str(atom_kv_cache_dtype).startswith("fp8"):
         atom_kv_cache_dtype = "fp8"
+    atom_index_cache_dtype = atom_kv_cache_dtype
+
+    from atom.plugin.sglang.deepseek_v41_bridge import (
+        is_deepseek_v41_config,
+        sglang_v41_kv_cache_dtype,
+    )
+
+    if is_deepseek_v41_config(sgl_model_config.hf_config):
+        # V4.1's runtime gate (run in Config.__post_init__) takes bf16/fp8/fp4
+        # for the main pool, never "auto"; ATOM owns that pool, so the
+        # operator's raw choice decides it (SGLang's DSV4 hook resolves "auto"
+        # to fp8_e4m3 only for its own pool). Its index plane is not the main
+        # pool's format: None lets Config pick its FP8 default.
+        atom_kv_cache_dtype = sglang_v41_kv_cache_dtype(server_args.kv_cache_dtype)
+        atom_index_cache_dtype = None
+        from aiter.jit.utils.chip_info import get_gfx
+
+        from atom.plugin.sglang.deepseek_v41_bridge import (
+            v41_default_online_quant_config,
+        )
+
+        # Before Config and the model: V4.1 refuses an FP4PTPC checkpoint
+        # whose routed experts are not converted to per-channel FP8.
+        online_quant_config = v41_default_online_quant_config(
+            online_quant_config, get_gfx(), sgl_model_config.hf_config
+        )
 
     atom_speculative_config = _build_atom_speculative_config_from_sglang(
         server_args, sgl_model_config.hf_config
@@ -757,7 +783,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enforce_eager=True,
         parallel_config=sgl_parallel_config,
         kv_cache_dtype=atom_kv_cache_dtype,
-        index_cache_dtype=atom_kv_cache_dtype,
+        index_cache_dtype=atom_index_cache_dtype,
         enable_prefix_caching=False,
         port=None,
         torch_profiler_dir=None,
