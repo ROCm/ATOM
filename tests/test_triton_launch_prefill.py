@@ -359,3 +359,164 @@ def test_gated_quant_match_plain_triton_bitwise(monkeypatch, gated, tokens, offs
     torch.cuda.synchronize()
     assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
     assert cached._kernels
+
+
+# --- QSA: mRoPE, cache rows, group pooling, selection expansion -------------
+
+
+@pytest.fixture
+def qsa():
+    pytest.importorskip("aiter.ops.topk", exc_type=ImportError)
+    from atom.model_ops.qwen4_exp.ops import qsa
+
+    return qsa
+
+
+def _rope(device="cuda", rotary_dim=64, max_position=16384):
+    """The checkpoint's mRoPE: 64 rotated dims, interleaved [11, 11, 10]."""
+    return SimpleNamespace(
+        rotary_dim=rotary_dim,
+        is_neox_style=True,
+        mrope_section=[11, 11, 10],
+        mrope_interleaved=True,
+        cos_cache=_randn(
+            max_position, rotary_dim // 2, dtype=torch.float32, seed=5, device=device
+        ),
+        sin_cache=_randn(
+            max_position, rotary_dim // 2, dtype=torch.float32, seed=6, device=device
+        ),
+    )
+
+
+def _qsa_batch(tokens, context=8192, page=64, pool_pages=400, device="cuda"):
+    """One request whose last `tokens` of `context` are in this forward, on
+    randomly placed pages."""
+    gen = torch.Generator(device=device).manual_seed(tokens)
+    order = torch.randperm(pool_pages, generator=gen, device=device).to(torch.int32)
+    used = -(-context // page)
+    table = torch.full((1, 256), -1, dtype=torch.int32, device=device)
+    table[0, :used] = order[:used]
+    positions = torch.arange(context - tokens, context, device=device)
+    token_to_req = torch.zeros(tokens, dtype=torch.int32, device=device)
+    slots = table[0, (positions // page).long()].long() * page + positions % page
+    return SimpleNamespace(
+        table=table,
+        positions=positions,
+        token_to_req=token_to_req,
+        slots=slots,
+        compressed=torch.where((positions + 1) % 4 == 0, slots // 4, -1),
+        seq_lens=torch.full((1,), context, dtype=torch.int32, device=device),
+        raw_cache=_randn(pool_pages, page, 1, 128, seed=7, device=device),
+        compressed_cache=_randn(pool_pages, page // 4, 1, 128, seed=8, device=device),
+    )
+
+
+def _qsa_helper_runs(qsa, tokens, offset=0, device="cuda"):
+    """name -> (launcher attribute, run) over one QSA layer's helper calls,
+    with the shapes and strides the layer passes them at TP2. A run returns
+    every tensor it writes; the caches are written into copies."""
+    b = _qsa_batch(tokens, device=device)
+    rope = _rope(device)
+    qkvg = _randn(tokens, 2 * 3072 + 512, offset=offset, seed=9, device=device)
+    q, k = qkvg[:, 3072:6144].view(tokens, 12, 256), qkvg[:, 6144:6400].view(
+        tokens, 1, 256
+    )
+    index_q = _randn(tokens, 4, 128, offset=offset, seed=10, device=device)
+    positions = b.positions.unsqueeze(0).expand(3, -1).contiguous()
+    # The indexer's raw key is a slice of its fused q/k projection.
+    raw_key = _randn(tokens, 5 * 128, seed=11, device=device)[:, 512:].view(
+        tokens, 1, 128
+    )
+    pooled = _randn(tokens, 1, 128, offset=offset, seed=12, device=device)
+    first = b.positions.unsqueeze(1).expand(-1, 3).transpose(0, 1)
+    gen = torch.Generator(device=device).manual_seed(13)
+    groups = torch.randint(
+        -1, 2048, (tokens, 512), dtype=torch.int32, device=device, generator=gen
+    )
+
+    def store(cache, slots, values):
+        cache = cache.clone()
+        qsa.qsa_store_rows(cache, slots, values)
+        return [cache]
+
+    def compressed_slots():
+        out = torch.empty(tokens, dtype=torch.int64, device=device)
+        qsa.qsa_compressed_slots(b.slots, b.positions, 4, out)
+        return [out]
+
+    return {
+        "mrope": (
+            "_qsa_mrope",
+            lambda: list(qsa.qsa_apply_mrope(rope, positions, q, k)),
+        ),
+        "mrope_index_q": (
+            "_qsa_mrope",
+            lambda: qsa.qsa_apply_mrope(rope, positions, index_q)[:1],
+        ),
+        "mrope_keys": (
+            "_qsa_mrope",
+            lambda: qsa.qsa_apply_mrope(rope, first, pooled)[:1],
+        ),
+        "store_raw": ("_qsa_store_rows", lambda: store(b.raw_cache, b.slots, raw_key)),
+        "store_compressed": (
+            "_qsa_store_rows",
+            lambda: store(b.compressed_cache, b.compressed, pooled),
+        ),
+        "compress": (
+            "_qsa_compress_groups",
+            lambda: list(
+                qsa.qsa_compress_groups(
+                    b.raw_cache, b.table, b.token_to_req, b.positions, b.compressed, 4
+                )
+            ),
+        ),
+        "expand": (
+            "_expand_selected",
+            lambda: [
+                qsa.qsa_expand_block_indices(
+                    groups,
+                    b.positions,
+                    b.seq_lens,
+                    b.token_to_req,
+                    4,
+                    2048,
+                    output_width=2051,
+                )
+            ],
+        ),
+        "compressed_slots": ("_qsa_compressed_slots", compressed_slots),
+    }
+
+
+@pytest.mark.parametrize("buffer_ops", ["1", "0"])
+def test_qsa_helper_keys_tell_apart_what_triton_tells_apart(
+    monkeypatch, qsa, buffer_ops
+):
+    _on_cpu(monkeypatch)
+    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
+    for attr, run in _qsa_helper_runs(qsa, 300, offset=1, device="cpu").values():
+        _check_keys(*_record(monkeypatch, qsa, attr, run))
+
+
+@gpu
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("tokens", [2112, 1056, 2096, 16, 2111, 3, 1])
+@torch.inference_mode()
+def test_qsa_helpers_match_plain_triton_bitwise(monkeypatch, qsa, tokens, offset):
+    for attr, run in _qsa_helper_runs(qsa, tokens, offset).values():
+        _plain_vs_cached(monkeypatch, [(qsa, attr)], run)
+
+
+@gpu
+@torch.inference_mode()
+def test_qsa_helpers_replay_in_a_cuda_graph(qsa):
+    """mRoPE and the cache writes also run in the decode graph."""
+    runs = _qsa_helper_runs(qsa, 16)
+    names = ("mrope", "store_raw", "store_compressed")
+    ref = [t for name in names for t in runs[name][1]()]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = [t for name in names for t in runs[name][1]()]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _bitwise_equal(out, ref)

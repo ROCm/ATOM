@@ -37,6 +37,7 @@ from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
 )
 from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 from atom.utils import envs
+from atom.utils.triton_launch import CachedLauncher
 
 # Quantized cache rows. FP8 rows carry one FP32 scale (row amax / FP8 max), so
 # any magnitude is representable and nothing saturates. FP4 rows are MXFP4:
@@ -500,6 +501,9 @@ def _qsa_compressed_slots_kernel(
     tl.store(out_ptr + tokens, tl.where(closes_group, slot // RATIO, -1), mask)
 
 
+_qsa_compressed_slots = CachedLauncher(_qsa_compressed_slots_kernel, num_warps=4)
+
+
 def qsa_compressed_slots(
     slot_mapping: torch.Tensor,
     logical_positions: torch.Tensor,
@@ -525,7 +529,8 @@ def qsa_compressed_slots(
     if out.ndim != 1 or out.stride(0) != 1:
         raise ValueError("QSA compressed slots output must be contiguous")
     if tokens:
-        _qsa_compressed_slots_kernel[(triton.cdiv(tokens, 256),)](
+        _qsa_compressed_slots(
+            (triton.cdiv(tokens, 256),),
             slot_mapping,
             logical_positions,
             out,
@@ -534,7 +539,6 @@ def qsa_compressed_slots(
             logical_positions.stride(0),
             RATIO=compress_ratio,
             BLOCK=256,
-            num_warps=4,
         )
 
 
@@ -597,6 +601,9 @@ def _qsa_mrope_kernel(
     tl.store(dst + dims, result, dims < HEAD_DIM)
 
 
+_qsa_mrope = CachedLauncher(_qsa_mrope_kernel, num_warps=1, enable_fp_fusion=False)
+
+
 def qsa_apply_mrope(
     rotary_emb,
     positions: torch.Tensor,
@@ -636,7 +643,8 @@ def qsa_apply_mrope(
         positions.stride(0) if positions.ndim == 2 and positions.shape[0] == 3 else 0
     )
     kv_heads = k.shape[1] if k is not None else 0
-    _qsa_mrope_kernel[(tokens * (heads + kv_heads),)](
+    _qsa_mrope(
+        (tokens * (heads + kv_heads),),
         q,
         k if k is not None else q,
         out_q,
@@ -659,8 +667,6 @@ def qsa_apply_mrope(
         SECTION_W=sections[2],
         INTERLEAVED=getattr(rotary_emb, "mrope_interleaved", False),
         BLOCK_D=triton.next_power_of_2(dim),
-        num_warps=1,
-        enable_fp_fusion=False,
     )
     return out_q, out_k
 
@@ -711,6 +717,9 @@ def _qsa_store_rows_kernel(
     )
 
 
+_qsa_store_rows = CachedLauncher(_qsa_store_rows_kernel, num_warps=4)
+
+
 def qsa_store_rows(
     cache: torch.Tensor,
     slots: torch.Tensor,
@@ -736,7 +745,8 @@ def qsa_store_rows(
 
     flat = cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
     head_dim = values.shape[2]
-    _qsa_store_rows_kernel[(rows, values.shape[1])](
+    _qsa_store_rows(
+        (rows, values.shape[1]),
         flat,
         slots,
         values,
@@ -751,7 +761,6 @@ def qsa_store_rows(
         NUM_HEADS=values.shape[1],
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
-        num_warps=4,
     )
 
 
@@ -874,6 +883,9 @@ def _qsa_compress_groups_kernel(
         )
 
 
+_qsa_compress_groups = CachedLauncher(_qsa_compress_groups_kernel, num_warps=4)
+
+
 def qsa_compress_groups(
     raw_key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -920,7 +932,8 @@ def qsa_compress_groups(
         position_cache = raw_key_cache
         position_strides = (0, 0, 0)
 
-    _qsa_compress_groups_kernel[(rows,)](
+    _qsa_compress_groups(
+        (rows,),
         raw_key_cache,
         position_cache,
         page_table,
@@ -949,7 +962,6 @@ def qsa_compress_groups(
         BLOCK_D=triton.next_power_of_2(head_dim),
         LOAD_POSITIONS=load_positions,
         ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
-        num_warps=4,
     )
     return pooled, first_positions
 
@@ -1295,6 +1307,9 @@ def _expand_selected_groups(
         tl.where(is_history, history, tail).to(tl.int32),
         cols < out_cols,
     )
+
+
+_expand_selected = CachedLauncher(_expand_selected_groups)
 
 
 @triton.jit
@@ -2003,7 +2018,8 @@ def qsa_expand_block_indices(
     if block_indices.shape[0] == 0:
         return out
 
-    _expand_selected_groups[(block_indices.shape[0], triton.cdiv(output_width, 128))](
+    _expand_selected(
+        (block_indices.shape[0], triton.cdiv(output_width, 128)),
         block_indices,
         context_lens,
         query_positions,
