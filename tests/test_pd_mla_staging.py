@@ -11,9 +11,7 @@ for the NIC, so every destination byte is compared, not just the plan.
 """
 
 import ctypes
-import logging
 import threading
-import time
 from contextlib import nullcontext
 
 import numpy as np
@@ -607,127 +605,23 @@ def _per_token_reference(mc, regions):
     return expected
 
 
-def test_an_uncertain_write_holds_back_only_its_own_slot(monkeypatch, caplog):
-    """The NIC may still read a slot whose write failed, so that slot sits out
-    ATOM_PD_FAILED_WRITE_HOLD_S with a warning; the other one keeps staging."""
+def test_a_failed_write_returns_its_slot_and_the_next_transfer_stages(monkeypatch):
+    """The NIC only reads a staging slot, so a failed write gives it back at
+    once; its late bytes can land only where the failed request was going."""
     mc = _mooncake()
-    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     regions = _source_regions(2, 8)
     expected = _per_token_reference(mc, regions)
-    new = _producer(mc, regions, pool_size=2, slot_pages=4)
+    new = _producer(mc, regions, pool_size=1, slot_pages=4)
     new._rdma_write = lambda *_a, **_k: False
     failed = [torch.zeros_like(t) for t in expected]
-    with caplog.at_level(logging.WARNING, logger="atom"):
-        assert not _run(
-            mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object()
-        )
-    (held,) = [r for r in caplog.records if "out of use for 60s" in r.message]
-    assert "1 of 2 slots left" in held.message
-    pool = new._kv_staging_slots
-    assert pool.usable() == 1
+    assert not _run(mc, new, _request(2, 2, 1, 1, failed), range(4), [3, 5], object())
+    assert new._kv_staging_slots.free == [0]
     new._rdma_write = new._nic.write
     actual = [torch.zeros_like(t) for t in expected]
     assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
     assert all(torch.equal(a, e) for a, e in zip(actual, expected))
     assert new._nic.labels == ["staged-kv"]
-    assert pool.usable() == 1  # still held: the hold has not ended
-
-
-def test_a_quarantined_slot_comes_back_after_the_hold(caplog):
-    mc = _mooncake()
-    pool = mc.SlotPool(1)
-    pool.quarantine(pool.acquire_or_none(), 0.2)
-    assert pool.usable() == 0
-    assert pool.acquire_or_none() is None  # nothing running to wait for
-    time.sleep(0.25)
-    with caplog.at_level(logging.INFO, logger="atom"):
-        assert pool.acquire_or_none() == 0
-    assert any("back in use" in r.message for r in caplog.records)
-    pool.quarantine(0, 0)  # no hold: free at once
-    assert pool.free == [0]
-
-
-def test_a_waiter_gets_a_slot_back_from_quarantine():
-    """With the other slot held by a running write, a waiter takes the
-    quarantined one as soon as its hold ends."""
-    mc = _mooncake()
-    pool = mc.SlotPool(2)
-    running = pool.acquire_or_none()
-    pool.quarantine(pool.acquire_or_none(), 0.2)
-    got = []
-    waiter = threading.Thread(target=lambda: got.append(pool.acquire_or_none()))
-    waiter.start()
-    waiter.join(0.1)
-    assert waiter.is_alive() and got == []
-    waiter.join(5)
-    assert got == [1 - running]
-
-
-def test_a_transfer_that_finds_no_usable_slot_sends_the_rest_per_token(
-    monkeypatch,
-):
-    """Every slot it could wait for is quarantined part-way through: the rest
-    goes per token, and the next transfer stages again."""
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    regions = _source_regions(2, 8)
-    expected = _per_token_reference(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=1)
-    acquire = new._kv_staging_slots.acquire_or_none
-    calls = []
-
-    def none_after_the_first_slot():
-        calls.append(None)
-        return acquire() if len(calls) == 1 else None
-
-    new._kv_staging_slots.acquire_or_none = none_after_the_first_slot
-    actual = [torch.zeros_like(t) for t in expected]
-    assert _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
-    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
-    assert new._nic.labels == ["staged-kv", "block"]
-    new._kv_staging_slots.acquire_or_none = acquire
-    again = [torch.zeros_like(t) for t in expected]
-    assert _run(mc, new, _request(2, 2, 1, 1, again), range(4), [3, 5], object())
-    assert all(torch.equal(a, e) for a, e in zip(again, expected))
-    assert new._nic.labels[2:] == ["staged-kv"] * (len(new._nic.labels) - 2)
-
-
-def test_a_transfer_waiting_on_a_quarantined_slot_sends_per_token(monkeypatch):
-    """A worker blocked on the only slot is woken when the write holding it
-    fails and quarantines it, and finishes per token instead of failing."""
-    mc = _mooncake()
-    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    regions = _source_regions(2, 8)
-    expected = _per_token_reference(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=4)
-    actual = [torch.zeros_like(t) for t in expected]
-    waiting = []
-    waiter = threading.Thread(
-        target=lambda: waiting.append(
-            _run(mc, new, _request(2, 2, 1, 1, actual), range(4), [3, 5], object())
-        )
-    )
-
-    def staged_write_is_uncertain(target, src, dst, sizes, req, label, **kwargs):
-        if label != "staged-kv":
-            return new._nic.write(target, src, dst, sizes, req, label, **kwargs)
-        # This transfer holds the only slot while the other one starts waiting.
-        waiter.start()
-        waiter.join(0.2)
-        assert waiter.is_alive() and not new._nic.labels
-        return False
-
-    new._rdma_write = staged_write_is_uncertain
-    first = [torch.zeros_like(t) for t in expected]
-    assert not _run(mc, new, _request(2, 2, 1, 1, first), range(4), [3, 5], object())
-    waiter.join(5)
-    assert waiting == [True]
-    assert all(torch.equal(a, e) for a, e in zip(actual, expected))
-    assert new._nic.labels == ["block"]
-    # The uncertain write's slot is not handed out during its hold.
-    assert new._kv_staging_slots.usable() == 0
 
 
 def test_staged_chunks_write_the_bytes_of_the_whole_transfer(monkeypatch):
