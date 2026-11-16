@@ -12,6 +12,7 @@ from atom.model_ops.kimi_k3.activations import (
 from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
 from atom.model_ops.kimi_k3.kda_state import gather_kda_initial_state
 from atom.model_ops.kimi_k3.quant import strided_per_token_quant
+from atom.model_ops.kimi_k3.two_step_add import two_step_add
 
 __all__ = [
     "apply_attn_res",
@@ -21,4 +22,5 @@ __all__ = [
     "situ_and_mul_maybe_quant",
     "situ_and_mul_quant",
     "strided_per_token_quant",
+    "two_step_add",
 ]

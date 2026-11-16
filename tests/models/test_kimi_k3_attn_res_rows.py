@@ -69,6 +69,12 @@ def _torch_attn_res(
     return y.to(prefix.dtype), prefix if add_hidden is None else ps.to(prefix.dtype)
 
 
+def _torch_two_step_add(a, b, c):
+    out = a + b
+    out += c
+    return out
+
+
 class _Attention(nn.Module):
     """This rank's share of a KDA mixer's output, all-reduced unless the layer
     turns `o_proj.reduce_results` off, as RowParallelLinear does."""
@@ -103,6 +109,9 @@ def logged(ranks, monkeypatch, split_op_on_cpu):  # noqa: F811
     monkeypatch.setattr(kimi, "tensor_model_parallel_all_reduce", all_reduce)
     monkeypatch.setattr(
         kimi_k3_ops, "apply_attn_res", _logs("attn_res", _torch_attn_res)
+    )
+    monkeypatch.setattr(
+        kimi_k3_ops, "two_step_add", _logs("two_step_add", _torch_two_step_add)
     )
     monkeypatch.setattr(
         torch.ops.aiter,
@@ -221,6 +230,7 @@ def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_n
             ("routed_expert_up_proj", chunk),
             ("shared_experts", tokens),
             ("reduce_scatter", padded),
+            ("two_step_add", chunk),
             ("all_gather", chunk),
         ]
         residual, routed, shared, bank = got
@@ -314,3 +324,22 @@ def test_folded_zeros_are_added_without_loading(monkeypatch):
     assert not attn_res._folded_zeros
     assert folded[1].data_ptr() != prefix.data_ptr()
     assert all(torch.equal(a, b) for a, b in zip(folded, loaded))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [2048, 13])
+def test_two_step_add_is_bitwise_the_two_torch_adds(rows):
+    """The row-sharded tail's fused add rounds after each add, as `routed +
+    shared` then `+= prefix` do. Magnitudes spread over 2**+-24, so the first
+    rounding often moves the second."""
+    gen = torch.Generator().manual_seed(rows)
+
+    def randn():
+        scale = 2.0 ** torch.randint(-24, 25, (rows, 7168), generator=gen)
+        return (torch.randn(rows, 7168, generator=gen) * scale).bfloat16().cuda()
+
+    u, s, p = randn(), randn(), randn()
+    want = u + s
+    want += p
+    got = kimi_k3_ops.two_step_add(u, s, p)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
