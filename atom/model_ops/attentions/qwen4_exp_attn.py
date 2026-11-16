@@ -45,11 +45,13 @@ from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     QSA_DRAFT_ROWS,
     QSA_ROWS,
     QSA_SIDE_PLANES,
-    check_kv_transfer,
-    kv_transfer_leaves,
     qsa_cache_formats,
     qsa_caches_rope_positions,
     qsa_paged_layout_id,
+)
+from atom.model_ops.qwen4_exp.qsa_kv_transfer import (
+    check_kv_transfer,
+    kv_transfer_leaves,
 )
 from atom.utils import CpuGpuBuffer, envs
 

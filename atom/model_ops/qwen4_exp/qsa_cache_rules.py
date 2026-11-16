@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Which QSA caches a Qwen3.8 engine keeps, which KV transfer may move them,
-and how the PAGE layout id spells them.
+"""Which QSA caches a Qwen3.8 engine keeps and how the PAGE layout id spells
+them.
 
 The arena, the layers binding its rows, the PAGE namespace, the layout id and
 `Qwen4ExpBackend.validate_config` all read these. Kept out of `qwen4_exp_attn`
@@ -9,7 +9,6 @@ and `ops/qsa.py`, which import Triton and AITER, so `kv_transfer` can import
 them and CPU CI runs their tests.
 """
 
-from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.utils import envs
 
 QSA_CACHE_FORMATS = ("bf16", "fp8", "fp4")
@@ -110,29 +109,3 @@ def qsa_paged_layout_id(base: str, ssm_storage: str, page_fields, ple_planes) ->
         + ";".join(f"{n}={_shape_and_dtype(s, d)}" for n, s, d in page_fields)
         + "".join(f":ple_{t}={_shape_and_dtype(s, d)}" for t, s, d in ple_planes)
     )
-
-
-def kv_transfer_leaves(config) -> list[str]:
-    return [name for name, _ in KVConnectorFactory.leaf_connectors(config) or ()]
-
-
-def check_kv_transfer(config) -> None:
-    """Qwen3.8's GDN and PLE state ride the PAGE checkpoint image, so only an
-    offload tier registered with `reads_page_images` may run."""
-    for name in kv_transfer_leaves(config):
-        if not KVConnectorFactory.is_offload_backend(name):
-            # A P/D connector moves the QSA pages alone, and decode would
-            # continue from a zero recurrent state: wrong output, no error.
-            raise ValueError(
-                "Qwen3.8 disaggregated serving is not supported: "
-                f"kv_connector={name!r} would transfer the QSA pages without "
-                "the GDN and PLE state. Use an offload connector "
-                "(lmcache_offload or lmcache_mp) or run without "
-                "kv_transfer_config."
-            )
-        if not KVConnectorFactory.reads_page_images(name):
-            raise ValueError(
-                "Qwen3.8 offload supports lmcache_offload and lmcache_mp; "
-                f"kv_connector={name!r} does not read the QSA/GDN/PLE PAGE "
-                "checkpoint image."
-            )

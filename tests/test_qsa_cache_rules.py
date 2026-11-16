@@ -11,12 +11,12 @@ import torch
 from atom.model_ops.qwen4_exp.qsa_cache_rules import (
     QSA_DRAFT_ROWS,
     QSA_ROWS,
-    check_kv_transfer,
     qsa_cache_formats,
     qsa_page_segments,
     qsa_paged_layout_id,
     qsa_row_space,
 )
+from atom.model_ops.qwen4_exp.qsa_kv_transfer import check_kv_transfer
 
 
 @pytest.mark.parametrize(
