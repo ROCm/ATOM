@@ -1,6 +1,6 @@
 # 455-CI 图和报告的生成脚本
 
-按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和结果。结果是一个英文 md，`recipes/result/<YYYYMMDD>-result.md`：简短 summary、发现、详细 summary。每周两场：周六测 MLPerf Endpoint（当天构建的镜像），周三测 8K/1K（复用上一个周六的镜像）；一场一份报告，以场次日期命名。
+按 [`455-CI-guide.md`](../../455-CI-guide.md) §5，从 `perf.csv` 和 `accuracy.csv` 生成一场测试的趋势图和结果。结果是一个英文 md，`recipes/result/<YYYYMMDD>-result.md`，标题是 `<YYYY-MM-DD> MI455 Workload Weekly Status Report`：Lowlights、Highlights（没有就不写）、总表、测试环境、发现、Details。每周两场：周六测 MLPerf Endpoint（当天构建的镜像），周三测 8K/1K，每场都用当天构建的镜像；一场一份报告，以场次日期命名。
 
 | 文件 | 作用 |
 |---|---|
@@ -25,7 +25,7 @@ python3 -m pytest -q                         # 改了脚本先跑测试
 
 - `--date` 是场次日期：周六那场或周三那场。每场测完跑一次，连同历史数据重新生成。那天跑的是哪个场景，脚本从数据里看出来。
 - 结果里不 @ 任何人：负责人在 Teams 里汇报时再加。
-- 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：Lowlights 是一张表（Model、What happened、Cause、Fix、Owner），`problem` 填 Cause 列，`action`（`open_pr` / `merged_pr` / `our_pr` / `repro`）和 `link` 填 Fix 列，详细 summary 里还有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
+- 每个问题（❌ 🔴 ⚠️）的说法取自 `../followups.csv`（guide §3.7）：Lowlights 是一张表（Model、What happened、Cause、Fix、Owner，Owner 始终留空），好消息另有一张 Highlights 表（Model、What happened、Owner），哪张没有内容就不写，`problem` 填 Cause 列，`action`（`open_pr` / `merged_pr` / `our_pr` / `repro`）和 `link` 填 Fix 列，Details 里还有 Follow-ups 表。还有问题没写说法时，`make_report.py` 会打 `no follow-up` 的警告。
 - 结果开头写全镜像名，以及 ATOM、aiter 的 branch、完整 commit 和日期；跑挂的模型在 Failures 里附复现命令，取自 `../runs/<YYYYMMDD>/<slug>/*_cmd*.sh`。
 - `../pending_fixes.csv` 登记某个模型在 main 上还在等的 PR。这个模型出了问题又没写说法时，`make_report.py` 会在警告下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。
 - 依赖：Python 3.10 以上、matplotlib；跑测试还要 pytest。没有字体文件也能画，会退回 DejaVu Sans。

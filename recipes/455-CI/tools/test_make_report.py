@@ -128,10 +128,10 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
     assert [p.name for p in (ci.parent / "result").iterdir()] == ["20261114-result.md"]
     report = result(ci, "20261114").read_text()
     summary, details = report.split("\n## Details\n")
-    assert summary.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")
-    assert "## Summary" in summary and "### Lowlights" in summary and "❌" in summary
+    assert summary.startswith("# 2026-11-14 MI455 Workload Weekly Status Report\n")
+    assert "## Summary" not in summary and "## Lowlights" in summary and "❌" in summary
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | N/A | N/A |" in summary
-    assert "base" not in summary.split("### Lowlights")[0].lower()
+    assert "base" not in summary.split("## Lowlights")[0].lower()
     assert "| Test date | 2026-11-14 |" in details and "sha256:abc" in details
     assert "Base image" not in details and "Dependency" not in details
     assert (
@@ -143,7 +143,7 @@ def test_a_saturday_report_is_one_file_with_the_summary_then_the_details(
     assert not re.search(CJK, report)
 
 
-def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(ci):
+def test_a_wednesday_report_covers_its_own_session_on_its_own_image(ci):
     g = {"scenario": "8k1k", "model": "glm-5.2"}
     write_csv(
         ci / "perf.csv",
@@ -152,24 +152,24 @@ def test_a_wednesday_report_covers_its_own_session_on_the_saturday_image(ci):
             perf(
                 "2026-11-14", 64, "1000"
             ),  # Saturday's endpoint session: not in this report
-            perf("2026-11-11", 64, "12000", tpot="30", image_date="2026-11-07", **g),
-            perf("2026-11-18", 64, "12300", tpot="30", image_date="2026-11-14", **g),
+            perf("2026-11-11", 64, "12000", tpot="30", **g),
+            perf("2026-11-18", 64, "12300", tpot="30", **g),
         ],
     )
-    image_json(ci / "runs" / "20261114", "sha256:saturday")
+    image_json(ci / "runs" / "20261118", "sha256:wednesday")
 
     main(["--date", "2026-11-18", "--data-dir", str(ci)])
 
     assert [p.name for p in (ci.parent / "result").iterdir()] == ["20261118-result.md"]
     report = result(ci, "20261118").read_text()
-    assert report.startswith("# 455-CI result · 2026-11-18 · 8K/1K")
+    assert report.startswith("# 2026-11-18 MI455 Workload Weekly Status Report\n")
     assert "| GLM-5.2 | 8K/1K | 12,000 | 12,300 | +2.5% |" in report
     assert "MLPerf Endpoint" not in report
     assert (
         "| Model | Scenario | 2026-11-11 (tok/s/GPU) | 2026-11-18 (tok/s/GPU) | Delta | GSM8K delta |"
         in report
     )
-    assert "sha256:saturday" in report and "| Test date | 2026-11-18 |" in report
+    assert "sha256:wednesday" in report and "| Test date | 2026-11-18 |" in report
     assert "../455-CI/runs/20261118/charts/perf-8k1k.png" in report
 
 
@@ -201,7 +201,7 @@ def test_a_model_left_untested_by_a_machine_failure_is_not_news(ci):
     )
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
     report = result(ci, "20261114").read_text()
-    assert "Kimi-K3" not in report.split("### Results")[0]
+    assert "Kimi-K3" not in report.split("## Results")[0]
     assert "| Kimi-K3 (2.8T) | MLPerf Endpoint | 1,000 | — | — | — |" in report
 
 
@@ -233,7 +233,9 @@ def test_follow_ups_reach_the_lowlights_and_a_problem_without_one_is_flagged(
     )
     main(["--date", "2026-11-14", "--data-dir", str(ci)])
     report = result(ci, "20261114").read_text()
-    assert "No fix yet; [repro](../455-CI/runs/20261114/kimi-k3/repro.md)" in report
+    assert (
+        "No fix yet; [reproducer](../455-CI/runs/20261114/kimi-k3/repro.md)" in report
+    )
     assert "@owner_tbd" not in report
     out = capsys.readouterr().out
     assert "| Model | What happened | Cause | Fix |" in out  # the draft is the table
@@ -311,7 +313,7 @@ def test_the_findings_of_the_session_sit_between_the_summary_and_the_details(ci)
     text = result(ci, "20261114").read_text()
     summary, rest = text.split("\n## Findings\n")
     findings, _details = rest.split("\n## Details\n")
-    assert "## Summary" in summary
+    assert "## Results" in summary
     assert "- The K3 server took 41 min to start (JIT)." in findings
 
 

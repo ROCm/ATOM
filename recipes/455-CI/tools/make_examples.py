@@ -3,8 +3,8 @@
 the example result, recipes/result/example.md.
 
 Made-up numbers in the real layout (perf.csv, accuracy.csv, followups.csv,
-runs/) to show what a session's result looks like. Each week has two sessions
-on one image: Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. The example
+runs/) to show what a session's result looks like. Each week has two sessions,
+each on its own image: Saturday runs MLPerf Endpoint, Wednesday runs 8K/1K. The example
 result is the newest Saturday session (11-14), which has one of everything:
 Qwen-35B-A3B fails at c64 (a repro), DeepSeek R1 c64 drops 5% (our verified
 PR), DeepSeek-V4.1-Flash gains 6% but loses 5 GSM8K points (someone else's open
@@ -197,18 +197,18 @@ def mock_rows():
     rng = random.Random(455)
     perf, acc = [], []
     for image in IMAGES:
-        tag = f"rocm/fw-bringup-mlperf:gfx1250-atom-ci455-{image.replace('-', '')}"
         for scenario, table in (("endpoint", ENDPOINT), ("8k1k", EIGHT_K)):
-            shift = (
-                0 if scenario == "endpoint" else 4
-            )  # 8K/1K runs midweek on the same image
+            # 8K/1K runs midweek, on its own image built that day.
+            shift = 0 if scenario == "endpoint" else 4
+            day = str(
+                datetime.date.fromisoformat(image) + datetime.timedelta(days=shift)
+            )
+            tag = f"rocm/fw-bringup-mlperf:gfx1250-atom-ci455-{day.replace('-', '')}"
             common = {
-                "image_date": image,
+                "image_date": day,
                 "scenario": scenario,
                 "image": tag,
-                "test_date": str(
-                    datetime.date.fromisoformat(image) + datetime.timedelta(days=shift)
-                ),
+                "test_date": day,
                 "atom_branch": "main",
                 "aiter_branch": "main",
             }

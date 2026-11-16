@@ -3,6 +3,7 @@
 from ci455_data import AccCell, PerfCell
 from ci455_report import (
     ModelResult,
+    highlights,
     lowlights,
     lowlights_md,
     missing_followups,
@@ -187,11 +188,13 @@ def test_flat_models_are_not_mentioned():
     assert lowlights([model(n, **FLAT) for n in ("Alpha", "Bravo", "Charlie")]) == []
 
 
-def test_without_problems_the_lowlights_are_one_line_not_an_empty_table():
+def test_without_problems_or_good_news_neither_lights_section_is_written():
     flat = [model("Alpha", **FLAT)]
-    assert lowlights_md(flat) == ["No failures or regressions."]
+    assert lowlights_md(flat) == []
     text = report_md("2026-11-14", {}, flat, "c", "r")
-    assert "\n### Lowlights\n\nNo failures or regressions.\n\n### Results\n" in text
+    assert "## Lowlights" not in text and "## Highlights" not in text
+    assert "No failures or regressions" not in text
+    assert text.index("\n## Results\n") < 60  # straight after the title
 
 
 def test_a_first_result_is_not_news():
@@ -240,16 +243,24 @@ def test_detail_performance_rows_show_the_parallelism_not_the_gpu_count():
     assert "| Alpha | tp4 | 4 |" in text and "| Alpha | tp4 | 64 |" in text
 
 
-def test_one_report_holds_the_summary_and_then_the_details():
+def test_one_report_holds_the_lights_results_environment_findings_and_details():
     text = report_md(
-        "2026-11-14", {}, [model("Alpha", **FLAT), model("Bravo", **FAILING)], "c", "r"
+        "2026-11-14",
+        {},
+        [model("Alpha", **GAINING), model("Bravo", **FAILING)],
+        "c",
+        "r",
     )
+    assert "## Summary" not in text
     order = [
-        "\n## Summary\n",
-        "\n### Lowlights\n",
+        "# 2026-11-14 MI455 Workload Weekly Status Report\n",
+        "\n## Lowlights\n",
         "\n| Model | What happened | Cause | Fix | Owner |",
+        "\n## Highlights\n",
+        "\n| Model | What happened | Owner |",
+        "\n## Results\n",
         "\n| Model | Scenario |",
-        "\n### Environment\n",
+        "\n## Environment\n",
         "\n## Findings\n",
         "\n## Details\n",
         "\n### Environment details\n",
@@ -275,7 +286,7 @@ GAINING = {
 
 
 def test_the_lowlights_tag_no_one_and_leave_the_owner_blank():
-    # The owner is filled in by hand (or in followups.csv), never guessed.
+    # The owner is filled in by hand, never by the generator.
     rows = lowlights(
         [model("Alpha", **GAINING), model("Bravo", **FAILING)],
         followups={"bravo": {"action": "repro", "link": "r.md"}},
@@ -284,15 +295,39 @@ def test_the_lowlights_tag_no_one_and_leave_the_owner_blank():
     assert not any("@" in cell for row in rows for cell in row)
 
 
-def test_an_owner_named_in_the_follow_up_fills_the_owner_column():
+def test_the_owner_column_stays_blank_whatever_the_follow_up_says():
     (row,) = lowlights(
         [model("Bravo", **FAILING)],
         followups={"bravo": {"action": "repro", "link": "r.md", "owner": "Alice"}},
     )
-    assert row[4] == "Alice"
+    assert row[4] == ""
 
 
-def test_the_lowlights_are_a_table_of_problems_in_the_summary():
+def test_gains_and_recoveries_are_highlights_with_a_blank_owner():
+    rows = highlights(
+        [
+            model("Alpha", **GAINING),
+            model(
+                "Bravo",
+                pc(4, 100.0, 99.0, prev_failed=True),
+                pc(64, 1000.0, 990.0),
+                ac(0.95, 0.95),
+            ),
+            model("Charlie", **FAILING),
+        ]
+    )
+    assert rows == [
+        ["🟢 Alpha", "throughput up 4.0%", ""],
+        ["✅ Bravo", "recovered from the previous failure", ""],
+    ]
+
+
+def test_without_good_news_there_is_no_highlights_section():
+    text = report_md("2026-11-14", {}, [model("Bravo", **FAILING)], "c", "r")
+    assert "\n## Lowlights\n" in text and "## Highlights" not in text
+
+
+def test_the_lowlights_are_a_table_of_problems():
     text = report_md(
         "2026-11-14",
         {},
@@ -301,7 +336,7 @@ def test_the_lowlights_are_a_table_of_problems_in_the_summary():
         "r",
         followups={"bravo": follow("open_pr", PR_OPEN)},
     )
-    table = text.split("\n### Lowlights\n\n")[1].split("\n\n")[0].splitlines()
+    table = text.split("\n## Lowlights\n\n")[1].split("\n\n")[0].splitlines()
     assert table == [
         "| Model | What happened | Cause | Fix | Owner |",
         "|---|---|---|---|---|",
@@ -496,7 +531,7 @@ def test_a_problem_with_only_a_repro_links_it():
         [model("Bravo", **FAILING)],
         followups={"bravo": follow("repro", "../runs/20261114/bravo/repro.md")},
     )
-    assert row[3] == "No fix yet; [repro](../runs/20261114/bravo/repro.md)"
+    assert row[3] == "No fix yet; [reproducer](../runs/20261114/bravo/repro.md)"
 
 
 def test_good_news_is_not_a_lowlight_even_with_a_follow_up():
@@ -562,7 +597,7 @@ def test_the_findings_text_goes_into_its_own_section():
         "2026-11-14", {}, [model("Alpha", **FLAT)], "c", "r", findings="- Note one.\n"
     )
     assert "\n## Findings\n\n- Note one.\n\n## Details\n" in text
-    assert text.startswith("# 455-CI result · 2026-11-14 · MLPerf Endpoint")
+    assert text.startswith("# 2026-11-14 MI455 Workload Weekly Status Report\n")
 
 
 def test_a_failure_says_why_with_the_follow_up_problem_instead_of_the_error():
@@ -631,8 +666,8 @@ ENV = {
 
 def test_the_environment_sits_after_the_results_and_before_the_findings():
     text = report_md("2026-11-14", ENV, [model("Alpha", **FLAT)], "c", "r")
-    assert "- Image:" not in text.split("## Summary")[0]
-    head = text.split("\n### Environment\n")[1].split("\n## Findings\n")[0]
+    assert "- Image:" not in text.split("\n## Results\n")[0]
+    head = text.split("\n## Environment\n")[1].split("\n## Findings\n")[0]
     assert "- Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`" in head
     assert (
         "- ATOM: `main` @ `9fec99786b088168aec7729858c1176e99d818e6` (2026-11-13)"

@@ -3,10 +3,11 @@
 
     python3 make_report.py --date 2026-11-18 [--scenario endpoint|8k1k] [--data-dir recipes/455-CI] [--out FILE] [--mock]
 
-A session is one day's run (Saturday: MLPerf Endpoint on the image built that
-day; Wednesday: 8K/1K on the previous Saturday's image). Writes one file,
+A session is one day's run (Saturday: MLPerf Endpoint, Wednesday: 8K/1K), each on
+the image built for it that day from ATOM main and aiter main. Writes one file,
 recipes/result/<YYYYMMDD>-result.md (the result dir next to the data dir, or
---out): the short summary (the lowlights and results tables, the environment), the findings from
+--out), titled "<date> MI455 Workload Weekly Status Report": the lowlights and
+highlights (each left out when empty), the results table, the environment, the findings from
 runs/<YYYYMMDD>/findings.md, then the details (environment, every number, the
 trend charts of make_charts.py and each failure's core error log from
 runs/<YYYYMMDD>/<slug>/error.log). Each problem
@@ -14,7 +15,7 @@ in the lowlights gets its next step from followups.csv (455-CI-guide.md §3.7);
 for one without, the unmerged PRs pending_fixes.csv lists for the model are
 suggested as a ready followups.csv row.
 GSM8K is also held to the known-good value in accuracy_baseline.csv (model,
-baseline, source). Prints the lowlights, a warning for a problem without a follow-up, and last the
+baseline, source). Prints the lowlights and highlights, a warning for a problem without a follow-up, and last the
 report's path. The result tags no one: the owners are added where it is posted.
 The image comes from runs/<image date>/image.json, written when the image was
 built (455-CI-guide.md §2.4), else from the CSV rows.
@@ -29,6 +30,7 @@ import os
 from ci455_data import FOLLOWUP_COLUMNS, MODELS, acc_cell, perf_cells, read_csv
 from ci455_report import (
     ModelResult,
+    highlights_md,
     lowlights_md,
     missing_followups,
     pr_label,
@@ -169,8 +171,12 @@ def main(argv=None):
                 _read(os.path.join(run_dir, "findings.md")),
             )
         )
-    for line in lowlights_md(results, followups):
-        print(line)
+    for title, table in (
+        ("Lowlights", lowlights_md(results, followups)),
+        ("Highlights", highlights_md(results)),
+    ):
+        if table:
+            print(f"{title}:", *table, sep="\n")
     pending = {
         r["model"]: (r.get("prs") or "").split()
         for r in _rows(os.path.join(args.data_dir, "pending_fixes.csv"))

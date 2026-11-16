@@ -4,18 +4,18 @@
 
 **目的**：暴露热点模型在 ATOM main + aiter main 上的支持度和覆盖度，也就是能不能跑起来、精度对不对、性能是多少。所以只用 main，依赖也跟着 main 走。跑挂本身就是结果，要如实记录。
 
-**每周两场测试，共用一个镜像**。一场只测 4 个模型，每场出一份报告：
+**每周两场测试，每场开测前都用当时的 ATOM main 和 aiter main 构建自己的镜像**。一场只测 4 个模型，每场出一份报告：
 
 | 场次 | 时间 | 机器 | 测什么 | 镜像 |
 |---|---|---|---|---|
-| 周末验证 | 每周六 10:30–22:30，12 小时 | 2 个节点：e15-06、e15-07 | MLPerf Endpoint 的 4 个模型 | 开测前按 §2 构建本周镜像：取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个作 base，装上当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<周六日期>` |
-| 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 不构建，复用上一个周六的镜像（§2.5） |
+| 周末验证 | 每周六 10:30–22:30，12 小时 | 2 个节点：e15-06、e15-07 | MLPerf Endpoint 的 4 个模型 | 开测前按 §2 构建本场镜像：取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个作 base，装上当时的 ATOM main 和 aiter main，推成 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<场次日期>` |
+| 周中验证 | 每周三 17:30–22:30，5 小时 | 1 个节点：e15-09 | 8K/1K 的 4 个模型 | 同上：开测前按 §2 用当时的 main 构建本场镜像 |
 
 - 每场按 §3 逐个模型测，每个模型先测 GSM8K 精度、再测性能。跑挂了就记下核心 error log，接着测下一个模型。机器挂了不算跑挂：告诉 user，等 user 重启恢复机器后接着测没测完的（§3.6）。
 - **跑挂或大幅回退不能只报问题，每个都要给出说法**（§3.7）：按顺序找已经在修的公开 PR；没有就自己修好、验证、开 PR；修不了就写好复现文档。
 - **每测完一个模型，就把它的精度和性能数据推到 `455-CI` 分支**（§3.5），不攒到最后。数据按 §4 记录，历史数据都留在 `recipes/455-CI/` 里。
 - **每场的结果记在 `recipes/result/<YYYYMMDD>-result.md`**（§5）：镜像和环境、跑出来的结果、发现、说法、跑挂的 error log 都在里面。测完一个模型就更新一次（§3.5），全部测完再补上图和说法、生成最终版，最后给出这个 md 文件的路径（§5.6）。格式见 [`result/example.md`](result/example.md)。
-- 只有周六构建镜像。周六构建失败时，这一周的两场都记 N/A（§2.1）。
+- **每场开测前都构建镜像**（§2），用当时的 ATOM main 和 aiter main，周三也不复用周六的。构建失败时，这一场都记 N/A（§2.1）。
 
 **前置条件**：
 
@@ -52,16 +52,16 @@
 - 每个模型都先测 GSM8K 精度（§3.3），再测表里的性能。
 - 8K/1K 的输入输出长度、请求数等参数以 recipe 为准。
 
-## 2. 准备本周镜像（每周六一次）
+## 2. 准备本场镜像（每场开测前一次）
 
 ### 2.1 规则
 
-- **每周只建一次**：周六开测前建，周三那场直接用它（§2.5），不构建。
+- **每场都建**：周六、周三开测前都用当时的 ATOM main 和 aiter main 建一个新镜像，不复用上一场的，这样每场测的都是当时的 main。
 - **base 取 `gfx1250-atom-<YYYYMMDD>` 系列里最新的一个**：只看不带后缀的纯日期 tag，也就是大家每天出的 bring-up 镜像，例如 `gfx1250-atom-20261111`。最新的那个 pull 不下来或明显有问题时，往前取一个，并在报告里写明。base 每周都会变，周与周之间的差异也可能来自 base（ROCm、torch、triton、mori 等），所以报告里要写出 base。
 - **只重装 ATOM 和 aiter，且只用 `ROCm/ATOM` 和 `ROCm/aiter` 的 `main`。** 不 checkout 私有分支或 PR，不 cherry-pick，不打 patch。base 里自带的补丁（如 `/app/endpoints-recipe-*/patches`）也不用。
 - **其他组件保持 base 原样**（torch、triton、mori 等），只有 ATOM / aiter main 自己锁定版本的依赖跟着 main 走。例如 aiter main 锁定 `flydsl==0.5.0`，base 里的版本不同时，安装会把它换掉。这正是本 CI 要暴露的状态：不要手动换回，把变化记进 `image.json` 的 `dependency_changes`（§2.4）。
-- **构建失败**（clone、安装或 import 不通过）时，这一周两场的所有模型都记 N/A，error 写构建的核心报错。周三不另建镜像，要补建先和负责人确认。不要改用私有分支凑合。
-- **构建时机器挂了不算构建失败**：按 §3.6 告诉 user。恢复后先 `docker rm -f ci455-build-${DATE}`，再从 §2.2 重新来；§2.2 的同名检查会说明本周镜像是不是已经推上去了。
+- **构建失败**（clone、安装或 import 不通过）时，这一场的所有模型都记 N/A，error 写构建的核心报错。要重建先和负责人确认。不要改用私有分支凑合，也不要拿上一场的镜像凑合。
+- **构建时机器挂了不算构建失败**：按 §3.6 告诉 user。恢复后先 `docker rm -f ci455-build-${DATE}`，再从 §2.2 重新来；§2.2 的同名检查会说明本场镜像是不是已经推上去了。
 
 ### 2.2 选 base、命名和同名检查
 
@@ -91,10 +91,10 @@ done
 echo "BASE_IMAGE=${BASE_IMAGE:-没找到，停下来通知负责人}"
 ```
 
-**命名**：新镜像叫 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，日期取周六构建当天（北京时间），例如 `gfx1250-atom-ci455-20261114`。
+**命名**：新镜像叫 `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`，日期取构建当天（北京时间，也就是场次日期），例如周六 `gfx1250-atom-ci455-20261114`、周三 `gfx1250-atom-ci455-20261118`。
 
 - **不用 `gfx1250-atom-<YYYYMMDD>`**：那是大家每天出镜像的格式（还有 `-dsv41`、`-dsv4pro` 等后缀），周六很容易撞名。`ci455` 只给本 CI 用，现有的 tag 里都没有。
-- **同一周重建**要先经负责人同意，tag 末尾加 `-r2`、`-r3`。
+- **同一场重建**要先经负责人同意，tag 末尾加 `-r2`、`-r3`。
 - **不另开新仓库**：往 org 里推一个不存在的仓库会自动创建它，可见性取决于 org 的默认设置，可能是公开的。
 
 **同名检查**：开始构建前查一次，push 前再查一次。
@@ -179,7 +179,7 @@ remote_tag_state "$NEW_IMAGE"          # push 前再查一次，必须是 absent
 docker push "$NEW_IMAGE"
 docker buildx imagetools inspect "$NEW_IMAGE" | grep -m1 Digest    # 记下 digest，写进报告
 
-# 记下本周镜像的信息，报告的 Environment 从这里读。CI_DIR 见前置条件
+# 记下本场镜像的信息，报告的 Environment 从这里读。CI_DIR 见前置条件
 mkdir -p "$CI_DIR/runs/$DATE"
 NEW_IMAGE="$NEW_IMAGE" BASE_IMAGE="$BASE_IMAGE" ATOM_SHA="$ATOM_SHA" AITER_SHA="$AITER_SHA" \
 DIGEST=$(docker buildx imagetools inspect "$NEW_IMAGE" | awk '/^Digest:/ {print $2; exit}') \
@@ -204,17 +204,17 @@ docker rm -f ci455-build-${DATE}
 - push 只上传新增的那一层，base 的层远端已经有了。
 - `image.json` 不用单独提交，随第一个模型的数据一起推到 `455-CI`（§3.5）。
 
-### 2.5 测试机使用本周镜像
+### 2.5 测试机使用本场镜像
 
-周六的两个节点（e15-06、e15-07，Kimi-K3 两个都用）和周三的 e15-09 都 pull 同一个本周镜像。周三不构建、不推送，直接用上一个周六推的那个，开测前先核对：
+本场的所有节点都 pull 同一个本场镜像（周六 e15-06、e15-07，Kimi-K3 两个都用；周三 e15-09），开测前先核对：
 
 ```bash
-NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<本周六日期>    # 上一个周六推的镜像
+NEW_IMAGE=rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<场次日期>    # 本场开测前推的镜像
 docker buildx imagetools inspect "$NEW_IMAGE" --format '{{json .Image.Config.Labels}}' | tr ',' '\n' | grep ci455
 docker pull "$NEW_IMAGE"
 ```
 
-能看到 `com.amd.ci455.*` 这几个 label，而且 commit 和周六那场报告里写的一致，才开测。周六构建失败、没有本周镜像时，周三这场也记 N/A，原因同周六的构建失败。
+能看到 `com.amd.ci455.*` 这几个 label，而且 commit 和 §2.4 记下的一致，才开测。
 
 ## 3. 跑测试
 
@@ -331,7 +331,7 @@ EOF
 下面任一情况都算失败：server 没起来或中途退出；GSM8K 或 bench 报错退出、卡住；结果文件缺失或不完整。机器挂了不算，按 §3.6 处理。
 
 1. **不盲目重试。** 纯环境问题（GPU 没释放、端口被占、下载失败）修好后可以重跑一次，并在报告里注明"重跑"。
-2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。报告详细 summary 的 Failures 一节会贴出它的前 60 行：
+2. **摘核心 error log**，存到 `$RUN_DIR/$MODEL/error.log`，不超过 100 行。报告 Details 里的 Failures 一节会贴出它的前 60 行：
 
    ```bash
    LOG="$RUN_DIR/$MODEL/server.log"      # client 侧失败就换成对应的 lm_eval.log 或 bench.log
@@ -367,7 +367,7 @@ CI 只负责记录。要查根因就另开任务，从 ATOM 的 `/debug-guide` �
    git status -sb | head -1                # 出现 [ahead N] 就是还没推上去
    ```
 
-- 周六第一个模型的这次提交会把 `runs/<YYYYMMDD>/image.json`（§2.4）一起带上去。
+- 每场第一个模型的这次提交会把本场的 `runs/<YYYYMMDD>/image.json`（§2.4）一起带上去。
 - 两个节点同时追加 CSV 不会冲突：`recipes/455-CI/.gitattributes` 给 `perf.csv`、`accuracy.csv` 设了 `merge=union`，rebase 时两边新加的行都保留。其他结果文件按模型分目录，互不影响。
 - 推不上去（例如网络问题）时本地 commit 还在，可以先接着测，下一个模型上传时会一起推。不要 force push。
 - commit message 不加 `Co-Authored-By` trailer，这是 ROCm/ATOM 维护者的要求。§5.6 的提交也一样。
@@ -401,7 +401,7 @@ agent 自己就跑在挂掉的机器上、会话也断了时，user 恢复机器
 **恢复后接着测**：
 
 ```bash
-# 1) 机器好了：GPU 都在、都空闲，本周镜像还在（NEW_IMAGE 见 §2.5）
+# 1) 机器好了：GPU 都在、都空闲，本场镜像还在（NEW_IMAGE 见 §2.5）
 rocm-smi --showid | grep -o '^GPU\[[0-9]*\]' | sort -u | wc -l    # 和开测前一样
 test "$(ls /sys/class/kfd/kfd/proc | wc -l)" = 0
 docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || docker pull "$NEW_IMAGE"
@@ -434,7 +434,7 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 2. **没人在修，就评估好不好修**：根因清楚、改动小、能在 455 机器上验证，就算好修。回退先看上一场和这一场之间 ATOM、aiter 的 commit（两场的 sha 在报告的 Environment 和 `perf.csv` 里），能定位到具体 commit 的通常好修。好修就自己修：
    - 从对应仓库的 main 拉分支，改动尽量小，按那个仓库的规矩跑测试和 lint（ATOM 见 `/ci-pr-guide`，commit 不加 `Co-Authored-By`）。
-   - 在 455 机器上验证：用本周镜像另起一个容器，装上这个修复，重跑出问题的那一项（跑挂的那个并发或 GSM8K、回退的那个指标），确认好了。不要把修复装进 CI 镜像，也不要推镜像。
+   - 在 455 机器上验证：用本场镜像另起一个容器，装上这个修复，重跑出问题的那一项（跑挂的那个并发或 GSM8K、回退的那个指标），确认好了。不要把修复装进 CI 镜像，也不要推镜像。
    - 开 PR，描述里写清楚问题、根因和 455 上的验证结果。说法是 `our_pr`，链接写这个 PR，`note` 写验证结果。
    - 验证的数字只写进 PR 和 `followups.csv`，不写进 `perf.csv`、`accuracy.csv`：那两个文件只记 main 的结果。
    - 当场验证不完（例如场次时间到了），先按第 3 步处理，验证好以后把说法改成 `our_pr`，重新生成报告。
@@ -476,9 +476,8 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 | `link` | PR 的链接，多个用空格隔开；`repro` 写复现文档的路径，相对 `recipes/455-CI/`，例如 `runs/20261114/qwen-35b-a3b/repro.md` |
 | `problem` | 英文短语，说清是什么问题，例如 `no cross-node TP on main`。它就是 Lowlights 表的 Cause 列；不填时，跑挂的模型用一句话报错 |
 | `note` | 英文一句话：验证结果、怀疑的方向等 |
-| `owner` | 负责跟进的人，就是 Lowlights 表的 Owner 列。agent 不填，由 user 自己写 |
 
-`make_report.py` 把说法写进 Lowlights 表那一行的 Fix 列，详细 summary 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
+`make_report.py` 把说法写进 Lowlights 表那一行的 Fix 列，Details 里还有一张 Follow-ups 表。还有问题没写说法时它会打 WARNING：**每个问题都有了说法，报告才能提交**（§5.6）。
 
 **已知还没合入的修复**登记在 `recipes/455-CI/pending_fixes.csv`。知道某个模型在 main 上要等一组 PR 合入才能跑通（或才有正常性能），就登记一行；PR 合入 main 后删掉这一行。这个模型出了问题又还没写说法时，`make_report.py` 会在 WARNING 下面列出这些 PR，并给出一行可以直接贴进 `followups.csv` 的说法。贴之前先用 `gh pr view` 确认 PR 还开着，并对一下这次的报错是不是它们修的。
 
@@ -521,12 +520,12 @@ awk -F, -v d=<YYYY-MM-DD> '$2 == d {print $4}' perf.csv accuracy.csv | sort -u
 
 | 列 | 内容 |
 |---|---|
-| `image_date` | 所用镜像的日期，也就是构建它的那个周六，`YYYY-MM-DD`。只用来追溯镜像 |
+| `image_date` | 所用镜像的构建日期，`YYYY-MM-DD`。每场都构建自己的镜像，所以和 `test_date` 相同；只用来追溯镜像 |
 | `test_date` | 场次日期（周六或周三，北京时间），`YYYY-MM-DD`。报告、对比和画图都以场次为单位 |
 | `scenario` | `endpoint` 或 `8k1k` |
 | `model` | §1 的 slug |
 | `gpus` | 每卡吞吐的分母 |
-| `parallel` | 并行策略，照 recipe 里该模型"并行"那一行写，小写、不加空格，例如 `tp8dcp8`、`tp4`。报告的详细 summary 里显示的是这一列 |
+| `parallel` | 并行策略，照 recipe 里该模型"并行"那一行写，小写、不加空格，例如 `tp8dcp8`、`tp4`。报告的 Details 里显示的是这一列 |
 | `concurrency` | `4` 或 `64` |
 | `status` | `ok` 或 `fail` |
 | `tok_s_per_gpu` | 每卡吞吐，按 §4.1 计算，保留两位小数 |
@@ -583,7 +582,7 @@ recipes/
     ├── .gitattributes     三个 CSV 设了 merge=union，两个节点同时提交不冲突（§3.5）
     ├── tools/             生成图和结果的脚本、样例数据（§5.5）
     └── runs/<YYYYMMDD>/   一场一个目录：本场的原始结果和图
-        ├── image.json     只在周六的目录里：本周镜像的信息（§2.4）
+        ├── image.json     本场镜像的信息（§2.4）
         ├── findings.md    本场的发现，放进 result 的 Findings（§5）
         ├── charts/        perf-<scenario>.png、accuracy-<scenario>.png
         └── <slug>/        本场每个模型一个目录
@@ -608,78 +607,92 @@ recipes/
 
 ## 5. 结果（报告）
 
-**每场的结果记在 `recipes/result/<YYYYMMDD>-result.md`**，日期是场次日期，例如周六 `20261114-result.md`、周三 `20261118-result.md`。测完一个模型就更新一次（§3.5）；全部测完、每个问题都有了说法（§3.7）之后，补上趋势图，生成最终版（§5.6）。**用英文写**，一个文件三部分：
+**每场的结果记在 `recipes/result/<YYYYMMDD>-result.md`**，文件名统一是"日期-result.md"，日期是场次日期，例如周六 `20261114-result.md`、周三 `20261118-result.md`。测完一个模型就更新一次（§3.5）；全部测完、每个问题都有了说法（§3.7）之后，补上趋势图，生成最终版（§5.6）。
 
 **一天一个结果文件**：同一天跑了两个场景（例如 2026-11-14 周六把 8K/1K 也测了），两个场景都放进这一个 `<YYYYMMDD>-result.md`。`make_report.py` 不加 `--scenario` 就会把当天跑过的场景都写进去，不要再另起 `-8k1k-result.md` 这样的文件。
 
+**用英文写**，标题是 `<YYYY-MM-DD> MI455 Workload Weekly Status Report`，不写 `## Summary`，标题下面直接是 Lowlights 和 Highlights，依次是：
+
 | 部分 | 给谁看 | 内容 |
 |---|---|---|
-| 简短 summary（`## Summary`） | 老板 | Lowlights、总表和测试环境（§5.1、§5.2） |
-| 发现（`## Findings`） | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
-| 详细 summary（`## Details`） | 要看细节的人 | 测试镜像和环境、全部数字、趋势图、说法、跑挂 case 的核心 error log（§5.3、§5.4） |
+| `## Lowlights` | 老板 | 问题：跑挂和回退，每行带原因和说法（§5.1）。这一场没有问题就不写这一节 |
+| `## Highlights` | 老板 | 好消息：提升和恢复（§5.1）。没有就不写这一节 |
+| `## Results` | 老板 | 总表：每个模型和上一场比（§5.2） |
+| `## Environment` | 所有人 | 全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期 |
+| `## Findings` | 所有人 | 测试中的发现，取自 `runs/<YYYYMMDD>/findings.md` |
+| `## Details` | 要看细节的人 | 全部数字、趋势图、说法、跑挂 case 的核心 error log 和复现命令（§5.3、§5.4） |
 
-这个文件会原样贴到 Teams 发给老板们，所以：Lowlights 是一张短表（§5.1）；总表后面是测试环境，写全镜像名，ATOM 和 aiter 各写 branch、完整 commit 和 commit 日期；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
+这个文件会原样贴到 Teams 发给老板们，所以：Lowlights 和 Highlights 都是短表（§5.1）；Findings 只写最要紧的几条（最多 5 条，每条一两句）；Details 写全，跑挂的 case 要贴复现命令（§5.3）。
 
 结果和图都用 §5.5 的脚本从 CSV 生成，不手填数字。唯一手写的是发现：写进 `runs/<YYYYMMDD>/findings.md`，英文，每条以 `- ` 开头，链接用完整 URL；脚本原样放进 Findings，没有这个文件就显示 `None recorded.`。跑挂或回退的线索、绕过的办法、异常的耗时（例如 server 启动特别慢）、和 recipe 对不上的地方，都算发现。样例见 [`result/example.md`](result/example.md)，那是 EXAMPLE（示例）：数字都是编的，不是真实测试数据。
 
-### 5.1 Lowlights
+### 5.1 Lowlights 和 Highlights
 
-大老板只看 Lowlights，所以这里只写问题：跑挂或回退的模型，每件事一行，五列：
+大老板只看这两节。**Lowlights 只写问题**：跑挂或回退的模型，每件事一行，五列：
 
 | 列 | 写什么 |
 |---|---|
 | Model | 标记加模型名，例如 `❌ Kimi-K3`；不写场景 |
 | What happened | 什么挂了，或掉了多少（只给一个关键数字），例如 `all runs failed`、`throughput down 4.2%` |
 | Cause | 原因，取自 `followups.csv` 的 `problem`（§3.7）；跑挂又没写 `problem` 时，用一句话报错 |
-| Fix | 说法（§3.7）：需要什么 PR，验证过没有 |
-| Owner | 负责跟进的人。agent 生成时留空，由 user 自己填；直接改 md 也行，但重新生成会被覆盖，要保留就写进 `followups.csv` 的 `owner` 列 |
+| Fix | 说法（§3.7）：需要什么 PR，验证过没有；只有复现文档时链接写成 `reproducer` |
+| Owner | 始终留空，由 user 自己填（例如贴到 Teams 之前）。重新生成会清掉手填的内容 |
 
-提升（🟢）和恢复（✅）不是 lowlight，不进这张表，提升在总表的 Delta 列里能看到。持平、变化不大或第一次有数据的模型也不提。一个问题都没有时不画表，只写 `No failures or regressions.`。
+**Highlights 只写好消息**：吞吐比上一场高 3% 及以上（🟢），或上一场跑挂、这一场跑通（✅）。三列：Model、What happened、Owner，Owner 同样留空。
 
-每一行的 Fix 列都要写上说法，不能只报问题。下面四行的 Fix 依次对应 `followups.csv` 的 `our_pr`、`merged_pr`、`open_pr`、`repro`：
+哪一节没有内容就整节不写：没有问题就没有 Lowlights，没有好消息就没有 Highlights。持平、变化不大或第一次有数据的模型两边都不提。
+
+Lowlights 每一行的 Fix 列都要写上说法，不能只报问题。下面四行的 Fix 依次对应 `followups.csv` 的 `our_pr`、`merged_pr`、`open_pr`、`repro`：
 
 | Model | What happened | Cause | Fix | Owner |
 |---|---|---|---|---|
 | ❌ Kimi-K3 | all runs failed | no cross-node TP on main | Passes with [ROCm/ATOM#2647](…) + [#2760](…) + [ROCm/aiter#7963](…) (verified) |  |
 | ❌ Qwen-35B-A3B | all runs failed | gfx1250 fused-MoE layout check | Fixed on main by [ROCm/ATOM#3223](…) (merged after the image was built) |  |
 | ⚠️ GLM-5.2 | throughput down 4.2% | MoE sorting default | Needs [ROCm/aiter#…](…) (open) |  |
-| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% | not known yet | No fix yet; [repro](…) |  |
+| 🔴 MiniMax-M3 | GSM8K 87.3%, 7.4 points below the known-good 94.7% | not known yet | No fix yet; [reproducer](…) |  |
 
-同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。结果里不 @ 任何人，Owner 列留给 user 填。
+同一个仓库的多个 PR 只写一次仓库名：`ROCm/ATOM#2647 + #2760`。结果里不 @ 任何人。
 
 `make_report.py` 按下表比较本次和历史结果，生成草稿；测试 agent 读一遍再提交，可以改措辞，但不能删掉 ❌ 和 🔴 的行，也不能改数字。
 
 比较都对该模型最近一次成功的那一场（"上一场"），不和更早的最好成绩比。另外，有已知正确精度的模型（`accuracy_baseline.csv`，§4.3），在上一场没什么可说的时候（例如第一次跑），GSM8K 还要和已知正确的值比。
 
-| 标记 | 什么时候算 | What happened 列 |
-|---|---|---|
-| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed`、`all runs failed`（原因写在 Cause 列） |
-| 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` |
-| ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` |
-| 🔴 / ⚠️ | GSM8K 比已知正确的值低超过 0.06 / 0.04 | `GSM8K 87.3%, 7.4 points below the known-good 94.7%` |
+| 标记 | 什么时候算 | What happened 列 | 放在 |
+|---|---|---|---|
+| ❌ | 任一并发或 GSM8K 跑挂 | `c64 failed`、`all runs failed`（原因写在 Cause 列） | Lowlights |
+| 🔴 | 吞吐比上一场低 10% 及以上，或 GSM8K 掉超过 0.06 | `throughput down 11.0%`、`GSM8K down 7.0 points to 88.0%` | Lowlights |
+| ⚠️ | 吞吐比上一场低 3% 及以上，或 GSM8K 掉超过 0.04 | `throughput down 4.2%`、`GSM8K down 4.6 points to 88.1%` | Lowlights |
+| 🔴 / ⚠️ | GSM8K 比已知正确的值低超过 0.06 / 0.04 | `GSM8K 87.3%, 7.4 points below the known-good 94.7%` | Lowlights |
+| 🟢 | 吞吐比上一场高 3% 及以上 | `throughput up 6.9%` | Highlights |
+| ✅ | 上一场跑挂，这一场跑通 | `recovered from the previous failure` | Highlights |
 
 - throughput 指并发 64 的每卡吞吐，和总表一致。并发 4 按同样的门槛判断，但只在 c64 没变化、或并发 4 更严重时才写，例如 `c4 throughput down 5.0%`。
 - GSM8K 看 flexible-extract，差值按点算（0.01 = 1 point）。
 - 门槛的来由：吞吐跑到跑之间有 1% 到 2% 的波动；GSM8K 在这套环境上 temp 0 也不完全确定，±0.02 以内通常是噪声。
 
-### 5.2 简短 summary：Lowlights、总表和测试环境
+### 5.2 Lowlights、Highlights、Results 和 Environment
 
 结果开头的格式如下（取自 `result/example.md`：周六那场，数字是编的）：
 
 ```markdown
-# 455-CI result · <YYYY-MM-DD> · MLPerf Endpoint
+# <YYYY-MM-DD> MI455 Workload Weekly Status Report
 
-## Summary
-
-### Lowlights
+## Lowlights
 
 | Model | What happened | Cause | Fix | Owner |
 |---|---|---|---|---|
-| ❌ Qwen-35B-A3B | c64 failed | out of memory capturing CUDA graphs | No fix yet; [repro](…) |  |
+| ❌ Qwen-35B-A3B | c64 failed | out of memory capturing CUDA graphs | No fix yet; [reproducer](…) |  |
 | ⚠️ DeepSeek R1 | throughput down 4.5% | a new MoE dispatch default | Passes with [ROCm/ATOM#…](…) (verified) |  |
 | ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | MoE scale rounding | Needs [ROCm/aiter#…](…) (open) |  |
 
-### Results
+## Highlights
+
+| Model | What happened | Owner |
+|---|---|---|
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% |  |
+| ✅ Kimi-K3 | recovered from the previous failure |  |
+
+## Results
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
@@ -688,7 +701,7 @@ recipes/
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
 
-### Environment
+## Environment
 
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-<YYYYMMDD>`
 - ATOM: `main` @ `<完整 commit>` (<commit 日期>)
@@ -700,20 +713,20 @@ recipes/
 
 ## Details
 
-……（详细 summary，§5.3）
+……（§5.3）
 ```
 
 - 总表（Results）一个模型一行，依次是 Model、Scenario、上一场、本场、Delta、GSM8K delta。表格下面不加说明文字。
 - 第三、四列是并发 64 的每卡吞吐（口径见 §4.1：endpoint 是输出 token，8K/1K 是输入加输出 token），表头写上一场和本场的日期。上一场取该模型最近一次成功的那一场：例子里 Kimi-K3 上一场（11-07）跑挂了，就和 10-31 那场比，并在格子里注明日期。
 - Delta 只写百分比，例如 `+6.9%`。GSM8K delta 写掉了多少、现在多少，例如 `−4.6 pts (now 88.1%)`。
 - N/A 表示跑挂、没有值；— 表示没有结果（例如机器挂了没测成，§3.6）；first 表示第一次有数据，没有可比的。
-- 测试环境（Environment）放在总表后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。详细 summary 里的 Environment details 另有 digest 和 commit 标题。
+- Environment 放在 Results 后面、Findings 前面：全镜像名，ATOM 和 aiter 的 branch、完整 commit 和 commit 日期。Details 里的 Environment details 另有 digest 和 commit 标题。
 
-### 5.3 详细 summary
+### 5.3 Details
 
 在 Findings 后面，`## Details` 下依次是以下几节，全部英文：
 
-1. **Environment**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与完整 commit（带 commit 日期和标题）、测试日期。镜像信息取自构建它的那个周六目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
+1. **Environment details**：测试 image 的全名和 digest、ATOM 和 aiter 的 branch 与完整 commit（带 commit 日期和标题）、测试日期。镜像信息取自本场目录里的 `image.json`（§2.4），缺的项从 CSV 里补。
 2. **Performance**：每个模型每个并发一行，列出并行策略（例如 `tp8dcp8`，不写 GPU 数）、tok/s/GPU 和第二指标（endpoint 是 E2E avg interactivity，8K/1K 是 ITL P50），以及各自和上一场比的变化。变化列的表头写上一场的日期，例如 `vs 2026-11-07`；某个模型上一场跑挂了，就和它最近一次成功的那场比，并在格子里注明，例如 `+1.0% (vs 2026-10-31)`。
 3. **Accuracy**：flexible-extract、strict-match、上一场的分数（表头写日期）和变化，写法同上。
 4. **Trends**：两张趋势图，见 §5.4。
@@ -736,11 +749,11 @@ recipes/
 cd recipes/455-CI/tools
 python3 fetch_fonts.py                              # 第一次用时下载 Instrument Sans；不下也能画
 python3 make_charts.py --date <YYYY-MM-DD>          # 场次日期（周六或周三），写 runs/<YYYYMMDD>/charts/
-python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMMDD>-result.md，打印 Lowlights 草稿，最后一行是它的路径
+python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMMDD>-result.md，打印 Lowlights 和 Highlights 草稿，最后一行是它的路径
 ```
 
 - 每场测完跑一次，连同历史数据重新生成。
-- 生成后按 §5.1 审一遍 Lowlights，再提交。
+- 生成后按 §5.1 审一遍 Lowlights 和 Highlights，再提交。
 - 输出里有 `no follow-up` 的 WARNING，说明还有问题没写说法：按 §3.7 补上，再重新生成。
 - 改了脚本先跑测试：`python3 -m pytest -q recipes/455-CI/tools`。
 
@@ -751,7 +764,7 @@ python3 make_report.py --date <YYYY-MM-DD>          # 写 recipes/result/<YYYYMM
 ```bash
 cd "$CI_DIR"
 git pull -q --rebase --autostash origin 455-CI    # 先拉下另一个节点推的数据，结果才完整
-# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和结果，审过 Lowlights，在 ../result/README.md 的索引最上面加一行（见下）
+# 每个问题都按 §3.7 写好说法后，按 §5.5 生成图和结果，审过 Lowlights 和 Highlights，在 ../result/README.md 的索引最上面加一行（见下）
 git add followups.csv runs/<YYYYMMDD> ../result/<YYYYMMDD>-result.md ../result/README.md
 git commit -q -m "[455-CI] <YYYY-MM-DD> MLPerf Endpoint result"    # 周三写 8K/1K result
 git pull -q --rebase --autostash origin 455-CI && git push -q origin 455-CI

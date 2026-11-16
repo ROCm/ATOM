@@ -1,9 +1,9 @@
 """Pick and compare the 455-CI results in perf.csv and accuracy.csv.
 
-A session is one day's run of one scenario: Saturday runs MLPerf Endpoint on
-the image built that morning, Wednesday runs 8K/1K on the previous Saturday's
-image. Sessions are keyed by their test date (ISO, so string order is date
-order); the image_date column only records which image a session used.
+A session is one day's run (Saturday: MLPerf Endpoint, Wednesday: 8K/1K), on an
+image built that day from ATOM main and aiter main. Sessions are keyed by their
+test date (ISO, so string order is date order); the image_date column only
+records which image a session used.
 
 Rows are dicts as csv.DictReader yields them, so every value is a string. A
 rerun appends rows: for a session and concurrency (perf) or a session
@@ -56,15 +56,7 @@ ACCURACY_COLUMNS = (
 )
 # Columns of followups.csv: the next step for each problem in the highlights
 # (455-CI-guide.md §3.7).
-FOLLOWUP_COLUMNS = (
-    "test_date",
-    "model",
-    "action",
-    "link",
-    "problem",
-    "note",
-    "owner",
-)
+FOLLOWUP_COLUMNS = ("test_date", "model", "action", "link", "problem", "note")
 # Columns of pending_fixes.csv: unmerged PRs a model is known to need on main,
 # all of `prs` together (455-CI-guide.md §3.7).
 PENDING_COLUMNS = ("model", "prs", "note", "since")

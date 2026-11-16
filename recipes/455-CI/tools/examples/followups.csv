@@ -1,4 +1,4 @@
-test_date,model,action,link,problem,note,owner
-2026-11-14,qwen-35b-a3b,repro,runs/20261114/qwen-35b-a3b/repro.md,(mock) out of memory capturing CUDA graphs,"(mock) OOM while capturing CUDA graphs, at c64 only",
-2026-11-14,deepseek-r1,our_pr,https://github.com/ROCm/ATOM/pull/99901,(mock) a new MoE dispatch default,"(mock) verified on 455: c64 back to 1,560 tok/s/GPU",
-2026-11-14,deepseek-v4.1-flash,open_pr,https://github.com/ROCm/aiter/pull/99902,(mock) MoE scale rounding,(mock) the open aiter PR fixes the MoE scale rounding,
+test_date,model,action,link,problem,note
+2026-11-14,qwen-35b-a3b,repro,runs/20261114/qwen-35b-a3b/repro.md,(mock) out of memory capturing CUDA graphs,"(mock) OOM while capturing CUDA graphs, at c64 only"
+2026-11-14,deepseek-r1,our_pr,https://github.com/ROCm/ATOM/pull/99901,(mock) a new MoE dispatch default,"(mock) verified on 455: c64 back to 1,560 tok/s/GPU"
+2026-11-14,deepseek-v4.1-flash,open_pr,https://github.com/ROCm/aiter/pull/99902,(mock) MoE scale rounding,(mock) the open aiter PR fixes the MoE scale rounding

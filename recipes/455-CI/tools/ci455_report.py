@@ -1,6 +1,7 @@
-"""Build the 455-CI result of one session, in English and in one file: a short
-summary for the boss (the lowlights table and the results table), the session's
-findings, then the details (environment, every number, trend charts, follow-ups
+"""Build the 455-CI result of one session, in English and in one file, the MI455
+workload weekly status report: the lowlights and highlights for the boss (each
+left out when the session has none), the results table, the environment, the
+session's findings, then the details (every number, trend charts, follow-ups
 and each failure's core error log) (455-CI-guide.md §5)."""
 
 import re
@@ -15,7 +16,6 @@ PERF_SEVERE = -0.10  # down by this much: severe regression
 ACC_WARN = 0.04  # GSM8K down by more than this (0.01 = one point): regression
 ACC_SEVERE = 0.06
 LOG_LINES = 60  # core error log lines shown in the details
-NONE = "No failures or regressions."
 EXAMPLE = [
     (
         "> ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; "
@@ -225,20 +225,21 @@ def _follow_text(f):
     if action == "merged_pr":
         return f"Fixed on main by {_prs(link)} (merged after the image was built)"
     if action == "repro":
-        return f"No fix yet; [repro]({link})"
+        return f"No fix yet; [reproducer]({link})"
     return ""
 
 
 LOWLIGHT_COLUMNS = ("Model", "What happened", "Cause", "Fix", "Owner")
+HIGHLIGHT_COLUMNS = ("Model", "What happened", "Owner")
+GOOD_NEWS = (4, 5)  # categories of _news: gains, recoveries
 
 
 def lowlights(results, followups=None):
     """The rows of the lowlights table, one per problem (❌ 🔴 ⚠️): the flag
-    and the short model name, what happened, its cause, its fix and its owner.
-    The cause is followups.csv's `problem` (a failure without one: its short
-    error), the fix comes from the follow-up's action and links, and the owner
-    is the follow-up's `owner`, blank until someone fills it in. Gains and
-    recoveries are not lowlights; the results table shows them."""
+    and the short model name, what happened, its cause, its fix and a blank
+    owner. The cause is followups.csv's `problem` (a failure without one: its
+    short error), the fix comes from the follow-up's action and links. The
+    owner is always left blank for the user to fill in."""
     rows = []
     for category, slug, flag, who, what, err in _news(results):
         if category not in PROBLEM:
@@ -246,23 +247,36 @@ def lowlights(results, followups=None):
         f = (followups or {}).get(slug) or {}
         code = (err or "").replace("`", "'")
         cause = (f.get("problem") or "").strip() or (f"`{code}`" if code else "")
-        owner = (f.get("owner") or "").strip()
-        rows.append(
-            [f"{flag} {who}", what, cause or "—", _follow_text(f) or "—", owner]
-        )
+        rows.append([f"{flag} {who}", what, cause or "—", _follow_text(f) or "—", ""])
     return rows
 
 
-def lowlights_md(results, followups=None):
-    """The Lowlights section: its table, or one line when nothing went wrong."""
-    rows = lowlights(results, followups)
-    if not rows:
-        return [NONE]
+def highlights(results):
+    """The rows of the highlights table, one per piece of good news (🟢 a gain,
+    ✅ a recovery): the flag and the short model name, what happened and a
+    blank owner."""
     return [
-        _md_row(LOWLIGHT_COLUMNS),
-        "|" + "---|" * len(LOWLIGHT_COLUMNS),
-        *map(_md_row, rows),
+        [f"{flag} {who}", what, ""]
+        for category, _, flag, who, what, _ in _news(results)
+        if category in GOOD_NEWS
     ]
+
+
+def _table(columns, rows):
+    """A markdown table, or nothing when there are no rows."""
+    if not rows:
+        return []
+    return [_md_row(columns), "|" + "---|" * len(columns), *map(_md_row, rows)]
+
+
+def lowlights_md(results, followups=None):
+    """The lowlights table; empty when nothing went wrong."""
+    return _table(LOWLIGHT_COLUMNS, lowlights(results, followups))
+
+
+def highlights_md(results):
+    """The highlights table; empty when there is no good news."""
+    return _table(HIGHLIGHT_COLUMNS, highlights(results))
 
 
 def _md_row(cells):
@@ -370,33 +384,26 @@ def _branch_commit(env, repo):
     return f"`{c.get('branch') or 'main'}` @ `{sha}`{date}"
 
 
-def _labels(results):
-    return [
-        LABEL[sc]
-        for sc in ("endpoint", "8k1k")
-        if any(r.scenario == sc for r in results)
-    ]
-
-
-def _summary(date, env, results, followups):
-    """The short summary, for the boss: the lowlights table, each model's c64
-    throughput against the previous session and its GSM8K change, then the
-    image and the commits it was built from."""
+def _lights_and_results(date, env, results, followups):
+    """The part for the boss: the lowlights and the highlights (each left out
+    when the session has none), each model's c64 throughput and GSM8K against
+    the previous session, then the image and the commits it was built from."""
     ref = previous_column(results)
-    return [
-        "## Summary",
-        "",
-        "### Lowlights",
-        "",
-        *lowlights_md(results, followups),
-        "",
-        "### Results",
+    out = []
+    for title, table in (
+        ("Lowlights", lowlights_md(results, followups)),
+        ("Highlights", highlights_md(results)),
+    ):
+        if table:
+            out += [f"## {title}", "", *table, ""]
+    return out + [
+        "## Results",
         "",
         f"| Model | Scenario | {ref or '—'} (tok/s/GPU) | {date} (tok/s/GPU) | Delta | GSM8K delta |",
         "|---|---|---|---|---|---|",
         *["| " + " | ".join(summary_row(r, date, ref)) + " |" for r in results],
         "",
-        "### Environment",
+        "## Environment",
         "",
         f"- Image: `{env.get('image') or '—'}`",
         f"- ATOM: {_branch_commit(env, 'atom')}",
@@ -628,15 +635,15 @@ def report_md(
     followups=None,
     findings=None,
 ):
-    """One session's result: the short summary (lowlights, results, environment), the
+    """One session's result: the lights, results and environment, the
     findings written down during the session, then the details. `charts_dir`
     and `runs_dir` are relative to the result file's directory."""
     out = [
-        f"# 455-CI result · {date} · {' + '.join(_labels(results))}"
+        f"# {date} MI455 Workload Weekly Status Report"
         + (" · EXAMPLE" if mock else ""),
         "",
         *(EXAMPLE if mock else []),
-        *_summary(date, env, results, followups),
+        *_lights_and_results(date, env, results, followups),
         "",
         "## Findings",
         "",

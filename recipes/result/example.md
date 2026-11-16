@@ -1,18 +1,23 @@
-# 455-CI result · 2026-11-14 · MLPerf Endpoint · EXAMPLE
+# 2026-11-14 MI455 Workload Weekly Status Report · EXAMPLE
 
 > ⚠️ **EXAMPLE**: this file only illustrates the format. All numbers are made up; they are not real test results.
 
-## Summary
-
-### Lowlights
+## Lowlights
 
 | Model | What happened | Cause | Fix | Owner |
 |---|---|---|---|---|
-| ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |  |
+| ❌ Qwen-35B-A3B | c64 failed | (mock) out of memory capturing CUDA graphs | No fix yet; [reproducer](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) |  |
 | ⚠️ DeepSeek R1 | throughput down 4.5% | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) |  |
 | ⚠️ DeepSeek-V4.1-Flash | GSM8K down 5.2 points to 88.9% | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) |  |
 
-### Results
+## Highlights
+
+| Model | What happened | Owner |
+|---|---|---|
+| 🟢 DeepSeek-V4.1-Flash | throughput up 6.9% |  |
+| ✅ Kimi-K3 | recovered from the previous failure |  |
+
+## Results
 
 | Model | Scenario | 2026-11-07 (tok/s/GPU) | 2026-11-14 (tok/s/GPU) | Delta | GSM8K delta |
 |---|---|---|---|---|---|
@@ -21,7 +26,7 @@
 | Kimi-K3 (2.8T) | MLPerf Endpoint | 336 (2026-10-31) | 340 | +1.0% | −0.1 pts (now 96.1%) (vs 2026-10-31) |
 | Qwen-35B-A3B | MLPerf Endpoint | 6,345 | N/A | N/A | −0.1 pts (now 90.1%) |
 
-### Environment
+## Environment
 
 - Image: `rocm/fw-bringup-mlperf:gfx1250-atom-ci455-20261114`
 - ATOM: `main` @ `0000000000000000000000000000000000000000` (2026-11-14)
@@ -81,7 +86,7 @@
 |---|---|---|---|
 | DeepSeek R1 | (mock) a new MoE dispatch default | Passes with [ROCm/ATOM#99901](https://github.com/ROCm/ATOM/pull/99901) (verified) | (mock) verified on 455: c64 back to 1,560 tok/s/GPU |
 | DeepSeek-V4.1-Flash | (mock) MoE scale rounding | Needs [ROCm/aiter#99902](https://github.com/ROCm/aiter/pull/99902) (open) | (mock) the open aiter PR fixes the MoE scale rounding |
-| Qwen-35B-A3B | (mock) out of memory capturing CUDA graphs | No fix yet; [repro](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) | (mock) OOM while capturing CUDA graphs, at c64 only |
+| Qwen-35B-A3B | (mock) out of memory capturing CUDA graphs | No fix yet; [reproducer](../455-CI/tools/examples/runs/20261114/qwen-35b-a3b/repro.md) | (mock) OOM while capturing CUDA graphs, at c64 only |
 
 ### Failures
 
