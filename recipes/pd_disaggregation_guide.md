@@ -52,9 +52,12 @@ and a cancelled one (once its writes drain) return it. With nothing pending,
 one request may exceed the byte budget, so long prompts are not starved. The
 decode reserve covers every admitted request, including one past its first
 forward, so it holds while any request runs on D; only an idle D admits below
-it. Falling below it defers admission only and never preempts. D must have
-PP=1, DCP=1, PCP=1, SP=1 and a single paged KV pool. Metrics are listed under
-`atom:pd_admission_*` in the [metrics guide](../docs/metrics_guide.md#scheduler).
+it. Falling below it defers admission only and never preempts. Both limits
+apply to Mooncake P/D receives only: a request parked for a tier or replay KV
+load through an offload connector is not checked, and holds its blocks outside
+the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
+SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
+in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
 ## Prerequisites
 
