@@ -10,6 +10,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 
 from typing import ClassVar
 
+import aiter
 import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
@@ -848,10 +849,12 @@ class KimiFullAttention(nn.Module):
         qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (
-            dtypes.fp8,
-            dtypes.fp4x2,
-        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
+        # An older aiter aborts on an E8M0 scale here; q_b_proj then quantizes q.
+        self.qknorm_e8m0_scale = _is_e8m0_blockscale(quant_config, qknorm_type)
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2) and (
+            not self.qknorm_e8m0_scale
+            or getattr(aiter, "FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE", False)
+        )
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
@@ -929,6 +932,7 @@ class KimiFullAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            e8m0_scale=self.qknorm_e8m0_scale,
         )
         if self.indexer is not None:
             # Projection weights retain checkpoint precision; the indexer owns

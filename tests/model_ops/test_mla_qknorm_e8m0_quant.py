@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+"""MLA q_a/kv_a RMSNorm with E8M0 scales: q and its scale are byte-identical to
+the consumer's per_1x128_e8m0_quant of the kernel's own bf16 q norm."""
+
+import pytest
+import torch
+
+aiter = pytest.importorskip("aiter")
+if not torch.cuda.is_available():
+    pytest.skip("ROCm GPU required", allow_module_level=True)
+if not getattr(aiter, "FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE", False):
+    pytest.skip("aiter without E8M0 fused_qk_rmsnorm", allow_module_level=True)
+
+from aiter import QuantType, dtypes
+
+from atom.model_ops.linear import per_1x128_e8m0_quant
+from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+
+# Kimi-K3 q_lora 1536 / kv_lora 512; 4100 rows: the kernel's prefill path
+@pytest.mark.parametrize("rows", [1, 15, 135, 1009, 4100])
+@torch.inference_mode()
+def test_mla_qknorm_e8m0_matches_bf16_norm_then_consumer_quant(rows):
+    g = torch.Generator(device="cuda").manual_seed(20261116 + rows)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=g, device="cuda")
+
+    q_c, kv_c = (randn(rows, 1536) * 3).bfloat16(), (randn(rows, 512) * 3).bfloat16()
+    (q, s), q_norm, _, _ = _fuse_rmsnorm_quant(
+        q_c,
+        randn(1536).bfloat16(),
+        1e-6,
+        kv_c,
+        randn(512).bfloat16(),
+        1e-6,
+        dtype_quant=dtypes.fp8,
+        group_size=128,
+        quant_type=QuantType.per_1x128.value,
+        output_unquantized_inp1=True,
+        transpose_scale=True,
+        e8m0_scale=True,
+    )
+    q_ref, s_ref = per_1x128_e8m0_quant(q_norm, dtypes.fp8, True)
+    assert s.dtype == dtypes.fp8_e8m0 and s.shape == s_ref.shape
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
