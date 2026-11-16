@@ -828,6 +828,7 @@ impl PDRouter {
             tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: false,
+            carries_media: context.carries_media,
         };
         let hash_ring = context
             .model_id
