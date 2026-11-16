@@ -268,10 +268,15 @@ class V41DSparkTargetSurface:
                     "did not run (widened inputs missing, or not an EXTEND)"
                 )
             own = int(expanded.output_rows.numel())
-            if rows != own + fused.num_rows:
+            # A step padded to a prefill token-graph bucket runs the widened
+            # rows first, then padding (`PaddedPrefillInputs`).
+            padded = getattr(metadata, "sglang_padded_inputs", None)
+            ran = rows if padded is None else int(padded.scheduled_tokens)
+            if ran != own + fused.num_rows or ran > rows:
                 raise RuntimeError(
-                    f"DeepSeek-V4.1 DSpark forward of {rows} rows under a radix "
-                    f"replay of {fused.num_rows} rows over {own} extend rows"
+                    f"DeepSeek-V4.1 DSpark forward of {rows} rows ({ran} "
+                    f"scheduled) under a radix replay of {fused.num_rows} rows "
+                    f"over {own} extend rows"
                 )
         if int(step.running_tokens) != rows or int(positions.shape[0]) != rows:
             raise RuntimeError(

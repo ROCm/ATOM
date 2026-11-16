@@ -2144,6 +2144,17 @@ class ExtendRowRead:
     batch whose allocation made it: same STATE slots in the same order, same
     request ids, at least the widths the staging needs; anything else (a
     MIXED batch, a batch that never ran) falls back to the read-back.
+
+    With radix cache on, the copy holds each row's prefix pages too
+    (``alloc_for_extend`` writes a hit's tree pages into ``[0, P)`` with the
+    extend's own), and a fused replay's ``[P - R, P)`` lies inside them. The
+    one in-place rewrite of a live row, a radix checkpoint
+    (``checkpoint_into_tree``), bumps the slot's `HostPageRows` generation;
+    `issue` notes each slot's generation and `take` refuses the copy if any
+    moved since (the staging reads back). A checkpoint of a request running
+    in this EXTEND happens before its allocation (a chunked request is
+    checkpointed when the next batch is built) or after its forward, so the
+    refusal guards ordering SGLang does not promise rather than one it takes.
     """
 
     def __init__(self):
@@ -2175,7 +2186,9 @@ class ExtendRowRead:
         host.copy_(table, non_blocking=True)
         event = module.Event()
         event.record()
-        self.pending = ([int(s) for s in slots], list(rids), widths, host, event)
+        slots = [int(s) for s in slots]
+        generations = [_HOST_ROWS.generation(slot) for slot in slots]
+        self.pending = (slots, list(rids), widths, host, event, generations)
         return True
 
     def take(self, slots, rids, widths):
@@ -2184,12 +2197,16 @@ class ExtendRowRead:
         pending, self.pending = self.pending, None
         if pending is None:
             return None
-        read_slots, read_rids, read_widths, host, event = pending
+        read_slots, read_rids, read_widths, host, event, generations = pending
         if (
             [int(s) for s in slots] != read_slots
             or list(rids) != read_rids
             or np.any(np.asarray(widths, np.int64) > read_widths)
         ):
+            return None
+        if [_HOST_ROWS.generation(slot) for slot in read_slots] != generations:
+            # A radix checkpoint rewrote a row after the copy was queued.
+            count_v41_dspark("extend_rows_rewritten")
             return None
         event.synchronize()
         table = host.numpy()
@@ -2598,7 +2615,15 @@ def build_v41_scheduled_batch(
     widths = -(-ends // block_size)
     rids = list(forward_batch.rids[:bs])
     rows = None
-    if not verify and not mode.is_decode():
+    # A radix side forward (`deepseek_v41_radix.build_side_batch`) runs inside
+    # its step's call, before the step's own staging: it reads its rows back
+    # and leaves the step's copy pending for that staging.
+    takes_early = (
+        not verify
+        and not mode.is_decode()
+        and not getattr(forward_batch, "encoder_swa_replay", False)
+    )
+    if takes_early:
         # The batch's own allocation queued these rows' copy on the
         # scheduler's stream (`ExtendRowRead`); taken, or dropped, here.
         early = None
@@ -2623,7 +2648,7 @@ def build_v41_scheduled_batch(
                 "DeepSeek-V4.1 EXTEND rows read at allocation disagree with the "
                 f"device: slots {slots.tolist()} vs {read_slots.tolist()}"
             )
-        if rows is None and not verify and not mode.is_decode():
+        if rows is None and takes_early:
             count_v41_dspark("extend_rows_read")
         slots, rows = read_slots, read_rows
     slots = np.asarray(slots, dtype=np.int32)
@@ -2827,7 +2852,11 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
                 # Only DSpark speculates on V4.1 here (`v41_dspark_capability_error`).
                 dspark_context_in_forward=speculative_tokens > 0,
             )
-        bucket = prefill_token_graph_bucket(running_tokens)
+        # A radix replay's rows are rows of the step like any other (native
+        # pads a replaying prefill too): a fused step buckets on its widened
+        # row count, its Replay records staged here for the eager regions.
+        radix_replay = bool(batch.replaying)
+        bucket = prefill_token_graph_bucket(running_tokens, radix_replay=radix_replay)
         if bucket is None:
             metadata, step_positions = builder.prepare_prefill(
                 batch, running_bs, running_tokens
@@ -2848,6 +2877,8 @@ def build_deepseek_v41_forward_metadata(forward_batch, positions):
                 scheduled_tokens_gpu=_PREFILL_GRAPHS.scheduled_tokens(running_tokens),
             )
             count_v41_dspark("prefill_token_graph")
+            if radix_replay:
+                count_v41_dspark("prefill_token_graph_radix")
     builder.prepare_model_inputs(input_ids, metadata)
     pending = getattr(getattr(metadata, "cache", None), "pending", None)
     if verify:
@@ -2902,6 +2933,15 @@ def v41_prefill_token_graphs_enabled() -> bool:
     return os.environ.get(V41_PREFILL_TOKEN_GRAPHS_ENV, "1") != "0"
 
 
+# Kill switch: "0" keeps an EXTEND carrying a radix replay (a fused hit's
+# widened rows, or a side forward) eager; every other EXTEND still replays.
+V41_PREFILL_TOKEN_GRAPHS_RADIX_ENV = "ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS_RADIX"
+
+
+def v41_prefill_token_graphs_radix_enabled() -> bool:
+    return os.environ.get(V41_PREFILL_TOKEN_GRAPHS_RADIX_ENV, "1") != "0"
+
+
 @dataclass
 class PaddedPrefillInputs:
     """A prefill padded to a token-graph bucket: the ids and positions the
@@ -2944,10 +2984,17 @@ class _PrefillTokenGraphs:
 _PREFILL_GRAPHS = _PrefillTokenGraphs()
 
 
-def prefill_token_graph_bucket(tokens: int) -> int | None:
+def prefill_token_graph_bucket(
+    tokens: int, *, radix_replay: bool = False
+) -> int | None:
     """The recorded bucket an EXTEND of ``tokens`` rows pads to, or None
-    (none recorded, or none holds it)."""
+    (none recorded, or none holds it). ``tokens``: the rows ATOM runs, a
+    fused radix hit's replay rows included. ``radix_replay``: the step
+    carries a radix replay, eager under
+    ``ATOM_SGLANG_V41_PREFILL_TOKEN_GRAPHS_RADIX=0``."""
     if not _PREFILL_GRAPHS.sizes:
+        return None
+    if radix_replay and not v41_prefill_token_graphs_radix_enabled():
         return None
     from atom.utils.region_graph import TokenGraph
 
@@ -3496,8 +3543,12 @@ V41_DSPARK_COUNTER_NAMES = (
     # (`ExtendRowRead`), and EXTENDs that read them back at staging
     "extend_rows_early",
     "extend_rows_read",
-    # EXTENDs padded to a recorded prefill token-graph bucket
+    # copies refused because a radix checkpoint rewrote a row after them
+    "extend_rows_rewritten",
+    # EXTENDs padded to a recorded prefill token-graph bucket, and those of
+    # them carrying a radix replay (fused hits widened, or a side forward)
     "prefill_token_graph",
+    "prefill_token_graph_radix",
     # verifies whose staging took the round's host lengths
     # (`_take_late_prefix`)
     "late_seq_lens",

@@ -1819,6 +1819,48 @@ class TestTargetSurface:
         with pytest.raises(RuntimeError, match="did not run"):
             self._finish_fused(monkeypatch, surface, fb, 9, wide_positions)
 
+    def test_finish_takes_a_radix_hit_padded_to_a_token_graph_bucket(
+        self, monkeypatch, target_forward
+    ):
+        """A fused step padded to a prefill token-graph bucket runs the
+        widened rows first, then padding: the forward is the bucket's rows,
+        the widened count is the padded inputs' scheduled rows."""
+        import atom.utils.forward_context as fc
+
+        wrapper, surface = self._surface(monkeypatch)
+        surface.set_layers_to_capture([1, 2, 3])
+        writes = []
+        surface.attach_draft(
+            SimpleNamespace(write_context_kv=lambda a, p: writes.append((a, p)))
+        )
+        fb, _, wide_positions, keep = self._hit_forward()
+        bucket = torch.cat([wide_positions, torch.zeros(7, dtype=torch.int64)])
+
+        def finish(scheduled):
+            metadata = SimpleNamespace(
+                step=SimpleNamespace(running_tokens=16, replay=None),
+                served_by_round=0,
+                sglang_padded_inputs=SimpleNamespace(scheduled_tokens=scheduled),
+            )
+            monkeypatch.setattr(
+                fc,
+                "get_forward_context",
+                lambda: SimpleNamespace(attn_metadata=metadata),
+            )
+            surface.begin_forward()
+            wrapper.model(_State(torch.randn(1, 16, 2, 4)))
+            return surface.finish_forward(torch.zeros(16, 4), bucket, fb)
+
+        aux = finish(9)
+        assert aux.shape == (16, 12)
+        ((written, positions),) = writes
+        assert written is aux and positions[:9].tolist() == wide_positions.tolist()
+        # SGLang's rows are a prefix-row selection of the bucket's output.
+        assert int(keep.max()) < 9
+        # A padded step that scheduled SGLang's rows only never ran the replay.
+        with pytest.raises(RuntimeError, match=r"16 rows \(5 scheduled\)"):
+            finish(5)
+
     def test_finish_refusals(self, monkeypatch, target_forward):
         wrapper, surface = self._surface(monkeypatch)
         surface.set_layers_to_capture([1, 2, 3])

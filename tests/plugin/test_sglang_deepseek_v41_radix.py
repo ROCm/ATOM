@@ -2341,3 +2341,297 @@ class TestDSparkUnderTheReplay:
         assert fused.starts.tolist() == [2 * PAGE - R]
         assert fused.ends.tolist() == [2 * PAGE]
         assert world.sides == []
+
+
+# ---------------------------------------------------------------------------
+# 10. The prefill fixes under radix: rows copied at allocation, prefill
+#     token graphs on a fused step
+# ---------------------------------------------------------------------------
+
+
+class _PrefillMode(_Mode):
+    """An EXTEND as the plugin forward context reads it too."""
+
+    def is_prefill(self):
+        return True
+
+    def is_decode_or_idle(self):
+        return False
+
+    def is_target_verify(self):
+        return False
+
+    def is_draft_extend(self, include_v2=False):
+        return False
+
+
+class _SyncedEvent:
+    def record(self, stream=None):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+@pytest.fixture
+def counters(monkeypatch):
+    table = dict.fromkeys(bridge.V41_DSPARK_COUNTERS, 0)
+    monkeypatch.setattr(bridge, "V41_DSPARK_COUNTERS", table)
+    return table
+
+
+class TestExtendRowsUnderRadix:
+    """`ExtendRowRead` with radix cache on: the copy holds a hit's prefix
+    pages and a fused replay's rows below P; a checkpoint after the copy
+    refuses it; a side forward leaves it for its step."""
+
+    @pytest.fixture(autouse=True)
+    def _rows(self, monkeypatch, req_to_token):
+        monkeypatch.setattr(bridge, "_EXTEND_ROWS", bridge.ExtendRowRead())
+        monkeypatch.setattr(
+            bridge, "_device_module", lambda device: SimpleNamespace(Event=_SyncedEvent)
+        )
+        monkeypatch.setattr(bridge, "_CHECK_HOST_ROWS", False)
+        monkeypatch.setattr(
+            bridge, "_V41_BUILDER", SimpleNamespace(cache=object(), block_size=PAGE)
+        )
+        self.reads = []
+        original = bridge._read_replay_rows
+
+        def counted(*args, **kwargs):
+            self.reads.append(args[2])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(bridge, "_read_replay_rows", counted)
+        return req_to_token
+
+    def _alloc(self, table, slots, rids, ends):
+        batch = SimpleNamespace(
+            reqs=[SimpleNamespace(rid=rid) for rid in rids],
+            seq_lens_cpu=torch.tensor(ends, dtype=torch.int64),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+        )
+        slots_cpu = torch.tensor(slots, dtype=torch.int64)
+        assert bridge.read_v41_extend_rows_at_alloc(batch, slots_cpu, slots_cpu)
+
+    def _hit_step(self):
+        # r0 hits at 2 PAGEs (fused, replaying [2 PAGE - R, 2 PAGE)); r1 cold.
+        fb = _extend_fb([2 * PAGE, 0], [5, 9], [1, 2])
+        fb.req_pool_indices_cpu = torch.tensor([1, 2], dtype=torch.int64)
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [2 * PAGE - R], [2 * PAGE]))
+        return fb
+
+    def test_a_hit_takes_its_copy_prefix_pages_included(self, req_to_token, counters):
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE, history=HISTORY)
+        assert self.reads == []
+        assert counters["extend_rows_early"] == 1
+        # The prefix pages the tree handed back, with the extend's own: the
+        # fused replay's rows [2 PAGE - R, 2 PAGE) sit in page 3.
+        assert [row.tolist() for row in batch.block_tables] == [[7, 3, 9], [5]]
+        assert batch.num_scheduled_tokens.tolist() == [5 + R, 9]
+
+    def test_a_checkpoint_after_the_copy_refuses_it(self, req_to_token, counters):
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        # The tree repoints slot 1's row in place (`checkpoint_into_tree`).
+        req_to_token[1, :PAGE] = 13 * PAGE + torch.arange(PAGE)
+        bridge.forget_host_page_rows(1)
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE, history=HISTORY)
+        assert self.reads == [2]
+        assert counters["extend_rows_rewritten"] == 1
+        assert counters["extend_rows_read"] == 1
+        assert [row.tolist() for row in batch.block_tables] == [[13, 3, 9], [5]]
+
+    def test_a_checkpoint_before_the_copy_keeps_it(self, req_to_token, counters):
+        # A chunked request is checkpointed while its next batch is built,
+        # before that batch's allocation queues the copy.
+        req_to_token[1, :PAGE] = 13 * PAGE + torch.arange(PAGE)
+        bridge.forget_host_page_rows(1)
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        batch = build_v41_scheduled_batch(self._hit_step(), PAGE, history=HISTORY)
+        assert self.reads == []
+        assert [row.tolist() for row in batch.block_tables] == [[13, 3, 9], [5]]
+
+    def test_a_side_forward_leaves_its_steps_copy(self, req_to_token, counters):
+        self._alloc(req_to_token, [1, 2], ["r0", "r1"], [2 * PAGE + 5, 9])
+        side = _replay_fb([2 * PAGE - R], [2 * PAGE], [1], torch.tensor([[1, 2, 3]]))
+        side.req_pool_indices_cpu = torch.tensor([1], dtype=torch.int64)
+        build_v41_scheduled_batch(side, PAGE, history=HISTORY)
+        assert self.reads == [1]
+        assert bridge._EXTEND_ROWS.pending is not None
+        assert counters["extend_rows_read"] == 0
+        # The step itself (its hit replayed by the side forward) takes it.
+        step = _extend_fb([2 * PAGE, 0], [5, 9], [1, 2])
+        step.req_pool_indices_cpu = torch.tensor([1, 2], dtype=torch.int64)
+        build_v41_scheduled_batch(step, PAGE, history=HISTORY)
+        assert self.reads == [1]
+        assert counters["extend_rows_early"] == 1
+
+
+class TestPrefillTokenGraphsUnderRadix:
+    """A fused step pads to the bucket holding its widened rows, as native
+    pads a replaying prefill; SGLang gets its own rows back."""
+
+    @pytest.fixture(autouse=True)
+    def _graphs(self, monkeypatch):
+        from atom.utils import region_graph
+
+        graphs = bridge._PrefillTokenGraphs()
+        graphs.sizes = (256, 512)
+        monkeypatch.setattr(bridge, "_PREFILL_GRAPHS", graphs)
+        monkeypatch.setattr(
+            region_graph.TokenGraph,
+            "bucket",
+            staticmethod(
+                lambda tokens, phase, multiple_of=1: next(
+                    (n for n in (256, 512) if n >= tokens), None
+                )
+            ),
+        )
+        monkeypatch.delenv(bridge.V41_PREFILL_TOKEN_GRAPHS_RADIX_ENV, raising=False)
+        return graphs
+
+    def _builder(self, monkeypatch, captured):
+        def prepare_prefill(batch, running_bs, running_tokens):
+            captured.update(batch=batch, bs=running_bs, tokens=running_tokens)
+            return (
+                SimpleNamespace(engram_embeddings=None),
+                torch.arange(1000, 1000 + running_tokens),
+            )
+
+        builder = SimpleNamespace(
+            cache=object(),
+            block_size=PAGE,
+            geometry=SimpleNamespace(
+                history_size=HISTORY, window_size=128, speculative_tokens=0
+            ),
+            max_bs=8,
+            max_num_batched_tokens=4096,
+            _decoder_replays=True,
+            prepare_prefill=prepare_prefill,
+            prepare_model_inputs=lambda ids, md: captured.update(ids=ids.clone()),
+        )
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        return builder
+
+    def _fused_step(self):
+        fb = _extend_fb([PAGE, 0], [3, 2], [1, 2])
+        fb.input_ids = torch.tensor([11, 12, 13, 21, 22])
+        fb.is_prefill_only = False
+        fb.return_logprob = False
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [PAGE - R], [PAGE]))
+        positions = torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1])
+        wide_ids, wide_pos, keep = expand_v41_forward_inputs(
+            fb, fb.input_ids, positions
+        )
+        return fb, wide_ids, wide_pos, keep
+
+    def test_a_fused_step_pads_on_its_widened_rows(
+        self, monkeypatch, req_to_token, counters
+    ):
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb, wide_ids, wide_pos, _ = self._fused_step()
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb, wide_pos)
+        # 5 + R = 133 rows ran by ATOM: the 256 bucket, not SGLang's 5 rows'.
+        assert captured["tokens"] == 256 and captured["bs"] == 2
+        assert captured["batch"].num_scheduled_tokens.tolist() == [3 + R, 2]
+        assert captured["batch"].replaying[0].until == PAGE
+        padded = metadata.sglang_padded_inputs
+        assert padded.scheduled_tokens == 5 + R
+        assert padded.input_ids.shape[0] == 256
+        assert torch.equal(padded.input_ids[: 5 + R], wide_ids)
+        assert not padded.input_ids[5 + R :].any()
+        assert torch.equal(captured["ids"], padded.input_ids)
+        assert padded.positions.tolist() == list(range(1000, 1256))
+        assert counters["prefill_token_graph"] == 1
+        assert counters["prefill_token_graph_radix"] == 1
+
+    def test_radix_kill_switch_keeps_replay_steps_eager(
+        self, monkeypatch, req_to_token, counters
+    ):
+        monkeypatch.setenv(bridge.V41_PREFILL_TOKEN_GRAPHS_RADIX_ENV, "0")
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb, _, wide_pos, _ = self._fused_step()
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb, wide_pos)
+        assert captured["tokens"] == 5 + R
+        assert getattr(metadata, "sglang_padded_inputs", None) is None
+        assert counters["prefill_token_graph"] == 0
+        # A step with no replay still pads.
+        cold = _extend_fb([0], [5], [2])
+        cold.input_ids = torch.arange(5)
+        cold.is_prefill_only = False
+        cold.return_logprob = False
+        metadata = bridge.build_deepseek_v41_forward_metadata(cold, torch.arange(5))
+        assert captured["tokens"] == 256
+        assert metadata.sglang_padded_inputs.scheduled_tokens == 5
+        assert counters["prefill_token_graph"] == 1
+        assert counters["prefill_token_graph_radix"] == 0
+
+    def test_a_widened_step_past_every_bucket_runs_eagerly(
+        self, monkeypatch, req_to_token, counters
+    ):
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb = _extend_fb([PAGE, 0], [3, 400], [1, 4])
+        fb.input_ids = torch.arange(403)
+        fb.is_prefill_only = False
+        fb.return_logprob = False
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [PAGE - R], [PAGE]))
+        positions = torch.cat([torch.arange(PAGE, PAGE + 3), torch.arange(400)])
+        _, wide_pos, _ = expand_v41_forward_inputs(fb, fb.input_ids, positions)
+        # SGLang's 403 rows would fit 512; ATOM's 531 do not.
+        metadata = bridge.build_deepseek_v41_forward_metadata(fb, wide_pos)
+        assert captured["tokens"] == 403 + R
+        assert getattr(metadata, "sglang_padded_inputs", None) is None
+        assert counters["prefill_token_graph"] == 0
+
+    def test_the_runtime_hands_sglang_its_rows_out_of_the_bucket(
+        self, monkeypatch, req_to_token
+    ):
+        from atom.plugin.sglang.runtime import forward_context as plugin_fc
+        from atom.plugin.sglang.runtime import model_arch
+        from atom.utils.forward_context import get_forward_context
+
+        captured = {}
+        self._builder(monkeypatch, captured)
+        fb, _, _, _ = self._fused_step()
+        setattr(fb, FUSED_ATTR, _fused([0], [1], ["r0"], [PAGE - R], [PAGE]))
+        fb.forward_mode = _PrefillMode("EXTEND")
+        spec = model_arch.SGLangModelAdapterSpec(
+            expand_forward_inputs=lambda *a: expand_v41_forward_inputs(*a),
+            build_forward_metadata=lambda config, batch, positions: (
+                bridge.build_deepseek_v41_forward_metadata(batch, positions)
+            ),
+        )
+        monkeypatch.setattr(
+            model_arch, "resolve_model_arch_spec", lambda config: ("X", spec)
+        )
+        monkeypatch.setattr(
+            plugin_fc, "_resolve_running_tokens_are_unified", lambda *a: True
+        )
+        atom_config = SimpleNamespace(
+            hf_config=None,
+            enable_dp_attention=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
+            compilation_config=SimpleNamespace(static_forward_context={}),
+        )
+        with plugin_fc.SGLangPluginRuntime(
+            atom_config=atom_config,
+            forward_batch=fb,
+            positions=torch.tensor([PAGE, PAGE + 1, PAGE + 2, 0, 1]),
+            input_ids=fb.input_ids,
+        ) as runtime:
+            forward = get_forward_context()
+            assert forward.tr_graph == "replay"
+            assert forward.context.scheduled_tokens == 5 + R
+            assert runtime.input_ids.shape[0] == 256
+            assert runtime.positions.shape[0] == 256
+            hidden = torch.arange(256)[:, None].expand(256, 2)
+            out = runtime.trim_output(hidden)
+            # SGLang's five rows: r0's own three after its R replay rows,
+            # then r1's two.
+            assert out[:, 0].tolist() == [R, R + 1, R + 2, R + 3, R + 4]
+            aux = runtime.trim_output((hidden, hidden + 1))
+            assert aux[1][:, 0].tolist() == [R + 1, R + 2, R + 3, R + 4, R + 5]

@@ -15,8 +15,12 @@ original's.
 Kill switch: ``ATOM_SGLANG_V41_EXTEND_ROWS_AT_ALLOC=0``. Version guard:
 SGLang 0.5.22 with ``schedule_batch.alloc_for_extend(batch)`` returning
 ``(out_cache_loc, req_pool_indices_device, req_pool_indices_cpu)``; any other
-version keeps the read-back and logs why. Radix cache keeps the read-back too
-(`deepseek_v41_bridge.host_page_rows_supported`).
+version keeps the read-back and logs why. With radix cache on the copy is
+taken too, once the radix seam invalidates rewritten rows
+(`deepseek_v41_bridge.host_page_rows_supported`): it holds a hit's prefix
+pages, which the allocation writes into the row with the extend's own, and a
+radix checkpoint of one of its rows after the copy refuses it
+(`ExtendRowRead.take`, the slot's `HostPageRows` generation).
 """
 
 from __future__ import annotations
