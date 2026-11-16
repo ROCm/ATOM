@@ -45,8 +45,9 @@ def test_v41_dims_tile_the_full_model(tp):
     assert d.heads * tp == 64 and d.groups * tp == 8
     assert d.o_rows == d.groups * 1024 and d.group_k == 8 * 512
     assert d.inter_real * tp == 2304
-    # the shared expert's share, padded by the loader to the group32 FP8 GEMM's 64-k step (SHARED_PAD)
-    assert d.sh_inter % 64 == 0 and 0 <= d.sh_inter - 2304 // tp < 64
+    # the shared expert's share: as split at TP2 and TP4, padded by the loader to the group32 FP8 GEMM's 64-k step
+    # (SHARED_PAD) at TP8, 288 -> 320
+    assert d.sh_inter == {2: 1152, 4: 576, 8: 320}[tp]
     assert d.inter % 128 == 0 and 0 <= d.inter - d.inter_real < 128
     assert d.down_scale_cols % 8 == 0 and d.down_scale_cols >= d.inter // 32
     # ug covers the real width, a task of 32 ug_groups columns, inside the

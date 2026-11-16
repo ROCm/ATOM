@@ -160,13 +160,13 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
         )
 
 
-def _is_mxfp4(quant_type, quant_dtype) -> bool:
+def _is_per_1x32(quant_type) -> bool:
     # By value: plugin-mode QuantType members do not compare equal under `==`.
-    return (
-        quant_type is not None
-        and quant_type.value == QuantType.per_1x32.value
-        and quant_dtype == dtypes.fp4x2
-    )
+    return quant_type is not None and quant_type.value == QuantType.per_1x32.value
+
+
+def _is_mxfp4(quant_type, quant_dtype) -> bool:
+    return _is_per_1x32(quant_type) and quant_dtype == dtypes.fp4x2
 
 
 def mxfp4_k_pad_align(quant_config, prefix: str) -> int | None:
@@ -187,12 +187,7 @@ GROUP32_FP8_K_ALIGN = 64
 
 
 def _is_fp8_group32(quant_type, quant_dtype) -> bool:
-    # By value, as _is_mxfp4: plugin-mode QuantType members do not compare equal.
-    return (
-        quant_type is not None
-        and quant_type.value == QuantType.per_1x32.value
-        and quant_dtype == dtypes.fp8
-    )
+    return _is_per_1x32(quant_type) and quant_dtype == dtypes.fp8
 
 
 def fp8_group32_k_pad_align(quant_config, prefix: str) -> int | None:
@@ -237,7 +232,7 @@ def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
         pass
     elif will_online_requant(quant_config, prefix, qt, dt):
         raise NotImplementedError(
-            f"{prefix}: MXFP4 K padding can't pad a {qt.name} checkpoint that is "
+            f"{prefix}: K padding can't pad a {qt.name} checkpoint that is "
             "requantized online; list this MLP in exclude_layer of "
             "--online_quant_config."
         )
