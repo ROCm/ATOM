@@ -40,6 +40,14 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
+# aiter fused_qknorm_idxrqknorm takes a layer without index heads (a dense
+# attention layer) into a per-token FP8 cache, with the faster gfx1250 kernel
+# (ROCm/aiter#8011). Earlier versions assert index operands there.
+AITER_QKNORM_TAKES_DENSE_LAYERS = getattr(
+    aiter, "FUSED_QKNORM_IDXRQKNORM_SUPPORTS_INDEXLESS_FP8", False
+)
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -302,7 +310,30 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
-            if isinstance(self.q_norm, GemmaRMSNorm) and (
+            aiter_norm_rope = isinstance(
+                self.q_norm, GemmaRMSNorm
+            ) and self._takes_aiter_gemma_norm_rope(
+                qkv, position, k_cache, v_cache, k_scale
+            )
+            if aiter_norm_rope and not fwd_ctx.context.is_prefill:
+                # One insert writes q and the K/V cache. k and v stay as they
+                # are: the decode backends read only the cache.
+                fp8 = self.kv_cache_dtype == "fp8"
+                q = self._aiter_gemma_norm_rope(
+                    qkv,
+                    position,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_k=k_cache,
+                    kv_cache_v=v_cache,
+                    block_size=k_cache.shape[3],
+                    kv_cache_dtype="fp8" if fp8 else "auto",
+                    k_scale=k_scale if fp8 else None,
+                    v_scale=v_scale if fp8 else None,
+                    asm_layout=True,
+                )
+                k = k_raw.view(-1, self.num_kv_heads, self.head_dim)
+                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            elif isinstance(self.q_norm, GemmaRMSNorm) and (
                 q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
                 and self._use_asm_cache_layout(
                     k_cache, v_cache, use_triton_attn=use_triton_attn
@@ -461,6 +492,74 @@ class PagedAttentionImpl(nn.Module):
         # gathers. Keeping the gather out of here also means dispatch_backend
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _takes_aiter_gemma_norm_rope(
+        self, qkv, position, k_cache, v_cache, k_scale
+    ) -> bool:
+        """Whether aiter fused_qknorm_idxrqknorm can take the Gemma q/k norm +
+        RoPE off the Triton kernel: a contiguous ``[q | k | v]`` row, head_dim
+        128, a NeoX RoPE without MRoPE sections over 1-D int64 positions, and a
+        5-D SHUFFLE cache, unquantized or per-token FP8. gfx1250 only, the arch
+        it was measured on.
+
+        The op aborts on arguments it refuses instead of raising, so whatever
+        the KV pool does not already guarantee is checked here."""
+        rope = self.rotary_emb
+        if self.kv_cache_dtype == "fp8":
+            cache_dtype_ok = k_scale is not None
+        else:
+            cache_dtype_ok = (
+                self.kv_cache_dtype == "bf16" and k_cache.dtype == qkv.dtype
+            )
+        return (
+            AITER_QKNORM_TAKES_DENSE_LAYERS
+            and get_gfx() == "gfx1250"
+            and qkv.is_contiguous()
+            and qkv.shape[-1]
+            == (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
+            and self.head_dim == 128
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and position is not None
+            and position.dim() == 1
+            and position.dtype == torch.int64
+            and position.is_contiguous()
+            and getattr(rope, "is_neox_style", False)
+            and getattr(rope, "mrope_section", None) is None
+            and hasattr(rope, "cos_cache")
+            and rope.rotary_dim % 8 == 0
+            and k_cache.dim() == 5
+            and v_cache.dim() == 5
+            and cache_dtype_ok
+        )
+
+    def _aiter_gemma_norm_rope(self, qkv, position, **insert):
+        """The Gemma q/k norm + RoPE of ``qkv`` in one aiter
+        fused_qknorm_idxrqknorm launch, returning q in a new tensor. The
+        ``insert`` arguments have it write the K/V cache (SHUFFLE layout,
+        per-token FP8 scales as the Triton kernel writes them) and leave
+        ``qkv`` as it was."""
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        q = torch.empty(
+            (qkv.shape[0], self.num_heads * self.head_dim),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            position,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            q_out=q,
+            **insert,
+        )
+        return q.view(-1, self.num_heads, self.head_dim)
 
     def _gemma_norm_rope_then_cache(
         self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
