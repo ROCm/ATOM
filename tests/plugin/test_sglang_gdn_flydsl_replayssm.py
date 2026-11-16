@@ -89,6 +89,7 @@ def test_ring_keeps_the_raw_checkpoint_and_runs_flydsl_prefill(monkeypatch, repl
     monkeypatch.setattr(fly, "ops", lambda: object())
     # Decode would be eligible on this device; only the ring rules it out.
     monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
+    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: True)
     schedule = object()
     monkeypatch.setattr(
         fly, "build_prefill_metadata", lambda lengths, cu_seqlens: schedule

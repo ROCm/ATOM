@@ -7,9 +7,10 @@ ReplaySSM needs the state pool to stay a contiguous KV checkpoint, and a
 prefill to rewrite that checkpoint wholesale without touching the record ring.
 FlyDSL decode needs a physical VK pool, so it stays off. FlyDSL prefill gathers
 the initial state through the pool's strides and returns the final state as a
-logical KV view, so it may run. These tests pin that contract on the policy,
-the Qwen4Exp cache binding and prefill metadata, and the Native GDN layer; the
-kernel numerics are compared on a GPU in tests/test_aiter_flydsl_gdn.py.
+logical KV view, so it may run. These tests pin that contract on the Qwen4Exp
+cache binding and prefill metadata, and the Native GDN layer. The policy matrix
+is in tests/test_gdn_flydsl_policy.py, which runs without AITER; the kernel
+numerics are compared on a GPU in tests/test_aiter_flydsl_gdn.py.
 """
 
 from types import SimpleNamespace
@@ -39,32 +40,11 @@ T = sum(LENGTHS)
 SLOTS = 6
 
 
-@pytest.mark.parametrize("allowed", [False, True])
-@pytest.mark.parametrize("missing_ops", [False, True])
-@pytest.mark.parametrize("prefill_backend", ["auto", "flydsl", "triton"])
+@pytest.mark.parametrize("gfx942", [False, True])
 @pytest.mark.parametrize("replayssm", [False, True])
-def test_policy_keeps_prefill_and_drops_decode_under_replayssm(
-    monkeypatch, allowed, missing_ops, prefill_backend, replayssm
+def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
+    monkeypatch, replayssm, gfx942
 ):
-    backends = {"prefill": prefill_backend, "decode": "auto"}
-    monkeypatch.setattr(fly, "backend", backends.__getitem__)
-    monkeypatch.setattr(fly, "ops", lambda: None if missing_ops else object())
-    # Decode would be eligible on this device; only the ring rules it out.
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
-    policy = fly.select_policy(
-        allowed=allowed,
-        replayssm=replayssm,
-        lossy_decode=False,
-        state=torch.empty(1, 24, 128, 128, dtype=torch.bfloat16),
-        activation_dtype=torch.bfloat16,
-    )
-    available = allowed and not missing_ops
-    assert policy.prefill == (available and prefill_backend != "triton")
-    assert policy.decode == (available and not replayssm)
-
-
-@pytest.mark.parametrize("replayssm", [False, True])
-def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(monkeypatch, replayssm):
     raw = torch.zeros(4, 24, 128, 128, dtype=torch.bfloat16)
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder,
@@ -75,6 +55,7 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(monkeypatch, rep
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: object())
     monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
+    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: gfx942)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
     attention = SimpleNamespace(allow_aiter_flydsl=True, dt_bias=raw)
@@ -82,7 +63,10 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(monkeypatch, rep
         SimpleNamespace(base_linear_attention=None, impl=attention)
     )
     policy = attention.gdn_flydsl_policy
-    assert policy.prefill and builder._flydsl_prefill_enabled
+    # Off gfx942, ReplaySSM keeps the Triton prefill and no FlyDSL schedule.
+    prefill = gfx942 or not replayssm
+    assert policy.prefill is prefill
+    assert builder._flydsl_prefill_enabled is prefill
     assert policy.decode is (not replayssm)
     if replayssm:
         # The exact tensor ReplaySSM addresses: no VK reinterpretation.
@@ -92,11 +76,7 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(monkeypatch, rep
         assert cache.v_cache.stride()[-2:] == (1, 128)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("replayssm", [False, True])
-def test_finish_prefill_builds_the_flydsl_schedule_under_replayssm(
-    monkeypatch, replayssm, enabled
-):
+def _finish_prefill(monkeypatch, *, replayssm, enabled):
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "finish_prefill", lambda self, *args: None
     )
@@ -129,14 +109,26 @@ def test_finish_prefill_builds_the_flydsl_schedule_under_replayssm(
         total_tokens_num_prefill=8,
     )
     builder.finish_prefill(batch, attn_metadata, 2, 8)
-    if enabled:
-        assert builds == [([3, 5], cu)]
-        assert attn_metadata.gdn_metadata.flydsl_prefill_metadata == "schedule"
-    else:
-        assert builds == []
-        assert attn_metadata.gdn_metadata.flydsl_prefill_metadata is None
     assert attn_metadata.qsa_metadata == "qsa"
     assert attn_metadata.ple_metadata == "ple"
+    return builds, attn_metadata.gdn_metadata.flydsl_prefill_metadata, cu
+
+
+def test_finish_prefill_builds_the_flydsl_schedule_under_replayssm(monkeypatch):
+    builds, schedule, cu = _finish_prefill(monkeypatch, replayssm=True, enabled=True)
+    assert builds == [([3, 5], cu)]
+    assert schedule == "schedule"
+
+
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_finish_prefill_builds_no_schedule_without_flydsl_prefill(
+    monkeypatch, replayssm
+):
+    builds, schedule, _ = _finish_prefill(
+        monkeypatch, replayssm=replayssm, enabled=False
+    )
+    assert builds == []
+    assert schedule is None
 
 
 def _gdn_layer(policy):

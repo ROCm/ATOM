@@ -36,12 +36,25 @@ def decode_device_supported(device):
     )
 
 
+def replayssm_prefill_device_supported(device):
+    # FlyDSL prefill under ReplaySSM (MTP) has Native GSM8K and TTFT data on
+    # gfx942 only. Other arches keep Triton until they have that run too.
+    return (
+        torch.version.hip is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        == "gfx942"
+    )
+
+
 def select_policy(*, allowed, replayssm, lossy_decode, state, activation_dtype):
     if not allowed:
         return GDNFlyDSLPolicy()
     # Prefill reads the initial state through the pool's strides and hands the
     # final state back as a logical KV view, so it runs on any pool layout.
-    prefill_enabled = backend("prefill") != "triton"
+    prefill_enabled = backend("prefill") != "triton" and (
+        not replayssm or replayssm_prefill_device_supported(state.device)
+    )
     # ReplaySSM kernels address a contiguous KV pool. Do not reinterpret it as
     # VK even when K == V makes the shape identical; keep decode original.
     decode_enabled = (
