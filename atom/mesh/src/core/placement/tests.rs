@@ -603,6 +603,25 @@ mod c_regular_planning {
     }
 
     #[tokio::test]
+    async fn test_single_charges_the_prompt_only_when_streaming() {
+        let src = MockWorkerSource::new().add_worker(make_regular_http("http://m1-w:8000", "m1"));
+        let planner = make_planner(src, MockPolicySource::new());
+        let tokens = [1u32, 2, 3];
+        for (stream, charged) in [(true, 3), (false, 0)] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m1"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Single { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, charged, "stream={stream}");
+                }
+                other => panic!("expected Single, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_grpc_single_worker_excludes_http() {
         let src = MockWorkerSource::new()
             .add_worker(make_regular_http("http://h:8000", "m"))
@@ -946,6 +965,24 @@ mod d_pd_planning {
             changes,
             [r#"mesh_session_worker_change_total{pool="prefill",reason="rebind"} 1"#]
         );
+    }
+
+    #[tokio::test]
+    async fn test_pair_charges_the_prefill_worker_whether_or_not_streaming() {
+        let planner = make_planner(one_p_one_d_http("m"), MockPolicySource::new());
+        let tokens = [1u32, 2, 3, 4];
+        for stream in [true, false] {
+            let descriptor = RequestDescriptor {
+                stream,
+                ..make_descriptor(Some("m"), None, Some(&tokens), None)
+            };
+            match planner.plan(&descriptor).await.unwrap() {
+                PlacementPlan::Pair { prefill_tokens, .. } => {
+                    assert_eq!(prefill_tokens, 4, "stream={stream}");
+                }
+                other => panic!("expected Pair, got {:?}", other),
+            }
+        }
     }
 
     #[tokio::test]
