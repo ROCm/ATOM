@@ -21,6 +21,7 @@ def test_wire_round_trip_keeps_the_complete_capability():
         StateTransfer.none(),
         StateTransfer.fork(7),
         StateTransfer.copy("layout-v2"),
+        StateTransfer.copy("layout-v2", decode_snapshot=True),
     )
 
     for transfer in transfers:
@@ -43,6 +44,13 @@ def test_invalid_kind_token_and_layout_combinations_are_rejected():
     for args in invalid:
         with pytest.raises(ValueError):
             StateTransfer(*args)
+
+
+def test_only_a_copy_builds_decode_snapshots():
+    with pytest.raises(ValueError, match="decode snapshots"):
+        StateTransfer("fork", 1, decode_snapshot=True)
+    with pytest.raises(TypeError, match="decode_snapshot"):
+        StateTransfer.copy("layout-v1", decode_snapshot=1)
 
 
 def test_copy_factory_requires_a_non_empty_layout():

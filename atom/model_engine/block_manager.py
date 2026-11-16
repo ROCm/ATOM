@@ -2511,6 +2511,8 @@ class BlockManager:
         replay has rebuilt the state whole there, so that may be checkpointed.
         Left unset it reads `seq.replay_until`, which under pipeline
         parallelism a later chunk's scheduling may already have moved.
+
+        `snapshot_step` reaches `StateCache.checkpoint`; see `hash_decode_blocks`.
         """
         if not self.enable_prefix_caching:
             return
@@ -2609,7 +2611,8 @@ class BlockManager:
         seq: Sequence,
         committed_kv_len: int,
         next_forward_tokens: int = 0,
-        snapshot_step: int = 0,
+        *,
+        snapshot_step: int,
     ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
@@ -3364,7 +3367,8 @@ class BlockManager:
             # reachable and generation keeps no checkpoints under -1.
             return []
         elif (
-            # No forward after this one: nothing will read the slot as it is.
+            # A finishing step: the slot is freed, and a stop may have cut the
+            # end inside the window `snapshot_step` names.
             not next_forward_tokens
             or pos % self.hash_block_size
             or pos - seq.last_checkpoint_pos < interval

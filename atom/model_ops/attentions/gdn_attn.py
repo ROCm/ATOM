@@ -58,6 +58,9 @@ logger = logging.getLogger("atom")
 # both kinds cannot number them into the same space.
 LINEAR_STATE_ROWS = "linear_state"
 
+# Decode stores one step builds images for; past it a store is dropped.
+DECODE_SNAPSHOT_SCRATCH_SLOTS = 4
+
 _GDN_SSM_DTYPES = {
     "fp32": torch.float32,
     "fp16": torch.float16,
@@ -656,17 +659,21 @@ class GDNStateMixin(PoolRowsMixin):
         prefix-reusing traffic. Decoupling the two is what the PAGE path does,
         by keeping the image in KV blocks instead of a slot; a flat cushion
         here would buy the same thing for `fork` at the cost of a knob nobody
-        can size without measuring, so it is not offered.
+        can size without measuring, so it is not offered. Decode snapshots get
+        a few scratch slots instead: without them a full batch has none to
+        build in, and every decode checkpoint is dropped.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
+        snapshot = self.state_transfer().decode_snapshot
         return state_pool(
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
+            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if snapshot else 0,
         )
 
     def slots_per_req(self) -> int:
@@ -1034,20 +1041,17 @@ class GDNStateMixin(PoolRowsMixin):
         lags the step by the records since the last flush.
         """
         runner = self.model_runner
-        planes = self._checkpoint_plane_tensors()
-        torch._foreach_copy_(
-            [p[:, op.scratch_slot] for op in ops for p in planes],
-            [p[:, op.src_slot] for op in ops for p in planes],
-        )
         conv = runner.mamba_k_cache
-        width = conv.shape[2] - self.num_spec
+        dsts, srcs = [], []
         for op in ops:
-            if op.step:
-                conv[:, op.scratch_slot, :width] = conv[
-                    :, op.src_slot, op.step : op.step + width
-                ]
-        if not self.replayssm:
-            return
+            for p in self._checkpoint_plane_tensors():
+                if p is conv and op.step:
+                    dsts.append(p[:, op.scratch_slot, : p.shape[2] - op.step])
+                    srcs.append(p[:, op.src_slot, op.step :])
+                else:
+                    dsts.append(p[:, op.scratch_slot])
+                    srcs.append(p[:, op.src_slot])
+        torch._foreach_copy_(dsts, srcs)
         cols = torch.tensor(
             [[op.src_slot, op.scratch_slot, op.step] for op in ops],
             dtype=torch.int64,

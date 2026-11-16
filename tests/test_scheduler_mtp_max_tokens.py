@@ -8,6 +8,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import SequenceType
 from atom.sampling_params import SamplingParams
 from tests.logprob_helpers import token_logprob
 
@@ -332,3 +333,56 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     outputs = dict(queue.put_nowait.call_args.args[0])
     assert outputs[bad.id].finish_reason == "logprob_error"
     assert outputs[good.id].output_tokens == [11]
+
+
+class TestDeferredDecodeBoundary:
+    """A deferred decode boundary is named by the forward its slot will hold.
+
+    A seq in the batch just run had its last sampled token forwarded by it, so
+    the boundary is that forward's first token (step 0). One not in it (a
+    prefill-only batch, a DP dummy) still holds the window that sampled them.
+    """
+
+    def _filed(self, seq_factory, in_batch):
+        mtp = TestMTPMaxTokens()
+        sched = mtp._scheduler()
+        seq = mtp._prefill(
+            sched,
+            seq_factory(
+                [1, 2, 3, 4],
+                sampling_params=SamplingParams(max_tokens=64, ignore_eos=True),
+            ),
+        )
+        seq.type = SequenceType.DECODE
+        filed = []
+
+        def record(s, committed, next_forward_tokens=0, *, snapshot_step):
+            filed.append((committed, snapshot_step))
+
+        sched.block_manager.hash_decode_blocks = record
+        seq.num_placeholder_tokens = sched.mtp_k
+        for token in (87, 88, 89, 90, 91, 92, 93):
+            seq.append_token(token)
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(5, 6, 7, 8)],
+                num_rejected=np.asarray([0]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[20, 21, 22]]),
+                is_deferred_out=True,
+            ),
+            batch=(
+                SimpleNamespace(req_ids=[seq.id], total_seqs_num_prefill=0)
+                if in_batch
+                else None
+            ),
+        )
+        return filed
+
+    def test_in_the_batch_it_is_step_0_of_that_forward(self, seq_factory):
+        ((committed, step),) = self._filed(seq_factory, in_batch=True)
+        assert step == 0
+        ((outside, outside_step),) = self._filed(seq_factory, in_batch=False)
+        assert (outside, outside_step) == (committed - 1, 3)

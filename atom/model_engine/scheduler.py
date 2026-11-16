@@ -4844,6 +4844,7 @@ class Scheduler:
                     seq.multimodal_cache_ready = True
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
+        forwarded_ids = set(batch.req_ids) if batch is not None else set()
         if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
                 seq = running_by_id.get(req_id)
@@ -5268,18 +5269,18 @@ class Scheduler:
             # from the post-truncation length.
             num_new_generation_tokens += len(new_tokens)
 
-            # Hash generated blocks. Deferred output: all tokens forwarded;
-            # undeferred: last token not yet forwarded, so exclude it.
-            # The store runs before the next commit, so the slot then holds the
-            # forward after this one (deferred: its first token is the boundary)
-            # or this one (undeferred: the boundary is its last accepted token).
+            # Hash generated blocks. A deferred seq in this batch has had every
+            # token forwarded, and its slot holds this forward, which began at the
+            # boundary. Otherwise the last token is not forwarded yet, and the slot
+            # holds the forward that sampled these tokens.
+            rode = is_deferred_out and seq.id in forwarded_ids
             self.block_manager.hash_decode_blocks(
                 seq,
-                num_tokens - (0 if is_deferred_out else 1),
+                num_tokens - (0 if rode else 1),
                 next_forward_tokens=self._checkpoint_room(
                     seq, leave_reason is not None
                 ),
-                snapshot_step=0 if is_deferred_out else num_new_token - 1,
+                snapshot_step=0 if rode else num_new_token - 1,
             )
 
             if leave_reason is not None:

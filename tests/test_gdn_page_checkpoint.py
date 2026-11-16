@@ -53,7 +53,7 @@ def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
     )
 
 
-def _layout(monkeypatch, **kwargs):
+def _transfer(monkeypatch, **kwargs):
     params = {
         "layers": 45,
         "shape_k": (3, 1536),
@@ -62,6 +62,7 @@ def _layout(monkeypatch, **kwargs):
         "dtype_v": torch.bfloat16,
         "tp": 8,
         "num_spec": 0,
+        "replayssm": False,
     }
     params.update(kwargs)
     builder_cls = _builder_cls()
@@ -71,13 +72,23 @@ def _layout(monkeypatch, **kwargs):
     )
     builder = SimpleNamespace(
         num_spec=params["num_spec"],
-        replayssm=False,
+        replayssm=params["replayssm"],
         _uses_paged_checkpoints=lambda: True,
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
-    return builder_cls.state_transfer(builder).paged_layout_id
+    return builder_cls.state_transfer(builder)
+
+
+def _layout(monkeypatch, **kwargs):
+    return _transfer(monkeypatch, **kwargs).paged_layout_id
+
+
+def test_replayssm_builds_its_decode_images(monkeypatch):
+    """Its slot lags the records, so a decode store needs a built image."""
+    assert _transfer(monkeypatch, replayssm=True).decode_snapshot
+    assert not _transfer(monkeypatch).decode_snapshot
 
 
 class TestWhoCopies:

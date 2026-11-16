@@ -194,8 +194,8 @@ def _replay_tiles(
         ).to(tl.float32)
     else:
         # Scalar gate: broadcast the per-record value across K so the cumsum
-        # and the weighting below stay one code path.  Only the fused-gating
-        # KDA kernel reaches this helper, and it always has a per-channel gate,
+        # and the weighting below stay one code path.  Only KDA callers reach
+        # this helper, and they always have a per-channel gate,
         # so in practice this branch is not instantiated -- the scalar-gate
         # callers go through `_replay_tiles_kmajor`, which keeps the gate a
         # [BH] vector instead of paying the broadcast.
@@ -667,10 +667,9 @@ def replayssm_materialize(
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
     is_kda = buf_g.ndim == 4
-    if is_kda:
-        _, HV, V, K = ckpt.shape
-    else:
-        _, HV, K, V = ckpt.shape
+    # The records name the head dims; the checkpoint's axis order is layout.
+    HV, K, V = ckpt.shape[1], buf_k.shape[-1], buf_u.shape[-1]
+    assert ckpt[0, 0].numel() == K * V, "checkpoint and records disagree on K, V"
     cap = buf_k.shape[2]
     assert flush_threshold_ok(cap, max_query_len)
     BK = triton.next_power_of_2(K)
@@ -716,7 +715,7 @@ def replayssm_materialize(
 
 
 # --------------------------------------------------------------------------- #
-# Fused rebuild + decode/verify kernel                                        #
+# Fused rebuild + decode/verify kernel                                         #
 # --------------------------------------------------------------------------- #
 
 

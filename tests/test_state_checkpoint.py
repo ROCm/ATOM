@@ -2297,7 +2297,9 @@ class TestDecodePointPublishing:
         while seq.num_tokens < end:
             seq.append_token(500 + seq.num_tokens)
             bm.may_append(seq)
-            bm.hash_decode_blocks(seq, seq.num_tokens, next_forward_tokens=room)
+            bm.hash_decode_blocks(
+                seq, seq.num_tokens, next_forward_tokens=room, snapshot_step=0
+            )
 
     def _prompt_of_10(self, bm):
         """A prompt that ends between rungs, so prefill publishes nothing."""
@@ -2485,7 +2487,7 @@ class StubStateCache:
     def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
         return P if self._cap is None else min(P, self._cap)
 
-    def checkpoint(self, seq, boundary_blocks, h):
+    def checkpoint(self, seq, boundary_blocks, h, step=-1):
         pass
 
     def reserve_midstep(self, seq, positions):
@@ -4462,7 +4464,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
             return 0
 
-        def checkpoint(self, seq, boundary_blocks, h):
+        def checkpoint(self, seq, boundary_blocks, h, step=-1):
             pass
 
         def checkpoint_fates(self) -> dict:
