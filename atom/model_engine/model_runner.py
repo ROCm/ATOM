@@ -3596,8 +3596,14 @@ class ModelRunner:
             if lossless is not None and not all_greedy:
                 ratio = lossless.verify_inputs(bs, temperatures, top_ks, top_ps)
             target_token_ids = None
-            # Only exact match on a sampled batch reads the target's own draw.
-            if not all_greedy and ratio is None:
+            # Only exact match on a sampled batch reads the target's own draw;
+            # the forced-acceptance verify (`synthetic_acceptance_rates`) reads
+            # the target argmax alone, so its draw and broadcast would be dead.
+            if (
+                not all_greedy
+                and ratio is None
+                and self.rejection_sampler.synthetic_acceptance_rates is None
+            ):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3614,6 +3620,7 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
+                any_greedy=bool((batch.temperatures[:bs] == 0).any()),
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,

@@ -147,6 +147,7 @@ class Sampler(nn.Module):
         ) = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        any_greedy: bool = True,  # False if no temperature is 0 (checked on CPU)
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -188,6 +189,10 @@ class Sampler(nn.Module):
             sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )
+            # With no greedy row the fallback's argmax and `where` keep every
+            # sampled id: a host-known `any_greedy` skips both launches.
+            if not any_greedy:
+                return sampled
             return _apply_greedy_tokens(logits, temperatures, sampled)
 
         # Apply top-k/top-p filtering
