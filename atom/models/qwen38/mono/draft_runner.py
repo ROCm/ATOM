@@ -54,7 +54,7 @@ class DraftRunner:
         logger.info("Qwen mono draft: layer %d (bf16) hooked, batches %s, served %s",
                     self.idx, BATCHES, sorted(self.kernels.served))  # fmt: skip
 
-    def serve(self, model, hidden, selected_rows):
+    def serve(self, model, positions, hidden, selected_rows):
         """(state, head input) of a draft step on the program, else None (the fallback draft): the first step's
         ``SPEC`` rows a request with ``selected_rows``, or a later step's one row a request.
         """
@@ -103,14 +103,12 @@ class DraftRunner:
             )
             self.checked.add((batch, spec))
         q = self.qsa
-        pools = QSAPools(
-            self.geo, q.k_cache, q.v_cache, q.raw_key_cache, q.compressed_key_cache
-        )
+        pools = QSAPools(self.geo, q.k_cache, q.v_cache, q.raw_key_cache, q.compressed_key_cache,
+                         rope_positions=q.rope_position_cache)  # fmt: skip
         m, counters = self.kernels.begin_step_buffers(batch, spec, width)
         sel = None if spec == 1 else selected_rows.reshape(batch)
-        draft_meta(
-            m, counters, qsa.logical_positions, qsa.slot_mapping, bt, sel, batch, spec
-        )
+        draft_meta(m, counters, qsa.logical_positions, qsa.slot_mapping, bt, sel, positions,
+                   batch, spec)  # fmt: skip
         out = self.io[:batch]
         self.layer.step(hidden, out, batch, spec, pools)
         head_input, (state, _) = model.hyper_connection_mixer.mix_fused(out, None)

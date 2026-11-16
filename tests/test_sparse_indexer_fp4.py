@@ -116,7 +116,6 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
             **{
                 "fused_writer": True,
                 "prefill_context_parallel": False,
-                "prefill_ubatching": False,
                 **overrides,
             }
         )
@@ -128,11 +127,6 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
         check(prefill_context_parallel=True)
-    # Decode micro-batching is supported; only the prefill split is not, because
-    # it rebuilds metadata from declared fields and the schedule rides on
-    # undeclared ones. A blanket TBO refusal would take the decode path with it.
-    with pytest.raises(ValueError, match="prefill micro-batching"):
-        check(prefill_ubatching=True)
 
 
 def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
@@ -497,6 +491,39 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950):
     assert (got[len(picks) :] == -1).all()
 
 
+def test_v4_prefill_scorer_on_an_idle_dp_rank(on_gfx950):
+    """An idle DP rank's prefill, as the V4 builder publishes it at the running
+    width: no scheduled request, one zero-length padding request on a padded
+    block-table row, one padding row. The row picks nothing."""
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+    from atom.model_ops.indexer import IndexCache, fp4_rows, score_topk
+
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights, _ = _written_cache_and_queries(
+        1, 1, 768, seed=1
+    )
+    index_rows = fp4_rows(
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        1,
+        None,
+        Fp4MqaRaggedMetadata(
+            torch.zeros(2, dtype=torch.int32, device="cuda"),
+            0,
+            torch.zeros_like(table[:1]),
+        ),
+        heads=weights.shape[1],
+        page_size=_BLOCK,
+    )
+    got = score_topk(
+        _fp4_query(q_fp4[:1], q_scale[:1]),
+        weights[:1].bfloat16(),
+        IndexCache(kv_cache, kv_scale, _BLOCK),
+        index_rows,
+        topk=512,
+        weight_scale=WEIGHTS_SCALE,
+    )
+    assert (got == -1).all()
+
+
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
     """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
     row per query token over this rank's shard, each its own sequence, so the
@@ -685,9 +712,8 @@ def test_builder_publishes_the_staging_indices_it_derives(device):
     g_lens = np.array([100, 150], dtype=np.int64)
     g_cu = np.concatenate([[0], np.cumsum(g_lens)]).astype(np.int64)
     table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
-    var = {"block_tables": SimpleNamespace(np=table)}
     meta = SimpleNamespace()
-    build(builder, meta, bs, lpad, cu_pad, g_cu, g_lens, var)
+    build(builder, meta, bs, lpad, cu_pad, g_cu, g_lens, table)
 
     read = torch.tensor(
         [7 * block + j for j in range(block)]
@@ -760,7 +786,7 @@ def _prefill_rows(batch, ctx_len, bands=None, stripe=None, new_rows=None):
         split = RowSplit.striped(ends.shape[0], rank, world, group="tp")
         ends = ends[rank::world].contiguous()
         owned = pcp_owned_rows_by_request(starts.cpu().numpy(), rank, world, split.end)
-        # As the builder groups them (`_split_query_starts`), an empty rank too.
+        # As the builder groups them (`_stage_split_query_starts`), an empty rank too.
         starts = torch.from_numpy(owned).cuda()
         max_qlen = max(int(np.diff(owned).max()), 1)
     rows = fp4_rows(
@@ -899,7 +925,7 @@ def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
 
     def publish(counts, running_bs, max_q):
         """`counts` real sequences padded with empty ones to `running_bs`, as
-        `prepare_cu_seqlens_q` publishes them; per-row bounds zero on the pad
+        `prepare_query_metadata` stages them; per-row bounds zero on the pad
         rows. A new metadata object each step, as the builder makes one."""
         nonlocal metadata
         cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)

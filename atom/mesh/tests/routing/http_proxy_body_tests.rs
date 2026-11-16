@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     core::{BasicWorkerBuilder, WorkerLoadGuard},
-    policies::{LoadBalancingPolicy, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo},
 };
 use http_body::Body as _;
 use http_body_util::BodyExt;
@@ -14,12 +14,12 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 struct RecordingPolicy(Mutex<Vec<bool>>);
 #[async_trait::async_trait]
 impl LoadBalancingPolicy for RecordingPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         _: &[Arc<dyn Worker>],
         _: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
-        Some(0)
+    ) -> (Option<usize>, RouteDecision) {
+        (Some(0), RouteDecision::branch("first"))
     }
     fn on_request_complete(&self, _: &str, success: bool) {
         self.0.lock().unwrap().push(success);

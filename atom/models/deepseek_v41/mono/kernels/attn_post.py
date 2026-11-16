@@ -98,7 +98,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
 from atom.models.deepseek_v41.mono.kernels.topk import lds_words
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
+from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
     bf16_round,
     butterfly,
@@ -194,7 +194,7 @@ ABI = KernelAbi(
         "itab_len", "ibatch", "ishift", "ibound",
         "ilog", "lstride", "isel", "icand", "ilift", "iprod", "ibmax", "bstride",
         "icout", "irow", "sbound",
-        "q", "pool", "sel", "topk", "kmeta", "table", "rows_per_page", "page_rows",
+        "q", "pool", "pool_scale", "window", "window_scale", "sel", "topk", "kmeta", "table", "rows_per_page", "page_rows",
         "main_off", "ring_off", "ring_slots", "sink", "qk_scale", "pos", "cos", "sin",
         "woa", "woa_s", "wob", "wob_s",
         "res_in", "post_in", "comb_in", "pre_in", "hc_fn", "hc_scale", "hc_base",
@@ -289,7 +289,7 @@ def irq_group(c, t, tile, dc, out, rope):
     o1 = o * cs - e * sn
     amax = butterfly(fx.max(abs(e1), abs(o1)), (1, 2, 4, 8), fx.max)
     code = code_ceil(fx.max(amax, fx.Float32(AMAX_FLOOR)) * fx.Float32(1.0 / FP8_MAX))
-    inv = pow2(254 - code)
+    inv = rcp_pow2(code)
     # this thread's two bytes and its neighbour's make a word (4 dims)
     q0, q1 = clamp_fp8(e1 * inv), clamp_fp8(o1 * inv)
     n0, n1 = xshfl(q0, 1), xshfl(q1, 1)
@@ -364,7 +364,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     )
     amax = fx.max(butterfly(abs(y), (1, 2, 4, 8, 16), fx.max), fx.Float32(AMAX_FLOOR))
     code = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-    q = clamp_fp8(y / pow2(code))
+    q = clamp_fp8(y * rcp_pow2(code))
     # rows row .. row + 3 (row a multiple of 4) make a word
     lane = c["lane"]
     w = fp8_pack4(
@@ -793,7 +793,7 @@ def build_attn_post(key: AttnPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -811,7 +811,7 @@ def build_attn_post(key: AttnPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
@@ -835,7 +835,7 @@ def build_attn_post(key: AttnPostBuild):
         ibound: Int64, ilog: Int64,
         lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32,
         ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64,
-        q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
+        q: Int64, pool: Int64, pool_scale: Int64, window: Int64, window_scale: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64,
         rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32,
         ring_slots: Int32, sink: Int64,
         qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64,
@@ -850,7 +850,7 @@ def build_attn_post(key: AttnPostBuild):
             iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len,
             ibatch, ishift, ibound, ilog, lstride,
             isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound,
-            q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
+            q, pool, pool_scale, window, window_scale, sel, topk, kmeta, table, rows_per_page, page_rows, main_off,
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in,
             pre_in, hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out,

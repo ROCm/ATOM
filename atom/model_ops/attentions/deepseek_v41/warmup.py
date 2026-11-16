@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Prepare ragged prefill addressing with the allocated serving pool geometry."""
 
-from types import SimpleNamespace
-
 import torch
 
-from .indices import build_indices, fill_step_indptrs
-from .packed_rows import write_packed_window
+from .indices import build_indices, fill_step_indptrs, splits_window
+from .metadata import BatchStep
+from .planes import split_source, write_window_planes
 
 
 @torch.no_grad()
@@ -36,21 +35,25 @@ def warmup_prefill_addressing(cache, topology, max_tokens, table_stride):
         first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
         groups.setdefault(first, spec)
     for rows in sorted(widths):
-        step = SimpleNamespace(
-            width=rows,
+        step = BatchStep(
+            requests=(),
             batch_ids=batches[:rows],
             positions=positions[:rows],
             cu_seqlens_q=cu,
             slots=slots,
             block_tables=tables,
-            decode=False,
+            is_prefill=True,
             max_q_len=rows,
             swa_replay_start=floor,
             swa_cached_until=floor,
         )
         indptrs = fill_step_indptrs(step, geometry, cache.indptr_buffers)
         for first, spec in groups.items():
-            layers = spec.index_group_size
+            layers = (
+                1
+                if geometry.window_fp8 or splits_window(step, geometry)
+                else spec.index_group_size
+            )
             window = geometry.window(first, cache.num_pages)
             stride = (
                 0
@@ -77,14 +80,20 @@ def warmup_prefill_addressing(cache, topology, max_tokens, table_stride):
             )
         if geometry.window_fp8:
             dim = geometry.head_dim
-            packed = torch.zeros(
-                (rows, geometry.row_bytes), dtype=torch.uint8, device=device
+            source = torch.zeros(
+                rows * geometry.window_row_bytes, dtype=torch.uint8, device=device
             )
-            values, scales = packed[:, :dim], packed[:, dim : dim + dim // 32]
+            values, scales = split_source(source, dim)
             for spec in topology:
-                window = geometry.window_bytes(spec.layer_id, cache.num_pages)
+                window = geometry.window(spec.layer_id, cache.num_pages)
                 for cached in (None, floor):
-                    write_packed_window(
-                        values, scales, cache.backing, step, window, dim, cached
+                    write_window_planes(
+                        values,
+                        scales,
+                        cache.ring_view(spec.layer_id),
+                        step,
+                        window,
+                        dim,
+                        cached,
                     )
     torch.cuda.synchronize(device)

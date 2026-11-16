@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """aiter MegaMoEInternode (two-node EP16 fused MoE) as ATOM's routed-experts step.
 
-``moe_backend="mega_internode"`` replaces dispatch + GEMM1 + activation + GEMM2 +
+``moe_backend="mega"`` on two-node EP16 replaces dispatch + GEMM1 + activation + GEMM2 +
 combine of an MXFP4 MoE layer with aiter's ``MegaMoEInternode`` (A4W4: the op
 quantizes the bf16 rows to MXFP4 itself and sends FP4 on dispatch).
 
@@ -81,7 +81,7 @@ def build_internode_weights(layer) -> None:
     E = int(w13.shape[0])
     if E != layer.local_num_experts:
         raise RuntimeError(
-            f"mega_internode: local weights {E} != local_num_experts "
+            f"internode MegaMoE: local weights {E} != local_num_experts "
             f"{layer.local_num_experts}"
         )
     # Same calls as the op's unit test (op_tests/.../megamoe_internode_inputs.py):
@@ -136,7 +136,7 @@ def _get_instance(
     if inst is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"mega_internode capacity {mtpr} was not built before graph capture"
+                f"internode MegaMoE capacity {mtpr} was not built before graph capture"
             )
         from aiter.ops.flydsl.kernels.mega_moe_internode import MegaMoEInternode
 
@@ -231,7 +231,9 @@ def _group_rows(local_rows: int) -> tuple[int, bool]:
         return int(ctx.running_tokens), True
     if fc.dp_metadata is not None:
         return int(fc.dp_metadata.max_tokens_across_dp), False
-    raise RuntimeError("mega_internode needs dp_metadata to agree on the chunk count")
+    raise RuntimeError(
+        "internode MegaMoE needs dp_metadata to agree on the chunk count"
+    )
 
 
 class MegaInternodeFusedExperts:
@@ -263,9 +265,9 @@ class MegaInternodeFusedExperts:
     ) -> torch.Tensor:
         from aiter import ActivationType
 
-        assert x_scale is None, "mega_internode takes bf16 rows"
+        assert x_scale is None, "internode MegaMoE takes bf16 rows"
         if apply_router_weight_on_input:
-            raise NotImplementedError("mega_internode: apply_router_weight_on_input")
+            raise NotImplementedError("internode MegaMoE: apply_router_weight_on_input")
         if activation == ActivationType.Situv2:
             act, limit = "situv2", 0.0
             extra = moe_extra_args or {}
@@ -281,7 +283,7 @@ class MegaInternodeFusedExperts:
             beta = linear_beta = 1.0
         else:
             raise NotImplementedError(
-                f"mega_internode: unsupported activation {activation}"
+                f"internode MegaMoE: unsupported activation {activation}"
             )
         del w1, w2, expert_map
         layer = self._layer
@@ -308,7 +310,7 @@ class MegaInternodeFusedExperts:
         group_rows, _ = _group_rows(rows)
         if rows > group_rows:
             raise RuntimeError(
-                f"mega_internode: local rows {rows} > group rows {group_rows}"
+                f"internode MegaMoE: local rows {rows} > group rows {group_rows}"
             )
         out = torch.empty(rows, self._model_dim, dtype=torch.bfloat16, device=x.device)
         for inst_d in inst_ds:

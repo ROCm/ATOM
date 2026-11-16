@@ -993,7 +993,7 @@ def _fill_qsa_like_native(
     ctx_len: int,
     buffers: _Qwen4ExpDecodeGraphBuffers | None = None,
 ) -> Qwen4ExpQSAMetadata:
-    """Native ``_build_qsa_metadata`` / ``prepare_decode`` for SGLang CUDA graphs.
+    """Native ``_stage_qsa`` / ``_finish_qsa`` (decode) for SGLang CUDA graphs.
 
     GPU packed token→req into the baked tensor, GPU gather of live page-table
     rows, Triton ``qsa_compressed_slots`` in place. Persistent addresses stay

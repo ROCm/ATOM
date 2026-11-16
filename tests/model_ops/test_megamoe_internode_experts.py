@@ -7,11 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from conftest import atom_config_double
 
-from atom.config import Config, use_custom_atom_config
+from atom.config import Config, is_internode_mega, use_custom_atom_config
 
 
 @pytest.fixture
@@ -150,6 +151,44 @@ def test_chunk_forwards_actual_views_and_invalid_routes(internode, start, rows):
     instance["op"].bind_weights.assert_called_once()
 
 
+@pytest.mark.parametrize("local_rows", [0, 3, 10])
+def test_mixed_dp_phase_uses_group_chunks_even_on_an_idle_rank(
+    internode, monkeypatch, local_rows
+):
+    from atom.utils import forward_context
+
+    group_rows = 10
+    context = SimpleNamespace(
+        running_tokens=local_rows,
+        running_tokens_are_unified=False,
+        is_prefill=local_rows == group_rows,
+    )
+    metadata = forward_context.DPMetadata(np.array([local_rows, group_rows]))
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=context, dp_metadata=metadata),
+    )
+    backend = internode.module.MegaInternodeFusedExperts(
+        _weights(), model_dim=64, inter_dim=32, max_tokens=group_rows
+    )
+    x = torch.arange(local_rows * 64).reshape(local_rows, 64).to(torch.bfloat16)
+    result = backend(
+        hidden_states=x,
+        topk_weights=torch.ones(local_rows, 2),
+        topk_ids=torch.zeros(local_rows, 2, dtype=torch.int32),
+        global_num_experts=256,
+        activation=internode.moe.ActivationType.Silu,
+    )
+    assert torch.equal(result, x)
+    prefill = next(op for op in internode.built if op.mtpr == 8)
+    assert [call[0].shape[0] for call in prefill.calls] == [
+        min(local_rows, 8),
+        max(local_rows - 8, 0),
+    ]
+    assert all(not op.calls for op in internode.built if op.mtpr != 8)
+
+
 def test_teardown_attempts_every_capacity_in_reverse_order(internode):
     first, second = _instance(internode), _instance(internode, capacity=4)
     calls = []
@@ -194,6 +233,7 @@ def test_inherited_apply_passes_model_activation_parameters(
     method = object.__new__(internode.moe.MegaInternodeMxfp4MoEMethod)
     method.fused_experts = backend
     method.use_triton = method.use_triton_ep = method.use_triton_decode = False
+    method.use_flydsl_herd = False
     method.fp8_activations = method.is_guinterleave = False
     method.quant_type = internode.moe.QuantType.per_1x32
     method.hidden_pad = method.intermediate_pad = 0
@@ -249,7 +289,7 @@ def test_situ_defaults_and_explicit_parameters(internode, monkeypatch, extra, ex
 
 def _config(**overrides):
     settings = {
-        "moe_backend": "mega_internode",
+        "moe_backend": "mega",
         "enable_expert_parallel": True,
         "enable_dp_attention": True,
         "tensor_parallel_size": 1,
@@ -275,6 +315,76 @@ def _parallel(atom_modules, monkeypatch, config):
 def test_unflattened_dp_is_rejected_before_loading_weights():
     with pytest.raises(ValueError, match="shard experts across DP ranks"):
         Config._init_moe_backend(_config(enable_dp_attention=False))
+
+
+@pytest.mark.parametrize(
+    "backend,sp,dp,local,expected",
+    [
+        ("standard", 1, 16, 8, False),
+        ("mega", 1, 8, 8, False),
+        ("mega", 1, 16, 8, True),
+        ("mega", 2, 1, 1, False),
+    ],
+)
+def test_mega_implementation_is_selected_by_topology(backend, sp, dp, local, expected):
+    config = _config(
+        moe_backend=backend,
+        sequence_parallel_size=sp,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp, data_parallel_size_local=local
+        ),
+    )
+    Config._init_moe_backend(config)
+    assert is_internode_mega(config) is expected
+
+
+def test_removed_internode_selector_is_rejected():
+    with pytest.raises(ValueError, match="moe_backend must be one of"):
+        Config._init_moe_backend(_config(moe_backend="mega_internode"))
+
+
+@pytest.mark.parametrize(
+    "overrides,reason",
+    [
+        ({"tensor_parallel_size": 2}, "two-node EP16"),
+        ({"pipeline_parallel_size": 2}, "two-node EP16"),
+        ({"prefill_context_parallel_size": 2}, "two-node EP16"),
+        ({"enable_tbo": True}, "disable TBO"),
+        ({"enable_tbo_decode": True}, "disable TBO"),
+    ],
+)
+def test_internode_mega_refuses_unsupported_topology_and_overlap(overrides, reason):
+    with pytest.raises(ValueError, match=reason):
+        Config._init_moe_backend(_config(**overrides))
+
+
+@pytest.mark.parametrize(
+    "backend,sp,dp,local,method_name",
+    [
+        ("standard", 1, 16, 8, "Mxfp4MoEMethod"),
+        ("mega", 1, 8, 8, "MegaMxfp4MoEMethod"),
+        ("mega", 1, 16, 8, "MegaInternodeMxfp4MoEMethod"),
+        ("mega", 2, 1, 1, "Mxfp4MoEMethod"),
+    ],
+)
+def test_method_factory_preserves_single_node_and_sp_mega(
+    atom_modules, monkeypatch, backend, sp, dp, local, method_name
+):
+    moe = atom_modules.moe
+    config = _config(
+        moe_backend=backend,
+        sequence_parallel_size=sp,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp, data_parallel_size_local=local
+        ),
+    )
+    methods = {}
+    for name in ("Mxfp4MoEMethod", "MegaMxfp4MoEMethod", "MegaInternodeMxfp4MoEMethod"):
+        methods[name] = object()
+        monkeypatch.setattr(moe, name, lambda *args, result=methods[name]: result)
+    monkeypatch.setattr(moe, "sp_is_enabled", lambda: sp > 1)
+    with use_custom_atom_config(config):
+        assert moe._make_mxfp4_moe_method(None, None) is methods[method_name]
 
 
 @pytest.mark.parametrize(

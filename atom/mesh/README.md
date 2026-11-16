@@ -28,6 +28,7 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
+| `GET /metrics` | Mesh self metrics, the same registry as the Prometheus exporter |
 | `GET /v1/models` | Model metadata |
 
 Responses resource operations (GET, DELETE, cancel and input_items) probe regular
@@ -247,6 +248,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `GET` / `PUT` / `DELETE` | `/workers/{id}` | Inspect, update, or remove worker |
 | `POST` | `/flush_cache` | Flush cache across HTTP workers |
 | `GET` | `/get_loads` | Sample current worker loads |
+| `GET` | `/kv_events/sources` | With `--kv-events`: each followed worker rank's KV event stream and what it carried. A worker not followed, as with the engine's KV events off (`ATOM_KV_EVENTS_ENABLE`) or sources that cannot be read, has no row, as if not registered; the log says why |
 
 ## Load balancing
 
@@ -254,7 +256,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 |--------|-------------|
 | `random` | Uniform random selection |
 | `round_robin` | Sequential rotation with atomic counters |
-| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds |
+| `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
 
@@ -298,10 +300,14 @@ registered token-routing template, so under `prefix_hash` they return
 
 Default bind: `0.0.0.0:29000` (`--prometheus-host` / `--prometheus-port`)
 
-Mesh self metrics are exposed by the Prometheus exporter above. Worker engine
-metrics remain available through the router's `/engine_metrics` endpoint, which
-scrapes backend workers, injects `worker_addr`, and aggregates their Prometheus
-text without changing worker metric names.
+Mesh self metrics are exposed by the Prometheus exporter above and by the
+router's own `/metrics` endpoint, which returns 503 when the exporter is not
+running. The router port serves the whole registry whatever `--prometheus-host`
+is set to, so binding the exporter to a private address does not hide these
+metrics from clients that can reach the router. Worker engine metrics remain
+available through the router's `/engine_metrics` endpoint, which scrapes backend
+workers, injects `worker_addr`, and aggregates their Prometheus text without
+changing worker metric names.
 
 | Layer | Prefix | Description |
 |-------|--------|-------------|
@@ -309,12 +315,23 @@ text without changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
+| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
+
+[Routing metrics](docs/metrics.md) covers each routing metric's labels, the
+policies and branches that record it, how to read the values, and example
+queries.
 
 ### Logging
 
 Structured logging via `tracing`, optional file sink (`--log-dir`), and log level (`--log-level`).
+
+`--route-log-sample-rate` (0 to 1, default 0 = off) logs the routing decisions of
+that fraction of inference requests at info level under target `mesh::route`.
+While it is above 0, a request carrying the `x-mesh-route-trace` header is always
+logged. HTTP routers only: gRPC workers and Envoy external processing do not
+emit these logs.
 
 ## Security
 

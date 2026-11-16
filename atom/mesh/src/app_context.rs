@@ -15,6 +15,7 @@ use crate::{
         prepare_pool::PrepareHandle, steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry,
         WorkerService,
     },
+    kv_events::KvEventMonitor,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -60,6 +61,8 @@ pub struct AppContext {
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// Set with `kv_events` in the router config.
+    pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -252,6 +255,20 @@ impl AppContextBuilder {
             &router_config,
             self.rate_limiter.clone(),
         ));
+        let kv_event_monitor = router_config
+            .kv_events
+            .then(|| KvEventMonitor::start().map(Arc::new))
+            .transpose()
+            .map_err(|e| {
+                tracing::error!(error = %e, "Cannot start the KV event monitor's thread");
+                AppContextBuildError("kv_event_monitor")
+            })?;
+        let policy_registry = self
+            .policy_registry
+            .ok_or(AppContextBuildError("policy_registry"))?;
+        if let Some(monitor) = &kv_event_monitor {
+            policy_registry.set_kv_events(monitor.clone());
+        }
         Ok(AppContext {
             prepare_pool: self
                 .prepare_pool
@@ -266,9 +283,7 @@ impl AppContextBuilder {
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
-            policy_registry: self
-                .policy_registry
-                .ok_or(AppContextBuildError("policy_registry"))?,
+            policy_registry,
             router_manager: self.router_manager,
             response_storage: self
                 .response_storage
@@ -289,6 +304,7 @@ impl AppContextBuilder {
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
             atom_standalone_runtime: self.atom_standalone_runtime,
+            kv_event_monitor,
         })
     }
 

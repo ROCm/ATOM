@@ -23,6 +23,7 @@ from atom.plugin.vllm.deepseek_v41_bridge import (
     ATOM_DEEPSEEK_V41_BLOCK_SIZE,
     AtomDeepseekV41ProxyAttention,
     _v41_dummy_batch,
+    _v41_dummy_lengths,
     _v41_scheduled_batch,
     is_deepseek_v41_vllm_config,
     snapshot_v41_batch,
@@ -110,15 +111,16 @@ class TestKVCacheDtype:
     def test_unquantized_spellings_select_the_bf16_pool(self, spelling):
         assert v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling)) == "bf16"
 
-    def test_nvfp4_selects_the_packed_pool(self):
+    def test_nvfp4_keeps_the_packed_pool(self):
         assert v41_kv_cache_dtype(_vllm_config(cache_dtype="nvfp4")) == "fp4"
 
-    @pytest.mark.parametrize("spelling", ["fp8", "fp8_e4m3", "fp8_e5m2"])
-    def test_fp8_is_refused_rather_than_downgraded(self, spelling):
-        # V4.1 has no fp8 pool. Silently serving bf16 instead would size the
-        # proxy layer for one geometry and address another.
+    @pytest.mark.parametrize("spelling", ["fp8", "fp8_e4m3"])
+    def test_fp8_selects_the_mxfp8_pool(self, spelling):
+        assert v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling)) == "fp8"
+
+    def test_e5m2_is_refused(self):
         with pytest.raises(ValueError, match="kv-cache-dtype"):
-            v41_kv_cache_dtype(_vllm_config(cache_dtype=spelling))
+            v41_kv_cache_dtype(_vllm_config(cache_dtype="fp8_e5m2"))
 
 
 class TestProxyBlockSizing:
@@ -366,9 +368,9 @@ class TestDummyBatch:
 
     def _split(self, running_tokens, max_reqs=64):
         return _v41_dummy_batch(
-            running_tokens,
-            max_req_tokens=self.MAX_REQ_TOKENS,
-            max_reqs=max_reqs,
+            _v41_dummy_lengths(
+                running_tokens, max_req_tokens=self.MAX_REQ_TOKENS, max_reqs=max_reqs
+            )
         )
 
     @pytest.mark.parametrize(
@@ -405,8 +407,7 @@ class TestDummyBatch:
         assert batch.total_tokens_num == sum(batch.num_scheduled_tokens) < 40_000
 
     def test_every_row_carries_a_token(self):
-        # `_prepare` skips zero-token rows, so an empty row would silently
-        # shrink the batch it published a width for.
+        # A request is a row with tokens: `begin_step` refuses an empty span.
         for running_tokens in (1, 3, 17, 16385):
             batch = self._split(running_tokens)
             assert min(batch.num_scheduled_tokens) >= 1
