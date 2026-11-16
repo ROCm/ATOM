@@ -100,12 +100,16 @@ def test_middle_prefill_draft_preserves_position_axes(
             positions[None, :] + torch.tensor([0, 20, 40], device=device)[:, None]
         )
     original_positions = positions.clone()
-    hidden = torch.randn(tokens, 4, 128, device=device, dtype=torch.bfloat16)
+    # A token-graph replay hands the whole padded bucket's hidden rows.
+    hidden = torch.randn(tokens + padding, 4, 128, device=device, dtype=torch.bfloat16)
     expected_positions = positions[..., :tokens] + 1
-    expected_q, _ = qsa_apply_mrope(qsa_rope, expected_positions, hidden)
+    expected_q, _ = qsa_apply_mrope(qsa_rope, expected_positions, hidden[:tokens])
     anchor = torch.tensor([99], device=device)
     context = SimpleNamespace(
-        scheduled_bs=1, is_draft=False, draft_anchor_overrides=anchor
+        scheduled_bs=1,
+        scheduled_tokens=tokens,
+        is_draft=False,
+        draft_anchor_overrides=anchor,
     )
     monkeypatch.setattr(
         eagle_proposer, "get_forward_context", lambda: SimpleNamespace(context=context)
