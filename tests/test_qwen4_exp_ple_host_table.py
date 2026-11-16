@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -22,6 +23,7 @@ from atom.model_ops.engram import host_memory
 from atom.model_ops.qwen4_exp.ple_host_table import HostTableHooks, PleHostTable
 from atom.rollout.memory_manager import MemoryManagerMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 DIM = 160
 SHARD_ROWS = 37
@@ -417,6 +419,8 @@ class _Model(torch.nn.Module):
 def _updater(model, device="cpu"):
     class _Updater(WeightUpdaterMixin):
         label, rank, world_size = "ple", 0, 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass

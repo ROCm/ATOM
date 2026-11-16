@@ -33,6 +33,7 @@ if not torch.cuda.is_available():
     )
 
 from aiter import QuantType, dtypes
+from conftest import atom_config_double
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.model_ops import moe as moe_module
@@ -40,6 +41,7 @@ from atom.model_ops.moe import Fp8MoEMethod, FusedMoE
 from atom.model_ops.utils import shuffle_weights
 from atom.rollout import weight_sync
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 DEVICE = torch.device("cuda")
 NUM_EXPERTS = 4
@@ -131,9 +133,8 @@ class _Runner(WeightUpdaterMixin):
         self.world_size = 1
         self.label = "test"
         self.kv_clears = 0
-        self.config = SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_rank_local=0)
-        )
+        self.config = atom_config_double()
+        self.attn_family = Family.MHA
 
     def clear_kv_cache(self):
         self.kv_clears += 1

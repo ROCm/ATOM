@@ -16,6 +16,7 @@ from unittest import mock
 
 import pytest
 import torch
+from conftest import atom_config_double
 from torch import nn
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
@@ -36,15 +37,14 @@ class _Runner(WeightUpdaterMixin):
     world_size = 1
 
     def __init__(self, model, config=None):
+        from atom.utils import get_hf_text_config
         from atom.utils.selector import attn_family
 
         self._init_weight_updater()
         self.model = model
-        self.config = config
-        # As ModelRunner declares it, from the config.
-        self.attn_family = attn_family(
-            getattr(config, "hf_text_config", None) or SimpleNamespace()
-        )
+        self.config = _config() if config is None else config
+        # As ModelRunner declares it, from the checkpoint's config.
+        self.attn_family = attn_family(get_hf_text_config(self.config.hf_config))
         self.kv_cleared = 0
 
     def clear_kv_cache(self):
@@ -53,6 +53,11 @@ class _Runner(WeightUpdaterMixin):
     def _sync_target_model(self):
         # No wrapper to peel; the real lookup imports the TBO package.
         return self.model
+
+
+def _config(**overrides):
+    """A Config of a dense checkpoint, with *overrides*."""
+    return atom_config_double(**{"hf_config": SimpleNamespace(), **overrides})
 
 
 def _param(*shape, dtype=torch.bfloat16):
@@ -613,10 +618,7 @@ def test_a_bucket_that_cannot_be_read_fences_no_engine(monkeypatch, unreadable, 
     exception, so a healthy engine was marked not whole by one bad bucket."""
     from atom.rollout import weight_sync
 
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_rank_local=0)
-    )
-    runner = _ReportingRunner(_dense_model(), config)
+    runner = _ReportingRunner(_dense_model())
     engine, send = _engine_with(runner)
     flat, meta = _staged(_dense_checkpoint())
     args = {"sync_id": "s1", "request_id": "a", "bucket_meta": meta, "is_last": True}
@@ -669,7 +671,7 @@ def test_the_writes_land_before_the_sync_completes(monkeypatch):
 
 
 # A latent rank is what makes a config MLA.
-_MLA_CONFIG = SimpleNamespace(hf_text_config=SimpleNamespace(kv_lora_rank=512))
+_MLA_CONFIG = _config(hf_config=SimpleNamespace(kv_lora_rank=512))
 
 
 def _mla_model():
@@ -710,7 +712,7 @@ _unreloadable = pytest.mark.parametrize(
     ("model", "config", "reason"),
     [
         (_mla_model, _MLA_CONFIG, "MLA"),
-        (_dense_model, SimpleNamespace(prefill_context_parallel_size=2), "prefill"),
+        (_dense_model, _config(prefill_context_parallel_size=2), "prefill"),
         (_int8_model, None, "format a full-precision write cannot produce"),
         (_expert_parallel_moe, None, "expert-parallel"),
         (_redundant_expert_moe, None, "redundant expert"),
@@ -736,6 +738,10 @@ def test_a_model_a_reload_cannot_rewrite_is_refused_on_every_path(
 
 class _ReportingRunner(CapabilityProviderMixin, _Runner):
     """A runner that also says what it supports, as ModelRunner does."""
+
+    def _rdma_receive_refusal(self):
+        # RDMAWeightReceiverMixin's, for an engine without DP or PP.
+        return self._reload_refusal()
 
 
 @_unreloadable

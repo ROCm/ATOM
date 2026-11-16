@@ -96,8 +96,7 @@ class ReloadPolicyMixin:
 
         Asked before any sync writes, whatever carries it.
         """
-        config = getattr(self, "config", None)
-        pcp = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
+        pcp = self.config.prefill_context_parallel_size
         if pcp > 1:
             return (
                 f"prefill_context_parallel_size={pcp}: a worker's rank counts "
@@ -106,9 +105,7 @@ class ReloadPolicyMixin:
                 f"another rank's shard"
             )
         model = self._sync_target_model()
-        # ModelRunner's, declared by the config it was built from.
-        family = getattr(self, "attn_family", None)
-        if family is not None and family.is_mla:
+        if self.attn_family.is_mla:
             return (
                 "the model attends through MLA, whose decode reads W_K and W_V "
                 "derived from kv_b_proj once, at load; a reload rewrites "

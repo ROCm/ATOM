@@ -17,7 +17,7 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,9 +52,9 @@ def test_only_the_group_lifecycle_is_on_the_public_rpc_path():
 
 
 def test_the_caller_waits_for_a_stream_as_long_as_the_engines_do():
-    """At five minutes the caller gave up on a stream the engines were still
-    taking, so a version they then wrote was reported unknown, and they stayed
-    fenced until a sync rewrote every parameter."""
+    """On its own, shorter timeout the caller gave up on a stream the engines
+    were still taking, so a version they then wrote was reported unknown, and
+    they stayed fenced until a sync rewrote every parameter."""
     with stubbed_aiter():
         from atom.model_engine.engine_utility import WEIGHT_STREAM_TIMEOUT_S
         from atom.rollout.async_engine import AsyncLLMEngine
@@ -777,9 +777,13 @@ class _Worker(
         import torch
         from torch import nn
 
+        from atom.utils.selector import Family
+
         self.rank = rank
         self.device = torch.device("cpu")
         self.config = _config(**config)
+        # As ModelRunner declares it from the checkpoint's config: dense here.
+        self.attn_family = Family.MHA
         self._init_weight_updater()
         self._init_rdma_receiver(self.config)
         self.model = nn.Module()
@@ -1416,9 +1420,9 @@ def test_a_group_joined_on_only_some_workers_is_not_reused(monkeypatch):
 def _world(monkeypatch, size):
     """aiter's world group as the vote finds it, and the groups voted over."""
     world = SimpleNamespace(world_size=size, cpu_group=object())
-    parallel_state = ModuleType("aiter.dist.parallel_state")
-    parallel_state.get_world_group = lambda: world
-    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    monkeypatch.setattr(
+        receiver.parallel_state, "get_world_group", lambda: world, raising=False
+    )
     voted = []
 
     def vote(ballots, group):

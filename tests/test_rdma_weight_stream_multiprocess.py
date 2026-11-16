@@ -61,14 +61,18 @@ def _expected() -> dict[str, list]:
 
 def _receiving_runner(device: torch.device, rejects_buckets: bool, refuses: bool):
     """The real updater, over a model holding exactly the checkpoint."""
+    from conftest import atom_config_double
     from torch import nn
 
     from atom.rollout.weight_updater import WeightUpdaterMixin
+    from atom.utils.selector import Family
 
     class _Runner(WeightUpdaterMixin):
         label = "smoke"
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def __init__(self):
             self._init_weight_updater()

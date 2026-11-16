@@ -55,13 +55,10 @@ class CapabilityProviderMixin:
         # and AsyncLLMEngine.receive_weights_rdma. The engine asks once, at
         # startup, and refuses a sync these rule out with the reason.
         unavailable = {}
-        for feature, refusal in (
-            (WEIGHT_RELOAD_FEATURE, "_reload_refusal"),
-            (RDMA_WEIGHT_RECEIVE_FEATURE, "_rdma_receive_refusal"),
+        for feature, ask in (
+            (WEIGHT_RELOAD_FEATURE, self._reload_refusal),
+            (RDMA_WEIGHT_RECEIVE_FEATURE, self._rdma_receive_refusal),
         ):
-            ask = getattr(self, refusal, None)
-            if not callable(ask):
-                continue
             reason = ask()
             if reason is None:
                 features.add(feature)

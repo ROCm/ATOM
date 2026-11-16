@@ -142,8 +142,10 @@ def _wrote_nothing(reply) -> bool:
 
 
 def _weights_discarded(reply) -> bool:
-    """Whether a release of the weights may have left any rank without them:
-    unless every rank said it kept them resident."""
+    """Whether a release of the weights may have discarded them: unless the
+    reply says they were kept resident. It carries rank 0's answer, which is
+    every rank's: the ranks keep or discard by the same config, and a rank
+    that failed makes the reply an error."""
     result = reply.get("result") if isinstance(reply, dict) else None
     return not (isinstance(result, dict) and result.get("weights_discarded") is False)
 

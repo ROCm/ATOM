@@ -126,6 +126,12 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         # (module, param_name) -> {expert_id: shard ids} this sync wrote.
         self._expert_relayout_pending: dict[tuple, dict[int, set]] = {}
         self._ipc_buffer: torch.Tensor | None = None
+        # The packed mapping the shard sets below were derived from.
+        self._cached_packed_shards_of: dict | None = None
+        self._cached_packed_shards: dict[str, tuple] = {}
+        # Set by ModelRunner when it loads a checkpoint; a runner that builds
+        # its weights another way leaves it None.
+        self._checkpoint_param_names: frozenset[str] | None = None
 
     def _sync_target_model(self) -> torch.nn.Module:
         """The model the trainer's parameter names are relative to.
@@ -249,7 +255,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         when that is.
         """
         packed = self._get_packed_modules_mapping()
-        if getattr(self, "_cached_packed_shards_of", None) is not packed:
+        if self._cached_packed_shards_of is not packed:
             self._cached_packed_shards = {}
             self._cached_packed_shards_of = packed
         shards = self._cached_packed_shards.get(atom_name)
@@ -1224,7 +1230,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         send. Every parameter if no checkpoint was read, as under a dummy load
         or weights imported from another engine."""
         model = self._sync_target_model()
-        loaded = getattr(self, "_checkpoint_param_names", None)
+        loaded = self._checkpoint_param_names
         if loaded is None:
             return dict(model.named_parameters())
         # By object: a tied parameter is loaded under either of its names.
@@ -1250,13 +1256,13 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         counts = self._apply_named_tensors(named_tensors, prepare)
         if complete:
             self._complete_sync(require_full, clear_kv_cache)
+        self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
+        self._refuse_unwritten(counts)
         logger.info(
             f"{self.label}: {path} weight update done - "
             f"updated={counts['updated']}, skipped={counts['skipped']}, "
             f"ignored_scales={counts['ignored_scales']}, is_last={complete}"
         )
-        self._warn_if_nothing_matched(counts["updated"], counts["skipped"])
-        self._refuse_unwritten(counts)
         return counts["updated"]
 
     @_one_update

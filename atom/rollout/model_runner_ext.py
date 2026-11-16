@@ -58,6 +58,7 @@ class RLHFModelRunner(
         self._true_vocab_size = config.true_vocab_size
         self._init_weight_updater()
         self._init_rdma_receiver(config)
+        self._init_memory_manager()
         super().__init__(rank, config)
         self._check_true_vocab_size(config)
 

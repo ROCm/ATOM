@@ -7,8 +7,10 @@ from multiprocessing import shared_memory
 
 import pytest
 import torch
+from conftest import atom_config_double
 
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 
 class _Runner(WeightUpdaterMixin):
@@ -16,6 +18,8 @@ class _Runner(WeightUpdaterMixin):
     label = "test"
     rank = 0
     world_size = 1
+    config = atom_config_double()
+    attn_family = Family.MHA
 
     def __init__(self):
         self._init_weight_updater()

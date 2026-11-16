@@ -19,10 +19,12 @@ slice does not undo the first shuffle, it produces a third layout.
 
 import pytest
 import torch
+from conftest import atom_config_double
 from torch import nn
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 needs_aiter = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -41,6 +43,8 @@ def _updater(model):
         label = "test"
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass

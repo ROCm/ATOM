@@ -23,10 +23,12 @@ if not torch.cuda.is_available():
     )
 
 from aiter import QuantType
+from conftest import atom_config_double
 
 from atom.model_ops import layernorm as layernorm_module
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.rollout.weight_updater import WeightUpdaterMixin
+from atom.utils.selector import Family
 
 HIDDEN = 256
 PER_GROUP = SimpleNamespace(quant_type=QuantType.per_1x128)
@@ -118,6 +120,8 @@ def test_a_rollout_sync_reaches_the_next_forward(calls, quant):
         label = "test"
         rank = 0
         world_size = 1
+        config = atom_config_double()
+        attn_family = Family.MHA
 
         def clear_kv_cache(self):
             pass
