@@ -1269,6 +1269,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Initial ramp: skip that interval while every DP rank can fill a whole
+    # prefill chunk from waiting requests that fit its free seq slots, so the
+    # batch fills with back-to-back full prefills; it ends for good when a rank
+    # cannot (or KV runs high) and re-arms when the group goes idle.
+    "ATOM_PREFILL_DECODE_INTERVAL_RAMP": lambda: (
+        os.getenv("ATOM_PREFILL_DECODE_INTERVAL_RAMP", "0") == "1"
+    ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.
