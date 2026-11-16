@@ -784,11 +784,11 @@ def _ensure_side_caches(
     # No scorer serves bf16; the pool shim can be reached without either resolver.
     from atom.model_ops.minimax_m3.index_topk import (
         _FP8_DTYPES,
-        INDEX_CACHE_MUST_BE_FP8,
+        index_cache_must_be_fp8,
     )
 
     if index_key.dtype not in _FP8_DTYPES:
-        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_key.dtype}.")
+        raise ValueError(index_cache_must_be_fp8("sglang", index_key.dtype))
 
     index_cache = getattr(layer, "_sglang_m3_index_cache", None)
     if (

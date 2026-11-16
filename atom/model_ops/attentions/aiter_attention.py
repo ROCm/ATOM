@@ -546,12 +546,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
         if index_dtype == "bf16":
             # refused here, at allocation, not 57 layers into the first decode step
-            from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+            from atom.model_ops.minimax_m3.index_topk import index_cache_must_be_fp8
 
-            raise ValueError(
-                f"{INDEX_CACHE_MUST_BE_FP8} Got 'bf16' (the index cache follows "
-                "--kv_cache_dtype unless --index-cache-dtype is passed)."
-            )
+            raise ValueError(index_cache_must_be_fp8("native", "'bf16'"))
         if index_dtype != "fp8":
             raise ValueError(
                 f"index_cache_dtype must be 'fp8' or 'fp4', got {index_dtype!r}"

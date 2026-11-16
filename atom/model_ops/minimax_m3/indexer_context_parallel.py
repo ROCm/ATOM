@@ -7,13 +7,13 @@ from atom.model_ops.minimax_m3.index_topk import (
     _FP8_DTYPES,
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
-    INDEX_CACHE_MUST_BE_FP8,
     PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _launch_select,
     _require_packable,
     decode_index_score,
     flydsl_ops,
+    index_cache_must_be_fp8,
 )
 from atom.model_ops.minimax_m3.mxfp4_pages import page_views
 
@@ -70,7 +70,7 @@ def indexer_context_scores(
     ):
         raise ValueError("index cache must be contiguous [pages,128,128]")
     if index_cache.dtype not in _FP8_DTYPES:
-        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_cache.dtype}.")
+        raise ValueError(index_cache_must_be_fp8("native", index_cache.dtype))
     blocks = triton.cdiv(max_seq_len, 128)
     if (
         block_table.ndim != 2

@@ -290,9 +290,9 @@ def _atom_m3_index_dtype(owner: Any) -> torch.dtype:
         from aiter import dtypes
 
         return dtypes.d_dtypes["fp8"]
-    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+    from atom.model_ops.minimax_m3.index_topk import index_cache_must_be_fp8
 
-    raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_dtype}.")
+    raise ValueError(index_cache_must_be_fp8("sglang", index_dtype))
 
 
 def _is_minimax_m3_owner(owner: Any) -> bool:

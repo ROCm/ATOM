@@ -68,12 +68,31 @@ def _small_k_selector():
 
 # Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn.
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-# One message for every refusal site, so they cannot name different flags.
-INDEX_CACHE_MUST_BE_FP8 = (
-    "MiniMax-M3's index cache must be fp8 (or fp4 on the native server): the FlyDSL "
-    "scorers are the only index scorers and they serve those only (ROCm/aiter#5626). "
-    "Pass --index-cache-dtype fp8."
-)
+# The flag that sets the index cache's dtype, by the front-end that refuses: the index
+# cache follows the KV dtype on all three, and only the native server has a flag of its own.
+_INDEX_CACHE_FLAGS = {
+    "native": "--kv_cache_dtype fp8 (the index cache follows it) or --index-cache-dtype fp8",
+    "vllm": "--kv-cache-dtype fp8",
+    "sglang": "--kv-cache-dtype fp8_e4m3",
+}
+
+
+def index_cache_must_be_fp8(front_end: str | None, got) -> str:
+    """The one refusal message for every site, so they cannot drift; ``front_end`` is
+    ``"native"``, ``"vllm"`` or ``"sglang"`` where the site belongs to one, ``None`` for
+    a backstop every front-end reaches (it then names all three flags)."""
+    if front_end is None:
+        flag = "; ".join(f"{k}: {v}" for k, v in _INDEX_CACHE_FLAGS.items())
+        flag = f"(one of, by front-end) {flag}"
+    else:
+        flag = _INDEX_CACHE_FLAGS[front_end]
+    fp4 = " (or fp4 on the native server)" if front_end in (None, "native") else ""
+    return (
+        f"MiniMax-M3's index cache must be fp8{fp4}: the FlyDSL scorers are the only "
+        f"index scorers and they serve those only (ROCm/aiter#5626). Pass {flag}. "
+        f"Got {got}."
+    )
+
 
 # Query rows one prefill score program owns.
 #
@@ -1372,7 +1391,7 @@ def decode_index_score(
     and non-contiguous; pass ``out`` when the consumer needs contiguous.
     """
     if index_kv_cache.dtype not in _FP8_DTYPES:
-        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_kv_cache.dtype}.")
+        raise ValueError(index_cache_must_be_fp8(None, index_kv_cache.dtype))
     batch = seq_lens.shape[0]
     if work_map is None:
         work_map = build_index_score_work_map(

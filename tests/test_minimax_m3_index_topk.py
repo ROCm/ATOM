@@ -1164,7 +1164,7 @@ def test_the_sglang_pool_refuses_bf16_by_name():
         kv_cache_dtype=torch.bfloat16,
         kv_cache_dtype_str="bfloat16",
     )
-    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+    with pytest.raises(ValueError, match="--kv-cache-dtype fp8_e4m3"):
         _atom_m3_index_dtype(bf16_owner)
     # an fp8 KV cache still resolves, through the fallback this guard sits after
     fp8_owner = SimpleNamespace(

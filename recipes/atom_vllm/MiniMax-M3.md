@@ -38,7 +38,7 @@ vllm serve "${MODEL}" \
     --max-num-batched-tokens 32768 \
     --block-size 128 \
     --no-async-scheduling \
-    --kv-cache-dtype auto \
+    --kv-cache-dtype fp8 \
     --no-enable-prefix-caching \
     --language-model-only \
     --no-trust-remote-code \
@@ -64,7 +64,7 @@ vllm serve "${MODEL}" \
     --max-num-batched-tokens 32768 \
     --block-size 128 \
     --no-async-scheduling \
-    --kv-cache-dtype auto \
+    --kv-cache-dtype fp8 \
     --no-enable-prefix-caching \
     --language-model-only \
     --no-trust-remote-code \
@@ -72,7 +72,9 @@ vllm serve "${MODEL}" \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
 ```
 
-To validate FP8 KV cache, set `--kv-cache-dtype fp8` in either command.
+`--kv-cache-dtype fp8` is required, not a tuning choice: MiniMax-M3's index
+scorers serve an fp8 index cache only, and the index cache follows the KV dtype, so
+`auto` (or `bf16`) is refused at startup with a message naming this flag.
 
 Notes:
 - Keep `--block-size 128`; MiniMax-M3 sparse attention assumes 128-token sparse
@@ -107,3 +109,6 @@ Reference average results from five local GSM8K runs are shown below.
 | MIXFP4 | 0.9399 | 0.9407 |
 | MIXFP8-kv_fp8 | 0.9480 | 0.9487 |
 | MIXFP4-kv_fp8 | 0.9439 | 0.9445 |
+
+The `MIXFP8` and `MIXFP4` rows were measured with `--kv-cache-dtype auto`, which the
+commands above no longer accept; the `kv_fp8` rows are the ones they reproduce.

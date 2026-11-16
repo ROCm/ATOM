@@ -95,9 +95,9 @@ def _index_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
     """
     if str(kv_cache_dtype).startswith("fp8"):
         return dtypes.d_dtypes["fp8"]
-    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+    from atom.model_ops.minimax_m3.index_topk import index_cache_must_be_fp8
 
-    raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {kv_cache_dtype!r}.")
+    raise ValueError(index_cache_must_be_fp8("vllm", repr(kv_cache_dtype)))
 
 
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
