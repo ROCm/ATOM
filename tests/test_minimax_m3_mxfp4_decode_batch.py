@@ -67,14 +67,20 @@ def test_the_scorer_buffers_are_one_workspace_and_a_map_per_decode_ubatch(
 
 
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
-@pytest.mark.parametrize("kv,index", [("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")])
+@pytest.mark.parametrize(
+    "kv,index,fp8_out",
+    [("fp4", "fp4", False), ("fp8", "fp4", False), ("fp8", "fp8", False)]
+    + [("fp8", "fp4", True), ("fp8", "fp8", True), ("fp4", "fp4", True)],
+)
 @pytest.mark.parametrize("q_rows", [6, 12])  # exactly the metadata's rows / a DP pad
 def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
-    monkeypatch, phase, kv, index, q_rows
+    monkeypatch, phase, kv, index, fp8_out, q_rows
 ):
     """One row rule for decode and prefill. With the MXFP4 index the scorer, selector
     and attention get the rows the metadata covers; the pad rows past them are never
-    read and the output is zero there. Another index cache keeps every row."""
+    read and the output is zero there. Another index cache keeps every row. An FP8
+    output (`unified_attention_fp8`) goes to the PA whole, which writes its pad
+    rows, and is what the impl returns."""
     pytest.importorskip("aiter")
     from atom.model_ops import attention_mha
     from atom.model_ops.minimax_m3 import index_topk, sparse_attn
@@ -99,7 +105,11 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
 
     def attend_fp8(q, k_cache, v_cache, topk_idx, bt, *a, **kw):
         seen["attend"] = q.shape[0]
-        (a[3] if phase == "decode" else a[5]).fill_(1)
+        if fp8_out:
+            seen["fp8 rows"] = kw["quantized_output"].shape[0]
+            kw["quantized_output"][: q.shape[0]].fill_(1)
+        else:
+            (a[3] if phase == "decode" else a[5]).fill_(1)
 
     monkeypatch.setattr(
         index_topk, f"minimax_m3_index_topk{'_decode' * (phase == 'decode')}", topk
@@ -134,8 +144,19 @@ def test_the_sparse_attention_runs_only_the_rows_the_metadata_covers(
         attn_metadata=types.SimpleNamespace(sparse_attention_metadata=md)
     )
     q = v = torch.zeros(q_rows, 4, 8)
-    out = getattr(layer, f"_sparse_{phase}")(q, None, v, None, None, None, None, ctx)
+    fp8 = {}
+    if fp8_out:
+        fp8 = {"quantized_output": torch.zeros_like(q), "output_scale": q[:, 0, :1]}
+    run = getattr(layer, f"_sparse_{phase}")
+    if fp8_out and kv == "fp4":  # the MXFP4 KV's PA writes no FP8 output
+        with pytest.raises(NotImplementedError):
+            run(q, None, v, None, None, None, None, ctx, **fp8)
+        return
+    out = run(q, None, v, None, None, None, None, ctx, **fp8)
     assert out.shape == q.shape
+    if fp8_out:
+        assert out.data_ptr() == fp8["quantized_output"].data_ptr()
+        assert seen["fp8 rows"] == q_rows
     assert seen["scorer"] == (rows, batch, batch) and seen["attend"] == rows
     assert (out[:rows] == 1).all() and (out[rows:] == 0).all()
 

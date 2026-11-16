@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
+from aiter import dtypes
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon_supports_arch,
 )
@@ -21,7 +22,7 @@ from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
-from .sp_attention import gather_heads, ulysses_attention
+from .sp_attention import _attention_fp8_fake, gather_heads, ulysses_attention
 
 logger = logging.getLogger("atom")
 
@@ -593,6 +594,8 @@ def run_pa_decode(
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -617,7 +620,15 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
+
+    ``quantized_output`` / ``output_scale``: a FlyDSL-only output in place of
+    ``output`` (aiter #7401), OCP FP8 in the attention layout
+    plus contiguous FP32 ``[rows, 1]`` descales. ``output`` then only gives the
+    layout and is not written; rows of the pair past ``q``'s are written as
+    FP8 zeros with a unit descale.
     """
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError("quantized_output and output_scale go together")
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
@@ -729,6 +740,14 @@ def run_pa_decode(
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
+        quant = {}
+        if quantized_output is not None:
+            quant = {
+                "quantized_output": quantized_output,
+                "output_scale": output_scale,
+                "store_output": False,
+                "quantized_pad_rows": quantized_output.shape[0] - q.shape[0],
+            }
         return _flydsl_pa_decode(
             output,
             q,
@@ -751,8 +770,11 @@ def run_pa_decode(
             sliding_window=0,
             work_plan=work_plan,
             max_context_length=context_bound,
+            **quant,
         )
 
+    if quantized_output is not None:
+        raise RuntimeError("only FlyDSL's paged decode writes a quantized output")
     if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
@@ -1040,6 +1062,36 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=["scale"])
+@eager_region()
+def unified_attention_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor | None,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """`unified_attention_with_output_base` for a layer whose impl writes its
+    output as OCP FP8 plus per-token descales (`supports_output_quant`): the
+    output, and its descales into ``scale``."""
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    output = torch.empty(q.shape, device=q.device, dtype=dtypes.fp8)
+    self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        qkv=qkv,
+        quantized_output=output,
+        output_scale=scale,
+    )
+    return output
 
 
 def linear_attention_with_output_base_fake(
