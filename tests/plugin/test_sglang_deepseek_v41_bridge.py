@@ -1671,6 +1671,186 @@ class TestGraphReplayStep:
             bridge.stage_deepseek_v41_graph_replay(_fb_view([1], [5], 2), replay_table)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_host_rows(monkeypatch):
+    # The bridge keeps one host PAGE-row cache per process; no test may leak one.
+    monkeypatch.setattr(bridge, "_HOST_ROWS", bridge.HostPageRows())
+    monkeypatch.setattr(bridge, "_CHECK_HOST_ROWS", False)
+    monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", True)
+
+
+def _mirrored_view(req_pool_indices, seq_lens, bs, rids):
+    """A replay view carrying the host request rows (`_install_host_mirror_patch`)."""
+    fb = _fb_view(req_pool_indices, seq_lens, bs)
+    fb.atom_v41_req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    fb.atom_v41_rids = list(rids)
+    return fb
+
+
+@pytest.fixture
+def device_reads(monkeypatch):
+    reads = []
+    original = bridge._read_replay_rows
+
+    def counted(*args, **kwargs):
+        reads.append(args[2])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "_read_replay_rows", counted)
+    return reads
+
+
+class TestHostPageRows:
+    def _replay(self, monkeypatch, table, view):
+        builder = _GraphBuilder()
+        monkeypatch.setattr(bridge, "_V41_BUILDER", builder)
+        bridge.stage_deepseek_v41_graph_replay(view, table)
+        return builder.batch
+
+    def test_steady_decode_reads_the_device_once(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        rids = ["a", "b", "c"]
+        first = self._replay(
+            monkeypatch, replay_table, _mirrored_view([3, 1, 2], [700, 300, 9], 4, rids)
+        )
+        again = self._replay(
+            monkeypatch,
+            replay_table,
+            _mirrored_view([3, 1, 2], [701, 301, 10], 4, rids),
+        )
+        assert device_reads == [3]
+        assert _tables(first) == _tables(again) == [[2, 11, 4], [7, 3], [5]]
+        assert again.state_slots_committed == [3, 1, 2]
+
+    def test_an_extend_seeds_the_replay(self, monkeypatch, req_to_token, device_reads):
+        build_v41_scheduled_batch(
+            _forward_batch(
+                ForwardMode.EXTEND,
+                req_pool_indices=[1, 3],
+                seq_lens=[PAGE + 5, 2 * PAGE + 1],
+                extend_seq_lens=[PAGE + 5, 2 * PAGE + 1],
+                extend_prefix_lens=[0, 0],
+                rids=["x", "y"],
+            ),
+            PAGE,
+        )
+        batch = self._replay(
+            monkeypatch,
+            req_to_token,
+            _mirrored_view([3, 1], [2 * PAGE + 2, PAGE + 6], 2, ["y", "x"]),
+        )
+        assert device_reads == []
+        assert _tables(batch) == [[2, 11, 4], [7, 3]]
+
+    def test_a_new_page_or_tenant_reads_the_device(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        self._replay(monkeypatch, replay_table, _mirrored_view([1], [PAGE], 1, ["a"]))
+        # Entering its second page.
+        batch = self._replay(
+            monkeypatch, replay_table, _mirrored_view([1], [PAGE + 1], 1, ["a"])
+        )
+        assert _tables(batch) == [[7, 3]]
+        # Another request in the same slot.
+        self._replay(monkeypatch, replay_table, _mirrored_view([1], [5], 1, ["b"]))
+        assert device_reads == [1, 1, 1]
+
+    def test_without_host_rows_every_replay_reads(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        for _ in range(2):
+            self._replay(monkeypatch, replay_table, _fb_view([1], [5], 1))
+        assert device_reads == [1, 1]
+
+    def test_check_mode_catches_a_stale_copy(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        bridge._HOST_ROWS.record([1], ["a"], [np.asarray([7, 99], np.int32)])
+        monkeypatch.setattr(bridge, "_CHECK_HOST_ROWS", True)
+        with pytest.raises(RuntimeError, match="disagree with the device"):
+            self._replay(
+                monkeypatch, replay_table, _mirrored_view([1], [PAGE + 1], 1, ["a"])
+            )
+
+    def test_host_slots_must_match_the_device(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        view = _mirrored_view([1, 2], [5, 6], 2, ["a", "b"])
+        view.atom_v41_req_pool_indices_cpu = torch.tensor([2, 1])
+        with pytest.raises(RuntimeError, match="disagree with the device"):
+            self._replay(monkeypatch, replay_table, view)
+
+    def test_host_slots_without_rids_read_the_device(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        view = _mirrored_view([1], [5], 1, ["a"])
+        view.atom_v41_rids = None
+        self._replay(monkeypatch, replay_table, view)
+        assert device_reads == [1]
+
+    def test_radix_cache_disables_the_host_copies(
+        self, monkeypatch, replay_table, device_reads
+    ):
+        monkeypatch.setattr(bridge, "_HOST_ROWS_SUPPORTED", False)
+        for _ in range(2):
+            self._replay(monkeypatch, replay_table, _mirrored_view([1], [5], 1, ["a"]))
+        assert device_reads == [1, 1]
+
+    def test_mirror_width_must_be_the_live_rows(self, monkeypatch, replay_table):
+        view = _mirrored_view([1, 2], [5, 6], 4, ["a", "b"])
+        view.atom_v41_rids = ["a"]
+        with pytest.raises(ValueError, match="request ids"):
+            self._replay(monkeypatch, replay_table, view)
+
+
+@needs_sglang
+def test_host_mirror_patch_carries_v41_decode_rows(real_sglang, monkeypatch):
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    runner_module = pytest.importorskip(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+    )
+
+    def fake_init_new(cls, batch, model_runner, **kwargs):
+        return SimpleNamespace(forward_mode=batch.mode, rids=batch.rids)
+
+    def fake_view(*, forward_batch, **kwargs):
+        return SimpleNamespace(batch_size=kwargs.get("bs"))
+
+    monkeypatch.setattr(ForwardBatch, "init_new", classmethod(fake_init_new))
+    monkeypatch.setattr(
+        ForwardBatch, "_atom_v41_host_mirror_patched", False, raising=False
+    )
+    monkeypatch.setattr(runner_module, "build_replay_fb_view", fake_view)
+    bridge._install_host_mirror_patch()
+    bridge._install_host_mirror_patch()  # idempotent
+
+    v41 = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=_sglang_normalized_v41())
+    )
+    v4 = SimpleNamespace(model_config=SimpleNamespace(hf_config=_deepseek_v4()))
+    slots = torch.tensor([4, 2])
+
+    def batch(mode):
+        return SimpleNamespace(mode=mode, rids=["a", "b"], req_pool_indices_cpu=slots)
+
+    decode = ForwardBatch.init_new(batch(ForwardMode.DECODE), v41)
+    assert decode.atom_v41_req_pool_indices_cpu is slots
+    extend = ForwardBatch.init_new(batch(ForwardMode.EXTEND), v41)
+    assert not hasattr(extend, "atom_v41_req_pool_indices_cpu")
+    other = ForwardBatch.init_new(batch(ForwardMode.DECODE), v4)
+    assert not hasattr(other, "atom_v41_req_pool_indices_cpu")
+
+    view = runner_module.build_replay_fb_view(forward_batch=decode, bs=2)
+    assert view.atom_v41_req_pool_indices_cpu is slots
+    assert view.atom_v41_rids == ["a", "b"]
+    assert not hasattr(
+        runner_module.build_replay_fb_view(forward_batch=other, bs=2),
+        "atom_v41_rids",
+    )
+
+
 class TestGraphAdapter:
     def _adapter(self):
         return MODEL_ADAPTER_SPECS[DEEPSEEK_V41_ARCH].build_forward_metadata

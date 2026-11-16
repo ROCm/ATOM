@@ -950,13 +950,76 @@ def _install_graph_variants_patch() -> None:
     )
 
 
+def _is_v41_runner(model_runner) -> bool:
+    cached = getattr(model_runner, "_atom_is_v41", None)
+    if cached is None:
+        model_config = getattr(model_runner, "model_config", None)
+        cached = is_deepseek_v41_config(getattr(model_config, "hf_config", None))
+        try:
+            model_runner._atom_is_v41 = cached
+        except AttributeError:
+            pass
+    return cached
+
+
+def _install_host_mirror_patch() -> None:
+    """Carry a decode batch's host request rows to the V4.1 replay staging.
+
+    SGLang keeps ``req_pool_indices_cpu`` on the ScheduleBatch through
+    decode (filter / merge maintain it) but hands it to the ForwardBatch for
+    EXTEND only, and the decode graph runner's replay view carries neither it
+    nor the request ids. Both ride along as ``atom_v41_*`` attributes, on
+    V4.1 batches only, so `build_v41_graph_replay_batch` can stage without
+    reading the device back.
+    """
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    if not getattr(ForwardBatch, "_atom_v41_host_mirror_patched", False):
+        original_init_new = ForwardBatch.init_new.__func__
+
+        @wraps(original_init_new)
+        def init_new(cls, batch, model_runner, *args, **kwargs):
+            forward_batch = original_init_new(cls, batch, model_runner, *args, **kwargs)
+            if forward_batch.forward_mode.is_decode() and _is_v41_runner(model_runner):
+                forward_batch.atom_v41_req_pool_indices_cpu = getattr(
+                    batch, "req_pool_indices_cpu", None
+                )
+            return forward_batch
+
+        ForwardBatch.init_new = classmethod(init_new)
+        ForwardBatch._atom_v41_host_mirror_patched = True
+
+    try:
+        from sglang.srt.model_executor.runner import decode_cuda_graph_runner
+    except Exception:  # noqa: BLE001 - graphs are optional
+        return
+    original_view = decode_cuda_graph_runner.build_replay_fb_view
+    if getattr(original_view, "_atom_v41_patched", False):
+        return
+
+    @wraps(original_view)
+    def build_replay_fb_view(*args, **kwargs):
+        view = original_view(*args, **kwargs)
+        forward_batch = kwargs.get("forward_batch", args[0] if args else None)
+        host_slots = getattr(forward_batch, "atom_v41_req_pool_indices_cpu", None)
+        if host_slots is not None:
+            view.atom_v41_req_pool_indices_cpu = host_slots
+            view.atom_v41_rids = getattr(forward_batch, "rids", None)
+        return view
+
+    build_replay_fb_view._atom_v41_patched = True
+    decode_cuda_graph_runner.build_replay_fb_view = build_replay_fb_view
+
+
 def install_deepseek_v41_proxy_pool_patch() -> None:
     """Make SGLang size and build the V4.1 proxy pool instead of its DSV4 pool,
-    and keep its own V4.1 decode-graph variants off the ATOM model."""
+    keep its own V4.1 decode-graph variants off the ATOM model, and carry
+    decode batches' host request rows to the replay staging."""
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
 
     _install_pool_sizing_patch()
     _install_graph_variants_patch()
+    _install_host_mirror_patch()
     original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
     if original_pool_cls is None:
         raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
@@ -1011,6 +1074,74 @@ def _block_rows(req_to_token, req_pool_indices, ends, block_size: int):
     rows = [table[i, : widths[i]].copy() for i in range(len(widths))]
     _refuse_padding_page(rows)
     return rows
+
+
+class HostPageRows:
+    """Host copies of live requests' PAGE rows, so a decode replay can stage
+    without reading ``req_to_token`` back.
+
+    That read is a device sync on the forward stream: under overlap
+    scheduling it waits for the previous step's graph and serializes the next
+    step's host staging behind it. A request's PAGE row only grows, one page
+    every 256 tokens, and only SGLang's allocator writes it -- which holds
+    only while radix cache is off (``host_page_rows_supported``): a radix
+    checkpoint rewrites a live row's tail in place. An EXTEND (every
+    request's first forward, and again after a retraction) reads the row back
+    anyway and records it here; a decode reads it again only when a request
+    has entered a page its copy does not hold, or the slot's request changed.
+
+    Keyed by STATE slot (``req_pool_idx``) and checked against the request id,
+    so a copy is never used for another tenant of the slot. Under
+    ``ATOM_SGLANG_V41_CHECK_HOST_ROWS=1`` every replay also reads the rows
+    back and compares (a device sync per step; validation only).
+    """
+
+    def __init__(self):
+        self._rows = {}
+
+    def record(self, slots, rids, rows):
+        for slot, rid, row in zip(slots, rids, rows):
+            self._rows[int(slot)] = (rid, row)
+
+    def lookup(self, slots, rids, widths):
+        """Each request's first ``widths[i]`` pages, or None if any request's
+        copy is missing, stale or too short."""
+        rows = []
+        for slot, rid, width in zip(slots, rids, widths):
+            entry = self._rows.get(int(slot))
+            if entry is None or entry[0] != rid or len(entry[1]) < width:
+                return None
+            rows.append(entry[1][:width])
+        return rows
+
+
+_HOST_ROWS = HostPageRows()
+
+
+_HOST_ROWS_SUPPORTED = None
+
+
+def host_page_rows_supported() -> bool:
+    """Whether a live request's PAGE row can only change through its own
+    forward: not with SGLang's radix cache, which rewrites the row's tail
+    when it checkpoints a request (``cache_unfinished_req``). Fixed for the
+    process, so resolved once."""
+    global _HOST_ROWS_SUPPORTED
+    if _HOST_ROWS_SUPPORTED is None:
+        from atom.plugin.config import get_sglang_server_args
+
+        memory = _sglang_bag("memory")
+        if memory is not None and hasattr(memory, "disable_radix_cache"):
+            radix_off = bool(memory.disable_radix_cache)
+        else:
+            radix_off = bool(
+                getattr(get_sglang_server_args(), "disable_radix_cache", False)
+            )
+        _HOST_ROWS_SUPPORTED = radix_off
+    return _HOST_ROWS_SUPPORTED
+
+
+_CHECK_HOST_ROWS = os.environ.get("ATOM_SGLANG_V41_CHECK_HOST_ROWS", "0") == "1"
 
 
 def _refuse_padding_page(rows) -> None:
@@ -1079,9 +1210,12 @@ def build_v41_scheduled_batch(forward_batch, block_size: int):
     rows = _block_rows(
         _req_to_token(), forward_batch.req_pool_indices[:bs], ends, block_size
     )
+    rids = list(forward_batch.rids[:bs])
+    # Decode replays stage off these copies (`HostPageRows`).
+    _HOST_ROWS.record(slots, rids, rows)
     return SimpleNamespace(
         is_dummy_run=False,
-        req_ids=list(forward_batch.rids[:bs]),
+        req_ids=rids,
         num_scheduled_tokens=lengths.astype(np.int32),
         context_lens=ends,
         # SGLang's ForwardBatch does not say whether a chunk finishes its
@@ -1289,28 +1423,10 @@ def stage_deepseek_v41_graph_capture(forward_batch, pool):
     return metadata
 
 
-def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int):
-    """ATOM's scheduled batch for the live rows of a padded decode replay.
-
-    One D2H for the slots and block rows; the lengths come off SGLang's host
-    mirror. The padding rows (``req_pool_idx`` 0, ``seq_len`` 1) are not
-    requests: ATOM pads them itself up to the bucket width.
-    """
-    bs = int(fb_view.batch_size)
-    raw_bs = bs - int(getattr(fb_view, "num_padding", 0) or 0)
-    if not 1 <= raw_bs <= bs:
-        raise ValueError(f"DeepSeek-V4.1 replay of {raw_bs} live rows in {bs}")
-    lengths = fb_view.seq_lens_cpu
-    if lengths is None:
-        raise ValueError(
-            "DeepSeek-V4.1 decode replay needs SGLang's host seq_lens mirror"
-        )
-    if torch.is_tensor(lengths):
-        lengths = lengths[:raw_bs].numpy()
-    ends = np.asarray(lengths[:raw_bs], dtype=np.int64)
-    if np.any(ends < 1):
-        raise ValueError(f"DeepSeek-V4.1 decode replay lengths {ends.tolist()}")
-    width = -(-int(ends.max()) // block_size)
+def _read_replay_rows(fb_view, req_to_token, raw_bs, widths, block_size):
+    """The live rows' slots and PAGE rows, read back from the device: one D2H,
+    a sync on the forward stream."""
+    width = int(widths.max())
     indices = fb_view.req_pool_indices[:raw_bs]
     host = (
         torch.cat(
@@ -1327,13 +1443,77 @@ def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int):
         .numpy()
     )
     slots, table = host[:, 0], host[:, 1:]
-    if np.unique(slots).size != raw_bs or np.any(slots <= 0):
+    _refuse_shared_or_padding_slots(slots, raw_bs)
+    rows = [table[i, : widths[i]].copy() for i in range(raw_bs)]
+    _refuse_padding_page(rows)
+    return slots, rows
+
+
+def _refuse_shared_or_padding_slots(slots, count: int) -> None:
+    if np.unique(slots).size != count or np.any(slots <= 0):
         raise ValueError(
             f"DeepSeek-V4.1 needs one live req_pool_idx per request; got {slots}"
         )
+
+
+def build_v41_graph_replay_batch(fb_view, req_to_token, block_size: int):
+    """ATOM's scheduled batch for the live rows of a padded decode replay.
+
+    The lengths come off SGLang's host seq_lens mirror and, when the forward
+    batch carried them (`_install_host_mirror_patch`), the slots off its host
+    ``req_pool_indices`` mirror and the PAGE rows off `HostPageRows`; else, or
+    when a request entered a page those copies do not hold, one D2H reads the
+    slots and rows back. The padding rows (``req_pool_idx`` 0, ``seq_len`` 1)
+    are not requests: ATOM pads them itself up to the bucket width.
+    """
+    bs = int(fb_view.batch_size)
+    raw_bs = bs - int(getattr(fb_view, "num_padding", 0) or 0)
+    if not 1 <= raw_bs <= bs:
+        raise ValueError(f"DeepSeek-V4.1 replay of {raw_bs} live rows in {bs}")
+    lengths = fb_view.seq_lens_cpu
+    if lengths is None:
+        raise ValueError(
+            "DeepSeek-V4.1 decode replay needs SGLang's host seq_lens mirror"
+        )
+    if torch.is_tensor(lengths):
+        lengths = lengths[:raw_bs].numpy()
+    ends = np.asarray(lengths[:raw_bs], dtype=np.int64)
+    if np.any(ends < 1):
+        raise ValueError(f"DeepSeek-V4.1 decode replay lengths {ends.tolist()}")
     widths = -(-ends // block_size)
-    rows = [table[i, : widths[i]].copy() for i in range(raw_bs)]
-    _refuse_padding_page(rows)
+    host_slots = getattr(fb_view, "atom_v41_req_pool_indices_cpu", None)
+    rids = getattr(fb_view, "atom_v41_rids", None)
+    rows = None
+    slots = None
+    if host_slots is not None and rids is not None:
+        if len(host_slots) != raw_bs or len(rids) != raw_bs:
+            raise ValueError(
+                f"DeepSeek-V4.1 replay of {raw_bs} live rows got "
+                f"{len(host_slots)} host slots and {len(rids)} request ids"
+            )
+        slots = np.asarray(host_slots, dtype=np.int32)
+        rids = list(rids)
+        if host_page_rows_supported():
+            rows = _HOST_ROWS.lookup(slots, rids, widths)
+    if rows is None or _CHECK_HOST_ROWS:
+        read_slots, read_rows = _read_replay_rows(
+            fb_view, req_to_token, raw_bs, widths, block_size
+        )
+        if slots is not None and (
+            not np.array_equal(read_slots, slots)
+            or (
+                rows is not None
+                and any(not np.array_equal(a, b) for a, b in zip(rows, read_rows))
+            )
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4.1 host request rows disagree with the device: "
+                f"slots {slots.tolist()} vs {read_slots.tolist()}"
+            )
+        slots, rows = read_slots, read_rows
+        if rids is not None:
+            _HOST_ROWS.record(slots, rids, rows)
+    _refuse_shared_or_padding_slots(slots, raw_bs)
     slot_list = [int(slot) for slot in slots]
     return SimpleNamespace(
         is_dummy_run=False,
