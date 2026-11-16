@@ -3,9 +3,10 @@
 //! socket connects once the engine binds, and reconnects after the engine restarts.
 //! Batches the stream missed are replayed from the engine, if it serves a replay.
 //! Admitted batches go to the writer of the rank's index partition, which has a thread of
-//! its own. What each stream carried is what `/kv_events/sources` shows. A worker without
-//! exact events is also predicted to hold the prompts routed to it. What a worker's engine
-//! will report cached also counts what it loads from the store it reads, if any.
+//! its own. What each stream carried is what `/kv_events/sources` shows. A registered
+//! worker without exact events is also predicted to hold the prompts routed to it. What a
+//! worker's engine will report cached also counts what it loads from the store it reads,
+//! if any.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -62,7 +63,9 @@ type SocketEvents = futures::channel::mpsc::Receiver<SocketEvent>;
 /// model, pool and block size.
 pub struct KvEventMonitor {
     subscriptions: DashMap<String, Subscription>,
-    predictors: DashMap<String, Predictor>,
+    /// Every worker from its registration to its detach; none until it is routed to, or
+    /// while its partition has no lane left.
+    predictors: DashMap<String, Option<Predictor>>,
     partitions: DashMap<(String, &'static str, u32), Arc<Partition>>,
     stores: OnceLock<Arc<StorageSources>>,
     threads: Handle,
@@ -198,6 +201,12 @@ impl KvEventMonitor {
             task,
         };
         self.subscriptions.insert(worker.into(), subscription);
+        self.register(worker);
+    }
+
+    /// Predicts the prompts routed to `worker` until it is detached.
+    pub fn register(&self, worker: &str) {
+        self.predictors.entry(worker.into()).or_default();
     }
 
     /// Stops following `worker`'s stream, if any, and predicting its cache.
@@ -242,7 +251,10 @@ impl PrefixMatchProvider for KvEventMonitor {
                     .and_then(|s| s.events());
                 let predicted = match events {
                     Some((_, true)) => None,
-                    _ => self.predictors.get(worker.url()).map(|p| p.lane()),
+                    _ => self
+                        .predictors
+                        .get(worker.url())
+                        .and_then(|p| p.as_ref().map(Predictor::lane)),
                 };
                 (events.map(|(lane, _)| lane), predicted)
             })
@@ -252,22 +264,59 @@ impl PrefixMatchProvider for KvEventMonitor {
 
     fn on_routed(&self, tokens: &[u32], worker: &dyn Worker) {
         let url = worker.url();
-        let partition = match self.subscriptions.get(url) {
+        let subscribed = match self.subscriptions.get(url) {
             Some(s) if s.events().is_some_and(|(_, exact)| exact) => return,
             subscription => subscription.map(|s| s.partition.clone()),
         };
-        if let Some(predictor) = self.predictors.get(url) {
-            predictor.record(tokens);
-            return;
+        // A followed rank's predictions are on its partition.
+        let placed = |p: &Predictor| subscribed.as_ref().is_none_or(|s| p.is_in(s));
+        match self.predictors.get(url).as_deref() {
+            // Not registered, or detached.
+            None => return,
+            Some(Some(predictor)) if placed(predictor) => {
+                predict(predictor, tokens, worker);
+                return;
+            }
+            Some(_) => {}
         }
-        let partition = partition.unwrap_or_else(|| {
+        let partition = subscribed.unwrap_or_else(|| {
             let pool = worker.worker_type().as_metric_label();
             self.partition(worker.model_id(), pool, PREDICTED_BLOCK_SIZE)
         });
-        if let Some(predictor) = partition.predict(url) {
-            predictor.record(tokens);
-            self.predictors.insert(url.into(), predictor);
+        // Under the entry's lock, so that concurrent routings make one predictor, and a
+        // worker detached since makes none.
+        let Some(mut entry) = self.predictors.get_mut(url) else {
+            return;
+        };
+        if !entry.as_ref().is_some_and(|p| p.is_in(&partition)) {
+            *entry = partition.predict(url);
         }
+        if let Some(predictor) = entry.as_ref() {
+            predict(predictor, tokens, worker);
+        }
+    }
+}
+
+/// Predicts that `worker` holds `tokens`; a prompt dropped as the writer is behind is
+/// counted, and warned of once per partition.
+fn predict(predictor: &Predictor, tokens: &[u32], worker: &dyn Worker) {
+    if predictor.record(tokens) {
+        return;
+    }
+    let pool = worker.worker_type().as_metric_label();
+    metrics::counter!(
+        "mesh_kv_events_dropped_predictions_total",
+        "model" => worker.model_id().to_string(),
+        "pool" => pool,
+    )
+    .increment(1);
+    if predictor.first_drop() {
+        warn!(
+            worker = worker.url(),
+            model_id = worker.model_id(),
+            pool,
+            "Dropping routed prompts from the KV index's predictions: its writer is behind"
+        );
     }
 
     async fn cached_tokens(&self, worker: &dyn Worker, tokens: &[u32], device: u32) -> Option<u32> {
@@ -559,7 +608,7 @@ fn record(status: &mut SourceStatus, trust: Trust, seq: u64, batch: &DecodedBatc
 
 #[cfg(test)]
 mod tests {
-    use zeromq::{PubSocket, RouterSocket};
+    use zeromq::{util::PeerIdentity, PubSocket, RouterSocket};
 
     use super::*;
     use crate::{core::BasicWorkerBuilder, kv_events::wire::tests::encode};
@@ -593,13 +642,24 @@ mod tests {
         send(socket, topic, seq, payload(events, rank)).await;
     }
 
-    /// Answers the next replay request, which must be from `from`, with `batches`.
-    async fn replay(router: &mut RouterSocket, from: u64, batches: &[(u64, Bytes)]) {
+    /// The peer of the next replay request, which must be from `from`.
+    async fn request(router: &mut RouterSocket, from: u64) -> Bytes {
         let request = router.recv().await.unwrap().into_vec();
         let [peer, _, start] = &request[..] else {
             panic!("replay request {request:?}");
         };
         assert_eq!(start.as_ref(), from.to_be_bytes());
+        peer.clone()
+    }
+
+    /// Answers the next replay request, which must be from `from`, with `batches`.
+    async fn replay(router: &mut RouterSocket, from: u64, batches: &[(u64, Bytes)]) {
+        let peer = request(router, from).await;
+        answer(router, &peer, batches).await;
+    }
+
+    /// Replays `batches` to `peer`, then ends the replay.
+    async fn answer(router: &mut RouterSocket, peer: &Bytes, batches: &[(u64, Bytes)]) {
         for (seq, payload) in batches {
             let frames = [
                 peer.clone(),
@@ -686,6 +746,42 @@ mod tests {
     fn free_endpoint() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         format!("tcp://{}", listener.local_addr().unwrap())
+    }
+
+    /// Waits for the writers to apply the prompts routed, until `workers` match `hits`.
+    async fn matched(
+        monitor: &KvEventMonitor,
+        prompt: &[u32],
+        workers: &[Arc<dyn Worker>],
+        hits: &[Option<u32>],
+    ) {
+        for _ in 0..500 {
+            if monitor.match_workers(prompt, workers) == hits {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(monitor.match_workers(prompt, workers), hits);
+    }
+
+    /// Rank 1 of a connected worker, its batches counted but not indexed.
+    fn rank() -> Rank {
+        let status = SourceStatus {
+            worker: WORKER.into(),
+            connected: true,
+            ..Default::default()
+        };
+        Rank {
+            dp_rank: 1,
+            block_size: 4,
+            status: Arc::new(Mutex::new(status)),
+            admission: RankState::default(),
+            holder: None,
+        }
+    }
+
+    fn decoded(seq: u64, payload: &Bytes) -> Batch {
+        batch(&[Bytes::new(), seq_frame(seq), payload.clone()], 4, 1).unwrap()
     }
 
     #[tokio::test]
@@ -789,6 +885,71 @@ mod tests {
         assert_eq!(lost.trust, Trust::Partial);
     }
 
+    /// A replay the engine never ends is given up at its deadline, with the batches it was
+    /// to fill in.
+    #[tokio::test]
+    async fn a_replay_that_never_ends_is_given_up_at_its_deadline() {
+        let endpoint = free_endpoint();
+        let mut router = RouterSocket::new();
+        router.bind(&endpoint).await.unwrap();
+        let mut rank = rank();
+        rank.admit(decoded(0, &payload(CLEAR, 1)), true).await;
+        let (from, first) = rank
+            .admit(decoded(2, &payload("[]", 1)), true)
+            .await
+            .unwrap();
+        let mut live = SubSocket::new();
+        let (_lost, mut events) = futures::channel::mpsc::channel(1);
+        let recovered = rank.recover(&endpoint, from, first, &mut live, &mut events);
+        let expired = async {
+            request(&mut router, 1).await;
+            // Paused, the clock skips to the deadline once nothing else is due.
+            tokio::time::pause();
+        };
+        tokio::join!(recovered, expired);
+        let status = rank.status.lock().clone();
+        assert_eq!(
+            (status.replays, status.failed_replays, status.resets),
+            (1, 1, 1)
+        );
+        assert_eq!((status.last_seq, status.trust), (Some(2), Trust::Partial));
+    }
+
+    /// A connection lost during a replay leaves the rank partial once the replay is
+    /// applied, and its next batch clears its holder.
+    #[tokio::test]
+    async fn a_connection_lost_during_a_replay_leaves_the_rank_partial() {
+        let endpoint = free_endpoint();
+        let mut router = RouterSocket::new();
+        router.bind(&endpoint).await.unwrap();
+        let mut rank = rank();
+        rank.admit(decoded(0, &payload(CLEAR, 1)), true).await;
+        let second = payload("[]", 1);
+        let (from, first) = rank.admit(decoded(2, &second), true).await.unwrap();
+        let mut live = SubSocket::new();
+        let (mut lost, mut events) = futures::channel::mpsc::channel(1);
+        let recovered = rank.recover(&endpoint, from, first, &mut live, &mut events);
+        let answered = async {
+            let peer = request(&mut router, 1).await;
+            let disconnected = SocketEvent::Disconnected(PeerIdentity::new());
+            lost.try_send(disconnected).unwrap();
+            let batches = [(1, payload("[]", 1)), (2, second.clone())];
+            answer(&mut router, &peer, &batches).await;
+        };
+        tokio::join!(recovered, answered);
+        let status = rank.status.lock().clone();
+        assert_eq!(
+            (status.replays, status.failed_replays, status.resets),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            (status.last_seq, status.trust, status.connected),
+            (Some(2), Trust::Partial, false)
+        );
+        rank.admit(decoded(3, &payload("[]", 1)), false).await;
+        assert_eq!(rank.status.lock().resets, 1);
+    }
+
     #[tokio::test]
     async fn a_stream_that_cannot_start_keeps_its_lane_and_matches_nothing() {
         const OTHER: &str = "http://127.0.0.1:8001@1";
@@ -834,6 +995,7 @@ mod tests {
         // One stream cannot start; the other waits for its engine, its trust partial.
         monitor.attach(WORKER, "model", "regular", 1, source("not an endpoint"));
         monitor.attach(OTHER, "model", "regular", 1, source("tcp://127.0.0.1:1"));
+        monitor.register(UNFOLLOWED);
         status_once(&monitor, |s| s.error.is_some()).await;
         let workers: Vec<Arc<dyn Worker>> = [WORKER, OTHER, UNFOLLOWED]
             .map(|url| Arc::new(BasicWorkerBuilder::new(url).build()) as Arc<dyn Worker>)
@@ -843,14 +1005,7 @@ mod tests {
             monitor.on_routed(&prompt, worker.as_ref());
         }
         // Blocks of 4 short of the last token, and of 16 for the worker without events.
-        let predicted = [Some(36), Some(36), Some(32)];
-        for _ in 0..500 {
-            if monitor.match_workers(&prompt, &workers) == predicted {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(monitor.match_workers(&prompt, &workers), predicted);
+        matched(&monitor, &prompt, &workers, &[Some(36), Some(36), Some(32)]).await;
         monitor
             .subscriptions
             .get(OTHER)
@@ -864,6 +1019,48 @@ mod tests {
         monitor.detach(UNFOLLOWED);
         let removed = [Some(36), Some(0), None];
         assert_eq!(monitor.match_workers(&prompt, &workers), removed);
+    }
+
+    /// A worker is predicted from its registration to its detach: in the partition of its
+    /// model and pool until its rank is followed, then in the rank's.
+    #[tokio::test]
+    async fn predictions_follow_the_worker_from_registration_to_detach() {
+        let monitor = KvEventMonitor::start().unwrap();
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorkerBuilder::new(WORKER).build())];
+        let prompt: Vec<u32> = (1..=40).collect();
+        let route = || monitor.on_routed(&prompt, workers[0].as_ref());
+        route();
+        assert!(monitor.predictors.is_empty());
+        monitor.register(WORKER);
+        route();
+        matched(&monitor, &prompt, &workers, &[Some(32)]).await;
+        // Activated before it is followed, as the two run in parallel.
+        let source = KvEventSource {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            topic: "kv".into(),
+            block_size: 4,
+            ..Default::default()
+        };
+        monitor.attach(WORKER, "model", "regular", 1, source);
+        route();
+        matched(&monitor, &prompt, &workers, &[Some(36)]).await;
+        monitor.detach(WORKER);
+        route();
+        assert!(monitor.predictors.is_empty());
+    }
+
+    /// A prompt the writer has no room for is counted by model and pool.
+    #[tokio::test]
+    async fn a_prompt_the_writer_has_no_room_for_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let monitor = KvEventMonitor::start().unwrap();
+        let worker = BasicWorkerBuilder::new(WORKER).model_id("model").build();
+        monitor.register(WORKER);
+        // More than the 64 MB of tokens the writer queues.
+        monitor.on_routed(&vec![0; (1 << 24) + 1], &worker);
+        let dropped = r#"mesh_kv_events_dropped_predictions_total{model="model",pool="regular"} 1"#;
+        assert!(recorder.handle().render().contains(dropped));
     }
 
     #[test]
