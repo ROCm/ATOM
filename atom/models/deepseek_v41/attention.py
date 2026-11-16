@@ -31,6 +31,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.attentions.deepseek_v41.packed_prefill_rows import batch_pages
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 from atom.model_ops.deepseek_v41.compressor import Compressor
@@ -588,6 +589,8 @@ class Attention(nn.Module):
         else:
             attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             attending = flat_query
+            if cache.packed and not step.decode:  # the prefill decodes the batch's pages once (no sync)
+                kwargs["batch_pages"] = batch_pages(step, self.spec.ratio, cache.geometry)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
             if cache.packed and not a8w4:

@@ -8,8 +8,62 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from atom.model_ops.attentions.deepseek_v41.packed_prefill_rows import (  # noqa: E402
+    BatchPages,
+    _page_rows,
+    _remap_rows_torch,
     distinct_rows,
 )
+
+RPP, RING = 8, 133
+
+
+def _paged_csr(tokens, cap, pages_total, slots_total, requests, gen, device="cpu"):
+    """A CSR over `requests` requests, each owning random pages (rows page * RPP + j) and a ring
+    (rows slot * RING + k), with the `BatchPages` that describe them."""
+    perm = torch.randperm(pages_total, generator=gen)
+    columns = [int(c) for c in torch.randint(1, 9, (requests,), generator=gen)]
+    width = max(columns) + 2
+    tables = torch.zeros(requests, width, dtype=torch.int32)
+    used = 0
+    for b, n in enumerate(columns):
+        tables[b, :n] = perm[used : used + n]
+        used += n
+    slots = [int(x) for x in torch.randperm(slots_total, generator=gen)[:requests]]
+    counts = torch.randint(1, cap + 1, (tokens,), generator=gen)
+    indptr = torch.zeros(tokens + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(counts, 0)
+    n = tokens * cap
+    req = torch.randint(0, requests, (n,), generator=gen)
+    win = torch.rand(n, generator=gen) < 0.3
+    col = (torch.rand(n, generator=gen) * torch.tensor(columns)[req]).long()
+    main = tables[req, col].long() * RPP + torch.randint(0, RPP, (n,), generator=gen)
+    ring = torch.tensor(slots)[req] * RING + torch.randint(0, RING, (n,), generator=gen)
+    indices = torch.where(win, ring * 2 + 1, main * 2)
+    indices[int(indptr[-1]) :] = -1
+    pages = BatchPages(tables.to(device), tuple(columns), tuple(slots), RPP, RING)
+    return indices.to(device), indptr.to(device), pages
+
+
+def test_page_rows_remap_every_named_row():
+    gen = torch.Generator().manual_seed(3)
+    indices, indptr, pages = _paged_csr(41, 32, 64, 8, 3, gen)
+    tagged, local = _page_rows(indices, indptr, 64 * RPP, 8 * RING, pages)
+    n = int(indptr[-1])
+    assert tagged.numel() == sum(pages.columns) * RPP + 3 * RING
+    assert torch.equal(tagged[local[:n].long()], indices[:n])
+
+
+def test_page_rows_of_a_window_only_layer():
+    gen = torch.Generator().manual_seed(4)
+    indices, indptr, pages = _paged_csr(9, 8, 16, 4, 2, gen)
+    keep = (indices & 1) == 1
+    indices = torch.where(keep, indices, torch.full_like(indices, 1))   # window rows only
+    pages = BatchPages(pages.tables, pages.columns, pages.slots, 0, RING)
+    tagged, local = _page_rows(indices, indptr, 0, 4 * RING, pages)
+    n = int(indptr[-1])
+    assert tagged.numel() == 2 * RING and int(local.min()) >= 0
+    named = indices[:n] != 1
+    assert torch.equal(tagged[local[:n].long()][named], indices[:n][named])
 
 
 def _csr(tokens, cap, main_rows, window_rows, gen, device="cpu"):
@@ -90,6 +144,26 @@ def test_the_prefill_modes_agree(tokens, monkeypatch):
         outs[mode] = packed_prefill(q, pool, indices, indptr, kv, ext, ext_ptr, sink, scale).float()
     monkeypatch.setenv("ATOM_DSV41_PACKED_PREFILL", "rows")   # (again: the plane's cached remap)
     outs["rows_cached"] = packed_prefill(q, pool, indices, indptr, kv, ext, ext_ptr, sink, scale).float()
+    # the batch's pages: a CSR over 3 requests' pages and rings of the same pool (M = 512 pages x 8, W = 8 x 133)
+    pidx, pptr, pages = _paged_csr(tokens, cap, M // RPP, W // RING, 3, gen, dev)
+    pidx[int(pptr[-1]) :] = 0
+    tagged, local = _page_rows(pidx, pptr, M, W, pages)   # (the Triton pass on the GPU)
+    inv_page = torch.zeros(M // RPP, dtype=torch.int32, device=dev)
+    inv_slot = torch.zeros(W // RING, dtype=torch.int32, device=dev)
+    nm = sum(pages.columns) * RPP
+    pg = torch.cat([pages.tables[b, :c] for b, c in enumerate(pages.columns)]).long()
+    inv_page[pg] = torch.arange(pg.numel(), dtype=torch.int32, device=dev)
+    inv_slot[torch.tensor(pages.slots, device=dev)] = torch.arange(3, dtype=torch.int32, device=dev)
+    assert torch.equal(local, _remap_rows_torch(pidx, pptr, inv_page, inv_slot, nm, RPP, RING))
+    pn = int(pptr[-1])
+    assert torch.equal(tagged[local[:pn].long()], pidx[:pn])
+    monkeypatch.setenv("ATOM_DSV41_PACKED_PREFILL", "tile32")
+    outs["pages_ref"] = packed_prefill(q, pool, pidx, pptr, kv, ext, ext_ptr, sink, scale).float()
+    monkeypatch.setenv("ATOM_DSV41_PACKED_PREFILL", "auto")
+    outs["pages"] = packed_prefill(q, pool, pidx, pptr, kv, ext, ext_ptr, sink, scale, batch_pages=pages).float()
+    err = (outs["pages"] - outs["pages_ref"]).abs().max().item()
+    print(f"pages vs tile32: max abs {err:.3e}")
+    assert err == 0 or ((outs["pages"] - outs["pages_ref"]).norm() / outs["pages_ref"].norm()).item() < 1e-2
     ref = outs["tile32"]
     for mode in ("tile256", "rows", "rows_cached"):
         err = (outs[mode] - ref).abs().max().item()

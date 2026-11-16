@@ -11,17 +11,25 @@ kernel once over all queries. The shadow holds the same BF16 values the tiled
 path stages (`gather_prefix_rows`), so the two differ only in the attention
 kernel's split / reduction order.
 
-`ATOM_DSV41_PACKED_PREFILL`: "auto" (the default: "rows" from AUTO_ROWS_MIN
-query tokens, "tile256" below -- measured on gfx1250 TP4: the remap's scans
-cost more than the wider tiles' launches on ~2K-token prompts and less from
-~8K), "rows" (this path), "tile256" (the tiled path with 256-query tiles and
-the tiles' indptr taken once), "tile32" (the original tiled path).
+With the batch's pages (`batch_pages`, from the step's host spans and block
+table) the shadow is laid out by page: every page each request's context spans
+(rows_per_page rows each) and each request's window ring, and one pass maps the
+CSR's rows onto it (`_page_rows`) -- no scan over the pool and no host sync.
+Without them, the distinct rows are found by a mark-and-scan over both sources
+(`distinct_rows`, one host sync).
+
+`ATOM_DSV41_PACKED_PREFILL`: "auto" (the default: "rows" with the batch's pages;
+without them "rows" from AUTO_ROWS_MIN query tokens and "tile256" below -- the
+scan costs more than the wider tiles' launches on ~2K-token prompts), "rows"
+(this path), "tile256" (the tiled path with 256-query tiles and the tiles'
+indptr taken once), "tile32" (the original tiled path).
 
 (The kernels are imported where they are called: the remap is importable and testable without a GPU.)
 """
 
 import os
 import weakref
+from dataclasses import dataclass
 
 import torch
 
@@ -29,13 +37,124 @@ MODES = ("auto", "rows", "tile256", "tile32")
 AUTO_ROWS_MIN = 4096
 
 
-def prefill_mode(tokens=0):
+def prefill_mode(tokens=0, pages=False):
     mode = os.environ.get("ATOM_DSV41_PACKED_PREFILL", "auto")
     if mode not in MODES:
         raise ValueError(f"ATOM_DSV41_PACKED_PREFILL={mode!r} is not one of {MODES}")
     if mode == "auto":
-        return "rows" if tokens >= AUTO_ROWS_MIN else "tile256"
+        return "rows" if pages or tokens >= AUTO_ROWS_MIN else "tile256"
     return mode
+
+
+@dataclass(frozen=True)
+class BatchPages:
+    """A prefill's requests, in batch order: `tables` the step's block table
+    (`[bs, cols]` int32, on the device), `columns` the pages each request's
+    context spans and `slots` its STATE slot (host), `rows_per_page` main rows a
+    page at the layer's ratio (0: a window-only layer), `ring` ring slots."""
+
+    tables: torch.Tensor
+    columns: tuple
+    slots: tuple
+    rows_per_page: int
+    ring: int
+
+
+def batch_pages(step, ratio, geometry):
+    """`BatchPages` of `step` for a layer at `ratio` (host spans only: no sync)."""
+    return BatchPages(
+        step.block_tables,
+        tuple(-(-r.end // geometry.block_size) for r in step.requests),
+        tuple(r.slot for r in step.requests),
+        geometry.rows_per_page(ratio) if ratio else 0,
+        geometry.ring_slots,
+    )
+
+
+def _remap_rows_torch(indices, indptr, inv_page, inv_slot, window0, rpp, ring):
+    n = indices.numel()
+    valid = torch.arange(n, device=indices.device) < indptr[-1].to(torch.int64)
+    row = indices >> 1
+    window = (indices & 1) != 0
+    main = inv_page[torch.where(valid & ~window, row // max(rpp, 1), 0)].long() * rpp + row % max(rpp, 1)
+    win = window0 + inv_slot[torch.where(valid & window, row // ring, 0)].long() * ring + row % ring
+    return torch.where(valid, torch.where(window, win, main), 0).clamp(min=0).to(torch.int32)
+
+
+def _page_rows(indices, indptr, main_rows, window_rows, pages):
+    """`(tagged, local)` as `distinct_rows`'s, the shadow laid out by page:
+    each request's context pages (`rows_per_page` rows each), then each request's
+    ring. Built from the host spans and the block table (a gather of the batch's
+    page ids), then one pass over the CSR; nothing waits for the GPU."""
+    dev, rpp, ring = indices.device, pages.rows_per_page, pages.ring
+    if not rpp:
+        pairs = []
+    else:
+        pairs = [(b, c) for b, n in enumerate(pages.columns) for c in range(n)]
+    pinned = dev.type == "cuda"
+
+    def host(values):
+        t = torch.tensor(values, dtype=torch.int64)
+        return (t.pin_memory() if pinned else t).to(dev, non_blocking=True)
+
+    nmain = len(pairs) * rpp
+    tagged = torch.empty(nmain + len(pages.slots) * ring, dtype=torch.int64, device=dev)
+    inv_page = torch.zeros(max(main_rows // max(rpp, 1), 1), dtype=torch.int32, device=dev)
+    if pairs:
+        bc = host(pairs)
+        page_ids = pages.tables[bc[:, 0], bc[:, 1]].long()
+        inv_page[page_ids] = torch.arange(len(pairs), dtype=torch.int32, device=dev)
+        tagged[:nmain] = ((page_ids[:, None] * rpp + torch.arange(rpp, device=dev)) << 1).flatten()
+    inv_slot = torch.zeros(max(window_rows // ring, 1), dtype=torch.int32, device=dev)
+    if pages.slots:
+        slots = host(pages.slots)
+        inv_slot[slots] = torch.arange(len(pages.slots), dtype=torch.int32, device=dev)
+        tagged[nmain:] = (((slots[:, None] * ring + torch.arange(ring, device=dev)) << 1) | 1).flatten()
+    if dev.type == "cuda" and indices.numel():
+        import triton
+
+        local = torch.empty(indices.numel(), dtype=torch.int32, device=dev)
+        _remap_rows[(triton.cdiv(indices.numel(), 1024),)](
+            indices, indptr, indptr.numel() - 1, local, inv_page, inv_slot, indices.numel(),
+            nmain, max(rpp, 1), ring, BLOCK=1024,
+        )
+    else:
+        local = _remap_rows_torch(indices, indptr, inv_page, inv_slot, nmain, rpp, ring)
+    return tagged, local
+
+
+def _remap_rows_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def remap(indices, indptr, last, local, inv_page, inv_slot, n, window0, RPP: tl.constexpr,
+              RING: tl.constexpr, BLOCK: tl.constexpr):
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = i < n
+        valid = m & (i < tl.load(indptr + last).to(tl.int64))
+        t = tl.load(indices + i, valid, other=0)
+        row = t >> 1
+        window = (t & 1) != 0
+        main = tl.load(inv_page + row // RPP, valid & ~window, other=0).to(tl.int64) * RPP + row % RPP
+        win = window0 + tl.load(inv_slot + row // RING, valid & window, other=0).to(tl.int64) * RING + row % RING
+        loc = tl.where(window, win, main)
+        tl.store(local + i, tl.maximum(tl.where(valid, loc, 0), 0).to(tl.int32), m)
+
+    return remap
+
+
+class _Lazy:
+    def __init__(self, make):
+        self.make, self.fn = make, None
+
+    def __getitem__(self, grid):
+        if self.fn is None:
+            self.fn = self.make()
+        return self.fn[grid]
+
+
+_remap_rows = _Lazy(_remap_rows_kernel)
 
 
 def distinct_rows(indices, indptr, main_rows, window_rows):
@@ -66,27 +185,34 @@ def distinct_rows(indices, indptr, main_rows, window_rows):
 _REMAPS = {}   # id(plane base) -> (weakref to it, signature, remap); entries go with their plane
 
 
-def _remap(indices, indptr, main_rows, window_rows):
+def _remap(indices, indptr, main_rows, window_rows, pages=None):
     base = indices if indices._base is None else indices._base
-    sig = (indices.data_ptr(), indices.numel(), indptr.data_ptr(), main_rows, window_rows)
+    psig = None if pages is None else (
+        pages.tables.data_ptr(), pages.columns, pages.slots, pages.rows_per_page, pages.ring
+    )
+    sig = (indices.data_ptr(), indices.numel(), indptr.data_ptr(), main_rows, window_rows, psig)
     hit = _REMAPS.get(id(base))
     if hit is not None and hit[0]() is base and hit[1] == sig:
         return hit[2]
-    remap = distinct_rows(indices, indptr, main_rows, window_rows)
+    if pages is not None and pages.slots:
+        remap = _page_rows(indices, indptr, main_rows, window_rows, pages)
+    else:
+        remap = distinct_rows(indices, indptr, main_rows, window_rows)
     key = id(base)
     # (keyed by id, not by the tensor: a WeakKeyDictionary compares a hit's tensors with ==)
     _REMAPS[key] = (weakref.ref(base, lambda _, k=key: _REMAPS.pop(k, None)), sig, remap)
     return remap
 
 
-def rows_prefill(q, pool, indices, indptr, kv, extend, extend_indptr, sink, scale, out):
-    """One decode of the batch's distinct rows, one attention launch."""
+def rows_prefill(q, pool, indices, indptr, kv, extend, extend_indptr, sink, scale, out, pages=None):
+    """One decode of the batch's rows (its pages' with `pages`, else the
+    distinct ones the CSR names), one attention launch."""
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     from .packed_rows import gather_prefix_rows
 
     (main, _), (window, _) = pool
-    tagged, local = _remap(indices, indptr, main.shape[0], window.shape[0])
+    tagged, local = _remap(indices, indptr, main.shape[0], window.shape[0], pages)
     shadow = torch.empty((tagged.numel(), q.shape[-1]), device=q.device, dtype=q.dtype)
     ptr = torch.tensor([0, tagged.numel()], dtype=torch.int32, device=q.device)
     gather_prefix_rows(pool, tagged, ptr, shadow, 0, 1)

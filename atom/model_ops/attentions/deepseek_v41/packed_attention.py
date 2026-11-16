@@ -31,6 +31,7 @@ def packed_prefill(
     *,
     out=None,
     query_tile=32,
+    batch_pages=None,
 ):
     if (
         not isinstance(pool, tuple) and pool.dtype != torch.uint8
@@ -44,10 +45,10 @@ def packed_prefill(
     if tokens == 0:
         return out
     planar = isinstance(pool, tuple) and not torch.cuda.is_current_stream_capturing()
-    mode = prefill_mode(tokens) if planar else "tile32"
+    mode = prefill_mode(tokens, batch_pages is not None) if planar else "tile32"
     if mode != "tile32":  # planar sources: one decode of the distinct rows, or wider tiles
         args = (q, pool, indices, indptr, kv, extend, extend_indptr, sink, scale, out)
-        return rows_prefill(*args) if mode == "rows" else tiled_prefill(*args, 256)
+        return rows_prefill(*args, batch_pages) if mode == "rows" else tiled_prefill(*args, 256)
     rows_per_query = indices.numel() // tokens
     if rows_per_query * tokens != indices.numel():
         raise ValueError("Packed CSR capacity must be declared per query")
