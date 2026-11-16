@@ -19,11 +19,12 @@ MTPR also selects the p2p wire format, so the choice must use group-agreed
 metadata, never a rank's local request count. Set ATOM_MEGA_DECODE_FAST_PATH=0
 to retain the configured capacity for all forwards.
 
-AITER builds whose ``MegaMoEV2.forward`` takes ``max_tokens`` also get the
-DP-group max rows of each step (``_max_tokens_hint``), from which AITER picks
-the staged, small-input or large-input route on the layouts its fused kernels
-support. Those builds give the large-input route one protocol slot per MoE
-layer. Older builds keep the staged route.
+AITER builds whose ``MegaMoEV2`` takes ``routed`` are built with
+``routed=True`` and get the DP-group max rows of each step
+(``_max_tokens_hint``), from which AITER picks the staged, small-input or
+large-input route on the layouts its fused kernels support. Those builds give
+the large-input route one protocol slot per MoE layer. Older builds keep the
+staged route.
 
 Weight prep uses aiter's own shuffles (``aiter.ops.shuffle``):
   w1/w1_scale: ``shuffle_weight_a16w4(., 16, gate_up=True)`` /
@@ -91,9 +92,10 @@ def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
 
 
 @functools.cache
-def _takes_max_tokens(mega_cls) -> bool:
-    """Whether this AITER MegaMoEV2 picks its route from a max_tokens hint."""
-    return "max_tokens" in inspect.signature(mega_cls.forward).parameters
+def _routes_calls(mega_cls) -> bool:
+    """Whether this AITER MegaMoEV2 builds its fused routes on request (routed=True)
+    and picks one per call from a max_tokens hint."""
+    return "routed" in inspect.signature(mega_cls).parameters
 
 
 def _mega_layer_slots() -> int:
@@ -227,8 +229,8 @@ def get_or_build_mega_moe(
         # The per-layer slots cost memory only on a capacity that builds the
         # large-input route.
         extra = (
-            {"large_m_state_slots": _mega_layer_slots()}
-            if _takes_max_tokens(MegaMoEV2)
+            {"routed": True, "large_m_state_slots": _mega_layer_slots()}
+            if _routes_calls(MegaMoEV2)
             else {}
         )
         with torch.inference_mode(False), torch.no_grad():
@@ -376,7 +378,7 @@ def run_mega_moe(
                 )
 
     hint = {}
-    if _takes_max_tokens(type(mega)):
+    if _routes_calls(type(mega)):
         from atom.utils.forward_context import get_forward_context
 
         hint["max_tokens"] = _max_tokens_hint(mega, get_forward_context())
