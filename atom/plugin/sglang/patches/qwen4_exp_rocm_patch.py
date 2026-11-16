@@ -214,7 +214,7 @@ def _live_gfx() -> str:
     ``get_gfx()`` returns the last entry of ``gfx942;gfx950``. On MI308 that
     is gfx950, which would send this bypass down the gfx942 hipBLASLt path.
     Read once: the config hook asks on every BF16 GEMM, and a device
-    properties query costs about 8 us there.
+    properties query there is host time on every call (ROCm/ATOM#3429).
     """
     import torch
 
