@@ -3222,7 +3222,9 @@ class TestPromptEndAnchorTemplateMargin:
 
     The setting mirrors Qwen3.5 AgentX: block 16, PAGE copy checkpoints, no
     ladder (`interval -1`) and no demand rung, so the anchor is the only
-    checkpoint a prompt leaves.
+    checkpoint a prompt leaves. The exception is the LMCache chunk grid
+    section, which turns the demand rung on: what it pins is the demand a
+    floored anchor makes the next turn cut.
     """
 
     BLOCK = 16
