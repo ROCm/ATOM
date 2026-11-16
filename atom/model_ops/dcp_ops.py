@@ -886,10 +886,11 @@ def mask_empty_dcp_lse(
 # capped at the widest merge under _MAILBOX_MAX_ELEMS, and its launch epoch
 # lives on each rank, so every rank must launch it the same number of times in
 # the same order -- which a DCP group's lock-step decode does, since every
-# condition below reads only shapes. Only graph-captured steps take it: an
-# eager call re-traces the FlyDSL kernel on the host every time (~77 ms a call
-# on Kimi-K3 DCP8), which a capture pays once. Sparse MLA's empty rows
-# (owned_counts == 0) are masked inside the combine through its ``row_counts``.
+# condition below reads only shapes, dtype and capture state. Only
+# graph-captured steps take it: an eager call re-traces the FlyDSL kernel on
+# the host every time (~77 ms a call on Kimi-K3 DCP8), which a capture pays
+# once. Sparse MLA's empty rows (owned_counts == 0) are masked inside the
+# combine through its ``row_counts``.
 
 _MAILBOX_WORKSPACES: dict = {}
 # Mailbox merges taken, per workspace. A merge can only take the mailbox inside
@@ -948,7 +949,7 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     except ImportError as error:
         raise ImportError(
             "DCP comm_backend 'mailbox' needs aiter with the FlyDSL mailbox "
-            "combine (d223b16cf or later) and FlyDSL >= 0.5.0. Set --dcp-config "
+            "combine (78a14ae5d or later) and FlyDSL >= 0.5.0. Set --dcp-config "
             '\'{"comm_backend": "a2a"}\' to run without it.'
         ) from error
     device = torch.device("cuda", torch.cuda.current_device())
