@@ -10,11 +10,11 @@ that registers it; the other ranks map that buffer over HIP IPC at start and con
 (``pd.convert`` on their own device, the same planes TileRT copies from cuda:0 to every rank).
 
 Startup (collective over a gloo group at ``dist_addr``): ``TkRank`` (its ``sym:`` arena exchange), ``load_params`` (the
-checkpoint, ``weights.ckpt.compute_engram_consts``), the token tables (``load_toktab``: built from the checkpoint by
-``tk.toktab``, or read from ``toktab_dir/rank<r>.pt`` when every rank has one there, a cache the build fills; ``[q,
-kv, hc]`` of ``layers.0`` then ``mtp.0``), kernels (``codeobj.CodeTable.from_source``, ``admit_kernel`` included; dev:
-``co`` = TileRT's ``.co``, ``swap`` a swap table over it), ``warmup`` + ``capture``, the receive buffer (rank 0:
-allocate, Mooncake init + register; broadcast its IPC handle; ranks 1..7 open it).
+checkpoint, ``weights.ckpt.compute_engram_consts``), the code table (``codeobj.CodeTable.from_source``, ``admit_kernel``
+included; dev: ``co`` = TileRT's ``.co``, ``swap`` a swap table over it), the token tables (``load_toktab``: built on
+this GPU by the table's kernels, ``tk.toktab_device``, bit-exact; ``toktab_dir/rank<r>.pt`` a cache the build fills;
+``[q, kv, hc]`` of ``layers.0`` then ``mtp.0``), the step's kernels, ``warmup`` + ``capture``, the receive buffer (rank
+0: allocate, Mooncake init + register; broadcast its IPC handle; ranks 1..7 open it).
 
 Ops: ``set_sampling`` (``on`` only: greedy needs mode-2 graphs) -> ``TkRank.set_sampling``; ``admit`` ->
 ``TkRank.admit_request``; ``load_kv`` -> ``pd.convert.convert`` + ``TkRank.import_planes``, synchronized (the receive
@@ -114,6 +114,9 @@ def _to_device(o, device):
     return type(o)(_to_device(v, device) for v in o)
 
 
+TOKTAB_BUILDS = ("gpu", "cpu", "cpu-hw")
+
+
 def load_toktab(
     tk,
     rank: int,
@@ -121,54 +124,115 @@ def load_toktab(
     ckpt: str | None = None,
     group=None,
     log=None,
-    hw: str = "cpu",
+    build: str = "gpu",
+    table=None,
 ) -> None:
-    """This rank's token tables into ``tk``: ``toktab_dir/rank<r>.pt`` (6 tensors in TileRT's order: q, kv, hc of
-    ``layers.0``, then of ``mtp.0``; or ``{scope: [q, kv, hc]}``) when it is there on every rank of ``group``, else
-    built from ``ckpt`` (``tk.toktab.build_rank_tables``, collective over ``group``) and, with ``toktab_dir``, saved
-    there. ``hw``: the build's hardware approximations, ``cpu`` (modelled) or ``device`` (this rank's GPU).
+    """This rank's token tables into ``tk``'s ``toktab:`` buffers.
+
+    ``toktab_dir/rank<r>.pt`` is a cache: 6 tensors in TileRT's order (q, kv, hc of ``layers.0``, then of ``mtp.0``),
+    or ``{scope: [q, kv, hc], "build": how}``. Without it the tables are built:
+
+    - ``gpu`` (default, bit-exact): on this rank's GPU by the kernels TileRT's build runs (``tk.toktab_device``),
+      from ``table`` (a ``codeobj.CodeTable``; default ``from_source``) and ``tk``'s packed parameters;
+    - dev only, not bit-exact: ``cpu`` (``tk.toktab`` on the CPU, ``v_rsq_f32`` / ``v_exp_f32`` / ``v_rcp_f32``
+      modelled) or ``cpu-hw`` (those three evaluated by the GPU), collective over ``group`` (``ckpt`` needed).
+
+    A cache written by another build than ``build`` is rebuilt; a built table is saved when ``toktab_dir`` is given.
     """
+    if build not in TOKTAB_BUILDS:
+        raise ValueError(f"toktab build: one of {TOKTAB_BUILDS}, not {build!r}")
+    path = os.path.join(toktab_dir, f"rank{rank}.pt") if toktab_dir else None
+    tabs = None
+    if build == "gpu":
+        if path is not None and os.path.isfile(path):
+            tabs = _cached_toktab(path, build, log)
+        if tabs is None:
+            from ..tk import codeobj, toktab_device
+
+            table = (
+                table if table is not None else codeobj.CodeTable.from_source(log=log)
+            )
+            builder = toktab_device.Builder(table, tk.device)
+            t = tk.buffers.tensors
+            for scope in toktab_device.SCOPES:
+                p = {s: tk.params[f"param:{scope}.{s}"] for s in toktab_device.SLOTS}
+                out = [t[f"toktab:{scope}.{n}"] for n in ("q", "kv", "hc")]
+                builder.build(p, tk.params["param:embed"], out=out, log=log)
+            if path is not None:
+                _save_toktab(path, {sc: [t[f"toktab:{sc}.{n}"].cpu() for n in ("q", "kv", "hc")]
+                                    for sc in toktab_device.SCOPES}, build)  # fmt: skip
+            return
+    else:
+        tabs = _build_toktab_cpu(tk, rank, path, ckpt, group, log, build)
+    for scope in ("layers.0", "mtp.0"):
+        tk.buffers.toktab(scope, *tabs[scope])
+
+
+def _cached_toktab(path: str, build: str, log) -> dict | None:
+    """A cache file's tables as ``{scope: [q, kv, hc]}``, or None when it was written by another build."""
     import torch
+
+    tabs = torch.load(path, map_location="cpu")
+    if isinstance(tabs, (list, tuple)):
+        return {"layers.0": tabs[0:3], "mtp.0": tabs[3:6]}
+    got = tabs.get("build", build)
+    if got != build:
+        if log:
+            log(f"toktab: {path} is a {got} build, rebuilding ({build})")
+        return None
+    return tabs
+
+
+def _save_toktab(path: str, tabs: dict, build: str) -> None:
+    import torch
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    torch.save({**tabs, "build": build}, tmp)
+    os.replace(tmp, path)
+
+
+def _build_toktab_cpu(tk, rank, path, ckpt, group, log, build) -> dict:
+    """The dev builds on the CPU (``tk.toktab``): every rank reads the cache, or every rank builds (collective)."""
+    import logging
+
     import torch.distributed as dist
 
-    path = os.path.join(toktab_dir, f"rank{rank}.pt") if toktab_dir else None
     have = path is not None and os.path.isfile(path)
     distributed = dist.is_available() and dist.is_initialized()
-    if distributed:  # every rank reads, or every rank builds (the build is collective)
+    if distributed:
         seen = [None] * dist.get_world_size(group)
         dist.all_gather_object(seen, have, group=group)
         have = all(seen)
     if have:
-        tabs = torch.load(path, map_location="cpu")
-    else:
-        if ckpt is None:
-            raise ValueError(
-                f"no token tables at {path} and no checkpoint to build them from"
-            )
-        from ..tk import toktab
-
-        grp = (
-            (group if group is not None else dist.group.WORLD) if distributed else None
+        tabs = _cached_toktab(path, build, log)
+        if tabs is not None:
+            return tabs
+    if ckpt is None:
+        raise ValueError(
+            f"no token tables at {path} and no checkpoint to build them from"
         )
-        if hw != "device" and rank == 0:
-            import logging
+    from ..tk import toktab
 
-            logging.getLogger("atom").warning(
-                "dsv41 tk: token tables built on the CPU (hw=cpu) are not bit-exact to TileRT's: the hardware's "
-                "v_rsq_f32 / v_exp_f32 / v_rcp_f32 round differently (hi/tk/toktab.py); pass a toktab dir built "
-                "on the GPU for bit-exact decoding"
-            )
-        provider = toktab.DeviceHw(tk.device) if hw == "device" else toktab.CpuHw()
-        tabs = toktab.build_rank_tables(ckpt, rank, group=grp, log=log, hw=provider)
-        if path is not None:
-            os.makedirs(toktab_dir, exist_ok=True)
-            tmp = f"{path}.tmp{os.getpid()}"
-            torch.save(tabs, tmp)
-            os.replace(tmp, path)
-    if isinstance(tabs, (list, tuple)):
-        tabs = {"layers.0": tabs[0:3], "mtp.0": tabs[3:6]}
-    for scope in ("layers.0", "mtp.0"):
-        tk.buffers.toktab(scope, *tabs[scope])
+    grp = (group if group is not None else dist.group.WORLD) if distributed else None
+    if rank == 0:
+        logging.getLogger("atom").warning(
+            "dsv41 tk: token tables built on the CPU (%s) are not bit-exact to TileRT's: the hardware's "
+            "v_rsq_f32 / v_exp_f32 / v_rcp_f32 and the build's own order differ (hi/tk/toktab.py); the default "
+            "build (gpu) is bit-exact",
+            build,
+        )
+    import torch
+
+    provider = toktab.DeviceHw(tk.device) if build == "cpu-hw" else toktab.CpuHw()
+    with torch.device(
+        "cpu"
+    ):  # (inside a ModelRunner the default device is the rank's GPU)
+        flat = toktab.build_rank_tables(ckpt, rank, group=grp, log=log, hw=provider)
+    tabs = {"layers.0": flat[0:3], "mtp.0": flat[3:6]}
+    if path is not None:
+        _save_toktab(path, tabs, build)
+    return tabs
 
 
 class TkRankWorker:
@@ -183,7 +247,7 @@ class TkRankWorker:
         toktab_dir: str | None = None,
         swap: str | None = None,
         fly_cache: str | None = None,
-        toktab_hw: str = "cpu",
+        toktab_build: str = "gpu",
         dist_addr: str = "127.0.0.1:29561",
         mooncake_host: str | None = None,
         cached_sym: bool = False,
@@ -227,8 +291,6 @@ class TkRankWorker:
         consts = CK.compute_engram_consts(ckpt)
         self.tk.load_params(ckpt, consts)
         self.token_map = torch.as_tensor(consts["token_map"]).to(torch.int64)
-        self._progress("toktab")
-        load_toktab(self.tk, rank, toktab_dir, ckpt=ckpt, log=self._log, hw=toktab_hw)
         self._progress("kernels")
         # ours from source by default; TileRT's .co / a swap table only as dev options
         table = (
@@ -238,6 +300,17 @@ class TkRankWorker:
         )
         if swap:
             table = table.swap(swap)
+        self._progress("toktab")
+        load_toktab(
+            self.tk,
+            rank,
+            toktab_dir,
+            ckpt=ckpt,
+            log=self._log,
+            build=toktab_build,
+            table=table,
+        )
+        self._progress("kernels")
         self.tk.load_kernels(table, extra=(host.ADMIT_SYMBOL,))
         self.stream = torch.cuda.Stream(self.device)
         dist.barrier()

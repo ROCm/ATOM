@@ -4,7 +4,8 @@
 # the device arithmetic of the kernels it runs (``embed_kernel``, ``mhc_v3_kernel<S, 2>``,
 # ``q_kv_xf_kg_kernel<S, true, 8, 0>`` with its mHC finalize, ``toktab::kv_extract_kernel``), as the gfx950 ports
 # in ``hi/kernels/gfx950`` (``mhc_pre``, ``qkv``) spell it out.
-"""The DSpark token tables, built from the checkpoint: for every token, the first block of a scope (``layers.0``: the target's first
+"""The DSpark token tables re-derived on the CPU (dev only: the default, bit-exact build runs the kernels on the GPU,
+``tk.toktab_device``): for every token, the first block of a scope (``layers.0``: the target's first
 layer; ``mtp.0``: the first draft layer) run on that token alone, at position 0, before its RoPE.
 
 The block's inputs are the token's embedding (4 identical mHC copies, mHC weights (1, 0, 0, 0)), so its outputs are

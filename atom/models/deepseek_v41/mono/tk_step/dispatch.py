@@ -230,7 +230,7 @@ def install_tk_step(
         toktab_dir=envs.ATOM_DSV41_TK_TOKTAB_DIR or None,
         swap=envs.ATOM_DSV41_TK_SWAP or None,
         fly_cache=envs.ATOM_DSV41_TK_FLY_CACHE or None,
-        toktab_hw=envs.ATOM_DSV41_TK_TOKTAB_HW,
+        toktab_build=envs.ATOM_DSV41_TK_TOKTAB_BUILD,
     )
     wrapped = TkStepModel(model, drafter, runner)
     metadata_builder.use_decode_round(TkRound(wrapped, metadata_builder))

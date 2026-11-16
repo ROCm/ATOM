@@ -618,10 +618,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="tk: the FlyDSL code object cache (default ~/.cache/atom/tk_fly)",
     )
     ap.add_argument(
-        "--toktab-hw",
-        choices=["cpu", "device"],
-        default="cpu",
-        help="tk: the token table build's v_rsq / v_exp / v_rcp: modelled on the CPU, or evaluated by rank 0's GPU",
+        "--toktab-build",
+        choices=["gpu", "cpu", "cpu-hw"],
+        default="gpu",
+        help="tk: the token tables without a cache: gpu (the step's kernels, bit-exact); dev only: cpu, cpu-hw",
     )
     ap.add_argument(
         "--toktab-dir",
@@ -662,7 +662,7 @@ def build_engine(args):
         "toktab_dir": args.toktab_dir,
         "swap": args.swap,
         "fly_cache": args.fly_cache,
-        "toktab_hw": args.toktab_hw,
+        "toktab_build": args.toktab_build,
         "dist_addr": f"127.0.0.1:{args.dist_port}",
         "mooncake_host": W.local_ip(),
         "accept": args.accept,

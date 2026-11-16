@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The decode step's code objects built from our FlyDSL sources (``hi/kernels/gfx950``), one per TileRT kernel the
-plan launches (``plan.decode_launches``' 28) plus ``admit_kernel``: what ``TkRank.load_kernels`` takes when no TileRT
-``.co`` is given (``code_table``).
+plan launches (``plan.decode_launches``' 28) plus ``admit_kernel`` and the token table build's ``kv_extract_kernel``:
+what ``TkRank.load_kernels`` and ``tk.toktab_device`` take when no TileRT ``.co`` is given (``code_table``).
 
 A recipe (``RECIPES``) names the TileRT symbol it replaces, the kernel module and its builder, the ``TK_*`` build
 switches the module reads at import, and the kernargs preloaded into SGPRs (``amdgpu-kernarg-preload-count``: 7 words
@@ -60,6 +60,7 @@ _QKV_FULL = "NS1_8mhc_cell15MhcFinalizeArgsENS1_7indexer8PrepArgsEiNS2_8CompArgs
 _MHC = "3mhc13mhc_v3_kernelIL{}EL{}ELb0ELi10ELi32EL{}ELi8ELi0EEEvNS2_6ParamsENS1_6engram10HashParamsE"
 _IX = "7indexer12fused_kernelILi1ELi0EL{}EL{}EEEvNS2_9ScoreArgsENS2_10SelectArgsENS2_8PrepArgsE"
 _IXE = "7indexer19fused_engram_kernelILi1ELi0EL{}EL{}ELi6EEEvNS2_9ScoreArgsENS2_10SelectArgsENS2_8PrepArgsENS1_6engram10GemvParamsE"
+KV_EXTRACT_SYMBOL = _T + "6toktab17kv_extract_kernelEPKhPKfPt"
 _TOKTAB = "6toktab13gather_kernelILi8EL{}EEEvNS1_6engram10HashParamsEiPKtS7_PKfPKiSB_S9_PtPfPhSE_SE_SE_"
 
 
@@ -93,9 +94,12 @@ RECIPES: tuple[Recipe, ...] = (
     Recipe("indexer_e4027", _T + _IXE.format("i4027", "i6"), "indexer", env=(("TK_IX", "e4027"),)),
     Recipe("indexer_e2747", _T + _IXE.format("i2747", "i6"), "indexer", env=(("TK_IX", "e2747"),)),
     Recipe("admit", ADMIT_SYMBOL, "admit"),
+    Recipe("kv_extract", KV_EXTRACT_SYMBOL, "kv_extract"),
 )  # fmt: skip
 BY_KEY = {r.key: r for r in RECIPES}
-STEP_RECIPES = tuple(r for r in RECIPES if r.key != "admit")
+# outside the step's graphs: a request's admission, the token table build's kv
+OUTSIDE_STEP = ("admit", "kv_extract")
+STEP_RECIPES = tuple(r for r in RECIPES if r.key not in OUTSIDE_STEP)
 
 
 # ---------------------------------------------------------------------------------------------------------------

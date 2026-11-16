@@ -350,18 +350,64 @@ def test_rows_shapes():
 # tkworker.load_toktab: the cache
 
 
-def test_load_toktab_reads_the_cache_or_builds(monkeypatch, tmp_path):
+def test_load_toktab_cache_and_builds(monkeypatch, tmp_path):
     from atom.models.deepseek_v41.mono.hi.pd import tkworker as TW
+    from atom.models.deepseek_v41.mono.hi.tk import toktab_device
 
     got = {}
+    bufs = {
+        f"toktab:{sc}.{n}": torch.zeros(2)
+        for sc in ("layers.0", "mtp.0")
+        for n in ("q", "kv", "hc")
+    }
     tk = SimpleNamespace(
+        device="cpu",
+        params={
+            "param:embed": torch.zeros(2),
+            **{
+                f"param:{sc}.{s}": torch.zeros(1)
+                for sc in toktab_device.SCOPES
+                for s in toktab_device.SLOTS
+            },
+        },
         buffers=SimpleNamespace(
-            toktab=lambda scope, q, kv, hc: got.__setitem__(scope, (q, kv, hc))
-        )
+            tensors=bufs,
+            toktab=lambda scope, q, kv, hc: got.__setitem__(scope, (q, kv, hc)),
+        ),
     )
+    with pytest.raises(ValueError, match="build"):
+        TW.load_toktab(tk, 0, build="tpu")
+    # TileRT's list format is read as it is
     tabs = [torch.full((2,), float(i)) for i in range(6)]
-    with pytest.raises(ValueError, match="checkpoint"):
-        TW.load_toktab(tk, 0, str(tmp_path))
+    torch.save(tabs, tmp_path / "rank0.pt")
+    TW.load_toktab(tk, 0, str(tmp_path))
+    assert got["layers.0"][0][0] == 0 and got["mtp.0"][2][0] == 5
+    # the GPU build (default): into the toktab buffers, then saved; a cache of another build is rebuilt
+    built = []
+
+    class FakeBuilder:
+        def __init__(self, table, device):
+            built.append(("init", table))
+
+        def build(self, p, embed, out=None, log=None):
+            assert set(p) == set(toktab_device.SLOTS)
+            built.append("scope")
+            for k, t in enumerate(out):
+                t.fill_(10 + k)
+            return out
+
+    monkeypatch.setattr(toktab_device, "Builder", FakeBuilder)
+    d = tmp_path / "gpu"
+    TW.load_toktab(tk, 1, str(d), table="T")
+    assert (
+        built == [("init", "T"), "scope", "scope"]
+        and float(bufs["toktab:mtp.0.hc"][0]) == 12
+    )
+    saved = torch.load(d / "rank1.pt")
+    assert saved["build"] == "gpu" and float(saved["layers.0"][1][0]) == 11
+    built.clear()
+    TW.load_toktab(tk, 1, str(d), table="T")  # the cache: no build
+    assert built == [] and float(got["layers.0"][1][0]) == 11
     calls = []
     monkeypatch.setattr(
         toktab,
@@ -369,9 +415,73 @@ def test_load_toktab_reads_the_cache_or_builds(monkeypatch, tmp_path):
         lambda ckpt, rank, group=None, log=None, hw=None: calls.append((ckpt, hw.name))
         or tabs,
     )
-    TW.load_toktab(tk, 0, str(tmp_path), ckpt="/ckpt")
-    assert calls == [("/ckpt", "cpu")] and (tmp_path / "rank0.pt").is_file()
-    assert got["layers.0"][0][0] == 0 and got["mtp.0"][2][0] == 5
-    got.clear()
-    TW.load_toktab(tk, 0, str(tmp_path), ckpt="/ckpt")  # the cache now
-    assert len(calls) == 1 and got["mtp.0"][0][0] == 3
+    with pytest.raises(ValueError, match="checkpoint"):
+        TW.load_toktab(tk, 1, str(d), build="cpu")  # a gpu cache is not a cpu one
+    TW.load_toktab(tk, 1, str(d), ckpt="/ckpt", build="cpu")
+    assert calls == [("/ckpt", "cpu")] and torch.load(d / "rank1.pt")["build"] == "cpu"
+    TW.load_toktab(tk, 1, str(d), table="T")  # a cpu cache under the gpu build: rebuilt
+    assert built == [("init", "T"), "scope", "scope"]
+
+
+def test_device_build_kernargs_name_the_plans_buffers():
+    """The device build's mhc / qkv kernargs put its buffers where the decode plan's launches of the same kernels put
+    theirs (``plan.decode_launches``: the step's ``temp:`` / ``param:`` names)."""
+    from atom.models.deepseek_v41.mono.hi.tk import toktab_device as TD
+
+    b = object.__new__(TD.Builder)
+    names = (
+        "X",
+        "P",
+        "hcA",
+        "xn",
+        "xq",
+        "xs",
+        "ws_m",
+        "ws_q",
+        "rope",
+        "pos",
+        "qr",
+        "q",
+        "wk",
+        "wsc",
+        "kv",
+    )
+    for k, n in enumerate(names):
+        setattr(
+            b,
+            n,
+            SimpleNamespace(data_ptr=lambda k=k: (k + 1) << 20, stride=lambda d: 4),
+        )
+    blobs = {}
+
+    class FakeLauncher:
+        def arg_bytes(self, sym):
+            return 0
+
+        def params(self, sym, buf):
+            blobs[sym] = bytes(buf)
+
+    b.launcher = FakeLauncher()
+    p = {s: SimpleNamespace(data_ptr=lambda k=k: (k + 1) << 32, dtype=torch.bfloat16)
+         for k, s in enumerate(TD.SLOTS)}  # fmt: skip
+    b._launches(p)
+    addr = {f"param:{{S+0}}.{s}": (k + 1) << 32 for k, s in enumerate(TD.SLOTS)}
+    addr.update({"temp:X2": b.X.data_ptr(), "temp:hcF": b.P.data_ptr(), "temp:hcA": b.hcA.data_ptr(),
+                 "temp:Xn": b.xn.data_ptr(), "temp:Xq": b.xq.data_ptr(), "temp:Xs": b.xs.data_ptr(),
+                 "temp:ws_mhc": b.ws_m.data_ptr(), "temp:ws_qkv": b.ws_q.data_ptr(), "param:rope0": b.rope.data_ptr(),
+                 "temp:vpos": b.pos.data_ptr(), "temp:Qr": b.qr.data_ptr(), "temp:Q": b.q.data_ptr(),
+                 "cache:win.{N+0}.kv": b.wk.data_ptr(), "cache:win.{N+0}.s": b.wsc.data_ptr()})  # fmt: skip
+    plan = DL.load()
+    for sym in (TD.MHC, TD.QKV):
+        fam = next(f for f in plan["families"] if plan["kernels"][f["kernel"]] == sym)
+        words = struct.unpack(f"<{len(blobs[sym]) // 8}Q", blobs[sym])
+        assert len(words) * 8 == fam["nbytes"]
+        for k, spec in enumerate(fam["words"]):
+            if isinstance(spec, list) and spec[0] == "p":
+                assert words[k] == addr[spec[1]] + spec[2], (sym[:40], k, spec)
+    kvx = struct.unpack("<3Q", blobs[TD.KVX])
+    assert kvx == (
+        b.ws_q.data_ptr(),
+        addr["param:{S+0}.window_kv.kv_norm"],
+        b.kv.data_ptr(),
+    )
