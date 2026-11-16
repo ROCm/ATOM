@@ -17,6 +17,7 @@ that break on this ROCm stack after the 0.5.20 upgrade:
 
 from __future__ import annotations
 
+import functools
 import logging
 
 logger = logging.getLogger("atom")
@@ -206,11 +207,14 @@ def bf16_config_avoiding_gfx950_hipblaslt(config, *, qwen4: bool, gfx: str):
     return config
 
 
+@functools.cache
 def _live_gfx() -> str:
     """Arch of the GPU actually running, not AITER's ``GPU_ARCHS`` list.
 
     ``get_gfx()`` returns the last entry of ``gfx942;gfx950``. On MI308 that
     is gfx950, which would send this bypass down the gfx942 hipBLASLt path.
+    Read once: the config hook asks on every BF16 GEMM, and a device
+    properties query costs about 8 us there.
     """
     import torch
 
