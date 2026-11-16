@@ -162,6 +162,36 @@ def test_the_state_pool_lends_scratch_only_where_it_is_borrowed():
     assert extra(pp=2) == extra(model_type="glm5_next_text") == 0
 
 
+def test_the_builder_hands_the_forward_its_rows():
+    """`kda_cu` joins the int32 query starts the KDA call is cut by."""
+    K3 = pytest.importorskip(
+        "atom.model_ops.attentions.kimi_mla_gdn_attn",
+        reason="the K3 builder's module imports aiter at load",
+        exc_type=ImportError,
+    )
+    from test_kda_layout_id import builder
+
+    bm = anchor_only_bm()
+    seq = admitted(bm, PROMPT)
+    bm.plan_midstep(seq, 0, 44)
+    batch = ScheduledBatch(
+        seqs={0: seq},
+        num_scheduled_tokens=[44],
+        total_tokens_num=44,
+        num_cached_tokens=[0],
+    )
+    b = object.__new__(K3.KimiAiterMLAGDNMetadataBuilder)
+    b.model_runner = builder().model_runner
+    b.model_runner.mamba_k_cache = torch.empty(1, 64)
+    b.device = "cpu"
+
+    got = b._checkpoint_targets(batch)
+
+    assert {k: v.tolist() for k, v in got.items()} == rerun_rows([seq], [44])
+    assert got["kda_cu"].dtype == torch.int32
+    assert got["kda_tokens"].dtype == got["head_slots"].dtype == torch.int64
+
+
 def test_the_forward_writes_heads_ends_and_conv_windows():
     attn = k3_module().KimiKDAAttention
     ckpt = {
