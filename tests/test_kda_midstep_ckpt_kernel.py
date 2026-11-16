@@ -9,34 +9,42 @@ from the runtime slot, and each one's conv window from the step's conv input.
 The pool's speculation-rollback columns are left as they were. GDN's use of
 the same kernel, from a chunk kernel's per-chunk states, is checked alongside.
 
-Runs on a GPU, or on the CPU under `TRITON_INTERPRET=1`; skipped without
-Triton, as on ATOM's CPU job.
+The writer is loaded from its file: importing it through `atom.model_ops.fla_ops`
+would pull in AITER. On a GPU the checks run in-process; on the CPU, under
+Triton's interpreter in a child process (the flag must precede the triton
+import). Skipped without Triton.
 """
 
+import importlib.util
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
+pytest.importorskip("triton", reason="the checkpoint writer is a Triton kernel")
+
 from atom.models.kimi_k3.midstep import kda_snapshots
 
-CKPT = pytest.importorskip(
-    "atom.model_ops.fla_ops.state_checkpoint",
-    reason="the checkpoint kernel needs Triton",
-    exc_type=ImportError,
-)
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif os.environ.get("TRITON_INTERPRET") == "1":
-    DEVICE = "cpu"
-else:
-    pytest.skip("needs a GPU or TRITON_INTERPRET=1", allow_module_level=True)
-
+ROOT = Path(__file__).resolve().parents[1]
 CONV_LEN, ROLLBACK = 3, 2
 SLOTS, H, V, K, D = 9, 2, 4, 4, 6
 
 
-def _pools(conv_transposed: bool):
+def load_writer():
+    """`write_state_checkpoints`, from `state_checkpoint.py` alone."""
+    spec = importlib.util.spec_from_file_location(
+        "state_checkpoint_under_test",
+        ROOT / "atom" / "model_ops" / "fla_ops" / "state_checkpoint.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.write_state_checkpoints
+
+
+def _pools(conv_transposed: bool, device):
     g = torch.Generator().manual_seed(0)
     ssm = torch.randn(SLOTS, H, V, K, generator=g)
     if conv_transposed:
@@ -44,14 +52,13 @@ def _pools(conv_transposed: bool):
         conv = torch.randn(SLOTS, CONV_LEN + ROLLBACK, D, generator=g).transpose(1, 2)
     else:
         conv = torch.randn(SLOTS, D, CONV_LEN + ROLLBACK, generator=g)
-    return ssm.to(DEVICE), conv.to(DEVICE)
+    return ssm.to(device), conv.to(device)
 
 
-@pytest.mark.parametrize("conv_transposed", [False, True])
-def test_one_launch_writes_interior_and_end_targets(conv_transposed):
+def check_interior_and_end_targets(write, device, conv_transposed):
     """Row 0: interior targets at 32 and 64 and the anchor at its end, 96.
     Row 1, 48 tokens after it: one interior target at 32."""
-    ssm, conv = _pools(conv_transposed)
+    ssm, conv = _pools(conv_transposed, device)
     snaps = kda_snapshots(
         [[(4, 32), (5, 64), (6, 96)], [(7, 32)]],
         state_rows=[0, 1],
@@ -60,17 +67,15 @@ def test_one_launch_writes_interior_and_end_targets(conv_transposed):
         runtime_slots=[1, 2],
         num_slots=SLOTS,
         conv_len=CONV_LEN,
-        device=DEVICE,
+        device=device,
     )
     assert snaps.targets == ((0, 32), (0, 64), (1, 32))
     g = torch.Generator().manual_seed(1)
-    snap_out = torch.randn(len(snaps.targets), H, V, K, generator=g).to(DEVICE)
-    mixed_qkv = torch.randn(144, D, generator=g).to(DEVICE)
+    snap_out = torch.randn(len(snaps.targets), H, V, K, generator=g).to(device)
+    mixed_qkv = torch.randn(144, D, generator=g).to(device)
     before_ssm, before_conv = ssm.clone(), conv.clone()
 
-    CKPT.write_state_checkpoints(
-        **snaps.checkpoint_args(snap_out, ssm, mixed_qkv, conv)
-    )
+    write(**snaps.checkpoint_args(snap_out, ssm, mixed_qkv, conv))
 
     for i, slot in enumerate((4, 5, 7)):
         assert torch.equal(ssm[slot], snap_out[i])
@@ -85,8 +90,8 @@ def test_one_launch_writes_interior_and_end_targets(conv_transposed):
         assert torch.equal(conv[slot], before_conv[slot])
 
 
-def test_an_end_target_alone_needs_no_snapshot():
-    ssm, conv = _pools(False)
+def check_an_end_target_alone(write, device):
+    ssm, conv = _pools(False, device)
     snaps = kda_snapshots(
         [[(4, 64)]],
         [0],
@@ -95,22 +100,22 @@ def test_an_end_target_alone_needs_no_snapshot():
         [1],
         num_slots=SLOTS,
         conv_len=CONV_LEN,
-        device=DEVICE,
+        device=device,
     )
-    mixed_qkv = torch.randn(64, D).to(DEVICE)
+    mixed_qkv = torch.randn(64, D).to(device)
     before = ssm.clone()
-    CKPT.write_state_checkpoints(**snaps.checkpoint_args(None, ssm, mixed_qkv, conv))
+    write(**snaps.checkpoint_args(None, ssm, mixed_qkv, conv))
     assert torch.equal(ssm[4], before[1])
     assert torch.equal(conv[4, :, :CONV_LEN], mixed_qkv[61:64].T)
 
 
-def test_gdn_chunk_states_still_read_by_chunk():
+def check_gdn_chunk_states(write, device):
     """GDN's path, unchanged: target i reads h[chunk_offsets[row] + off // 64]."""
-    ssm, conv = _pools(False)
-    h = torch.randn(1, 6, H, V, K).to(DEVICE)
-    x = torch.randn(200, D).to(DEVICE)
-    i32 = {"dtype": torch.int32, "device": DEVICE}
-    CKPT.write_state_checkpoints(
+    ssm, conv = _pools(False, device)
+    h = torch.randn(1, 6, H, V, K).to(device)
+    x = torch.randn(200, D).to(device)
+    i32 = {"dtype": torch.int32, "device": device}
+    write(
         h,
         ssm,
         x,
@@ -128,3 +133,54 @@ def test_gdn_chunk_states_still_read_by_chunk():
     assert torch.equal(ssm[4], h[0, 1])
     assert torch.equal(ssm[5], h[0, 3])
     assert torch.equal(conv[5, :, :CONV_LEN], x[128 + 61 : 128 + 64].T)
+
+
+def run_all_checks(device):
+    write = load_writer()
+    for conv_transposed in (False, True):
+        check_interior_and_end_targets(write, device, conv_transposed)
+    check_an_end_target_alone(write, device)
+    check_gdn_chunk_states(write, device)
+
+
+def test_the_writer_passes_every_check_under_the_triton_interpreter():
+    code = (
+        "import importlib.util;"
+        f"s = importlib.util.spec_from_file_location('kernel_checks', {__file__!r});"
+        "m = importlib.util.module_from_spec(s); s.loader.exec_module(m);"
+        "m.run_all_checks('cpu')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        env={
+            **os.environ,
+            "TRITON_INTERPRET": "1",
+            "HIP_VISIBLE_DEVICES": "",
+            "CUDA_VISIBLE_DEVICES": "",
+        },
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+
+
+GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@GPU
+@pytest.mark.parametrize("conv_transposed", [False, True])
+def test_one_launch_writes_interior_and_end_targets(conv_transposed):
+    check_interior_and_end_targets(load_writer(), "cuda", conv_transposed)
+
+
+@GPU
+def test_an_end_target_alone_needs_no_snapshot():
+    check_an_end_target_alone(load_writer(), "cuda")
+
+
+@GPU
+def test_gdn_chunk_states_still_read_by_chunk():
+    check_gdn_chunk_states(load_writer(), "cuda")
