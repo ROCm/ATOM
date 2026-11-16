@@ -7,11 +7,14 @@ import torch
 if not torch.version.hip or not torch.cuda.is_available():
     pytest.skip("requires a ROCm GPU", allow_module_level=True)
 
-from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
+from aiter import concat_and_cache_mla, dtypes, fused_qk_rope_concat_and_cache_mla
 
 from atom.model_ops import attention_mla
 from atom.model_ops.attention_mla import MLAAttention
-from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
+from atom.model_ops.rotary_embedding import (
+    NoPositionalRotaryEmbedding,
+    RotaryEmbedding,
+)
 from atom.model_ops.triton_mla_absorb_qpack import mla_absorb_q_pack
 
 # Kimi-K3.1 DSA prefill under QREP: 96 replicated heads, 128 nope, 64 rope,
@@ -69,7 +72,7 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     # forward_impl sizes q_out from q_nope's leading dims either way.
     assert q_nope.shape == (tokens, HEADS, NOPE)
     assert ql_nope.shape == (tokens, HEADS, LORA)
-    kv = torch.randn(tokens, 1, LORA + PE, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(tokens, LORA + PE, device="cuda", dtype=torch.bfloat16)
     k_nope, k_pe = kv.split([LORA, PE], dim=-1)
     # Every other token is another DCP rank's: its K is not written, its Q is.
     slots = torch.arange(tokens, device="cuda")
@@ -79,8 +82,10 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     scale = torch.tensor([q_scale], device="cuda")
 
     def buffers():
+        # q_out starts as FP8 NaN codes, so a byte the kernels skip shows.
+        shape = (tokens, HEADS, LORA + PE)
         return (
-            torch.empty(tokens, HEADS, LORA + PE, device="cuda", dtype=dtypes.fp8),
+            torch.full(shape, 0x7F, device="cuda", dtype=torch.uint8).view(dtypes.fp8),
             torch.zeros(tokens, 1, LORA + PE, device="cuda", dtype=dtypes.fp8),
         )
 
@@ -88,14 +93,16 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
     _pack(ql_nope, q_pe, k_nope, k_pe, ref_q, ref_kv, slots, rope, scale)
 
     new_q, new_kv = buffers()
-    stand_in = q_pe.new_empty(LORA).expand(tokens, HEADS, -1)
-    _pack(stand_in, q_pe, k_nope, k_pe, new_q, new_kv, slots, rope, scale)
-    mla_absorb_q_pack(q_nope.transpose(0, 1), w_k, new_q, scale)
+    one = torch.ones(1, device="cuda")
+    concat_and_cache_mla(k_nope, k_pe, new_kv, slots, "fp8", one)
+    mla_absorb_q_pack(q_nope.transpose(0, 1), q_pe.transpose(0, 1), w_k, new_q, scale)
 
     torch.testing.assert_close(new_kv.view(torch.uint8), ref_kv.view(torch.uint8))
-    torch.testing.assert_close(
-        new_q[..., LORA:].view(torch.uint8), ref_q[..., LORA:].view(torch.uint8)
-    )
+    # Past the FP8 range aiter's pack stores q_pe as NaN; the absorb saturates.
+    ref_pe = ref_q[..., LORA:].float()
+    fp8_max = torch.finfo(dtypes.fp8).max
+    ref_pe = torch.where(ref_pe.isnan(), q_pe.float().sign() * fp8_max, ref_pe)
+    torch.testing.assert_close(new_q[..., LORA:].float(), ref_pe, rtol=0, atol=0)
     # The NaN code sits one step past the largest finite one, which the
     # step bound below would accept.
     assert not new_q[..., :LORA].float().isnan().any(), "nope half stores an FP8 NaN"
@@ -108,24 +115,28 @@ def test_absorb_into_q_out_matches_two_kernel_path(tokens, q_scale):
 
 
 # GLM-5.x has 192 nope dims, which the absorb kernel does not compile for, and
-# 512 overruns gfx950's shared memory. The kernel has not run on gfx942.
+# 512 overruns gfx950's shared memory. The kernel has not run on gfx942, and
+# it stores q_pe unrotated.
 @pytest.mark.parametrize(
-    "gfx, nope, absorbs",
+    "gfx, nope, rope_cls, absorbs",
     [
-        ("gfx950", NOPE, True),
-        ("gfx950", 192, False),
-        ("gfx950", 512, False),
-        ("gfx942", NOPE, False),
+        ("gfx950", NOPE, NoPositionalRotaryEmbedding, True),
+        ("gfx950", 192, NoPositionalRotaryEmbedding, False),
+        ("gfx950", 512, NoPositionalRotaryEmbedding, False),
+        ("gfx942", NOPE, NoPositionalRotaryEmbedding, False),
+        ("gfx950", NOPE, RotaryEmbedding, False),
     ],
 )
 def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(
-    monkeypatch, gfx, nope, absorbs
+    monkeypatch, gfx, nope, rope_cls, absorbs
 ):
     monkeypatch.setattr(attention_mla, "get_gfx_runtime", lambda: gfx)
     layer = SimpleNamespace(
         W_K_qrep_scale=None,
         kv_shuffled=False,
+        rotary_emb=rope_cls(PE, PE, 16, 10000.0),
         qk_nope_head_dim=nope,
+        qk_rope_head_dim=PE,
         kv_lora_rank=LORA,
     )
     kv_cache = torch.empty(1, device="cuda", dtype=dtypes.fp8)
@@ -134,11 +145,15 @@ def test_absorb_gate_takes_two_kernel_path_off_kernel_shapes(
 
 
 # L=96 would store its second 64-column block over half the rope columns.
-@pytest.mark.parametrize("nope, lora", [(NOPE, 96), (192, LORA), (512, LORA)])
-def test_absorb_q_pack_rejects_shapes_its_kernel_cannot_take(nope, lora):
+@pytest.mark.parametrize(
+    "nope, pe, lora",
+    [(NOPE, PE, 96), (192, PE, LORA), (512, PE, LORA), (NOPE, 48, LORA)],
+)
+def test_absorb_q_pack_rejects_shapes_its_kernel_cannot_take(nope, pe, lora):
     tokens = 2048
-    q_nope = torch.randn(HEADS, tokens, nope, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(HEADS, tokens, nope + pe, device="cuda", dtype=torch.bfloat16)
+    q_nope, q_pe = q.split([nope, pe], dim=-1)
     w_k = torch.randn(HEADS, lora, nope, device="cuda", dtype=torch.bfloat16)
-    q_out = torch.zeros(tokens, HEADS, lora + PE, device="cuda", dtype=dtypes.fp8)
+    q_out = torch.zeros(tokens, HEADS, lora + pe, device="cuda", dtype=dtypes.fp8)
     with pytest.raises(AssertionError, match="no absorb kernel"):
-        mla_absorb_q_pack(q_nope, w_k, q_out, torch.ones(1, device="cuda"))
+        mla_absorb_q_pack(q_nope, q_pe, w_k, q_out, torch.ones(1, device="cuda"))

@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.sparse_mla_work_plan import patch_work_kv_ranges
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
@@ -1593,6 +1594,7 @@ class MLAAttention(nn.Module):
         # Prefill BF16 absorb at the replicated heads stores FP8 into q_out
         # itself (mla_absorb_q_pack), so no bf16 [N, T, L] is written. gfx950
         # only: the kernel has not run on gfx942, where FP8 is e4m3fnuz.
+        # NoPE only: the kernel stores q_pe unrotated.
         return (
             use_qrep
             and is_prefill
@@ -1602,7 +1604,10 @@ class MLAAttention(nn.Module):
             and kv_cache.numel() > 0
             and dtype_q == dtypes.fp8
             and get_gfx_runtime() == "gfx950"
-            and mla_absorb_q_pack_supports(self.qk_nope_head_dim, self.kv_lora_rank)
+            and isinstance(self.rotary_emb, NoPositionalRotaryEmbedding)
+            and mla_absorb_q_pack_supports(
+                self.qk_nope_head_dim, self.qk_rope_head_dim, self.kv_lora_rank
+            )
         )
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
@@ -3232,25 +3237,33 @@ class MLAAttention(nn.Module):
                         self.rotary_emb.sin_cache,
                         is_neox=self.rotary_emb.is_neox_style,
                     )
+                elif absorb_into_q_out:
+                    # The absorb writes every q_out token, so only K is left.
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        write_slot_mapping,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
+                    mla_absorb_q_pack(
+                        q_nope.transpose(0, 1),
+                        q_rope.transpose(0, 1),
+                        self.W_K_qrep,
+                        q_out_write,
+                        self._q_scale,
+                    )
                 else:
                     # DCP: q_out is head all-gathered, so every rank must compute
                     # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
                     # keeps the default (early-return on padded tokens).
                     fused_qk_rope_concat_and_cache_mla(
-                        # Absorbing into q_out, this op is wanted only for the
-                        # rope half and the KV write: a one-row stand-in keeps
-                        # it off q_nope, and the absorb below overwrites the
-                        # nope half it stores. shortcut: that nope store is one
-                        # wasted FP8 q_out[..., :L] write; drop it once the
-                        # absorb kernel also writes the rope half, or aiter's
-                        # q_nope_prestored writer runs off gfx1250.
-                        (
-                            q_rope.new_empty(self.kv_lora_rank).expand(
-                                *q_rope.shape[:2], -1
-                            )
-                            if absorb_into_q_out
-                            else q_nope
-                        ),
+                        q_nope,
                         q_rope,
                         k_nope,
                         k_rope,
@@ -3270,13 +3283,6 @@ class MLAAttention(nn.Module):
                         is_nope_first=True,
                         compute_all_q_rope=self.dcp_world_size > 1,
                     )
-                    if absorb_into_q_out:
-                        mla_absorb_q_pack(
-                            q_nope.transpose(0, 1),
-                            self.W_K_qrep,
-                            q_out_write,
-                            self._q_scale,
-                        )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
                 if pcp:
