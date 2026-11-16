@@ -1196,7 +1196,7 @@ def f0_row(c, r):
     """This CTA's LDS x8 (row 0) = MXFP8 of bf(x1[r] rstd nw) (x8_self's arithmetic, one row)."""
     t, w, l, sm = c["t"], c["w"], c["l"], c["sm"]
     NV = [hx.gload(c["nw"] + i64(fx.min(t, I32(159)) * 32 + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
-    hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 13)
+    hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 13, backoff=True)
     gpu.barrier()
     if w == 0:
         pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + r) * 32 + 25) * 4, F32) for k in range(5)]

@@ -684,7 +684,7 @@ def router_v2(c, TR):
                 hx.lstore(sm + GL_OFF + e * GL_STR + q[j] * 16, G[e][j], align=16)
     ipf(16)
     if fx.const_expr(SELFN and "pflag" in c):   # (v3 e9) the 256 owners' LL flags
-        hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11)
+        hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11, backoff=True)
     else:
         if t == 0:
             if fx.const_expr(SELFN):
@@ -974,7 +974,7 @@ def router_v3(c, TR):
     G = [[hx.gload(c["gate"] + i64((e0 + e) * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)] for e in range(RV3_EPC)]
     NV = [hx.gload(c["nw"] + i64(q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
     ipf(8)
-    hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11)
+    hx.wait_flags(c["pflag"], 160, c["ptag"], w, l, 11, backoff=True)
     gpu.barrier()
     rr = fx.min(r, I32(TR - 1))
     X = [hx.gload(c["x1g"] + i64(rr * H + q[j] * 8) * 2, BF16, 8, align=16) for j in range(3)]
@@ -1197,7 +1197,7 @@ def ffn_c2(c, TR):
     p = b
     c0 = p * COLS
     if fx.const_expr("pflag" in c):
-        hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13)
+        hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13, backoff=True)
     else:
         if t == 0:
             hx.wait_count(c["cnt"], NOWN, 13)
@@ -1383,7 +1383,7 @@ def x8_self(c, TR):
     waits for the 160 owners' flags, rstd of each row from their partials (ffn_c2's sum order), then bf(x1 rs nw) and
     the MXFP8 block of each 32 cols (front_C's arithmetic). c: t w l sm x1g part2 pflag ptag nw norm_eps."""
     t, w, l, sm = c["t"], c["w"], c["l"], c["sm"]
-    hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13)
+    hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13, backoff=True)
     gpu.barrier()
     wr = fx.min(w, I32(TR - 1))
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + wr) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]
@@ -1423,7 +1423,7 @@ def xh_out(c, TR):
     layer wrote it) from the TP2 owners' x1 + square-sum partials: CTA b < 16 its 320 cols. c: t b w l sm x1g part2
     pflag ptag nw norm_eps xh."""
     t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
-    hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13)
+    hx.wait_flags(c["pflag"], NOWN, c["ptag"], w, l, 13, backoff=True)
     gpu.barrier()
     wr = fx.min(w, I32(TR - 1))
     pv = [hx.gload(c["part2"] + i64(((l + 32 * k) * 8 + wr) * 32 + 25) * 4, F32) for k in range(NOWN // 32)]

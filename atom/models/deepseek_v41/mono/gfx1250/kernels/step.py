@@ -659,7 +659,7 @@ def target_layer(E, Ly):
             gpu.barrier()
             MS.union_init(crr)
         if fx.const_expr(FS.RFLAG):   # every router CTA's scores landed (wave 0: the NRC flags)
-            hx.wait_flags(plog(FS.RFL_OFF) + i64(par) * 1024, FS.NRC, hx.epoch32(tep, Ly, 1), w, l, 12)
+            hx.wait_flags(plog(FS.RFL_OFF) + i64(par) * 1024, FS.NRC, hx.epoch32(tep, Ly, 1), w, l, 12, backoff=True)
         if fx.const_expr((moe_ids == "ids") or FS.RFLAG):
             gpu.barrier()
         FS.topk_v3(dict(t=t, b=b, w=w, l=l, sm=sm + FLO, scores=fptr(fp, "plog"), gbias=ltab(fp, Ly, "gbias")(),

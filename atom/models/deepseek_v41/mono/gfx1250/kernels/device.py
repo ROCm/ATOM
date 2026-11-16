@@ -379,6 +379,20 @@ POLL_TICKS = 2000000000   # (v2 study) 20 s: the first launch's rank skew (modul
 FAST_TICKS = 10000        # 100 us
 
 
+# The LL flag fan-ins (FFN post F_P / attention post AP: 160 owner flags; router scores: 96 router flags; ~100+
+# waiting CTAs each) back off: past BACKOFF_ROUNDS poll rounds (each >= ~1 us: a system-scope load round trip and the
+# loop's clock read, so >= ~5 ms; no normal wait comes near it, a whole step is ~4 ms) every round sleeps
+# 4 x s_sleep 127 more. Without it, ~120 CTAs re-polling the F_P lines with uncached (system-scope) loads every
+# s_sleep(1) starved the one owner still on its way to its put: on g13-10 (gfx1250) its own memory requests did not
+# complete until the pollers gave up at POLL_TICKS (20 s), and the step failed (pollhang, 11-16: the flag landed 7.5 us
+# after its pollers stopped).
+# The loop itself is the original one (its clock read, its order); the back-off is a round counter and a cold branch,
+# at these sites only. Cheaper-looking variants cost the step 25-80 us on CT11 t3: a second clock read a round
+# (s_sendmsg_rtn GET_REALTIME), a timed pause loop at every poll site (code layout: 56 sites), the loop rewritten to
+# reuse its clock value.
+BACKOFF_ROUNDS = 5000
+
+
 import threading as _threading
 
 _FAIL = _threading.local()
@@ -530,9 +544,10 @@ def get_fp8(addr, ep24, site):
 
 
 @ASTRewriter.transform
-def wait_flags(base, n, tag, w, l, site):
+def wait_flags(base, n, tag, w, l, site, backoff=False):
     """(v3) Wave 0 waits for the n LL flags base + 8 i (lane l: flags l, l + 32, ..), every lane's peeks issued together
-    and re-polled together (one round trip a poll, not one a flag); the caller's barrier follows."""
+    and re-polled together (one round trip a poll, not one a flag); the caller's barrier follows. backoff: the owners'
+    fan-in sites (a cold back-off past BACKOFF_ROUNDS rounds)."""
     if w == 0:
         K = (n + 31) // 32
         ad = [base + I64(fx.min(l + 32 * k, I32(n - 1))) * I64(8) for k in range(K)]
@@ -541,12 +556,25 @@ def wait_flags(base, n, tag, w, l, site):
         bad = I32(0)
         for k in range_constexpr(K):
             bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
-        while (bad != 0) & (clock() - t0 < I64(POLL_TICKS)):
-            s_sleep(1)
-            pg = [peek(ad[k]) for k in range(K)]
-            bad = I32(0)
-            for k in range_constexpr(K):
-                bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
+        if fx.const_expr(backoff):
+            rn = I32(0)
+            while (bad != 0) & (clock() - t0 < I64(POLL_TICKS)):
+                s_sleep(1)
+                rn = rn + 1
+                if unlikely(rn > I32(BACKOFF_ROUNDS)):
+                    for _ in range_constexpr(4):
+                        s_sleep(127)
+                pg = [peek(ad[k]) for k in range(K)]
+                bad = I32(0)
+                for k in range_constexpr(K):
+                    bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
+        else:
+            while (bad != 0) & (clock() - t0 < I64(POLL_TICKS)):
+                s_sleep(1)
+                pg = [peek(ad[k]) for k in range(K)]
+                bad = I32(0)
+                for k in range_constexpr(K):
+                    bad = bad | (pg[k][1] != tag).select(I32(1), I32(0))
 
 
 @ASTRewriter.transform

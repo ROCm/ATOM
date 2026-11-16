@@ -228,7 +228,7 @@ def stage_A(c):
                 if c["newA"]:
                     # (seam) x8 / xs written by the TP2 owners themselves (ffn_post_owner, un-normalized): this K half's
                     # 80 owners' apflags, no publisher hop
-                    hx.wait_flags(c["apflag"] + i64(kh * 80) * 8, 80, c["aptag"], w, l, 9)
+                    hx.wait_flags(c["apflag"] + i64(kh * 80) * 8, 80, c["aptag"], w, l, 9, backoff=True)
                     gpu.barrier()
             if fx.const_expr(NEWA and not PUB):   # (v2) x1 from the TP2 column owners: wait for them, each row's rstd from 256 partials
                 if c["newA"]:
@@ -237,7 +237,7 @@ def stage_A(c):
                     blks = [fx.min(t + it * 256, I32(TR * 80 - 1)) for it in range(NB)]
                     cols = [kh * 2560 + (blks[it] % 80) * 32 for it in range(NB)]
                     if fx.const_expr("apflag" in c):   # (v3 e1) the 256 TP2 owners' LL flags
-                        hx.wait_flags(c["apflag"], 160, c["aptag"], w, l, 9)
+                        hx.wait_flags(c["apflag"], 160, c["aptag"], w, l, 9, backoff=True)
                     else:
                         if t == 0:   # (the poll first: a load issued before it would hold the poll until it lands)
                             hx.wait_count(c["attpost"], 160, 9)
@@ -406,7 +406,7 @@ def stage_Apub(c):
         bc = p * 5 + t % 5
         col = bc * 32
         nv = [hx.gload(c["anw"] + i64(col + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
-        hx.wait_flags(c["apflag"], 160, c["aptag"], w, l, 9)
+        hx.wait_flags(c["apflag"], 160, c["aptag"], w, l, 9, backoff=True)
         gpu.barrier()
         xv = [hx.gload(c["x1a"] + i64(rr * HID + col + 8 * h) * 2, BF16, 8, align=16) for h in range(4)]
         wr = fx.min(w, I32(TR - 1))
