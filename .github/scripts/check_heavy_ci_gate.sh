@@ -62,7 +62,7 @@ find_allowed_pr_label() {
 }
 
 check_relevant_paths() {
-  if [ -z "${CI_GATE_PATHS_IGNORE:-}" ]; then
+  if [ -z "${CI_GATE_PATHS_IGNORE:-}" ] && [ -z "${CI_GATE_PATHS_INCLUDE:-}" ]; then
     return 0
   fi
 
@@ -80,9 +80,14 @@ import os
 import sys
 
 files = [line.strip() for line in os.environ["CHANGED_FILES"].splitlines() if line.strip()]
-patterns = [
+ignore_patterns = [
     line.strip()
     for line in os.environ.get("CI_GATE_PATHS_IGNORE", "").splitlines()
+    if line.strip()
+]
+include_patterns = [
+    line.strip()
+    for line in os.environ.get("CI_GATE_PATHS_INCLUDE", "").splitlines()
     if line.strip()
 ]
 
@@ -97,7 +102,8 @@ def matches(pattern, path):
 relevant = [
     path
     for path in files
-    if not any(matches(pattern, path) for pattern in patterns)
+    if (not include_patterns or any(matches(pattern, path) for pattern in include_patterns))
+    and not any(matches(pattern, path) for pattern in ignore_patterns)
 ]
 
 print(f"Changed files: {len(files)}; relevant files for this workflow: {len(relevant)}")
@@ -110,7 +116,11 @@ sys.exit(0 if relevant else 1)
 PY
   )"; then
     echo "${filter_result}"
-    emit_decision "false" "ignored-paths-only"
+    local reason="ignored-paths-only"
+    if [ -n "${CI_GATE_PATHS_INCLUDE:-}" ] && [ -z "${CI_GATE_PATHS_IGNORE:-}" ]; then
+      reason="paths-not-included"
+    fi
+    emit_decision "false" "${reason}"
     exit 0
   fi
 
@@ -133,6 +143,7 @@ emit_decision() {
     smoke_requested="true"
   elif [ "${EVENT_NAME}" != "pull_request_review" ] \
     && [ "${reason}" != "ignored-paths-only" ] \
+    && [ "${reason}" != "paths-not-included" ] \
     && [ "${reason}" != "draft-pull-request" ] \
     && [ "${reason}" != "pull-request-closed" ]; then
     smoke_requested="true"
