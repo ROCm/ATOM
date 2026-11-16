@@ -895,7 +895,8 @@ def _native_mtp_keeps(prompt, gens):
     ``gens[j]`` tokens each (block 256, interval 512, a PAGE checkpoint):
     postprocess as native's scheduler, ``hash_decode_blocks(seq, committed,
     next_forward_tokens=1)`` with ``committed = num_tokens - 1`` (the KV the
-    step computed; undeferred output)."""
+    step computed; undeferred output), on a backend that builds every verify
+    step's image (ReplaySSM), so no step is refused at filing."""
     from conftest import MockConfig  # ATOM tests/conftest.py
 
     from atom.model_engine.block_manager import BlockManager
@@ -920,7 +921,8 @@ def _native_mtp_keeps(prompt, gens):
     bm = BlockManager(
         cfg,
         state_runtime=StateRuntime(
-            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+            transfer=StateTransfer.copy(spec.layout_id, decode_snapshot=True),
+            checkpoint_spec=spec,
         ),
     )
     coord = bm.paged_state_checkpoints

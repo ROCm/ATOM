@@ -1305,11 +1305,7 @@ class PagedStateCheckpointCoordinator:
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
             build = step >= 0 and self.decode_snapshot
-            # A slot copied as it stands holds no verify step past 0.
-            unbuildable = step > 0 and not self.decode_snapshot
-            if unbuildable or (
-                build and (self._scratch is None or not self._scratch.has_free())
-            ):
+            if build and (self._scratch is None or not self._scratch.has_free()):
                 self.checkpoints_dropped += 1
                 continue
             op = self.store.begin_store(h, src_slot)

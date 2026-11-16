@@ -526,7 +526,8 @@ def _replayssm_materialize_kernel(
     DOT_MODE: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # Rows on axis 0: layers x sequences x heads outgrows axis 1's limit.
+    i_nh, i_v = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     if i_n >= N:
         return
@@ -653,7 +654,8 @@ def replayssm_materialize(
     round-trip.  The source slot's checkpoint and records are only read.
 
     Args:
-        ckpt: ``[num_slots, HV, K, V]`` contiguous checkpoint pool
+        ckpt: ``[num_slots, HV, K, V]`` (KDA ``[num_slots, HV, V, K]``)
+            contiguous checkpoint pool
         buf_k / buf_u / buf_g: this layer's record buffers
         write_pos: ``[num_slots]`` int32 cursor, not yet advanced for this step
         slot_idx: ``[N]`` live slot of each sequence
@@ -679,7 +681,7 @@ def replayssm_materialize(
     # The forward's replay tile: `base + step + 1` never exceeds
     # `cap - max_query_len` (see the flush policy above).
     BH = max(16, triton.next_power_of_2(cap - max_query_len))
-    _replayssm_materialize_kernel[(NV, n * HV)](
+    _replayssm_materialize_kernel[(n * HV, NV)](
         ckpt=ckpt,
         buf_k=buf_k,
         buf_u=buf_u,

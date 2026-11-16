@@ -2565,7 +2565,7 @@ class BlockManager:
             )
         pos = base + num_new_tokens
         kept = (
-            self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed, snapshot_step)
             if pos > seq.scheduled_checkpoint_pos
             else []
         )
@@ -3278,6 +3278,7 @@ class BlockManager:
         pos: int,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        snapshot_step: int = -1,
     ) -> list[StateCache]:
         """State classes that should keep a checkpoint at `pos`, in class order.
 
@@ -3394,6 +3395,10 @@ class BlockManager:
             if not (aimed and c.readable_midstep)
             and c.applies(seq)
             and next_forward_tokens >= c.successor_room
+            # A slot copied as it stands is trusted only at step 0: GDN's conv
+            # window and draft slots move past it (a position-addressed state
+            # such as V4's would serve any step, but is not told apart).
+            and (snapshot_step <= 0 or c.decode_snapshot)
         ]
 
     def publish_loaded_prefix(

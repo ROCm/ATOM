@@ -85,10 +85,40 @@ def _layout(monkeypatch, **kwargs):
     return _transfer(monkeypatch, **kwargs).paged_layout_id
 
 
-def test_replayssm_builds_its_decode_images(monkeypatch):
-    """Its slot lags the records, so a decode store needs a built image."""
-    assert _transfer(monkeypatch, replayssm=True).decode_snapshot
-    assert not _transfer(monkeypatch).decode_snapshot
+@pytest.mark.parametrize(
+    ("replayssm", "prefix_caching", "interval", "spare"),
+    [
+        (True, True, 8192, True),
+        (False, True, 8192, False),
+        (True, False, 8192, False),
+        (True, True, 0, False),
+        (True, True, -1, False),
+    ],
+)
+def test_decode_images_get_spare_slots_only_where_they_are_built(
+    monkeypatch, replayssm, prefix_caching, interval, spare
+):
+    """A full batch leaves no free slot to build a decode image in."""
+    from atom.model_ops.attentions.gdn_attn import DECODE_SNAPSHOT_SCRATCH_SLOTS
+
+    transfer = _transfer(monkeypatch, replayssm=replayssm)
+    assert transfer.decode_snapshot is replayssm
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            config=SimpleNamespace(
+                enable_prefix_caching=prefix_caching,
+                state_checkpoint_interval_tokens=interval,
+            )
+        ),
+        state_transfer=lambda: transfer,
+        _state_shape_for_runner=lambda: ((3, 16), (2, 4, 4)),
+        _state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
+        num_state_layers=lambda: 2,
+        _replayssm_bytes_per_slot=lambda: 0,
+        slots_per_req=lambda: 1,
+    )
+    spec = _builder_cls().state_spec(builder)
+    assert spec.extra_entries == (DECODE_SNAPSHOT_SCRATCH_SLOTS if spare else 0)
 
 
 class TestWhoCopies:

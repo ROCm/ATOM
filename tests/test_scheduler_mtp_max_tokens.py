@@ -335,15 +335,16 @@ def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
     assert outputs[good.id].output_tokens == [11]
 
 
-class TestDeferredDecodeBoundary:
-    """A deferred decode boundary is named by the forward its slot will hold.
+class TestDecodeBoundaryStep:
+    """A decode boundary is named by the forward its slot holds when stored.
 
-    A seq in the batch just run had its last sampled token forwarded by it, so
-    the boundary is that forward's first token (step 0). One not in it (a
-    prefill-only batch, a DP dummy) still holds the window that sampled them.
+    A deferred seq in the batch just run had its last sampled token forwarded
+    by it, so the boundary is that forward's first token (step 0). One that did
+    not run (a prefill-only batch, a DP dummy), or undeferred output, still
+    holds the window that sampled them, whose last token is not forwarded yet.
     """
 
-    def _filed(self, seq_factory, in_batch):
+    def _filed(self, seq_factory, ran, deferred=True):
         mtp = TestMTPMaxTokens()
         sched = mtp._scheduler()
         seq = mtp._prefill(
@@ -363,26 +364,29 @@ class TestDeferredDecodeBoundary:
         seq.num_placeholder_tokens = sched.mtp_k
         for token in (87, 88, 89, 90, 91, 92, 93):
             seq.append_token(token)
+        # No `batch`, as RapidServe's decode engine calls it: `seqs` alone
+        # names the batch just run.
         sched.postprocess(
-            list(sched.running),
+            [seq] if ran else [],
             ScheduledBatchOutput(
                 req_ids=[seq.id],
                 token_ids=[(5, 6, 7, 8)],
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
-                is_deferred_out=True,
-            ),
-            batch=(
-                SimpleNamespace(req_ids=[seq.id], total_seqs_num_prefill=0)
-                if in_batch
-                else None
+                is_deferred_out=deferred,
             ),
         )
-        return filed
+        return filed, seq.num_finalized_tokens
 
-    def test_in_the_batch_it_is_step_0_of_that_forward(self, seq_factory):
-        ((committed, step),) = self._filed(seq_factory, in_batch=True)
-        assert step == 0
-        ((outside, outside_step),) = self._filed(seq_factory, in_batch=False)
-        assert (outside, outside_step) == (committed - 1, 3)
+    def test_a_seq_that_ran_names_step_0_of_that_forward(self, seq_factory):
+        (filed,), n = self._filed(seq_factory, ran=True)
+        assert filed == (n, 0)
+
+    def test_a_seq_that_did_not_run_names_its_last_accepted_token(self, seq_factory):
+        (filed,), n = self._filed(seq_factory, ran=False)
+        assert filed == (n - 1, 3)
+
+    def test_undeferred_output_names_its_last_accepted_token(self, seq_factory):
+        (filed,), n = self._filed(seq_factory, ran=True, deferred=False)
+        assert filed == (n - 1, 3)

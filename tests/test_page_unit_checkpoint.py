@@ -793,13 +793,11 @@ def test_a_decode_boundary_with_no_scratch_free_is_dropped():
     assert c.checkpoints_dropped == 1
 
 
-def test_a_backend_copying_its_slot_as_is_keeps_only_step_0():
+def test_a_backend_copying_its_slot_as_is_borrows_nothing():
     c, pool = _snapshot_coordinator(1, decode_snapshot=False)
-    c.checkpoint(_seq(5), 8, 101, step=2)
-    c.checkpoint(_seq(6), 8, 102, step=0)
+    c.checkpoint(_seq(5), 8, 101, step=0)
     stores, _ = c.take_checkpoint_ops()
-    assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(6, -1, -1)]
-    assert c.checkpoints_dropped == 1
+    assert [(op.src_slot, op.step, op.scratch_slot) for op in stores] == [(5, -1, -1)]
     assert pool.has_free()
 
 

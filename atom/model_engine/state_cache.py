@@ -76,6 +76,10 @@ class StateCache(Protocol):
     #: can a copying one, so neither implies the other.
     readable_midstep: bool
 
+    #: Whether a decode boundary past verify step 0 can be kept: the class
+    #: builds the step's image rather than keeping its slot as it stands.
+    decode_snapshot: bool
+
     def applies(self, seq: Sequence) -> bool:
         """Whether this class gates or checkpoints anything for `seq`."""
         ...

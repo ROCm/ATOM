@@ -2282,6 +2282,39 @@ class TestPagedCopyCheckpoint:
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 
+class TestDecodeBoundaryStep:
+    """A decode boundary carries the verify step its slot holds to the store."""
+
+    def _decode_to(self, bm, end, step):
+        seq = stateful_seq(list(range(10)))
+        run_prompt(bm, seq)  # ends off the grid: keeps nothing
+        while seq.num_tokens < end:
+            seq.append_token(500 + seq.num_tokens)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, end, next_forward_tokens=1, snapshot_step=step)
+        return seq
+
+    def test_a_snapshot_backend_builds_the_step_in_scratch(self):
+        runtime = StateRuntime(
+            transfer=StateTransfer.copy(
+                PAGED_COPY_SPEC.layout_id, decode_snapshot=True
+            ),
+            checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        bm = make_block_manager(ckpt_config(), state_runtime=runtime)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        (op,) = bm.take_state_maintenance_ops().checkpoint_stores
+        assert (op.src_slot, op.step) == (seq.state_slot, 2)
+        assert op.scratch_slot not in (-1, seq.state_slot)
+
+    def test_a_slot_kept_as_it_stands_files_no_later_step(self):
+        """Nor does it spend the spacing on one it cannot keep."""
+        bm = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = self._decode_to(bm, 3 * BLOCK, step=2)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+        assert seq.last_checkpoint_pos == 0
+
+
 class TestDecodePointPublishing:
     """The same ladder, walked by generation instead of by prompt.
 
@@ -2479,6 +2512,7 @@ class StubStateCache:
         self.successor_room = successor_room
         self.enabled = enabled
         self.readable_midstep = readable_midstep
+        self.decode_snapshot = False
         self._cap = cap
 
     def applies(self, seq):
@@ -4457,6 +4491,7 @@ def test_checkpoint_funnel_includes_second_state_class():
         """Minimal StateCache with checkpoint_fates — mimics a second real class."""
 
         successor_room = 0
+        decode_snapshot = False
 
         def applies(self, seq):
             return False

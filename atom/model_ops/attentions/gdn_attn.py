@@ -659,21 +659,25 @@ class GDNStateMixin(PoolRowsMixin):
         prefix-reusing traffic. Decoupling the two is what the PAGE path does,
         by keeping the image in KV blocks instead of a slot; a flat cushion
         here would buy the same thing for `fork` at the cost of a knob nobody
-        can size without measuring, so it is not offered. Decode snapshots get
-        a few scratch slots instead: without them a full batch has none to
-        build in, and every decode checkpoint is dropped.
+        can size without measuring, so it is not offered.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
-        snapshot = self.state_transfer().decode_snapshot
+        cfg = self.model_runner.config
+        # Decode images are built in scratch, which a full batch leaves none of.
+        scratch = (
+            self.state_transfer().decode_snapshot
+            and cfg.enable_prefix_caching
+            and cfg.state_checkpoint_interval_tokens > 0
+        )
         return state_pool(
             STATE_SLOT_CLASS,
             self.num_state_layers() * per_layer + self._replayssm_bytes_per_slot(),
             entries_per_req=self.slots_per_req(),
-            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if snapshot else 0,
+            extra_entries=DECODE_SNAPSHOT_SCRATCH_SLOTS if scratch else 0,
         )
 
     def slots_per_req(self) -> int:
@@ -1046,8 +1050,11 @@ class GDNStateMixin(PoolRowsMixin):
         for op in ops:
             for p in self._checkpoint_plane_tensors():
                 if p is conv and op.step:
-                    dsts.append(p[:, op.scratch_slot, : p.shape[2] - op.step])
-                    srcs.append(p[:, op.src_slot, op.step :])
+                    # The tail is never read; filled from the same slot so the
+                    # image holds this request's bytes alone.
+                    cut = p.shape[2] - op.step
+                    dsts += [p[:, op.scratch_slot, :cut], p[:, op.scratch_slot, cut:]]
+                    srcs += [p[:, op.src_slot, op.step :], p[:, op.src_slot, cut:]]
                 else:
                     dsts.append(p[:, op.scratch_slot])
                     srcs.append(p[:, op.src_slot])
