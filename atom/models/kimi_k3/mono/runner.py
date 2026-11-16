@@ -570,8 +570,8 @@ class K3MonoDecodeRunner:
         have run, on this step's return rather than reimplementing it, so the
         two cannot drift apart. ``out`` is ``(prefix, add, add2)``; the layer's
         own return carries the block bank in a fourth slot, and mono keeps that
-        in ``blocks`` -- a fixed-size slot stack, not the forward's grown
-        ``cat``, so only the slots banked so far hold this step's data.
+        in ``blocks`` -- a fixed-size slot stack like the forward's
+        ``block_bank``, so only the slots banked so far hold this step's data.
         """
         if layer_id not in self.aux.layer_ids:
             return
