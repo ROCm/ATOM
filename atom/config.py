@@ -3458,6 +3458,10 @@ class Config:
         # ATOM_M3_FHMOE moves the shared expert into the MoE op: the block no
         # longer applies the routed scale or adds shared_experts() itself.
         factors.append(bool(envs.ATOM_M3_FHMOE))
+        # ATOM_M3_FUSE_MXFP8_QUANT decides in Python whether the input norm hands
+        # qkv_proj MXFP8 rows (a different traced graph); the 2-stage switch is read
+        # inside the custom op and needs no key.
+        factors.append(bool(envs.ATOM_M3_FUSE_MXFP8_QUANT))
         # The sparse-attention indexer bakes max_model_len and max_num_seqs into
         # the graph as constants, so a cache built for a smaller max_model_len
         # faults on the first decode past the old width.
