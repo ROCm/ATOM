@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.plugin.sglang.attention_backend import attention_gdn
 from atom.plugin.sglang.attention_backend.attention_gdn import (
@@ -261,6 +262,55 @@ def test_extend_metadata_carries_per_step_prefill_indices():
         metadata.non_spec_state_indices_i64,
     )
     assert torch.equal(metadata.no_initial_state, torch.tensor([True, False]))
+
+
+class _ScalarReadSpy(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten._local_scalar_dense.default:
+            self.reads += 1
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    "logical_num_tokens, expected_tokens, expected_reads",
+    [(5, 5, 0), (None, 99, 1)],
+    ids=["sglang-host-count", "no-host-count"],
+)
+def test_extend_token_count_comes_from_sglang_host_count(
+    logical_num_tokens, expected_tokens, expected_reads
+):
+    """``logical_num_tokens`` is SGLang's host sum of extend_seq_lens.
+
+    Reading ``query_start_loc[-1]`` instead syncs the stream once per prefill;
+    it is only the fallback when SGLang left the host count unset.
+    """
+    forward_metadata = SimpleNamespace(
+        # The device offsets disagree with the host count, to show which is read.
+        query_start_loc=torch.tensor([0, 3, 99], dtype=torch.int32),
+        mamba_cache_indices=torch.tensor([4, 7], dtype=torch.int32),
+        logical_num_tokens=logical_num_tokens,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 2], dtype=torch.int32),
+        extend_seq_lens_cpu=[3, 2],
+    )
+    linear = SimpleNamespace(
+        forward_metadata=forward_metadata, req_to_token_pool=_MambaPool()
+    )
+
+    with _ScalarReadSpy() as spy:
+        metadata = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+
+    assert spy.reads == expected_reads
+    assert metadata.num_prefill_tokens == expected_tokens
+    assert metadata.num_actual_tokens == expected_tokens
 
 
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):

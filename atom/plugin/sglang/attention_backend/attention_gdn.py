@@ -27,6 +27,10 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
+from atom.plugin.sglang.attention_backend.gdn_radix_track import (
+    fused_track_supported,
+    write_radix_track_snapshots,
+)
 from atom.plugin.sglang.attention_backend.gdn_replayssm import (
     note_full_state_write,
     prepare_layer,
@@ -370,22 +374,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 )
             out = super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
             self._track_mamba_states(forward_batch, mixed_qkv)
-            # Chunked prefill rewrites the checkpoint in place. The ring
-            # cursor has to drop the previous tenant's records or the next
-            # verify folds them on top of that new state.
-            mode = None if forward_batch is None else forward_batch.forward_mode
-            draft_extend = bool(
-                mode is not None
-                and callable(getattr(mode, "is_draft_extend_v2", None))
-                and mode.is_draft_extend_v2()
-            )
-            if (
-                replayssm_enabled()
-                and mode is not None
-                and mode.is_extend()
-                and not draft_extend
-            ):
-                note_full_state_write(self._verify_cache_slots(forward_batch))
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -477,10 +465,13 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         SGLang's HybridLinearAttnBackend owns the prefix cache and computes the
         track metadata, but the snapshot calls live inside its own GDN kernels,
         which the plugin replaces. They are made here, after the ATOM forward,
-        through SGLang's helpers so the snapshot semantics stay defined there.
-        Every source is final by now: the conv window is read from the pre-conv
-        input, the SSM state from the prefill kernel's chunk states `h` (Triton
-        or FlyDSL) or the runtime slot.
+        from SGLang's track metadata. On device the conv window, the unaligned
+        `h` rows and the aligned slot copies go out in one launch
+        (`write_radix_track_snapshots`, the same copies SGLang's eager code
+        makes); anything that kernel does not cover falls back to SGLang's
+        helper. Every source is final by now: the conv window is read from the
+        pre-conv input, the SSM state from the prefill kernel's chunk states
+        `h` (Triton or FlyDSL) or the runtime slot.
 
         Decode goes through `_track_mamba_radix_slots`, which also covers the
         replayed decode graph via the post-replay epilogue.
@@ -519,6 +510,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         if not metadata.has_mamba_track_mask:
             return
         track_conv_indices = metadata.track_conv_indices
+        dst = None
         if track_conv_indices is not None and track_conv_indices.numel() > 0:
             # Only SGLang's GDN backend caches the destination slots; indexing
             # the pool with a None would broadcast over every slot.
@@ -526,25 +518,31 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             if dst is None:
                 rows = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 dst = metadata.mamba_track_indices[rows]
-            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
-            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
+        else:
+            track_conv_indices = None
         if metadata.track_ssm_h_src.numel() > 0 and h is None:
             raise RuntimeError(
                 "SGLang mamba radix cache needs the GDN chunk kernel's "
                 "intermediate states, but this prefill kept none."
             )
+        if mixed_qkv.is_cuda and fused_track_supported(metadata, h):
+            write_radix_track_snapshots(
+                mixed_qkv,
+                track_conv_indices,
+                dst,
+                conv_states,
+                h,
+                metadata.track_ssm_h_src,
+                metadata.track_ssm_h_dst,
+                metadata.track_ssm_final_src,
+                metadata.track_ssm_final_dst,
+                ssm_states,
+            )
+            return
+        if track_conv_indices is not None:
+            # [rows, state_len, dim] -> the pool's [slot, dim, state_len].
+            conv_states[dst] = mixed_qkv[track_conv_indices].transpose(1, 2)
         linear_backend._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
-
-    def _verify_cache_slots(self, forward_batch: Any) -> torch.Tensor | None:
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-        if attn_backend is None:
-            return None
-        linear = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-        metadata = getattr(linear, "forward_metadata", None)
-        indices = getattr(metadata, "mamba_cache_indices", None)
-        if indices is None:
-            return None
-        return indices[: int(forward_batch.batch_size)]
 
     def _verify_replayssm(
         self,
@@ -1050,11 +1048,16 @@ class SGLangGDNForwardContext:
         fm = getattr(linear_backend, "forward_metadata", None)
         query_start_loc = getattr(fm, "query_start_loc", None)
         idx = getattr(fm, "mamba_cache_indices", None)
+        live_slots = idx
+        # Extend only: SGLang's host sum of extend_seq_lens, i.e. the value of
+        # query_start_loc[-1].
+        num_query_tokens = getattr(fm, "logical_num_tokens", None)
         if query_start_loc is None or idx is None:
             reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
             if reconstructed is None:
                 return None
             query_start_loc, idx = reconstructed
+            num_query_tokens = None
         device = query_start_loc.device
         # Decode cuda-graph: keep Hybrid's static buffers (already pad=-1 on
         # dead rows in ``_replay_metadata``). Cloning here bakes a throwaway
@@ -1110,9 +1113,17 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
+            if replayssm_enabled():
+                # Chunked prefill rewrites the checkpoint in place. The ring
+                # cursor, shared by every GDN layer, has to drop the previous
+                # tenant's records once per forward or the next verify folds
+                # them on top of that new state.
+                note_full_state_write(None if live_slots is None else live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
-            seq_sum = int(query_start_loc[-1].item())
+            if num_query_tokens is None:
+                num_query_tokens = query_start_loc[-1].item()
+            seq_sum = int(num_query_tokens)
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
