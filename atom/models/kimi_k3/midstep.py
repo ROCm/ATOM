@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
+from atom.model_ops.gdn_midstep_snapshots import checkpoint_target_columns
 from atom.utils import envs
 
 #: aiter FlashKDA's recurrence chunk: the state exists only at a chunk's top,
@@ -173,14 +174,17 @@ def kda_snapshots(
     def mk(col):
         return torch.tensor(col, dtype=torch.int32, device=device)
 
+    rows, slots, offs, is_end, runtime_slots = checkpoint_target_columns(
+        ordered, device
+    )
     return KdaSnapshots(
         targets=tuple((row, off) for row, _dst, off, _end, _rt in interior),
         conv_len=conv_len,
-        rows=mk([row for row, *_ in ordered]),
-        slots=mk([int(dst) for _row, dst, *_ in ordered]),
-        offs=mk([off for _row, _dst, off, *_ in ordered]),
-        is_end=mk([int(bool(end)) for *_, end, _rt in ordered]),
-        runtime_slots=mk([int(rt) for *_, rt in ordered]),
+        rows=rows,
+        slots=slots,
+        offs=offs,
+        is_end=is_end,
+        runtime_slots=runtime_slots,
         h_rows=mk(list(range(len(interior))) + [0] * (len(ordered) - len(interior))),
         cu_seqlens=mk(cu_seqlens),
     )
