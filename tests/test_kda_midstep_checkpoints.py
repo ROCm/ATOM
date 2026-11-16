@@ -327,6 +327,26 @@ def test_interior_and_end_targets_share_one_launch():
     assert args["conv_state_len"] == CONV_LEN
 
 
+def test_a_snapshot_buffer_strided_unlike_the_pool_is_refused():
+    """The writer reads row i of `snap_out` at i times the pool's slot stride."""
+    snaps = kda_snapshots(
+        [[(4, 32), (5, 96)]],
+        [0],
+        [0],
+        [96],
+        [1],
+        num_slots=8,
+        conv_len=CONV_LEN,
+        device="cpu",
+    )
+    padded = torch.zeros(8 * 36).as_strided((8, 2, 4, 4), (36, 16, 4, 1))
+    snap_out = torch.zeros(len(snaps.targets), 2, 4, 4)
+    with pytest.raises(ValueError, match="as far apart as the slots"):
+        snaps.checkpoint_args(
+            snap_out, padded, torch.zeros(96, 5), torch.zeros(8, 5, CONV_LEN)
+        )
+
+
 def test_an_end_position_alone_reads_the_pool():
     snaps = kda_snapshots(
         [[(4, 64)]],
