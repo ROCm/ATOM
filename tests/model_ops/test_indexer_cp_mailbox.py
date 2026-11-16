@@ -27,17 +27,28 @@ pytestmark = pytest.mark.skipif(
 
 WORLD, QLEN, TOPK, MAX_LEN = 4, 4, 16, 1 << 20
 # 900000: shard rows past two narrow local top-k tiles take the wide one.
-CASES = [(1, 1000, 0, 1), (16, 60000, 1, 4), (64, 100000, 1, 4), (8, 900000, 1, 4)]
+# A fifth field of 1 emits the MXFP4 KV's page geometry (one page a block).
+CASES = [
+    (1, 1000, 0, 1),
+    (16, 60000, 1, 4),
+    (64, 100000, 1, 4),
+    (8, 900000, 1, 4),
+    (16, 60000, 1, 4, 1),
+]
 # The first four calls cross both boundaries: 2**30 wraps the stored counter,
 # and 2**30 == 1 (mod 32767) crosses the 15-bit tag boundary too.
 COUNTER_START = (1 << 30) - 3
 
 
-def _case(rank, mailbox, batch, context, init, keep):
+def _case(rank, mailbox, batch, context, init, keep, pages=None):
     """Whether each call of one case matched: eager calls, then graph replays."""
     import torch.distributed as dist
 
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as ex
+
+    geometry = {}
+    if pages is not None:
+        geometry = {"pages_per_block": pages, "block_page_stride": pages}
 
     blocks = triton.cdiv(MAX_LEN, 128)
     local = triton.cdiv(blocks, WORLD)
@@ -63,11 +74,23 @@ def _case(rank, mailbox, batch, context, init, keep):
         parts = [torch.empty_like(keys) for _ in range(WORLD)]
         dist.all_gather(parts, keys)
         recv = torch.stack([part[rank] for part in parts])
-        return ex.merge_candidate_keys(recv, table, seq, TOPK, init, keep, QLEN)
+        return ex.merge_candidate_keys(
+            recv, table, seq, TOPK, init, keep, QLEN, **geometry
+        )
 
     def one_launch(i):
         return ex.select_exchanged_candidates(
-            scores[i], seq, table, TOPK, rank, WORLD, QLEN, init, keep, mailbox
+            scores[i],
+            seq,
+            table,
+            TOPK,
+            rank,
+            WORLD,
+            QLEN,
+            init,
+            keep,
+            mailbox,
+            **geometry,
         )
 
     expected = [tuple(t.clone() for t in gathered(i)) for i in range(2)]
