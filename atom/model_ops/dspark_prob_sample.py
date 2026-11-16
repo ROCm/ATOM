@@ -53,6 +53,7 @@ requests are not reproducible on this path.
 
 import logging
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 import triton
@@ -66,6 +67,11 @@ from atom.model_ops.dspark_markov_argmax import (
 from atom.model_ops.dspark_markov_stage1 import markov_logits_tile
 from atom.model_ops.rejection_sampler import _draft_token, _finish_request
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.spec_sampling.sampling_scratch import (
+    Region,
+    carve,
+    scratch_buffer,
+)
 from atom.model_ops.tile_argmax import NO_HIT, argmax_lowest_id
 from atom.utils import envs
 
@@ -1353,9 +1359,11 @@ def _prob_decide_kernel(
     rm_nch,
     QTP: tl.constexpr,
     USE_BLOCK: tl.constexpr,
+    RM_NCH: tl.constexpr,  # power of two >= rm_nch: one lane per chunk
 ):
     req_idx = tl.program_id(0)
     bs = tl.num_programs(0)
+    chs = tl.arange(0, RM_NCH)
     start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
     temp = tl.load(temps_ptr + req_idx).to(tl.float32)
     greedy = temp <= _GREEDY_T
@@ -1392,8 +1400,9 @@ def _prob_decide_kernel(
                     rm = tl.zeros((), tl.float32)
                     for j in tl.static_range(QTP):
                         rbase = rmall_ptr + (j * N + start + k + 1) * rm_nch
-                        for c in range(rm_nch):
-                            rm += tl.load(rbase + c)
+                        rm += tl.sum(
+                            tl.load(rbase + chs, mask=chs < rm_nch, other=0.0), axis=0
+                        )
                     denom = rm + 1.0 - P
                     h = tl.where(denom > 0.0, rm / denom, 1.0)
                 else:
@@ -1592,33 +1601,35 @@ def _prob_finish_kernel(
     )
 
 
-class _TopPWorkspace:
-    """The top-p search's per-step scratch, carved from one allocation: the
-    compacted final-interval tokens ``cand`` [N, 2, RB]; the two chunked
-    levels' thresholds ``thr`` [2, N, K] and per-chunk mass / count records
-    ``lm`` / ``lc`` [2, N, nch, K]; the final interval ``fin`` [N, 4] (a, b,
-    mass at or above b, threshold spacing); and its int32 token count
-    ``fin_n`` [N]. ``nch`` 0 (no top-p): only the per-row slots, never
-    read."""
+class _TopPScratch(NamedTuple):
+    """The top-p search's per-step scratch, carved from one buffer
+    (`sampling_scratch.carve`): the compacted final-interval tokens ``cand``
+    [N, 2, RB]; the two chunked levels' thresholds ``thr`` [2, N, K] and
+    per-chunk mass / count records ``lm`` / ``lc`` [2, N, nch, K]; the final
+    interval ``fin`` [N, 4] (a, b, mass at or above b, threshold spacing); and
+    its int32 token count ``fin_n`` [N]."""
 
-    def __init__(self, nrow: int, nch: int, device):
-        f32, i32 = torch.float32, torch.int32
-        k = _TOPP_K if nch else 0
-        layout = (
-            ("cand", (nrow, 2, _TOPP_RB if nch else 0), f32),
-            ("thr", (2, nrow, k), f32),
-            ("lm", (2, nrow, nch, k), f32),
-            ("lc", (2, nrow, nch, k), i32),
-            ("fin", (nrow, 4), f32),
-            ("fin_n", (nrow,), i32),
-        )
-        sizes = [torch.Size(shape).numel() for _, shape, _ in layout]
-        words = torch.empty(sum(sizes), dtype=i32, device=device)
-        off = 0
-        for (name, shape, dtype), n in zip(layout, sizes):
-            part = words[off : off + n]
-            setattr(self, name, (part if dtype is i32 else part.view(f32)).view(shape))
-            off += n
+    cand: torch.Tensor
+    thr: torch.Tensor
+    lm: torch.Tensor
+    lc: torch.Tensor
+    fin: torch.Tensor
+    fin_n: torch.Tensor
+
+
+def _topp_scratch(nrow: int, nch: int) -> _TopPScratch:
+    """`_TopPScratch`'s regions for ``nrow`` rows of ``nch`` chunks; ``nch`` 0
+    (no top-p): only the per-row slots, never read."""
+    f32, i32 = torch.float32, torch.int32
+    k = _TOPP_K if nch else 0
+    return _TopPScratch(
+        Region((nrow, 2, _TOPP_RB if nch else 0), f32),
+        Region((2, nrow, k), f32),
+        Region((2, nrow, nch, k), f32),
+        Region((2, nrow, nch, k), i32),
+        Region((nrow, 4), f32),
+        Region((nrow,), i32),
+    )
 
 
 def prob_rejection_sample(
@@ -1684,7 +1695,8 @@ def prob_rejection_sample(
         top_p_scalar = 1.0 if top_ps is None else float(top_ps)
     temps = temperatures.to(torch.float32)
     topp = has_ptr or top_p_scalar < 1.0
-    ws = _TopPWorkspace(nrow, nch_stats if topp else 0, device)
+    ws_spec = _topp_scratch(nrow, nch_stats if topp else 0)
+    ws = carve(scratch_buffer(ws_spec, device), ws_spec)
     gather = (
         (lambda t: tp_group.all_gather(t, dim=0, use_custom=use_custom))
         if qtp > 1
@@ -1861,6 +1873,7 @@ def prob_rejection_sample(
         nch_q,
         QTP=qtp,
         USE_BLOCK=use_block,
+        RM_NCH=triton.next_power_of_2(nch_q),
         num_warps=1,
     )
     _prob_resample_kernel[(bs, nch_q)](
