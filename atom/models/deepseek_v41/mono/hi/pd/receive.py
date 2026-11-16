@@ -75,6 +75,16 @@ class MooncakeTransport:
         return {"session_id": self.session_id}
 
 
+class PublishedTransport:
+    """A transport another process owns (the rank-0 worker of ``fanout``): only what the hello publishes of it."""
+
+    def __init__(self, name: str, meta: dict):
+        self.name, self._meta = name, dict(meta)
+
+    def local_meta(self) -> dict:
+        return dict(self._meta)
+
+
 def make_transport(name: str | None):
     key = (name or "mooncake").lower()
     if key == "mooncake":

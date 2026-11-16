@@ -15,6 +15,9 @@ TileRT's code objects and our swap table; no GPU.
   parameter of its own, that parameter is declared ``void* const*`` (the demangled symbol, ``c++filt``).
 - ``code``: every plan kernel in TileRT's code objects, its explicit kernarg layout ending at the plan's blob size and
   equal to ``kargs.tsv``'s; every swap line's function in its code object, with the line's layout.
+- ``admit``: ``host.admit_args`` over a recording's address maps rebuilds every recorded ``admit_kernel`` blob of every
+  rank (tkserve's sequence a rank: ``_reset_streams``' admit, then one ``dsv41_e2e_begin`` a restore, the sampling
+  counter at 1 after the one ``set_sampling``); exact apart from ``host.ADMIT_PAD`` (uninitialized struct padding).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import itertools
 import json
 import random
 import shutil
+import struct
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -329,19 +333,91 @@ def check_params_mode(plan, steps, tables: dict) -> dict:
     return dict(res)
 
 
+def _f32(x: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(x)))[0]
+
+
+def check_admit(
+    records: list[dict],
+    maps: dict,
+    first: int = 2581,
+    pos: int = 400045,
+    seed: int = 591402,
+    temperature: float = 1.0,
+    counter0: int = 1,
+) -> dict:
+    """Rebuild each recorded ``admit_kernel`` blob (``records``: tkshim lines, ``maps[rank]``: the address map entries).
+    A rank's call i: 0 = ``_reset_streams`` (``admit(0, 0, False)``), i >= 1 = ``dsv41_e2e_begin(first, pos,
+    pack_params(seed, temperature), on)`` with the sampling counter at ``counter0 + i``. The defaults are tkserve's
+    11-16 request (400,045 prompt tokens, first token 2581, ``SamplingParams(temperature=1, seed=591402)``).
+    """
+    res = Counter()
+    pads = Counter()
+    calls: Counter = Counter()
+    for r in sorted(records, key=lambda r: r["seq"]):
+        d = r["dev"]
+        i = calls[d]
+        calls[d] += 1
+        addr = {name: p for name, p, n, *_ in maps[d] if p and n}
+        if i == 0:
+            blob = host.admit_args(addr, 0, 0, False, None)
+        else:
+            params = [seed, _f32(temperature) | _f32(1.0) << 32, 0, counter0 + i]
+            blob = host.admit_args(addr, first, pos, True, params)
+        want = bytes.fromhex(r["a"])
+        head = (r["k"], tuple(r["g"]), tuple(r["b"]), r["shm"]) == (
+            host.ADMIT_SYMBOL,
+            host.ADMIT_GRID,
+            host.ADMIT_BLOCK,
+            0,
+        )
+        res["launches"] += 1
+        res["launches_head"] += head
+        res["exact"] += blob == want
+        masked = bytearray(want)
+        for o in host.ADMIT_PAD:
+            if masked[o : o + 4] != bytes(4):
+                pads[f"+{o:#x}"] += 1
+            masked[o : o + 4] = bytes(4)
+        res["exact_but_pad"] += blob == bytes(masked) and len(want) == host.ADMIT_BYTES
+        for o in range(0, host.ADMIT_BYTES, 8):
+            res["words"] += 1
+            res["words_exact"] += blob[o : o + 8] == want[o : o + 8]
+    return {
+        **res,
+        "nonzero_pad": dict(pads),
+        "calls_per_rank": dict(sorted(calls.items())),
+    }
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="CPU checks of the tk decode host")
     ap.add_argument(
         "--runs",
         required=True,
-        help="runs/20261115-flydsl-tilert (m6/, m5/paramsum.json.gz, shim/)",
+        help="runs/20261115-flydsl-tilert (m6/, m5/paramsum.json.gz, shim/); '-' with --admit: that check only",
     )
     ap.add_argument("--co", help="TileRT's code objects (*.co)")
     ap.add_argument("--swap", help="a swap table (pd/swap_fly20.tsv)")
     ap.add_argument(
         "--wheel", help="the unzipped TileRT wheel's tilert/ (TileRT's sym_table)"
     )
+    ap.add_argument(
+        "--admit",
+        nargs=2,
+        metavar=("REC", "MAPS"),
+        help="admit_kernel records (m7/rec_admit.jsonl) and the same process's address maps (dir of addr_rank<d>.json)",
+    )
     a = ap.parse_args(argv)
+    if a.admit:
+        recs = [json.loads(line) for line in Path(a.admit[0]).read_text().splitlines()]
+        amaps = {
+            d: json.loads((Path(a.admit[1]) / f"addr_rank{d}.json").read_text())
+            for d in range(alloc.NPES)
+        }
+        print("admit:", check_admit(recs, amaps))
+        if a.runs == "-":
+            return
     runs = Path(a.runs)
     plan = DL.load()
     steps, maps = DL.read_recording(

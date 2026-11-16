@@ -39,20 +39,8 @@ deliberate difference: a zero budget streams the first token (TileRT returns it 
 then reports as a truncated stream).
 
 Engines: ``FakeEngine`` (CPU: the logs as the admission and the steps write them, scripted accept counts and tokens;
-for tests and for wiring a real P and router to this host without a decode) and ``TkEngine`` (ATOM's ``tk.TkRank``).
-
-``TkEngine`` is not usable yet. Implemented: ``read_outputs`` (rank 0's ``temp:ar_num`` / ``temp:ar_acc``) and
-``wait``; ``check_sampling`` refuses greedy requests. Stubs that raise ``NotImplementedError``:
-
-- ``admit``: ``admit_kernel``'s 176-byte ``AdmitArgs`` (``TkEngine.admit`` gives the layout a static read of its ISA
-  finds; the buffers it names need a ``TKSHIM_REC=all`` recording to confirm);
-- ``set_sampling``: ``temp:samp_params`` and the ``sym:sample`` zeroing on all 8 ranks, and greedy's mode-2 graphs
-  (``plan/decode_launches.json`` holds mode 5 only);
-- ``load_kv``: ``pd.convert`` on rank 0 and the planes into all 8 ranks' ``cache:`` buffers (one process a rank);
-- ``step``: the fan-out of a chunk to the 8 rank processes (every rank must replay its graph; a rank alone hangs in
-  the step's cross-rank polls);
-- ``build_toktab``: the DSpark token tables (TileRT ``toktab.build_table``: its embed / mHC / q-kv / kv-extract ops
-  over the vocabulary), which ``tk.alloc.Buffers.toktab`` takes ready-made.
+for tests and for wiring a real P and router to this host without a decode) and ``fanout.RankEngine`` (one worker process
+a GPU: ``tkworker.TkRankWorker`` over ``tk.TkRank``, or ``fanout.FakeRank`` on the CPU).
 """
 
 from __future__ import annotations
@@ -679,86 +667,3 @@ class FakeEngine:
         acc = self.ar_num[1 + acc_from : 1 + acc_from + k]
         n = sum(acc)
         return list(acc), self.ar_acc[1 + tok_from : 1 + tok_from + n]
-
-
-_STUB = {
-    "admit": "admit_kernel's AdmitArgs (176 B) are not built yet: the layout read from its ISA (TkEngine.admit) "
-    "needs a TKSHIM_REC=all recording to confirm which temps it names (TileRT: dsv41_e2e_begin / dsv41_e2e_admit)",
-    "set_sampling": "the sampling mode is not set yet: temp:samp_params and the sym:sample zeroing on all 8 ranks "
-    "(TileRT: dsv41_e2e_set_sampling); greedy needs mode-2 graphs, which plan/decode_launches.json (mode 5) lacks",
-    "load_kv": "the landed KV is not imported yet: pd.convert on rank 0 and the planes into the cache: buffers of all 8 "
-    "rank processes (TileRT: profile.convert + DsV41Graph.import_kv)",
-    "step": "the 8-rank fan-out is not built yet: every rank process must replay its graph k times (TileRT: "
-    "dsv41_e2e_enqueue); one rank alone hangs in the step's cross-rank polls",
-    "toktab": "the DSpark token tables are not built yet (TileRT: toktab.build_table, its embed / mHC / q-kv / "
-    "kv-extract ops over the vocabulary); tk.alloc.Buffers.toktab takes tables built elsewhere",
-}
-
-
-class TkEngine:
-    """The ``DecodeEngine`` over ATOM's TP8 ``tk.TkRank``s (``tk``: this process's, rank 0's; ``peers``: the fan-out
-    to ranks 1..7). Not usable yet: the stubs of the module docstring raise ``NotImplementedError``.
-    """
-
-    name = "tk"
-
-    def __init__(self, tk=None, peers=None):
-        from ..tk import alloc
-
-        self.tk, self.peers = tk, peers
-        self.max_seq_len = alloc.MAX_SEQ_LEN
-        self.num_mtp = NUM_MTP
-        self.stop_token_ids = frozenset({EOS_ID})
-
-    def check_sampling(self, sp: SamplingParams | None) -> None:
-        if sp is None:
-            raise CapabilityUnavailable(
-                "greedy decoding (temperature 0) is not served: it runs TileRT's mode-2 graphs, and this host's plan "
-                "(plan/decode_launches.json) holds the mode-5 (sampling) step only"
-            )
-
-    def set_sampling(self, params: list[int], on: bool) -> None:
-        raise NotImplementedError(_STUB["set_sampling"])
-
-    def admit(
-        self, first_token: int, pos: int, params: list[int] | None = None
-    ) -> None:
-        """Stub. ``admit_kernel<<<64, 256>>>(AdmitArgs)`` on every rank's step stream, outside the graphs. The
-        176-byte ``AdmitArgs`` as a static read of the kernel's ISA finds them (unverified on a GPU; the buffer names
-        are the likely ones, F = the flag at 0x84, L = the limit at 0x80):
-
-        - 0x00 int32* / 0x08 n: zeroed (``plain_acc``); 0x10 / 0x18: ``[F, F ? first : 0, 0...]`` (``ar_acc``);
-          0x20 / 0x28: ``[F, F, 0...]`` (``ar_num``); 0x30 int32[16]: ``[0] = pos - 1``, ``[1] = first``, ``[5] = 1``
-          when F, ``[3] = L`` always (``ctl``);
-        - when F, workgroup 0: 0x38 / 0x40 / 0x48 tokens, positions, n: ``tok[i] = i ? 128799 : first``, ``pos[i] =
-          pos + i`` for ``i < 5`` and ``pos + i < L``, else -1; 0x50 / 0x58 / 0x60 the same without ``i < 5``
-          (``blk_tok`` / ``blk_pos``, ``vtok`` / ``vpos``);
-        - when F, workgroups ``w < n(0x48)``: 0x68 bf16* embedding table, 0x70 bf16* rows: row ``w`` = the 4 mHC copies
-          of the embedding of ``first`` (``w == 0``) or 128799, zeros past the vocabulary (``param:embed`` ->
-          ``temp:X``, the first step's input);
-        - 0x78 pos, 0x7c first, 0x80 L, 0x84 F (int32); 0x88 int64*: when non-null, gets the 4 x int64 at 0x90
-          (``samp_params``; the parameters ride along with ``dsv41_e2e_begin``).
-        """
-        raise NotImplementedError(_STUB["admit"])
-
-    def load_kv(self, received: W.ReceivedRequest, buffer) -> None:
-        raise NotImplementedError(_STUB["load_kv"])
-
-    def step(self, k: int):
-        raise NotImplementedError(_STUB["step"])
-
-    def wait(self, ticket) -> None:
-        ticket.synchronize()  # a torch.cuda.Event recorded after the chunk's replays
-
-    def read_outputs(
-        self, acc_from: int, k: int, tok_from: int
-    ) -> tuple[list[int], list[int]]:
-        t = self.tk.buffers.tensors
-        acc = t["temp:ar_num"][0, 1 + acc_from : 1 + acc_from + k].tolist()
-        n = sum(acc)
-        return acc, t["temp:ar_acc"][0, 1 + tok_from : 1 + tok_from + n].tolist()
-
-
-def build_toktab(*args, **kwargs):
-    """The DSpark token tables of a rank (``toktab:layers.0.*`` / ``toktab:mtp.0.*``). Stub."""
-    raise NotImplementedError(_STUB["toktab"])

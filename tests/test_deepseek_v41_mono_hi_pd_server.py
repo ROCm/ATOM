@@ -35,10 +35,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from atom.models.deepseek_v41.mono.hi.pd import fanout as F
 from atom.models.deepseek_v41.mono.hi.pd import receive as R
 from atom.models.deepseek_v41.mono.hi.pd import server as SV
 from atom.models.deepseek_v41.mono.hi.pd import session as S
+from atom.models.deepseek_v41.mono.hi.pd import tkworker as TW
 from atom.models.deepseek_v41.mono.hi.pd import wire as W
+from atom.models.deepseek_v41.mono.hi.tk import host as H
 
 MAX_SEQ = 1 << 20
 
@@ -452,34 +455,227 @@ def test_decoder_chunks_and_unbegun_path():
     assert S.pack_params(S.SamplingParams(temperature=0.5, seed=-1))[0] == -1
 
 
-def test_tk_engine_stubs():
-    tk = S.TkEngine()
-    assert tk.max_seq_len == MAX_SEQ and tk.num_mtp == 5
-    for call in (
-        lambda: tk.admit(1, 2),
-        lambda: tk.set_sampling([0] * 4, True),
-        lambda: tk.load_kv(None, None),
-        lambda: tk.step(1),
-        S.build_toktab,
-    ):
-        try:
-            call()
-        except NotImplementedError as e:
-            assert "TileRT" in str(e) or "toktab" in str(e)
-        else:
-            raise AssertionError("a stub did not raise")
+# tkserve 11-16, rank 0, the 2nd dsv41_e2e_begin (m7/rec_admit.jsonl seq 52488) and its buffers (the same process's map)
+REC_ADMIT = (
+    "0000ae2fde7e0000400012000000000000003ca2df7e0000400010000000000000800c14557e000040001000000000000078"
+    "7f18707f0000007a7f18707f0000007c7f18707f00000800000000000000007e7f18707f000000807f18707f00000600000000"
+    "0000000000a04d057f000000006018707f0000ad1a0600150a0000000010000100000000867f18707f00002a06090000000000"
+    "0000803f0000803f00000000000000000300000000000000"
+)
+REC_ADDR = {
+    "temp:plain_acc": 0x7EDE2FAE0000,
+    "temp:ar_acc": 0x7EDFA23C0000,
+    "temp:ar_num": 0x7E55140C8000,
+    "temp:ctl": 0x7F70187F7800,
+    "temp:blk_tok": 0x7F70187F7A00,
+    "temp:blk_pos": 0x7F70187F7C00,
+    "temp:vtok": 0x7F70187F7E00,
+    "temp:vpos": 0x7F70187F8000,
+    "param:embed": 0x7F054DA00000,
+    "temp:X": 0x7F7018600000,
+    "temp:samp_params": 0x7F70187F8600,
+}
+
+
+def test_admit_args_rebuild_recorded_blob():
+    # dsv41_e2e_begin(first 2581, pos 400045, pack_params(temperature 1, seed 591402)): the .so's sampling counter is
+    # the 4th word (3: set_sampling made it 1, this is the 2nd begin)
+    params = S.pack_params(S.SamplingParams(temperature=1.0, seed=591402))
+    assert params[3] == 0
+    blob = H.admit_args(REC_ADDR, 2581, 400045, True, params[:3] + [3])
+    assert blob == bytes.fromhex(REC_ADMIT)
+    reset = H.admit_args(
+        REC_ADDR, 0, 0, False, None
+    )  # _reset_streams: no parameters, flag 0
+    assert reset[:0x78] == blob[:0x78] and reset[0x78:] == bytes(8) + (
+        1 << 20
+    ).to_bytes(4, "little") + bytes(44)
+
+
+@contextmanager
+def rank_stack(nranks=8, timeouts=None, **rank_kw):
+    """The decode server over ``fanout.RankEngine`` and ``nranks`` spawned ``FakeRank`` workers."""
+    group = F.RankGroup(
+        nranks,
+        "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank",
+        rank_kw,
+        timeouts=timeouts,
+    )
     try:
-        tk.check_sampling(None)
+        eng = F.RankEngine(group)
+        info = group.reports[0]
+        recv = R.ReceiveServer(
+            eng.max_seq_len,
+            info["base_ptr"],
+            R.PublishedTransport(info["transport"], {"session_id": info["session_id"]}),
+            port=0,
+            host="127.0.0.1",
+        )
+        app = SV.DecodeServer(recv, S.Decoder(eng), poll_s=0.002, abandon_drain_s=0.3)
+        port = app.start()
+        try:
+            yield group, eng, recv, port
+        finally:
+            app.shutdown()
+            recv.close()
+    finally:
+        group.close()
+
+
+def test_fanout_eight_ranks_end_to_end():
+    buf = torch.zeros(W.HDR_BYTES, dtype=torch.uint8)
+    with rank_stack(eos_at=10) as (group, eng, recv, port):
+        assert [r["rank"] for r in group.reports] == list(range(8))
+        assert len({r["pid"] for r in group.reports}) == 8  # one process a rank
+        send_kv(recv.port, "f1", 1000, buf)
+        status, lines = stream(
+            port,
+            {
+                "rid": "f1",
+                "first_token_id": 12345,
+                "max_tokens": 256,
+                "sampling": {"temperature": 1.0},
+            },
+        )
+        toks, term = read_reply(lines)
+        assert (
+            status == 200
+            and toks == expected(12345, 10)
+            and term["finish_reason"] == "stop"
+        )
+        send_kv(recv.port, "f2", 2000, buf)
+        status, lines = stream(
+            port,
+            {
+                "rid": "f2",
+                "first_token_id": 777,
+                "max_tokens": 23,
+                "sampling": {"temperature": 1.0, "ignore_eos": True},
+            },
+        )
+        toks, term = read_reply(lines)
+        assert (
+            toks == expected(777, 23, eos_at=10) and term["finish_reason"] == "length"
+        )
+        states = [a.json() for a in group.call("state")]
+        logs = [st["log"] for st in states]
+        assert all(lg == logs[0] for lg in logs)  # every rank got the same commands
+        ops = [e[0] for e in logs[0]]
+        assert ops == ["set_sampling", "admit", "load_kv", "admit", "load_kv"]
+        (_, p1, on), (_, f, pos, mtp, p_none) = logs[0][0], logs[0][1]
+        assert on and p1[3] == 1 and (f, pos, mtp, p_none) == (12345, 1000, True, None)
+        _, f, pos, mtp, p2 = logs[0][
+            3
+        ]  # same sampling mode: the parameters ride with the admission
+        assert (
+            (f, pos, mtp) == (777, 2000, True) and p2[1:3] == p1[1:3] and p2[3] == 2
+        )  # [0]: a fresh seed
+        assert eng.counter == 2
+        for st in states:  # each rank's AdmitArgs over its own buffers
+            blob, addr = bytes.fromhex(st["admit_blob"]), st["addr"]
+            assert blob == H.admit_args(addr, 777, 2000, True, p2)
+            assert int.from_bytes(blob[0x88:0x90], "little") == addr["temp:samp_params"]
+        assert (
+            wait_idle(port)["current_rid"] is None
+            and recv.state_snapshot()["rid"] is None
+        )
+
+
+def test_fanout_failures():
+    # an op raising on one rank: RankError with that rank's traceback; the group stays usable
+    g = F.RankGroup(
+        2,
+        "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank",
+        {"fail": {"op": "admit", "rank": 1}},
+    )
+    try:
+        eng = F.RankEngine(g)
+        try:
+            eng.admit(5, 10, None)
+        except F.RankError as e:
+            assert (
+                e.op == "admit"
+                and sorted(e.errors) == [1]
+                and "injected failure" in e.errors[1]
+            )
+        else:
+            raise AssertionError("no RankError")
+        assert len(g.call("state")) == 2 and g.broken is None
+    finally:
+        g.close()
+    # an op not answered in time: RankTimeout, then the group is broken
+    g = F.RankGroup(
+        2,
+        "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank",
+        {"hang": {"op": "step", "rank": 1, "s": 5}},
+        timeouts={"step": 0.3},
+    )
+    try:
+        t = time.monotonic()
+        try:
+            g.call("step", [1, 1])
+        except F.RankTimeout as e:
+            assert "[1]" in str(e) and time.monotonic() - t < 3
+        else:
+            raise AssertionError("no RankTimeout")
+        try:
+            g.call("state")
+        except F.RankGroupBroken:
+            pass
+        else:
+            raise AssertionError("a broken group answered")
+    finally:
+        g.close(graceful=False)
+    # a worker gone: RankDied at once, not at the timeout
+    g = F.RankGroup(
+        2,
+        "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank",
+        {"hang": {"op": "sync", "rank": 0, "s": 30}},
+    )
+    try:
+        g.procs[1].kill()
+        g.procs[1].join(5)
+        t = time.monotonic()
+        try:
+            g.call("state")
+        except F.RankDied as e:
+            assert "[1]" in str(e) and time.monotonic() - t < 3
+        else:
+            raise AssertionError("no RankDied")
+    finally:
+        g.close(graceful=False)
+    # a backend that cannot start: its traceback at startup
+    try:
+        F.RankGroup(
+            2, "atom.models.deepseek_v41.mono.hi.pd.fanout:FakeRank", {"no_such_arg": 1}
+        )
+    except F.RankError as e:
+        assert e.op == "hello" and "no_such_arg" in e.errors[0]
+    else:
+        raise AssertionError("bad backend started")
+
+
+def test_tk_worker_stubs_and_greedy():
+    try:
+        TW.build_toktab(None, 0)
+    except NotImplementedError as e:
+        assert "toktab" in str(e)
+    else:
+        raise AssertionError("build_toktab did not raise")
+    eng = F.RankEngine.__new__(F.RankEngine)
+    eng._S, eng.greedy = S, False
+    try:
+        eng.check_sampling(None)
     except S.CapabilityUnavailable as e:
         assert "mode-2" in str(e)
     else:
         raise AssertionError("greedy accepted")
-    tk.check_sampling(S.SamplingParams())
+    eng.check_sampling(S.SamplingParams())
 
 
 def test_imports_without_gpu_stack():
     code = (
-        "import sys; import atom.models.deepseek_v41.mono.hi.pd.server, atom.models.deepseek_v41.mono.hi.pd.session; "
+        "import sys; import atom.models.deepseek_v41.mono.hi.pd.server, atom.models.deepseek_v41.mono.hi.pd.tkworker; "
         "print(sorted({m.split('.')[0] for m in sys.modules} & {'aiter', 'flydsl', 'triton'}))"
     )
     env = {

@@ -20,9 +20,13 @@
 
 Every rank of the TP group runs the same sequence: the kernels poll each other's ``sym:`` slots within a step.
 
-Not here (TileRT runs them outside the step graphs, and the recording has none of them): the per-request
-``admit_kernel`` (``AdmitArgs``) that seeds the device state of a request, and the token tables' build
-(``toktab.build_table``: the scope's first block for every token). ``admit(blob)`` takes a recorded ``AdmitArgs`` blob;
+A request's device work outside the step graphs, as TileRT's ``dsv41_e2e_set_sampling`` / ``dsv41_e2e_begin`` /
+``dsv41_e2e_admit`` / ``DsV41Graph.import_kv`` do it (each on the current stream, stream-ordered after any step still
+in flight): ``set_sampling(params)`` (``temp:samp_params`` <- 4 x int64, ``sym:sample`` zeroed), ``admit_request``
+(``admit_kernel<<<64, 256>>>`` with ``admit_args``, the 176-byte ``AdmitArgs`` built from this rank's buffers),
+``import_planes`` (a converted request's planes into the caches) and ``read_logs`` (``ar_num`` / ``ar_acc``).
+
+Not here: the token tables' build (TileRT ``toktab.build_table``: the scope's first block for every token);
 ``Buffers.toktab`` takes tables built elsewhere.
 
 How to validate on GPU (the CPU checks: ``tk.check``):
@@ -44,8 +48,74 @@ How to validate on GPU (the CPU checks: ``tk.check``):
 
 from __future__ import annotations
 
+import struct
+
 from ..plan import decode_launches as DL
 from . import alloc
+
+# ---------------------------------------------------------------------------------------------------------------
+# admit_kernel (outside the graphs; tkshim recording of 2026-11-16, m7/rec_admit.jsonl, checked by ``check.check_admit``)
+
+ADMIT_SYMBOL = (
+    "_ZN6tilert3lib13ds_v4_1_flash12_GLOBAL__N_112admit_kernelENS2_9AdmitArgsE"
+)
+ADMIT_GRID, ADMIT_BLOCK = (64, 1, 1), (256, 1, 1)
+ADMIT_BYTES = 176
+ADMIT_PAD = (
+    0x0C,
+    0x1C,
+    0x2C,
+    0x4C,
+    0x64,
+)  # the 4 bytes after each int32 count: TileRT leaves them uninitialized
+VERIFY_ROWS = 6  # a DSpark step's target rows: the token and 5 drafts
+
+
+def stream_len(cap: int) -> int:
+    """The ``ar_acc`` / ``ar_num`` logs' length (TileRT ``e2e_graph.stream_len``)."""
+    return cap + 64
+
+
+def admit_args(
+    addr: dict,
+    first: int,
+    pos: int,
+    mtp: bool,
+    params: list[int] | None = None,
+    cap: int = alloc.MAX_SEQ_LEN,
+) -> bytes:
+    """``AdmitArgs`` (176 B) of one rank, ``addr`` its ``{buffer name: address}``. ``mtp`` is TileRT's flag (1 for a
+    request, 0 for ``_reset_streams``); ``params`` the 4 x int64 ``samp_params`` (``dsv41_e2e_begin``: ``pack_params``'
+    first three and the .so's sampling counter, which ``dsv41_e2e_set_sampling`` and ``dsv41_e2e_begin`` each bump),
+    or None (``dsv41_e2e_admit``: ``samp_params`` untouched).
+
+    The kernel (ISA, matching the recording): zeroes ``plain_acc``; ``ar_acc = [mtp, mtp ? first : 0, 0...]``,
+    ``ar_num = [mtp, mtp, 0...]``; ``ctl[0] = pos - 1``, ``ctl[1] = first``, ``ctl[5] = 1`` when mtp, ``ctl[3] = cap``;
+    when mtp: ``blk_tok`` / ``vtok`` = ``[first, 128799 (pad)...]``, ``blk_pos = [pos .. pos + 4, -1, -1, -1]``, ``vpos =
+    [pos .. pos + 5]``, rows 0..7 of ``X`` the 4 mHC copies of the embedding of ``first`` / the pad; ``samp_params`` <-
+    ``params`` when given."""
+    b = bytearray(ADMIT_BYTES)
+    n = stream_len(cap)
+    for off, name, count in (
+        (0x00, "temp:plain_acc", n + cap // 8),
+        (0x10, "temp:ar_acc", n),
+        (0x20, "temp:ar_num", n),
+    ):
+        struct.pack_into("<Qi", b, off, addr[name], count)
+    struct.pack_into("<Q", b, 0x30, addr["temp:ctl"])
+    struct.pack_into(
+        "<QQi", b, 0x38, addr["temp:blk_tok"], addr["temp:blk_pos"], alloc.ROWS
+    )
+    struct.pack_into("<QQi", b, 0x50, addr["temp:vtok"], addr["temp:vpos"], VERIFY_ROWS)
+    struct.pack_into("<QQ", b, 0x68, addr["param:embed"], addr["temp:X"])
+    struct.pack_into("<iiii", b, 0x78, int(pos), int(first), cap, int(bool(mtp)))
+    if params is not None:
+        if len(params) != 4:
+            raise ValueError(f"samp_params: 4 int64, got {len(params)}")
+        struct.pack_into(
+            "<Q4q", b, 0x88, addr["temp:samp_params"], *(int(p) for p in params)
+        )
+    return bytes(b)
 
 
 def _zero_junk(spec):
@@ -210,9 +280,15 @@ class TkRank:
         self.steps += 1
 
     def admit(
-        self, blob: bytes, symbol: str, grid=(64, 1, 1), block=(256, 1, 1)
+        self,
+        blob: bytes,
+        symbol: str = ADMIT_SYMBOL,
+        grid=ADMIT_GRID,
+        block=ADMIT_BLOCK,
     ) -> None:
-        """``admit_kernel`` with a recorded ``AdmitArgs`` blob (module docstring: not in the plan)."""
+        """``admit_kernel`` with an ``AdmitArgs`` blob (``admit_args``, or a recording's) on the current stream; the
+        launcher needs ``ADMIT_SYMBOL`` (``load_kernels(table, extra=(ADMIT_SYMBOL,))``).
+        """
         import ctypes
 
         import torch
@@ -229,3 +305,61 @@ class TkRank:
             torch.cuda.current_stream(self.device).cuda_stream,
             params,
         )
+
+    # ---- a request's device work outside the graphs
+    def _addr(self) -> dict:
+        if getattr(self, "_own_addr", None) is None:
+            self._own_addr = self.address_map()[self.rank]
+        return self._own_addr
+
+    def admit_request(
+        self, first: int, pos: int, mtp: bool = True, params: list[int] | None = None
+    ) -> None:
+        """TileRT's ``dsv41_e2e_begin`` (``params`` given) / ``dsv41_e2e_admit`` on this rank."""
+        if mtp and not 0 < pos < alloc.MAX_SEQ_LEN:
+            raise ValueError(f"admit: pos {pos} outside (0, {alloc.MAX_SEQ_LEN})")
+        self.admit(admit_args(self._addr(), first, pos, mtp, params))
+
+    def set_sampling(self, params: list[int]) -> None:
+        """TileRT's ``set_sampling`` on this rank: ``sym:sample`` zeroed, ``temp:samp_params`` <- ``params`` (4 x
+        int64, the counter included); the mode is the captured graphs' (mode 5, sampling).
+        """
+        import torch
+
+        from atom.mono.runtime.uncached import DeviceBytes
+
+        b = self.buffers
+        base = b.peer_bases[self.rank] + b.sym_offsets["sample"]
+        sym = torch.as_tensor(
+            DeviceBytes(base, alloc.SYM_BYTES["sample"]), device=self.device
+        )
+        sym.zero_()
+        src = torch.tensor([int(p) for p in params], dtype=torch.int64)
+        b.tensors["temp:samp_params"].copy_(src.to(self.device, non_blocking=False))
+
+    def import_planes(self, planes: dict, n: int) -> None:
+        """TileRT's ``DsV41Graph.import_kv(planes, n, 0)`` on this rank (``pd.convert`` planes, on this device)."""
+        t = self.buffers.tensors
+        for s, ratio in alloc.KV_SOURCES.items():
+            for name in ("main_kv", "index_k"):
+                for j, src in enumerate(planes[name][s]):
+                    t[f"cache:{name}.{s}.{j}"][: n // ratio].copy_(
+                        src, non_blocking=True
+                    )
+        for i, (kv, sc) in enumerate(planes["win"]):
+            t[f"cache:win.{i}.kv"].copy_(
+                kv.view(t[f"cache:win.{i}.kv"].dtype), non_blocking=True
+            )
+            t[f"cache:win.{i}.s"].copy_(sc, non_blocking=True)
+        for s, st in planes["state"].items():
+            t[f"cache:state.{s}"].copy_(st, non_blocking=True)
+        t["temp:hist"].copy_(planes["hist"], non_blocking=True)
+
+    def read_logs(
+        self, acc_from: int, k: int, tok_from: int
+    ) -> tuple[list[int], list[int]]:
+        """``ar_num[1 + acc_from :][:k]`` (each step's accepted count) and the accepted tokens after ``tok_from``."""
+        t = self.buffers.tensors
+        acc = t["temp:ar_num"][0, 1 + acc_from : 1 + acc_from + k].tolist()
+        n = sum(acc)
+        return acc, t["temp:ar_acc"][0, 1 + tok_from : 1 + tok_from + n].tolist()

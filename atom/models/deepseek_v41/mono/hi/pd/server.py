@@ -28,9 +28,11 @@ Each finished, refused or failed request resets the decoder and releases the rec
 a late P of it is refused). The HTTP server is the standard library's (threads, HTTP/1.1, chunked streaming), bound
 dual-stack on ``::`` as TileRT's uvicorn is.
 
-``python -m atom.models.deepseek_v41.mono.hi.pd.server``: ``--engine tk`` (ATOM's TkRank decode; not usable yet,
-``session.TkEngine``) or ``--engine fake`` (``session.FakeEngine``: the receive path, the KV header check and the
-router protocol with scripted tokens, to wire a real P and router to this host before the decode is ready).
+``python -m atom.models.deepseek_v41.mono.hi.pd.server``: ``--engine tk`` (8 ``tkworker.TkRankWorker`` processes behind
+``fanout.RankEngine``; rank 0's worker owns the receive buffer and its Mooncake registration, this process only the
+control plane and HTTP; needs ``--toktab-dir`` until the token tables are built here) or ``--engine fake``
+(``session.FakeEngine``: the receive path, the KV header check and the router protocol with scripted tokens, to wire a
+real P and router to this host before the decode is ready).
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import fanout as F
 from . import receive as R
 from . import session as S
 from . import wire as W
@@ -575,17 +578,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--pd-buffer-device",
         choices=["cuda", "cpu"],
         default="cuda",
-        help="cpu: plain host memory (TileRT's pinned huge pages are not ported)",
+        help="fake engine: cpu = plain host memory (TileRT's pinned huge pages are not ported)",
+    )
+    ap.add_argument("--co", help="tk: TileRT's code objects (*.co)")
+    ap.add_argument("--swap", help="tk: a swap table of FlyDSL builds")
+    ap.add_argument(
+        "--toktab-dir", help="tk: the token tables, rank<r>.pt (TileRT's g.toktab[r])"
+    )
+    ap.add_argument(
+        "--dist-port", type=int, default=29561, help="tk: the workers' gloo group"
     )
     return ap
 
 
 def build_engine(args):
+    """``(engine, receive server)``: the fake engine with its own buffer, or the rank group whose rank 0 owns it."""
     if args.engine == "fake":
-        return S.FakeEngine(max_seq_len=args.max_seq_len)
-    raise NotImplementedError(
-        "--engine tk: the TkRank decode is not usable yet (session.TkEngine's stubs: admit, set_sampling, load_kv, "
-        "the 8-rank step fan-out, build_toktab)"
+        engine = S.FakeEngine(max_seq_len=args.max_seq_len)
+        device = "cpu" if args.pd_buffer_device == "cpu" else "cuda:0"
+        return engine, R.open_receive_server(
+            args.max_seq_len, args.ctrl_port, args.transport, device=device
+        )
+    if not (args.model_weights_dir and args.co):
+        raise SystemExit("--engine tk needs --model-weights-dir and --co")
+    kw = {
+        "ckpt": args.model_weights_dir,
+        "co": args.co,
+        "toktab_dir": args.toktab_dir,
+        "swap": args.swap,
+        "dist_addr": f"127.0.0.1:{args.dist_port}",
+        "mooncake_host": W.local_ip(),
+    }
+    group = F.RankGroup(
+        8, "atom.models.deepseek_v41.mono.hi.pd.tkworker:TkRankWorker", kw
+    )
+    engine = F.RankEngine(group)
+    info = group.reports[0]
+    published = R.PublishedTransport(
+        info["transport"], {"session_id": info["session_id"]}
+    )
+    return engine, R.ReceiveServer(
+        args.max_seq_len, info["base_ptr"], published, port=args.ctrl_port
     )
 
 
@@ -609,17 +642,13 @@ def main(argv=None) -> None:
             f"--kv-cache-dtype {args.kv_cache_dtype}: the prefill must run fp8_ds_mla"
         )
     try:
-        engine = build_engine(args)
-    except NotImplementedError as e:
+        engine, receive = build_engine(args)
+    except (NotImplementedError, F.RankError) as e:
         raise SystemExit(str(e)) from None
     if engine.max_seq_len != args.max_seq_len:
         raise SystemExit(
             f"--max-seq-len {args.max_seq_len}: the engine serves {engine.max_seq_len}"
         )
-    device = "cpu" if args.pd_buffer_device == "cpu" else "cuda:0"
-    receive = R.open_receive_server(
-        args.max_seq_len, args.ctrl_port, args.transport, device=device
-    )
     server = DecodeServer(receive, S.Decoder(engine, ar_steps=S.AR_STEPS))
     logger.info(
         "decode host: engine=%s, ctrl=:%d, http=:%d",
