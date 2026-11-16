@@ -61,9 +61,15 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   any_kv_low      = any prefillable rank below the low KV watermark
   any_partial     = any rank mid-chunked-prefill
   any_prefill_ran = any rank completed a prefill forward on the previous tick
+  n_full          = #prefillable ranks whose resumable partials plus the waiting
+                    requests that fit their free seq slots fill a prefill
+                    chunk (initial ramp only)
 
   if any_prefill_ran:                              arm decode interval
-  if post-prefill decode interval is active and decode exists:
+  if G_running_dec == 0:                          re-arm the initial ramp
+  elif n_full < dp_size or any_kv_high:           end the initial ramp
+  if post-prefill decode interval is active, decode exists and the
+     initial ramp is off or has ended:
       stall = 0 if the group's work changed;      HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
   # -- must-fire bounds (release even if unaligned / underfilled) --
@@ -71,6 +77,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if any_kv_high or any_kv_low:                   FIRE   # KV pressure / starvation
   if any_queue_hot:                             FIRE   # queue age bound
   if hold_ticks >= ttft_max_ticks:                FIRE   # TTFT bound
+  # -- prefill_admit_policy adaptive (see below) --
+  if adaptive and the initial ramp is on:         FIRE   # every rank fills a chunk
+  if adaptive:                                    rent-or-buy FIRE / HOLD
   if any_partial and hold_ticks >= partial_max_ticks: FIRE  # partial holds KV — tight bound
   # -- adaptive give-up: the group's work stopped changing --
   if G_pending > prev_G_pending or n_prefillable != prev_n_prefillable
@@ -103,7 +112,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over an 11-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over a 12-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. The cost gate's step
@@ -130,7 +139,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 11
+_FIXED_SLOTS = 12
 
 
 class _Gate(NamedTuple):
@@ -278,6 +287,7 @@ class PrefillDelayer:
         "_prev_prefillable",
         "_prev_running_dec",
         # buffer / episode state
+        "_ramp_done",
         "_rank",
         "_reduce_buf",
         "_stall_count",
@@ -292,12 +302,14 @@ class PrefillDelayer:
         "_stat_fire_nodecode",
         "_stat_fire_partial",
         "_stat_fire_queue_ms",
+        "_stat_fire_ramp",
         "_stat_fire_stall",
         "_stat_fire_ttft",
         "_stat_fire_vacuous",
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
+        "_stat_ramp",
         "admit_policy",
         "cpu_group",
         "dp_size",
@@ -306,6 +318,7 @@ class PrefillDelayer:
         "max_queue_ms",
         "partial_max_ticks",
         "prefill_decode_interval",
+        "prefill_ramp",
         "rank_prefill_costs",
         "stall_ticks",
         "target_fill",
@@ -326,6 +339,7 @@ class PrefillDelayer:
         token_usage_low_watermark: float | None = None,
         max_queue_ms: float | None = None,
         prefill_decode_interval: int = 0,
+        prefill_ramp: bool = False,
         exchange_prefill_costs: bool = False,
         cost_gate: bool = False,
         clock=time.perf_counter,
@@ -388,6 +402,10 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
+        # Initial ramp (one-shot): while every rank can fill a whole prefill chunk
+        # from waiting requests that fit its free seq slots, the interval policy
+        # skips the interval and the adaptive policy releases at once.
+        self.prefill_ramp = bool(prefill_ramp)
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
@@ -406,6 +424,8 @@ class PrefillDelayer:
         #                                head cannot be admitted)
         #   slot 10 = unreachable flag  (SUM → n_unreachable; no prefill and no
         #                                decode completion within the hold)
+        #   slot 11 = full_chunk flag   (SUM → n_full; waiting requests that fit
+        #                                the free seq slots fill a prefill chunk)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -471,6 +491,7 @@ class PrefillDelayer:
         # (mirrors SGL PR #19836's skip_first).
         self._first = True
         self._decode_interval_remaining = 0
+        self._ramp_done = False
         self._prefill_executed_since_last_decision = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
@@ -486,8 +507,10 @@ class PrefillDelayer:
         self._stat_fire_nodecode = 0
         self._stat_fire_queue_ms = 0
         self._stat_fire_vacuous = 0
+        self._stat_fire_ramp = 0
         self._stat_hold = 0
         self._stat_hold_decode_interval = 0
+        self._stat_ramp = 0
         self._stat_log_every = int(
             os.environ.get("ATOM_PREFILL_DELAYER_LOG_EVERY", "1000")
         )
@@ -521,12 +544,19 @@ class PrefillDelayer:
     def is_local(self) -> bool:
         return self.dp_size == 1 and self.cpu_group is None
 
+    @property
+    def ramp_active(self) -> bool:
+        """The initial ramp is on: the decode interval is skipped while every
+        rank can still fill a whole prefill chunk."""
+        return self.prefill_ramp and not self._ramp_done
+
     def protects_decode(self, running_decode_batch: int) -> bool:
         """Whether the local decision can skip cache probes during protection."""
         return (
             self.is_local
             and not self._first
             and running_decode_batch > 0
+            and not self.ramp_active
             and (
                 self._decode_interval_remaining > 0
                 or (
@@ -549,6 +579,7 @@ class PrefillDelayer:
         arrived_requests: int = 0,
         next_completion_steps: int | None = None,
         admittable_requests: int | None = None,
+        full_chunk: bool = False,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -596,6 +627,9 @@ class PrefillDelayer:
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
+            full_chunk: (prefill ramp) the waiting requests that fit this rank's
+                free seq slots, plus resumable partials, fill a prefill chunk
+                (`target_fill` of `max_num_batched_tokens`).
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -638,6 +672,7 @@ class PrefillDelayer:
         self._reduce_buf[8] = int(arrived_requests)
         self._reduce_buf[9] = 1 if blocked else 0
         self._reduce_buf[10] = 1 if unreachable else 0
+        self._reduce_buf[11] = 1 if prefillable and full_chunk else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -721,6 +756,7 @@ class PrefillDelayer:
             g_arrived,
             n_blocked,
             n_unreachable,
+            n_full,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -748,6 +784,13 @@ class PrefillDelayer:
             self._reset()
             return True
 
+        # The initial ramp ends for good once a rank can no longer fill a prefill
+        # chunk from its free seq slots, or KV runs high; an idle group re-arms it.
+        if g_running_dec == 0:
+            self._ramp_done = False
+        elif not self._ramp_done and (n_full < self.dp_size or any_kv_high):
+            self._ramp_done = True
+
         # Hard post-prefill decode protection. The countdown is identical on
         # all ranks because it is armed from the globally reduced execution
         # signal and schedule() calls this method in lockstep. Do not advance the
@@ -755,7 +798,11 @@ class PrefillDelayer:
         # invoking PrefillDelayer, so its delay budget starts afterwards.
         if self._decode_interval_remaining > 0:
             self._decode_interval_remaining -= 1
-            if n_prefillable > 0 and g_running_dec > 0:
+            if self.ramp_active and n_prefillable > 0 and g_running_dec > 0:
+                # Ramp: every rank already fills a whole chunk, so the interval
+                # would only leave slots empty; the coalescer decides this tick.
+                self._stat_ramp += 1
+            elif n_prefillable > 0 and g_running_dec > 0:
                 # Not a coalescer tick, so the stall count does not advance,
                 # but work that arrives in the window still restarts it.
                 if self._work_changed(g_pending, n_prefillable, g_arrived):
@@ -784,6 +831,10 @@ class PrefillDelayer:
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
         if self.admit_policy == "adaptive":
+            # Initial ramp: every rank fills a whole chunk from its free seq
+            # slots, so the rent-or-buy wait would only leave them empty.
+            if self.ramp_active:
+                return self._fire("ramp", g_pending)
             return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
@@ -902,7 +953,8 @@ class PrefillDelayer:
             self._decode_tick_us = _ema(self._decode_tick_us, step_s * 1e6)
 
     def _fire(self, reason: str, g_pending: int) -> bool:
-        # reason ∈ {fill, stall, cost, ttft, kv, partial, nodecode, queue_ms};
+        # reason ∈ {fill, stall, cost, ttft, kv, partial, nodecode, queue_ms,
+        # adaptive, adaptcap, ramp};
         # each maps to a dedicated _stat_fire_<reason> slot so the log shows
         # what released.
         attr = f"_stat_fire_{reason}"
@@ -1044,6 +1096,7 @@ class PrefillDelayer:
             + self._stat_fire_nodecode
             + self._stat_fire_queue_ms
             + self._stat_fire_vacuous
+            + self._stat_fire_ramp
             + self._stat_fire_adaptive
             + self._stat_fire_adaptcap
             + self._stat_hold
@@ -1063,6 +1116,8 @@ class PrefillDelayer:
                 f"fire_queue_ms={self._stat_fire_queue_ms} "
                 f"fire_vacuous={self._stat_fire_vacuous} "
                 f"hold_decode_interval={self._stat_hold_decode_interval} "
+                f"ramp={self._stat_ramp} "
+                f"fire_ramp={self._stat_fire_ramp} "
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )

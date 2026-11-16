@@ -1477,7 +1477,7 @@ class Scheduler:
         if self.engine_stats.window_expired(now):
             self._record_throughput()
 
-    def _waiting_new_token_count(self) -> int:
+    def _waiting_new_token_count(self, max_seqs: int | None = None) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
         saturated at `max_num_batched_tokens`.
 
@@ -1494,10 +1494,13 @@ class Scheduler:
         batch has accumulated. The `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
+        ``max_seqs`` counts only that many admittable seqs (the free seq slots).
         """
         cap = self.max_num_batched_tokens
         total = 0
         for seq in self.waiting:
+            if max_seqs is not None and max_seqs <= 0:
+                break
             if self._unschedulable_reason(seq) is not None:
                 continue
             if seq.status in (
@@ -1514,6 +1517,8 @@ class Scheduler:
             total += max(0, num_new_tokens)
             if total >= cap:
                 return cap
+            if max_seqs is not None:
+                max_seqs -= 1
         return total
 
     def _partial_prefill_remaining_tokens(self) -> int:
@@ -2161,6 +2166,17 @@ class Scheduler:
                 else 0.0
             )
             waiting_requests = len(self.waiting) + self._partial_prefill_count
+            # Prefill ramp: a whole chunk is ready from the waiting heads that
+            # fit the free seq slots, so delaying it only leaves slots empty.
+            full_chunk = (
+                prefillable
+                and self.prefill_delayer.ramp_active
+                and self._partial_prefill_remaining_tokens()
+                + self._waiting_new_token_count(
+                    max_seqs=max(0, self.max_num_seqs - len(self.running))
+                )
+                >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
+            )
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2192,6 +2208,7 @@ class Scheduler:
                     len(self.waiting),
                     max(0, self.max_num_seqs - len(self.running)),
                 ),
+                full_chunk=full_chunk,
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)

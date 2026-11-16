@@ -1536,6 +1536,18 @@ class TestWaitingNewTokenCount:
         )
         assert sched._waiting_new_token_count() == 18
 
+    def test_max_seqs_counts_only_free_slots(self, seq_factory):
+        sched = self._sched()
+        remote = seq_factory(list(range(10)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque(
+            [seq_factory(list(range(8))), remote, seq_factory(list(range(6)))]
+            + [seq_factory(list(range(5)))]
+        )
+        # A skipped seq takes no slot: two slots hold the 8- and 6-token heads.
+        assert sched._waiting_new_token_count(max_seqs=2) == 14
+        assert sched._waiting_new_token_count(max_seqs=0) == 0
+
     def test_skips_remote_kv_seqs(self, seq_factory):
         sched = self._sched()
         normal = seq_factory(list(range(8)))
@@ -1762,6 +1774,7 @@ class _LocalDelayer:
     max_queue_ms = None
     ttft_max_ticks = 5
     rank_prefill_costs = ()
+    ramp_active = False
 
     def protects_decode(self, running_decode_batch):
         return False
