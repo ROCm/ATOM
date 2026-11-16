@@ -16,11 +16,13 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Lock, RLock, Thread, local
+from typing import Any
 
 import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.distributed.kv_events import offset_endpoint
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
@@ -53,7 +55,7 @@ from atom.model_engine.engine_utility import (
     completes_weight_sync,
     kv_change,
 )
-from atom.model_engine.prefix_hash import take_shipped_chains
+from atom.model_engine.prefix_hash import hash_block_size_for, take_shipped_chains
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -167,6 +169,27 @@ def iter_dp_rank_assignments(config) -> list[tuple[int, int]]:
     ]
 
 
+def kv_event_sources(config) -> dict[str, dict[str, Any]]:
+    """Where each engine on this node publishes KV events (`/kv_event_sources`),
+    keyed by the global DP rank its publisher binds for: the endpoint after the
+    per-rank offset (a wildcard host stays a wildcard), the topic, and the
+    tokens per hashed block. Empty with events off or the null publisher."""
+    events = config.kv_events_config
+    if not events.enable or events.publisher == "null":
+        return {}
+    block_size = hash_block_size_for(
+        config.kv_cache_block_size, config.decode_context_parallel_size
+    )
+    return {
+        str(rank): {
+            "endpoint": offset_endpoint(events.endpoint, rank),
+            "topic": events.topic,
+            "block_size": block_size,
+        }
+        for rank, _ in iter_dp_rank_assignments(config)
+    }
+
+
 def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     """How many DP-attention EngineCores to launch for a `logical`-wide run.
 
@@ -259,6 +282,8 @@ class CoreManager:
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
+        # Fixed for the engines' lifetime, so `/kv_event_sources` serves it as is.
+        self.kv_event_sources = kv_event_sources(config)
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
@@ -1068,12 +1093,12 @@ class CoreManager:
                 self.structured_request_prepare(structured)
                 self._add_prepared_requests(seqs)
             except BaseException:
-                self._release_structured_requests(structured)
+                self._release_constraints(structured)
                 raise
         else:
             self._add_prepared_requests(seqs)
 
-    def _release_structured_requests(self, seqs):
+    def _release_constraints(self, seqs):
         # The submitted/finished sequences own the cleanup information. There
         # is no cross-thread registry: workers tolerate repeated releases.
         ids = [seq.id for seq in seqs if is_structured(seq)]
@@ -1081,9 +1106,7 @@ class CoreManager:
             return
         try:
             # Never wait for an RPC reply on the output receiver thread.
-            self.broadcast_utility_command(
-                "release_structured_requests", request_ids=ids
-            )
+            self.broadcast_utility_command("release_constraints", request_ids=ids)
         except Exception:
             # Cleanup must neither interrupt terminal delivery nor hide the
             # original admission failure. Worker teardown also frees state.
@@ -1631,7 +1654,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        self._release_structured_requests([seq])
+        self._release_constraints([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False
