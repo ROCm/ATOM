@@ -34,9 +34,11 @@ workspace_real=$(realpath "$GITHUB_WORKSPACE")
 shared_real=$(realpath -m "$SHARED_ROOT")
 [[ "$shared_real" != "$workspace_real" && "$shared_real" != "$workspace_real/"* ]]
 mkdir -p "$SHARED_SOURCE" "$LOG_ROOT"
-cp -a "$GITHUB_WORKSPACE/." "$SHARED_SOURCE/"
+cp -R --no-preserve=mode,ownership,timestamps "$GITHUB_WORKSPACE/." "$SHARED_SOURCE/"
 export CURRENT_USER="$(id -un)"
-export SLURM_CANCEL_HELPER="$GITHUB_WORKSPACE/review-evidence/slurm-cancel.sh"
+cancel_dir="/tmp/pr-review-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}-${PR}"
+mkdir -p "$cancel_dir"
+export SLURM_CANCEL_HELPER="$cancel_dir/slurm-cancel.sh"
 export SLURM_LOG_POLL_INTERVAL=30
 source "$GITHUB_WORKSPACE/.github/scripts/slurm_submit_helpers.sh"
 detect_slurm_backend
@@ -49,6 +51,8 @@ submitted=$("${SBATCH_CMD[@]}")
 JOB_ID=$(parse_sbatch_job_id "$submitted")
 printf '%s\n' "$JOB_ID" > "$GITHUB_WORKSPACE/review-evidence/slurm-job-id.txt"
 write_slurm_cancel_helper "$JOB_ID"
+cp --no-preserve=mode,ownership,timestamps "$SLURM_CANCEL_HELPER" \
+  "$GITHUB_WORKSPACE/review-evidence/slurm-cancel.sh"
 set_slurm_job_log_paths "$JOB_ID"
 SLURM_STATUS_DIR="$LOG_ROOT"
 SLURM_STATUS_RANKS=1

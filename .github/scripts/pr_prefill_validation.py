@@ -51,12 +51,31 @@ def run(argv, log, *, env=None, timeout=3600):
 def model_path(model):
     target = Path("/models") / model
     if Path("/models").is_dir():
+        index = target / "model.safetensors.index.json"
+        if (target / "config.json").is_file() and index.is_file():
+            shards = set(json.loads(index.read_text())["weight_map"].values())
+            if shards and all(
+                (target / shard).is_file() and (target / shard).stat().st_size > 0
+                for shard in shards
+            ):
+                save(
+                    OUT / (model.replace("/", "-") + "-cache.json"),
+                    {
+                        "path": str(target),
+                        "shards_present": len(shards),
+                        "refreshed": False,
+                    },
+                )
+                return str(target)
         env = dict(
             os.environ,
             MODEL_ID=model,
             TARGET_DIR=str(target),
             MODEL_DOWNLOAD_TIMEOUT="30m",
             MODEL_LOCK_WAIT_SECONDS="1800",
+            MODEL_STAGING_ROOT="/models/.atom-model-staging",
+            MODEL_LOCK_ROOT="/models/.atom-model-locks",
+            MODEL_ENABLE_REMOTE_REVISION_CHECK="0",
         )
         rc = run(
             ["bash", ".github/scripts/download_model_with_lock.sh", model, str(target)],
@@ -146,7 +165,16 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
     folder = OUT / name
     folder.mkdir()
     subprocess.run(
-        ["git", "-c", "safe.directory=/workspace", "checkout", "--detach", sha],
+        [
+            "git",
+            "-c",
+            "safe.directory=/workspace",
+            "-c",
+            "core.filemode=false",
+            "checkout",
+            "--detach",
+            sha,
+        ],
         cwd=ROOT,
         check=True,
     )
@@ -155,6 +183,8 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
             "git",
             "-c",
             "safe.directory=/workspace",
+            "-c",
+            "core.filemode=false",
             "diff",
             "--exit-code",
             "HEAD",
@@ -209,6 +239,11 @@ def scenario(sha, name, model, *, mono="0", payload="0"):
         "model_config_sha256": hashlib.sha256(
             (Path(model) / "config.json").read_bytes()
         ).hexdigest(),
+        "model_revision": (
+            (Path(model) / ".hf-revision").read_text().strip()
+            if (Path(model) / ".hf-revision").is_file()
+            else None
+        ),
     }
     save(folder / "contract.json", metadata)
     with (folder / "server.log").open("w") as log:

@@ -125,9 +125,9 @@ jobs:
           set -euo pipefail
           if [[ -s review-evidence/shared-root.txt ]]; then
             shared=$(cat review-evidence/shared-root.txt)
-            cp -a "$shared/logs/." review-evidence/ || true
+            cp -R --no-preserve=mode,ownership,timestamps "$shared/logs/." review-evidence/ || true
             if [[ -d "$shared/source/review-evidence" ]]; then
-              cp -a "$shared/source/review-evidence/." review-evidence/
+              cp -R --no-preserve=mode,ownership,timestamps "$shared/source/review-evidence/." review-evidence/
             fi
           fi
       - uses: actions/upload-artifact@v7

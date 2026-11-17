@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-runtime=/workspace/.validation-runtime
+runtime=/tmp/atom-pr-review-runtime
+mkdir -p "$runtime"/{home,cache,bin}
 python3 -m venv --system-site-packages "$runtime/venv"
 source "$runtime/venv/bin/activate"
 export PATH="$runtime/bin:$PATH"

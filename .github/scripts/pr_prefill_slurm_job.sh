@@ -6,7 +6,6 @@ job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-}}"
 export CONTAINER_NAME="atom-pr-review-${GITHUB_RUN_ID}-${PR}-${job_id}"
 test -d "$MODEL_ROOT"
 mkdir -p "$SHARED_SOURCE/review-evidence"
-mkdir -p "$SHARED_SOURCE/.validation-runtime"/{home,cache,bin}
 evidence="$SHARED_SOURCE/review-evidence"
 printf 'node=%s\njob=%s\naccount=%s\npartition=%s\nqos=%s\n' \
   "$(hostname)" "$job_id" "$SLURM_ACCOUNT" "$SLURM_PARTITION" "$SLURM_QOS" \
@@ -58,20 +57,20 @@ docker run -dt --pull always --user "$(id -u):$(id -g)" --device=/dev/kfd --devi
   --ipc=host "${group_flags[@]}" --shm-size=16G --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --ulimit stack=67108864 \
   --env-file "$LOG_ROOT/model-env.list" -e HF_TOKEN -e PR -e HEAD_SHA -e BASE_SHA -e AITER_GIT_REF \
-  -e HOME=/workspace/.validation-runtime/home \
-  -e XDG_CACHE_HOME=/workspace/.validation-runtime/cache \
-  -e TORCHINDUCTOR_CACHE_DIR=/workspace/.validation-runtime/cache/torchinductor \
-  -e TRITON_CACHE_DIR=/workspace/.validation-runtime/cache/triton \
-  -e AITER_CACHE_DIR=/workspace/.validation-runtime/cache/aiter \
-  -e AITER_JIT_DIR=/workspace/.validation-runtime/cache/aiter/jit \
-  -e FLYDSL_RUNTIME_CACHE_DIR=/workspace/.validation-runtime/cache/flydsl \
-  -e AITER_SOURCE_PATH=/workspace/.validation-runtime/aiter \
+  -e HOME=/tmp/atom-pr-review-runtime/home \
+  -e XDG_CACHE_HOME=/tmp/atom-pr-review-runtime/cache \
+  -e TORCHINDUCTOR_CACHE_DIR=/tmp/atom-pr-review-runtime/cache/torchinductor \
+  -e TRITON_CACHE_DIR=/tmp/atom-pr-review-runtime/cache/triton \
+  -e AITER_CACHE_DIR=/tmp/atom-pr-review-runtime/cache/aiter \
+  -e AITER_JIT_DIR=/tmp/atom-pr-review-runtime/cache/aiter/jit \
+  -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/atom-pr-review-runtime/cache/flydsl \
+  -e AITER_SOURCE_PATH=/tmp/atom-pr-review-runtime/aiter \
   --name "$CONTAINER_NAME" "$IMAGE"
 docker inspect --format '{{.Image}}' "$CONTAINER_NAME" > "$evidence/image-id.txt"
 cd "$SHARED_SOURCE"
 docker exec "$CONTAINER_NAME" bash /workspace/_review_harness/.github/scripts/pr_prefill_slurm_runtime.sh
 docker exec "$CONTAINER_NAME" bash -c '
-  export PATH="/workspace/.validation-runtime/venv/bin:/workspace/.validation-runtime/bin:$PATH"
+  export PATH="/tmp/atom-pr-review-runtime/venv/bin:/tmp/atom-pr-review-runtime/bin:$PATH"
   export PYTHONPATH="/workspace:$AITER_SOURCE_PATH${PYTHONPATH:+:$PYTHONPATH}"
   exec python /workspace/_review_harness/.github/scripts/pr_prefill_validation.py
 '
