@@ -346,7 +346,8 @@ def select_mc(c, hb, ctr, isrx, G):
     """Every row's top KSEL of its n scores (FULL: n = bound, the ilog row; REINDEX: n = its compacted columns, lifted
     at the emit) -> isel / irow (the tree's final emit), by G CTAs a row (traced: MC_G or MC_G_SHORT): CTA g of row r takes keys
     [g CH, (g + 1) CH), CH = ceil(n / G); 4 radix rounds of 8 bits: its LDS histogram -> global atomics into
-    hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (release / acquire), every CTA of
+    hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (release; the bins read by agent-scope
+    loads, no acquire), every CTA of
     the group scans the 256 bins alike; then the winners: keys above the k-th key's value take positions from
     ctr[r][0], ties from ctr[r][1] (< need). n <= k: all, position = index; past min(n, k): -1 (the group's CTA 0)."""
     t, b, sm, TR = c["t"], c["b"], c["sm"], c["TR"]
@@ -388,10 +389,12 @@ def select_mc(c, hb, ctr, isrx, G):
                     hx.fence_release("agent")
                     hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
                     hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
-                    hx.fence_acquire("agent")
                 gpu.barrier()
                 if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
-                    cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, nt=True) for q in range(8)]
+                    # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
+                    # loads at their scope see them -- as wait_count's see the count; the fence's cache invalidate
+                    # every round cost the group's CTAs)
+                    cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, scope="agent") for q in range(8)]
                     s4 = cs[0]
                     for q in range_constexpr(1, 8):
                         s4 = s4 + cs[q]
