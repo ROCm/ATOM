@@ -497,12 +497,12 @@ direct_register_custom_op(
 
 
 def _resolve_transpose_scale(transpose_scale: bool, row_major_key: int, T: int) -> bool:
-    """The out-norm's row-major x_scale group (``row_major_key``) may hand its
-    GEMMs a row-major E8M0 scale at this T instead of the column-major default."""
+    """The out-norm's x_scale layout rule (``row_major_key``) may hand its GEMMs
+    a row-major E8M0 scale at this T instead of the column-major default."""
     if transpose_scale and row_major_key:
-        from atom.model_ops.linear import row_major_x_scale_for
+        from atom.model_ops.linear import x_scale_row_major
 
-        return not row_major_x_scale_for(row_major_key, T)
+        return not x_scale_row_major(row_major_key, T)
     return transpose_scale
 
 

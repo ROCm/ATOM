@@ -467,50 +467,24 @@ def gemm_a4w4_quant(
     return y[:m, ...]
 
 
-@functools_cache
-def _aiter_row_major_x_scale_query():
-    """aiter's per-shape "row-major x_scale is not slower" query on gfx1250,
-    else None (other archs, or an aiter without it)."""
-    from aiter.jit.utils.chip_info import get_gfx
-
-    if not get_gfx().startswith("gfx1250"):
-        return None
-    try:
-        from aiter.ops.gemm_op_a8w8 import (
-            gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale as query,
-        )
-    except ImportError:
-        return None
-    return query
+# Rules that lay an E8M0 per-1x128 x_scale of M rows out row-major instead of
+# column-major. A producer of such a scale and the GEMMs reading it carry the
+# same int key into their custom ops, so each decides on the concrete M outside
+# torch.compile tracing, and both get the same answer. Key 0: column-major.
+_X_SCALE_ROW_MAJOR_RULES: list[Callable[[int], bool]] = [lambda m: False]
 
 
-def _aiter_takes_row_major_x_scale() -> bool:
-    return _aiter_row_major_x_scale_query() is not None
-
-
-# Row-major x_scale groups: one producer (a norm's fused E8M0 quant) and the
-# (N, K) of every GEMM reading its scale. Key 0 is "always column-major". The
-# key travels into the custom ops as an int so the per-M choice is made on
-# concrete shapes, outside torch.compile tracing.
-_ROW_MAJOR_X_SCALE_GROUPS: list[tuple[tuple[int, int], ...]] = [()]
-
-
-def register_row_major_x_scale_group(shapes: list[tuple[int, int]]) -> int:
-    _ROW_MAJOR_X_SCALE_GROUPS.append(tuple(shapes))
-    return len(_ROW_MAJOR_X_SCALE_GROUPS) - 1
+def register_x_scale_row_major_rule(rule: Callable[[int], bool]) -> int:
+    """A key for ``rule(M) -> row-major``. The rule is first asked at the first
+    forward, after loading, and its answer is kept per M."""
+    _X_SCALE_ROW_MAJOR_RULES.append(rule)
+    return len(_X_SCALE_ROW_MAJOR_RULES) - 1
 
 
 @functools_cache
-def row_major_x_scale_for(key: int, m: int) -> bool:
-    """Whether group ``key`` hands its E8M0 per-1x128 scale row-major at M rows:
-    only when every GEMM of the group reads row-major at least as fast. Producer
-    and consumers ask with the same (key, M), so they always agree."""
-    if not key or m <= 0:
-        return False
-    query = _aiter_row_major_x_scale_query()
-    return query is not None and all(
-        query(m, n, k) for n, k in _ROW_MAJOR_X_SCALE_GROUPS[key]
-    )
+def x_scale_row_major(key: int, m: int) -> bool:
+    """Whether an x_scale of ``m`` rows under rule ``key`` is row-major."""
+    return m > 0 and _X_SCALE_ROW_MAJOR_RULES[key](m)
 
 
 def gemm_a8w8_blockscale_preshuffle_fake(
@@ -535,7 +509,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     prefix: str = "",
     row_major_key: int = 0,
 ) -> torch.Tensor:
-    if row_major_x_scale_for(row_major_key, x_scale.shape[0]):
+    if x_scale_row_major(row_major_key, x_scale.shape[0]):
         return gemm_a8w8_blockscale_bpreshuffle(
             x, weight, x_scale, w_scale, dtype, x_scale_transposed=False
         )
@@ -574,7 +548,7 @@ def gemm_a8w8_blockscale_preshuffle_into_output(
     # cannot lower). Lets the downstream attention cudagraph read this output at
     # a stable address with no per-step input copy. Mirrors 035db69's
     # unified_attention_into_output.
-    if row_major_x_scale_for(row_major_key, x_scale.shape[0]):
+    if x_scale_row_major(row_major_key, x_scale.shape[0]):
         gemm_a8w8_blockscale_bpreshuffle(
             x, weight, x_scale, w_scale, dtype, out=out, x_scale_transposed=False
         )
@@ -1642,29 +1616,20 @@ class LinearBase(nn.Module):
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
 
-    # Set by use_row_major_x_scale(): the row-major x_scale group a caller's
-    # E8M0 per-1x128 x_scale belongs to (0: always column-major).
+    # The x_scale_row_major() rule a caller's E8M0 per-1x128 x_scale follows
+    # (0: column-major). A scale this Linear quantizes itself stays column-major.
     x_scale_row_major_key: int = 0
 
-    def use_row_major_x_scale(self, key: int = 0) -> bool:
-        """Whether this Linear's GEMM can take a row-major E8M0 per-1x128
-        x_scale (gfx1250, where the aiter GEMM reads that layout natively), and
-        with a nonzero ``key`` read a caller's x_scale as group ``key`` lays it
-        out. A scale this Linear quantizes itself stays column-major."""
-        if not (
+    @property
+    def takes_row_major_x_scale(self) -> bool:
+        """Whether a caller's x_scale reaches the E8M0 per-1x128 preshuffle
+        GEMM, the one that also reads it row-major. Computed on access, as
+        ``supports_out``: online quantisation rewrites ``quant_type`` at load."""
+        return bool(
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             and self.blockscale_e8m0_scale
             and self.native_a8_group_rows is None
-            and _aiter_takes_row_major_x_scale()
-        ):
-            return False
-        if key:
-            self.x_scale_row_major_key = key
-        return True
-
-    def row_major_x_scale_shape(self) -> tuple[int, int]:
-        """(N, K) of this Linear's GEMM, as the row-major x_scale query takes."""
-        return int(self.weight.shape[0]), int(self.weight.shape[1])
+        )
 
     def quantize_input(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The activation quant ``forward`` applies when given no ``x_scale``.

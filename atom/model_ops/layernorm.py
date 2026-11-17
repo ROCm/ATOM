@@ -26,6 +26,7 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.linear import x_scale_row_major
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -239,9 +240,7 @@ def _aiter_rms_quant(
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     if transpose_scale and row_major_key:
-        from atom.model_ops.linear import row_major_x_scale_for
-
-        transpose_scale = not row_major_x_scale_for(row_major_key, x.shape[0])
+        transpose_scale = not x_scale_row_major(row_major_key, x.shape[0])
     out, scale, out_res1 = _aiter_rms_quant_fake(
         x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
     )
@@ -316,19 +315,21 @@ class RMSNorm(nn.Module):
             quant_type.value == _QV_PER_1X128 and quant_config.blockscale_e8m0_scale
         )
 
-    # Set by use_row_major_scale(): the row-major x_scale group of this norm's
-    # fused E8M0 per-1x128 quant (0: always column-major). Per M, the group says
-    # whether the scale goes out row-major (``linear.row_major_x_scale_for``).
-    _row_major_key: int = 0
+    # The ``linear.x_scale_row_major`` rule that turns this norm's column-major
+    # fused-quant scale row-major per M (0: never); its GEMMs carry the same key.
+    x_scale_row_major_key: int = 0
 
-    def use_row_major_scale(self, key: int) -> bool:
-        """Join row-major x_scale group ``key`` (its consumers must join too,
-        ``LinearBase.use_row_major_x_scale``). Not for the fused-AllReduce
-        quant, which only writes the column-major preshuffle layout here."""
-        if self.fused_allreduce:
-            return False
-        self._row_major_key = key
-        return True
+    @property
+    def emits_col_major_e8m0_scale(self) -> bool:
+        """Whether the fused quant writes a column-major E8M0 per-1x128 scale
+        that ``x_scale_row_major_key`` may turn row-major. Not the fused-
+        AllReduce quant, which only writes the preshuffle layout. Computed on
+        access: ``online_quantize_activation`` realigns the scheme at load."""
+        return bool(
+            self._aiter_transpose_scale
+            and self._aiter_e8m0_scale
+            and not self.fused_allreduce
+        )
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -536,7 +537,7 @@ class RMSNorm(nn.Module):
                     ),
                     self.params_dtype,
                     self._aiter_e8m0_scale,
-                    self._row_major_key,
+                    self.x_scale_row_major_key,
                 )
                 if batched:
                     x = x.view(*lead, -1)

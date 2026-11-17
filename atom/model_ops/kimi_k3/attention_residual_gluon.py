@@ -239,8 +239,12 @@ def attn_res_tdm_supported(block_residual: torch.Tensor) -> bool:
     )
 
 
-_XCD_REMAP_MIN_T = 512
-_XCD_REMAP_MIN_T_ROW = 160
+# E8M0 scale lines written from every XCD: a column-major scale (stride_ys_t
+# == 1) puts neighbouring tokens in one line, and a row-major token's codes need
+# not start on a line boundary. The remap gives each XCD a contiguous run of
+# tokens. Smallest T to remap from, keyed by "column-major" (no entry: never).
+# The remap only picks which program computes a token, so it trades speed only.
+_XCD_REMAP_MIN_T = {True: 512, False: 160}
 
 
 @functools.cache
@@ -254,14 +258,10 @@ def launch_attn_res_tdm(
     br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
 ):
     T, B, H = br.shape
-    # E8M0 scale lines hold neighbouring tokens (column-major), or a token's
-    # 56 codes straddle two lines (row-major); written from every XCD's L2 they
-    # cost more than the remap from these T. The remap only picks which program
-    # computes a token, so the bytes do not depend on T.
-    remap = False
+    min_t = None
     if flags.get("E8M0_SCALE", False):
-        col_scales = flags.get("stride_ys_t") == 1
-        remap = T >= (_XCD_REMAP_MIN_T if col_scales else _XCD_REMAP_MIN_T_ROW)
+        min_t = _XCD_REMAP_MIN_T.get(flags.get("stride_ys_t") == 1)
+    remap = min_t is not None and T >= min_t
     _attn_res_tdm_kernel[(T,)](
         br,
         ps,
