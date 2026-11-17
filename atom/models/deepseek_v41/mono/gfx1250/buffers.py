@@ -214,10 +214,12 @@ CTPTRS_ROLE = {
 }
 
 
-# the scorer's row width: the widest index bound a step may have -- 256K tokens at compression 1 (E13 c1 contexts pass
-# 128K); past 8192 x 16 rows the selection takes a third level (topk.selection_levels). (The full 1M sizing made short
-# contexts slower.)
-ILW = 262144
+# the scorer's row width: the widest index bound a step may have -- 512K tokens at compression 1 (AgentX trajectories
+# run 314K-400K, gfx950 serves them at max-model-len 409600). A runtime stride only (the layer table's ilw / bstride):
+# the kernel's code is the same for any capacity, a step's work follows its own bound. Past 8192 x 16 rows layer 20's
+# top-512 takes a third tree level, past 8 x 8192 x 4 rows its top-2048 blocks too (topk.selection_levels); the tree
+# holds 1M (index_plan.NLMAX).
+ILW = 524288
 BCOLS = ILW // 16  # block-table columns a request (16-token pages)
 
 

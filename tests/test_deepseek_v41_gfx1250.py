@@ -492,6 +492,25 @@ def test_task_counts(kind):
             assert int(IP.lists(Z(n), IP.NLMAX, fan)) <= 1
 
 
+def test_the_index_capacity_holds_agentx_contexts():
+    """buffers.ILW (the scorer's row width; the block tables' columns, 16-token pages) holds a 409600-token context at
+    compression 1 (AgentX trajectories reach ~400K; gfx950 serves them at max-model-len 409600). At that width layer
+    20's top-512 over ILW scores and top-2048 over its ILW / 8 block maxima each reach one list within the levels
+    topk.selection_levels picks (index_plan.tree_levels), and every level's lists fit the row's list stride in ilvl (the
+    kernel's _cdiv(vstride, SEG) k; buffers.scratch_bytes sizes ilvl by the larger of the two)."""
+    from atom.models.deepseek_v41.mono.gfx1250 import buffers
+
+    ilw = buffers.ILW
+    assert ilw >= 409600 and ilw % IP.CHUNK == 0 and buffers.BCOLS * 16 == ilw
+    for kind, n in (("sel", ilw), ("blk", ilw // 8)):
+        k, fan = KINDS[kind]
+        levels = int(IP.tree_levels(Z(n), k))
+        assert levels <= IP.NLMAX and int(IP.lists(Z(n), levels - 1, fan)) == 1, kind
+        stride = -(-n // IP.SEG) * k
+        for lev in range(levels):
+            assert int(IP.lists(Z(n), lev, fan)) * k <= stride, (kind, lev)
+
+
 def rx(bd, cand):
     kept = IP.rx_kept(Z(bd))
     last = Z(cand[max(int(kept) - 1, 0)]) if int(kept) else Z(0)
