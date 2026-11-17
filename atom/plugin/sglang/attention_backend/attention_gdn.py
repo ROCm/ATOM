@@ -1088,7 +1088,7 @@ class SGLangGDNForwardContext:
                 # cursor, shared by every GDN layer, has to drop the previous
                 # tenant's records once per forward or the next verify folds
                 # them on top of that new state.
-                note_full_state_write(None if live_slots is None else live_slots[:bs])
+                note_full_state_write(live_slots[:bs])
             # SGLang's seq_lens_sum includes cached prefix tokens for some
             # hybrid batches; GDN only receives the active query tokens.
             if num_query_tokens is None:
