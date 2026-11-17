@@ -347,7 +347,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict[str, object] | None:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -355,12 +355,15 @@ class EngineCore:
         ceiling rather than the raw block count leaves the dcp arithmetic with
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
+
+        `weight_syncs_unavailable` maps each weight-sync feature this engine's
+        runners cannot take to the reason. CoreManager merges every engine's
+        and refuses such a sync before any engine runs it: under PP, one
+        stage's runners alone may be the ones that cannot.
         """
         payload = {}
         if self.scheduler is not None:
             payload["max_pool_tokens"] = self.scheduler.block_manager.max_pool_tokens
-        # So CoreManager refuses, before any engine runs it, a sync one of
-        # them cannot take: under PP, one stage's runners alone may refuse.
         if self._weight_syncs_unavailable:
             payload["weight_syncs_unavailable"] = self._weight_syncs_unavailable
         return payload or None

@@ -16,8 +16,10 @@ from atom.model_engine.capabilities import (
 )
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
+    DESTROY_RDMA_WEIGHT_GROUP_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
     FINISH_WEIGHT_SYNC_CMD,
+    INIT_RDMA_WEIGHT_GROUP_CMD,
     RECEIVE_WEIGHTS_RDMA_CMD,
     RpcPayload,
     checked_timeout,
@@ -148,10 +150,6 @@ def _weights_discarded(reply) -> bool:
     that failed makes the reply an error."""
     result = reply.get("result") if isinstance(reply, dict) else None
     return not (isinstance(result, dict) and result.get("weights_discarded") is False)
-
-
-# The runners' weight-group methods, which the engine keeps a record for.
-_WEIGHT_GROUP_METHODS = ("init_rdma_weight_group", "destroy_rdma_weight_group")
 
 
 class _ReplyQueue:
@@ -409,6 +407,7 @@ class EngineUtilityHandler:
                         if self._awaiting_finish_stream is not None:
                             group, version = self._awaiting_finish_stream
                             self._committed_stream_versions[group] = version
+                            self._awaiting_finish_stream = None
                         engine._rl_weights_inconsistent = False
                         engine._weight_sync_fenced = False
                         engine._is_rl_weights_offloaded = False
@@ -607,7 +606,10 @@ class EngineUtilityHandler:
                 kwargs=dict(args.get("kwargs") or {}),
                 barrier=bool(args.get("barrier", False)),
             )
-            if method in _WEIGHT_GROUP_METHODS and "group_name" not in payload.kwargs:
+            if (
+                method in (INIT_RDMA_WEIGHT_GROUP_CMD, DESTROY_RDMA_WEIGHT_GROUP_CMD)
+                and "group_name" not in payload.kwargs
+            ):
                 # The engine reads the name to keep its record of the group.
                 raise TypeError(f"{method} takes group_name as a keyword")
             replies = self.runner_mgr.collective_rpc(
@@ -634,8 +636,8 @@ class EngineUtilityHandler:
         # what the engine recorded for the old one commits nothing there. A
         # retried join keeps the group, and leaving one drops it whatever its
         # teardown raised.
-        if method == "destroy_rdma_weight_group" or (
-            method == "init_rdma_weight_group"
+        if method == DESTROY_RDMA_WEIGHT_GROUP_CMD or (
+            method == INIT_RDMA_WEIGHT_GROUP_CMD
             and any(r.ok and r.value is True for r in replies)
         ):
             self._committed_stream_versions.pop(payload.kwargs["group_name"], None)

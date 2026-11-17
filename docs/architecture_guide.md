@@ -296,7 +296,11 @@ then has to be joined again, and the engine stays fenced until a sync rewrites
 every parameter. A caller that stops waiting before the engine answers does
 not learn whether the stream was written, and the engine stays fenced the same
 way. A stream's version is used up only once FINISH commits it, so a sync the
-engine failed can be retried at the same version.
+engine failed can be retried at the same version. The engine keeps each group's
+committed version, and forgets it when the runners join that group anew or
+leave it; so ``collective_rpc`` takes ``group_name`` only as a keyword for
+``init_rdma_weight_group`` and ``destroy_rdma_weight_group``, and refuses
+either call otherwise.
 
 ## Sequence lifecycle
 

@@ -767,10 +767,11 @@ class CoreManager:
         self._asyncio_mode = config.asyncio_mode
 
     def _record_ready_payload(self, data) -> None:
-        """Fold one rank's READY facts into the manager's view of capacity."""
+        """Fold one rank's READY facts into the manager's view of capacity,
+        and of the weight syncs some engine cannot take."""
         if not data:
             return
-        for feature, reason in (data.get("weight_syncs_unavailable") or {}).items():
+        for feature, reason in data.get("weight_syncs_unavailable", {}).items():
             self._weight_syncs_unavailable.setdefault(feature, reason)
         reported = data.get("max_pool_tokens")
         if reported is None:

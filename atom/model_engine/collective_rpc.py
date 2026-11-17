@@ -22,6 +22,8 @@ COLLECTIVE_RPC_CMD = "collective_rpc"
 DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
 FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
 RECEIVE_WEIGHTS_RDMA_CMD = "receive_weights_rdma"
+INIT_RDMA_WEIGHT_GROUP_CMD = "init_rdma_weight_group"
+DESTROY_RDMA_WEIGHT_GROUP_CMD = "destroy_rdma_weight_group"
 
 
 class WeightReloadRefused(RuntimeError):
@@ -46,8 +48,8 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "release_constraints",
         # Joining and leaving the trainer's RDMA weight group; the stream it
         # carries is the receive_weights_rdma utility command.
-        "init_rdma_weight_group",
-        "destroy_rdma_weight_group",
+        INIT_RDMA_WEIGHT_GROUP_CMD,
+        DESTROY_RDMA_WEIGHT_GROUP_CMD,
     }
 )
 

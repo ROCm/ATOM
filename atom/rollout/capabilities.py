@@ -25,7 +25,8 @@ class CapabilityProviderMixin:
     """Lets a ModelRunner describe itself to a negotiating caller."""
 
     def get_worker_capabilities(self) -> dict:
-        """Report this rank's protocol version, position, and what it supports.
+        """Report this rank's protocol version, position, and what it supports,
+        with the reason for each weight sync it cannot take (``unavailable``).
 
         Returns a plain dict rather than a dataclass so the reply stays
         picklable across the worker boundary without the engine and the worker

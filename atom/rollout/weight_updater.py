@@ -80,8 +80,8 @@ def _one_update(method):
     return update
 
 
-def _synchronize(device) -> None:
-    if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
         torch.cuda.synchronize(device)
 
 
@@ -389,8 +389,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         if not callable(sync):
             return False
         if not self._module_readers_awaited:
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
+            _synchronize(self.device)
             self._module_readers_awaited = True
         return sync(param_name, tensor, shard_id)
 
@@ -798,7 +797,7 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         with the write, which is why every writer goes through
         ``_copy_into_param`` or ``_load_into_param`` rather than calling this.
         """
-        _synchronize(getattr(param, "device", None))
+        _synchronize(param.device)
 
     def _copy_into_param(self, param: torch.nn.Parameter, tensor: torch.Tensor) -> None:
         """Overwrite a live parameter's buffer, after its readers are done.

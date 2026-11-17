@@ -52,8 +52,8 @@ _CMD_BUCKET = 1
 _HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 
 # What a header is held to before anything is allocated for it. Metadata is a
-# JSON entry per tensor, so 64 MiB is hundreds of thousands of them, and no
-# bucket carries a terabyte: past either, the header is corrupt or another
+# JSON entry per tensor, which this ceiling holds hundreds of thousands of, and
+# no bucket carries a terabyte: past either, the header is corrupt or another
 # protocol's.
 _MAX_METADATA_BYTES = 64 << 20
 _MAX_PAYLOAD_BYTES = 1 << 40
@@ -496,7 +496,7 @@ class RDMAWeightReceiverMixin:
 
     def _rdma_receive_refusal(self) -> str | None:
         """Why this engine cannot take weights over RDMA, if it cannot."""
-        dp = int(self._deployment_data_parallel_size or 1)
+        dp = self._deployment_data_parallel_size
         if dp > 1:
             return (
                 f"data_parallel_size={dp}: one group would span {dp} "
@@ -504,7 +504,7 @@ class RDMAWeightReceiverMixin:
                 f"alone, so DP replicas could end on different versions; run "
                 f"each DP replica as its own server"
             )
-        pp = int(self.config.pipeline_parallel_size or 1)
+        pp = self.config.pipeline_parallel_size
         if pp > 1:
             return (
                 f"pipeline_parallel_size={pp}: each stage's workers would "
@@ -522,9 +522,7 @@ class RDMAWeightReceiverMixin:
         """
         # The engine's workers as ModelRunner places devices: one per TP
         # shard that has a process, per prefill-context rank.
-        workers = int(self.config.tp_world_size) * int(
-            self.config.prefill_context_parallel_size
-        )
+        workers = self.config.tp_world_size * self.config.prefill_context_parallel_size
         if workers <= 1:
             return ballots
         world = get_world_group()

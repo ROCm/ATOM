@@ -651,7 +651,6 @@ def test_the_writes_land_before_the_sync_completes(monkeypatch):
     """With clear_kv_cache=False nothing waited for them, and the forward
     FINISH lets run next may be on another stream."""
     calls = []
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: calls.append(d))
     runner = _Runner(_dense_model())
     runner.device = torch.device("cuda", 1)
