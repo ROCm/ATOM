@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `VocabParallelEmbedding` | `embed_head.py` | `F.embedding` + TP all-reduce | Vocab embedding |
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
-| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
+| `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.fusions.fused_mixed_sample.fused_mixed_sample`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `spec_sampling/` (`ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `triton_required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
