@@ -233,7 +233,7 @@ DSpark proposer of a served step
 
 - **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
   or FP4 index cache (FP4: the gfx1250 natural layout, `--index-cache-dtype
-  fp4`; the step's long-context scoring reads half the bytes), up to 8 requests (6 verify rows each), no DSpark confidence
+  fp4`; the step's long-context scoring reads half the bytes), one request a step (6 verify rows; `runner.MAX_STEP_ROWS`, wider steps take the production path), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
   (`V4.1 single-launch step off: <why>`).
 - **Draft temperature.** `ATOM_DSPARK_PROB_DRAFT_TSCALE` scales the
@@ -249,7 +249,7 @@ DSpark proposer of a served step
   - prefill;
   - steps with structured output, logprobs or top-k;
   - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
-- **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
+- **Build.** The 6-row width is built at startup, ~2.5 min cold.
   The builds go to the FlyDSL disk cache; clear it after editing a kernel.
 - **Debug switches** (the mono ones, `atom/utils/envs.py`):
   - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
