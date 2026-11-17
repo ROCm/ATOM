@@ -45,6 +45,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_AITER_PROVIDER_ENABLE",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -397,3 +398,10 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+def test_aiter_provider_enable_environment(monkeypatch):
+    # Default empty = OFF; a set value is stripped (operator override only).
+    assert _get_envs().ATOM_AITER_PROVIDER_ENABLE == ""
+    monkeypatch.setenv("ATOM_AITER_PROVIDER_ENABLE", " qsa-index-scorer-provider ")
+    assert _get_envs().ATOM_AITER_PROVIDER_ENABLE == "qsa-index-scorer-provider"
