@@ -1192,12 +1192,12 @@ mod g_chat_rendering {
             chat_rendering::{
                 atom_chat_template_kwargs, ChatRendering, KWARGS_HOOKS, REASONING_RULES,
             },
-            chat_template::render_chat_messages,
+            chat_template::{process_chat_messages, render_chat_messages, ProcessedMessages},
             inference::{ParsedInference, SentControls},
         },
         test_mocks::tokenizer::hf_tokenizer_path,
     };
-    use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+    use crate::tokenizer::{factory, traits::Tokenizer, HuggingFaceTokenizer};
 
     /// What ATOM's chat endpoint renders chats with on servers in a few states:
     /// the chat renderings they report, and the kwargs each case's request gets,
@@ -1358,6 +1358,75 @@ mod g_chat_rendering {
             let rendered = render_chat_messages(request, &tokenizer, &kwargs).unwrap();
             assert_eq!(&rendered.text, want, "{fields}");
         }
+    }
+
+    /// How a chat's tokens compare with ATOM's, `want`, which is `None` where
+    /// ATOM rejects the chat.
+    fn compare(want: Option<&Vec<u32>>, got: &Result<Vec<u32>, String>) -> String {
+        match (want, got) {
+            (Some(want), Ok(got)) if want == got => format!("identical ({} tokens)", want.len()),
+            (Some(want), Ok(got)) => {
+                let at = want.iter().zip(got).position(|(a, b)| a != b);
+                let at = at.unwrap_or(want.len().min(got.len()));
+                format!("diverge at token {at} of {}", want.len())
+            }
+            (Some(_), Err(e)) => format!("rejected, where ATOM is not: {e}"),
+            (None, Ok(_)) => "rendered, where ATOM rejects it".to_string(),
+            (None, Err(_)) => "rejected, as on ATOM".to_string(),
+        }
+    }
+
+    /// A checkpoint's chats tokenize as on ATOM, which
+    /// `atom/mesh/scripts/atom_chat_parity.py` reports as $ATOM_CHAT_PARITY: its
+    /// chat rendering on the checkpoint and the tokens of a set of chats. Each
+    /// chat gets ATOM's tokens, or is rejected where ATOM rejects it. The table
+    /// also compares the chat's tokens with only its own kwargs, as when its
+    /// workers report no rendering.
+    #[tokio::test]
+    #[ignore = "needs a checkpoint and ATOM's tokens for it: atom/mesh/scripts/atom_chat_parity.py"]
+    async fn test_checkpoint_chats_tokenize_as_on_atom() {
+        let path = std::env::var("ATOM_CHAT_PARITY").expect("$ATOM_CHAT_PARITY");
+        let atom: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let model = atom["model"].as_str().unwrap();
+        let rendering = ChatRendering::parse(&atom["chat_rendering"].to_string()).unwrap();
+        let tokenizer = factory::create_tokenizer_async_with_chat_template(model, None)
+            .await
+            .unwrap();
+        let tokens = |rendered: Result<ProcessedMessages, String>| {
+            let text = rendered?.text;
+            let encoding = tokenizer.encode(&text, true).map_err(|e| e.to_string())?;
+            Ok::<_, String>(encoding.token_ids().to_vec())
+        };
+        let mut differ = Vec::new();
+        eprintln!("{model}");
+        for chat in atom["chats"].as_array().unwrap() {
+            let name = chat["name"].as_str().unwrap();
+            let want: Option<Vec<u32>> = serde_json::from_value(chat["ids"].clone()).unwrap();
+            let body = chat["request"].to_string();
+            let (routed, own) =
+                match ParsedInference::parse("/v1/chat/completions", body.as_bytes()) {
+                    Ok(parsed) => {
+                        let (request, sent) = parsed.chat_as_sent().unwrap();
+                        let routed = atom_chat_template_kwargs(request, sent, &rendering)
+                            .and_then(|kwargs| render_chat_messages(request, &*tokenizer, &kwargs));
+                        let own = process_chat_messages(request, &*tokenizer);
+                        (tokens(routed), tokens(own))
+                    }
+                    Err(e) => (Err(e.clone()), Err(e)),
+                };
+            eprintln!(
+                "  {name:20} {}; with only its own kwargs: {}",
+                compare(want.as_ref(), &routed),
+                compare(want.as_ref(), &own)
+            );
+            if routed.ok() != want {
+                differ.push(name);
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{differ:?} tokenize otherwise than on ATOM"
+        );
     }
 }
 

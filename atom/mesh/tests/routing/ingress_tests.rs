@@ -162,6 +162,7 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         }
     }
 }
+
 /// An app whose model `m` has a tokenizer with a word per id, and a template
 /// that adds `off` when `enable_thinking` is false.
 async fn app_with_switched_chats() -> (AppContext, PreparePoolRuntime) {
