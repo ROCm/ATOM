@@ -54,9 +54,9 @@ def _copy_checkpoints_kernel(
     NBLK_SSM: tl.constexpr,  # blocks covering HKV; the grid split point
     K: tl.constexpr,
     V: tl.constexpr,
+    H_VK: tl.constexpr,
     STATE_VK: tl.constexpr = False,
     HAS_H_ROWS: tl.constexpr = False,
-    H_VK: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -176,19 +176,19 @@ def write_state_checkpoints(
     ``h`` is a logical ``[..., H, K, V]`` tensor whose states are stored
     either KV (the Triton chunk kernel's ``h``, ``h_snap``) or VK (FlyDSL's
     snapshot, handed over as its ``transpose(-1, -2)``); like the pool's, the
-    layout is read off its strides. Any other inner layout is rejected rather
-    than read as KV. Rows are ``ssm_state.stride(0)`` apart in both.
+    layout is read off its strides. Any other inner layout is rejected. Rows
+    are ``ssm_state.stride(0)`` apart in both.
     """
     n = rows.numel()
     if n == 0:
         return
     hkv = ssm_state.stride(0)
     k, v = ssm_state.shape[-2:]
-    h_inner = tuple(h.stride()[-3:])
-    h_vk = h_inner == (k * v, 1, k) and h_inner != (k * v, v, 1)
+    h_inner = h.stride()[-3:]
+    h_vk = h_inner == (k * v, 1, k)
     if not h_vk and h_inner != (k * v, v, 1):
         raise ValueError(
-            f"GDN checkpoint source strides {tuple(h.stride())} are neither a "
+            f"GDN checkpoint source strides {h.stride()} are neither a "
             f"KV nor a VK layout of [{k}, {v}] states"
         )
     d, state_len = conv_state.shape[1], conv_state_len
