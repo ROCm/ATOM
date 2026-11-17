@@ -356,14 +356,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def _project_taps(self, taps):
         """`main_proj(concat(taps))` as `[1, N, hidden]`, before the norm.
 
-        `main_proj` quantizes its input with `quantize_fp8`; the taps are
-        quantized where they lie instead, to the same fp8 rows and scales,
+        An FP8 `main_proj` quantizes its input with `quantize_fp8`; the taps
+        are quantized where they lie instead, to the same fp8 rows and scales,
         minus the concatenated copy. `quantize_fp8_taps` joins them itself for
         a shape its kernel does not take, and passes a single joined block
-        (a PP relay) through as it is.
+        (a PP relay) through as it is. A BF16 `main_proj` (no group32 FP8
+        GEMM) takes the joined taps unquantized.
         """
         main_proj = self.mtp[0].main_proj
-        if main_proj.runs_bf16:  # no group32 FP8 GEMM here: BF16 in
+        if main_proj.runs_bf16:
             return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
         return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
