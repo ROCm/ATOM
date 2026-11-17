@@ -521,8 +521,8 @@ server's address), `topic`, `block_size`, the tokens per hashed block, and
 the `null` publisher. A server that offloads to a Mooncake Store
 (`mooncake_store`) also reports `offload`, the same for every rank: `backend`,
 the pools' `masters`, and the key rule's `namespace`, `chunk_tokens` and `world`,
-with `min_load_tokens`, the engine's `OFFLOAD_MIN_LOAD_TOKENS` (512 unless set),
-and `chain_check`, the hex
+with `min_load_tokens`, the threshold the engine resolved (`OFFLOAD_MIN_LOAD_TOKENS`
+when set, else the Store's own 512), and `chain_check`, the hex
 digest of the first chunk of tokens `0..chunk_tokens`, by which a router checks
 that it computes the same keys.
 
