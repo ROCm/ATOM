@@ -3,16 +3,13 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github" / "scripts" / "download_aiter_wheel.sh"
 
 
 def _write_fake_curl(bin_dir: Path) -> None:
     curl = bin_dir / "curl"
-    curl.write_text(
-        textwrap.dedent(
-            r"""
+    curl.write_text(textwrap.dedent(r"""
             #!/usr/bin/env python3
             import json
             import os
@@ -105,9 +102,7 @@ def _write_fake_curl(bin_dir: Path) -> None:
             else:
                 print(f"unexpected curl URL: {url}", file=sys.stderr)
                 sys.exit(22)
-            """
-        ).lstrip()
-    )
+            """).lstrip())
     curl.chmod(0o755)
 
 
