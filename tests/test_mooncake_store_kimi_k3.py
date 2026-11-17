@@ -382,6 +382,18 @@ def test_the_engine_sees_a_store_hosted_state_tier(kvc):
     assert state_offload.state_tier_verified_for_s(config) == 5.0
 
 
+def test_the_engine_index_takes_no_cpu_budget_cap_on_the_store():
+    spec = SimpleNamespace(image_bytes=1 << 20, pipeline_op_bytes=0)
+    store = _k3_config(kv_transfer_config=_store_kvc())
+    assert state_offload.state_tier_index_cap(spec, store) is None
+    lmcache = _k3_config(
+        kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    )
+    cap = state_offload.state_tier_index_cap(spec, lmcache)
+    assert cap == state_offload.state_tier_cpu_entries(spec, lmcache)
+    assert state_offload.state_tier_index_cap(None, lmcache) is None
+
+
 def test_the_store_hosts_no_state_tier_for_another_layout(monkeypatch):
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "qwen")
     config = _k3_config(kv_transfer_config=_store_kvc())

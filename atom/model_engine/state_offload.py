@@ -643,6 +643,14 @@ def state_tier_cpu_entries(spec, config) -> int:
     return state_tier_cpu_bytes() * stages // spec.pipeline_op_bytes
 
 
+def state_tier_index_cap(spec, config) -> int | None:
+    """The engine index's entry cap: the CPU tier's, or None for the Mooncake
+    Store, which evicts on its own and whose touches report what is gone."""
+    if spec is None or _offload_connector(config)[0] == "mooncake_store":
+        return None
+    return state_tier_cpu_entries(spec, config)
+
+
 def state_tier_chunk_tokens(config) -> int:
     """The tier's chunk size in tokens for the joint KV leg (LMCache's, or
     the Mooncake Store's `mooncake_store.chunk_tokens`), or 0.
