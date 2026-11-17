@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """`UmbpBlockPool`: private blocks first, cold content demoted into the part
-UMBP manages (atom/kv_transfer/l1/umbp_l1/pool.py)."""
+UMBP manages (atom/kv_transfer/pool/umbp/pool.py)."""
 
 import test_umbp_l1_pool as umbp_tests
 from test_umbp_l1_pool import make_pool, settle, toks
@@ -10,13 +10,13 @@ from test_umbp_l1_pool import make_pool, settle, toks
 # The L1 service fixture, the Python model and then the real one.
 l1 = umbp_tests.l1
 
-from atom.kv_transfer.l1.umbp_l1 import pool as umbp_pool
-from atom.kv_transfer.l1.umbp_l1.pool import (
+from atom.kv_transfer.pool.umbp import pool as umbp_pool
+from atom.kv_transfer.pool.umbp.pool import (
     UmbpBlockPool,
     make_umbp_block_pool,
     split_point,
 )
-from atom.kv_transfer.l1.umbp_l1.settings import UmbpL1Settings
+from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
 
 def make_split(client, name, private_blocks, shared_blocks, evicted=None):
@@ -27,7 +27,7 @@ def make_split(client, name, private_blocks, shared_blocks, evicted=None):
         return make_pool(client, name, num_blocks, **kwargs)
 
     umbp_pool.make_umbp_l1_pool = l1_pool
-    settings = UmbpL1Settings(
+    settings = UmbpPoolSettings(
         address="unix:///unused",
         share_ratio=shared_blocks / (private_blocks + shared_blocks),
     )

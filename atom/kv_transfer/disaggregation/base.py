@@ -95,7 +95,7 @@ class KVConnectorBase(ABC):
     def kv_pool_memory(self, config: Any, rank: int) -> Any | None:
         """Provide the paged KV pool's memory, or None to leave it to the runner.
 
-        A connector that takes the pool over (`atom/kv_transfer/l1`) returns a
+        A connector that takes the pool over (`atom/kv_transfer/pool`) returns a
         `KVPoolMemory`: where the bytes come from, how they divide into blocks
         and when the device has finished writing them. Asked once, before the
         pool is allocated. Transfer and offload connectors keep None.

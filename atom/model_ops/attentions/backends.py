@@ -410,7 +410,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         its shared part). A backend whose pool can be split implements it."""
         raise NotImplementedError(
             f"{type(self).__name__} cannot copy paged blocks; "
-            "a share_ratio below 1 (umbp_l1 connector) is not supported for this model"
+            "a share_ratio below 1 (umbp_pool connector) is not supported for this model"
         )
 
     def execute_paged_state_copies(

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The `umbp_l1` connector's settings, read off its `kv_transfer_config`.
+"""The `umbp_pool` connector's settings, read off its `kv_transfer_config`.
 
 Example::
 
-    --kv-transfer-config '{"kv_connector": "umbp_l1",
+    --kv-transfer-config '{"kv_connector": "umbp_pool",
                            "kv_connector_extra_config": {
                                "address": "unix:///tmp/umbp-l1/server.sock",
                                "share_ratio": 0.5}}'
@@ -36,7 +36,7 @@ from atom.kv_transfer.offload.config import connector_extras
 
 
 @dataclass(frozen=True)
-class UmbpL1Settings:
+class UmbpPoolSettings:
     address: str
     namespace: str = "atom"
     group: str = ""
@@ -47,22 +47,22 @@ class UmbpL1Settings:
     @classmethod
     def from_transfer_config(
         cls, kv_transfer_config: Mapping[str, Any] | None
-    ) -> UmbpL1Settings:
+    ) -> UmbpPoolSettings:
         extra = connector_extras(kv_transfer_config)
         address = str(extra.get("address", "") or "")
         if not address:
             raise ValueError(
-                "the umbp_l1 connector needs 'address', the gRPC address of the "
+                "the umbp_pool connector needs 'address', the gRPC address of the "
                 "UMBP standalone server (e.g. unix:///tmp/umbp-l1/server.sock)"
             )
         ratio = float(extra.get("share_ratio", 1.0))
         if not 0 < ratio <= 1:
-            raise ValueError(f"umbp_l1 share_ratio={ratio}: a share in (0, 1]")
+            raise ValueError(f"umbp_pool share_ratio={ratio}: a share in (0, 1]")
         margin = extra.get("session_migrate_margin")
         if margin is not None:
             margin = float(margin)
             if margin < 0:
-                raise ValueError(f"umbp_l1 session_migrate_margin={margin} < 0")
+                raise ValueError(f"umbp_pool session_migrate_margin={margin} < 0")
         fetch = extra.get("fetch", True)
         if isinstance(fetch, str):
             fetch = fetch.strip().lower() not in ("0", "false", "no", "off")
