@@ -18,9 +18,16 @@ one wave owns a row:
   (``v_fma_mixlo_bf16``, a +0 addend); here the product is rounded to FP32 first.
   The two differ only where the FP32 product sits on a BF16 tie, which is then
   stepped one FP32 ulp toward the exact product (``fma`` gives the error).
-* Programs are remapped so each XCD takes a contiguous run of rows: the
-  column-major scale of neighbouring tokens shares lines, and written from every
-  XCD those lines cost more than the whole norm at T >= 1024.
+* Programs are remapped so each XCD takes a contiguous run of programs: the
+  column-major scale of neighbouring tokens shares lines, which cost more than
+  the whole norm at large T when every XCD writes into them.
+
+A workgroup takes ``_ROWS_PER_PROGRAM`` consecutive rows, one wave per row. With
+the column-major scale, from ``_HEAD_MAJOR_MIN_T`` tokens (``HEAD_MAJOR``) it
+takes one head of ``_HEAD_MAJOR_TOKENS`` consecutive tokens instead, so its scale
+codes are adjacent bytes; the row-major scale has no such lines to share. Only
+the row-to-wave mapping changes, not a row's arithmetic, so the bytes do not
+depend on T.
 """
 
 from __future__ import annotations
@@ -28,12 +35,19 @@ from __future__ import annotations
 import functools
 
 import torch
+import triton
 from aiter import dtypes
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language import PropagateNan
 
 _PROPAGATE_NAN = gl.constexpr(PropagateNan.ALL)  # keep NaN through the FP8 clamp
+# One wave per row; rows per workgroup.
+_ROWS_PER_PROGRAM = 4
+# From this many tokens a workgroup takes one head of _HEAD_MAJOR_TOKENS tokens
+# (column-major scale only).
+_HEAD_MAJOR_MIN_T = 768
+_HEAD_MAJOR_TOKENS = 8
 
 
 @gluon.jit
@@ -43,6 +57,8 @@ def _rmsnorm_gated_e8m0_kernel(
     g_ptr,
     y_ptr,
     s_ptr,
+    M,
+    T,
     H,
     eps,
     stride_xm,
@@ -54,32 +70,60 @@ def _rmsnorm_gated_e8m0_kernel(
     HEADS: gl.constexpr,
     FP8_MAX: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    RPW: gl.constexpr,
+    HEAD_MAJOR: gl.constexpr,
 ):
-    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [1, 1], [1, 0])
-    row = gl.program_id(0)
+    # [row, k, lane]: wave r of the program owns one row, element 32 * k + lane in
+    # lane ``lane``, register ``k`` (register k is what wave k held in the Triton
+    # kernel, which fixes the variance order below).
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 1], [1, 1, 32], [RPW, 1, 1], [2, 1, 0]
+    )
+    l_rk: gl.constexpr = gl.SliceLayout(2, layout)
+    l_r: gl.constexpr = gl.SliceLayout(1, l_rk)
+    prog = gl.program_id(0)
     if NUM_XCDS > 1:
         G = gl.num_programs(0)
         per = (G + NUM_XCDS - 1) // NUM_XCDS
         tall = G % NUM_XCDS
         tall += (tall == 0).to(gl.int32) * NUM_XCDS
-        xcd = row % NUM_XCDS
-        row = xcd * per + row // NUM_XCDS - (xcd - tall) * (xcd > tall).to(gl.int32)
-    k = gl.arange(0, 4, layout=gl.SliceLayout(1, layout))
-    lane = gl.arange(0, 32, layout=gl.SliceLayout(0, layout))
-    cols = gl.expand_dims(k, 1) * 32 + gl.expand_dims(lane, 0)
+        xcd = prog % NUM_XCDS
+        prog = xcd * per + prog // NUM_XCDS - (xcd - tall) * (xcd > tall).to(gl.int32)
+    if HEAD_MAJOR:
+        # The program takes RPW consecutive tokens of one head.
+        ntb = (T + RPW - 1) // RPW
+        tok = (prog % ntb) * RPW + gl.arange(0, RPW, layout=l_r)
+        m_r = tok < T
+        row = gl.where(m_r, tok, 0) * HEADS + prog // ntb
+    else:
+        # The program takes RPW consecutive rows.
+        row = prog * RPW + gl.arange(0, RPW, layout=l_r)
+        m_r = row < M
+        row = gl.where(m_r, row, 0)
+    k = gl.arange(0, 4, layout=gl.SliceLayout(0, l_rk))
+    lane = gl.arange(0, 32, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+    cols = gl.expand_dims(gl.expand_dims(k, 0), 2) * 32 + gl.expand_dims(
+        gl.expand_dims(lane, 0), 1
+    )
+    m3 = gl.expand_dims(gl.expand_dims(m_r, 1), 2)
+    row3 = gl.expand_dims(gl.expand_dims(row.to(gl.int64), 1), 2)
     outer = (row // HEADS).to(gl.int64)
     head = (row % HEADS).to(gl.int64)
-    x = gl.load(x_ptr + row.to(gl.int64) * stride_xm + cols).to(gl.float32)
-
-    part = gl.sum(x * x, axis=1)
-    p0 = gl.sum(gl.where(k == 0, part, 0.0), axis=0)
-    p1 = gl.sum(gl.where(k == 1, part, 0.0), axis=0)
-    p2 = gl.sum(gl.where(k == 2, part, 0.0), axis=0)
-    p3 = gl.sum(gl.where(k == 3, part, 0.0), axis=0)
-    rstd = 1.0 / gl.sqrt(((p0 + p2) + (p1 + p3)) / H + eps)
+    x = gl.load(x_ptr + row3 * stride_xm + cols, mask=m3, other=0.0).to(gl.float32)
     w = gl.load(w_ptr + cols).to(gl.float32)
-    gate = gl.load(g_ptr + outer * stride_g_outer + head * stride_g_head + cols)
-    a = x * rstd * w
+    g_row = gl.expand_dims(
+        gl.expand_dims(outer * stride_g_outer + head * stride_g_head, 1), 2
+    )
+    gate = gl.load(g_ptr + g_row + cols, mask=m3, other=0.0)
+
+    part = gl.sum(x * x, axis=2)
+    kk = gl.expand_dims(k, 0)
+    p0 = gl.sum(gl.where(kk == 0, part, 0.0), axis=1)
+    p1 = gl.sum(gl.where(kk == 1, part, 0.0), axis=1)
+    p2 = gl.sum(gl.where(kk == 2, part, 0.0), axis=1)
+    p3 = gl.sum(gl.where(kk == 3, part, 0.0), axis=1)
+    rstd = 1.0 / gl.sqrt(((p0 + p2) + (p1 + p3)) / H + eps)
+    a = x * gl.expand_dims(gl.expand_dims(rstd, 1), 2) * w
     sg = 1 / (1 + gl.exp(-gate.to(gl.float32)))
     p = a * sg + 0.0  # as the +0 addend: a -0 product rounds to +0
     err = gl.fma(a, sg, -p)
@@ -89,16 +133,22 @@ def _rmsnorm_gated_e8m0_kernel(
     y = bits.to(gl.float32, bitcast=True).to(x_ptr.dtype.element_ty).to(gl.float32)
 
     # triton_e8m0_quant.fp8_e8m0_group_scale (Gluon cannot call it)
-    amax = gl.max(gl.max(gl.abs(y), axis=1), axis=0)
+    amax = gl.max(gl.max(gl.abs(y), axis=2), axis=1)
     amax = gl.minimum(gl.maximum(amax, 1e-10), 448.0 * 2.0**119)
     bits = (amax * (1.0 / FP8_MAX)).to(gl.uint32, bitcast=True)
     code = (bits >> 23) & 0xFF
     code += ((code < 0xFF) & ((bits & 0x7FFFFF) != 0)).to(gl.uint32)
-    y = y * ((254 - code) << 23).to(gl.float32, bitcast=True)
+    y = y * gl.expand_dims(
+        gl.expand_dims(((254 - code) << 23).to(gl.float32, bitcast=True), 1), 2
+    )
     y = gl.maximum(y, -FP8_MAX, propagate_nan=_PROPAGATE_NAN)
     y = gl.minimum(y, FP8_MAX, propagate_nan=_PROPAGATE_NAN)
-    gl.store(s_ptr + outer * stride_s_outer + head * stride_s_head, code.to(gl.uint8))
-    gl.store(y_ptr + row.to(gl.int64) * stride_ym + cols, y.to(y_ptr.dtype.element_ty))
+    gl.store(
+        s_ptr + outer * stride_s_outer + head * stride_s_head,
+        code.to(gl.uint8),
+        mask=m_r,
+    )
+    gl.store(y_ptr + row3 * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=m3)
 
 
 @functools.cache
@@ -127,12 +177,17 @@ def rmsnorm_gated_e8m0(
         (heads, t) if col_major else (t, heads), dtype=torch.uint8, device=x.device
     )
     if m:
-        _rmsnorm_gated_e8m0_kernel[(m,)](
+        head_major = col_major and t >= _HEAD_MAJOR_MIN_T
+        rpw = _HEAD_MAJOR_TOKENS if head_major else _ROWS_PER_PROGRAM
+        grid = heads * triton.cdiv(t, rpw) if head_major else triton.cdiv(m, rpw)
+        _rmsnorm_gated_e8m0_kernel[(grid,)](
             x2,
             weight,
             gate,
             y,
             scale,
+            m,
+            t,
             h,
             float(eps),
             x2.stride(0),
@@ -144,6 +199,8 @@ def rmsnorm_gated_e8m0(
             HEADS=heads,
             FP8_MAX=float(torch.finfo(quant_dtype).max),
             NUM_XCDS=_num_xcds(),
-            num_warps=1,
+            RPW=rpw,
+            HEAD_MAJOR=head_major,
+            num_warps=rpw,
         )
     return y.view(t, heads * h), scale.view(t, heads).view(dtypes.fp8_e8m0)
