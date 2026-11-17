@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import inspect
 from functools import cache
 
 import aiter
 import torch
-from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter import fused_qk_norm_rope_cache_quant_shuffle, reduce_splitk_partials
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -30,14 +29,7 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
 from .attention_mla import MLAModules
-from .linear import claim_splitk_partials, reduce_splitk_partials
-
-
-@cache
-def _qknorm_takes_qkv_partials() -> bool:
-    """Whether aiter's fused_qknorm_idxrqknorm sums a deferred qkv's split-K
-    partials itself (``qkv_partials``, ROCm/aiter#8011)."""
-    return "qkv_partials" in inspect.signature(aiter.fused_qknorm_idxrqknorm).parameters
+from .linear import claim_splitk_partials
 
 
 @cache
@@ -64,9 +56,14 @@ class PagedAttentionImpl(nn.Module):
         """(heads, head dim) of each column range of the fused qkv, in order."""
         return [(num_heads, head_dim)] + [(num_kv_heads, head_dim)] * 2
 
-    # rope_cache claims the split-K partials of a deferred QKV GEMM
-    # (`claim_splitk_partials`); a subclass overriding it must too, or reset this.
+    # This class's rope_cache claims the split-K partials of a deferred QKV GEMM
+    # (`claim_splitk_partials`). Opt-in per class: a subclass, which may override
+    # rope_cache, claims them only if it sets this itself.
     claims_splitk_partials = True
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.claims_splitk_partials = vars(cls).get("claims_splitk_partials", False)
 
     def __init__(
         self,
@@ -1291,6 +1288,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
+    # rope_cache passes qkv's split-K partials to aiter.fused_qknorm_idxrqknorm.
+    claims_splitk_partials = True
 
     @staticmethod
     def qkv_fields(
@@ -1532,21 +1531,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             else qkv.dtype
         )
 
-        # fused_qknorm_idxrqknorm sums the partials only when it writes every qkv
-        # column back (the index branch runs) and has no fp4/nvfp4 cache or fp8 q.
-        if qkv_partials is not None and (
-            self.skip_index_topk
-            or self.kv_cache_dtype in FP4_CACHE_DTYPES
-            or self.index_cache_dtype in FP4_CACHE_DTYPES
-            or not _qknorm_takes_qkv_partials()
-        ):
-            reduce_splitk_partials(qkv, qkv_partials)
-            qkv_partials = None
-
         if self.skip_index_topk and self.kv_cache_dtype not in FP4_CACHE_DTYPES:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                 triton_fused_norm_rope_cache,
             )
+
+            # This kernel reads a reduced qkv (the index columns it skips too).
+            if qkv_partials is not None:
+                reduce_splitk_partials(qkv, qkv_partials)
 
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
@@ -1620,7 +1612,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=fused_v_scale,
             asm_layout=self.kv_cache_dtype not in FP4_CACHE_DTYPES,
             skip_index_branch=self.skip_index_topk,
-            **({} if qkv_partials is None else {"qkv_partials": qkv_partials}),
+            qkv_partials=qkv_partials,
         )
 
         q = q_out.view(-1, self.num_heads, self.head_dim)

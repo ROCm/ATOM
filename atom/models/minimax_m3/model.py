@@ -21,7 +21,10 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+from atom.model_ops.attention_mha import (
+    PagedAttentionImpl,
+    SparseMHAPagedAttentionImpl,
+)
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
@@ -40,12 +43,12 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     mxfp4_k_pad_align,
-    splitk_consumer_reduce_supported,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.paged_attention import Attention as AtomAttention
 from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_reducing
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -163,10 +166,14 @@ def _linear_consumes_per_token_fp8(linear: nn.Module) -> bool:
 
 def _rope_cache_claims_splitk_partials(attn: nn.Module) -> bool:
     """Whether ``attn``'s impl claims a deferred QKV's split-K partials in its
-    rope_cache (`PagedAttentionImpl.claims_splitk_partials`). Not under Ulysses
-    SP: its head exchange reads qkv before the impl does."""
-    return getattr(attn, "sp_columns", None) is None and getattr(
-        type(getattr(attn, "impl", None)), "claims_splitk_partials", False
+    rope_cache (`PagedAttentionImpl.claims_splitk_partials`): ATOM's own
+    attention layer only (the plugins' run their own), not under Ulysses SP (its
+    head exchange reads qkv before the impl does)."""
+    return (
+        isinstance(attn, AtomAttention)
+        and attn.sp_columns is None
+        and isinstance(attn.impl, PagedAttentionImpl)
+        and attn.impl.claims_splitk_partials
     )
 
 
@@ -174,8 +181,9 @@ def _defer_splitk_reduce(linear: nn.Module, consumer_claims: bool) -> None:
     """Let ``linear``'s per-token FP8 GEMM leave its split-K reduction to the one
     kernel that reads its output, which sums the partials as it reads them (the
     result is bit-identical), when that consumer claims them. The GEMM decides per
-    call whether it splits K (aiter.gemm_a8w8_bpreshuffle_splitk_deferred)."""
-    if consumer_claims and splitk_consumer_reduce_supported():
+    call, arch included, whether it splits K and defers
+    (aiter.gemm_a8w8_bpreshuffle_splitk_deferred)."""
+    if consumer_claims:
         linear.splitk_consumer_max_m = envs.ATOM_SPLITK_CONSUMER_REDUCE_MAX_M
 
 
