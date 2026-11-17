@@ -7,8 +7,9 @@ the stages).
     score   (a long row's block of local keys, wave w the keys 16 w ..): the cache
             block's preshuffled rows as the MFMA's B operand (two 16 B loads a
             lane), the row's FP8 q (IQ8) as A, 4 chained 16x16x32 FP8 MFMAs a
-            16-head half, relu(dot k_scale) w_h summed in gluon's head order
-            -> ILOG (device scope), SFLAG[row, block]
+            16-head half, relu(dot k_scale) w_h summed in gluon's head order;
+            FP4 one scaled E2M1 MFMA a 16-head half, summed in the FP4
+            scorer's order (``_score_fp4``) -> ILOG (device scope), SFLAG[row, block]
     select  (a long row, one CTA; every rank the same rows): the exact global
             top-K by (score desc, rank asc, local index asc) without moving a
             candidate -- 4 radix passes of 8 bits over the merge's ordinal,
@@ -29,8 +30,11 @@ rank holds, in local order (the original merge's answer whenever ctx <= K).
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from atom.model_ops.sparse_indexer_fp4 import FP4_QUANT_BLOCK_SIZE
+from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     CM_SYS,
@@ -43,6 +47,7 @@ from atom.mono.device.ops import (
     traced,
     wave_incl_scan,
     wave_sum,
+    xred,
 )
 from atom.mono.device.queue import word
 from atom.mono.device.select import INT_MIN, f32_key, u32_gt
@@ -51,8 +56,12 @@ from atom.mono.dsa_indexer.plan import (
     SCORE_KEYS,
     TILE,
     cache_byte,
+    fp4_byte,
+    fp4_scale_byte,
     key_pos,
     local_len,
+    q_fp4_byte,
+    q_fp4_scale,
     scale_byte,
     short,
 )
@@ -507,6 +516,26 @@ def _block_keys(c, blk, key, j):
     return b64, ks
 
 
+def _block_keys_fp4(c, blk, sblk, key, j):
+    """FP4: a lane's key of one cache block, dims 32 j .. +32 (one 16 B load,
+    the MFMA's B operand), and its E8M0 for them."""
+    sh = c["shape"]
+    kv = fx.Vector(
+        bo.buffer_load(
+            blk,
+            fp4_byte(sh, key, FP4_QUANT_BLOCK_SIZE * j) // 4,
+            vec_width=4,
+            dtype=T.i32,
+            cache_modifier=CM_DEV,
+        )
+    )
+    at = fp4_scale_byte(sh, key, j)
+    sw = fx.Int32(
+        bo.buffer_load(sblk, at // 4, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)
+    )
+    return kv, (sw >> (8 * (at % 4))) & 0xFF
+
+
 # LDS ``qrows``: a score task's rows 1 .. rg - 1 (row 0 is read straight to
 # registers), each its FP8 query -- a head's head_dim bytes at a stride of
 # QPAD words more (16 lanes reading 16 B at heads lane % 16 then meet the 64
@@ -515,11 +544,14 @@ QPAD = 4
 
 
 def head_words(sh):
-    return sh.head_dim // 4 + QPAD
+    """A head's query words in LDS: FP8 head_dim bytes, FP4 half of them."""
+    return sh.head_dim // (8 if sh.fp4 else 4) + QPAD
 
 
 def qrow_words(sh):
-    return sh.heads * head_words(sh) + sh.heads
+    """A row's LDS words: its heads' queries, FP4 a scale word a head, then
+    its head weights."""
+    return sh.heads * head_words(sh) + sh.heads * (2 if sh.fp4 else 1)
 
 
 def _query(sh, j, lane, q_at, w_at):
@@ -540,10 +572,31 @@ def _query(sh, j, lane, q_at, w_at):
     return qs, ws
 
 
+def _query_fp4(sh, j, lane, q_at, s_at, w_at):
+    """FP4: a row's query (16 B of E2M1, dims 32 j .. of head 16 hh + lane %
+    16, the MFMA's A operand) with its E8M0, and head weights, a lane's share;
+    ``s_at(head)`` loads the word of a head's four chunk scales."""
+    qs, scs, ws = [], [], []
+    for hh in range_constexpr(sh.heads // TILE):
+        head = TILE * hh + lane % 16
+        qs.append(fx.Vector(q_at(head, 4 * j)))
+        scs.append((fx.Int32(s_at(head)) >> (8 * j)) & 0xFF)
+        w = w_at(TILE * hh + 4 * j)
+        ws.append([fx.Int32(w[i]).bitcast(fx.Float32) for i in range(4)])
+    return qs, scs, ws
+
+
 def _row_query(c, q, j, lane):
     """Row q's query and head weights from where ``stage_iquant`` wrote them
     (device scope: this launch's)."""
     sh = c["shape"]
+    if const_expr(sh.fp4):
+        return _query_fp4(
+            sh, j, lane,
+            lambda h, x: ld_dev(c["iq8"], q_fp4_byte(sh, q, h, 0) // 4 + x, 4),
+            lambda h: ld_dev(c["iq8"], q_fp4_scale(sh, q, h, 0) // 4),
+            lambda h: fx.Vector(ld_dev(c["iw"], q * sh.heads + h, 4)),
+        )  # fmt: skip
     return _query(
         sh, j, lane,
         lambda h, x: fx.Vector(ld_dev(c["iq8"], (q * sh.qrows + h * sh.head_dim) // 4 + x, 4)),
@@ -556,6 +609,14 @@ def _staged_query(c, r, j, lane):
     sh = c["shape"]
     base = c["qrows"] + (r - 1) * qrow_words(sh)
     vec4 = fx.Vector.make_type(4, fx.Int32)
+    if const_expr(sh.fp4):
+        sw = base + sh.heads * head_words(sh)
+        return _query_fp4(
+            sh, j, lane,
+            lambda h, x: fx.ptr_load(base + h * head_words(sh) + x, result_type=vec4),
+            lambda h: fx.ptr_load(sw + h),
+            lambda h: fx.Vector(fx.ptr_load(sw + sh.heads + h, result_type=vec4)),
+        )  # fmt: skip
     return _query(
         sh, j, lane,
         lambda h, x: fx.Vector(fx.ptr_load(base + h * head_words(sh) + x, result_type=vec4)),
@@ -569,24 +630,50 @@ def _rows_loads(c, lead, span, rg):
     LDS ``qrows`` word and whether it is one: a task waits one load's latency
     for its rows, not one a row. Rows past the span repeat the last."""
     sh, tid = c["shape"], c["tid"]
-    hc, wc = sh.head_dim // 16, sh.heads // 4
+    hc = sh.head_dim // (32 if sh.fp4 else 16)
+    wc = sh.heads // 4
+    hw = sh.heads * head_words(sh)
+    # (base, 16 B chunks a row, the query's?, a row's chunk i's source word
+    # and LDS word): the queries', FP4 their scales', then the weights'
+    srcs = [(c["iq8"], sh.heads * hc, True, None)]
+    if const_expr(sh.fp4):
+        srcs.append(
+            (
+                c["iq8"],
+                wc,
+                False,
+                lambda row, i: (q_fp4_scale(sh, row, 0, 0) // 4 + 4 * i, hw + 4 * i),
+            )
+        )
+    srcs.append(
+        (
+            c["iw"],
+            wc,
+            False,
+            lambda row, i: (
+                row * sh.heads + 4 * i,
+                hw + (sh.heads if sh.fp4 else 0) + 4 * i,
+            ),
+        )
+    )
     out = []
-    # the queries' chunks, then the weights': a base a loop, not one a lane
-    for base, per, at0 in (
-        (c["iq8"], sh.heads * hc, 0),
-        (c["iw"], wc, sh.heads * head_words(sh)),
-    ):
+    for base, per, query, at_of in srcs:
         n = (rg - 1) * per
         for k in range_constexpr(-(-n // THREADS)):
             e = fx.min(tid + THREADS * k, n - 1)
             r, i = e // per, e % per
             row = lead + fx.min(r + 1, span - 1)
-            if const_expr(at0 == 0):
+            if const_expr(query):
                 h, x = i // hc, i % hc
-                src = (row * sh.qrows + h * sh.head_dim) // 4 + 4 * x
+                head0 = (
+                    q_fp4_byte(sh, row, h, 0)
+                    if sh.fp4
+                    else row * sh.qrows + h * sh.head_dim
+                )
+                src = head0 // 4 + 4 * x
                 at = h * head_words(sh) + 4 * x
             else:
-                src, at = row * sh.heads + 4 * i, at0 + 4 * i
+                src, at = at_of(row, i)
             v = fx.Vector(ld_dev(base, src, 4))
             out.append((v, r * qrow_words(sh) + at, tid + THREADS * k < n))
     return out
@@ -598,6 +685,47 @@ def _rows_store(c, vs):
     for v, at, live in vs:
         if live:
             fx.ptr_store(v, c["qrows"] + at)
+
+
+def _terms_fp8(sh, qrow, key):
+    """FP8: a key's per-head relu(q k) * key scale with its head weight, the
+    ``head_sum`` terms."""
+    qs, ws = qrow
+    b64, ks = key
+    terms = {}
+    for hh in range_constexpr(sh.heads // TILE):
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for x in range_constexpr(4):
+            acc = mfma_fp8(qs[hh][x], b64[x], acc)
+        for e in range_constexpr(4):
+            terms[hh, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), ws[hh][e])
+    return terms
+
+
+def _score_fp4(sh, qrow, key):
+    """FP4: a key's score for a row, as the FP4 scorer sums it: per 16-head
+    half one scaled E2M1 MFMA (q A, key B), 2 relu (dot + |dot|) times the
+    weight (raw times weights_scale / 2), a lane's heads 16 hh + 4 g + e in
+    order (a product, then fmas), then lane groups (0 + 2) + (1 + 3)."""
+    qs, scs, ws = qrow
+    kv, ks = key
+    p = None
+    for hh in range_constexpr(sh.heads // TILE):
+        acc = mfma_scaled(
+            qs[hh],
+            kv,
+            fx.Vector.filled(4, 0.0, fx.Float32),
+            scs[hh],
+            ks,
+            a_fmt=FP4,
+            b_fmt=FP4,
+        )
+        for e in range_constexpr(4):
+            t2 = acc[e] + abs(acc[e])
+            p = t2 * ws[hh][e] if p is None else fx.Float32(fmath.fma(t2, ws[hh][e], p))
+    for off in (32, 16):
+        p = xred(p, off, lambda x, y: x + y)
+    return p
 
 
 @traced
@@ -658,33 +786,43 @@ def stage_score(c, p, u0, nu, width):
     # a row's LDS reads a row ahead of its MFMAs
     nxt = _row_query(c, rows_g[0], dg, lane)
     staged = _rows_loads(c, lead, span, rg) if const_expr(rg > 1) else []
-    keys = [
-        _block_keys(
-            c,
-            rsrc(a["cache"] + fx.Int64(e) * fx.Int64(sh.block_bytes)),
-            row + lane % 16,
-            dg,
-        )
-        for e, row in blocks
-    ]
+    if const_expr(sh.fp4):
+        keys = [
+            _block_keys_fp4(
+                c,
+                rsrc(a["cache"] + fx.Int64(e) * fx.Int64(sh.block_bytes)),
+                rsrc(a["cache_scale"] + fx.Int64(e) * fx.Int64(sh.scale_block_bytes)),
+                row + lane % 16,
+                dg,
+            )
+            for e, row in blocks
+        ]
+    else:
+        keys = [
+            _block_keys(
+                c,
+                rsrc(a["cache"] + fx.Int64(e) * fx.Int64(sh.block_bytes)),
+                row + lane % 16,
+                dg,
+            )
+            for e, row in blocks
+        ]
     if const_expr(rg > 1):
         _rows_store(c, staged)
         gpu.barrier()
     for r in range_constexpr(rg):
-        qs, ws = nxt
+        qrow = nxt
         if const_expr(r + 1 < rg):
             nxt = _staged_query(c, r + 1, dg, lane)
         for i in range_constexpr(width):
-            b64, ks = keys[i]
-            terms = {}
-            for hh in range_constexpr(sh.heads // TILE):
-                acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for x in range_constexpr(4):
-                    acc = mfma_fp8(qs[hh][x], b64[x], acc)
-                for e in range_constexpr(4):
-                    terms[hh, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), ws[hh][e])
-            col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
-            score = fx.Float32(head_sum(terms))
+            # FP8 takes its column after the MFMAs; hoisting it changes FP8's code
+            if const_expr(sh.fp4):
+                col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+                score = _score_fp4(sh, qrow, keys[i])
+            else:
+                terms = _terms_fp8(sh, qrow, keys[i])
+                col = SCORE_KEYS * (u0 + i) + TILE * wave + lane % 16
+                score = fx.Float32(head_sum(terms))
             # the row's keys alone: the next row's ILOG starts past its last
             stored = (lane < 16) & (i < nu) & (col < ns[r])
             if const_expr(not static):

@@ -75,6 +75,11 @@ _SHAPE = bind.IndexerShape(
     heads=32, head_dim=128, topk=2048, q_lora=1536, wq_dtype="bf16",
     kv_dtype="fp8", block_rows=128, rope_dim=0,
 )  # fmt: skip
+_FP4_SHAPE = bind.IndexerShape(
+    heads=_SHAPE.heads, head_dim=_SHAPE.head_dim, topk=_SHAPE.topk,
+    q_lora=_SHAPE.q_lora, wq_dtype="bf16", kv_dtype="fp4",
+    block_rows=64, rope_dim=64,
+)  # fmt: skip
 
 
 def _indexer(**fields):
@@ -154,3 +159,32 @@ def test_a_layer_is_refused_on_its_own_flags_and_no_model_attribute():
         bind._layer_refusal(_indexer(**rope, use_qk_rope_cache_fusion=True), _SHAPE)
         == ""
     )
+
+
+def test_fp4_refuses_dcp_and_a_mismatched_scale_plane():
+    module = _module(
+        _indexer_fp4=True,
+        rope_dim=64,
+        rotary_emb=SimpleNamespace(is_neox_style=False),
+        use_qk_rope_cache_fusion=True,
+    )
+    cfg = _cfg(dcp=4)
+    cfg.kv_cache_block_size = _FP4_SHAPE.block_rows
+    assert "FP4 index cache under DCP" in bind._static_refusal(
+        cfg, tp=4, rank=0, indexers={3: module}
+    )
+
+    blocks = 3
+    cache = torch.empty(blocks * _FP4_SHAPE.block_bytes)
+
+    def refusal(scale):
+        indexer = SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[cache], kv_cache_scale=scale)
+        )
+        return bind._cache_refusal(indexer, _FP4_SHAPE)
+
+    scale_bytes = blocks * _FP4_SHAPE.scale_block_bytes
+    assert refusal(torch.empty(scale_bytes)) == ""
+    assert "FP4 index scales" in refusal(None)
+    assert "FP4 index scales" in refusal(torch.empty(scale_bytes - 1))
+    assert "FP4 index scales" in refusal(torch.empty(scale_bytes * 2)[::2])
