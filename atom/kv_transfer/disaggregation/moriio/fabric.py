@@ -12,7 +12,9 @@
 - Every PAGE region is then addressed as (offset in the pool, bytes per block),
   and a request moves as one batch on the single (local pool, remote pool)
   session; mori merges segments that are contiguous on both sides and copies
-  each with its fabric copy kernel.
+  up to 512 of them per launch of its fabric copy kernel. Blocks of one batch
+  run concurrently, so a batch's destinations must not overlap: no block may
+  appear twice on the side being written.
 """
 
 from __future__ import annotations
@@ -117,6 +119,17 @@ def desc_fabric_info(packed_desc: bytes) -> tuple[bool, int]:
     fields = msgpack.unpackb(packed_desc, raw=True)
     handle = fields[_DESC_FABRIC_HANDLE]
     return bool(handle) and any(handle), int(fields[_DESC_VPOD_ID])
+
+
+def repeated_blocks(block_ids: list[int]) -> list[int]:
+    """The block ids that appear more than once, sorted."""
+    seen: set[int] = set()
+    repeated: set[int] = set()
+    for b in block_ids:
+        if b in seen:
+            repeated.add(b)
+        seen.add(b)
+    return sorted(repeated)
 
 
 def block_runs(src: list[int], dst: list[int]) -> list[tuple[int, int, int]]:

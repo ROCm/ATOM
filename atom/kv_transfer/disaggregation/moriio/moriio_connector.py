@@ -45,6 +45,7 @@ from atom.kv_transfer.disaggregation.moriio.fabric import (
     page_offsets,
     page_region_digests,
     pool_span,
+    repeated_blocks,
 )
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
@@ -1362,8 +1363,18 @@ class MoRIIOConnector(KVConnectorBase):
         local_block_ids: list[int],
         remote_block_ids: list[int],
         remote_regions: list[tuple[int, int]],
+        into_remote: bool,
     ) -> tuple[list[int], list[int], list[int]]:
-        """Pool-relative (local offsets, remote offsets, sizes) of one request."""
+        """Pool-relative (local offsets, remote offsets, sizes) of one request,
+        read into the local blocks or written into the remote ones."""
+        written = remote_block_ids if into_remote else local_block_ids
+        repeated = repeated_blocks(written)
+        if repeated:
+            raise ValueError(
+                f"{'remote' if into_remote else 'local'} blocks {repeated[:8]} "
+                f"appear more than once among the {len(written)} a fabric batch "
+                "writes; its copies run concurrently, so they must not overlap"
+            )
         runs = block_runs(local_block_ids, remote_block_ids)
         local_regions = [(offset, unit) for offset, unit, _ in self._page_regions]
         return page_offsets(local_regions, remote_regions, runs)
@@ -1373,7 +1384,9 @@ class MoRIIOConnector(KVConnectorBase):
     ) -> list[Any]:
         """Push every PAGE region's source blocks into the consumer's, as one batch."""
         session, remote_regions = self._get_or_build_page_session(engine_id)
-        l_offs, r_offs, sizes = self._page_batch(src, dst, remote_regions)
+        l_offs, r_offs, sizes = self._page_batch(
+            src, dst, remote_regions, into_remote=True
+        )
         if self._verify_kv:
             request["page_digest"] = self._page_digests(src)
             request["_page_src"] = list(src)
@@ -1706,7 +1719,7 @@ class MoRIIOConnector(KVConnectorBase):
             session, remote_regions = self._get_or_build_page_session(dp_engine_id)
             local = local_block_ids
             l_offs, r_offs, sizes = self._page_batch(
-                local, remote_block_ids[: len(local)], remote_regions
+                local, remote_block_ids[: len(local)], remote_regions, into_remote=False
             )
             self._page_reads[request_id] = (
                 time.monotonic(),

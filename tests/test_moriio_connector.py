@@ -1007,6 +1007,23 @@ class WritePathTest(unittest.TestCase):
         }
         self.assertEqual(consumer.describe_blocks([6]), "target of req d1's push: [6]")
 
+    def test_a_fabric_batch_never_writes_a_block_twice(self):
+        conn = self.make(producer=True)
+        conn._page_regions = [(0, 16, "k"), (1000, 4, "k_scale")]
+        remote = [(64, 16), (5000, 4)]
+        l_offs, r_offs, sizes = conn._page_batch(
+            [2, 3, 7], [3, 4, 0], remote, into_remote=True
+        )
+        self.assertEqual(l_offs, [32, 112, 1008, 1028])
+        self.assertEqual(r_offs, [112, 64, 5012, 5000])
+        self.assertEqual(sizes, [32, 16, 8, 4])
+        with self.assertRaisesRegex(ValueError, r"remote blocks \[4\] appear more"):
+            conn._page_batch([2, 3, 7], [4, 5, 4], remote, into_remote=True)
+        # A read writes the local blocks; a source read twice is allowed.
+        conn._page_batch([2, 3, 7], [4, 5, 4], remote, into_remote=False)
+        with self.assertRaisesRegex(ValueError, r"local blocks \[2\] appear more"):
+            conn._page_batch([2, 3, 2], [4, 5, 6], remote, into_remote=False)
+
     def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
         conn = self.make(producer=True)
         started = time.monotonic()
