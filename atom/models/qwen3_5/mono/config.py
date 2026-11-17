@@ -62,6 +62,12 @@ def proj_kind(weights: str) -> str:
     return {"fp8": "block", "mxfp4": "bf16", "mxfp4_attnfp8": "ptpc"}[weights]
 
 
+def max_rows(weights: str) -> int:
+    """The widest step mono serves with this checkpoint. MXFP4-AttnFP8: past 8 rows the original
+    path's fused-shared MXFP4 MoE (aiter's a4w4 kernels) is faster than the kernel's."""
+    return 8 if weights == "mxfp4_attnfp8" else MAX_TOKENS
+
+
 def shared_fused(weights: str) -> bool:
     return weights in ("fp8", "mxfp4_attnfp8")
 
@@ -110,6 +116,11 @@ class Q35Config:
     def proj_kind(self) -> str:
         """The projections: "block" (FP8 per 128 x 128), "bf16" or "ptpc" (FP8 per channel x per token)."""
         return proj_kind(self.weights)
+
+    @property
+    def max_rows(self) -> int:
+        """The widest step mono serves (``max_rows``)."""
+        return max_rows(self.weights)
 
     @property
     def shared_fused(self) -> bool:

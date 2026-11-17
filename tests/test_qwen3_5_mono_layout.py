@@ -329,6 +329,13 @@ def test_per_token_fp8_gemm_orders_match_aiters_tuned_picks():
     assert ptpc_gemm_refusal(Q35Config(weights="mxfp4_attnfp8")) is None
 
 
+@pytest.mark.parametrize(
+    "weights, rows", [("fp8", MAX_TOKENS), ("mxfp4", MAX_TOKENS), ("mxfp4_attnfp8", 8)]
+)
+def test_the_widest_step_each_checkpoint_serves(weights, rows):
+    assert Q35Config(weights=weights).max_rows == rows
+
+
 def test_every_launch_width_has_its_bf16_gemm_rule():
     """A launch's rows are the M baseline ATOM's GEMMs run at (ATOM pads the step before the model sees
     it): every width the kernel launches has its rounding rule."""

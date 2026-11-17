@@ -686,8 +686,9 @@ class Qwen35MonoDecodeRunner:
         return out
 
     def launch_width(self, rows: int) -> int | None:
-        """The launch width of a ``rows``-row step, or None (not served): whole requests' rows."""
-        return rows if 0 < rows <= MAX_TOKENS and rows % self.T == 0 else None
+        """The launch width of a ``rows``-row step, or None (not served): whole requests' rows, up to the
+        checkpoint's widest (``Q35Config.max_rows``)."""
+        return rows if 0 < rows <= self.cfg.max_rows and rows % self.T == 0 else None
 
     def prepare(self, rows: int) -> bool:
         """Whether every rank holds the launch of a ``rows``-row step."""
@@ -698,7 +699,7 @@ class Qwen35MonoDecodeRunner:
         """Every width a step can take, built now (collective, at install). A CUDA-graph deployment
         builds them while capturing; an eager one would otherwise stall a serving step on each.
         """
-        for rows in range(self.T, MAX_TOKENS + 1, self.T):
+        for rows in range(self.T, self.cfg.max_rows + 1, self.T):
             self.prepare(rows)
 
     # ---------------------------------------------------------------- forward
