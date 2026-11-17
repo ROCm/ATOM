@@ -733,13 +733,14 @@ def weight_is_stored_preshuffled(
     preshuffle path is off, so it is shuffled once at load rather than per
     forward.
 
-    ``native_group_rows`` marks a native group32 weight (1x32 or 32x32),
-    otherwise read as checkpoint bytes. Native weights are shuffled on gfx950
-    for AITER's preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by
-    default), always on gfx1250, whose only group32 GEMM is AITER's preshuffled
-    FlyDSL one, and always under ``needs_preshuffled_weight``. A shuffled 1x32
-    weight's scale takes the layout aiter's ``shuffle_mxfp8_bpreshuffle_scale``
-    gives it (n32k4 on gfx1250).
+    ``native_group_rows`` marks a native group32 weight, otherwise read as
+    checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
+    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
+    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
+    one. Native 1x32 weights are shuffled only when the existing
+    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
+    opt-in path does. A shuffled 1x32 weight's scale takes the layout of
+    aiter's ``shuffle_mxfp8_bpreshuffle_scale``.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -785,6 +786,8 @@ def weight_is_stored_preshuffled(
 
 
 class LinearBase(nn.Module):
+    native_a8_group_rows: int | None = None
+
     def __init__(
         self,
         input_size: int,
