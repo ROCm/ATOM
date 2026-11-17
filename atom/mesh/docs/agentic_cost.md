@@ -1,7 +1,8 @@
-# Agentic prefill cost
+# Agentic routing
 
-`policies::agentic` scores eligible workers using externally supplied cache-hit
-and load snapshots:
+`agentic` places each request on the worker (`url@rank`) with the lowest
+prefill cost, so a long multi-turn prompt stays where its KV lives until that
+worker's queue costs more than prefilling the prompt elsewhere:
 
 ```text
 uncached_tokens = max(prompt_tokens - cached_tokens, 0)
@@ -9,59 +10,50 @@ cost = inflight_prefill_tokens + uncached_tokens
      + request_token_equivalent * inflight_requests
 ```
 
-The minimum cost wins, with uniform random tie-breaking. The result includes the
-original worker index and `uncached_tokens`, the charge for the eventual placement.
-Cache hits save their corresponding prefill cost; there is no extra hit bonus.
-`AgenticCost::request_token_equivalent` (default 512) is the request weight; keep it
-equal to the engine's `ATOM_DP_LB_REQ_EQUIV`, which its `least_tokens` DP balancer
-uses for the same weight.
+The minimum cost wins, ties at random. A hit saves only the prefill it covers,
+with no extra bonus, as in the engine's `least_tokens` DP balancer.
 
-## Integration boundary
+| Input | Source |
+| --- | --- |
+| `prompt_tokens` | The request's tokens (`--model-path` or `--tokenizer-path`, prompts up to `--prepare-max-tokenize-bytes`); without them, its text bytes / 4. |
+| `cached_tokens` | The KV event index (`--kv-events`): the leading prompt tokens each worker's GPU cache holds. A request the index cannot match (no tokens, media, or no candidate's events indexed) uses a text tree of past placements: the worker with the longest text match is credited its bytes / 4. The tree shares `--eviction-interval` and `--max-tree-size` with `cache_aware`. |
+| `inflight_prefill_tokens` | Tokens charged to the worker whose prefill has not finished, `mesh_worker_prefill_tokens{worker}`. |
+| `inflight_requests` | `mesh_worker_requests_active{worker}`. |
+| `request_token_equivalent` | `--agentic-request-token-equivalent` (512). Keep it equal to the engine's `ATOM_DP_LB_REQ_EQUIV`. |
 
-This module is a standalone cost function, not yet a selectable router policy.
-It does not enable a CLI option or change request routing. Integration and GPU
-acceptance wait for the KV-event path led by
-[PR #3252](https://github.com/ROCm/ATOM/pull/3252), including the
-[prefix-match provider in #3274](https://github.com/ROCm/ATOM/pull/3274).
+The selected worker is charged its `uncached_tokens`, released when its P/D
+prefill response completes or at a streaming response's first frame;
+non-streaming regular responses are not charged. Under idx2idx the planner
+selects decode first, so `agentic` chooses among the prefill workers on its
+rank. For a request the index can match, `agentic` predicts the selected
+worker's blocks (`on_routed`) and reports an estimated hit ratio, reconciled
+with the cached tokens the engine reports.
 
-```text
-KV-event index -> unified prefix-match provider --+
-                                                  +-> agentic cost -> worker
-shared per-worker prefill/request load -----------+
-```
+## Branches
 
-The integration should:
+| Branch | Meaning |
+| --- | --- |
+| `hit`, `relocate`, `miss` | By the index: the selected worker holds the longest prefix; another worker holds a longer one but its queue outweighs the reuse; no candidate holds any. |
+| `text_hit`, `text_relocate`, `text_miss` | The same, by the text tree. |
+| `unmatched` | Neither tokens nor text. |
 
-1. Filter workers for health, model, pool and any hard affinity constraints.
-2. Query the shared provider once for those workers. Map its answer to each
-   candidate's reusable leading token count. `None` means unknown and earns no
-   cache credit; `Some(0)` means a known miss. Both remain eligible. Event trust,
-   prediction and invalidation belong to the provider.
-3. Supply per-`url@rank` in-flight prefill tokens and requests from common load
-   accounting. These are snapshots, not counters owned by the cost function.
-4. Select a worker. If a later rank mapping changes the actual destination,
-   recompute the charge using that destination's hit information before accounting
-   for it. Account for the final destination and release its prefill charge on
-   prefill completion or cancellation.
+## Requirements and limits
 
-The provider's `CacheHit.tokens` entries are cumulative tier depths, so they must
-not be added together. Lower-tier cache credit must correspond to the worker's
-usable load path, not merely to KV stored somewhere. The conversion of tier hits
-to reusable tokens, and any transfer-cost weighting, must be agreed during joint
-validation. This module takes that resolved token count as input.
-
-## Validation
-
-The unit tests cover cache reuse versus queueing, request pressure, unknown and
-zero hits, clamping cache credit, counter overflow, ties and empty candidates:
+- Prefill and regular pools only: configuration rejects `agentic` for decode,
+  including `--policy agentic` in P/D mode without `--decode-policy`.
+- DP engines need `--dp-aware` for their KV events to be followed. Messages and
+  Responses requests carry `data_parallel_rank` only with the `mesh.apis`
+  label; otherwise the engine picks the rank the router charged.
+- Token routing wants `--prepare-max-tokenize-bytes` around 4 MiB and
+  `--tokenizer-cache-enable-l1`; longer prompts use the text tree.
+- The index follows the GPU tier only. With Mooncake Store or LMCache as L2,
+  `uncached_tokens` overstates the cost of relocating.
+- Selection and charge are not atomic, so concurrent requests that read the
+  same minimum land on the same worker.
+- There is no session-owner layer: a session stays only while its hits hold.
 
 ```sh
-cargo test --manifest-path atom/mesh/Cargo.toml --lib policies::agentic
+atomesh launch --pd-disaggregation --prefill http://p:8000 --decode http://d:8000 \
+  --model-path <model> --kv-events --prepare-max-tokenize-bytes 4194304 \
+  --tokenizer-cache-enable-l1 --prefill-policy agentic --decode-policy dp_sticky
 ```
-
-CI runs this suite in the `Test agentic prefill cost` step of
-`.github/workflows/atomesh-mocker-benchmark.yaml`, using the same `ci` profile and
-target directory as the P/D lifecycle tests so the test binary is reused.
-
-Joint validation must also check the provider adapter, final-rank accounting and
-the prefill charge's release timing, before measuring AgentX TTFT and throughput.

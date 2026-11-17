@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    AgenticConfig, AgenticCost, AgenticPolicy, CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy,
+    LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -45,6 +46,17 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::Agentic {
+                request_token_equivalent,
+                eviction_interval_secs,
+                max_tree_size,
+            } => Arc::new(AgenticPolicy::new(AgenticConfig {
+                cost: AgenticCost {
+                    request_token_equivalent: *request_token_equivalent,
+                },
+                eviction_interval_secs: *eviction_interval_secs,
+                max_tree_size: *max_tree_size,
+            })),
         }
     }
 
@@ -57,6 +69,7 @@ impl PolicyFactory {
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "agentic" => Some(Arc::new(AgenticPolicy::default())),
             _ => None,
         }
     }
@@ -161,6 +174,14 @@ mod tests {
                     load_factor: 1.25,
                 },
             ),
+            (
+                "agentic",
+                PolicyConfig::Agentic {
+                    request_token_equivalent: 512,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 500,
+                },
+            ),
         ];
 
         for (expected_name, config) in configs {
@@ -192,6 +213,8 @@ mod tests {
             ("cacheaware", "cache_aware"),
             ("prefix_hash", "prefix_hash"),
             ("prefixhash", "prefix_hash"),
+            ("agentic", "agentic"),
+            ("Agentic", "agentic"),
         ];
 
         for (input, expected_name) in cases {

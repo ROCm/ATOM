@@ -64,12 +64,12 @@ skipped after a failed prefill adds none.
 | Metric | Type / unit | Labels | Recorded when |
 | --- | --- | --- | --- |
 | `mesh_route_branch_total` | Counter, decisions | `pool`, `policy`, `branch` (see [Branches](#branches)) | Every selection, including one in a pool without candidates. |
-| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`. |
+| `mesh_route_prefix_match_ratio` | Histogram, ratio 0 to 1 | `pool`, `policy` | `cache_aware` branches `affinity` and `relocate`; every `agentic` branch except `unmatched`. |
 | `mesh_route_selected_worker_active_requests` | Histogram, active requests | `pool`, `policy`, `branch` | Every selection that picks a worker, before the router adds the request (see [below](#selected-workers-active-requests)). |
 | `mesh_session_worker_change_total` | Counter, requests | `pool`, `reason`: `rebind`, `expired`, `rank_mapping` | A `dp_sticky` session request is sent to a different worker (URL and DP rank) than the session's previous request (see [below](#worker-changes)). |
 | `mesh_selected_dp_rank_total` | Counter, dispatches | `pool`, `worker` (base URL), `dp_rank` (rank or `none`) | HTTP routers send a request, after DP rank mapping (see [below](#dp-ranks)). |
 | `mesh_route_cache_tokens_total` | Counter, tokens | `pool` (`regular` or `prefill`), `kind`: `prompt`, `cached` | HTTP routers; the response reported cached tokens. Any policy (see [below](#router-estimate-and-engine-reported-cached-tokens)). |
-| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on; today only `cache_aware`. |
+| `mesh_route_cache_estimate_tokens_total` | Counter, tokens | `pool`, `kind`: `prompt`, `estimated`, `actual` | The same, when the policy also estimated a hit on the worker the prompt ran on: `cache_aware` and `agentic`. |
 | `mesh_route_cache_estimate_error_ratio` | Histogram, ratio -1 to 1 | `pool` | Same requests: (estimated - actual) / prompt tokens. |
 | `mesh_kv_events_dropped_predictions_total` | Counter, prompts | `model`, `pool` | `--kv-events`: a prompt routed to a worker is left out of the KV index's predictions, as the writer of its partition is behind. The first drop in a partition also logs a warning. |
 | `mesh_prefix_hash_policy_branch_total` | Counter, decisions | `branch` | `prefix_hash`, the same branches without `pool`. Deprecated by [#3141] for `mesh_route_branch_total{policy="prefix_hash"}`. |
@@ -109,6 +109,13 @@ Defaults are the CLI defaults.
 | | `no_tokens` | The request has no tokens: no worker. | |
 | `dp_sticky` | `hit`, `new`, `rebind`, `expired` | See [session affinity](#session-affinity). | |
 | | `no_session` | No `x-session-id` header: the least-loaded worker. | |
+| `agentic` | `hit` | The lowest [prefill cost](agentic_cost.md); the KV event index says it holds the longest prefix. | ratio, estimate |
+| | `relocate` | The lowest cost, though the index says another worker holds a longer prefix: that worker's queue outweighs the reuse. | ratio, estimate when the index knows the worker |
+| | `miss` | The lowest cost; by the index, no candidate holds any of the prompt. | ratio, estimate when the index knows the worker |
+| | `text_hit` | The request cannot match the index (no tokens, media, or no candidate's events indexed): the lowest cost, crediting the worker holding the longest match in the text tree. | ratio, estimate |
+| | `text_relocate` | The same, but another worker holds the longest text match. | ratio |
+| | `text_miss` | The same; nothing in the text tree matches. | ratio |
+| | `unmatched` | Neither tokens nor text: the lowest cost by load. | |
 
 ## Reading the values
 

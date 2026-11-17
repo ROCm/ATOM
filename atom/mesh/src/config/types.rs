@@ -384,6 +384,38 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// Lowest prefill cost: in-flight prefill tokens, plus the prompt tokens the
+    /// worker's GPU cache does not hold, plus a token charge per in-flight request.
+    /// Cache hits come from the KV event index (`--kv-events`), or from a text tree
+    /// for requests the index cannot match. Prefill and regular pools only.
+    #[serde(rename = "agentic")]
+    Agentic {
+        /// Tokens charged per in-flight request; keep it equal to the engine's
+        /// `ATOM_DP_LB_REQ_EQUIV` (default: 512)
+        #[serde(default = "default_request_token_equivalent")]
+        request_token_equivalent: u64,
+        /// Seconds between text tree evictions (default: 120)
+        #[serde(default = "default_agentic_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Size the text tree is evicted down to (default: 67108864)
+        #[serde(default = "default_agentic_max_tree_size")]
+        max_tree_size: usize,
+    },
+}
+
+fn default_request_token_equivalent() -> u64 {
+    crate::policies::AgenticConfig::default()
+        .cost
+        .request_token_equivalent
+}
+
+fn default_agentic_eviction_interval_secs() -> u64 {
+    crate::policies::AgenticConfig::default().eviction_interval_secs
+}
+
+fn default_agentic_max_tree_size() -> usize {
+    crate::policies::AgenticConfig::default().max_tree_size
 }
 
 fn default_prefix_token_count() -> usize {
@@ -403,6 +435,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::Agentic { .. } => "agentic",
         }
     }
 }
@@ -927,6 +960,17 @@ mod tests {
             load_check_interval_secs: 60,
         };
         assert_eq!(power_of_two.name(), "power_of_two");
+
+        let agentic: PolicyConfig = serde_json::from_str(r#"{"type":"agentic"}"#).unwrap();
+        assert_eq!(agentic.name(), "agentic");
+        assert!(matches!(
+            agentic,
+            PolicyConfig::Agentic {
+                request_token_equivalent: 512,
+                eviction_interval_secs: 120,
+                max_tree_size: 67108864,
+            }
+        ));
     }
 
     #[test]

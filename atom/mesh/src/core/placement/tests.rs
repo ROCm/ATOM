@@ -272,6 +272,48 @@ mod b_policy_apply {
         ]
     }
 
+    /// Picks the first worker and reports one token left to prefill.
+    #[derive(Debug)]
+    struct OneTokenLeft;
+
+    #[async_trait::async_trait]
+    impl LoadBalancingPolicy for OneTokenLeft {
+        async fn select_with_decision(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _info: &crate::policies::SelectWorkerInfo<'_>,
+        ) -> (Option<usize>, crate::policies::RouteDecision) {
+            let decision = crate::policies::RouteDecision {
+                prefill_tokens: Some(1),
+                ..crate::policies::RouteDecision::branch("cached")
+            };
+            (Some(0), decision)
+        }
+
+        fn name(&self) -> &'static str {
+            "one_token_left"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_policy_reports_its_prefill_estimate() {
+        let candidates = two_workers();
+        let tokens = [1u32, 2, 3];
+        let descriptor = make_descriptor(Some("m"), None, Some(&tokens), None);
+        let placed = apply_policy(&candidates, &RoundRobinPolicy::new(), &descriptor, None)
+            .await
+            .unwrap();
+        assert_eq!(placed.prefill_tokens, None);
+        let placed = apply_policy(&candidates, &OneTokenLeft, &descriptor, None)
+            .await
+            .unwrap();
+        assert_eq!(placed.prefill_tokens, Some(1));
+    }
+
     #[tokio::test]
     async fn test_round_robin_invoked_once_idx_in_range() {
         let candidates = two_workers();
@@ -282,7 +324,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -295,7 +337,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -308,7 +350,7 @@ mod b_policy_apply {
             .await
             .unwrap();
         assert_eq!(recorder.call_count(), 1);
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -366,7 +408,7 @@ mod b_policy_apply {
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].hash_ring.is_none());
-        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen)));
+        assert!(candidates.iter().any(|w| Arc::ptr_eq(w, &chosen.worker)));
     }
 
     #[tokio::test]
@@ -462,7 +504,7 @@ mod b_policy_apply {
             let chosen = apply_policy(&candidates, &policy, &descriptor, None)
                 .await
                 .unwrap();
-            assert!(candidate_urls.iter().any(|u| u == chosen.url()));
+            assert!(candidate_urls.iter().any(|u| u == chosen.worker.url()));
         }
     }
 }
@@ -2420,13 +2462,14 @@ mod i_route_metrics {
     use crate::core::Worker;
     use crate::policies::PolicyFactory;
 
-    const POLICIES: [&str; 6] = [
+    const POLICIES: [&str; 7] = [
         "random",
         "round_robin",
         "dp_sticky",
         "power_of_two",
         "cache_aware",
         "prefix_hash",
+        "agentic",
     ];
 
     fn unhealthy(worker: Arc<dyn Worker>) -> Arc<dyn Worker> {
