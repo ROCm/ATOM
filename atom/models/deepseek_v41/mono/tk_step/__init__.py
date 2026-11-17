@@ -21,7 +21,8 @@ MAX_SEQ_LEN = 1 << 20  # the plan's context (its kernargs and workspaces)
 
 
 def enabled() -> bool:
-    return envs.ATOM_DSV41_TK_STEP
+    """Under the mono master switch (``ATOM_MONO_ENABLE``, as every mono path), then ``ATOM_DSV41_TK_STEP``."""
+    return envs.ATOM_MONO_ENABLE and envs.ATOM_DSV41_TK_STEP
 
 
 def refusal(atom_config) -> str | None:
