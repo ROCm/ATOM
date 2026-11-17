@@ -115,9 +115,14 @@ def staging_reserve_bytes(config):
 
 
 def landing_reserve_bytes(config):
+    """HBM to hold back from the KV budget for this rank's KV landing.
+
+    The pool plus the scatter's int64 ``[3, segments]`` device table, both
+    allocated in ``register_kv_caches`` after the KV cache is sized.
+    """
+
     spec = landing_spec(config)
-    return (
-        0
-        if spec is None
-        else LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 24 * spec.table_segments
-    )
+    if spec is None:
+        return 0
+    table_bytes = 3 * 8 * spec.table_segments
+    return LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + table_bytes

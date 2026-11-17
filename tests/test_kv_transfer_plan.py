@@ -53,7 +53,7 @@ def test_dcp_rank_owns_its_interleaved_token_rows(rank):
     destination = torch.zeros(5, 8, 4, 4, dtype=torch.uint8)
     dst_ids = [3]
     topology = TransferTopology(target_dcp=4, target_dcp_rank=rank, interleave=2)
-    layout = RegionLayout(0, 7, destination.data_ptr(), 128, 128, True)
+    layout = RegionLayout(0, 7, destination.data_ptr(), 128, 128)
     ordered = source[ids].reshape(-1, 4, 4)
     expected = ordered[(torch.arange(24) // 2) % 4 == rank]
     plan = build_transfer_plan(topology, [layout], ids, dst_ids, 8)
@@ -74,7 +74,7 @@ def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
     # selects tokens whatever the producer and target TP sizes are.
     source = torch.arange(64, dtype=torch.uint8).view(2, 8, 4)
     destination = torch.full((3, 8, 4), 255, dtype=torch.uint8)
-    layout = RegionLayout(0, 0, destination.data_ptr(), 32, 32, token_contiguous=True)
+    layout = RegionLayout(0, 0, destination.data_ptr(), 32, 32)
     plan = build_transfer_plan(
         TransferTopology(
             source_tp=source_tp,
@@ -94,19 +94,11 @@ def test_tp_replicated_units_can_also_be_partitioned_by_dcp(source_tp, rank):
     assert (destination[:2] == 255).all()
 
 
-def test_unknown_token_layout_and_unsupported_topologies_are_rejected():
-    layout = RegionLayout(0, 0, 0, 128, 128, False)
+def test_unsupported_layouts_and_topologies_are_rejected():
+    layout = RegionLayout(0, 0, 0, 128, 128)
     dcp = TransferTopology(target_dcp=4)
-    with pytest.raises(ValueError, match="token-contiguous"):
-        build_transfer_plan(dcp, [layout], [0], [0], 8)
     with pytest.raises(ValueError, match="equal source and target"):
-        build_transfer_plan(
-            dcp,
-            [replace(layout, token_contiguous=True, target_page_bytes=64)],
-            [0],
-            [0],
-            8,
-        )
+        build_transfer_plan(dcp, [replace(layout, target_page_bytes=64)], [0], [0], 8)
     with pytest.raises(ValueError, match="non-DCP producer"):
         build_transfer_plan(replace(dcp, source_dcp=4), [layout], [0], [0], 8)
     with pytest.raises(ValueError, match="PAGE adapter"):

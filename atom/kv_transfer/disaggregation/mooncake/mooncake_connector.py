@@ -10,7 +10,6 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import logging
 import math
@@ -20,7 +19,6 @@ import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from dataclasses import asdict, astuple, dataclass
 from pathlib import Path
 from typing import Any
@@ -202,18 +200,6 @@ class SlotPool:
         with self._cv:
             self.free.append(idx)
             self._cv.notify()
-
-
-@functools.cache
-def _log_page_wider_than_landing(target: str, page_bytes: int, slot_bytes: int):
-    """Logged once per decode rank: every transfer to it takes the same path."""
-    logger.warning(
-        "[PRODUCER] %s offers %d-byte landing slots, less than one %d-byte "
-        "destination PAGE; KV to it is staged straight to its pages",
-        target,
-        slot_bytes,
-        page_bytes,
-    )
 
 
 def _mc_transfer_timeout_s() -> float:
@@ -1729,11 +1715,6 @@ class MooncakeConnector(KVConnectorBase):
         slots = staging_slot_count(
             self._num_send_workers, slot_bytes, reserve_bytes=self._kv_staging_reserve
         )
-        if not slots:
-            logger.warning(
-                "PD KV staging: PAGE exceeds the reserved pool; using direct writes"
-            )
-            return None
         self._kv_staging = torch.empty(
             (slots, slot_bytes),
             dtype=torch.uint8,
@@ -1742,10 +1723,13 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_staging_slots = SlotPool(slots)
         self._kv_source_views = eligible
         logger.info(
-            "PD KV staging: %d slots x %.1f MiB for %d regions, reserved from KV budget",
+            "PD KV staging: %d slots x %.1f MiB for %d regions, %d send workers, "
+            "held back from the KV cache. Only transfers to DCP decode ranks use "
+            "it; set ATOM_PD_MLA_STAGING=0 if no decode runs DCP",
             slots,
             slot_bytes / (1 << 20),
             len(eligible),
+            self._num_send_workers,
         )
         return KVTransferRegion(
             base_addr=self._kv_staging.data_ptr(),
@@ -1777,9 +1761,12 @@ class MooncakeConnector(KVConnectorBase):
             table_segments=spec.table_segments,
         )
         logger.info(
-            "PD KV landing: %d slots x %.1f MiB, %s, %d units/PAGE",
+            "PD KV landing: %d slots x %.1f MiB for %d regions, %s, %d units/PAGE, "
+            "held back from the KV cache. Only non-DCP MLA prefills with MLA "
+            "staging on land; set ATOM_PD_MLA_LANDING=0 if none does",
             LANDING_POOL_SLOTS,
             LANDING_SLOT_BYTES / (1 << 20),
+            len(regions),
             spec.wire_layout,
             spec.units_per_page,
         )
@@ -3329,13 +3316,8 @@ class MooncakeConnector(KVConnectorBase):
                     logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                     return False
                 continue
-            if (
-                stages_token_units
-                and region_idx in self._kv_source_views
-                and bpb <= self._kv_staging.shape[1]
-            ):
-                # Validate only: staging sends page runs, and per-token
-                # arrays for a long prompt would dominate the planning time.
+            if stages_token_units and region_idx in self._kv_source_views:
+                # Validate only: _make_staging_plan addresses its tokens.
                 self._dcp_token_unit(region_idx, bpb)
                 staged_token_regions.append(region_idx)
                 continue
@@ -3423,16 +3405,10 @@ class MooncakeConnector(KVConnectorBase):
         token_ownership: DCPShardPlan | None = None,
     ) -> TransferPlan:
         """Resolve rank ownership before byte addressing; no attention-family dispatch."""
-        roles = request.get("consumer_region_roles")
         widths = request.get("consumer_block_bpb")
         layouts = []
         for region in regions:
             consumer = cmap[region]
-            if (
-                roles is not None
-                and roles[consumer] != self._block_region_roles[region]
-            ):
-                raise ValueError("KV staging region role mismatch")
             width = self._per_block_bytes_list[region]
             layouts.append(
                 RegionLayout(
@@ -3441,7 +3417,6 @@ class MooncakeConnector(KVConnectorBase):
                     request["consumer_base_addrs"][consumer],
                     width,
                     widths[consumer] if widths is not None else width,
-                    token_contiguous=self._block_region_roles[region] == MLA_KV_ROLE,
                 )
             )
         plan = build_transfer_plan(
@@ -3483,15 +3458,7 @@ class MooncakeConnector(KVConnectorBase):
         if landing is not None:
             if landing.get("layout", TOKEN_UNITS) != plan.wire_layout:
                 raise ValueError("KV landing wire layout mismatch")
-            if plan.minimum_slot_bytes <= int(landing["slot_bytes"]):
-                slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
-            else:
-                # P can gather this PAGE, but D cannot land it. Use staged
-                # direct writes without acquiring credits or sending READYs.
-                _log_page_wider_than_landing(
-                    target, plan.minimum_slot_bytes, int(landing["slot_bytes"])
-                )
-                landing = None
+            slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
         slots = plan.pack(slot_bytes)
         stream = self._send_worker_stream()
         stream.wait_event(ready_event)
@@ -3502,14 +3469,19 @@ class MooncakeConnector(KVConnectorBase):
         try:
             # Keep both host and device indices alive until all queued gathers
             # finish, including upload and notification setup failures.
-            with torch.cuda.stream(stream) if device.type == "cuda" else nullcontext():
+            with torch.cuda.stream(stream):
                 index = host.to(device, non_blocking=True)
             land = landing is not None and len(slots) >= LANDING_MIN_SLOTS
+            if land:
+                epoch = int(landing["epoch"])
+                notify = make_zmq_path(
+                    "tcp", request["notify_host"], request["notify_port"]
+                )
             for items in slots:
                 credit = None
                 if land:
                     credit = self._landing_credits.acquire(
-                        target, int(landing["epoch"]), LANDING_CREDIT_WAIT_S
+                        target, epoch, LANDING_CREDIT_WAIT_S
                     )
                     if credit is None:
                         land = False
@@ -3537,9 +3509,6 @@ class MooncakeConnector(KVConnectorBase):
                         manifest = request.setdefault("_landed_slots", [])
                         seq = len(manifest)
                         manifest.append(credit)  # Must precede any failing READY send.
-                        notify = make_zmq_path(
-                            "tcp", request["notify_host"], request["notify_port"]
-                        )
                         self._send_on_socket(
                             notify,
                             [
@@ -3560,14 +3529,10 @@ class MooncakeConnector(KVConnectorBase):
                     # Never announced, so the consumer will not return it.
                     if credit is not None and written is None:
                         # Nothing was sent to it: it can be used again.
-                        self._landing_credits.release(
-                            target, int(landing["epoch"]), [credit]
-                        )
+                        self._landing_credits.release(target, epoch, [credit])
                     elif credit is not None and not written:
                         # The failed write may still land in it.
-                        self._landing_credits.quarantine(
-                            target, int(landing["epoch"]), credit
-                        )
+                        self._landing_credits.quarantine(target, epoch, credit)
                 if not written:
                     logger.error(
                         "[PRODUCER] %s transfer failed for req %s", label, req_id
@@ -3610,7 +3575,7 @@ class MooncakeConnector(KVConnectorBase):
             staging = self._kv_staging[pool_idx]
             used = 0
             try:
-                with torch.cuda.stream(stream) if staging.is_cuda else nullcontext():
+                with torch.cuda.stream(stream):
                     for pos, start, stop, offset in items:
                         region = plan.regions[pos]
                         end = offset + (stop - start) * region.gather.unit_bytes

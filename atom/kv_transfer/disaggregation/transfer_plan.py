@@ -45,8 +45,6 @@ class RegionLayout:
     target_base: int
     source_page_bytes: int
     target_page_bytes: int
-    # Declared physical capability, not inferred from a byte width alone.
-    token_contiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,14 +62,6 @@ class TransferPlan:
     destination_pages: np.ndarray
     units_per_page: int
     wire_layout: str
-
-    @property
-    def minimum_slot_bytes(self) -> int:
-        """Space for one destination PAGE after ownership mapping."""
-        return max(
-            (r.gather.unit_bytes * self.units_per_page for r in self.regions),
-            default=0,
-        )
 
     def pack(self, slot_bytes: int) -> list[list[tuple[int, int, int, int]]]:
         return pack_slots(
@@ -125,7 +115,7 @@ def build_transfer_plan(
     *,
     token_ownership: DCPShardPlan | None = None,
 ) -> TransferPlan:
-    """Plan supported topology/layout combinations; never guess a token layout.
+    """Plan supported topology/layout combinations.
 
     PP layer ownership is already expressed by each region's source/target map.
     DCP ownership is calculated before addressing bytes; a TP-replicated plane
@@ -165,10 +155,6 @@ def build_transfer_plan(
     regions = []
     for layout in layouts:
         src, dst = layout.source_page_bytes, layout.target_page_bytes
-        if not layout.token_contiguous:
-            raise ValueError(
-                "Token ownership needs an explicit token-contiguous layout adapter"
-            )
         if src != dst:
             raise ValueError("Token ownership needs equal source and target PAGEs")
         if src % block_size:

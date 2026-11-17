@@ -20,7 +20,7 @@ block size.
 Protocol, per decode rank (every rank has its own pool and connector):
 
 1. On first contact the rank gives a prefill stage endpoint a partition of
-   ``pool_slots // pp_size`` slots (``pp_size`` is the prefill's), first
+   ``max(1, pool_slots // pp_size)`` slots (``pp_size`` is the prefill's), first
    come, first served, and takes it back only from a stage that reports it
    cannot land (no KV staging pool: a DCP prefill, ``ATOM_PD_MLA_STAGING=0``
    or a build without landing); such an endpoint is not offered slots
@@ -428,7 +428,7 @@ class LandingReceiver:
         """The ``mla_landing`` field for a write request to ``stage_addr``.
 
         The first request to a stage endpoint assigns it a partition of
-        ``pool_slots // num_stages`` slots; None once the pool is spent, for
+        ``max(1, pool_slots // num_stages)`` slots; None once the pool is spent, for
         an endpoint that cannot land, or when landing is disabled (a scatter
         error).
         """

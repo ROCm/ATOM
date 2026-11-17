@@ -59,7 +59,7 @@ def _token_plan(src_ids, dst_ids, *, dcp_size, dcp_rank, interleave=1, token_byt
         TransferTopology(
             target_dcp=dcp_size, target_dcp_rank=dcp_rank, interleave=interleave
         ),
-        [RegionLayout(0, 0, 0, page_bytes, page_bytes, token_contiguous=True)],
+        [RegionLayout(0, 0, 0, page_bytes, page_bytes)],
         src_ids,
         dst_ids,
         BLOCK_SIZE,
@@ -575,33 +575,6 @@ def test_staged_mla_still_refuses_a_non_mla_region(monkeypatch):
     with pytest.raises(RuntimeError, match="relayout refuses region 0"):
         _run(mc, conn, request, range(4), [3, 5], object())
     assert conn._nic.labels == []
-
-
-@pytest.mark.parametrize("source_too_small", [False, True])
-def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small, caplog):
-    mc = _mooncake()
-    mc._log_page_wider_than_landing.cache_clear()
-    regions = _source_regions(1, 8)
-    old = _producer(mc, regions)
-    new = _producer(mc, regions, pool_size=1, slot_pages=4)
-    if source_too_small:
-        new._kv_staging = new._kv_staging[:, : PAGE_BYTES - 4]
-    expected = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)]
-    actual = [torch.zeros_like(expected[0])]
-    request = _request(1, 2, 1, 1, actual)
-    # Fits individual rows but not one destination PAGE. No credit metadata
-    # is needed: an undersized offer must not reach the landing credit path.
-    request["mla_landing"] = {"slot_bytes": PAGE_BYTES - 4}
-    assert _run(mc, old, _request(1, 2, 1, 1, expected), range(4), [3, 5], None)
-    with caplog.at_level(logging.WARNING, logger="atom"):
-        assert _run(mc, new, request, range(4), [3, 5], object())
-    assert torch.equal(actual[0], expected[0])
-    assert "_landed_slots" not in request
-    assert set(new._nic.labels) == ({"block"} if source_too_small else {"staged-kv"})
-    assert new._kv_staging_slots.free == [0]
-    # The staged path says why it left the offer unused.
-    dropped = [r for r in caplog.records if "less than one" in r.message]
-    assert len(dropped) == (0 if source_too_small else 1)
 
 
 def test_a_landing_offer_for_another_unit_layout_fails_before_any_rdma():
