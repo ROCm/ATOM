@@ -50,6 +50,9 @@ class PagedAttentionImpl(nn.Module):
     # Whether forward_impl takes ``quantized_output`` / ``output_scale`` and writes
     # its output there as OCP FP8 plus per-token FP32 descales.
     supports_output_quant = False
+    # Whether aiter's q/k norm + RoPE takes this layer's long prefills
+    # (_aiter_gemma_norm_rope): None until its first one, then kept.
+    _aiter_takes_norm_rope = None
 
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
@@ -468,9 +471,18 @@ class PagedAttentionImpl(nn.Module):
         """The Gemma q/k norm + NeoX RoPE of a long prefill's ``qkv`` in one aiter
         fused_qknorm_idxrqknorm launch: q into a new tensor, k in place in
         ``qkv``. None where it is not taken: off the gfx1250 family (where it was
-        measured), for a non-NeoX rotation, and for a call the op does not take
-        (aiter's fused_qknorm_idxrqknorm_supports, e.g. head_dim 256)."""
-        if not (is_gfx1250_family(get_gfx()) and self.rotary_emb.is_neox_style):
+        measured), for a non-NeoX rotation, for q/k norms with different eps (the
+        op takes one), and for a call the op does not take (aiter's
+        fused_qknorm_idxrqknorm_supports, e.g. head_dim 256). Decided once per
+        layer, at its first long prefill: its shapes, dtypes and rotary do not
+        change."""
+        if self._aiter_takes_norm_rope is None and not (
+            is_gfx1250_family(get_gfx())
+            and self.rotary_emb.is_neox_style
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        ):
+            self._aiter_takes_norm_rope = False
+        if self._aiter_takes_norm_rope is False:
             return None
         from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
@@ -490,8 +502,12 @@ class PagedAttentionImpl(nn.Module):
             self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon,
         )
-        if not aiter.fused_qknorm_idxrqknorm_supports(*args, q_out=q):
-            return None
+        if self._aiter_takes_norm_rope is None:
+            self._aiter_takes_norm_rope = aiter.fused_qknorm_idxrqknorm_supports(
+                *args, q_out=q
+            )
+            if not self._aiter_takes_norm_rope:
+                return None
         aiter.fused_qknorm_idxrqknorm(*args, q_out=q)
         return q
 

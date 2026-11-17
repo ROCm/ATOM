@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 """The aiter route of the Gemma q/k norm + RoPE of a long prefill on gfx1250.
 
-Above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS, `PagedAttentionImpl.rope_cache`
-hands the Gemma q/k norm and NeoX RoPE to aiter `fused_qknorm_idxrqknorm` (k in
-place in qkv) before the cache write, where the op takes the layer (the
-MiniMax-M3 dense layers; not head_dim 256). It must leave the attention the q,
-k and K/V cache of the Triton kernel.
+Above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS and with the pre-shuffled (ASM)
+KV cache layout (`_use_asm_cache_layout`), `PagedAttentionImpl.rope_cache` hands
+the Gemma q/k norm and NeoX RoPE to aiter `fused_qknorm_idxrqknorm` (k in place
+in qkv) before the cache write, where the op takes the layer (the MiniMax-M3
+dense layers; not head_dim 256), asked once per layer. It must leave the
+attention the q, k and K/V cache of the Triton kernel.
 Not bitwise: the sum of squares is reduced in another order and aiter rounds k
 to bf16 before the per-token FP8 quantization, so a cache is compared
 dequantized, within one step at the row maximum (32 of the 448 an FP8 row
@@ -165,12 +166,22 @@ def test_rope_cache_matches_the_triton_kernel(
     torch.testing.assert_close(v.reshape(num_tokens, -1), qkv_in[:, -NKV * HD :])
 
 
-def test_aiter_route_declines_what_the_op_does_not_take():
+def test_aiter_route_declines_what_the_op_does_not_take(monkeypatch):
+    asked = []
+    supports = aiter.fused_qknorm_idxrqknorm_supports
+    monkeypatch.setattr(
+        aiter,
+        "fused_qknorm_idxrqknorm_supports",
+        lambda *a, **kw: asked.append(1) or supports(*a, **kw),
+    )
     position = torch.zeros(8, dtype=torch.long, device="cuda")
     for hd, taken in ((HD, True), (256, False)):  # 256: Qwen3-Next, Qwen3.5
         impl = make_impl("bf16", hd)
         qkv = torch.zeros(8, (NQ + 2 * NKV) * hd, dtype=torch.bfloat16, device="cuda")
-        assert (impl._aiter_gemma_norm_rope(qkv, position) is not None) == taken
+        asked.clear()
+        for _ in range(2):  # the layer asks aiter once and keeps the answer
+            assert (impl._aiter_gemma_norm_rope(qkv, position) is not None) == taken
+        assert len(asked) == 1
     # GPT-J: not the rotation the op computes
     from aiter.rotary_embedding import get_rope
 
