@@ -560,20 +560,33 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 
         Not under DP: a decoding or idle rank would replay the prefill
         recording (`ForwardMode._pad_to_token_graph`), whose regions serve a
-        prefill alone. Nor while an MLA layer the model records cannot take
-        the prefill split (`MLAAttention.prefill_split_supported`: a sparse
-        layer, PCP, ``ATOM_USE_TRITON_GEMM``): its whole-layer region would cut
-        the step's rows out of an FP8 q scale whose bytes are column-major. A
-        drafter's layers do not count; the recording runs the target alone."""
+        prefill alone. Only while the model opted every MLA layer of its own
+        into the prefill split (`MLAAttention.split_prefill_recording`, which
+        Kimi-K3 sets) and each can take it
+        (`MLAAttention.prefill_split_supported`: no sparse layer, PCP or
+        ``ATOM_USE_TRITON_GEMM``). Any other layer runs as one region, which
+        would cut the step's rows out of an FP8 q scale whose bytes are
+        column-major; a sparse layer's DSA indexer is besides no eager region
+        and returns on the recording's dummy step, so a replay would attend
+        with a stale top-k. A model sharing this builder that opted nothing in
+        (GLM-5.3-Flash, whose MLA layers are all sparse) therefore records
+        none, and nor does Kimi-K3.1. A drafter's layers, numbered past the
+        target's (`layer_offset`), do not count: the recording runs the target
+        alone."""
         config = self.model_runner.config
         if config.parallel_config.data_parallel_size != 1:
             return False
+        target_layers = config.hf_config.num_hidden_layers
         sfc = config.compilation_config.static_forward_context
-        return all(
-            impl.prefill_split_supported()
+        target_mla = [
+            impl
             for module in sfc.values()
             if isinstance(impl := getattr(module, "impl", None), MLAAttention)
-            and impl.split_prefill_recording
+            and impl.layer_num < target_layers
+        ]
+        return bool(target_mla) and all(
+            impl.split_prefill_recording and impl.prefill_split_supported()
+            for impl in target_mla
         )
 
     def build_for_token_graph_capture(self, tokens: int):
