@@ -21,8 +21,8 @@ from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
-# the prob drafter's temperature as a multiple of the request's (T_d = T * scale; ATOM dspark_prob_sample's
-# ATOM_DSPARK_PROB_DRAFT_TSCALE). Lossless for any value: the drafts are sampled from q = softmax(z / T_d) and verified
+# the prob drafter's temperature as a multiple of the request's (T_d = T * scale; single launch only: the production
+# DSpark sampler drafts at the request's temperature). Lossless for any value: the drafts are sampled from q = softmax(z / T_d) and verified
 # against that same q. Default 1 (T_d = T).
 DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
 
