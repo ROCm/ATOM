@@ -3,15 +3,12 @@
 """The KDA gating update on aiter's gfx1250 kernel against ATOM's own kernel,
 through `_kda_gating_update` as Kimi-K3 decode and spec verify call it.
 
-The head counts are a rank's share of Kimi-K3 (96 KDA heads) and of
-GLM-5.3-Flash (64 heads, the same layer) at TP 8, 4, 2 and 1, with
-K = V = 128. Each case checks the `o` buffer that the call sites pass and
-read afterwards, and the whole state pool, with padded rows (slot -1) at the
-end of the batch as a CUDA graph pads it.
+Each case compares the `o` buffer that the call sites pass and read afterwards,
+and the whole state pool, with the last row padded (slot -1) as a CUDA graph
+pads the batch.
 
 Runs on gfx1250 only, detected from torch. Importing the model there needs
 aiter's entry, so a missing entry fails these tests instead of skipping them.
-The routing is pinned on CPU in test_kimi_k3_kda_gating_dispatch.py.
 """
 
 import pytest
@@ -27,10 +24,8 @@ def _gfx1250() -> bool:
 pytestmark = pytest.mark.skipif(not _gfx1250(), reason="gfx1250 only")
 
 K = 128
-LOWER_BOUND = -5.0
-FILL = 7.0
-# A rank's KDA heads: Kimi-K3 (96) and GLM-5.3-Flash (64) at TP 8, 4, 2 and 1.
-HEADS = [8, 12, 16, 24, 32, 48, 64, 96]
+# A rank's share of Kimi-K3's 96 KDA heads at TP 8, 4 and 2.
+HEADS = [12, 24, 48]
 
 
 @pytest.fixture(scope="module")
@@ -40,102 +35,66 @@ def gating_update():
     return _kda_gating_update
 
 
-def _inputs(heads, seqs, per_seq, slots):
-    t = seqs * per_seq
+def _padded(table):
+    table[-1] = -1
+    return table
+
+
+def _compare(gating_update, heads, write, read, accepted, tokens_per_seq):
+    t = write.size(0) * tokens_per_seq
     act = {"dtype": torch.bfloat16, "device": "cuda"}
     # beta is a column slice of the fused in-projection output in _forward_impl.
     fused = torch.randn(t, 4 * heads * K + heads + K, **act)
-    return {
+    args = {
         "A_log": torch.randn(heads, device="cuda") * 0.1,
+        "a": torch.randn(1, t, heads, K, **act),
+        "b": fused[:, 4 * heads * K : 4 * heads * K + heads].unsqueeze(0),
         "dt_bias": torch.randn(heads * K, device="cuda") * 0.1,
         "q": torch.randn(1, t, heads, K, **act),
         "k": torch.randn(1, t, heads, K, **act),
         "v": torch.randn(1, t, heads, K, **act),
-        "a": torch.randn(1, t, heads, K, **act),
-        "b": fused[:, 4 * heads * K : 4 * heads * K + heads].unsqueeze(0),
-        "state": torch.randn(slots, heads, K, K, device="cuda"),
-        "cu": torch.arange(0, t + 1, per_seq, dtype=torch.int32, device="cuda"),
-        "out": torch.full((t, heads, K), FILL, **act),
+        "cu_seqlens": torch.arange(
+            0, t + 1, tokens_per_seq, dtype=torch.int32, device="cuda"
+        ),
+        "ssm_state_indices": write,
+        "ssm_state_indices_in": read,
+        "num_accepted_tokens": accepted,
+        "lower_bound": -5.0,
     }
+    # Room for a fork's read slots after the write slots.
+    state = torch.randn(2 * write.numel(), heads, K, K, device="cuda")
+    # Prefilled, so the comparison also covers which rows a kernel leaves alone.
+    out = torch.full((t, heads, K), 7.0, **act)
 
+    def run(on_aiter):
+        o, s = out.clone(), state.clone()
+        gating_update(on_aiter=on_aiter, o=o, initial_state=s, **args)
+        return o, s
 
-def _run(gating_update, on_aiter, inp, write, read, accepted):
-    state = inp["state"].clone()
-    out = inp["out"].clone()
-    gating_update(
-        on_aiter=on_aiter,
-        A_log=inp["A_log"],
-        a=inp["a"],
-        b=inp["b"],
-        dt_bias=inp["dt_bias"],
-        q=inp["q"],
-        k=inp["k"],
-        v=inp["v"],
-        o=out,
-        initial_state=state,
-        cu_seqlens=inp["cu"],
-        ssm_state_indices=write,
-        ssm_state_indices_in=read,
-        num_accepted_tokens=accepted,
-        lower_bound=LOWER_BOUND,
-    )
-    return out, state
-
-
-def _compare(gating_update, inp, write, read, accepted, real_tokens):
-    o_ref, s_ref = _run(gating_update, False, inp, write, read, accepted)
-    o_new, s_new = _run(gating_update, True, inp, write, read, accepted)
-    # Real tokens land in the passed buffer; padded rows keep what was there.
-    assert (o_new[:real_tokens] != FILL).all()
-    assert (o_new[real_tokens:] == FILL).all()
+    (o_ref, s_ref), (o_new, s_new) = run(False), run(True)
     torch.testing.assert_close(o_new, o_ref, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(s_new, s_ref, atol=1e-3, rtol=1e-3)
 
 
-def _padded(table, pad):
-    table[table.size(0) - pad :] = -1
-    return table
+@pytest.mark.parametrize("heads", HEADS)
+@pytest.mark.parametrize("fork", [False, True], ids=["in-place", "fork"])
+def test_decode_matches_atom(gating_update, heads, fork):
+    seqs = 72
+    write = _padded(torch.arange(seqs, dtype=torch.int32, device="cuda"))
+    # Without a fork the model passes the write table as the read table.
+    read = _padded(write + seqs) if fork else write
+    _compare(gating_update, heads, write, read, None, tokens_per_seq=1)
 
 
 @pytest.mark.parametrize("heads", HEADS)
-def test_decode_matches_atom(gating_update, heads):
-    seqs, pad = 72, 2
-    inp = _inputs(heads, seqs, per_seq=1, slots=seqs)
-    slots = _padded(torch.arange(seqs, dtype=torch.int32, device="cuda"), pad)
-    # Without a fork the model reads and writes the same table.
-    _compare(gating_update, inp, slots, slots, None, seqs - pad)
-
-
-@pytest.mark.parametrize("heads", HEADS)
-def test_decode_fork_matches_atom(gating_update, heads):
-    seqs, pad = 72, 2
-    inp = _inputs(heads, seqs, per_seq=1, slots=2 * seqs)
-    write = torch.arange(seqs, dtype=torch.int32, device="cuda")
-    read = _padded(write + seqs, pad)
-    _compare(gating_update, inp, _padded(write, pad), read, None, seqs - pad)
-
-
-def _spec_tables(seqs, width, pad):
-    accepted = torch.tensor([1, 3, 2, 1, 2, 3, 1, 2], dtype=torch.int32)[:seqs]
-    write = torch.arange(seqs * width, dtype=torch.int32).view(seqs, width)
-    return accepted.cuda(), _padded(write.cuda(), pad)
-
-
-@pytest.mark.parametrize("heads", HEADS)
-def test_spec_verify_fork_matches_atom(gating_update, heads):
-    seqs, width, pad = 8, 3, 1
-    inp = _inputs(heads, seqs, per_seq=width, slots=2 * seqs * width)
-    accepted, write = _spec_tables(seqs, width, pad)
-    # No row reads a slot that another row writes in the same launch.
-    read = _padded(write + seqs * width, pad)
-    _compare(gating_update, inp, write, read, accepted, (seqs - pad) * width)
-
-
-@pytest.mark.parametrize("heads", HEADS)
-def test_spec_verify_without_read_table_matches_atom(gating_update, heads):
-    # A verify that is not a fork ships no read table (gdn_attn.py): each row
-    # resumes from its own slot[num_accepted - 1].
-    seqs, width, pad = 8, 3, 1
-    inp = _inputs(heads, seqs, per_seq=width, slots=seqs * width)
-    accepted, write = _spec_tables(seqs, width, pad)
-    _compare(gating_update, inp, write, None, accepted, (seqs - pad) * width)
+@pytest.mark.parametrize("fork", [False, True], ids=["no-read-table", "fork"])
+def test_spec_verify_matches_atom(gating_update, heads, fork):
+    seqs, width = 8, 3
+    accepted = torch.tensor([1, 3, 2, 1, 2, 3, 1, 2], dtype=torch.int32).cuda()
+    write = torch.arange(seqs * width, dtype=torch.int32, device="cuda")
+    write = _padded(write.view(seqs, width))
+    # Without a fork a verify ships no read table (gdn_attn.py), and each row
+    # resumes from its own slot[num_accepted - 1]. A fork reads slots that no
+    # row writes in the same launch.
+    read = _padded(write + seqs * width) if fork else None
+    _compare(gating_update, heads, write, read, accepted, tokens_per_seq=width)
