@@ -496,6 +496,11 @@ def target_layer(E, Ly):
         gpu.barrier()
         ci = cwith(c, iqw=ltab(fp, Ly, "iqw")(), iqws=ltab(fp, Ly, "iqws")(), iww=ltab(fp, Ly, "iww")(),
                    iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), axn=fptr(fp, "axn"))
+        # (P2) a REINDEX layer: waves 6 / 7 (idle through iq / iw) put the scorer's first page batch in LDS now
+        if ((ltab(fp, Ly, "lflags")() & fx.Int64(64)) != fx.Int64(0)) & (w >= 6):
+            SC.rx_prefill(cwith(c, ibound=ltab(fp, Ly, "ibound")(), ibat=ltab(fp, Ly, "ibat")(), icand=ltab(fp, Ly, "icand")(),
+                                btab=ltab(fp, Ly, "btab")(), bstride=fx.Int32(ltab(fp, Ly, "bstride")()),
+                                irpp=fx.Int32(ltab(fp, Ly, "irpp")())))
         IS.stage_iq(ci)
         IS.stage_iw(ci)
         lfl1 = ltab(fp, Ly, "lflags")()
@@ -548,7 +553,7 @@ def target_layer(E, Ly):
             lfl3 = ltab(fp, Ly, "lflags")()
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),
-                        iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None)
+                        iprod=(lfl3 & fx.Int64(32)) != fx.Int64(0), ts=None, rxpre=isrx)   # (P2: rx_prefill ran on REINDEX)
             # (segsel) the candidate layer on the grouped scorer: every score task counts its 8192-column segment (the
             # layer's select_mc histogram slot, zeroed a step: layer 20 runs no select_mc), the tree's level-0 tasks wait
             # for their own segments' counts -- no SCORE handoff: a segment's selection starts as its scores land

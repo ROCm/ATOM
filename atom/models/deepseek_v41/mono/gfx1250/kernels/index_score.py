@@ -105,6 +105,59 @@ O_PF = O_SRB + 3 * 64 * 4        # a batch's key rows [RB][SUB][256] int64
 
 
 @ASTRewriter.transform
+def rx_prefill(c):
+    """(P2) A REINDEX layer's first page batch of this CTA (stage_score_any's pages_to_lds(b): compacted column ->
+    icand -> real row -> block table -> O_PF, the same values) computed by waves 6 and 7 while waves 0..5 run iq / iw
+    (no LDS there, no barrier): the scorer then skips that chain before its INDEX_QUANT wait. Wave-local: every row's
+    context / bound / slot in the lanes (TR <= 32), the task map by ballots as tmap. 64 threads x RB*SUB*128/64 items:
+    item q = (w - 6) * 32 + l + 64 i -> slot j = q // 128 (task k = j // SUB, chunk u = j % SUB), column w' 16 + c16 =
+    q % 128, stored for threads w' 32 + c16 and + 16 (the lanes 16 apart share a column)."""
+    t, b, w, l, sm = c["t"], c["b"], c["w"], c["l"], c["sm"]
+    TR = c["TR"]
+    assert TR <= 32
+    SUB_ = IP.score_sub(TR, CTAS)
+    TCOLS_ = SUB_ * CHUNK
+    RB = SCORE_RB
+    ln = l
+    tc = fx.min(ln, I32(TR - 1))
+    bdt = hx.gload(c["ibound"] + i64(tc) * 4, I32)
+    cxt = TK.rx_context(c, tc, bdt)
+    qt = fx.max(hx.gload(c["ibat"] + i64(tc) * 4, I32), I32(0))
+    cnt = (ln < TR).select(IP.score_tasks(cxt, TCOLS_), I32(0))
+    inc = TK.wave_incl_scan(cnt, ln)
+    nt = hx.lane_gather(inc, I32(31))
+    nme = fx.max((nt - b + (CTAS - 1)) // CTAS, I32(0))
+    if nme > 0:
+        NI = RB * SUB_ * 128 // 64
+        NG = 4   # (items a group: their icand then block-table loads in flight together; the groups a runtime loop)
+        for gi in range(NI // NG):
+            rows, pcols, qs, bds, qq = [], [], [], [], []
+            for i in range_constexpr(NG):
+                q_ = (w - 6) * 32 + ln + 64 * (gi * NG + i)
+                j = q_ // 128
+                ii = fx.min(b + (j // SUB_) * CTAS, nt - 1)
+                p0 = inc <= ii
+                r = fx.min(TK._popc(TK._ballot(p0)), I32(TR - 1))
+                ch = ii - TK.wave_max(p0.select(inc, I32(0)))
+                rows.append(r)
+                pcols.append(ch * TCOLS_ + (j % SUB_) * CHUNK + q_ % 128)
+                qs.append(hx.lane_gather(qt, r))
+                bds.append(hx.lane_gather(bdt, r))
+                qq.append(q_)
+            blks = [hx.gload(c["icand"] + i64(rows[i] * 2048 + fx.min(pcols[i] // 8, I32(2047))) * 4, I32) for i in range(NG)]
+            krows = [fx.max(blks[i], I32(0)) * 8 + pcols[i] % 8 for i in range(NG)]
+            pages = [hx.gload(c["btab"] + (i64(qs[i]) * i64(c["bstride"]) + i64(IP.key_row(krows[i], bds[i]) // c["irpp"])) * 4, I32)
+                     for i in range(NG)]
+            for i in range_constexpr(NG):
+                j = qq[i] // 128
+                cw = qq[i] % 128
+                tt = (cw // 16) * 32 + cw % 16
+                v = i64(pages[i]) * i64(c["irpp"]) + i64(krows[i] % c["irpp"])
+                hx.lstore(sm + O_PF + (j * 256 + tt) * 8, v)
+                hx.lstore(sm + O_PF + (j * 256 + tt + 16) * 8, v)
+
+
+@ASTRewriter.transform
 def stage_score_any(c, isrx):
     """(see the module doc) isrx traced: FULL (context = the bound) and REINDEX (context = rx_context, the columns
     lifted through icand) with one code instance."""
@@ -172,10 +225,15 @@ def stage_score_any(c, isrx):
             hx.lstore(sm + O_PF + (j * 256 + t) * 8, i64(pages[j]) * i64(c["irpp"]) + i64(krows[j] % c["irpp"]))
 
     # the first batch's page chain (icand -> block table: this step's tables, not this layer's outputs) before
-    # the wait for the query (c["prewait"]: the INDEX_QUANT handoff), every CTA passes it
+    # the wait for the query (c["prewait"]: the INDEX_QUANT handoff), every CTA passes it -- unless rx_prefill (P2) put
+    # it in LDS already, during iq / iw (c["rxpre"]: true on a REINDEX layer whose prefill ran)
     if fx.const_expr("prewait" in c):
-        if nme > 0:
-            pages_to_lds(b)
+        if fx.const_expr("rxpre" in c):
+            if (nme > 0) & (c["rxpre"] == (fx.Int32(0) != fx.Int32(0))):
+                pages_to_lds(b)
+        else:
+            if nme > 0:
+                pages_to_lds(b)
         c["prewait"]()
     for gb in range((nme + (RB - 1)) // RB):
         base_i = b + gb * (RB * CTAS)
