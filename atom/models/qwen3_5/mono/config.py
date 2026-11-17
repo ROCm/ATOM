@@ -71,6 +71,13 @@ def max_rows(weights: str, T: int) -> int:
     return MAX_TOKENS
 
 
+def fp4_mids(weights: str, S: int) -> bool:
+    """Does up / gate publish the MXFP4 mids (E2M1 codes, E8M0 scales) for down to stage as they are?
+    The fused bank from 8 rows (an up / gate item is then the four tiles of a 32-mid block; fewer rows
+    would leave too few items to keep every CTA streaming weights)."""
+    return weights == "mxfp4_attnfp8" and S >= 8
+
+
 def shared_fused(weights: str) -> bool:
     return weights in ("fp8", "mxfp4_attnfp8")
 

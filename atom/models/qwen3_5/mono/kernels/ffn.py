@@ -48,6 +48,7 @@ def ffn_stages(ctx):
     INTER = ctx["INTER"]
     MOE_SLOTS = ctx["MOE_SLOTS"]
     MX = ctx["MX"]
+    FP4_MIDS = ctx["FP4_MIDS"]
     FSE = ctx["FSE"]
     # the MXFP4 checkpoint's separate BF16 shared expert (MX without FSE: "mxfp4")
     SH_BF16 = MX and not FSE
@@ -108,6 +109,18 @@ def ffn_stages(ctx):
 
     # MXFP4: mailbox ``xb``'s scale words follow its S * HIDDEN / 8 code words; LDS xs the same
     XF4_SC = S * HIDDEN // 8
+    # FP4_MIDS: mailbox ``mid``'s, after its S * MOE_SLOTS * INTER / 8 code words
+    MID_SC = S * MOE_SLOTS * INTER // 8
+
+    def stage_fp4(name, n_words):
+        """LDS xs: MXFP4 mailbox ``name``'s n_words code words, then its n_words / 4 scale words."""
+        stage_x_pairs(name, 2 * n_words, lambda k: k)
+        n_sc = n_words // 4
+        for i in range_constexpr(-(-n_sc // THREADS)):
+            w = tid + i * THREADS
+            if w < n_sc:
+                v = poll([(mb(name), n_words + w, 1)])[0]
+                lds_st(xs, n_words + w, v[0].bitcast(fx.Float32))
 
     # ====== 5. post-attn RMSNorm -> router logits (+ shared gate) + this task's FP8 MoE input blocks
     r_wr = rsrc(w_r)
@@ -175,7 +188,7 @@ def ffn_stages(ctx):
                 if const_expr(MX):
                     # MXFP4 checkpoint: the normed input (the BF16 shared expert's) and its per-32 MXFP4
                     # quant (the A4W4 routed experts'): mailbox ``xb`` holds the E2M1 codes, one word a
-                    # 8 elements, sample-major, then the E8M0 scales, one word a 128-K block
+                    # 8 elements, sample-major, then the E8M0 scales, one word a 32-block
                     if const_expr(SH_BF16):
                         put_bf(mb("x2b"), x_s * HIDDEN + xk, [v0, v1])
                     qb, qe = mxfp4_q(v0, v1)
@@ -188,11 +201,11 @@ def ffn_stages(ctx):
                             (x_s * HIDDEN + x_blk * 128) // 8 + lane // 4,
                             [qb, qb2],
                         )
-                    qe = qe | (xshfl(qe, 16) << 8)
-                    qe = qe | (xshfl(qe, 32) << 16)
-                    if lane == 0:
+                    if lane % 16 == 0:
                         put_words(
-                            mb("xb"), XF4_SC + x_s * (HIDDEN // 128) + x_blk, [qe]
+                            mb("xb"),
+                            XF4_SC + (x_s * HIDDEN + x_blk * 128) // 32 + lane // 16,
+                            [qe],
                         )
                 else:
                     q0, q1, qs = quant_floor(v0, v1)
@@ -338,20 +351,13 @@ def ffn_stages(ctx):
                         (sn * HIDDEN + kt * 128) // 8,
                         None,
                         w_ln,
-                        b_scale=XF4_SC + sn * (HIDDEN // 128) + kt,
+                        b_scale=XF4_SC + (sn * HIDDEN + kt * 128) // 32,
                     )
                 )
             return units
 
         def stage_xf4():
-            """LDS xs: the MXFP4 input's code words, then its scale words (mailbox ``xb``'s order)."""
-            stage_x_pairs("xb", 2 * XF4_SC, lambda k: k)
-            n_sc = S * HIDDEN // 128
-            for i in range_constexpr(-(-n_sc // THREADS)):
-                w = tid + i * THREADS
-                if w < n_sc:
-                    v = poll([(mb("xb"), XF4_SC + w, 1)])[0]
-                    lds_st(xs, XF4_SC + w, v[0].bitcast(fx.Float32))
+            stage_fp4("xb", XF4_SC)
 
         def sh_units(w_rg, w_ln):
             """The BF16 shared expert's tile (its [gate | up] rows, row-major) against the normed input;
@@ -443,65 +449,185 @@ def ffn_stages(ctx):
             _l, _u, c, slot, _h, w_rg, w_ln, s_rg = ug8_tile(uu)
             return live, uu, sample, c, slot, w_rg, w_ln, s_rg
 
-        live0, _uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
-        if const_expr(SH_BF16):
-            shared_pre = sh_units(wr0, wl0)
-        else:
-            shared_pre = ug8_units(
-                c0, wr0, wl0, sr0, fx.Int32(SHARED_EXPERT), None, has_sh0 & live0
-            )
-        dn_route()
-        gpu.barrier()
-        items = [ug8_item(0)]
-        lv, _uu, sm, c_, sl, wr, wl, sr = items[0]
-        cur = ug8_units(
-            c_, wr, wl, sr, uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv
-        )
-        if const_expr(SH_BF16):
-            # the shared expert on the normed input, then the routed experts' MXFP4 input in its place
-            stage_x_pairs("x2b", S * HIDDEN, lambda k: k)
+        def ug_tiles():
+            """A tile an item (8 mids of one sample and slot), the mids f32."""
+            live0, _uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
+            if const_expr(SH_BF16):
+                shared_pre = sh_units(wr0, wl0)
+            else:
+                shared_pre = ug8_units(
+                    c0, wr0, wl0, sr0, fx.Int32(SHARED_EXPERT), None, has_sh0 & live0
+                )
+            dn_route()
             gpu.barrier()
-            if has_sh0 & live0:
+            items = [ug8_item(0)]
+            lv, _uu, sm, c_, sl, wr, wl, sr = items[0]
+            cur = ug8_units(
+                c_, wr, wl, sr, uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv
+            )
+            if const_expr(SH_BF16):
+                # the shared expert on the normed input, then the routed experts' MXFP4 input in its place
+                stage_x_pairs("x2b", S * HIDDEN, lambda k: k)
+                gpu.barrier()
+                if has_sh0 & live0:
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
+                        emit_out(16),
+                        rule=SH_UG_RULE,
+                    )
+                    gpu.barrier()
+                    ug8_emit(c0, slot0, 0, True, live0)
+                gpu.barrier()
+                stage_xf4()
+                gpu.barrier()
+            else:
+                # the fused bank: the shared expert's tile on the routed experts' input
+                if const_expr(MX):
+                    stage_xf4()
+                else:
+                    stage_moe_input(list(range(S)))
+                gpu.barrier()
+                if has_sh0 & live0:
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    ug8_emit(c0, slot0, 0, True, live0)
+            for k in range_constexpr(UG_ITEMS):
+                live, _uu, sample, c, slot, _w_rg, _w_ln, _s_rg = items[k]
+                pre = cur
+                if const_expr(k + 1 < UG_ITEMS):
+                    items.append(ug8_item(k + 1))
+                    lv, _uu, sm, c_, sl, wr, wl, sr = items[k + 1]
+                    cur = ug8_units(
+                        c_,
+                        wr,
+                        wl,
+                        sr,
+                        uniform(lds_ld(keys, sm * MOE_SLOTS + sl)),
+                        sm,
+                        lv,
+                    )
                 reduce_rows(
-                    1,
-                    mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
-                    emit_out(16),
-                    rule=SH_UG_RULE,
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
                 )
                 gpu.barrier()
-                ug8_emit(c0, slot0, 0, True, live0)
+                ug8_emit(c, slot, sample, False, live)
+
+        # FP4_MIDS: an item is the four tiles of a 32-mid block of one (sample, routed slot), or of the
+        # shared expert for every sample (B columns); it publishes the block per-32 MXFP4 for down
+        GRP = 32 // UG8
+        N_GRP = UG_PER_SLOT // GRP
+        N_G_ITEMS = N_GRP + S * TOP_K * N_GRP
+        G_ITEMS = (N_G_ITEMS + G - 1) // G
+        # LDS xs past the staged input: an item's f32 mids, [sample column][32]
+        MID_BUF = XF4_SC + S * HIDDEN // 32
+
+        def g_item(k):
+            """Item k of this CTA: (live, shared, group, sample, slot); a shared item's sample is 0."""
+            w = u0 + k * G
+            live = w < N_G_ITEMS
+            ww = fx.min(w, fx.Int32(N_G_ITEMS - 1))
+            shared = ww < N_GRP
+            r = fx.max(ww - N_GRP, fx.Int32(0))
+            grp = shared.select(ww, r % N_GRP)
+            sample = shared.select(fx.Int32(0), r // (TOP_K * N_GRP))
+            slot = shared.select(fx.Int32(0), 1 + (r // N_GRP) % TOP_K)
+            return live, shared, grp, sample, slot
+
+        def g_units(it, t):
+            live, shared, grp, sample, slot = it
+            c = grp * GRP + t
+            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
+            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+            e = uniform(lds_ld(keys, sample * MOE_SLOTS + slot))
+            return mx_units(w_rg, w_ln, e, shared.select(n_sel(), sample), live)
+
+        def g_emit(it, t):
+            """Tile t's mids, (g * v_rcp(1 + exp(-g))) * u as aiter's stage 1, into MID_BUF."""
+            live, shared, grp, sample, slot = it
+            if tid < shared.select(fx.Int32(S), fx.Int32(1)) * (UG8 // 2):
+                n = tid // (UG8 // 2)
+                r = (tid % (UG8 // 2)) * 2
+                for h in range_constexpr(2):
+                    gv = lds_ld(outs, n * 16 + r + h)
+                    uv = lds_ld(outs, n * 16 + UG8 + r + h)
+                    lds_st(
+                        xs,
+                        MID_BUF + n * 32 + t * UG8 + r + h,
+                        gv * sigmoid_fast(gv) * uv,
+                    )
+            # the routing a slot (see ug8_emit)
+            if (
+                (grp == 0)
+                & (t == 0)
+                & live
+                & (tid < shared.select(fx.Int32(S), fx.Int32(1)))
+            ):
+                sn = shared.select(tid, sample)
+                put(
+                    mb("sel"),
+                    sn * MOE_SLOTS + slot,
+                    lds_ld(keys, sn * MOE_SLOTS + slot),
+                )
+                put(
+                    mb("prob"),
+                    sn * MOE_SLOTS + slot,
+                    lds_ld(dnw, sn * MOE_SLOTS + slot),
+                )
+
+        def g_publish(it):
+            """The item's 32-mid blocks per-32 MXFP4 (aiter's stage-1 epilogue quant): 16 lanes a
+            sample column, two mids a lane."""
+            live, shared, grp, sample, slot = it
+            n = tid // 16
+            j = tid % 16
+            nn = fx.min(n, fx.Int32(S - 1))
+            qb, qe = mxfp4_q(
+                lds_ld(xs, MID_BUF + nn * 32 + 2 * j),
+                lds_ld(xs, MID_BUF + nn * 32 + 2 * j + 1),
+            )
+            qb = qb | (xshfl(qb, 1) << 8)
+            qb = qb | (xshfl(qb, 2) << 16)
+            qb2 = xshfl(qb, 4)
+            blk = (shared.select(nn, sample) * MOE_SLOTS + slot) * (INTER // 32) + grp
+            mine = live & (n < shared.select(fx.Int32(S), fx.Int32(1)))
+            if mine & (j % 8 == 0):
+                put_words(mb("mid"), blk * 4 + j // 4, [qb, qb2])
+            if mine & (j == 0):
+                put_words(mb("mid"), MID_SC + blk, [qe])
+
+        def ug_groups():
+            dn_route()
             gpu.barrier()
+            items = [g_item(0)]
+            cur = g_units(items[0], 0)
             stage_xf4()
             gpu.barrier()
-        else:
-            # the fused bank: the shared expert's tile on the routed experts' input
-            if const_expr(MX):
-                stage_xf4()
-            else:
-                stage_moe_input(list(range(S)))
-            gpu.barrier()
-            if has_sh0 & live0:
+            for kk in range_constexpr(G_ITEMS * GRP):
+                k, t = kk // GRP, kk % GRP
+                pre = cur
+                if const_expr(kk + 1 < G_ITEMS * GRP):
+                    k2, t2 = (kk + 1) // GRP, (kk + 1) % GRP
+                    if const_expr(t2 == 0):
+                        items.append(g_item(k2))
+                    cur = g_units(items[k2], t2)
                 reduce_rows(
-                    1,
-                    mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
-                    emit_out(16),
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
                 )
                 gpu.barrier()
-                ug8_emit(c0, slot0, 0, True, live0)
-        for k in range_constexpr(UG_ITEMS):
-            live, _uu, sample, c, slot, _w_rg, _w_ln, _s_rg = items[k]
-            pre = cur
-            if const_expr(k + 1 < UG_ITEMS):
-                items.append(ug8_item(k + 1))
-                lv, _uu, sm, c_, sl, wr, wl, sr = items[k + 1]
-                cur = ug8_units(
-                    c_, wr, wl, sr, uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv
-                )
-            reduce_rows(
-                1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
-            )
-            gpu.barrier()
-            ug8_emit(c, slot, sample, False, live)
+                g_emit(items[k], t)
+                if const_expr(t == GRP - 1):
+                    gpu.barrier()
+                    g_publish(items[k])
+
+        if const_expr(FP4_MIDS):
+            ug_groups()
+        else:
+            ug_tiles()
 
     up_gate()
 
@@ -574,6 +700,10 @@ def ffn_stages(ctx):
                     uniform_f32(lds_ld(misc, q)), fx.Float32(0.0)
                 )
 
+            if const_expr(FP4_MIDS):  # the staged MXFP4 mid block q; unweighted
+                return unit_mxfp4_atom(
+                    wb, sb, dn_rg + gu, kc, INTER, q * 16, b_scale=DN_BLK * 16 + q * 4
+                )
             if const_expr(
                 MX
             ):  # the mid's per-32 scales are in its bf16 values; unweighted
@@ -598,33 +728,42 @@ def ffn_stages(ctx):
         # the experts are known: stream their down weights while up/gate finishes
         pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
         gpu.barrier()
-        # the mids in rounds of at most DN_MID_ROUND blocks a lane (S <= 8 is one round): at S = 16 all
-        # of them in flight next to the prefetched weights spill
-        for r0 in range_constexpr(0, DN_MID_BLOCKS, DN_MID_ROUND):
-            rb = min(DN_MID_ROUND, DN_MID_BLOCKS - r0)
-            mids = get2_many(
-                [
-                    (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
-                    for b in range(r0, r0 + rb)
-                ]
-            )
-            for b in range_constexpr(rb):
-                blk = wave + (r0 + b) * WAVES
-                if blk < DN_BLK:
-                    if const_expr(MX):
-                        # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's stage-1
-                        # epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16 values in LDS, K order
-                        m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
-                        if const_expr(SH_BF16):
-                            v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
-                            sh = (blk // DN_UNITS_PER_SLOT) % MOE_SLOTS == 0
-                            m0, m1 = sh.select(v0, m0), sh.select(v1, m1)
-                        lds_st(xs, blk * 64 + lane, bf16_pair(m0, m1))
-                    else:
-                        q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
-                        st_f8(blk * 128 + lane * 2, q0, q1)
-                        if lane == 0:
-                            lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))
+        if const_expr(FP4_MIDS):
+            # the mids as up / gate published them: per-32 MXFP4 codes, then the scale words
+            stage_fp4("mid", DN_BLK * 16)
+        else:
+            # the mids in rounds of at most DN_MID_ROUND blocks a lane (S <= 8 is one round): at S = 16 all
+            # of them in flight next to the prefetched weights spill
+            for r0 in range_constexpr(0, DN_MID_BLOCKS, DN_MID_ROUND):
+                rb = min(DN_MID_ROUND, DN_MID_BLOCKS - r0)
+                mids = get2_many(
+                    [
+                        (
+                            mb("mid"),
+                            fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2,
+                        )
+                        for b in range(r0, r0 + rb)
+                    ]
+                )
+                for b in range_constexpr(rb):
+                    blk = wave + (r0 + b) * WAVES
+                    if blk < DN_BLK:
+                        if const_expr(MX):
+                            # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's stage-1
+                            # epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16 values in LDS, K order
+                            m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
+                            if const_expr(SH_BF16):
+                                v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
+                                sh = (blk // DN_UNITS_PER_SLOT) % MOE_SLOTS == 0
+                                m0, m1 = sh.select(v0, m0), sh.select(v1, m1)
+                            lds_st(xs, blk * 64 + lane, bf16_pair(m0, m1))
+                        else:
+                            q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
+                            st_f8(blk * 128 + lane * 2, q0, q1)
+                            if lane == 0:
+                                lds_st(
+                                    misc, blk, qs * lds_ld(dnw, blk // (INTER // 128))
+                                )
         gpu.barrier()
         if const_expr(MX):
 

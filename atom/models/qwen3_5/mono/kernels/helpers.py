@@ -205,8 +205,8 @@ def unit_mxfp4_atom(
     """Issue one 128-K tile of an MXFP4 bank in ATOM's gfx950 layout and its E8M0 scale (lane
     ``16 * kl + r`` holds one 32-K scale block of row ``r``; the scale dword's four bytes cover
     tiles kc (even, odd) x row groups (even, odd)). With ``b_scale`` the activation is staged MXFP4:
-    ``b_word`` its first E2M1 code word, ``b_scale`` its scale word (one native FP4 MFMA); without,
-    bf16 words."""
+    ``b_word`` its first E2M1 code word, ``b_scale`` its first 32-block's scale word (one native FP4
+    MFMA); without, bf16 words."""
     lane = st.lane
     ln = lane if ln is None else ln
     k1n = -(-(K // 32) // 8)  # scale K blocks, padded to 8, in groups of 8
@@ -238,15 +238,13 @@ def mma_units(st, acc, units):
     for unit_format, wv, coef, bw in units:
         if const_expr(unit_format == "mxfp4_native"):
             # one FP4 x FP4 scaled MFMA a 128-K tile: B = the staged E2M1 codes (lane 16 kl + n: K
-            # 32 kl .. + 31 of its column's sample), its E8M0 scale byte kl of the block's scale word
+            # 32 kl .. + 31 of its column's sample) and the 32-block's E8M0 scale word (sbi + kl)
             raw, sc_byte, sbi = wv
             z = fx.Int32(0)
             a = fx.Vector.from_elements([raw[e] for e in range(4)] + [z] * 4, fx.Int32)
             bq = fx.Vector(fx.ptr_load(xs + bw, result_type=v4f)).bitcast(fx.Int32)
             b = fx.Vector.from_elements([bq[e] for e in range(4)] + [z] * 4, fx.Int32)
-            sb = lds_ld(xs, sbi).bitcast(fx.Int32).shrui(
-                (st.lane // 16) * 8
-            ) & fx.Int32(0xFF)
+            sb = lds_ld(xs, sbi + st.lane // 16).bitcast(fx.Int32) & fx.Int32(0xFF)
             c = fx.Vector(
                 rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                     T.vec(4, T.f32),

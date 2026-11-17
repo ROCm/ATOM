@@ -3,7 +3,7 @@
 """Host-side shapes of the Qwen3.5 MonoKernel: execution constants, per-stage task counts and the
 mailbox layout."""
 
-from atom.models.qwen3_5.mono.config import experts_mxfp4, proj_kind
+from atom.models.qwen3_5.mono.config import experts_mxfp4, fp4_mids, proj_kind
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import DIAG_WORDS
@@ -331,13 +331,22 @@ def layout(
             ("xqs", S * hidden // 128 * pr),
             ("sel", S * slots * pr),
             ("prob", S * slots * pr),
-            ("mid", S * slots * inter * pr),
+            # silu(gate) * up as f32 pairs, or (fp4_mids) as the MoE input below: per-32 MXFP4 codes, then
+            # a word a 32-block's E8M0 scale
+            (
+                "mid",
+                (
+                    (S * slots * inter // 8 + S * slots * inter // 32)
+                    if fp4_mids(weights, S)
+                    else S * slots * inter
+                )
+                * pr,
+            ),
             # MXFP4 experts: the MoE input per-32 MXFP4 (the bank's: a word a 8 E2M1 codes, then a word a
-            # 128-K block's four E8M0 scales), and normed as bf16 pairs (the separate BF16 shared expert's,
-            # "mxfp4")
+            # 32-block's E8M0 scale), and normed as bf16 pairs (the separate BF16 shared expert's, "mxfp4")
             *([("x2b", S * hidden // 2 * pr)] if weights == "mxfp4" else []),
             *(
-                [("xb", (S * hidden // 8 + S * hidden // 128) * pr)]
+                [("xb", (S * hidden // 8 + S * hidden // 32) * pr)]
                 if experts_mxfp4(weights)
                 else []
             ),
