@@ -57,19 +57,21 @@ def test_o_norm_e8m0_matches_rmsnorm_gated_then_o_proj_quant(
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
 
 
-def _codes(s, tokens, col_major):
+def _codes(s, tokens, heads, col_major):
     raw = s.view(torch.uint8).reshape(-1)
-    return raw.reshape(HEADS, tokens).t() if col_major else raw.reshape(tokens, HEADS)
+    return raw.reshape(heads, tokens).t() if col_major else raw.reshape(tokens, heads)
 
 
+# 6 heads (TP16) with an odd T leaves a partial last workgroup in the row mapping.
+@pytest.mark.parametrize("heads", [HEADS, 6])
 @pytest.mark.parametrize("col_major", [True, False])
-def test_o_norm_e8m0_is_batch_invariant(col_major):
+def test_o_norm_e8m0_is_batch_invariant(col_major, heads):
     # The decode launch packs rows per workgroup and long batches take one head of
     # consecutive tokens per workgroup; a token's bytes must not depend on which.
     torch.manual_seed(20261117)
     full = 1024
-    x = torch.randn(full, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
-    gate = torch.randn(full, HEADS, 3 * DIM, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(full, heads, DIM, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(full, heads, 3 * DIM, dtype=torch.bfloat16, device="cuda")
     gate = gate[..., DIM : 2 * DIM]
     weight = torch.randn(DIM, dtype=torch.bfloat16, device="cuda")
 
@@ -77,7 +79,7 @@ def test_o_norm_e8m0_is_batch_invariant(col_major):
         q, s = rmsnorm_gated_e8m0(
             x[:tokens], weight, gate[:tokens], 1e-6, dtypes.fp8, col_major
         )
-        return q.view(torch.uint8), _codes(s, tokens, col_major)
+        return q.view(torch.uint8), _codes(s, tokens, heads, col_major)
 
     q_full, s_full = run(full)
     for tokens in (1, 3, 4, 5, 58, 545, 767, 768, 769):
