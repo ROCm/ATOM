@@ -1296,6 +1296,69 @@ def test_every_job_below_the_gate_reads_the_gate_decision():
         )
 
 
+def _workflow():
+    import yaml
+
+    return yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-perf-check.yaml").read_text()
+    )
+
+
+def _step(job, name):
+    return next(s for s in _workflow()["jobs"][job]["steps"] if s.get("name") == name)
+
+
+def test_the_published_base_is_the_base_that_was_measured():
+    """The comment must name the merge-base, not the base branch tip.
+
+    `Resolve merge-base` says why it does not use the tip -- it "moves as other
+    PRs land, so the same PR measured twice would not be comparable" -- and then
+    the comment published `github.event.pull_request.base.sha` anyway. Whenever
+    main had advanced, the delta was attributed to a commit nothing measured,
+    and a reader reproducing it checked out the wrong tree while the right sha
+    sat unread in every cell's provenance.json.
+    """
+    judge = "".join(
+        s.get("run", "") for s in _workflow()["jobs"]["judge"]["steps"]
+    )
+    assert "steps.collect.outputs.base_sha" in judge
+    assert "github.event.pull_request.base.sha" not in judge, (
+        "the base branch tip is not the tree that was benchmarked"
+    )
+
+
+def test_the_cleanup_safety_net_is_not_refused_by_the_authz_plugin():
+    """`--privileged` plus `|| true` is a safety net that cannot fire.
+
+    These runners' authz plugin denies the flag outright (`denied [P1]:
+    --privileged`) -- the GPU preflight step says so in its own comment and
+    drops the flag for exactly that reason -- and `|| true` swallowed the
+    denial, so the step that reclaims root-owned debris was a silent no-op on
+    the only boxes this workflow runs on. The failure surfaces in the *next*
+    job's actions/checkout, somewhere unrelated.
+    """
+    # Comments, not commands: the step's own comment explains why the flag is
+    # gone and names it, so a plain substring check passes on prose. It did.
+    commands = "\n".join(
+        ln for ln in _step("paired-bench", "Clean up")["run"].splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    assert "--privileged" not in commands
+
+
+def test_the_container_action_is_told_which_runner_it_is_on():
+    """setup-gpu-container pins the socket interfaces off the runner label.
+
+    Without `runner`, its `NCCL_SOCKET_IFNAME`/`MORI_SOCKET_IFNAME=lo` case
+    never appends to the container env-file. perf_check_half.sh re-pins the
+    NCCL half per `docker exec` and nothing pins MORI -- inert for the TP-only
+    matrix shipped here, live the day a DPA/EP variant joins PERF_MODELS, which
+    the matrix builder's comments invite. benchmark-tmpl.yml passes it.
+    """
+    step = _step("paired-bench", "Start container and download model")
+    assert step["with"].get("runner") == "${{ matrix.cell.runner }}"
+
+
 # --- matrix builder -------------------------------------------------------
 # The matrix is built by a script rather than inline in the workflow so these
 # can exist at all; `minimax-m3-mxfp8` (the catalog calls it `m3-mxfp8`) is the

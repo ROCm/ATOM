@@ -105,8 +105,9 @@ git --no-pager log -1 --format='%H %s'
 #
 # `--fake-eplb` is required, not optional: `--load_dummy` alone leaves the
 # recycled `e_score_correction_bias` in place, which collapses every token onto
-# one EP rank (see moe.py:2899). MXFP4 is the validated dummy path
-# (loader.py:179); FP8 is made finite but is not distribution-realistic.
+# one EP rank (see model_ops/moe.py:3842-3849). MXFP4 is the validated dummy
+# path (model_loader/loader.py:210, called at 348-349); FP8 is made finite but
+# is not distribution-realistic.
 #
 # The cost and the two things it changes for a reader -- absolute numbers stop
 # matching the dashboard, and delta magnitude is uncalibrated -- are measured

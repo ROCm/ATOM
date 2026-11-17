@@ -246,6 +246,15 @@ jobs:
           # accuracy suites, and folding a paired benchmark into it would double
           # GPU time for every PR that asks for a full run.
           CI_GATE_LABELS: ci:perf
+          # No GH_TOKEN/GITHUB_TOKEN, unlike atom-test.yaml, and deliberately so.
+          # With a token the shared script reaches its `APPROVED) allow_heavy_ci`
+          # branch, and every approval would spend eight GPU cells on a PR nobody
+          # labelled -- the opposite of "nothing is spent unless someone applies
+          # ci:perf". The cost is that an unlabelled PR reports
+          # `decidable=false`/`review-query-failed` rather than a clean "no
+          # label"; that noise is the intended trade, not an oversight. (Today
+          # the token would be inert anyway: under rulesets `reviewDecision` is
+          # null and falls to `*)`. That is a quirk to not depend on.)
         run: .github/scripts/check_heavy_ci_gate.sh
 
   # -------------------------------------------------------- build matrix ---
@@ -418,6 +427,12 @@ jobs:
         uses: ./.github/actions/atom-bench-container
         with:
           image: rocm/atom-dev:latest
+          # setup-gpu-container keys its NCCL_SOCKET_IFNAME/MORI_SOCKET_IFNAME=lo
+          # case off this label, and without it neither reaches the container
+          # env-file. perf_check_half.sh re-pins only the NCCL half per `docker
+          # exec`, so MORI stayed unpinned -- inert for the TP-only matrix shipped
+          # here, live the day a DPA/EP variant joins PERF_MODELS.
+          runner: ${{ matrix.cell.runner }}
           container-name: ${{ env.CONTAINER }}
           model-path: ${{ env.MODEL_PATH }}
           env-vars: ${{ matrix.cell.env_vars }}
@@ -546,7 +561,13 @@ jobs:
           # workspace back: root-owned leftovers break the *next* job's
           # actions/checkout, not this one, so the failure surfaces somewhere
           # unrelated. Mirrors benchmark-tmpl.yml's Clean Up.
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+          # No --privileged: these runners' authz plugin refuses it outright
+          # ("denied [P1]: --privileged"), and `|| true` swallowed the denial, so
+          # the safety net was a silent no-op on exactly the boxes it guards. The
+          # container's root already carries CAP_CHOWN, which is all a chown over
+          # a bind mount needs -- the same reasoning the GPU preflight step spells
+          # out above.
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
             rocm/atom-dev:latest bash -lc \
             "chown -R $(id -u):$(id -g) /workspace" || true
           git checkout -- . || true
@@ -596,6 +617,20 @@ jobs:
           # xargs -r with no input succeeds silently, so DIGEST ends up empty
           # rather than "unknown" unless it is defaulted here.
           echo "digest=${DIGEST:-unknown}" >> "$GITHUB_OUTPUT"
+          # The measured base is the merge-base this workflow resolved, not
+          # `pull_request.base.sha`: the branch tip moves as other PRs land, which
+          # is why Resolve merge-base does not use it. Publishing the tip named a
+          # commit that was never measured, and a reader reproducing the delta
+          # checked out the wrong tree while the right sha sat unread here.
+          BASE_SHA=$(find pairs -name provenance.json -exec \
+                     jq -r '.base_sha // empty' {} + 2>/dev/null \
+                     | sort -u | paste -sd, -)
+          case "${BASE_SHA}" in
+            "")   echo "::warning::no cell recorded a base sha" ;;
+            *,*)  echo "::warning::cells did not all measure one base -- ${BASE_SHA}"
+                  BASE_SHA="MIXED:${BASE_SHA}" ;;
+          esac
+          echo "base_sha=${BASE_SHA:-unknown}" >> "$GITHUB_OUTPUT"
           case "${DIGEST}" in
             # Not averaged away: two digests mean the halves were not paired on
             # one image, and that premise is what the comparison rests on.
@@ -644,7 +679,7 @@ jobs:
             echo "::warning::no dashboard history -- baseline sanity check and sigma gate are off"
             HISTORY_ARG="--no-history"
           fi
-          CONTEXT="base \`${{ github.event.pull_request.base.sha }}\` -> head \`${{ github.event.pull_request.head.sha }}\` · \`${{ steps.collect.outputs.digest }}\`"
+          CONTEXT="base \`${{ steps.collect.outputs.base_sha }}\` -> head \`${{ github.event.pull_request.head.sha }}\` · \`${{ steps.collect.outputs.digest }}\`"
           # Say it in the comment, not only in the log. A reader who takes an
           # absolute number from this table to the dashboard has to be told it
           # will not match, and that the delta's magnitude is not calibrated
