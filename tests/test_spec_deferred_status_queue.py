@@ -22,6 +22,20 @@ from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
 
+def test_postprocess_keeps_its_profiler_stage():
+    runner = SimpleNamespace(profiler=object())
+    with (
+        mock.patch("atom.model_engine.model_runner.record_function") as span,
+        mock.patch(
+            "atom.model_engine.model_runner.get_forward_context",
+            side_effect=RuntimeError("stop before sampling"),
+        ),
+        pytest.raises(RuntimeError, match="stop before sampling"),
+    ):
+        ModelRunner.postprocess(runner, None, None, None, None, None, False, None)
+    span.assert_called_once_with("ATOM::postprocess")
+
+
 def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
     batch = object.__new__(ScheduledBatch)
     batch.scheduled_tokens = np.arange(4, dtype=np.int32)
@@ -256,14 +270,26 @@ def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
     group.publish.assert_called_once()
 
 
-def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
+@pytest.mark.parametrize("is_mixed", [False, True])
+def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
     """Nothing reaches it with drafts: PP verifies none locally and a producer
     never speculates. Staging them here would size rows by `max_seqlen_q`,
     which under DP is the group's maximum for a block drafter, not this
     batch's row width."""
     processor = _recurrent_producer_processor()
+    batch = _decode_batch(num_spec_step=3)
+    if is_mixed:
+        batch.scheduled_tokens = np.arange(5, dtype=np.int32)
+        batch.total_tokens_num = 5
+        batch.total_tokens_num_prefill = 1
+        batch.total_tokens_num_decode = 4
+        batch.total_seqs_num = 2
+        batch.total_seqs_num_prefill = 1
+        batch.total_seqs_num_decode = 1
+        batch.num_rejected = None
+        batch.num_bonus = None
 
-    with pytest.raises(AssertionError, match="num_spec_step=3"):
+    with pytest.raises(NotImplementedError, match="num_spec_step=3"):
         tokenIDProcessor.prepare_input_ids(
             processor,
             _decode_batch(num_spec_step=3),
@@ -443,6 +469,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
     batch = SimpleNamespace(
         scheduled_tokens=np.arange(8, dtype=np.int32),
+        is_mixed=False,
         # Two q=4 rows, so the flat width is 8 and the request count is 2.
         total_tokens_num=8,
         total_tokens_num_prefill=0,

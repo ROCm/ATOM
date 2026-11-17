@@ -29,7 +29,7 @@ from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Replay, SequenceStatus
+from atom.model_engine.sequence import Replay, SequenceStatus, SequenceType
 
 META = object()
 
@@ -147,6 +147,40 @@ def setup(monkeypatch, seq_factory):
 
 def _free(sched):
     return sched.block_manager.pool_occupancy()["free"]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_early_tier_load_preserves_mixed_decode_append_pages(
+    monkeypatch, seq_factory, mixed
+):
+    sched, _, (waiting,) = _make(
+        monkeypatch,
+        seq_factory,
+        blocks=5,
+        ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK=1.0,
+        ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC=1.0,
+    )
+    sched.enable_mixed_prefill_decode = mixed
+    decode = seq_factory([100, 101, 102, 103])
+    assert sched.block_manager.allocate(decode)
+    decode.num_cached_tokens = 4
+    decode.append_token(104)
+    decode.type = SequenceType.DECODE
+    decode.status = SequenceStatus.RUNNING
+    sched.running.append(decode)
+
+    parked = sched._early_load_tier_prefixes()
+
+    assert parked == (0 if mixed else 1)
+    if mixed:
+        assert not waiting.block_table
+        assert waiting.status == SequenceStatus.WAITING
+        assert sched.block_manager.can_append(decode)
+        sched.block_manager.may_append(decode)
+        assert len(decode.block_table) == 2
+    else:
+        assert waiting.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert not sched.block_manager.can_append(decode)
 
 
 def test_hold_tick_parks_a_request_and_ships_its_load(setup):
@@ -350,7 +384,7 @@ def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
     class _Probe:
         num_cached_blocks = 1
 
-    sched._probe_hbm_prefix = lambda s: _Probe()
+    sched._probe_hbm_prefix = lambda s, **kw: _Probe()
 
     sched.schedule()
 
