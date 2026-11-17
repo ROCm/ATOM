@@ -92,8 +92,10 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                else:
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
+                    self._wait_for_work()
         finally:
             self._drain_kv_work_at_exit()
             try:

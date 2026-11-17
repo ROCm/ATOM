@@ -145,6 +145,9 @@ class _Engine:
     def _advance_idle_kv_transfer(self):
         raise AssertionError("no KV work was scripted")
 
+    def _wait_for_work(self):
+        pass
+
     def _drain_kv_work_at_exit(self):
         return None
 

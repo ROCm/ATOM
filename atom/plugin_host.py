@@ -33,6 +33,9 @@ Rules:
   every call seam dispatches even while the boot plan owns none, so a plan can
   be installed afterwards (``hotplug_plan``) without rebuilding the model.
   Captures made before the install keep their decisions: recapture them.
+- A boot-only seam (``v41.mono.install``) is called once, while the model is
+  built: a hot-plug plan that would change its owners is refused
+  (``recipe-boot-only``); restart instead.
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
 """
 
@@ -98,6 +101,7 @@ class SeamSpec:
     parent: str | None = None
     boundary: str = "tensor"
     doc: str = ""
+    boot_only: bool = False  # called once at build: a hot-plug may not change it
 
 
 def _seam(
@@ -263,6 +267,20 @@ SEAMS = MappingProxyType(
                 _V41 + "dspark.py",
                 doc="DSpark context taps -> main_proj's input pair or (bf16, None)",
             ),
+            _seam(
+                "v41.mono.install",
+                1,
+                "region",
+                "call",
+                ("model", "atom_config", "drafter"),
+                ("metadata_builder",),
+                ("model",),
+                (),
+                "eager",
+                "atom/model_engine/model_runner.py",
+                boot_only=True,
+                doc="mono_decode_installers' V4.1 installer -> the model to serve",
+            ),
         ]
     )
 )
@@ -271,6 +289,7 @@ SEAMS = MappingProxyType(
 # calls through a ``bind`` made at build. Call seams dispatch by name and need
 # no list (`call` checks `_hotplug`).
 _HOTPLUG_BINDS = frozenset(name for name, spec in SEAMS.items() if spec.form == "bind")
+BOOT_ONLY = frozenset(name for name, spec in SEAMS.items() if spec.boot_only)
 
 
 @dataclass(frozen=True)
@@ -1016,6 +1035,16 @@ def _restore(snapshot: dict[str, Any]) -> None:
     _configure_aiter(snapshot["aiter"])
 
 
+def _boot_owners(tables) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Each boot-only seam's owners per table: what a hot-plug must keep."""
+    return {
+        (str(key), seam): tuple(route.owner for route in routes)
+        for key, table in tables.items()
+        for seam, routes in table.items()
+        if seam in BOOT_ONLY and routes
+    }
+
+
 def _swap_in(plan, arm: str) -> dict[str, Any]:
     """Build the new plan's state in place; the caller restores on any error.
 
@@ -1027,6 +1056,7 @@ def _swap_in(plan, arm: str) -> dict[str, Any]:
     from atom.utils import envs
 
     global _plan, _requested, _kill_switch, _strict, _on_decline, _owned, _loading
+    boot = _boot_owners(_tables)
     _plan = plan
     _kill_switch = False
     _strict = envs.ATOM_PLUGIN_HOST_STRICT or bool(
@@ -1059,6 +1089,11 @@ def _swap_in(plan, arm: str) -> dict[str, Any]:
             finally:
                 _loading = None
         _tables.update(_route_tables(plan, shorthand))
+    if _boot_owners(_tables) != boot:
+        raise plugin_recipe.RecipeRefused(
+            "recipe-boot-only",
+            f"{sorted(BOOT_ONLY)} serve {boot or 'native'} until a restart",
+        )
     # Conservative: seams bound before stay bound (their call sites exist), and
     # a seam once planned keeps dispatching even under a plan that drops it.
     _owned = _owned | frozenset(s for table in _tables.values() for s in table)

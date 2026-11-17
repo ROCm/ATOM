@@ -434,6 +434,7 @@ def test_select_reads_only_what_the_key_holds():
             "kv_indptr_extend",
         ),
         "v41.draft.ctx": (),
+        "v41.mono.install": ("model", "atom_config", "drafter"),
     }
 
 

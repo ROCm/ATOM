@@ -148,3 +148,6 @@ container the plain command has no such issue.
   sizes; `capture_rows` are the plan's declared buckets.
 - The empty plan is how a server goes back to native without losing hot-plug
   (the AITER list is emptied; bindings stay).
+- A boot-only seam (`v41.mono.install`, the DeepSeek-V4.1 whole-step decode
+  installer) runs once, at build: `hotplug_plan` refuses a plan that would
+  change its owners (`RecipeRefused("recipe-boot-only")`); restart instead.

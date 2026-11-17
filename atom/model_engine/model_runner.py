@@ -1013,14 +1013,19 @@ class ModelRunner:
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
         self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
-        installer = mono_decode_installers.get(hf_config.architectures[0])
+        mono_arch = hf_config.architectures[0]
+        installer = mono_decode_installers.get(mono_arch)
         if installer is not None:
-            self.model = resolve_obj_by_qualname(installer)(
-                self.model,
-                config,
-                getattr(self, "drafter", None),
-                metadata_builder=self.attn_metadata_builder,
-            )
+            install = resolve_obj_by_qualname(installer)
+            drafter = getattr(self, "drafter", None)
+            kwargs = {"metadata_builder": self.attn_metadata_builder}
+            if mono_arch == "DeepseekV41ForCausalLM":
+                # Boot-only seam: a planned plugin may install its own instead.
+                self.model = plugin_host.call(
+                    "v41.mono.install", install, self.model, config, drafter, **kwargs
+                )
+            else:
+                self.model = install(self.model, config, drafter, **kwargs)
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
@@ -3346,7 +3351,9 @@ class ModelRunner:
         (`hidden_states`): the model's own where it gives one
         (`compute_head`: the logits, or a verify's output token ids
         [requests, num_spec_steps + 1] and verdict [3, requests] -- accepted,
-        rejected, anchor row -- as the rejection sampler lays them out, for
+        rejected, anchor row -- as the rejection sampler lays them out,
+        optionally with each request's next id [requests] (its id at the
+        accepted count, which `postprocess` would gather), for
         the forward's requests each verifying the full draft span); else,
         with `logits`, the logits. A decode graph's capture records it
         (`capture_cudagraph`), the logits at TP 1."""
@@ -3387,7 +3394,7 @@ class ModelRunner:
             or get_pcp_world_size() > 1
         ):
             return False
-        tokens, verdict = head
+        tokens, verdict = head[:2]
         bs, steps = batch.total_seqs_num, spec.num_spec_steps
         if (
             tokens.shape[0] < bs
@@ -3514,6 +3521,7 @@ class ModelRunner:
                     logits, batch, spec_decode_metadata, rows=logprob_rows
                 )
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
+        head_next = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per row the step FORWARDED, which a
             # decode keeps at `running_bs` for the draft pass that follows it
@@ -3557,8 +3565,11 @@ class ModelRunner:
             # the rejection sampler gives them. The next ids are gathered
             # below from the broadcast ids, as on the logits path.
             channel = None
-            sampled_tokens, verdict = logits
+            sampled_tokens, verdict, *head_next = logits
             sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
+            # A third output, each request's next id: valid until a broadcast
+            # (in place) gives the ids rank 0's values.
+            head_next = head_next[0][:bs] if head_next else None
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
@@ -3630,19 +3641,26 @@ class ModelRunner:
             sampled_tokens = get_pcp_group().broadcast(
                 sampled_tokens.contiguous(), src=0
             )
+            head_next = None
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
         # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them.)
+        # broadcast would wait for the work it queued after them. So are the
+        # ids of a head whose model says so: `identical_head_ids`.)
         if (
             get_tp_group().world_size > 1
             and self._served is None
+            and not (
+                isinstance(logits, tuple)
+                and getattr(self.model, "identical_head_ids", False)
+            )
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            head_next = None
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
@@ -3688,11 +3706,14 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
-            next_token_ids = torch.gather(
-                sampled_tokens.view(bs, batch.num_spec_step + 1),
-                1,
-                next_token_locs.view(-1, 1),
-            ).view(bs)
+            if head_next is not None:
+                next_token_ids = head_next  # the gather below, done in the forward
+            else:
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, batch.num_spec_step + 1),
+                    1,
+                    next_token_locs.view(-1, 1),
+                ).view(bs)
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num

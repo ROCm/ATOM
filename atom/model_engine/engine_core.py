@@ -537,6 +537,7 @@ class EngineCore:
                     self.scheduler.engine_stats.note_idle(now)
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
+                    self._wait_for_work()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -550,6 +551,15 @@ class EngineCore:
                 self.scheduler.shutdown_kv_events()
             finally:
                 tracing.shutdown()
+
+    def _wait_for_work(self) -> None:
+        """Block an idle loop, GIL released, until input or KV progress sets the
+        event (at most `KV_IDLE_DRAIN_INTERVAL_S`). A loop spinning in Python
+        lets the socket threads have the GIL only once per
+        `sys.getswitchinterval()` (5ms), so each request's last output sat that
+        long in `output_queue`."""
+        self._kv_progress_event.clear()
+        self._wait_for_kv_progress()
 
     def _process_engine_step(self):
         try:
