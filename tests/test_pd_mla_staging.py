@@ -456,29 +456,29 @@ def test_staged_mla_needs_the_ready_event(monkeypatch):
 
 
 def test_staged_mla_builds_no_per_token_descriptors(monkeypatch):
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    conn = _producer(mc, _source_regions(3, 8), pool_size=1, slot_pages=4)
+    mc = mooncake(monkeypatch)
+    conn = make_producer(mc, source_regions(3, 8), slots=1, slot_bytes=4 * PAGE_BYTES)
 
     def per_token(region_idx, *_args):
         raise AssertionError(f"staged region {region_idx} built token descriptors")
 
     conn._dcp_token_descriptors = per_token
     dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in range(3)]
-    assert _run(mc, conn, _request(3, 2, 1, 1, dst), range(8), [3, 5, 6, 7], object())
+    assert run_transfer(
+        mc, conn, write_request(3, 2, 1, dst), range(8), [3, 5, 6, 7], object()
+    )
     assert set(conn._nic.labels) == {"staged-kv"}
 
 
 def test_staged_mla_still_refuses_a_non_mla_region(monkeypatch):
-    mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    conn = _producer(mc, _source_regions(1, 8), pool_size=1, slot_pages=4)
+    mc = mooncake(monkeypatch)
+    conn = make_producer(mc, source_regions(1, 8), slots=1, slot_bytes=4 * PAGE_BYTES)
     conn._block_region_roles = ["state"]
     dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)]
-    request = _request(1, 2, 0, 1, dst)
+    request = write_request(1, 2, 0, dst)
     request["consumer_region_roles"] = ["state"]
     with pytest.raises(RuntimeError, match="relayout refuses region 0"):
-        _run(mc, conn, request, range(4), [3, 5], object())
+        run_transfer(mc, conn, request, range(4), [3, 5], object())
     assert conn._nic.labels == []
 
 
