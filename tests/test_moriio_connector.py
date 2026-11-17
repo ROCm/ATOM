@@ -800,6 +800,31 @@ class WritePathTest(unittest.TestCase):
         self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
         self.assertEqual(conn._awaiting_write["d1"][0], request["deadline"])
 
+    def test_a_producer_over_two_hosts_is_reached_on_its_ranks_host(self):
+        import types
+
+        # A TP8 producer over two hosts (4 ranks each) reports only its first
+        # host; rank 5 asks, and later notifies, rank 5 on the second.
+        conn = self.make(producer=False)
+        conn.tp_rank = 5
+        conn._remote_tp_hosts = {"10.0.0.1": ["10.0.0.1", "10.0.0.9"]}
+        conn.request_id_to_transfer_id = {"d1": 77}
+        meta = self.recv_meta([4, 5], [10, 11, 12])
+        conn._request_write("d1", meta)
+        ((frames, host, port),) = conn.sent
+        self.assertEqual((host, port), ("10.0.0.9", 7306))
+        conn._notify_producer("d1", meta)
+        self.assertEqual(conn.notified, [(77, "10.0.0.9", 7306)])
+        # Rank 3 is on the first host; a producer the map does not name keeps
+        # its remote_host; hosts that do not split the TP group are refused.
+        conn.tp_rank = 3
+        self.assertEqual(conn._producer_host(meta), "10.0.0.1")
+        other = types.SimpleNamespace(remote_host="10.0.0.3", tp_size=8)
+        self.assertEqual(conn._producer_host(other), "10.0.0.3")
+        conn._remote_tp_hosts = {"10.0.0.1": ["a", "b", "c"]}
+        with self.assertRaises(ValueError):
+            conn._producer_host(meta)
+
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
         conn._request_write("d1", self.recv_meta([4, 5, 6], [10, 11]))

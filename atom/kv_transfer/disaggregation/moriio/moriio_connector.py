@@ -144,6 +144,14 @@ class MoRIIOConnector(KVConnectorBase):
         self.base_handshake_port = kv_transfer_config.get(
             "handshake_port", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT
         )
+        # A producer whose TP group spans hosts (--tensor-parallel-size-local)
+        # reports only its engine core's address as remote_host, but each of its
+        # ranks listens on its own host. remote_tp_hosts maps that address to the
+        # producer's hosts in TP-rank order, so this rank reaches its peer.
+        self._remote_tp_hosts = {
+            str(head): [str(h) for h in hosts]
+            for head, hosts in (kv_transfer_config.get("remote_tp_hosts") or {}).items()
+        }
 
         # Compute unique side-channel port for this (dp, tp) rank
         handshake_port = self.base_handshake_port
@@ -781,7 +789,7 @@ class MoRIIOConnector(KVConnectorBase):
                 dst_engine_id=meta.remote_engine_id,
                 local_block_ids=meta.local_block_ids,
                 remote_block_ids=meta.remote_block_ids,
-                remote_host=meta.remote_host,
+                remote_host=self._producer_host(meta),
                 remote_handshake_port=meta.remote_handshake_port,
                 remote_dp_rank=meta.remote_dp_rank,
                 remote_tp_size=int(meta.tp_size or 0),
@@ -814,7 +822,7 @@ class MoRIIOConnector(KVConnectorBase):
             )
             self.moriio_wrapper.send_notify(
                 self.request_id_to_transfer_id.get(req_id, meta.transfer_id),
-                meta.remote_host,
+                self._producer_host(meta),
                 port,
             )
         except Exception:
@@ -823,6 +831,20 @@ class MoRIIOConnector(KVConnectorBase):
                 req_id,
                 exc_info=True,
             )
+
+    def _producer_host(self, meta: ReqMeta) -> str:
+        """The host of the producer rank this rank exchanges with."""
+        # getattr: tests build the connector without __init__
+        hosts = getattr(self, "_remote_tp_hosts", {}).get(str(meta.remote_host))
+        if not hosts:
+            return meta.remote_host
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        if remote_tp_size % len(hosts):
+            raise ValueError(
+                f"remote_tp_hosts for {meta.remote_host} lists {len(hosts)} hosts, "
+                f"which do not split TP {remote_tp_size} evenly"
+            )
+        return hosts[self.tp_rank // (remote_tp_size // len(hosts))]
 
     @staticmethod
     def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
@@ -1083,7 +1105,7 @@ class MoRIIOConnector(KVConnectorBase):
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_REQ, msgpack.dumps(request)],
-                meta.remote_host,
+                self._producer_host(meta),
                 port,
             )
         except Exception:
@@ -2453,7 +2475,7 @@ class MoRIIOConnector(KVConnectorBase):
 
     def _start_read_handshakes(self, remote_engine_id: EngineId, meta: ReqMeta) -> None:
         """Handshake with every producer DP rank not registered or in flight."""
-        host = meta.remote_host
+        host = self._producer_host(meta)
         port = int(meta.remote_handshake_port)
         tp_size = int(meta.tp_size)
         wanted = int(meta.remote_dp_rank or 0)
