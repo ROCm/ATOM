@@ -114,6 +114,54 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
     }
 }
+
+#[tokio::test]
+async fn chats_rendered_without_their_template_are_not_tokenized() {
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    let id = TokenizerRegistry::generate_id();
+    app.tokenizer_registry
+        .load(&id, "m", "hf-test", || async {
+            Ok(crate::routers::test_mocks::tokenizer::hf_tokenizer())
+        })
+        .await
+        .unwrap();
+    for marked in [false, true] {
+        if marked {
+            app.chats_without_template.write().insert(id.clone());
+        }
+        let parsed = ParsedInference::parse(
+            "/v1/chat/completions",
+            br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#,
+        )
+        .unwrap();
+        let routing = IngressRouting::new(&app);
+        let result = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        if marked {
+            assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
+        } else {
+            assert!(result.unwrap().1.is_some());
+        }
+    }
+}
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
