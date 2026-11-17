@@ -93,6 +93,35 @@ def test_mixed_attention_storage_is_refused():
         attention_format(_layer(kinds=("per_Token", "No", "No")))
 
 
+def test_block_fp8_attention_storage_is_refused():
+    with pytest.raises(MonoUnsupported, match="not PTPC FP8 or BF16"):
+        attention_format(_layer(kinds=("per_1x32",) * 3))
+
+
+def test_bf16_absorbed_attention_storage_is_refused():
+    layer = _layer()
+    layer.self_attn.mla_attn.W_K_scale = None
+    layer.self_attn.mla_attn.W_V_scale = None
+    with pytest.raises(MonoUnsupported, match="ATOM_MLA_ABSORB_BF16"):
+        attention_format(layer)
+
+
 def test_a_layer_stored_unlike_the_deployment_is_refused():
     with pytest.raises(MonoUnsupported, match="attention is bf16_absorb_fp8"):
         layer_weights(_layer(), 0, 4, attention=AttentionWeight.FP8_PTPC)
+
+
+def test_a_preshuffled_bf16_projection_is_refused():
+    attn = _layer().self_attn
+    attn.o_proj.weight.is_shuffled = True
+    with pytest.raises(
+        MonoUnsupported, match="o_proj BF16 weight must not be preshuffled"
+    ):
+        projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)
+
+
+def test_a_fused_qkv_a_not_led_by_q_a_and_kv_a_is_refused():
+    attn = _layer().self_attn
+    attn.qkv_a_split = [CFG.kv_lora, CFG.q_lora, CFG.pe_dim]
+    with pytest.raises(MonoUnsupported, match="fused_qkv_a split"):
+        projection_weights(attn, CFG, AttentionWeight.BF16_ABSORB_FP8)
