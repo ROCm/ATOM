@@ -23,6 +23,6 @@ def validate_fp8_draft_support(config):
     )
     if backend is None:
         raise ValueError(
-            "draft_kv_dtype=fp8 requires supported AITER V4.1 A8W8 attention. "
-            "Use draft_kv_dtype=auto for BF16 drafting."
+            "draft_attention_dtype=fp8 requires supported AITER V4.1 A8W8 attention. "
+            "Use draft_attention_dtype=auto for BF16 drafting."
         )

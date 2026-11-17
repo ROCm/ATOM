@@ -111,7 +111,7 @@ def test_v41_calibration_requires_matching_draft_precision(
             hf_config=SimpleNamespace(model_type="deepseek_v41_text"),
             kv_cache_dtype=target_dtype,
             speculative_config=SimpleNamespace(draft_kv_dtype=target_dtype),
-            dspark=SimpleNamespace(draft_kv_dtype=draft_dtype),
+            dspark=SimpleNamespace(draft_attention_dtype=draft_dtype),
         )
 
     bf16, fp8 = identity("auto"), identity("fp8")
@@ -153,7 +153,7 @@ def test_pre_pr_bf16_draft_profile_still_matches(
         hf_config=SimpleNamespace(model_type="deepseek_v41_text"),
         kv_cache_dtype=target_dtype,
         speculative_config=SimpleNamespace(draft_kv_dtype=target_dtype),
-        dspark=SimpleNamespace(draft_kv_dtype="auto"),
+        dspark=SimpleNamespace(draft_attention_dtype="auto"),
     )
     assert current == legacy
     validate_calibration(
@@ -176,7 +176,7 @@ def test_fp4_calibration_distinguishes_actual_target_backend(
             enable_dp_attention=dp,
             kv_cache_dtype="fp4",
             speculative_config=SimpleNamespace(draft_kv_dtype="fp4"),
-            dspark=SimpleNamespace(draft_kv_dtype="auto"),
+            dspark=SimpleNamespace(draft_attention_dtype="auto"),
         )
 
     adapter = identity()

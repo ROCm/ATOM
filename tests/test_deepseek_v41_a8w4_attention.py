@@ -1,41 +1,35 @@
 # SPDX-License-Identifier: MIT
-"""A8W4 host contracts without importing AITER or initializing a device."""
+"""A8W4 host contracts through real production imports."""
 
-import ast
 from dataclasses import replace
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+from tests.conftest import gpu_stack_import
+
 OPS = "atom/model_ops/attentions/deepseek_v41/"
 
 
-def functions(path, names, scope=None, *, class_name=None):
-    """Load the host boundary, as the vLLM copy tests do, without GPU imports."""
-    tree = ast.parse((ROOT / path).read_text())
-    body = tree.body
-    if class_name:
-        body = next(
-            n.body for n in body if isinstance(n, ast.ClassDef) and n.name == class_name
-        )
-    selected = [n for n in body if isinstance(n, ast.FunctionDef) and n.name in names]
-    assert {n.name for n in selected} == set(names)
-    for node in selected:
-        node.decorator_list = []
-    namespace = {"torch": torch, **(scope or {})}
-    exec(  # noqa: S102 - only host functions from this repository.
-        compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / path), "exec"),
-        namespace,
-    )
-    return namespace
+@pytest.fixture
+def functions(monkeypatch):
+    def load(path, names, scope=None, *, class_name=None):
+        if path.startswith("atom/plugin/vllm/"):
+            pytest.importorskip("vllm")
+        module = gpu_stack_import(path.removesuffix(".py").replace("/", "."))
+        for name, value in (scope or {}).items():
+            if hasattr(module, name) and name not in names:
+                monkeypatch.setattr(module, name, value)
+        owner = getattr(module, class_name) if class_name else module
+        return {**(scope or {}), **{name: getattr(owner, name) for name in names}}
+
+    return load
 
 
 @pytest.fixture
-def api():
+def api(functions):
     scope = functions(
         OPS + "a8w4_attention.py",
         ["supports_a8w4_attention"],
@@ -144,7 +138,7 @@ def test_adapter_preserves_source_storage_and_csr(api, rows, splits, fp4):
 @pytest.mark.parametrize(
     "packed,supported", [(False, True), (True, False), (True, True)]
 )
-def test_only_packed_cache_queries_a8w4_support(supported, packed):
+def test_only_packed_cache_queries_a8w4_support(supported, packed, functions):
     probe = Mock(return_value=supported)
     scope = functions(
         "atom/models/deepseek_v41/attention.py",
@@ -163,7 +157,7 @@ def test_only_packed_cache_queries_a8w4_support(supported, packed):
 
 
 @pytest.mark.parametrize("bounded", [False, True])
-def test_support_is_requeried_before_each_q_producer(api, bounded):
+def test_support_is_requeried_before_each_q_producer(api, bounded, functions):
     events = []
 
     def probe(device, shape, **kwargs):
@@ -234,7 +228,7 @@ def test_support_is_requeried_before_each_q_producer(api, bounded):
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("bounded", [False, True])
 def test_native_and_plugin_use_same_sources_and_commit_order(
-    plugin, a8w4, decode, bounded
+    plugin, a8w4, decode, bounded, functions
 ):
     events, calls = [], []
 
@@ -367,7 +361,7 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     assert torch.all(result == 3)
 
 
-def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():
+def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs(functions):
     from dataclasses import dataclass, field
 
     @dataclass
@@ -404,27 +398,14 @@ def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():
 
 
 @pytest.mark.parametrize("row_ids", [[5, 0, 4, 3, 5, 1], []])
-def test_mono_reference_gathers_before_packing_sources(row_ids, monkeypatch):
-    pack = functions(OPS + "packed_rows.py", ["pack_rows"])["pack_rows"]
-    gather = functions(
-        "atom/models/deepseek_v41/mono/check.py",
-        ["_gather_key_rows"],
-        {"pack_rows": pack},
-    )["_gather_key_rows"]
+def test_mono_reference_gathers_selected_planes(row_ids, functions):
+    gather = functions("atom/models/deepseek_v41/mono/check.py", ["_gather_key_rows"])[
+        "_gather_key_rows"
+    ]
     data = torch.arange(7 * 32).view(7, 32).to(torch.uint8)
     scales = torch.arange(7, dtype=torch.uint8).view(7, 1)
     main, window = (data[:4], scales[:4]), (data[4:], scales[4:])
     ids = torch.tensor(row_ids, dtype=torch.int32)
-    expected = pack(data[ids.long()], scales[ids.long()])
-    cat = torch.cat
-    calls = []
-
-    def selected_only(parts, dim=0):
-        assert dim == -1
-        assert all(p.shape[0] == ids.numel() for p in parts)
-        calls.append(tuple(p.shape for p in parts))
-        return cat(parts, dim=dim)
-
-    monkeypatch.setattr(torch, "cat", selected_only)
-    torch.testing.assert_close(gather(main, window, ids), expected)
-    assert len(calls) == 1
+    actual = gather(main, window, ids)
+    for plane, source in zip(actual, (data, scales)):
+        torch.testing.assert_close(plane, source[ids.long()])

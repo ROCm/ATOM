@@ -16,24 +16,9 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-import triton
-import triton.language as tl
-
-from atom.model_ops.attentions.deepseek_v41.packed_rows import (
-    load_mixed_rows,
-    pack_rows,
-)
+from atom.model_ops.attentions.deepseek_v41.packed_rows import gather_prefix_rows
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.blockscale import quantize_fp4, quantize_fp8
-
-
-@triton.jit
-def _read_mixed(pool, addresses, out, D: tl.constexpr):
-    row = tl.program_id(0)
-    ids = tl.load(addresses + row + tl.arange(0, 1))
-    d = tl.arange(0, D)
-    value = load_mixed_rows(pool, ids, d, tl.full((1,), True, tl.int1), D)
-    tl.store(out + row * D + d[None, :], value)
 
 
 def test_native_byte_accounting():
@@ -82,16 +67,13 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
     x = (torch.randn(13, 512, device="cuda") * magnitude).bfloat16()
     main = quantize_fp4(x, group_size=16, scale_dtype=torch.float8_e4m3fn)
     window = quantize_fp8(x)
-    main_rows, window_rows = pack_rows(*main), pack_rows(*window)
-    pool = torch.cat((main_rows.flatten(), window_rows.flatten()))
+    pool = tuple(tuple(p.view(torch.uint8) for p in pair) for pair in (main, window))
     addresses = torch.cat(
-        (
-            torch.arange(13, device="cuda") * 288 * 2,
-            ((main_rows.numel() + torch.arange(13, device="cuda") * 528) * 2) | 1,
-        )
+        (torch.arange(13, device="cuda") * 2, torch.arange(13, device="cuda") * 2 + 1)
     )
     actual = torch.empty((26, 512), dtype=torch.bfloat16, device="cuda")
-    _read_mixed[(26,)](pool, addresses, actual, 512)
+    ptr = torch.tensor([0, 26], dtype=torch.int32, device="cuda")
+    gather_prefix_rows(pool, addresses, ptr, actual, 0, 1)
     expected = torch.cat(
         (
             quantize_fp4(
@@ -105,8 +87,7 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("batch", [1, 4, 8])
-@pytest.mark.parametrize("planar", [False, True])
-def test_packed_decode_reuses_v4_with_ragged_rows(batch, planar):
+def test_packed_decode_reuses_v4_with_ragged_rows(batch):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import gather_prefix_rows
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
@@ -115,18 +96,17 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch, planar):
     main = torch.randn(1024, 512, device="cuda", dtype=torch.bfloat16) * 0.2
     window = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16) * 0.2
     main_values = quantize_fp4(main, group_size=16, scale_dtype=torch.float8_e4m3fn)
-    main_bytes = pack_rows(*main_values).flatten()
-    window_bytes = pack_rows(*quantize_fp8(window)).flatten()
-    pool = torch.cat((main_bytes, window_bytes))
+    pool = (
+        tuple(v.view(torch.uint8) for v in main_values),
+        tuple(v.view(torch.uint8) for v in quantize_fp8(window)),
+    )
+    reference_indices = []
     choices, lengths = [], []
     for i in range(batch):
         selected = torch.randperm(1024, device="cuda")[: 512 - i * 23]
         history = torch.arange(i * 128, (i + 1) * 128, device="cuda")
-        choices.append(
-            torch.cat(
-                (selected * 288 * 2, ((main_bytes.numel() + history * 528) * 2) | 1)
-            )
-        )
+        choices.append(torch.cat((selected * 2, history * 2 + 1)))
+        reference_indices.append(torch.cat((selected, 1024 + history)))
         lengths.append(choices[-1].numel())
     indices = torch.full((batch * 640,), 2**45, dtype=torch.int64, device="cuda")
     selected = torch.cat(choices)
@@ -144,24 +124,8 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch, planar):
             quantize_fp8(window, dequantize=True),
         )
     )
-    bf16_indices = torch.where(
-        (indices & 1) != 0,
-        1024 + ((indices >> 1) - main_bytes.numel()) // 528,
-        (indices >> 1) // 288,
-    ).to(torch.int32)
+    bf16_indices = torch.cat(reference_indices).int()
     expected = sparse_attn_v4_paged_decode(q, bf16, bf16_indices, ptr, sink, 512**-0.5)
-    if planar:
-        indices = torch.where(
-            (indices & 1) != 0,
-            (((indices >> 1) - main_bytes.numel()) // 528) * 2 + 1,
-            ((indices >> 1) // 288) * 2,
-        )
-        pool = (
-            tuple(v.view(torch.uint8) for v in main_values),
-            tuple(v.view(torch.uint8) for v in quantize_fp8(window)),
-        )
-    else:
-        pool = pool.view(-1, 1)
     actual = packed_decode(q, pool, indices, ptr, sink, 512**-0.5)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # Capacity padding contains invalid addresses; the gather must use indptr.

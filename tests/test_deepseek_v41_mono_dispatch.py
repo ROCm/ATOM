@@ -296,7 +296,7 @@ class _DraftRunner:
 
 class _Draft(torch.nn.Module):
     block_size = 5
-    draft_kv_dtype = "auto"
+    draft_attention_dtype = "auto"
 
     def block_backbone(self, input_ids, positions, num_draft):
         return "original"
@@ -311,7 +311,7 @@ def test_the_draft_is_routed_by_its_request_count(
     # the target step before the draft pass (a prefill or a decode) is not read
     _context(monkeypatch, prefill=prefill)
     draft = _Draft()
-    draft.draft_kv_dtype = draft_dtype
+    draft.draft_attention_dtype = draft_dtype
     routed = routed and draft_dtype != "fp8"
     model = dispatch.MonoDraftModel(draft)
     runner = _DraftRunner()
@@ -334,7 +334,7 @@ def test_explicit_fp8_draft_bypasses_hi_and_mono(monkeypatch, draft_dtype, reque
     fwd.attn_metadata.cache = object()
     fwd.attn_metadata.state_slot_out = torch.arange(requests)
     draft = _Draft()
-    draft.draft_kv_dtype = draft_dtype
+    draft.draft_attention_dtype = draft_dtype
     draft.embed = torch.nn.Embedding(2, 4)
     draft._noise_embedding = lambda: None
     hook = SimpleNamespace(draft_serves=Mock(return_value=True), draft_run=Mock())

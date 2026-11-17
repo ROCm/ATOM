@@ -176,6 +176,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
                 prefill_window_staging=self._prefill_window_staging,
+                a8w4_attention=self.a8w4_attention,
             )
         cached = getattr(self, "_capture_dummy", None)
         if cached is None:
@@ -193,6 +194,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 max_tokens=ceiling_tokens,
                 workspace=self.score_workspace,
                 prefill_window_staging=self._prefill_window_staging,
+                a8w4_attention=self.a8w4_attention,
             )
             self._capture_dummy = cached
         elif (

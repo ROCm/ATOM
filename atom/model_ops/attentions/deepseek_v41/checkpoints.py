@@ -41,7 +41,7 @@ class StateCopies:
             spec.image_bytes,
         )
         self.staging = DescriptorStaging(
-            2 * max_batch * self.plan.num_spans, cache.pool.device
+            2 * max_batch * self.plan.num_spans, cache.backing.device
         )
         self.staging.reserve([0])
 
@@ -84,7 +84,7 @@ class StateCopies:
         for ops, storing in ((stores, True), (restores, False)):
             for op in ops:
                 self._validate(op, storing)
-        if not self.cache.pool.is_cuda:
+        if not self.cache.backing.is_cuda:
             for ops, storing in ((stores, True), (restores, False)):
                 for op in ops:
                     self._copy_on_host(op=op, storing=storing)
@@ -146,7 +146,7 @@ class StateCopies:
             (page if storing else state).copy_(state if storing else page)
 
     def warmup(self):
-        if self.spec is None or not self.cache.pool.is_cuda:
+        if self.spec is None or not self.cache.backing.is_cuda:
             return
         src = np.asarray([self._range_addresses(0)], dtype=np.int64)
         dst = np.zeros(

@@ -145,6 +145,7 @@ class BatchStep:
     # and its indptrs in buffers of each microbatch's own.
     tile_workspace: TileWorkspace | None = None
     indptr_buffers: dict[int, tuple] | None = None
+    a8w4_indptr_buffers: dict[int, tuple] | None = None
     # [requests] int32: the lowest position whose window row a request's
     # queries may read (SGLang's `swa_replay_start`). Zeros (the cache's fixed
     # buffer, so a capture records one address) except on a bounded-replay

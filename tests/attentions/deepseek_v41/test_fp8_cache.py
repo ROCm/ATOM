@@ -37,8 +37,6 @@ def test_fp8_source_rows_preserve_budget_and_use_local_addresses():
         rows = geo.window(layer, pages)
         assert rows.ring_start == 0
         assert rows.slot_rows == rows.ring_slots == geo.ring_slots
-        with pytest.raises(ValueError, match="separate data/scale"):
-            geo.window_bytes(layer, pages)
     # the padding to whole rows costs nothing at the served page
     assert geo.page_bytes == sum(f.bytes_per_entry for f in geo.page_fields)
     assert geo.page_bytes / bf16.page_bytes == pytest.approx(528 / 1024)
@@ -47,8 +45,7 @@ def test_fp8_source_rows_preserve_budget_and_use_local_addresses():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("planar", [False, True])
-def test_v41_attention_matches_its_dequantized_reference(heads, planar):
+def test_v41_attention_matches_its_dequantized_reference(heads):
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx950":
@@ -57,7 +54,6 @@ def test_v41_attention_matches_its_dequantized_reference(heads, planar):
         sparse_attn_v41_paged_2src,
         sparse_attn_v41_paged_2src_reference,
     )
-    from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
 
     torch.manual_seed(41)
@@ -65,7 +61,7 @@ def test_v41_attention_matches_its_dequantized_reference(heads, planar):
 
     def rows(n):
         values = quantize_fp8(torch.randn(n, dim, device=device).bfloat16())
-        return tuple(v.contiguous() for v in values) if planar else pack_rows(*values)
+        return tuple(v.contiguous() for v in values)
 
     pool, extend = rows(4096), rows(tokens + 128)
     prefix_counts = [0, 1, 37, 512, 300, 64, 129]

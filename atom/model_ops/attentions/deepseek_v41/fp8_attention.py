@@ -3,7 +3,6 @@
 
 CSA and SWA have independent row spaces. A prefill's SWA source contains
 the current batch's rings followed by the current chunk; decode uses the ring directly.
-Legacy packed rows remain accepted by the standalone wrappers.
 """
 
 import torch
@@ -19,13 +18,10 @@ def _split(rows, dim, scale_dtype=torch.float8_e8m0fnu):
     (D/2 + D/16) rows without copying either source."""
     fp4 = scale_dtype == torch.float8_e4m3fn
     data_dtype = torch.uint8 if fp4 else FP8_DTYPE
-    width = dim // 2 if fp4 else dim
-    if isinstance(rows, tuple):
-        values, scales = rows
-        if not values.is_contiguous() or not scales.is_contiguous():
-            raise ValueError("KV data and scale planes must each be contiguous")
-        return values.view(data_dtype), scales.view(scale_dtype)
-    return rows[:, :width].view(data_dtype), rows[:, width:].view(scale_dtype)
+    values, scales = rows
+    if not values.is_contiguous() or not scales.is_contiguous():
+        raise ValueError("KV data and scale planes must each be contiguous")
+    return values.view(data_dtype), scales.view(scale_dtype)
 
 
 @mark_trace

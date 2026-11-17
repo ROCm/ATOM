@@ -71,7 +71,7 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         rope_theta=10000,
     )
     config = SimpleNamespace(
-        hf_config=args, dspark=DSparkConfig(draft_kv_dtype=dtype), max_num_seqs=4
+        hf_config=args, dspark=DSparkConfig(draft_attention_dtype=dtype), max_num_seqs=4
     )
     monkeypatch.setattr(dspark, "make_v4_quant_config", lambda *a, **kw: None)
     monkeypatch.setattr(
@@ -84,7 +84,7 @@ def test_runtime_setting_reaches_draft_constructor(monkeypatch, dtype):
         dspark.DeepseekV41DSpark, "_build_main_norm_quant", lambda self: None
     )
     monkeypatch.setattr(dspark, "RotaryEmbedding", lambda *a, **kw: nn.Identity())
-    assert dspark.DeepseekV41DSpark(config).draft_kv_dtype == dtype
+    assert dspark.DeepseekV41DSpark(config).draft_attention_dtype == dtype
 
 
 def oracle(query, context, current, anchors, window, sink):
@@ -202,7 +202,7 @@ def test_stages_share_one_source_build_per_draft_round(
     draft.embed = nn.Embedding(8, 32, device="cuda", dtype=torch.bfloat16)
     draft.head = nn.Identity()
     draft.block_size, draft.window_size = 5, 128
-    draft.draft_kv_dtype = "fp8" if dtype == "fp8" else "auto"
+    draft.draft_attention_dtype = "fp8" if dtype == "fp8" else "auto"
     draft.draft_src_buffers = DraftSrcBuffers(3, 5)
     draft.config = SimpleNamespace(hc_mult=4)
     draft.rope = None

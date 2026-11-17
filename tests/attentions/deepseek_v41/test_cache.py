@@ -358,7 +358,11 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp4", "fp8"])
+@pytest.mark.parametrize("prefill", [False, True])
+def test_one_grouped_build_writes_what_the_per_layer_builds_would(
+    ratio, kv_dtype, prefill
+):
     """A run's launch against the launches it replaces, plane by plane, on the
     packed pool (whose decode lists each layer's window in its prefix).
 
@@ -378,7 +382,7 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         8,
         512,
         32,
-        kv_dtype="fp4",
+        kv_dtype=kv_dtype,
         layer_ratios=(ratio,),
         index_topk=8,
     )
@@ -387,8 +391,10 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
         PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
     )
-    step = begin_step(cache, spans, running_bs=2, running_tokens=2, max_q_len=1)
-    assert step.decode
+    step = begin_step(
+        cache, spans, running_bs=2, running_tokens=2, max_q_len=1, is_prefill=prefill
+    )
+    assert step.decode is (not prefill)
     selection = torch.where(
         torch.arange(8, device="cuda") < ((step.positions + 1) // ratio)[:, None],
         torch.arange(8, device="cuda").expand(step.running_tokens, 8),
@@ -416,9 +422,11 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         return rows
 
     alone, grouped = built(1), built(layers)
-    # Layer-local planes share row coordinates but have distinct storage.
-    assert torch.equal(alone[0], alone[1])
-    assert cache.ring_view(0)[0].data_ptr() != cache.ring_view(1)[0].data_ptr()
+    if kv_dtype == "bf16" and prefill:
+        # BF16 grouped prefill uses the layer stride in the common row space.
+        assert not torch.equal(alone[0], alone[1])
+    else:
+        assert torch.equal(alone[0], alone[1])
     assert all(torch.equal(a, b) for a, b in zip(alone, grouped, strict=True))
 
 

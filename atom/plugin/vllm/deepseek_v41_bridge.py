@@ -1292,6 +1292,7 @@ def bind_deepseek_v41_proxy_cache(
         # with the throwaway profiling cache.
         workspace=builder.score_workspace,
         prefill_window_staging=builder._prefill_window_staging,
+        a8w4_attention=builder.a8w4_attention,
         backing=raw,
     )
     from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
@@ -1701,7 +1702,6 @@ def _v41_live_step_inputs(
         or builder.cache is None
         or snapshot.num_reqs == 0
     ):
-
         running_tokens = max(running_tokens, 1)
         lengths = _v41_dummy_lengths(
             running_tokens,

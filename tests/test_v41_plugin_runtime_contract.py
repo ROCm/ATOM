@@ -28,9 +28,18 @@ def scratch_allocator():
     )
 
     def allocate(
-        geometry, pages, slots, device, *, max_tokens, workspace, prefill_window_staging
+        geometry,
+        pages,
+        slots,
+        device,
+        *,
+        max_tokens,
+        workspace,
+        prefill_window_staging,
+        a8w4_attention,
     ):
         assert prefill_window_staging is builder._prefill_window_staging
+        assert a8w4_attention is builder.a8w4_attention
         return SimpleNamespace(num_pages=pages, num_slots=slots, max_tokens=max_tokens)
 
     scope = {"PagedAttentionCache": Mock(side_effect=allocate)}
@@ -44,6 +53,7 @@ def scratch_allocator():
         device="cpu",
         score_workspace=None,
         _prefill_window_staging=object(),
+        a8w4_attention=True,
         max_num_batched_tokens=96,
         max_bs=4,
         model_runner=SimpleNamespace(v41_graphs_enabled=True),
