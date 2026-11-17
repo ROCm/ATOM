@@ -354,15 +354,23 @@ member order before model construction. It projects the saved execution plan ont
 the worker's launch rank; it does not select transport again. MoE layers consume
 that worker plan through `FusedMoEParallelConfig.from_plan()`.
 
+`AsyncLLMEngine` supplies the rollout isolation policy before constructing
+`Config`. DP workers use independent TP worlds; a DP=1 worker also uses that
+path when the shared device-map environment variable is present. Adapters with
+a different environment name pass `dp_isolation_device_map_env` to the engine.
+The worker reads the saved `ParallelMapping.dp_isolated` decision, so custom
+runner subclasses and environment changes after configuration do not change
+ownership.
+
 Expert sharding preserves the existing rules: DP participates with DP-attention or `moe_ep_flatten_tp_across_dp`, PCP merge uses the checkpoint's `PCP x (DP x TP)` ordering, and EP eligibility uses the pre-PCP `logical DP x TP` width. The transport process group retains AITER's `DP x PCP x TP` ordering. `local_ep_size` retains `local DP x TP`, independently of checkpoint shard order. With EP, each device owns whole experts and the MoE TP size becomes one.
 
 Transport selection is unchanged: real DP peers with EP use explicit RCCL, or MoRI when available and enabled, including native TP+DP+EP without DP-attention. `auto`/`mori` fall back when MoRI is unavailable or disabled; `none` disables routed all-to-all. DP gather/scatter requires DP-attention, so vLLM flattening alone does not enable it. Simulated DP keeps the existing DP-attention fallback. The original TBO guards for RCCL and DP-attention+EP fallback are preserved.
 
 Mega owns its expert kernels and allocates no standard prepare/finalize kernel. The surrounding row movement, PCP merge, and outer TP reduction retain their original conditions. Under Ulysses SP, Mega retains the native TP weight mapping and existing per-step SP Mega eligibility checks. This change moves resolution to startup without changing communication policy.
 
-The compile cache key includes the normalized MoE backend snapshot, resolved
-parallel mapping. PCP merge is also captured in the
-snapshot, so later environment changes do not alter worker ownership.
+The compile cache key includes the normalized MoE backend snapshot and the
+resolved ParallelMapping (including PCP merge), so later environment changes
+do not alter worker ownership.
 
 ### Expert distribution
 
@@ -688,3 +696,56 @@ python atom/benchmarks/internode_dp_ep_smoke.py \
 
 Expect both nodes to report an EP group spanning all global ranks and an
 `ep_all_reduce_sum` equal to the sum of those ranks.
+
+## 10. Tensor parallelism across nodes
+
+One TP group may span nodes, for a model too large for one node's GPUs at the
+TP size it needs. The node that runs TP rank 0 runs the engine, the API server
+and its own ranks' workers; every other node runs only its workers
+(`atom/model_engine/tp_multinode.py`). The engine reaches them through the same
+broadcast queue and reply channels as local ranks, over TCP, and finds them
+through the model-runner TCPStore on `--data-parallel-master-ip` /
+`--data-parallel-base-port`.
+
+### Flags
+
+| Flag | Meaning |
+|---|---|
+| `--tensor-parallel-size-local` | TP ranks on **this** node (default: `-tp`) |
+| `--tensor-parallel-rank` | First TP rank this node owns; a multiple of the local size |
+| `--data-parallel-master-ip` | Address of the node that runs TP rank 0 |
+| `--data-parallel-base-port` | Model-runner rendezvous port, the same nonzero value on every node |
+
+### Example — TP8 over 2 nodes of 4 GPUs
+
+```bash
+# Node 0 (10.0.0.1): engine, API server, TP ranks 0-3
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 0 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+
+# Node 1: TP ranks 4-7 only
+python -m atom.entrypoints.openai_server --model <model> -tp 8 \
+  --tensor-parallel-size-local 4 --tensor-parallel-rank 4 \
+  --data-parallel-master-ip 10.0.0.1 --data-parallel-base-port 29501
+```
+
+Start the nodes in either order. Every node must set `AITER_MLA_DECODE_PS1_FLYDSL`
+alike; a worker node refuses a mismatch. A failed worker on either side stops
+the whole group.
+
+### Timeouts
+
+- `ATOM_MULTINODE_TP_TIMEOUT_S` (1800): startup waits, e.g. a worker node for
+  the engine's endpoints and the engine for every remote rank to subscribe.
+- `ATOM_MULTINODE_PG_TIMEOUT_S` (7200): floor for the process groups' gloo and
+  NCCL timeouts, so a slow node's weight load does not time them out.
+
+### Restrictions
+
+- Rejected with a `ValueError`: DP, `--enable-dp-attention`, PP, prefill
+  context parallelism, `--fake-eplb`, RapidServe.
+- Mono decode is refused (its peer memory is HIP IPC, which cannot reach another
+  node), and so are barrier RPCs (the TP barrier is a local multiprocessing one).
+- The custom all-reduce is node-local, so collectives between nodes go through
+  RCCL. On gfx950 also set `ATOM_USE_CUSTOM_ALL_GATHER=0`.

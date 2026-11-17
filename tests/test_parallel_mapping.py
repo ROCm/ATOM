@@ -254,9 +254,9 @@ def test_worker_binds_the_saved_plan_without_resolving_transport_again(monkeypat
         lambda *_args, **_kwargs: pytest.fail("worker re-resolved transport"),
     )
     config.moe_all2all_backend = "none"
-    bind_worker_parallel_mapping(config, global_rank=6)
-    assert config.worker_parallel_mapping.tp_rank == 2
-    assert config.worker_parallel_mapping.dp_rank == 1
+    rank = bind_worker_parallel_mapping(config, global_rank=6)
+    assert rank.tp_rank == 2
+    assert rank.dp_rank == 1
     assert config.worker_moe_execution_plan.mapping.ep_rank == 6
     assert config.worker_moe_execution_plan.transport == plan.transport == "mori"
     assert get_moe_execution_plan(config) is config.worker_moe_execution_plan
@@ -346,9 +346,14 @@ def test_real_plugin_launcher_binds_after_group_creation_or_reuse(
     reuse_module.init_aiter_dist_from_vllm = Mock(return_value=reuse)
     monkeypatch.setitem(sys.modules, reuse_module.__name__, reuse_module)
 
+    from atom.distributed import worker_binding
+
+    bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
+    monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
+
     init_aiter_dist(config)
 
-    assert config.worker_parallel_mapping.global_rank == 3
+    bind.assert_called_once_with(config, global_rank=3)
     assert config.worker_moe_execution_plan is not None
     if reuse:
         initialize.assert_not_called()

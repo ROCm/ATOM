@@ -178,8 +178,8 @@ def resolve_parallel_mapping(
         merge_pcp=get_moe_backend_config(config).pcp_merge or sp > 1,
         enable_dp_attention=dp_attention,
         dp_isolated=(
-            config.runner_qualname == "atom.rollout.model_runner_ext.RLHFModelRunner"
-            and (dp > 1 or "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER" in os.environ)
+            config.dp_isolation_device_map_env is not None
+            and (dp > 1 or config.dp_isolation_device_map_env in os.environ)
         ),
     )
 

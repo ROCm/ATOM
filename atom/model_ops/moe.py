@@ -3532,9 +3532,6 @@ class FusedMoE(torch.nn.Module):
         num_expert_group: int | None = None,
         topk_group: int | None = None,
         quant_config: QuantizationConfig | None = None,
-        tp_size: int | None = None,
-        ep_size: int | None = None,
-        dp_size: int | None = None,
         layer_id: int | None = None,
         prefix: str = "",
         custom_routing_function: Callable | None = None,
@@ -3573,17 +3570,10 @@ class FusedMoE(torch.nn.Module):
         self.has_bias = has_bias
 
         atom_config = get_current_atom_config()
-        topology = atom_config.parallel_mapping.worker_topology()
-        tp_size = tp_size if tp_size is not None else topology.tp_size
-        dp_size = dp_size if dp_size is not None else topology.dp_size
         plan = atom_config.worker_moe_execution_plan
         if plan is None:
             raise ValueError(
                 "Bind the worker parallel mapping before constructing MoE layers"
-            )
-        if (tp_size, dp_size) != (topology.tp_size, topology.dp_size):
-            raise ValueError(
-                "MoE layer TP/DP sizes must match the resolved parallel mapping"
             )
         self.moe_parallel_config = FusedMoEParallelConfig.from_plan(plan)
         # Attached by `initialize_sp_mega_moe` under -sp --moe-backend mega.

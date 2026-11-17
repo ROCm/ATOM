@@ -13,6 +13,59 @@ from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
 from atom.moe_config import get_moe_execution_plan
 from atom.parallel_mapping import get_parallel_mapping
 from atom.plugin.config import PluginConfig, _generate_atom_config_from_vllm_config
+from atom.rollout.config import DP_DEVICE_MAP_ENV
+
+
+@pytest.mark.parametrize("dp,device_map", [(2, False), (1, True), (1, False)])
+@pytest.mark.parametrize("custom_policy", [False, True])
+def test_rollout_entrypoint_supplies_isolation_before_real_config(
+    monkeypatch, tmp_path, dp, device_map, custom_policy
+):
+    from aiter_stub import atom_under_stubs
+    from transformers import LlamaConfig
+
+    LlamaConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        architectures=["LlamaForCausalLM"],
+    ).save_pretrained(tmp_path)
+    device_map_env = "CUSTOM_ROLLOUT_DEVICE_MAP" if custom_policy else DP_DEVICE_MAP_ENV
+    monkeypatch.delenv(DP_DEVICE_MAP_ENV, raising=False)
+    monkeypatch.delenv(device_map_env, raising=False)
+    if device_map:
+        monkeypatch.setenv(device_map_env, "0,1")
+    with atom_under_stubs() as load, monkeypatch.context() as patch:
+        config_module = load("atom.config")
+        llm_engine = load("atom.model_engine.llm_engine")
+        rollout = load("atom.rollout.async_engine")
+        patch.setattr(config_module, "QuantizationConfig", lambda *a, **k: None)
+        patch.setattr(llm_engine, "InputOutputProcessor", Mock())
+        patch.setattr(llm_engine, "CoreManager", Mock())
+        patch.setattr(llm_engine, "WorkerGrammarPreflight", Mock())
+        kwargs = {}
+        if custom_policy:
+            kwargs.update(
+                runner_qualname="custom.rollout.Runner",
+                dp_isolation_device_map_env=device_map_env,
+            )
+        engine = rollout.AsyncLLMEngine(
+            str(tmp_path),
+            tokenizer=SimpleNamespace(bos_token_id=1, eos_token_id=2),
+            kv_cache_dtype="bf16",
+            index_cache_dtype="fp8",
+            enforce_eager=True,
+            tensor_parallel_size=2,
+            data_parallel_size=dp,
+            **kwargs,
+        )
+        config = engine.config
+        assert config.dp_isolation_device_map_env == device_map_env
+        assert config.parallel_mapping.dp_isolated is (dp > 1 or device_map)
+        assert config.parallel_mapping.dp_size == dp
+        assert config.moe_execution_plan.mapping.dp_size == 1
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -101,20 +154,29 @@ def test_vllm_translation_carries_pipeline_stages(monkeypatch, rank):
 
 
 @pytest.mark.parametrize("dp,device_map", [(2, False), (1, True)])
-def test_rlhf_isolated_worker_plan_is_saved_before_binding(monkeypatch, dp, device_map):
+@pytest.mark.parametrize("custom_runner", [False, True])
+def test_rlhf_isolated_worker_plan_is_saved_before_binding(
+    monkeypatch, dp, device_map, custom_runner
+):
     import torch
     from aiter_stub import atom_under_stubs
     from test_parallel_mapping import _install_runtime_groups
 
+    device_map_env = "CUSTOM_ROLLOUT_DEVICE_MAP" if custom_runner else DP_DEVICE_MAP_ENV
+    monkeypatch.delenv(DP_DEVICE_MAP_ENV, raising=False)
+    monkeypatch.delenv(device_map_env, raising=False)
     if device_map:
-        monkeypatch.setenv("VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER", "0,1")
-    else:
-        monkeypatch.delenv("VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER", raising=False)
+        monkeypatch.setenv(device_map_env, "0,1")
     config = atom_config_double(
         model="test-model",
         tensor_parallel_size=2,
         parallel_config=ParallelConfig(data_parallel_size=dp),
-        runner_qualname="atom.rollout.model_runner_ext.RLHFModelRunner",
+        runner_qualname=(
+            "custom.rollout.Runner"
+            if custom_runner
+            else "atom.rollout.model_runner_ext.RLHFModelRunner"
+        ),
+        dp_isolation_device_map_env=device_map_env,
         enable_expert_parallel=True,
     )
     Config._init_parallel_mapping(config)
@@ -124,6 +186,8 @@ def test_rlhf_isolated_worker_plan_is_saved_before_binding(monkeypatch, dp, devi
     assert launch.worker_topology().dp_size == plan.mapping.dp_size == 1
     assert plan.transport == "local"
     config.parallel_config.data_parallel_rank_local = dp - 1
+    # Workers must consume the saved decision even if spawn loses the env.
+    monkeypatch.delenv(device_map_env, raising=False)
 
     with atom_under_stubs() as load, monkeypatch.context() as patch:
         module = load("atom.rollout.model_runner_ext")
@@ -139,12 +203,19 @@ def test_rlhf_isolated_worker_plan_is_saved_before_binding(monkeypatch, dp, devi
             "input": SimpleNamespace(tensor=None)
         }
         patch.setattr(module, "get_tp_group", lambda: group)
-        runner = object.__new__(module.RLHFModelRunner)
+        bind = Mock(wraps=module.bind_worker_parallel_mapping)
+        patch.setattr(module, "bind_worker_parallel_mapping", bind)
+
+        class CustomRunner(module.RLHFModelRunner):
+            DP_DEVICE_MAP_ENV = device_map_env
+
+        runner_type = CustomRunner if custom_runner else module.RLHFModelRunner
+        runner = object.__new__(runner_type)
         runner._setup_device_and_distributed(1, config)
 
     assert initialize.call_args.kwargs["data_parallel_size"] == 1
     assert initialize.call_args.kwargs["local_rank"] == (dp - 1) * 2 + 1
-    assert config.worker_parallel_mapping.global_rank == 1
+    bind.assert_called_once_with(config, global_rank=1)
     assert config.worker_moe_execution_plan.mapping.dp_size == 1
     assert config.worker_moe_execution_plan.mapping.ep_rank == 1
     assert config.worker_moe_execution_plan.transport == plan.transport
@@ -177,9 +248,14 @@ def test_vllm_pp_binds_the_second_pipeline_stage(monkeypatch, rank, reuse):
     pp = ModuleType("atom.distributed.pp_comm")
     pp.init_pp_aware_dist_env = Mock()
     monkeypatch.setitem(sys.modules, pp.__name__, pp)
+
+    from atom.distributed import worker_binding
+
+    bind = Mock(wraps=worker_binding.bind_worker_parallel_mapping)
+    monkeypatch.setattr(worker_binding, "bind_worker_parallel_mapping", bind)
     init_aiter_dist(config)
-    assert config.worker_parallel_mapping.pp_rank == 1
-    assert config.worker_parallel_mapping.tp_rank == rank % 2
+    bind.assert_called_once_with(config, global_rank=rank)
+    assert config.worker_moe_execution_plan.mapping.tp_rank == rank % 2
     if reuse:
         pp.init_pp_aware_dist_env.assert_not_called()
     else:

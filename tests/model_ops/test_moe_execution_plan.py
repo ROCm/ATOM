@@ -42,6 +42,50 @@ def _plan(backend="standard", all2all="none"):
     )
 
 
+@pytest.mark.parametrize("enable_ep", [False, True])
+def test_mixtral_constructs_weights_from_bound_worker_ownership(
+    monkeypatch, atom_modules, enable_ep
+):
+    from transformers import MixtralConfig
+
+    from atom.config import QuantizationConfig, use_custom_atom_config
+    from atom.model_ops import linear
+    from atom.models.mixtral import MixtralMoE
+
+    mapping = MoEParallelMapping.make(
+        tp_size=2, tp_rank=1, dp_size=1, local_dp_size=1, enable_ep=enable_ep
+    )
+    plan = resolve_moe_execution_plan(mapping, MoEBackendConfig())
+    config = atom_config_double(
+        worker_moe_execution_plan=plan,
+        torch_dtype=torch.float32,
+        quant_config=QuantizationConfig(),
+    )
+    monkeypatch.setattr(
+        linear, "get_tp_group", lambda: SimpleNamespace(world_size=2, rank_in_group=1)
+    )
+    monkeypatch.setattr(
+        atom_modules.moe,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+    )
+    with use_custom_atom_config(config):
+        layer = MixtralMoE(
+            MixtralConfig(),
+            num_experts=4,
+            top_k=2,
+            hidden_size=16,
+            intermediate_size=32,
+        )
+    experts = layer.experts
+    assert experts.moe_parallel_config.execution_plan is plan
+    assert (experts.tp_size, experts.ep_size) == (mapping.tp_size, mapping.ep_size)
+    local_experts = 4 // mapping.ep_size
+    local_intermediate = 32 // mapping.tp_size
+    assert experts.w13_weight.shape == (local_experts, 2 * local_intermediate, 16)
+    assert experts.w2_weight.shape == (local_experts, 16, local_intermediate)
+
+
 @pytest.mark.parametrize(
     "backend, all2all, gather",
     [("standard", "none", True), ("standard", "auto", False), ("mega", "none", True)],

@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from atom.moe_config import get_moe_execution_plan
-from atom.parallel_mapping import get_parallel_mapping
+from atom.parallel_mapping import ParallelRankMapping, get_parallel_mapping
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -15,7 +15,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 
-def bind_worker_parallel_mapping(config: "Config", *, global_rank: int) -> None:
+def bind_worker_parallel_mapping(
+    config: "Config", *, global_rank: int
+) -> ParallelRankMapping:
     from aiter.dist import parallel_state as groups
 
     topology = get_parallel_mapping(config).worker_topology()
@@ -54,7 +56,6 @@ def bind_worker_parallel_mapping(config: "Config", *, global_rank: int) -> None:
                 f"Resolved {dimension.upper()} group members/order must match the mapping: "
                 f"mapping={expected}, group={tuple(group.ranks)}"
             )
-    config.worker_parallel_mapping = rank
     config.worker_moe_execution_plan = plan
     logger.info(
         "Resolved worker mapping: rank=%d TP=%d/%d DP=%d/%d PCP=%d/%d PP=%d/%d "
@@ -76,3 +77,4 @@ def bind_worker_parallel_mapping(config: "Config", *, global_rank: int) -> None:
         plan.transport,
         plan.reason,
     )
+    return rank
