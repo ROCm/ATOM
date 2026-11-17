@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -406,7 +407,7 @@ class _TemporalPool:
 def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -437,7 +438,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
     """Same query lengths keep one schedule and do not reread the GPU offsets."""
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -485,7 +486,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
 def test_flydsl_prefill_schedules_keep_only_the_most_recent(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
-    attention_gdn._PREFILL_SCHEDULES.clear()
+    monkeypatch.setattr(attention_gdn, "_PREFILL_SCHEDULES", OrderedDict())
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -525,7 +526,6 @@ def test_flydsl_prefill_schedules_keep_only_the_most_recent(monkeypatch):
     # Writing to the buffer invalidates it, exactly as before the bound.
     locs[3][1] = 8
     assert schedule_for(locs[3]) is not first[3]
-    attention_gdn._PREFILL_SCHEDULES.clear()
 
 
 def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):
