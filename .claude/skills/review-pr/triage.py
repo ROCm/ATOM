@@ -2928,10 +2928,17 @@ def _check_coverage_line(card_text, work_dir=None):
                 return [("EMPTY-COVERAGE", st[:70],
                          "no verdict after the colon -- copy rules.txt's coverage line")]
             if strict and "BEYOND ONE PASS" not in st:
+                # Two different reasons, and the message has to name the right one: the
+                # measured path has a rules.txt verdict behind it, the refused one does
+                # not and rests on the policy above.
+                why = (f"GitHub would not serve this diff, so it counts as BEYOND ONE "
+                       f"PASS, and the card does not say so. Write: `{spell}`"
+                       if too_large else
+                       "Step 1 measured this diff as BEYOND ONE PASS and the card does "
+                       "not say so")
                 return [("SOFTENED-COVERAGE", st[:70],
-                         "Step 1 measured this diff as BEYOND ONE PASS and the card does "
-                         "not say so -- the findings below read as complete when they "
-                         "are a sample" + (f". Write: `{spell}`" if too_large else ""))]
+                         why + " -- the findings below read as complete when they are "
+                         "a sample")]
             return []
     return [("MISSING-COVERAGE", (want or "[diff-too-large]")[:70],
              f"rules.txt has no line to copy here, so write: `{spell}`" if too_large else

@@ -507,7 +507,7 @@ def build_review(pr, card, diff_text, flagged, sha):
         parts.append(
             f"**0 of {len(loose)} finding(s) could be anchored to a line in this diff** "
             "— each is stated in full above. A finding anchors when it cites a "
-            "`path:line` the PR actually changed."
+            "`path:line` inside this diff's hunks."
         )
     ind = _line_starting(card, "_Independent refutation:")
     if ind:

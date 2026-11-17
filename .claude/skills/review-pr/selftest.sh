@@ -481,6 +481,22 @@ t "a diff GitHub refused to serve passes once the card says it is partial" \
 t "a diff GitHub refused to serve may not be called ordinary" \
   "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: 3 files / 20 added lines -- within one review pass')" \
   "SOFTENED-COVERAGE"
+# And it may not claim a measurement that does not exist: with `[diff-too-large]` the
+# rule is policy, so the message must not open "Step 1 measured this diff".
+_cov_why() {  # <full rules.txt> <card coverage line> -> the problem's reason text
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+p = triage._check_coverage_line("## T\n\nReview: OK\n" + sys.argv[3] + "\n", d)
+print(p[0][2] if p else "ok")' "$S" "$1" "$2"
+}
+t "a refused diff is not described as measured" \
+  "$(_cov_why '    [diff-too-large        ] A1 A2' 'Coverage: 3 files -- within one review pass' \
+     | grep -c 'Step 1 measured')" "0"
+t "a measured BEYOND ONE PASS diff still says so" \
+  "$(_cov_why "$_BIG" 'Coverage: 47 files / 16647 added lines' | grep -c 'Step 1 measured')" "1"
 t "an underivable diff has nothing to compare and stays silent" \
   "$(_cov_raw '    [underivable           ] A1 A2' -)" "ok"
 t "a failed derivation has nothing to compare and stays silent" \
