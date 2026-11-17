@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from atom.model_engine.dp_routing.prefix_spread import PrefixSpreadRouter
+from atom.utils import envs
 
 
 class SharedWorkPlacement:
@@ -48,6 +49,7 @@ class ShareCacheRouter(PrefixSpreadRouter):
     def __init__(self, tier, req_equiv: int) -> None:
         super().__init__(idle_tokens=0, tier=tier, max_seqs=0)
         self.placement = SharedWorkPlacement(req_equiv)
+        self.load_cost_weight = envs.ATOM_SHARE_CACHE_LOAD_WEIGHT
 
     def place(self, seq, rank, n_ranks):
         route = super().place(seq, rank, n_ranks)

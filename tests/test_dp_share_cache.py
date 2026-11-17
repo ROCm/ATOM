@@ -546,3 +546,44 @@ def test_sibling_successor_debt_uses_contiguous_confirmed_prefix():
     router.prefill_complete(4)
     path = router._path(_seq(5, right).prompt_hash_chain)
     assert router._rank_hits(2, path)[0][0] == 1024
+
+
+def _after_first_turn(monkeypatch, weight):
+    """A prefix produced on one rank and stored; returns that rank, the router."""
+    monkeypatch.setenv("ATOM_SHARE_CACHE_LOAD_WEIGHT", weight)
+    router = ShareCacheRouter(_store_tier(512), 512)
+    first, _ = _route(router, _seq(1, PREFIX), [0, 0], [0, 0])
+    router.prefill_complete(1)
+    return first.rank, router
+
+
+NEXT_TURN = PREFIX + list(range(10**6, 10**6 + 2_000))
+
+
+def test_load_weight_defaults_to_zero(monkeypatch):
+    monkeypatch.delenv("ATOM_SHARE_CACHE_LOAD_WEIGHT", raising=False)
+    assert ShareCacheRouter(_store_tier(512), 512).load_cost_weight == 0.0
+
+
+def test_load_weight_zero_places_by_backlog_alone(monkeypatch):
+    owner, router = _after_first_turn(monkeypatch, "0")
+    backlog = [0, 0]
+    backlog[owner] += 1_000  # owner holds the HBM copy but is busier
+    route, _ = _route(router, _seq(2, NEXT_TURN), backlog, [0, 0])
+    assert route.rank != owner
+
+
+def test_load_weight_one_keeps_session_on_the_hbm_rank(monkeypatch):
+    owner, router = _after_first_turn(monkeypatch, "1.0")
+    backlog = [0, 0]
+    backlog[owner] += 1_000
+    route, _ = _route(router, _seq(2, NEXT_TURN), backlog, [0, 0])
+    assert route.rank == owner
+
+
+def test_load_weight_one_moves_when_backlog_gap_exceeds_the_prefix(monkeypatch):
+    owner, router = _after_first_turn(monkeypatch, "1.0")
+    backlog = [0, 0]
+    backlog[owner] += 100_000
+    route, _ = _route(router, _seq(2, NEXT_TURN), backlog, [0, 0])
+    assert route.rank != owner

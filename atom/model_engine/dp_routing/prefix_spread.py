@@ -223,6 +223,9 @@ class PrefixSpreadRouter:
 
     # -- placement ------------------------------------------------------------
 
+    # Fraction of a tier-loaded prefix charged as placement cost.
+    load_cost_weight: float = 0.0
+
     def select_work(
         self,
         seq: Any,
@@ -247,7 +250,10 @@ class PrefixSpreadRouter:
             self._credit(seq, rank, hits, None, path, in_tier)
             for rank in range(len(rank_tokens))
         ]
-        costs = [max(0, seq.num_prompt_tokens - hit) for hit, _loaded in credits]
+        costs = [
+            max(0, seq.num_prompt_tokens - hit) + int(self.load_cost_weight * loaded)
+            for hit, loaded in credits
+        ]
         rank = choose(rank_tokens, rank_reqs, costs, owner)
         hit, loaded = credits[rank]
         self._record(

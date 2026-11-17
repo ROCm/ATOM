@@ -214,6 +214,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pressure) and a smaller value toward prompt-token balance (prefill
     # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
     "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
+    # "share_cache" DP strategy: fraction of a Store-loaded prefix charged as
+    # placement cost, next to the uncovered tokens. 0 treats a Store load as
+    # free (placement is then least-backlog once every rank can load the
+    # prefix); 1 charges a load like a recompute, so a session stays on the
+    # rank whose HBM holds its prefix unless another rank's backlog is lower
+    # by more than the prefix.
+    "ATOM_SHARE_CACHE_LOAD_WEIGHT": lambda: float(
+        os.getenv("ATOM_SHARE_CACHE_LOAD_WEIGHT", "0")
+    ),
     # Per-rank cap on in-flight load-balanced requests. 0 sprays the whole
     # offline batch up front. >0 holds the rest and refills a rank only as it
     # finishes, so ranks finish prefilling together and the tail stays
