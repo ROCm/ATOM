@@ -6,9 +6,9 @@
 //! mirrored here: `tests/entrypoints/fixtures/chat_rendering.json` holds the
 //! kwargs ATOM renders a set of chats with, which its tests and these check.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
-use serde::Deserialize;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use super::inference::SentControls;
@@ -17,15 +17,17 @@ use crate::protocols::chat::ChatCompletionRequest;
 type Kwargs = HashMap<String, Value>;
 
 /// How an ATOM worker renders chats: its `/v1/models` card's `chat_rendering`
-/// (ATOM's `model_capabilities.chat_rendering`).
+/// (ATOM's `model_capabilities.chat_rendering`). A card parses as one only
+/// when this router mirrors the rules and the kwargs hook it names.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct ChatRendering {
     /// The server's `--default-chat-template-kwargs`.
     default_kwargs: Kwargs,
     /// The kwarg that switches reasoning, if one does.
     reasoning_toggle: Option<ReasoningToggle>,
-    /// The name of the rules the chat endpoint applies reasoning controls by.
-    reasoning_rules: String,
+    /// The rules the chat endpoint applies reasoning controls by.
+    #[serde(deserialize_with = "mirrored_rules")]
+    reasoning_rules: &'static ReasoningRules,
     /// The efforts ATOM's `chat` rules forward to a template; `None` under
     /// other rules, which do not read them.
     template_efforts: Option<Vec<String>>,
@@ -43,33 +45,69 @@ struct ReasoningToggle {
 
 /// A custom encoder, as ATOM's `MessageEncoderAdapter.rendering` reports it.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "EncoderCard")]
 struct ChatEncoder {
-    name: String,
     /// What its loader sets where the kwargs do not.
     defaults: Kwargs,
     /// The kwargs its signature takes; any, when `None`.
     accepts: Option<Vec<String>>,
-    /// Whether its model's `prepare_kwargs` hook applies, which is mirrored by `name`.
+    /// Its model's `prepare_kwargs`, if that applies.
+    kwargs_hook: Option<KwargsHook>,
+}
+
+/// A `ChatEncoder` as the card reports it. When it `prepares_kwargs`, its
+/// `name` names the kwargs hook.
+#[derive(Deserialize)]
+struct EncoderCard {
+    name: String,
+    defaults: Kwargs,
+    accepts: Option<Vec<String>>,
     prepares_kwargs: bool,
+}
+
+impl TryFrom<EncoderCard> for ChatEncoder {
+    type Error = String;
+
+    fn try_from(card: EncoderCard) -> Result<Self, String> {
+        let kwargs_hook = if card.prepares_kwargs {
+            let name = Value::String(card.name);
+            let hook = KwargsHook::deserialize(&name);
+            Some(hook.map_err(|_| format!("unknown kwargs hook {name}"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            defaults: card.defaults,
+            accepts: card.accepts,
+            kwargs_hook,
+        })
+    }
+}
+
+/// The encoders whose model's `prepare_kwargs` ATOM applies, by the encoder's
+/// name, mirrored here.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) enum KwargsHook {
+    #[serde(rename = "encoding_dsv41")]
+    DeepseekV41,
+}
+
+impl KwargsHook {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 1] = [Self::DeepseekV41];
+
+    fn prepare(self, kwargs: Kwargs) -> Result<Kwargs, String> {
+        match self {
+            Self::DeepseekV41 => deepseek_v41_prepare_kwargs(kwargs),
+        }
+    }
 }
 
 impl ChatRendering {
     /// The rendering a worker reports as `json`, if this router mirrors the
     /// rules and kwargs hook it names.
     pub(crate) fn parse(json: &str) -> Result<Self, String> {
-        let rendering: Self = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        if rules(&rendering.reasoning_rules).is_none() {
-            return Err(format!(
-                "unknown reasoning rules {:?}",
-                rendering.reasoning_rules
-            ));
-        }
-        if let Some(encoder) = rendering.encoder.as_ref().filter(|e| e.prepares_kwargs) {
-            if !KWARGS_HOOKS.contains(&encoder.name.as_str()) {
-                return Err(format!("unknown kwargs hook {:?}", encoder.name));
-            }
-        }
-        Ok(rendering)
+        serde_json::from_str(json).map_err(|e| e.to_string())
     }
 }
 
@@ -98,8 +136,7 @@ pub(crate) fn atom_chat_template_kwargs(
     {
         kwargs.insert("tool_choice".to_string(), choice.clone());
     }
-    let rules = rules(&rendering.reasoning_rules)
-        .ok_or_else(|| format!("unknown reasoning rules {:?}", rendering.reasoning_rules))?;
+    let rules = rendering.reasoning_rules;
     let controls = resolve_reasoning_controls(
         sent.thinking.as_ref(),
         request.reasoning_effort.as_deref(),
@@ -114,49 +151,61 @@ pub(crate) fn atom_chat_template_kwargs(
     }
 }
 
+/// The effort a request names, or an error for one ATOM rejects, given the
+/// efforts the worker's templates read.
+type NormalizeEffort = fn(Option<&Value>, &[String]) -> Result<Option<Value>, String>;
+
 /// ATOM's `ReasoningRules`.
 pub(crate) struct ReasoningRules {
-    /// The effort a request names, or an error for one ATOM rejects, given the
-    /// efforts the worker's templates read.
-    normalize_effort: fn(Option<&Value>, &[String]) -> Result<Option<Value>, String>,
+    /// What ATOM's `/v1/models` calls them.
+    pub(crate) name: &'static str,
+    normalize_effort: NormalizeEffort,
     string_effort_enables: bool,
     none_disables: bool,
     reconcile_effort_with_toggle: bool,
 }
 
-/// ATOM's `ReasoningRules` a chat can render under, by the names it reports
-/// them by: `CHAT_REASONING_RULES` and `deepseek_v41_encoder.REASONING_RULES`.
-pub(crate) static REASONING_RULES: [(&str, ReasoningRules); 2] = [
-    (
-        "chat",
-        ReasoningRules {
-            normalize_effort: legacy_chat_effort,
-            string_effort_enables: false,
-            none_disables: true,
-            reconcile_effort_with_toggle: false,
-        },
-    ),
-    (
-        "deepseek_v41",
-        ReasoningRules {
-            normalize_effort: |effort, _| deepseek_v41_effort(effort),
-            string_effort_enables: true,
-            none_disables: true,
-            reconcile_effort_with_toggle: true,
-        },
-    ),
+impl fmt::Debug for ReasoningRules {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(self.name)
+    }
+}
+
+/// Rules are told apart by the name ATOM gives each.
+impl PartialEq for ReasoningRules {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+/// ATOM's `ReasoningRules` a chat can render under: `CHAT_REASONING_RULES`
+/// and `deepseek_v41_encoder.REASONING_RULES`.
+pub(crate) static REASONING_RULES: [ReasoningRules; 2] = [
+    ReasoningRules {
+        name: "chat",
+        normalize_effort: legacy_chat_effort,
+        string_effort_enables: false,
+        none_disables: true,
+        reconcile_effort_with_toggle: false,
+    },
+    ReasoningRules {
+        name: "deepseek_v41",
+        normalize_effort: |effort, _| deepseek_v41_effort(effort),
+        string_effort_enables: true,
+        none_disables: true,
+        reconcile_effort_with_toggle: true,
+    },
 ];
 
-/// The encoders whose model's `prepare_kwargs` ATOM applies, by name.
-pub(crate) const KWARGS_HOOKS: [&str; 1] = [DEEPSEEK_V41_ENCODER];
-
-const DEEPSEEK_V41_ENCODER: &str = "encoding_dsv41";
-
-fn rules(name: &str) -> Option<&'static ReasoningRules> {
+/// The `ReasoningRules` a card names, if mirrored here.
+fn mirrored_rules<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'static ReasoningRules, D::Error> {
+    let name = String::deserialize(deserializer)?;
     REASONING_RULES
         .iter()
-        .find(|(rules, _)| *rules == name)
-        .map(|(_, rules)| rules)
+        .find(|rules| rules.name == name)
+        .ok_or_else(|| D::Error::custom(format!("unknown reasoning rules {name:?}")))
 }
 
 /// ATOM's `resolve_reasoning_controls`: whether a chat switches reasoning on or
@@ -244,11 +293,8 @@ impl ChatEncoder {
         for (name, value) in &self.defaults {
             kwargs.entry(name.clone()).or_insert_with(|| value.clone());
         }
-        if self.prepares_kwargs {
-            kwargs = match self.name.as_str() {
-                DEEPSEEK_V41_ENCODER => deepseek_v41_prepare_kwargs(kwargs)?,
-                name => return Err(format!("unknown kwargs hook {name:?}")),
-            };
+        if let Some(hook) = self.kwargs_hook {
+            kwargs = hook.prepare(kwargs)?;
         }
         if let Some(accepts) = &self.accepts {
             kwargs.retain(|name, _| accepts.contains(name));
@@ -277,7 +323,7 @@ fn deepseek_v41_prepare_kwargs(mut kwargs: Kwargs) -> Result<Kwargs, String> {
     }
     if !kwargs
         .get("thinking_mode")
-        .map_or(true, |mode| *mode == "thinking" || *mode == "chat")
+        .is_none_or(|mode| *mode == "thinking" || *mode == "chat")
     {
         return Err("DeepSeek-V4.1 thinking_mode must be 'thinking' or 'chat'".to_string());
     }

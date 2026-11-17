@@ -1,6 +1,7 @@
 use super::*;
 use crate::core::{
     prepare_pool::{PoolConfig, PreparePoolRuntime},
+    worker::CHAT_RENDERING_LABEL,
     BasicWorkerBuilder,
 };
 use serde_json::json;
@@ -231,8 +232,8 @@ async fn chat_tokens(app: &AppContext, fields: &serde_json::Value) -> Option<Vec
 /// A chat is tokenized as the workers it can be placed on render it, by the
 /// chat rendering they report: their default kwargs under the request's, and
 /// its reasoning controls setting their toggle, `thinking` too, which the
-/// typed request has no field for. Without one alike for all, it is tokenized
-/// with its own template kwargs alone.
+/// typed request has no field for. Unless they all report the same one, it is
+/// tokenized with its own template kwargs alone.
 #[tokio::test]
 async fn chats_are_tokenized_as_their_workers_render_them() {
     let (app, _pool) = app_with_switched_chats().await;
@@ -286,7 +287,15 @@ async fn chats_are_tokenized_as_their_workers_render_them() {
             .build(),
     ));
     assert_eq!(chat_tokens(&app, &json!({})).await, Some(vec![1, 2]));
-    app.worker_registry.register(worker(4, None));
+    let silent = app.worker_registry.register(worker(4, None));
+    for (fields, want) in own.clone() {
+        assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
+    }
+    app.worker_registry.remove(&silent);
+    let mut other = rendering.clone();
+    other["default_kwargs"]["enable_thinking"] = json!(true);
+    app.worker_registry
+        .register(worker(5, Some(&other.to_string())));
     for (fields, want) in own {
         assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
     }

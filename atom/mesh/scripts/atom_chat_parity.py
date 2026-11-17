@@ -2,13 +2,15 @@
 """ATOM's prompt tokens for a set of chats, to compare with the router's.
 
 Renders each chat as ATOM's /v1/chat/completions does on a checkpoint, and
-prints as JSON the `chat_rendering` its /v1/models card reports with each
-chat's request and token ids, or the error ATOM rejects it with. The router's
-ignored test `test_checkpoint_chats_tokenize_as_on_atom` reads that, renders
-the chats as HTTP routing does for workers reporting that rendering, and
-compares the tokens:
+prints as JSON the `chat_rendering` its /v1/models card reports, the
+`--chat-template` it renders with if one is given, and each chat's request and
+token ids, or the error ATOM rejects it with. The router's ignored test
+`test_checkpoint_chats_tokenize_as_on_atom` reads that, renders the chats as
+HTTP routing does for workers reporting that rendering, with that template,
+and compares the tokens:
 
     python atom/mesh/scripts/atom_chat_parity.py <checkpoint dir> \\
+        [--chat-template <file or template>] \\
         [--default-chat-template-kwargs '{"enable_thinking": false}'] > atom.json
     cd atom/mesh && ATOM_CHAT_PARITY=../../atom.json \\
         cargo test --lib checkpoint_chats -- --ignored --nocapture
@@ -18,6 +20,7 @@ Needs ATOM's Python dependencies, not a GPU.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -80,14 +83,22 @@ CHATS = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("model", help="the checkpoint directory")
+    parser.add_argument(
+        "--chat-template", help="a template file or template, as the server takes it"
+    )
     parser.add_argument("--default-chat-template-kwargs", default="{}")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
     defaults = json.loads(args.default_chat_template_kwargs)
 
-    # As the server starts (api_server's _setup_tokenizer_and_template and
+    # As the server starts (api_server's _setup_frontend, then
     # _setup_reasoning_and_tools).
     tokenizer = load_tokenizer(args.model, args.trust_remote_code)
+    template = args.chat_template or None
+    if template is not None:
+        if os.path.isfile(template):
+            template = Path(template).read_text(encoding="utf-8")
+        tokenizer.chat_template = template
     encoder = load_custom_message_encoder(args.model)
     toggle = resolve_reasoning_toggle(tokenizer, encoder)
     keeps = template_keeps_tool_call_arguments(
@@ -125,7 +136,12 @@ def main():
 
     rendering = chat_rendering(defaults, toggle, encoder, rules)
     json.dump(
-        {"model": args.model, "chat_rendering": rendering, "chats": chats},
+        {
+            "model": args.model,
+            "chat_template": template,
+            "chat_rendering": rendering,
+            "chats": chats,
+        },
         sys.stdout,
         ensure_ascii=False,
     )

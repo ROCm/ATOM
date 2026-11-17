@@ -25,7 +25,6 @@ use crate::{
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
         },
         prepare_pool::{JobContext, PrepareHandle},
-        worker::CHAT_RENDERING_LABEL,
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
@@ -820,9 +819,7 @@ impl IngressRouting {
         };
         workers.retain(|w| matches!(w.connection_mode(), ConnectionMode::Http));
         let configured = !workers.is_empty();
-        workers.retain(|w| {
-            endpoint.supports(w.as_ref()) && matches!(w.worker_type(), WorkerType::Regular) != pd
-        });
+        workers.retain(|w| self.serves(endpoint, w.as_ref()));
         if configured && workers.is_empty() {
             return Err(IngressError::new(
                 http::StatusCode::NOT_IMPLEMENTED,
@@ -855,37 +852,41 @@ impl IngressRouting {
         Ok(())
     }
 
+    /// Whether a request to `endpoint` can be placed on `worker`: an HTTP worker
+    /// serving the API, in this router's topology.
+    fn serves(&self, endpoint: &EndpointSpec, worker: &dyn Worker) -> bool {
+        matches!(worker.connection_mode(), ConnectionMode::Http)
+            && endpoint.supports(worker)
+            && matches!(worker.worker_type(), WorkerType::Regular) != self.pd
+    }
+
     /// How the workers a chat can be placed on render it: the chat rendering they
-    /// all report, if this router mirrors it. `None` when none reports one, as
-    /// backends other than ATOM do not, and, warning once for the model, when
-    /// they report different ones or one naming rules or a kwargs hook this
-    /// router does not mirror.
-    fn chat_rendering(&self, metadata: &InferenceMetadata) -> Option<ChatRendering> {
+    /// all report. `None` when none reports one, as backends other than ATOM do
+    /// not, and, warning once for the model, when only some of them report one
+    /// or they report different ones. A worker whose card reports one this
+    /// router does not mirror reports none; discovery warns of it.
+    fn chat_rendering(&self, metadata: &InferenceMetadata) -> Option<Arc<ChatRendering>> {
         let model = metadata.model.as_deref()?;
-        let workers = self.candidates(metadata, false).ok()?;
-        let labels: Vec<_> = workers
-            .iter()
-            .map(|worker| worker.metadata().labels.get(CHAT_RENDERING_LABEL))
-            .collect();
-        if labels.iter().all(Option::is_none) {
+        let endpoint = EndpointSpec::find(metadata.route)?;
+        let workers = self.worker_registry.get_by_model(model);
+        let (mut rendering, mut silent) = (None, false);
+        for worker in workers.iter().filter(|w| self.serves(endpoint, w.as_ref())) {
+            match (&worker.metadata().chat_rendering, rendering) {
+                (None, _) => silent = true,
+                (Some(reported), None) => rendering = Some(reported),
+                (Some(reported), Some(first))
+                    if Arc::ptr_eq(reported, first) || reported == first => {}
+                (Some(_), Some(_)) => {
+                    unmirrored(model, "the workers report different chat renderings");
+                    return None;
+                }
+            }
+        }
+        if silent && rendering.is_some() {
+            unmirrored(model, "only some of the workers report a chat rendering");
             return None;
         }
-        let parse = |label: Option<&String>| match label {
-            Some(json) => ChatRendering::parse(json),
-            None => Err("a worker reports none".to_string()),
-        };
-        let first = labels[0];
-        let rendering = parse(first).and_then(|rendering| {
-            let alike = labels[1..]
-                .iter()
-                .all(|label| *label == first || parse(*label).as_ref() == Ok(&rendering));
-            if alike {
-                Ok(rendering)
-            } else {
-                Err("the workers report different ones".to_string())
-            }
-        });
-        rendering.map_err(|reason| unmirrored(model, &reason)).ok()
+        rendering.cloned()
     }
 
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens

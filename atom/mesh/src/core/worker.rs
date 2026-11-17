@@ -16,7 +16,9 @@ use super::{CircuitBreaker, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
     observability::metrics::{metrics_labels, MeshMetrics},
     protocols::worker_spec::WorkerInfo,
-    routers::grpc::engine::worker_client_cache::GrpcClient,
+    routers::{
+        grpc::engine::worker_client_cache::GrpcClient, prepare::chat_rendering::ChatRendering,
+    },
 };
 
 /// Default worker priority (mid-range on 0-100 scale)
@@ -484,6 +486,9 @@ pub struct WorkerMetadata {
     pub tool_parser: Option<String>,
     /// Chat template
     pub chat_template: Option<String>,
+    /// How the worker renders chats, from its `chat_rendering` label, if this
+    /// router mirrors that.
+    pub(crate) chat_rendering: Option<Arc<ChatRendering>>,
 }
 
 /// Basic worker implementation
@@ -1771,6 +1776,7 @@ mod tests {
             reasoning_parser: None,
             tool_parser: None,
             chat_template: None,
+            chat_rendering: None,
         };
 
         assert_eq!(metadata.model_id.as_deref(), Some("my-model"));

@@ -1190,7 +1190,7 @@ mod g_chat_rendering {
     use crate::routers::{
         prepare::{
             chat_rendering::{
-                atom_chat_template_kwargs, ChatRendering, KWARGS_HOOKS, REASONING_RULES,
+                atom_chat_template_kwargs, ChatRendering, KwargsHook, REASONING_RULES,
             },
             chat_template::{process_chat_messages, render_chat_messages, ProcessedMessages},
             inference::{ParsedInference, SentControls},
@@ -1234,9 +1234,9 @@ mod g_chat_rendering {
     #[test]
     fn test_the_rules_and_hooks_are_atoms() {
         let fixture = fixture();
-        let rules: Vec<_> = REASONING_RULES.iter().map(|(name, _)| *name).collect();
+        let rules: Vec<_> = REASONING_RULES.iter().map(|rules| rules.name).collect();
         assert_eq!(json!(rules), fixture["reasoning_rules"]);
-        assert_eq!(json!(KWARGS_HOOKS), fixture["kwargs_hooks"]);
+        assert_eq!(json!(KwargsHook::ALL), fixture["kwargs_hooks"]);
     }
 
     /// Each chat gets the kwargs ATOM's chat endpoint renders it with on a server
@@ -1277,7 +1277,8 @@ mod g_chat_rendering {
     }
 
     /// The controls ATOM reads are kept as sent by the one parse, at the top
-    /// level only, and the typed request is as it parses alone.
+    /// level only, and the typed request is as it parses alone, keys written
+    /// with escapes included.
     #[test]
     fn test_chats_keep_their_controls_as_sent() {
         let fields = json!({
@@ -1311,6 +1312,12 @@ mod g_chat_rendering {
         assert_eq!(sent.tool_choice, Some(json!("none")));
         assert_eq!(sent.response_format, None);
         assert!(chat(&json!({"tool_choice": 5})).is_err());
+        let escaped = br#"{"mode\u006c": "m", "messages": [{"role": "user", "content": "hi"}],
+            "thinkin\u0067": {"type": "disabled"}}"#;
+        let parsed = ParsedInference::parse("/v1/chat/completions", escaped).unwrap();
+        let (request, sent) = parsed.chat_as_sent().unwrap();
+        assert_eq!(request.model, "m");
+        assert_eq!(sent.thinking, Some(json!({"type": "disabled"})));
     }
 
     /// Chats render as ATOM renders them on a template with GLM-5.2's reasoning lines,
@@ -1378,10 +1385,11 @@ mod g_chat_rendering {
 
     /// A checkpoint's chats tokenize as on ATOM, which
     /// `atom/mesh/scripts/atom_chat_parity.py` reports as $ATOM_CHAT_PARITY: its
-    /// chat rendering on the checkpoint and the tokens of a set of chats. Each
-    /// chat gets ATOM's tokens, or is rejected where ATOM rejects it. The table
-    /// also compares the chat's tokens with only its own kwargs, as when its
-    /// workers report no rendering.
+    /// chat rendering on the checkpoint, the template it renders with if not
+    /// the checkpoint's, and the tokens of a set of chats. Each chat gets
+    /// ATOM's tokens, or is rejected where ATOM rejects it. The table also
+    /// compares the chat's tokens with only its own kwargs, as when its workers
+    /// report no rendering.
     #[tokio::test]
     #[ignore = "needs a checkpoint and ATOM's tokens for it: atom/mesh/scripts/atom_chat_parity.py"]
     async fn test_checkpoint_chats_tokenize_as_on_atom() {
@@ -1389,9 +1397,19 @@ mod g_chat_rendering {
         let atom: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let model = atom["model"].as_str().unwrap();
         let rendering = ChatRendering::parse(&atom["chat_rendering"].to_string()).unwrap();
-        let tokenizer = factory::create_tokenizer_async_with_chat_template(model, None)
-            .await
-            .unwrap();
+        // llm-tokenizer reads a template from JSON as is, and from a `.jinja`
+        // file trimmed and with its `\n`s unescaped.
+        let dir = tempfile::TempDir::new().unwrap();
+        let template = atom["chat_template"].as_str().map(|template| {
+            let path = dir.path().join("chat_template.json");
+            let json = json!({"chat_template": template}).to_string();
+            std::fs::write(&path, json).unwrap();
+            path.to_str().unwrap().to_string()
+        });
+        let tokenizer =
+            factory::create_tokenizer_async_with_chat_template(model, template.as_deref())
+                .await
+                .unwrap();
         let tokens = |rendered: Result<ProcessedMessages, String>| {
             let text = rendered?.text;
             let encoding = tokenizer.encode(&text, true).map_err(|e| e.to_string())?;

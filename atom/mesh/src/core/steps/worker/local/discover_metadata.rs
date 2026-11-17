@@ -16,7 +16,9 @@ use crate::{
     core::{
         steps::workflow_data::LocalWorkerWorkflowData, worker::CHAT_RENDERING_LABEL, ConnectionMode,
     },
-    routers::grpc::engine::worker_client_cache::GrpcClient,
+    routers::{
+        grpc::engine::worker_client_cache::GrpcClient, prepare::chat_rendering::ChatRendering,
+    },
 };
 
 // HTTP client for metadata fetching
@@ -307,7 +309,8 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
 }
 
 /// Discover HTTP metadata from an OpenAI-compatible backend (vLLM, ATOM) via
-/// /v1/models: the model id, and how an ATOM card reports it renders chats.
+/// /v1/models: the model id, and how an ATOM card reports it renders chats,
+/// if this router mirrors that.
 async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
@@ -317,8 +320,16 @@ async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<Strin
                 labels.insert("model_path".to_string(), id.to_string());
             }
             let rendering = &card["chat_rendering"];
-            if rendering.is_object() {
-                labels.insert(CHAT_RENDERING_LABEL.to_string(), rendering.to_string());
+            if !rendering.is_null() {
+                match ChatRendering::deserialize(rendering) {
+                    Ok(_) => {
+                        labels.insert(CHAT_RENDERING_LABEL.to_string(), rendering.to_string());
+                    }
+                    Err(e) => warn!(
+                        "{url} reports a chat rendering this router does not read, so its chats \
+                         render with only their own template kwargs: {e}"
+                    ),
+                }
             }
         }
         Err(e) => {
@@ -409,16 +420,24 @@ mod tests {
 
     use super::*;
 
-    /// An ATOM card's chat rendering becomes a label, as reported.
+    /// An ATOM card's chat rendering becomes a label, as reported, if this
+    /// router mirrors it.
     #[tokio::test]
     async fn test_openai_discovery_records_the_chat_rendering() {
+        let rendering = json!({"default_kwargs": {"enable_thinking": false},
+            "reasoning_toggle": null, "reasoning_rules": "chat",
+            "template_efforts": ["high"], "encoder": null});
+        let mut unmirrored = rendering.clone();
+        unmirrored["reasoning_rules"] = json!("responses");
         for (card, want) in [
             (
-                json!({"id": "m", "chat_rendering": {"default_kwargs": {"enable_thinking": false}}}),
-                Some(r#"{"default_kwargs":{"enable_thinking":false}}"#),
+                json!({"id": "m", "chat_rendering": rendering}),
+                Some(rendering.to_string()),
             ),
             (json!({"id": "m", "chat_rendering": null}), None),
             (json!({"id": "m"}), None),
+            (json!({"id": "m", "chat_rendering": "chat"}), None),
+            (json!({"id": "m", "chat_rendering": unmirrored}), None),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -431,8 +450,7 @@ mod tests {
 
             let labels = discover_http_openai(&url, None).await;
             assert_eq!(labels.get("model_path").map(String::as_str), Some("m"));
-            let rendering = labels.get(CHAT_RENDERING_LABEL);
-            assert_eq!(rendering.map(String::as_str), want);
+            assert_eq!(labels.get(CHAT_RENDERING_LABEL), want.as_ref());
         }
     }
 }

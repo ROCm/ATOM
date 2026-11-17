@@ -9,7 +9,10 @@ use crate::protocols::{
     validated::Normalizable,
 };
 use serde::{
-    de::{value::StrDeserializer, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
+    de::{
+        value::{BorrowedStrDeserializer, StrDeserializer},
+        DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor,
+    },
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use validator::Validate;
@@ -143,11 +146,29 @@ impl SentControls {
         Ok((parsed, sent))
     }
 
-    fn field(&mut self, key: &str) -> Option<&mut Option<serde_json::Value>> {
+    fn field(&mut self, control: Control) -> &mut Option<serde_json::Value> {
+        match control {
+            Control::Thinking => &mut self.thinking,
+            Control::ToolChoice => &mut self.tool_choice,
+            Control::ResponseFormat => &mut self.response_format,
+        }
+    }
+}
+
+/// A field `SentControls` keeps.
+#[derive(Clone, Copy)]
+enum Control {
+    Thinking,
+    ToolChoice,
+    ResponseFormat,
+}
+
+impl Control {
+    fn named(key: &str) -> Option<Self> {
         match key {
-            "thinking" => Some(&mut self.thinking),
-            "tool_choice" => Some(&mut self.tool_choice),
-            "response_format" => Some(&mut self.response_format),
+            "thinking" => Some(Self::Thinking),
+            "tool_choice" => Some(Self::ToolChoice),
+            "response_format" => Some(Self::ResponseFormat),
             _ => None,
         }
     }
@@ -211,7 +232,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Capture<'_, V> {
         self.inner.visit_map(CaptureMap {
             inner: map,
             sent: self.sent,
-            key: None,
+            control: None,
         })
     }
 
@@ -224,8 +245,8 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for Capture<'_, V> {
 struct CaptureMap<'a, M> {
     inner: M,
     sent: &'a mut SentControls,
-    /// The key of the value to come.
-    key: Option<String>,
+    /// The control the value to come is for, if any.
+    control: Option<Control>,
 }
 
 impl<'de, M: MapAccess<'de>> MapAccess<'de> for CaptureMap<'_, M> {
@@ -235,26 +256,56 @@ impl<'de, M: MapAccess<'de>> MapAccess<'de> for CaptureMap<'_, M> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, M::Error> {
-        let Some(key) = self.inner.next_key::<String>()? else {
-            return Ok(None);
-        };
-        let field = seed.deserialize(StrDeserializer::<M::Error>::new(&key))?;
-        self.key = Some(key);
-        Ok(Some(field))
+        self.inner.next_key_seed(ControlKey {
+            inner: seed,
+            control: &mut self.control,
+        })
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value, M::Error> {
-        let key = self.key.take();
-        let Some(field) = key.as_deref().and_then(|key| self.sent.field(key)) else {
+        let Some(control) = self.control.take() else {
             return self.inner.next_value_seed(seed);
         };
         let value: serde_json::Value = self.inner.next_value()?;
-        *field = Some(value.clone()).filter(|value| !value.is_null());
+        *self.sent.field(control) = (!value.is_null()).then(|| value.clone());
         seed.deserialize(value).map_err(M::Error::custom)
     }
 
     fn size_hint(&self) -> Option<usize> {
         self.inner.size_hint()
+    }
+}
+
+/// A key of the request's map, given to the request's own seed as read, and
+/// borrowed where the input allows, noting the control it names.
+struct ControlKey<'a, K> {
+    inner: K,
+    control: &'a mut Option<Control>,
+}
+
+impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for ControlKey<'_, K> {
+    type Value = K::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<K::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de, K: DeserializeSeed<'de>> Visitor<'de> for ControlKey<'_, K> {
+    type Value = K::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a field name")
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, key: &'de str) -> Result<K::Value, E> {
+        *self.control = Control::named(key);
+        self.inner.deserialize(BorrowedStrDeserializer::new(key))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<K::Value, E> {
+        *self.control = Control::named(key);
+        self.inner.deserialize(StrDeserializer::new(key))
     }
 }
 
