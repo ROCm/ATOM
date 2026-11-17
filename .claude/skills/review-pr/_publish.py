@@ -497,6 +497,18 @@ def build_review(pr, card, diff_text, flagged, sha):
             f"**{len(index)} finding(s) posted inline, on the lines they are about:**\n"
             + "\n".join(index)
         )
+    elif loose:
+        # The branch above states its own reason and then stops one case short of it. With
+        # no anchors at all the block vanishes, and the review goes out with no inline
+        # comments and nothing saying any were expected -- which is the same invisibility,
+        # total instead of partial. ATOM#2152 published six findings this way: five cite no
+        # `path:line`, the sixth cites merge-target files the diff never touches. A reader
+        # cannot tell that from a review whose findings simply had nowhere to attach.
+        parts.append(
+            f"**0 of {len(loose)} finding(s) could be anchored to a line in this diff** "
+            "— each is stated in full above. A finding anchors when it cites a "
+            "`path:line` the PR actually changed."
+        )
     ind = _line_starting(card, "_Independent refutation:")
     if ind:
         parts.append(ind)

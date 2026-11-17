@@ -424,6 +424,33 @@ def test_summary_carries_the_coverage_verdict(report, monkeypatch):
     assert body.index("Coverage:") < body.index("finding(s) posted inline")
 
 
+def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
+    """0 of N anchored must be stated, not inferred from an absent block.
+
+    ATOM#2152 -- 4546 lines, 8 files, the largest diff this bot has reviewed --
+    posted six findings and anchored none: five cite no `path:line` at all, and the
+    sixth cites merge-target files the diff never touches. The summary names the
+    anchored count only when there IS one, so the review went out with no inline
+    comments and nothing saying any were expected. That is the failure the index
+    block's own comment describes one branch away: "an invisible finding reads
+    exactly like a finding that was never made."
+    """
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    unanchorable = CARD.replace(
+        "⚠️ atom/model_ops/moe.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.",
+        "⚠️ The workflow's cleanup step cannot fire — **Author must** drop the flag.",
+    ).replace(
+        "🔴 moe.py:22 and helper.py:7 — one of these citations was flagged.", ""
+    )
+    (report / "card.md").write_text(unanchorable, encoding="utf-8")
+    body = _publish.review_payload("9999")["body"]
+    assert "finding(s) posted inline" not in body
+    assert "could be anchored" in body, (
+        "a review with findings and no anchors must say so -- silence reads as a "
+        "review that simply had nothing to attach"
+    )
+
+
 def test_card_md_is_not_rewritten(report, monkeypatch):
     before = (report / "card.md").read_text(encoding="utf-8")
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
