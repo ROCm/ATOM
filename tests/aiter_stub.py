@@ -224,16 +224,11 @@ class _ExternalModuleLoader(importlib.abc.Loader):
         module.__getattr__ = resolve
 
 
-def _is_under(name: str, roots: tuple[str, ...]) -> bool:
-    return name.split(".", 1)[0] in roots
-
-
 class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, roots: tuple[str, ...]) -> None:
-        self.roots = roots
-
     def find_spec(self, fullname, path, target=None):
-        if _is_under(fullname, self.roots):
+        if fullname in {"aiter", "triton"} or fullname.startswith(
+            ("aiter.", "triton.")
+        ):
             return importlib.util.spec_from_loader(
                 fullname, _ExternalModuleLoader(), is_package=True
             )
@@ -243,30 +238,28 @@ class _ExternalModuleFinder(importlib.abc.MetaPathFinder):
 @contextmanager
 def stubbed_external_kernel_modules():
     """Serve every `aiter` / `triton` import from a stand-in: the names in
-    `_external_module_attributes` are real, any other attribute is a MagicMock.
-    `einops`, which model code imports but ATOM does not depend on, gets a
-    stand-in too where it is not installed (the CPU job)."""
+    `_external_module_attributes` are real, any other attribute is a MagicMock."""
     # Torch imports its own optional Triton integration lazily. Resolve that
     # first so this test's deliberately small Triton stub cannot affect it.
     importlib.import_module("torch._dynamo.config")
 
-    roots = ("aiter", "triton")
-    if importlib.util.find_spec("einops") is None:
-        roots += ("einops",)
+    prefixes = ("aiter", "triton")
     saved = {
-        name: module for name, module in sys.modules.items() if _is_under(name, roots)
+        name: module
+        for name, module in sys.modules.items()
+        if name in prefixes or name.startswith(("aiter.", "triton."))
     }
     for name in saved:
         sys.modules.pop(name, None)
 
-    finder = _ExternalModuleFinder(roots)
+    finder = _ExternalModuleFinder()
     sys.meta_path.insert(0, finder)
     try:
         yield
     finally:
         sys.meta_path.remove(finder)
         for name in list(sys.modules):
-            if _is_under(name, roots):
+            if name in prefixes or name.startswith(("aiter.", "triton.")):
                 sys.modules.pop(name, None)
         sys.modules.update(saved)
 
