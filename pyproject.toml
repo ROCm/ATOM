@@ -10,9 +10,10 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle", "jsonschema>=4.25,<5"]
 
 [project.optional-dependencies]
+structured-output = ["llguidance==1.9.1", "google-re2>=1.1"]
 tracing = ["opentelemetry-api>=1.40,<2", "opentelemetry-sdk>=1.40,<2", "opentelemetry-exporter-otlp-proto-http>=1.40,<2"]
 # atom/diffusion only. Kept out of the base install because none of it is
 # reachable from the LLM engine: PyAV muxes the H.264 + AAC MP4, Pillow does
@@ -65,6 +66,32 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # vendored the same way and carry the same exemption -- black already excludes
 # this directory below, for the same reason.
 "tests/models/glm52/kernels/*.py" = ["ALL"]
+# review-pr's gate infrastructure is vendored from ROCm/aiter at pinned commit
+# c1c482e00 and kept close to upstream so the port stays diffable against
+# `git -C aiter show c1c482e00:<path>` -- that diff is what let reviewers
+# confirm vendored logic was changed only where intended, across ten
+# deliberate ATOM couplings. Reformatting these files destroys that
+# comparison permanently. The exemption follows the FILES, not the directory
+# they happen to sit in: ATOM's own additions stay linted -- check_citations.py,
+# _publish_test.py and the two shell-region tests -- and so does _notify.py,
+# whose owner map was rewritten for ATOM against a different set of failure
+# classes rather than carried over with renames. Drop this exemption once
+# review-pr re-vendors against a newer aiter commit and the delta is re-
+# audited, or once a file here is deliberately rewritten past recognition.
+".claude/skills/review-pr/triage.py" = ["ALL"]
+".claude/skills/review-pr/_lib.py" = ["ALL"]
+".claude/skills/review-pr/_gates.py" = ["ALL"]
+".claude/skills/review-pr/_collect.py" = ["ALL"]
+".claude/skills/review-pr/_apply_refutation.py" = ["ALL"]
+".claude/skills/review-pr/_publish.py" = ["ALL"]
+".claude/skills/review-pr/queue_gate.py" = ["ALL"]
+".claude/skills/review-pr/queue_gate_test.py" = ["ALL"]
+".claude/skills/review-pr/watchdog.py" = ["ALL"]
+".claude/skills/review-pr/watchdog_test.py" = ["ALL"]
+".claude/skills/review-pr/lost_review.py" = ["ALL"]
+".claude/skills/review-pr/lost_review_test.py" = ["ALL"]
+".claude/skills/review-pr/check_prompts.py" = ["ALL"]
+".claude/skills/review-pr/scan_index_width.py" = ["ALL"]
 
 [tool.black]
 # The same exemption, for the same reason: the ruff ignores above do not bind
@@ -76,9 +103,37 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # `force-exclude`, not `extend-exclude`: extend-exclude is ignored for paths
 # passed explicitly, which is exactly how both CI and the PostToolUse
 # `auto_lint.py` hook invoke black (`black <file>` on the file just edited).
+#
+# review-pr's gate infrastructure carries the same exemption, for the same
+# reason: these files are vendored from ROCm/aiter at pinned commit
+# c1c482e00 and kept byte-identical to upstream apart from import/name
+# rewrites (ROCm/aiter -> ROCm/ATOM, aiter-bot -> rocm-atom-bot, and similar),
+# so the port stays diffable against `git -C aiter show c1c482e00:<path>` and
+# can be offered back upstream. Reformatting them breaks that comparison
+# permanently. The exemption follows the FILES, not the directory: it does
+# not cover review-pr/tests/ (written for ATOM on this branch) or _notify.py
+# (its owner-resolution was substantially rewritten for ATOM, not just
+# renamed, so it is linted normally). Drop this once review-pr re-vendors
+# against a newer aiter commit and the delta is re-audited.
 force-exclude = '''
 /(
     atom/models/glm52/mono/kernels
   | tests/models/glm52/kernels
 )/
+| \.claude/skills/review-pr/(
+    triage
+  | _lib
+  | _gates
+  | _collect
+  | _apply_refutation
+  | _publish
+  | queue_gate
+  | queue_gate_test
+  | watchdog
+  | watchdog_test
+  | lost_review
+  | lost_review_test
+  | check_prompts
+  | scan_index_width
+)\.py$
 '''

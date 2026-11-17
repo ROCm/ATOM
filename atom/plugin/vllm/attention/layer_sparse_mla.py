@@ -138,6 +138,7 @@ def generate_sparse_seqlen_kernel(
     out_ptr,
     topk_token: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    INDEX_KPOOL: tl.constexpr = 1,
 ):
     seq_id = tl.program_id(0)
     query_offset = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -152,9 +153,20 @@ def generate_sparse_seqlen_kernel(
         return
     context_start_point = seq_len - query_len
     sparse_seqlen = context_start_point + query_offset
-    sparse_seqlen_masked = tl.where(
-        sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
-    )
+    if INDEX_KPOOL > 1:
+        # Pooled selection: top-k runs over COMPLETE pools and each selected
+        # pool expands back to its `INDEX_KPOOL` token positions, then the
+        # still-open tail is always appended. Counting `min(n, topk)` here
+        # would leave the compact rows the expansion writes misaligned against
+        # `paged_kv_indptr`.
+        n = sparse_seqlen + 1
+        pools = n // INDEX_KPOOL
+        selected = tl.minimum(pools, topk_token // INDEX_KPOOL)
+        sparse_seqlen_masked = selected * INDEX_KPOOL + (n % INDEX_KPOOL)
+    else:
+        sparse_seqlen_masked = tl.where(
+            sparse_seqlen + 1 < topk_token, sparse_seqlen + 1, topk_token
+        )
     tl.store(
         out_ptr + query_start + query_offset,
         sparse_seqlen_masked,
@@ -169,6 +181,7 @@ def generate_sparse_seqlen_triton(
     topk_token: int,
     num_tokens: int,
     max_query_len: int,
+    index_kpool: int = 1,
 ):
     num_seqs = query_lens.size(0)
     out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
@@ -181,6 +194,7 @@ def generate_sparse_seqlen_triton(
         out,
         topk_token,
         block_size,
+        INDEX_KPOOL=index_kpool,
     )
     return out
 
@@ -558,6 +572,12 @@ def _deepseek_v32_indexer_get_kv_cache_spec(self, vllm_config):
         num_kv_heads=1,
         head_size=self.head_dim,
         dtype=self.dtype,
+        # 1 for every model but GLM-5.3-Flash's pooled indexer, which caches one
+        # row per `index_kpool` tokens. vLLM then budgets and views
+        # `block_size // tokens_per_state` rows per block, which is the
+        # addressing ATOM's native `pool_slot_mapping` does
+        # (atom/model_ops/glm5_next/kpool.py).
+        tokens_per_state=int(getattr(self, "tokens_per_state", 1) or 1),
     )
 
 

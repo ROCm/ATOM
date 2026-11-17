@@ -145,7 +145,7 @@ def test_scheduler_ack_retry_preempt_abort_and_no_decode_payload():
     core = SimpleNamespace(
         runner_mgr=SimpleNamespace(call_func=lambda *args: calls.append(args))
     )
-    EngineCore._release_multimodal_requests(core, finished)
+    EngineCore._release_request_resources(core, finished)
     assert calls == [("release_multimodal_requests", [seq.id])]
 
 

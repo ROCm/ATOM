@@ -5,7 +5,8 @@
 
 Everything but the transport is the dense offload's: the executors and the
 per-step producer fence (``start_load_kv``), the completion reports, the block
-GPU connector and the dense codec. What changes is where a packed chunk goes:
+GPU connector and a dense, M3 PAGE, or V4.1 replay PAGE codec. A packed chunk
+moves through:
 
 * save: KV blocks --pack, copy--> a slot of the registered transfer pool
   --``batch_put_from``--> the Store owners;
@@ -49,13 +50,13 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
+from atom.kv_transfer.offload import atom_lmcache_staging
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
     BlockGPUConnector,
 )
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
@@ -70,6 +71,7 @@ from atom.kv_transfer.offload.mooncake_store.keys import (
     probe_key,
     store_namespace,
 )
+from atom.kv_transfer.offload.mooncake_store.layouts import build_mooncake_codec
 from atom.kv_transfer.offload.mooncake_store.nic import requester_rdma_device
 from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
@@ -159,7 +161,8 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
 
 
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
-    """Dense offload worker whose tier is a Mooncake Store, reached directly."""
+    """Offload worker (dense KV, M3 PAGE, or V4.1 replay PAGEs) whose tier is a
+    Mooncake Store, reached directly."""
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
@@ -233,17 +236,34 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
 
     # -- lifecycle --------------------------------------------------------
+    # The stream the forward runs on: seeded at registration, then reported
+    # before each forward by `RapidServeModelRunner`, the one runner that picks
+    # a stream per forward (`RapidServeModelRunner.prefill_forward`).
+    _forward_stream: Any = None
+
+    def set_forward_stream(self, stream: Any) -> None:
+        if stream is not None:
+            self._forward_stream = stream
+
     def register_kv_caches(
         self, kv_caches: dict, transfer_tensors=None, num_blocks: int | None = None
     ) -> None:
+        # The model runner's thread: its current stream is the forward's. The
+        # first load is dispatched before the first forward reports its stream.
+        if torch.cuda.is_available():
+            self.set_forward_stream(torch.cuda.current_stream())
         rank, world = pp_aware_rank_and_world(self._config, _tp_group())
         self._rank = rank
         self._world = world
         # Scheduler blocks, threaded from the model runner. MLA stores its KV
         # token-major, so the codec cannot infer the count from shape[0].
-        self._codec = DenseKVByteCodec(
+        # The dense codec reads kv_caches. M3 and V4.1 read the PAGE region map.
+        # V4.1 also requires the replay contract; its state is not stored.
+        self._codec = build_mooncake_codec(
+            self._config,
             kv_caches,
-            num_blocks=num_blocks,
+            transfer_tensors,
+            num_blocks,
             permit_per_request_state=self._permit_per_request_state,
         )
         cfg = self._store_cfg
@@ -261,6 +281,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             virtual_block_size=self.virtual_block_size,
             source_safe_callback=self._source_group_safe,
             max_staging_bytes=_staging_buffer_bound(),
+            # The Store stages on the forward's stream: its saves on a side
+            # stream froze the engine (persistent forward kernels against
+            # concurrent offload kernels on ROCm).
+            compute_stream_provider=lambda: self._forward_stream,
         )
         client = pool = None
         try:
@@ -305,10 +329,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._namespace = namespace
         self._chunk_bytes = gpu_connector.gpu_staging_chunk_bytes
         # A window whose slots are one run of the pool is a chunk-major buffer
-        # the dense codec fills or drains with one kernel; the block GPU
-        # connector instead stages it 48 MB at a time, with a copy per chunk
-        # and a stream handshake per group, each a GIL round trip against the
-        # forward thread. The fused kernel exists only on the GPU.
+        # the codec fills or drains with one kernel; the block GPU connector
+        # instead stages it 48 MB at a time, with a copy per chunk and a
+        # stream handshake per group, each a GIL round trip against the
+        # forward thread. A codec with ``supports_strided_restore`` (the
+        # DSV4/M3 PAGE codec) also restores a run of padded slots in place;
+        # saves into padded slots still stage. The fused kernel exists only on
+        # the GPU.
         self._in_place = self._codec.has_fused_chunk_major_staging
         self._next_stats_log_at = time.monotonic() + _STATS_LOG_INTERVAL_S
         logger.info(
@@ -538,6 +565,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def _do_save_req(self, req: LMCacheReqMeta, *, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
+        self._pin_in_place_stream()
         t_total0 = time.perf_counter()
         chunk = self.chunk_size
         end = len(req.chunk_hashes or b"") // DIGEST_BYTES
@@ -705,6 +733,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
         assert ls is not None
+        self._pin_in_place_stream()
         hbm = int(ls.hbm_cached_tokens)
         lmc = int(ls.lmcache_cached_tokens)
         t_total0 = time.perf_counter()
@@ -792,10 +821,21 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
                 break
             run = pool.contiguous_view(slots) if self._in_place else None
+            chunk_stride_bytes = None
+            if run is None and self._in_place and self._codec.supports_strided_restore:
+                run = pool.strided_view(slots)
+                if run is not None:
+                    chunk_stride_bytes = pool.slot_stride
             t_unpack0 = time.perf_counter()
             try:
                 if run is not None:
-                    self._copy_in_place(run, window, req.block_ids, pack=False)
+                    self._copy_in_place(
+                        run,
+                        window,
+                        req.block_ids,
+                        pack=False,
+                        chunk_stride_bytes=chunk_stride_bytes,
+                    )
                     in_place_windows += 1
                 else:
                     gpu_connector.batched_to_gpu(
@@ -864,11 +904,22 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     # -- in-place copies ---------------------------------------------------
     def _in_place_stream(self) -> torch.cuda.Stream:
         """This copy thread's stream for in-place packs and unpacks."""
+        # The forward's stream as pinned when this transfer began
+        # (`_pin_in_place_stream`), so every window of it uses one stream.
+        shared = getattr(self._in_place_tls, "pinned", None)
+        if shared is not None:
+            return shared
         stream = getattr(self._in_place_tls, "stream", None)
         if stream is None:
             stream = torch.cuda.Stream(device=self._codec.device)
             self._in_place_tls.stream = stream
         return stream
+
+    def _pin_in_place_stream(self) -> None:
+        """Pin the stream this thread's coming load or save stages on: the
+        forward's, as it is now. A runner that picks a stream per forward may
+        move on during the transfer; the switch happens between transfers."""
+        self._in_place_tls.pinned = self._forward_stream
 
     def _copy_in_place(
         self,
@@ -878,8 +929,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         *,
         pack: bool,
         producer_event: Any = None,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         """Pack ``window``'s KV blocks into ``run``, or unpack it into them.
+        With ``chunk_stride_bytes``, ``run`` holds padded Store slots and is
+        unpacked in place; each slot's padding is skipped, not read.
 
         Returns once the copy is done. A pack is ordered after
         ``producer_event`` like the staged pack, so the kernels that produced
@@ -889,6 +943,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         chunk = self.chunk_size
         stream = self._in_place_stream()
         if producer_event is not None:
+            # Also on the forward's stream: it may have changed since the
+            # producer recorded the event, and a same-stream wait is free.
             stream.wait_event(producer_event)
         # Only the window's part of the block table, with token offsets from
         # its first chunk: converting the whole table would cost every window
@@ -903,13 +959,24 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         owner = codec.prepare_block_id_groups(
             [groups], device=codec.device, stream=stream
         )
-        copy = (
-            codec.gpu_to_chunk_major_device_buffer_prepared
-            if pack
-            else codec.chunk_major_device_buffer_to_gpu_prepared
-        )
-        copy(run, owner, 0, stream=stream)
-        stream.synchronize()
+        if chunk_stride_bytes is not None:
+            codec.chunk_major_strided_buffer_to_gpu_prepared(
+                run,
+                owner,
+                0,
+                stream=stream,
+                items_per_chunk=per_chunk,
+                chunk_stride_bytes=chunk_stride_bytes,
+            )
+        elif pack:
+            codec.gpu_to_chunk_major_device_buffer_prepared(
+                run, owner, 0, stream=stream
+            )
+        else:
+            codec.chunk_major_device_buffer_to_gpu_prepared(
+                run, owner, 0, stream=stream
+            )
+        atom_lmcache_staging.fence_submitted_work(stream)
 
         # -- slot settlement -----------------------------------------------
 

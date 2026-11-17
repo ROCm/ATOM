@@ -17,6 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .images import NO_FILES_API
 from .reasoning import ReasoningChannel
 from .sse import event_frame
 from .tool_parser import ToolCallStreamParser
@@ -65,6 +66,56 @@ class AnthropicMessagesRequest(BaseModel):
 # ── Format Conversion ──────────────────────────────────────────────────
 
 
+def _block_field(block: dict, key: str) -> Any:
+    """A field the Anthropic spec requires on this block type. A missing one is
+    the client's error (HTTP 400), not a ``KeyError``."""
+    value = block.get(key)
+    if value is None:
+        raise ValueError(f"{block.get('type')} block requires '{key}'")
+    return value
+
+
+_IMAGES_NOT_HERE = "images are allowed in user messages and tool results only, not in "
+
+
+def _has_image(blocks: Any) -> bool:
+    return isinstance(blocks, list) and any(
+        isinstance(block, dict) and block.get("type") == "image" for block in blocks
+    )
+
+
+def _parts(blocks: list) -> list[dict]:
+    """Text and image blocks as chat content parts, in their order."""
+    parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            parts.append({"type": "text", "text": _block_field(block, "text")})
+        elif block.get("type") == "image":
+            parts.append(_image_part(block))
+    return parts
+
+
+def _image_part(block: dict) -> dict:
+    """An ``image`` block as the chat ``image_url`` part; the server checks it
+    with every other image (``images.check_chat_images``)."""
+    source = block.get("source")
+    kind = source.get("type") if isinstance(source, dict) else None
+    if kind == "base64":
+        media_type, data = source.get("media_type"), source.get("data")
+        if not isinstance(media_type, str) or not isinstance(data, str):
+            raise ValueError("a base64 image source requires media_type and data")
+        url = f"data:{media_type};base64,{data}"
+    elif kind == "url":
+        url = source.get("url")
+    elif kind == "file":
+        raise ValueError(NO_FILES_API)
+    else:
+        raise ValueError("an image block needs a base64 or url source")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -77,10 +128,12 @@ def anthropic_to_openai_messages(
         if isinstance(system, str):
             result.append({"role": "system", "content": system})
         elif isinstance(system, list):
+            if _has_image(system):
+                raise ValueError(_IMAGES_NOT_HERE + "the system prompt")
             text_parts = []
             for b in system:
                 if b.get("type") == "text":
-                    text = b["text"]
+                    text = _block_field(b, "text")
                     if text.startswith("x-anthropic-billing-header"):
                         continue
                     text_parts.append(text)
@@ -95,13 +148,15 @@ def anthropic_to_openai_messages(
             if isinstance(content, str):
                 result.append({"role": "assistant", "content": content})
             elif isinstance(content, list):
+                if _has_image(content):
+                    raise ValueError(_IMAGES_NOT_HERE + "assistant messages")
                 text_parts = []
                 reasoning_parts = []
                 tool_calls = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "thinking":
                             thinking = block.get("thinking")
                             if isinstance(thinking, str) and thinking:
@@ -109,11 +164,13 @@ def anthropic_to_openai_messages(
                         elif block.get("type") == "tool_use":
                             tool_calls.append(
                                 {
-                                    "id": block["id"],
+                                    "id": _block_field(block, "id"),
                                     "type": "function",
                                     "function": {
-                                        "name": block["name"],
-                                        "arguments": json.dumps(block.get("input", {})),
+                                        "name": block.get("name"),
+                                        "arguments": json.dumps(
+                                            block.get("input", {}), ensure_ascii=False
+                                        ),
                                     },
                                 }
                             )
@@ -133,10 +190,12 @@ def anthropic_to_openai_messages(
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
-                            if isinstance(tool_content, list):
+                            if _has_image(tool_content):
+                                tool_content = _parts(tool_content)
+                            elif isinstance(tool_content, list):
                                 tool_content = "\n".join(
                                     b.get("text", "")
                                     for b in tool_content
@@ -145,14 +204,22 @@ def anthropic_to_openai_messages(
                             tool_results.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": block["tool_use_id"],
-                                    "content": str(tool_content),
+                                    "tool_call_id": _block_field(block, "tool_use_id"),
+                                    "content": (
+                                        tool_content
+                                        if isinstance(tool_content, list)
+                                        else str(tool_content)
+                                    ),
                                 }
                             )
-                if text_parts:
+                if _has_image(content):
+                    result.append({"role": "user", "content": _parts(content)})
+                elif text_parts:
                     result.append({"role": "user", "content": "\n".join(text_parts)})
                 result.extend(tool_results)
         else:
+            if _has_image(content):
+                raise ValueError(_IMAGES_NOT_HERE + f"{role} messages")
             result.append({"role": role, "content": str(content) if content else ""})
 
     return result
@@ -210,15 +277,21 @@ def read_whole_blocks(
     tools: list | None = None,
     *,
     suppress_calls: bool = False,
+    stopped: bool,
 ) -> list:
     """One complete output as ordered events, reasoning included.
 
-    The streaming branch's own loop over a single chunk: the reasoning filter
-    first, the tool parser on the content segments it yields. `split()`
+    The streaming branch's own loop over the whole output: the reasoning
+    filter first, the tool parser on the content segments it yields. `split()`
     returns `(reasoning, content)` and loses the interleaving at that line, so
     blocks rebuilt from the pair put a whole answer in one block ahead of a
     `thinking` that belonged in the middle of it -- two blocks where streaming
     sent three, for the same generation.
+
+    Adjacent reasoning segments are one event. The filter splits a chain of
+    thought wherever it drops framing inside it, and each event becomes a
+    `thinking` block or a Responses reasoning item, while streaming sends the
+    same run as one. ``stopped`` is as for `ReasoningFilter.flush`.
 
     Not Anthropic-specific except that Anthropic is the only endpoint whose
     wire format has an order to lose; the chat path's fields are flat.
@@ -228,13 +301,19 @@ def read_whole_blocks(
         tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
     )
     out: list = []
-    for field, segment in reader.process(text) + reader.flush():
+    thought: list[str] = []
+    for field, segment in reader.read_whole_events(text, stopped=stopped):
         if not segment:
             continue
         if field == "reasoning_content":
-            out.append(("reasoning", segment))
-        else:
-            out.extend(engine.process(segment))
+            thought.append(segment)
+            continue
+        if thought:
+            out.append(("reasoning", "".join(thought)))
+            thought = []
+        out.extend(engine.process(segment))
+    if thought:
+        out.append(("reasoning", "".join(thought)))
     out.extend(engine.flush())
     return out
 

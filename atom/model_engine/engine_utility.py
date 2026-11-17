@@ -5,7 +5,10 @@ import logging
 import queue
 import time
 import uuid
+from collections.abc import Iterable
 from typing import ClassVar
+
+import numpy as np
 
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -14,17 +17,58 @@ from atom.model_engine.collective_rpc import (
     RpcPayload,
     checked_timeout,
 )
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import BlockTable, SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 # Commands whose senders never wait, so their handlers answer nothing and a
 # synchronous caller could only wait out its timeout on them.
-FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
+FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
+    {"abort_request", "get_mtp_stats", "release_constraints"}
+)
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
+# As vLLM's pause_generation(mode="keep") / resume_generation.
+PAUSE_GENERATION_CMD = "pause_generation"
+RESUME_GENERATION_CMD = "resume_generation"
+
+
+def memory_tags(args) -> tuple[str, ...]:
+    """The resources a release_memory / resume_memory acts on; none named
+    means both, as the runner reads it."""
+    tags = args.get("tags") if isinstance(args, dict) else None
+    return ("weights", "kv_cache") if tags is None else tuple(tags)
+
+
+def kv_change(cmd: str, args) -> str | None:
+    """What *cmd* does to the KV pool: ``"weights"`` if it commits new weights
+    (the update's last step clears the KV cache), ``"kv"`` if it zeroes, frees
+    or reallocates the pool, ``None`` if neither."""
+    args = args if isinstance(args, dict) else {}
+    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+        return "weights" if completes_weight_sync(cmd, args) else None
+    if cmd == "clear_kv_cache":
+        return "kv"
+    # A resume reallocates the pool too, so the block tables running sequences
+    # hold no longer point at their KV.
+    if cmd in ("release_memory", "resume_memory") and "kv_cache" in memory_tags(args):
+        return "kv"
+    return None
+
+
+def physical_block_count(tables: Iterable[BlockTable], num_blocks: int) -> int:
+    """Physical blocks across tables, a shared prefix counted once.
+
+    A boolean mask over the pool, filled from each table's buffer. Building a
+    Python set of every id costs tens to hundreds of milliseconds once finished
+    requests hold a long context, and this runs on the engine thread.
+    """
+    seen = np.zeros(num_blocks, dtype=bool)
+    for table in tables:
+        seen[np.frombuffer(table, dtype=np.int32)] = True
+    return int(seen.sum())
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
@@ -37,6 +81,11 @@ def completes_weight_sync(cmd: str, args: dict) -> bool:
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
+# How long a KV change waits for transfers in flight, and a pause for the
+# pipeline to empty, before refusing: long enough for a slow offload save to
+# report, and short enough that a stuck one is refused while a weight sync's
+# longer deadline still has time left.
+_KV_QUIESCE_TIMEOUT_S = 30.0
 _FAILED_SYNC_CLEANUP_TIMEOUT_S = 1.0
 
 
@@ -105,7 +154,10 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
+        "release_constraints": "_handle_release_constraints",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
+        PAUSE_GENERATION_CMD: "_handle_pause_generation",
+        RESUME_GENERATION_CMD: "_handle_resume_generation",
     }
 
     def __init__(
@@ -115,6 +167,8 @@ class EngineUtilityHandler:
         self.output_queue = _ReplyQueue(output_queue)
         self.label = label
         self.scheduler = scheduler
+        # Set by process_queue to the engine whose queue it drains.
+        self.engine = None
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
         # Why the current sync can no longer complete. Its later updates and
@@ -141,10 +195,18 @@ class EngineUtilityHandler:
         if not engine._has_pending_utility:
             return
         engine._has_pending_utility = False
+        # The engine whose queue this is; pause/resume and KV changes act on it.
+        self.engine = engine
 
         while True:
             try:
                 cmd, args = utility_queue.get_nowait()
+                change = kv_change(cmd, args)
+                refusal = self._prepare_engine(engine, cmd, change, args)
+                if refusal is not None and not self._continues_weight_sync(cmd, args):
+                    # Nothing of it has been written: the engine stays as it was.
+                    self._refuse(cmd, args, refusal)
+                    continue
                 if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     # Local success is not global success: another DP engine
                     # can still fail this bucket. Stay fenced until CoreManager
@@ -155,11 +217,16 @@ class EngineUtilityHandler:
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
-                reply = self._execute_utility_command(cmd, args)
+                if refusal is None:
+                    reply = self._execute_utility_command(cmd, args)
+                    if change is not None:
+                        self._forget_cached_prefixes()
+                else:
+                    # Its sync wrote earlier buckets, so it fails as a sync.
+                    reply = self._refuse(cmd, args, refusal)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
-                    tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if "weights" in tags:
+                    if "weights" in memory_tags(args):
                         # Some ranks may already have released their weights
                         # before a peer reports failure. Conservatively stop
                         # serving until an all-rank resume succeeds.
@@ -172,8 +239,7 @@ class EngineUtilityHandler:
                         else:
                             logger.info(f"{self.label}: engine entered sleep mode")
                 elif cmd == "resume_memory":
-                    tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if "weights" in tags and not (
+                    if "weights" in memory_tags(args) and not (
                         isinstance(reply, dict) and reply.get("error")
                     ):
                         engine._is_rl_weights_offloaded = False
@@ -198,6 +264,13 @@ class EngineUtilityHandler:
                         )
                     elif completes_weight_sync(cmd, args):
                         self._awaiting_finish = args.get("request_id")
+                elif cmd == DISCARD_WEIGHT_SYNC_CMD and not self._weight_sync_fenced:
+                    # No update of it ran here (the fence goes up with the
+                    # first), so this engine still holds the committed weights.
+                    logger.info(
+                        f"{self.label}: discarded weight sync wrote nothing "
+                        f"here; serving is unchanged"
+                    )
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
@@ -231,6 +304,60 @@ class EngineUtilityHandler:
                         )
             except queue.Empty:
                 break
+
+    def _continues_weight_sync(self, cmd: str, args) -> bool:
+        """Whether *cmd* is a later bucket of the sync in progress."""
+        return (
+            cmd in WEIGHT_UPDATE_UTILITY_CMDS
+            and self._weight_sync_in_progress
+            and args.get("sync_id") == self._sync_id
+        )
+
+    def _prepare_engine(self, engine, cmd: str, change: str | None, args) -> str | None:
+        """Ready *engine* for *cmd*; return why it cannot be, or None.
+
+        A weight sync's first update waits for what is in flight. A KV change
+        preempts what is running, so nothing decodes on a zeroed or recomputed
+        pool. A refused command preempts nothing and runs nothing.
+        """
+        starts_sync = cmd in WEIGHT_UPDATE_UTILITY_CMDS and not (
+            self._continues_weight_sync(cmd, args)
+        )
+        if change is None and not starts_sync:
+            return None
+        args = args if isinstance(args, dict) else {}
+        deadline = time.monotonic() + min(
+            _KV_QUIESCE_TIMEOUT_S, _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+        )
+        try:
+            if starts_sync:
+                engine.prepare_weight_sync(deadline)
+            if change is not None:
+                engine.prepare_kv_change(weights=change == "weights", deadline=deadline)
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
+    def _refuse(self, cmd: str, args, reason: str) -> dict:
+        """Answer *cmd* with *reason* without running it."""
+        reply = {"cmd": cmd, "error": f"refused: {reason}"}
+        logger.error(f"{self.label}: {cmd} refused: {reason}")
+        self.output_queue.request_id = (
+            args.get("request_id") if isinstance(args, dict) else None
+        )
+        try:
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        finally:
+            self.output_queue.request_id = None
+        return reply
+
+    def _forget_cached_prefixes(self) -> None:
+        """Drop the prefix-cache index; live sequences keep their blocks.
+
+        A prefill-only engine has no block manager; the decode engine owns it.
+        """
+        if self.scheduler is not None and self.scheduler.block_manager is not None:
+            self.scheduler.block_manager.clear_cache()
 
     def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
         """Run *cmd*'s handler and return what it returned: the weight
@@ -634,6 +761,41 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
+    def _handle_release_constraints(self, args: dict):
+        self.runner_mgr.call_func("release_constraints", args["request_ids"])
+
+    def _handle_pause_generation(self, args: dict) -> dict:
+        """Schedule nothing until ``resume_generation``.
+
+        What is running waits. A weight update in between preempts it (see
+        ``EngineCore.prepare_kv_change``), and once resumed it recomputes its
+        context on the new weights, keeping the tokens and logprobs it has.
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            mode = args.get("mode", "keep")
+            if mode != "keep":
+                raise ValueError(f"unsupported pause mode {mode!r}; only 'keep'")
+            self.engine.pause_generation(
+                deadline=time.monotonic()
+                + _remaining_timeout(args, _KV_QUIESCE_TIMEOUT_S)
+            )
+            reply = {"cmd": PAUSE_GENERATION_CMD}
+            logger.info(f"{self.label}: generation paused")
+        except (ValueError, RuntimeError) as exc:
+            reply = self._error_reply(PAUSE_GENERATION_CMD, exc)
+            logger.error(f"{self.label}: pause_generation failed: {reply['error']}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_resume_generation(self, args: dict) -> dict:
+        """Let scheduling go on after ``pause_generation``."""
+        self.engine.resume_generation()
+        reply = {"cmd": RESUME_GENERATION_CMD}
+        logger.info(f"{self.label}: generation resumed")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
     def _handle_abort_request(self, args: dict):
         """Cancel queued work promptly; running forwards finish via postprocess."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
@@ -823,6 +985,11 @@ class EngineUtilityHandler:
             }
             if kv_pool is not None:
                 reusable = kv_pool.num_reusable_free
+                # Finished or aborted requests held whole until every connector
+                # releases them: a P/D decode pull, a whole-request offload
+                # save, or a load still writing into their blocks. Early-release
+                # offload leases are excluded.
+                deferred_free = self.scheduler.deferred_free_blocks.values()
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
@@ -830,6 +997,11 @@ class EngineUtilityHandler:
                     "kv_blocks_indexed": kv_pool.num_indexed,
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,
+                    "requests_deferred_free": len(deferred_free),
+                    "kv_blocks_deferred_free": physical_block_count(
+                        (seq.block_table for seq in deferred_free),
+                        kv_pool.num_blocks,
+                    ),
                 }
 
             metrics = getattr(self.scheduler, "metrics", None)
@@ -846,5 +1018,12 @@ class EngineUtilityHandler:
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,
                 }
+                admission = self.scheduler.pd_admission
+                if admission is not None:
+                    result["scheduler_metrics"]["pd_admission"] = {
+                        "pending": admission.pending_states,
+                        "pending_kv_bytes": admission.pending_bytes,
+                        "deferred": dict(admission.deferred),
+                    }
 
         return result

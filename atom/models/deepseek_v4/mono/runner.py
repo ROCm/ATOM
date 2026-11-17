@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from atom.distributed.group_agreement import group_agree
 from atom.models.deepseek_v4.mono.binding import (
     LayerStep,
     input_identity,
@@ -35,7 +36,7 @@ from atom.models.deepseek_v4.mono.runtime import require_resident_grid
 from atom.models.deepseek_v4.mono.state import Dsv4Variant
 from atom.models.deepseek_v4.mono.weights import pack_layer_weights
 from atom.mono.runtime.compile import compile_only, kernel_names, launcher_resources
-from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 
 logger = logging.getLogger("atom")
 
@@ -234,6 +235,11 @@ class V4MonoDecodeRunner:
                     compressor_projection_bf16=True,
                     attention_fp8_bf16=True,
                     indexer_hadamard=False,
+                    indexer_layout=(
+                        block.attn.indexer.indexer_layout
+                        if indexed
+                        else V4Config.indexer_layout
+                    ),
                     index_topk_refresh=index_topk_refresh if indexed else True,
                     index_topk_source_layer=index_topk_source_layer if indexed else -1,
                 )
@@ -372,7 +378,7 @@ class V4MonoDecodeRunner:
                 rows,
                 tokens_per_seq,
             )
-        if not tp_agree(failure is None, self.group):
+        if not group_agree(failure is None, self.group):
             self._refused.add(key)
             return False
         Dsv4Variant._cache.update(builds)
@@ -440,7 +446,7 @@ class V4MonoDecodeRunner:
                 # in the TP-wide refusal instead of escaping on one rank.
                 except Exception as error:  # noqa: BLE001
                     failure = error
-                if not tp_agree(failure is None, self.group):
+                if not group_agree(failure is None, self.group):
                     raise MonoUnsupported(
                         "a rank failed to allocate the target width"
                     ) from failure

@@ -10,21 +10,25 @@ split across DCP or TP ranks, each rank's share of the rows and their
 all-gather -- are here.
 
 The names below are loaded on first use, so importing a submodule that needs
-no kernels (``schedule``) does not import AITER."""
+no kernels (``layout``) does not import AITER."""
 
 import importlib
 
 _EXPORTS = {
-    "NATURAL": ".rows",
-    "PRESHUFFLE": ".rows",
+    "MFMA": ".layout",
+    "NATURAL": ".layout",
+    "PRESHUFFLE": ".layout",
     "ConcatKeys": ".rows",
+    "ConcatPass": ".workspace",
     "Fp4LaunchStorages": ".rows",
     "IndexCache": ".rows",
     "IndexRows": ".rows",
     "RowSplit": ".rows",
+    "concat_passes": ".workspace",
     "concat_rows": ".rows",
     "fp4_rows": ".rows",
     "fp8_rows": ".rows",
+    "packed_concat_rows": ".rows",
     "fold_query_scale": ".query",
     "quantize_query": ".query",
     "quantize_query_rows": ".query",
@@ -32,17 +36,21 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "MFMA",
     "NATURAL",
     "PRESHUFFLE",
     "ConcatKeys",
+    "ConcatPass",
     "Fp4LaunchStorages",
     "IndexCache",
     "IndexRows",
     "RowSplit",
+    "concat_passes",
     "concat_rows",
     "fold_query_scale",
     "fp4_rows",
     "fp8_rows",
+    "packed_concat_rows",
     "quantize_query",
     "quantize_query_rows",
     "score_topk",

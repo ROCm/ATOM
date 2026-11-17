@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import zmq
 
+from atom.config import KVEventsConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
@@ -76,6 +77,9 @@ def _bare_manager(cls, **kwargs):
             dp_load_balance="round_robin",
             tp_world_size=1,
             prefill_context_parallel_size=1,
+            keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
+            asyncio_mode=kwargs.get("asyncio_mode", False),
+            kv_events_config=KVEventsConfig(),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -130,6 +134,37 @@ class OutputThreadStateTest(unittest.TestCase):
         finally:
             sender.close(linger=0)
 
+    def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
+        # Off by default: online front ends take every output through the
+        # callbacks, and a queued Sequence would stay for the process's life.
+        # asyncio_mode reads the queue, so it keeps them too.
+        for keep, asyncio_mode in ((True, False), (False, True), (False, False)):
+            mgr = _bare_manager(
+                CoreManager, keep_finished_outputs=keep, asyncio_mode=asyncio_mode
+            )
+            self.addCleanup(mgr.ctx.term)
+            mgr._deliver_terminal_output = lambda seq: False
+            mgr._release_seq = lambda seq_id: None
+            mgr._shutdown_engine_core_rank = lambda rank: None
+            url = f"inproc://outputs-{uuid.uuid4().hex}"
+            receiver = mgr.ctx.socket(zmq.PULL)
+            receiver.bind(url)
+            sender = mgr.ctx.socket(zmq.PUSH)
+            sender.connect(url)
+            thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+            thread.start()
+            try:
+                seqs = [SimpleNamespace(id=7)]
+                sender.send(pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+                sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(
+                    mgr.outputs_queue.qsize(), 1 if keep or asyncio_mode else 0
+                )
+            finally:
+                sender.close(linger=0)
+
     def _terminate(self):
         for mgr in self.managers:
             mgr.ctx.term()
@@ -158,6 +193,12 @@ class OutputThreadStateTest(unittest.TestCase):
         """It stays None until the API server resolves it; offline never does."""
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
+
+    def test_kv_event_sources_are_built_with_the_shared_state(self):
+        """`/kv_event_sources` serves what the manager built, under either
+        manager; with events off there is no publisher to report."""
+        for mgr in self.managers:
+            self.assertEqual(mgr.kv_event_sources, {})
 
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)

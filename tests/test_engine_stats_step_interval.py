@@ -25,14 +25,18 @@ def _stats(**kw) -> EngineStats:
     return EngineStats(**kw)
 
 
-def test_time_mode_is_unchanged_by_default():
+def test_time_mode_is_unchanged_by_default(monkeypatch):
     """Default construction keeps the clock; steps are inert."""
+    # Use exactly representable times for the inclusive interval boundary.
+    monkeypatch.setattr(engine_stats, "time", SimpleNamespace(monotonic=lambda: 100.0))
     s = _stats(throughput_log_interval_s=10.0)
     assert s.throughput_log_interval_steps == 0
     for _ in range(1000):
         s.bump_step()
     assert not s.window_expired(s._throughput_last_log_time + 1.0)
-    assert s.window_expired(s._throughput_last_log_time + 10.0)
+    # A hair past the interval: `last + 10.0 - last` is not exactly 10.0 for a
+    # clock reading like 508.68, so the boundary itself is not a stable probe.
+    assert s.window_expired(s._throughput_last_log_time + 10.0 + 1e-6)
 
 
 def test_step_mode_ignores_the_clock():
@@ -324,10 +328,13 @@ def test_ranks_stay_aligned_when_only_one_of_them_has_work():
 
 
 @pytest.mark.parametrize("steps", [-5, -1])
-def test_a_negative_interval_falls_back_to_the_clock(steps):
+def test_a_negative_interval_falls_back_to_the_clock(steps, monkeypatch):
     """Clamped rather than raised: a bad value must not stop the engine."""
+    monkeypatch.setattr(engine_stats, "time", SimpleNamespace(monotonic=lambda: 100.0))
     s = _stats(throughput_log_interval_s=10.0, throughput_log_interval_steps=steps)
     assert s.throughput_log_interval_steps == 0
     s.bump_step()
     assert not s.window_expired(s._throughput_last_log_time + 1.0)
-    assert s.window_expired(s._throughput_last_log_time + 10.0)
+    # A hair past the interval: `last + 10.0 - last` is not exactly 10.0 for a
+    # clock reading like 508.68, so the boundary itself is not a stable probe.
+    assert s.window_expired(s._throughput_last_log_time + 10.0 + 1e-6)

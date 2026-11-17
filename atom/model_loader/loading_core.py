@@ -92,8 +92,21 @@ def verify_shard_files_present(model_name_or_path: str) -> None:
 def _one_omp_thread() -> None:
     """A loader thread's own OpenMP team: one thread (``omp_set_num_threads``
     sets the calling thread's count only; torch's OpenMP runtime is loaded,
-    so the process resolves it)."""
-    ctypes.CDLL(None).omp_set_num_threads(1)
+    so resolve the symbol through torch's extension and its dependencies).
+
+    PyTorch can load its shared libraries with ``RTLD_LOCAL``. In that case
+    ``CDLL(None)`` cannot see ``omp_set_num_threads`` even though torch's own
+    OpenMP runtime is already loaded. Looking the symbol up from ``torch._C``
+    searches that extension's dependency graph and selects the same runtime
+    torch uses instead of loading a second OpenMP implementation.
+    """
+    # torch sets a thread's OpenMP count to the process default on that
+    # thread's first ATen call; run it now, or it overwrites the 1 set below.
+    torch.get_num_threads()
+    set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
+    set_num_threads.argtypes = [ctypes.c_int]
+    set_num_threads.restype = None
+    set_num_threads(1)
 
 
 def load_weights_into_model(

@@ -12,6 +12,7 @@
 # import here is a declared dependency, so a plain CPU runner has them.
 
 import dataclasses
+import os
 import sys
 from itertools import count
 from pathlib import Path
@@ -35,6 +36,32 @@ from atom.sampling_params import SamplingParams
 from atom.utils.region_graph import ReqGraph
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
+
+
+def gpu_stack_import(name):
+    """Import an atom module that may need the aiter/triton GPU stack.
+
+    Tries the import first, so a module that imports fine without the stack
+    still runs on the CPU-only CI runner. A failure is turned into a skip only
+    when the stack is genuinely absent -- no aiter or triton, or no GPU for
+    aiter to probe the arch of at import. On a GPU host any import error FAILS.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        try:
+            importlib.import_module("aiter")
+            importlib.import_module("triton")
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception as e:  # noqa: BLE001 - any failure here means no stack
+            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
+        if not gpu:
+            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
+        raise
 
 
 class _MockHFConfig:
@@ -70,12 +97,19 @@ class MockConfig:
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
             "decode_context_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "kv_transfer_config": {},
             "max_model_len": 64,
             "bos_token_id": 1,
             "eos_token_id": 2,
             "stop_token_ids": [],
             "scheduler_delay_factor": 0.0,
+            "prefill_admit_policy": "interval",
             "speculative_config": None,
+            # What `Config` resolves: the env override, else the global default.
+            "offload_min_load_tokens": int(
+                os.environ.get("OFFLOAD_MIN_LOAD_TOKENS", "8192")
+            ),
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
             "hf_config": _MockHFConfig(),
@@ -83,6 +117,15 @@ class MockConfig:
         defaults.update(overrides)
         for k, v in defaults.items():
             setattr(self, k, v)
+
+
+def with_min_load(config):
+    """Settle on a stand-in config what `Config` settles at construction: the
+    minimum tier load, from the env override or the tier's own default."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
+    return config
 
 
 def atom_config_double(**overrides):
@@ -294,6 +337,14 @@ def req_graph_recordings(monkeypatch):
     return recordings
 
 
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
+
+
 @pytest.fixture(autouse=True)
 def mono_runs_on_gfx950(monkeypatch):
     """Mono's deployment checks see gfx950, the only arch its kernels are built
@@ -303,3 +354,19 @@ def mono_runs_on_gfx950(monkeypatch):
     from atom.mono.runtime import deployment
 
     monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")
+
+
+@pytest.fixture
+def mxfp4_default_backends(monkeypatch):
+    """Pin the MXFP4 linear backend to the default preshuffled ASM path.
+
+    `mxfp4_k_pad_align` and the load-time K check read the backend live
+    (`ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM`, the gfx1250 32x4 switch), so a
+    test of either must not depend on what the shell exported. Imported here
+    lazily: `atom.model_ops.linear` needs AITER.
+    """
+    from atom.model_ops import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "_mxfp4_n32k4_backend", lambda: False)

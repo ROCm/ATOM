@@ -17,7 +17,7 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
 
 
 @pytest.fixture
@@ -73,11 +73,13 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
     monkeypatch.setattr(engine_core, "time", timer)
     monkeypatch.setattr(pp_engine_core, "time", timer)
     proc = SimpleNamespace(
+        _report_backlog=False,
         label="test",
         utility_queue=None,
         kv_transfer_enabled=False,
         _is_rl_weights_offloaded=True,
-        _is_idle_rl_weights_offloaded=lambda: True,
+        _is_engine_held=lambda: True,
+        _report_held_kv_work=lambda: None,
         _drain_kv_work_at_exit=lambda: None,
         pull_and_process_input_queue=lambda: now[0] >= 2 * interval,
         _sync_dp_state=lambda unfinished, shutdown, offloaded: (False, shutdown, True),
@@ -87,6 +89,7 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
             is_finished=lambda: True,
             publish_kv_events=lambda: None,
             shutdown_kv_events=lambda: None,
+            close_kv_connector=lambda: None,
             # Both loops park the window while the weights are offloaded,
             # which is the state this test drives them through.
             engine_stats=SimpleNamespace(note_idle=lambda _: None),
@@ -159,6 +162,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         ),
     )
     engine = core.EngineCore.__new__(core.EngineCore)
+    engine._kv_progress_event = core.threading.Event()
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.process_input_sockets("input", "control")
@@ -220,7 +224,7 @@ def test_scheduler_abort_releases_pending_metric_state(clock):
     )
     scheduler.add(seq)
     scheduler._count_inflight_load(seq)
-    scheduler._reject_aborted_waiting(seq)
+    scheduler._finish_rejected_waiting(seq)
     scheduler._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_recving={seq.id})
     )
@@ -309,6 +313,39 @@ def test_pool_partition_and_waiting_queue_exclusion():
     assert snapshot["scheduler_metrics"]["waiting"] == 0
     assert snapshot["scheduler_metrics"]["waiting_kv"] == 1
     pool.free(used.block_id)
+
+
+def test_deferred_free_counts_shared_blocks_once():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    ranks = {}
+    # Finished P/D sources awaiting their send. Rank 0's two share a prefix
+    # block, so they hold 5 physical blocks; rank 1's one holds 3.
+    for rank, tables in enumerate(([[3, 4], [3, 5, 6, 7]], [[1, 2, 9]])):
+        scheduler = Scheduler(MockConfig())
+        handler = EngineUtilityHandler(None, Queue(), scheduler=scheduler)
+        assert handler.collect_metrics()["kv_blocks_deferred_free"] == 0
+        scheduler.deferred_free_blocks = {
+            seq_id: SimpleNamespace(block_table=new_block_table(table))
+            for seq_id, table in enumerate(tables)
+        }
+        ranks[rank] = handler.collect_metrics()
+    assert ranks[0]["requests_deferred_free"] == 2
+    assert ranks[0]["kv_blocks_deferred_free"] == 5
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
+    )
+    stats = LLMEngine.get_metrics_statistics(engine)
+    assert stats["requests_deferred_free"] == 3
+    assert stats["kv_blocks_deferred_free"] == 8
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(stats)
+    values = samples(exporter)
+    assert values[("atom:requests_deferred_free", ())] == 3
+    assert values[("atom:kv_cache_blocks_deferred_free", ())] == 8
 
 
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():
@@ -568,10 +605,12 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
         _partial_prefill_count=1,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, first)
     metrics.enqueue(first)
@@ -638,10 +677,12 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     owner = SimpleNamespace(
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
+        _behind_settled_resumes=lambda: 0,
+        pd_admission=None,
     )
     assert Scheduler.preempt(owner, seqs[1])
     metrics.enqueue(seqs[1])

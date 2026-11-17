@@ -156,8 +156,15 @@ if __name__ == "__main__":
     for s in sizes:
         for feeds_index, fp4 in ((False, False), (True, False), (True, True)):
             check_k1(k1.AttnPreBuild(tokens=s, feeds_index=feeds_index, index_fp4=fp4))
-        for bound, fp4 in ((0, False), (65536, False), (65536, True)):
-            check_k2(k2.LayerPostBuild(tokens=s, index_bound_max=bound, index_fp4=fp4))
+        for bound, fp4, mfma in (
+            (0, False, False),
+            (65536, False, False),
+            (65536, True, False),
+            (65536, True, True),
+        ):
+            check_k2(k2.LayerPostBuild(
+                tokens=s, index_bound_max=bound, index_fp4=fp4, index_mfma=mfma
+            ))  # fmt: skip
         # an FP8 pool: the window row's bytes, the attention's dequant
         check_k1(k1.AttnPreBuild(tokens=s, kv_fp8=True))
         check_k2(k2.LayerPostBuild(

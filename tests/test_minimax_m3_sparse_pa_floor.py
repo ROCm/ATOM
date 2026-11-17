@@ -25,6 +25,7 @@ pytest.importorskip("aiter", reason="the floor reads aiter's own split ladder")
 import torch
 from aiter.ops.triton.gluon import pa_decode_gluon
 
+from atom.distributed import ulysses_sp
 from atom.model_ops.minimax_m3 import sparse_attn
 from atom.models.minimax_m3 import model as minimax_m3_model
 
@@ -99,28 +100,22 @@ def test_real_device_agrees_with_aiter(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gluon, enabled, arch, api, max_tokens, error",
+    "gluon, enabled, arch, max_tokens, error",
     [
-        (True, False, False, False, 65536, None),
-        (False, False, True, True, 32768, "requires ATOM_PA_FLYDSL=1"),
-        (False, True, False, True, 32768, "GPU supported"),
-        (False, True, True, False, 32768, "explicit-plan API"),
-        (False, True, True, True, 32768, None),
-        (False, True, True, True, 65536, "lower --max-num-batched-tokens"),
+        (True, False, False, 65536, None),
+        (False, False, True, 32768, "requires ATOM_PA_FLYDSL=1"),
+        (False, True, False, 32768, "GPU supported"),
+        (False, True, True, 32768, None),
+        (False, True, True, 65536, "lower --max-num-batched-tokens"),
     ],
 )
-def test_flydsl_startup_config(
-    monkeypatch, gluon, enabled, arch, api, max_tokens, error
-):
+def test_flydsl_startup_config(monkeypatch, gluon, enabled, arch, max_tokens, error):
     monkeypatch.setattr(
         minimax_m3_model, "pa_decode_gluon_supports_arch", lambda: gluon
     )
     monkeypatch.setattr(minimax_m3_model.envs, "ATOM_PA_FLYDSL", enabled)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_arch_supported", lambda: arch)
-    monkeypatch.setattr(minimax_m3_model, "_flydsl_explicit_plan_api", lambda: api)
-    monkeypatch.setattr(
-        minimax_m3_model, "get_tensor_model_parallel_world_size", lambda: 4
-    )
+    monkeypatch.setattr(ulysses_sp, "attn_head_shard_size", lambda: 4)
     monkeypatch.setattr(minimax_m3_model, "_flydsl_plan_max_batch", lambda: 81792)
     atom_config = SimpleNamespace(max_num_batched_tokens=max_tokens)
     model_config = SimpleNamespace(

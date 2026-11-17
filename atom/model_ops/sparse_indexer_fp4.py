@@ -79,7 +79,7 @@ def sparse_indexer_fp4_enabled(
 
 
 def assert_fp4_indexer_supported(
-    *, fused_writer: bool, prefill_context_parallel: bool, prefill_ubatching: bool
+    *, fused_writer: bool, prefill_context_parallel: bool
 ) -> None:
     """Reject the FP4 requests this build cannot serve.
 
@@ -102,14 +102,6 @@ def assert_fp4_indexer_supported(
             "The FP4 sparse indexer does not support PCP, whose candidate "
             "exchange is the one reader of the fp32 `weights` the FP4 writer "
             "does not produce. Pass --index-cache-dtype fp8."
-        )
-    if prefill_ubatching:
-        raise ValueError(
-            "The FP4 sparse indexer does not support prefill micro-batching. "
-            "`split_attn_metadata` rebuilds the metadata from its declared "
-            "fields, and the FP4 schedule rides on undeclared ones whose row "
-            "ids a ubatch rebases. Decode micro-batching (--enable-tbo-decode) "
-            "is supported. Pass --index-cache-dtype fp8."
         )
 
 

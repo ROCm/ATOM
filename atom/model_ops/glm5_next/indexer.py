@@ -168,7 +168,7 @@ def _sparse_attn_indexer_kpool(
             state_slot_idx_in,
             state_slot_idx,
             positions,
-            sparse_kv_indices_buffer,
+            attn_metadata.sparse_kv_indices,
             index_kpool,
             topk_tokens,
             topk_out_width,
@@ -259,7 +259,7 @@ def _sparse_attn_indexer_kpool(
             PAGE_SIZE=block_size,
             NUM_TOPK_TOKENS=topk_out_width,
             BLOCK_N=128,
-            out=sparse_kv_indices_buffer,
+            out=attn_metadata.sparse_kv_indices,
         )
         return result
 
@@ -318,7 +318,7 @@ def _sparse_attn_indexer_kpool(
         attn_metadata.kv_indices,
         topk_indices,
         NUM_TOPK_TOKENS=topk_out_width,
-        out=sparse_kv_indices_buffer,
+        out=attn_metadata.sparse_kv_indices,
     )
     return result
 
