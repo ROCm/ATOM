@@ -831,7 +831,8 @@ def _aiter_selector_wins(
     decode_max_q=0,
 ):
     if arch == "gfx1250":
-        # This PR tunes prefill only. Decode keeps main's width crossover.
+        # Decode is graph-captured and keeps the width-only crossover
+        # (_AITER_MIN_WIDTH / _AITER_MIN_WIDTH_WITH_EMIT).
         if decode_max_q > 0:
             return width >= (_AITER_MIN_WIDTH_WITH_EMIT if emit else _AITER_MIN_WIDTH)
         return (

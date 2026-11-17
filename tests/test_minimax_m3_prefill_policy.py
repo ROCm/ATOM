@@ -68,6 +68,9 @@ def q256(chunk_blocks: int) -> PrefillScoreConfig:
         ("gfx1250", 4096, 170, True, 1, 0, False),
         ("gfx1250", 4096, 171, True, 1, 0, True),
         ("gfx1250", 4097, 512, True, 1, 0, False),
+        # The [2858, 2331] GPU parity case: 4 tiles x 16 = 64 keys, exactly
+        # the 16 * 8 // 2 workspace.
+        ("gfx1250", 3942, 5189, True, 1, 0, True),
         ("gfx1250", 1280, 512, False, 1, 0, False),
         ("gfx1250", 1280, 512, True, 4, 0, False),
         ("gfx1250", 1280, 512, True, 1, 1, False),
