@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
-    runs-on: linux-atom-do-mi350x-8
+    runs-on: linux-atom-pitt-mi350x-8
     timeout-minutes: 240
     env:
       CONTAINER_NAME: atom-pr-review-${{ github.run_id }}
@@ -42,7 +42,7 @@ jobs:
         with:
           container-name: ${{ env.CONTAINER_NAME }}
           base-image: ${{ env.IMAGE }}
-          runner: linux-atom-do-mi350x-8
+          runner: linux-atom-pitt-mi350x-8
           hf-token: ${{ secrets.AMD_HF_TOKEN }}
           env-vars: |
             AITER_LOG_LEVEL=WARNING
