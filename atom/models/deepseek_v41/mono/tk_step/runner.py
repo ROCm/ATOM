@@ -5,14 +5,19 @@
 """One TP rank's ``TkRank`` serving ATOM decode steps (``TkStepModel``'s runner), what ``ModelRunner`` asks of it:
 
 - ``run_step(input_ids, batch, forward_context)``: a new request -> its admission (``admit``: the sampling mode and
-  parameters, ``admit_kernel`` at the anchor's position with the anchor token, the KV ATOM holds converted by ``kv``);
-  then one TileRT step (one graph replay) on the current stream;
+  parameters, ``admit_kernel`` at the anchor's position with the anchor token, the KV ATOM holds converted by ``kv``,
+  on ATOM's stream); then one TileRT step (one graph replay) and its outputs, on TkRank's own stream (``stream``);
 - ``verify_outputs(bs)``: the rejection sampler's ``(output_token_ids [1, 6] int32, -1 past the a emitted tokens;
   verdict [3, 1] int32: a - 1 accepted drafts, 6 - a rejected, anchor row a - 1)``, gathered on the device from the
   logs the step appended to (``ar_num``: a; ``ar_acc``: the a tokens), no host sync;
 - ``draft_ids(bs)``: [1, 5] int64 for ATOM's next input rows. TkRank verifies the drafts its own state holds and
-  reads no host input, so these only keep ATOM's bookkeeping shaped (``vtok[1:6]``; which buffer holds the next
-  drafts after a step is a GPU check).
+  reads no host input, so these only keep ATOM's bookkeeping shaped (``vtok[1:6]`` after the step).
+
+Streams (GPU): TkRank's steps and the gather of their outputs run on ``stream``, one after another, and ATOM's stream
+waits for a step's outputs only where it reads them (``verify_outputs``). ATOM's own per-step work (the next step's
+inputs and layout, the commit, the output copies) runs on its stream beside TkRank's next step instead of between two
+of them; none of it is a collective. The admission orders the two (``join``): ATOM's stream after TkRank's last step,
+TkRank's after the admission; a production forward joins first (``TkStepModel``).
 
 The device (``TkDevice``, or a fake in the CPU tests): ``set_sampling(params)``, ``admit(first, pos, params)``,
 ``import_planes(planes, n)``, ``step()``, ``logs() -> (ar_acc[0], ar_num[0])``, ``drafts() -> vtok``.
@@ -87,7 +92,12 @@ class TkStepRunner:
     (``hist`` from tail ids), or None (from ATOM's cursor)."""
 
     def __init__(
-        self, device, rank: int = 0, token_map=None, max_seq_len: int = 1 << 20
+        self,
+        device,
+        rank: int = 0,
+        token_map=None,
+        max_seq_len: int = 1 << 20,
+        stream=None,
     ):
         self.dev, self.rank, self.token_map, self.cap = (
             device,
@@ -96,17 +106,17 @@ class TkStepRunner:
             max_seq_len,
         )
         self.held = None  # the request whose state TkRank holds: req id
-        self.pos = 0  # the anchor position of its next step (TkRank's own count)
+        self.pos = 0  # ATOM's anchor position of the last step
         self.counter = 0  # TileRT's sampling counter (samp_params[3]): set_sampling and every admission bump it
         self._samp_mode = None
-        self._verdict = (
-            None  # the last step's verdict (device), read a step late for ``pos``
-        )
-        self.output_stream = None
-        if torch.cuda.is_available():
-            self.output_stream = torch.cuda.Stream()
-            self._ev_step = torch.cuda.Event()
-            self.verify_ready = torch.cuda.Event()
+        # the last step's (output ids, verdict, drafts), on ``stream``
+        self._outs = None
+        # ``stream`` holds steps ATOM's stream is not ordered after
+        self._unjoined = False
+        # TkRank's stream (``create``: a CUDA stream), where a served step's outputs are ready (ModelRunner's
+        # ``output_stream``); None: every op on the caller's stream (the CPU tests)
+        self.stream = self.output_stream = stream
+        self.outputs_ready = torch.cuda.Event() if stream is not None else None
 
     def prepare(self, rows: int) -> bool:
         return rows == ROWS
@@ -115,7 +125,14 @@ class TkStepRunner:
         return self.held is not None and req_id == self.held
 
     def release(self) -> None:
-        self.held, self._verdict = None, None
+        self.held = None
+
+    def join(self) -> None:
+        """ATOM's stream after every step TkRank was given (before anything else of ATOM's touches the GPU's state
+        or runs a collective)."""
+        if self.stream is not None and self._unjoined:
+            torch.cuda.current_stream().wait_stream(self.stream)
+            self._unjoined = False
 
     def precheck(self, batch, anchor_pos: int) -> str | None:
         """Why this step cannot be served (None: it can). Request-constant, so a held request never fails it."""
@@ -150,7 +167,7 @@ class TkStepRunner:
             else KV.request_planes(kv, n, token_map=self.token_map)
         )
         self.dev.import_planes(planes, n)
-        self.held, self.pos, self._verdict = req_id, n, None
+        self.held, self.pos = req_id, n
         if self.rank == 0:
             logger.info("V4.1 TileRT-path step: admitted request %s at position %d (T %.3g)", req_id, n, temperature)  # fmt: skip
 
@@ -163,34 +180,44 @@ class TkStepRunner:
         (``kv.RequestKV``). Neither is read for a held request (the device sync of the token, the cache views).
         """
         if not self.holds(req_id):
+            self.join()  # the previous request's last steps, before its state is replaced
             self.admit(req_id, int(input_ids[0]), n, temperature, kv_source())
-        elif self._verdict is not None:
-            self.pos += (
-                int(self._verdict[0, 0]) + 1
-            )  # the last step's a (ATOM already waited for it)
-        self.dev.step()
-        if self.output_stream is not None:
-            self._ev_step.record()
-        self._verdict = None
+            if self.stream is not None:
+                self.stream.wait_stream(torch.cuda.current_stream())
+        # ATOM's anchor position (no device read: a step that skips the verdict wait launches before the last step's
+        # verdict exists; there ``n`` runs ahead by the last step's rejected drafts)
+        self.pos = n
+        if self.stream is None:
+            self.dev.step()
+            self._outs = self._outputs()
+            return
+        with torch.cuda.stream(self.stream):
+            self.dev.step()
+            self._outs = self._outputs()
+            self.outputs_ready.record()
+        self._unjoined = True
 
     def verify_outputs(self, bs: int):
         if bs != 1:
             raise ValueError(f"TileRT-path step: {bs} requests")
-        cur = torch.cuda.current_stream() if self.output_stream is not None else None
-        if cur is not None:
-            with torch.cuda.stream(self.output_stream):
-                self.output_stream.wait_event(self._ev_step)
-                out, verdict = self._outputs()
-                self.verify_ready.record()
-            out.record_stream(cur)
-            verdict.record_stream(cur)
-            cur.wait_event(self.verify_ready)
-        else:
-            out, verdict = self._outputs()
-        self._verdict = verdict
+        if self.stream is not None:
+            cur = torch.cuda.current_stream()
+            cur.wait_event(self.outputs_ready)
+            for t in self._outs:
+                t.record_stream(cur)
+        out, verdict, _ = self._outs
         return out, verdict
 
     def _outputs(self):
+        """(output ids, verdict, drafts) of the step just enqueued: one launch on the GPU (``outputs``)."""
+        if self.stream is None:
+            return self._outputs_torch()
+        from . import outputs
+
+        acc, num = self.dev.logs()
+        return outputs.gather(acc, num, self.dev.drafts(), ROWS, SPEC_TOKENS)
+
+    def _outputs_torch(self):
         acc, num = self.dev.logs()
         a = num.gather(0, num[:1].long()).to(
             torch.int32
@@ -201,12 +228,11 @@ class TkStepRunner:
             torch.int32
         )
         verdict = torch.stack([a - 1, ROWS - a, a - 1]).to(torch.int32)
-        return out.view(1, ROWS), verdict.view(3, 1)
+        drafts = self.dev.drafts()[1 : 1 + SPEC_TOKENS].to(torch.int64)
+        return out.view(1, ROWS), verdict.view(3, 1), drafts.view(1, SPEC_TOKENS)
 
     def draft_ids(self, bs: int):
-        return (
-            self.dev.drafts()[1 : 1 + SPEC_TOKENS].to(torch.int64).view(1, SPEC_TOKENS)
-        )
+        return self._outs[2]
 
     # ---- construction on a GPU rank
     @classmethod
@@ -261,4 +287,4 @@ class TkStepRunner:
         tk.warmup()
         tk.capture()
         logger.info("V4.1 TileRT-path step: TkRank ready (rank %d)", rank)
-        return cls(TkDevice(tk), rank, token_map=None)
+        return cls(TkDevice(tk), rank, token_map=None, stream=torch.cuda.Stream())

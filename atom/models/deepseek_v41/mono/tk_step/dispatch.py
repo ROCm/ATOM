@@ -20,6 +20,14 @@ speculative commit is TkStep's (``TkRound.committed``): ATOM's tentative state -
 run -- is dropped, and the request's state cursor moved to where the verdict leaves it, as ``commit_tentative`` would
 (``commit_served``), so the next step's probe passes and checks ATOM's position against TkRank's. Production steps
 (no decision) keep every path unchanged.
+
+Every later step of the held request skips the verdict wait (``TkRound.consumes_device_verdict``, as the hi path's
+device round): TkRank reads neither ATOM's positions nor its input ids, so the runner builds the step without waiting
+for the previous one's verdict (as if no draft had been rejected) and replays TkRank's next step behind it on the
+stream, taking the wait after the launch: the host's whole step (its output, the scheduler, the next step's layout)
+runs under the GPU's step instead of between two of them. Such a step is laid out ``DEVICE`` (no stale-state probe:
+``cache.prepare_device_round_state`` checks it continues the previous step's request) and commits by advancing the
+cursor by the verdict's accepted count on the device, so the cursor stays where ``commit_tentative`` would put it.
 """
 
 import logging
@@ -38,16 +46,25 @@ from atom.utils.forward_context import RoundService, get_forward_context
 logger = logging.getLogger("atom")
 
 
-def commit_served(cache, step, anchors) -> None:
+def commit_served(cache, step, anchors, advance: bool = False) -> None:
     """A served verify step's speculative commit: ATOM's tentative state dropped (its staging was the forward's), each
     request's state cursor at its next step's start -- one past its accepted anchor's position, where
     ``TentativeState.commit`` puts it (prefix ``t`` of a request at ``position``: ``position + 1 + t``,
-    ``speculative.py``) -- on the device, without a host round trip. The cursor's history ids are left: nothing of
-    ATOM reads a held request's state again."""
+    ``speculative.py``) -- on the device, without a host round trip. ``advance``: a step laid out without the
+    previous verdict (its positions are not the request's), whose cursor already holds its start: moved by the
+    accepted count (``anchor - cu_seqlens_q + 1``) instead. The cursor's history ids are left: nothing of ATOM reads a
+    held request's state again."""
     n = step.scheduled_bs
-    rows = anchors[:n].to(step.positions.device, torch.int64)
-    starts = step.positions.index_select(0, rows).to(cache.cursor.dtype) + 1
-    cache.cursor[step.slots[:n].long(), 0] = starts.to(cache.cursor.device)
+    dev = cache.cursor.device
+    slots = step.slots[:n].to(dev).long()
+    col = torch.zeros_like(slots)
+    if advance:
+        rows = anchors[:n].to(dev, torch.int64) - step.cu_seqlens_q[:n].to(dev, torch.int64)  # fmt: skip
+        cache.cursor.index_put_((slots, col), (rows + 1).to(cache.cursor.dtype), accumulate=True)  # fmt: skip
+    else:
+        rows = anchors[:n].to(step.positions.device, torch.int64)
+        starts = step.positions.index_select(0, rows).to(cache.cursor.dtype) + 1
+        cache.cursor.index_put_((slots, col), starts.to(dev))
     cache.pending = None
 
 
@@ -57,12 +74,39 @@ class TkRound(DecodeRound):
 
     def __init__(self, model, builder) -> None:
         self.model, self.builder = model, builder
+        # a step that skips the verdict wait takes the cache's device-round state: the on-device Engram path's
+        engram = getattr(builder, "engram", None)
+        self.defers = engram is not None and engram.host.overlap is not None
+        if not self.defers:
+            logger.info("V4.1 TileRT-path step: no on-device Engram path; every step waits for its verdict")  # fmt: skip
+        self._ready = None  # the request whose served step left its verdict (``committed``), for the next forward
+        self._on = False  # this forward continues it without the verdict wait (``consumes_device_verdict``)
+
+    def consumes_device_verdict(self, batch, max_seqlen_q) -> bool:
+        """Every forward, before its input ids: whether it is the next step of the request the previous forward
+        served (module docstring). Host-side and TP-uniform: the scheduler's batch and this rank's own history.
+        """
+        ready, self._ready = self._ready, None
+        self._on = bool(
+            self.defers
+            and ready is not None
+            and not batch.is_dummy_run
+            and batch.total_seqs_num == 1
+            and getattr(batch, "total_seqs_num_prefill", 0) == 0
+            and max_seqlen_q == ROWS
+            and batch.req_ids[0] == ready
+            and self.model._runner.holds(ready)
+        )
+        return self._on
 
     def service(self, batch, spans, running_bs, running_tokens, *, max_q_len, decode, tentative, is_prefill, resumes, image_rows):  # fmt: skip
+        on, self._on = self._on, False
         # a step the builder runs eagerly (its rows past the score workspace) gets no step override
         eager = partial(self.builder.step_needs_eager, batch)
         if self.model.decide(batch, running_bs, max_q_len, decode, eager):
-            return RoundService.LEAN
+            return RoundService.DEVICE if on else RoundService.LEAN
+        if on:  # (a held request's step: ``decide`` raised already)
+            raise RuntimeError("V4.1 TileRT-path step: a step built without its verdict is not served")  # fmt: skip
         return RoundService.NONE
 
     def committed(self, metadata, anchors) -> bool:
@@ -72,7 +116,9 @@ class TkRound(DecodeRound):
             raise RuntimeError(
                 "V4.1 TileRT-path step: a step laid out for it was not served"
             )
-        commit_served(metadata.cache, metadata.step, anchors)
+        advance = metadata.served_by_round is RoundService.DEVICE
+        commit_served(metadata.cache, metadata.step, anchors, advance=advance)
+        self._ready = self.model._decode_batch.req_ids[0]
         return True
 
 
@@ -163,6 +209,7 @@ class TkStepModel(StepOverrideModel, nn.Module):
         planned, self._decision = self._decision, None
         if planned is None:
             self._served = self._decode_batch = None
+            self._runner.join()  # the production step's graph after TkRank's last step
             return None
         # laid out LEAN for TkStep (``decide``): it serves it or nothing does
         if planned is not batch or input_ids.numel() != ROWS or get_forward_context().spec_decode_metadata is None:  # fmt: skip
@@ -198,6 +245,7 @@ class TkStepModel(StepOverrideModel, nn.Module):
                 "V4.1 TileRT-path step: a step laid out for it ran ATOM's forward (an eager decode?)"
             )
         self._served = self._decode_batch = None
+        self._runner.join()  # after TkRank's last step: the forward's collectives must not run beside it
         return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(self, hidden_states):

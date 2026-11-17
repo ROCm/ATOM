@@ -181,7 +181,7 @@ def test_runner_admits_once_and_reads_the_logs():
         assert r.draft_ids(1).tolist() == [
             [102 + k + j for j in range(5)]
         ]  # vtok[1:6] after the step
-    assert r.pos == 500 + 3 + 6
+    assert r.pos == 500  # ATOM's anchor position, no device read
     (_, p1), (_, f, n, none), _ = tk.calls[:3]
     assert (
         tk.calls[0][0] == "set_sampling"
@@ -207,9 +207,10 @@ def test_sampling_refusals():
     assert RN.sampling_refusal(0.7, 1.0, -1) is None
 
 
-def _served_model(monkeypatch):
+def _served_model(monkeypatch, defers=False):
     """A ``TkStepModel`` over a fake TkRank, its ``TkRound`` on a builder whose ``step_needs_eager`` reads the
-    batch's ``eager``."""
+    batch's ``eager``; ``defers``: the builder's Engram on the device (held steps skip the verdict wait).
+    """
     fc = SimpleNamespace(
         spec_decode_metadata=object(), attn_metadata=SimpleNamespace(cache=None)
     )
@@ -227,6 +228,8 @@ def _served_model(monkeypatch):
         "atom.models.deepseek_v41.mono.tk_step.kv.from_cache", lambda *a: "kv"
     )
     builder = SimpleNamespace(step_needs_eager=lambda b: b.eager)
+    if defers:
+        builder.engram = SimpleNamespace(host=SimpleNamespace(overlap=object()))
     return m, D.TkRound(m, builder), runner, drafter
 
 
@@ -429,3 +432,60 @@ def test_install_needs_the_v41_builder(monkeypatch):
     builder = SimpleNamespace(use_decode_round=lambda r: setattr(builder, "round", r))
     wrapped = D.install_tk_step(model, cfg, None, builder)
     assert isinstance(wrapped, D.TkStepModel) and builder.round.model is wrapped
+
+
+def test_held_steps_skip_the_verdict_wait(monkeypatch):
+    """The admission step waits for its verdict (the builder's probe checks it); every later step of the held request
+    is built without the wait (``consumes_device_verdict``), laid out ``DEVICE`` (no probe), and commits by moving the
+    cursor on by the verdict's accepted count, whatever the positions it was built with: the cursor stays at the
+    request's next start. Any other forward in between, or another request, waits again.
+    """
+    m, rnd, runner, _ = _served_model(monkeypatch, defers=True)
+    LEAN, DEVICE = D.RoundService.LEAN, D.RoundService.DEVICE
+    cache = SimpleNamespace(cursor=torch.zeros(4, 4, dtype=torch.int64), pending=None)
+
+    def step(kind, positions_start):
+        b = _batch(5)
+        on = rnd.consumes_device_verdict(b, 6)
+        assert (on, _layout(rnd, b)) == (kind is DEVICE, kind)
+        assert m.step_override(IDS, 1, b) is runner
+        _, verdict = runner.verify_outputs(1)
+        cache.pending = object()
+        meta = SimpleNamespace(served_by_round=kind, cache=cache, step=_fake_step([positions_start], [2]))  # fmt: skip
+        assert rnd.committed(meta, verdict[2]) and cache.pending is None
+
+    pos = 4782
+    step(LEAN, pos)  # admission
+    pos += runner.dev.accepts[0]
+    assert int(cache.cursor[2, 0]) == pos
+    for k in range(1, 6):
+        step(
+            DEVICE, pos + 1000
+        )  # built without the verdict: its positions are not the request's
+        pos += runner.dev.accepts[k % len(runner.dev.accepts)]
+        assert int(cache.cursor[2, 0]) == pos
+    # a forward between them (another request's prefill), then the held request again: it waits
+    assert not rnd.consumes_device_verdict(SimpleNamespace(**{**vars(_batch(7)), "total_seqs_num_prefill": 1}), 6)  # fmt: skip
+    rnd.service(_batch(7), [], 1, 100, max_q_len=None, decode=False, tentative=False, is_prefill=True, resumes=None, image_rows=False)  # fmt: skip
+    assert not rnd.consumes_device_verdict(_batch(5), 6)
+    # never for a dummy run, another width, or without the on-device Engram path
+    rnd._ready = 5
+    assert not rnd.consumes_device_verdict(SimpleNamespace(**{**vars(_batch(5)), "is_dummy_run": True}), 6)  # fmt: skip
+    rnd._ready = 5
+    assert not rnd.consumes_device_verdict(_batch(5), 4)
+    _, rnd2, _, _ = _served_model(monkeypatch)
+    rnd2._ready = 5
+    assert not rnd2.defers and not rnd2.consumes_device_verdict(_batch(5), 6)
+
+
+def test_tk_step_obeys_the_mono_master_switch(monkeypatch):
+    """ATOM_MONO_ENABLE=0 turns every mono path off, the TileRT-path step too."""
+    from atom.models.deepseek_v41.mono import tk_step
+
+    monkeypatch.setenv("ATOM_DSV41_TK_STEP", "1")
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
+    assert not tk_step.enabled()
+    monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
+    assert tk_step.enabled()
+    monkeypatch.setenv("ATOM_DSV41_TK_STEP", "0")
+    assert not tk_step.enabled()
