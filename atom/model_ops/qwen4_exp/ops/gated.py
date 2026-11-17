@@ -190,7 +190,7 @@ def _gated_pointwise_kernel(
     tl.store(out_ptr + row * WIDTH + cols, result, cols < WIDTH)
 
 
-_scaled_silu = fast_launch(_gated_pointwise_kernel, by_specialization=True)
+_gated_pointwise = fast_launch(_gated_pointwise_kernel, by_specialization=True)
 
 
 def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
@@ -199,7 +199,7 @@ def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _scaled_silu[(rows, triton.cdiv(width, block))](
+        _gated_pointwise[(rows, triton.cdiv(width, block))](
             x,
             x,
             x,
@@ -231,7 +231,7 @@ def sigmoid_mul(
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _gated_pointwise_kernel[(rows, triton.cdiv(width, block))](
+        _gated_pointwise[(rows, triton.cdiv(width, block))](
             x,
             gate,
             residual if residual is not None else x,

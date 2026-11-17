@@ -194,7 +194,7 @@ def test_gating_and_l2norm_replay_in_a_cuda_graph(gdn):
     assert _bitwise_equal(out, ref)
 
 
-# --- sigmoid RMSNorm + FP8 quant (GDN output), sigmoid gate + FP8 quant (QSA)
+# --- output gates: sigmoid RMSNorm + FP8 quant (GDN), sigmoid gate (QSA, MoE)
 
 
 @pytest.fixture
@@ -207,6 +207,7 @@ def gated():
 
 # GDN output per rank at TP2 (24 value heads x 128), QSA output (12 x 256).
 _GDN_OUT, _QSA_OUT = (24, 128), 12 * 256
+_HIDDEN, _ROUTED_EXPERTS = 2560, 512
 _FP8 = torch.float8_e4m3fnuz
 
 
@@ -241,6 +242,32 @@ def test_gated_quant_match_plain_triton_bitwise(gated, tokens, offset):
     _plain_vs_cached(
         lambda: list(gated.sigmoid_mul_quant(*inputs)),
         (gated._sigmoid_mul_quant, gated._sigmoid_mul_quant_kernel),
+    )
+
+
+def _mul_inputs(tokens, per_row, offset=0, device="cuda"):
+    """The BF16 output gates: QSA attention's per-element gate, or the MoE
+    shared expert's per-row gate (the last router logit) plus the routed
+    output."""
+    if not per_row:
+        x, gate, _ = _mul_quant_inputs(tokens, offset, device)
+        return x, gate, None
+    x = _randn(tokens, _HIDDEN, offset=offset, seed=tokens, device=device)
+    logits = _randn(tokens, _ROUTED_EXPERTS + 1, seed=4, device=device)
+    routed = _randn(tokens, _HIDDEN, seed=5, device=device)
+    return x, logits[:, _ROUTED_EXPERTS:], routed
+
+
+@gpu
+@pytest.mark.parametrize("per_row", [False, True], ids=["qsa", "shared_expert"])
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("tokens", [2112, 2096, 16, 3, 1])
+@torch.inference_mode()
+def test_sigmoid_mul_matches_plain_triton_bitwise(gated, tokens, offset, per_row):
+    inputs = _mul_inputs(tokens, per_row, offset)
+    _plain_vs_cached(
+        lambda: [gated.sigmoid_mul(*inputs)],
+        (gated._gated_pointwise, gated._gated_pointwise_kernel),
     )
 
 
@@ -658,7 +685,7 @@ def test_hc_launches_match_plain_triton_bitwise(hc, m, combine, offset):
     _plain_vs_cached(
         lambda: [x for part in _hc_launches(hc, t, combine, quant) for x in part],
         combine_norm,
-        (hc.gated._scaled_silu, hc.gated._gated_pointwise_kernel),
+        (hc.gated._gated_pointwise, hc.gated._gated_pointwise_kernel),
         gated_mean,
     )
 
