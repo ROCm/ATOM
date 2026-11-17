@@ -7,7 +7,9 @@
 tokens its request has generated: the bits of its table row, and on a
 verification row the drafts before it (`input_ids[first + 1 .. row]`). Only
 those logits are read and written. `mark_emitted` sets the bits of the tokens a
-step emitted, -1 entries (rejected drafts) excluded.
+step emitted, -1 entries (rejected drafts) excluded. Before it penalizes,
+`penalize_rows` clears the rows the step claimed and marks a resumed request's
+earlier output.
 """
 
 import torch
@@ -90,16 +92,18 @@ def penalize_rows(
     input_ids: torch.Tensor | None,
     max_drafts: int,
 ) -> None:
-    """Clear the rows the step claimed, then penalize `logits` in place. Row
+    """Prepare the rows the step claimed, then penalize `logits` in place. Row
     `t` of `logits` is the step's row `t` (the source logits, before any
     gather); `input_ids` are the step's input ids on a verification step."""
     if rows.fresh.numel():
         seen.index_fill_(0, rows.fresh.long(), 0)
+    vocab = min(logits.shape[-1], seen.shape[1] * 32)
+    if rows.resumed_ids.numel():
+        _mark(seen, rows.resumed_slots, rows.resumed_ids.view(-1, 1), vocab)
     n = rows.slots.numel()
     if n == 0:
         return
     assert logits.stride(-1) == 1
-    vocab = min(logits.shape[-1], seen.shape[1] * 32)
     _penalize_kernel[(n, triton.cdiv(vocab, _BLOCK))](
         logits,
         logits.stride(0),
@@ -121,15 +125,18 @@ def mark_emitted(
     """Set the bits of the tokens each request emitted: `tokens` holds one row
     per request (a verify's accepted drafts and bonus, -1 past them)."""
     bs = rows.emit_slots.numel()
-    if bs == 0:
-        return
-    tokens = tokens.reshape(tokens.shape[0], -1)[:bs]
+    if bs:
+        _mark(seen, rows.emit_slots, tokens.reshape(tokens.shape[0], -1)[:bs], vocab)
+
+
+def _mark(seen, slots, tokens, vocab) -> None:
+    """Set the bits of `tokens` row r in table row `slots[r]` (-1: none)."""
     assert tokens.stride(-1) == 1
-    _mark_kernel[(bs,)](
+    _mark_kernel[(slots.numel(),)](
         tokens,
         tokens.stride(0),
         tokens.shape[1],
-        rows.emit_slots,
+        slots,
         seen,
         seen.stride(0),
         vocab,

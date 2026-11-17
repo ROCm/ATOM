@@ -129,6 +129,23 @@ class RequiredChannel:
         return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
+def require_local_sampling(config, feature, *, kv_transfer=None):
+    """Refuse an engine where a request's tokens are not all sampled by this
+    engine's `postprocess`, which `feature` needs: pipeline parallelism,
+    RapidServe prefill and P/D (the first token comes from another engine). A
+    KV offload tier (LMCache CPU) is not P/D: the request still decodes here."""
+    from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
+
+    if config.pipeline_parallel_size > 1:
+        raise ValueError(f"{feature} does not support pipeline parallelism")
+    if (
+        kv_transfer
+        or config.enable_rapidserve
+        or disaggregated_kv_role(config) is not None
+    ):
+        raise ValueError(f"{feature} is unavailable with RapidServe or P/D")
+
+
 @dataclass
 class SamplingParams:
     temperature: float = 1.0
@@ -176,23 +193,9 @@ class SamplingParams:
             raise ValueError("presence_penalty must be in range [-2.0, 2.0]")
 
     def validate_presence_penalty(self, config, *, kv_transfer=None):
-        """Execution admission shared by HTTP and direct engine callers. The
-        penalty counts the tokens this engine's `postprocess` emits: a P/D
-        request's first token comes from another engine, and RapidServe's
-        prefill samples outside `postprocess`."""
-        if not self.presence_penalty:
-            return
-        from atom.kv_transfer.disaggregation.pd_producer import disaggregated_kv_role
-
-        if getattr(config, "pipeline_parallel_size", 1) > 1:
-            raise ValueError("presence_penalty does not support pipeline parallelism")
-        # A KV offload tier (LMCache CPU) is not P/D: every token is emitted here.
-        if (
-            kv_transfer
-            or getattr(config, "enable_rapidserve", False)
-            or disaggregated_kv_role(config) is not None
-        ):
-            raise ValueError("presence_penalty is unavailable with RapidServe or P/D")
+        """Execution admission shared by HTTP and direct engine callers."""
+        if self.presence_penalty:
+            require_local_sampling(config, "presence_penalty", kv_transfer=kv_transfer)
 
     def validate_logprob_options(
         self, config, *, kv_transfer=None, multimodal=False, synthetic=False

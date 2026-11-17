@@ -41,6 +41,7 @@ def penalize_rows_twin(seen, rows, logits, input_ids, max_drafts):
     for slot in rows.fresh.tolist():
         seen[slot] = 0
     vocab = min(logits.shape[-1], seen.shape[1] * 32)
+    _mark_twin(seen, rows.resumed_slots, rows.resumed_ids.view(-1, 1), vocab)
     bits = bit_rows(seen)
     for t, slot in enumerate(rows.slots.tolist()):
         if slot < 0:
@@ -55,9 +56,12 @@ def penalize_rows_twin(seen, rows, logits, input_ids, max_drafts):
 
 def mark_emitted_twin(seen, rows, tokens, vocab):
     bs = rows.emit_slots.numel()
-    tokens = tokens.reshape(tokens.shape[0], -1)[:bs]
+    _mark_twin(seen, rows.emit_slots, tokens.reshape(tokens.shape[0], -1)[:bs], vocab)
+
+
+def _mark_twin(seen, slots, tokens, vocab):
     one = torch.tensor(1, dtype=torch.int32)
-    for r, slot in enumerate(rows.emit_slots.tolist()):
+    for r, slot in enumerate(slots.tolist()):
         if slot < 0:
             continue
         for tok in tokens[r].tolist():

@@ -55,12 +55,15 @@ The presence penalty (`atom/model_ops/presence_penalty.py`, kernels in
 `triton_presence_penalty.py`) follows vLLM: a request's logits lose the penalty
 on every token it has generated, not its prompt, and a verification row also
 counts the drafts before it. Each request with a penalty holds a row of a bit
-table from its first step to its release; `prepare_sample` stages each logits
-row's table row, penalty and draft count in the `sampling` publication.
-Admission (`SamplingParams.validate_presence_penalty`) refuses RapidServe and
-P/D engines and requests, whose first token never reaches this engine's
-`postprocess`, and pipeline parallelism, which it does not cover; a KV offload
-tier (LMCache) keeps the penalty.
+table from its first sampled step to its release or preemption; a resumed
+request marks its earlier output again (`ScheduledBatch.presence_resumed`).
+The table has two rows per `max_num_seqs` and is allocated before the memory
+profile. `prepare_sample` stages each logits row's table row, penalty and
+draft count in the `sampling` publication.
+Admission (`require_local_sampling` in `sampling_params.py`, shared with
+structured output) refuses RapidServe and P/D engines and requests, whose first
+token never reaches this engine's `postprocess`, and pipeline parallelism; a KV
+offload tier (LMCache) keeps the penalty.
 
 Grammar release uses asynchronous copy buffer leases: a release must not clear
 or reuse a still-in-flight buffer.

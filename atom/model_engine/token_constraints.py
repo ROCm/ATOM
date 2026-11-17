@@ -107,7 +107,7 @@ class TokenConstraints:
 
             step.presence = batch.presence_rows
             penalize_rows(
-                runner.presence_penalties.table(step.presence.num_slots),
+                runner.presence_penalties.seen,
                 step.presence,
                 logits,
                 None if metadata is None else metadata.input_ids,
@@ -146,7 +146,7 @@ class TokenConstraints:
 
             penalties = self.runner.presence_penalties
             mark_emitted(
-                penalties.table(self.presence.num_slots),
+                penalties.seen,
                 self.presence,
                 sampled_tokens,
                 penalties.vocab_size,

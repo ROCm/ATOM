@@ -30,14 +30,21 @@ def _buffer(n=256):
     return SimpleNamespace(np=host, gpu=torch.from_numpy(host))
 
 
-def _batch(req_ids, penalties, final=None):
+def _batch(req_ids, penalties, final=None, resumed=None):
     return SimpleNamespace(
         total_seqs_num=len(req_ids),
         req_ids=list(req_ids),
         presence_penalties=np.asarray(penalties, dtype=np.float32),
+        presence_resumed=resumed or {},
         is_final_chunk=final,
         structured_requests=None,
         required_channel=None,
+    )
+
+
+def _config(**fields):
+    return SimpleNamespace(
+        **{"pipeline_parallel_size": 1, "enable_rapidserve": False, **fields}
     )
 
 
@@ -58,16 +65,16 @@ def test_out_of_range_penalty_is_refused(penalty):
 @pytest.mark.parametrize(
     "config, kv_transfer, match",
     [
-        (SimpleNamespace(enable_rapidserve=True), None, "RapidServe"),
-        (SimpleNamespace(), {"do_remote_prefill": True}, "P/D"),
+        (_config(enable_rapidserve=True), None, "RapidServe"),
+        (_config(), {"do_remote_prefill": True}, "P/D"),
         (
-            SimpleNamespace(
+            _config(
                 kv_transfer_config={"kv_connector": "moriio", "kv_role": "kv_consumer"}
             ),
             None,
             "P/D",
         ),
-        (SimpleNamespace(pipeline_parallel_size=2), None, "pipeline"),
+        (_config(pipeline_parallel_size=2), None, "pipeline"),
     ],
 )
 def test_engines_that_emit_tokens_elsewhere_refuse_a_penalty(
@@ -81,7 +88,7 @@ def test_engines_that_emit_tokens_elsewhere_refuse_a_penalty(
 
 @pytest.mark.parametrize("role", ["offload", "kv_producer", "kv_consumer"])
 def test_a_kv_offload_tier_keeps_the_penalty(role):
-    config = SimpleNamespace(
+    config = _config(
         kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": role}
     )
     SamplingParams(presence_penalty=1.5).validate_presence_penalty(config)
@@ -91,18 +98,19 @@ def test_a_kv_offload_tier_keeps_the_penalty(role):
 
 
 def test_one_row_per_request_outside_verification():
-    table = PresencePenalties(VOCAB, 4, "cpu")
+    table = PresencePenalties(VOCAB, 2, "cpu")
     rows, count = table.stage(_batch([7, 8, 9], [1.5, 0.0, -0.5]), None, _buffer())
     assert rows.slots.tolist() == [0, -1, 1]
     assert rows.penalties.tolist() == [1.5, 0.0, -0.5]
     assert rows.drafts_before.tolist() == [0, 0, 0]
     assert rows.emit_slots.tolist() == [0, -1, 1]
     assert rows.fresh.tolist() == [0, 1]
+    assert rows.resumed_ids.numel() == 0
     assert count == 3 * 3 + 3 + 2
 
 
 def test_verification_rows_count_the_drafts_before_them():
-    table = PresencePenalties(VOCAB, 4, "cpu")
+    table = PresencePenalties(VOCAB, 2, "cpu")
     batch = _batch([7, 8], [1.0, 2.0])
     rows, _ = table.stage(batch, np.array([4, 2]), _buffer())
     assert rows.slots.tolist() == [0] * 4 + [1] * 2
@@ -111,17 +119,20 @@ def test_verification_rows_count_the_drafts_before_them():
     assert rows.emit_slots.tolist() == [0, 1]
 
 
-def test_a_middle_prefill_chunk_emits_nothing():
-    table = PresencePenalties(VOCAB, 4, "cpu")
+def test_a_middle_prefill_chunk_claims_no_row():
+    """Its token is not sampled, and its step may return before the
+    boundary clears a claimed row."""
+    table = PresencePenalties(VOCAB, 2, "cpu")
     rows, _ = table.stage(
         _batch([7, 8], [1.0, 1.0], final=[False, True]), None, _buffer()
     )
-    assert rows.slots.tolist() == [0, 1]
-    assert rows.emit_slots.tolist() == [-1, 1]
+    assert rows.slots.tolist() == [-1, 0]
+    assert rows.emit_slots.tolist() == [-1, 0]
+    assert rows.fresh.tolist() == [0]
 
 
 def test_rows_are_claimed_once_and_reused_after_release():
-    table = PresencePenalties(VOCAB, 2, "cpu")
+    table = PresencePenalties(VOCAB, 1, "cpu")
     table.stage(_batch([7, 8], [1.0, 1.0]), None, _buffer())
     again, _ = table.stage(_batch([8, 7], [1.0, 1.0]), None, _buffer())
     assert again.slots.tolist() == [1, 0]
@@ -132,20 +143,21 @@ def test_rows_are_claimed_once_and_reused_after_release():
     assert newcomer.fresh.tolist() == [0]
 
 
-def test_live_requests_keep_their_rows_and_the_table_grows():
+def test_a_resumed_request_marks_its_earlier_output_again():
     table = PresencePenalties(VOCAB, 2, "cpu")
-    rows, _ = table.stage(_batch([7, 8], [1.0, 1.0]), None, _buffer())
-    mark_emitted_twin(table.seen, rows, torch.tensor([[31], [63]]), VOCAB)
-    # 7 and 8 are preempted, not released: a third request must not take
-    # their rows.
-    later, _ = table.stage(_batch([9], [1.0]), None, _buffer())
-    assert later.slots.tolist() == [2]
-    assert later.num_slots == 4
-    seen = table.table(later.num_slots)
-    assert seen.shape[0] == 4
-    bits = bit_rows(seen)
-    assert bits[0].nonzero()[0].tolist() == [31]
-    assert bits[1].nonzero()[0].tolist() == [63]
+    batch = _batch([7, 8], [1.0, 1.0], resumed={8: np.array([31, 63], np.int32)})
+    rows, _ = table.stage(batch, None, _buffer())
+    assert rows.fresh.tolist() == [0, 1]
+    assert rows.resumed_slots.tolist() == [1, 1]
+    assert rows.resumed_ids.tolist() == [31, 63]
+
+
+def test_the_table_has_two_rows_per_max_num_seqs():
+    table = PresencePenalties(VOCAB, 1, "cpu")
+    assert table.seen.shape == (2, 3)
+    table.stage(_batch([7, 8], [1.0, 1.0]), None, _buffer())
+    with pytest.raises(RuntimeError, match="table full"):
+        table.stage(_batch([9], [1.0]), None, _buffer())
 
 
 # -- token-constraint boundary -----------------------------------------------
@@ -190,7 +202,7 @@ def test_a_finished_request_with_a_penalty_is_released(seq_factory, penalty, rel
 
 
 def test_release_frees_the_rows(twins):
-    penalties = PresencePenalties(VOCAB, 2, "cpu")
+    penalties = PresencePenalties(VOCAB, 1, "cpu")
     penalties.stage(_batch([7], [1.0]), None, _buffer())
     runner = SimpleNamespace(structured_output=None, presence_penalties=penalties)
     boundary.release_token_constraints(runner, [7])
@@ -202,7 +214,7 @@ def test_release_frees_the_rows(twins):
 def test_decode_then_verify_penalize_what_was_emitted(twins):
     """Request 0 (penalty 1.5) and request 1 (none) through a decode step,
     then a verify step whose second draft is rejected."""
-    penalties = PresencePenalties(VOCAB, 4, "cpu")
+    penalties = PresencePenalties(VOCAB, 2, "cpu")
     runner = SimpleNamespace(structured_output=None, presence_penalties=penalties)
     pens = [1.5, 0.0]
     generated = [[], []]
@@ -246,3 +258,65 @@ def test_decode_then_verify_penalize_what_was_emitted(twins):
     slot0, slot1 = batch.presence_rows.slots[0], batch.presence_rows.slots[4]
     assert int(slot1) == -1
     assert bits[int(slot0)].nonzero()[0].tolist() == [31, 40, 63]
+
+
+def _emit(penalties, runner, batch, tokens, lengths=None):
+    """One step through the boundary: stage, apply, commit `tokens`."""
+    batch.presence_rows, _ = penalties.stage(batch, lengths, _buffer())
+    logits = torch.zeros(len(batch.req_ids), VOCAB)
+    step = boundary.TokenConstraints.apply(runner, batch, logits, None)
+    step.commit(torch.tensor(tokens), batch, deferred=False)
+    return logits
+
+
+def test_a_reused_row_is_clear_after_a_step_of_middle_chunks(twins):
+    """Request 7 emits 5 and is released. Request 8 then runs a step that is
+    only a middle chunk (it returns before the boundary), then its final
+    chunk: 5 is not 8's output."""
+    penalties = PresencePenalties(VOCAB, 1, "cpu")
+    runner = SimpleNamespace(structured_output=None, presence_penalties=penalties)
+    _emit(penalties, runner, _batch([7], [1.0]), [5])
+    penalties.release([7])
+    penalties.stage(_batch([8], [1.0], final=[False]), None, _buffer())
+    logits = _emit(penalties, runner, _batch([8], [1.0], final=[True]), [6])
+    assert not logits.any()
+
+
+def test_a_preempted_request_resumes_with_its_output(twins):
+    """Request 7 emits 31 and 63 and is preempted; request 8 takes its row and
+    emits 5; 7 resumes on another row with 31 and 63 penalized, not 5."""
+    penalties = PresencePenalties(VOCAB, 1, "cpu")
+    runner = SimpleNamespace(structured_output=None, presence_penalties=penalties)
+    _emit(penalties, runner, _batch([7], [1.0]), [31])
+    _emit(penalties, runner, _batch([7], [1.0]), [63])
+    penalties.release([7])  # `prepare_sample`, from `presence_preempted`
+    _emit(penalties, runner, _batch([8], [1.0]), [5])
+    resumed = {7: np.array([31, 63], np.int32)}
+    logits = _emit(penalties, runner, _batch([8, 7], [1.0, 1.0], None, resumed), [9, 9])
+    assert logits[1].nonzero()[:, 0].tolist() == [31, 63]
+    assert logits[0].nonzero()[:, 0].tolist() == [5]
+
+
+def test_the_scheduler_hands_preempted_and_resumed_requests_to_the_runner():
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.model_engine.sequence import Sequence
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=64))
+    seq = Sequence(
+        [10, 11, 12, 13],
+        4,
+        SamplingParams(max_tokens=40, ignore_eos=True, presence_penalty=1.0),
+    )
+    sched.add(seq)
+    batch, active = sched.schedule()
+    assert batch.presence_resumed == {} and batch.presence_preempted == []
+    out = ScheduledBatchOutput([seq.id], [(20,)], None, None, None, False)
+    sched.postprocess(list(active.values()), out, batch=batch)
+    sched.running.remove(seq)
+    assert sched.preempt(seq)
+    batch, _ = sched.schedule()
+    assert batch.presence_preempted == [seq.id]
+    assert batch.presence_resumed[seq.id].tolist() == list(seq.output_tokens)
+    assert list(seq.output_tokens)

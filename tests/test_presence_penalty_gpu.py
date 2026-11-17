@@ -26,11 +26,12 @@ from atom.model_ops.triton_presence_penalty import (
 VOCAB = 248320  # Qwen3.5's; ids 31, 32 and VOCAB - 1 sit on word edges
 
 
-def _batch(req_ids, penalties, final=None):
+def _batch(req_ids, penalties, final=None, resumed=None):
     return SimpleNamespace(
         total_seqs_num=len(req_ids),
         req_ids=list(req_ids),
         presence_penalties=np.asarray(penalties, dtype=np.float32),
+        presence_resumed=resumed or {},
         is_final_chunk=final,
     )
 
@@ -46,7 +47,7 @@ def _stage(table, batch, lengths=None):
 
 
 def _step(table, rows, logits, input_ids=None, max_drafts=0):
-    penalize_rows(table.table(rows.num_slots), rows, logits, input_ids, max_drafts)
+    penalize_rows(table.seen, rows, logits, input_ids, max_drafts)
 
 
 def _logits(rows, dtype):
@@ -56,12 +57,13 @@ def _logits(rows, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_kernels_follow_the_plain_rule(dtype):
     torch.manual_seed(0)
-    table = PresencePenalties(VOCAB, 2, "cuda")  # grows to 4 on the first step
+    table = PresencePenalties(VOCAB, 2, "cuda")
     ids = [10, 11, 12]
     pens = [1.5, 1.0, -0.75]
     generated = {10: [], 11: [], 12: []}
 
-    # Prefill: request 11 runs a middle chunk, so its sampled id is not output.
+    # Prefill: request 11 runs a middle chunk; it claims no row, and its
+    # sampled id is not output.
     batch = _batch(ids, pens, final=[True, False, True])
     rows = _stage(table, batch)
     logits = _logits(3, dtype)
@@ -117,13 +119,21 @@ def test_kernels_follow_the_plain_rule(dtype):
     _step(table, rows, logits)
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
-    # 10 finishes; a new request takes its row and starts with nothing.
-    table.release([10])
-    rows = _stage(table, _batch([13, 11], [2.0, 1.0]))
-    assert int(rows.slots[0]) == 0 and rows.fresh.tolist() == [0]
-    logits = _logits(2, dtype)
+    # 10 finishes and 12 is preempted (their rows go back); a new request
+    # takes 10's row and starts with nothing; 12 resumes on another row with
+    # its output marked again.
+    released = {int(rows.emit_slots[0]), int(rows.emit_slots[2])}
+    table.release([10, 12])
+    resumed = {12: np.asarray(generated[12], dtype=np.int32)}
+    rows = _stage(table, _batch([13, 11, 12], [2.0, 1.0, -0.75], None, resumed))
+    assert {int(rows.emit_slots[0]), int(rows.emit_slots[2])} == released
+    logits = _logits(3, dtype)
     expected = expected_logits(
-        logits, [[], generated[11]], [0, 1], [[], []], [2.0, 1.0]
+        logits,
+        [[], generated[11], generated[12]],
+        [0, 1, 2],
+        [[], [], []],
+        [2.0, 1.0, -0.75],
     )
     _step(table, rows, logits)
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)

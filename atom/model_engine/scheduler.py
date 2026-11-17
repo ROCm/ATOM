@@ -331,6 +331,23 @@ class ScheduledBatch:
             [seq.presence_penalty for seq in seqs.values()], dtype=np.float32
         )
         self.presence_penalties = presence if presence.any() else None
+        # A resumed request's earlier output, on the step that samples its
+        # recomputed prefill: its table row went back when it was preempted.
+        self.presence_resumed = {}
+        if self.presence_penalties is not None:
+            for i, seq in enumerate(seqs.values()):
+                if (
+                    seq.presence_penalty
+                    and seq.output_tokens
+                    and seq.type == SequenceType.PREFILL
+                    and (is_final_chunk is None or is_final_chunk[i])
+                ):
+                    self.presence_resumed[seq.id] = np.asarray(
+                        seq.output_tokens, dtype=np.int32
+                    )
+        # Requests with a penalty preempted since the last batch: their rows go
+        # back before this batch claims any (`Scheduler.schedule` fills it).
+        self.presence_preempted: list[int] = []
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
         # and therefore requires fresh per-row random noise at the sampler
         # rather than the cached shared exponential tensor.
@@ -836,6 +853,9 @@ class Scheduler:
         self.total_generation_tokens = 0
         self.total_finished_requests = 0
         self.total_preemptions = 0
+        # Request ids `preempt` took a presence-penalty row from, for the next
+        # batch (`ScheduledBatch.presence_preempted`).
+        self._presence_preempted: list[int] = []
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -2227,6 +2247,13 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
+        if (
+            result is not None
+            and self._presence_preempted
+            and not result[0].is_dummy_run
+        ):
+            result[0].presence_preempted = self._presence_preempted
+            self._presence_preempted = []
         if self.pd_admission is not None and result is not None:
             batch, seqs = result
             if not batch.is_dummy_run:
@@ -4637,6 +4664,8 @@ class Scheduler:
         if not self._is_preemptable(seq):
             return False
         self.total_preemptions += 1
+        if seq.presence_penalty:
+            self._presence_preempted.append(seq.id)
         # Routing credit describes the old allocation, which is surrendered.
         # A new admission must recheck HBM and tier availability.
         seq.dp_est_cached_tokens = 0

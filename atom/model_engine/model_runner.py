@@ -2895,7 +2895,10 @@ class ModelRunner:
                 buffer.gpu[n + m : logprob_count].view(n, width),
             )
 
-        # Read back by `postprocess` through the token-constraint boundary.
+        # A preempted request gives its row back; it marks its output again
+        # when it resumes (`PresencePenalties.stage`).
+        if batch.presence_preempted:
+            self.presence_penalties.release(batch.presence_preempted)
         presence_count = None
         batch.presence_rows = None
         if batch.presence_penalties is not None:
@@ -2905,6 +2908,7 @@ class ModelRunner:
             batch.presence_rows, presence_count = self.presence_penalties.stage(
                 batch, lengths, self.forward_vars["presence_penalty_rows"]
             )
+        # Read back by `postprocess` through the token-constraint boundary.
         channel_count = None
         if batch.required_channel is not None:
             self.forward_vars["required_channel_states"].np[

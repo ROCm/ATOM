@@ -10,10 +10,15 @@ output there. The bonus row counts every draft.
 
 A request's generated tokens are bits in its row of `PresencePenalties.seen`.
 The step that emits a token sets its bit after the token broadcast, so every
-rank holds the same bits. A request claims a row the first time it is
-scheduled and gives it back when the engine releases it (finished, aborted or
-refused). A preempted request keeps its row. The table starts with
-`max_num_seqs` rows; only preempted requests can need more, and then it doubles.
+rank holds the same bits. A request claims a row on its first step that
+samples it, the step that clears the row before it penalizes. The request gives
+the row back when the engine releases it (finished, aborted or refused) or
+preempts it; a resumed request marks its earlier output again on the step that
+claims its new row.
+
+The table has a fixed size, allocated before the memory profile: two rows per
+`max_num_seqs`. A finished request keeps its row until its release, which
+comes one step after it leaves the batch.
 
 `ModelRunner.prepare_sample` stages each logits row's table row, penalty and
 draft count with the other sampling parameters (`stage`). `TokenConstraints`
@@ -36,19 +41,20 @@ class PresenceRows:
     drafts_before: torch.Tensor  # [rows] int32: the request's drafts before it
     emit_slots: torch.Tensor  # [requests] int32: -1 where no token is emitted
     fresh: torch.Tensor  # [claimed] int32: rows to clear before use
-    num_slots: int  # the table rows the step addresses
+    resumed_slots: torch.Tensor  # [ids] int32: the row of each id below
+    resumed_ids: torch.Tensor  # [ids] int32: resumed requests' earlier output
 
 
 class PresencePenalties:
     """The per-request bit table of generated tokens, and its row bookkeeping
     on the host. Every rank runs the same bookkeeping on the same batches."""
 
-    def __init__(self, vocab_size: int, num_slots: int, device):
+    def __init__(self, vocab_size: int, max_num_seqs: int, device):
         self.vocab_size = vocab_size
+        num_slots = 2 * max_num_seqs
         self.seen = torch.zeros(
             num_slots, -(-vocab_size // 32), dtype=torch.int32, device=device
         )
-        self._num_slots = num_slots
         self._slot_of: dict[int, int] = {}
         self._free = list(range(num_slots - 1, -1, -1))
 
@@ -62,30 +68,43 @@ class PresencePenalties:
         """Write the step's rows into `buffer` (int32, `sampling` publication)
         and return their views and the count to publish. `lengths` is each
         request's query length on a verification step, None when every request
-        has one logits row."""
+        has one logits row. Only a row that is sampled gets a table row: a
+        middle prefill chunk's token is not output."""
         bs = batch.total_seqs_num
         penalties = batch.presence_penalties[:bs]
+        sampled = penalties != 0
+        if batch.is_final_chunk is not None:
+            sampled &= np.asarray(batch.is_final_chunk[:bs], dtype=bool)
         slots = np.full(bs, -1, dtype=np.int32)
-        fresh = []
-        for i in np.flatnonzero(penalties):
-            slots[i], claimed = self._claim(batch.req_ids[i])
-            if claimed:
+        fresh, resumed_slots, resumed_ids = [], [], []
+        for i in np.flatnonzero(sampled):
+            request_id = batch.req_ids[i]
+            slots[i], claimed = self._claim(request_id)
+            earlier = batch.presence_resumed.get(request_id)
+            if claimed or earlier is not None:
                 fresh.append(slots[i])
+            if earlier is not None:
+                resumed_slots.append(np.full(len(earlier), slots[i], np.int32))
+                resumed_ids.append(earlier)
         q = np.ones(bs, np.int64) if lengths is None else np.asarray(lengths, np.int64)
         rows = int(q.sum())
-        emit = slots.copy()
-        if batch.is_final_chunk is not None:
-            # A middle prefill chunk's sampled token is not output.
-            emit[~np.asarray(batch.is_final_chunk[:bs], dtype=bool)] = -1
         out = buffer.np
         out[:rows] = np.repeat(slots, q)
         out[rows : 2 * rows] = np.repeat(penalties, q).view(np.int32)
         out[2 * rows : 3 * rows] = np.arange(rows) - np.repeat(np.cumsum(q) - q, q)
         e = 3 * rows
-        out[e : e + bs] = emit
+        out[e : e + bs] = slots
         out[e + bs : e + bs + len(fresh)] = fresh
         count = e + bs + len(fresh)
         gpu = buffer.gpu
+        # Rare (a resumed request) and of any length: a blocking copy of its
+        # own, not the fixed-size publication.
+        resumed = [
+            torch.from_numpy(np.concatenate(part or [np.zeros(0, np.int32)])).to(
+                gpu.device
+            )
+            for part in (resumed_slots, resumed_ids)
+        ]
         return (
             PresenceRows(
                 slots=gpu[:rows],
@@ -93,7 +112,8 @@ class PresencePenalties:
                 drafts_before=gpu[2 * rows : e],
                 emit_slots=gpu[e : e + bs],
                 fresh=gpu[e + bs : count],
-                num_slots=self._num_slots,
+                resumed_slots=resumed[0],
+                resumed_ids=resumed[1],
             ),
             count,
         )
@@ -109,19 +129,10 @@ class PresencePenalties:
         if slot is not None:
             return slot, False
         if not self._free:
-            # Running requests fit; preempted ones keep their rows.
-            n = self._num_slots
-            self._free = list(range(2 * n - 1, n - 1, -1))
-            self._num_slots = 2 * n
+            raise RuntimeError(
+                "presence_penalty table full: more requests hold rows than "
+                "two per max_num_seqs"
+            )
         slot = self._free.pop()
         self._slot_of[request_id] = slot
         return slot, True
-
-    def table(self, num_slots: int) -> torch.Tensor:
-        """The device table with at least `num_slots` rows; grown on the stream
-        that reads it, so earlier steps' kernels finish on the old one first."""
-        if self.seen.shape[0] < num_slots:
-            grown = self.seen.new_zeros(num_slots, self.seen.shape[1])
-            grown[: self.seen.shape[0]] = self.seen
-            self.seen = grown
-        return self.seen
