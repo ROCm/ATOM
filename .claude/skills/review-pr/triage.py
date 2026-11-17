@@ -2892,19 +2892,48 @@ def _check_coverage_line(card_text, work_dir=None):
     Compared against rules.txt rather than re-derived here: Step 1 owns the measurement,
     this only enforces that it reached the reader.
     """
+    # Every way this could read nothing and still return green used to be silent, which
+    # is the failure this whole gate exists to prevent one level up: a card that omitted
+    # the coverage verdict was caught, but a gate that never got to compare was not. The
+    # expensive one is `[diff-too-large]` -- GitHub refusing to serve a diff over 20000
+    # lines -- because that is the largest PR the bot can ever see, the exact case where
+    # "a sample, not a sweep" has to reach the reader, and it read as a pass.
+    #
+    # Only two markers entitle silence: `[underivable]` and `[derivation-failed]`. There
+    # Step 1 genuinely measured nothing, so there is no verdict the card could be
+    # dropping. Anything else that yields no `coverage:` line means this gate did not run.
     want = ""
+    text = None
     if work_dir:
         try:
-            for ln in (pathlib.Path(work_dir) / "rules.txt").read_text(
+            text = (pathlib.Path(work_dir) / "rules.txt").read_text(
                 encoding="utf-8", errors="replace"
-            ).splitlines():
-                if ln.strip().startswith("coverage:"):
-                    want = ln.strip()
-                    break
-        except OSError:
-            return []
+            )
+        except OSError as exc:
+            return [("UNCHECKED-COVERAGE", f"rules.txt: {exc.__class__.__name__}",
+                     "the coverage gate could not read Step 1's rules.txt, so it compared "
+                     "nothing -- re-run Step 1 into this work dir before the card gate")]
+        for ln in text.splitlines():
+            if ln.strip().startswith("coverage:"):
+                want = ln.strip()
+                break
     if not want:
-        return []
+        if text is None:
+            return []          # no work dir: the caller is not asking for the comparison
+        if "[underivable" in text or "[derivation-failed" in text:
+            return []          # Step 1 measured nothing; no verdict exists to drop
+        if "[diff-too-large" in text:
+            # GitHub refusing the diff IS the measurement, and it is the strongest one.
+            for line in (card_text or "").splitlines():
+                if line.strip().lower().startswith("coverage:"):
+                    return []
+            return [("MISSING-COVERAGE", "[diff-too-large]",
+                     "GitHub would not serve this diff (over 20000 lines), which makes it "
+                     "the largest PR this bot reviews -- the card must say the findings "
+                     "are a sample, not a sweep")]
+        return [("UNCHECKED-COVERAGE", "rules.txt has no `coverage:` line",
+                 "this is not Step 1's output, so the card's coverage claim was compared "
+                 "against nothing -- re-run `triage.py rules` into this work dir")]
     for line in (card_text or "").splitlines():
         st = line.strip()
         if st.lower().startswith("coverage:"):

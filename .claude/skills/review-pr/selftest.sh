@@ -439,6 +439,36 @@ t "a card that softens BEYOND ONE PASS is refused" \
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
 
+# The gate read rules.txt and compared. The three ways it could READ NOTHING and still
+# return green were invisible: no rules.txt at all, a rules.txt that is not Step 1's
+# output, and -- worst -- `[diff-too-large]`, which is GitHub refusing to serve a diff
+# over 20000 lines. That last one is the largest PR the bot can ever see, the exact case
+# where "a sample, not a sweep" has to reach the reader, and the card could omit coverage
+# entirely and pass. A check that does not run must not look like a check that passed.
+_cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
+  python3 -c '
+import sys, tempfile, pathlib
+sys.path.insert(0, sys.argv[1]); import triage
+d = tempfile.mkdtemp()
+if sys.argv[2] != "MISSING":
+    pathlib.Path(d, "rules.txt").write_text(sys.argv[2] + "\n")
+card = "## T\n\nReview: OK\n" + ("" if sys.argv[3] == "-" else sys.argv[3] + "\n")
+p = triage._check_coverage_line(card, d)
+print(p[0][0] if p else "ok")' "$S" "$1" "$2"
+}
+t "no rules.txt at all is not a pass" \
+  "$(_cov_raw MISSING -)" "UNCHECKED-COVERAGE"
+t "a rules.txt that is not Step 1 output is not a pass" \
+  "$(_cov_raw 'some other file entirely' -)" "UNCHECKED-COVERAGE"
+t "a diff GitHub refused to serve still owes the reader a coverage line" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' -)" "MISSING-COVERAGE"
+t "a diff GitHub refused to serve passes once the card says it is partial" \
+  "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: BEYOND ONE PASS -- GitHub refused the diff')" "ok"
+t "an underivable diff has nothing to compare and stays silent" \
+  "$(_cov_raw '    [underivable           ] A1 A2' -)" "ok"
+t "a failed derivation has nothing to compare and stays silent" \
+  "$(_cov_raw '    [derivation-failed     ] A1 A2' -)" "ok"
+
 # The pollution case needs REAL skill prose, not a one-line stand-in: a synthetic hunk
 # trips no family and the test passes with the filter removed -- it did, until this was
 # measured. testdata/skill_prose.diff is three files cut from ATOM#2762's own diff, and
