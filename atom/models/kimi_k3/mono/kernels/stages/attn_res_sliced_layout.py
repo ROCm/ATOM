@@ -100,11 +100,13 @@ class SlicedGeometry:
         return rank * self.columns + min(slot, self.lanes - 1) * ELEMENTS
 
 
-def check(count: int, addends: int) -> None:
+def check(count: int, addends: int, out_norm: bool = True, gram: bool = False) -> None:
     if not 1 <= count < MAX_CANDIDATES:
         raise ValueError(f"the AttnRes mix holds 1 to {MAX_CANDIDATES - 1} blocks")
     if addends not in range(MAX_ADDENDS + 1):
         raise ValueError(f"the AttnRes mix folds up to {MAX_ADDENDS} addends")
+    if gram and not out_norm:
+        raise ValueError("the Gram form is the output norm's; no out_norm, no Gram")
 
 
 def scratch_bytes(count: int, tokens: int, cluster: int, gram: bool = False) -> int:

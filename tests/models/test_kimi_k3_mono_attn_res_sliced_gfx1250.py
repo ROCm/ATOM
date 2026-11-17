@@ -118,6 +118,12 @@ def test_refuses_what_it_cannot_hold(count, addends):
         plan.check(count, addends)
 
 
+def test_gram_needs_the_output_norm():
+    plan.check(4, 1, out_norm=True, gram=True)
+    with pytest.raises(ValueError):
+        plan.check(4, 1, out_norm=False, gram=True)
+
+
 @pytest.mark.parametrize("cluster", (1, 2, 12, 32))
 def test_refuses_other_slicings(cluster):
     with pytest.raises(ValueError):

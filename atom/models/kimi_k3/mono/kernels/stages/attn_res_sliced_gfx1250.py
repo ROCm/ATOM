@@ -143,8 +143,12 @@ def build_attn_res_sliced(
     ``gram``: the output norm's sum of squares as the softmax weights'
     quadratic form in the candidates' Gram matrix, whose slice sums travel
     with the scores', so one cluster exchange a pass instead of two; the
-    reassociation is not only a reduction order."""
-    check(count, addends)
+    reassociation is not only a reduction order. Its FP32 error scales with
+    the mix's cancellation R = (sum_c p_c |v_c|)^2 / |sum_c p_c v_c|^2: the
+    rstd's relative error is about 2e-9 R, the direct sum's about 1e-7 at any
+    R, so the two agree to R ~ 50 and Gram flips measurably more BF16 outputs
+    past R ~ 100."""
+    check(count, addends, out_norm, gram)
     candidates = count + 1
     geometry = SlicedGeometry(cluster)
     lanes = geometry.lanes
