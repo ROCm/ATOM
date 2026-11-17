@@ -118,8 +118,8 @@ def _require_contract(
 
 
 # The thread that arrives: the last wave's first lane, whose first TDM copy in
-# ``gemv_tdm.project``'s issue order is a weight slab several slabs ahead, so
-# the atomic's round trip holds up no copy slab 0 waits on.
+# ``gemv_tdm.project``'s issue order is a weight slab several slabs ahead (it
+# has none rolled), so the atomic's round trip holds up no copy slab 0 waits on.
 _ARRIVER = 7 * GFX1250.wave_size
 
 

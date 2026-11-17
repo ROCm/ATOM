@@ -17,6 +17,10 @@ opens every slab, so the CTAs' identical loads are in flight together and merge.
 LDS rows are padded by 8 BF16 after each 512 columns: a TDM pad interval is at
 most 256 dwords, and the 1040-byte row pitch spreads the 16 rows one operand
 read touches over distinct banks.
+
+``ATOM_KIMI_MONO_TDM_ROLLED=N`` (N >= 1, default 1) runs the slab loop as a
+runtime loop with an LLVM unroll hint of N (1: none), so a launch fetches one
+slab's code whatever K; 0 unrolls the loop at trace time.
 """
 
 import math
@@ -26,7 +30,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import vector
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T, as_ir_value
 
@@ -51,6 +55,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
 )
 from atom.mono.device.ops import mma_bf16, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
+from atom.utils import envs
 
 SLAB = TDM_SLAB
 ROW_STRIDE = TDM_ROW_STRIDE
@@ -59,11 +64,13 @@ FP8_DEPTH = TDM_FP8_DEPTH
 WAVES = 8
 WAVE_COLUMNS = SLAB // WAVES
 WAVE_STEPS = WAVE_COLUMNS // K_PER_MMA
+OPERAND_ELEMENTS = K_PER_MMA * ROWS // GFX1250.wave_size
 assert WAVES * GFX1250.wave_size == TDM_FP8_SCALE_WORDS
 _DESCRIPTOR_TYPE = 2 << 30
 # gfx12 CPol TH_NT: each weight slab is read once per launch.
 _WEIGHT_CACHE_POLICY = 1
 _CLUSTER_MASK = (1 << TDM_CLUSTER) - 1 if TDM_CLUSTER > 1 else 0
+_ROLLED_UNROLL = envs.ATOM_KIMI_MONO_TDM_ROLLED
 CLUSTER_LAUNCH = {
     "value_attrs": {"rocdl.cluster_dims": f"{TDM_CLUSTER},1,1"},
     "cluster": (TDM_CLUSTER, 1, 1),
@@ -72,6 +79,11 @@ CLUSTER_LAUNCH = {
 
 def _i32(value: int):
     return fx.Int32(value - (1 << 32) if value >= 1 << 31 else value)
+
+
+def _uniform(value):
+    """A wave-uniform ``value`` in an SGPR."""
+    return fx.Int32(rocdl.readfirstlane(T.i32, as_ir_value(fx.Int32(value))))
 
 
 def load_rows(
@@ -86,6 +98,7 @@ def load_rows(
     whole: bool = False,
     width: int = SLAB,
     pad_every: int = 0,
+    uniform: bool = False,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, width] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
@@ -94,7 +107,9 @@ def load_rows(
     ``pad_every``: with ``padded`` off, one pad dword after every ``pad_every``
     dwords the copy writes (a power of two up to 256), across rows alike.
     ``whole``: the first ``rows_per_wave`` rows in one copy, by the caller's
-    one wave. Widths and strides are in BF16 units, whatever the bytes hold."""
+    one wave. Widths and strides are in BF16 units, whatever the bytes hold.
+    ``uniform``: read the row count into an SGPR here, so a loop issuing the
+    copy keeps its descriptor in SGPRs, not VGPRs read back every copy."""
     if padded and width != SLAB:
         raise ValueError("only a SLAB-wide copy pads its LDS rows")
     if pad_every and (
@@ -110,6 +125,8 @@ def load_rows(
     pitch = ROW_STRIDE if padded else width
     destination = fx.Int32(fx.ptrtoint(lds)) + row0 * (pitch * 2)
     live = fx.max(fx.min(fx.Int32(rows) - row0, rows_per_wave), 0)
+    if uniform:
+        live = _uniform(live)
     group0 = vector.from_elements(
         T.vec(4, T.i32),
         [
@@ -257,6 +274,23 @@ def project(
     if fp8 and slabs > GFX1250.wave_size:
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
+    if _ROLLED_UNROLL and wide and 1 + 2 * tasks <= WAVES:
+        return _project_rolled(
+            lds,
+            x,
+            x_stride,
+            rows,
+            w,
+            w_rows,
+            k,
+            task_rows,
+            lane,
+            wave,
+            w_scale,
+            depth,
+            prologue,
+            x_cache_policy,
+        )
     tiles = (rows + ROWS - 1) // ROWS
     x_words, _ = tdm_lds_words(rows, tasks, fp8)
     token_words = rows * ROW_STRIDE // 2
@@ -421,3 +455,242 @@ def project(
                         GFX1250,
                     )
     return accumulators
+
+
+@traced
+def _rolled_token_step(s, slabs, issue):
+    """Wave 0's part of slab ``s``: copy the next token slab, then wait for
+    this one."""
+    if s + 1 < slabs:
+        issue(s + 1)
+    rocdl.s_wait_tensorcnt(1)
+    if s + 1 >= slabs:
+        rocdl.s_wait_tensorcnt(0)
+
+
+@traced
+def _rolled_weight_tail(s, slabs, ahead):
+    """Past ``s_wait_tensorcnt(ahead)``, once fewer than ``ahead`` of this
+    wave's slabs (``s + 2``, ``s + 4`` ..) follow ``s``: every count from
+    ``ahead - 1`` down to that number."""
+    if s + 2 * ahead >= slabs:
+        for count in range_constexpr(ahead - 1, -1, -1):
+            if s + 2 * (count + 1) >= slabs:
+                rocdl.s_wait_tensorcnt(count)
+
+
+@traced
+def _rolled_weight_step(parity, s, slabs, depth, issue):
+    """A weight wave's part of slab ``s``; ``parity`` is 1 on the wave whose
+    slab ``s`` is, which waits with ``depth // 2`` of its later slabs in
+    flight. Slab ``s + depth`` is copied by the wave of its parity."""
+    if const_expr(depth % 2 == 0):
+        if parity == 1:
+            if s + depth < slabs:
+                issue(s + depth)
+            rocdl.s_wait_tensorcnt(depth // 2)
+            _rolled_weight_tail(s, slabs, depth // 2)
+    else:
+        if parity == 1:
+            rocdl.s_wait_tensorcnt(depth // 2)
+            _rolled_weight_tail(s, slabs, depth // 2)
+        if (parity == 0) & (s + depth < slabs):
+            issue(s + depth)
+
+
+@traced
+def _rolled_roles(role, s, slabs, tasks, depth, issue_tokens, issue_weight):
+    """Slab ``s``'s copies and waits. ``role`` is the wave in an SGPR, so every
+    test is a scalar branch: under a lane-mask ``if``, ``s_wait_tensorcnt``
+    loses its EXEC-empty skip and every wave runs it, draining its copies."""
+    if role == 0:
+        _rolled_token_step(s, slabs, issue_tokens)
+    if (role > 0) & (role < 1 + 2 * tasks):
+        _rolled_weight_step((role + s) & 1, s, slabs, depth, issue_weight)
+
+
+def _rolled_last_tile(accs, pend, tasks, tiles):
+    """The last token tile's WMMAs of the slab whose operands ``pend`` holds:
+    each task's weights a step, then the tile's activations."""
+    accs = list(accs)
+    for tk in range(tasks):
+        acc = accs[tk * tiles + tiles - 1]
+        for st in range(WAVE_STEPS):
+            acc = mma_bf16(
+                pend[tk * WAVE_STEPS + st], pend[tasks * WAVE_STEPS + st], acc, GFX1250
+            )
+        accs[tk * tiles + tiles - 1] = acc
+    return accs
+
+
+@traced
+def _project_rolled(
+    lds,
+    x,
+    x_stride,
+    rows,
+    w,
+    w_rows,
+    k,
+    task_rows,
+    lane,
+    wave,
+    w_scale,
+    depth,
+    prologue,
+    x_cache_policy,
+):
+    """``project`` (wide) with its slab loop a runtime loop. Wave 0 copies
+    every token slab and waves ``1 + 2 t`` and ``2 + 2 t`` task ``t``'s
+    weight slabs of even and odd slabs, so each wave's copies in flight, and
+    its waits, repeat every two slabs. A slab's last token tile multiplies
+    behind the next slab's operand loads, its operands held in registers, so
+    the WMMAs still overlap a barrier as in the unrolled schedule."""
+    slabs = k // SLAB
+    fp8 = w_scale is not None
+    tasks = len(task_rows)
+    tiles = (rows + ROWS - 1) // ROWS
+    x_words, _ = tdm_lds_words(rows, tasks, fp8)
+    token_words = rows * ROW_STRIDE // 2
+    task_words = tdm_task_words(fp8)
+    stages = depth + 1
+    scales = lds + x_words + stages * tasks * task_words
+    if const_expr(fp8):
+        row = task_rows[0]
+        for t in range_constexpr(1, tasks):
+            row = (wave == t).select(task_rows[t], row)
+        word = bo.buffer_load(
+            rsrc(w_scale),
+            row // 128 * (k // 512) + fx.min(lane, slabs - 1),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        fx.ptr_store(fx.Int32(word), scales + wave * GFX1250.wave_size + lane)
+
+    role = _uniform(wave)
+    task = fx.min(fx.max(role - 1, 0) // 2, tasks - 1)
+    task_row = task_rows[0]
+    for t in range_constexpr(1, tasks):
+        task_row = (task == t).select(task_rows[t], task_row)
+    task_row = _uniform(task_row)
+
+    def issue_tokens(slab):
+        load_rows(
+            x + fx.Int64(slab) * fx.Int64(SLAB * 2),
+            x_stride,
+            lds + (slab % 2) * token_words,
+            rows,
+            rows,
+            _CLUSTER_MASK,
+            cache_policy=x_cache_policy,
+            whole=True,
+        )
+
+    def issue_weight(slab):
+        destination = lds + x_words + ((slab % stages) * tasks + task) * task_words
+        if const_expr(fp8):
+            # The task's slab is one contiguous 16 x 512 B block: copied as
+            # WAVES packed 512-element rows.
+            load_rows(
+                w
+                + fx.Int64(task_row) * fx.Int64(k)
+                + fx.Int64(slab) * fx.Int64(SLAB * ROWS),
+                SLAB,
+                destination,
+                WAVES,
+                WAVES,
+                padded=False,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+            )
+        else:
+            load_rows(
+                w
+                + fx.Int64(task_row) * fx.Int64(k * 2)
+                + fx.Int64(slab) * fx.Int64(SLAB * 2),
+                k,
+                destination,
+                fx.Int32(w_rows) - task_row,
+                ROWS,
+                cache_policy=_WEIGHT_CACHE_POLICY,
+                whole=True,
+                uniform=True,
+            )
+
+    if const_expr(prologue is None):
+        _on_wave(role, 0, lambda: issue_tokens(fx.Int32(0)))
+    for first in range_constexpr(min(depth, slabs)):
+        _on_wave(
+            role,
+            fx.Int32(1) + 2 * task + first % 2,
+            lambda first=first: issue_weight(fx.Int32(first)),
+        )
+    if const_expr(prologue is not None):
+        prologue()
+        _on_wave(role, 0, lambda: issue_tokens(fx.Int32(0)))
+    accs = [
+        fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+        for _ in range(tasks * tiles)
+    ]
+    # Zeros before slab 0: their WMMAs leave the accumulators +0.
+    pend = [
+        fx.Vector.filled(OPERAND_ELEMENTS, 0.0, fx.BFloat16)
+        for _ in range((tasks + 1) * WAVE_STEPS)
+    ]
+    for s in range(fx.Int32(0), fx.Int32(slabs), unroll=_ROLLED_UNROLL):
+        if s > 0:
+            # The buffers slab s - 1 read are the ones refilled below.
+            if const_expr(TDM_CLUSTER > 1):
+                cluster.cluster_barrier()
+            else:
+                gpu.barrier()
+        _rolled_roles(role, s, slabs, tasks, depth, issue_tokens, issue_weight)
+        gpu.barrier()
+        slab_weights = [
+            (
+                _fp8_operand(
+                    lds + x_words + ((s % stages) * tasks + tk) * task_words,
+                    wave,
+                    lane,
+                    (
+                        fx.ptr_load(scales + tk * GFX1250.wave_size + s)
+                        >> (wave // (128 // WAVE_COLUMNS) * 8)
+                    )
+                    & 0xFF,
+                )
+                if fp8
+                else _operand(
+                    lds + x_words + ((s % stages) * tasks + tk) * task_words,
+                    lane % ROWS,
+                    wave,
+                    lane,
+                )
+            )
+            for tk in range(tasks)
+        ]
+        slab_tokens = lds + (s % 2) * token_words
+        activations = [
+            _operand(
+                slab_tokens,
+                tl * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tl * ROWS) - 1),
+                wave,
+                lane,
+            )
+            for tl in range(tiles)
+        ]
+        updated = _rolled_last_tile(accs, pend, tasks, tiles)
+        for tl in range_constexpr(tiles - 1):
+            for tk in range_constexpr(tasks):
+                acc = updated[tk * tiles + tl]
+                for st in range_constexpr(WAVE_STEPS):
+                    acc = mma_bf16(
+                        slab_weights[tk][st], activations[tl][st], acc, GFX1250
+                    )
+                updated[tk * tiles + tl] = acc
+        pend = [
+            slab_weights[tk][st] for tk in range(tasks) for st in range(WAVE_STEPS)
+        ] + list(activations[tiles - 1])
+        accs = updated
+    accs = _rolled_last_tile(accs, pend, tasks, tiles)
+    return [[accs[tk * tiles + tl] for tl in range(tiles)] for tk in range(tasks)]

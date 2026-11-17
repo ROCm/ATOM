@@ -639,6 +639,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 gfx1250 mono: the AttnRes seams' mix on the gfx1250 FlyDSL kernel
     # (a CTA a token, the reductions in another order); 0 keeps Triton's.
     "ATOM_KIMI_MONO_ATTN_RES": lambda: os.getenv("ATOM_KIMI_MONO_ATTN_RES", "1") == "1",
+    # Kimi-K3 gfx1250 mono: the TDM GEMV's slab loop as a runtime loop with this
+    # LLVM unroll hint (1: none), so a cold launch fetches one slab's code; 0
+    # unrolls it at trace time.
+    "ATOM_KIMI_MONO_TDM_ROLLED": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_TDM_ROLLED", "1")
+    ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the
