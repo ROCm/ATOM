@@ -95,8 +95,6 @@ class PPEngineCoreProc(EngineCore):
                 else:
                     if self.has_pending_kv_work():
                         self._advance_idle_kv_transfer()
-                    # Block, don't spin: the output thread needs the GIL to
-                    # send the last step's output (see `IDLE_WAIT_S`).
                     self._wait_for_work()
         finally:
             self._drain_kv_work_at_exit()
