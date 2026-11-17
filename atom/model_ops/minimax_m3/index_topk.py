@@ -908,7 +908,9 @@ def _prefill_topk_block_size_k(max_block: int) -> int:
 
 
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
-@triton.jit
+# Score head/row strides vary with context width and query count. Keep unit-stride
+# and algorithm/tile specializations while sharing their alignment variants.
+@triton.jit(do_not_specialize_on_alignment=["stride_s_h", "stride_s_n"])
 def _topk_index_packed_kernel(
     s_ptr,  # [num_heads, total_q, max_block]
     ti_ptr,  # [num_heads, total_q, topk]
