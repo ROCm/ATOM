@@ -24,6 +24,7 @@ from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_widt
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.draft_q_staging import DraftQStaging
+from atom.spec_decode.dspark_verify import require_ell_from_older_drafts
 from atom.utils import CpuGpuBuffer, envs
 
 logger = logging.getLogger("atom")
@@ -140,6 +141,10 @@ class DSparkLossless:
                 reason,
             )
             return None
+        # A confidence-scheduled verify takes its length from the confidence
+        # head, which reads the sampled drafts: lossless only if that length
+        # comes from older drafts than the ones it verifies.
+        require_ell_from_older_drafts()
         if envs.ATOM_ENABLE_RELAXED_MTP:
             # Relaxed top-N accepts tokens the target would not have drawn.
             raise ValueError(
