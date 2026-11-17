@@ -116,6 +116,36 @@ def test_ple_planes_are_all_allocated_or_none():
     ]
 
 
+def test_decode_image_steps_the_ple_windows_back_to_the_verify_step():
+    """A verify leaves each PLE window `history + num_spec` wide; the image of
+    step `s` is the history-wide window starting `s` columns in."""
+    builder, cls = _builder()
+    builder.num_spec = num_spec = 2
+    # (ple_conv_kernel_size - 1) * ngram_size taps; ngram_size - 1 context ids.
+    conv_history, ngram_context = 3 * 3, 2
+    runner = builder.model_runner
+    runner.mamba_k_cache = torch.zeros(2, 4, 3, 4, dtype=torch.bfloat16)
+    runner.mamba_v_cache = torch.zeros(2, 4, 2, 2, dtype=torch.float32)
+    conv = runner.ple_conv_state = torch.arange(
+        4 * 16 * (conv_history + num_spec), dtype=torch.float32
+    ).reshape(4, 16, conv_history + num_spec)
+    ngram = runner.ple_ngram_state = torch.arange(
+        4 * (ngram_context + num_spec), dtype=torch.int64
+    ).reshape(4, ngram_context + num_spec)
+    src = (conv[1].clone(), ngram[1].clone())
+    for step in range(num_spec + 1):
+        cls._build_decode_images(
+            builder, [SimpleNamespace(src_slot=1, scratch_slot=3, step=step)]
+        )
+        assert torch.equal(
+            conv[3, :, :conv_history], src[0][:, step : step + conv_history]
+        )
+        assert torch.equal(
+            ngram[3, :ngram_context], src[1][step : step + ngram_context]
+        )
+    assert torch.equal(conv[1], src[0]) and torch.equal(ngram[1], src[1])
+
+
 def test_layout_id_names_ple_and_forks_under_pipeline_parallel(one_tp_rank):
     builder, cls = _builder()
     layout = cls.state_transfer(builder).paged_layout_id

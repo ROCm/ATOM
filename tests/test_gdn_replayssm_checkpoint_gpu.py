@@ -32,12 +32,17 @@ from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 from atom.model_ops.attentions.pool_layout.page_unit_geometry import (
     PageUnitGeometryMixin,
 )
+from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
 from atom.model_ops.fla_ops.chunk import chunk_gated_delta_rule
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
     replayssm_gated_delta_rule,
     replayssm_materialize,
+)
+from atom.model_ops.qwen4_exp.ops.ple import (
+    advance_ngram_state,
+    dilated_causal_conv1d,
 )
 
 DEV = "cuda"
@@ -284,3 +289,75 @@ def test_materialize_folds_exactly_the_step_s_records(kda, h, step):
     want = s0 * decay[:, :, None] + s
     got = ckpt[2].float().transpose(1, 2) if kda else ckpt[2].float()
     assert _rel_l2(got, want) < 1e-2
+
+
+PLE_KERNEL, NGRAM, PLE_CHANNELS = 4, 3, 16
+
+
+def _qwen38_builder():
+    """`_copier`'s slots behind Qwen3.8's builder, with its two PLE windows."""
+    c = object.__new__(Qwen4ExpMetadataBuilder)
+    c.__dict__.update(vars(_copier()))
+    r = c.model_runner
+    r.config.torch_dtype = torch.bfloat16
+    r.config.hf_config = SimpleNamespace(
+        ple_layer_ids=[0],
+        ple_conv_kernel_size=PLE_KERNEL,
+        ngram_size=NGRAM,
+        hidden_size=PLE_CHANNELS // 2,
+        hc_count=2,
+    )
+    c.ngram_context_len = NGRAM - 1
+    c.eos_token_id = 0
+    history = (PLE_KERNEL - 1) * NGRAM
+    r.ple_conv_state = torch.randn(
+        SLOTS, PLE_CHANNELS, history + c.num_spec, dtype=torch.bfloat16, device=DEV
+    )
+    r.ple_ngram_state = torch.randint(
+        1, 1000, (SLOTS, NGRAM - 1 + c.num_spec), dtype=torch.int64, device=DEV
+    )
+    return c
+
+
+@pytest.mark.parametrize("step", [0, 1, 3])
+def test_a_qwen38_decode_image_resumes_its_ple_windows_at_the_verify_step(step):
+    """The next verify would read each PLE window `step` columns into the live
+    slot; a prefill resumed from the image reads it from column 0. Both reads
+    of the same new tokens have to agree."""
+    torch.manual_seed(step)
+    c = _qwen38_builder()
+    r = c.model_runner
+    _decode(c, LIVE, 1, [_window() for _ in range(LAYERS)])
+    c._build_decode_images(
+        [SimpleNamespace(src_slot=LIVE, scratch_slot=SCRATCH, step=step)]
+    )
+
+    def one(value):
+        return torch.tensor([value], dtype=torch.int32, device=DEV)
+
+    has = torch.tensor([True], device=DEV)
+    accepted = one(step + 1)
+    x = torch.randn(T, PLE_CHANNELS, dtype=torch.bfloat16, device=DEV)
+    w = torch.randn(PLE_CHANNELS, PLE_KERNEL, dtype=torch.bfloat16, device=DEV)
+    conv = r.ple_conv_state
+    want = dilated_causal_conv1d(
+        x, w, conv.clone(), _cu(), one(LIVE), one(REF), has, NGRAM, accepted
+    )
+    got = dilated_causal_conv1d(
+        x, w, conv.clone(), _cu(), one(SCRATCH), one(REF), has, NGRAM
+    )
+    assert torch.equal(got, want), "the PLE conv resumes elsewhere"
+
+    ids = torch.randint(1, 1000, (T,), dtype=torch.int64, device=DEV)
+    ngram = r.ple_ngram_state
+    want = advance_ngram_state(
+        ids, _cu(), ngram.clone(), one(LIVE), one(REF), has, 0, NGRAM - 1, accepted
+    )
+    got = advance_ngram_state(
+        ids, _cu(), ngram.clone(), one(SCRATCH), one(REF), has, 0, NGRAM - 1
+    )
+    assert torch.equal(got, want), "the n-gram context resumes elsewhere"
+    assert torch.equal(
+        r.mamba_k_cache[:, SCRATCH, :WIDTH],
+        r.mamba_k_cache[:, LIVE, step : step + WIDTH],
+    ), "the GDN conv window is not the step's"

@@ -496,6 +496,18 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             state.unsqueeze(0) for state in self._ple_tensors()
         ]
 
+    def _build_decode_images(self, ops) -> None:
+        super()._build_decode_images(ops)
+        # Like the GDN conv window, each PLE window holds the verify's
+        # candidates past its history; the step's own window starts `step` in.
+        for state in self._ple_tensors():
+            width = state.shape[-1] - self.num_spec
+            for op in ops:
+                if op.step:
+                    state[op.scratch_slot, ..., :width] = state[
+                        op.src_slot, ..., op.step : op.step + width
+                    ]
+
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         # The parent range-checks `slot`; PLE shares its slot class.
         return super().state_entry_views(slot) + [
