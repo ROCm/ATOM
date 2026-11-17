@@ -964,7 +964,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":nocopy={nocopy}"
             ":entry=packed"
         )
-        return StateTransfer.copy(layout_id, spec_step_settled=True)
+        return StateTransfer.copy(layout_id)
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per plane: a V4 slot is one row per plane."""

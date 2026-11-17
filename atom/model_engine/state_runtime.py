@@ -52,16 +52,6 @@ class StateTransfer:
     #: (`conv_kernel - 1`) is sliced out of the step's own conv input. 0 when
     #: not readable.
     midstep_min_offset: int = 0
-    #: Whether a slot holds the committed state once a speculative decode step
-    #: retires, so a decode-step checkpoint may be copied out of it. GDN's does
-    #: not: the verify leaves the accepted state in column `num_accepted - 1`
-    #: (under ReplaySSM, partly in records the image does not carry) and its
-    #: conv windows are rolled back only by the next forward, so an image
-    #: copied in between is not the boundary's state. DeepSeek-V4's ring is
-    #: sized for the drafts and needs no rollback, so it declares True. False
-    #: by default: an undeclared class recomputes past its last prefill
-    #: checkpoint instead of restoring a state it never had.
-    spec_step_settled: bool = False
     #: A decode boundary's image is built from the slot at its verify step
     #: (`CheckpointStoreOp.step`) rather than copied as the slot stands, so the
     #: coordinator lends each such store a scratch slot to build it in.
@@ -72,8 +62,6 @@ class StateTransfer:
             raise TypeError("fork_tokens must be an integer")
         if not isinstance(self.readable_midstep, bool):
             raise TypeError("readable_midstep must be a bool")
-        if not isinstance(self.spec_step_settled, bool):
-            raise TypeError("spec_step_settled must be a bool")
         if not isinstance(self.decode_snapshot, bool):
             raise TypeError("decode_snapshot must be a bool")
         if self.decode_snapshot and self.kind != COPY:
@@ -139,7 +127,6 @@ class StateTransfer:
         readable_midstep: bool = False,
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
-        spec_step_settled: bool = False,
         decode_snapshot: bool = False,
     ) -> "StateTransfer":
         return cls(
@@ -148,7 +135,6 @@ class StateTransfer:
             readable_midstep=readable_midstep,
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
-            spec_step_settled=spec_step_settled,
             decode_snapshot=decode_snapshot,
         )
 
@@ -160,7 +146,6 @@ class StateTransfer:
             "readable_midstep": self.readable_midstep,
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
-            "spec_step_settled": self.spec_step_settled,
             "decode_snapshot": self.decode_snapshot,
         }
 
@@ -175,7 +160,6 @@ class StateTransfer:
             "readable_midstep",
             "midstep_grid",
             "midstep_min_offset",
-            "spec_step_settled",
             "decode_snapshot",
         }
         if set(wire) != expected:
@@ -190,7 +174,6 @@ class StateTransfer:
             readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
-            spec_step_settled=wire["spec_step_settled"],  # type: ignore[arg-type]
             decode_snapshot=wire["decode_snapshot"],  # type: ignore[arg-type]
         )
 

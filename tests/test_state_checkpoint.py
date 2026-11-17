@@ -2278,52 +2278,6 @@ class TestPagedCopyCheckpoint:
         assert copying._checkpoint_room(seq, False) == 1
         assert copying._checkpoint_room(seq, True) == 0
 
-    def _speculative_copier(self, settled):
-        spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
-        transfer = StateTransfer.copy(
-            PAGED_COPY_SPEC.layout_id, spec_step_settled=settled
-        )
-        return make_scheduler(
-            paged_copy_config(
-                speculative_config=spec, state_checkpoint_interval_tokens=2 * BLOCK
-            ),
-            state_runtime=StateRuntime(
-                transfer=transfer, checkpoint_spec=PAGED_COPY_SPEC
-            ),
-        )
-
-    @pytest.mark.parametrize("settled, stores", [(True, 1), (False, 0)])
-    def test_a_spec_step_keeps_a_decode_checkpoint_only_from_a_settled_slot(
-        self, settled, stores
-    ):
-        """GDN's verify leaves the accepted state in column `num_accepted - 1`
-        and its conv windows unrolled until the next forward, and a decode keep
-        is copied out of `state_slot` before that forward. V4's ring is settled
-        and keeps it."""
-        scheduler = self._speculative_copier(settled)
-        bm = scheduler.block_manager
-        seq = stateful_seq(list(range(10)))
-        run_prompt(bm, seq)
-        bm.take_state_maintenance_ops()
-        seq.type = SequenceType.DECODE
-        # The first sampled token, then a verify accepting one draft plus its
-        # bonus: `num_accepted == 2`, committed KV on the boundary at 12.
-        for token in (100, 101, 102):
-            seq.append_token(token)
-        bm.may_append(seq)
-        bm.hash_decode_blocks(
-            seq,
-            seq.num_tokens - 1,
-            next_forward_tokens=scheduler._checkpoint_room(seq, False),
-        )
-        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == stores
-
-    def test_an_unsettled_slot_still_keeps_its_prompt_rungs(self):
-        bm = self._speculative_copier(False).block_manager
-        seq = stateful_seq(list(range(2 * BLOCK)))
-        run_prompt(bm, seq)
-        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
-
 
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
@@ -2523,7 +2477,6 @@ class StubStateCache:
         self.successor_room = successor_room
         self.enabled = enabled
         self.readable_midstep = readable_midstep
-        self.spec_step_settled = True
         self._cap = cap
 
     def applies(self, seq):

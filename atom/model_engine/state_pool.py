@@ -62,7 +62,6 @@ class StateSlotPool:
         # reason `BlockManager` still cuts prefill chunks onto rungs; see
         # `StateTransfer.readable_midstep`.
         self.readable_midstep: bool = self.transfer.readable_midstep
-        self.spec_step_settled: bool = self.transfer.spec_step_settled
         self.hash_block_size: int = hash_block_size
         if self.transfer.copies:
             raise ValueError("PAGE-copy checkpoints do not belong to StateSlotPool")

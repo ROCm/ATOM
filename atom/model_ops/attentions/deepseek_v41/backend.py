@@ -430,7 +430,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # replay_start`).
         if self.model_runner.config.enable_encoder_swa_bounded_replay:
             return StateTransfer.replay()
-        return StateTransfer.copy(self.geometry.layout_id, spec_step_settled=True)
+        return StateTransfer.copy(self.geometry.layout_id)
 
     def checkpoint_image_bytes(self):
         return self.geometry.checkpoint_image_bytes

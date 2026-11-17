@@ -39,6 +39,7 @@ def qsa_like_fields(block=4):
 def _builder():
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.num_spec = 1
+    builder.replayssm = False
     builder.ngram_context_len = 2
     builder.eos_token_id = 7
     builder._ssm_storage = "kv"

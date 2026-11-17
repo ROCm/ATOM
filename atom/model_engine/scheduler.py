@@ -815,7 +815,6 @@ class Scheduler:
             block_drafter=(has_spec and config.speculative_config.use_dspark()),
         )
         self.block_manager.draft_lookahead = self.draft_lookahead
-        self.block_manager.speculative_decode = bool(self.mtp_k)
         self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:
             logger.info(
@@ -3927,9 +3926,7 @@ class Scheduler:
           forwards down the non-spec path.
 
         A class that checkpoints by copying is bound by none of that: the
-        destination is complete when the copy lands, so any decode step will do
-        -- unless its slot is not settled when a spec step retires
-        (`StateTransfer.spec_step_settled`), which `checkpointers_at` checks.
+        destination is complete when the copy lands, so any decode step will do.
 
         Otherwise plain decode carries exactly one token, and whether that is
         enough to fill a fresh slot is the backend's `min_fork_tokens` to say.

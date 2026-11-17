@@ -20,7 +20,6 @@ def test_wire_round_trip_keeps_the_complete_capability():
     transfers = (
         StateTransfer.none(),
         StateTransfer.fork(7),
-        StateTransfer.copy("layout-v1", spec_step_settled=True),
         StateTransfer.copy("layout-v2"),
     )
 

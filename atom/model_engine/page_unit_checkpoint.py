@@ -1010,12 +1010,10 @@ class PagedStateCheckpointCoordinator:
         enabled: bool,
         offload=None,
         readable_midstep: bool = False,
-        spec_step_settled: bool = False,
         decode_snapshot: bool = False,
     ) -> None:
         self.enabled = enabled
         self.readable_midstep = bool(readable_midstep)
-        self.spec_step_settled = bool(spec_step_settled)
         self.decode_snapshot = bool(decode_snapshot)
         # The state pool scratch slots are borrowed from, and how many stores
         # one batch's copy descriptor has room for. Set by

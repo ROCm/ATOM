@@ -76,10 +76,6 @@ class StateCache(Protocol):
     #: can a copying one, so neither implies the other.
     readable_midstep: bool
 
-    #: Whether this class's slot holds the committed state once a speculative
-    #: decode step retires; see `StateTransfer.spec_step_settled`.
-    spec_step_settled: bool
-
     def applies(self, seq: Sequence) -> bool:
         """Whether this class gates or checkpoints anything for `seq`."""
         ...
