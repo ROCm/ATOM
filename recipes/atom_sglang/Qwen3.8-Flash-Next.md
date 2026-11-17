@@ -3,10 +3,10 @@
 Flash uses `qwen4_exp` / `Qwen4ExpForConditionalGeneration`. Target and MTP
 compute run through Native ATOM `Qwen4Exp` and `Qwen4ExpMTP`; the plugin
 adapts SGLang scheduling, QSA KV pools, PLE state and HC hidden storage.
-It requires the Native Flash implementation in this tree and SGLang 0.5.17 or
-newer; CI and the SGLang release image (`docker/sglang_release.dockerfile`)
-use v0.5.22. The recognition patch supplies Flash config registration for
-these versions.
+It requires the Native Flash implementation in this tree and SGLang 0.5.20 or
+newer (CI and the release image use v0.5.22); upstream recognizes
+`qwen4_exp`, and the recognition patch adds only the MTP draft-arch and
+HC-width adapters.
 
 `Qwen4ExpForConditionalGeneration` is 48 layers: 36 Gated-DeltaNet and 12 QSA
 (query-sparse, 2048-token budget) attention layers, 4-stream
@@ -163,41 +163,42 @@ export SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP=1
 
 Measured with the MTP command above on 2x MI308X (gfx942), ROCm 7.2.4, SGLang
 v0.5.22. The default was run twice, before and after the switch, to show
-run-to-run drift. Burst TTFT in ms, median (mean), for N requests sent
+run-to-run drift. Burst TTFT in ms, median / mean / P99, for N requests sent
 together to an idle server:
 
 | Prompt | N | Default | Default, repeat | Switch on |
 |---|---|---|---|---|
-| 2048 | 1 | 233 (238) | 229 (240) | 228 (230) |
-| 2048 | 2 | 453 (455) | 477 (474) | 344 (343) |
-| 2048 | 4 | 585 (585) | 613 (614) | 587 (498) |
-| 2048 | 8 | 1003 (1001) | 1046 (1045) | 1000 (907) |
-| 4096 | 1 | 275 (282) | 282 (292) | 274 (274) |
-| 4096 | 2 | 538 (539) | 549 (552) | 411 (410) |
-| 4096 | 4 | 947 (950) | 950 (971) | 948 (780) |
-| 4096 | 8 | 1813 (1731) | 1868 (1785) | 1159 (1299) |
+| 2048 | 1 | 233 / 238 / 269 | 229 / 240 / 293 | 228 / 230 / 242 |
+| 2048 | 2 | 453 / 455 / 464 | 477 / 474 / 505 | 344 / 343 / 460 |
+| 2048 | 4 | 585 / 585 / 590 | 613 / 614 / 646 | 587 / 498 / 591 |
+| 2048 | 8 | 1003 / 1001 / 1018 | 1046 / 1045 / 1102 | 1000 / 907 / 1017 |
+| 4096 | 1 | 275 / 282 / 314 | 282 / 292 / 330 | 274 / 274 / 277 |
+| 4096 | 2 | 538 / 539 / 543 | 549 / 552 / 571 | 411 / 410 / 552 |
+| 4096 | 4 | 947 / 950 / 978 | 950 / 971 / 1027 | 948 / 780 / 951 |
+| 4096 | 8 | 1813 / 1731 / 1836 | 1868 / 1785 / 1913 | 1159 / 1299 / 1834 |
 
 In every wave the first request of the burst was admitted alone (splits
 `1+1`, `1+3`, `1+7`, and `1+4+3` for 4096 x 8). The switch returns
 that request after its own batch instead of after the next one. When the
 median request falls in the second batch (N=4, and 2048 x 8), only the mean
-improves. P99 does not change.
+improves. P99 is set by the last batch. With the switch it is within or below
+the range of the two default runs.
 
-Steady-load output throughput in tok/s, mean of 2 runs (`bench_serving`
-random, 128 prompts, `--max-concurrency 8`; the concurrency cap holds the
-achieved rate at 1.0 / 1.3 req/s for both request rates):
+Steady-load output throughput in tok/s, mean of 4 runs (`bench_serving`
+random, 128 prompts, `--max-concurrency 8`). Request rates inf and 2 were run
+twice each; the concurrency cap holds both at the same achieved 1.0 / 1.3
+req/s, so they are pooled:
 
-| Input / output | Request rate | Default | Default, repeat | Switch on |
-|---|---|---|---|---|
-| 2048 / 512 | inf | 508 | 520 | 518 |
-| 2048 / 512 | 2 | 515 | 498 | 487 |
-| 6144 / 256 | inf | 324 | 343 | 340 |
-| 6144 / 256 | 2 | 338 | 340 | 332 |
+| Input / output | Default | Default, repeat | Switch on |
+|---|---|---|---|
+| 2048 / 512 | 512 | 509 | 503 |
+| 6144 / 256 | 331 | 342 | 336 |
 
-The differences are within the run-to-run spread of the default (single runs
-ranged 488-517 tok/s at 2048 / 512, rate 2). Median ITL is 9.7-9.8 ms in all
-runs. GSM8K (5-shot, chat, 200 questions): 0.98 / 0.985 default, 0.99 with the
-switch.
+In the 2048 / 512 runs at request rate 2, the switch was 2-5% lower (mean 487
+vs 498-515 for the two default runs; single runs 472.5 / 502.3 vs 513.5 /
+516.9 / 507.8 / 488.0). The other runs were within noise. Median ITL is
+9.7-9.8 ms in all runs. GSM8K (5-shot, chat, 200 questions): 0.98 / 0.985
+default, 0.99 with the switch.
 
 ## Benchmark
 
