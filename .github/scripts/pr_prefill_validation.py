@@ -73,8 +73,8 @@ def model_path(model):
             TARGET_DIR=str(target),
             MODEL_DOWNLOAD_TIMEOUT="30m",
             MODEL_LOCK_WAIT_SECONDS="1800",
-            MODEL_STAGING_ROOT="/models/.atom-model-staging",
-            MODEL_LOCK_ROOT="/models/.atom-model-locks",
+            MODEL_STAGING_ROOT=str(target.parent / ".atom-model-staging"),
+            MODEL_LOCK_ROOT=str(target.parent / ".atom-model-locks"),
             MODEL_ENABLE_REMOTE_REVISION_CHECK="0",
         )
         rc = run(
