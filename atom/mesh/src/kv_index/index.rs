@@ -292,6 +292,83 @@ impl PrefixIndex {
     }
 }
 
+/// The leading blocks of `prefix` each worker holds, in their order, the more of what its
+/// lanes `[events, predicted]` hold in the two indexes. One walk, which looks a block up
+/// in the predictions only for the workers whose events miss it: both hold whole prefixes,
+/// so that a worker's predictions count only past the end of its events.
+pub(super) fn find_matches(
+    [events, predicted]: [&PrefixIndex; 2],
+    workers: &[[Option<HolderId>; 2]],
+    prefix: &[PrefixHash],
+) -> Vec<u32> {
+    let blocks = prefix.len() as u32;
+    // By index and lane, the first block the lane misses, and by lane of the events, the
+    // worker's lane of the predictions, which goes on from there.
+    let mut depth = [[blocks; 64]; 2];
+    let mut then = [None; 64];
+    let (mut open, mut predicting) = (0, 0);
+    for &[on_events, on_predicted] in workers {
+        match on_events {
+            Some(holder) => {
+                open |= lane(holder);
+                then[holder.0 as usize] = on_predicted;
+            }
+            None => predicting |= on_predicted.map_or(0, lane),
+        }
+    }
+    let mut walk = Walk::new(events);
+    let mut predictions: Option<Walk<'_>> = None;
+    for &hash in prefix.iter().take(PREFETCH) {
+        walk.prefetch(hash);
+    }
+    for (i, &hash) in prefix.iter().enumerate() {
+        if open | predicting == 0 {
+            break;
+        }
+        if i % YIELD_BLOCKS == 0 {
+            walk.yield_to_writer();
+            if let Some(predictions) = &mut predictions {
+                predictions.yield_to_writer();
+            }
+        }
+        if open != 0 {
+            if let Some(&ahead) = prefix.get(i + PREFETCH) {
+                walk.prefetch(ahead);
+            }
+            let mut gone = open & !walk.get(hash);
+            open &= !gone;
+            while gone != 0 {
+                let holder = gone.trailing_zeros() as usize;
+                depth[0][holder] = i as u32;
+                predicting |= then[holder].map_or(0, lane);
+                gone &= gone - 1;
+            }
+        }
+        if predicting != 0 {
+            let predictions = predictions.get_or_insert_with(|| Walk::new(predicted));
+            if let Some(&ahead) = prefix.get(i + PREFETCH) {
+                predictions.prefetch(ahead);
+            }
+            let mut gone = predicting & !predictions.get(hash);
+            predicting &= !gone;
+            while gone != 0 {
+                depth[1][gone.trailing_zeros() as usize] = i as u32;
+                gone &= gone - 1;
+            }
+        }
+    }
+    workers
+        .iter()
+        .map(|&[events, predicted]| {
+            let events = events.map_or(0, |holder| depth[0][holder.0 as usize]);
+            match predicted {
+                Some(holder) if events < blocks => events.max(depth[1][holder.0 as usize]),
+                _ => events,
+            }
+        })
+        .collect()
+}
+
 /// A walk's read locks, each shard's taken once and past a waiting writer, so that a walk
 /// never waits behind it for the walks under way. Every `YIELD_BLOCKS` blocks, and while
 /// it waits, the walk gives up the shards the writer waits for, and to take one again it

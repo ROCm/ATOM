@@ -971,6 +971,21 @@ def test_kv_event_sources_suffixes_ipc_endpoints_per_rank(monkeypatch):
     }
 
 
+def test_kv_event_sources_offsets_the_replay_endpoint_per_rank(monkeypatch):
+    _kv_events_engine(
+        monkeypatch,
+        enable=True,
+        endpoint="tcp://*:5557",
+        topic="kv",
+        replay_endpoint="tcp://*:5600",
+    )
+    sources = asyncio.run(api_server.kv_event_sources())
+    expected = _tcp_sources({0: 5557, 1: 5558})
+    expected["0"]["replay_endpoint"] = "tcp://*:5600"
+    expected["1"]["replay_endpoint"] = "tcp://*:5601"
+    assert sources == expected
+
+
 @pytest.mark.parametrize(
     "events", [{"enable": False}, {"enable": True, "publisher": "null"}]
 )
