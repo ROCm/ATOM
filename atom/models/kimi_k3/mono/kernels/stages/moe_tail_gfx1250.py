@@ -4,7 +4,7 @@
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.config import (
@@ -126,16 +126,39 @@ def sdown_accumulator_words(tasks: int, tokens: int, waves: int) -> int:
 
 
 @traced
-def sdown_tasks(c, tasks, operands, waves, rows):
+def sdown_tasks(c, tasks, operands, waves, rows, rolled=False):
     """``sdown_staged`` of every task in ``tasks`` whose weights ``operands``
     holds, over all ``c["S"]`` rows staged at ``rows``: every WMMA tile first,
     then one cross-wave reduction, so the tiles share two barriers. Tasks past
-    the last are skipped."""
+    the last are skipped. ``rolled`` takes the token tiles and the reduction
+    as runtime loops."""
 
     tokens, tid, threads = c["S"], c["tid"], c["threads"]
     tiles = (tokens + GEMV_ROWS - 1) // GEMV_ROWS
     accumulators = c["tail"]["gemv_accumulator"]
-    for index in range_constexpr(len(tasks)):
+    rolled_tiles = rolled and tiles > 1
+    if const_expr(rolled_tiles):
+        # A token tile an iteration, every task's WMMAs in its body.
+        for row_tile in range(fx.Int32(0), fx.Int32(tiles), unroll=1):
+            for task_index in range_constexpr(len(tasks)):
+                tile_accumulator = gemv_device.mfmas(
+                    c["lane"],
+                    c["wave"],
+                    waves,
+                    rows + row_tile * (GEMV_ROWS * SHARED_ROW_STRIDE // 2),
+                    SHARED_ROW_STRIDE,
+                    SHARED_INTERMEDIATE,
+                    fx.min(GEMV_ROWS, tokens - row_tile * GEMV_ROWS),
+                    operands[task_index],
+                )
+                gemv_device.store_accumulator(
+                    tile_accumulator,
+                    accumulators
+                    + (task_index * tiles + row_tile) * _slot_words(waves),
+                    c["wave"],
+                    c["lane"],
+                )
+    for index in range_constexpr(0 if rolled_tiles else len(tasks)):
         for tile in range_constexpr(tiles):
             accumulator = gemv_device.mfmas(
                 c["lane"],
@@ -155,7 +178,36 @@ def sdown_tasks(c, tasks, operands, waves, rows):
             )
     gpu.barrier()
     total = tokens * (GEMV_ROWS // 2)
-    for index in range_constexpr(len(tasks)):
+    rounds = (total + threads - 1) // threads
+    if const_expr(rolled):
+        # Every task's rounds as one runtime loop: one body of the reduction.
+        for job in range(fx.Int32(0), fx.Int32(len(tasks) * rounds), unroll=1):
+            job_index = job // rounds
+            job_task = tasks[0]
+            for other in range_constexpr(1, len(tasks)):
+                job_task = (job_index == other).select(tasks[other], job_task)
+            job_work = tid + threads * (job % rounds)
+            if (job_task < HIDDEN // GEMV_ROWS) & (job_work < total):
+                job_token = job_work // (GEMV_ROWS // 2)
+                job_pair = job_work % (GEMV_ROWS // 2)
+                job_slot = accumulators + (
+                    job_index * tiles + job_token // GEMV_ROWS
+                ) * _slot_words(waves)
+                job_sums = [
+                    bf16_round(
+                        gemv_device.row_sum(
+                            job_slot, 2 * job_pair + half, job_token % GEMV_ROWS, waves
+                        )
+                    )
+                    for half in range_constexpr(2)
+                ]
+                _store_pair(
+                    c["shared_partial"],
+                    (job_token * HIDDEN + job_task * GEMV_ROWS + 2 * job_pair) // 2,
+                    job_sums[0],
+                    job_sums[1],
+                )
+    for index in range_constexpr(0 if rolled else len(tasks)):
         if tasks[index] < HIDDEN // GEMV_ROWS:
             for round_index in range_constexpr((total + threads - 1) // threads):
                 work = tid + threads * round_index

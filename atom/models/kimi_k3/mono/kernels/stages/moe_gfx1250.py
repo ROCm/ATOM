@@ -378,6 +378,174 @@ def stage_route(c, token, front_payload_words=0):
     gpu.barrier()
 
 
+def route_cta_words(threads: int) -> dict[str, int]:
+    """LDS i32 words ``stage_route_cta`` needs with ``threads`` threads."""
+    return {
+        "maxima": threads,
+        "count": 1,
+        "ahead": EXPERTS,
+        "keys": EXPERTS,
+        "experts": EXPERTS,
+        "sigmoids": EXPERTS,
+        "top_experts": WAVE,
+        "top_sigmoids": WAVE,
+    }
+
+
+@traced
+def stage_route_cta(c, token, front_payload_words=0):
+    """``stage_route``'s routes, bit for bit, by the whole CTA in runtime loops:
+    a cold launch fetches a few hundred instructions instead of its unrolled
+    28-expert lane code and its sorts.
+
+    A thread scores experts ``tid + threads * j``, so wave ``w`` lane ``l``
+    holds some of ``stage_route`` lane ``l``'s experts and the waves' maxima
+    give its lane maxima and the same bound. Each score at or above the bound
+    takes an LDS slot (in any order); a survivor's rank is the count of
+    survivors before it by key, then expert id (ids are distinct, so the ranks
+    are the sorted order), and the top ``width`` land at their ranks."""
+
+    tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    threads = c["threads"]
+    waves = threads // WAVE
+    lds = c["route_lds"]
+    contiguous = "contiguous_logits" in c and c["contiguous_logits"]
+    width = TOPK + 1 if "herd" in c and c["herd"] else TOPK
+    per_thread = (EXPERTS + threads - 1) // threads
+    scores = []
+    sigmoid = []
+    for index in range_constexpr(per_thread):
+        expert = fx.min(tid + threads * index, EXPERTS - 1)
+        source = expert // (EXPERTS // 8)
+        location = (source * c["S"] + token) * (EXPERTS // 8) + expert % (EXPERTS // 8)
+        if const_expr(front_payload_words != 0):
+            location = (
+                source * front_payload_words
+                + token * (EXPERTS // 8)
+                + expert % (EXPERTS // 8)
+            )
+        if const_expr(contiguous):
+            location = token * EXPERTS + expert
+        got = c["poll"]([(c["peer"]["rlog_own"], location, 1)])[0][0]
+        logit = _f32_of(got)
+        sig = hw_rcp(fx.Float32(1.0) + hw_exp2(logit * fx.Float32(-LOG2E)))
+        score = sig + _load_f32(c["args"]["bias"], expert)
+        live = score == score  # noqa: PLR0124 - NaN ranks last.
+        key = _ordered_key(live.select(score, fx.Float32(-3.0e38)))
+        if const_expr(threads * (index + 1) > EXPERTS):
+            # Below every score's key (the lowest is -3e38's), so it never
+            # survives.
+            key = (tid + threads * index < EXPERTS).select(key, fx.Uint32(0))
+        scores.append(key)
+        sigmoid.append((sig == sig).select(sig, fx.Float32(0.0)))  # noqa: PLR0124
+    fx.ptr_store(fx.Int32(_umax_tree(scores)), lds["maxima"] + tid)
+    if tid == 0:
+        fx.ptr_store(fx.Int32(0), lds["count"])
+    gpu.barrier()
+    # Every wave takes the bound itself: ``stage_route``'s lane maxima, sorted.
+    lane_max = fx.Uint32(fx.ptr_load(lds["maxima"] + lane))
+    for other_wave in range_constexpr(1, waves):
+        wave_max = fx.Uint32(fx.ptr_load(lds["maxima"] + other_wave * WAVE + lane))
+        lane_max = (wave_max > lane_max).select(wave_max, lane_max)
+    # The lane maxima's width-th largest: the one with width - 1 ahead of it
+    # by value, then lane.
+    max_rank = fx.Int32(0)
+    for peer_lane in range(fx.Int32(0), fx.Int32(WAVE), unroll=4):
+        peer_max = fx.Uint32(readlane(fx.Int32(lane_max), peer_lane))
+        max_before = (peer_max > lane_max) | ((peer_max == lane_max) & (peer_lane < lane))
+        max_rank = max_rank + max_before.select(fx.Int32(1), fx.Int32(0))
+    at_bound = _ballot32(max_rank == width - 1)
+    bound_lane = _popcount32((at_bound & (~at_bound + fx.Uint32(1))) - fx.Uint32(1))
+    bound = fx.Uint32(readlane(fx.Int32(lane_max), bound_lane))
+    # A wave's survivors take consecutive slots from one LDS atomic.
+    kept = _count_tree([score >= bound for score in scores])
+    inclusive = _wave_inclusive_scan32(kept, lane)
+    wave_kept = readlane(inclusive, WAVE - 1)
+    wave_first = fx.Int32(0)
+    if (wave_kept > 0) & (lane == 0):
+        wave_first = fx.atomic_add(lds["count"], wave_kept, syncscope="workgroup")
+    slot = readlane(wave_first, 0) + inclusive - kept
+    for index in range_constexpr(per_thread):
+        if scores[index] >= bound:
+            fx.ptr_store(fx.Int32(scores[index]), lds["keys"] + slot)
+            fx.ptr_store(tid + threads * index, lds["experts"] + slot)
+            fx.ptr_store(sigmoid[index], lds["sigmoids"] + slot)
+            fx.ptr_store(fx.Int32(0), lds["ahead"] + slot)
+        slot = slot + (scores[index] >= bound).select(fx.Int32(1), fx.Int32(0))
+    gpu.barrier()
+    survivors = uniform(fx.ptr_load(lds["count"]))
+    # A survivor's rank, the count of survivors before it, summed over the
+    # waves: each compares every survivor with every waves-th one.
+    for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
+        entry = fx.min(first + lane, survivors - 1)
+        entry_key = fx.Uint32(fx.ptr_load(lds["keys"] + entry))
+        entry_expert = fx.ptr_load(lds["experts"] + entry)
+        ahead = fx.Int32(0)
+        for chunk in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
+            chunk_at = fx.min(chunk + lane, survivors - 1)
+            chunk_keys = fx.ptr_load(lds["keys"] + chunk_at)
+            chunk_experts = fx.ptr_load(lds["experts"] + chunk_at)
+            for peer in range(
+                wave, fx.min(survivors - chunk, WAVE), fx.Int32(waves), unroll=1
+            ):
+                peer_key = fx.Uint32(readlane(chunk_keys, peer))
+                peer_expert = readlane(chunk_experts, peer)
+                entry_before = (peer_key > entry_key) | (
+                    (peer_key == entry_key) & (peer_expert < entry_expert)
+                )
+                ahead = ahead + entry_before.select(fx.Int32(1), fx.Int32(0))
+        if (first + lane < survivors) & (ahead > 0):
+            fx.atomic_add(lds["ahead"] + entry, ahead, syncscope="workgroup")
+    gpu.barrier()
+    if wave == 0:
+        # The top ``width`` to their ranks: a wave's LDS accesses are in order.
+        for first in range(fx.Int32(0), survivors, fx.Int32(WAVE), unroll=1):
+            entry = fx.min(first + lane, survivors - 1)
+            entry_rank = fx.ptr_load(lds["ahead"] + entry)
+            if (first + lane < survivors) & (entry_rank < width):
+                fx.ptr_store(
+                    fx.ptr_load(lds["experts"] + entry), lds["top_experts"] + entry_rank
+                )
+                fx.ptr_store(
+                    fx.ptr_load(lds["sigmoids"] + entry),
+                    lds["top_sigmoids"] + entry_rank,
+                )
+        rank = lane
+        top = fx.min(lane, width - 1)
+        my_expert = fx.ptr_load(lds["top_experts"] + top)
+        my_sigmoid = fx.ptr_load(lds["top_sigmoids"] + top)
+        total = fx.Float32(0.0)
+        for item in range_constexpr(TOPK):
+            total = total + fx.ptr_load(lds["top_sigmoids"] + item)
+        inverse = fx.Float32(1.0) / total
+        if lane < width:
+            expert = fx.min(fx.max(my_expert, 0), fx.Int32(EXPERTS - 1))
+            if const_expr(width != TOPK):
+                c["put"](c["route"], token * width + rank, expert)
+                c["put"](c["route_weights"], token * width + rank, my_sigmoid)
+                if const_expr("herd_candidates" in c):
+                    pairs, tag = c["herd_candidates"]
+                    bo.buffer_store(
+                        fx.Vector.from_elements(
+                            [my_sigmoid.bitcast(fx.Int32), tag | expert], fx.Int32
+                        ),
+                        rsrc(pairs),
+                        (token * width + rank) * 2,
+                        cache_modifier=CM_DEV,
+                    )
+            elif const_expr("route_weights" in c):
+                c["put"](c["route"], token * TOPK + rank, expert)
+                c["put"](c["route_weights"], token * TOPK + rank, my_sigmoid * inverse)
+            else:
+                c["put"](c["route"], token * 2 * TOPK + rank, expert)
+                c["put"](
+                    c["route"],
+                    token * 2 * TOPK + TOPK + rank,
+                    my_sigmoid * inverse,
+                )
+    gpu.barrier()
+
+
 # A HERD candidate's tag word: the launch's tag over the expert id's bits.
 _HERD_EXPERT_BITS = 10
 assert EXPERTS <= 1 << _HERD_EXPERT_BITS

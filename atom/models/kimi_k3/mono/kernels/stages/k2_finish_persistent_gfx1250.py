@@ -42,6 +42,7 @@ from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import bf_hi, bf_lo, rsrc, traced
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
+from atom.utils import envs
 
 THREADS = 256
 WAVES = 8
@@ -225,6 +226,7 @@ def build_packed_finish(
     local_union: bool | None = None,
     fp8_shared_down: bool = False,
     precompute_herd: bool = False,
+    rolled: bool | None = None,
 ) -> K2FinishKernel:
     """Without ``include_routed`` the routed experts are left to AITER's grouped
     MoE: ``route`` and ``tile_route`` then receive contiguous [rows, 16] expert
@@ -237,7 +239,12 @@ def build_packed_finish(
     grouped-MoE finish reads ATOM's online per_1x128 FP8 shared down, its E8M0
     block scales in ``shared_down_scale``. With ``precompute_herd`` one CTA also
     finishes HERD for the grouped MoE (``moe_gfx1250``'s ``stage_herd_finalize``)
-    into ``herd_scratch_layout``'s outputs in ``scratch``."""
+    into ``herd_scratch_layout``'s outputs in ``scratch``. ``rolled`` (default
+    ``ATOM_KIMI_MONO_ROLLED_LITE``) routes a token by its whole CTA in runtime
+    loops (``stage_route_cta``, the same routes) and the shared down's tiles
+    and reduction too: a cold launch fetches far less code."""
+    if rolled is None:
+        rolled = envs.ATOM_KIMI_MONO_ROLLED_LITE
     if precompute_herd and not (herd and replicated_front):
         raise ValueError("only a HERD grouped-MoE finish precomputes the routes")
     if fp8_shared_down and (include_routed or not include_shared):
@@ -260,9 +267,19 @@ def build_packed_finish(
         # barrier, so three-tile widths keep the published union.
         local_union = tiles <= LOCAL_UNION_MAX_TILES
 
+    route_lds_words = moe_gfx1250.route_cta_words(THREADS) if rolled else {}
+
     @fx.struct
     class RouteRole:
         red: fx.Array[fx.Float32, moe_gfx1250.ROUTE_RED_WORDS, 16]
+        maxima: fx.Array[fx.Int32, route_lds_words.get("maxima", 1), 16]
+        count: fx.Array[fx.Int32, route_lds_words.get("count", 1), 16]
+        ahead: fx.Array[fx.Int32, route_lds_words.get("ahead", 1), 16]
+        keys: fx.Array[fx.Int32, route_lds_words.get("keys", 1), 16]
+        experts: fx.Array[fx.Int32, route_lds_words.get("experts", 1), 16]
+        sigmoids: fx.Array[fx.Float32, route_lds_words.get("sigmoids", 1), 16]
+        top_experts: fx.Array[fx.Int32, route_lds_words.get("top_experts", 1), 16]
+        top_sigmoids: fx.Array[fx.Float32, route_lds_words.get("top_sigmoids", 1), 16]
 
     @fx.struct
     class PrepRole:
@@ -339,11 +356,14 @@ def build_packed_finish(
 
     name = (
         f"k3_k2_gfx1250_persistent_finish_s{rows}_b{plan.blocks}"
+        f"{'_rl' if rolled else ''}"
         f"_gu{int(gu_interleave)}_sh{int(include_shared)}"
         f"_pq_u{int(local_union)}_r{int(include_routed)}"
         f"{'_rf' if replicated_front else ''}{'_herd' if herd else ''}"
         f"{'_f8' if fp8_shared_down else ''}{'_hp' if precompute_herd else ''}"
     )
+    # After a replicated front there is no gathered latent to unpack.
+    unpack = not (rolled and replicated_front)
 
     sources = SOURCES
     # It is the CTA before the routing ones, and its one shared-down task goes
@@ -400,52 +420,54 @@ def build_packed_finish(
         # Rank-major compressed payload -> logical token-major FP4/scales.
         total_words = 0 if replicated_front else rows * (LATENT // 8)
         work = bid * THREADS + tid
-        while work < total_words:
-            token = work // (LATENT // 8)
-            column_word = work % (LATENT // 8)
-            rank = column_word // (LOCAL_LATENT // 8)
-            local_word = column_word % (LOCAL_LATENT // 8)
-            source = (
-                rank * payload.local_bytes
-                + payload.latent_offset
-                + (token * (LOCAL_LATENT // 8) + local_word) * 4
-            )
-            value = fx.Int32(
-                bo.buffer_load(
-                    rsrc(front_gathered + fx.Int64(source)),
-                    0,
-                    vec_width=1,
-                    dtype=T.i32,
+        if const_expr(unpack):
+            while work < total_words:
+                token = work // (LATENT // 8)
+                column_word = work % (LATENT // 8)
+                rank = column_word // (LOCAL_LATENT // 8)
+                local_word = column_word % (LOCAL_LATENT // 8)
+                source = (
+                    rank * payload.local_bytes
+                    + payload.latent_offset
+                    + (token * (LOCAL_LATENT // 8) + local_word) * 4
                 )
-            )
-            bo.buffer_store(value, rsrc(latent_fp4), work)
-            work = work + stride
+                value = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(front_gathered + fx.Int64(source)),
+                        0,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                bo.buffer_store(value, rsrc(latent_fp4), work)
+                work = work + stride
         total_scales = 0 if replicated_front else rows * (LATENT // 32)
         work = bid * THREADS + tid
-        while work < total_scales:
-            token = work // (LATENT // 32)
-            group = work % (LATENT // 32)
-            rank = group // (LOCAL_LATENT // 32)
-            local_group = group % (LOCAL_LATENT // 32)
-            source = (
-                rank * payload.local_bytes
-                + payload.latent_scale_offset
-                + token * (LOCAL_LATENT // 32)
-                + local_group
-            )
-            code = fx.Int32(
-                bo.buffer_load(
-                    rsrc(front_gathered + fx.Int64(source)),
-                    0,
-                    vec_width=1,
-                    dtype=T.i8,
+        if const_expr(unpack):
+            while work < total_scales:
+                token = work // (LATENT // 32)
+                group = work % (LATENT // 32)
+                rank = group // (LOCAL_LATENT // 32)
+                local_group = group % (LOCAL_LATENT // 32)
+                source = (
+                    rank * payload.local_bytes
+                    + payload.latent_scale_offset
+                    + token * (LOCAL_LATENT // 32)
+                    + local_group
                 )
-            ) & fx.Int32(0xFF)
-            if const_expr(include_routed):
-                bo.buffer_store(code, rsrc(latent_scales), work)
-            else:
-                bo.buffer_store(fx.Int8(code), rsrc(latent_scales), work)
-            work = work + stride
+                code = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(front_gathered + fx.Int64(source)),
+                        0,
+                        vec_width=1,
+                        dtype=T.i8,
+                    )
+                ) & fx.Int32(0xFF)
+                if const_expr(include_routed):
+                    bo.buffer_store(code, rsrc(latent_scales), work)
+                else:
+                    bo.buffer_store(fx.Int8(code), rsrc(latent_scales), work)
+                work = work + stride
         # The unpacked latent is first read by gate/up, so the unpack shares
         # the routing phase instead of paying for its own grid barrier.
 
@@ -487,11 +509,24 @@ def build_packed_finish(
             }
             # One CTA owns one token.  The old candidate serialized all rows
             # through CTA 0 even though routing has no cross-token reduction.
-            moe_gfx1250.stage_route(
-                context,
-                route_token,
-                payload.local_bytes // 4,
-            )
+            if const_expr(rolled):
+                moe_gfx1250.stage_route_cta(
+                    {
+                        **context,
+                        "threads": THREADS,
+                        "route_lds": {
+                            name: getattr(route_role, name).ptr for name in route_lds_words
+                        },
+                    },
+                    route_token,
+                    payload.local_bytes // 4,
+                )
+            else:
+                moe_gfx1250.stage_route(
+                    context,
+                    route_token,
+                    payload.local_bytes // 4,
+                )
         if const_expr(precompute_herd):
             # The CTA before the routing ones has no shared-down task: it polls
             # every token's tagged candidates and finishes HERD while the other
@@ -676,6 +711,7 @@ def build_packed_finish(
                     operands,
                     WAVES,
                     shared_down.rows.ptr,
+                    rolled,
                 )
 
         # Shared-down and routed gate/up are independent and share a static

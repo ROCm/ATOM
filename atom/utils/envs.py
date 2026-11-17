@@ -652,6 +652,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_ROLLED_MOE": lambda: (
         os.getenv("ATOM_KIMI_MONO_ROLLED_MOE", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: the lite finish routes a token by its whole CTA in
+    # runtime loops (the same routes), reduces its shared down in one loop and
+    # drops the gathered latent's dead unpack loops after a replicated front,
+    # so a cold launch fetches far less code; 0, the default, keeps the
+    # unrolled one-wave routing.
+    "ATOM_KIMI_MONO_ROLLED_LITE": lambda: (
+        os.getenv("ATOM_KIMI_MONO_ROLLED_LITE", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the

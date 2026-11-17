@@ -91,3 +91,19 @@ def test_precomputed_herd_scratch_holds_every_output_apart(rows):
     assert spans[-1][1] <= candidate.scratch_bytes
     with pytest.raises(ValueError, match="HERD grouped-MoE finish"):
         build_packed_finish(_plan(rows), precompute_herd=True)
+
+
+@pytest.mark.parametrize("herd", (False, True))
+@pytest.mark.parametrize("rolled", (False, True))
+def test_a_rolled_finish_is_a_build_of_its_own(herd, rolled):
+    candidate = build_packed_finish(
+        _plan(40),
+        include_routed=False,
+        replicated_front=True,
+        herd=herd,
+        fp8_shared_down=True,
+        precompute_herd=herd,
+        rolled=rolled,
+    )
+    assert ("_b256_rl_" in candidate.name) == rolled
+    assert candidate.name.endswith("_rf_herd_f8_hp" if herd else "_rf_f8")
