@@ -281,6 +281,10 @@ class MoRIIOConnector(KVConnectorBase):
         self._kv_ready_batches: deque[tuple[float, Any, list[int]]] = deque()
         self._kv_ready_expired: dict[int, None] = {}
         self._kv_ready_lock = threading.Lock()
+        # ATOM_MORIIO_DIAG_POST_READY: per transfer, when this rank ran a
+        # forward over it after its KV-ready event (monotonic), oldest first.
+        self._diag_post_ready = envs.ATOM_MORIIO_DIAG_POST_READY
+        self._post_ready_forwards: dict[int, list[float]] = {}
         # Consumer: this step's write requests and an event after every forward
         # already queued. One of those may still be writing a block the
         # scheduler has just freed and handed to one of these requests, so the
@@ -879,6 +883,94 @@ class MoRIIOConnector(KVConnectorBase):
             while len(expired) > self._KV_READY_EXPIRED_MAX:
                 del expired[next(iter(expired))]
 
+    def note_forward(self, batch: Any, block_size: int, num_spec_tokens: int) -> None:
+        """ATOM_MORIIO_DIAG_POST_READY: log each request this forward runs
+        after its final prefill forward recorded the KV-ready event.
+
+        Called before the forward, from the CPU-side batch only. The written
+        positions are the target's window and the draft's `k - 1` lookahead
+        past it (`draft_kv_lookahead`); a deferred decode row's window may sit
+        `num_rejected` earlier.
+        """
+        if not (
+            self._diag_post_ready and self.is_producer and self.transfer_mode == "write"
+        ):
+            return
+        req_ids = getattr(batch, "req_ids", None) or []
+        with self._kv_ready_lock:
+            rows = [
+                (row, int(req_id))
+                for row, req_id in enumerate(req_ids)
+                if int(req_id) in self._kv_ready_events
+                or int(req_id) in self._kv_ready_expired
+            ]
+        if not rows:
+            return
+        now = time.monotonic()
+        tables = batch.block_tables
+        if len(tables) != len(req_ids):
+            tables = None
+        for row, transfer_id in rows:
+            scheduled = int(batch.num_scheduled_tokens[row])
+            end = int(batch.context_lens[row])
+            first = end - scheduled
+            last = end + max(num_spec_tokens - 2, 0)
+            table = tables[row] if tables is not None else []
+            indices = range(max(first, 0) // block_size, last // block_size + 1)
+            touched = sorted({table[i] for i in indices if i < len(table)})
+            push = self._push_request(transfer_id)
+            src = (push or {}).get("src_block_ids") or []
+            overlap = sorted(set(touched) & {int(b) for b in src})
+            forwards = self._post_ready_forwards.setdefault(transfer_id, [])
+            forwards.append(now)
+            logger.warning(
+                "[moriio-diag] transfer %d: forward after its KV-ready event "
+                "(rows %d, prefill rows %d, dummy %s; this row: %d tokens at "
+                "positions %d..%d, draft through %d, num_rejected %d, %d blocks "
+                "in its table, writes blocks %s; push %s, its %d source blocks "
+                "%s)",
+                transfer_id,
+                len(req_ids),
+                int(getattr(batch, "total_seqs_num_prefill", 0)),
+                bool(getattr(batch, "is_dummy_run", False)),
+                scheduled,
+                first,
+                end - 1,
+                last,
+                int(batch.num_rejected[row]),
+                len(table),
+                touched,
+                self._push_state(transfer_id, now),
+                len(src),
+                f"include {overlap}" if overlap else "are not among them",
+            )
+        while len(self._post_ready_forwards) > self._KV_READY_EXPIRED_MAX:
+            del self._post_ready_forwards[next(iter(self._post_ready_forwards))]
+
+    def _push_request(self, transfer_id: int) -> dict[str, Any] | None:
+        """The WRITE_REQ of a push queued or in flight, if any."""
+        sending = self._sending_writes.get(transfer_id)
+        if sending is not None:
+            return sending[1]
+        for request, _ in list(self._pending_writes):
+            if int(request["transfer_id"]) == transfer_id:
+                return request
+        return None
+
+    def _push_state(self, transfer_id: int, now: float) -> str:
+        """How far a transfer's push is, for the diagnostic log."""
+        sending = self._sending_writes.get(transfer_id)
+        if sending is not None:
+            stats = sending[1].get("_page_stats")
+            started = stats[0] if stats else now
+            return f"in flight for {(now - started) * 1e3:.2f} ms"
+        if transfer_id not in self._write_ids:
+            return "not asked for yet"
+        finished = self._write_ids[transfer_id]
+        if finished is None:
+            return "queued or starting"
+        return f"finished {(now - finished) * 1e3:.2f} ms ago"
+
     def _source_ready(self, transfer_id: int) -> bool:
         """Whether the prefill that wrote this transfer's source has finished.
 
@@ -1313,12 +1405,28 @@ class MoRIIOConnector(KVConnectorBase):
         if after[0] != before[0]:
             logger.error(
                 "[moriio-verify] transfer %s: the %d source blocks changed during "
-                "the push (all but the last block %s; %s)",
+                "the push (all but the last block %s; %s)%s",
                 request["transfer_id"],
                 len(src),
                 "unchanged" if after[1] == before[1] else "changed too",
                 self._changed_regions(before[2], after[2]),
+                self._post_ready_summary(request),
             )
+
+    def _post_ready_summary(self, request: dict[str, Any]) -> str:
+        """ATOM_MORIIO_DIAG_POST_READY: the forwards this rank ran over the
+        transfer after its KV-ready event, timed from the push's start."""
+        if not self._diag_post_ready:
+            return ""
+        forwards = self._post_ready_forwards.get(int(request["transfer_id"]), [])
+        stats = request.get("_page_stats")
+        if not forwards or not stats:
+            return "; no forward ran it after its KV-ready event on this rank"
+        offsets = ", ".join(f"{(t - stats[0]) * 1e3:+.2f}" for t in forwards[:8])
+        return (
+            f"; {len(forwards)} forward(s) ran it after its KV-ready event on "
+            f"this rank, at {offsets} ms from the push start"
+        )
 
     def _verify_page_landed(self, req_id: ReqId) -> None:
         """Compare the destination blocks with the producer's source digest."""

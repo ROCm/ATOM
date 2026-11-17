@@ -625,6 +625,8 @@ class WritePathTest(unittest.TestCase):
         conn._kv_ready_batches = collections.deque()
         conn._kv_ready_expired = {}
         conn._kv_ready_lock = threading.Lock()
+        conn._diag_post_ready = False
+        conn._post_ready_forwards = {}
         conn._gated_writes = collections.deque()
         conn._state_tensors = {}
         conn._num_state_slots = 0
@@ -935,6 +937,67 @@ class WritePathTest(unittest.TestCase):
         self.assertIs(conn._kv_ready_events[2], conn._kv_ready_events[3])
         self.assertNotIn(2, conn._kv_ready_expired)
         self.assertFalse(conn._source_ready(2))
+
+    def post_ready_batch(self):
+        import types
+
+        # Transfer 9 decodes 4 tokens ending at position 6 with k = 3, so the
+        # draft writes through position 8: block indices 1..4 of a 3-block
+        # table. Transfer 3 has recorded no KV-ready event.
+        return types.SimpleNamespace(
+            req_ids=[3, 9],
+            num_scheduled_tokens=[5, 4],
+            context_lens=[5, 7],
+            num_rejected=[0, 1],
+            block_tables=[[1, 2, 3], [4, 5, 6]],
+            total_seqs_num_prefill=1,
+            is_dummy_run=False,
+        )
+
+    def test_the_diagnostic_logs_a_forward_after_the_kv_ready_event(self):
+        conn = self.make(producer=True)
+        conn._diag_post_ready = True
+        started = time.monotonic()
+        conn._write_ids = {9: None}
+        conn._sending_writes = {
+            9: (
+                [],
+                {
+                    "transfer_id": 9,
+                    "src_block_ids": [4, 5],
+                    "_page_stats": (started, 16, 2, 2),
+                },
+            )
+        }
+        with self.assertLogs("atom", "WARNING") as logs:
+            conn.note_forward(self.post_ready_batch(), 2, 3)
+        self.assertEqual(len(logs.output), 1)
+        line = logs.output[0]
+        self.assertIn("transfer 9: forward after its KV-ready event", line)
+        self.assertIn("positions 3..6, draft through 8, num_rejected 1", line)
+        self.assertIn("writes blocks [5, 6]", line)
+        self.assertIn("push in flight for", line)
+        self.assertIn("its 2 source blocks include [5]", line)
+        self.assertEqual(list(conn._post_ready_forwards), [9])
+
+    def test_the_diagnostic_is_silent_when_off(self):
+        conn = self.make(producer=True)
+        with self.assertNoLogs("atom", "WARNING"):
+            conn.note_forward(self.post_ready_batch(), 2, 3)
+        self.assertEqual(conn._post_ready_forwards, {})
+
+    def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
+        conn = self.make(producer=True)
+        started = time.monotonic()
+        request = {"transfer_id": 9, "_page_stats": (started, 16, 2, 2)}
+        self.assertEqual(conn._post_ready_summary(request), "")
+        conn._diag_post_ready = True
+        self.assertIn("no forward ran it", conn._post_ready_summary(request))
+        conn._post_ready_forwards[9] = [started + 0.002]
+        self.assertIn(
+            "1 forward(s) ran it after its KV-ready event on this rank, at +2.00 ms",
+            conn._post_ready_summary(request),
+        )
 
     def test_the_consumer_asks_for_a_push_once_earlier_forwards_finished(self):
         conn = self.make(producer=False)
