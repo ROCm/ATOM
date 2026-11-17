@@ -72,8 +72,8 @@ def _dcp_stage_indexer_fp4_prefill(
         page = prefill_metadata.dcp_indexer_fp4_stage_page
         row = prefill_metadata.dcp_indexer_fp4_stage_row
         pages = prefill_metadata.dcp_indexer_fp4_stage_pages
-        staged = kv_cache.new_zeros(pages, 4, 64, 16)
-        staged_scale = kv_cache_scale.new_zeros(pages, 2, 32, 4)
+        staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
+        staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
         staged[page, :, row, :] = data
         scale_at = fp4_scale_byte(row[:, None], g[None, :])
         staged_scale.view(-1, 256)[page[:, None], scale_at] = scale

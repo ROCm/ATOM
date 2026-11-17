@@ -17,7 +17,12 @@ from atom.model_ops.indexer.layout import (
     fp4_cache_byte,
     fp4_scale_byte,
 )
-from atom.mono.dsa_indexer.build import IxBuild, dual_score_resources_fit, unfit
+from atom.mono.dsa_indexer.build import (
+    IxBuild,
+    dual_score_resources_fit,
+    local_step_symbol,
+    unfit,
+)
 from atom.mono.dsa_indexer.fp4_plan import e2m1_magnitude
 from atom.mono.dsa_indexer.plan import (
     REPLICA_INTERLEAVE,
@@ -36,7 +41,7 @@ from atom.mono.dsa_indexer.selection_plan import (
     short_flag_count,
     split_request_keys,
 )
-from atom.mono.plan.build_key import symbol_params
+from atom.mono.plan.build_key import kernel_symbol, symbol_params
 from atom.mono.plan.execution import BLOCKS
 
 CTXS = [0, 1, 7, 127, 128, 129, 1023, 1024, 1025, 2049, 5000, 33333, 131073]
@@ -253,6 +258,29 @@ def test_dual_grid_rejects_unsupported_launches(q_lora):
         {"shape": _shape(q_lora, "fp4")},
     ):
         assert unfit(replace(key, **changes))
+
+
+@pytest.mark.parametrize("changed", ["rows", "qlen", "world", "debug", 0, 1, 2, 3])
+def test_local_step_codegen_settings_have_distinct_kernel_symbols(changed):
+    args = {"rows": 48, "qlen": 6, "world": 8, "compact": (512, 1024, 49664, 53760)}
+    baseline = local_step_symbol(**args)
+    stem = "mono_local_step_s48_q6_w8_debug0_prefix512_flag_stride1024_suffix49664_total53760"
+    assert baseline == f"_ZN4atom{len(stem)}{stem}E"
+    if isinstance(changed, int):
+        compact = list(args["compact"])
+        compact[changed] += 16
+        args["compact"] = tuple(compact)
+    else:
+        args[changed] = {"rows": 54, "qlen": 8, "world": 4, "debug": True}[changed]
+    assert baseline != local_step_symbol(**args)
+
+
+def test_kernel_symbols_keep_boolean_and_negative_parameter_rendering():
+    stem = "index_s1_debug1_rank_1"
+    assert (
+        kernel_symbol("index", s=1, debug=True, rank=-1)
+        == f"_ZN4atom{len(stem)}{stem}E"
+    )
 
 
 def test_score_grid_builds_have_distinct_symbol_parameters():

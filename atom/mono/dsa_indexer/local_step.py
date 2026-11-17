@@ -17,11 +17,11 @@ from atom.mono.device.ops import (
     CM_DEV,
     CM_SYS,
     ballot,
-    kernel_symbol,
     launcher,
     load_ptr64,
     rsrc,
 )
+from atom.mono.dsa_indexer.build import local_step_symbol
 from atom.mono.dsa_indexer.kernel import scratch_layout
 from atom.mono.dsa_indexer.selection_plan import SHORT_VERIFY_CTX, short_flag_count
 from atom.mono.plan.build_key import source_digest
@@ -43,17 +43,7 @@ _STREAM = fx.Stream(None)
 def build(rows, qlen, world, compact, debug=False):
     assert rows <= (256 if qlen == 6 else 64) and rows % qlen == 0 and qlen in (6, 8)
     prefix, flag_stride, suffix, total = compact
-    name = kernel_symbol(
-        "mono_local_step",
-        s=rows,
-        q=qlen,
-        w=world,
-        debug=int(debug),
-        prefix=prefix,
-        flag_stride=flag_stride,
-        suffix=suffix,
-        total=total,
-    )
+    name = local_step_symbol(rows, qlen, world, compact, debug)
     keyed = (name, source_digest("mono"))
 
     @flyc.kernel(

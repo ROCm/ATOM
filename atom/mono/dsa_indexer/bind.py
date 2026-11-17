@@ -28,6 +28,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_rank
 from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.model_ops.indexer.layout import MFMA
+from atom.model_ops.sparse_indexer_fp4 import fp4_index_block_shapes
 from atom.model_ops.utils import shuffle_weights
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.plan import (
@@ -195,16 +197,19 @@ def _cache_refusal(m, shape: IndexerShape) -> str:
     cache = m.k_cache.kv_cache[0]
     if shape.kv_dtype == "fp4":
         scales = m.k_cache.kv_cache_scale
+        data_shape, scale_shape = fp4_index_block_shapes(
+            shape.block_rows, shape.head_dim, layout=MFMA
+        )
         if (
             cache.dtype != torch.uint8
             or cache.ndim != 4
-            or tuple(cache.shape[1:]) != (4, 64, 16)
+            or tuple(cache.shape[1:]) != data_shape
             or scales is None
             or scales.dtype != torch.uint8
-            or tuple(scales.shape) != (cache.shape[0], 2, 32, 4)
+            or tuple(scales.shape) != (cache.shape[0], *scale_shape)
             or not scales.is_contiguous()
         ):
-            return "FP4 cache must be OPUS [groups,4,64,16] / [groups,2,32,4] uint8"
+            return f"FP4 cache must be OPUS {data_shape} / {scale_shape} uint8"
     if cache.numel() % shape.block_bytes or not cache.is_contiguous():
         return f"index cache {tuple(cache.shape)}"
     return ""

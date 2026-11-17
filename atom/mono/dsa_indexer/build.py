@@ -12,12 +12,29 @@ from atom.mono.dsa_indexer.plan import (
     local_len,
     unsupported,
 )
+from atom.mono.plan.build_key import kernel_symbol
 from atom.mono.plan.execution import BLOCKS
 
 MAX_LEGACY_TOKENS = 64
 MAX_TOKENS = BLOCKS
 MAX_VERIFY_TOKENS = BLOCKS
 TL_PASS0 = 7
+
+
+def local_step_symbol(rows, qlen, world, compact, debug=False):
+    """Name every local-reset codegen setting on CPU and in the launcher."""
+    prefix, flag_stride, suffix, total = compact
+    return kernel_symbol(
+        "mono_local_step",
+        s=rows,
+        q=qlen,
+        w=world,
+        debug=int(debug),
+        prefix=prefix,
+        flag_stride=flag_stride,
+        suffix=suffix,
+        total=total,
+    )
 
 
 @dataclass(frozen=True)
