@@ -120,8 +120,9 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | The PAGE-backed native-state layout and `stores_state_images`, scheduler leases, and the worker's restore into an Active SLOT. Its registration and block-id validation are `mp/worker.py`'s (shared with the plugin), and `require_native_state_server` is `mp/deployment.py`'s. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, and V4.1 PAGE, DCP > 1, odd chunks). |
-| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE), and the codec for each. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included) and the startup refusals (layouts other than dense, M3 PAGE, V4.1 PAGE and Kimi-K3, DCP > 1, odd chunks). |
+| `mooncake_store/layouts.py` | Which layouts this connector moves (dense, M3 PAGE, V4.1 replay PAGE, Kimi-K3), and the codec for each. |
+| `mooncake_store/kimi_k3.py` | Kimi-K3's KDA state tier over the Store: the checkpoint image codec and the worker and scheduler the Store's classes resolve to for a K3 model. |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
@@ -390,8 +391,12 @@ regions in `KVTransferTensors.block_regions`, with no SLOT state and a tensor
 view for every region. M3's regions include the NSA index cache and the draft
 KV. The `m3-page-regions` codec namespace keeps these objects separate from
 dense KV objects and from V4.1's `v41-replay-page-v1` objects. V4.1 stores PAGE
-regions only; its request state is rebuilt by replay. Other stateful layouts
-and DCP greater than 1 remain unsupported.
+regions only; its request state is rebuilt by replay. Kimi-K3 stores its dense
+KV chunks and, beside them, the KDA state tier's checkpoint images
+(`mooncake_store/kimi_k3.py`): one object per PP stage and TP rank, packed
+into a registered HBM lane and put GPUDirect, all of a checkpoint's objects in
+one Mooncake group. Other stateful layouts and DCP greater than 1 remain
+unsupported.
 
 ### Data path
 
