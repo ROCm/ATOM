@@ -9,6 +9,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 """
 
 import functools
+import logging
 from typing import ClassVar
 
 import torch
@@ -18,6 +19,10 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+)
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.kda_atom import (
+    fused_sigmoid_gating_delta_rule_update as aiter_kda_gating_update,
 )
 from einops import rearrange
 from torch import nn
@@ -33,7 +38,7 @@ from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
-    fused_sigmoid_gating_delta_rule_update as _atom_kda_gating_update,
+    fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
@@ -77,49 +82,85 @@ from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
 
-try:
-    # aiter's gfx1250 entry: same parameter names as the ATOM kernel above. It
-    # returns None, without a launch, for inputs its kernel does not cover.
-    from aiter.ops.triton.attention.kda_atom import (
-        fused_sigmoid_gating_delta_rule_update as _aiter_kda_gating_update,
-    )
-except ImportError:  # aiter without the gfx1250 KDA entry
-    _aiter_kda_gating_update = None
+logger = logging.getLogger("atom")
 
 
 @functools.cache
-def _current_gfx() -> str:
-    from aiter.jit.utils.chip_info import get_gfx
+def _use_aiter_kda_gating(lower_bound: float | None) -> bool:
+    """Whether decode and spec verify run the KDA gating update on aiter's
+    gfx1250 kernel instead of ATOM's Triton kernel.
 
-    return get_gfx()
-
-
-def _use_aiter_kda_gating(kwargs) -> bool:
-    """aiter's entry covers gfx1250 KDA with the lower-bound gate and bf16
-    activations over an fp32 state. Everything else stays on ATOM's kernel."""
-    if _aiter_kda_gating_update is None:
-        return False
-    if not kwargs.get("is_kda") or kwargs.get("lower_bound") is None:
-        return False
-    if _current_gfx() != "gfx1250":
-        return False
-    acts = (kwargs["q"], kwargs["k"], kwargs["v"], kwargs["a"], kwargs["b"])
-    state = kwargs.get("initial_state")
-    return (
-        all(t.dtype == torch.bfloat16 for t in acts)
-        and state is not None
-        and state.dtype == torch.float32
+    Decided from what is fixed before the first call: the arch, the gate and
+    the state pool's dtype (aiter's kernel reads and writes an fp32 state).
+    aiter checks the rest of its limits on every call. One cached decision and
+    one log line serve every KDA layer.
+    """
+    gfx = get_gfx()
+    state_dtype = envs.ATOM_GDN_SSM_DTYPE
+    on_aiter = gfx == "gfx1250" and lower_bound is not None and state_dtype == "fp32"
+    logger.info(
+        "KDA decode and spec verify gating on %s (arch %s, lower_bound %s, "
+        "ATOM_GDN_SSM_DTYPE=%s)",
+        "aiter's gfx1250 kernel" if on_aiter else "ATOM's Triton kernel",
+        gfx,
+        lower_bound,
+        state_dtype,
     )
+    return on_aiter
 
 
-def fused_sigmoid_gating_delta_rule_update(**kwargs):
-    """KDA gating update for decode and spec verify. Call sites pass keywords.
-    ATOM's kernel runs every call that aiter's entry declines."""
-    if _use_aiter_kda_gating(kwargs):
-        result = _aiter_kda_gating_update(**kwargs)
-        if result is not None:
-            return result
-    return _atom_kda_gating_update(**kwargs)
+def _kda_gating_update(
+    *,
+    on_aiter: bool,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    ssm_state_indices_in: torch.Tensor | None,
+    lower_bound: float | None,
+    num_accepted_tokens: torch.Tensor | None = None,
+) -> None:
+    """KDA gating update for decode and spec verify. Writes ``o`` and updates
+    ``initial_state`` in place at ``ssm_state_indices``.
+
+    ``on_aiter`` is the layer's ``_use_aiter_kda_gating``. aiter returns None,
+    without a launch, for inputs its kernel does not take, and a routed call
+    that it declines raises.
+    """
+    kernel = (
+        aiter_kda_gating_update if on_aiter else fused_sigmoid_gating_delta_rule_update
+    )
+    result = kernel(
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        initial_state=initial_state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        ssm_state_indices_in=ssm_state_indices_in,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        lower_bound=lower_bound,
+    )
+    if on_aiter and result is None:
+        raise RuntimeError(
+            "aiter's gfx1250 KDA gating kernel declined a call routed to it; "
+            "aiter's try_kda_gating lists the inputs it takes"
+        )
 
 
 def _text_config(config):
@@ -1153,6 +1194,7 @@ class KimiKDAAttention(nn.Module):
         self._kda_gate_lower_bound = (
             getattr(config, "linear_attn_config", {}) or {}
         ).get("gate_lower_bound", None)
+        self._kda_gating_on_aiter = _use_aiter_kda_gating(self._kda_gate_lower_bound)
         loader = _sharded_vector_loader(self.tp_rank, self.tp_size)
         self.A_log.weight_loader = loader
         self.dt_bias.weight_loader = loader
@@ -1525,7 +1567,8 @@ class KimiKDAAttention(nn.Module):
                     fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
-                fused_sigmoid_gating_delta_rule_update(
+                _kda_gating_update(
+                    on_aiter=self._kda_gating_on_aiter,
                     A_log=self.A_log,
                     a=gate,
                     b=beta,
@@ -1535,12 +1578,9 @@ class KimiKDAAttention(nn.Module):
                     v=v,
                     o=out,
                     initial_state=ssm_state,
-                    inplace_final_state=True,
                     cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                     ssm_state_indices=decode_state_indices,
                     ssm_state_indices_in=decode_state_indices_in,
-                    use_qk_l2norm_in_kernel=True,
-                    is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
                 )
         elif kda_metadata.num_spec_decodes > 0:
@@ -1607,7 +1647,8 @@ class KimiKDAAttention(nn.Module):
                     fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
-                fused_sigmoid_gating_delta_rule_update(
+                _kda_gating_update(
+                    on_aiter=self._kda_gating_on_aiter,
                     A_log=self.A_log,
                     a=gate,
                     b=beta,
@@ -1617,7 +1658,6 @@ class KimiKDAAttention(nn.Module):
                     v=v,
                     o=out,
                     initial_state=ssm_state,
-                    inplace_final_state=True,
                     cu_seqlens=spec_query_start_loc[
                         : kda_metadata.num_spec_decodes + 1
                     ],
@@ -1627,8 +1667,6 @@ class KimiKDAAttention(nn.Module):
                     ssm_state_indices=spec_state_indices,
                     ssm_state_indices_in=spec_state_indices_in,
                     num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                    is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
                 )
         else:

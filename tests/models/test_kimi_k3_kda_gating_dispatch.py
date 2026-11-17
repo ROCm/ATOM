@@ -1,94 +1,135 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Which KDA gating kernel the Kimi-K3 decode and spec calls reach.
+"""Which kernel runs the KDA gating update of Kimi-K3 decode and spec verify.
 
-aiter's gfx1250 entry replaces ATOM's kernel only where it is verified: the
-lower-bound KDA gate, bf16 activations over an fp32 state, on gfx1250. Every
-other call, and every call that the entry declines by returning None, must
-still reach ATOM's own kernel, so these tests pin the routing with the two
-kernels replaced by recorders.
+`_use_aiter_kda_gating` decides once: aiter's gfx1250 kernel for the
+lower-bounded gate over an fp32 state pool on gfx1250, ATOM's Triton kernel
+otherwise. A routed call that aiter declines raises instead of running ATOM's
+kernel. The kernels are recorders here, and AITER, Triton and einops are
+stood in for where they are not installed, so these tests run on the CPU job.
 """
+
+import importlib.util
+import sys
+import types
+from contextlib import contextmanager
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from aiter_stub import atom_without_aiter
 
-model = pytest.importorskip("atom.models.kimi_k3.model")
+
+@contextmanager
+def _einops_where_missing():
+    """model.py imports einops at the top, and the CPU job does not install it."""
+    if "einops" in sys.modules or importlib.util.find_spec("einops") is not None:
+        yield
+        return
+    stand_in = types.ModuleType("einops")
+    stand_in.rearrange = MagicMock(name="einops.rearrange")
+    sys.modules["einops"] = stand_in
+    try:
+        yield
+    finally:
+        sys.modules.pop("einops", None)
 
 
-def _kwargs(**overrides):
-    base = {
-        "A_log": None,
-        "a": torch.empty(1, 2, 12, 128, dtype=torch.bfloat16),
-        "b": torch.empty(1, 2, 12, dtype=torch.bfloat16),
-        "dt_bias": None,
-        "q": torch.empty(1, 2, 12, 128, dtype=torch.bfloat16),
-        "k": torch.empty(1, 2, 12, 128, dtype=torch.bfloat16),
-        "v": torch.empty(1, 2, 12, 128, dtype=torch.bfloat16),
-        "o": None,
-        "initial_state": torch.empty(4, 12, 128, 128, dtype=torch.float32),
-        "is_kda": True,
-        "lower_bound": -5.0,
-        "use_qk_l2norm_in_kernel": True,
-    }
-    base.update(overrides)
-    return base
+@pytest.fixture(scope="module")
+def model():
+    with atom_without_aiter() as load, _einops_where_missing():
+        yield load("atom.models.kimi_k3.model")
 
 
 @pytest.fixture
-def recorders(monkeypatch):
-    calls = {"aiter": 0, "atom": 0}
+def decide(model, monkeypatch):
+    """`_use_aiter_kda_gating` for an arch and state pool dtype, decided afresh."""
+    monkeypatch.setattr(model, "logger", Mock())
 
-    def aiter_kernel(**kwargs):
-        calls["aiter"] += 1
-        return "aiter"
+    def decide(lower_bound=-5.0, gfx="gfx1250", ssm_dtype="fp32"):
+        monkeypatch.setattr(model, "get_gfx", lambda: gfx)
+        monkeypatch.setenv("ATOM_GDN_SSM_DTYPE", ssm_dtype)
+        model._use_aiter_kda_gating.cache_clear()
+        return model._use_aiter_kda_gating(lower_bound)
 
-    def atom_kernel(**kwargs):
-        calls["atom"] += 1
-        return "atom"
-
-    monkeypatch.setattr(model, "_aiter_kda_gating_update", aiter_kernel)
-    monkeypatch.setattr(model, "_atom_kda_gating_update", atom_kernel)
-    monkeypatch.setattr(model, "_current_gfx", lambda: "gfx1250")
-    return calls
+    yield decide
+    model._use_aiter_kda_gating.cache_clear()
 
 
-def test_gfx1250_kda_lower_bound_routes_to_aiter(recorders):
-    assert model.fused_sigmoid_gating_delta_rule_update(**_kwargs()) == "aiter"
-    assert recorders == {"aiter": 1, "atom": 0}
-
-
-def test_inputs_declined_by_aiter_run_atom_kernel(recorders, monkeypatch):
-    def declining_kernel(**kwargs):
-        recorders["aiter"] += 1
-
-    monkeypatch.setattr(model, "_aiter_kda_gating_update", declining_kernel)
-    assert model.fused_sigmoid_gating_delta_rule_update(**_kwargs()) == "atom"
-    assert recorders == {"aiter": 1, "atom": 1}
-
-
-def test_other_arch_stays_on_atom_kernel(recorders, monkeypatch):
-    monkeypatch.setattr(model, "_current_gfx", lambda: "gfx950")
-    model.fused_sigmoid_gating_delta_rule_update(**_kwargs())
-    assert recorders == {"aiter": 0, "atom": 1}
+def test_gfx1250_lower_bound_fp32_state_routes_to_aiter(decide):
+    assert decide() is True
 
 
 @pytest.mark.parametrize(
-    "overrides",
-    [
-        {"lower_bound": None},
-        {"is_kda": False},
-        {"a": torch.empty(1, 2, 12, 128, dtype=torch.float32)},
-        {"q": torch.empty(1, 2, 12, 128, dtype=torch.float16)},
-        {"initial_state": torch.empty(4, 12, 128, 128, dtype=torch.bfloat16)},
-        {"initial_state": None},
-    ],
+    "case",
+    [{"gfx": "gfx950"}, {"lower_bound": None}, {"ssm_dtype": "fp16"}],
+    ids=["gfx950", "no-lower-bound", "fp16-state"],
 )
-def test_unverified_inputs_stay_on_atom_kernel(recorders, overrides):
-    model.fused_sigmoid_gating_delta_rule_update(**_kwargs(**overrides))
-    assert recorders == {"aiter": 0, "atom": 1}
+def test_other_deployments_stay_on_atom_kernel(decide, case):
+    assert decide(**case) is False
 
 
-def test_missing_aiter_entry_stays_on_atom_kernel(recorders, monkeypatch):
-    monkeypatch.setattr(model, "_aiter_kda_gating_update", None)
-    model.fused_sigmoid_gating_delta_rule_update(**_kwargs())
-    assert recorders == {"aiter": 0, "atom": 1}
+def test_route_is_decided_and_logged_once(model, decide, monkeypatch):
+    assert decide() is True
+    monkeypatch.setattr(model, "get_gfx", lambda: "gfx950")
+    assert all(model._use_aiter_kda_gating(-5.0) for _ in range(3))
+    model.logger.info.assert_called_once()
+
+
+def _spec_verify_args():
+    def act(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16)
+
+    return {
+        "A_log": torch.empty(12),
+        "a": act(1, 6, 12, 128),
+        "b": act(1, 6, 12),
+        "dt_bias": torch.empty(12 * 128),
+        "q": act(1, 6, 12, 128),
+        "k": act(1, 6, 12, 128),
+        "v": act(1, 6, 12, 128),
+        "o": act(6, 12, 128),
+        "initial_state": torch.empty(6, 12, 128, 128),
+        "cu_seqlens": torch.tensor([0, 3, 6], dtype=torch.int32),
+        "ssm_state_indices": torch.arange(6, dtype=torch.int32).view(2, 3),
+        "ssm_state_indices_in": None,
+        "num_accepted_tokens": torch.tensor([1, 2], dtype=torch.int32),
+        "lower_bound": -5.0,
+    }
+
+
+@pytest.fixture
+def kernels(model, monkeypatch):
+    """Both kernels replaced by recorders of the keywords they receive."""
+    calls = {}
+
+    def recorder(name):
+        def kernel(**kwargs):
+            calls[name] = kwargs
+            return kwargs["o"], kwargs["initial_state"]
+
+        return kernel
+
+    monkeypatch.setattr(model, "aiter_kda_gating_update", recorder("aiter"))
+    monkeypatch.setattr(
+        model, "fused_sigmoid_gating_delta_rule_update", recorder("atom")
+    )
+    return calls
+
+
+@pytest.mark.parametrize("on_aiter, chosen", [(True, "aiter"), (False, "atom")])
+def test_call_reaches_only_the_chosen_kernel(model, kernels, on_aiter, chosen):
+    args = _spec_verify_args()
+    model._kda_gating_update(on_aiter=on_aiter, **args)
+    assert list(kernels) == [chosen]
+    sent = kernels[chosen]
+    assert all(sent[name] is value for name, value in args.items())
+    assert sent["is_kda"] and sent["inplace_final_state"]
+    assert sent["use_qk_l2norm_in_kernel"]
+
+
+def test_routed_call_that_aiter_declines_raises(model, kernels, monkeypatch):
+    monkeypatch.setattr(model, "aiter_kda_gating_update", lambda **kwargs: None)
+    with pytest.raises(RuntimeError, match="declined a call routed to it"):
+        model._kda_gating_update(on_aiter=True, **_spec_verify_args())
+    assert kernels == {}
