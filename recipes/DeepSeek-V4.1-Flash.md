@@ -236,6 +236,11 @@ DSpark proposer of a served step
   fp4`; the step's long-context scoring reads half the bytes), up to 8 requests (6 verify rows each), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
   (`V4.1 single-launch step off: <why>`).
+- **Draft temperature.** `ATOM_DSPARK_PROB_DRAFT_TSCALE` scales the
+  probabilistic drafter's temperature (`T_d = T * scale`, default 1). The
+  verify uses the same draft distribution, so any value keeps the output
+  distribution. On E13 c1 (3 interleaved pairs), `0.85` raised tokens per
+  forward 3.99 -> 4.06 and TPS ~5% with TPOT unchanged; set it for c1.
 - **Memory.** The kernel reads the routed experts in place, as the
   production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
   scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
