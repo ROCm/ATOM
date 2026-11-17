@@ -125,9 +125,8 @@ def indexer_qk_rope_quant_and_cache(
 
     The two scale buffers together switch the op to packed E2M1 + e8m0 outputs.
     Supplying only one is refused before it can write FP8 into FP4 buffers.
-    OPUS requires AITER's HIP extension (PR 7798), accepts NoPE and publishes
-    all Q rows. Explicit FP4 layout calls forward scale_layout and rope_dim;
-    forwarding them on default FP8/FlyDSL calls awaits that extension's merge.
+    OPUS accepts NoPE and publishes all Q rows. The writer receives the
+    explicit layout and RoPE width on every call, including FP8/FlyDSL defaults.
     """
     if (q_scale_out is None) != (kv_cache_scale is None):
         raise ValueError(
@@ -139,10 +138,8 @@ def indexer_qk_rope_quant_and_cache(
         if q_scale_out is not None
         else {}
     )
-    if scale_layout != "flydsl" or rope_dim != 64:
-        if q_scale_out is None:
-            raise ValueError("An explicit FP4 layout requires both scale buffers")
-        fp4_out.update(scale_layout=scale_layout, rope_dim=rope_dim)
+    if scale_layout != "flydsl" and q_scale_out is None:
+        raise ValueError("An explicit FP4 layout requires both scale buffers")
     _indexer_qk_rope_quant_and_cache(
         q,
         q_out,
@@ -164,6 +161,8 @@ def indexer_qk_rope_quant_and_cache(
         is_neox=is_neox,
         # OPUS has always published every Q row, including negative K slots.
         compute_all_q_rope=scale_layout == "opus" or get_dcp_world_size() > 1,
+        scale_layout=scale_layout,
+        rope_dim=rope_dim,
         **fp4_out,
     )
 

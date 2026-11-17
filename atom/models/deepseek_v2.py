@@ -1269,8 +1269,8 @@ class DeepseekV32IndexerCache(nn.Module):
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
-        # The OPUS custom op takes the scale plane before the KV pool is bound.
-        self.kv_cache_scale = torch.empty(0, dtype=torch.uint8)
+        # A scale plane is bound with the FP4 KV pool; FP8 and dummy runs have none.
+        self.kv_cache_scale: torch.Tensor | None = None
         self.head_dim = head_dim
         self.prefix = prefix
         self.cache_config = cache_config

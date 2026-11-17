@@ -93,6 +93,8 @@ def config(**extra):
     return SimpleNamespace(
         kv_cache_block_size=4,
         tensor_parallel_size=2,
+        decode_context_parallel_size=1,
+        dcp_config=SimpleNamespace(interleave_size=1),
         hf_config=SimpleNamespace(model_type="reusable_test_model", kv_lora_rank=512),
         speculative_config=None,
         kv_transfer_config={

@@ -134,12 +134,16 @@ def install_mono_decode(
         logger.info("Kimi-K3 mono decode off: mono kernels unavailable: %s", error)
         return model
     inner = getattr(getattr(model, "language_model", model), "model", None)
-    if inner is not None:
-        indexers = indexer_modules(inner)
-        why = routing_refusal(atom_config, indexers)
-        if why:
-            logger.info("Kimi-K3 mono indexer off: %s", why)
-        else:
-            prepare_weights(indexers)
-    logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
+    if inner is None:
+        logger.info("Kimi-K3 mono decode off: model has no layer stack")
+        return model
+    indexers = indexer_modules(inner)
+    why = routing_refusal(atom_config, indexers)
+    if why:
+        logger.info("Kimi-K3 mono indexer off: %s", why)
+    else:
+        prepare_weights(indexers)
+    logger.info(
+        "Kimi-K3 mono decode wrapper installed (TP%d)", atom_config.tensor_parallel_size
+    )
     return MonoDecodeModel(model, drafter, metadata_builder)

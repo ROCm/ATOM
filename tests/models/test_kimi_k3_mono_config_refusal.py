@@ -241,3 +241,31 @@ def test_both_k3_drafts_are_served(servable, arch):
         draft_model_hf_config=SimpleNamespace(architectures=[arch]),
     )
     assert config_refusal(atom_config) is None
+
+
+def test_installer_keeps_a_model_without_a_layer_stack_on_native(monkeypatch, caplog):
+    import logging
+    import sys
+
+    from torch import nn
+
+    from atom.models.kimi_k3.mono import dispatch
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a model without a layer stack must not prepare or route indexers")
+
+    monkeypatch.setattr(dispatch, "config_refusal", lambda config: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.mono.dsa_indexer.bind",
+        SimpleNamespace(
+            indexer_modules=unexpected,
+            prepare_weights=unexpected,
+            routing_refusal=unexpected,
+        ),
+    )
+    model = nn.Module()
+    with caplog.at_level(logging.INFO, logger="atom"):
+        assert dispatch.install_mono_decode(model, _atom_config(), None) is model
+    assert "model has no layer stack" in caplog.text
+    assert "armed" not in caplog.text

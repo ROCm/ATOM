@@ -164,7 +164,7 @@ def test_opus_key_and_scale_planes_match_physical_tensor_coordinates(block_rows)
 
     sh = _shape(cache="fp4", block_rows=block_rows, rope_dim=0)
     assert sh.block_bytes == block_rows * 64
-    assert sh.block_scale_bytes == block_rows * 4
+    assert sh.scale_block_bytes == block_rows * 4
 
 
 @pytest.mark.parametrize("block_rows", [64, 128])
@@ -177,7 +177,7 @@ def test_opus_page_addressing_does_not_wrap_at_four_gib(block_rows):
             assert address > 1 << 32
             assert address == fp4_cache_byte(page * block_rows + row, col)
         for group in range(4):
-            address = page * sh.block_scale_bytes + fp4_scale_byte(row, group)
+            address = page * sh.scale_block_bytes + fp4_scale_byte(row, group)
             assert address == fp4_scale_byte(page * block_rows + row, group)
 
 
@@ -321,4 +321,4 @@ def test_fp8_contract_unchanged():
         _shape(cache="fp4", rope_dim=0), kv_dtype="fp8", cache_layout=PRESHUFFLE
     )
     assert sh.row_bytes == 144 and sh.block_bytes == 9216
-    assert sh.block_scale_bytes == 0 and not unsupported(sh)
+    assert sh.scale_block_bytes == 0 and not unsupported(sh)

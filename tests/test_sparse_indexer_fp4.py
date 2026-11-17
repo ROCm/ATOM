@@ -81,9 +81,8 @@ def test_index_cache_scale_exists_before_pool_allocation():
     cache = model.DeepseekV32IndexerCache(
         head_dim=132, dtype=torch.uint8, prefix="indexer.k_cache", cache_config="fp8"
     )
-    # OPUS passes the scale plane to its custom op even in the dummy forward.
-    assert cache.kv_cache_scale.dtype == torch.uint8
-    assert cache.kv_cache_scale.numel() == 0
+    # Dummy forwards accept no scale plane; allocation binds the FP4 tensor.
+    assert cache.kv_cache_scale is None
     assert cache.kv_cache[0].numel() == 0
     allocated = torch.empty((2, 4, 64), dtype=torch.uint8)
     cache.kv_cache_scale = allocated
@@ -1251,10 +1250,18 @@ def test_dcp_prefill_preserves_opus_rows_and_all_four_exponents(monkeypatch):
     assert torch.equal(unpacked, natural_scale.reshape(-1, 4)[source])
 
 
-@pytest.mark.parametrize("layout,rope", [("flydsl", 64), ("opus", 0), ("opus", 64)])
+@pytest.mark.parametrize(
+    "layout,rope,fp4",
+    [
+        ("flydsl", 64, False),
+        ("flydsl", 64, True),
+        ("opus", 0, True),
+        ("opus", 64, True),
+    ],
+)
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
-    monkeypatch, layout, rope, dcp
+    monkeypatch, layout, rope, fp4, dcp
 ):
     attention_mla = _import_or_skip("atom.model_ops.attention_mla")
 
@@ -1266,7 +1273,7 @@ def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
         lambda *args, **kwargs: captured.append((args, kwargs)),
     )
     tensors = tuple(object() for _ in range(12))
-    q_scale, k_scale = object(), object()
+    q_scale, k_scale = (object(), object()) if fp4 else (None, None)
     attention_mla.indexer_qk_rope_quant_and_cache(
         *tensors,
         1e-6,
@@ -1281,10 +1288,10 @@ def test_hip_writer_adapter_preserves_outputs_and_dcp_semantics(
     assert len(captured) == 1
     args, kwargs = captured[0]
     assert all(actual is original for actual, original in zip(args[:12], tensors))
-    assert kwargs["q_scale_out"] is q_scale
-    assert kwargs["kv_cache_scale"] is k_scale
-    assert kwargs["compute_all_q_rope"] == (layout == "opus" or dcp > 1)
-    if layout == "opus":
-        assert kwargs["scale_layout"] == "opus" and kwargs["rope_dim"] == rope
+    if fp4:
+        assert kwargs["q_scale_out"] is q_scale
+        assert kwargs["kv_cache_scale"] is k_scale
     else:
-        assert "scale_layout" not in kwargs and "rope_dim" not in kwargs
+        assert "q_scale_out" not in kwargs and "kv_cache_scale" not in kwargs
+    assert kwargs["compute_all_q_rope"] == (layout == "opus" or dcp > 1)
+    assert kwargs["scale_layout"] == layout and kwargs["rope_dim"] == rope

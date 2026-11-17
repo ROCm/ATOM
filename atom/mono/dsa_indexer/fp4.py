@@ -39,7 +39,7 @@ def store_key(c, slot, y):
     lane, sh, a = c["lane"], c["shape"], c["args"]
     page, row = slot // sh.block_rows, slot % sh.block_rows
     data = rsrc(a["cache"] + fx.Int64(page) * fx.Int64(sh.block_bytes))
-    scales = rsrc(a["cache_scale"] + fx.Int64(page) * fx.Int64(sh.block_scale_bytes))
+    scales = rsrc(a["cache_scale"] + fx.Int64(page) * fx.Int64(sh.scale_block_bytes))
     for i in range_constexpr(2):
         amax = butterfly(abs(y[i]), (1, 2, 4, 8, 16), fx.max)
         code, inv = scale(amax)
@@ -97,7 +97,7 @@ def keys(c, block, key, chunk, page):
         )
     )
     scales = rsrc(
-        c["args"]["cache_scale"] + fx.Int64(page) * fx.Int64(sh.block_scale_bytes)
+        c["args"]["cache_scale"] + fx.Int64(page) * fx.Int64(sh.scale_block_bytes)
     )
     byte = fp4_scale_byte(key, chunk)
     word = fx.Int32(

@@ -165,7 +165,6 @@ class IxBuild:
 
     @property
     def name(self) -> str:
-        from atom.mono.device.ops import kernel_symbol
         from atom.mono.plan.build_key import symbol_params
 
         return kernel_symbol(

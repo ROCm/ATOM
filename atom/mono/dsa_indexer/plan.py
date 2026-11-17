@@ -58,6 +58,10 @@ class IndexerShape:
         return self.heads * self.head_dim
 
     @property
+    def fp4(self) -> bool:
+        return self.kv_dtype == "fp4"
+
+    @property
     def row_bytes(self) -> int:
         """Data plane bytes per row. FP8 includes an inline FP32 scale and
         16 B padding; FP4 has a separate E8M0 plane."""
@@ -70,8 +74,9 @@ class IndexerShape:
         return self.block_rows * self.row_bytes
 
     @property
-    def block_scale_bytes(self) -> int:
-        return self.block_rows * (self.head_dim // 32) if self.kv_dtype == "fp4" else 0
+    def scale_block_bytes(self) -> int:
+        """An FP4 block's E8M0 plane, or zero when the cache has no scale plane."""
+        return self.block_rows * (self.head_dim // 32) if self.fp4 else 0
 
     @property
     def weights_scale(self) -> float:

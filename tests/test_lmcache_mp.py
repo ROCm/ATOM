@@ -95,6 +95,7 @@ def _config(
             tensor_parallel_size=tp,
             pipeline_parallel_size=pp,
             decode_context_parallel_size=dcp,
+            dcp_config=SimpleNamespace(interleave_size=1),
             prefill_context_parallel_size=pcp,
             enable_dp_attention=enable_dp_attention,
             enable_expert_parallel=enable_expert_parallel,

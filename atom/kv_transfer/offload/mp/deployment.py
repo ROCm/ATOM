@@ -109,7 +109,7 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     )
     dcp_size = offcfg._strict_integer(
         "decode_context_parallel_size",
-        getattr(config, "decode_context_parallel_size", 1) or 1,
+        config.decode_context_parallel_size,
         minimum=1,
     )
     pcp_size = offcfg._strict_integer(
@@ -181,7 +181,7 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
 def _dcp_interleave(config: Any) -> int:
     return offcfg._strict_integer(
         "DCP interleave size",
-        getattr(getattr(config, "dcp_config", None), "interleave_size", 1),
+        config.dcp_config.interleave_size,
         minimum=1,
     )
 
@@ -196,7 +196,7 @@ def _logical_block_size(config: Any) -> int:
         "LMCache MP block size", config.kv_cache_block_size, minimum=1
     ) * offcfg._strict_integer(
         "decode_context_parallel_size",
-        getattr(config, "decode_context_parallel_size", 1) or 1,
+        config.decode_context_parallel_size,
         minimum=1,
     )
 
@@ -215,7 +215,7 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
 
     from atom.spec_decode.draft_kv import draft_owns_kv_pool
 
-    if int(getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+    if int(config.decode_context_parallel_size) > 1:
         return False
     if draft_owns_kv_pool(config):
         # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
@@ -254,7 +254,7 @@ def _tp_replication_factor(config: Any) -> int:
         collapse = configured
     else:
         raise TypeError("lmcache.mp.tp_rank_collapse must be true, false, or 'auto'")
-    if collapse and int(getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+    if collapse and int(config.decode_context_parallel_size) > 1:
         raise ValueError("LMCache MP TP rank collapse cannot discard DCP shards")
     return tp_size if collapse else 1
 
@@ -338,7 +338,7 @@ def _model_namespace(
         world_size,
     )
     namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
-    if int(getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+    if int(config.decode_context_parallel_size) > 1:
         # PAGE namespaces already include DCP size. Interleave also changes
         # which global tokens each rank's otherwise equal-shaped bytes hold.
         namespace += f"::dcp-interleave-{_dcp_interleave(config)}"

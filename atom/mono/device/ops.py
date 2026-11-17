@@ -35,7 +35,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.mono.plan.build_key import kernel_symbol as _kernel_symbol
+from atom.mono.plan.build_key import kernel_symbol  # noqa: F401
 from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.polling import SPIN_PAUSE_ASM
 
@@ -50,11 +50,6 @@ CM_SYS = 17
 # NT = 2: nontemporal. A weight a layer reads once streams past the caches it
 # would only evict the step's reused data from
 CM_NT = 2
-
-
-def kernel_symbol(stem, **params):
-    """The CPU build-key naming helper, also exposed to device-kernel callers."""
-    return _kernel_symbol(stem, **params)
 
 
 def launcher(symbol):

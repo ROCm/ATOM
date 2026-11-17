@@ -29,6 +29,7 @@ class _Indexer:
 
 def _hook(monkeypatch, modules):
     launched = []
+    monkeypatch.setattr(bind.torch.cuda, "current_stream", lambda: None)
     monkeypatch.setattr(
         bind, "launch_args", lambda module, qr, k, w, *rest: [module, rest[-1]]
     )
