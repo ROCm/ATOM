@@ -63,7 +63,10 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
-from atom.models.kimi_k3.mono.kernels.stages import attn_res_gfx1250
+from atom.models.kimi_k3.mono.kernels.stages import (
+    attn_res_gfx1250,
+    attn_res_sliced_gfx1250,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     GATHER_ALLREDUCE_ABI,
     allreduce_peer_bytes,
@@ -291,6 +294,54 @@ class Gfx1250WidthBuild:
 
 
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
+_ATTN_RES_SLICED: dict[tuple, attn_res_sliced_gfx1250.AttnResSlicedKernel] = {}
+# Every sliced-mix scratch ever handed out: a captured graph may replay any.
+_ATTN_RES_SCRATCH: list[torch.Tensor] = []
+
+
+def _sliced_scratch(nbytes, device):
+    """A device buffer of at least ``nbytes``, the largest yet; none is freed."""
+    for scratch in reversed(_ATTN_RES_SCRATCH):
+        if scratch.device == device and scratch.numel() >= nbytes:
+            return scratch
+    _ATTN_RES_SCRATCH.append(torch.empty(nbytes, dtype=torch.uint8, device=device))
+    return _ATTN_RES_SCRATCH[-1]
+
+
+def _sliced_attn_res(key, prefix, addends, blocks, site, norm):
+    """``_mono_attn_res`` on ``attn_res_sliced_gfx1250``."""
+    count = key[0]
+    if key not in _ATTN_RES_SLICED:
+        _ATTN_RES_SLICED[key] = attn_res_sliced_gfx1250.build_attn_res_sliced(
+            count, len(addends), True, *key[2:]
+        )
+    kernel = _ATTN_RES_SLICED[key]
+    prefix = prefix.contiguous()
+    addends = [a.contiguous() for a in addends]
+    out = torch.empty_like(prefix)
+    prefix_out = torch.empty_like(prefix) if addends else prefix
+    first, second = (addends + [prefix, prefix])[:2]
+    scratch = _sliced_scratch(
+        attn_res_sliced_gfx1250.scratch_bytes(
+            count, prefix.size(0), kernel.geometry.cluster
+        ),
+        prefix.device,
+    )
+    kernel.launcher(
+        blocks.data_ptr(),
+        prefix.data_ptr(),
+        first.data_ptr(),
+        second.data_ptr(),
+        site.score_weight.data_ptr(),
+        norm.weight.data_ptr(),
+        out.data_ptr(),
+        prefix_out.data_ptr(),
+        blocks.stride(0),
+        prefix.size(0),
+        scratch.data_ptr(),
+        stream=torch.cuda.current_stream(),
+    )
+    return out, prefix_out
 
 
 def _mono_attn_res(site, prefix, blocks, add, add2):
@@ -318,6 +369,8 @@ def _mono_attn_res(site, prefix, blocks, add, add2):
     ):
         return _bf16_attn_res(site, prefix, blocks, add, add2)
     key = (count, len(addends), float(site.eps), float(site.out_eps))
+    if envs.ATOM_KIMI_MONO_ATTN_RES_SLICED:
+        return _sliced_attn_res(key, first_prefix, addends, blocks, site, norm)
     if key not in _ATTN_RES_MIXES:
         _ATTN_RES_MIXES[key] = attn_res_gfx1250.build_attn_res(
             count, len(addends), True, *key[2:]
