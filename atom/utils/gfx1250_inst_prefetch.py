@@ -36,12 +36,16 @@ def prefetch_block(code_bytes: int) -> list:
     lines = (code_bytes - _HEAD) // _LINE
     if lines <= 0:
         return []
-    out = ["\ts_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1 ; scalar prefetch on (inst prefetch)"]
+    out = [
+        "\ts_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 24, 1), 1 ; scalar prefetch on (inst prefetch)"
+    ]
     i = 0
     while lines > 0:
         n = min(_PER_INSTR, lines)
         # koffset counts from the next instruction: prefetch i starts at block + 16 + 4 KB * i
-        out.append(f"\ts_prefetch_inst_pc_rel {i * _PER_INSTR * _LINE - 8 * i:#x}, null, {n - 1}")
+        out.append(
+            f"\ts_prefetch_inst_pc_rel {i * _PER_INSTR * _LINE - 8 * i:#x}, null, {n - 1}"
+        )
         lines -= n
         i += 1
     return out
@@ -50,7 +54,9 @@ def prefetch_block(code_bytes: int) -> list:
 def add_prefetch(asm: str, name: str) -> str:
     """The AMDGCN assembly `asm` of kernel `name` with the prefetch block at its entry."""
     m = re.search(r"codeLenInByte = (\d+)", asm)
-    if not m or "s_prefetch_inst_pc_rel" in asm:  # (once: a second block would move the first)
+    if (
+        not m or "s_prefetch_inst_pc_rel" in asm
+    ):  # (once: a second block would move the first)
         return asm
     block = prefetch_block(int(m.group(1)))
     if not block:
@@ -69,7 +75,7 @@ def add_prefetch(asm: str, name: str) -> str:
             continue
         insts += 1
         if t.startswith("global_prefetch_b8"):
-            return "\n".join(lines[: j + 1] + block + lines[j + 1:])
+            return "\n".join(lines[: j + 1] + block + lines[j + 1 :])
         if insts >= 8:
             break
     return asm  # no recognized prologue: leave the kernel alone
@@ -90,7 +96,7 @@ def install(pattern: str) -> None:
         if not args:  # the cache-key query
             key, digest = prev() if prev is not None else ("", "")
             return key + tag, digest + tag
-        backend, stages, options, language, capability = args
+        _backend, stages, options, _language, _capability = args
         if prev is not None:
             prev(*args)
         if getattr(options, "arch", "") != "gfx1250" or "amdgcn" not in stages:

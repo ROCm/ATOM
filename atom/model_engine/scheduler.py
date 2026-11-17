@@ -75,7 +75,7 @@ def _log_spec_steps(seq, reason, num_tokens) -> None:
     try:
         if _spec_step_file is None:
             os.makedirs(_SPEC_STEP_LOG, exist_ok=True)
-            _spec_step_file = open(
+            _spec_step_file = open(  # noqa: SIM115 - one handle for the process
                 os.path.join(_SPEC_STEP_LOG, f"spec_steps_{os.getpid()}.jsonl"),
                 "a",
                 buffering=1 << 20,
@@ -92,8 +92,9 @@ def _log_spec_steps(seq, reason, num_tokens) -> None:
             "steps": list(getattr(seq, "_spec_emits", [])),
         }
         _spec_step_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
-    except Exception as e:  # diagnostics never fail a request
+    except Exception as e:  # noqa: BLE001 - diagnostics never fail a request
         logger.warning("ATOM_SPEC_STEP_LOG: %s", e)
+
 
 if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer

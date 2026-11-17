@@ -667,7 +667,8 @@ def quant_mxfp4_online_even(
 
 def quantize_weight_to_fp8_128x128_blockscale_e8m0(weight, quant_dtype):
     """128x128 block FP8 with E8M0 (power-of-two) scales: scale = 2^ceil(log2(amax / fp8_max)), so the
-    quantized block never exceeds the FP8 range. Returns (q_weight, scale as dtypes.fp8_e8m0)."""
+    quantized block never exceeds the FP8 range. Returns (q_weight, scale as dtypes.fp8_e8m0).
+    """
     from aiter import dtypes
 
     w = weight.to(torch.float32).contiguous()
@@ -678,9 +679,17 @@ def quantize_weight_to_fp8_128x128_blockscale_e8m0(weight, quant_dtype):
     w_blocks = w.view(n_blocks, 128, k_blocks, 128).permute(0, 2, 1, 3).contiguous()
     finfo = torch.finfo(quant_dtype)
     amax = w_blocks.abs().amax(dim=(2, 3)).clamp_min(torch.finfo(torch.float32).tiny)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / finfo.max))).clamp(2.0 ** -127, 2.0 ** 127)
-    q_blocks = torch.clamp(w_blocks / scale[:, :, None, None], min=finfo.min, max=finfo.max).to(quant_dtype)
-    q_weight = q_blocks.permute(0, 2, 1, 3).reshape(n_blocks * 128, k_blocks * 128)[:n, :k].contiguous()
+    scale = torch.exp2(torch.ceil(torch.log2(amax / finfo.max))).clamp(
+        2.0**-127, 2.0**127
+    )
+    q_blocks = torch.clamp(
+        w_blocks / scale[:, :, None, None], min=finfo.min, max=finfo.max
+    ).to(quant_dtype)
+    q_weight = (
+        q_blocks.permute(0, 2, 1, 3)
+        .reshape(n_blocks * 128, k_blocks * 128)[:n, :k]
+        .contiguous()
+    )
     return q_weight, scale.to(dtypes.fp8_e8m0)
 
 
