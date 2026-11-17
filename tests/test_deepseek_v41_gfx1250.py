@@ -609,9 +609,6 @@ def test_the_step_kernel_traces_on_several_threads_at_once(monkeypatch):
     """
     pytest.importorskip("flydsl")
     monkeypatch.setenv("ARCH", "gfx1250")
-    monkeypatch.setenv(
-        "FLYDSL_RUNTIME_ENABLE_CACHE", "0"
-    )  # a cached build is not traced
     from atom.models.deepseek_v41.mono.gfx1250.kernels import device as hx
     from atom.models.deepseek_v41.mono.gfx1250.kernels import step
     from atom.mono.runtime.compile import compile_only
