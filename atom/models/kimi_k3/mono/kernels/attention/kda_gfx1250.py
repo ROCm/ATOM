@@ -1127,6 +1127,13 @@ def epoch_arrive_system_atomic(address, value):
     return comm_ops.atomic_add_system(address, value)
 
 
+def epoch_arrive_device_atomic(address, value):
+    """Device-scope fetch-and-add without ordering, returning the old value;
+    an Int64 ``value`` adds to the 64-bit word."""
+
+    return comm_ops.atomic_add_agent(address, value)
+
+
 @dataclass(frozen=True)
 class RoleLdsTypes:
     """FlyDSL classes emitted from a host-validated K1 LDS type spec."""
