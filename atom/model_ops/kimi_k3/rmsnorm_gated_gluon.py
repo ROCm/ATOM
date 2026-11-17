@@ -73,7 +73,9 @@ def _rmsnorm_gated_e8m0_kernel(
 ):
     # [row, k, lane]: wave r of the program owns row r, laid out as the one-wave
     # program did (element 32 * k + lane in lane ``lane``, register ``k``).
-    layout: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 1, 32], [RPW, 1, 1], [2, 1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 1], [1, 1, 32], [RPW, 1, 1], [2, 1, 0]
+    )
     l_rk: gl.constexpr = gl.SliceLayout(2, layout)
     l_r: gl.constexpr = gl.SliceLayout(1, l_rk)
     prog = gl.program_id(0)
@@ -98,7 +100,9 @@ def _rmsnorm_gated_e8m0_kernel(
     head = (row % HEADS).to(gl.int64)
     x = gl.load(x_ptr + row3 * stride_xm + cols, mask=m3, other=0.0).to(gl.float32)
     w = gl.load(w_ptr + cols).to(gl.float32)
-    g_row = gl.expand_dims(gl.expand_dims(outer * stride_g_outer + head * stride_g_head, 1), 2)
+    g_row = gl.expand_dims(
+        gl.expand_dims(outer * stride_g_outer + head * stride_g_head, 1), 2
+    )
     gate = gl.load(g_ptr + g_row + cols, mask=m3, other=0.0)
 
     part = gl.sum(x * x, axis=2)
