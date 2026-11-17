@@ -990,11 +990,12 @@ class WeightUpdaterMixin:
         from atom.model_ops.utils import shuffle_weights
 
         # The same decision the initial load makes, from the same function.
+        native_group_rows = getattr(module, "native_a8_group_rows", None)
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
-            native_group_rows=getattr(module, "native_a8_group_rows", None),
+            native_group_rows=native_group_rows,
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
@@ -1006,10 +1007,11 @@ class WeightUpdaterMixin:
             # overwritten -- and the one the PR measured a decode graph
             # catching half-done, five syncs out of seven.
             self._await_readers_of(param)
-            if param is not weight_scale or module.native_a8_group_rows is None:
+            # A synced native scale takes the load's layout: a 1x32 scale is
+            # re-laid out in place by aiter's helper, a 32x32 one stays row-major.
+            if param is not weight_scale or native_group_rows is None:
                 shuffle_weights(param)
-            elif module.native_a8_group_rows == 1:
-                # A synced native scale keeps the load's layout (32x32 row-major).
+            elif native_group_rows == 1:
                 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
 
                 param.data.copy_(shuffle_mxfp8_bpreshuffle_scale(param.data))
