@@ -32,19 +32,21 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster as hw_cluster
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.kimi_k3.mono.config import HIDDEN
 from atom.models.kimi_k3.mono.kernels.stages.attn_res_gfx1250 import _wave_sums
+from atom.models.kimi_k3.mono.kernels.stages.attn_res_sliced_layout import (
+    ELEMENTS,
+    HIDDEN,
+    THREADS,
+    WAVES,
+    SlicedGeometry,
+    check,
+    pairs,
+    sums,
+)
 from atom.mono.device.ops import bf_hi, bf_lo, exp, hw_rsq, rsrc
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 
-THREADS = 256
-WAVES = THREADS // GFX1250.wave_size
-ELEMENTS = 8
-# a candidate's two sums a lane of a wave: up to 16 candidates
-MAX_CANDIDATES = GFX1250.wave_size // 2
-# gfx1250's CUs: at most one cluster's CTA a CU
-MAX_CTAS = 256
 # buffer cache policy scope field SCOPE_SE
 CM_CLUSTER = 8
 
@@ -63,58 +65,6 @@ ATTN_RES_SLICED_ABI = KernelAbi(
         "scratch",
     )
 )
-
-
-@dataclass(frozen=True)
-class SlicedGeometry:
-    """A ``cluster``-CTA slicing of the hidden row."""
-
-    cluster: int
-
-    @property
-    def columns(self) -> int:
-        return HIDDEN // self.cluster
-
-    @property
-    def lanes(self) -> int:
-        """Threads a token's slice keeps busy, ``ELEMENTS`` columns each."""
-        return self.columns // ELEMENTS
-
-    @property
-    def token_threads(self) -> int:
-        """A token's thread group: its busy threads, whole waves."""
-        return -(-self.lanes // GFX1250.wave_size) * GFX1250.wave_size
-
-    @property
-    def token_waves(self) -> int:
-        return self.token_threads // GFX1250.wave_size
-
-    @property
-    def tokens_a_pass(self) -> int:
-        return THREADS // self.token_threads
-
-    @property
-    def max_clusters(self) -> int:
-        return MAX_CTAS // self.cluster
-
-    def record_words(self, candidates: int, gram: bool = False) -> int:
-        """A token's scratch, slices innermost: each slice's candidate sums
-        (with ``gram``, then the candidates' cross products), and without it
-        each slice's sum of squares of the mix."""
-        return (sums(candidates, gram) + (not gram)) * self.cluster
-
-    def clusters(self, tokens: int) -> int:
-        return min(tokens, self.max_clusters)
-
-
-def sums(candidates: int, gram: bool) -> int:
-    """A slice's sums of a token: each candidate's square and score dot, and
-    with ``gram`` each pair's cross product."""
-    return 2 * candidates + (candidates * (candidates - 1) // 2 if gram else 0)
-
-
-def scratch_bytes(count: int, tokens: int, cluster: int, gram: bool = False) -> int:
-    return SlicedGeometry(cluster).record_words(count + 1, gram) * tokens * 4
 
 
 @dataclass(frozen=True)
@@ -194,13 +144,8 @@ def build_attn_res_sliced(
     quadratic form in the candidates' Gram matrix, whose slice sums travel
     with the scores', so one cluster exchange a pass instead of two; the
     reassociation is not only a reduction order."""
+    check(count, addends)
     candidates = count + 1
-    if not 1 <= count < MAX_CANDIDATES:
-        raise ValueError(f"the AttnRes mix holds 1 to {MAX_CANDIDATES - 1} blocks")
-    if addends not in (0, 1, 2):
-        raise ValueError("the AttnRes mix folds up to two addends")
-    if cluster not in (4, 8, 16) or HIDDEN % (cluster * ELEMENTS):
-        raise ValueError(f"no {cluster}-CTA slicing of the hidden row")
     geometry = SlicedGeometry(cluster)
     lanes = geometry.lanes
     group = geometry.token_threads
@@ -209,8 +154,8 @@ def build_attn_res_sliced(
     gram = gram and out_norm
     record = geometry.record_words(candidates, gram)
     reductions = sums(candidates, gram)
-    pairs = [(c, d) for c in range(candidates) for d in range(c + 1, candidates)]
-    crosses = len(pairs) if gram else 0
+    crossed = pairs(candidates)
+    crosses = len(crossed) if gram else 0
     msq_at = reductions * cluster
     # the gate's work items a pass: a candidate's score, or a pair's product
     items = candidates + crosses
@@ -285,7 +230,7 @@ def build_attn_res_sliced(
                     busy.select(dot, fx.Float32(0.0)),
                 ]
             if const_expr(gram):
-                for c, d in pairs:
+                for c, d in crossed:
                     cross = rows[c][0] * rows[d][0]
                     for j in range_constexpr(1, ELEMENTS):
                         cross = cross + rows[c][j] * rows[d][j]
@@ -369,12 +314,13 @@ def build_attn_res_sliced(
                         lds.diagonal.ptr + local * candidates + c
                     )
                     for d in range_constexpr(c + 1, candidates):
-                        pair = pairs.index((c, d))
+                        pair = crossed.index((c, d))
                         row = row + fx.Float32(2.0) * odds[d] * fx.ptr_load(
                             lds.cross.ptr + local * crosses + pair
                         )
                     norm = norm + odds[c] * row
-                norm = norm / (denominator * denominator)
+                # a near-cancelling mix can round the form below zero
+                norm = fx.max(norm, fx.Float32(0.0)) / (denominator * denominator)
                 inverse = hw_rsq(norm * fx.Float32(1.0 / HIDDEN) + fx.Float32(out_eps))
                 mixed = [m * inverse * g for m, g in zip(mixed, gains)]
             elif const_expr(out_norm):

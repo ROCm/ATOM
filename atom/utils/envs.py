@@ -640,9 +640,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (a CTA a token, the reductions in another order); 0 keeps Triton's.
     "ATOM_KIMI_MONO_ATTN_RES": lambda: os.getenv("ATOM_KIMI_MONO_ATTN_RES", "1") == "1",
     # Kimi-K3 gfx1250 mono: that mix column-sliced over a hardware cluster's
-    # CTAs a token group (``attn_res_sliced_gfx1250``) instead of a CTA a token.
-    "ATOM_KIMI_MONO_ATTN_RES_SLICED": lambda: (
-        os.getenv("ATOM_KIMI_MONO_ATTN_RES_SLICED", "0") == "1"
+    # CTAs a token group (``attn_res_sliced_gfx1250``) instead of a CTA a token:
+    # 0 off, 4 / 8 / 16 the cluster's CTAs, 1 the 8-CTA slicing.
+    "ATOM_KIMI_MONO_ATTN_RES_SLICED": lambda: {"0": 0, "1": 8}.get(
+        os.getenv("ATOM_KIMI_MONO_ATTN_RES_SLICED", "0"),
+        int(os.getenv("ATOM_KIMI_MONO_ATTN_RES_SLICED", "0")),
     ),
     # Kimi-K3 gfx1250 mono: the TDM GEMV's slab loop as a runtime loop with this
     # LLVM unroll hint (1: none), so a cold launch fetches one slab's code; 0

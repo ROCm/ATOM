@@ -66,6 +66,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
 from atom.models.kimi_k3.mono.kernels.stages import (
     attn_res_gfx1250,
     attn_res_sliced_gfx1250,
+    attn_res_sliced_layout,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     GATHER_ALLREDUCE_ABI,
@@ -308,21 +309,22 @@ def _sliced_scratch(nbytes, device):
     return _ATTN_RES_SCRATCH[-1]
 
 
-def _sliced_attn_res(key, prefix, addends, blocks, site, norm):
-    """``_mono_attn_res`` on ``attn_res_sliced_gfx1250``."""
+def _sliced_attn_res(key, prefix, addends, blocks, site, norm, cluster):
+    """``_mono_attn_res`` on ``attn_res_sliced_gfx1250``, ``cluster`` CTAs a
+    token group."""
     count = key[0]
-    if key not in _ATTN_RES_SLICED:
-        _ATTN_RES_SLICED[key] = attn_res_sliced_gfx1250.build_attn_res_sliced(
-            count, len(addends), True, *key[2:]
+    if (key, cluster) not in _ATTN_RES_SLICED:
+        _ATTN_RES_SLICED[key, cluster] = attn_res_sliced_gfx1250.build_attn_res_sliced(
+            count, len(addends), True, *key[2:], cluster
         )
-    kernel = _ATTN_RES_SLICED[key]
+    kernel = _ATTN_RES_SLICED[key, cluster]
     prefix = prefix.contiguous()
     addends = [a.contiguous() for a in addends]
     out = torch.empty_like(prefix)
     prefix_out = torch.empty_like(prefix) if addends else prefix
     first, second = (addends + [prefix, prefix])[:2]
     scratch = _sliced_scratch(
-        attn_res_sliced_gfx1250.scratch_bytes(
+        attn_res_sliced_layout.scratch_bytes(
             count, prefix.size(0), kernel.geometry.cluster
         ),
         prefix.device,
@@ -369,8 +371,9 @@ def _mono_attn_res(site, prefix, blocks, add, add2):
     ):
         return _bf16_attn_res(site, prefix, blocks, add, add2)
     key = (count, len(addends), float(site.eps), float(site.out_eps))
-    if envs.ATOM_KIMI_MONO_ATTN_RES_SLICED:
-        return _sliced_attn_res(key, first_prefix, addends, blocks, site, norm)
+    cluster = envs.ATOM_KIMI_MONO_ATTN_RES_SLICED
+    if cluster:
+        return _sliced_attn_res(key, first_prefix, addends, blocks, site, norm, cluster)
     if key not in _ATTN_RES_MIXES:
         _ATTN_RES_MIXES[key] = attn_res_gfx1250.build_attn_res(
             count, len(addends), True, *key[2:]
