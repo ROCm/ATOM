@@ -14,7 +14,8 @@ use crate::{
     kv_events::source,
 };
 
-/// Follows every rank just registered. A worker whose sources cannot be read still serves.
+/// Follows every rank just registered, and predicts the prompts routed to every worker. A
+/// worker whose sources cannot be read still serves.
 pub struct FollowKvEventsStep;
 
 #[async_trait]
@@ -36,6 +37,9 @@ impl StepExecutor<LocalWorkerWorkflowData> for FollowKvEventsStep {
             .actual_workers
             .as_ref()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
+        for worker in workers {
+            monitor.register(worker.url());
+        }
         let Some(first) = workers
             .first()
             .filter(|worker| matches!(worker.connection_mode(), ConnectionMode::Http))
