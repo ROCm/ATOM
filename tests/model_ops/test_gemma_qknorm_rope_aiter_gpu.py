@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""The aiter route of the Gemma q/k norm + RoPE + cache write on gfx1250.
+"""The aiter route of the Gemma q/k norm + RoPE of a long prefill on gfx1250.
 
-For a Gemma q/k norm layer with a plain NeoX RoPE and head_dim 128 (the
-MiniMax-M3 dense layers), `PagedAttentionImpl.rope_cache` hands the norm and
-RoPE to aiter `fused_qknorm_idxrqknorm`: a decode batch as one insert into the
-cache, a prefill batch above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS as the
-norm and RoPE (k in place in qkv) before the cache write. Either must leave the
-attention the q and K/V cache of the Triton kernel, and a prefill its k too.
+Above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS, `PagedAttentionImpl.rope_cache`
+hands the Gemma q/k norm and NeoX RoPE to aiter `fused_qknorm_idxrqknorm` (k in
+place in qkv) before the cache write, where the op takes the layer (the
+MiniMax-M3 dense layers; not head_dim 256). It must leave the attention the q,
+k and K/V cache of the Triton kernel.
 Not bitwise: the sum of squares is reduced in another order and aiter rounds k
 to bf16 before the per-token FP8 quantization, so a cache is compared
 dequantized, within one step at the row maximum (32 of the 448 an FP8 row
@@ -36,21 +35,21 @@ NQ, NKV, HD, ROT, MAX_POS = 16, 1, 128, 64, 1 << 16
 FUSED_MAX = envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
 
 
-def make_impl(kv_cache_dtype):
+def make_impl(kv_cache_dtype, hd=HD):
     from aiter.rotary_embedding import get_rope
 
     from atom.model_ops.layernorm import GemmaRMSNorm
 
     norms = []
     for _ in range(2):
-        norm = GemmaRMSNorm(HD, eps=1e-6)
-        norm.weight.data = (torch.randn(HD) * 0.1).to(torch.bfloat16).cuda()
+        norm = GemmaRMSNorm(hd, eps=1e-6)
+        norm.weight.data = (torch.randn(hd) * 0.1).to(torch.bfloat16).cuda()
         norms.append(norm)
-    rope = get_rope(HD, ROT, MAX_POS, 10000, is_neox_style=True, dtype=torch.bfloat16)
-    impl = attention_mha.PagedAttentionImpl(
+    rope = get_rope(hd, ROT, MAX_POS, 10000, is_neox_style=True, dtype=torch.bfloat16)
+    return attention_mha.PagedAttentionImpl(
         NQ,
-        HD,
-        HD**-0.5,
+        hd,
+        hd**-0.5,
         NKV,
         None,
         kv_cache_dtype=kv_cache_dtype,
@@ -58,8 +57,6 @@ def make_impl(kv_cache_dtype):
         q_norm=norms[0],
         k_norm=norms[1],
     )
-    impl.aiter_gemma_norm_rope = True  # as MiniMax-M3's dense layers set it
-    return impl
 
 
 def make_cache(kv_cache_dtype, num_blocks, block_size):
@@ -110,18 +107,10 @@ def run_rope_cache(impl, qkv, position, slots, cache, is_prefill):
 @pytest.mark.parametrize("block_size", [16, 128])
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "bf16"])
 @pytest.mark.parametrize(
-    ("is_prefill", "num_tokens", "aiter_calls"),
-    [
-        (False, 1, ["insert"]),
-        (False, 64, ["insert"]),
-        (False, 3000, ["insert"]),
-        (True, 64, []),
-        (True, FUSED_MAX, []),
-        (True, FUSED_MAX + 1, ["norm_rope"]),
-    ],
+    ("num_tokens", "aiter_calls"), [(FUSED_MAX, 0), (FUSED_MAX + 1, 1)]
 )
 def test_rope_cache_matches_the_triton_kernel(
-    monkeypatch, kv_cache_dtype, block_size, is_prefill, num_tokens, aiter_calls
+    monkeypatch, kv_cache_dtype, block_size, num_tokens, aiter_calls
 ):
     from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
         triton_fused_norm_rope_cache,
@@ -133,8 +122,6 @@ def test_rope_cache_matches_the_triton_kernel(
     position = torch.randint(0, MAX_POS, (num_tokens,), device="cuda")
     num_blocks = num_tokens // block_size + 8
     slots = torch.randperm(num_blocks * block_size, device="cuda")[:num_tokens]
-    if not is_prefill:  # CUDA graph padding rows
-        slots[num_tokens - num_tokens // 8 :] = -1
 
     ref_cache = make_cache(kv_cache_dtype, num_blocks, block_size)
     q_raw, k_raw, v_raw = qkv.split([NQ * HD, NKV * HD, NKV * HD], dim=-1)
@@ -162,36 +149,34 @@ def test_rope_cache_matches_the_triton_kernel(
     monkeypatch.setattr(
         aiter,
         "fused_qknorm_idxrqknorm",
-        lambda *a, **kw: calls.append("insert" if "kv_cache_k" in kw else "norm_rope")
-        or op(*a, **kw),
+        lambda *a, **kw: calls.append(1) or op(*a, **kw),
     )
     cache = make_cache(kv_cache_dtype, num_blocks, block_size)
     qkv_in = qkv.clone()
-    q, k, v = run_rope_cache(impl, qkv, position, slots, cache, is_prefill)
+    q, k, v = run_rope_cache(impl, qkv, position, slots, cache, True)
 
-    assert calls == aiter_calls
+    assert len(calls) == aiter_calls
     torch.testing.assert_close(q.reshape(num_tokens, -1), ref_q.reshape(num_tokens, -1))
     frac = 1 / 8 if kv_cache_dtype == "fp8" else 1 / 128
     for got, ref in zip(read_cache(cache), read_cache(ref_cache)):
         assert_close_to_row_max(got, ref, frac)
-    if is_prefill:
-        # prefill attention reads k
-        torch.testing.assert_close(
-            k.reshape(num_tokens, -1), ref_k.reshape(num_tokens, -1)
-        )
-    else:
-        # the insert leaves qkv alone: the decode backends read the cache
-        assert torch.equal(qkv, qkv_in)
+    # prefill attention reads k
+    torch.testing.assert_close(k.reshape(num_tokens, -1), ref_k.reshape(num_tokens, -1))
     torch.testing.assert_close(v.reshape(num_tokens, -1), qkv_in[:, -NKV * HD :])
 
 
-def test_aiter_route_is_opt_in_and_needs_the_shuffle_cache():
-    impl = make_impl("fp8")
-    k_cache, v_cache, _, _ = make_cache("fp8", 4, 128)
-    ok = impl._takes_aiter_gemma_norm_rope
-    assert ok(k_cache, v_cache, False)
-    # a V cache the Triton backend keeps in its standard 4-D layout
-    assert not ok(k_cache, v_cache.flatten(2, 3), True)
-    # a model that did not opt in
-    impl.aiter_gemma_norm_rope = False
-    assert not ok(k_cache, v_cache, False)
+def test_aiter_route_declines_what_the_op_does_not_take():
+    position = torch.zeros(8, dtype=torch.long, device="cuda")
+    for hd, taken in ((HD, True), (256, False)):  # 256: Qwen3-Next, Qwen3.5
+        impl = make_impl("bf16", hd)
+        qkv = torch.zeros(8, (NQ + 2 * NKV) * hd, dtype=torch.bfloat16, device="cuda")
+        assert (impl._aiter_gemma_norm_rope(qkv, position) is not None) == taken
+    # GPT-J: not the rotation the op computes
+    from aiter.rotary_embedding import get_rope
+
+    impl = make_impl("bf16")
+    impl.rotary_emb = get_rope(
+        HD, ROT, MAX_POS, 10000, is_neox_style=False, dtype=torch.bfloat16
+    ).cuda()
+    qkv = torch.zeros(8, (NQ + 2 * NKV) * HD, dtype=torch.bfloat16, device="cuda")
+    assert impl._aiter_gemma_norm_rope(qkv, position) is None

@@ -21,10 +21,7 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attention_mha import (
-    PagedAttentionImpl,
-    SparseMHAPagedAttentionImpl,
-)
+from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
@@ -48,7 +45,6 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.paged_attention import Attention as AtomAttention
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -446,11 +442,6 @@ class MiniMaxM3Attention(nn.Module):
             per_token_fp8_out=effective_layer_quant(quant_config, f"{prefix}.o_proj")
             == (QuantType.per_Token, dtypes.fp8),
         )
-        # Measured on these layers (gfx1250): q/k norm + RoPE through aiter.
-        if isinstance(self.attn, AtomAttention) and isinstance(
-            self.attn.impl, PagedAttentionImpl
-        ):
-            self.attn.impl.aiter_gemma_norm_rope = True
 
     def forward(
         self,

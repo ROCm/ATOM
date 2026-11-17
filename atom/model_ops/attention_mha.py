@@ -50,9 +50,6 @@ class PagedAttentionImpl(nn.Module):
     # Whether forward_impl takes ``quantized_output`` / ``output_scale`` and writes
     # its output there as OCP FP8 plus per-token FP32 descales.
     supports_output_quant = False
-    # Set by a model that measured its Gemma q/k norm + RoPE through aiter
-    # fused_qknorm_idxrqknorm on gfx1250 (`_takes_aiter_gemma_norm_rope`).
-    aiter_gemma_norm_rope = False
 
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
@@ -306,28 +303,7 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
-            aiter_norm_rope = isinstance(
-                self.q_norm, GemmaRMSNorm
-            ) and self._takes_aiter_gemma_norm_rope(k_cache, v_cache, use_triton_attn)
-            if aiter_norm_rope and not fwd_ctx.context.is_prefill:
-                # One insert writes q and the K/V cache. k and v stay as they
-                # are: the decode backends read only the cache.
-                fp8 = self.kv_cache_dtype == "fp8"
-                q = self._aiter_gemma_norm_rope(
-                    qkv,
-                    position,
-                    slot_mapping=attn_metadata.slot_mapping,
-                    kv_cache_k=k_cache,
-                    kv_cache_v=v_cache,
-                    block_size=k_cache.shape[3],
-                    kv_cache_dtype="fp8" if fp8 else "auto",
-                    k_scale=k_scale if fp8 else None,
-                    v_scale=v_scale if fp8 else None,
-                    asm_layout=True,
-                )
-                k = k_raw.view(-1, self.num_kv_heads, self.head_dim)
-                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
-            elif isinstance(self.q_norm, GemmaRMSNorm) and (
+            if isinstance(self.q_norm, GemmaRMSNorm) and (
                 q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
                 and self._use_asm_cache_layout(
                     k_cache, v_cache, use_triton_attn=use_triton_attn
@@ -343,7 +319,7 @@ class PagedAttentionImpl(nn.Module):
                     k_scale,
                     v_scale,
                     attn_metadata,
-                    qkv=qkv if aiter_norm_rope else None,
+                    qkv,
                 )
             elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
@@ -488,25 +464,14 @@ class PagedAttentionImpl(nn.Module):
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-    def _takes_aiter_gemma_norm_rope(self, k_cache, v_cache, use_triton_attn) -> bool:
-        """Whether aiter fused_qknorm_idxrqknorm takes the Gemma q/k norm + RoPE
-        off the Triton kernel: for a model that measured it (opted in with
-        ``aiter_gemma_norm_rope``), on the gfx1250 family where it was measured,
-        into the SHUFFLE cache. The op raises on arguments it does not take."""
-        return (
-            self.aiter_gemma_norm_rope
-            and is_gfx1250_family(get_gfx())
-            and self._use_asm_cache_layout(
-                k_cache, v_cache, use_triton_attn=use_triton_attn
-            )
-        )
-
-    def _aiter_gemma_norm_rope(self, qkv, position, **insert):
-        """The Gemma q/k norm + RoPE of ``qkv`` in one aiter
-        fused_qknorm_idxrqknorm launch, returning q in a new tensor. With the
-        ``insert`` arguments it writes the K/V cache (SHUFFLE layout, per-token
-        FP8 scales as the Triton kernel writes them) and leaves ``qkv`` as it
-        was; without them it norms and ropes k in place in ``qkv``."""
+    def _aiter_gemma_norm_rope(self, qkv, position):
+        """The Gemma q/k norm + NeoX RoPE of a long prefill's ``qkv`` in one aiter
+        fused_qknorm_idxrqknorm launch: q into a new tensor, k in place in
+        ``qkv``. None where it is not taken: off the gfx1250 family (where it was
+        measured), for a non-NeoX rotation, and for a call the op does not take
+        (aiter's fused_qknorm_idxrqknorm_supports, e.g. head_dim 256)."""
+        if not (is_gfx1250_family(get_gfx()) and self.rotary_emb.is_neox_style):
+            return None
         from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
         q = torch.empty(
@@ -514,7 +479,7 @@ class PagedAttentionImpl(nn.Module):
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        aiter.fused_qknorm_idxrqknorm(
+        args = (
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -524,10 +489,11 @@ class PagedAttentionImpl(nn.Module):
             self.num_kv_heads,
             self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon,
-            q_out=q,
-            **insert,
         )
-        return q.view(-1, self.num_heads, self.head_dim)
+        if not aiter.fused_qknorm_idxrqknorm_supports(*args, q_out=q):
+            return None
+        aiter.fused_qknorm_idxrqknorm(*args, q_out=q)
+        return q
 
     def _gemma_norm_rope_then_cache(
         self,
@@ -540,7 +506,7 @@ class PagedAttentionImpl(nn.Module):
         k_scale,
         v_scale,
         attn_metadata,
-        qkv=None,
+        qkv,
     ):
         """Unfused twin of triton_fused_norm_rope_cache for long batches.
 
@@ -552,12 +518,12 @@ class PagedAttentionImpl(nn.Module):
         FP8 for an FP8 cache, unquantized otherwise. Same SHUFFLE layout and
         scales the fused kernel writes.
 
-        With ``qkv`` (``_takes_aiter_gemma_norm_rope``), the norm and RoPE
-        are one aiter fused_qknorm_idxrqknorm launch instead, k in place in
-        ``qkv``.
+        Where aiter takes it (``_aiter_gemma_norm_rope``), the norm and RoPE
+        are one aiter launch instead, k in place in ``qkv``.
         """
-        if qkv is not None:
-            q = self._aiter_gemma_norm_rope(qkv, position)
+        q_aiter = self._aiter_gemma_norm_rope(qkv, position)
+        if q_aiter is not None:
+            q = q_aiter
         else:
             from atom.model_ops.layernorm import DualRMSNorm
             from atom.model_ops.triton_mrope import try_mrope_qk_fused
