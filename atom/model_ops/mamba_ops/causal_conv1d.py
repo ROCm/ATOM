@@ -1323,7 +1323,10 @@ def causal_conv1d_update(
             conv_state_in.dtype == conv_state.dtype
             and conv_state_in.size(1) == conv_state.size(1)
             and conv_state_in.size(2) >= width - 1
-        ), "conv_state_in must match conv_state in dtype and dim"
+        ), (
+            "conv_state_in must match conv_state in dtype and dim, "
+            "and hold at least width - 1 state columns"
+        )
     # num_cache_lines masks only the STEP-2 history load (read slot against
     # conv_state_in's rows). The STEP-1 column loads and the store are not
     # bounds-checked, so both index tables must hold valid slots or
