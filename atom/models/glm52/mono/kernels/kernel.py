@@ -509,6 +509,7 @@ def build_glm5_monokernel(
     for name, n in stage_tasks(
         S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
         inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
+        uv_by_head=S >= 4 and D == 1,
     ):
         first[name] = acc
         acc += n
@@ -518,6 +519,7 @@ def build_glm5_monokernel(
         stage_tasks(
             S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
         inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
+        uv_by_head=S >= 4 and D == 1,
         )
     )
     acc = 0

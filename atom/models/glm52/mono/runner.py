@@ -194,9 +194,16 @@ class _GlmFusedLayerOp:
         prepared_weights,
         runtime,
         launches_per_step: int,
+        *,
+        attention_weight: AttentionWeight,
     ) -> None:
         from atom.models.glm52.mono.kernels.tp4_op import Glm5TP4MonoKernel
 
+        attention_weight = AttentionWeight(attention_weight)
+        if attention_weight is not AttentionWeight.FP8_PTPC:
+            raise MonoUnsupported(
+                f"fused indexer requires FP8 PTPC attention, got {attention_weight.value}"
+            )
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
         self.op = Glm5TP4MonoKernel(
@@ -213,7 +220,7 @@ class _GlmFusedLayerOp:
             index_page_size=index_page_size,
             index_block_table_stride=index_block_table_stride,
             index_cache_dtype="fp8",
-            attention_weight=AttentionWeight.FP8_PTPC,
+            attention_weight=attention_weight,
             kv_cache_layout=KvCacheLayout.ATOM,
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
@@ -660,6 +667,7 @@ class Glm52MonoRunner:
                             self._prepared[layer.layer_idx],
                             fused_runtime,
                             launches_per_step=fused_layer_count,
+                            attention_weight=self._attention,
                         )
                         if fused_runtime is None:
                             fused_runtime = fused_owned.op

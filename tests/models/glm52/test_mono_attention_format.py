@@ -83,6 +83,11 @@ def test_projections_are_read_in_place_in_the_format_production_loaded(kind, att
     tensors = projection_weights(attn, CFG, attention)
     for key, name in zip(("qkv_a", "q_b", "o"), SHAPES):
         assert tensors[f"w_{key}"].data_ptr() == getattr(attn, name).weight.data_ptr()
+        if kind == "per_Token":
+            assert (
+                tensors[f"s_{key}"].data_ptr()
+                == getattr(attn, name).weight_scale.data_ptr()
+            )
     if kind == "No":
         # q_a / kv_a lead the folded indexer's rows
         assert tensors["w_qkv_a"].shape == SHAPES["fused_qkv_a_proj"]

@@ -453,6 +453,7 @@ def test_fused_layer_op_forwards_width_and_stride_to_the_kernel_not_its_defaults
         prepared,
         runtime,
         18,  # launches_per_step -- the fused runtime's own count (full layers)
+        attention_weight=AttentionWeight.FP8_PTPC,
     )
     assert captured["weights"] is weights
     assert captured["samples"] == 8
@@ -471,6 +472,23 @@ def test_fused_layer_op_forwards_width_and_stride_to_the_kernel_not_its_defaults
     assert captured["index_max_seq"] != FUSED_INDEX_MAX_SEQ
     assert captured["rank"] == 2
     assert captured["npes"] == 4
+
+    with pytest.raises(MonoUnsupported, match="requires FP8 PTPC attention"):
+        _GlmFusedLayerOp(
+            weights,
+            8,
+            128,
+            "fp8",
+            16,
+            4,
+            2048,
+            False,
+            32768,
+            prepared,
+            runtime,
+            18,
+            attention_weight=AttentionWeight.BF16_ABSORB_FP8,
+        )
 
 
 def test_fused_weight_mapping_failure_falls_back_without_refusing_rows(monkeypatch):

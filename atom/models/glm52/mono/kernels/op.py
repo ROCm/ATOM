@@ -288,6 +288,7 @@ class Glm5MonoKernel:
             npes=npes,
             inter=W.config.inter,
             split_head_merge=W.heads // MONO_WAVES > 1,
+            uv_by_head=samples >= 4 and dcp_size == 1,
         )
         n_tasks = sum(n for _, n in self.stages)
         if with_indexer:

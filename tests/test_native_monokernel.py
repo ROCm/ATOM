@@ -574,12 +574,18 @@ def test_glm_tp4_symmetric_and_split_schedule_contracts():
     assert symmetric["_part_stride"] == part and symmetric["_bytes"] == 4 * part
     stages = dict(
         glm_layout.stage_tasks(
-            samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
+            samples,
+            cfg.local_heads,
+            2048,
+            expert_mxfp4=True,
+            inter=cfg.inter,
+            uv_by_head=True,
         )
     )
     assert stages["split"] == samples * 2 * (
         2048 // glm_layout.sparse_keys_per_task(samples, cfg.local_heads)
     )
+    assert stages["uv"] == samples * cfg.local_heads * 2
     assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
     assert [glm_layout.down_prefetch_batch(s, True) for s in (4, 5, 6, 8, 12)] == [
         9,
