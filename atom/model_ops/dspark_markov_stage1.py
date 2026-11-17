@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Stage 1 of both DSpark Markov ops: the bias GEMV over one (V tile, row
-tile), the tile's (max, lowest id), and the launch geometry.
+"""Stage 1 of the DSpark Markov ops: the bias GEMV over one (V tile, row
+tile), the tile's (max, lowest id), and the default launch geometry.
 
-The greedy op (`dspark_markov_argmax`) and the sampled one
-(`spec_sampling.dspark_markov_sample`) run the same GEMV on the same tiles and
-differ only in what they keep of it, so the tile, its constants and its
-launch live here, once: retuning the GEMV retunes both.
+The greedy op (`dspark_markov_argmax`), the sampled one
+(`spec_sampling.dspark_markov_sample`) and the probabilistic stage-1 kernels
+(`dspark_prob_sample`, `dspark_prob_markov_chain`) run the same GEMV and
+differ only in what they keep of it, so the tile and its constants live here,
+once: retuning the GEMV retunes all of them. `markov_launch_geometry` is the
+default tiling; the fused probabilistic chain starts from it and overrides it
+only for larger batches.
 """
 
 from typing import NamedTuple
@@ -15,7 +18,7 @@ from typing import NamedTuple
 import triton
 import triton.language as tl
 
-from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.tile_argmax import NO_HIT, argmax_lowest_id
 
 # Chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -33,12 +36,19 @@ MAX_BLOCK_ROW = 64
 
 
 class MarkovGeometry(NamedTuple):
-    """How a stage-1 launch tiles ``num_rows`` x ``vocab_size``."""
+    """How a stage-1 launch tiles ``num_rows`` x ``vocab_size``: a
+    ``(v_tiles, row_tiles)`` grid whose programs each cover ``block_row``
+    rows and ``tiles_per_program`` consecutive ``block_v``-column vocab
+    tiles. The defaults are the single-tile layout every Markov stage-1
+    kernel uses; only the fused probabilistic chain overrides them."""
 
     block_row: int
     row_tiles: int
     v_tiles: int
     num_warps: int
+    block_v: int = BLOCK_V
+    tiles_per_program: int = 1
+    num_stages: int = 2
 
 
 def markov_launch_geometry(num_rows: int, vocab_size: int) -> MarkovGeometry:
@@ -75,13 +85,18 @@ def markov_logits_tile(
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
     STORE_EMBED: tl.constexpr,
+    FROM_PACKED: tl.constexpr = False,
 ):
     """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
     padded vocab lanes; with ``STORE_EMBED`` tile 0 also publishes
     ``W1[prev]`` to ``embed_out`` (the greedy op's confidence head reads it).
+    With ``FROM_PACKED`` the previous ids are the probabilistic chain's
+    packed uint64 keys (`dspark_prob_markov_chain`): the low word is the
+    inverted id, and a zero key (empty row) reads id 0.
 
-    The GEMV both stage-1 kernels run (`dspark_markov_argmax`'s and
-    `dspark_markov_sample`'s); each keeps only its own tail. ``base``
+    The GEMV every Markov stage-1 kernel runs (`dspark_markov_argmax`'s,
+    `dspark_markov_sample`'s, and the probabilistic ones through
+    `_sampled_tile_argmax`); each keeps only its own tail. ``base``
     holds the tile's columns from 0, W2 is read from vocab id ``vocab_offset``
     on (a TP rank's shard of the LM head; 0 for the whole vocab). The vocab
     and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
@@ -90,6 +105,8 @@ def markov_logits_tile(
     # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
     # assuming unit stride here reads another position's tokens.
     prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
+    if FROM_PACKED:
+        prev = tl.where(prev == 0, 0, ~prev.to(tl.uint32)).to(tl.int64)
 
     acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
     for k in range(tl.cdiv(rank, BLOCK_K)):
@@ -154,10 +171,10 @@ def publish_tile_argmax(
     # `v_mask` also covers the all--inf row: without it a padded lane, which
     # is -inf too, could win the id.
     tile_max, tile_idx = argmax_lowest_id(
-        vals, offs_v[None, :], v_mask[None, :], 2147483647
+        vals, offs_v[None, :], v_mask[None, :], NO_HIT
     )
     # Global id. A tile with no hit (all NaN) keeps `argmax_of_tiles`' one
-    # sentinel, unoffset, which it answers as id 0 for an all-NaN row.
-    tile_idx = tl.where(tile_idx != 2147483647, tile_idx + vocab_offset, 2147483647)
+    # sentinel, `NO_HIT`, unoffset; it answers that as id 0 for an all-NaN row.
+    tile_idx = tl.where(tile_idx != NO_HIT, tile_idx + vocab_offset, NO_HIT)
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
