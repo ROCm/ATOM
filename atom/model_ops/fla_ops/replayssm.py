@@ -524,6 +524,7 @@ def _replayssm_materialize_kernel(
     stride_bufg_pos: tl.constexpr,
     stride_bufg_hv: tl.constexpr,
     DOT_MODE: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -549,8 +550,48 @@ def _replayssm_materialize_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
+    if IS_KDA:
+        # KDA keeps the state transposed as [V, K]: the KDA forward's flush.
+        mask_t = mask_v[:, None] & mask_k[None, :]
+        off_t = i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+        b_s0t = tl.load(
+            ckpt + src * stride_ckpt_slot + off_t, mask=mask_t, other=0.0
+        ).to(tl.float32)
+        b_kw_t, b_ru_t, b_decay_t = _replay_tiles(
+            buf_k,
+            buf_u,
+            buf_g,
+            src,
+            n,
+            stride_bufk_slot,
+            stride_bufk_pos,
+            stride_bufk_hv,
+            stride_bufu_slot,
+            stride_bufu_pos,
+            stride_bufu_hv,
+            stride_bufg_slot,
+            stride_bufg_pos,
+            stride_bufg_hv,
+            i_hv,
+            o_k,
+            o_v,
+            mask_k,
+            mask_v,
+            K,
+            V,
+            BK,
+            BH,
+            True,
+        )
+        b_ht = b_s0t * b_decay_t[None, :] + _replay_dot(
+            tl.trans(b_ru_t), b_kw_t, False, DOT_MODE
+        )
+        p_dst_t = ckpt + dst * stride_ckpt_slot + off_t
+        tl.store(p_dst_t, b_ht.to(p_dst_t.dtype.element_ty), mask=mask_t)
+        return
+
+    mask_h = mask_k[:, None] & mask_v[None, :]
     p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
     b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
         tl.float32
@@ -602,7 +643,8 @@ def replayssm_materialize(
     max_query_len: int,
 ) -> None:
     """Write the state after verify step ``step_idx[i]`` of ``slot_idx[i]``
-    into checkpoint slot ``dst_idx[i]`` (GDN, scalar gate).
+    into checkpoint slot ``dst_idx[i]``. GDN (scalar gate, ``[HV, K, V]``) or
+    KDA (per-channel gate, a 4-D ``buf_g``, transposed ``[HV, V, K]``).
 
     Call after the verify forward and before :func:`replayssm_commit` for that
     step: the rebuild re-derives the forward's append offset from the cursor
@@ -624,9 +666,11 @@ def replayssm_materialize(
         return
     if not ckpt.is_contiguous():
         raise ValueError("replayssm_materialize requires a contiguous checkpoint")
-    if buf_g.ndim != 3:
-        raise ValueError("replayssm_materialize supports the scalar-gate GDN ring")
-    _, HV, K, V = ckpt.shape
+    is_kda = buf_g.ndim == 4
+    if is_kda:
+        _, HV, V, K = ckpt.shape
+    else:
+        _, HV, K, V = ckpt.shape
     cap = buf_k.shape[2]
     assert flush_threshold_ok(cap, max_query_len)
     BK = triton.next_power_of_2(K)
@@ -665,13 +709,14 @@ def replayssm_materialize(
         stride_bufg_pos=buf_g.stride(2),
         stride_bufg_hv=buf_g.stride(1),
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        IS_KDA=is_kda,
         num_warps=1,
         num_stages=3,
     )
 
 
 # --------------------------------------------------------------------------- #
-# Fused rebuild + decode/verify kernel                                         #
+# Fused rebuild + decode/verify kernel                                        #
 # --------------------------------------------------------------------------- #
 
 

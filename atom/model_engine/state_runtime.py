@@ -62,6 +62,10 @@ class StateTransfer:
     #: by default: an undeclared class recomputes past its last prefill
     #: checkpoint instead of restoring a state it never had.
     spec_step_settled: bool = False
+    #: A decode boundary's image is built from the slot at its verify step
+    #: (`CheckpointStoreOp.step`) rather than copied as the slot stands, so the
+    #: coordinator lends each such store a scratch slot to build it in.
+    decode_snapshot: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
@@ -70,6 +74,10 @@ class StateTransfer:
             raise TypeError("readable_midstep must be a bool")
         if not isinstance(self.spec_step_settled, bool):
             raise TypeError("spec_step_settled must be a bool")
+        if not isinstance(self.decode_snapshot, bool):
+            raise TypeError("decode_snapshot must be a bool")
+        if self.decode_snapshot and self.kind != COPY:
+            raise ValueError("only a copy transfer builds decode snapshots")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
         for name in ("midstep_grid", "midstep_min_offset"):
@@ -132,6 +140,7 @@ class StateTransfer:
         midstep_grid: int = 0,
         midstep_min_offset: int = 0,
         spec_step_settled: bool = False,
+        decode_snapshot: bool = False,
     ) -> "StateTransfer":
         return cls(
             COPY,
@@ -140,6 +149,7 @@ class StateTransfer:
             midstep_grid=midstep_grid,
             midstep_min_offset=midstep_min_offset,
             spec_step_settled=spec_step_settled,
+            decode_snapshot=decode_snapshot,
         )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
@@ -151,6 +161,7 @@ class StateTransfer:
             "midstep_grid": self.midstep_grid,
             "midstep_min_offset": self.midstep_min_offset,
             "spec_step_settled": self.spec_step_settled,
+            "decode_snapshot": self.decode_snapshot,
         }
 
     @classmethod
@@ -165,6 +176,7 @@ class StateTransfer:
             "midstep_grid",
             "midstep_min_offset",
             "spec_step_settled",
+            "decode_snapshot",
         }
         if set(wire) != expected:
             raise ValueError(
@@ -179,6 +191,7 @@ class StateTransfer:
             midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
             midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
             spec_step_settled=wire["spec_step_settled"],  # type: ignore[arg-type]
+            decode_snapshot=wire["decode_snapshot"],  # type: ignore[arg-type]
         )
 
     @property

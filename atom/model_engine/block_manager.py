@@ -402,6 +402,7 @@ class BlockManager:
                 enabled=enabled,
                 readable_midstep=state_runtime.transfer.readable_midstep,
                 spec_step_settled=state_runtime.transfer.spec_step_settled,
+                decode_snapshot=state_runtime.transfer.decode_snapshot,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -2487,6 +2488,7 @@ class BlockManager:
         next_forward_tokens: int | None = None,
         aimed: bool = True,
         replay_until: int | None = None,
+        snapshot_step: int = -1,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -2571,7 +2573,7 @@ class BlockManager:
             else []
         )
         for cache in kept:
-            cache.checkpoint(seq, end, h)
+            cache.checkpoint(seq, end, h, snapshot_step)
         if kept:
             seq.last_checkpoint_pos = pos
         # The midstep half of the same moment. Here rather than at each of the
@@ -2608,7 +2610,11 @@ class BlockManager:
         return True
 
     def hash_decode_blocks(
-        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+        self,
+        seq: Sequence,
+        committed_kv_len: int,
+        next_forward_tokens: int = 0,
+        snapshot_step: int = 0,
     ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
@@ -2631,6 +2637,9 @@ class BlockManager:
         `next_forward_tokens` reaches `checkpointers_at`; see there. It
         defaults to "no next forward", i.e. hash but never checkpoint, so a
         caller opts into decode-point checkpointing rather than out of it.
+
+        `snapshot_step` is the step of the slot's last verify window that
+        `committed_kv_len` ends on, as the slot stands when the store runs.
         """
         if not self.enable_prefix_caching:
             return
@@ -2645,6 +2654,7 @@ class BlockManager:
                 # speculative one, so it is held to spacing rather than to the
                 # grid.
                 aimed=False,
+                snapshot_step=snapshot_step,
             )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
@@ -3358,7 +3368,12 @@ class BlockManager:
             # aimed placements are both prompt positions, so nothing here is
             # reachable and generation keeps no checkpoints under -1.
             return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+        elif (
+            # No forward after this one: nothing will read the slot as it is.
+            not next_forward_tokens
+            or pos % self.hash_block_size
+            or pos - seq.last_checkpoint_pos < interval
+        ):
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos

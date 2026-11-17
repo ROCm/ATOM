@@ -753,3 +753,63 @@ def test_backend_published_unit_overrides_the_share():
 def test_page_unit_needs_target_page_bytes():
     with pytest.raises(RuntimeError, match="declares no PAGE bytes"):
         published_page_unit_bytes(_Builder([state_pool("s", 64, entries_per_req=1)]))
+
+
+class _ScratchSlots:
+    def __init__(self, *free):
+        self.free = list(free)
+
+    def has_free(self):
+        return bool(self.free)
+
+    def pop(self):
+        return self.free.pop()
+
+    def release(self, slot):
+        self.free.append(slot)
+
+
+def _snapshot_coordinator(*free, decode_snapshot=True):
+    from types import SimpleNamespace
+
+    c = PagedStateCheckpointCoordinator(
+        BlockPool(20),
+        PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
+        enabled=True,
+        decode_snapshot=decode_snapshot,
+    )
+    slots = _ScratchSlots(*free)
+    c.attach_midstep_scratch(slots, 8)
+
+    def seq(slot):
+        return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
+
+    return c, slots, seq
+
+
+def test_a_decode_boundary_borrows_scratch_for_one_batch():
+    c, slots, seq = _snapshot_coordinator(9)
+    c.checkpoint(seq(1), 8, 101, step=2)
+    c.checkpoint(seq(2), 6, 102)  # a prefill wrote that slot whole
+    stores, _ = c.take_checkpoint_ops()
+    got = {(op.src_slot, op.step, op.scratch_slot) for op in stores}
+    assert got == {(1, 2, 9), (2, -1, -1)}
+    assert slots.free == []
+    c.complete_previous_batch()
+    assert slots.free == [9]
+
+
+def test_a_decode_boundary_with_no_scratch_free_is_dropped():
+    c, _, seq = _snapshot_coordinator()
+    c.checkpoint(seq(1), 8, 101, step=0)
+    stores, _ = c.take_checkpoint_ops()
+    assert stores == ()
+    assert c.checkpoints_dropped == 1
+
+
+def test_a_backend_that_copies_its_slot_as_is_borrows_nothing():
+    c, slots, seq = _snapshot_coordinator(9, decode_snapshot=False)
+    c.checkpoint(seq(1), 8, 101, step=2)
+    stores, _ = c.take_checkpoint_ops()
+    assert [(op.step, op.scratch_slot) for op in stores] == [(-1, -1)]
+    assert slots.free == [9]
