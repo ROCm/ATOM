@@ -546,7 +546,7 @@ KVConnectorFactory.register(
 # value type does not recursively import this factory.
 register_backends(KVConnectorFactory)
 
-# Connectors that provide the paged pool itself (atom/kv_transfer/l1).
-from atom.kv_transfer.l1 import register_backends as _register_l1
+# Connectors that provide the paged pool itself (atom/kv_transfer/pool).
+from atom.kv_transfer.pool import register_backends as _register_pool
 
-_register_l1(KVConnectorFactory)
+_register_pool(KVConnectorFactory)

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The `umbp_l1` connector provides the KV pool; the engine asks connectors
-for it before falling back to its own (atom/kv_transfer/l1)."""
+"""The `umbp_pool` connector provides the KV pool; the engine asks connectors
+for it before falling back to its own (atom/kv_transfer/pool)."""
 
 import types
 
@@ -12,10 +12,10 @@ from conftest import MockConfig
 from test_umbp_l1_pool import make_pool
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.l1.umbp_l1 import pool as umbp_pool
-from atom.kv_transfer.l1.umbp_l1.connector import UmbpL1ConnectorScheduler
-from atom.kv_transfer.l1.umbp_l1.pool import UmbpBlockPool
-from atom.kv_transfer.l1.umbp_l1.settings import UmbpL1Settings
+from atom.kv_transfer.pool.umbp import pool as umbp_pool
+from atom.kv_transfer.pool.umbp.connector import UmbpPoolConnectorScheduler
+from atom.kv_transfer.pool.umbp.pool import UmbpBlockPool
+from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block_pool import LocalPoolMemory, make_pool_memory
@@ -27,7 +27,7 @@ l1 = umbp_tests.l1
 
 def transfer(**extra):
     return {
-        "kv_connector": "umbp_l1",
+        "kv_connector": "umbp_pool",
         "kv_connector_extra_config": {"address": ADDRESS, **extra},
     }
 
@@ -38,7 +38,7 @@ def config_with(kv_transfer_config):
 
 class TestSettings:
     def test_defaults(self):
-        s = UmbpL1Settings.from_transfer_config(transfer())
+        s = UmbpPoolSettings.from_transfer_config(transfer())
         assert (s.address, s.namespace, s.group, s.fetch, s.share_ratio) == (
             ADDRESS,
             "atom",
@@ -50,20 +50,20 @@ class TestSettings:
 
     def test_the_address_is_required(self):
         with pytest.raises(ValueError, match="address"):
-            UmbpL1Settings.from_transfer_config({"kv_connector": "umbp_l1"})
+            UmbpPoolSettings.from_transfer_config({"kv_connector": "umbp_pool"})
 
     @pytest.mark.parametrize("ratio", [0, -0.1, 1.5])
     def test_the_share_ratio_is_a_share(self, ratio):
         with pytest.raises(ValueError, match="share_ratio"):
-            UmbpL1Settings.from_transfer_config(transfer(share_ratio=ratio))
+            UmbpPoolSettings.from_transfer_config(transfer(share_ratio=ratio))
 
     def test_fetch_accepts_text(self):
-        assert not UmbpL1Settings.from_transfer_config(transfer(fetch="false")).fetch
+        assert not UmbpPoolSettings.from_transfer_config(transfer(fetch="false")).fetch
 
 
 class TestRegistry:
     def test_registered_under_its_name(self):
-        assert KVConnectorFactory.canonical_name("umbp_l1") == "umbp_l1"
+        assert KVConnectorFactory.canonical_name("umbp_pool") == "umbp_pool"
 
     def test_routing_learns_that_ranks_load_from_each_other(self):
         sharing = KVConnectorFactory.pool_sharing(
@@ -106,14 +106,14 @@ class TestProvidesThePool:
 
     def test_whole_pool_by_default(self, shared_pools):
         # The same pool at every ratio: at 1 its private part is empty.
-        conn = UmbpL1ConnectorScheduler(config_with(transfer()))
+        conn = UmbpPoolConnectorScheduler(config_with(transfer()))
         pool = conn.make_block_pool(None, 8)
         assert isinstance(pool, UmbpBlockPool)
         assert pool.offset == 0 and pool.private.num_blocks == 0
         assert shared_pools == [8]
 
     def test_a_share_ratio_splits_the_pool(self, shared_pools):
-        conn = UmbpL1ConnectorScheduler(config_with(transfer(share_ratio=0.25)))
+        conn = UmbpPoolConnectorScheduler(config_with(transfer(share_ratio=0.25)))
         pool = conn.make_block_pool(None, 8)
         assert isinstance(pool, UmbpBlockPool)
         assert pool.offset == 6 and shared_pools == [2]
@@ -122,7 +122,7 @@ class TestProvidesThePool:
         cfg = MockConfig(
             num_kvcache_blocks=16, kv_cache_block_size=4, enable_prefix_caching=True
         )
-        conn = UmbpL1ConnectorScheduler(config_with(transfer(share_ratio=0.5)))
+        conn = UmbpPoolConnectorScheduler(config_with(transfer(share_ratio=0.5)))
         bm = BlockManager(cfg, kv_connector=conn)
         assert isinstance(bm.kv, UmbpBlockPool)
 

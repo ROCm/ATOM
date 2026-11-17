@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`umbp_l1`: a KV connector that hands the paged KV pool to MORI-UMBP.
+"""`umbp_pool`: a KV connector that hands the paged KV pool to MORI-UMBP.
 
 Unlike a transfer or offload connector it moves nothing around the pool: it
 provides the pool. The worker side answers `kv_pool_memory` (where the paged
@@ -26,13 +26,13 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
-from atom.kv_transfer.l1.umbp_l1.settings import UmbpL1Settings
+from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 
 logger = logging.getLogger("atom")
 
 
-def _settings(config: Any) -> UmbpL1Settings:
-    return UmbpL1Settings.from_transfer_config(
+def _settings(config: Any) -> UmbpPoolSettings:
+    return UmbpPoolSettings.from_transfer_config(
         getattr(config, "kv_transfer_config", None)
     )
 
@@ -42,7 +42,7 @@ def pool_sharing(kv_transfer_config) -> dict[str, Any]:
     rank copies a prefix it lacks from another rank's pool when fetching is on,
     and sessions move off a crowded rank when a margin is set. From the
     settings alone; nothing is built and mori is not imported."""
-    settings = UmbpL1Settings.from_transfer_config(kv_transfer_config)
+    settings = UmbpPoolSettings.from_transfer_config(kv_transfer_config)
     return {
         "loads": settings.fetch,
         "session_migrate_margin": (
@@ -51,7 +51,7 @@ def pool_sharing(kv_transfer_config) -> dict[str, Any]:
     }
 
 
-class UmbpL1Connector(KVConnectorBase):
+class UmbpPoolConnector(KVConnectorBase):
     """Worker side: the paged pool's memory."""
 
     is_producer = False
@@ -61,7 +61,7 @@ class UmbpL1Connector(KVConnectorBase):
         self.settings = _settings(config)
 
     def kv_pool_memory(self, config: Any, rank: int):
-        from atom.kv_transfer.l1.umbp_l1.pool import make_umbp_pool_memory
+        from atom.kv_transfer.pool.umbp.pool import make_umbp_pool_memory
 
         return make_umbp_pool_memory(config, self.settings, rank)
 
@@ -75,7 +75,7 @@ class UmbpL1Connector(KVConnectorBase):
         return set(), set()
 
 
-class UmbpL1ConnectorScheduler(KVConnectorSchedulerBase):
+class UmbpPoolConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler side: the block pool."""
 
     is_producer = False
@@ -95,7 +95,7 @@ class UmbpL1ConnectorScheduler(KVConnectorSchedulerBase):
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
     ):
-        from atom.kv_transfer.l1.umbp_l1.pool import make_umbp_block_pool
+        from atom.kv_transfer.pool.umbp.pool import make_umbp_block_pool
 
         # One pool for every share ratio: at 1 its private part is empty.
         self.pool = make_umbp_block_pool(

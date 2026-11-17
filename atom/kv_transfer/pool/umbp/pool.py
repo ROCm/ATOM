@@ -3,7 +3,7 @@
 
 """The paged KV pool, with the part MORI-UMBP manages shared across ranks.
 
-`UmbpBlockPool` is what the `umbp_l1` connector hands the scheduler: this
+`UmbpBlockPool` is what the `umbp_pool` connector hands the scheduler: this
 process's own `BlockPool` for block ids `[0, P)` and a `UmbpL1Pool` for
 `[P, N)`, where `P = split_point(N, share_ratio)` -- 0 at a ratio of 1, when
 UMBP manages every block. Placement is private first; a private block whose
@@ -38,7 +38,7 @@ updates carries a timestamp, the runner records a device event after each
 forward, and when the event completes it tells UMBP that everything stamped up
 to then has landed. UMBP reads or fills a block from outside only after that.
 
-Built by the `umbp_l1` KV connector (`connector.py`), which reads its settings
+Built by the `umbp_pool` KV connector (`connector.py`), which reads its settings
 off `kv_transfer_config` (`settings.py`). Needs the `mori_umbp_l1` client
 module and a running UMBP standalone server.
 """
@@ -56,7 +56,7 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 from itertools import islice, pairwise
 from typing import Any
 
-from atom.kv_transfer.l1.umbp_l1.settings import UmbpL1Settings
+from atom.kv_transfer.pool.umbp.settings import UmbpPoolSettings
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import Block
 from atom.model_engine.kv_block_pool import KVBlockPool, KVPoolMemory
@@ -72,25 +72,25 @@ def _load_client_module():
         import mori_umbp_l1
     except ImportError as exc:  # pragma: no cover - deployment error
         raise RuntimeError(
-            "the umbp_l1 connector needs the mori_umbp_l1 module on "
+            "the umbp_pool connector needs the mori_umbp_l1 module on "
             "PYTHONPATH (built from mori with -DBUILD_UMBP_L1_PYTHON=ON)"
         ) from exc
     return mori_umbp_l1
 
 
-def _connect(settings: UmbpL1Settings):
+def _connect(settings: UmbpPoolSettings):
     module = _load_client_module()
     return module, module.L1Client(settings.address)
 
 
-def pool_id_for(config, settings: UmbpL1Settings, rank: int = 0) -> str:
+def pool_id_for(config, settings: UmbpPoolSettings, rank: int = 0) -> str:
     """The name both processes of one engine rank know their pool by."""
     parallel = getattr(config, "parallel_config", None)
     dp_rank = getattr(parallel, "data_parallel_rank", 0) or 0
     return f"{settings.namespace}:dp{dp_rank}:tp{rank}"
 
 
-def share_group_for(config, settings: UmbpL1Settings) -> str:
+def share_group_for(config, settings: UmbpPoolSettings) -> str:
     """Pools exchange blocks only inside one group.
 
     The id has to change whenever a block's bytes would mean something else:
@@ -725,7 +725,7 @@ class UmbpPoolMemory(KVPoolMemory):
 
 def make_umbp_l1_pool(
     config,
-    settings: UmbpL1Settings,
+    settings: UmbpPoolSettings,
     num_blocks: int,
     *,
     on_evict: Callable[[int], None] | None = None,
@@ -745,7 +745,7 @@ def make_umbp_l1_pool(
 
 
 def make_umbp_pool_memory(
-    config, settings: UmbpL1Settings, rank: int = 0
+    config, settings: UmbpPoolSettings, rank: int = 0
 ) -> UmbpPoolMemory:
     if rank != 0:
         raise NotImplementedError(
@@ -767,7 +767,7 @@ def split_point(num_blocks: int, ratio: float) -> int:
 class UmbpBlockPool(KVBlockPool):
     """Private `BlockPool` below `offset`, `UmbpL1Pool` from `offset` on.
 
-    Always the pool the `umbp_l1` connector provides; at a share ratio of 1
+    Always the pool the `umbp_pool` connector provides; at a share ratio of 1
     `offset` is 0 and every call goes to the UMBP part.
     """
 
@@ -1039,7 +1039,7 @@ class UmbpBlockPool(KVBlockPool):
 
 def make_umbp_block_pool(
     config,
-    settings: UmbpL1Settings,
+    settings: UmbpPoolSettings,
     num_blocks: int,
     *,
     on_evict: Callable[[int], None] | None = None,
