@@ -1,7 +1,61 @@
-# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 points
+# Qwen3.5-35B-A3B MXFP4 on 4 x MI455X (gfx1250): MLPerf Endpoints agentic, the 2026-11-01 to 11-07 points
 
 How to reproduce the numbers below: the exact code, the settings, the run, and how each number is computed.
 They are 10-minute measurement points, not official results (see [What these numbers are](#what-these-numbers-are)).
+
+## 2026-11-07: Qwen3.6, GDN mid-step checkpoints, 1x32 MXFP8 projections, ~2x decode intervals
+
+`agentic_20261107.env` on top of `agentic_20261101.env`, run with `run_point_20261107.sh <concurrency> [run dir]`
+(`AITER_DIR` = the aiter tree). Over 11-05: the Qwen3.6-35B-A3B MXFP4 checkpoint, the GDN verify split / unroll and
+`ATOM_GDN_STATE_MIDSTEP=1` (about half the TTFT, spent on decode intervals about twice the 11-05/06 ones), and 1x32
+MXFP8 projections (`ATOM_MXFP8_1X32=1`) with the activation quant fused into every producer, including the GDN verify
+(matrix form) and the MoE gather + tail RMSNorm. Client: the submission settings (`STOP_FIRST=0 ACC_INLINE=1`, 6743
+trajectories, `CAP_MIN=10`), every point a complete run read from `result_summary.json` (`METRICS_ISL=0`).
+
+| concurrency | decode interval | output tok/s | tps_per_user (1000 / p90 TPOT) | TTFT p50 / p90 (ms) | inline accuracy | MTP accept |
+|---|---|---:|---:|---|---:|---:|
+| 1536 | 10, 20,480-token prefill budget | 81,856 | 136.5 | 2651 / 3979 | 57.76% | 63.5% |
+| 1024 | 24 | 63,976 | 231.0 | 2693 / 3659 | 57.46% | 63.8% |
+| 768 | 32 | 58,349 | 262.5 | 1887 / 2680 | 57.21% | 64.3% |
+| 512 | 48 | 50,144 | 314.2 | 1032 / 1670 | 56.59% | 65.4% |
+| 384 | 80 | 40,406 | 391.5 | 905 / 1595 | 56.74% | 65.9% |
+| 256 | 128 | 31,799 | 477.6 | 568 / 1198 | 56.38% | 65.2% |
+| 128 | 96 | 20,441 | 632.1 | 221 / 412 | 56.48% | 67.2% |
+| 64 | 96 | 10,995 | 785.2 | 160 / 312 | 55.77% | 65.8% |
+
+At matched intervals the 1x32 MXFP8 projections add 2-5% tok/s and 2-5% tps_per_user over bf16 (c128 bf16: 19,524 @
+614.0, accuracy 56.59%). c64 is 0.09 points under the 55.86% accuracy gate on 17.5k outputs (c128 and up: 32k-132k).
+
+## 2026-11-05: DP4 with replicated experts, API offload, MoE fusions
+
+`agentic_20261105.env` on top of `agentic_20261101.env`: DP4 attention with every routed expert on every GPU and
+independent ranks, the A8K4V8 KV cache with 128-token blocks, MTP-3, the MoE / attention fusion flags of this PR, and
+request preparation in 64 tokenize workers (`ATOM_API_OFFLOAD_PREPROCESS=1`, #3018). Client: the submission settings
+(`STOP_FIRST=0 ACC_INLINE=1`, 6743 trajectories, `CAP_MIN=10`, a 10-minute issue cap).
+
+| concurrency | decode interval | output tok/s | tps_per_user (1000 / p90 TPOT) | requests/s |
+|---|---|---:|---:|---:|
+| 1536 | 10, 20,480-token prefill budget | 65,987 | 137.2 | 190.7 |
+| 1024 | 8 | 63,723 | 137.0 | 180.1 |
+| 768 | 16 | 56,503 | 181.2 | 157.3 |
+| 512 | 24 | 46,440 | 239.8 | 130.5 |
+| 256 | 32 | 29,326 | 380.2 | 82.0 |
+| 128 | 48 | 16,993 | 578.3 | 47.0 |
+
+Scored with `quick_score.sh <run dir>` (run inside the container next to a `bench_point.sh` run started with
+`STOP_S=0`): when the client's performance window closes and its tracked turns complete, `replay_report.py` scores
+`events.jsonl` with the client's own code (the same window, OSL and TPOT rules as `result_summary.json`), writes
+`<run dir>.quick_summary.json` and stops the run, about 15 minutes a point instead of 35-40. A run the client ends by
+itself (c128: no user finishes before the issue cap) is read from its `result_summary.json` (c128: complete, inline
+accuracy 55.48%, full-run OSL 361.3). Not official results: Qwen3.5 MXFP4 is not an approved checkpoint, and the
+Qwen3.5 chat template drops earlier turns' reasoning.
+
+```bash
+set -a; . ./agentic_20261101.env; . ./agentic_20261105.env; set +a
+export ATOM_PREFILL_DECODE_INTERVAL=8 PREFILL_TOKENS=16384 NUM_TRAJ=6743 STOP_FIRST=0 ACC_INLINE=1 CAP_MIN=10
+STOP_S=0 ./bench_point.sh 1024 /work/qwen35_ep/c1024_1105 &
+./quick_score.sh /work/qwen35_ep/c1024_1105
+```
 
 ## Results
 

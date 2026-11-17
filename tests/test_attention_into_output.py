@@ -159,6 +159,8 @@ def _triton_impl(**overrides):
         "kv_scale": None,
         "scale": 1.0,
         "sinks": None,
+        # ATOM_UA_FUSED_OUTPUT_GATE: no gate for this forward.
+        "_take_output_gate": lambda rows: None,
     }
     attrs.update(overrides)
     return SimpleNamespace(**attrs)

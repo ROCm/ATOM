@@ -76,6 +76,16 @@ if [ "$MODE" = dp ]; then
   export ATOM_GDN_GLUON_INVERSE=${ATOM_GDN_GLUON_INVERSE:-1}
   export ATOM_GDN_CHUNK_H_PAIRED_LOADS=${ATOM_GDN_CHUNK_H_PAIRED_LOADS:-1}
   export ATOM_GDN_CHUNK_O_FAST_NORM=${ATOM_GDN_CHUNK_O_FAST_NORM:-1}
+  # e8m0 FP8 projections (FP8_PROJ=0: bf16): the GDN in_proj / out_proj and the attention qkv_proj /
+  # o_proj quantized online to 128x128 e8m0 block FP8, each one's input written as MXFP8 by the kernel
+  # that produces it. c1024 DP4 + MTP-3 vs bf16 on one node: GSM8K 3-shot 0.8643 / 0.8575 (bf16
+  # 0.8605 / 0.8499), TPS flat, interactivity 95.2 vs 94.1. Needs SPEC > 0 (the online quant config).
+  if [ "${FP8_PROJ:-1}" = 1 ]; then
+    export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=${ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE:-1}
+    export ATOM_GDN_IN_PROJ_ONLINE_QUANT=${ATOM_GDN_IN_PROJ_ONLINE_QUANT:-1}
+    export ATOM_MXFP8_FUSED_ACT_QUANT=${ATOM_MXFP8_FUSED_ACT_QUANT:-1}
+    FP8_PROJ_OQC='{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4","*language_model*.linear_attn":"per_block_fp8","*.linear_attn.out_proj":"per_block_fp8","*.self_attn.qkv_proj":"per_block_fp8","*.self_attn.o_proj":"per_block_fp8"}}'
+  fi
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
@@ -145,11 +155,12 @@ case $MODE in
 esac
 # SPEC=<n>: MTP speculative decoding (graphed draft steps); the checkpoint keeps the MTP
 # layer BF16 and gfx1250 has no BF16 fused MoE, so its routed experts are quantized to MXFP4 at load
-# ONLINE_QUANT_CONFIG overrides the online quant config (default: only the MTP experts to MXFP4), e.g. e8m0 FP8
+# ONLINE_QUANT_CONFIG overrides the online quant config (default: the MTP experts to MXFP4, plus the DP
+# block's e8m0 FP8 projections unless FP8_PROJ=0), e.g. e8m0 FP8
 # projections: the MTP-expert entry plus "*language_model*.linear_attn", ".linear_attn.out_proj",
 # ".self_attn.qkv_proj", ".self_attn.o_proj": "per_block_fp8" (with ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1).
 SPEC=${SPEC:-0}
-OQC=${ONLINE_QUANT_CONFIG:-'{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}'}
+OQC=${ONLINE_QUANT_CONFIG:-${FP8_PROJ_OQC:-'{"layer_quant_config":{"mtp.layers.*.mlp.experts":"mxfp4"}}'}}
 [ "$SPEC" -gt 0 ] && ARGS+=(--method mtp --num-speculative-tokens $SPEC
   --online_quant_config "$OQC")
 # TRACE_DIR=<dir>: torch profiler on every rank, armed only; run_ep.sh's TRACE_AT_MIN takes the window

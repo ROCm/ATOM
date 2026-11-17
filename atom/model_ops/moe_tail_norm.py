@@ -32,6 +32,7 @@ before its LM head disappears.
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple
 
 import torch
@@ -41,8 +42,13 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
 from atom.model_ops.mxfp8_1x32 import alloc as mx32_alloc
-from atom.model_ops.mxfp8_1x32 import mx32_quant_groups, mx32_scale_offset
+from atom.model_ops.mxfp8_1x32 import (
+    mx32_quant_groups,
+    mx32_quant_groups_bits,
+    mx32_scale_offset,
+)
 from atom.model_ops.mxfp8_1x32 import note as mx32_note
+from atom.utils import envs
 
 
 class MoEGatedSum(NamedTuple):
@@ -415,7 +421,12 @@ def _moe_tail_rmsnorm_mx32_kernel(
 
 
 def can_fuse_moe_tail_mx32(moe: MoEGatedSum, residual: Tensor, weight: Tensor) -> bool:
-    """`can_fuse_moe_tail` plus what the 1x32 epilogue needs: a power-of-2 hidden, K % 128."""
+    """`can_fuse_moe_tail` plus what the 1x32 epilogue needs: a power-of-2 hidden, K % 128.
+    A deferred gather (ATOM_MOE_GATHER_TAIL_NORM's GatheredRouted) is not this kernel's: it
+    takes the gather + tail kernel's epilogue (`can_fuse_gather_tail_mx32`), and where that
+    does not apply runs in bf16 and the Linear quantizes (the same bytes)."""
+    if isinstance(moe.routed, GatheredRouted):
+        return False
     if not can_fuse_moe_tail(moe, residual, weight, None):
         return False
     hidden = moe.routed.shape[1]
@@ -511,12 +522,559 @@ def moe_tail_rmsnorm_mx32(
     )
 
 
+# ---------------------------------------------------------------------------
+# ATOM_MOE_GATHER_TAIL_NORM: the routed experts' top-k gather-reduce in the tail
+# ---------------------------------------------------------------------------
+#
+# The routed sum normally comes out of aiter's moe_gather_reduce (MoE2's output
+# rows, `topk` of them a token, weighted and summed in fp32, rounded to bf16)
+# and goes through memory to the kernel above. With the gather deferred
+# (`GatheredRouted`), one kernel does both: a program a token loads its `topk`
+# MoE2 rows by the route -> row map, sums them exactly as moe_gather_reduce does
+# (fp32, `acc + w_k * row_k` for k = 0 .. topk - 1, no FMA, rounded to the
+# activation dtype), and continues with `_moe_tail_row`'s steps.
+
+
+class GatheredRouted(NamedTuple):
+    """MoE2's output rows before the top-k weighted sum: `routed[t] = sum_k
+    weights[t, k] * grouped[route_rows[t, k]]` (aiter's
+    `flydsl_moe_gather_reduce`). Slots holding a negative row contribute 0;
+    tokens at or past `num_valid_tokens` (a (1,) int32, padding) have no routed
+    sum (the fused kernel takes it as 0, the reduce leaves the row unwritten)."""
+
+    grouped: Tensor  # [rows, hidden], last dim dense
+    route_rows: Tensor  # [tokens, topk] int32
+    weights: Tensor  # [tokens, topk] f32 / bf16 / f16
+    num_valid_tokens: Tensor | None
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.route_rows.shape[0], self.grouped.shape[1])
+
+    def materialize(self) -> Tensor:
+        """The routed sum as moe_gather_reduce writes it (the unfused path)."""
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import flydsl_moe_gather_reduce
+
+        return flydsl_moe_gather_reduce(
+            self.grouped.view(1, *self.grouped.shape),
+            self.route_rows,
+            self.weights,
+            num_valid_tokens=self.num_valid_tokens,
+        )
+
+
+def resolve_gathered(moe: MoEGatedSum) -> MoEGatedSum:
+    """`moe` with a deferred gather (`GatheredRouted`) reduced to a tensor, for
+    every consumer but the fused gather + tail kernel."""
+    if isinstance(moe.routed, GatheredRouted):
+        return moe._replace(routed=moe.routed.materialize())
+    return moe
+
+
+@triton.jit
+def _gather_tail_row(
+    row,
+    src,
+    grouped_ptr,
+    route_rows_ptr,
+    route_w_ptr,
+    nvt_ptr,
+    shared_ptr,
+    gate_ptr,
+    residual_ptr,
+    weight_ptr,
+    res_out_ptr,
+    stride_grouped,
+    stride_shared,
+    stride_gate,
+    stride_residual,
+    stride_res_out,
+    eps,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    WRITE_RESIDUAL: tl.constexpr,
+    HAS_NVT: tl.constexpr,
+):
+    """Output row `row` (source row `src`): moe_gather_reduce's sum of the
+    token's TOPK MoE2 rows, then `_moe_tail_row`'s steps; stores the new
+    residual (WRITE_RESIDUAL) and returns the normed row in the activation
+    dtype, [BLOCK] (bitwise both: the row layout, and with it the norm's
+    reduction order, is the tail kernel's)."""
+    act = shared_ptr.dtype.element_ty
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    if HAS_NVT:
+        tok_valid = src < tl.load(nvt_ptr)
+    else:
+        tok_valid = True
+    # Every load that does not wait on the route map goes first, then all TOPK
+    # row loads before the first add: the reduction only waits on the slowest.
+    shared = tl.load(shared_ptr + src * stride_shared + cols, mask, other=0.0).to(
+        tl.float32
+    )
+    if HAS_GATE:
+        gate = tl.load(gate_ptr + src * stride_gate)
+    resid = tl.load(residual_ptr + src * stride_residual + cols, mask, other=0.0)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        r = tl.load(route_rows_ptr + src * TOPK + k)
+        w = tl.load(route_w_ptr + src * TOPK + k).to(tl.float32)
+        live = tok_valid & (r >= 0)
+        x = tl.load(
+            grouped_ptr + r.to(tl.int64) * stride_grouped + cols,
+            mask & live,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.where(tok_valid, w, 0.0)
+        # moe_gather_reduce's step: a product, then a sum, each rounded (an
+        # FMA here differs from it in the last bit).
+        acc = acc + w * x
+    routed = acc.to(act).to(tl.float32)
+    if HAS_GATE:
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        shared = (shared * gate).to(act).to(tl.float32)
+    moe = (shared + routed).to(act).to(tl.float32)
+    x = moe + resid.to(tl.float32)
+    if WRITE_RESIDUAL:
+        tl.store(
+            res_out_ptr + row * stride_res_out + cols,
+            x.to(res_out_ptr.dtype.element_ty),
+            mask,
+        )
+    rstd = tl.rsqrt(tl.sum(x * x, axis=0) / N + eps)
+    weight = tl.load(weight_ptr + cols, mask, other=0.0).to(tl.float32) + 1.0
+    return ((x * rstd) * weight).to(act)
+
+
+@triton.jit
+def _moe_gather_tail_rmsnorm_kernel(
+    grouped_ptr,
+    route_rows_ptr,
+    route_w_ptr,
+    nvt_ptr,
+    shared_ptr,
+    gate_ptr,
+    residual_ptr,
+    weight_ptr,
+    rows_ptr,
+    out_ptr,
+    res_out_ptr,
+    stride_grouped,
+    stride_shared,
+    stride_gate,
+    stride_residual,
+    stride_out,
+    stride_res_out,
+    eps,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    GATHER: tl.constexpr,
+    WRITE_RESIDUAL: tl.constexpr,
+    HAS_NVT: tl.constexpr,
+):
+    """One program an output row: `_gather_tail_row`, the normed row stored
+    in the activation dtype."""
+    row = tl.program_id(0).to(tl.int64)
+    if GATHER:
+        src = tl.load(rows_ptr + row).to(tl.int64)
+    else:
+        src = row
+    normed = _gather_tail_row(
+        row,
+        src,
+        grouped_ptr,
+        route_rows_ptr,
+        route_w_ptr,
+        nvt_ptr,
+        shared_ptr,
+        gate_ptr,
+        residual_ptr,
+        weight_ptr,
+        res_out_ptr,
+        stride_grouped,
+        stride_shared,
+        stride_gate,
+        stride_residual,
+        stride_res_out,
+        eps,
+        N,
+        BLOCK,
+        TOPK,
+        HAS_GATE,
+        WRITE_RESIDUAL,
+        HAS_NVT,
+    )
+    cols = tl.arange(0, BLOCK)
+    tl.store(out_ptr + row * stride_out + cols, normed, cols < N)
+
+
+@triton.jit
+def _moe_gather_tail_rmsnorm_mx32_kernel(
+    grouped_ptr,
+    route_rows_ptr,
+    route_w_ptr,
+    nvt_ptr,
+    shared_ptr,
+    gate_ptr,
+    residual_ptr,
+    weight_ptr,
+    res_out_ptr,
+    q_ptr,
+    s_ptr,
+    stride_grouped,
+    stride_shared,
+    stride_gate,
+    stride_residual,
+    stride_res_out,
+    eps,
+    M,
+    N: tl.constexpr,
+    TOPK: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    HAS_NVT: tl.constexpr,
+    N32K4: tl.constexpr,
+    NUM_XCD: tl.constexpr,
+):
+    """`_moe_gather_tail_rmsnorm_kernel` (no row subset, residual written)
+    whose normed row goes out as 1x32 MXFP8 (`_moe_tail_rmsnorm_mx32_kernel`'s
+    epilogue): fp8 e4m3 [M, N] plus one e8m0 byte per 32 columns in the GEMM's
+    x-scale layout. One program a row; program r < pad32(M) - M also writes
+    n32k4 pad row M + r (byte 0x7F).
+
+    n32k4 puts a row's 64 bytes in 16 pieces of 4, 128 bytes apart: a 128-byte
+    line holds 32 rows' pieces. Programs go to the XCDs round robin, so row
+    after row would land on another XCD's L2 and no line would be assembled in
+    one (measured: +30% kernel time at 8k rows). Rows are therefore remapped so
+    that each XCD runs a contiguous range of them."""
+    pid = tl.program_id(0)
+    if N32K4 and NUM_XCD > 1:
+        per = (M + NUM_XCD - 1) // NUM_XCD  # rows of the first `tall` XCDs
+        tall = M - (per - 1) * NUM_XCD
+        xcd = pid % NUM_XCD
+        loc = pid // NUM_XCD
+        pid = tl.where(
+            xcd < tall,
+            xcd * per + loc,
+            tall * per + (xcd - tall) * (per - 1) + loc,
+        )
+    row = pid.to(tl.int64)
+    KG: tl.constexpr = N // 32
+    g = tl.arange(0, KG)
+    normed = _gather_tail_row(
+        row,
+        row,
+        grouped_ptr,
+        route_rows_ptr,
+        route_w_ptr,
+        nvt_ptr,
+        shared_ptr,
+        gate_ptr,
+        residual_ptr,
+        weight_ptr,
+        res_out_ptr,
+        stride_grouped,
+        stride_shared,
+        stride_gate,
+        stride_residual,
+        stride_res_out,
+        eps,
+        N,
+        N,
+        TOPK,
+        HAS_GATE,
+        True,
+        HAS_NVT,
+    )
+    # The fp8 codes as bytes (q_ptr is uint8): no fp8 conversion, so the route
+    # map / weight / gate loads stay scalar loads (see mx32_e4m3_bits).
+    q, e = mx32_quant_groups_bits(tl.reshape(normed.to(tl.float32), (KG, 32)))
+    # 8 contiguous codes a thread, the reshape's own layout: a wider store
+    # would go through an LDS layout conversion.
+    qcols = tl.max_contiguous(g[:, None] * 32 + tl.arange(0, 32)[None, :], [1, 8])
+    tl.store(q_ptr + row * N + qcols, q)
+    tl.store(s_ptr + mx32_scale_offset(row, g, KG, N32K4), e)
+    if N32K4:
+        pad_row = M + row
+        tl.store(
+            s_ptr + mx32_scale_offset(pad_row, g, KG, N32K4),
+            tl.full([KG], 0x7F, dtype=tl.uint8),
+            (g < KG) & (pad_row < (M + 31) // 32 * 32),
+        )
+
+
+def can_fuse_gather_tail(
+    moe: MoEGatedSum, residual: Tensor, weight: Tensor, rows: Tensor | None = None
+) -> bool:
+    """`can_fuse_moe_tail` for a deferred gather: the same row conditions, the
+    MoE2 rows of the activation dtype and width, dense."""
+    g = moe.routed
+    if not isinstance(g, GatheredRouted):
+        return False
+    shared, gate = moe.shared, moe.gate_logits
+    dtype = shared.dtype
+    if dtype not in (torch.bfloat16, torch.half) or shared.dim() != 2:
+        return False
+    tokens, hidden = shared.shape
+    if g.grouped.dtype != dtype or g.grouped.dim() != 2 or g.grouped.shape[1] != hidden:
+        return False
+    if g.route_rows.shape[0] != tokens or g.route_rows.dtype != torch.int32:
+        return False
+    if g.weights.shape != g.route_rows.shape or g.weights.dtype not in (
+        torch.float32,
+        torch.bfloat16,
+        torch.half,
+    ):
+        return False
+    if not (g.route_rows.is_contiguous() and g.weights.is_contiguous()):
+        return False
+    if residual.dtype != dtype or residual.shape != shared.shape:
+        return False
+    if any(t.stride(1) != 1 for t in (g.grouped, shared, residual)):
+        return False
+    if gate is not None and (gate.dtype != dtype or gate.shape != (tokens, 1)):
+        return False
+    if weight.shape != (hidden,) or weight.stride(0) != 1:
+        return False
+    return rows is None or (
+        rows.dim() == 1 and rows.dtype in (torch.int32, torch.int64)
+    )
+
+
+# Compiled fused kernels by launch key (see `moe_gather_tail_rmsnorm`).
+_GATHER_COMPILED: dict[tuple, object] = {}
+
+
+def moe_gather_tail_rmsnorm(
+    moe: MoEGatedSum,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+    rows: Tensor | None = None,
+    write_residual: bool = True,
+) -> Tensor | tuple[Tensor, Tensor]:
+    """`moe_tail_rmsnorm` (write_residual) / `moe_tail_rmsnorm_rows` (not) of
+    `MoEGatedSum(gather_reduce(moe.routed), shared, gate)` in one launch,
+    bitwise the two kernels in sequence on every token below
+    `num_valid_tokens` (past it the routed sum is 0, where the reduce leaves the
+    row unwritten). `moe.routed` is a `GatheredRouted` (`can_fuse_gather_tail`)."""
+    g, shared, gate = moe
+    tokens, hidden = shared.shape
+    n_out = tokens if rows is None else rows.shape[0]
+    assert rows is None or not write_residual, "a row subset has no new residual"
+    out = torch.empty((n_out, hidden), dtype=shared.dtype, device=shared.device)
+    res_out = torch.empty_like(out) if write_residual else None
+    if n_out == 0:
+        return (out, res_out) if write_residual else out
+    if envs.ATOM_MOE_GATHER_TAIL_NORM_PIPE:
+        # Prefill sizes: the software-pipelined TDM kernel (same bits).
+        from atom.model_ops import moe_gather_tail_gluon as tdm
+
+        if tdm.gather_tail_tdm_takes(g, shared, residual, n_out):
+            tdm.launch_gather_tail_tdm(
+                g, shared, gate, residual, weight, eps, rows, out, res_out
+            )
+            return (out, res_out) if write_residual else out
+    nvt = g.num_valid_tokens
+    ptrs = (
+        g.grouped,
+        g.route_rows,
+        g.weights,
+        nvt if nvt is not None else g.route_rows,
+        shared,
+        gate if gate is not None else shared,
+        residual,
+        weight,
+        rows if rows is not None else g.route_rows,
+        out,
+        res_out if res_out is not None else out,
+    )
+    strides = (
+        g.grouped.stride(0),
+        shared.stride(0),
+        gate.stride(0) if gate is not None else 0,
+        residual.stride(0),
+        out.stride(0),
+        res_out.stride(0) if res_out is not None else 0,
+    )
+    block = triton.next_power_of_2(hidden)
+    topk = g.route_rows.shape[1]
+    # The compiled kernel launched directly, as `_launch` does (eager prefill is
+    # host-bound): only where every pointer is 16-byte aligned and every row
+    # offset stays within 2 GiB (Triton's AMD buffer-op assumption), under a key
+    # at least as fine as Triton's specialization.
+    reach = (
+        max(g.grouped.shape[0] * strides[0], max(tokens, n_out) * max(strides[1:]))
+        + hidden
+    ) * shared.element_size()
+    cacheable = reach <= _INT32_MAX and not any(t.data_ptr() % 16 for t in ptrs)
+    key = (
+        hidden,
+        block,
+        topk,
+        shared.dtype,
+        g.weights.dtype,
+        None if gate is None else gate.dtype,
+        None if rows is None else rows.dtype,
+        nvt is not None,
+        write_residual,
+        tuple((v == 1, v % 16 == 0) for v in strides),
+    )
+    kernel = _GATHER_COMPILED.get(key) if cacheable else None
+    if kernel is not None:
+        kernel[(n_out, 1, 1)](*ptrs, *strides, eps)
+        return (out, res_out) if write_residual else out
+    kernel = _moe_gather_tail_rmsnorm_kernel[(n_out,)](
+        *ptrs,
+        *strides,
+        eps,
+        N=hidden,
+        BLOCK=block,
+        TOPK=topk,
+        HAS_GATE=gate is not None,
+        GATHER=rows is not None,
+        WRITE_RESIDUAL=write_residual,
+        HAS_NVT=nvt is not None,
+        # The tail kernel's layout (and so its sum-of-squares order).
+        num_warps=4 if block <= 2048 else 8,
+        enable_fp_fusion=False,
+    )
+    if cacheable:
+        _GATHER_COMPILED[key] = kernel
+    return (out, res_out) if write_residual else out
+
+
+def can_fuse_gather_tail_mx32(
+    moe: MoEGatedSum, residual: Tensor, weight: Tensor
+) -> bool:
+    """`can_fuse_gather_tail` (no row subset) plus what the 1x32 epilogue
+    needs: a power-of-2 hidden, K % 128 (`can_fuse_moe_tail_mx32`'s)."""
+    if not can_fuse_gather_tail(moe, residual, weight, None):
+        return False
+    hidden = moe.shared.shape[1]
+    return hidden == triton.next_power_of_2(hidden) and hidden % 128 == 0
+
+
+@functools.cache
+def num_xcds() -> int:
+    """XCDs of the device (aiter's table; 8 where it has no entry)."""
+    try:
+        from aiter.ops.triton.utils.device_info import get_num_xcds
+    except ImportError:
+        return 8
+    return get_num_xcds()
+
+
+# Compiled 1x32 fused kernels by launch key (see `moe_gather_tail_rmsnorm_mx32`).
+_GATHER_MX32_COMPILED: dict[tuple, object] = {}
+
+
+def moe_gather_tail_rmsnorm_mx32(
+    moe: MoEGatedSum, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    """`moe_gather_tail_rmsnorm` (residual written) with the normed rows as
+    1x32 MXFP8 for the next projection: `(x_fp8 [M, hidden], x_scale (flat
+    uint8, mxfp8_1x32 layout), new_residual)`, as `moe_tail_rmsnorm_mx32`
+    returns. Bitwise `moe_gather_tail_rmsnorm`'s normed rows followed by
+    mxfp8_1x32.quant_standalone (scale pad rows 0x7F); the residual is bitwise
+    its residual. Callers check `can_fuse_gather_tail_mx32`. Eager / CUDA-graph
+    only, like the deferred gather itself."""
+    g, shared, gate = moe
+    m, hidden = shared.shape
+    mx32_note("fused: moe_gather_tail_rmsnorm (qkv_proj / GDN in_proj input)")
+    q, s = mx32_alloc(m, hidden, shared.device)
+    res_out = torch.empty_like(shared)
+    if m == 0:
+        return q, s, res_out
+    if envs.ATOM_MOE_GATHER_TAIL_NORM_PIPE and m >= 32:  # its epilogue is n32k4
+        from atom.model_ops import moe_gather_tail_gluon as tdm
+
+        if tdm.gather_tail_tdm_takes(g, shared, residual, m):
+            tdm.launch_gather_tail_tdm(
+                g,
+                shared,
+                gate,
+                residual,
+                weight,
+                eps,
+                None,
+                res_out,
+                res_out,
+                mx32=(q, s),
+            )
+            return q, s, res_out
+    nvt = g.num_valid_tokens
+    ptrs = (
+        g.grouped,
+        g.route_rows,
+        g.weights,
+        nvt if nvt is not None else g.route_rows,
+        shared,
+        gate if gate is not None else shared,
+        residual,
+        weight,
+        res_out,
+        q.view(torch.uint8),
+        s,
+    )
+    strides = (
+        g.grouped.stride(0),
+        shared.stride(0),
+        gate.stride(0) if gate is not None else 0,
+        residual.stride(0),
+        res_out.stride(0),
+    )
+    grid = m
+    topk = g.route_rows.shape[1]
+    # Launched directly where cacheable, as `moe_gather_tail_rmsnorm` does; M
+    # is an int argument too (== 1 / % 16 in the key).
+    reach = (
+        max(g.grouped.shape[0] * strides[0], m * max(strides[1:])) + hidden
+    ) * shared.element_size()
+    cacheable = reach <= _INT32_MAX and not any(t.data_ptr() % 16 for t in ptrs)
+    key = (
+        hidden,
+        topk,
+        shared.dtype,
+        g.weights.dtype,
+        None if gate is None else gate.dtype,
+        nvt is not None,
+        m >= 32,
+        tuple((v == 1, v % 16 == 0) for v in (*strides, m)),
+    )
+    kernel = _GATHER_MX32_COMPILED.get(key) if cacheable else None
+    if kernel is not None:
+        kernel[(grid, 1, 1)](*ptrs, *strides, eps, m)
+        return q, s, res_out
+    kernel = _moe_gather_tail_rmsnorm_mx32_kernel[(grid,)](
+        *ptrs,
+        *strides,
+        eps,
+        m,
+        N=hidden,
+        TOPK=topk,
+        HAS_GATE=gate is not None,
+        HAS_NVT=nvt is not None,
+        N32K4=m >= 32,
+        NUM_XCD=num_xcds(),
+        # The tail kernel's layout (and so its sum-of-squares order).
+        num_warps=4 if hidden <= 2048 else 8,
+        enable_fp_fusion=False,
+    )
+    if cacheable:
+        _GATHER_MX32_COMPILED[key] = kernel
+    return q, s, res_out
+
+
 def gated_sum(moe: MoEGatedSum) -> Tensor:
     """`routed + sigmoid(gate_logits) * shared` with the unfused ops' rounding
     (the fallback when the fused kernel cannot take the inputs)."""
     from atom.model_ops.sigmoid_gate import shared_expert_gate_add
 
-    routed, shared, gate = moe
+    routed, shared, gate = resolve_gathered(moe)
     if gate is None:
         return shared + routed
     return shared_expert_gate_add(shared, gate, routed, True)
@@ -625,3 +1183,72 @@ def silu_gate_up_gemm(x: Tensor, w_interleaved: Tensor) -> Tensor:
     if torch.compiler.is_compiling():
         return silu_gate_up_gemm_op(x, w_interleaved)
     return _silu_gate_up_gemm_impl(x, w_interleaved)
+
+
+# ---------------------------------------------------------------------------
+# ATOM_FUSED_ROUTER_SHARED_EXPERT: the router GEMM and the shared expert in one
+# kernel
+# ---------------------------------------------------------------------------
+
+# The fused kernel's last router tile reads whole 16-row groups fast; a
+# 257-row weight makes its TDM loads slow. The weight is padded with zero rows
+# to this multiple once, and the module keeps a view of the real rows.
+_ROUTER_ROW_ALIGN = 16
+
+
+def fused_router_shared_available() -> bool:
+    """aiter's gfx1250 gluon router + shared expert kernel."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_router_shared_expert import (  # noqa: F401
+            fused_gemm_a16w16_router_shared_expert,
+        )
+    except ImportError:
+        return False
+    return get_gfx() == "gfx1250"
+
+
+def fused_router_shared_prefill_available() -> bool:
+    """aiter's prefill path of the fused router + shared expert (the router +
+    gate_up GEMM)."""
+    if not fused_router_shared_available():
+        return False
+    from aiter.ops.triton.gemm.fused import (
+        fused_gemm_a16w16_router_shared_expert as k,
+    )
+
+    return hasattr(k, "fused_gemm_a16w16_router_shared_expert_prefill")
+
+
+def pad_router_weight(weight: Tensor) -> Tensor:
+    """`weight` [N, K] in a buffer of whole 16-row groups (zero rows past N):
+    returns the padded buffer. Set the module weight to `padded[:N]`."""
+    n, k = weight.shape
+    rows = -(-n // _ROUTER_ROW_ALIGN) * _ROUTER_ROW_ALIGN
+    padded = weight.new_zeros((rows, k))
+    padded[:n].copy_(weight)
+    return padded
+
+
+def router_shared_expert(
+    x: Tensor,
+    w_router_padded: Tensor,
+    n_router: int,
+    w_gate_up: Tensor,
+    w_down: Tensor,
+    prefill: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """(x @ w_router.T [M, n_router], the shared expert's output [M, hidden]),
+    bitwise the router GEMM and the gated gate_up + down GEMMs. `w_gate_up`
+    is interleaved gate / up (`interleave_gate_up`). Decode sizes run one
+    persistent kernel; with `prefill`, the router and gate_up run as one GEMM
+    over both weights, then the down GEMM."""
+    from aiter.ops.triton.gemm.fused import fused_gemm_a16w16_router_shared_expert as k
+
+    if prefill:
+        return k.fused_gemm_a16w16_router_shared_expert_prefill(
+            x, w_router_padded, w_gate_up, w_down, None, None, None, n_router
+        )
+    return k.fused_gemm_a16w16_router_shared_expert(
+        x, w_router_padded, w_gate_up, w_down, n_router=n_router
+    )

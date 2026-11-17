@@ -587,17 +587,23 @@ class EngineCore:
             raise ret
         return ret
 
+    def _steps_alone(self) -> bool:
+        """Whether this engine steps without coordinating with another one: no
+        DP lockstep, prefill / decode split or pipeline stages."""
+        return type(self) is EngineCore
+
     def _early_prefill_ok(self, scheduled_batch) -> bool:
         """ATOM_EARLY_PREFILL_SCHEDULE: may the next tick's prefill half run
         while this batch's forward is in flight? Only after a pure decode
-        batch, with no partial prefill in flight, on a single TP group without
+        batch, with no partial prefill in flight, on an engine that steps alone
+        (`_steps_alone`: a single TP group or an independent DP rank) without
         a KV connector or pipeline stages (see
         `Scheduler.try_schedule_prefill_early`)."""
         sch = self.scheduler
         delayer = getattr(sch, "prefill_delayer", None)
         return (
             envs.ATOM_EARLY_PREFILL_SCHEDULE
-            and type(self) is EngineCore
+            and self._steps_alone()
             and (delayer is None or delayer.is_local)
             and not self.kv_transfer_enabled
             and scheduled_batch.total_seqs_num_prefill == 0
@@ -991,6 +997,11 @@ class DPEngineCoreProc(EngineCore):
         super().exit()
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
+
+    def _steps_alone(self) -> bool:
+        # ATOM_DP_INDEPENDENT: the rank runs the lone engine's busy loop with a
+        # local prefill delayer.
+        return type(self) is DPEngineCoreProc and envs.ATOM_DP_INDEPENDENT
 
     def busy_loop(self):
         if envs.ATOM_DP_INDEPENDENT:
