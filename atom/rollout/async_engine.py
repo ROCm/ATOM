@@ -10,6 +10,7 @@ from atom.model_engine.engine_utility import (
     RESUME_GENERATION_CMD,
 )
 from atom.model_engine.llm_engine import LLMEngine
+from atom.rollout.config import DP_DEVICE_MAP_ENV
 from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
 logger = logging.getLogger("atom")
@@ -35,6 +36,7 @@ class AsyncLLMEngine(LLMEngine):
             "runner_qualname",
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
+        kwargs.setdefault("dp_isolation_device_map_env", DP_DEVICE_MAP_ENV)
         super().__init__(model, **kwargs)
 
     def collective_rpc(

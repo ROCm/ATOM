@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import importlib.util
 import logging
 from functools import cache
 
@@ -29,16 +28,6 @@ def atom_parameter(data: torch.Tensor) -> nn.Parameter:
         data.is_floating_point() or data.is_complex()
     )
     return nn.Parameter(data, requires_grad=requires_grad)
-
-
-@cache
-def _has_module(module_name: str) -> bool:
-    """Return True if *module_name* can be found in the current environment.
-
-    The result is cached so that subsequent queries for the same module incur
-    no additional overhead.
-    """
-    return importlib.util.find_spec(module_name) is not None
 
 
 MXFP4_QUANT_BLOCK_SIZE = 32

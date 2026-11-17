@@ -13,6 +13,7 @@ from transformers import PretrainedConfig
 
 import atom.config as config_module
 from atom.config import CompilationConfig, Config, SpeculativeConfig
+from atom.plugin.config import PluginConfig
 
 _V4_KERNELS_INIT = (
     Path(__file__).resolve().parents[1] / "atom/model_ops/v4_kernels/__init__.py"
@@ -159,7 +160,7 @@ def test_v4_fp8_fallback_is_not_applied_under_a_plugin(monkeypatch):
         monkeypatch,
         gfx="gfx942",
         kv_cache_dtype="fp8",
-        plugin_config=SimpleNamespace(is_vllm=False, vllm_config=None),
+        plugin_config=PluginConfig(is_plugin_mode=True),
     )
 
     assert config.kv_cache_dtype == "fp8"
@@ -186,10 +187,7 @@ def test_native_v4_defaults_indexer_to_fp8_on_gfx942(monkeypatch):
 def test_v4_integrations_without_fp4_layout_default_to_fp8(monkeypatch, integration):
     overrides = {}
     if integration == "plugin":
-        overrides["plugin_config"] = SimpleNamespace(
-            is_vllm=False,
-            vllm_config=None,
-        )
+        overrides["plugin_config"] = PluginConfig(is_plugin_mode=True)
     else:
         overrides["kv_transfer_config"] = {"kv_role": "producer"}
 

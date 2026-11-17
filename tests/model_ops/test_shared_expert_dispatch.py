@@ -9,11 +9,17 @@ pytest.importorskip("aiter", reason="full dispatch tests require aiter")
 import atom.model_ops.eplb as eplb_module
 import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module
+import atom.moe_config as moe_config_module
 from atom.model_ops.fused_moe import shared_expert_dispatch as dispatch_module
 from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
 from atom.model_ops.moe import FusedMoE, FusedMoEParallelConfig, Mxfp4MoEMethod
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+)
+from atom.moe_config import (
+    MoEParallelMapping,
+    get_moe_backend_config,
+    resolve_moe_execution_plan,
 )
 
 
@@ -161,7 +167,7 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
 def _parallel_config(
     *, dp_size: int, use_ep: bool, backend: str = "auto"
 ) -> FusedMoEParallelConfig:
-    return FusedMoEParallelConfig(
+    mapping = MoEParallelMapping(
         tp_size=8,
         dp_size=dp_size,
         ep_size=8 if use_ep else 1,
@@ -170,7 +176,10 @@ def _parallel_config(
         ep_rank=0,
         use_ep=use_ep,
         local_ep_size=8,
-        requested_all2all_backend=backend,
+    )
+    config = atom_config_double(moe_all2all_backend=backend)
+    return FusedMoEParallelConfig.from_plan(
+        resolve_moe_execution_plan(mapping, get_moe_backend_config(config))
     )
 
 
@@ -199,7 +208,9 @@ def test_ep_alone_does_not_imply_all2all(
     backend,
     expected_backend,
 ):
-    monkeypatch.setattr(moe_module, "_has_module", lambda name: has_mori)
+    monkeypatch.setattr(
+        moe_config_module, "find_spec", lambda name: object() if has_mori else None
+    )
     monkeypatch.setattr(moe_module.envs, "ATOM_DISABLE_MORI_EP", disable_mori)
 
     config = _parallel_config(dp_size=dp_size, use_ep=use_ep, backend=backend)
@@ -228,6 +239,7 @@ def _atom_config(*, eplb: bool, backend: str = "auto") -> SimpleNamespace:
         # Left at Config's default of False, the early return is unreachable
         # and the (no eplb, no switch) row stops meaning anything.
         enable_dp_attention=True,
+        enable_expert_parallel=True,
     )
 
 
@@ -245,7 +257,7 @@ def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expe
     monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
     # Stated, not inherited: the gate asks whether MoRI is importable, so
     # without this the truth table below holds only on a box that has it.
-    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    monkeypatch.setattr(moe_config_module, "find_spec", lambda name: object())
     monkeypatch.setattr(
         topK_module,
         "get_current_atom_config",
@@ -260,7 +272,7 @@ def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expe
 def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
     monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", False)
     monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
-    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    monkeypatch.setattr(moe_config_module, "find_spec", lambda name: object())
     monkeypatch.setattr(
         topK_module,
         "get_current_atom_config",

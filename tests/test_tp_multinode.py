@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch.distributed as dist
+from conftest import atom_config_double
 
 from atom.config import Config, ParallelConfig
 from atom.model_engine import arg_utils, tp_multinode
@@ -122,12 +123,13 @@ def test_the_engine_serves_its_store_to_other_nodes_for_cross_node_tp(
     monkeypatch.setattr(CoreManager, "_init_shared_state", lambda *a, **k: None)
     monkeypatch.setattr(CoreManager, "_start_distributed_store", start_store)
     monkeypatch.setattr(CoreManager, "close", lambda self: None)
-    config = SimpleNamespace(
-        parallel_config=ParallelConfig(),
+    config = atom_config_double(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size_local=4 if multinode_tp else 8
+        ),
         pipeline_parallel_size=1,
         enable_dp_attention=False,
         tensor_parallel_size=8,
-        is_multinode_tp=multinode_tp,
     )
     manager = CoreManager.__new__(CoreManager)
     manager.label = "test"

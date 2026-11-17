@@ -24,6 +24,12 @@ import torch
 from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
+from atom.moe_config import (
+    MoEBackendConfig,
+    MoEParallelMapping,
+    resolve_moe_execution_plan,
+)
+
 
 @dataclass(frozen=True)
 class _ShapeKey:
@@ -894,6 +900,16 @@ def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
     process groups are stand-ins."""
     moe = atom_modules.moe
     layer = _new_fused_moe(atom_modules)
+    plan = resolve_moe_execution_plan(
+        MoEParallelMapping.make(
+            tp_size=1,
+            dp_size=dp_world,
+            local_dp_size=dp_world,
+            enable_ep=True,
+            flatten_dp=True,
+        ),
+        MoEBackendConfig(mori_available=True),
+    )
     routed = torch.randn(4, 8)
     method = SimpleNamespace(
         routed_rows_wire=None,
@@ -910,12 +926,7 @@ def _recording_fused_moe(monkeypatch, atom_modules, *, dp_world):
         "balance_router_logits": None,
         "reduce_results": False,
         # EP all2all: forward_impl_graph does no DP gather/scatter of its own.
-        "moe_parallel_config": SimpleNamespace(
-            dp_size=dp_world,
-            pcp_merge=False,
-            dp_logical_ratio=1,
-            use_all2all_kernels=True,
-        ),
+        "moe_parallel_config": moe.FusedMoEParallelConfig.from_plan(plan),
         "global_num_experts": 16,
         "expert_map": None,
         "activation": None,

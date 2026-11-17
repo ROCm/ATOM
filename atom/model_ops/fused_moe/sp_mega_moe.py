@@ -269,7 +269,12 @@ def initialize_sp_mega_moe(model, config):
     """
     from aiter.dist.parallel_state import get_pcp_group
 
-    if config.moe_backend != "mega" or config.sequence_parallel_size < 2:
+    from atom.moe_config import get_moe_backend_config
+
+    if (
+        get_moe_backend_config(config).backend != "mega"
+        or config.sequence_parallel_size < 2
+    ):
         return
     layers = _model_layers(model)
     if not layers:
