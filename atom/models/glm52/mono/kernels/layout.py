@@ -476,6 +476,11 @@ def layout(
     return scratch, symmetric
 
 
+def uv_by_head(samples: int, dcp_size: int) -> bool:
+    """Whether UV tasks merge one head's ``16 * WAVES``-row output parts."""
+    return samples >= 4 and dcp_size == 1
+
+
 def stage_tasks(
     samples: int,
     heads: int,

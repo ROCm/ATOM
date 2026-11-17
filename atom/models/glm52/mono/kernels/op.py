@@ -33,7 +33,7 @@ from atom.models.glm52.mono.kernels.geometry_config import (
     validate_shard,
 )
 from atom.models.glm52.mono.kernels.kernel import build_glm5_monokernel
-from atom.models.glm52.mono.kernels.layout import INDEX_ALIGNED_DIM, INDEX_DIM, INDEX_TILE, layout, stage_tasks
+from atom.models.glm52.mono.kernels.layout import INDEX_ALIGNED_DIM, INDEX_DIM, INDEX_TILE, layout, stage_tasks, uv_by_head
 from atom.models.glm52.mono.kernels.geometry import WAVES as MONO_WAVES
 from atom.models.glm52.mono.kernels.geometry import TL_COLS
 from atom.mono.weights.packing import (
@@ -288,7 +288,7 @@ class Glm5MonoKernel:
             npes=npes,
             inter=W.config.inter,
             split_head_merge=W.heads // MONO_WAVES > 1,
-            uv_by_head=samples >= 4 and dcp_size == 1,
+            uv_by_head=uv_by_head(samples, dcp_size),
         )
         n_tasks = sum(n for _, n in self.stages)
         if with_indexer:

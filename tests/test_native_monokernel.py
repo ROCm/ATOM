@@ -566,6 +566,9 @@ def test_glm_q6_sparse_rows_are_intra_request_causal():
 
 def test_glm_tp4_symmetric_and_split_schedule_contracts():
     cfg, samples = glm5_tp_config(4), 12
+    assert glm_layout.uv_by_head(4, 1)
+    assert not glm_layout.uv_by_head(3, 1)
+    assert not glm_layout.uv_by_head(4, 4)
     scratch, symmetric = glm_layout.layout(
         samples, cfg.local_heads, 4, 2048, inter=cfg.inter
     )
@@ -579,7 +582,7 @@ def test_glm_tp4_symmetric_and_split_schedule_contracts():
             2048,
             expert_mxfp4=True,
             inter=cfg.inter,
-            uv_by_head=True,
+            uv_by_head=glm_layout.uv_by_head(samples, 1),
         )
     )
     assert stages["split"] == samples * 2 * (

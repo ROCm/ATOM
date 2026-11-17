@@ -131,6 +131,7 @@ from atom.models.glm52.mono.kernels.layout import (
     ug_split,
     ptpc_stage_chunk,
     ug_task_rounds,
+    uv_by_head,
 )
 from atom.models.glm52.mono.kernels.geometry import (
     CM_DEV,
@@ -315,6 +316,7 @@ def build_glm5_monokernel(
     L = H if output_heads is None else output_heads
     W = npes
     D = dcp_size
+    UV_BY_HEAD = uv_by_head(S, D)
     expert_inter = inter
     assert expert_inter in (256, 512), "GLM TP8/TP4 requires complete 256-CTA expert rounds"
     paired_ug_rows = expert_mxfp4 and not atom_experts
@@ -509,7 +511,7 @@ def build_glm5_monokernel(
     for name, n in stage_tasks(
         S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
         inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
-        uv_by_head=S >= 4 and D == 1,
+        uv_by_head=UV_BY_HEAD,
     ):
         first[name] = acc
         acc += n
@@ -519,7 +521,7 @@ def build_glm5_monokernel(
         stage_tasks(
             S, H, topk, with_indexer, index_max_seq, expert_mxfp4, indexer_cp=indexer_cp, npes=W,
         inter=expert_inter, split_head_merge=bool(split_head_merge) and H // WAVES > 1,
-        uv_by_head=S >= 4 and D == 1,
+        uv_by_head=UV_BY_HEAD,
         )
     )
     acc = 0
@@ -3089,7 +3091,9 @@ def build_glm5_monokernel(
                 stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
-        # below four rows: 4 row groups x 8 chunks, 2 waves per row group, 4 chunks each
+        # Without the by-head schedule (S < 4 or DCP > 1), a task covers one
+        # 64-row UV tile: four row groups, eight K chunks, two waves per row
+        # group, four chunks per wave.
         r_wuv, r_suv = _rsrc(w_uv), _rsrc(s_uv)
         UV_NKC = KV_LORA // 64
         UV_R = UV_TILE // 16
@@ -3145,7 +3149,6 @@ def build_glm5_monokernel(
                 gpu.barrier()
 
         UV_PARTS = V_DIM // (16 * WAVES)
-        UV_BY_HEAD = S >= 4 and D == 1
         if const_expr(UV_BY_HEAD):
             assert V_DIM % (16 * WAVES) == 0 and THREADS == KV_LORA and N_SPLIT <= 64
             UVH_UNITS = UV_NKC // absorb_k_chunks_per_unit
@@ -3222,7 +3225,7 @@ def build_glm5_monokernel(
                         [lds_ld(outs, r + e) for e in range(4)],
                     )
                 stamp("uv", tt, 4)
-        if const_expr(not UV_BY_HEAD):
+        else:
             for tt in range(start("uv"), S * N_UV, G):
                 tt = fx.Int32(tt)
                 stamp("uv", tt, 0)
