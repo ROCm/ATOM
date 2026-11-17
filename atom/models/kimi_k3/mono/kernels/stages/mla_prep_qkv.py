@@ -412,31 +412,7 @@ def p4_task(c, j):
             )
             for q in range(4)
         ]
-        vals = []
-        for q in range_constexpr(4):
-            for e in range_constexpr(4):
-                w = avals[q][e]
-                vals += [bf_lo(w), bf_hi(w)]
-        # The amax and the clamp ignore a NaN, as triton's prequant does (see
-        # mla_post's v-up): one NaN in the group must not make the head NaN.
-        lm = abs(vals[0])
-        for e in range_constexpr(1, 32):
-            lm = mp.fmaxnum(lm, abs(vals[e]))
-        am = butterfly(lm, (16, 32), mp.fmaxnum)
-        m = mp.fmaxnum(am, _f32(mp.AMAX_FLOOR))
-        sc = m * _f32(INV_FP8_MAX)
-        rcp = _f32(1.0) / sc
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for q in range_constexpr(4):
-            qv = [
-                mp.fminnum(
-                    mp.fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX)
-                )
-                for e in range(8)
-            ]
-            d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
-            d1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
-            acc = mfma_bf16(mp.w8_operand(vops[q]), fp8x8_bf16_pk([d0, d1]), acc)
+        acc, sc = mp.prequant_mfma(avals, vops)
         # lane: token lane % 16, rows 4 g .. 4 g + 3 of this wave's 16
         tok = t0 + lane % ROWS
         _, neg = _ld_i64_lo(a["slots"], fx.min(tok, s - 1))
