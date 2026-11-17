@@ -148,7 +148,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GPU landing pool, first come, first served (see mooncake/landing.py). A stage
     # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
     # the decode side scatters them into the paged KV and returns the slot.
-    # 0 = staged per-page writes only.
+    # 0 = staged writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
     # Mooncake and MoRIIO P/D: how long a failed transfer may still land. A
     # decode holds a failed receive's KV pages this long before reporting the

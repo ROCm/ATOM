@@ -95,10 +95,10 @@ MSG_LANDING_READY = b"landing_ready"
 MSG_LANDING_CREDIT = b"landing_credit"
 
 # Prefill: a transfer needing fewer landing slots than this keeps the staged
-# per-page path; the scatter round trip would not pay off.
+# path; the scatter round trip would not pay off.
 LANDING_MIN_SLOTS = 2
 # Prefill: how long a send worker waits for a free landing slot before it
-# sends the rest of the transfer through the staged per-page path.
+# sends the rest of the transfer through the staged path.
 LANDING_CREDIT_WAIT_S = 0.010
 # Decode: one rank's landing pool, held back from the KV budget and handed
 # out to prefill stages first come, first served (``advertise``).
@@ -444,7 +444,7 @@ class LandingReceiver:
                         self._warned_spent = True
                         logger.warning(
                             "[PD-LANDING] pool spent: stage %s and later new "
-                            "stage endpoints use staged per-page writes",
+                            "stage endpoints use staged writes",
                             stage_addr,
                         )
                     return None
@@ -702,7 +702,7 @@ class LandingReceiver:
             logger.warning(
                 "[PD-LANDING] stage %s cannot land (a DCP prefill, "
                 "staging disabled or a build without landing); its %d "
-                "slots go back to the pool and it keeps staged per-page writes",
+                "slots go back to the pool and it keeps staged writes",
                 stage.stage_addr,
                 reclaimed,
             )
