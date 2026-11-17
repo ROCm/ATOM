@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.library import Library
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.utils.custom_register import direct_register_custom_op, eager_direct_call
 
@@ -38,6 +39,11 @@ def _scale_fake(x: torch.Tensor, factor: float = 2.0) -> torch.Tensor:
 _scale_op = direct_register_custom_op(
     "scale", _scale, [], fake_impl=_scale_fake, target_lib=_LIB, dispatch_key="CPU"
 )
+
+
+class Passthrough(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        return func(*args, **(kwargs or {}))
 
 
 def _paths(fn, name):
@@ -63,8 +69,6 @@ def test_caller_keeps_the_signature_and_registers_once():
 
 
 def test_caller_runs_directly_in_eager_and_dispatches_otherwise():
-    from torch.utils._python_dispatch import TorchDispatchMode
-
     x = torch.arange(4.0)
     name = "atom_moe_eager_test::scale"
     _PY_CALLS.clear()
@@ -74,10 +78,6 @@ def test_caller_runs_directly_in_eager_and_dispatches_otherwise():
 
     _PY_CALLS.clear()
     assert torch.equal(_scale_op(x, 3.0), x * 3) and _PY_CALLS == [3.0]
-
-    class Passthrough(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            return func(*args, **(kwargs or {}))
 
     with Passthrough():
         ref, ran = _paths(lambda: _scale_op(x, factor=3.0), name)
@@ -114,15 +114,9 @@ def test_caller_stays_an_op_under_torch_compile():
 
 def test_eager_direct_call_only_for_real_eager_tensors():
     from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.utils._python_dispatch import TorchDispatchMode
 
     x = torch.zeros(2)
     assert eager_direct_call(x)
-
-    class Passthrough(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            return func(*args, **(kwargs or {}))
-
     with Passthrough():
         assert not eager_direct_call(x)
     with FakeTensorMode() as mode:
