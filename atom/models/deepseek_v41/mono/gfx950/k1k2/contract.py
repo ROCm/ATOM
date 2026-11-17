@@ -13,16 +13,16 @@ K1, K2a and K2b of a layer share the scratch: their regions of one name are
 told apart by the tag ranges their launches take (``runner.POST_TAG0`` /
 ``MOE_TAG0``), not by address.
 
-Usage: python -m atom.models.deepseek_v41.mono.contract [S ...]
+Usage: python -m atom.models.deepseek_v41.mono.gfx950.k1k2.contract [S ...]
 """
 
 import sys
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels.moe_shape import MoeBuild
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import MoeBuild
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.trace import Space
 from atom.mono.runtime.compile import check_traced

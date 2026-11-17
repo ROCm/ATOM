@@ -26,11 +26,11 @@ import torch
 
 from atom.model_ops.deepseek_v41.dspark import build_block_state
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-from atom.models.deepseek_v41.mono.config import MAX_REQUESTS
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import MAX_REQUESTS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.runner import V41MonoDecodeRunner
+from atom.models.deepseek_v41.mono.gfx950.k1k2.weights import bind_layer
 from atom.models.deepseek_v41.mono.step_meta import write_draft_step_meta
-from atom.models.deepseek_v41.mono.weights import bind_layer
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context

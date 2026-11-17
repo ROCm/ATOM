@@ -407,7 +407,7 @@ def test_bounded_queries_do_not_reuse_full_step_a8w4_indptrs():
 def test_mono_reference_gathers_before_packing_sources(row_ids, monkeypatch):
     pack = functions(OPS + "packed_rows.py", ["pack_rows"])["pack_rows"]
     gather = functions(
-        "atom/models/deepseek_v41/mono/check.py",
+        "atom/models/deepseek_v41/mono/gfx950/k1k2/check.py",
         ["_gather_key_rows"],
         {"pack_rows": pack},
     )["_gather_key_rows"]

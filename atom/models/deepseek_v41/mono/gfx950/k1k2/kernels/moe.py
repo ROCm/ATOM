@@ -57,13 +57,13 @@ from atom.model_ops.deepseek_v41.router import (
     router_weight_loads,
     router_x_loads,
 )
-from atom.models.deepseek_v41.mono import moe_plan as mplan
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import moe_plan as mplan
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import MAX_MOE_ROWS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
 
 # helpers the kernel calls are imported by name: FlyDSL keys a build by the
 # source of the same-directory functions it names, never through a module
-from atom.models.deepseek_v41.mono.kernels.attn_pre import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.attn_pre import (
     TILE,
     gemv_fp8_loads,
     gemv_fp8_mfmas,
@@ -74,21 +74,24 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     tile_rows,
     token_tiles,
 )
-from atom.models.deepseek_v41.mono.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import (
+    SORT_NETS,
+    MoeBuild,
+    route_shape,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.mx import AMAX_FLOOR
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.token_par import (
+    own_count,
+    own_view,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.sources import SOURCES
 from atom.models.deepseek_v41.mono.kernels.dims import (
     ROUTE_COPIES,
     SHARED_INTER,
     UG_PART,
 )
-from atom.models.deepseek_v41.mono.kernels.moe_shape import (
-    SORT_NETS,
-    MoeBuild,
-    route_shape,
-)
-from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
-from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
-from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device import queue, route
 from atom.mono.device.mx import (
     FP4,

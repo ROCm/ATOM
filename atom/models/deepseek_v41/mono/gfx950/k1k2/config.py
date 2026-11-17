@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The deployments V4.1 mono serves, and why any other is refused."""
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.utils import envs

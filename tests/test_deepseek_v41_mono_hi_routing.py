@@ -29,9 +29,9 @@ def D():
             ("runner", "V41MonoDecodeRunner"),
             ("draft_runner", "DraftMonoRunner"),
         ):
-            if f"atom.models.deepseek_v41.mono.{mod}" in sys.modules:
+            if f"atom.models.deepseek_v41.mono.gfx950.k1k2.{mod}" in sys.modules:
                 continue
-            stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
+            stub = types.ModuleType(f"atom.models.deepseek_v41.mono.gfx950.k1k2.{mod}")
             setattr(stub, cls, object)
             mp.setitem(sys.modules, stub.__name__, stub)
         with atom_without_aiter() as load:

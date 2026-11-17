@@ -7,7 +7,7 @@ region, pair index, tags and CTA in the scratch words at the build's
 
 import flydsl.expr as fx
 
-from atom.models.deepseek_v41.mono.kernels.peer_layout import PEER_REGIONS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.peer_layout import PEER_REGIONS
 from atom.mono.device.sync import Mailbox
 from atom.mono.runtime.debug import region_ids, region_namer
 

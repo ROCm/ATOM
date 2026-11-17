@@ -34,30 +34,33 @@ from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
 from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.check import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2.check import (
     check_front,
     check_moe,
     check_post,
     check_selection,
     decode_keys,
 )
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.index_query import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import MAX_MOE_ROWS, MAX_ROWS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import debug as kernel_debug
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_query import (
     QS_BYTES,
     QS_M_TILES,
 )
-from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
-from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import EXPERTS, TOPK
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.peer_layout import (
+    peer_bytes,
+    plain_layout,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.token_par import own_rows
+from atom.models.deepseek_v41.mono.gfx950.k1k2.weights import bind_model
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
-from atom.models.deepseek_v41.mono.weights import bind_model
 from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps

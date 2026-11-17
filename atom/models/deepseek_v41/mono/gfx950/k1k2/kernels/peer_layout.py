@@ -3,7 +3,7 @@
 """The peer buffer: every region one rank's kernels store into another's, laid
 out once for the kernels, the runner's allocation and the debug report."""
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HIDDEN,
     KV_DIM,

@@ -32,7 +32,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
 from atom.mono.device.mx import FP8_MAX, clamp_fp8
 from atom.mono.device.ops import (
     CM_NT,

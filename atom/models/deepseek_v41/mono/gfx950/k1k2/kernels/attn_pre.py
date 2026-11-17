@@ -43,9 +43,28 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.config import MAX_ROWS
-from atom.models.deepseek_v41.mono.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import MAX_ROWS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_query import (
+    IDX_ROPE,
+    IDX_ROWS,
+    IW_TASKS,
+    stage_iquant,
+    stage_iquant_fp4,
+    stage_iw,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_query import (
+    scratch_pairs as indexer_pairs,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.mx import (
+    AMAX_FLOOR,
+    code_round,
+    fp8_value,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.token_par import own_view
+from atom.models.deepseek_v41.mono.gfx950.k1k2.sources import SOURCES
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HC,
     HEAD_DIM,
@@ -54,21 +73,6 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     Q_RANK,
     Dims,
 )
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    IDX_ROPE,
-    IDX_ROWS,
-    IW_TASKS,
-    stage_iquant,
-    stage_iquant_fp4,
-    stage_iw,
-)
-from atom.models.deepseek_v41.mono.kernels.index_query import (
-    scratch_pairs as indexer_pairs,
-)
-from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR, code_round, fp8_value
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
-from atom.models.deepseek_v41.mono.kernels.token_par import own_view
-from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import (
     FP8_MAX,
     UNIT_SCALE,

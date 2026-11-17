@@ -43,8 +43,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels.attention import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.attention import (
     COLS,
     GROUPS,
     SCORE_LDS_WORDS,
@@ -57,13 +57,13 @@ from atom.models.deepseek_v41.mono.kernels.attention import (
     tile_head,
     tile_task,
 )
-from atom.models.deepseek_v41.mono.kernels.attention import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.attention import (
     scratch_pairs as attention_pairs,
 )
 
 # helpers the kernel calls are imported by name: FlyDSL keys a build by the
 # source of the same-directory functions it names, never through a module
-from atom.models.deepseek_v41.mono.kernels.attn_pre import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.attn_pre import (
     MAX_TOKENS,
     TILE,
     gemv_fp8_loads,
@@ -80,24 +80,27 @@ from atom.models.deepseek_v41.mono.kernels.attn_pre import (
     tile_tasks,
     token_tiles,
 )
-from atom.models.deepseek_v41.mono.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_score import (
+    PER_THREAD as SEL_PER_THREAD,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_score import run_indexer
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_score import (
+    scratch_pairs as index_pairs,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.mx import AMAX_FLOOR
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.token_par import (
+    own_count,
+    own_view,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.topk import lds_words
+from atom.models.deepseek_v41.mono.gfx950.k1k2.sources import SOURCES
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_TILE,
     WOA_ROWS,
     Dims,
 )
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    PER_THREAD as SEL_PER_THREAD,
-)
-from atom.models.deepseek_v41.mono.kernels.index_score import run_indexer
-from atom.models.deepseek_v41.mono.kernels.index_score import (
-    scratch_pairs as index_pairs,
-)
-from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
-from atom.models.deepseek_v41.mono.kernels.token_par import own_count, own_view
-from atom.models.deepseek_v41.mono.kernels.topk import lds_words
-from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
 from atom.mono.device.ops import (
     bf16_round,

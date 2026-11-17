@@ -5,7 +5,7 @@
 
 import pytest
 
-from atom.models.deepseek_v41.mono import moe_plan as mplan
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import moe_plan as mplan
 from atom.models.deepseek_v41.mono.kernels.dims import UG_PART, Dims
 from atom.mono.plan.shard import Shard, ShardError, Tiles, padded, shard_refusal
 

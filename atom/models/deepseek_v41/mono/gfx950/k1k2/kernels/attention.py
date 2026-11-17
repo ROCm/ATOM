@@ -49,14 +49,14 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.deepseek_v41.mono import attention_plan as aplan
-from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.config import ATTENTION_KEYS_MAX
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import attention_plan as aplan
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import index_plan as ip
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import ATTENTION_KEYS_MAX
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
     HEAD_TILE,
 )
-from atom.models.deepseek_v41.mono.kernels.mx import AMAX_FLOOR
 from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.mx import (
     FP8_MAX,

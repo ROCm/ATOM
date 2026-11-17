@@ -35,10 +35,10 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.attn_post import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import MAX_MOE_ROWS
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.attn_post import (
     attn_post_args,
     attn_post_context,
     attn_post_smem,
@@ -46,24 +46,26 @@ from atom.models.deepseek_v41.mono.kernels.attn_post import (
     run_attn_post,
     run_gates,
 )
-from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.index_score import await_candidates
-from atom.models.deepseek_v41.mono.kernels.moe import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.debug import mailbox
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.index_score import (
+    await_candidates,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe import (
     moe_args,
     moe_context,
     moe_smem,
     run_moe,
 )
-from atom.models.deepseek_v41.mono.kernels.moe_shape import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import (
     EXPERTS,
     SORT_NETS,
     TOPK,
     MoeBuild,
     route_shape,
 )
-from atom.models.deepseek_v41.mono.kernels.token_par import own_count
-from atom.models.deepseek_v41.mono.sources import SOURCES
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.token_par import own_count
+from atom.models.deepseek_v41.mono.gfx950.k1k2.sources import SOURCES
+from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
