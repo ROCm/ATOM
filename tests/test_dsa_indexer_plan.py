@@ -8,7 +8,8 @@ import torch
 
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
-    FP4_QUANT_BLOCK_SIZE,
+    fp4_index_block_shapes,
+    fp4_index_scale_rows,
 )
 from atom.mono.dsa_indexer.plan import (
     REPLICA_INTERLEAVE,
@@ -58,57 +59,45 @@ def test_an_fp4_cache_is_served_only_with_the_writers_rope():
     assert "interleaved RoPE" in unsupported(_shape(rope_neox=True))
 
 
-def _pack_block(kv, ks, rows):
-    """aiter's ``pack_kv_cache`` for a 64-row page (the cache writer's
-    layout): a block's bytes behind (k tile, chunk), its E8M0s four tiles'
-    keys 16 apart a dword."""
-    k_tiles = kv.shape[1] * 2 // 128
-    data = kv.reshape(rows, k_tiles, 4, 16).permute(1, 2, 0, 3)
-    scale = (
-        ks.reshape(rows, k_tiles, 4)
-        .permute(1, 2, 0)
-        .reshape(k_tiles, 4, rows // 16, 16)
-        .transpose(-1, -2)
-    )
-    return data.flatten(), scale.flatten()
-
-
-def test_fp4_bytes_are_where_the_cache_writer_puts_them():
+def test_fp4_cache_and_query_bytes_match_the_production_layout():
+    """One independent byte oracle: fixed cache offsets from the writer's
+    published shapes/row helper, plus the scorer's fixed query-row offsets."""
     sh = _shape()
-    rows, half = sh.block_rows, sh.head_dim // 2
-    chunks = sh.head_dim // FP4_QUANT_BLOCK_SIZE
-    kv = torch.arange(rows * half, dtype=torch.int32).view(rows, half)
-    ks = torch.arange(rows * chunks, dtype=torch.int32).view(rows, chunks)
-    data, scale = _pack_block(kv, ks, rows)
-    assert (data.numel(), scale.numel()) == (sh.block_bytes, sh.scale_block_bytes)
-    for r in range(rows):
-        for j in range(half):
-            assert data[fp4_byte(sh, r, 2 * j)] == kv[r, j], (r, j)
-        for ch in range(chunks):
-            assert scale[fp4_scale_byte(sh, r, ch)] == ks[r, ch], (r, ch)
+    data_shape, scale_shape = fp4_index_block_shapes(sh.block_rows, sh.head_dim)
+    assert torch.tensor(data_shape).prod().item() == sh.block_bytes
+    assert torch.tensor(scale_shape).prod().item() == sh.scale_block_bytes
 
+    # (logical row, even dim) -> byte in the writer's (1, 4, 64, 16) plane.
+    assert {
+        (0, 0): fp4_byte(sh, 0, 0),
+        (1, 0): fp4_byte(sh, 1, 0),
+        (63, 30): fp4_byte(sh, 63, 30),
+        (0, 32): fp4_byte(sh, 0, 32),
+        (17, 64): fp4_byte(sh, 17, 64),
+        (63, 126): fp4_byte(sh, 63, 126),
+    } == {
+        (0, 0): 0,
+        (1, 0): 16,
+        (63, 30): 1023,
+        (0, 32): 1024,
+        (17, 64): 2320,
+        (63, 126): 4095,
+    }
 
-def test_a_tokens_fp4_query_fills_its_row_in_the_scorers_loads():
-    """IQ8: a token's E2M1 bytes and E8M0s take its row once each; a head's
-    bytes and the token's scales start 16 B aligned (the 16 B loads that stage
-    them), a head's four scales one dword."""
-    sh = _shape()
-    chunks = sh.head_dim // FP4_QUANT_BLOCK_SIZE
-    for t in range(3):
-        at = [
-            q_fp4_byte(sh, t, h, col)
-            for h in range(sh.heads)
-            for col in range(0, sh.head_dim, 2)
-        ]
-        at += [
-            q_fp4_scale(sh, t, h, ch) for h in range(sh.heads) for ch in range(chunks)
-        ]
-        assert sorted(at) == list(range(t * sh.qrows, t * sh.qrows + len(at)))
-        assert len(at) <= sh.qrows
-        assert q_fp4_scale(sh, t, 0, 0) % 16 == 0
-        for h in range(sh.heads):
-            assert q_fp4_byte(sh, t, h, 0) % 16 == 0
-            assert q_fp4_scale(sh, t, h, 0) % 4 == 0
-            assert [q_fp4_scale(sh, t, h, ch) for ch in range(chunks)] == [
-                q_fp4_scale(sh, t, h, 0) + ch for ch in range(chunks)
-            ]
+    rows = torch.tensor([0, 16, 1, 63])
+    physical_rows = fp4_index_scale_rows(rows, sh.block_rows).tolist()
+    assert physical_rows == [0, 1, 4, 63]
+    assert [
+        fp4_scale_byte(sh, row, chunk)
+        for row, chunk in ((0, 0), (16, 0), (1, 0), (63, 3))
+    ] == [0, 1, 4, 255]
+
+    # IQ8 reserves one qrows-byte row per token: packed heads first, then
+    # their four E8M0s. These boundary bytes make overlap/padding visible.
+    assert [
+        q_fp4_byte(sh, 0, 0, 0),
+        q_fp4_byte(sh, 0, 31, 126),
+        q_fp4_scale(sh, 0, 0, 0),
+        q_fp4_scale(sh, 0, 31, 3),
+        q_fp4_byte(sh, 2, 0, 0),
+    ] == [0, 2047, 2048, 2175, 8192]

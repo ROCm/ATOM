@@ -19,8 +19,8 @@ numbers, and ``plan.unsupported`` the shapes this kernel is not written for).
             two planes (``plan.fp4_byte`` / ``fp4_scale_byte``), KDONE
     iquant  (a (token, head), wave 0): the head's row groups (QRDY) (-> RoPE
             -> bf16) -> per-(token, head) FP8 q and its head weight (w q_scale
-            weights_scale), FP4 E2M1 q, its E8M0 and the raw weight -> IQ8 / IW
-            (the scorer's operands), QQ
+            weights_scale), FP4 E2M1 q, its E8M0 and the head weight scaled by
+            weights_scale / 2 -> IQ8 / IW (the scorer's operands), QQ
     score   (a long row's unit of 128 local keys, every CTA): ``select``
     select  (a long row's segments): its distributed selection (``select``)
     row     (a row, CTA 255 - r): a short row's every key; replicated, a long
@@ -599,8 +599,8 @@ def iquant_task(c, task, lane):
 def _iquant_fp4(c, t, h, lane, x0, x1):
     """FP4: the writer's q (lane l: dims 2 l, 2 l + 1): its RoPE on the pairs
     of dims 0 .. 63, a 32-dim group's (16 lanes') E8M0 and E2M1 byte, to IQ8
-    as ``q_fp4_byte`` / ``q_fp4_scale``; the head weight raw (the scorer's
-    2 relu folds the writer's weight_scale / 2 in)."""
+    as ``q_fp4_byte`` / ``q_fp4_scale``; the head weight times
+    ``weights_scale / 2`` (the scorer's factor 2 cancels the division)."""
     a, sh = c["args"], c["shape"]
     half = sh.rope_dim // 2
     cs = _rope_cs(c, t, fx.min(lane, fx.Int32(half - 1)))
