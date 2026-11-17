@@ -33,10 +33,9 @@ Rules:
   every call seam dispatches even while the boot plan owns none, so a plan can
   be installed afterwards (``hotplug_plan``) without rebuilding the model.
   Captures made before the install keep their decisions: recapture them.
-- A boot-only seam (``SeamSpec.boot_only``; ``v41.mono.install``, the whole-step
-  decode installer) is called once, while the runner builds the model. The boot
-  plan fixes its owners: a hot-plug plan that would change them is refused
-  (``recipe-boot-only``), since what the boot installed stays until a restart.
+- A boot-only seam (``v41.mono.install``) is called once, while the model is
+  built: a hot-plug plan that would change its owners is refused
+  (``recipe-boot-only``); restart instead.
 - Decisions, not launches, are counted: a CUDA-graph replay runs no Python.
 """
 
@@ -290,9 +289,7 @@ SEAMS = MappingProxyType(
                 "eager",
                 "atom/model_engine/model_runner.py",
                 boot_only=True,
-                doc="the whole-step decode installer (models.registry."
-                "mono_decode_installers), once after load and before KV sizing "
-                "and capture: returns the model to serve",
+                doc="mono_decode_installers' V4.1 installer -> the model to serve",
             ),
         ]
     )
@@ -302,9 +299,6 @@ SEAMS = MappingProxyType(
 # calls through a ``bind`` made at build. Call seams dispatch by name and need
 # no list (`call` checks `_hotplug`).
 _HOTPLUG_BINDS = frozenset(name for name, spec in SEAMS.items() if spec.form == "bind")
-# Seams called once while the model is built. A hot-plug plan may not change
-# their owners: what the boot installed (packed weights, a wrapped model, the
-# KV sizing that followed) stays installed until a restart.
 BOOT_ONLY = frozenset(name for name, spec in SEAMS.items() if spec.boot_only)
 
 
@@ -1111,9 +1105,7 @@ def _swap_in(plan, arm: str) -> dict[str, Any]:
     if _boot_owners(_tables) != boot:
         raise plugin_recipe.RecipeRefused(
             "recipe-boot-only",
-            f"{sorted(BOOT_ONLY)} are installed at boot (serving "
-            f"{boot or 'native'}, the plan asks for {_boot_owners(_tables) or 'native'}); "
-            "restart to change them",
+            f"{sorted(BOOT_ONLY)} serve {boot or 'native'} until a restart",
         )
     # Conservative: seams bound before stay bound (their call sites exist), and
     # a seam once planned keeps dispatching even under a plan that drops it.

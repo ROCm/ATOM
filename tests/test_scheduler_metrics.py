@@ -163,7 +163,6 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     )
     engine = core.EngineCore.__new__(core.EngineCore)
     engine._kv_progress_event = core.threading.Event()
-    engine._work_arrived = core.threading.Event()
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.process_input_sockets("input", "control")

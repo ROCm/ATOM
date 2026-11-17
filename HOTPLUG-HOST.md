@@ -148,20 +148,6 @@ container the plain command has no such issue.
   sizes; `capture_rows` are the plan's declared buckets.
 - The empty plan is how a server goes back to native without losing hot-plug
   (the AITER list is emptied; bindings stay).
-
-## Boot-only seams
-
-`SEAMS[...].boot_only` marks a seam the runner calls once while it builds the
-model. Today that is only `v41.mono.install`: the DeepSeek-V4.1 whole-step
-decode installer (`models.registry.mono_decode_installers`), which packs
-weights and wraps the model before KV sizing and graph capture. A plugin owns
-it like any call seam (`register(..., graph="eager")`; the impl gets
-`(model, atom_config, drafter, *, metadata_builder, capability, valid_rows)` and
-returns the model to serve). With no owner it is ATOM's own
-`install_mono_decode`, called exactly as before, and no other model's installer
-goes through the host.
-
-The boot plan fixes its owners. `hotplug_plan` refuses a plan that would
-change them (`RecipeRefused("recipe-boot-only")`) and the serving plan stays;
-a plan that keeps them, or never had one, hot-plugs as before. Changing the
-installer needs a restart.
+- A boot-only seam (`v41.mono.install`, the DeepSeek-V4.1 whole-step decode
+  installer) runs once, at build: `hotplug_plan` refuses a plan that would
+  change its owners (`RecipeRefused("recipe-boot-only")`); restart instead.

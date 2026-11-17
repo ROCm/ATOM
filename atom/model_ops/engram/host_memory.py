@@ -242,12 +242,9 @@ class _HipHostAllocator:
     memory at that moment also gets base pages; that costs it nothing but
     huge-page TLB reach.
 
-    The range is also marked `MADV_NOHUGEPAGE`, so khugepaged never collapses
-    it once THP is back on: a collapse moves pages the GPU maps, and amdgpu
-    evicts the process's queues until it has revalidated the mapping. With a
-    TP8 rank's two 11.4 GiB Engram shards that took ~1 s, on khugepaged's
-    10.24 s wakeups, from ~25 min after the server started: a decode stall
-    the whole TP group waits out.
+    The range is also marked `MADV_NOHUGEPAGE`: a khugepaged collapse moves
+    pages the GPU maps, and amdgpu stalls the process's queues until it has
+    revalidated them (~1 s with a TP8 rank's two 11.4 GiB shards).
     """
 
     def __init__(self, hip, libc):
@@ -273,10 +270,9 @@ class _HipHostAllocator:
         if rc != 0 or not ptr.value:
             _clear_hip_error()
             return None
-        start = ptr.value & ~(_PAGE - 1)
-        end = -(-(ptr.value + max(nbytes, 1)) // _PAGE) * _PAGE
+        start = ptr.value - ptr.value % _PAGE  # the kernel rounds the length up
         # best effort: a kernel without THP answers EINVAL, and nothing is lost
-        self._madvise(start, end - start, _MADV_NOHUGEPAGE)
+        self._madvise(start, ptr.value + nbytes - start, _MADV_NOHUGEPAGE)
         return ptr.value
 
     def free(self, ptr: int) -> None:

@@ -24,14 +24,9 @@ _OUTSIDE_POOL = "_atom_outside_graph_pool"
 
 
 def outside_pool(tensor: torch.Tensor) -> torch.Tensor:
-    """Mark ``tensor`` (a pass's output) as a view of storage the pass owns
-    outside the graph pool, so a replay hands it back without a copy
-    (`_owned`).
-
-    Only for storage allocated before the capture that nothing but the
-    pass's own next replay rewrites: whoever reads the output must be done
-    with it before that replay, as with a staged input.
-    """
+    """Mark a pass's output as storage it owns outside the graph pool, so a
+    replay hands it back uncopied (`_owned`). Only for storage allocated before
+    the capture that nothing but the pass's own next replay rewrites."""
     setattr(tensor, _OUTSIDE_POOL, True)
     return tensor
 

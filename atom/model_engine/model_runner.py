@@ -1028,31 +1028,17 @@ class ModelRunner:
         installer = mono_decode_installers.get(mono_arch)
         if installer is not None:
             install = resolve_obj_by_qualname(installer)
+            kwargs = {"metadata_builder": self.attn_metadata_builder}
             if mono_arch == "DeepseekV41ForCausalLM":
-                # Boot-only seam: a planned plugin may install its own
-                # whole-step decode instead (same arguments, returns the model
-                # to serve). With no owner this is exactly the call below.
+                # Boot-only seam: a planned plugin may install its own instead.
                 self.model = plugin_host.call(
-                    "v41.mono.install",
-                    install,
-                    self.model,
-                    config,
-                    drafter,
-                    metadata_builder=self.attn_metadata_builder,
+                    "v41.mono.install", install, self.model, config, drafter, **kwargs
                 )
             else:
-                self.model = install(
-                    self.model,
-                    config,
-                    drafter,
-                    metadata_builder=self.attn_metadata_builder,
-                )
+                self.model = install(self.model, config, drafter, **kwargs)
         # The installed model's own head output, where it has one: its
         # forward's logits, or a verify's token ids and verdict (`_head_output`).
         self.compute_head = getattr(self.model, "compute_head", None)
-        # Whether that head picks the same output ids on every TP rank, so
-        # `postprocess` need not broadcast them: the model says so.
-        self.identical_head_ids = bool(getattr(self.model, "identical_head_ids", False))
         # A model that can run a whole decode step itself (sampling and
         # verification included); see run_model.
         self._step_override = (
@@ -3528,9 +3514,9 @@ class ModelRunner:
             # below from the broadcast ids, as on the logits path.
             sampled_tokens, verdict, *head_next = logits
             sampled_tokens, verdict = sampled_tokens[:bs], verdict[:, :bs]
-            # (a third output: the next ids, valid while the ids stay the head's)
+            # A third output, each request's next id: valid until a broadcast
+            # (in place) gives the ids rank 0's values.
             head_next = head_next[0][:bs] if head_next else None
-            head_tokens = sampled_tokens
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
@@ -3600,39 +3586,26 @@ class ModelRunner:
             sampled_tokens = get_pcp_group().broadcast(
                 sampled_tokens.contiguous(), src=0
             )
+            head_next = None
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
         # (An overridden step's ids are identical on every TP rank, and the
-        # broadcast would wait for the work it queued after them. So are those
-        # of a head that picked every row in the forward, greedy or drawn
-        # seeded alike on every rank, when its model says so
-        # (`identical_head_ids`): ATOM_HEAD_IDS_SYNC=check broadcasts them
-        # anyway and counts the steps whose ids differed.)
-        head_ids = (
-            isinstance(logits, tuple)
-            and getattr(self, "identical_head_ids", False)
-            and envs.ATOM_HEAD_IDS_SYNC != "1"
-        )
+        # broadcast would wait for the work it queued after them. So are the
+        # ids of a head whose model says so: `identical_head_ids`.)
         if (
             get_tp_group().world_size > 1
             and self._served is None
-            and (not head_ids or envs.ATOM_HEAD_IDS_SYNC == "check")
+            and not (
+                isinstance(logits, tuple)
+                and getattr(self.model, "identical_head_ids", False)
+            )
             and _needs_id_sync(
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
-            synced = get_tp_group().broadcast(
-                sampled_tokens.clone() if head_ids else sampled_tokens, src=0
-            )
-            if head_ids and not torch.equal(synced, sampled_tokens):
-                self._head_ids_mismatch = getattr(self, "_head_ids_mismatch", 0) + 1
-                logger.warning(
-                    "rank %d: head ids differ from rank 0's (%d steps so far)",
-                    self.rank,
-                    self._head_ids_mismatch,
-                )
-            sampled_tokens = synced
+            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            head_next = None
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
@@ -3679,9 +3652,8 @@ class ModelRunner:
         draft_token_ids: np.ndarray | None = None
         next_token_ids = None
         if hasattr(self, "drafter"):
-            if head_next is not None and sampled_tokens is head_tokens:
-                # The head output's: the same ids, gathered in the forward.
-                next_token_ids = head_next
+            if head_next is not None:
+                next_token_ids = head_next  # the gather below, done in the forward
             else:
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, batch.num_spec_step + 1),

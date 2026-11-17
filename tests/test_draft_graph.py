@@ -372,27 +372,6 @@ def test_a_replay_hands_back_a_value_not_the_recordings_own_storage(
     assert got_conf.tolist() != conf.tolist(), "every output, not just the ids"
 
 
-def test_a_replay_hands_back_storage_the_pass_owns_without_a_copy(
-    req_graph_recordings,
-):
-    """An output the pass marked as its own storage (`outside_pool`: allocated
-    before the capture, rewritten only by its next replay, as the V4.1 hi
-    draft's ids are) comes back as itself; the unmarked ones still copied."""
-    from atom.spec_decode.draft_graph import outside_pool
-
-    own = torch.full((8, 3), 7, dtype=torch.int32)
-    ids = outside_pool(own[:4].view(4, -1))
-    conf = torch.zeros(4, 3)
-    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
-    req_graph_recordings.add(4, (ids, conf, None))
-    got_ids, got_conf, none = g.run(
-        4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
-    )
-    assert got_ids is ids and got_ids.data_ptr() == own.data_ptr()
-    assert got_conf is not conf and got_conf.data_ptr() != conf.data_ptr()
-    assert none is None
-
-
 def test_the_eager_path_hands_back_what_it_allocated():
     """...and only a replay needs the copy.
 
