@@ -245,6 +245,17 @@ def stage_score_any(c, isrx):
         gpu.barrier()
 
 
+def _grouped_key(c, flat, l):
+    """(plain python: outside the AST rewriter) key row flat's B operand and scale for the grouped scorer."""
+    if c["ifp4"]:
+        return fp4_key(c, flat, l)
+    kbase = c["iplane"] + (flat // 8) * 1056
+    tt = flat % 8
+    kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
+    return fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32), hx.gload(kbase + 1024 + tt * 4, F32)
+
+
+SCORE_PREFETCH = True     # the grouped scorer prefetches the next task's page row (False: the old loop)
 GROUPED_MIN_BOUND = 8192   # index rows past which a c1 FULL layer scores its key tiles once for every row
 
 
@@ -299,21 +310,10 @@ def stage_score_grouped(c):
     for k in range_constexpr(TR):   # every row's query and head weights -> LDS slots 0..TR-1
         stage_q_rows(c, sm, t, k, k)
     gpu.barrier()
-    for i in range(nme):
-        task = vb + i * ncta
-        if early & ((task + 1) * CHUNK > newc):   # (B) this step's new keys: the compressor rows' flags
-            hx.wait_flags(c["crflag"], NCROW, c["crtag"], w, l, 11)
-            gpu.barrier()
+    key_of = lambda flat: _grouped_key(c, flat, l)
+
+    def score_task(task, kb, ks):
         col = task * CHUNK + w * 16 + l % 16
-        flat = (i == I32(0)).select(flat0, page_row(task))
-        if fx.const_expr(c["ifp4"]):
-            kb, ks = fp4_key(c, flat, l)
-        else:
-            kbase = c["iplane"] + (flat // 8) * 1056
-            tt = flat % 8
-            kp = [hx.gload(kbase + i64(((l // 16) + 2 * cc) * 128) + tt * 16, I32, 4) for cc in range(4)]
-            kb = fx.Vector.from_elements([kp[cc][e] for cc in range(4) for e in range(4)], I32)
-            ks = hx.gload(kbase + 1024 + tt * 4, F32)
         for r in range_constexpr(TR):
             cx = hx.lload(osr + r * 4, I32)
             bd = hx.lload(osr + (64 + r) * 4, I32)
@@ -343,6 +343,25 @@ def stage_score_grouped(c):
                 m = (bk == nblk - 1).select(F32(float("inf")), m)
                 if (cx > I32(TOPK)) & (l < 16) & (l % 8 == 0) & (bk < nblk):
                     c["stx"](c["ibmax"] + i64(r * (c["ilw"] // 8) + bk) * 4, m)
+
+    pf = c.get("score_pf", SCORE_PREFETCH)
+    last = fx.max(vb + (nme - 1) * ncta, vb)
+    fnext = flat0
+    for i in range(nme):
+        task = vb + i * ncta
+        if early & ((task + 1) * CHUNK > newc):   # (B) this step's new keys: the compressor rows' flags
+            hx.wait_flags(c["crflag"], NCROW, c["crtag"], w, l, 11)
+            gpu.barrier()
+        if fx.const_expr(pf):
+            # the next task's page row (block table: this step's tables, not this layer's outputs) loaded before this
+            # task's key tile, so the next round's chain is the key load alone, not block table -> key (2 VGPRs carried;
+            # several tasks' key tiles in flight instead spilled the step kernel: 300K +150 us)
+            flat = fnext
+            fnext = page_row(fx.min(task + ncta, last))
+        else:
+            flat = (i == I32(0)).select(flat0, page_row(task))
+        kb, ks = key_of(flat)
+        score_task(task, kb, ks)
         if fx.const_expr("segcnt" in c):   # (segsel) the candidate layer: this task's 8192-column segment, one more
             if iprod:
                 hx.wait_storecnt0()
