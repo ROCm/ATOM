@@ -247,12 +247,6 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 | **ATOM_MORI_V1_LL** | bool | 0 (false) | With `--all2all-backend low-latency`, run MoRI as vLLM's `mori_low_latency` does. Across nodes it uses `InterNodeV1LL`, launched at the geometry its handle was built with (no per-call block/warp override); aiter sizes that from `MORI_EP_BLOCK_NUM`, `MORI_EP_RDMA_BLOCK_NUM` and `MORI_EP_WARP_PER_BLOCK`, and vLLM uses 64 / 32 / 8 on gfx950. Within a node it uses the `IntraNode` kernel, as high-throughput does. Off keeps aiter's mapping, which picks `AsyncLL` within a node. |
 
-## MoRI chunking comparisons
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_BENCH_MOE_CHUNK_SIZE** | int | 0 | Opt-in chunk size, in local token rows, for the two-node EP16 MoRI comparison path. `0` disables chunking. Positive values cap each chunk at the MoRI handle's token capacity; all ranks must use the same value. Malformed or negative values warn and fall back to `0`. The first-call chunk geometry is logged through the ATOM logger. Set before startup. |
-
 ## EPLB
 
 Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`

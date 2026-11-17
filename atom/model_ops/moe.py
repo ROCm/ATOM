@@ -29,6 +29,7 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
     is_internode_mega,
+    validate_internode_mega_topology,
 )
 from atom.distributed.comm_utils import gather_rows
 from atom.distributed.pcp_utils import (
@@ -695,16 +696,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                     "unsupported on the inter-node MoRI kernels."
                 )
 
-            from atom.model_ops.fused_moe.mori_chunked_experts import (
-                benchmark_chunk_size,
-            )
-
-            moe_chunk_size = benchmark_chunk_size()
-            mori_capacity = (
-                min(moe.max_num_tokens, moe_chunk_size)
-                if moe_chunk_size
-                else moe.max_num_tokens
-            )
             all_to_all_args = {
                 "rank": all2all_manager.rank,
                 "num_ep_ranks": all2all_manager.world_size,
@@ -714,7 +705,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "token_hidden_size": moe.hidden_dim,
                 "scale_dim": scale_dim,
                 "scale_type_size": scale_type_size,
-                "max_num_tokens_per_dp_rank": mori_capacity,
+                "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 "input_dtype": moe.in_dtype,
                 "num_local_experts": moe.num_local_experts,
@@ -740,7 +731,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
-                max_tokens_per_rank=mori_capacity,
+                max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
                 dispatch_format=dispatch_format,
                 low_latency=low_latency,
@@ -796,18 +787,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 # layer.shared_experts,
                 quant_config=self.moe_quant_config,
             )
-
-            if isinstance(prepare_finalize, MoriPrepareAndFinalize):
-                from atom.model_ops.fused_moe.mori_chunked_experts import (
-                    MoriChunkedExperts,
-                    benchmark_chunk_size,
-                )
-
-                chunk_size = benchmark_chunk_size()
-                if chunk_size:
-                    self.fused_experts = MoriChunkedExperts(
-                        self.fused_experts, chunk_size
-                    )
 
             # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
             # told the expert-GEMM recipe that only the layer + this quant method
@@ -2779,16 +2758,14 @@ class MegaInternodeMxfp4MoEMethod(Mxfp4MoEMethod):
 
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         parallel = moe.moe_parallel_config
-        if (
-            not parallel.use_ep
-            or parallel.ep_size != 16
-            or parallel.dp_size != 16
-            or parallel.local_ep_size != 8
-            or parallel.dp_logical_ratio != 1
-        ):
-            raise ValueError(
-                "internode MegaMoE requires actual two-node EP16 expert sharding"
-            )
+        validate_internode_mega_topology(
+            use_ep=parallel.use_ep,
+            tp_size=parallel.tp_size,
+            dp_size=parallel.dp_size,
+            ep_size=parallel.ep_size,
+            local_ep_size=parallel.local_ep_size,
+            dp_logical_ratio=parallel.dp_logical_ratio,
+        )
         # The inherited routing/layout/forward paths use this selector to keep
         # rows local. Refuse the DP-gather fallback before allocating weights.
         if not parallel.use_mori_kernels:

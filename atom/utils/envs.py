@@ -1099,10 +1099,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DSV41_MOE_FP8_ACTIVATIONS", "1"
     )
     == "1",
-    # Optional MoRI chunking for EP16 comparisons; 0 keeps the normal path.
-    "ATOM_BENCH_MOE_CHUNK_SIZE": lambda: _nonnegative_int_env(
-        "ATOM_BENCH_MOE_CHUNK_SIZE", 0
-    ),
     # --- MoE all2all (MoRI) wire format ---
     "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;

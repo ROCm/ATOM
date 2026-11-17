@@ -32,11 +32,8 @@ checkpoint layout (gate rows then up rows).
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from contextlib import ExitStack
-from pathlib import Path
 
 import torch
 
@@ -67,8 +64,7 @@ def close_internode_instances() -> None:
 
 
 def build_internode_weights(layer) -> None:
-    """Stash the op's weight layouts on the layer from ATOM's raw MXFP4
-    tensors. Must run before ATOM's own shuffle."""
+    """Build internode layouts from raw MXFP4 weights, replacing ATOM's shuffle."""
     from aiter.ops.shuffle import (
         shuffle_scale_a16w4,
         shuffle_weight,
@@ -163,7 +159,6 @@ def _get_instance(
             )
             inst = {"op": op}
             _INSTANCES[key] = inst
-        _write_tune_audit(op, rank, mtpr)
         if rank == 0:
             logger.info(
                 "[MEGA-INTERNODE] built capacity=%d ep=%d experts/rank=%d topk=%d",
@@ -172,43 +167,7 @@ def _get_instance(
                 experts // world,
                 topk,
             )
-            logger.info(
-                "[MEGA-INTERNODE] stage1=%s window_bytes=%d single_kernel=%s",
-                op.stage1_kernel_name,
-                op.layout.total_bytes,
-                op._single_kernel,
-            )
     return inst
-
-
-def _write_tune_audit(op, rank, mtpr) -> None:
-    """Optional profiler artifact; an audit failure must not break serving."""
-    profiler_dir = os.environ.get("ATOM_TORCH_PROFILER_DIR")
-    if not profiler_dir:
-        return
-    try:
-        audit = {
-            "rank": rank,
-            "capacity": mtpr,
-            "quant": op.quant,
-            "stage1": op._s1_tile,
-            "paired_tune": op._s2_tuned,
-            "gemm2_bn": op._gemm2_bn,
-            "gemm2_bm": op._gemm2_bm,
-            "gemm2_cu": op._gemm2_cu,
-            "return_chunk_tokens": op._chunk_tokens,
-            "stage2_sdma": op._stage2_sdma,
-            "stage1_kernel": op.stage1_kernel_name,
-            "tune_path": os.environ.get("AITER_CONFIG_MEGAMOE_INTERNODE"),
-        }
-        audit_dir = Path(profiler_dir).parent / "tune_audit"
-        audit_dir.mkdir(parents=True, exist_ok=True)
-        (audit_dir / f"rank{rank}_capacity{mtpr}.json").write_text(
-            json.dumps(audit, indent=2) + "\n", encoding="utf-8"
-        )
-        logger.info("[MEGA-TUNE] %s", json.dumps(audit))
-    except (OSError, TypeError, ValueError, AttributeError):
-        logger.warning("[MEGA-TUNE] unable to write optional tune audit", exc_info=True)
 
 
 def _run_chunk(inst, layer, x, ids, wts, start, n):
@@ -223,16 +182,16 @@ def _run_chunk(inst, layer, x, ids, wts, start, n):
         return op.forward(x[start:end].contiguous(), wts[start:end], ids[start:end])
 
 
-def _group_rows(local_rows: int) -> tuple[int, bool]:
-    """(rows every rank agrees on, whether the step is unified)."""
+def _group_rows() -> int:
+    """Return the row count agreed across ranks for this collective step."""
     from atom.utils.forward_context import get_forward_context
 
     fc = get_forward_context()
     ctx = fc.context
     if ctx is not None and ctx.running_tokens_are_unified and ctx.running_tokens > 0:
-        return int(ctx.running_tokens), True
+        return int(ctx.running_tokens)
     if fc.dp_metadata is not None:
-        return int(fc.dp_metadata.max_tokens_across_dp), False
+        return int(fc.dp_metadata.max_tokens_across_dp)
     raise RuntimeError(
         "internode MegaMoE needs dp_metadata to agree on the chunk count"
     )
@@ -334,7 +293,7 @@ class MegaInternodeFusedExperts:
         inst_p = _get_instance(self._prefill_mtpr, **build)
         inst_ds = [_get_instance(m, **build) for m in self._decode_mtprs]
 
-        group_rows, _ = _group_rows(rows)
+        group_rows = _group_rows()
         if rows > group_rows:
             raise RuntimeError(
                 f"internode MegaMoE: local rows {rows} > group rows {group_rows}"

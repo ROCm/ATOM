@@ -2,8 +2,6 @@
 """CPU regressions at the EP16 adapter's AITER/MoRI boundaries."""
 
 import importlib
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -29,11 +27,6 @@ def internode(atom_modules, monkeypatch):
             self.device = torch.device("cpu")
             self.mtpr = kwargs["max_tok_per_rank"]
             self.quant = kwargs["quant"]
-            self._s1_tile = self._gemm2_bn = self._gemm2_bm = self._gemm2_cu = 16
-            self._chunk_tokens = 32
-            self._s2_tuned = self._stage2_sdma = self._single_kernel = False
-            self.stage1_kernel_name = "cpu-boundary"
-            self.layout = SimpleNamespace(total_bytes=0)
             self.close = Mock()
             self.bind_weights = Mock()
             self.calls = []
@@ -125,7 +118,7 @@ def test_token_budget_limits_actual_operator_allocations(
     backend = internode.module.MegaInternodeFusedExperts(
         _weights(), model_dim=64, inter_dim=32, max_tokens=budget
     )
-    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (budget, True))
+    monkeypatch.setattr(internode.module, "_group_rows", lambda: budget)
     x = torch.ones(1, 64, dtype=torch.bfloat16)
     result = backend(
         hidden_states=x,
@@ -169,7 +162,7 @@ def test_different_rank_budgets_produce_one_preallocation_sequence(
 ):
     _production_capacities(internode, monkeypatch)
     calls = _ep_budgets(internode, monkeypatch, [129] + [128] * 15)
-    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
+    monkeypatch.setattr(internode.module, "_group_rows", lambda: 1)
     for local_budget in (128, 129):
         with torch.inference_mode():
             backend = internode.module.MegaInternodeFusedExperts(
@@ -206,9 +199,9 @@ def test_budgeted_capacities_are_ready_for_padded_and_idle_graph_steps(
     backend = internode.module.MegaInternodeFusedExperts(
         _weights(), model_dim=64, inter_dim=32, max_tokens=4
     )
-    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
 
     def run(rows, valid):
+        monkeypatch.setattr(internode.module, "_group_rows", lambda: rows)
         ids = torch.zeros(rows, 2, dtype=torch.int32)
         ids[valid:] = -1
         return backend(
@@ -244,40 +237,14 @@ def test_cold_graph_step_cannot_allocate_a_budgeted_operator(internode, monkeypa
     assert not internode.built
 
 
-@pytest.mark.parametrize("profiler_dir", [None, ""])
-def test_initialization_without_profiler_is_cached_and_closed(
-    internode, monkeypatch, profiler_dir
-):
+@pytest.mark.parametrize("profiler_dir", [None, "", "/unused/trace"])
+def test_initialization_is_cached_and_closed(internode, monkeypatch, profiler_dir):
     if profiler_dir is not None:
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", profiler_dir)
     first = _instance(internode)
     assert _instance(internode) is first
     assert len(internode.built) == 1
     first["op"].close.assert_not_called()
-    internode.module.close_internode_instances()
-    first["op"].close.assert_called_once_with()
-
-
-def test_profiler_audit_creates_parent_directories(internode, monkeypatch, tmp_path):
-    profiler = tmp_path / "missing" / "trace"
-    monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", str(profiler))
-    _instance(internode)
-    audit = json.loads(
-        (profiler.parent / "tune_audit" / "rank0_capacity2.json").read_text()
-    )
-    assert audit["rank"] == 0 and audit["capacity"] == 2
-    assert audit["quant"] == "a4w4"
-
-
-@pytest.mark.parametrize("operation", ["mkdir", "write_text"])
-def test_audit_io_failure_preserves_cached_operator(
-    internode, monkeypatch, tmp_path, caplog, operation
-):
-    monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", str(tmp_path / "trace"))
-    monkeypatch.setattr(Path, operation, Mock(side_effect=OSError("unwritable")))
-    first = _instance(internode)
-    assert _instance(internode) is first
-    assert "unable to write optional tune audit" in caplog.text
     internode.module.close_internode_instances()
     first["op"].close.assert_called_once_with()
 
@@ -343,6 +310,43 @@ def test_mixed_dp_phase_uses_group_chunks_even_on_an_idle_rank(
     assert all(not op.calls for op in internode.built if op.mtpr != 8)
 
 
+@pytest.mark.parametrize(
+    "unified,running,dp_rows,expected",
+    [(True, 4, None, 4), (False, 3, 10, 10), (True, 0, 10, 10)],
+)
+def test_group_rows_uses_the_agreed_step_width(
+    internode, monkeypatch, unified, running, dp_rows, expected
+):
+    from atom.utils import forward_context
+
+    context = SimpleNamespace(
+        running_tokens=running, running_tokens_are_unified=unified
+    )
+    metadata = (
+        forward_context.DPMetadata(np.array([running, dp_rows]))
+        if dp_rows is not None
+        else None
+    )
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=context, dp_metadata=metadata),
+    )
+    assert internode.module._group_rows() == expected
+
+
+def test_group_rows_requires_collective_metadata(internode, monkeypatch):
+    from atom.utils import forward_context
+
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=None, dp_metadata=None),
+    )
+    with pytest.raises(RuntimeError, match="needs dp_metadata"):
+        internode.module._group_rows()
+
+
 def test_teardown_attempts_every_capacity_in_reverse_order(internode):
     first, second = _instance(internode), _instance(internode, capacity=4)
     calls = []
@@ -391,7 +395,7 @@ def test_inherited_apply_passes_model_activation_parameters(
     method.fp8_activations = method.is_guinterleave = False
     method.quant_type = internode.moe.QuantType.per_1x32
     method.hidden_pad = method.intermediate_pad = 0
-    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
+    monkeypatch.setattr(internode.module, "_group_rows", lambda: 2)
     activation = (
         internode.moe.ActivationType.Situv2
         if situ
@@ -426,7 +430,7 @@ def test_situ_defaults_and_explicit_parameters(internode, monkeypatch, extra, ex
     backend = internode.module.MegaInternodeFusedExperts(
         _weights(), model_dim=64, inter_dim=32, max_tokens=8
     )
-    monkeypatch.setattr(internode.module, "_group_rows", lambda rows: (rows, True))
+    monkeypatch.setattr(internode.module, "_group_rows", lambda: 1)
     backend(
         hidden_states=torch.zeros(1, 64, dtype=torch.bfloat16),
         topk_weights=torch.ones(1, 2),
@@ -503,6 +507,24 @@ def test_removed_internode_selector_is_rejected():
         ({"tensor_parallel_size": 2}, "two-node EP16"),
         ({"pipeline_parallel_size": 2}, "two-node EP16"),
         ({"prefill_context_parallel_size": 2}, "two-node EP16"),
+        ({"enable_expert_parallel": False}, "two-node EP16"),
+        ({"dp_logical_size": 32}, "two-node EP16"),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    data_parallel_size=32, data_parallel_size_local=8
+                )
+            },
+            "two-node EP16",
+        ),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    data_parallel_size=16, data_parallel_size_local=4
+                )
+            },
+            "two-node EP16",
+        ),
         ({"enable_tbo": True}, "disable TBO"),
         ({"enable_tbo_decode": True}, "disable TBO"),
     ],
@@ -558,6 +580,7 @@ def test_supported_config_shards_experts_over_all_sixteen_ranks(
     "overrides",
     [
         {"use_ep": False},
+        {"tp_size": 2},
         {"ep_size": 1},
         {"dp_size": 8},
         {"local_ep_size": 16},
@@ -567,7 +590,7 @@ def test_supported_config_shards_experts_over_all_sixteen_ranks(
 def test_method_rejects_actual_sharding_mismatch(atom_modules, monkeypatch, overrides):
     parallel = _parallel(atom_modules, monkeypatch, _config())
     vars(parallel).update(overrides)
-    with pytest.raises(ValueError, match="actual two-node EP16 expert sharding"):
+    with pytest.raises(ValueError, match="two-node EP16"):
         atom_modules.moe.MegaInternodeMxfp4MoEMethod(
             None, SimpleNamespace(moe_parallel_config=parallel)
         )

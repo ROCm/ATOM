@@ -6,9 +6,10 @@ selection-only per-expert bias, renormalized top-k and a `routed_scaling_factor`
 the experts use the inherited V4 quantization, clamped SwiGLU and whole-expert
 ownership. The routed FP4 experts take MXFP8 activations, as the checkpoint's
 reference runs them by default. ATOM_DSV41_MOE_FP8_ACTIVATIONS=0 explicitly
-selects A4W4 for both standard and internode deployment. MXFP4 put the
-routed output ~12% off the reference and cost ~1.4pp of GSM8K. Activation
-format, routing-weight placement and kernel dispatch are owned by V4/FusedMoE.
+selects A4W4 for both standard and internode deployment. Using MXFP4
+activations put the routed output ~12% off the reference and cost ~1.4pp of
+GSM8K. Activation format, routing-weight placement and kernel dispatch are
+owned by V4/FusedMoE.
 `DeepseekV4Args` reads all of it off the V4.1 config by its HF names, so V4's
 `MoE` constructs directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
 
