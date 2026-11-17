@@ -398,6 +398,13 @@ class EagleProposer(Drafter):
                 d_input_ids, d_positions, d_hidden
             )
 
+        slot_check = getattr(self.runner, "_draft_slot_check", None)
+        if slot_check is not None:
+            slot_check.check(
+                forward_context.attn_metadata.slot_mapping,
+                "compute_draft_kv",
+                per_token=True,
+            )
         was_draft = context.is_draft
         context.is_draft = True
         try:
@@ -726,7 +733,12 @@ class EagleProposer(Drafter):
         mid_label = (
             self.step.label(scheduled_bs, running_bs) if self.step else step0_label
         )
+        slot_check = getattr(self.runner, "_draft_slot_check", None)
         for i in range(self.mtp_k):
+            if slot_check is not None:
+                slot_check.check(
+                    attn_metadata.slot_mapping, f"propose step {i}", per_token=i == 0
+                )
             # `tok` is this step's real row count, NOT `scheduled_bs`: step 0
             # runs the target's whole token stream (a prefill chunk, or
             # scheduled_bs*(mtp_k+1) on decode) and only steps 1+ run one row

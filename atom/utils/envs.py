@@ -228,6 +228,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MORIIO_DIAG_POST_READY": lambda: _flag_env(
         "ATOM_MORIIO_DIAG_POST_READY", "0"
     ),
+    # Speculative decoding (debugging): flag every draft KV write whose slot
+    # lies outside the blocks of the forward's own requests. Checked on the
+    # GPU and read back asynchronously, so it adds no synchronization.
+    "ATOM_DRAFT_SLOT_CHECK": lambda: _flag_env("ATOM_DRAFT_SLOT_CHECK", "0"),
     # P/D producer: 0 surfaces each prefill's sampled token from its own
     # forward, as for a producer with recurrent state, instead of deferring it
     # to one more decode step of that request.
