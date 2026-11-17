@@ -1111,8 +1111,8 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
-            (request, target, src, dst, data, req_id, engine)
+        lambda request, target, src, dst, data, req_id, *, engine=None, **_: (
+            captured.append((request, target, src, dst, data, req_id, engine))
         )
         or True
     )
@@ -2130,6 +2130,96 @@ def test_a_tp_split_the_state_cannot_take_is_refused(
     assert not nic.mem[_DST_MLA[0] : _DST_SLOT[0]].any()
 
 
+@pytest.fixture
+def _no_cuda_stream(monkeypatch):
+    """The staging stream is a mock: entering it is a no-op here."""
+    from contextlib import nullcontext
+
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+
+
+def _sparse_pp_stage(mc, index_src=1 << 20):
+    """A PP stage of a sparse hybrid (Kimi-K3.1): one MLA and one index region
+    at a 16-token block, the peer's second MLA row and second index layer."""
+    from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
+
+    writes = []
+    connector = _pp_stage_connector(mc, _ByteNic())
+    connector.block_size = 16
+    connector._block_regions = [(0, 16 * 576), (index_src, 16 * 144)]
+    connector._per_block_bytes_list = [16 * 576, 16 * 144]
+    connector._block_region_roles = [MLA_KV_ROLE, INDEX_CACHE_ROLE]
+    connector._block_head_major_runs = [None, None]
+    connector._block_region_consumer_indices = [1, 3]
+    connector._index_staging_chunk_pages = 256
+    connector._prepare_sharded_index = MagicMock(return_value="gather")
+    connector._gather_sharded_index = MagicMock()
+    connector._send_worker_stream = MagicMock()
+    connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
+    connector._rdma_write = lambda _t, src, dst, sizes, *_a, **_k: (
+        writes.extend(zip(src, dst, sizes)) or True
+    )
+    request = _dcp_tp_request()
+    request["consumer_block_base_addrs"] = [1 << 22, 2 << 22, 3 << 22, 4 << 22]
+    request["consumer_block_bpb"] = [16 * 576, 16 * 576, 16 * 144, 16 * 144]
+    request["consumer_region_roles"] = [MLA_KV_ROLE] * 2 + [INDEX_CACHE_ROLE] * 2
+    return connector, request, writes
+
+
+def test_slot_transfer_gathers_index_pages_onto_the_dcp_plan(_no_cuda_stream):
+    """A stateful model's PP stage sends through the slot path: its MLA tokens
+    relayout per token, its preshuffled index pages, which split below one
+    16-row tile, go through the staged gather once the prefill is ready."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    index_src = 1 << 20
+    connector, request, writes = _sparse_pp_stage(mc, index_src)
+    ready = object()
+
+    assert mc.MooncakeConnector._execute_block_slot_transfer(
+        connector,
+        request,
+        "consumer:1234",
+        [0, 1, 2, 3],
+        [1, 2],
+        {"slot_index": 5},
+        "req-1",
+        kv_cache_ready_event=ready,
+    )
+
+    connector._send_worker_stream().wait_event.assert_called_once_with(ready)
+    connector._execute_staged_index_layer_chunk.assert_called_once_with(
+        "consumer:1234",
+        1,
+        4 << 22,
+        16 * 144,
+        [1, 2],
+        "req-1",
+        "gather",
+        engine=None,
+        deadline=None,
+    )
+    # DCP rank 1 of 2 owns the 32 odd tokens of the 64-token prompt.
+    mla = [w for w in writes if 2 << 22 <= w[1] < 3 << 22]
+    assert len(mla) == 32 and all(size == 576 for _, _, size in mla)
+    assert not any(index_src <= src < 2 * index_src for src, _, _ in writes)
+
+
+def test_slot_transfer_refuses_index_staging_without_a_ready_event(_no_cuda_stream):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, request, _ = _sparse_pp_stage(mc)
+
+    with pytest.raises(RuntimeError, match="ready event"):
+        _run_slot_transfer(mc, connector, request)
+    connector._execute_staged_index_layer_chunk.assert_not_called()
+
+
 def test_dcp_index_staging_waits_for_request_ready_event(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
@@ -2557,7 +2647,7 @@ def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matche
         conn._rail_pool = SimpleNamespace(get=engines.__getitem__)
     barrier = threading.Barrier(2)
 
-    def transfer(data, target, *_args, engine=None):
+    def transfer(data, target, *_args, engine=None, **_kwargs):
         # Both selections must finish before either write. Mutating the
         # connector's shared engine here would send a request on the wrong rail.
         barrier.wait(timeout=10)

@@ -489,12 +489,36 @@ def test_moriio_keeps_refusing_pp():
         builder.get_kv_transfer_tensors()
 
 
-def test_a_sparse_mla_model_keeps_refusing_pp():
-    builder = kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+def _sparse_second_stage(builder):
+    """Index slices at both MLA layers, the second on this stage, and one
+    draft MLA row the peer counts before its index layers."""
     builder.model_runner.has_mla_indexer = True
+    builder._index_cache_layout = lambda: ((7,), (3, 7))
+    builder._global_num_draft_layers = lambda: 1
+    return builder
 
-    with pytest.raises(NotImplementedError, match="sparse MLA indexer"):
-        builder.get_kv_transfer_tensors()
+
+def test_a_pp_stage_places_its_index_regions_after_every_mla_row():
+    """The peer lists its two target MLA rows, the draft's row, then one index
+    region per index layer: layer 7's lands at 3 + 1, not after this stage's
+    own MLA row."""
+    builder = _sparse_second_stage(
+        kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    )
+
+    block, slots = builder._pp_consumer_region_indices(2, 6)
+
+    assert block == [1, 4]
+    assert slots == [3, 4, 5, 9, 10, 11]
+
+
+def test_a_sparse_pp_stage_refuses_a_region_count_it_did_not_place():
+    builder = _sparse_second_stage(
+        kimi_builder({"kv_connector": "mooncake"}, pp_size=2)
+    )
+
+    with pytest.raises(RuntimeError, match="MLA and index rows"):
+        builder._pp_consumer_region_indices(1, 6)
 
 
 def test_a_pp_stage_places_its_rows_by_layer_number():
