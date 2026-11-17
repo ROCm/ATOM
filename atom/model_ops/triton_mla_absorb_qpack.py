@@ -9,6 +9,12 @@ reads back to write ``q_out[..., :kv_lora_rank]`` as ``cast(x * (1/q_scale))``.
 This kernel keeps the fp32 accumulator and applies that epilogue itself, so the
 intermediate is never written.
 
+AITER's batched_gemm_bf16 supports a strided FP8 output, but no output scale
+or finite-range clamp (aiter 0d894387bbbf, ops/triton/gemm/batched/
+batched_gemm_bf16.py). Its fused BMM/RoPE/cache op instead requires FP8
+weights. Neither preserves this BF16 absorb with arbitrary q_scale; replacing
+this adapter requires that scaled, saturating epilogue in AITER first.
+
 Numerics: the two-kernel path rounds the accumulator to bf16 before the FP8
 cast, this one does not, and the fp32 reduction order differs. Both only move a
 value across an e4m3 rounding boundary, so the stored code differs by at most

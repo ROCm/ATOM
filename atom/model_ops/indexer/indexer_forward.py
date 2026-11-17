@@ -278,7 +278,13 @@ def sparse_attn_indexer(
     # A single-rank prefill's slot conversion subtracts concat rows' request
     # base itself; decode and the DCP filter read request-local ids.
     single_rank_prefill = context.is_prefill and get_dcp_world_size() == 1
-    exchange = _exchange_stream(indexer_module, context.is_prefill)
+    # Packed passes gather into separate padded slots inside score_topk; they
+    # cannot be gathered again using the whole step's row split.
+    exchange = (
+        _exchange_stream(indexer_module, context.is_prefill)
+        if rows.passes is None
+        else None
+    )
     topk_indices = score_topk(
         ((q_quant.unsqueeze(1), q_fp4_scale.unsqueeze(1)) if indexer_fp4 else q_quant),
         weights_mqa,

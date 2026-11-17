@@ -50,7 +50,7 @@ def dcp_prefill(monkeypatch):
     monkeypatch.setattr(indexer_forward, "get_dcp_rank", lambda: 0)
     monkeypatch.setattr(indexer_forward, "pcp_is_enabled", lambda: False)
 
-    def run(stream):
+    def run(stream, *, passes=None):
         indexer = SimpleNamespace(
             _indexer_fp4=False, use_nope_cache_fusion=False, exchange_stream=stream
         )
@@ -67,7 +67,9 @@ def dcp_prefill(monkeypatch):
         )
         md = AttentionMetaData()
         md.run_sparse = True
-        md.index_rows = SimpleNamespace(out_rows=8, concat=None, split=None)
+        md.index_rows = SimpleNamespace(
+            out_rows=8, concat=None, split=None, passes=passes
+        )
         monkeypatch.setattr(
             indexer_forward,
             "get_forward_context",
@@ -105,6 +107,14 @@ def test_capture_tbo_and_a_streamless_indexer_keep_the_serial_order(
     if serial == "tbo":
         monkeypatch.setattr(indexer_forward, "tbo_active", lambda: True, raising=False)
     calls, md = dcp_prefill(None if serial == "no stream" else torch.cuda.Stream())
+    main = torch.cuda.current_stream()
+    assert calls == [("score", main, True), ("filter", main)]
+    assert md.index_exchange_done is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA streams")
+def test_packed_prefill_keeps_its_per_pass_gathers_in_the_scorer(dcp_prefill):
+    calls, md = dcp_prefill(torch.cuda.Stream(), passes=(object(), object()))
     main = torch.cuda.current_stream()
     assert calls == [("score", main, True), ("filter", main)]
     assert md.index_exchange_done is None
