@@ -187,7 +187,10 @@ def xshfl(v, off, architecture: Architecture = GFX950):
         return v.shuffle_xor(off, architecture.wave_size)
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
-    if off == 8:
+    if off in (8, 4) and architecture.wave_size == 32:
+        # DPP16 row_xmask: lane ^ off within its row, in one move
+        y = fx.Int32(update_dpp_i32(x, x, 0x160 | off, 0xF, 0xF, False))
+    elif off == 8:
         y = fx.Int32(update_dpp_i32(x, x, 0x118, 0xF, 0xC, False))
         y = fx.Int32(update_dpp_i32(y, x, 0x108, 0xF, 0x3, False))
     elif off == 4:

@@ -23,10 +23,13 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     PACK_ELEMENTS,
     ROWS,
 )
-from atom.mono.device.ops import CM_NT, mma_bf16, rsrc
+from atom.mono.device.ops import mma_bf16, rsrc
 from atom.mono.plan.architecture import GFX1250
 
 ACCUMULATOR_ELEMENTS = GFX1250_GEMV.accumulator_elements_per_lane
+# gfx12 CPol TH_NT: a weight read once per launch streams past the caches
+# (the shared CM_NT is gfx95x's encoding, TH_HT on gfx12)
+TH_NT = 1
 
 
 def chunks(k: int, waves: int) -> tuple[int, int]:
@@ -83,7 +86,7 @@ def loads(lane, wave, waves, w, row0, k, nt=True, ldk=None, k0=0):
                         base + offset,  # noqa: B023 - consumed immediately
                         vec_width=PACK_ELEMENTS // 2,
                         dtype=T.i32,
-                        cache_modifier=CM_NT if nt else 0,
+                        cache_modifier=TH_NT if nt else 0,
                     ),
                     lane_group,
                     mma_step,
@@ -139,7 +142,7 @@ def fp8_loads(lane, wave, waves, w, scale, row0, k, nt=True):
                     byte // 4,
                     vec_width=2,
                     dtype=T.i32,
-                    cache_modifier=CM_NT if nt else 0,
+                    cache_modifier=TH_NT if nt else 0,
                 )
                 converted = fp8x8_to_bf16(raw, exponent)
                 elements.extend(converted[i] for i in range_constexpr(PACK_ELEMENTS))

@@ -92,10 +92,10 @@ GFX1250 = Architecture(
         k=32,
         accumulator_elements_per_lane=8,
     ),
-    # The gfx950 reduction path's permlane32 exchange crosses halves of a
-    # wave64.  A wave32 has no corresponding 32-lane partner; shared code uses
-    # shuffle_xor for its one cross-row (offset 16) exchange instead.
-    native_permlane_exchange=False,
+    # A wave32's one cross-row (offset 16) exchange is v_permlane16_swap: the
+    # two 16-lane rows trade in registers, not through LDS (ds_bpermute). It
+    # has no offset 32, the wave64 permlane32 exchange.
+    native_permlane_exchange=True,
     # Checked-in AITER gfx1250 sources consistently enforce 327680 bytes:
     # pa_decode_kernel.py and pa_decode/traits.py use that exact limit, while
     # fmha_gfx1250 documents it as the 320-KiB workgroup budget.

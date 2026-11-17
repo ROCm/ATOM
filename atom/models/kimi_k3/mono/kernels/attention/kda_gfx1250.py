@@ -25,6 +25,7 @@ from atom.models.kimi_k3.mono.kernels.attention.layout import (
 from atom.models.kimi_k3.mono.kernels.attention.protocol import ATTENTION_CTAS
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
     ACCUMULATOR_ELEMENTS,
+    TH_NT,
     _fragment,
     accumulator_offset,
 )
@@ -34,7 +35,6 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
 )
 from atom.mono.device.ops import (
     CM_DEV,
-    CM_NT,
     butterfly,
     hw_exp2,
     hw_rsq,
@@ -108,7 +108,7 @@ def gemv_loads(c, row_group, groups):
                         base + offset,
                         vec_width=PACK_ELEMENTS // 2,
                         dtype=T.i32,
-                        cache_modifier=CM_NT,
+                        cache_modifier=TH_NT,
                     ),
                     lane_group,
                     step,
