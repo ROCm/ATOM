@@ -25,3 +25,7 @@
 ## Next step
 
 Run the recipe's own GSM8K (5-shot chat, the command in recipes/MiniMax-M3.md) against the same image and server. Near 94.7%: the gap is the eval method, and 455-CI needs a known-good value measured its own way. Well below it: a real accuracy regression on main or on gfx1250.
+
+## Result of the next step (2026-11-14 16:15 UTC)
+
+The recipe-style GSM8K (`local-chat-completions`, chat template, 5-shot as multiturn, `max_gen_toks=16384`, num_concurrent 16), run against the same image and the same 455-CI recipe server on e15-07, scores **94.9% flexible-extract / 94.0% strict-match** ([command](chat-5shot/gsm8k_cmd.sh), [results](chat-5shot/)). That is within the known-good range (94.7% here; 95.0-95.7% in LLM-Booster#470 and the M3 image runs), so the gap is the eval method, not a regression. Raising the 3-shot completions run to `max_gen_toks=2048` does not close it (85.9%), so it is not truncation either.
