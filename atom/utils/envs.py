@@ -647,18 +647,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
-    # cold launch fetches one body's code each (the same bits); 0, the default,
-    # unrolls them at trace time.
+    # cold launch fetches one body's code each (the same bits); 0 unrolls them
+    # at trace time.
     "ATOM_KIMI_MONO_ROLLED_MOE": lambda: (
-        os.getenv("ATOM_KIMI_MONO_ROLLED_MOE", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_ROLLED_MOE", "1") == "1"
     ),
     # Kimi-K3 gfx1250 mono: the lite finish routes a token by its whole CTA in
     # runtime loops (the same routes), reduces its shared down in one loop and
     # drops the gathered latent's dead unpack loops after a replicated front,
-    # so a cold launch fetches far less code; 0, the default, keeps the
-    # unrolled one-wave routing.
+    # so a cold launch fetches far less code; 0 keeps the unrolled one-wave
+    # routing.
     "ATOM_KIMI_MONO_ROLLED_LITE": lambda: (
-        os.getenv("ATOM_KIMI_MONO_ROLLED_LITE", "0") == "1"
+        os.getenv("ATOM_KIMI_MONO_ROLLED_LITE", "1") == "1"
     ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
