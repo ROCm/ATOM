@@ -30,6 +30,7 @@ The standalone GQA drafts (Kimi-K3 DSpark GQA, MiniMax-M3.1) also share one laye
 forward, ``DSparkGQADecoderLayer``.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -351,15 +352,20 @@ class KVCacheBinding(nn.Module):
 
     ``check_cache``, if given, is called with the views before they are bound,
     and raises for a pool its reader was not built for.
+    ``page_tokens`` declares the page the reader views; None uses the pool's
+    own block, while a reader that re-pages it must name that page explicitly.
     """
 
     base_attention = None
     use_mla = False
 
-    def __init__(self, layer_num: int, check_cache=None) -> None:
+    def __init__(
+        self, layer_num: int, check_cache=None, *, page_tokens: int | None = None
+    ) -> None:
         super().__init__()
         self.layer_num = layer_num
         self.check_cache = check_cache
+        self.page_tokens = page_tokens
         self.max_model_len = 0
         self.k_cache = self.v_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
@@ -523,11 +529,17 @@ class DSparkDraftModel(nn.Module):
 
     def write_context_kv(
         self,
-        aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
+        taps: Sequence[torch.Tensor],  # per tap [N, target_hidden]
         positions: torch.Tensor,  # [N] absolute positions
         slot_mapping: torch.Tensor | None = None,  # [N] paged-pool slots
+        pcp_num_tokens: int | None = None,
     ) -> None:
         """Absorb one target forward's hidden states into this draft's KV.
+
+        ``taps`` are the target's aux hidden states in tap order, as
+        ``Drafter.aux_for`` serves them; under PP the leading entry may be
+        several taps already joined, relayed from earlier stages. Joining
+        them is the model's business, in ``project_context``.
 
         Where those rows land -- a private rolling window, a paged pool -- is
         the layer's business, not this method's. A paged layer writes at
@@ -537,9 +549,13 @@ class DSparkDraftModel(nn.Module):
 
         That makes the call site load-bearing: this must run while
         ``attn_metadata`` still describes the TARGET forward that produced
-        ``aux_concat``. A drafter that has already retargeted the metadata to
+        ``taps``. A drafter that has already retargeted the metadata to
         its own block pass (see ``DSparkProposer._propose_with_draft``) is
         past the point where these rows can be placed.
+
+        After a PCP row-split target prefill of ``pcp_num_tokens`` rows,
+        each tap is only this rank's round-robin stripe of them
+        (``pcp_aux_rows``); see ``write_split_context_kv``.
         """
         from atom.utils.forward_context import get_forward_context
 
@@ -551,18 +567,43 @@ class DSparkDraftModel(nn.Module):
         # the memory-profiling pass, so it must still run.
         if get_forward_context().context.is_dummy_run:
             return
-        ctx_hidden = self.project_context(aux_concat)
+        if pcp_num_tokens is not None:
+            self.write_split_context_kv(taps, positions, pcp_num_tokens, slot_mapping)
+            return
+        ctx_hidden = self.project_context(taps)
         for layer in self.context_layers:
             layer.write_context_kv(ctx_hidden, positions, slot_mapping)
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """Fuse the concatenated target aux hidden states into one [N, hidden]
-        context tensor, shared by every layer: ``hidden_norm(fc(aux))``.
+    def write_split_context_kv(
+        self,
+        taps_local: Sequence[torch.Tensor],  # this PCP rank's stripe of each tap
+        positions: torch.Tensor,  # [num_tokens] absolute positions
+        num_tokens: int,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> None:
+        """`write_context_kv` from this rank's stripe of the aux rows: gather
+        every tap in one collective, then write as usual. A draft that projects
+        its context KV row by row overrides this to gather the (smaller) KV
+        rows instead."""
+        from atom.distributed.pcp_utils import pcp_allgather_rerange_many
+
+        taps = [t[:num_tokens] for t in pcp_allgather_rerange_many(list(taps_local))]
+        self.write_context_kv(taps, positions, slot_mapping)
+
+    @staticmethod
+    def concat_taps(taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """The taps as one ``[N, target_hidden * num_taps]`` tensor, for a
+        projection that wants it; no copy when they arrive already joined."""
+        return taps[0] if len(taps) == 1 else torch.cat(tuple(taps), dim=-1)
+
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Fuse the target aux taps into one [N, hidden] context tensor,
+        shared by every layer: ``hidden_norm(fc(concat(taps)))``.
 
         A target layer id is that layer's output, the residual stream before
         any final norm, which is what the standalone drafts are trained on.
         """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
+        return self.hidden_norm(linear_out(self.fc(self.concat_taps(taps))))
 
     @property
     def context_layers(self):
@@ -685,8 +726,7 @@ class DSparkDraftModel(nn.Module):
                 f"vocab {target_vocab}. The draft shares the target's embedding "
                 "and LM head, so the two must agree."
             )
-        # A draft that loaded its own embedding (K3 DSpark on PP stage > 0)
-        # keeps it.
-        if self.embed_tokens is None:
-            self.embed_tokens = target_base.model.embed_tokens
+        # A stage without the target's embedding binds its PPMissingLayer,
+        # which the drafter's check_shared_embedding refuses.
+        self.embed_tokens = target_base.model.embed_tokens
         self.lm_head = target_base.lm_head

@@ -38,6 +38,8 @@ def _run_gate(
     runs_query_fails=False,
     jobs_query_fails=False,
     pr_check_job="Offline inference smoke test",
+    paths_ignore="docs/**",
+    paths_include="",
 ):
     event_path = tmp_path / "event.json"
     output_path = tmp_path / "output.txt"
@@ -122,7 +124,8 @@ fi
             "CI_GATE_WORKFLOW": "atom-vllm-test.yaml",
             "CI_GATE_PR_CHECK_JOB": pr_check_job,
             "CI_GATE_LABELS": allowed,
-            "CI_GATE_PATHS_IGNORE": "docs/**",
+            "CI_GATE_PATHS_IGNORE": paths_ignore,
+            "CI_GATE_PATHS_INCLUDE": paths_include,
             "FAKE_REVIEW_DECISION": review_decision,
             "FAKE_REVIEW_QUERY_FAIL": "1" if review_query_fails else "0",
             "FAKE_PR_QUERY_FAIL": "1" if pr_query_fails else "0",
@@ -293,6 +296,33 @@ def test_ignored_paths_remain_gated(tmp_path):
     assert result["should_run"] == "false"
     assert result["reason"] == "ignored-paths-only"
     assert result["decidable"] == "true"
+    assert result["smoke_requested"] == "false"
+
+
+def test_included_paths_can_release_gate(tmp_path):
+    result = _run_gate(
+        tmp_path,
+        review_decision="APPROVED",
+        changed_files="atom/mesh/router.py",
+        paths_ignore="",
+        paths_include="atom/mesh/**",
+    )
+
+    assert result["should_run"] == "true"
+    assert result["reason"] == "current-approval"
+
+
+def test_paths_outside_include_remain_gated(tmp_path):
+    result = _run_gate(
+        tmp_path,
+        review_decision="APPROVED",
+        changed_files="atom/plugin/vllm/model.py",
+        paths_ignore="",
+        paths_include="atom/mesh/**",
+    )
+
+    assert result["should_run"] == "false"
+    assert result["reason"] == "paths-not-included"
     assert result["smoke_requested"] == "false"
 
 

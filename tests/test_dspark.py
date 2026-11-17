@@ -648,8 +648,8 @@ def test_write_context_kv_stays_eager_and_still_writes():
     class _Wrapper(DSparkDraftModel):
         # project_context is stage 0's main_proj/main_norm; stub it so the test
         # covers the fan-out, not the projection.
-        def project_context(self, aux_concat):
-            return aux_concat
+        def project_context(self, taps):
+            return self.concat_taps(taps)
 
         @property
         def context_layers(self):
@@ -660,10 +660,67 @@ def test_write_context_kv_stays_eager_and_still_writes():
     saved = fc.get_forward_context
     fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
     try:
-        DSparkDraftModel.write_context_kv(_Wrapper(), torch.zeros(4, 2), None)
+        DSparkDraftModel.write_context_kv(
+            _Wrapper(), [torch.zeros(4, 1), torch.zeros(4, 1)], None
+        )
     finally:
         fc.get_forward_context = saved
     assert calls == [4, 4, 4], "one rolling-KV write per stage"
+
+
+def test_concat_taps_joins_only_what_needs_joining():
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    block = torch.randn(4, 6)
+    assert DSparkDraftModel.concat_taps([block]) is block
+    # Under PP a relayed pair can lead the list beside a tap captured here.
+    taps = [torch.randn(4, 4), torch.randn(4, 2)]
+    assert torch.equal(DSparkDraftModel.concat_taps(taps), torch.cat(taps, -1))
+
+
+@pytest.mark.parametrize("flavor", ["v4", "kimi_k3", "kimi_k3_gqa", "minimax_m3"])
+def test_concatenating_drafts_project_the_joined_taps(flavor):
+    """The proposers hand every draft the taps; a draft whose projection
+    takes the concatenation joins them itself, so it projects what the
+    proposer used to join for it."""
+    from torch import nn
+
+    seen = []
+
+    def proj(x):
+        seen.append(x)
+        return x
+
+    if flavor == "v4":
+        from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+
+        draft = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+        nn.Module.__init__(draft)
+        stage0 = types.SimpleNamespace(main_proj=proj, main_norm=lambda x: x)
+        draft.model = types.SimpleNamespace(mtp=[stage0])
+    elif flavor == "kimi_k3":
+        from atom.models.kimi_k3_dspark import KimiK3DSpark
+
+        draft = KimiK3DSpark.__new__(KimiK3DSpark)
+        nn.Module.__init__(draft)
+        draft.context_proj, draft.context_norm = proj, lambda x: x
+    elif flavor == "kimi_k3_gqa":
+        from atom.models.kimi_k3_dspark_gqa import KimiK3DSparkGQA
+
+        draft = KimiK3DSparkGQA.__new__(KimiK3DSparkGQA)
+        nn.Module.__init__(draft)
+        draft.fc, draft.hidden_norm = proj, lambda x: x
+    else:
+        from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
+
+        draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
+        nn.Module.__init__(draft)
+        draft.fc, draft.hidden_norm = proj, lambda x: x
+    taps = [torch.randn(5, 3) for _ in range(3)]
+    assert torch.equal(draft.project_context(taps), torch.cat(taps, -1))
+    joined = torch.randn(5, 9)
+    assert draft.project_context([joined]) is joined
+    assert len(seen) == 2
 
 
 def test_attention_is_reached_only_through_the_opaque_op():
@@ -2293,6 +2350,7 @@ def _non_mla_draft(monkeypatch, module, cls_name, *, dcp, max_model_len, block_s
         kv_cache_block_size=block_size,
         decode_context_parallel_size=dcp,
         kv_cache_dtype="bf16",
+        kv_transfer_config={},
         speculative_config=types.SimpleNamespace(num_speculative_tokens=7),
     )
     return getattr(mod, cls_name)(atom_config), hf
@@ -2775,8 +2833,80 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+    atom_config = types.SimpleNamespace(kv_transfer_config={})
     with pytest.raises(ValueError, match="needs TP >= 4"):
-        m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+        m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=0)
+
+
+def test_minimax_m31_dspark_producer_holds_every_kv_head_and_never_drafts(
+    monkeypatch,
+):
+    """A TP1 P/D producer builds the draft with all 4 KV heads; its block pass,
+    which decodes one head per rank, refuses before writing anything."""
+    import atom.models.minimax_m3.dspark as m3_dspark
+
+    monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: 1)
+    for name in ("QKVParallelLinear", "RowParallelLinear", "GemmaRMSNorm", "get_rope"):
+        monkeypatch.setattr(m3_dspark, name, lambda *a, **k: torch.nn.Identity())
+    config = types.SimpleNamespace(
+        num_attention_heads=64,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=6144,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=5e6,
+    )
+    atom_config = types.SimpleNamespace(
+        kv_transfer_config={"kv_role": "kv_producer"}, kv_cache_dtype="fp8"
+    )
+    attn = m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=60)
+    assert attn.num_kv_heads == 4
+    with pytest.raises(RuntimeError, match="one KV head per rank"):
+        attn(torch.zeros(2, dtype=torch.long), torch.zeros(2, 6144))
+
+
+def test_standalone_draft_is_built_with_its_own_kv_dtype_target_untouched(monkeypatch):
+    """The draft model reads its KV dtype off the config it is built with: the shallow
+    copy carries the draft's (bf16 under a target fp4); the target's keeps its own."""
+    from atom.config import CompilationConfig
+    from atom.spec_decode import draft_kv
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    seen = {}
+    monkeypatch.setattr(draft_kv, "draft_kv_builder", lambda runner, hf, model: None)
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(),
+        draft_kv_dtype="bf16",  # as `Config` resolved it, under an fp4 target
+        use_dspark_with_draft=lambda: True,
+    )
+    p.runner = types.SimpleNamespace()
+    p.config = types.SimpleNamespace(
+        kv_cache_dtype="fp4",
+        hf_config=types.SimpleNamespace(num_hidden_layers=3),
+        compilation_config=CompilationConfig(),
+    )
+
+    def model_class(cfg, layer_offset):
+        seen["dtype"] = cfg.kv_cache_dtype
+        return object()
+
+    p._build_draft_model(model_class)
+
+    assert seen == {"dtype": "bf16"} and p.config.kv_cache_dtype == "fp4"
+
+
+def test_dtype_q_follows_the_drafts_dtype_not_the_targets():
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.config = types.SimpleNamespace(kv_cache_dtype="fp4")
+    p.dtype = torch.bfloat16
+    p.speculative_config = types.SimpleNamespace(draft_kv_dtype="bf16")
+    p._bound_draft_k_cache = lambda fc: None
+
+    assert p._resolve_dtype_q(None) == (torch.bfloat16, False)
 
 
 # ---- shared across the DSpark drafts: aux capture, slots, block plan ------
@@ -2941,7 +3071,7 @@ def _compute_draft_kv(
         config=types.SimpleNamespace(
             kv_cache_block_size=128, decode_context_parallel_size=dcp
         ),
-        # Two taps, so the trim is checked on each before the concat.
+        # Two taps, so the trim is checked on each; they reach the model unjoined.
         aux_for=lambda h: [h, h + 1],
         runner=types.SimpleNamespace(
             forward_vars={"draft_ctx_slots": slots} if publish_ctx_slots else {}
@@ -2977,7 +3107,7 @@ def test_the_proposer_hands_a_pooled_draft_its_own_slots():
     from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
     seen = _compute_draft_kv(DraftKvPoolSpec(), 5)
-    assert seen["aux"].shape == (5, 8)
+    assert [tuple(tap.shape) for tap in seen["aux"]] == [(5, 4), (5, 4)]
     assert seen["slots"].tolist() == [100, 101, 102, 103, 104]
 
 
@@ -3018,7 +3148,8 @@ def test_the_proposer_drops_padded_target_rows(pooled):
     seen = _compute_draft_kv(spec, 9, n_rows=12)
     assert seen["pos"] == 9 and seen["slots"].numel() == 9
     zeros = torch.zeros(9, 4)
-    assert torch.equal(seen["aux"], torch.cat([zeros, zeros + 1], dim=-1))
+    first, second = seen["aux"]
+    assert torch.equal(first, zeros) and torch.equal(second, zeros + 1)
 
 
 # The two non-MLA block drafts: the K3 GQA draft under DCP 8, whose entry is

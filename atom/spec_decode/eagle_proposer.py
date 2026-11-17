@@ -245,6 +245,10 @@ class EagleProposer(Drafter):
                 self.config.compilation_config
             )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # The draft's attention reads its cache dtype from this config, and
+            # its pool is built at `speculative_config.draft_kv_dtype`: they
+            # must be the one value (DSpark does the same).
+            draft_atom_config.kv_cache_dtype = self.speculative_config.draft_kv_dtype
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(
@@ -865,6 +869,9 @@ class EagleProposer(Drafter):
                             num_reject_tokens,
                         )
                         # From here the loop owns the pass's positions buffer.
+                        # `prepare_mtp_decode` derives each step's SWA extents
+                        # from it, so it must be `running_bs` wide before the
+                        # metadata advance; padding only before forward is late.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

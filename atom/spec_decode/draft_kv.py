@@ -15,6 +15,37 @@ logger = logging.getLogger("atom")
 DRAFT_KV_ROWS = "draft_kv"
 
 
+# The methods whose proposer calls `draft_kv_builder`; the others (MTP, ngram) run
+# the target's own layers or have no draft model.
+DRAFT_POOL_METHODS = ("eagle3", "dspark")
+
+
+def draft_owns_kv_pool(config) -> bool:
+    """Whether `config`'s speculative draft caches into a KV pool of its own.
+
+    What `draft_kv_builder` will answer for the same draft, from the config alone so
+    `Config` and the offload checks can ask before any runner exists: EAGLE3 / DSpark
+    on a family in `DRAFT_POOL_FAMILIES` (not by resolving its backend, which would
+    import aiter into the API process), native runner only.
+    """
+    from atom.plugin import is_plugin_mode
+
+    # First: under a plugin the offload adapter hands over vLLM's own speculative
+    # config unchanged, which has no `draft_model_hf_config` to read.
+    if is_plugin_mode():
+        return False
+    spec = config.speculative_config
+    if (
+        spec is None
+        or spec.method not in DRAFT_POOL_METHODS
+        or spec.draft_model_hf_config is None
+    ):
+        return False
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family
+
+    return attn_family(spec.draft_model_hf_config) in DRAFT_POOL_FAMILIES
+
+
 @dataclass(frozen=True)
 class DraftKvPoolSpec:
     """The pool a draft declares of its own, as the draft class's
@@ -74,11 +105,11 @@ def draft_kv_builder(model_runner, draft_hf, model):
     A draft is not an attention flavor; it is a model that has one. So the
     flavor comes from the draft's own config through the same selector the
     target uses, and that backend says whether a draft of its flavor caches
-    into a pool of its own (`DRAFT_OWNS_KV_POOL`). Where it does not, the
+    into a pool of its own (`selector.DRAFT_POOL_FAMILIES`). Where it does not, the
     runner never sees a draft builder at all.
 
     Which is why speculative decoding imports no attention anywhere: adding a
-    flavor is a flag and a `make_kv_pool` on that backend.
+    flavor is a table entry and a `make_kv_pool` on that backend.
 
     `model` is the built draft; its `kv_pool_spec` (None, or undeclared as on
     Eagle3, is the generic pool) adds to the pool's kwargs.
@@ -91,16 +122,19 @@ def draft_kv_builder(model_runner, draft_hf, model):
             "scale planes and nothing loads a scale into it"
         )
 
-    from atom.utils.selector import attn_family, get_attn_backend
+    from aiter import dtypes
 
-    backend = get_attn_backend(attn_family(draft_hf))
-    if not backend.DRAFT_OWNS_KV_POOL:
+    from atom.utils.selector import DRAFT_POOL_FAMILIES, attn_family, get_attn_backend
+
+    family = attn_family(draft_hf)
+    if family not in DRAFT_POOL_FAMILIES:
         if spec is not None:
             raise ValueError(
                 f"{type(model).__name__} declares a KV pool of its own, but its "
-                f"attention backend {backend.__name__} cannot own a draft pool"
+                f"attention family {family} cannot own a draft pool"
             )
         return None
+    backend = get_attn_backend(family)
 
     if spec is None:
         spec_kwargs, block_size, kv_scale = {}, None, None
@@ -113,7 +147,8 @@ def draft_kv_builder(model_runner, draft_hf, model):
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=draft_kv_dtype(model_runner.config),
+        # settled once, by `Config`
+        kv_dtype=dtypes.d_dtypes[model_runner.config.speculative_config.draft_kv_dtype],
         **spec_kwargs,
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
@@ -296,7 +331,7 @@ class DraftKvBuilder(PoolRowsMixin):
                     (1,), self._kv_scale, dtype=torch.float32, device=k_cache.device
                 )
             module.k_scale = module.v_scale = self._kv_scale_tensor
-        elif runner.config.kv_cache_dtype == "fp8":
+        elif pool.scale_fields:  # the layout's, as the target binder asks
             module.k_scale, module.v_scale = pool.scale_views(idx)
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
@@ -317,7 +352,16 @@ class DraftKvBuilder(PoolRowsMixin):
         return KVTransferTensors(
             # Described by its pool like the target's, under a namespace of its
             # own: its rows sit in the same block ids.
-            pages=pool.transfer_pages("draft", "draft", [m.layer_num for m in modules]),
+            pages=pool.transfer_pages(
+                "draft",
+                "draft",
+                [m.layer_num for m in modules],
+                # Each binding declares the page it reads its cache in.
+                [
+                    pool.block_size if m.page_tokens is None else m.page_tokens
+                    for m in modules
+                ],
+            ),
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.
             tp_replication_factor=1,
