@@ -331,6 +331,10 @@ def fused_sigmoid_gating_delta_rule_update(
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
     num_warps = 4
+    # With onorm, each wave holds a quarter of the fp32 [V, K] state in VGPRs;
+    # the kernel is state-bandwidth bound and needs three waves per SIMD
+    # resident, so cap the allocation at that occupancy.
+    launch_hints = {"waves_per_eu": 3} if onorm is not None else {}
 
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
@@ -453,6 +457,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
+        **launch_hints,
     )
     if onorm is not None:
         return (on_y, on_s.view(T * B, HV).view(dtypes.fp8_e8m0)), final_state
