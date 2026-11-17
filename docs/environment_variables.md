@@ -217,6 +217,8 @@ On the deployment they are built for, V4.1 mono decode's served steps run the hi
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DSV41_MONO_HI** | str | auto | `auto`: the hi monokernels on the deployment they serve (above), ATOM's mono decode on any other with one info line (`V4.1 mono hi off: <why>`), also when only the loaded model shows the mismatch; `1`: on, or an error naming why not; `0`: off. Off, the `mono/hi` package is never imported. |
+| **ATOM_DSV41_TK_TOKTAB_DIR** | str | "" | For the TileRT-path step (`mono/gfx950/tk`): a cache of the DSpark token tables, `rank<r>.pt` (read when present, else built on the GPU by the step's kernels and saved there). |
+| **ATOM_DSV41_TK_FLY_CACHE** | str | "" | For the TileRT-path step (`mono/gfx950/tk`): the node-local cache of the step's FlyDSL code objects built from source (`gfx950/tk/flybuild.py`; default `~/.cache/atom/tk_fly`). |
 
 The hi path serves the step widths 6 to 48 rows (1 to 8 requests verifying DSpark's 5 drafts and the anchor; past 4 requests on the batch bands of 6 and 8) and a context up to 1 Mi tokens (a `--max-model-len` past it keeps ATOM's mono decode). Its builds use FlyDSL's disk cache (`FLYDSL_RUNTIME_CACHE_DIR`), which also holds the gfx950 linear blocks' fitted prefetch depths where the frozen table does not apply (`dsv41_hi_fits`); `FLYDSL_DEBUG_MAX_LOC_DEPTH=1` shortens the trace of a first start's builds.
 

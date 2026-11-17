@@ -670,6 +670,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # The TileRT-derived TP8 step (`mono/gfx950/tk`; selected by `mono/selection.py`
+    # under ATOM_MONO_ENABLE on its deployment: gfx950 TP8, DSpark 5, max_num_seqs
+    # 1, ...). Its kernels are our FlyDSL builds from source, cached node-locally
+    # (ATOM_DSV41_TK_FLY_CACHE, default ~/.cache/atom/tk_fly); the DSpark token
+    # tables are built on the GPU by those kernels, ATOM_DSV41_TK_TOKTAB_DIR
+    # (rank<r>.pt) their cache.
+    "ATOM_DSV41_TK_TOKTAB_DIR": lambda: os.getenv("ATOM_DSV41_TK_TOKTAB_DIR", ""),
+    "ATOM_DSV41_TK_FLY_CACHE": lambda: os.getenv("ATOM_DSV41_TK_FLY_CACHE", ""),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
