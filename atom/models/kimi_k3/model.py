@@ -32,6 +32,7 @@ from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+    ONormE8M0,
     fused_sigmoid_gating_delta_rule_update,
 )
 from atom.model_ops.fla_ops.replayssm import (
@@ -1365,14 +1366,13 @@ class KimiKDAAttention(nn.Module):
 
     def _decode_onorm(
         self, out_gate: torch.Tensor, ssm_state: torch.Tensor, num_seqs: int
-    ):
+    ) -> ONormE8M0 | None:
         """``onorm`` for fused_sigmoid_gating_delta_rule_update at one token per
         request: the decode recurrence then emits o_proj's E8M0 FP8 input
         (``self.o_norm`` on its BF16 output, see the kernel for the rounding).
         None where o_norm would not take the gfx1250 Gluon kernel, for a
         non-fp32 state, or where fusing is slower (``onorm_fits``)."""
-        from atom.model_ops.fla_ops.fused_sigmoid_gating import onorm_fits
-        from atom.model_ops.kimi_k3 import rmsnorm_gated_e8m0_col_major
+        from atom.model_ops.kimi_k3 import onorm_fits, rmsnorm_gated_e8m0_col_major
 
         if ssm_state.dtype != torch.float32 or not onorm_fits(
             num_seqs, self.num_local_heads
@@ -1385,7 +1385,9 @@ class KimiKDAAttention(nn.Module):
         if col_major is None:
             return None
         gate = rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
-        return (norm.weight, gate, norm.variance_epsilon, norm.quant_dtype, col_major)
+        return ONormE8M0(
+            norm.weight, gate, norm.variance_epsilon, norm.quant_dtype, col_major
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1425,6 +1427,8 @@ class KimiKDAAttention(nn.Module):
             conv_state = conv_state.transpose(-1, -2)
 
         num_actual_tokens = kda_metadata.num_actual_tokens
+        # o_proj's input when the decode recurrence fused o_norm, else None.
+        normed = None
         hidden_states = hidden_states[:num_actual_tokens]
         if hidden_states_scale is not None:
             hidden_states_scale = hidden_states_scale[:num_actual_tokens]
@@ -1539,7 +1543,7 @@ class KimiKDAAttention(nn.Module):
                     onorm=onorm,
                 )
                 if onorm is not None:
-                    return self.o_proj(o[0], x_scale=o[1])
+                    normed = o
         elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
             spec_state_indices = kda_metadata.spec_state_indices_tensor
@@ -1631,7 +1635,9 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        return self._project_out(out, out_gate, kda_metadata.num_prefills > 0)
+        if normed is None:
+            normed = self._o_norm(out, out_gate, kda_metadata.num_prefills > 0)
+        return self._project_out(normed)
 
     def _project_in(
         self,
@@ -1744,15 +1750,20 @@ class KimiKDAAttention(nn.Module):
         assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
         return kda_out.squeeze(0)
 
-    def _project_out(
+    def _o_norm(
         self, out: torch.Tensor, out_gate: torch.Tensor, is_prefill: bool
-    ) -> torch.Tensor:
-        """The gated output norm and ``o_proj`` (its all-reduce included)."""
-        normed = self.o_norm(
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """The gated output norm, quantized for ``o_proj`` where it fuses that."""
+        return self.o_norm(
             out,
             rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
             is_prefill=is_prefill,
         )
+
+    def _project_out(
+        self, normed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        """``o_proj`` (its all-reduce included) of ``_o_norm``'s output."""
         # A fused per-token quant makes o_norm return (quantized, scale); feed it
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
         if isinstance(normed, tuple):
@@ -1775,7 +1786,7 @@ class KimiKDAAttention(nn.Module):
             (mixed_qkv.shape[0], self.num_local_heads, self.head_dim)
         )
         out = _kda_recurrence(mixed_qkv, gate, beta, out, self.layer_name)
-        return self._project_out(out, out_gate, True)
+        return self._project_out(self._o_norm(out, out_gate, True))
 
     def _prefill_recurrence_rows(
         self,
