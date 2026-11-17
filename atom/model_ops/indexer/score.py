@@ -50,7 +50,7 @@ _fp8_paged_mqa_logits = (
 # small a grid the top-k's prefilter does not pay for itself and the
 # scorer's lane-max stores would still cost. A band's rows are fixed when a
 # graph is recorded, so each captured batch takes the same side every replay.
-_LANE_MAX_MIN_ROWS = 64
+_LANE_MAX_MIN_ROWS = 128
 
 
 def score_topk(

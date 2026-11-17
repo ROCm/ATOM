@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Lane maxima: held beside the packed FP4 logits, handed only to a band of
-at least 64 rows, and written only by an FP4 band launch whose config
+at least 128 rows, and written only by an FP4 band launch whose config
 writes them."""
 
 from types import SimpleNamespace
@@ -64,12 +64,12 @@ def test_the_packed_workspace_holds_lane_max_sized_by_aiter():
     assert fp8.packed_lane_max() is None
 
 
-@pytest.mark.parametrize("count", [1, 63, 64, 65])
-def test_a_band_below_64_rows_hands_lane_max_to_neither_kernel(
+@pytest.mark.parametrize("count", [1, 127, 128, 129])
+def test_a_band_below_128_rows_hands_lane_max_to_neither_kernel(
     score, monkeypatch, count
 ):
-    """A packed FP4 band of fewer than 64 rows passes no lane maxima to its
-    scorer or its top-k; from 64 rows on both get the workspace's buffer.
+    """A packed FP4 band of fewer than 128 rows passes no lane maxima to its
+    scorer or its top-k; from 128 rows on both get the workspace's buffer.
     The band's rows alone decide it, so a captured batch decides it once."""
     lane_max = torch.zeros(16)
     workspace = SimpleNamespace(
@@ -106,6 +106,6 @@ def test_a_band_below_64_rows_hands_lane_max_to_neither_kernel(
         None,
         torch.empty(count, 8, dtype=torch.int32),
     )
-    expected = lane_max if count >= 64 else None
+    expected = lane_max if count >= 128 else None
     assert seen["scorer"] is expected
     assert seen["top_k"] is expected
