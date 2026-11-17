@@ -437,6 +437,7 @@ def _middle_chunk(req_id):
         connector_meta_output=None,
         pp_completion_ack=True,
         total_seqs_num_decode=0,
+        total_seqs_num_prefill=1,
         is_final_chunk=[False],
         produces_output=lambda: False,
     )

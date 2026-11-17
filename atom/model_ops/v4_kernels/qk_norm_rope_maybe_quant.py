@@ -71,6 +71,16 @@ class QKNormRopeOut:
     k_packed: torch.Tensor | None = None
     k_rope: torch.Tensor | None = None
 
+    def slice_tokens(self, token_slice: slice) -> "QKNormRopeOut":
+        """A view of every output plane on its leading token axis."""
+        return type(self)(
+            **{
+                name: None if value is None else value[token_slice]
+                for name in self.__dataclass_fields__
+                for value in (getattr(self, name),)
+            }
+        )
+
     def custom_op_return(self) -> list["torch.Tensor"]:
         """This struct as a custom op's return value: the active layout's
         tensors, in the order the boundary carries them.
