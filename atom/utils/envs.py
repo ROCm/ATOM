@@ -74,6 +74,11 @@ def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     return value
 
 
+def _non_negative_or_none(value: int | None) -> int | None:
+    """A negative value clamps to 0; None stays None."""
+    return None if value is None else max(0, value)
+
+
 def _int_env(name: str, default: int) -> int:
     """Unset or empty reads as ``default``; anything else must be an integer."""
     value = _optional_int_env(name)
@@ -196,8 +201,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
-    # Floor for the timeout of groups a multi-node DP rank creates without one
-    # (aiter's gloo groups; torch's own default is 30 minutes), in seconds.
+    # Floor for the gloo and NCCL timeouts of groups a rank creates without one
+    # (aiter's groups; torch's own defaults are 30 and 10 minutes) when its DP
+    # or TP group spans nodes, in seconds.
     "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
         os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
     ),
@@ -538,9 +544,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
     # buffer-descriptor cap, above which the kernel fails to compile and aborts
     # the process (see atom/model_ops/sparse_indexer_chunk.py).
-    # It also sizes the decode logits workspace (`max_model_len` wide, held for
-    # the server's life and counted in the KV budget) and so its band count:
-    # lowering it saves memory but splits decode into more launches.
+    # It also sizes the logits workspace (counted in the KV budget) to the larger
+    # of the decode and packed FP8 prefill planes; a lower budget adds launches.
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
@@ -640,6 +645,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # gfx950 mono mailbox retry spacing in s_sleep units (1..127, unset: 16).
+    # Read and checked by atom/mono/polling.py at import, which needs no ATOM
+    # import; 1 restores the pre-backoff polling (ROCm/ATOM#3369).
+    "ATOM_MONO_POLL_SLEEP_UNITS": lambda: os.getenv("ATOM_MONO_POLL_SLEEP_UNITS"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -656,10 +665,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serves, every decoder layer, the verify head, the DSpark draft and the
     # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
     # "auto" (default): on for the deployment they serve (MI355X, TP2 / TP4 /
-    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; TP8 also needs ATOM's own
-    # V4.1 path to start at TP8, ROCm/aiter#7967), any other keeps ATOM's mono
-    # path; "1":
-    # on, or an error naming why not; "0": off.
+    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; at TP8 ATOM's own path
+    # starts on gfx950 through the shared expert's in-place K pad, 288 -> 320,
+    # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
+    # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
@@ -816,6 +825,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
+    # How long the nodes of a TP group that spans nodes wait for each other at
+    # startup: a remote node for the engine's endpoints, the engine for every
+    # remote rank to subscribe to its broadcast queue, a rank on the
+    # model-runner store. Process groups take ATOM_MULTINODE_PG_TIMEOUT_S.
+    "ATOM_MULTINODE_TP_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_MULTINODE_TP_TIMEOUT_S", "1800"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
@@ -1375,12 +1391,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
     "OFFLOAD_MAX_PENDING_SAVES": lambda: _optional_int_env("OFFLOAD_MAX_PENDING_SAVES"),
-    # Minimum external-tier hit worth loading, in tokens. And the shortest
-    # prefix native lmcache_mp stores: an absolute boundary, for normal and
-    # late saves alike (other connectors ignore it).
-    "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
-        0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
+    # Early tier load (a waiting request whose async lookup answered gets its
+    # blocks and its load on any scheduler tick): the KV-pressure bounds.
+    # No early allocation once the KV pool would be fuller than this fraction.
+    "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.7, allow_zero=True
     ),
+    # Cap on the blocks held by early-loaded requests, as a fraction of the pool.
+    "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
+    ),
+    # Minimum external-tier hit worth loading, in tokens. None when unset: each
+    # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
+    "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(
+        _optional_int_env("OFFLOAD_MIN_LOAD_TOKENS")
+    ),
+    # The shortest prefix native lmcache_mp stores: an absolute boundary, for
+    # normal and late saves alike (other connectors ignore it).
     "OFFLOAD_MIN_SAVE_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_SAVE_TOKENS", 8192)
     ),
@@ -1400,7 +1427,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
     # How long admission may pass over a request whose async lookup has not
-    # answered before it waits for the answer instead.
+    # answered; after it `lmcache_mp` waits for the answer and the Mooncake
+    # Store admits the request without one.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),

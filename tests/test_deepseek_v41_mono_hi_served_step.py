@@ -32,7 +32,10 @@ def _context(monkeypatch, module, service):
 def _proposer(module, writes):
     p = module.DSparkProposer.__new__(module.DSparkProposer)
     p.model = SimpleNamespace(
-        write_context_kv=lambda hidden, positions, slots: writes.append(hidden.shape),
+        # Each tap's shape, so a proposer that joined the taps first fails.
+        write_context_kv=lambda taps, positions, slots: writes.append(
+            [tap.shape for tap in taps]
+        ),
         kv_pool_spec=None,
         vocab_size=100,
     )
@@ -66,7 +69,7 @@ def test_the_context_write_follows_the_routing_decision(
     _context(monkeypatch, proposer_module, service)
     p = _proposer(proposer_module, writes)
     p.compute_draft_kv(torch.arange(6), torch.zeros(6, 4), None)
-    assert writes == ([torch.Size([6, 8])] if written else [])
+    assert writes == ([[torch.Size([6, 4])] * 2] if written else [])
 
 
 @pytest.mark.parametrize(
