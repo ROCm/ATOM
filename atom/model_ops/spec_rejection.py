@@ -56,6 +56,18 @@ def _kb(k: int) -> int:
     return max(16, triton.next_power_of_2(int(k)))
 
 
+@triton.jit(do_not_specialize=["seed", "rows"])
+def _draft_uniform_kernel(u_ptr, state_ptr, seed, rows, BLOCK: tl.constexpr):
+    """``u[:rows]`` uniform in [0, 1) by Philox at counter ``state[0]``, then
+    ``state[0] += rows``: a recorded draw that advances on every replay without
+    torch's generator (whose graph replay launches two fills)."""
+    off = tl.load(state_ptr)
+    r = tl.arange(0, BLOCK)
+    tl.store(u_ptr + r, tl.rand(seed, off + r.to(tl.int64)), mask=r < rows)
+    tl.debug_barrier()
+    tl.store(state_ptr, off + rows)
+
+
 @triton.jit
 def _record_dist(rec, K, KB: tl.constexpr, LP: tl.constexpr, greedy):
     """``(columns, probabilities)`` of the distribution the sampler drew a row
@@ -165,6 +177,9 @@ class SpecRejectionSampling:
         self.dbg_scratch = torch.zeros(self.max_rows, self.DW, **i32)
         self.tok_scratch = torch.zeros(self.max_rows, **i32)
         self.u_draft = torch.zeros(self.max_rows, **f32)
+        # ATOM_MTP_DRAFT_DEVICE_RNG: the draws' Philox counter (int64) and seed.
+        self._rng_state = torch.zeros(1, dtype=torch.int64, device=device)
+        self._rng_seed = int(torch.initial_seed() ^ 0x5DEECE66D) & ((1 << 63) - 1)
         self.row_temp = torch.ones(self.max_rows, **f32)
         self.row_topp = torch.ones(self.max_rows, **f32)
         self._topp_scalar = 1.0
@@ -221,6 +236,25 @@ class SpecRejectionSampling:
                 self.row_topp.fill_(tp)
                 self._topp_scalar = tp
 
+    def record_args(self, i: int, scheduled_bs: int, context=None):
+        """`store_step`'s copies as arguments for a fused launch
+        (`eagle_fused_glue`): (records, record_tok, dbg_scratch, tok_scratch,
+        step_slots, column, rows), or None where `store_step` stores nothing."""
+        if context is not None and getattr(context, "is_dummy_run", False):
+            return None
+        bs = min(int(scheduled_bs), self.active_bs)
+        if bs <= 0 or i >= self.mtp_k:
+            return None
+        return (
+            self.records,
+            self.record_tok,
+            self.dbg_scratch,
+            self.tok_scratch,
+            self.step_slots,
+            int(i),
+            bs,
+        )
+
     def store_step(self, i: int, scheduled_bs: int, context=None) -> None:
         """Draft pass ``i``'s records (the scratch the pass wrote) into each
         request's slot; after the pass, before the next one overwrites them."""
@@ -267,7 +301,19 @@ class SpecRejectionSampling:
         rows = logits.shape[0]
         assert rows <= self.max_rows, f"{rows} draft rows > {self.max_rows}"
         u = self.u_draft[:rows]
-        u.uniform_()  # in the recorded pass: a fresh draw every replay
+        from atom.utils import envs
+
+        if envs.ATOM_MTP_DRAFT_DEVICE_RNG:
+            _draft_uniform_kernel[(1,)](
+                u,
+                self._rng_state,
+                self._rng_seed,
+                rows,
+                BLOCK=max(16, triton.next_power_of_2(self.max_rows)),
+                num_warps=1,
+            )
+        else:
+            u.uniform_()  # in the recorded pass: a fresh draw every replay
         tts.topk_topp_sample(
             logits,
             self.row_temp,

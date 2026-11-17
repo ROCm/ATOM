@@ -28,6 +28,7 @@ and only the GDN hybrid's builder (`supports_fused_mtp_glue`) is matched.
 """
 
 import dataclasses
+import itertools
 from dataclasses import dataclass
 
 import torch
@@ -123,8 +124,20 @@ def _floor_div(a, b: tl.constexpr):
 
 
 @triton.jit(
-    do_not_specialize=["draft_col", "scheduled_bs", "running_bs", "num_slot_rows"],
+    do_not_specialize=[
+        "draft_col",
+        "scheduled_bs",
+        "running_bs",
+        "num_slot_rows",
+        "rec_col",
+        "rec_bs",
+    ],
     do_not_specialize_on_alignment=[
+        "rec_ptr",
+        "rec_tok_ptr",
+        "rec_scratch_ptr",
+        "rec_tok_scratch_ptr",
+        "rec_slots_ptr",
         "src_ids_ptr",
         "dst_ids_ptr",
         "dst_positions_ptr",
@@ -168,6 +181,20 @@ def _advance_draft_pass_kernel(
     anchors_ptr,
     # the next pass's attention tiles per segment (SPLIT_TILE > 0)
     segm_tiles_ptr,
+    # HAS_REC (ATOM_MTP_FUSED_RS_STORE): this pass's rejection-sampling
+    # records, scratch row r into slot rec_slots[r], column rec_col
+    rec_ptr,
+    rec_tok_ptr,
+    rec_scratch_ptr,
+    rec_tok_scratch_ptr,
+    rec_slots_ptr,
+    rec_slot_stride,
+    rec_col_stride,
+    rec_tok_slot_stride,
+    rec_scratch_stride,
+    rec_dw,
+    rec_col,
+    rec_bs,
     scheduled_bs,
     running_bs,
     num_slot_rows,
@@ -183,6 +210,8 @@ def _advance_draft_pass_kernel(
     SPLIT_PROGRAMS: tl.constexpr = 1,
     SPLIT_MIN: tl.constexpr = 1,
     SPLIT_MAX: tl.constexpr = 1,
+    HAS_REC: tl.constexpr = False,
+    REC_DWB: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     if pid == 0:
@@ -259,6 +288,178 @@ def _advance_draft_pass_kernel(
                 tl.store(
                     dst_hidden_ptr + row.to(tl.int64) * dst_hidden_stride + cols, x
                 )
+        if HAS_REC:
+            _store_records(
+                rec_ptr,
+                rec_tok_ptr,
+                rec_scratch_ptr,
+                rec_tok_scratch_ptr,
+                rec_slots_ptr,
+                rec_slot_stride,
+                rec_col_stride,
+                rec_tok_slot_stride,
+                rec_scratch_stride,
+                rec_dw,
+                rec_col,
+                rec_bs,
+                (pid - 1) * ROWS,
+                ROWS,
+                REC_DWB,
+            )
+
+
+@triton.jit
+def _store_records(
+    rec_ptr,
+    rec_tok_ptr,
+    rec_scratch_ptr,
+    rec_tok_scratch_ptr,
+    rec_slots_ptr,
+    rec_slot_stride,
+    rec_col_stride,
+    rec_tok_slot_stride,
+    rec_scratch_stride,
+    rec_dw,
+    rec_col,
+    rec_bs,
+    row0,
+    ROWS: tl.constexpr,
+    REC_DWB: tl.constexpr,
+):
+    """`DraftRejectionSampler.store_step` for rows row0 .. row0 + ROWS - 1:
+    records[slot, col] = dbg_scratch[r], record_tok[slot, col] = tok_scratch[r]
+    with slot = step_slots[r], for r < rec_bs. The same int32 copies."""
+    d = tl.arange(0, REC_DWB)
+    for k in tl.static_range(ROWS):
+        r = row0 + k
+        if r < rec_bs:
+            slot = tl.load(rec_slots_ptr + r).to(tl.int64)
+            x = tl.load(
+                rec_scratch_ptr + r.to(tl.int64) * rec_scratch_stride + d,
+                mask=d < rec_dw,
+            )
+            tl.store(
+                rec_ptr + slot * rec_slot_stride + rec_col * rec_col_stride + d,
+                x,
+                mask=d < rec_dw,
+            )
+            t = tl.load(rec_tok_scratch_ptr + r)
+            tl.store(rec_tok_ptr + slot * rec_tok_slot_stride + rec_col, t)
+
+
+@triton.jit(
+    do_not_specialize=["draft_col", "scheduled_bs", "rec_col", "rec_bs"],
+    do_not_specialize_on_alignment=[
+        "src_ids_ptr",
+        "draft_ptr",
+        "rec_ptr",
+        "rec_tok_ptr",
+        "rec_scratch_ptr",
+        "rec_tok_scratch_ptr",
+        "rec_slots_ptr",
+    ],
+)
+def _last_draft_pass_kernel(
+    src_ids_ptr,
+    draft_ptr,
+    draft_stride,
+    draft_col,
+    scheduled_bs,
+    rec_ptr,
+    rec_tok_ptr,
+    rec_scratch_ptr,
+    rec_tok_scratch_ptr,
+    rec_slots_ptr,
+    rec_slot_stride,
+    rec_col_stride,
+    rec_tok_slot_stride,
+    rec_scratch_stride,
+    rec_dw,
+    rec_col,
+    rec_bs,
+    HAS_REC: tl.constexpr,
+    REC_DWB: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    """The last draft pass's tail: ``draft_ids[:, draft_col] =
+    src_ids[:scheduled_bs]`` and, with HAS_REC, its records (`_store_records`)."""
+    row0 = tl.program_id(0) * ROWS
+    r = row0 + tl.arange(0, ROWS)
+    ids = tl.load(src_ids_ptr + r, mask=r < scheduled_bs)
+    tl.store(
+        draft_ptr + r.to(tl.int64) * draft_stride + draft_col,
+        ids,
+        mask=r < scheduled_bs,
+    )
+    if HAS_REC:
+        _store_records(
+            rec_ptr,
+            rec_tok_ptr,
+            rec_scratch_ptr,
+            rec_tok_scratch_ptr,
+            rec_slots_ptr,
+            rec_slot_stride,
+            rec_col_stride,
+            rec_tok_slot_stride,
+            rec_scratch_stride,
+            rec_dw,
+            rec_col,
+            rec_bs,
+            row0,
+            ROWS,
+            REC_DWB,
+        )
+
+
+def _rec_launch_args(records, dummy: torch.Tensor) -> tuple[list, dict]:
+    """The record arguments of the advance / last-pass kernels: ``records`` is
+    `DraftRejectionSampler.record_args` (None: no records to store, ``dummy``
+    stands in for the pointers)."""
+    if records is None:
+        return [dummy] * 5 + [0] * 7, {"HAS_REC": False, "REC_DWB": 1}
+    rec, tok, scratch, tok_scratch, slots, col, bs = records
+    assert rec.stride(-1) == 1 and scratch.stride(-1) == 1
+    assert tok.stride(-1) == 1 and scratch.shape[-1] == rec.shape[-1]
+    dw = rec.shape[-1]
+    return [
+        rec,
+        tok,
+        scratch,
+        tok_scratch,
+        slots,
+        rec.stride(0),
+        rec.stride(1),
+        tok.stride(0),
+        scratch.stride(0),
+        dw,
+        col,
+        bs,
+    ], {"HAS_REC": True, "REC_DWB": triton.next_power_of_2(dw)}
+
+
+def store_last_draft_pass(
+    src_ids: torch.Tensor,
+    draft_ids: torch.Tensor,
+    draft_col: int,
+    scheduled_bs: int,
+    records=None,
+) -> None:
+    """``draft_ids[:, draft_col].copy_(src_ids[:scheduled_bs])`` and the
+    pass's `store_step` (``records``: `record_args`) in one launch."""
+    assert draft_ids.shape[0] == scheduled_bs and draft_ids.dim() == 2
+    rec_args, rec_kw = _rec_launch_args(records, src_ids)
+    grid = (triton.cdiv(scheduled_bs, _COPY_ROWS_PER_PROGRAM),)
+    _last_draft_pass_kernel[grid](
+        src_ids,
+        draft_ids,
+        draft_ids.stride(0),
+        draft_col,
+        scheduled_bs,
+        *rec_args,
+        ROWS=_COPY_ROWS_PER_PROGRAM,
+        **rec_kw,
+        num_warps=1,
+    )
 
 
 def _block(max_bs: int) -> int:
@@ -348,8 +549,10 @@ def _launch_advance(
     kv_page,
     slot_page,
     token_split=None,
+    records=None,
 ):
     first = positions_src is not None
+    rec_args, rec_kw = _rec_launch_args(records, context_lens)
     assert 1 <= scheduled_bs <= running_bs < context_lens.shape[0] + 1
     assert src_hidden.stride(-1) == 1 and dst_hidden.stride(-1) == 1
     assert draft_ids.shape[0] == scheduled_bs and draft_ids.dim() == 2
@@ -376,6 +579,7 @@ def _launch_advance(
         positions_src if first else dst_positions,
         anchors if first else dst_positions,
         token_split.tiles if token_split is not None else context_lens,
+        *rec_args,
         scheduled_bs,
         running_bs,
         num_slot_rows,
@@ -387,6 +591,7 @@ def _launch_advance(
         BLOCK=_block(context_lens.shape[0]),
         ROWS=_COPY_ROWS_PER_PROGRAM,
         **(token_split.constexprs() if token_split is not None else {}),
+        **rec_kw,
         num_warps=4,
     )
 
@@ -513,6 +718,7 @@ def advance_draft_pass(
     anchors: torch.Tensor | None = None,
     token_split: DraftTokenSplit | None = None,
     kv_indices: bool = True,
+    records=None,
 ) -> dict:
     """Advance the one-row-per-sequence metadata a drafted token and stage the
     next pass, as `_enter_decode_metadata` (``positions_src`` given: the first
@@ -526,7 +732,8 @@ def advance_draft_pass(
     ``num_slot_rows`` is ``scheduled_bs``, or 0 on a dummy run.
     ``token_split``: also write the next pass's token split (returned as the
     ``gfx12_token_split_tiles`` workinfo). ``kv_indices=False`` skips the
-    ``kv_indices`` generation (`draft_reads_kv_indices` False).
+    ``kv_indices`` generation (`draft_reads_kv_indices` False). ``records``
+    (`DraftRejectionSampler.record_args`): also the pass's `store_step`.
     """
     var = builder.model_runner.forward_vars
     kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
@@ -555,6 +762,7 @@ def advance_draft_pass(
         kv_page=builder.block_size,
         slot_page=builder.model_runner.block_size,
         token_split=token_split,
+        records=records,
     )
     if kv_indices:
         # The CSR the step's page list is laid out by is the one just written.
@@ -580,10 +788,13 @@ def warm_fused_glue_kernels(
     query_width: int,
     max_bs: int,
     token_split: DraftTokenSplit | None = None,
+    rs=None,
 ) -> None:
     """Compile every variant the glue launches (step 0's staging, the first and
     the later advances) on scratch tensors of the served dtypes, so the first
-    decode step after startup compiles nothing. Writes only the scratch."""
+    decode step after startup compiles nothing. Writes only the scratch.
+    ``rs`` (a `DraftRejectionSampler`, ATOM_MTP_FUSED_RS_STORE): also the
+    variants that store its records, on scratch of its buffers' shapes."""
     var = builder.model_runner.forward_vars
     dev = var["context_lens"].gpu.device
     i32 = {"dtype": torch.int32, "device": dev}
@@ -618,7 +829,20 @@ def warm_fused_glue_kernels(
             torch.zeros(1, **i32), *dataclasses.astuple(token_split)[1:]
         )
         token_split.write(context_lens)
-    for first in (True, False):
+    rec_variants = [None]
+    if rs is not None:
+        rec_variants.append(
+            (
+                torch.zeros_like(rs.records),
+                torch.zeros_like(rs.record_tok),
+                torch.zeros_like(rs.dbg_scratch),
+                torch.zeros_like(rs.tok_scratch),
+                torch.zeros_like(rs.step_slots),
+                1,
+                1,
+            )
+        )
+    for first, records in itertools.product((True, False), rec_variants):
         _launch_advance(
             src_ids=ids[:1],
             src_hidden=hidden[:1],
@@ -643,4 +867,13 @@ def warm_fused_glue_kernels(
             kv_page=builder.block_size,
             slot_page=builder.model_runner.block_size,
             token_split=token_split,
+            records=records,
+        )
+    for records in rec_variants:
+        store_last_draft_pass(
+            ids[:1],
+            torch.zeros(1, 2, dtype=ids_dtype, device=dev),
+            1,
+            1,
+            records=records,
         )

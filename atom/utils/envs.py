@@ -1552,6 +1552,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stand when q is close to p. Verify steps the fused sampler does not serve,
     # or with top_k not an int <= ATOM_MTP_RS_MAX_TOPK (at most 64), keep the
     # default rule (still exact with sampled drafts).
+    # With ATOM_MTP_REJECTION_SAMPLING and ATOM_MTP_FUSED_DRAFT_GLUE: each draft
+    # pass's record store (two index_copy_) runs inside the advance kernel, and
+    # the last pass's store and draft id export in one launch. The same int32
+    # copies; 7 launches a step at mtp_k=3 down to 1.
+    "ATOM_MTP_FUSED_RS_STORE": lambda: _flag_env("ATOM_MTP_FUSED_RS_STORE", "0"),
+    # GDN speculative decode: the metadata builder's padding after the ReplaySSM
+    # commit (state index / mask / accepted-count fills and the query prefix
+    # copy + broadcast: 5 launches and a memcpy a step) in one Triton launch.
+    # The same values.
+    "ATOM_GDN_FUSED_DECODE_PAD": lambda: _flag_env("ATOM_GDN_FUSED_DECODE_PAD", "0"),
+    # With ATOM_MTP_REJECTION_SAMPLING: the draft sampler's uniforms from a
+    # Philox kernel with a device counter instead of torch's generator, so the
+    # recorded draft passes hold no torch RNG and their replays skip its two
+    # seed / offset fills. Different (equally uniform) draws.
+    "ATOM_MTP_DRAFT_DEVICE_RNG": lambda: _flag_env("ATOM_MTP_DRAFT_DEVICE_RNG", "0"),
     "ATOM_MTP_REJECTION_SAMPLING": lambda: _flag_env(
         "ATOM_MTP_REJECTION_SAMPLING", "0"
     ),

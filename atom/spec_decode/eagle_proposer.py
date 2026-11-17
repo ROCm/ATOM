@@ -602,6 +602,11 @@ class EagleProposer(Drafter):
                     if envs.ATOM_MTP_ADVANCE_TOKEN_SPLIT
                     else None
                 ),
+                rs=(
+                    getattr(self, "spec_rs", None)
+                    if envs.ATOM_MTP_FUSED_RS_STORE
+                    else None
+                ),
             )
 
     def _step_warmup_inputs(self, running_bs, **staged):
@@ -1323,6 +1328,7 @@ class EagleProposer(Drafter):
         from atom.spec_decode.eagle_fused_glue import (
             advance_draft_pass,
             stage_verify_step0,
+            store_last_draft_pass,
         )
 
         forward_context = get_forward_context()
@@ -1389,6 +1395,7 @@ class EagleProposer(Drafter):
         step_hidden = self.step.buffer("hidden_states", running_bs)
         step_positions = self.step.buffer("positions", running_bs)
         spec_rs = getattr(self, "spec_rs", None)
+        fused_rs_store = envs.ATOM_MTP_FUSED_RS_STORE
         for i in range(self.mtp_k):
             with record_function(
                 f"propose_eagle[{i}/{self.mtp_k} "
@@ -1456,13 +1463,23 @@ class EagleProposer(Drafter):
                         positions=step_positions,
                         hidden_states=step_hidden,
                     )
+                records = None
                 if spec_rs is not None:
                     # ATOM_MTP_REJECTION_SAMPLING: this pass's q records, before
-                    # the next pass overwrites the scratch they sit in.
-                    spec_rs.store_step(i, scheduled_bs, context)
+                    # the next pass overwrites the scratch they sit in -- in the
+                    # advance / last-pass launch below with ATOM_MTP_FUSED_RS_STORE.
+                    if fused_rs_store:
+                        records = spec_rs.record_args(i, scheduled_bs, context)
+                    else:
+                        spec_rs.store_step(i, scheduled_bs, context)
 
                 if i == self.mtp_k - 1:
-                    draft_ids[:, i].copy_(out_ids[:scheduled_bs])
+                    if fused_rs_store:
+                        store_last_draft_pass(
+                            out_ids, draft_ids, i, scheduled_bs, records=records
+                        )
+                    else:
+                        draft_ids[:, i].copy_(out_ids[:scheduled_bs])
                     continue
                 if i == 0:
                     # The host half of the one-row-per-sequence rewrite. The
@@ -1503,6 +1520,7 @@ class EagleProposer(Drafter):
                         not envs.ATOM_MTP_SKIP_DRAFT_KV_INDICES
                         or self._draft_kv_indices()
                     ),
+                    records=records,
                 )
                 for k, v in workinfos.items():
                     attn_metadata.__dict__[k] = v
