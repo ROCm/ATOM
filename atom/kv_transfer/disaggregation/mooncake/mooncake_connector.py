@@ -3405,7 +3405,8 @@ class MooncakeConnector(KVConnectorBase):
                 )
             # Wait only for this request's prefill writes; unrelated GPU work
             # can continue on other streams while the staging stream is blocked.
-            self._send_worker_stream().wait_event(kv_cache_ready_event)
+            stream = self._send_worker_stream()
+            stream.wait_event(kv_cache_ready_event)
             for dst_start in range(
                 0, len(dst_block_ids), self._index_staging_chunk_pages
             ):
@@ -3415,7 +3416,10 @@ class MooncakeConnector(KVConnectorBase):
                 chunk_plan = sharded_plan.slice_pages(
                     dst_start, dst_start + len(dst_chunk)
                 )
-                gather_indices = self._prepare_sharded_index(chunk_plan)
+                # On the gathers' stream: on the default (compute) stream the
+                # gathers could read these indices before they are written.
+                with torch.cuda.stream(stream):
+                    gather_indices = self._prepare_sharded_index(chunk_plan)
 
                 for region_idx, dst_base, bpb in staged_regions:
                     if not self._execute_staged_index_layer_chunk(
