@@ -29,6 +29,7 @@ def _atom_config(**overrides):
         "tensor_parallel_size": 4,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_expert_parallel": False,
         "enable_dp_attention": False,
         "decode_context_parallel_size": 1,

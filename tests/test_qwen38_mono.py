@@ -74,6 +74,7 @@ def _atom_config(**overrides):
         "pipeline_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "prefill_context_parallel_size": 1,
+        "is_multinode_tp": False,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "compilation_config": SimpleNamespace(level=3, cudagraph_mode=None),
@@ -110,6 +111,16 @@ def test_configuration_f_is_served_on_either_verify(native, monkeypatch, replays
         monkeypatch.setenv("ATOM_ENABLE_REPLAYSSM", replayssm)
     assert mono_config.config_refusal(_atom_config()) is None
     offload = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    assert mono_config.config_refusal(_atom_config(kv_transfer_config=offload)) is None
+
+
+@pytest.mark.parametrize(
+    "name", ["LMCache_Offload", "LMCacheOffloadConnector", "LMCacheConnectorV1"]
+)
+def test_the_offload_connector_is_served_under_any_name_the_factory_builds(
+    native, name
+):
+    offload = {"kv_connector": name, "kv_role": "offload"}
     assert mono_config.config_refusal(_atom_config(kv_transfer_config=offload)) is None
 
 

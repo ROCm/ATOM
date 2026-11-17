@@ -74,6 +74,7 @@ def _atom_config(**hf_overrides):
         enable_expert_parallel=False,
         decode_context_parallel_size=1,
         prefill_context_parallel_size=1,
+        is_multinode_tp=False,
         enable_tbo=False,
         enable_tbo_decode=False,
         kv_transfer_config=None,
@@ -135,6 +136,57 @@ def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
     atom_config.decode_context_parallel_size = 8
     checks = deployment.common_refusals(atom_config, Dims, SUPPORTED_TP)
     assert deployment.first_refusal(checks) == "decode CP"
+
+
+_MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
+
+
+def _with_transport(kv_transfer_config):
+    cfg = _atom_config()
+    cfg.kv_transfer_config = kv_transfer_config
+    return cfg
+
+
+@pytest.mark.parametrize("name", ["mooncake", "Mooncake", " mooncake "])
+def test_a_mooncake_pd_decode_is_served(servable, name):
+    # its receives are NIC writes; it queues no copy kernel beside mono's
+    decode = dict(_MOONCAKE_DECODE, kv_connector=name)
+    assert config_refusal(_with_transport(decode)) is None
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_role": "kv_producer", "kv_connector": "mooncake"},
+        {"kv_role": "kv_consumer", "kv_connector": "moriio"},
+        {"kv_connector": "lmcache_offload"},
+        {
+            "kv_role": "kv_consumer",
+            "kv_connector": "multi",
+            "connectors": [dict(_MOONCAKE_DECODE), {"kv_connector": "lmcache_offload"}],
+        },
+    ],
+    ids=["mooncake-producer", "moriio-consumer", "offload", "mooncake-plus-offload"],
+)
+def test_a_transport_that_may_copy_on_its_own_stream_is_refused(
+    servable, kv_transfer_config
+):
+    assert (
+        config_refusal(_with_transport(kv_transfer_config))
+        == f"KV connector {kv_transfer_config['kv_connector']}"
+    )
+
+
+def test_a_mooncake_pd_decode_with_decode_context_parallelism_is_refused(servable):
+    # mono serves decode CP on its own, but never behind a connector
+    atom_config = _with_transport(dict(_MOONCAKE_DECODE))
+    atom_config.decode_context_parallel_size = 8
+    assert config_refusal(atom_config) == "KV connector mooncake"
+
+
+def test_other_mono_models_still_refuse_a_mooncake_pd_decode(servable):
+    checks = deployment.resident_grid_refusals(_with_transport(dict(_MOONCAKE_DECODE)))
+    assert deployment.first_refusal(checks) == "KV connector mooncake"
 
 
 @pytest.mark.parametrize(

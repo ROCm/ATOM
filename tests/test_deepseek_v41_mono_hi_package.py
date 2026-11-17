@@ -120,9 +120,10 @@ def test_the_hook_and_its_entry_modules_import():
         importlib.import_module(f"{PKG}.{entry}")
 
 
-def test_the_served_schedules_build_dual_copy_mailboxes():
-    """V4.1's schedules (MI355X, TP4) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2" regions): the
-    served programs need the run-time half of the dual-copy scratch (``runtime.dual``).
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_the_served_schedules_build_dual_copy_mailboxes(tp):
+    """V4.1's schedules (MI355X, TP2, TP4 and TP8) put its tagged mailboxes in dual copies (``NUMA_DUAL``, "numa2"
+    regions): the served programs need the run-time half of the dual-copy scratch (``runtime.dual``).
     """
     pytest.importorskip("flydsl")
     pytest.importorskip(
@@ -132,10 +133,29 @@ def test_the_served_schedules_build_dual_copy_mailboxes():
 
     for kind in schedules.KINDS:
         for rows in (6, 12, 24):
-            assert schedules.knobs(kind, rows)["NUMA_DUAL"] > 0, (
+            assert schedules.knobs(kind, rows, tp=tp)["NUMA_DUAL"] > 0, (
                 kind,
                 rows,
             )
+
+
+@pytest.mark.parametrize("tp", [2, 8])
+def test_a_tp_schedule_entry_cannot_set_a_steps_or_a_process_knob(monkeypatch, tp):
+    """``schedules._check_entries`` holds ``TP_SCHEDULES`` to the rule ``SCHEDULES`` is held to: a (kind, rows)
+    entry never sets a chain knob (``CHAIN_KNOBS``, a step's) or a precision knob (``PRECISION_KNOBS``, a
+    process's)."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip(
+        "aiter"
+    )  # (the hi device code re-exports atom.mono.device's primitives)
+    from atom.models.deepseek_v41.mono.hi.v41 import schedules
+
+    schedules._check_entries()  # the shipped tables pass
+    for knob in (*schedules.CHAIN_KNOBS, *schedules.PRECISION_KNOBS):
+        table = {**schedules.TP_SCHEDULES[tp], (schedules.WINDOW, 6): {knob: True}}
+        monkeypatch.setitem(schedules.TP_SCHEDULES, tp, table)
+        with pytest.raises(ValueError, match=f"TP{tp} schedule entry"):
+            schedules._check_entries()
 
 
 def test_a_dual_copy_scratch_takes_its_calibrated_word(monkeypatch):

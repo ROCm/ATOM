@@ -5,7 +5,10 @@ import logging
 import queue
 import time
 import uuid
+from collections.abc import Iterable
 from typing import ClassVar
+
+import numpy as np
 
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -14,7 +17,7 @@ from atom.model_engine.collective_rpc import (
     RpcPayload,
     checked_timeout,
 )
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import BlockTable, SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -22,7 +25,7 @@ logger = logging.getLogger("atom")
 # Commands whose senders never wait, so their handlers answer nothing and a
 # synchronous caller could only wait out its timeout on them.
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset(
-    {"abort_request", "get_mtp_stats", "release_structured_requests"}
+    {"abort_request", "get_mtp_stats", "release_constraints"}
 )
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
@@ -53,6 +56,19 @@ def kv_change(cmd: str, args) -> str | None:
     if cmd in ("release_memory", "resume_memory") and "kv_cache" in memory_tags(args):
         return "kv"
     return None
+
+
+def physical_block_count(tables: Iterable[BlockTable], num_blocks: int) -> int:
+    """Physical blocks across tables, a shared prefix counted once.
+
+    A boolean mask over the pool, filled from each table's buffer. Building a
+    Python set of every id costs tens to hundreds of milliseconds once finished
+    requests hold a long context, and this runs on the engine thread.
+    """
+    seen = np.zeros(num_blocks, dtype=bool)
+    for table in tables:
+        seen[np.frombuffer(table, dtype=np.int32)] = True
+    return int(seen.sum())
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
@@ -138,7 +154,7 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
-        "release_structured_requests": "_handle_release_structured_requests",
+        "release_constraints": "_handle_release_constraints",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
         PAUSE_GENERATION_CMD: "_handle_pause_generation",
         RESUME_GENERATION_CMD: "_handle_resume_generation",
@@ -745,8 +761,8 @@ class EngineUtilityHandler:
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
-    def _handle_release_structured_requests(self, args: dict):
-        self.runner_mgr.call_func("release_structured_requests", args["request_ids"])
+    def _handle_release_constraints(self, args: dict):
+        self.runner_mgr.call_func("release_constraints", args["request_ids"])
 
     def _handle_pause_generation(self, args: dict) -> dict:
         """Schedule nothing until ``resume_generation``.
@@ -969,6 +985,11 @@ class EngineUtilityHandler:
             }
             if kv_pool is not None:
                 reusable = kv_pool.num_reusable_free
+                # Finished or aborted requests held whole until every connector
+                # releases them: a P/D decode pull, a whole-request offload
+                # save, or a load still writing into their blocks. Early-release
+                # offload leases are excluded.
+                deferred_free = self.scheduler.deferred_free_blocks.values()
                 result |= {
                     "kv_blocks_used": kv_pool.num_used,
                     "kv_blocks_free": kv_pool.num_free,
@@ -976,6 +997,11 @@ class EngineUtilityHandler:
                     "kv_blocks_indexed": kv_pool.num_indexed,
                     "kv_blocks_evictable": reusable,
                     "kv_blocks_vacant": kv_pool.num_free - reusable,
+                    "requests_deferred_free": len(deferred_free),
+                    "kv_blocks_deferred_free": physical_block_count(
+                        (seq.block_table for seq in deferred_free),
+                        kv_pool.num_blocks,
+                    ),
                 }
 
             metrics = getattr(self.scheduler, "metrics", None)
@@ -992,5 +1018,12 @@ class EngineUtilityHandler:
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,
                 }
+                admission = self.scheduler.pd_admission
+                if admission is not None:
+                    result["scheduler_metrics"]["pd_admission"] = {
+                        "pending": admission.pending_states,
+                        "pending_kv_bytes": admission.pending_bytes,
+                        "deferred": dict(admission.deferred),
+                    }
 
         return result

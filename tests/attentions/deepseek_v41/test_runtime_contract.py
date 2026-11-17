@@ -152,14 +152,19 @@ def test_mp_store_and_mooncake_are_the_kv_transfers_admitted():
         validate_runtime_config(
             runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
-    for connector in ("lmcache_offload", "moriio", "multi"):
+    for connector in ("lmcache_offload", "moriio"):
         with pytest.raises(
             ValueError,
-            match="KV transfer other than lmcache_mp, mooncake or mooncake_store",
+            match="KV transfer other than lmcache_mp, mooncake_store or mooncake",
         ):
             validate_runtime_config(
                 runtime_config(kv_transfer_config={"kv_connector": connector})
             )
+    # `multi` is admitted only as mooncake plus one offload tier.
+    with pytest.raises(ValueError, match="multi: mooncake plus one offload tier"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "multi"})
+        )
     with pytest.raises(ValueError, match="RapidServe"):
         validate_runtime_config(
             runtime_config(
@@ -414,12 +419,16 @@ def test_an_fp8_or_fp4_index_plane_is_admitted(index_dtype):
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("level", [0, 3])
-def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, level):
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8", "fp4"])
+def test_native_dspark_passes_production_admission(
+    graph, dynamic, tp_size, level, kv_dtype
+):
     from atom.config import CUDAGraphMode, DSparkConfig
 
     value = runtime_config(
         model="/model",
         tensor_parallel_size=tp_size,
+        kv_cache_dtype=kv_dtype,
         enable_expert_parallel=False,
         enforce_eager=not graph,
         compilation_config=SimpleNamespace(
@@ -442,9 +451,6 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         ),
     )
     validate_runtime_config(value)
-    value.kv_cache_dtype = "fp4"
-    with pytest.raises(ValueError, match="BF16"):
-        validate_runtime_config(value)
 
 
 def test_level3_requires_full_graph_or_eager_runtime():
@@ -769,3 +775,24 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
         assert (
             out.shape[:-2].numel() == tokens
         ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
+
+
+def test_pd_store_requires_bounded_replay_for_the_offload_leaf():
+    from atom.models.deepseek_v41.config import validate_runtime_config
+
+    transfer = {
+        "kv_connector": "multi",
+        "connectors": [
+            {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            {"kv_connector": "mooncake_store", "kv_role": "offload"},
+        ],
+    }
+    with pytest.raises(ValueError, match="Mooncake Store without encoder SWA"):
+        validate_runtime_config(runtime_config(kv_transfer_config=transfer))
+    validate_runtime_config(
+        runtime_config(
+            kv_transfer_config=transfer,
+            enable_encoder_swa_bounded_replay=True,
+            kv_cache_block_size=256,
+        )
+    )

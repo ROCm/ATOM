@@ -181,7 +181,9 @@ def _normalize_tool_call_arguments(tool_calls: Any) -> Any:
     OpenAI clients send tool-call arguments as a JSON *string*, but chat
     templates (Qwen3 qwen3_coder/qwen3_xml, Hermes, etc.) iterate
     ``tool_call.arguments.items()`` and require a mapping. Mirrors how vLLM and
-    SGLang deserialize arguments before applying the chat template.
+    SGLang deserialize arguments before applying the chat template. Skipped for
+    templates that take the string (Kimi-K3, DeepSeek-R1/V3); see
+    ``preserve_tool_call_arguments`` in ``api_server``.
     """
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -235,7 +237,8 @@ class ChatMessage(BaseModel):
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
         ``preserve_tool_call_arguments`` keeps ``function.arguments`` strings
-        as sent, for templates that render them verbatim (Kimi-K3).
+        as sent, for templates that take them as strings (Kimi-K3 renders them
+        verbatim, DeepSeek-R1/V3 concatenate them).
         """
         d: dict[str, Any] = {
             "role": self.role,

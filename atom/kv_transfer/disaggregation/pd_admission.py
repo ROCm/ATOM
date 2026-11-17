@@ -96,6 +96,10 @@ class PdAdmissionController:
         self._block_manager = block_manager
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
+        # Requests deferred, once per admission wait and limit, for the metrics
+        # snapshot. `_deferred_by` holds the limits each waiting request hit.
+        self.deferred = {"bytes": 0}
+        self._deferred_by: dict[str, set[str]] = {}
         logger.info(
             "PD admission enabled: pending_kv_bytes=%d per D rank, "
             "block_bytes=%d; credits held until first forward",
@@ -106,6 +110,19 @@ class PdAdmissionController:
     @property
     def pending_bytes(self):
         return len(self._block_refs) * self.block_bytes
+
+    @property
+    def pending_states(self) -> dict[str, int]:
+        """Pending requests by state; a cancelled one drains whether or not ready."""
+        states = dict.fromkeys(("receiving", "ready", "cancel_draining"), 0)
+        for entry in self.pending.values():
+            if entry.cancelled:
+                states["cancel_draining"] += 1
+            elif entry.ready:
+                states["ready"] += 1
+            else:
+                states["receiving"] += 1
+        return states
 
     def check(self, seq, probe) -> tuple[bool, ReceivePlan | None]:
         """Whether `seq` may allocate now, and the range a later `commit` charges.
@@ -127,10 +144,19 @@ class PdAdmissionController:
         if not self.pending:
             return True, plan
         receive_blocks = num_blocks - offset - self._charged_hits(probe, offset)
-        return (
-            self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes,
-            plan,
-        )
+        if self.pending_bytes + receive_blocks * self.block_bytes <= self.max_bytes:
+            return True, plan
+        reason = "bytes"
+        # One deferral per admission wait and limit, however many passes it
+        # takes; a repeated pass allocates nothing.
+        key = str(seq.id)
+        reasons = self._deferred_by.get(key)
+        if reasons is None:
+            reasons = self._deferred_by[key] = set()
+        if reason not in reasons:
+            reasons.add(reason)
+            self.deferred[reason] += 1
+        return False, plan
 
     def _charged_hits(self, probe, offset: int) -> int:
         """Prefix hits inside the receive range that pending credits already hold.
@@ -155,6 +181,7 @@ class PdAdmissionController:
         key = str(seq.id)
         if key in self.pending:
             raise RuntimeError(f"Duplicate PD admission for sequence {key}")
+        self._deferred_by.pop(key, None)
         blocks = frozenset(seq.block_table[plan.offset : plan.num_blocks])
         self.pending[key] = PendingReceive(seq, blocks)
         for block in blocks:
@@ -166,7 +193,10 @@ class PdAdmissionController:
             entry.ready = True
 
     def cancel(self, seq):
-        entry = self.pending.get(str(seq.id))
+        key = str(seq.id)
+        # A request rejected while deferred never reaches `commit`.
+        self._deferred_by.pop(key, None)
+        entry = self.pending.get(key)
         if entry is not None and entry.sequence is seq:
             entry.cancelled = True
 
@@ -186,6 +216,7 @@ class PdAdmissionController:
 
     def release(self, seq):
         key = str(seq.id)
+        self._deferred_by.pop(key, None)
         entry = self.pending.get(key)
         if entry is None or entry.sequence is not seq:
             return
