@@ -36,7 +36,7 @@ from atom.models.deepseek_v41.mono.gfx1250.config import (
     ROWS_PER_REQ,
     TP,
 )
-from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs
+from atom.models.deepseek_v41.mono.gfx1250.inputs import StepInputs, sim_acc_words
 from atom.models.deepseek_v41.mono.gfx1250.tables import StepTables
 from atom.mono.plan.build_key import source_digest
 from atom.mono.runtime.compile import compile_only
@@ -101,6 +101,14 @@ class SingleStepRunner(StepInputs):
                 f"TP {get_tensor_model_parallel_world_size()} (the step kernel is TP{TP})"
             )
         self.rank = get_tensor_model_parallel_rank()
+        # forced acceptance (--spec-decode-acceptance-length / -rate): the kernel's verify draws it (``_sampling``)
+        spec = getattr(atom_config, "speculative_config", None)
+        self.sim_acc = sim_acc_words(getattr(spec, "synthetic_acceptance_rates", None))
+        if self.sim_acc is not None:
+            logger.info(
+                "V4.1 single-launch step: forced acceptance, %d drafts then one with probability %.4f",
+                *self.sim_acc,
+            )
         self.device = torch.device("cuda", torch.cuda.current_device())
         cache = get_forward_context().attn_metadata.cache
         window = cache.geometry.window(0, cache.num_pages)

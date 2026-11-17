@@ -26,6 +26,33 @@ logger = logging.getLogger("atom")
 # against that same q. Default 1 (T_d = T).
 DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
 
+# forced acceptance's marker in a request's bonus row (``kernels.sample.SIM_MAGIC``; that row verifies no draft, so its
+# sp words 5..7 -- hasq, qsrc, seed_acc -- are free)
+SIM_MAGIC = 0x53494D41
+
+
+def sim_acc_words(rates, drafts=ROWS_PER_REQ - 1):
+    """ATOM's forced acceptance (``SpeculativeConfig.synthetic_acceptance_rates``: per-position *unconditional* rates,
+    ``rejection_sampler.acceptance_length_to_rates``) -> the kernel's ``(nf, fr)``: the conditional rate of draft p is 1
+    for p < nf, fr at p = nf, 0 past it -- what ``rejection_synthetic_sample_kernel`` walks (``_get_synthetic_cond_rates``).
+    None -> None (real verification). Any other curve shape is refused (the kernel holds two words, not a curve)."""
+    if rates is None:
+        return None
+    rates = [float(r) for r in rates]
+    if len(rates) != drafts:
+        raise MonoUnsupported(f"forced acceptance over {len(rates)} positions (the step verifies {drafts} drafts)")
+    cond, prev = [], 1.0
+    for r in rates:
+        cond.append(r / prev if prev > 0.0 else 0.0)
+        prev = r
+    nf = 0
+    while nf < drafts and cond[nf] >= 1.0:
+        nf += 1
+    fr = cond[nf] if nf < drafts else 0.0
+    if not 0.0 <= fr < 1.0 or any(c != 0.0 for c in cond[nf + 1 :]):
+        raise MonoUnsupported(f"forced acceptance curve {rates} (only 1 .. 1, f, 0 .. 0)")
+    return nf, np.float32(fr)
+
 
 class StepInputs:
     """``SingleStepRunner``'s per-step input preparation (it owns ``tables``, ``scratch``, ``drafter``)."""
@@ -300,6 +327,14 @@ class StepInputs:
         ints[:n, 7] = ((self._step_no * 0xC2B2AE35 + sc[3]) & 0x7FFFFFFF).astype(
             np.int32
         )
+        sim = getattr(self, "sim_acc", None)
+        if sim is not None:
+            # forced acceptance: each request's bonus row carries (SIM_MAGIC, nf, fr) -- it verifies no draft, so the
+            # three words are its own sampling's unused ones (hasq, qsrc, seed_acc); rewritten each step (above)
+            b = slice(ROWS_PER_REQ - 1, n, ROWS_PER_REQ)
+            ints[b, 5] = SIM_MAGIC
+            ints[b, 6] = sim[0]
+            sp[b, 7] = sim[1]
         # staged in a fixed pinned buffer; ``_device_inputs`` copies it (non-blocking: a pageable copy waited for the
         # stream to drain -- the previous step's draft launch -- stalling this step's host preparation). Rewritten a
         # step later only after that step's first launch, which follows the copy, has completed (``verify_ready``).
