@@ -439,6 +439,7 @@ if __name__ == "__main__":
     ]
     if PR == "3311":
         passed.append(scenario(HEAD, "head-k3-payload-fp8", MODELS[K3], payload="1"))
+        passed.append(scenario(BASE, "base-glm52", MODELS[GLM]))
         passed.append(scenario(HEAD, "head-glm52", MODELS[GLM]))
     else:
         passed.append(scenario(HEAD, "head-k3-mono", MODELS[K3], mono="1"))
