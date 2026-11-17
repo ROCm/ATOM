@@ -455,9 +455,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
-    # MiniMax-M3 on gfx1250: batches of at most this many tokens may leave the
-    # split-K reduction of the per-token FP8 QKV GEMM to the q/k norm + RoPE +
-    # cache kernel that consumes it; 0 keeps the standalone reduce kernel.
+    # MiniMax-M3: batches of at most this many tokens may leave the split-K
+    # reduction of two per-token FP8 GEMMs to the kernel that consumes them: the
+    # QKV GEMM to the q/k norm + RoPE + cache kernel, the dense MLP gate/up GEMM
+    # to SwiGLU-OAI (aiter decides per call; gfx1250 today). 0 keeps the
+    # standalone reduce kernel.
     "ATOM_SPLITK_CONSUMER_REDUCE_MAX_M": lambda: int(
         os.getenv("ATOM_SPLITK_CONSUMER_REDUCE_MAX_M", "64")
     ),

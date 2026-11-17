@@ -26,14 +26,27 @@ N = (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM
 
 
 def _aiter_or_skip():
-    aiter = pytest.importorskip("aiter")
+    import aiter
+    from aiter.jit.utils.build_targets import is_gfx1250_family
     from aiter.jit.utils.chip_info import get_gfx
 
-    if get_gfx() != "gfx1250" or not hasattr(
-        aiter, "gemm_a8w8_bpreshuffle_splitk_deferred"
-    ):
-        pytest.skip("needs gfx1250 and aiter's consumer-side split-K reduction")
+    if not is_gfx1250_family(get_gfx()):
+        pytest.skip("aiter defers the split-K reduction on gfx1250 only")
     return aiter
+
+
+def test_claims_splitk_partials_is_opt_in():
+    from atom.model_ops.attention_mha import (
+        PagedAttentionImpl,
+        SparseMHAPagedAttentionImpl,
+    )
+
+    class OwnRopeCache(PagedAttentionImpl):
+        pass
+
+    assert PagedAttentionImpl.claims_splitk_partials
+    assert SparseMHAPagedAttentionImpl.claims_splitk_partials
+    assert not OwnRopeCache.claims_splitk_partials
 
 
 def _gemm_inputs(aiter, rows, n=N):

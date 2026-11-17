@@ -16,7 +16,9 @@ from aiter import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
+    gemm_a8w8_bpreshuffle_splitk_deferred,
     get_hip_quant,
+    splitk_partials,
 )
 
 # import torch.distributed as dist
@@ -53,15 +55,6 @@ from atom.quantization.quark.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-
-try:  # aiter with consumer-side split-K reduction (gfx1250 PTPC)
-    from aiter import (
-        gemm_a8w8_bpreshuffle_splitk_deferred as aiter_gemm_a8w8_bpreshuffle_splitk_deferred,
-    )
-    from aiter import reduce_splitk_partials, splitk_partials
-except ImportError:
-    aiter_gemm_a8w8_bpreshuffle_splitk_deferred = None
-    reduce_splitk_partials = splitk_partials = None
 
 logger = logging.getLogger("atom")
 
@@ -604,25 +597,11 @@ def gemm_a8w8_per_token_fake(
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=dtype, device=x.device)
 
 
-def splitk_consumer_reduce_supported() -> bool:
-    """Whether a per-token FP8 bpreshuffle GEMM here may leave its split-K
-    reduction to its consumer (`LinearBase.splitk_consumer_max_m`): gfx1250 with
-    an aiter that has aiter.gemm_a8w8_bpreshuffle_splitk_deferred."""
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return (
-        aiter_gemm_a8w8_bpreshuffle_splitk_deferred is not None
-        and get_gfx_runtime() == "gfx1250"
-    )
-
-
 def claim_splitk_partials(y: torch.Tensor | None) -> torch.Tensor | None:
     """The fp32 split-K partials a deferred GEMM left unreduced in ``y``
     (`LinearBase.splitk_consumer_max_m`), claimed; None when ``y`` holds its
     values. The caller reduces them itself or with ``reduce_splitk_partials``."""
-    if y is None or splitk_partials is None:
-        return None
-    return splitk_partials(y)
+    return None if y is None else splitk_partials(y)
 
 
 def gemm_a8w8_bpreshuffle_splitk_deferred_fake(
@@ -655,7 +634,7 @@ def gemm_a8w8_bpreshuffle_splitk_deferred_impl(
 
     if recording_segments():
         max_m = 0
-    return aiter_gemm_a8w8_bpreshuffle_splitk_deferred(
+    return gemm_a8w8_bpreshuffle_splitk_deferred(
         x, weight, x_scale, w_scale, dtype=dtype, max_m=max_m
     )
 
@@ -832,10 +811,10 @@ class LinearBase(nn.Module):
         super().__init__()
         self.reduce_results = reduce_results
         # Rows up to which a per-token FP8 bpreshuffle GEMM may leave its split-K
-        # reduction to the consumer (aiter.gemm_a8w8_bpreshuffle_splitk_deferred);
-        # 0 keeps it in the GEMM. Set only by a model whose every consumer of this
-        # layer's output claims the partials (aiter.splitk_partials) first, and
-        # only where splitk_consumer_reduce_supported().
+        # reduction to the consumer (aiter.gemm_a8w8_bpreshuffle_splitk_deferred,
+        # which decides per call whether it does); 0 keeps it in the GEMM. Set only
+        # by a model whose every consumer of this layer's output claims the
+        # partials (aiter.splitk_partials) first.
         self.splitk_consumer_max_m = 0
         self.input_size = input_size
         self.output_size = (
