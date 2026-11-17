@@ -291,9 +291,6 @@ def load_model(
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str
     ) -> bool:
-        # A model whose built MoE layers decide per layer answers from them.
-        if hasattr(model, "fuses_shared_expert"):
-            return model.fuses_shared_expert(routed_expert_prefix)
         model_quant_config = getattr(
             getattr(model, "atom_config", None), "quant_config", None
         )

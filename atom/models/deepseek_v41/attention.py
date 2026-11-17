@@ -442,7 +442,8 @@ class Attention(nn.Module):
                 pos,
                 rope.rope_dim,
             )
-            # Written through a [G, M, N] view: wo_b needs no transpose copy.
+            # The bmm writes through y's [groups, rows, o_rank] view, so y is
+            # already wo_b's [rows, groups * o_rank] input: no transpose copy.
             w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
             x = x.view(rows, self.groups, -1)
             y = torch.empty(
@@ -542,10 +543,7 @@ class Attention(nn.Module):
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
         if queries is not None:
-            if qr_scale is None:  # BF16 Q
-                (qr,) = queries.take(qr)
-            else:
-                qr, qr_scale = queries.take(qr, qr_scale)
+            qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )

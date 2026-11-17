@@ -353,36 +353,6 @@ def test_ptpc_shared_expert_stays_unfused_under_dp_expert_parallel(monkeypatch):
     )
 
 
-def test_loader_asks_a_model_whose_layers_decide(monkeypatch):
-    """A model whose built MoE layers record their fusion answers the loader's
-    shared-expert rename; the quant config is not consulted."""
-    from atom.model_loader import loader
-
-    class _Stop(Exception):
-        pass
-
-    captured, asked = {}, []
-
-    def capture(**kwargs):
-        captured.update(kwargs)
-        raise _Stop
-
-    def probe(*_a, **_k):
-        raise AssertionError("consulted the quant config")
-
-    monkeypatch.setattr(loader, "load_weights_into_model", capture)
-    monkeypatch.setattr(
-        loader, "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config", probe
-    )
-    model = torch.nn.Module()
-    model.fuses_shared_expert = lambda prefix: asked.append(prefix) or True
-    with pytest.raises(_Stop):
-        loader.load_model(model, "unused", hf_config=None)
-    fuse = captured["fuse_shared_expert"]
-    assert fuse("layers.0.ffn.shared_experts", "layers.0.ffn.experts")
-    assert asked == ["layers.0.ffn.experts"]
-
-
 def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
     monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", False)
     monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)

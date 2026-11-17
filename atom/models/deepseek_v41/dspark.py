@@ -210,7 +210,6 @@ class DeepseekV41DSpark(DSparkDraftModel):
     weights_mapping = DeepseekV41ForCausalLM.weights_mapping
     packed_modules_mapping = DeepseekV41ForCausalLM.packed_modules_mapping
     disable_fused_shared_loading = DeepseekV41ForCausalLM.disable_fused_shared_loading
-    fuses_shared_expert = DeepseekV41ForCausalLM.fuses_shared_expert
 
     def __init__(self, config, *, max_length=None, alt_stream=None):
         super().__init__()
@@ -238,6 +237,8 @@ class DeepseekV41DSpark(DSparkDraftModel):
             shared_expert_spec=converted_linear_spec(draft),
             online_routed_experts=True,
         )
+        # As V4's: the loader's shared-expert rename reads it.
+        self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a
         # stream of its own would buy nothing. Absent when built offline,

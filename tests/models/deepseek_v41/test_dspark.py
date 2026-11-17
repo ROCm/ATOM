@@ -123,3 +123,27 @@ def test_the_input_tap_pays_the_post_the_block_ahead_of_it_still_owes():
     assert torch.equal(
         draft._target_layer_input((settled,), None), torch.ones(tokens, hidden)
     )
+
+
+@pytest.mark.parametrize("runs_bf16", [True, False])
+def test_project_context_projects_only_the_kv_rows_of_a_bf16_wqkv_a(runs_bf16):
+    """A BF16 `wqkv_a` projects only its KV rows; an FP8 one projects both
+    halves and drops the query."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    pytest.importorskip("aiter", reason="the draft attention builds AITER layers")
+    from atom.models.deepseek_v41.dspark import DraftAttention
+
+    attention = object.__new__(DraftAttention)
+    torch.nn.Module.__init__(attention)
+    hidden, kv = torch.randn(3, 8), torch.randn(3, 4)
+    attention.wqkv_a = SimpleNamespace(runs_bf16=runs_bf16)
+    attention._wkv_shard = Mock(return_value=kv)
+    attention.project_qkv = Mock(return_value=(torch.randn(3, 2), kv))
+    attention.kv_norm = lambda x: 2 * x
+    attention.context_keys = Mock(return_value="keys")
+    assert attention.project_context(hidden, "positions", "rope") == "keys"
+    assert attention._wkv_shard.call_count == int(runs_bf16)
+    assert attention.project_qkv.call_count == int(not runs_bf16)
+    assert torch.equal(attention.context_keys.call_args.args[0], 2 * kv)

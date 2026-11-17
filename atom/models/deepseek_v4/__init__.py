@@ -3870,12 +3870,11 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @property
     def disable_fused_shared_loading(self) -> bool:
-        """True when shared experts are NOT fused into the routed MoE kernel, so
-        the weight loader must keep `ffn.shared_experts.*` on the standalone
-        Expert module instead of rewriting them into the fused slot. Read from
-        the actual built MoE layers so it always agrees with model structure;
-        where only some fuse (online quant excluding a layer), the loader
-        decides per layer.
+        """True when no MoE layer fuses its shared experts into the routed
+        kernel, so the weight loader must keep `ffn.shared_experts.*` on the
+        standalone Expert module instead of rewriting them into the fused slot.
+        Read from the actual built MoE layers so it always agrees with model
+        structure.
         """
         return not any(
             m._fuse_shared_into_routed

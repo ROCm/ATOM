@@ -307,6 +307,14 @@ def test_native_linear_bf16_fallback(linear_modules, monkeypatch):
     module, x, full_weight = _native_dispatch_case(linear, monkeypatch)
     assert module.weight_scale is None
     assert torch.equal(module.weight.float().cpu(), full_weight)
+
+    def reached(*_args, **_kwargs):
+        raise AssertionError("a BF16 weight reached the shuffle decision")
+
+    # A second call returns as the first did.
+    monkeypatch.setattr(linear, "weight_is_stored_preshuffled", reached)
+    module.process_weights_after_loading()
+    assert torch.equal(module.weight.float().cpu(), full_weight)
     expected = torch.nn.functional.linear(x.float(), full_weight)
     # BF16 operands, so only the GEMM's own rounding is left: a few BF16 ulps.
     torch.testing.assert_close(

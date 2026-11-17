@@ -1354,23 +1354,19 @@ class LinearBase(nn.Module):
         # unless it is one the preshuffled group32 GEMM reads; with
         # `runs_bf16` it becomes a BF16 weight without scales.
         if self.native_a8_group_rows is not None:
-            # Still FP8: a second call finds the BF16 weight and skips.
-            if (
-                self.runs_bf16
-                and self.weight.numel()
-                and self.weight.dtype == torch.float8_e4m3fn
-            ):
-                from atom.model_ops.blockscale import dequantize_fp8_weight
+            if self.runs_bf16:
+                # No group32 FP8 GEMM here: a BF16 weight, never shuffled.
+                if self.weight.numel() and self.weight.dtype == torch.float8_e4m3fn:
+                    from atom.model_ops.blockscale import dequantize_fp8_weight
 
-                # No group32 FP8 GEMM here: keep a BF16 weight.
-                self.weight = atom_parameter(
-                    dequantize_fp8_weight(
-                        self.weight.data,
-                        self.weight_scale.data,
-                        group_rows=self.native_a8_group_rows,
+                    self.weight = atom_parameter(
+                        dequantize_fp8_weight(
+                            self.weight.data,
+                            self.weight_scale.data,
+                            group_rows=self.native_a8_group_rows,
+                        )
                     )
-                )
-                self.weight_scale = None
+                    self.weight_scale = None
                 return
             if self.weight.numel() and weight_is_stored_preshuffled(
                 self.quant_type,

@@ -581,3 +581,24 @@ def test_per_expert_path_trims_the_source_intermediate_padding(monkeypatch):
         assert torch.equal(w1, full13[:inter])
         assert torch.equal(w3, full13[padded : padded + inter])
         assert torch.equal(w2_q, full2[:, :inter])
+
+
+@pytest.mark.parametrize(("hidden_pad", "bias"), [(64, None), (0, torch.zeros(1))])
+def test_mxfp4_source_with_hidden_padding_or_bias_is_refused(hidden_pad, bias):
+    """The converted experts carry neither an MXFP4 source's hidden padding nor
+    its expert bias, which their consumers keep."""
+    target = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
+    layer = SimpleNamespace(
+        online_quant=True,
+        quant_config=SimpleNamespace(get_layer_quant_config=lambda *_a, **_k: target),
+        layer_name="model.layers.0.ffn.experts",
+        layer_quant_config=LayerQuantConfig(
+            quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2
+        ),
+        source_is_nvfp4=False,
+        params_dtype=dtypes.fp4x2,
+        quant_method=SimpleNamespace(hidden_pad=hidden_pad),
+        w13_bias=bias,
+    )
+    with pytest.raises(NotImplementedError, match="hidden padding or expert bias"):
+        FusedMoE._online_quant(layer)

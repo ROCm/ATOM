@@ -268,7 +268,8 @@ def normalize_hf_config(raw: dict) -> DeepseekV41TextConfig:
         # quant (the routed experts' FP4 -> FP8) only for methods it knows,
         # and V4's routed-expert detection would take `w8a8_fp8` for FP8
         # experts. `fp4ptpc` marks the converted linears
-        # (`layers.converted_linear_config`) and keys the compile cache.
+        # (`layers.converted_linear_config`) and, as a text-config field, keys
+        # the compile cache.
         text["quantization_config"] = {
             **text["quantization_config"],
             "quant_method": "fp8",

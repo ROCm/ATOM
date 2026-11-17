@@ -322,7 +322,7 @@ def test_native_and_plugin_use_same_sources_and_commit_order(
     )
     queries = (
         SimpleNamespace(
-            take=Mock(side_effect=lambda *tensors: tensors),
+            take=Mock(return_value=(None, None)),
             indices=Mock(return_value=csr),
             positions=object(),
         )
