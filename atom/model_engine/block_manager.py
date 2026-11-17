@@ -498,7 +498,6 @@ class BlockManager:
         # capability above is the same gate the tier itself uses.
         if kv_offload_enabled:
             self._joint_chunk_tokens = state_tier_chunk_tokens(config)
-        self._floor_anchor_to_chunk = getattr(config, "pipeline_parallel_size", 1) > 1
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_group) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot
@@ -2770,7 +2769,7 @@ class BlockManager:
             else 0
         )
         # Onto the LMCache chunk grid when the joint load serves this tier, as
-        # the anchor is under PP (`_record_checkpoint_end`), and for the same
+        # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
         # missing chunk. A demand sits where prompts fork, so the chunk covering
         # it also holds tokens past the fork, and LMCache keys a chunk by all of
         # its tokens: the next fork's lookup stops at the chunk floor. Once the
@@ -2789,6 +2788,29 @@ class BlockManager:
             and demand - demand % chunk > hit * self.hash_block_size
         ):
             demand -= demand % chunk
+        # Dropped when the hit is a nonzero chunk-grid position and the demand
+        # sits under one chunk above it. That is what a floored prompt-end
+        # anchor leaves the next turn: the hit stops at the anchor while the KV
+        # runs on to the unfloored end. Kept, the demand would cut a second
+        # chunk and store a second image on every turn, for a rung that serves
+        # little past this turn: the next one resumes from its own, newer
+        # anchor. Dropped, this forward recomputes the gap and cuts nothing.
+        # The test cannot tell that shape from a real fork that close above a
+        # grid rung; such a fork recomputes the same gap on every later request
+        # while the prefix is in HBM, and past HBM its off-grid demand would be
+        # out of reach anyway (above). An anchor under one chunk is never
+        # floored, so a hit at 0 is no floored anchor and a short shared header
+        # keeps its rung.
+        hit_tokens = hit * self.hash_block_size
+        if (
+            demand
+            and chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+            and hit_tokens > 0
+            and hit_tokens % chunk == 0
+            and demand - hit_tokens < chunk
+        ):
+            demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
         # every replay admission's forward at the hit and write a checkpoint
@@ -2917,23 +2939,23 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
-        # Onto the LMCache chunk grid when the joint load serves this tier. HBM
+        # Onto the LMCache chunk grid when the joint load serves this tier and
+        # its chunk is a multiple of the hash block, coarser than it. HBM
         # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
         # an eviction the anchor resumes only through `_joint_kv_boundary`,
         # whose KV leg needs the whole chunk covering it -- and for an off-grid
         # anchor that chunk runs past this prompt, so no store ever holds it.
-        # A hash block finer than the chunk (PP: 128 against 1024) otherwise
-        # loses 7 anchors in 8 once the prompt leaves HBM. While it is still
-        # there, a floored anchor costs under one chunk of reuse and makes the
-        # next turn record a demand at the unfloored position (`wanted > hit`
-        # in `_record_checkpoint_demand`): a second cut and checkpoint every
-        # turn. Only PP, which this serves, takes that trade. An anchor below
-        # one chunk stays put: the joint load has no whole chunk to restore it
-        # from, so flooring it to 0 would only take away its HBM reuse.
+        # A hash block finer than the chunk (block 128 against chunk 1024
+        # without DCP) otherwise loses 7 anchors in 8 once the prompt leaves
+        # HBM. While it is still there, the next turn resumes from the floored
+        # anchor and recomputes under one chunk; the demand its KV would ask
+        # for just above is dropped (`_record_checkpoint_demand`), so the floor
+        # costs no extra cut. An anchor below one chunk stays put: the joint
+        # load has no whole chunk to restore it from, so flooring it to 0 would
+        # only take away its HBM reuse.
         chunk = self._joint_chunk_tokens
         if (
-            self._floor_anchor_to_chunk
-            and chunk > self.hash_block_size
+            chunk > self.hash_block_size
             and chunk % self.hash_block_size == 0
             and end >= chunk
         ):
