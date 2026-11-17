@@ -159,6 +159,17 @@ class UMBPStoreClient:
         self._count("put", keys, stored, answers)
         return answers
 
+    def link_group(self, group_id: str, keys: list[str]) -> bool:
+        """Associate ``keys`` as an eviction group on the server.
+
+        When any member is evicted the server evicts all other members in the
+        group.  Idempotent; a no-op on older servers that pre-date LinkGroup.
+        """
+        client = self._live()
+        if not hasattr(client, "link_group"):
+            return True  # pre-LinkGroup server; best-effort
+        return bool(client.link_group(group_id, list(keys)))
+
     def get(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> list[bool]:
         """Read each object into its buffer; per key whether it was read whole.
 
