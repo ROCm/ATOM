@@ -51,6 +51,21 @@ def is_full_attention(layer_id: int) -> bool:
     return (layer_id + 1) % FULL_ATTENTION_INTERVAL == 0
 
 
+WEIGHTS = ("fp8", "mxfp4", "mxfp4_attnfp8")
+
+
+def experts_mxfp4(weights: str) -> bool:
+    return weights in ("mxfp4", "mxfp4_attnfp8")
+
+
+def proj_kind(weights: str) -> str:
+    return {"fp8": "block", "mxfp4": "bf16", "mxfp4_attnfp8": "ptpc"}[weights]
+
+
+def shared_fused(weights: str) -> bool:
+    return weights in ("fp8", "mxfp4_attnfp8")
+
+
 @dataclass(frozen=True)
 class Q35Config:
     """Rank ``rank`` of a ``tp``-way shard. Dimension fields are model-global; properties give the shard."""
@@ -73,15 +88,33 @@ class Q35Config:
     inter: int = INTER
     shared_inter: int = SHARED_INTER
     eps: float = EPS
-    # checkpoint format: "fp8" (FP8 128 x 128 matrices, the shared expert fused into the bank) or "mxfp4"
+    # checkpoint format: "fp8" (FP8 128 x 128 matrices, the shared expert fused into the bank), "mxfp4"
     # (amd/Qwen3.5-397B-A17B-MXFP4: MXFP4 routed experts on MXFP4 activations, A4W4; BF16 projections,
-    # a separate BF16 shared expert)
+    # a separate BF16 shared expert) or "mxfp4_attnfp8" (amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2: A4W4
+    # experts with the shared expert fused into the bank; FP8 projections, per-channel weights and
+    # per-token activations)
     weights: str = "fp8"
     # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION: the original attention's fused q / k norm + RoPE +
     # cache-quant kernel (one bf16 rounding; its KV and o_proj input quants), which the kernel follows
     qk_fusion: bool = False
     # ATOM_PA_FLYDSL: follow aiter's FlyDSL paged decode instead of pa_decode_gluon
     pa_flydsl: bool = False
+
+    # --- checkpoint format
+    @property
+    def experts_mxfp4(self) -> bool:
+        """Routed experts in MXFP4 on MXFP4 activations (A4W4)."""
+        return experts_mxfp4(self.weights)
+
+    @property
+    def proj_kind(self) -> str:
+        """The projections: "block" (FP8 per 128 x 128), "bf16" or "ptpc" (FP8 per channel x per token)."""
+        return proj_kind(self.weights)
+
+    @property
+    def shared_fused(self) -> bool:
+        """The shared expert is the last entry of the expert bank (ATOM's fused shared expert)."""
+        return shared_fused(self.weights)
 
     # --- Gated DeltaNet shard
     @property

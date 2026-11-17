@@ -15,7 +15,7 @@ from atom.models.qwen3_5.mono.kernels.common import (
     quant_rule_q2,
     quant_rule_q4,
 )
-from atom.models.qwen3_5.mono.kernels.ops import lds_ld
+from atom.models.qwen3_5.mono.kernels.ops import lds_ld, lds_st
 from atom.models.qwen3_5.mono.layout import (
     MOE_MISC,
     PROJ_GROUPS,
@@ -33,6 +33,7 @@ def mixer_defs(ctx):
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
     MX = ctx["MX"]
+    PTPC = ctx["PTPC"]
     S = ctx["S"]
     XIN = ctx["XIN"]
     XQ_BLOCKS = ctx["XQ_BLOCKS"]
@@ -102,22 +103,26 @@ def mixer_defs(ctx):
             if tid < NB:
                 put(mb("xins"), s * NB + tid, lds_ld(misc, MOE_MISC + tid))
 
-    def proj_stage(name, n_groups, w, sc, bf16_w, epilogue, prefetch=None):
+    def proj_stage(name, n_groups, w, sc, bf16_w, epilogue, prefetch=None, row0=0):
         """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
         PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
         matrix runs W8A8 (aiter's blockscale GEMM): the input FP8 per 1x128, each 128-K block's partial
         times ``a_scale * w_scale``. An FP8 matrix of the MXFP4 checkpoint (``MX``) is BF16 there,
-        row-major as ATOM holds it. ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's
-        loads before the GEMM; its result is the epilogue's fourth argument.
+        row-major as ATOM holds it. A per-token checkpoint's (``PTPC``) is FP8 per channel: the input FP8
+        per token, one f32 sum over K, then ``(sum * w_scale[row]) * x_scale`` (aiter's CK bpreshuffle
+        epilogue), ``sc`` the per-row scales; its rows start at ``row0`` of ``w`` (a merged projection).
+        ``prefetch(s, row)`` (every thread, s clamped) issues the epilogue's loads before the GEMM; its
+        result is the epilogue's fourth argument.
         """
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
-        a8 = not bf16_w and not MX
+        ptpc = PTPC and not bf16_w
+        a8 = not bf16_w and not MX and not ptpc
         if const_expr(name == "proj" and XIN):
             xin_stage()
         batch = max(1, NKC // WAVES // (4 if bf16_w else 1))  # units in flight per wave
         if const_expr(S > 8):  # past 8 samples the staged activations need the room
             batch = max(1, batch // 2)
-        if const_expr(a8):  # a 128-K unit loads what two 64-K units did
+        if const_expr(a8 or ptpc):  # a 128-K unit loads what two 64-K units did
             batch = max(1, batch // 2)
         for t in range(start(name), n_groups // PROJ_GROUPS, G):
             t = fx.Int32(t)
@@ -125,6 +130,18 @@ def mixer_defs(ctx):
             rg = t * PROJ_GROUPS + wave // WPR
 
             def u(c):
+                if const_expr(ptpc):
+                    kb = (wave % WPR) * UPW8 + c
+                    return unit_f8f8(
+                        r_w,
+                        None,
+                        row0 // 16 + rg,
+                        kb * 2,
+                        NKC,
+                        HIDDEN,
+                        n_sel() * (HIDDEN // 4) + kb * 32,
+                        None,
+                    )
                 if const_expr(a8):
                     kb = (wave % WPR) * UPW8 + c
                     sn = n_sel()
@@ -148,19 +165,38 @@ def mixer_defs(ctx):
             # the epilogue's loads, ahead of the GEMM
             if const_expr(prefetch is not None):
                 pf = prefetch(fx.min(tid // ROWS, S - 1), t * ROWS + tid % ROWS)
+            if const_expr(ptpc):  # the output row's weight scale, ahead of the GEMM
+                ws_row = fx.Float32(
+                    bo.buffer_load(
+                        r_s, row0 + t * ROWS + tid % ROWS, vec_width=1, dtype=T.f32
+                    )
+                )
             if const_expr(a8 and XIN):
                 stage_x8("xinq", "xins", HIDDEN, list(range(S)))
+            elif const_expr(ptpc):
+                stage_x_gemma(ld_h, HIDDEN, g_in1, fp8_rule="ptpc")
             else:
                 stage_x_gemma(ld_h, HIDDEN, g_in1, fp8_rule=input_quant if a8 else None)
             gpu.barrier()
-            acc = run_units(u, UPW8 if a8 else UPW, batch, pre)
+            acc = run_units(u, UPW8 if (a8 or ptpc) else UPW, batch, pre)
             reduce_rows(PROJ_GROUPS, acc, emit_out(ROWS))
             gpu.barrier()
+            if const_expr(ptpc):
+                # the scales in place: an epilogue may read other rows' outputs from LDS (the MTP conv window)
+                if tid < S * ROWS:
+                    lds_st(
+                        outs,
+                        tid,
+                        (lds_ld(outs, tid) * ws_row)
+                        * lds_ld(misc, MOE_MISC + tid // ROWS),
+                    )
+                gpu.barrier()
             if tid < S * ROWS:
+                v = lds_ld(outs, tid)
                 if const_expr(prefetch is not None):
-                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid), pf)
+                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, v, pf)
                 else:
-                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, lds_ld(outs, tid))
+                    epilogue(tid // ROWS, t * ROWS + tid % ROWS, v)
 
     return {"proj_stage": proj_stage}
 
@@ -169,9 +205,14 @@ def mixer_defs(ctx):
 def out_stages(ctx):
     """out_proj over the mixer's [S, OUT_K] output, the attention-side TP peer reduce and the residual
     ``h`` -> mailbox ``a``. The FP8 checkpoint runs it W8A8: attention's bf16 ``gated`` output quantized
-    as aiter's per-1x128 quant does (Q1), the GDN output FP8 already (``gq``, its gated norm's Q3).
+    as aiter's per-1x128 quant does (Q1), the GDN output FP8 already (``gq``, its gated norm's Q3). The
+    per-token checkpoint (``PTPC``) quantizes the bf16 ``gated`` row per token and sums all of K, then
+    ``(sum * x_scale) * w_scale`` (aiter's FlyDSL bpreshuffle epilogue for this shape).
     """
     FULL = ctx["FULL"]
+    PTPC = ctx["PTPC"]
+    outs = ctx["outs"]
+    tid = ctx["tid"]
     QKF_O = ctx["QKF_O"]
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
@@ -190,6 +231,7 @@ def out_stages(ctx):
     s_out = ctx["s_out"]
     stage_f32_q8 = ctx["stage_f32_q8"]
     stage_pairs_q8 = ctx["stage_pairs_q8"]
+    stage_pairs_q8_rows = ctx["stage_pairs_q8_rows"]
     stage_x8 = ctx["stage_x8"]
     stage_x_pairs = ctx["stage_x_pairs"]
     start = ctx["start"]
@@ -200,10 +242,10 @@ def out_stages(ctx):
     OUT_NKC = OUT_K // 64
     OUT_R = ROW_TILE // 16
     OUT_WPR = WAVES // OUT_R
-    OUT_UPW = OUT_NKC // OUT_WPR if MX else OUT_K // 128 // OUT_WPR
+    OUT_UPW = OUT_NKC // OUT_WPR if (MX and not PTPC) else OUT_K // 128 // OUT_WPR
     # the MXFP4 checkpoint's BF16 out_proj rounds as baseline ATOM's GEMM: with K halves, wave j of a
     # row group takes the first (j even) or second (j odd) 128 of every 256-wide K tile
-    OUT_RULE = bf16_gemm_rule("out", ctx["GEMM_M"]) if MX else None
+    OUT_RULE = bf16_gemm_rule("out", ctx["GEMM_M"]) if (MX and not PTPC) else None
     HALVES = OUT_RULE is not None and OUT_RULE[0] == "halves"
     if HALVES:
         assert OUT_WPR % 2 == 0 and OUT_K % 256 == 0 and OUT_WPR * OUT_UPW == OUT_NKC
@@ -219,7 +261,19 @@ def out_stages(ctx):
         rg = t * OUT_R + wave // OUT_WPR
 
         def u_o(c):
-            if const_expr(MX):
+            if const_expr(PTPC):
+                kb = (wave % OUT_WPR) * OUT_UPW + c
+                return unit_f8f8(
+                    r_wo,
+                    None,
+                    rg,
+                    kb * 2,
+                    OUT_NKC,
+                    OUT_K,
+                    n_sel() * (OUT_K // 4) + kb * 32,
+                    None,
+                )
+            if const_expr(MX):  # the BF16 projections ("mxfp4")
                 j = wave % OUT_WPR
                 if const_expr(HALVES):
                     q = (j // 2) * OUT_UPW + c  # this half's q-th 64-wide chunk
@@ -242,8 +296,18 @@ def out_stages(ctx):
             )
 
         pre = [u_o(c) for c in range(OUT_UPW)]
+        if const_expr(
+            PTPC
+        ):  # this thread's output row's weight scale, ahead of the GEMM
+            ws_row = fx.Float32(
+                bo.buffer_load(
+                    r_so, t * ROW_TILE + tid % ROW_TILE, vec_width=1, dtype=T.f32
+                )
+            )
         gpu.barrier()
-        if const_expr(MX):
+        if const_expr(PTPC):
+            stage_pairs_q8_rows("gated", OUT_K)
+        elif const_expr(MX):
             stage_x_pairs("gated", S * OUT_K, lambda k: k)
         elif const_expr(QKF_O):
             stage_f32_q8("gated", OUT_K, quant_rule_q4)
@@ -255,6 +319,15 @@ def out_stages(ctx):
         acc = run_units(u_o, OUT_UPW, OUT_UPW, pre)
         reduce_rows(OUT_R, acc, emit_out(ROW_TILE), rule=OUT_RULE)
         gpu.barrier()
+        if const_expr(PTPC):
+            if tid < S * ROW_TILE:
+                lds_st(
+                    outs,
+                    tid,
+                    (lds_ld(outs, tid) * lds_ld(misc, MOE_MISC + tid // ROW_TILE))
+                    * ws_row,
+                )
+            gpu.barrier()
         peer_reduce(
             "attn",
             t,

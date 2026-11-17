@@ -62,6 +62,7 @@ def gdn_stages(ctx):
     KEY_DIM = ctx["KEY_DIM"]
     K_DIM = ctx["K_DIM"]
     MX = ctx["MX"]
+    PTPC = ctx["PTPC"]
     S = ctx["S"]
     REPLAY = ctx["REPLAY"]
     T_SEQ = ctx["T_SEQ"]
@@ -207,14 +208,23 @@ def gdn_stages(ctx):
         qkvz_epilogue,
         prefetch=conv_prefetch if T_SEQ == 1 else None,
     )
-    proj_stage(
-        "proj_ba",
-        2 * HV // PROJ_TILE,
-        w_ba,
-        None,
-        True,
-        lambda s, row, v: put(mb("ba"), s * 2 * HV + row, bf16_round(v)),
-    )
+
+    def ba_epilogue(s, row, v):
+        put(mb("ba"), s * 2 * HV + row, bf16_round(v))
+
+    if const_expr(PTPC):
+        # the per-token checkpoint's b | a rows: the merged [q | k | v | z | b | a] FP8 matrix's last ones
+        proj_stage(
+            "proj_ba",
+            2 * HV // PROJ_TILE,
+            w_qkvz,
+            s_qkvz,
+            False,
+            ba_epilogue,
+            row0=CONV_DIM + VALUE_DIM,
+        )
+    else:
+        proj_stage("proj_ba", 2 * HV // PROJ_TILE, w_ba, None, True, ba_epilogue)
 
     # ================================ 2. gated delta rule + gated RMSNorm (one task per sample x v-head)
     assert (

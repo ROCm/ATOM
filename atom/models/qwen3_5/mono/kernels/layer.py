@@ -32,7 +32,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.qwen3_5.mono.config import GLUON_VERIFY_TOKENS, MAX_VERIFY_TOKENS
+from atom.models.qwen3_5.mono.config import (
+    GLUON_VERIFY_TOKENS,
+    MAX_VERIFY_TOKENS,
+    WEIGHTS,
+    experts_mxfp4,
+    proj_kind,
+    shared_fused,
+)
 from atom.models.qwen3_5.mono.kernels.attn import attn_stages
 from atom.models.qwen3_5.mono.kernels.attn_flydsl import flydsl_lds_words
 from atom.models.qwen3_5.mono.kernels.common import common_defs
@@ -131,11 +138,16 @@ def build_qwen35_kernel(
     ) == 0, "b | a rows must fill whole proj tasks"
     assert VALUE_DIM % 256 == 0 and HIDDEN % ROW_TILE == 0
     N_EXPERTS, TOP_K, INTER = n_experts, top_k, inter
-    # "mxfp4": BF16 projections, MXFP4 routed experts on MXFP4 activations (A4W4), a BF16 shared expert
+    # "mxfp4": BF16 projections, MXFP4 routed experts on MXFP4 activations (A4W4), a BF16 shared expert;
+    # "mxfp4_attnfp8": the same experts with the shared expert fused into the bank, per-token FP8 projections
     WFMT = weights
-    MX = WFMT == "mxfp4"
-    assert WFMT in ("fp8", "mxfp4")
-    assert not MX or GEMM_M in BF16_GEMM_RULES["out"], "no BF16 GEMM rule at this M"
+    assert WFMT in WEIGHTS
+    MX = experts_mxfp4(WFMT)  # MXFP4 experts (A4W4)
+    PTPC = proj_kind(WFMT) == "ptpc"  # FP8 projections, per channel x per token
+    FSE = shared_fused(WFMT)  # the shared expert is the bank's last entry
+    assert (
+        proj_kind(WFMT) != "bf16" or GEMM_M in BF16_GEMM_RULES["out"]
+    ), "no BF16 GEMM rule at this M"
     EPS = eps
     MOE_SLOTS = TOP_K + 1
     SHARED_EXPERT = N_EXPERTS
@@ -229,10 +241,22 @@ def build_qwen35_kernel(
             else 0
         ),
         flydsl_lds_words(T_SEQ, HD) if PA_FLYDSL else 0,
+        # MXFP4 down: the staged mids (a 64-word block each), then every unit's [DN_TILE] partial
+        (
+            (
+                S * MOE_SLOTS * (INTER // 128) * 64
+                + S * (MOE_SLOTS if FSE else TOP_K) * (INTER // 128) * DN_TILE
+            )
+            if MX
+            else 0
+        ),
     )  # split: scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales
     ON = max(
-        # MXFP4: the expert down's routed tile and, after it, the shared expert's
-        S * max(ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE * (2 if MX else 1)),
+        # MXFP4 with a separate shared expert: the down's routed tile and, after it, the shared expert's
+        S
+        * max(
+            ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE * (2 if MX and not FSE else 1)
+        ),
         V_DIM,
         HD,
         H * HD if FULL else 0,  # a split's output, every head

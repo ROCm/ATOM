@@ -47,6 +47,9 @@ def ffn_stages(ctx):
     INTER = ctx["INTER"]
     MOE_SLOTS = ctx["MOE_SLOTS"]
     MX = ctx["MX"]
+    FSE = ctx["FSE"]
+    # the MXFP4 checkpoint's separate BF16 shared expert (MX without FSE: "mxfp4")
+    SH_BF16 = MX and not FSE
     N_DN_TILES = ctx["N_DN_TILES"]
     N_EXPERTS = ctx["N_EXPERTS"]
     N_ROUTER = ctx["N_ROUTER"]
@@ -168,7 +171,8 @@ def ffn_stages(ctx):
                     # MXFP4 checkpoint: the normed input (the BF16 shared expert's) and its per-32 MXFP4
                     # quantize-dequantize (the A4W4 routed experts'), bf16 pairs
                     m0, m1 = mxfp4_qd(v0, v1)
-                    put_bf(mb("x2b"), x_s * HIDDEN + xk, [v0, v1])
+                    if const_expr(SH_BF16):
+                        put_bf(mb("x2b"), x_s * HIDDEN + xk, [v0, v1])
                     put_bf(mb("xb"), x_s * HIDDEN + xk, [m0, m1])
                 else:
                     q0, q1, qs = quant_floor(v0, v1)
@@ -213,10 +217,11 @@ def ffn_stages(ctx):
             s_ = wave + j * WAVES
             if s_ < S:
                 e, w = route_softmax(s_)
-                # the shared expert's weight: aiter's top-k kernel's f32 sigmoid of the bf16 logit (FP8
-                # checkpoint, slot 512 of the fused bank); torch's, to bf16, for the MXFP4 checkpoint
+                # the shared expert's weight: the top-k kernel's f32 sigmoid of the bf16 logit (a fused
+                # bank: aiter's, ATOM's Triton top-k at decode, alike); torch's, to bf16, for the separate
+                # BF16 shared expert ("mxfp4")
                 sg = sigmoid_precise(getf(mb("scores"), s_ * ROUTER_ROWS + N_EXPERTS))
-                if const_expr(MX):
+                if const_expr(SH_BF16):
                     sg = bf16_round(sg)
                 if lane < MOE_SLOTS:
                     q = s_ * MOE_SLOTS + (lane + 1) % MOE_SLOTS
@@ -228,7 +233,7 @@ def ffn_stages(ctx):
     # ================================ 6. expert up/gate + SiLU (W8A8; MXFP4: A4W4 and the BF16 shared expert)
     UG_NKC = HIDDEN // 64
     # the MXFP4 checkpoint's BF16 shared gate_up (wave w: K range w of WAVES) rounds as baseline ATOM's GEMM
-    SH_UG_RULE = bf16_gemm_rule("shared_ug", ctx["GEMM_M"]) if MX else None
+    SH_UG_RULE = bf16_gemm_rule("shared_ug", ctx["GEMM_M"]) if SH_BF16 else None
     UG_W_BYTES = 2 * INTER * HIDDEN
     UG_S_BYTES = 2 * INTER // 128 * (HIDDEN // 128) * 4
     # MXFP4 bank: packed E2M1 [2 INTER, HIDDEN / 2], E8M0 [2 INTER, HIDDEN / 32 padded to 8]
@@ -343,7 +348,9 @@ def ffn_stages(ctx):
                 v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(
                     outs, n * 16 + UG8 + r + 1
                 )
-                if const_expr(MX and shared):  # the BF16 MLP's gate_up output is bf16
+                if const_expr(
+                    SH_BF16 and shared
+                ):  # the BF16 MLP's gate_up output is bf16
                     g0, g1, v0, v1 = (
                         bf16_round(g0),
                         bf16_round(g1),
@@ -406,7 +413,7 @@ def ffn_stages(ctx):
             return live, uu, sample, c, slot, w_rg, w_ln, s_rg
 
         live0, _uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
-        if const_expr(MX):
+        if const_expr(SH_BF16):
             shared_pre = sh_units(wr0, wl0)
         else:
             shared_pre = ug8_units(
@@ -419,7 +426,7 @@ def ffn_stages(ctx):
         cur = ug8_units(
             c_, wr, wl, sr, uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv
         )
-        if const_expr(MX):
+        if const_expr(SH_BF16):
             # the shared expert on the normed input, then the routed experts' MXFP4 input in its place
             stage_x_pairs("x2b", S * HIDDEN, lambda k: k)
             gpu.barrier()
@@ -436,7 +443,11 @@ def ffn_stages(ctx):
             stage_x_pairs("xb", S * HIDDEN, lambda k: k)
             gpu.barrier()
         else:
-            stage_moe_input(list(range(S)))
+            # the fused bank: the shared expert's tile on the routed experts' input
+            if const_expr(MX):
+                stage_x_pairs("xb", S * HIDDEN, lambda k: k)
+            else:
+                stage_moe_input(list(range(S)))
             gpu.barrier()
             if has_sh0 & live0:
                 reduce_rows(
@@ -469,8 +480,9 @@ def ffn_stages(ctx):
     DN_R = DN_TILE // 16
     DN_WPR = WAVES // DN_R
     DN_UNITS_PER_SLOT = INTER // 128
-    # MXFP4: the routed slots only (the shared expert, slot 0, runs as its own BF16 pass)
-    DN_NU = S * (TOP_K if MX else MOE_SLOTS) * DN_UNITS_PER_SLOT
+    # the slots the bank's down runs: a separate BF16 shared expert ("mxfp4": slot 0) runs as its own pass
+    DN_SLOTS = TOP_K if SH_BF16 else MOE_SLOTS
+    DN_NU = S * DN_SLOTS * DN_UNITS_PER_SLOT
     DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
     DN_BLK = S * MOE_SLOTS * INTER // 128
     DN_W_BYTES = HIDDEN * INTER // (2 if MX else 1)
@@ -483,7 +495,7 @@ def ffn_stages(ctx):
         INTER // 64
     )  # the shared expert's down: one 64-K chunk a wave of its row group
     assert (
-        not MX or SH_DN_CHUNKS <= DN_WPR
+        not SH_BF16 or SH_DN_CHUNKS <= DN_WPR
     ), "the shared expert's down needs a wave a chunk"
     # 128-k chunks per wave in flight / prefetched before the mid wait (fewer past S = 8: register room)
     DN_BATCH = 9 if S <= 8 else 5
@@ -503,7 +515,7 @@ def ffn_stages(ctx):
             qu = (wave % DN_WPR) * DN_UPW + cc
             live = qu < DN_NU
             r = fx.min(qu, DN_NU - 1)
-            if const_expr(MX):
+            if const_expr(SH_BF16):
                 s_q = r // (TOP_K * DN_UNITS_PER_SLOT)
                 slot_q = 1 + (r // DN_UNITS_PER_SLOT) % TOP_K
             else:
@@ -572,13 +584,11 @@ def ffn_stages(ctx):
                         # the routed slots per-32 MXFP4 (A4W4) from the f32 silu * up, as aiter's stage-1
                         # epilogue quantizes; the shared expert's (a BF16 MLP) bf16; bf16 values in LDS, K order
                         m0, m1 = mxfp4_qd(mids[b][0], mids[b][1])
-                        v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
-                        sh = (blk // DN_UNITS_PER_SLOT) % MOE_SLOTS == 0
-                        lds_st(
-                            xs,
-                            blk * 64 + lane,
-                            bf16_pair(sh.select(v0, m0), sh.select(v1, m1)),
-                        )
+                        if const_expr(SH_BF16):
+                            v0, v1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
+                            sh = (blk // DN_UNITS_PER_SLOT) % MOE_SLOTS == 0
+                            m0, m1 = sh.select(v0, m0), sh.select(v1, m1)
+                        lds_st(xs, blk * 64 + lane, bf16_pair(m0, m1))
                     else:
                         q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
                         st_f8(blk * 128 + lane * 2, q0, q1)
@@ -591,16 +601,20 @@ def ffn_stages(ctx):
                 """Unit cc's [16 rows] tile (its sample's column) -> DN_PART[unit][row]."""
                 qu = (wave % DN_WPR) * DN_UPW + cc
                 r = fx.min(qu, DN_NU - 1)
-                s_q = r // (TOP_K * DN_UNITS_PER_SLOT)
+                s_q = r // (DN_SLOTS * DN_UNITS_PER_SLOT)
                 if (qu < DN_NU) & (lane % 16 == s_q):
                     for e in range_constexpr(4):
                         row = gu * 16 + 4 * (lane // 16) + e
                         lds_st(xs, DN_PART + r * DN_TILE + row, c[e])
 
             run_units(u_dn, DN_UPW, DN_BATCH, pre, each=dn_part)
+            if const_expr(not SH_BF16):
+                # every wave's partials in LDS before the combine reads them (the separate shared
+                # expert's reduce_rows below was this barrier on the "mxfp4" checkpoint)
+                gpu.barrier()
         else:
             acc = run_units(u_dn, DN_UPW, DN_BATCH, pre)
-        if const_expr(MX):
+        if const_expr(SH_BF16):
             # baseline ATOM's MoE block on the MXFP4 checkpoint: the shared expert apart (BF16 MLP, its
             # down bf16), times the bf16 sigmoid gate (bf16), plus the routed experts' bf16 output (bf16)
             sh_acc = mma_units([fx.Float32(0.0) for _ in range(4)], [sh_dn_unit()])
@@ -622,30 +636,43 @@ def ffn_stages(ctx):
 
         if const_expr(MX):
             # baseline ATOM's MXFP4 GEMM2 epilogue: a route's full-K fp32 sum times its weight, bf16; the
-            # routes in slot order, bf16 atomic adds at M <= 4, else an fp32 sum rounded once
+            # routes in aiter's id-column order (the picks, then a fused shared expert: column TOP_K), bf16
+            # atomic adds at M <= 4, else an fp32 sum rounded once
+            # (part slot, weight slot) per route: parts index the down's slots, weights the routing's
+            routes = (
+                [(sl, 1 + sl) for sl in range(TOP_K)]
+                if SH_BF16
+                else [(sl, sl) for sl in range(1, MOE_SLOTS)] + [(0, 0)]
+            )
             for it in range_constexpr(-(-(S * DN_TILE) // THREADS)):
                 k_ = tid + it * THREADS
                 if k_ < S * DN_TILE:
                     n = k_ // DN_TILE
                     i_ = k_ % DN_TILE
                     tot = fx.Float32(0.0)
-                    for sl in range_constexpr(TOP_K):
+                    for j in range_constexpr(
+                        len(routes)
+                    ):  # unrolled: tot is no loop state
+                        ps, ws = routes[j]
                         p = (
                             DN_PART
-                            + (n * TOP_K + sl) * DN_UNITS_PER_SLOT * DN_TILE
+                            + (n * DN_SLOTS + ps) * DN_UNITS_PER_SLOT * DN_TILE
                             + i_
                         )
                         part = lds_ld(xs, p)
                         for kc in range_constexpr(1, DN_UNITS_PER_SLOT):
                             part = part + lds_ld(xs, p + kc * DN_TILE)
-                        y = bf16_round(part * lds_ld(dnw, n * MOE_SLOTS + 1 + sl))
-                        if const_expr(sl == 0):
+                        y = bf16_round(part * lds_ld(dnw, n * MOE_SLOTS + ws))
+                        if const_expr(j == 0):
                             tot = y
                         elif const_expr(DN_ATOMIC):
                             tot = bf16_round(tot + y)
                         else:
                             tot = tot + y
-                    lds_st(outs, k_, sh_combine(n, k_, bf16_round(tot)))
+                    if const_expr(SH_BF16):
+                        lds_st(outs, k_, sh_combine(n, k_, bf16_round(tot)))
+                    else:
+                        lds_st(outs, k_, bf16_round(tot))
             gpu.barrier()
         else:
             reduce_rows(DN_R, acc, emit_dn)

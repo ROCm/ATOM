@@ -266,12 +266,17 @@ class Qwen35MonoDecodeRunner:
             raise MonoUnsupported(
                 f"{cus} CUs: the kernel needs all {BLOCKS} CTAs co-resident"
             )
-        # the checkpoint format, from the expert bank: FP8 (the shared expert fused into it) or MXFP4
-        # (amd/Qwen3.5-397B-A17B-MXFP4: A4W4 experts, BF16 projections and shared expert)
+        # the checkpoint format, from the expert bank: FP8 (the shared expert fused into it), MXFP4 with a
+        # separate BF16 shared expert (amd/Qwen3.5-397B-A17B-MXFP4: BF16 projections) or MXFP4 with the
+        # shared expert fused into the bank (amd/Qwen3.5-397B-A17B-MXFP4-AttnFP8-V2: per-token FP8
+        # projections); the bind checks every tensor against the format
         w13 = self.lm.layers[0].mlp.experts.w13_weight
-        weights = (
-            "mxfp4" if w13.dtype == getattr(torch, "float4_e2m1fn_x2", None) else "fp8"
-        )
+        if w13.dtype != getattr(torch, "float4_e2m1fn_x2", None):
+            weights = "fp8"
+        elif self.lm.layers[0].mlp.shared_expert is None:
+            weights = "mxfp4_attnfp8"
+        else:
+            weights = "mxfp4"
         self.cfg = Q35Config(
             tp=self.tp,
             rank=self.rank,
@@ -335,8 +340,15 @@ class Qwen35MonoDecodeRunner:
 
         mlp = layer.mlp
         ex = mlp.experts
-        mx = cfg.weights == "mxfp4"
+        mx = cfg.experts_mxfp4
+        fse = cfg.shared_fused
+        pk = cfg.proj_kind
         E, inter, hidden = cfg.n_experts, cfg.local_inter, cfg.hidden
+        EB = E + (
+            1 if fse else 0
+        )  # the bank: the routed experts (and a fused shared expert)
+        # the BF16 projections and a fused shared expert leave kernel arguments unused: a placeholder
+        none = torch.zeros(1, dtype=torch.float32, device=self.dev)
         model = torch.bfloat16
         # ATOM zero-pads the router + shared-gate rows (513) to 16 (output_row_alignment)
         _need(i, "router", mlp.gate.weight, (router_rows(E), hidden), model)
@@ -346,22 +358,30 @@ class Qwen35MonoDecodeRunner:
             why = baseline_refusal(ex)
             if why is not None:
                 raise MonoUnsupported(f"layer {i}: {why}")
-            if ex.w13_weight.shape[0] != cfg.n_experts or mlp.shared_expert is None:
+            if ex.w13_weight.shape[0] != EB or (mlp.shared_expert is None) != fse:
                 raise MonoUnsupported(
-                    f"layer {i}: MXFP4 bank {tuple(ex.w13_weight.shape)} without a BF16 shared expert"
+                    f"layer {i}: MXFP4 bank {tuple(ex.w13_weight.shape)}"
+                    + (
+                        " without the fused shared expert"
+                        if fse
+                        else " without a BF16 shared expert"
+                    )
                 )
             pad = -(-(hidden // 32) // 8) * 8
             # E2M1 two a byte, E8M0 a byte, each scale row padded to 8
-            _need(i, "w13", ex.w13_weight, None, nbytes=E * 2 * inter * hidden // 2)
-            _need(i, "w13 scale", ex.w13_weight_scale, None, nbytes=E * 2 * inter * pad)
-            _need(i, "w2", ex.w2_weight, None, nbytes=E * hidden * inter // 2)
+            _need(i, "w13", ex.w13_weight, None, nbytes=EB * 2 * inter * hidden // 2)
+            _need(
+                i, "w13 scale", ex.w13_weight_scale, None, nbytes=EB * 2 * inter * pad
+            )
+            _need(i, "w2", ex.w2_weight, None, nbytes=EB * hidden * inter // 2)
             _need(
                 i,
                 "w2 scale",
                 ex.w2_weight_scale,
                 None,
-                nbytes=E * hidden * (-(-(inter // 32) // 8) * 8),
+                nbytes=EB * hidden * (-(-(inter // 32) // 8) * 8),
             )
+        if mx and not fse:
             sh = cfg.shared_inter // cfg.tp
             _need(
                 i,
@@ -379,7 +399,7 @@ class Qwen35MonoDecodeRunner:
                 model,
                 False,
             )
-        elif (
+        if not mx and (
             ex.w13_weight.dtype != torch.float8_e4m3fn
             or ex.w13_weight.shape[0] != cfg.n_experts + 1
         ):
@@ -387,7 +407,7 @@ class Qwen35MonoDecodeRunner:
                 f"layer {i}: routed experts {ex.w13_weight.dtype} {tuple(ex.w13_weight.shape)}, the kernel's"
                 f" FP8 bank of {cfg.n_experts} + the fused shared expert"
             )
-        else:
+        if not mx:
             f8, f32_ = torch.float8_e4m3fn, torch.float32
             _need(i, "w13", ex.w13_weight, (E + 1, 2 * inter, hidden), f8, True)
             _need(
@@ -420,18 +440,21 @@ class Qwen35MonoDecodeRunner:
 
             p.update(
                 w_ug=ex.w13_weight.data.view(torch.uint8).view(
-                    E, 2 * inter, hidden // 2
+                    EB, 2 * inter, hidden // 2
                 ),
                 s_ug=ex.w13_weight_scale.data.view(torch.uint8).view(
-                    E, 2 * inter, pad8(hidden // 32)
+                    EB, 2 * inter, pad8(hidden // 32)
                 ),
-                w_dn=ex.w2_weight.data.view(torch.uint8).view(E, hidden, inter // 2),
+                w_dn=ex.w2_weight.data.view(torch.uint8).view(EB, hidden, inter // 2),
                 s_dn=ex.w2_weight_scale.data.view(torch.uint8).view(
-                    E, hidden, pad8(inter // 32)
+                    EB, hidden, pad8(inter // 32)
                 ),
-                w_sh_ug=mlp.shared_expert.gate_up_proj.weight,
-                w_sh_dn=mlp.shared_expert.down_proj.weight,
             )
+            if not fse:
+                p.update(
+                    w_sh_ug=mlp.shared_expert.gate_up_proj.weight,
+                    w_sh_dn=mlp.shared_expert.down_proj.weight,
+                )
         else:
             p.update(
                 w_ug=ex.w13_weight,
@@ -439,15 +462,15 @@ class Qwen35MonoDecodeRunner:
                 w_dn=ex.w2_weight,
                 s_dn=ex.w2_weight_scale,
             )
-        # the BF16 projections of the MXFP4 checkpoint have no scales: a placeholder in their slot
-        none = torch.zeros(1, dtype=torch.float32, device=self.dev)
-        # the projections: FP8 in aiter's shuffled layout with 128 x 128 scales, or (MXFP4 checkpoint)
-        # BF16 row-major
-        proj = torch.bfloat16 if mx else torch.float8_e4m3fn
+        # the projections: FP8 in aiter's shuffled layout with 128 x 128 scales ("block") or a scale a row,
+        # its rows padded to 128 as ATOM pads them for the per-token GEMM ("ptpc"), or BF16 row-major
+        proj = torch.bfloat16 if pk == "bf16" else torch.float8_e4m3fn
 
         def need_proj(name, lin, n, k):
-            _need(i, name, lin.weight, (n, k), proj, not mx)
-            if not mx:
+            if pk == "ptpc":
+                n = -(-n // 128) * 128
+            _need(i, name, lin.weight, (n, k), proj, pk != "bf16")
+            if pk == "block":
                 _need(
                     i,
                     name + " scale",
@@ -455,6 +478,11 @@ class Qwen35MonoDecodeRunner:
                     (n // 128, k // 128),
                     torch.float32,
                 )
+            elif pk == "ptpc":
+                _need(i, name + " scale", lin.weight_scale, (n, 1), torch.float32)
+
+        def scale(lin):
+            return none if pk == "bf16" else lin.weight_scale
 
         hd, hv = cfg.head_dim, cfg.hv
         if self.full[i]:
@@ -465,23 +493,43 @@ class Qwen35MonoDecodeRunner:
             _need(i, "k_norm", a.k_norm.weight, (hd,))
             p.update(
                 w_qkvz=a.qkv_proj.weight,
-                s_qkvz=none if mx else a.qkv_proj.weight_scale,
+                s_qkvz=scale(a.qkv_proj),
                 g_qn1=1.0 + f32(a.q_norm.weight),
                 g_kn1=1.0 + f32(a.k_norm.weight),
                 w_out=a.o_proj.weight,
-                s_out=none if mx else a.o_proj.weight_scale,
+                s_out=scale(a.o_proj),
             )
         else:
             a = layer.linear_attn
-            if not hasattr(a, "in_proj_qkvz") or not hasattr(a, "in_proj_ba"):
+            # the per-token checkpoint's input projection is one merged [q | k | v | z | b | a] layer (ATOM's
+            # gdn_in_proj_is_merged); the others' the qkvz + b | a pair
+            merged = pk == "ptpc"
+            if merged != hasattr(a, "in_proj_qkvzba") or (
+                not merged
+                and (not hasattr(a, "in_proj_qkvz") or not hasattr(a, "in_proj_ba"))
+            ):
                 raise MonoUnsupported(
-                    f"layer {i}: GDN input projection not the qkvz + b | a pair"
+                    f"layer {i}: GDN input projection not the "
+                    + ("merged qkvzba" if merged else "qkvz + b | a pair")
                 )
-            need_proj(
-                "in_proj_qkvz", a.in_proj_qkvz, cfg.conv_dim + cfg.value_dim, hidden
-            )
+            if merged:
+                need_proj(
+                    "in_proj_qkvzba",
+                    a.in_proj_qkvzba,
+                    cfg.conv_dim + cfg.value_dim + 2 * hv,
+                    hidden,
+                )
+                w_in = a.in_proj_qkvzba
+            else:
+                need_proj(
+                    "in_proj_qkvz",
+                    a.in_proj_qkvz,
+                    cfg.conv_dim + cfg.value_dim,
+                    hidden,
+                )
+                _need(i, "in_proj_ba", a.in_proj_ba.weight, (2 * hv, hidden), model)
+                w_in = a.in_proj_qkvz
             need_proj("out_proj", a.out_proj, hidden, cfg.value_dim)
-            _need(i, "in_proj_ba", a.in_proj_ba.weight, (2 * hv, hidden), model)
             _need(
                 i, "conv1d", a.conv1d.weight, (cfg.conv_dim, 1, cfg.conv_kernel), model
             )
@@ -489,15 +537,15 @@ class Qwen35MonoDecodeRunner:
             _need(i, "dt_bias", a.dt_bias, (hv,))
             _need(i, "norm", a.norm.weight, (cfg.linear_v_dim,))
             p.update(
-                w_qkvz=a.in_proj_qkvz.weight,
-                s_qkvz=none if mx else a.in_proj_qkvz.weight_scale,
-                w_ba=pack_bf16(a.in_proj_ba.weight.detach()),
+                w_qkvz=w_in.weight,
+                s_qkvz=scale(w_in),
+                w_ba=none if merged else pack_bf16(a.in_proj_ba.weight.detach()),
                 w_conv=a.conv1d.weight,
                 a_log=f32(a.A_log),
                 dt_bias=f32(a.dt_bias),
                 g_norm=f32(a.norm.weight),
                 w_out=a.out_proj.weight,
-                s_out=none if mx else a.out_proj.weight_scale,
+                s_out=scale(a.out_proj),
             )
         for k, t in p.items():
             if k in ("w_qkvz", "w_out"):

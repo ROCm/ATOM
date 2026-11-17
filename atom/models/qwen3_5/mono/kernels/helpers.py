@@ -142,7 +142,8 @@ def block_sum(st, v):
 
 def unit_f8f8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
     """Issue one 128-k chunk (64-k chunks kc, kc + 1) of row group ``rg`` against the
-    FP8 activation at LDS word ``b_word``; ``coef()`` = activation scale (x route weight).
+    FP8 activation at LDS word ``b_word``; ``coef()`` = activation scale (x route weight). ``s_rsrc`` None:
+    no per-block scale (a per-channel matrix), the chunk's partial summed plainly.
     """
     lane = st.lane
     ln = lane if ln is None else ln
@@ -154,6 +155,10 @@ def unit_f8f8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef, ln=None):
         )
         for h in range(2)
     ]
+    if (
+        s_rsrc is None
+    ):  # a per-channel FP8 matrix: the scales apply once, after the whole K sum
+        return ("f8f8", wv, None, b_word + (lane // 16) * 4)
     s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
     return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
 

@@ -4,7 +4,7 @@
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
@@ -14,11 +14,12 @@ from atom.models.qwen3_5.mono.kernels.helpers import (
     LaunchState,
     traced,
 )
-from atom.models.qwen3_5.mono.kernels.ops import lds_st
+from atom.models.qwen3_5.mono.kernels.ops import lds_ld, lds_st
 from atom.models.qwen3_5.mono.layout import MOE_MISC
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
+    bf16_round,
     exp,
     fp8_pack4,
     rcp,
@@ -30,6 +31,7 @@ from atom.mono.device.ops import (
     write_lane_i32,
     xshfl,
 )
+from atom.mono.plan.execution import THREADS, WAVES
 
 
 def sort_network(n):
@@ -160,6 +162,14 @@ def quant_rule_q4(amax):
     return sc, lambda x: _clamp8(x * inv)
 
 
+def quant_rule_ptpc(amax):
+    """aiter's ``dynamic_per_token_scaled_quant`` (the per-token FP8 projections' input): the row max times
+    ``fl(1 / 448)``, no floor, x times ``v_rcp_f32(scale)``."""
+    sc = amax * (1.0 / FP8_MAX)
+    inv = rcp(sc)
+    return sc, lambda x: _clamp8(x * inv)
+
+
 def quant_floor(a0, a1):
     """``quant_rule_q1`` of a 128-block held as 2 f32 per lane of a wave -> (q0, q1, scale)."""
     sc, q = quant_rule_q1(wave_max(fx.max(fmath.absf(a0), fmath.absf(a1))))
@@ -226,6 +236,28 @@ def common_defs(ctx):
     block_sums = st.block_sums
     rmsnorm_tail_ks = st.rmsnorm_tail_ks
 
+    def block_maxes(vs):
+        """Block-wide maxima of several per-thread values with one LDS exchange."""
+        ws = [wave_max(v) for v in vs]
+        if lane == 0:
+            for i in range_constexpr(len(vs)):
+                lds_st(red, i * WAVES + wave, ws[i])
+        gpu.barrier()
+        tots = []
+        for i in range_constexpr(len(vs)):
+            t = lds_ld(red, i * WAVES)
+            for w in range_constexpr(1, WAVES):
+                t = fx.max(t, lds_ld(red, i * WAVES + w))
+            tots.append(t)
+        gpu.barrier()
+        return tots
+
+    def absmax4(a):
+        return fx.max(
+            fx.max(fmath.absf(a[0]), fmath.absf(a[1])),
+            fx.max(fmath.absf(a[2]), fmath.absf(a[3])),
+        )
+
     def put_x8(s, n, k, v4, fp8_rule):
         """FP8 X[s][k .. k + 3] (K order) of the f32 normed ``v4``; the 32 lanes of a 128-block share its
         scale, misc[MOE_MISC + s * XQ_BLOCKS + k / 128]."""
@@ -248,8 +280,12 @@ def common_defs(ctx):
         """LDS X[s][0:n] = rmsnorm(x_s) * gamma for ``count`` samples, ``gamma`` an f32 vector (the Gemma
         ``1 + w``, formed on the host); ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])]. As bf16 pairs, or
         with ``fp8_rule`` (one of the ``quant_rule_*``) as FP8 bytes in K order quantized per 128-block
-        from the f32 normed values, the block scales in misc[MOE_MISC + s * XQ_BLOCKS + block].
+        from the f32 normed values, the block scales in misc[MOE_MISC + s * XQ_BLOCKS + block]. With
+        ``fp8_rule="ptpc"``, per token as the per-token FP8 projections' input: the normed values rounded
+        to bf16 (the norm's output), quantized with the row's max (``quant_rule_ptpc``), the row's scale in
+        misc[MOE_MISC + s].
         """
+        ptpc = fp8_rule == "ptpc"
         count = S if count is None else count
         ks, active = rmsnorm_tail_ks(n)
         per = len(ks)
@@ -278,28 +314,57 @@ def common_defs(ctx):
             vals = ld4s([(c0 + s, k) for s in range(cn) for k in ks])
             sss = [sumsq(vals, s) for s in range(cn)]
             rstds = [rsq(tot * (1.0 / n) + EPS) for tot in block_sums(sss)]
-            for s_ in range_constexpr(cn):
-                s = c0 + s_
-                for i in range_constexpr(per):
-                    a = vals[s_ * per + i]
-                    if const_expr(fp8_rule is not None):
-                        put_x8(
-                            s,
-                            n,
-                            ks[i],
-                            [a[e] * rstds[s_] * gs[i][e] for e in range(4)],
-                            fp8_rule,
-                        )
-                        continue
-                    for j in range_constexpr(2):
+            if const_expr(ptpc):
+                vbs = [
+                    [
+                        [
+                            bf16_round(vals[s_ * per + i][e] * rstds[s_] * gs[i][e])
+                            for e in range(4)
+                        ]
+                        for i in range(per)
+                    ]
+                    for s_ in range(cn)
+                ]
+                amaxes = []
+                for s_ in range_constexpr(cn):
+                    m = absmax4(vbs[s_][0])
+                    for i in range_constexpr(1, per):
+                        m = fx.max(m, absmax4(vbs[s_][i]))
+                    amaxes.append(m)
+                for s_, amax in enumerate(block_maxes(amaxes)):
+                    sc, q = quant_rule_ptpc(amax)
+                    s = c0 + s_
+                    for i in range_constexpr(per):
                         lds_st(
                             xs,
-                            (s * n + ks[i]) // 2 + j,
-                            bf16_pair(
-                                a[2 * j] * rstds[s_] * gs[i][2 * j],
-                                a[2 * j + 1] * rstds[s_] * gs[i][2 * j + 1],
-                            ),
+                            (s * n + ks[i]) // 4,
+                            fp8_pack4(*[q(x) for x in vbs[s_][i]]).bitcast(fx.Float32),
                         )
+                    if tid == 0:
+                        lds_st(misc, MOE_MISC + s, sc)
+            else:
+                for s_ in range_constexpr(cn):
+                    s = c0 + s_
+                    for i in range_constexpr(per):
+                        a = vals[s_ * per + i]
+                        if const_expr(fp8_rule is not None):
+                            put_x8(
+                                s,
+                                n,
+                                ks[i],
+                                [a[e] * rstds[s_] * gs[i][e] for e in range(4)],
+                                fp8_rule,
+                            )
+                            continue
+                        for j in range_constexpr(2):
+                            lds_st(
+                                xs,
+                                (s * n + ks[i]) // 2 + j,
+                                bf16_pair(
+                                    a[2 * j] * rstds[s_] * gs[i][2 * j],
+                                    a[2 * j + 1] * rstds[s_] * gs[i][2 * j + 1],
+                                ),
+                            )
             return rstds
 
         # more than 8 samples: groups of 8 (what registers hold at once), each normalized from its own
@@ -380,6 +445,27 @@ def common_defs(ctx):
                 if lane % 32 == 0:
                     lds_st(misc, MOE_MISC + w // 32, sc)
 
+    def stage_pairs_q8_rows(name, n):
+        """LDS FP8 [S, n] (K order) of the bf16 mailbox ``name``, quantized per row as aiter's per-token quant
+        (``quant_rule_ptpc``): a row is n / 4 words, a thread's word each (n = 4 * THREADS); the row
+        scales to misc[MOE_MISC + s]."""
+        assert n == 4 * THREADS, "a row is one word a thread"
+        rows = []
+        for s in range_constexpr(S):
+            v = poll([(mb(name), (s * THREADS + tid) * 2, 2)])[0]
+            a0, a1 = bf2_f32(v[0].bitcast(fx.Int32))
+            a2, a3 = bf2_f32(v[1].bitcast(fx.Int32))
+            rows.append([a0, a1, a2, a3])
+        for s, amax in enumerate(block_maxes([absmax4(a) for a in rows])):
+            sc, q = quant_rule_ptpc(amax)
+            lds_st(
+                xs,
+                s * THREADS + tid,
+                fp8_pack4(*[q(x) for x in rows[s]]).bitcast(fx.Float32),
+            )
+            if tid == 0:
+                lds_st(misc, MOE_MISC + s, sc)
+
     def route_softmax(s):
         """Softmax top-``TOP_K`` of sample ``s``'s router logits (one whole wave), as aiter's
         ``topkGatingSoftmax``: the picks on the raw (bf16) logits in descending order, ties to the
@@ -443,6 +529,7 @@ def common_defs(ctx):
         "stage_moe_input": stage_moe_input,
         "stage_x8": stage_x8,
         "stage_pairs_q8": stage_pairs_q8,
+        "stage_pairs_q8_rows": stage_pairs_q8_rows,
         "stage_f32_q8": stage_f32_q8,
         "route_softmax": route_softmax,
     }

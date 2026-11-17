@@ -3,6 +3,7 @@
 """Host-side shapes of the Qwen3.5 MonoKernel: execution constants, per-stage task counts and the
 mailbox layout."""
 
+from atom.models.qwen3_5.mono.config import experts_mxfp4, proj_kind
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.layout import DIAG_WORDS
@@ -106,12 +107,11 @@ BF16_GEMM_RULES = {
 def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
     """Baseline ATOM's BF16 GEMMs on the decode path the kernel reproduces, as (name, N, K, its
     ``BF16_GEMM_RULES`` entry or None: the kernel sums those in one fp32 pass) for a ``Q35Config``
-    rank: the router and the GDN b | a projection in both checkpoints, the MXFP4 checkpoint's BF16
-    projections and shared expert."""
-    gemms = [
-        ("router", router_rows(cfg.n_experts), cfg.hidden, "router"),
-        ("in_proj_ba", 2 * cfg.hv, cfg.hidden, None),
-    ]
+    rank: the router; the GDN b | a projection unless it is FP8 (the per-token checkpoint's merged input
+    projection); the MXFP4 checkpoint's BF16 projections and shared expert."""
+    gemms = [("router", router_rows(cfg.n_experts), cfg.hidden, "router")]
+    if cfg.proj_kind != "ptpc":
+        gemms.append(("in_proj_ba", 2 * cfg.hv, cfg.hidden, None))
     if cfg.weights == "mxfp4":
         sh = cfg.shared_inter // cfg.tp
         gemms += [
@@ -256,7 +256,7 @@ def layout(
         full and qk_fusion and weights == "fp8"
     ):  # gated, f32 (one a pair): quantized from f32
         out_in = [("gated", S * out_k(full, dims) * pr)]
-    elif full or weights == "mxfp4":  # the mixer's output, bf16 pairs
+    elif full or proj_kind(weights) != "block":  # the mixer's output, bf16 pairs
         out_in = [("gated", S * out_k(full, dims) // 2 * pr)]
     else:  # the FP8 checkpoint's GDN output: FP8 (four bytes a pair) and its per-128 scales
         out_in = [
@@ -285,13 +285,10 @@ def layout(
             ("sel", S * slots * pr),
             ("prob", S * slots * pr),
             ("mid", S * slots * inter * pr),
-            # MXFP4 checkpoint: the MoE input as bf16 pairs, normed (the shared expert's) and per-32 MXFP4
-            # quantize-dequantized (the routed experts')
-            *(
-                [("x2b", S * hidden // 2 * pr), ("xb", S * hidden // 2 * pr)]
-                if weights == "mxfp4"
-                else []
-            ),
+            # MXFP4 experts: the MoE input as bf16 pairs, per-32 MXFP4 quantize-dequantized (the bank's), and
+            # normed (the separate BF16 shared expert's, "mxfp4")
+            *([("x2b", S * hidden // 2 * pr)] if weights == "mxfp4" else []),
+            *([("xb", S * hidden // 2 * pr)] if experts_mxfp4(weights) else []),
         ]
     )
     # a debug build's wait records (one a CTA, atom.mono.device.sync), zeroed with the mailboxes at a
@@ -325,9 +322,11 @@ def mailbox_regions(S: int, full: bool, weights: str, npes: int) -> list[RegionD
     else:
         r += [RegionDecl(n, Space.SCRATCH, "proj") for n in ("conv", "z")]
         r += [RegionDecl("ba", Space.SCRATCH, "proj_ba")]
-        gdn_out = ("gated",) if weights == "mxfp4" else ("gq", "gqs")
+        gdn_out = ("gated",) if proj_kind(weights) != "block" else ("gq", "gqs")
         r += [RegionDecl(n, Space.SCRATCH, "gdn") for n in gdn_out]
-    moe_in = ("x2b", "xb") if weights == "mxfp4" else ("xq", "xqs")
+    moe_in = {"fp8": ("xq", "xqs"), "mxfp4": ("x2b", "xb"), "mxfp4_attnfp8": ("xb",)}[
+        weights
+    ]
     r += [RegionDecl(n, Space.SCRATCH, "router") for n in moe_in]
     r += [RegionDecl(n, Space.SCRATCH, "ug") for n in ("mid", "sel", "prob")]
     if npes > 1:

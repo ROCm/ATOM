@@ -59,6 +59,6 @@ if __name__ == "__main__":
     sizes = [int(a) for a in sys.argv[1:]] or list(range(1, 17))
     for s in sizes:
         for full in (False, True):
-            for weights in ("fp8", "mxfp4"):
+            for weights in ("fp8", "mxfp4", "mxfp4_attnfp8"):
                 check_build(s, full, weights)
                 print(f"S={s} full={full} {weights}: contract holds")
