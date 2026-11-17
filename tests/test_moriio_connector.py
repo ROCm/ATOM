@@ -986,6 +986,27 @@ class WritePathTest(unittest.TestCase):
             conn.note_forward(self.post_ready_batch(), 2, 3)
         self.assertEqual(conn._post_ready_forwards, {})
 
+    def test_blocks_are_described_by_the_transfer_holding_them(self):
+        import types
+
+        producer = self.make(producer=True)
+        producer._sending_writes = {
+            9: ([], {"transfer_id": 9, "src_block_ids": [4, 5]})
+        }
+        producer._pending_writes = [({"transfer_id": 3, "src_block_ids": [7]}, 0.0)]
+        self.assertEqual(
+            producer.describe_blocks([5, 7, 8]),
+            "source of transfer 9 (pushing): [5]; source of transfer 3 (queued): [7]",
+        )
+        self.assertEqual(
+            producer.describe_blocks([1]), "no transfer in flight holds them"
+        )
+        consumer = self.make(producer=False)
+        consumer._awaiting_write = {
+            "d1": (0.0, types.SimpleNamespace(local_block_ids=[2, 6]))
+        }
+        self.assertEqual(consumer.describe_blocks([6]), "target of req d1's push: [6]")
+
     def test_a_changed_source_reports_the_forwards_after_the_kv_ready_event(self):
         conn = self.make(producer=True)
         started = time.monotonic()

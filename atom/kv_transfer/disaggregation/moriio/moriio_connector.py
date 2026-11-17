@@ -957,6 +957,35 @@ class MoRIIOConnector(KVConnectorBase):
                 return request
         return None
 
+    def describe_blocks(self, blocks: list[int]) -> str:
+        """ATOM_DRAFT_SLOT_CHECK: which transfers in flight hold these blocks.
+
+        Read from another thread's bookkeeping without its lock, as a
+        diagnostic: an entry may be a moment stale.
+        """
+        wanted = set(blocks)
+        hits = []
+        if self.is_producer:
+            pushes = [
+                (int(tid), request, "pushing")
+                for tid, (_, request) in list(self._sending_writes.items())
+            ] + [
+                (int(request["transfer_id"]), request, "queued")
+                for request, _ in list(self._pending_writes)
+            ]
+            for transfer_id, request, state in pushes:
+                held = wanted & {int(b) for b in request.get("src_block_ids") or []}
+                if held:
+                    hits.append(
+                        f"source of transfer {transfer_id} ({state}): {sorted(held)[:8]}"
+                    )
+        else:
+            for req_id, (_, meta) in list(self._awaiting_write.items()):
+                held = wanted & {int(b) for b in meta.local_block_ids}
+                if held:
+                    hits.append(f"target of req {req_id}'s push: {sorted(held)[:8]}")
+        return "; ".join(hits) or "no transfer in flight holds them"
+
     def _push_state(self, transfer_id: int, now: float) -> str:
         """How far a transfer's push is, for the diagnostic log."""
         sending = self._sending_writes.get(transfer_id)
