@@ -46,6 +46,7 @@
     {"rendering": "deepseek_v41", "request": {"reasoning_effort": "max"}, "kwargs": {"thinking_mode": "thinking", "reasoning_effort": "max"}},
     {"rendering": "deepseek_v41", "request": {"reasoning_effort": "medium"}, "kwargs": {"thinking_mode": "thinking", "reasoning_effort": "high"}},
     {"rendering": "deepseek_v41", "request": {"reasoning_effort": "minimal"}, "kwargs": {"thinking_mode": "thinking", "reasoning_effort": "low"}},
+    {"rendering": "deepseek_v41", "request": {"reasoning_effort": "xhigh"}, "kwargs": {"thinking_mode": "thinking", "reasoning_effort": "high"}},
     {"rendering": "deepseek_v41", "request": {"reasoning_effort": "none"}, "kwargs": {"thinking_mode": "chat"}},
     {"rendering": "deepseek_v41", "request": {"thinking": {"type": "disabled"}}, "kwargs": {"thinking_mode": "chat"}},
     {"rendering": "deepseek_v41", "request": {"thinking": {"type": "enabled", "effort": 30}}, "kwargs": {"thinking_mode": "thinking", "reasoning_effort": 30}},
