@@ -543,7 +543,11 @@ def test_per_expert_path_trims_the_source_intermediate_padding(monkeypatch):
         layer_quant_config=source,
         source_is_nvfp4=False,
         params_dtype=dtypes.fp4x2,
-        quant_method=SimpleNamespace(hidden_pad=0, intermediate_pad=padded - inter),
+        quant_method=SimpleNamespace(
+            hidden_pad=0,
+            intermediate_pad=padded - inter,
+            need_normalize_e4m3fn_to_e4m3fnuz=False,
+        ),
         w13_bias=None,
         has_bias=False,
         moe_config=SimpleNamespace(),

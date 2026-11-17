@@ -103,3 +103,18 @@ def test_shared_loading_follows_any_fused_layer():
     assert probe(Mock(model=layers)) is False
     layers[1]._fuse_shared_into_routed = False
     assert probe(Mock(model=layers)) is True
+
+
+def test_loader_rename_follows_the_built_fused_moe():
+    from torch import nn
+
+    root = nn.Module()
+    root.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    for layer, shared in zip(root.layers, (0, 1)):
+        layer.ffn = nn.Module()
+        layer.ffn.experts = nn.Module()
+        layer.ffn.experts.num_fused_shared_experts = shared
+    fuses = model.DeepseekV41ForCausalLM.fuses_shared_expert
+    assert not fuses(root, "layers.0.ffn.experts")
+    assert fuses(root, "layers.1.ffn.experts")
+    assert dspark.DeepseekV41DSpark.fuses_shared_expert is fuses

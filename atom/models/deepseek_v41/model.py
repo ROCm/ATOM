@@ -335,6 +335,11 @@ class DeepseekV41ForCausalLM(nn.Module):
     # That reaches the layers through `self.model`, so it applies here as is.
     disable_fused_shared_loading = DeepseekV4ForCausalLM.disable_fused_shared_loading
 
+    def fuses_shared_expert(self, routed_prefix: str) -> bool:
+        """Whether the built FusedMoE at `routed_prefix` holds the shared expert
+        in a slot: the loader's shared-expert rename follows it."""
+        return self.get_submodule(routed_prefix).num_fused_shared_experts > 0
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """(param_name, weight_name, expert_id, shard_id) for FusedMoE.
 

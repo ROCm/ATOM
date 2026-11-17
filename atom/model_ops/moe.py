@@ -523,6 +523,9 @@ def _select_logical(
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    # Set by a method that fixes OCP E4M3 bytes up to E4M3FNUZ after loading.
+    need_normalize_e4m3fn_to_e4m3fnuz: bool = False
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
         self.moe = moe
@@ -4360,7 +4363,7 @@ class FusedMoE(torch.nn.Module):
         # For per_1x128 source we also need the old scales for dequantization.
         old_w13_data = self.w13_weight.data
         old_w2_data = self.w2_weight.data
-        if getattr(self.quant_method, "need_normalize_e4m3fn_to_e4m3fnuz", False):
+        if self.quant_method.need_normalize_e4m3fn_to_e4m3fnuz:
             # Still OCP E4M3 bytes; the source method's FNUZ fixup never runs.
             old_w13_data = old_w13_data.view(torch.float8_e4m3fn)
             old_w2_data = old_w2_data.view(torch.float8_e4m3fn)

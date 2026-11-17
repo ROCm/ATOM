@@ -489,10 +489,14 @@ def validate_fp4ptpc_recipe(config):
     fused slot."""
     if not config.hf_config.fp4ptpc:
         return
-    from aiter import QuantType
+    from aiter import QuantType, dtypes
 
     routed = config.quant_config.online_pattern_spec("layers.0.ffn.experts")
-    if routed is None or routed.quant_type.value != QuantType.per_Token.value:
+    if (
+        routed is None
+        or routed.quant_type.value != QuantType.per_Token.value
+        or routed.quant_dtype != dtypes.fp8
+    ):
         raise ValueError(
             "DeepSeek-V4.1 FP4PTPC needs its routed experts converted to "
             'per-channel FP8: --online_quant_config \'{"layer_quant_config": '

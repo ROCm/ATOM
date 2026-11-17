@@ -822,3 +822,18 @@ def test_pd_store_requires_bounded_replay_for_the_offload_leaf():
             kv_cache_block_size=256,
         )
     )
+
+
+def test_fp4ptpc_needs_per_token_fp8_experts():
+    pytest.importorskip("aiter", reason="the quant specs are AITER enums")
+    from aiter import QuantType, dtypes
+
+    from atom.quant_spec import LayerQuantConfig
+
+    fp4 = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp4x2)
+    config = runtime_config(
+        hf_config=SimpleNamespace(sliding_window=128, fp4ptpc=True),
+        quant_config=SimpleNamespace(online_pattern_spec=lambda _name: fp4),
+    )
+    with pytest.raises(ValueError, match="FP4PTPC needs its routed experts"):
+        validate_runtime_config(config)

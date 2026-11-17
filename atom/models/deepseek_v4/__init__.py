@@ -3878,7 +3878,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         decides per layer.
         """
         return not any(
-            getattr(m, "_fuse_shared_into_routed", False)
+            m._fuse_shared_into_routed
             for m in self.model.modules()
             if m.__class__.__name__ == "MoE"
         )

@@ -210,6 +210,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     weights_mapping = DeepseekV41ForCausalLM.weights_mapping
     packed_modules_mapping = DeepseekV41ForCausalLM.packed_modules_mapping
     disable_fused_shared_loading = DeepseekV41ForCausalLM.disable_fused_shared_loading
+    fuses_shared_expert = DeepseekV41ForCausalLM.fuses_shared_expert
 
     def __init__(self, config, *, max_length=None, alt_stream=None):
         super().__init__()

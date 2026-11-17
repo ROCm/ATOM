@@ -353,9 +353,9 @@ def test_ptpc_shared_expert_stays_unfused_under_dp_expert_parallel(monkeypatch):
     )
 
 
-def test_loader_decides_with_the_models_own_moe_quant_config(monkeypatch):
-    """The loader's shared-expert rename must agree with the config the MoE
-    layers were built with, not the engine-wide one."""
+def test_loader_asks_a_model_whose_layers_decide(monkeypatch):
+    """A model whose built MoE layers record their fusion answers the loader's
+    shared-expert rename; the quant config is not consulted."""
     from atom.model_loader import loader
 
     class _Stop(Exception):
@@ -367,23 +367,20 @@ def test_loader_decides_with_the_models_own_moe_quant_config(monkeypatch):
         captured.update(kwargs)
         raise _Stop
 
+    def probe(*_a, **_k):
+        raise AssertionError("consulted the quant config")
+
     monkeypatch.setattr(loader, "load_weights_into_model", capture)
     monkeypatch.setattr(
-        loader,
-        "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config",
-        lambda quant_config, **_: asked.append(quant_config) or True,
+        loader, "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config", probe
     )
-    own = SimpleNamespace(get_layer_quant_config=None)
     model = torch.nn.Module()
-    model.moe_quant_config = own
-    model.atom_config = SimpleNamespace(
-        quant_config=SimpleNamespace(get_layer_quant_config=None)
-    )
+    model.fuses_shared_expert = lambda prefix: asked.append(prefix) or True
     with pytest.raises(_Stop):
         loader.load_model(model, "unused", hf_config=None)
     fuse = captured["fuse_shared_expert"]
     assert fuse("layers.0.ffn.shared_experts", "layers.0.ffn.experts")
-    assert asked == [own]
+    assert asked == ["layers.0.ffn.experts"]
 
 
 def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
