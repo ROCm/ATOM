@@ -439,9 +439,7 @@ def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
     unanchorable = CARD.replace(
         "⚠️ atom/model_ops/moe.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.",
         "⚠️ The workflow's cleanup step cannot fire — **Author must** drop the flag.",
-    ).replace(
-        "🔴 moe.py:22 and helper.py:7 — one of these citations was flagged.", ""
-    )
+    ).replace("🔴 moe.py:22 and helper.py:7 — one of these citations was flagged.", "")
     (report / "card.md").write_text(unanchorable, encoding="utf-8")
     body = _publish.review_payload("9999")["body"]
     assert "finding(s) posted inline" not in body
