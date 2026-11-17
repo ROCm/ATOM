@@ -8,11 +8,15 @@ import pytest
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
-from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS, SUPPORTED_DPA
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.k1k2.config import (
+    MAX_MOE_ROWS,
+    MAX_ROWS,
+    SUPPORTED_DPA,
+)
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import RouteShape
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.moe_shape import RouteShape
 from atom.mono.device.ops import lds_bytes
 from atom.mono.plan.execution import LDS_BYTES
 

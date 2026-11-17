@@ -15,9 +15,9 @@ import pytest
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
-from atom.models.deepseek_v41.mono import contract
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import contract
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import layer_post as k2
 from atom.mono.plan.check import ContractError, check
 from atom.mono.runtime.compile import trace
 

@@ -2,7 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Which deployments and which steps the DeepSeek-V4.1 mono decode takes."""
 
-from types import SimpleNamespace
+import logging
+import re
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -11,11 +14,14 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.deepseek_v41.config import AttentionMode
-from atom.models.deepseek_v41.mono import config as mono_config
-from atom.models.deepseek_v41.mono import dispatch
-from atom.models.deepseek_v41.mono import weights as mono_weights
+from atom.models.deepseek_v41.mono import dispatch, hi_gate, selection
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import config as mono_config
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import dispatch as k1k2
+from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights as mono_weights
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
 from atom.mono.runtime import deployment
+from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.step_override import StepOverrideModel
 
 
 class _Mode:
@@ -187,7 +193,7 @@ def test_moe_tp_weight_table_is_every_expert_at_a_share():
 
 def test_expert_parallel_weight_table_is_a_ranks_experts_whole():
     from atom.models.deepseek_v41.config import AttentionMode
-    from atom.models.deepseek_v41.mono import weights
+    from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights
 
     table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(1, 2))
     # half the routed experts, each at its whole (padded) width
@@ -237,25 +243,25 @@ def _context(monkeypatch, *, prefill=False, ubatch=None, **step_fields):
         ubatch_slices=ubatch,
         attn_metadata=SimpleNamespace(step=step, image_mask=None),
     )
-    monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
+    monkeypatch.setattr(k1k2, "get_forward_context", lambda: fwd)
     return fwd
 
 
 def test_verify_step_is_routed(monkeypatch):
     _context(monkeypatch)
-    assert dispatch.step_supported(torch.zeros(6, dtype=torch.int64), None)
+    assert k1k2.step_supported(torch.zeros(6, dtype=torch.int64), None)
 
 
 def test_plain_decode_step_is_routed(monkeypatch):
     # no drafter: a token a request, not a tentative verify
     _context(monkeypatch, tentative=False, requests=[object()] * 3, running_tokens=3)
-    assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
+    assert k1k2.step_supported(torch.zeros(3, dtype=torch.int64), None)
 
 
 def test_ragged_verify_step_is_routed(monkeypatch):
     # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
     _context(monkeypatch, requests=[object()] * 3, running_tokens=12)
-    assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
+    assert k1k2.step_supported(torch.zeros(12, dtype=torch.int64), None)
 
 
 @pytest.mark.parametrize(
@@ -271,7 +277,7 @@ def test_ragged_verify_step_is_routed(monkeypatch):
 )
 def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
     _context(monkeypatch, **kwargs)
-    assert not dispatch.step_supported(torch.zeros(tokens, dtype=torch.int64), None)
+    assert not k1k2.step_supported(torch.zeros(tokens, dtype=torch.int64), None)
 
 
 @pytest.mark.parametrize(
@@ -280,10 +286,10 @@ def test_other_steps_keep_the_original_model(monkeypatch, tokens, kwargs):
 def test_the_target_is_routed_by_its_rows_alone(monkeypatch, tokens, routed):
     # a padded graph width: neither the scheduled request count nor how the rows
     # split into requests is read
-    monkeypatch.setattr(dispatch, "MAX_ROWS", 12)
+    monkeypatch.setattr(k1k2, "MAX_ROWS", 12)
     _context(monkeypatch, running_tokens=tokens, requests=[object()])
     ids = torch.zeros(tokens, dtype=torch.int64)
-    assert dispatch.step_supported(ids, None) is routed
+    assert k1k2.step_supported(ids, None) is routed
 
 
 class _DraftRunner:
@@ -313,7 +319,7 @@ def test_the_draft_is_routed_by_its_request_count(
     draft = _Draft()
     draft.draft_kv_dtype = draft_dtype
     routed = routed and draft_dtype != "fp8"
-    model = dispatch.MonoDraftModel(draft)
+    model = k1k2.MonoDraftModel(draft)
     runner = _DraftRunner()
     model._mono = SimpleNamespace(
         runner=runner, ready=lambda rows: runner.rows.append(rows) or True
@@ -358,9 +364,9 @@ def test_explicit_fp8_draft_bypasses_hi_and_mono(monkeypatch, draft_dtype, reque
 def test_embeddings_or_images_keep_the_original_model(monkeypatch):
     fwd = _context(monkeypatch)
     ids = torch.zeros(6, dtype=torch.int64)
-    assert not dispatch.step_supported(ids, torch.zeros(6, 8))
+    assert not k1k2.step_supported(ids, torch.zeros(6, 8))
     fwd.attn_metadata.image_mask = torch.zeros(6, dtype=torch.bool)
-    assert not dispatch.step_supported(ids, None)
+    assert not k1k2.step_supported(ids, None)
 
 
 def test_refused_deployment_is_not_wrapped(native, monkeypatch):
@@ -370,9 +376,162 @@ def test_refused_deployment_is_not_wrapped(native, monkeypatch):
         is model
     )
     wrapped = dispatch.install_mono_decode(model, _atom_config(), None)
-    assert isinstance(wrapped, dispatch.MonoDecodeModel)
+    assert isinstance(wrapped, k1k2.MonoDecodeModel)
     # attributes the runner never overrides pass through to the wrapped model
     assert wrapped.in_features == 2
+
+
+# ---- which backend a deployment takes (``selection``: tk, hi, k1k2 or none, each refusal's line or error)
+
+# the deployment the hi path serves (TP4, the FP4 index, DeepSeek-V4.1-Flash, DSpark 5) and the TileRT-path step's
+# (TP8, one request, the FP8 index, no prefix caching); the full matrix is verified against the legacy cascade apart
+_HI = {
+    "hf_config": SimpleNamespace(**{**_HF, **hi_gate.GEOMETRY}, dspark_block_size=5),
+    "index_cache_dtype": "fp4",
+    "index_cache_layout": "mfma",
+    "kv_cache_block_size": 128,
+    "max_num_seqs": 16,
+    "enable_prefix_caching": True,
+}
+_TK = {
+    **_HI,
+    "tensor_parallel_size": 8,
+    "index_cache_dtype": "fp8",
+    "index_cache_layout": None,
+    "max_num_seqs": 1,
+    "enable_prefix_caching": False,
+}
+
+
+class _TkModel(StepOverrideModel):
+    pass
+
+
+def _install_world(monkeypatch, *, arch="gfx950", hi_install=None):
+    """A whole ``arch`` device with FlyDSL, every install a stand-in: tk a ``StepOverrideModel``, hi "hi" (or raising
+    ``MonoUnsupported(hi_install)``), k1k2 ATOM's own wrappers (built lazily: nothing compiles).
+    """
+    from atom.models.deepseek_v41.mono import deployment as v41_deployment
+    from atom.models.deepseek_v41.mono import gfx1250
+    from atom.models.deepseek_v41.mono.gfx950.tk import dispatch as tk_dispatch
+    from atom.models.deepseek_v41.mono.gfx950.tk import gate as tk_gate
+
+    cus = 256 if arch == "gfx950" else 304
+    monkeypatch.setattr(deployment, "_gfx", lambda: arch)
+    monkeypatch.setattr(tk_gate, "_arch", lambda: arch)
+    monkeypatch.setattr(hi_gate, "_device", lambda: (arch, cus))
+    monkeypatch.setattr(v41_deployment, "_device", lambda: (arch, cus))
+    monkeypatch.setattr(gfx1250, "enabled", lambda: False)
+    found = {"flydsl": object()}
+    monkeypatch.setattr(hi_gate.importlib.util, "find_spec", lambda n: found.get(n))
+    monkeypatch.setattr(hi_gate, "_LOGGED", set())
+    monkeypatch.setattr(tk_dispatch, "install_tk_step", lambda *a: _TkModel())
+
+    def install_hi(*a):
+        if hi_install:
+            raise MonoUnsupported(hi_install)
+        return "hi"
+
+    stub = ModuleType("atom.models.deepseek_v41.mono.hi_dispatch")
+    stub.install_hi = install_hi
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    for name in ("ATOM_DSV41_MONO_HI", "ATOM_USE_TRITON_MOE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _builder(decode_round=True):
+    engram = SimpleNamespace(host=SimpleNamespace(uva=True, overlap=object()))
+    builder = SimpleNamespace(engram=engram)
+    if decode_round:
+        builder.use_decode_round = Mock()
+    return builder
+
+
+_OFF_HI = "V4.1 mono hi off: --index-cache-dtype fp8 (the hi path serves fp4); ATOM's mono path"
+# fmt: off
+# (configuration, world, ATOM_DSV41_MONO_HI, the backend or the error raised, a line logged or the error's message)
+SELECTIONS = {
+    # R2: the TileRT-path step first where it serves; ATOM_DSV41_MONO_HI=0 does not skip it, =1 does
+    "tk": (_TK, {}, "auto", "tk", ""),
+    "tk under hi=0": (_TK, {}, "0", "tk", ""),
+    "tk under hi=1": (_TK, {}, "1", RuntimeError, "the hi path does not serve this deployment: --index-cache-dtype fp8"),
+    "tk refused": ({**_TK, "max_num_seqs": 4}, {}, "auto", "k1k2", "V4.1 TileRT-path step off: max_num_seqs 4"),
+    "tk without a round": (_TK, {"builder": _builder(False)}, "auto", "k1k2", "step off: no V4.1 metadata builder"),
+    "tk off the device": (_TK, {"arch": "gfx942"}, "auto", "off", "V4.1 mono decode off: arch gfx942"),
+    # R1: an invalid mode raises, on a tk host or not
+    "invalid mode, tk host": (_TK, {}, "on", ValueError, "ATOM_DSV41_MONO_HI='on'"),
+    "invalid mode, switched off": (_HI, {"env": {"ATOM_MONO_ENABLE": "0"}}, "on", ValueError, "ATOM_DSV41_MONO_HI='on'"),
+    # R3: k1k2's refusal leaves the model unwrapped (an error when hi is forced)
+    "switched off": (_HI, {"env": {"ATOM_MONO_ENABLE": "0"}}, "auto", "off", "V4.1 mono decode off: switched off"),
+    "side streams, hi=0": (_HI, {"env": {"ATOM_DSV41_SIDE_STREAMS": "1"}}, "0", "off", "decode off: ATOM_DSV41_SIDE_STREAMS"),
+    "k1k2 refused, hi=1": ({**_HI, "tensor_parallel_size": 16}, {}, "1", RuntimeError, "=1, but V4.1 mono decode is off: "),
+    # R4: hi where the gate serves it; any refusal of it takes k1k2
+    "hi": (_HI, {}, "auto", "hi", "V4.1 TileRT-path step off: TP 4 not in (8,)"),
+    "hi under hi=1": (_HI, {}, "1", "hi", "step off: ATOM_DSV41_MONO_HI=1 keeps the hi path"),
+    "hi=0": (_HI, {}, "0", "k1k2", "V4.1 mono hi off: ATOM_DSV41_MONO_HI=0"),
+    "hi refused": ({**_HI, "index_cache_dtype": "fp8"}, {}, "auto", "k1k2", _OFF_HI),
+    "hi refused, hi=1": ({**_HI, "index_cache_dtype": "fp8"}, {}, "1", RuntimeError, "--index-cache-dtype fp8"),
+    "hi install refused": (_HI, {"hi_install": "shard"}, "auto", "k1k2", "V4.1 mono hi off: shard"),
+    "hi install refused, hi=1": (_HI, {"hi_install": "shard"}, "1", MonoUnsupported, "shard"),
+    # R5: k1k2 (the drafter's block backbone wrapped too); without a drafter, the target alone
+    "no drafter": (_HI, {"drafter": None}, "auto", "k1k2", "V4.1 mono hi off: no DSpark draft; ATOM's mono path"),
+    "dp attention": ({**_HI, **_DPA}, {}, "auto", "k1k2", "V4.1 mono hi off: DP attention; ATOM's mono path"),
+}
+# fmt: on
+
+
+@pytest.mark.parametrize("case", SELECTIONS)
+def test_the_backend_a_deployment_takes(native, monkeypatch, caplog, case):
+    over, world, mode, want, line = SELECTIONS[case]
+    world = dict(world)
+    drafter = world.pop("drafter", SimpleNamespace(model=_Draft()))
+    builder = world.pop("builder", _builder())
+    for name, value in world.pop("env", {}).items():
+        monkeypatch.setenv(name, value)
+    _install_world(monkeypatch, **world)
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
+    install = dispatch.install_mono_decode
+    model = torch.nn.Linear(2, 2)
+    draft = None if drafter is None else drafter.model
+    with caplog.at_level(logging.INFO, logger="atom"):
+        if not isinstance(want, str):
+            with pytest.raises(want, match=re.escape(line)):
+                install(model, _atom_config(**over), drafter, metadata_builder=builder)
+            return
+        got = install(model, _atom_config(**over), drafter, metadata_builder=builder)
+    kinds = {"tk": _TkModel, "k1k2": k1k2.MonoDecodeModel}
+    assert got is model if want == "off" else got == "hi" if want == "hi" else isinstance(got, kinds[want])  # fmt: skip
+    assert line in caplog.text
+    if draft is not None:  # only k1k2 wraps the drafter's model itself
+        wrapped = isinstance(drafter.model, k1k2.MonoDraftModel)
+        assert wrapped == (want == "k1k2") and (drafter.model.model if wrapped else drafter.model) is draft  # fmt: skip
+
+
+def test_gfx1250_comes_before_every_gfx950_backend(native, monkeypatch):
+    from atom.models.deepseek_v41.mono import gfx1250
+    from atom.models.deepseek_v41.mono.gfx1250 import dispatch as gfx1250_dispatch
+
+    _install_world(monkeypatch)
+    monkeypatch.setattr(gfx1250, "enabled", lambda: True)
+    monkeypatch.setattr(gfx1250_dispatch, "install_single_step", lambda m, c, d: "single")  # fmt: skip
+    assert selection.install("m", _atom_config(**_TK), None) == "single"
+
+
+def test_a_deployment_is_read_without_raising(monkeypatch):
+    from atom.models.deepseek_v41.mono.deployment import Deployment
+
+    _install_world(monkeypatch)
+    empty = Deployment.of(SimpleNamespace())
+    assert (empty.tp, empty.band, empty.prefix_caching, empty.drafter) == (1, None, True, False)  # fmt: skip
+    dep = Deployment.of(_atom_config(**_TK), None, _builder())
+    assert (dep.tp, dep.band, dep.index_cache_dtype, dep.prefix_caching) == (8, "C1", "fp8", False)  # fmt: skip
+    assert dep.decode_round_builder and dep.engram_overlap and not dep.drafter
+    assert {b.name: b.hook for b in selection.PRIORITY} == {
+        "tk": selection.Hook.STEP,
+        "hi": selection.Hook.LAYER,
+        "k1k2": selection.Hook.LAYER,
+    }
+    assert all(isinstance(b, selection.MonoBackend) for b in selection.PRIORITY)
 
 
 def _v41_config():
@@ -401,7 +560,7 @@ class _Block(torch.nn.Module):
 
 def test_weight_table_is_the_loaded_tp4_shard():
     from atom.models.deepseek_v41.config import AttentionMode
-    from atom.models.deepseek_v41.mono import weights
+    from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights
 
     table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
     # as a TP4 server loads them (the p1 weight manifest)
@@ -438,7 +597,7 @@ def test_weight_table_is_the_loaded_tp4_shard():
 )
 def test_weight_table_follows_the_tp_size(tp, name, shape):
     from atom.models.deepseek_v41.config import AttentionMode
-    from atom.models.deepseek_v41.mono import weights
+    from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights
 
     assert (
         weights.expected(_v41_config(), AttentionMode.FULL, Dims(tp))[name][0] == shape
@@ -447,7 +606,7 @@ def test_weight_table_follows_the_tp_size(tp, name, shape):
 
 def test_a_weight_off_the_table_is_refused():
     from atom.models.deepseek_v41.config import AttentionMode
-    from atom.models.deepseek_v41.mono import weights
+    from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights
     from atom.mono.runtime.consensus import MonoUnsupported
 
     table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))
@@ -469,7 +628,7 @@ def test_a_weight_off_the_table_is_refused():
 )
 def test_routed_experts_off_a8w4_are_refused(interleaved, fp8_activations):
     from atom.models.deepseek_v41.config import AttentionMode
-    from atom.models.deepseek_v41.mono import weights
+    from atom.models.deepseek_v41.mono.gfx950.k1k2 import weights
     from atom.mono.runtime.consensus import MonoUnsupported
 
     table = weights.expected(_v41_config(), AttentionMode.FULL, Dims(4))

@@ -184,7 +184,7 @@ def run_fixture(args):
     tag = 10
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-    from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
+    from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
     from atom.mono.runtime.mailboxes import StepMailboxes
     from atom.mono.runtime.peer_memory import PeerBuffer
     from atom.mono.runtime.uncached import uncached_bytes

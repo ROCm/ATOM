@@ -29,7 +29,7 @@ from torch import nn
 
 from atom.models.deepseek_v41.mono import hi_runner
 from atom.models.deepseek_v41.mono import round as hi_round
-from atom.models.deepseek_v41.mono.dispatch import (
+from atom.models.deepseek_v41.mono.gfx950.k1k2.dispatch import (
     MonoDecodeModel,
     MonoDraftModel,
     step_supported,

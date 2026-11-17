@@ -90,13 +90,18 @@ Key entry points:
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
   `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
-  `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
+  `deepseek_v41/mono/gfx950/k1k2/{index,attention,moe}_plan.py`, each called by both the
   kernel and its CPU I3 test. On gfx1250, V4.1's whole DSpark decode step is one
   persistent FlyDSL kernel a rank (`deepseek_v41/mono/gfx1250/`: a target launch
   through sampling and verification, then a draft launch), which ModelRunner
   is offered through `atom/mono/runtime/step_override.py`; it reads the
   production MoE's experts in place, and `tests/test_deepseek_v41_gfx1250.py`
-  is its CPU test. Kimi-K3 runs K1 (the attention seam through
+  is its CPU test. On gfx950 one table picks V4.1's backend
+  (`deepseek_v41/mono/selection.py` over `deployment.py`): the TileRT-structured
+  TP8 step (`mono/gfx950/tk`: FlyDSL ports of TileRT 0.1.7's step kernels and
+  ATOM's own host for them, behind the same step override; its PD decode server
+  in `mono/gfx950/pd`; CPU test `tests/test_deepseek_v41_mono_tk.py`), the
+  high-interactivity monokernels below, or ATOM's K1 / K2 (`mono/gfx950/k1k2`). Kimi-K3 runs K1 (the attention seam through
   the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, on
   a plain decode or a uniform speculative verify of at most 64 rows (16-row
   token groups past 16), with or without ReplaySSM. The MLA layers keep
@@ -133,7 +138,8 @@ Key entry points:
   V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
-  python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
+  python -m atom.models.<model>.mono.contract` (DeepSeek-V4.1's:
+  `atom.models.deepseek_v41.mono.gfx950.k1k2.contract`); GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
   yet). DeepSeek-V4.1 also has the high-interactivity monokernels
   (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`

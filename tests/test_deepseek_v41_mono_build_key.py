@@ -12,11 +12,11 @@ import pytest
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
-from atom.models.deepseek_v41.mono.kernels.moe_shape import MoeBuild
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.k1k2.kernels.moe_shape import MoeBuild
 from atom.mono.runtime.compile import compile_only
 
 # a diag offset past every build's regions

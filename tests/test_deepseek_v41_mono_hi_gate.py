@@ -119,6 +119,10 @@ def mi355x(monkeypatch):
         lambda name: object() if name == "flydsl" else None,
     )
     monkeypatch.delenv("ATOM_DSV41_MONO_HI", raising=False)
+    # on a gfx950 host the TileRT-path step is asked first; its selection is test_deepseek_v41_mono_dispatch.py's
+    from atom.models.deepseek_v41.mono.gfx950.tk import gate as tk_gate
+
+    monkeypatch.setattr(tk_gate, "enabled", lambda: False)
 
 
 def test_the_default_is_auto(mi355x):
@@ -371,13 +375,13 @@ def dispatch_module(monkeypatch):
 
     from aiter_stub import _drop
 
-    name = "atom.models.deepseek_v41.mono.dispatch"
+    name = "atom.models.deepseek_v41.mono.gfx950.k1k2.dispatch"
     saved = sys.modules.get(name)
     for mod, cls in (
         ("runner", "V41MonoDecodeRunner"),
         ("draft_runner", "DraftMonoRunner"),
     ):
-        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
+        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.gfx950.k1k2.{mod}")
         setattr(stub, cls, object)
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     _drop(name)
@@ -409,16 +413,23 @@ def test_a_model_the_hi_path_does_not_serve_falls_back(
     stub.install_hi = install_hi
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     monkeypatch.setenv("ATOM_DSV41_MONO_HI", mode)
-    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
-    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
-    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    monkeypatch.setattr(
+        "atom.models.deepseek_v41.mono.gfx950.k1k2.config.config_refusal",
+        lambda cfg: None,
+    )
+    monkeypatch.setattr(
+        "atom.mono.runtime.deployment.dp_attention_ranks", lambda cfg: 0
+    )
+    monkeypatch.setattr(hi_gate, "refusal", lambda *a: "")
     monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
+    from atom.models.deepseek_v41.mono.dispatch import install_mono_decode
+
     if mode == "1":
         with pytest.raises(MonoUnsupported, match="FlyDSL layout"):
-            dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+            install_mono_decode("model", served, None, metadata_builder=None)
         return
     with caplog.at_level(logging.INFO, logger="atom"):
-        got = dispatch.install_mono_decode("model", served, None, metadata_builder=None)
+        got = install_mono_decode("model", served, None, metadata_builder=None)
     assert got == "atom mono"
     assert [r.getMessage() for r in caplog.records] == [
         "V4.1 mono hi off: routed experts not in the gfx950 FlyDSL layout"
@@ -452,13 +463,16 @@ def hi_dispatch_module(monkeypatch):
 
     from aiter_stub import _drop
 
-    names = [f"atom.models.deepseek_v41.mono.{m}" for m in ("hi_dispatch", "dispatch")]
+    names = [
+        "atom.models.deepseek_v41.mono.hi_dispatch",
+        "atom.models.deepseek_v41.mono.gfx950.k1k2.dispatch",
+    ]
     saved = {name: sys.modules.get(name) for name in names}
     for mod, cls in (
         ("runner", "V41MonoDecodeRunner"),
         ("draft_runner", "DraftMonoRunner"),
     ):
-        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.{mod}")
+        stub = types.ModuleType(f"atom.models.deepseek_v41.mono.gfx950.k1k2.{mod}")
         setattr(stub, cls, object)
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
     for name in names:
@@ -617,22 +631,27 @@ def test_a_refusal_on_another_rank_keeps_atoms_mono_path_here(
     """Through ``install_mono_decode`` under "auto": a refusal agreed at install (here another rank's) leaves this
     rank on ATOM's mono decode, as every other rank, with one line naming the rank and its reason.
     """
-    dispatch = sys.modules["atom.models.deepseek_v41.mono.dispatch"]
+    dispatch = sys.modules["atom.models.deepseek_v41.mono.gfx950.k1k2.dispatch"]
     _, args, draft = _install_world(
         hi_dispatch_module, monkeypatch, others=("MonoUnsupported: shard", None, None)
     )
-    monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
-    monkeypatch.setattr(dispatch, "dp_attention_ranks", lambda cfg: 0)
-    monkeypatch.setattr(dispatch.hi_gate, "decide", lambda *a: True)
+    monkeypatch.setattr(
+        "atom.models.deepseek_v41.mono.gfx950.k1k2.config.config_refusal",
+        lambda cfg: None,
+    )
+    monkeypatch.setattr(
+        "atom.mono.runtime.deployment.dp_attention_ranks", lambda cfg: 0
+    )
+    monkeypatch.setattr(hi_gate, "refusal", lambda *a: "")
     monkeypatch.setattr(dispatch, "MonoDecodeModel", lambda *a: "atom mono")
     monkeypatch.setattr(
         dispatch, "MonoDraftModel", lambda m, dp: ("atom mono draft", m)
     )
     model, cfg, drafter, builder, _ = args
     with caplog.at_level(logging.INFO, logger="atom"):
-        got = dispatch.install_mono_decode(
-            model, cfg, drafter, metadata_builder=builder
-        )
+        from atom.models.deepseek_v41.mono.dispatch import install_mono_decode
+
+        got = install_mono_decode(model, cfg, drafter, metadata_builder=builder)
     assert got == "atom mono"
     assert drafter.model == ("atom mono draft", draft)
     assert [r.getMessage() for r in caplog.records] == [

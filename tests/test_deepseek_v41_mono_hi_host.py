@@ -744,11 +744,13 @@ def test_engram_staging_skips_its_lookup_on_a_served_step():
 
 
 def test_the_gate_decides_before_any_hi_import():
-    """``dispatch`` imports the gate (``hi_gate``: configuration, environment and device properties only) and reaches
-    the hook only through the gate's yes (a lazy import of ``hi_dispatch``); the hook's modules import nothing of the
-    hi runtime (``mono.hi``) at module level, and importing them loads none of it."""
+    """``dispatch`` / ``selection`` import the gate (``hi_gate``: configuration, environment and device properties
+    only) and reach the hook only through the gate's yes (a lazy import of ``hi_dispatch``); the hook's modules
+    import nothing of the hi runtime (``mono.hi``) at module level, and importing them loads none of it.
+    """
     hi = re.compile(r"(^|[.:])hi(_|\.|$)")
-    tree = ast.parse((MONO / "dispatch.py").read_text())
+    files = ("dispatch.py", "selection.py")
+    tree = ast.Module([n for f in files for n in ast.parse((MONO / f).read_text()).body], [])  # fmt: skip
     top = {
         (n.module or "") + ":" + a.name
         for n in tree.body
