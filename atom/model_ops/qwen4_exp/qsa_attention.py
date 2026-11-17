@@ -53,7 +53,6 @@ from atom.model_ops.qwen4_exp.ops.gated import (
     sigmoid_mul_quant,
 )
 from atom.model_ops.qwen4_exp.ops.qsa import (
-    _selection_widths,
     qsa_apply_mrope,
     qsa_cache_formats,
     qsa_cache_row_layout,
@@ -61,6 +60,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_expand_block_indices,
     qsa_select_paged_groups,
     qsa_select_paged_tokens,
+    qsa_selection_widths,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
     qsa_store_rows,
@@ -184,12 +184,13 @@ class _FlyDSLPrefill:
     lengths, so the first one makes the checks, the per-request prefix lengths
     and the kernel-width selection buffer, and leaves them on the forward's
     QSA metadata. `key` holds what the decision reads from the layer and the
-    query; a layer with another key makes its own. The host lengths
-    (`query_lens`, `prefix_lens`) come from `qsa.host_lens` and are not in the
-    key. That is safe because the layout lives on one forward's metadata: the
-    SGLang bridge builds a new `Qwen4ExpQSAMetadata` every forward
-    (`build_qsa_metadata` in `qwen4_exp_bridge.py`), and a `for_tokens` that
-    trims rows returns a copy without the layout.
+    query; a layer with another key makes its own. What it reads from `qsa`
+    (the host lengths, and the block table width and longest sequence that set
+    the selection width) is not in the key. That is safe because the layout
+    lives on one forward's metadata: the SGLang bridge builds a new
+    `Qwen4ExpQSAMetadata` every forward (`build_qsa_metadata` in
+    `qwen4_exp_bridge.py`), and a `for_tokens` that trims rows returns a copy
+    without the layout.
     """
 
     __slots__ = (
@@ -222,7 +223,7 @@ class _FlyDSLPrefill:
             return
         self.laid_out = True
         if reason is None:
-            columns = _selection_widths(
+            columns = qsa_selection_widths(
                 layer.compressed_key_cache,
                 qsa.block_tables,
                 topk,
@@ -710,7 +711,7 @@ class Qwen4ExpAttention(nn.Module):
                 plan = _FlyDSLPrefill.of(self, query, qsa)
                 if plan.ready:
                     # FlyDSL reads the selection at its kernel width: select
-                    # straight into that buffer instead of padding a copy.
+                    # straight into that buffer.
                     out = plan.selection_out(query.device)
             selected = self._select_tokens(hidden_states, positions, qsa, rows, out)
             attn_out = None

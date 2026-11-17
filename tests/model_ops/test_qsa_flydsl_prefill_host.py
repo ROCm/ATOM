@@ -203,14 +203,14 @@ def test_layout_is_made_once_per_forward(modules, flydsl, monkeypatch):
     layout."""
     qa = modules.qsa_attention
     checks, widths = [], []
-    real_check, real_widths = qa.flydsl_fallback_reason, qa._selection_widths
+    real_check, real_widths = qa.flydsl_fallback_reason, qa.qsa_selection_widths
     monkeypatch.setattr(
         qa,
         "flydsl_fallback_reason",
         lambda *a, **kw: checks.append(a) or real_check(*a, **kw),
     )
     monkeypatch.setattr(
-        qa, "_selection_widths", lambda *a: widths.append(a) or real_widths(*a)
+        qa, "qsa_selection_widths", lambda *a: widths.append(a) or real_widths(*a)
     )
     layer, qsa = _layer(), _qsa(modules, prefix=6080)
     for _ in range(12):
