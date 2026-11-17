@@ -51,6 +51,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_ROW_STRIDE,
     TDM_SLAB,
     TDM_SPLIT_FP4_PITCH,
+    TDM_SPLIT_FP4_ROW_WORDS,
     TDM_SPLIT_GROUP,
     TDM_SPLIT_MAX_TASKS,
     TDM_SPLIT_ROW_STRIDE,
@@ -722,7 +723,11 @@ SPLIT_TOKEN_WAVES = WAVES - 2
 SCOPE_SE = 8
 THREADS = WAVES * GFX1250.wave_size
 _STAGE_WORDS = WAVES * TDM_SPLIT_TILE_WORDS
+_FP4_PAD_EVERY = (
+    TDM_SPLIT_FP4_ROW_WORDS if TDM_SPLIT_FP4_PITCH > TDM_SPLIT_FP4_ROW_WORDS else 0
+)
 assert TDM_CLUSTER == 4
+assert TDM_SPLIT_FP4_PITCH - TDM_SPLIT_FP4_ROW_WORDS in (0, 1)
 
 
 def fp4x8_to_bf16(word, exponent, scale_sel=0):
@@ -739,11 +744,11 @@ def fp4x8_to_bf16(word, exponent, scale_sel=0):
     )
 
 
-def _fp4_operand(lds, wave, lane, exponent):
+def _fp4_operand(lds, wave, lane, exponent, pitch=TDM_SPLIT_FP4_PITCH):
     """``_operand`` of a 16-row MXFP4 slab (E2M1 pairs, low nibble first, rows
-    ``TDM_SPLIT_FP4_PITCH`` dwords apart) times its E8M0 ``exponent``: exact."""
+    ``pitch`` dwords apart) times its E8M0 ``exponent``: exact."""
 
-    base = lds + (lane % ROWS) * TDM_SPLIT_FP4_PITCH + wave * 4 + lane // ROWS
+    base = lds + (lane % ROWS) * pitch + wave * 4 + lane // ROWS
     elements = []
     for pack in range_constexpr(2):
         converted = fp4x8_to_bf16(fx.ptr_load(base + 2 * pack), exponent)
@@ -788,9 +793,12 @@ def _split_weight_wait(role, s, slabs, stages):
 
 @traced
 def _split_weight_issue(role, s, slabs, stages, groups, issue):
-    if (role >= SPLIT_TOKEN_WAVES) & (role < SPLIT_TOKEN_WAVES + groups):
-        if s + stages < slabs:
-            issue(s + stages)
+    if (
+        (role >= SPLIT_TOKEN_WAVES)
+        & (role < SPLIT_TOKEN_WAVES + groups)
+        & (s + stages < slabs)
+    ):
+        issue(s + stages)
 
 
 @traced
@@ -826,6 +834,7 @@ def project_split(
     resident=False,
     prologue=None,
     x_cache_policy=0,
+    cta0=0,
 ):
     """``project`` with K split over the TDM cluster. The cluster's tasks are
     ``len(groups)`` groups of four consecutive 16-row tasks, task ``4 g + i``
@@ -841,8 +850,12 @@ def project_split(
     ``fmt``: ``SPLIT_FORMATS``; FP8 groups each lie in one 128-row scale block.
     ``resident``: the CTA's whole weight share is copied up front, before
     ``prologue`` (which may wait for ``x``), so only the tokens follow it.
+    ``cta0``: the launch's first CTA that calls this (a multiple of the
+    cluster), so ``scratch`` holds the CTAs from it on.
     Every CTA of a cluster calls this alike: it runs one cluster barrier."""
 
+    if cta0 % TDM_CLUSTER:
+        raise ValueError(f"split-K CTAs start a cluster, not at {cta0}")
     slabs = tdm_split_slabs(k)
     group_count = len(groups)
     if len(owners) != group_count or not 1 <= group_count <= 2:
@@ -869,7 +882,7 @@ def project_split(
     if const_expr(group_count == 2):
         group_row = _uniform((group == 1).select(group_rows[1], group_rows[0]))
 
-    if const_expr(fmt == "fp8"):
+    if const_expr(fmt == "fp8"):  # noqa: SIM102
         if wave < group_count:
             word = bo.buffer_load(
                 rsrc(w_scale),
@@ -887,10 +900,9 @@ def project_split(
             if item < share:
                 row = item // row_words
                 row_group = row // (TDM_SPLIT_GROUP * ROWS)
-                source = (
-                    (row_group == 1).select(group_rows[-1], group_rows[0])
-                    + row % (TDM_SPLIT_GROUP * ROWS)
-                )
+                source = (row_group == 1).select(
+                    group_rows[-1], group_rows[0]
+                ) + row % (TDM_SPLIT_GROUP * ROWS)
                 word = bo.buffer_load(
                     rsrc(w_scale),
                     (source * (k // 32) + rank * (8 * slabs)) // 4 + item % row_words,
@@ -919,7 +931,9 @@ def project_split(
         global_slab = fx.Int64(rank * slabs + slab)
         if const_expr(fmt == "bf16"):
             load_rows(
-                w + fx.Int64(row) * fx.Int64(k * 2) + global_slab * fx.Int64(SPLIT_SLAB * 2),
+                w
+                + fx.Int64(row) * fx.Int64(k * 2)
+                + global_slab * fx.Int64(SPLIT_SLAB * 2),
                 k,
                 destination,
                 fx.Int32(w_rows) - row,
@@ -934,7 +948,9 @@ def project_split(
             # A task's slab is one contiguous 16 x 256 B block, the group's
             # four of them 16 rows of K apart.
             load_rows(
-                w + fx.Int64(row) * fx.Int64(k) + global_slab * fx.Int64(SPLIT_SLAB * ROWS),
+                w
+                + fx.Int64(row) * fx.Int64(k)
+                + global_slab * fx.Int64(SPLIT_SLAB * ROWS),
                 ROWS * k // 2,
                 destination,
                 TDM_SPLIT_GROUP,
@@ -947,13 +963,15 @@ def project_split(
             )
         else:
             load_rows(
-                w + fx.Int64(row) * fx.Int64(k // 2) + global_slab * fx.Int64(SPLIT_SLAB // 2),
+                w
+                + fx.Int64(row) * fx.Int64(k // 2)
+                + global_slab * fx.Int64(SPLIT_SLAB // 2),
                 k // 4,
                 destination,
                 fx.Int32(w_rows) - row,
                 TDM_SPLIT_GROUP * ROWS,
                 padded=False,
-                pad_every=0,
+                pad_every=_FP4_PAD_EVERY,
                 cache_policy=_WEIGHT_CACHE_POLICY,
                 whole=True,
                 uniform=True,
@@ -1004,7 +1022,10 @@ def project_split(
         block = rank * (2 * slabs) + 2 * s + wave // 4
         if const_expr(fmt == "fp8"):
             exponents = [
-                (fx.ptr_load(scales + g * GFX1250.wave_size + block // 4) >> (block % 4 * 8))
+                (
+                    fx.ptr_load(scales + g * GFX1250.wave_size + block // 4)
+                    >> (block % 4 * 8)
+                )
                 & 0xFF
                 for g in range(group_count)
             ]
@@ -1075,7 +1096,7 @@ def project_split(
     gpu.barrier()
     own = lds + tasks * tiles * _STAGE_WORDS
     owned = [owner(rank) for owner in owners]
-    cta = fx.Int32(fx.block_idx.x)
+    cta = fx.Int32(fx.block_idx.x) - cta0
     partials = rsrc(scratch)
     items = tasks * tiles * GFX1250.wave_size
     for round_index in range_constexpr((items + THREADS - 1) // THREADS):
@@ -1089,7 +1110,9 @@ def project_split(
             slot = (t == owned[1]).select(fx.Int32(1), fx.Int32(0))
             mine = mine | (t == owned[1])
         if valid:
-            slab_sums = lds + (t * tiles + tl) * _STAGE_WORDS + lane * ACCUMULATOR_ELEMENTS
+            slab_sums = (
+                lds + (t * tiles + tl) * _STAGE_WORDS + lane * ACCUMULATOR_ELEMENTS
+            )
             total = _load8(slab_sums)
             for source_wave in range_constexpr(1, WAVES):
                 total = _add8(
@@ -1099,11 +1122,14 @@ def project_split(
             if mine:
                 fx.ptr_store(
                     total.bitcast(fx.Int32),
-                    own + (slot * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                    own
+                    + (slot * tiles + tl) * TDM_SPLIT_TILE_WORDS
                     + lane * ACCUMULATOR_ELEMENTS,
                 )
             else:
-                at = ((cta * TDM_SPLIT_MAX_TASKS + t) * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                at = (
+                    (cta * TDM_SPLIT_MAX_TASKS + t) * tiles + tl
+                ) * TDM_SPLIT_TILE_WORDS
                 for half in range_constexpr(2):
                     bo.buffer_store(
                         fx.Vector.from_elements(
@@ -1127,7 +1153,9 @@ def project_split(
             if const_expr(group_count == 2):
                 task_id = (j == 1).select(owned[1], owned[0])
             own_sum = _load8(
-                own + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS + lane * ACCUMULATOR_ELEMENTS
+                own
+                + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                + lane * ACCUMULATOR_ELEMENTS
             )
             summed = None
             for source in range_constexpr(TDM_CLUSTER):
@@ -1156,6 +1184,8 @@ def project_split(
                 summed = term if summed is None else _add8(summed, term)
             fx.ptr_store(
                 summed.bitcast(fx.Int32),
-                out + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS + lane * ACCUMULATOR_ELEMENTS,
+                out
+                + (j * tiles + tl) * TDM_SPLIT_TILE_WORDS
+                + lane * ACCUMULATOR_ELEMENTS,
             )
     gpu.barrier()

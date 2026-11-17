@@ -19,6 +19,8 @@ from atom.models.kimi_k3.mono.kernels.attention.mailbox_contract import (
     K1_REQUIRED_CAPABILITIES,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import (
+    ATTENTION_CTAS,
+    PROJECTION_TASKS,
     K1Protocol,
     ProgressProof,
     ResidencyAssumption,
@@ -30,8 +32,13 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     LdsRegion,
 )
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_CLUSTER,
     TDM_FP8_DEPTH,
+    TDM_SPLIT_MAX_TASKS,
     tdm_lds_bytes,
+    tdm_split_lds_words,
+    tdm_split_scratch_bytes,
+    tdm_split_stages,
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import TokenTile
 from atom.mono.plan.architecture import GFX1250
@@ -168,6 +175,10 @@ class K1RoleLdsPlan:
     smem_fields: tuple[LdsField, ...]
     role_variants: tuple[RoleLdsVariant, ...]
     xrow: int
+    # Split-K in-projection (``gemv_tdm.project_split``): its weight format
+    # and slab stages, or None and 0.
+    split_format: str | None = None
+    split_stages: int = 0
 
     @property
     def smem(self) -> LdsRegion:
@@ -363,12 +374,24 @@ class K1LocalBuildSpec:
     # The in-projection is ATOM's online per_1x128 FP8 (preshuffled, E8M0
     # block scales in ``w_in_scale``) rather than BF16.
     fp8_projection: bool = False
+    # Split K over each TDM cluster of in-projection CTAs
+    # (ATOM_KIMI_MONO_SPLITK=k1): a CTA streams a quarter of K for eight
+    # tasks, then sums its two over the cluster.
+    split_projection: bool = False
+
+    @property
+    def split_format(self) -> str | None:
+        if not self.split_projection:
+            return None
+        return "fp8" if self.fp8_projection else "bf16"
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
             raise ValueError("local K1 qlen must be in [1, 16] and divide tokens")
         if self.fp8_projection and not self.tdm_projection:
             raise ValueError("local K1 reads an FP8 in-projection through the TDM only")
+        if self.split_projection and not self.tdm_projection:
+            raise ValueError("local K1 splits K of a TDM in-projection only")
         # The FP8 slabs reuse the LDS planned for the BF16 ones.
         if self.fp8_projection and tdm_lds_bytes(
             plan.tokens, PROJECTION_TASKS_PER_CTA, True, TDM_FP8_DEPTH
@@ -424,13 +447,28 @@ class K1LocalBuildSpec:
         return len(self.stage_order)
 
 
+def split_projection_ctas(blocks: int) -> int:
+    """The split-K in-projection's CTAs: whole clusters past the attention
+    CTAs, eight tasks a cluster."""
+
+    ctas = blocks - ATTENTION_CTAS
+    if ATTENTION_CTAS % TDM_CLUSTER or ctas % TDM_CLUSTER:
+        raise ValueError("split-K K1 projection CTAs must be whole TDM clusters")
+    if ctas // TDM_CLUSTER * TDM_SPLIT_MAX_TASKS < PROJECTION_TASKS:
+        raise ValueError(f"split-K K1 needs {PROJECTION_TASKS} tasks of {ctas} CTAs")
+    assert TDM_SPLIT_MAX_TASKS == TDM_CLUSTER * PROJECTION_TASKS_PER_CTA
+    return ctas
+
+
 def role_lds_plan(
     plan: Gfx1250KimiBuildPlan,
     *,
     qlen: int,
     gemv_unit: int = 2,
+    split: str | None = None,
 ) -> K1RoleLdsPlan:
-    """Construct K1's exact Smem + role-union LDS byte layout."""
+    """Construct K1's exact Smem + role-union LDS byte layout. ``split``: the
+    split-K in-projection's weight format (``K1LocalBuildSpec.split_format``)."""
 
     if plan.nblocks is None:
         raise ValueError("gfx1250 K1 LDS needs explicit nblocks")
@@ -473,6 +511,19 @@ def role_lds_plan(
     accumulator_bytes = (
         PROJECTION_TASKS_PER_CTA * plan.token_tiling.tile_count * red_elements * 4
     )
+    split_stages = 0
+    if split is not None:
+        split_projection_ctas(plan.blocks)
+        budget = (plan.lds_bytes - smem_bytes - _align(accumulator_bytes)) // 4
+        split_stages = tdm_split_stages(plan.tokens, HIDDEN, split, budget)
+        if not split_stages:
+            raise ValueError(
+                f"gfx1250 K1 split-K projection does not fit {plan.tokens} rows"
+            )
+        projection_bytes = max(
+            projection_bytes,
+            4 * tdm_split_lds_words(plan.tokens, HIDDEN, split, split_stages),
+        )
     if smem_bytes + projection_bytes + accumulator_bytes > plan.lds_bytes:
         raise ValueError(
             "gfx1250 K1 projection needs "
@@ -509,7 +560,7 @@ def role_lds_plan(
         LdsRegion("role", smem_bytes, role_bytes),
     )
     arena = KimiLdsPlan(plan.lds_bytes, regions, (slabs,))
-    return K1RoleLdsPlan(arena, smem_fields, variants, xrow)
+    return K1RoleLdsPlan(arena, smem_fields, variants, xrow, split, split_stages)
 
 
 def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
@@ -571,15 +622,30 @@ def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
     return spec
 
 
+def split_projection_fits(
+    plan: Gfx1250KimiBuildPlan, *, qlen: int, gemv_unit: int = 2, fp8: bool = True
+) -> bool:
+    """Whether K1's split-K in-projection fits ``plan``'s grid and LDS."""
+
+    try:
+        role_lds_plan(
+            plan, qlen=qlen, gemv_unit=gemv_unit, split="fp8" if fp8 else "bf16"
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def declare(
     plan: Gfx1250KimiBuildPlan,
     *,
     qlen: int,
     gemv_unit: int = 2,
+    split: str | None = None,
 ) -> K1KernelDeclaration:
     """Create the gfx1250 K1 declaration up to kernel-body emission."""
 
-    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit)
+    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit, split=split)
     GFX1250_MAILBOX.require(*K1_REQUIRED_CAPABILITIES)
     assert plan.nblocks is not None
     name = (
@@ -613,6 +679,7 @@ def declare_local(
     *,
     qlen: int,
     gemv_unit: int = 2,
+    split: str | None = None,
 ) -> K1KernelDeclaration:
     """Declare K1 for the external-collective path.
 
@@ -622,7 +689,7 @@ def declare_local(
     """
 
     return replace(
-        declare(plan, qlen=qlen, gemv_unit=gemv_unit),
+        declare(plan, qlen=qlen, gemv_unit=gemv_unit, split=split),
         unsupported_device_protocol=(),
     )
 
@@ -637,6 +704,14 @@ def local_scratch_layout(
     layout["sync"] = (_align(end), 8)
     end = layout["sync"][0] + layout["sync"][1]
     layout["x"] = (_align(end), declaration.tokens * HIDDEN * 2)
+    if declaration.lds.split_stages:
+        end = layout["x"][0] + layout["x"][1]
+        layout["split"] = (
+            _align(end),
+            tdm_split_scratch_bytes(
+                split_projection_ctas(declaration.blocks), declaration.tokens
+            ),
+        )
     return layout
 
 
@@ -652,6 +727,7 @@ def build_local(
         plan,
         qlen=spec.qlen,
         gemv_unit=spec.gemv_unit,
+        split=spec.split_format,
     )
     declaration = replace(
         declaration,

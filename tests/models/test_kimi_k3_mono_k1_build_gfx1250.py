@@ -86,6 +86,55 @@ def test_local_scratch_covers_every_protocol_region():
         assert layout[name][1] == pairs * 8
 
 
+def test_split_projection_owns_whole_clusters_past_attention():
+    assert builder.split_projection_ctas(256) == 200
+    with pytest.raises(ValueError, match="whole TDM clusters"):
+        builder.split_projection_ctas(254)
+    with pytest.raises(ValueError, match="tasks"):
+        builder.split_projection_ctas(240)
+
+
+@pytest.mark.parametrize("rows", [1, 10, 20, 40, 48])
+def test_fp8_split_projection_fits_every_row_count(rows):
+    plan = _plan(rows)
+    assert builder.split_projection_fits(plan, qlen=1)
+    lds = builder.role_lds_plan(plan, qlen=1, split="fp8")
+    assert lds.split_format == "fp8"
+    assert lds.split_stages == (3 if rows <= 46 else 2)
+    assert lds.smem.bytes + lds.role.bytes <= plan.lds_bytes
+
+
+def test_bf16_split_projection_refuses_rows_it_cannot_hold():
+    assert builder.split_projection_fits(_plan(36), qlen=1, fp8=False)
+    assert not builder.split_projection_fits(_plan(40), qlen=1, fp8=False)
+    with pytest.raises(ValueError, match="does not fit 40 rows"):
+        builder.role_lds_plan(_plan(40), qlen=1, split="bf16")
+
+
+def test_split_scratch_follows_the_x_handoff():
+    plan = _plan(40)
+    declaration = builder.declare_local(plan, qlen=1, split="fp8")
+    layout = builder.local_scratch_layout(declaration)
+    x_offset, x_bytes = layout["x"]
+    offset, size = layout["split"]
+    assert tuple(layout)[-2:] == ("x", "split")
+    assert offset % 16 == 0 and offset >= x_offset + x_bytes
+    assert size == 200 * 8 * 3 * 256 * 4
+    assert "split" not in builder.local_scratch_layout(
+        builder.declare_local(plan, qlen=1)
+    )
+
+
+def test_split_projection_requires_the_tdm_projection():
+    spec = replace(
+        _spec(qlen=1), state_len=3, split_projection=True, tdm_projection=False
+    )
+    with pytest.raises(ValueError, match="split"):
+        spec.validate(_plan(40))
+    assert replace(spec, tdm_projection=True).split_format == "bf16"
+    assert replace(spec, fp8_projection=True).split_format == "fp8"
+
+
 def test_resident_projection_reuses_each_weight_slab_across_s48_tiles():
     plan = _plan(48)
     spec = _spec()

@@ -163,16 +163,15 @@ def _as_f32(param, n: int, name: str) -> torch.Tensor:
     return t.reshape(-1).float().contiguous()
 
 
-def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
-    """A preshuffled MXFP4 linear as bf16 ``shape``: both AITER shuffles undone
-    (``layouts``), then the E2M1 values scaled by their E8M0 group scale. A bf16
-    checkpoint has no scale and is already what the kernels read."""
-    from atom.model_ops.quant_v4 import dequant_fp4_e2m1
-
+def _mxfp4_planes(module, name: str, shape: tuple[int, int]):
+    """A preshuffled MXFP4 linear as row-major planes: ``(packed, scale)``,
+    ``[rows, cols / 2]`` E2M1 pairs (low nibble first) and ``[rows, cols / 32]``
+    E8M0 bytes, both AITER shuffles undone (``layouts``). None for a bf16
+    checkpoint, which has no scale."""
     w = _param(module, name)
     scale = getattr(module, "weight_scale", None)
     if scale is None and w.dtype == BF16:
-        return _plain_bf16(module, name, shape)
+        return None
     rows, cols = shape
     _need(scale is not None, f"{name}: no weight_scale")
     _need(w.element_size() == 1, f"{name} is {w.dtype}, expected packed FP4")
@@ -201,6 +200,19 @@ def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
             f"expected {rows * groups}",
         )
         plane = scale.data.reshape(rows, groups)
+    return packed.contiguous(), plane.view(torch.uint8).contiguous()
+
+
+def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
+    """A preshuffled MXFP4 linear as bf16 ``shape``: ``_mxfp4_planes``, then the
+    E2M1 values scaled by their E8M0 group scale. A bf16 checkpoint is already
+    what the kernels read."""
+    from atom.model_ops.quant_v4 import dequant_fp4_e2m1
+
+    planes = _mxfp4_planes(module, name, shape)
+    if planes is None:
+        return _plain_bf16(module, name, shape)
+    packed, plane = planes
     return dequant_fp4_e2m1(
         packed.view(torch.int8), plane.view(torch.float8_e8m0fnu), MX_GROUP, BF16
     )
@@ -295,6 +307,10 @@ class ExternalMoeLayer(RoutedMoeLayer):
     # None (BF16).
     w_sgu_scale: torch.Tensor | None = None
     w_sd_scale: torch.Tensor | None = None
+    # The latent down-projection's MXFP4 planes (``_mxfp4_planes``) where the
+    # split-K front reads them (ATOM_KIMI_MONO_SPLITK=front), else None.
+    w_ld_fp4: torch.Tensor | None = None
+    w_ld_scale: torch.Tensor | None = None
 
 
 def _seam(site, name: str) -> AttnRes:
@@ -556,10 +572,12 @@ def bind_external_moe(
     rank: int,
     architecture: Architecture,
     fp8_shared: bool = False,
+    fp4_latent: bool = False,
 ) -> ExternalMoeLayer:
     """Bind native K2 local stages while leaving o_proj on its quantized path.
     ``fp8_shared``: K2 reads an online per_1x128 FP8 shared gate/up and down
-    as they are; otherwise they must stay BF16."""
+    as they are; otherwise they must stay BF16. ``fp4_latent``: an MXFP4
+    latent down-projection's planes too (``ExternalMoeLayer.w_ld_fp4``)."""
 
     routed = bind_routed_moe(
         layer,
@@ -592,6 +610,16 @@ def bind_external_moe(
     w_sd, w_sd_scale = linear(
         shared.down_proj, f"{name} shared down_proj", (HIDDEN, dims.sh_inter)
     )
+    planes = (
+        _mxfp4_planes(
+            layer.block_sparse_moe.routed_expert_down_proj,
+            f"{name} routed_expert_down_proj",
+            (LATENT, HIDDEN),
+        )
+        if fp4_latent
+        else None
+    )
+    w_ld_fp4, w_ld_scale = planes if planes is not None else (None, None)
     return ExternalMoeLayer(
         **routed.__dict__,
         w_up_full=up.data if whole_up else None,
@@ -599,6 +627,8 @@ def bind_external_moe(
         w_sgu_scale=w_sgu_scale,
         w_sd=w_sd,
         w_sd_scale=w_sd_scale,
+        w_ld_fp4=w_ld_fp4,
+        w_ld_scale=w_ld_scale,
     )
 
 

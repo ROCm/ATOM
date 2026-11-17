@@ -88,8 +88,10 @@ _SPLIT_STAGE_WORDS = 8 * TDM_SPLIT_TILE_WORDS
 # Weight formats: BF16, ATOM's per_1x128 FP8 (AITER preshuffle, [rows / 128,
 # k / 128] E8M0), and MXFP4 ([rows, k / 2] E2M1 pairs, [rows, k / 32] E8M0).
 SPLIT_FORMATS = ("bf16", "fp8", "fp4")
-# An FP4 row's 128-byte slab lands 33 dwords apart in LDS.
-TDM_SPLIT_FP4_PITCH = TDM_SPLIT_SLAB // 8
+# An FP4 row's 128-byte slab lands 33 dwords apart in LDS (a pad dword after
+# every row), so a 16-row operand read spreads over distinct banks.
+TDM_SPLIT_FP4_ROW_WORDS = TDM_SPLIT_SLAB // 8
+TDM_SPLIT_FP4_PITCH = TDM_SPLIT_FP4_ROW_WORDS + 1
 
 
 def tdm_split_slabs(k: int) -> int:
@@ -147,6 +149,19 @@ def tdm_split_post_words(rows: int, groups: int = 2) -> int:
     )
 
 
+def tdm_split_out_word(rows: int) -> int:
+    """Where in the split-K LDS its sums may land (``project_split``'s
+    ``out``): past every wave's accumulators and the CTA's own partials,
+    inside ``tdm_split_post_words`` of two groups."""
+
+    tiles = (rows + ROWS - 1) // ROWS
+    return (
+        tiles
+        * (TDM_SPLIT_MAX_TASKS * _SPLIT_STAGE_WORDS // TDM_SPLIT_TILE_WORDS + 2)
+        * (TDM_SPLIT_TILE_WORDS)
+    )
+
+
 def tdm_split_lds_words(
     rows: int, k: int, fmt: str, stages: int, groups: int = 2
 ) -> int:
@@ -173,9 +188,7 @@ def tdm_split_resident_fits(
 ) -> bool:
     """Whether the CTA's whole weight share fits LDS with its tokens."""
 
-    return (
-        tdm_split_lds_words(rows, k, fmt, tdm_split_slabs(k), groups) <= budget_words
-    )
+    return tdm_split_lds_words(rows, k, fmt, tdm_split_slabs(k), groups) <= budget_words
 
 
 def tdm_split_scratch_bytes(ctas: int, rows: int) -> int:

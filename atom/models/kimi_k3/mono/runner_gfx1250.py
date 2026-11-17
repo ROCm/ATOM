@@ -58,6 +58,7 @@ from atom.models.kimi_k3.mono.k1_local_runner_gfx1250 import (
 )
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     K1LocalBuildSpec,
+    split_projection_fits,
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
@@ -83,7 +84,9 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
     build_role_lds_front,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_tdm_gfx1250 import (
+    REPLICATED_FRONT_FP4_ABI,
     build_replicated_front,
+    split_front_fits,
 )
 from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
     build_finalize_local,
@@ -411,6 +414,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 self.rank,
                 GFX1250,
                 fp8_shared=True,
+                fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK,
             )
             for plan in self.plans
             if plan.kda is not None
@@ -434,7 +438,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 continue
             try:
                 moe = bind_external_moe(
-                    layer, plan.layer_id, self.dims, self.rank, GFX1250, fp8_shared=True
+                    layer,
+                    plan.layer_id,
+                    self.dims,
+                    self.rank,
+                    GFX1250,
+                    fp8_shared=True,
+                    fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK,
                 )
                 # its core is o_proj's input, which the o_proj kernel reads
                 # [rows, proj]: only a layer whose o_proj it binds
@@ -510,6 +520,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     quant_core=_fuse_ptpc_core(self.inner.layers[layer.layer_id], rows),
                     external_seam=True,
                     fp8_projection=weight.w_in_scale is not None,
+                    split_projection="k1" in envs.ATOM_KIMI_MONO_SPLITK
+                    and split_projection_fits(
+                        self._plan(rows, 1),
+                        qlen=qlen,
+                        fp8=weight.w_in_scale is not None,
+                    ),
                 )
                 cache_key = spec
                 local = k1_cache.get(cache_key)
@@ -533,6 +549,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     routed.w_sgu_scale is not None,
                     routed.w_sd_scale is not None,
                 )
+                fp4_latent = routed.w_ld_fp4 is not None
                 tail_eps = None
                 if envs.ATOM_KIMI_MONO_TAIL:
                     moe = getattr(
@@ -547,6 +564,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     whole_up,
                     fp8_shared,
                     tail_eps,
+                    fp4_latent,
                 )
                 k2_local = k2_cache.get(k2_key)
                 if k2_local is None:
@@ -558,6 +576,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         whole_up,
                         fp8_shared,
                         tail_eps,
+                        fp4_latent,
                     )
                     k2_cache[k2_key] = k2_local
                 k2_by_layer[layer.layer_id] = k2_local
@@ -578,9 +597,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         whole_up: bool = False,
         fp8_shared: tuple[bool, bool] = (False, False),
         tail_eps: float | None = None,
+        fp4_latent: bool = False,
     ) -> Gfx1250RoutedK2Build:
         """``tail_eps``: the routed norm's epsilon where the gathering
-        all-reduce, the norm and the finalize may run as one launch."""
+        all-reduce, the norm and the finalize may run as one launch.
+        ``fp4_latent``: the layers bind their MXFP4 latent planes, which the
+        split-K front reads where it fits the width."""
         plan = self._plan(rows, nblocks)
         # AITER's grouped TDM MoE reads GUGU gate/up planes only.
         grouped = gu_interleave
@@ -599,7 +621,12 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         width = TOPK + 1 if herd else TOPK
         front = (
-            build_replicated_front(plan, fp8_shared=fp8_gate_up)
+            build_replicated_front(
+                plan,
+                fp8_shared=fp8_gate_up,
+                fp4_latent=fp4_latent
+                and split_front_fits(plan, fp8_gate_up, fp4_latent=True),
+            )
             if grouped
             else build_role_lds_front(plan, include_attention=False, reset=reset)
         )
@@ -872,16 +899,18 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             None,
         )
         if local.grouped_experts:
+            fp4_latent = local.front.abi is REPLICATED_FRONT_FP4_ABI
             local.front.launcher(
                 x.data_ptr(),
                 weight.w_gate.data_ptr(),
-                weight.w_ld.data_ptr(),
+                (weight.w_ld_fp4 if fp4_latent else weight.w_ld).data_ptr(),
                 weight.w_sgu.data_ptr(),
                 0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
                 buffers["router_logits"].data_ptr(),
                 buffers["latent_fp4"].data_ptr(),
                 buffers["latent_scales"].data_ptr(),
                 buffers["shared_hidden"].data_ptr(),
+                *([weight.w_ld_scale.data_ptr()] if fp4_latent else []),
                 stream=stream,
             )
             gathered = buffers["router_logits"]

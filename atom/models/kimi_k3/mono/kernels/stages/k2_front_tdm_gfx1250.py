@@ -27,10 +27,10 @@ from atom.models.kimi_k3.mono.kernels.stages import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
-    TDM_SPLIT_MAX_TASKS,
     TDM_SPLIT_TILE_WORDS,
     tdm_lds_words,
     tdm_split_lds_words,
+    tdm_split_out_word,
     tdm_split_post_words,
     tdm_split_resident_fits,
     tdm_split_scratch_bytes,
@@ -145,7 +145,6 @@ def _front_tasks(
     the token slabs', which a cluster peer's multicast may still be filling)."""
     red = lds.gemv.ptr + tdm_lds_words(rows, 2)[0]
     router_weight, latent_weight, shared_weight, shared_scale = weights
-    router_logits, latent_fp4, latent_scales, shared_hidden = outputs
     router = pair < LATENT_PAIR0
     latent = (pair >= LATENT_PAIR0) & (pair < SHARED_PAIR0)
     weight = router.select(router_weight, latent.select(latent_weight, shared_weight))
@@ -411,7 +410,7 @@ def front_split_tasks(
     latent = (latent_cluster >= 0) & (shared_cluster < 0)
     shared = shared_cluster >= 0
     gemv = lds.gemv.ptr
-    out = gemv + tiles * (TDM_SPLIT_MAX_TASKS * 8 + 2) * TDM_SPLIT_TILE_WORDS
+    out = gemv + tdm_split_out_word(rows)
 
     def project(weight, weight_rows, groups, owners, kind, scale):
         fmt, stages, whole = plan[kind]
@@ -604,19 +603,49 @@ def build_replicated_front(
     return K2ReplicatedFrontKernel(name, launch, (PAIRS,), (THREADS,))
 
 
+class _TailedLauncher:
+    """``launch`` with trailing arguments the caller does not pass (the split
+    front's scratch, the BF16 latent's absent scale); its ``_mem_cache`` is
+    ``launch``'s, for ``launcher_resources``."""
+
+    def __init__(self, launch, tail):
+        self.launch = launch
+        self.tail = tail
+
+    def __call__(self, *args, **kwargs):
+        return self.launch(*args, *self.tail, **kwargs)
+
+    @property
+    def _mem_cache(self):
+        return self.launch._mem_cache
+
+
+def _split_front_plan(plan, fp8_shared, fp4_latent):
+    if plan.architecture is not GFX1250 or SPLIT_CTAS > plan.blocks:
+        return None
+    return front_split_plan(
+        plan.tokens,
+        fp8_shared,
+        fp4_latent,
+        (plan.lds_bytes - 1024) // 4 - plan.tokens * 16,
+    )
+
+
+def split_front_fits(plan, fp8_shared: bool = False, fp4_latent: bool = False) -> bool:
+    """Whether ``build_replicated_front`` splits K at ``plan``'s width (an
+    MXFP4 latent needs it)."""
+    return _split_front_plan(plan, fp8_shared, fp4_latent) is not None
+
+
 def _build_split_front(plan, fp8_shared, fp4_latent):
     import torch
 
-    if plan.architecture is not GFX1250 or SPLIT_CTAS > plan.blocks:
+    split = _split_front_plan(plan, fp8_shared, fp4_latent)
+    if split is None:
         return None
     rows = plan.tokens
     tiles = (rows + ROWS - 1) // ROWS
     group_words = rows * 16
-    split = front_split_plan(
-        rows, fp8_shared, fp4_latent, (plan.lds_bytes - 1024) // 4 - group_words
-    )
-    if split is None:
-        return None
     words = front_split_lds_words(rows, split)
 
     @fx.struct
@@ -708,17 +737,8 @@ def _build_split_front(plan, fp8_shared, fp4_latent):
         )
 
     _SPLIT_KERNEL_ABI.check(kernel, launch)
-    scratch_address = scratch.data_ptr()
-
-    if fp4_latent:
-
-        def launcher(*args, **kwargs):
-            return launch(*args, scratch_address, **kwargs)
-
-    else:
-
-        def launcher(*args, **kwargs):
-            return launch(*args, 0, scratch_address, **kwargs)
+    tail = (scratch.data_ptr(),) if fp4_latent else (0, scratch.data_ptr())
+    launcher = _TailedLauncher(launch, tail)
 
     return K2ReplicatedFrontKernel(
         name,

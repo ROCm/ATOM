@@ -107,6 +107,43 @@ def test_layout_selection_is_explicit():
     assert layout.layout_for(GFX1250) is layout.GFX1250_GEMV
 
 
+@pytest.mark.parametrize("rows", [1, 10, 16, 17, 40, 48])
+def test_split_sums_land_past_partials_inside_the_reduction(rows):
+    tiles = (rows + layout.ROWS - 1) // layout.ROWS
+    accumulators = tiles * layout.TDM_SPLIT_MAX_TASKS * 8 * layout.TDM_SPLIT_TILE_WORDS
+    partials = tiles * 2 * layout.TDM_SPLIT_TILE_WORDS
+    sums = tiles * 2 * layout.TDM_SPLIT_TILE_WORDS
+    out = layout.tdm_split_out_word(rows)
+    assert out == accumulators + partials
+    assert out + sums <= layout.tdm_split_post_words(rows)
+
+
+def test_split_fp4_rows_spread_over_distinct_banks():
+    pitch = layout.TDM_SPLIT_FP4_PITCH
+    assert pitch - layout.TDM_SPLIT_FP4_ROW_WORDS == 1
+    assert layout.TDM_SPLIT_FP4_ROW_WORDS * 8 == layout.TDM_SPLIT_SLAB
+    for word in range(layout.TDM_SPLIT_FP4_ROW_WORDS):
+        banks = {(row * pitch + word) % 64 for row in range(layout.ROWS)}
+        assert len(banks) == layout.ROWS
+    assert layout.tdm_split_task_words("fp4") == layout.ROWS * pitch
+
+
+@pytest.mark.parametrize("fmt", layout.SPLIT_FORMATS)
+def test_split_stages_are_the_most_that_fit(fmt):
+    k, rows = 7168, 40
+    words = {s: layout.tdm_split_lds_words(rows, k, fmt, s) for s in (2, 3)}
+    for budget in (words[2] - 1, words[2], words[3] - 1, words[3]):
+        fitting = [s for s in (3, 2) if words[s] <= budget]
+        assert layout.tdm_split_stages(rows, k, fmt, budget) == max(fitting, default=0)
+
+
+def test_split_k_quarters_whole_slabs():
+    assert layout.tdm_split_slabs(7168) == 7
+    with pytest.raises(ValueError, match="divisible"):
+        layout.tdm_split_slabs(7168 + 256)
+    assert layout.tdm_split_scratch_bytes(200, 40) == 200 * 8 * 3 * 256 * 4
+
+
 def test_unknown_architecture_has_no_inferred_backend():
     future = Architecture(
         gfx="gfx9999",

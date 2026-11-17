@@ -35,6 +35,11 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_SPLIT_GROUP,
+    TDM_SPLIT_TILE_WORDS,
+    tdm_split_out_word,
+)
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
@@ -84,6 +89,7 @@ class ResidentBuildKey:
     external_seam: bool
     tdm_projection: bool
     fp8_projection: bool
+    split_stages: int
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,17 @@ def _generation(slots):
     return fx.Int32(fx.ptr_load(slots))
 
 
+def _split_sum(out, task_offset, tile, tiles, row, token):
+    """Output ``[row, token]`` of a split-K task sum ``project_split`` left
+    at ``out``: one lane's v8, wave 0's accumulator layout."""
+
+    lane = token + ROWS * (row // 8)
+    word = fx.ptr_load(
+        out + (task_offset * tiles + tile) * TDM_SPLIT_TILE_WORDS + lane * 8 + row % 8
+    )
+    return fx.Int32(word).bitcast(fx.Float32)
+
+
 def _task_start(block, first, blocks):
     return (block - first + blocks) % blocks
 
@@ -184,6 +201,15 @@ def build_resident_k1(
     device = declaration.bind_device_protocol(backend)
     lds_types = device["emit_role_lds_types"](declaration.lds_type_spec)
     layout = local_scratch_layout(declaration)
+    split_stages = declaration.lds.split_stages
+    if split_stages and declaration.lds.split_format != spec.split_format:
+        raise ValueError("resident K1 split-K format drifted from its declaration")
+    if split_stages and any(
+        tile.row_start != ROWS * index
+        for index, tile in enumerate(declaration.token_tiles)
+    ):
+        raise ValueError("resident K1 split-K needs 16-row token tiles")
+    split_out = tdm_split_out_word(declaration.tokens)
     slabs = declaration.lds.arena.gemv_slabs[0]
     tile_starts = tuple(tile.row_start for tile in declaration.token_tiles)
     tile_rows = tuple(tile.rows for tile in declaration.token_tiles)
@@ -214,6 +240,7 @@ def build_resident_k1(
             spec.external_seam,
             spec.tdm_projection,
             spec.fp8_projection,
+            declaration.lds.split_stages,
         ),
         SOURCES,
     )
@@ -222,6 +249,7 @@ def build_resident_k1(
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
         f"{'_f8' if spec.fp8_projection else ''}"
+        f"{f'_sk{split_stages}' if split_stages else ''}"
     )
 
     @traced
@@ -631,7 +659,32 @@ def build_resident_k1(
                 device["device_fence_acquire"]()
                 gpu.barrier()
             first_task = (bid - ATTENTION_CTAS) * PROJECTION_ROWS_PER_CTA
-            if const_expr(spec.tdm_projection):
+            if const_expr(split_stages):
+                # Cluster c's tasks are [8c, 8c + 8); CTA r (= bid % 4) sums
+                # tasks 8c + 2r and 8c + 2r + 1, ``first_task``'s two.
+                group_row = (
+                    first_task // (2 * TDM_SPLIT_GROUP) * (2 * TDM_SPLIT_GROUP * ROWS)
+                )
+                gemv_tdm.project_split(
+                    projection.xl.ptr,
+                    x,
+                    HIDDEN,
+                    s,
+                    w_in,
+                    FUSED_ROWS,
+                    HIDDEN,
+                    [group_row, group_row + TDM_SPLIT_GROUP * ROWS],
+                    [lambda r: 2 * r, lambda r: 2 * r + 1],
+                    lane,
+                    wave,
+                    scratch + fx.Int64(layout["split"][0]),
+                    projection.xl.ptr + split_out,
+                    fmt=spec.split_format,
+                    w_scale=w_in_scale if spec.fp8_projection else None,
+                    stages=split_stages,
+                    cta0=ATTENTION_CTAS,
+                )
+            elif const_expr(spec.tdm_projection):
                 accumulators0, accumulators1 = gemv_tdm.project(
                     projection.xl.ptr,
                     x,
@@ -707,7 +760,9 @@ def build_resident_k1(
                         gpu.barrier()
             # Every accumulator first, then one cross-wave reduction of them all.
             slot_words = plan.kda_accumulator_lds_elements
-            for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+            for task_offset in range_constexpr(
+                0 if split_stages else PROJECTION_ROWS_PER_CTA
+            ):
                 accumulators = (
                     accumulators0 if const_expr(task_offset == 0) else accumulators1
                 )
@@ -738,9 +793,20 @@ def build_resident_k1(
                             if work < work_items:
                                 local_token = work // ROWS
                                 row = work % ROWS
-                                value = fx.Float32(
-                                    compute["kda_gemv_row_sum"](slot, row, local_token)
-                                ).to(fx.BFloat16)
+                                if const_expr(split_stages):
+                                    total = _split_sum(
+                                        projection.xl.ptr + split_out,
+                                        task_offset,
+                                        tile,
+                                        len(tile_starts),
+                                        row,
+                                        local_token,
+                                    )
+                                else:
+                                    total = compute["kda_gemv_row_sum"](
+                                        slot, row, local_token
+                                    )
+                                value = fx.Float32(total).to(fx.BFloat16)
                                 value = fx.Float32(value)
                                 global_token = tile_starts[tile] + local_token
                                 gfx_backend.mailbox_store_device(

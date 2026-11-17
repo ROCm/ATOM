@@ -41,6 +41,22 @@ def test_fp8_shared_front_takes_the_block_scales(rows):
     assert names.index("shared_scale") == names.index("shared_weight") + 1
 
 
+@pytest.mark.parametrize("rows", (1, 10, 20, 40, 48))
+@pytest.mark.parametrize("fp4_latent", (False, True))
+def test_split_front_fits_every_row_count(rows, fp4_latent):
+    assert front.split_front_fits(_plan(rows), True, fp4_latent=fp4_latent)
+
+
+def test_mxfp4_latent_front_refuses_a_grid_without_its_clusters():
+    plan = Gfx1250KimiBuildPlan(
+        threads=256, blocks=front.SPLIT_CTAS - 4, lds_bytes=320 * 1024, tokens=16
+    )
+    assert not front.split_front_fits(plan, fp4_latent=True)
+    with pytest.raises(ValueError, match="MXFP4"):
+        front.build_replicated_front(plan, fp4_latent=True)
+    assert front.REPLICATED_FRONT_FP4_ABI.names[-1] == "latent_scale"
+
+
 def test_replicated_front_feeds_only_the_grouped_moe_finish():
     with pytest.raises(ValueError, match="grouped-MoE"):
         build_packed_finish(_plan(16), replicated_front=True)
