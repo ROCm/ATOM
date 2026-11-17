@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
@@ -26,6 +27,35 @@ BASE = os.environ["BASE_SHA"]
 K3 = "moonshotai/Kimi-K3.1-Pro"
 GLM = "zai-org/GLM-5.2-FP8"
 PY = sys.executable
+BASELINE_GQA_CASES = [
+    "test_unified_block_read_matches_the_bidirectional_reference[False-fp8]",
+    "test_unified_block_read_matches_the_bidirectional_reference[True-fp8]",
+    "test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments",
+    "test_fp8_q_cast_saturates_instead_of_producing_nan",
+]
+
+
+def baseline_gqa_failures_match(head_xml, base_xml):
+    expected = set(BASELINE_GQA_CASES)
+    message = "_UAParams.__new__() missing 2 required positional arguments: 'v_cache_dtype' and 'spec_decode'"
+    for path in (head_xml, base_xml):
+        cases = list(ET.parse(path).iter("testcase"))
+        if not cases or any(
+            case.find("error") is not None or case.find("skipped") is not None
+            for case in cases
+        ):
+            return False
+        failures = {
+            case.attrib["name"]: case.find("failure")
+            for case in cases
+            if case.find("failure") is not None
+        }
+        if set(failures) != expected or any(
+            message not in failure.attrib.get("message", "")
+            for failure in failures.values()
+        ):
+            return False
+    return True
 
 
 def save(path, data):
@@ -394,6 +424,7 @@ if __name__ == "__main__":
         "rocm": torch.version.hip,
         "aiter_ref": os.environ["AITER_GIT_REF"],
         "gpu": [torch.cuda.get_device_name(i) for i in range(8)],
+        "gpu_arch": [torch.cuda.get_device_properties(i).gcnArchName for i in range(8)],
         "packages": {
             **{p: importlib.metadata.version(p) for p in ("amd-aiter", "lm_eval")},
             "triton": __import__("triton").__version__,
@@ -435,6 +466,75 @@ if __name__ == "__main__":
         OUT / "gpu-tests.log",
         timeout=2700,
     )
+    distributed_test_rc = 0
+    baseline_test_rc = None
+    baseline_only = False
+    if PR == "3311":
+        distributed_test_rc = run(
+            [
+                PY,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                "--nproc-per-node=2",
+                "--module",
+                "pytest",
+                "tests/model_ops/test_indexer_packed_concat.py",
+                "-k",
+                "test_dcp_passes_gather_shards_and_selections",
+                "-q",
+            ],
+            OUT / "gpu-distributed-tests.log",
+            timeout=600,
+        )
+    else:
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "safe.directory=/workspace",
+                "-c",
+                "core.filemode=false",
+                "checkout",
+                "--detach",
+                BASE,
+            ],
+            cwd=ROOT,
+            check=True,
+        )
+        baseline_test_rc = run(
+            [
+                PY,
+                "-m",
+                "pytest",
+                *[
+                    "tests/test_kimi_k3_dspark_gqa.py::" + name
+                    for name in BASELINE_GQA_CASES
+                ],
+                "-q",
+                "--junitxml=" + str(OUT / "base-gqa-tests.xml"),
+            ],
+            OUT / "base-gqa-tests.log",
+            timeout=600,
+        )
+        baseline_only = (
+            test_rc == baseline_test_rc == 1
+            and baseline_gqa_failures_match(
+                OUT / "gpu-tests.xml", OUT / "base-gqa-tests.xml"
+            )
+        )
+    tests_accepted = (test_rc == 0 or baseline_only) and distributed_test_rc == 0
+    if PR == "3312":
+        cases = {
+            case.attrib["name"]: case
+            for case in ET.parse(OUT / "gpu-tests.xml").iter("testcase")
+        }
+        for compiled in (False, True):
+            name = (
+                f"test_gqa_aggregate_and_successor_read_cloned_zero_addends[{compiled}]"
+            )
+            tests_accepted = tests_accepted and name in cases and len(cases[name]) == 0
     passed = [
         scenario(BASE, "base-k3", MODELS[K3]),
         scenario(HEAD, "head-k3", MODELS[K3]),
@@ -449,8 +549,13 @@ if __name__ == "__main__":
         OUT / "summary.json",
         {
             "test_rc": test_rc,
+            "distributed_test_rc": distributed_test_rc,
+            "baseline_test_rc": baseline_test_rc,
+            "baseline_only_failures": BASELINE_GQA_CASES if baseline_only else [],
+            "tests_accepted": tests_accepted,
             "scenarios": passed,
-            "passed": test_rc == 0 and all(passed),
+            "passed": test_rc == distributed_test_rc == 0 and all(passed),
+            "review_acceptance": tests_accepted and all(passed),
         },
     )
-    sys.exit(0 if test_rc == 0 and all(passed) else 1)
+    sys.exit(0 if tests_accepted and all(passed) else 1)

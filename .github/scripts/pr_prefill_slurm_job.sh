@@ -57,6 +57,7 @@ docker run -dt --pull always --user "$(id -u):$(id -g)" --device=/dev/kfd --devi
   --ipc=host "${group_flags[@]}" --shm-size=16G --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --ulimit stack=67108864 \
   --env-file "$LOG_ROOT/model-env.list" -e HF_TOKEN -e PR -e HEAD_SHA -e BASE_SHA -e AITER_GIT_REF \
+  -e USER="$(id -un)" -e LOGNAME="$(id -un)" \
   -e HOME=/tmp/atom-pr-review-runtime/home \
   -e XDG_CACHE_HOME=/tmp/atom-pr-review-runtime/cache \
   -e TORCHINDUCTOR_CACHE_DIR=/tmp/atom-pr-review-runtime/cache/torchinductor \

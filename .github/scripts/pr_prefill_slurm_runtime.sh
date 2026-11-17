@@ -6,7 +6,7 @@ mkdir -p "$runtime"/{home,cache,bin}
   "$runtime/venv" /workspace/review-evidence/image-python.json
 source "$runtime/venv/bin/activate"
 export PATH="$runtime/bin:$PATH"
-python -c 'import torch; assert torch.version.hip; assert torch.cuda.device_count() == 8; print("ROCm runtime:", torch.__version__, torch.version.hip)'
+python -c 'import getpass, torch; import torch._inductor.compile_fx; assert getpass.getuser(); assert torch.version.hip; assert torch.cuda.device_count() == 8; print("ROCm runtime:", torch.__version__, torch.version.hip, "user:", getpass.getuser())'
 cat > "$runtime/bin/nvcc" <<'SHIM'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --version ]]; then exec hipcc --version; fi
