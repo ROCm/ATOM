@@ -240,6 +240,11 @@ DSpark proposer of a served step
   (`V4.1 single-launch step off: <why>`). On the current MI455X driver,
   back-to-back ~300K-token prefills (production path; BF16 and FP4 KV alike)
   have hung the GPUs in MES `REMOVE_QUEUE`; not root-caused.
+- **NUMA balancing.** With `kernel.numa_balancing=1`, the kernel's scan makes
+  KFD evict a rank's GPU queues for ~4-5 ms a few times a second, and the whole
+  step waits (c1 ITL p99 2.3 ms vs 1.3 ms). ATOM opts its serving processes out
+  (`ATOM_NUMA_BALANCING_OPT_OUT`, on by default); in a container this needs
+  `--cap-add SYS_NICE`, otherwise set `kernel.numa_balancing=0` on the host.
 - **Draft temperature.** `ATOM_DSPARK_PROB_DRAFT_TSCALE` scales the
   probabilistic drafter's temperature (`T_d = T * scale`, default 1). The
   verify uses the same draft distribution, so any value keeps the output
