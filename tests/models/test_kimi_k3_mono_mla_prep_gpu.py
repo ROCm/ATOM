@@ -24,7 +24,7 @@ applied to the previous stage's own output. References:
 * P4: AITER's triton FP8 BMM (the absorb) and aiter's
   ``fused_qk_rope_concat_and_cache_mla``: q_out's rope part bit for bit, its
   nope part within the BMM's summation order: one FP8 step, or, near 0 where
-  E4M3's steps are finest, 2^-14 of the dot's sum |a w| (``ABSORB_ACC_TOL``);
+  E4M3's steps are finest, 2^-12 of the dot's sum |a w| (``ABSORB_ACC_TOL``);
   each side's distance to the exact dot is reported. Padded tokens (negative
   slot) keep their q_out rows;
 * P5 (on P2's kv CTAs): the same rope / cache kernel's FP8 KV rows,
@@ -629,9 +629,10 @@ def test_p4_absorb_rope(s):
 
 @pytest.mark.parametrize("s", [1, 16])
 def test_p4_ignores_nan_in_qb(s):
-    """The triton BMM's A prequant ignores a NaN in its amax and clamp, so one
-    NaN in a (token, head) group leaves the rest of that head's q_out finite.
-    P4 must do the same, or the NaN makes the group's scale, hence the head, NaN."""
+    """The triton BMM's A prequant ignores a NaN in its amax and clamp, so NaN
+    values in a (token, head) group (here two qb columns) leave the rest of that
+    head's q_out finite. P4 must do the same, or a NaN makes the group's scale,
+    hence the head, NaN."""
     d = _inputs(s, seed=3)
     qb = d["qb"].view(s, pr.HEADS, pr.QH)
     qb[:, :, 0] = float("nan")

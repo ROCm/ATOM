@@ -92,7 +92,7 @@ from atom.mono.device.sync import publish
 from atom.mono.plan.execution import THREADS, WAVES
 
 
-def fmaxnum(a, b):
+def _fmaxnum(a, b):
     """max that ignores a NaN operand (``arith.maxnumf``), as triton's
     ``tl.maximum`` / ``tl.max`` / ``tl.clamp`` do by default; ``fx.max`` propagates
     NaN (``arith.maximumf``)."""
@@ -103,8 +103,8 @@ def fmaxnum(a, b):
     )
 
 
-def fminnum(a, b):
-    """min that ignores a NaN operand (``arith.minnumf``); see ``fmaxnum``."""
+def _fminnum(a, b):
+    """min that ignores a NaN operand (``arith.minnumf``); see ``_fmaxnum``."""
     return fx.Float32(
         farith.minnumf(
             farith.as_ir_value(fx.Float32(a)), farith.as_ir_value(fx.Float32(b))
@@ -185,6 +185,38 @@ def _f32(v):
     return fx.Float32(v)
 
 
+def prequant_mfma(words, vops):
+    """Triton's per-token 128-group FP8 A prequant, in registers, then the
+    group's MFMA against ``vops``. ``words``: the 4 Int32x4 loads holding this
+    lane's 32 bf16 values; lanes lane % 16 == t of the 4 lane groups hold token
+    t's group, so their amax is the group's. The amax and the clamp ignore a
+    NaN as triton's do, so one NaN does not turn the group's scale (and every
+    value of the group) NaN. Returns (acc, sc): the fp32 accumulator and the
+    group's scale."""
+    vals = []
+    for q in range_constexpr(4):
+        for e in range_constexpr(4):
+            w = words[q][e]
+            vals += [bf_lo(w), bf_hi(w)]
+    lm = abs(vals[0])
+    for e in range_constexpr(1, 32):
+        lm = _fmaxnum(lm, abs(vals[e]))
+    am = butterfly(lm, (16, 32), _fmaxnum)
+    m = _fmaxnum(am, _f32(AMAX_FLOOR))
+    sc = m * _f32(INV_FP8_MAX)
+    rcp = _f32(1.0) / sc
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for q in range_constexpr(4):
+        qv = [
+            _fminnum(_fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
+            for e in range(8)
+        ]
+        d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
+        d1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
+        acc = mfma_bf16(w8_operand(vops[q]), fp8x8_bf16_pk([d0, d1]), acc)
+    return acc, sc
+
+
 @traced
 def post_task(c, j):
     """Task ``j``: core columns 16 j .. 16 j + 15 for every token -> ``core``
@@ -262,36 +294,13 @@ def post_task(c, j):
                     )
                     xb = fp8x8_bf16_pk([d[0], d[1]])
                     accs[jt] = mfma_bf16(wa, xb, accs[jt])
-    # ---- v-up: the triton kernel's per-token 128-group FP8 quant, in registers.
-    # Lanes lane % 16 == t of the 4 lane groups hold token t's 128 values of
-    # this wave's chunk; their amax is the group's. The amax and the clamp ignore
-    # a NaN as triton's do: the MLA decode can return whole NaN latent columns,
-    # which the production v-up turns into finite values, and a propagated NaN
-    # amax would make every value of the group (so the whole core) NaN.
+    # ---- v-up: the triton kernel's per-token 128-group FP8 quant, in registers
+    # (prequant_mfma). Its NaN handling matters here: the MLA decode can return
+    # whole NaN latent columns, which the production v-up turns into finite values.
     vaccs = []
     vscs = []
     for jt in range_constexpr(len(tiles)):
-        vals = []
-        for q in range_constexpr(4):
-            for e in range_constexpr(4):
-                w = avals[jt][q][e]
-                vals += [bf_lo(w), bf_hi(w)]
-        lm = abs(vals[0])
-        for e in range_constexpr(1, 32):
-            lm = fmaxnum(lm, abs(vals[e]))
-        am = butterfly(lm, (16, 32), fmaxnum)
-        m = fmaxnum(am, _f32(AMAX_FLOOR))
-        sc = m * _f32(INV_FP8_MAX)
-        rcp = _f32(1.0) / sc
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for q in range_constexpr(4):
-            qv = [
-                fminnum(fmaxnum(vals[8 * q + e] * rcp, _f32(-FP8_MAX)), _f32(FP8_MAX))
-                for e in range(8)
-            ]
-            d0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
-            d1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
-            acc = mfma_bf16(w8_operand(vops[q]), fp8x8_bf16_pk([d0, d1]), acc)
+        acc, sc = prequant_mfma(avals[jt], vops)
         vaccs.append(acc)
         vscs.append(sc)
     # ---- epilogue a token tile at a time
