@@ -1629,6 +1629,24 @@ class TestReplayRowSelection:
 
 
 @needs_sglang
+def _joined_taps(taps):
+    """The one joined aux block the surface hands ATOM's
+    `DSparkDraftModel.write_context_kv`, which takes the taps as a sequence."""
+    assert isinstance(taps, list) and len(taps) == 1, taps
+    return taps[0]
+
+
+def test_the_joined_block_is_what_atom_projects():
+    """ATOM's taps API (`write_context_kv(taps, ...)`): a one-entry list is a
+    block already joined, which `concat_taps` hands on as is, without a copy;
+    a bare 2-D block would be iterated row by row."""
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    aux = torch.randn(5, 12)
+    assert DSparkDraftModel.concat_taps([aux]) is aux
+    assert DSparkDraftModel.concat_taps(list(aux)).shape == (60,)
+
+
 class TestTargetSurface:
     def _surface(self, monkeypatch, wrapper=None):
         from atom.plugin.sglang import deepseek_v41_dspark as dspark
@@ -1740,7 +1758,7 @@ class TestTargetSurface:
             monkeypatch, surface, rows=rows, mode=ForwardMode.TARGET_VERIFY, bs=2
         )
         assert aux.shape == (rows, 12)
-        assert len(writes) == 1 and writes[0][0] is aux
+        assert len(writes) == 1 and _joined_taps(writes[0][0]) is aux
         assert writes[0][1].tolist() == list(range(rows))
 
     def _finish_fused(self, monkeypatch, surface, fb, rows, positions):
@@ -1794,7 +1812,8 @@ class TestTargetSurface:
         wrapper.model(_State(torch.randn(1, 9, 2, 4)))
         aux = self._finish_fused(monkeypatch, surface, fb, 9, wide_positions)
         assert aux.shape == (9, 12)
-        ((written, positions),) = writes
+        ((taps, positions),) = writes
+        written = _joined_taps(taps)
         assert written is aux
         assert positions.tolist() == [4, 5, 6, 7, 8, 9, 10, 0, 1]
         # The wrapper's trim (`SGLangPluginRuntime.trim_output`): SGLang's rows.
@@ -1853,7 +1872,8 @@ class TestTargetSurface:
 
         aux = finish(9)
         assert aux.shape == (16, 12)
-        ((written, positions),) = writes
+        ((taps, positions),) = writes
+        written = _joined_taps(taps)
         assert written is aux and positions[:9].tolist() == wide_positions.tolist()
         # SGLang's rows are a prefix-row selection of the bucket's output.
         assert int(keep.max()) < 9
@@ -1924,7 +1944,7 @@ class TestTargetSurface:
             bs=1,
             step=SimpleNamespace(running_tokens=6, replay=None, decoder=object()),
         )
-        assert aux.shape == (6, 12) and writes[0][0] is aux
+        assert aux.shape == (6, 12) and _joined_taps(writes[0][0]) is aux
 
     def test_chunk_finishing_no_prompt_writes_no_draft_context(
         self, monkeypatch, target_forward
@@ -2004,7 +2024,7 @@ class TestTargetSurface:
         # What native's write_context_kv reads under the plan: the tail, in
         # tail order, every real row its own (padding repeats the last).
         torch.testing.assert_close(aux[plan.tail_rows][:7], tail[:7])
-        assert len(writes) == 1 and writes[0][0] is aux
+        assert len(writes) == 1 and _joined_taps(writes[0][0]) is aux
         assert writes[0][1].tolist() == list(range(9))
 
     def test_radix_hit_under_decoder_replay_writes_its_widened_tail(
@@ -2067,7 +2087,8 @@ class TestTargetSurface:
         assert aux.shape == (9, 12)
         torch.testing.assert_close(aux[3:9], tail[:6])
         assert not aux[:3].any()
-        ((written, positions),) = writes
+        ((taps, positions),) = writes
+        written = _joined_taps(taps)
         assert written is aux and positions.tolist() == wide_positions.tolist()
         # SGLang's injection sees its own rows; their last is in the tail.
         assert aux.index_select(0, keep)[[2, 4]].abs().sum(-1).gt(0).all()

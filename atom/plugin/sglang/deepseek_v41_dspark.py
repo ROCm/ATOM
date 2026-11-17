@@ -320,8 +320,12 @@ class V41DSparkTargetSurface:
             )
         # Native's drafter call: under a replay it takes `aux[plan.tail_rows]`
         # and writes them under the tail's step, so only the rows above are
-        # read; the rest are zero (no draft block reads them).
-        self.draft.write_context_kv(aux, positions)
+        # read; the rest are zero (no draft block reads them). ATOM takes the
+        # taps as a sequence (`DSparkDraftModel.write_context_kv`); this one
+        # block is them already joined, as a PP relay hands them, which ATOM
+        # projects as is (FP8 `main_proj`: `quantize_fp8` of the block; BF16:
+        # the block itself), exactly as before the list API.
+        self.draft.write_context_kv([aux], positions)
         if _AUX_DUMP.directory is not None and not _is_target_verify(mode):
             _AUX_DUMP.record(aux, positions, forward_batch, plan)
         return aux
