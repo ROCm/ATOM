@@ -138,7 +138,8 @@ def _remap_rows_kernel():
     import triton
     import triton.language as tl
 
-    @triton.jit
+    # (sizes not specialized on: a new prompt length would otherwise compile a variant in the serving path)
+    @triton.jit(do_not_specialize=["last", "n", "window0"])
     def remap(indices, indptr, last, local, inv_page, inv_slot, n, window0, RPP: tl.constexpr,
               RING: tl.constexpr, BLOCK: tl.constexpr):
         i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -213,6 +214,14 @@ def _remap(indices, indptr, main_rows, window_rows, pages=None):
     return remap
 
 
+def _span(n, device):
+    """`[0, n]` int32 on `device` from a device fill: `torch.tensor` of a host list is a pageable copy, and on ROCm
+    that waits for the stream to drain (a GPU bubble a layer)."""
+    return torch.arange(0, 2 * n, max(n, 1), dtype=torch.int32, device=device)[:2] if n else torch.zeros(
+        2, dtype=torch.int32, device=device
+    )
+
+
 def rows_prefill(q, pool, indices, indptr, kv, extend, extend_indptr, sink, scale, out, pages=None):
     """One decode of the batch's rows (its pages' with `pages`, else the
     distinct ones the CSR names), one attention launch."""
@@ -222,9 +231,22 @@ def rows_prefill(q, pool, indices, indptr, kv, extend, extend_indptr, sink, scal
 
     (main, _), (window, _) = pool
     tagged, local = _remap(indices, indptr, main.shape[0], window.shape[0], pages)
-    shadow = torch.empty((tagged.numel(), q.shape[-1]), device=q.device, dtype=q.dtype)
-    ptr = torch.tensor([0, tagged.numel()], dtype=torch.int32, device=q.device)
-    gather_prefix_rows(pool, tagged, ptr, shadow, 0, 1)
+    n = tagged.numel()
+    if pages is not None:
+        # one shadow and span a step and size, shared by its layers (one stream: a layer's attention has read the
+        # shadow before the next layer's gather rewrites it); a step is a TBO microbatch's own
+        key = ("shadow", n, q.shape[-1], q.dtype)
+        held = pages.layouts.get(key)
+        if held is None:
+            held = pages.layouts[key] = (
+                torch.empty((n, q.shape[-1]), device=q.device, dtype=q.dtype),
+                _span(n, q.device),
+            )
+        shadow, ptr = held
+    else:
+        shadow, ptr = torch.empty((n, q.shape[-1]), device=q.device, dtype=q.dtype), _span(n, q.device)
+    if n:
+        gather_prefix_rows(pool, tagged, ptr, shadow, 0, 1)
     result = sparse_attn_v4_paged_2src(
         q, shadow, local, indptr, kv, extend, extend_indptr, sink, scale, out=out
     )
