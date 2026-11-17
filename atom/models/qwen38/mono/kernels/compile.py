@@ -7,8 +7,8 @@ A resident kernel is only safe if every CTA is resident at once: zero scratch
 the CU's, and the target's grid admitted (at least one CTA per CU, and the CUs
 times the CTAs per CU HIP admits cover the grid). ``gate`` raises on any of those.
 
-``compile_traced`` sets FlyDSL's arch (``ARCH`` / ``FLYDSL_GPU_ARCH``) to the
-program's ``target.mcpu`` while it compiles, so it needs no GPU (no launch, no
+``compile_traced`` sets FlyDSL's arch (``FLYDSL_GPU_ARCH``) to the program's
+``target.mcpu`` while it compiles, so it needs no GPU (no launch, no
 admission query without one). The code object reading is main's
 (``atom.mono.runtime.compile``).
 """
@@ -54,7 +54,6 @@ def compile_traced(launcher, program: Program):
         _env(
             COMPILE_ONLY=1,
             FLYDSL_RUNTIME_ENABLE_CACHE=0,
-            ARCH=arch,
             FLYDSL_GPU_ARCH=arch,
         ),
     ):

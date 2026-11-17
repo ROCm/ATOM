@@ -57,7 +57,7 @@ def _entries(cache: pathlib.Path) -> set:
 
 @pytest.fixture
 def cache(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARCH", "gfx950")
+    monkeypatch.setenv("FLYDSL_GPU_ARCH", "gfx950")
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path))
     return tmp_path
 
