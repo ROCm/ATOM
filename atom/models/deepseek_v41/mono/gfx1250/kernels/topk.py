@@ -345,7 +345,8 @@ O_MCH = O_MC + 16
 def select_mc(c, hb, ctr, isrx, G):
     """Every row's top KSEL of its n scores (FULL: n = bound, the ilog row; REINDEX: n = its compacted columns, lifted
     at the emit) -> isel / irow (the tree's final emit), by G CTAs a row (traced: MC_G or MC_G_SHORT): CTA g of row r takes keys
-    [g CH, (g + 1) CH), CH = ceil(n / G); 4 radix rounds of 8 bits: its LDS histogram -> global atomics into
+    [g CH, (g + 1) CH), CH = ceil(n / G); up to 4 radix rounds of 8 bits (done once the k-th key's bin is exactly the keys
+    still needed): its LDS histogram -> global atomics into
     hb[round][r][256] (zeroed at the step's entry), the group's count ctr[r][2 + round] (every wave's s_wait_storecnt 0, no
     fences; the bins read by agent-scope loads), every CTA of
     the group scans the 256 bins alike; then the winners: keys above the k-th key's value take positions from
@@ -372,44 +373,50 @@ def select_mc(c, hb, ctr, isrx, G):
         rowp = vals + i64(r) * i64(vstride) * 4
         if n > k:
             for p in range(4):
-                shift = 24 - 8 * p
-                hx.lstore(sm + O_MCH + t * 4, I32(0))
-                gpu.barrier()
-                st4 = hx.lload(sm + O_MC, I32, 4)
-                for i in range(i0 + t, i1, 256):
-                    key = order_key(hx.gload(rowp + i64(i) * 4, I32))
-                    if (key & st4[1]) == st4[0]:
-                        hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
-                gpu.barrier()
-                v = hx.lload(sm + O_MCH + t * 4, I32)
-                if v != 0:
-                    hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
-                hx.wait_storecnt0()   # (every wave its bin atomics done: the count needs no release fence)
-                gpu.barrier()
-                if t == 0:
-                    hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
-                    hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
-                gpu.barrier()
-                if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
-                    # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
-                    # loads at their scope see them -- as wait_count's see the count; the fence's cache invalidate
-                    # every round cost the group's CTAs)
-                    cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, scope="agent") for q in range(8)]
-                    s4 = cs[0]
-                    for q in range_constexpr(1, 8):
-                        s4 = s4 + cs[q]
-                    need = st4[2]
-                    before = wave_incl_scan(s4, lane) - s4
-                    found = I32(-1)
-                    for q in range_constexpr(8):
-                        hit = (before < need) & (need <= before + cs[q])
-                        found = hit.select(((255 - 8 * lane - q) << 16) | (need - before), found)
-                        before = before + cs[q]
-                    found = wave_max(found)
-                    if lane == 0:
-                        hx.lstore(sm + O_MC, fx.Vector.from_elements(
-                            [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF, n], I32))
-                gpu.barrier()
+                if hx.lload(sm + O_MC + 12, I32) >= 0:   # (bit 31: an earlier round's bin held exactly the keys
+                    # still needed: every key of its prefix is in, the selection is final)
+                    shift = 24 - 8 * p
+                    hx.lstore(sm + O_MCH + t * 4, I32(0))
+                    gpu.barrier()
+                    st4 = hx.lload(sm + O_MC, I32, 4)
+                    for i in range(i0 + t, i1, 256):
+                        key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                        if (key & st4[1]) == st4[0]:
+                            hx.latomic_add_i32(sm + O_MCH + ((key >> shift) & 255) * 4, I32(1))
+                    gpu.barrier()
+                    v = hx.lload(sm + O_MCH + t * 4, I32)
+                    if v != 0:
+                        hx.atomic_add(hb + i64(((p * MC_ROWS + r) * 256 + t) * 4), v)
+                    hx.wait_storecnt0()   # (every wave its bin atomics done: the count needs no release fence)
+                    gpu.barrier()
+                    if t == 0:
+                        hx.atomic_add(ctr + i64((r * 8 + 2 + p) * 4), 1)
+                        hx.wait_count(ctr + i64((r * 8 + 2 + p) * 4), G, 8)
+                    gpu.barrier()
+                    if t < 32:   # wave 0: the bin of the k-th key (lds_topk's scan, over the global bins)
+                        # (agent-scope loads, no acquire fence: the bins are device-scope atomics, read once a layer, so
+                        # loads at their scope see them -- as wait_count's see the count; the fence's cache invalidate
+                        # every round cost the group's CTAs)
+                        cs = [hx.gload(hb + i64(((p * MC_ROWS + r) * 256 + 255 - 8 * lane - q) * 4), I32, scope="agent") for q in range(8)]
+                        s4 = cs[0]
+                        for q in range_constexpr(1, 8):
+                            s4 = s4 + cs[q]
+                        need = st4[2]
+                        before = wave_incl_scan(s4, lane) - s4
+                        found = I32(-1)
+                        done = I32(0)
+                        for q in range_constexpr(8):
+                            hit = (before < need) & (need <= before + cs[q])
+                            found = hit.select(((255 - 8 * lane - q) << 16) | (need - before), found)
+                            done = (hit & (need == before + cs[q])).select(I32(1), done)
+                            before = before + cs[q]
+                        found = wave_max(found)
+                        done = wave_max(done)
+                        if lane == 0:
+                            hx.lstore(sm + O_MC, fx.Vector.from_elements(
+                                [st4[0] | (((found >> 16) & 255) << shift), st4[1] | (I32(255) << shift), found & 0xFFFF,
+                                 (done != 0).select(n | I32(INT_MIN), n)], I32))
+                    gpu.barrier()
         st4 = hx.lload(sm + O_MC, I32, 4)
         q = fx.max(hx.gload(c["ibat"] + i64(r) * 4, I32), I32(0))
         for i in range(i0 + t, i1, 256):
@@ -417,7 +424,7 @@ def select_mc(c, hb, ctr, isrx, G):
             if n <= k:
                 pos = i
             else:
-                key = order_key(hx.gload(rowp + i64(i) * 4, I32))
+                key = order_key(hx.gload(rowp + i64(i) * 4, I32)) & st4[1]   # (the resolved prefix: rounds may end early)
                 if ult(st4[0], key):
                     pos = hx.atomic_add(ctr + i64(r * 32), 1)
                 if key == st4[0]:
