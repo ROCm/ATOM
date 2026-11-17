@@ -1006,7 +1006,16 @@ class WeightUpdaterMixin:
             # overwritten -- and the one the PR measured a decode graph
             # catching half-done, five syncs out of seven.
             self._await_readers_of(param)
-            shuffle_weights(param)
+            native_rows = getattr(module, "native_a8_group_rows", None)
+            if param is not weight_scale or native_rows is None:
+                shuffle_weights(param)
+            elif native_rows == 1:
+                # A synced native group32 scale (E8M0, so it arrives here too)
+                # takes the layout the load gave it: 1x32 the aiter GEMM's,
+                # 32x32 row-major. Needs aiter with ROCm/aiter#8084.
+                from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale
+
+                param.data.copy_(shuffle_mxfp8_bpreshuffle_scale(param.data))
 
     @_one_update
     @_discard_sync_state_on_error
