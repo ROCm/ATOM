@@ -5,6 +5,7 @@ preparation the launch's graph captures (``_host_inputs`` / ``_device_inputs``),
 parameters (``_sampling``). ``SingleStepRunner`` inherits them."""
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -19,6 +20,11 @@ from atom.models.deepseek_v41.mono.step_meta import write_step_meta
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
+
+# the prob drafter's temperature as a multiple of the request's (T_d = T * scale; ATOM dspark_prob_sample's
+# ATOM_DSPARK_PROB_DRAFT_TSCALE). Lossless for any value: the drafts are sampled from q = softmax(z / T_d) and verified
+# against that same q. Default 1 (T_d = T).
+DRAFT_TSCALE = float(os.environ.get("ATOM_DSPARK_PROB_DRAFT_TSCALE", "1.0"))
 
 
 class StepInputs:
@@ -266,7 +272,7 @@ class StepInputs:
             for c, v in (
                 (0, inv_t),
                 (1, np.where(greedy, 1.0, top_ps)),
-                (4, inv_t),  # the drafts' inverse temperature: the request's
+                (4, inv_t / np.float32(DRAFT_TSCALE)),  # the drafts' inverse temperature: 1 / (T * DRAFT_TSCALE)
             ):
                 sp[:n, c] = np.repeat(
                     v, ROWS_PER_REQ
