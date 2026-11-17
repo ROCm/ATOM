@@ -1582,10 +1582,7 @@ check_mooncake_store_capacity() {
 # Returns non-zero when a Store process died before it was stopped, or a
 # master lost owner capacity during the run.
 stop_mooncake_store() {
-  if mooncake_page_cache_dropper_running; then
-    terminate_process_group "${mooncake_page_cache_dropper_pid}"
-  fi
-  mooncake_page_cache_dropper_pid=""
+  stop_mooncake_page_cache_dropper
   mooncake_store_running || return 0
   save_mooncake_store_metrics
   reap_dead_mooncake_store || true
@@ -1712,9 +1709,9 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s for 30 min while the workers load
-# weights, which would refill it; page cache is per file, so this serves every
-# node.
+# Drops the model's page cache every 45 s until this node's owners have mounted
+# (30 min at most): loads refill it, and a bound owner would reclaim it on every
+# allocation. Page cache is per file, so this serves every node.
 start_mooncake_page_cache_dropper() {
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
     --every 45 --for 1800 "${MODEL_PATH}" &
@@ -1728,6 +1725,15 @@ start_mooncake_page_cache_dropper() {
     kill -0 "${mooncake_page_cache_dropper_pid}" 2>/dev/null || return 0
     sleep 0.02
   done
+}
+
+# Once the owners have pinned their segments, the dropper only evicts the pages
+# the workers are still loading (an NFS model then loads ~9x slower).
+stop_mooncake_page_cache_dropper() {
+  if mooncake_page_cache_dropper_running; then
+    terminate_process_group "${mooncake_page_cache_dropper_pid}"
+  fi
+  mooncake_page_cache_dropper_pid=""
 }
 
 # Whether the page-cache dropper this shell started still runs. It exits on its
@@ -1889,6 +1895,7 @@ start_mooncake_store() {
   fi
   wait_for_mooncake_store "owners" "${owners_timeout}" \
     mooncake_store_capacity_reaches "${host_ip}"
+  stop_mooncake_page_cache_dropper
   mooncake_store_ready=1
   report_mooncake_store_owners
   mooncake_store_prefill_env=(
@@ -1930,6 +1937,7 @@ start_mooncake_store_decode_owners() {
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
   wait_for_mooncake_store "owners" "${timeout}" \
     mooncake_store_capacity_reaches "${NODE0_ADDR}"
+  stop_mooncake_page_cache_dropper
   report_mooncake_store_owners
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
 }
