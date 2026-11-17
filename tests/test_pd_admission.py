@@ -123,7 +123,6 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
-        draft_lookahead=0,
         draft_lookahead_blocks=lambda tokens: 0,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
@@ -339,10 +338,19 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
     assert policy._growth_reserve(candidate, len(candidate), running) == 2 + 5 + 0 + 4
 
 
-@pytest.mark.parametrize("num_kvcache_blocks, b_admitted", [(6, True), (5, False)])
-# B has plenty left to generate, or is a 6-token prompt with one token left,
-# fewer than the lookahead.
-@pytest.mark.parametrize("b_tokens, b_max_tokens", [(8, 64), (6, 1)])
+@pytest.mark.parametrize(
+    "b_tokens, b_max_tokens, num_kvcache_blocks, b_admitted",
+    [
+        (8, 64, 8, True),
+        (8, 64, 7, False),
+        # One token left, fewer than a first decode takes.
+        (6, 1, 8, True),
+        (6, 1, 7, False),
+        # The first decode's reach ends a block past what it allocates.
+        (9, 1, 9, True),
+        (9, 1, 8, False),
+    ],
+)
 @pytest.mark.parametrize("chunked", [False, True])
 def test_decode_reserve_counts_the_draft_lookahead_once(
     build, chunked, b_tokens, b_max_tokens, num_kvcache_blocks, b_admitted
@@ -353,52 +361,66 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
         speculative_config=SimpleNamespace(
             num_speculative_tokens=3, use_dspark=lambda: True
         ),
-        options={"enabled": True, "num_reserved_decode_tokens": 4},
+        options={"enabled": True, "num_reserved_decode_tokens": 8},
     )
     bm = sched.block_manager
-    assert bm.draft_lookahead_blocks(b_tokens) == 1
+    assert bm.draft_lookahead_blocks(8) == 1
+    assert sched.pd_admission.first_decode_tokens == 8
     a, b = request(), request(b_tokens)
     b.max_tokens = b_max_tokens
     sched.extend([a, b])
     sched.schedule()
     # A receives its two prompt blocks; its lookahead block waits for its
-    # first decode. B takes two blocks too. Each needs one more to grow by 4
-    # tokens, their lookahead included, and B with one token left still needs
-    # it for the lookahead its first decode allocates: 6 blocks admit B with
-    # none to spare and 5 do not. Charging B's lookahead now, or reserving it
-    # on top of the growth, would defer B at 6; leaving it out of the reserve,
-    # or capping B's growth at the one token it has left, would admit B at 5.
+    # first decode. A first decode takes 8 tokens past the prompt (T0, 3
+    # verify slots, then `can_append`'s 4-token reach), so A and B each
+    # reserve two more blocks however little B has left: B is admitted with
+    # none to spare in the larger pool and deferred in the smaller. Charging
+    # B's lookahead now, or reserving it on top of the growth, defers the 8-
+    # and 6-token B in the larger pool. Flooring B's growth at its lookahead,
+    # or not at all, admits B with one token left in the smaller pool; so
+    # does flooring it at the 7 tokens the decode allocates, for the 9-token B.
     assert len(a.block_table) == 2
     assert bool(b.block_table) is b_admitted
     assert sched.pd_admission.deferred["free_kv"] == (0 if b_admitted else 1)
     sched._update_from_kv_xfer_finished(receive_success(a))
     batch, _ = sched.schedule()
-    # A's first decode starts past T0 and its 3 verify slots, so it takes two
-    # blocks, not only its lookahead's; B has yet to decode, so nothing is
-    # preempted.
     assert a.id in batch.req_ids
     assert len(a.block_table) == 4
     assert bm.draft_writes_allocated(a)
+    if b_admitted:
+        sched._update_from_kv_xfer_finished(receive_success(b))
+        batch, _ = sched.schedule()
+        assert b.id in batch.req_ids
+        assert bm.draft_writes_allocated(b)
+    # Each first decode fits in what the reserve kept for it.
     assert sched.total_preemptions == 0
 
 
-@pytest.mark.parametrize("block_drafter, lookahead", [(True, 3), (False, 2)])
-def test_decode_reserve_below_the_draft_lookahead_rejected(
-    build, block_drafter, lookahead
+@pytest.mark.parametrize(
+    "speculative_config, first_decode_tokens",
+    [
+        # T0 and 3 verify slots, then a 4-token reach for either drafter.
+        (SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: True), 8),
+        (SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False), 8),
+        # T0, then a 1-token reach.
+        (None, 2),
+    ],
+    ids=["dspark", "serial_mtp", "no_spec"],
+)
+def test_decode_reserve_below_a_first_decode_rejected(
+    build, speculative_config, first_decode_tokens
 ):
     def reserve(tokens):
         return build(
-            speculative_config=SimpleNamespace(
-                num_speculative_tokens=3, use_dspark=lambda: block_drafter
-            ),
+            speculative_config=speculative_config,
             options={"enabled": True, "num_reserved_decode_tokens": tokens},
         )
 
-    with pytest.raises(ValueError, match="draft lookahead"):
-        reserve(lookahead - 1)
-    sched, _ = reserve(lookahead)
-    assert sched.block_manager.draft_lookahead == lookahead
-    assert sched.pd_admission.reserve_tokens == lookahead
+    with pytest.raises(ValueError, match="first decode"):
+        reserve(first_decode_tokens - 1)
+    sched, _ = reserve(first_decode_tokens)
+    assert sched.pd_admission.first_decode_tokens == first_decode_tokens
+    assert sched.pd_admission.reserve_tokens == first_decode_tokens
 
 
 @pytest.mark.parametrize("chunked", [False, True])

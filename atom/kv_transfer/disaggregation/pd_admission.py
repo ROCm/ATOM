@@ -57,7 +57,7 @@ class PdAdmissionController:
     """Credits never free KV or decide whether a remote writer is safe."""
 
     @classmethod
-    def from_config(cls, config, connector, block_manager):
+    def from_config(cls, config, connector, block_manager, *, first_decode_tokens):
         options = (config.kv_transfer_config or {}).get("pd_admission", {})
         if not isinstance(options, dict):
             raise TypeError("pd_admission must be an object")
@@ -97,12 +97,11 @@ class PdAdmissionController:
         reserve_tokens = _positive_int(
             "num_reserved_decode_tokens", options.get("num_reserved_decode_tokens")
         )
-        # `check` leaves a receive's draft lookahead to the reserve.
-        lookahead = block_manager.draft_lookahead
-        if reserve_tokens is not None and reserve_tokens < lookahead:
+        # Less admits a receive whose first decode then preempts.
+        if reserve_tokens is not None and reserve_tokens < first_decode_tokens:
             raise ValueError(
                 "pd_admission.num_reserved_decode_tokens must be at least the "
-                f"draft lookahead ({lookahead} tokens)"
+                f"{first_decode_tokens} tokens a P/D receive's first decode takes"
             )
         if fraction is not None:
             if byte_limit is not None:
@@ -114,10 +113,18 @@ class PdAdmissionController:
             connector,
             block_manager,
             reserve_tokens=reserve_tokens,
+            first_decode_tokens=first_decode_tokens,
         )
 
     def __init__(
-        self, max_bytes, block_bytes, connector, block_manager, *, reserve_tokens=None
+        self,
+        max_bytes,
+        block_bytes,
+        connector,
+        block_manager,
+        *,
+        reserve_tokens=None,
+        first_decode_tokens=0,
     ):
         self.max_bytes = max_bytes
         self.block_bytes = block_bytes
@@ -125,8 +132,10 @@ class PdAdmissionController:
         # allocator's destination table; neither is the scheduler's to know.
         self._connector = connector
         self._block_manager = block_manager
-        # Decode tokens kept free for each admitted request to grow by.
+        # Decode tokens kept free for each admitted request to grow by, and
+        # the fewest any request is given: what a first decode takes.
         self.reserve_tokens = reserve_tokens
+        self.first_decode_tokens = first_decode_tokens
         self.pending: dict[str, PendingReceive] = {}
         self._block_refs: dict[int, int] = {}
         # Requests deferred, once per admission wait and limit, for the metrics
@@ -187,10 +196,11 @@ class PdAdmissionController:
         # those past their first batch and so no longer pending. Only an idle D
         # admits below it, so a request that alone exceeds it is not starved.
         if (self.pending or running) and self.reserve_tokens is not None:
-            # What this request takes off the free list now: the allocator's
-            # demand, where a hit on a cached-but-free block counts and one on
-            # a block another request holds does not. The draft lookahead in it
-            # is decode growth, which a PD receive allocates at its first decode.
+            # What this request takes off the free list now: the prompt's share
+            # of the allocator's demand, where a hit on a cached-but-free block
+            # counts and one on a block another request holds does not. A P/D
+            # receive takes the demand's draft lookahead only at its first
+            # decode, which the reserve below covers.
             demand = probe.num_new_blocks - self._block_manager.draft_lookahead_blocks(
                 len(seq)
             )
@@ -234,10 +244,9 @@ class PdAdmissionController:
         # Past the blocks `seq` holds, which can lead its length by a draft
         # lookahead already allocated or trail it by the block this step's
         # decode has yet to take. No more than it may still generate, but no
-        # less than the lookahead its next decode allocates whatever is left.
+        # less than a first decode takes whatever is left.
         left = max(0, seq.max_tokens - seq.num_completion_tokens)
-        lookahead = self._block_manager.draft_lookahead
-        tokens = max(min(self.reserve_tokens, left), lookahead)
+        tokens = max(min(self.reserve_tokens, left), self.first_decode_tokens)
         return max(0, self._block_manager.num_pool_blocks(len(seq) + tokens) - held)
 
     def _charged_hits(self, probe, offset: int) -> int:

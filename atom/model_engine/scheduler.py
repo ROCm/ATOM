@@ -895,8 +895,17 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        # What a P/D receive's first decode takes past its prompt: T0 and the
+        # `mtp_k` verify slots its handoff appends, then the reach past them
+        # that `can_append` checks before the step runs, as decode does below.
+        decode_reach = max(
+            1 + (self.mtp_k if self.use_spec else 0), self.draft_lookahead
+        )
         self.pd_admission = PdAdmissionController.from_config(
-            config, self.kv_connector, self.block_manager
+            config,
+            self.kv_connector,
+            self.block_manager,
+            first_decode_tokens=1 + self.mtp_k + decode_reach,
         )
         bind_block_manager = getattr(self.kv_connector, "bind_block_manager", None)
         if callable(bind_block_manager):
