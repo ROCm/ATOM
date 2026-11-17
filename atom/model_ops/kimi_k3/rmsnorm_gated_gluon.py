@@ -22,11 +22,12 @@ one wave owns a row:
   column-major scale of neighbouring tokens shares lines, which cost more than
   the whole norm at large T when every XCD writes into them.
 
-A workgroup takes ``_ROWS_PER_PROGRAM`` consecutive rows, one wave per row. From
-``_HEAD_MAJOR_MIN_T`` tokens (``HEAD_MAJOR``) it takes one head of
-``_HEAD_MAJOR_TOKENS`` consecutive tokens instead, so its scale codes are
-adjacent bytes of the column-major scale. Only the row-to-wave mapping changes,
-not a row's arithmetic, so the bytes do not depend on T.
+A workgroup takes ``_ROWS_PER_PROGRAM`` consecutive rows, one wave per row. With
+the column-major scale, from ``_HEAD_MAJOR_MIN_T`` tokens (``HEAD_MAJOR``) it
+takes one head of ``_HEAD_MAJOR_TOKENS`` consecutive tokens instead, so its scale
+codes are adjacent bytes; the row-major scale has no such lines to share. Only
+the row-to-wave mapping changes, not a row's arithmetic, so the bytes do not
+depend on T.
 """
 
 from __future__ import annotations
@@ -43,7 +44,8 @@ from triton.language import PropagateNan
 _PROPAGATE_NAN = gl.constexpr(PropagateNan.ALL)  # keep NaN through the FP8 clamp
 # One wave per row; rows per workgroup.
 _ROWS_PER_PROGRAM = 4
-# From this many tokens a workgroup takes one head of _HEAD_MAJOR_TOKENS tokens.
+# From this many tokens a workgroup takes one head of _HEAD_MAJOR_TOKENS tokens
+# (column-major scale only).
 _HEAD_MAJOR_MIN_T = 768
 _HEAD_MAJOR_TOKENS = 8
 
@@ -175,7 +177,7 @@ def rmsnorm_gated_e8m0(
         (heads, t) if col_major else (t, heads), dtype=torch.uint8, device=x.device
     )
     if m:
-        head_major = t >= _HEAD_MAJOR_MIN_T
+        head_major = col_major and t >= _HEAD_MAJOR_MIN_T
         rpw = _HEAD_MAJOR_TOKENS if head_major else _ROWS_PER_PROGRAM
         grid = heads * triton.cdiv(t, rpw) if head_major else triton.cdiv(m, rpw)
         _rmsnorm_gated_e8m0_kernel[(grid,)](
