@@ -56,7 +56,7 @@ from atom.utils import (
     worker_process_name,
 )
 from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
-from atom.utils.numa_utils import numa_bind_to_node
+from atom.utils.numa_utils import numa_bind_to_node, opt_out_of_numa_balancing
 
 logger = logging.getLogger("atom")
 
@@ -126,6 +126,9 @@ class AsyncIOProc:
         from atom.utils import enable_orphan_reaping
 
         enable_orphan_reaping()
+        # Before any thread: the memory policy is per thread, inherited only by
+        # those created after it (see opt_out_of_numa_balancing).
+        opt_out_of_numa_balancing(f"rank {rank}")
 
         # Named once, before anything logs: `ps`, the GC lines here and the
         # freeze line the runner emits over RPC all have to be the same string,
