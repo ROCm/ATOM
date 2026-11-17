@@ -3,7 +3,7 @@
 ReplaySSM verify replays the raw contiguous checkpoint and refuses a strided
 one (`SGLangGatedDeltaNet._verify_replayssm`), so under the ring the plugin
 keeps FlyDSL decode and its VK view off while the layout-agnostic FlyDSL
-prefill still runs.
+prefill still runs on gfx942.
 """
 
 from collections import OrderedDict
@@ -88,8 +88,7 @@ def test_ring_keeps_the_raw_checkpoint_and_runs_flydsl_prefill(monkeypatch, repl
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: object())
     # Decode would be eligible on this device; only the ring rules it out.
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
-    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: True)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: True)
     schedule = object()
     monkeypatch.setattr(
         fly, "build_prefill_metadata", lambda lengths, cu_seqlens: schedule

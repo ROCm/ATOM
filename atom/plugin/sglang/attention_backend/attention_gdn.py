@@ -108,7 +108,7 @@ def _ensure_flydsl_policy(state: torch.Tensor):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy, select_policy
 
     # Under ReplaySSM the ring addresses the raw contiguous checkpoint, so
-    # `select_policy` keeps decode (and its VK view) off; prefill still runs.
+    # `select_policy` keeps decode (and its VK view) off; prefill runs only on gfx942.
     policy = select_policy(
         allowed=True,
         replayssm=replayssm_enabled(),

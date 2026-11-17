@@ -7,10 +7,11 @@ ReplaySSM needs the state pool to stay a contiguous KV checkpoint, and a
 prefill to rewrite that checkpoint wholesale without touching the record ring.
 FlyDSL decode needs a physical VK pool, so it stays off. FlyDSL prefill gathers
 the initial state through the pool's strides and returns the final state as a
-logical KV view, so it may run. These tests pin that contract on the Qwen4Exp
-cache binding and prefill metadata, and the Native GDN layer. The policy matrix
-is in tests/test_gdn_flydsl_policy.py, which runs without AITER; the kernel
-numerics are compared on a GPU in tests/test_aiter_flydsl_gdn.py.
+logical KV view, so it may run; it is enabled on gfx942 only. These tests pin
+that contract on the Qwen4Exp cache binding and prefill metadata, and the
+Native GDN layer. The policy matrix is in tests/test_gdn_flydsl_policy.py,
+which runs without AITER; the kernel numerics are compared on a GPU in
+tests/test_aiter_flydsl_gdn.py.
 """
 
 from types import SimpleNamespace
@@ -54,8 +55,7 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
     monkeypatch.setattr(fly, "backend", lambda stage: "auto")
     monkeypatch.setattr(fly, "ops", lambda: object())
-    monkeypatch.setattr(fly, "decode_device_supported", lambda device: True)
-    monkeypatch.setattr(fly, "replayssm_prefill_device_supported", lambda d: gfx942)
+    monkeypatch.setattr(fly, "_validated_on_gfx942", lambda: gfx942)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
     attention = SimpleNamespace(allow_aiter_flydsl=True, dt_bias=raw)
@@ -67,13 +67,13 @@ def test_qwen_binding_keeps_the_replayssm_checkpoint_contiguous(
     prefill = gfx942 or not replayssm
     assert policy.prefill is prefill
     assert builder._flydsl_prefill_enabled is prefill
-    assert policy.decode is (not replayssm)
+    assert policy.decode is (gfx942 and not replayssm)
     if replayssm:
         # The exact tensor ReplaySSM addresses: no VK reinterpretation.
         assert cache.v_cache is raw
     else:
         assert cache.v_cache.data_ptr() == raw.data_ptr()
-        assert cache.v_cache.stride()[-2:] == (1, 128)
+        assert cache.v_cache.stride()[-2:] == ((1, 128) if gfx942 else (128, 1))
 
 
 def _finish_prefill(monkeypatch, *, replayssm, enabled):
