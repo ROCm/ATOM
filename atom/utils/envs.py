@@ -636,6 +636,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_KERNEL_AR": lambda: (
         os.getenv("ATOM_KIMI_MONO_KERNEL_AR", "1") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: the AttnRes seams' mix on the gfx1250 FlyDSL kernel
+    # (a CTA a token, the reductions in another order); 0 keeps Triton's.
+    "ATOM_KIMI_MONO_ATTN_RES": lambda: os.getenv("ATOM_KIMI_MONO_ATTN_RES", "1") == "1",
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the

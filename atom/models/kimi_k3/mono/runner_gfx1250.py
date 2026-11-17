@@ -62,6 +62,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+from atom.models.kimi_k3.mono.kernels.stages import attn_res_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     GATHER_ALLREDUCE_ABI,
     allreduce_peer_bytes,
@@ -262,6 +263,59 @@ class Gfx1250WidthBuild:
         for launcher, abi in pairs:
             unique.setdefault(id(launcher), (launcher, abi))
         return list(unique.values())
+
+
+_ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
+
+
+def _mono_attn_res(site, prefix, blocks, add, add2):
+    """``_bf16_attn_res`` on the gfx1250 AttnRes mix (``attn_res_gfx1250``):
+    the same mix, its reductions in another order, a CTA a token. Where that
+    kernel does not apply -- nothing to mix, no BF16 out_norm, blocks not rows
+    HIDDEN apart -- or ATOM_KIMI_MONO_ATTN_RES is 0, ``_bf16_attn_res``."""
+    if not (envs.ATOM_KIMI_MONO_ATTN_RES and getattr(site, "enabled", False)):
+        return _bf16_attn_res(site, prefix, blocks, add, add2)
+    if site.score_weight is None:
+        site.process_weights_after_loading()
+    first_prefix = add if prefix is None else prefix
+    addends = [a for a in ((add2,) if prefix is None else (add, add2)) if a is not None]
+    norm = getattr(site, "out_norm", None)
+    count = blocks.shape[1]
+    if not (
+        1 <= count < attn_res_gfx1250.MAX_CANDIDATES
+        and norm is not None
+        and norm.weight.dtype == torch.bfloat16
+        and site.score_weight.dtype == torch.float32
+        and first_prefix.dtype == torch.bfloat16
+        and first_prefix.is_cuda
+        and blocks.stride(-1) == 1
+        and blocks.stride(1) == HIDDEN
+    ):
+        return _bf16_attn_res(site, prefix, blocks, add, add2)
+    key = (count, len(addends), float(site.eps), float(site.out_eps))
+    if key not in _ATTN_RES_MIXES:
+        _ATTN_RES_MIXES[key] = attn_res_gfx1250.build_attn_res(
+            count, len(addends), True, *key[2:]
+        )
+    prefix = first_prefix.contiguous()
+    addends = [a.contiguous() for a in addends]
+    out = torch.empty_like(prefix)
+    prefix_out = torch.empty_like(prefix) if addends else prefix
+    first, second = (addends + [prefix, prefix])[:2]
+    _ATTN_RES_MIXES[key].launcher(
+        blocks.data_ptr(),
+        prefix.data_ptr(),
+        first.data_ptr(),
+        second.data_ptr(),
+        site.score_weight.data_ptr(),
+        norm.weight.data_ptr(),
+        out.data_ptr(),
+        prefix_out.data_ptr(),
+        blocks.stride(0),
+        prefix.size(0),
+        stream=torch.cuda.current_stream(),
+    )
+    return out, prefix_out
 
 
 class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
@@ -674,6 +728,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
         return hidden
 
+    def _seam(self, plan, prefix, blocks, add, add2, bf16=False):
+        """The attention-side seam; K1's BF16 row on the gfx1250 AttnRes mix."""
+        if not bf16:
+            return super()._seam(plan, prefix, blocks, add, add2, bf16)
+        layer = self.inner.layers[plan.layer_id]
+        before, write_idx = layer_block(plan.layer_id)
+        normed, prefix = _mono_attn_res(
+            layer.self_attention_attn_res, prefix, blocks[:, :before], add, add2
+        )
+        return layer, normed, prefix, before, write_idx
+
     def _layer(self, build, plan, positions, prefix, blocks, add, add2, metadata):
         if plan.layer_id not in self.routed:
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
@@ -741,7 +806,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         buffers = local.buffers
         stream = torch.cuda.current_stream()
         reset = weight.write_idx >= 0
-        x, prefix = _bf16_attn_res(
+        x, prefix = _mono_attn_res(
             self.inner.layers[plan.layer_id].mlp_attn_res,
             None if reset else prefix,
             blocks[:, : weight.blocks + reset],
