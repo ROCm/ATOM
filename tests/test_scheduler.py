@@ -1852,6 +1852,80 @@ def test_probe_stops_at_a_seq_waiting_for_an_inflight_prefix():
     assert consumer.id in sched._inflight_prefix_wait
 
 
+class _RampDelayer:
+    """A cross-DP delayer in its initial ramp that records what the scheduler
+    reports each tick and holds prefill."""
+
+    is_local = False
+    max_queue_ms = None
+    rank_prefill_costs = ()
+    ramp_active = True
+    target_fill = 0.5
+
+    def __init__(self):
+        self.reports = []
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        self.reports.append(kwargs)
+        return PrefillDecision(allow=False, prefillable_ranks=int(prefillable))
+
+
+class TestInitialRampFullChunk:
+    """`full_chunk`: resumable partials plus the waiting prompts that fit the
+    free seq slots reach target_fill (0.5) of the 64-token chunk, 32 tokens."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(num_kvcache_blocks=100, max_model_len=128, max_num_seqs=4)
+        )
+
+    def _report(self, sched, delayer):
+        sched.set_prefill_delayer(delayer)
+        sched.schedule()
+        return delayer.reports[-1]
+
+    def test_waiting_prompts_reach_target_fill(self, seq_factory):
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.add(seq_factory(list(range(30, 50))))
+        report = self._report(sched, _RampDelayer())
+        assert report["full_chunk"] is True  # 20 + 20 >= 32
+        assert report["admittable_requests"] == 2
+
+    def test_waiting_prompts_short_of_target_fill(self, seq_factory):
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        assert self._report(sched, _RampDelayer())["full_chunk"] is False  # 20
+
+    def test_partial_counts_toward_target_fill(self, seq_factory):
+        sched = self._sched()
+        part = seq_factory(list(range(100, 124)))
+        sched.add(part)
+        sched.schedule()
+        # Mid-chunked-prefill with 16 tokens left; it holds one of the 4 slots.
+        part.num_cached_tokens = 8
+        part.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        sched.add(seq_factory(list(range(10, 30))))
+        report = self._report(sched, _RampDelayer())
+        assert report["full_chunk"] is True  # 16 + 20 >= 32
+        assert report["admittable_requests"] == 2
+
+    def test_parked_remote_kv_takes_free_slots(self, seq_factory):
+        sched = self._sched()
+        sched.add(seq_factory(list(range(10, 30))))
+        sched.add(seq_factory(list(range(30, 50))))
+        # Three parked remote-KV loads hold three of the 4 seq slots: only the
+        # first 20-token prompt fits the one left.
+        sched._num_parked_remote_kv = 3
+        report = self._report(sched, _RampDelayer())
+        assert report["full_chunk"] is False
+        assert report["admittable_requests"] == 1
+
+
 class TestOldestWaitingPrefillAge:
     """TTFT SLA guard signal: age (ms) of the oldest ADMITTABLE waiting prefill,
     skipping the same non-admittable seqs as _can_admit_head_prefill."""

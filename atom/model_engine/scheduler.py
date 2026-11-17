@@ -2318,15 +2318,17 @@ class Scheduler:
                 else 0.0
             )
             waiting_requests = len(self.waiting) + self._partial_prefill_count
-            # Prefill ramp: a whole chunk is ready from the waiting heads that
-            # fit the free seq slots, so delaying it only leaves slots empty.
+            # Seq slots a FIRE can fill: a parked remote-KV seq holds one too.
+            free_slots = max(
+                0, self.max_num_seqs - len(self.running) - self._num_parked_remote_kv
+            )
+            # Prefill ramp: target_fill of a chunk is ready from the waiting heads
+            # that fit the free seq slots, so delaying it only leaves slots empty.
             full_chunk = (
                 prefillable
                 and self.prefill_delayer.ramp_active
                 and self._partial_prefill_remaining_tokens()
-                + self._waiting_new_token_count(
-                    max_seqs=max(0, self.max_num_seqs - len(self.running))
-                )
+                + self._waiting_new_token_count(max_seqs=free_slots)
                 >= self.prefill_delayer.target_fill * self.max_num_batched_tokens
             )
             decision = self.prefill_delayer.should_allow_prefill(
@@ -2356,10 +2358,7 @@ class Scheduler:
                 # prefill_admit_policy adaptive: what a FIRE could add to the
                 # decode batch -- partials plus waiting heads up to free slots
                 admittable_requests=self._partial_prefill_count
-                + min(
-                    len(self.waiting),
-                    max(0, self.max_num_seqs - len(self.running)),
-                ),
+                + min(len(self.waiting), free_slots),
                 full_chunk=full_chunk,
             )
         else:
