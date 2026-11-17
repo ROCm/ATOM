@@ -29,8 +29,9 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 MODES = ("auto", "1", "0")
-# the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations; at TP8 a V4.1 server
-# also needs ATOM's own path to start, which waits on AITER's group-32 FP8 GEMM at K = 288, ROCm/aiter#7967)
+# the tensor-parallel sizes the hi programs are built for (MI355X, the validated configurations; at TP8 ATOM's own path
+# starts on gfx950 through the shared expert's in-place K pad, 288 -> 320, ``linear.fp8_group32_k_pad_align``, which
+# goes away with ROCm/aiter#7967)
 SERVED_TPS = (2, 4, 8)
 REQ_ROWS = 6  # a verify's rows a request: DSpark's 5 drafts + the anchor
 # the KV cache's page in tokens: ATOM's for V4.1 (``Config`` sets ``kv_cache_block_size`` to 128 for

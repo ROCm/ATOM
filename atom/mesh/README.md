@@ -77,8 +77,9 @@ listing it; accepting an unknown JSON field does not establish rank-routing supp
   source "$HOME/.cargo/env"
   ```
 
-- **Protocol Buffers compiler (`protoc`)**, only when enabling the optional
-  `ext-proc` Cargo feature, for the vendored Envoy protocol bindings:
+- **Protocol Buffers compiler (`protoc`)**, for every build: the `smg-grpc-client`
+  dependency's build script runs it (this crate's own protos, including the optional
+  `ext-proc` Envoy bindings, are compiled in-process by protox):
   ```bash
   sudo apt-get install protobuf-compiler
   ```
@@ -94,7 +95,7 @@ cargo build
 # Release build (optimized)
 cargo build --release
 
-# Release build with optional Envoy ext-proc support (requires protoc)
+# Release build with optional Envoy ext-proc support
 cargo build --release --features ext-proc
 ```
 
@@ -129,8 +130,8 @@ ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .
 
 `ATOM_MESH_FEATURES` accepts Cargo's comma- or space-separated feature list and
 defaults to empty. Both `docker/Dockerfile` and `docker/atom_release.dockerfile`
-accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in; the build
-image must provide `protoc` when enabling it.
+accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in. The build
+image must provide `protoc` either way, for `smg-grpc-client`.
 
 ## Usage
 
@@ -264,8 +265,11 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
-`cache_aware` or `round_robin`, for models served through these APIs.
+`501 token_routing_unsupported`. So do chats for a model whose tokenizer
+llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
+chat template, such as DeepSeek V3.2 and V4
+([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
+need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 ## Reliability
 
@@ -315,7 +319,7 @@ changing worker metric names.
 | Router | `mesh_router_*` | Requests by model/endpoint, latency, errors |
 | Inference | `mesh_router_ttft/tpot/tokens_*` | TTFT, TPOT, token counts (gRPC) |
 | Worker | `mesh_worker_*` | Pool size, connections, health, selection |
-| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes |
+| Routing | `mesh_route_*`, `mesh_session_*` | Policy decisions, session worker changes, engine-reported cached tokens against the router estimate |
 | Circuit breaker | `mesh_worker_cb_*` | State, transitions, outcomes |
 | Retry | `mesh_worker_retries_*` | Attempts, exhaustion, backoff |
 
