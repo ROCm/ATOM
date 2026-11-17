@@ -24,6 +24,8 @@ import hashlib
 from dataclasses import fields, is_dataclass
 from pathlib import Path
 
+from atom.mono import polling
+
 _SCALARS = (int, float, bool, str, enum.Enum)
 _ATOM = Path(__file__).resolve().parents[2]
 
@@ -42,6 +44,8 @@ def source_digest(*paths: str) -> str:
         for f in files:
             h.update(str(f.relative_to(_ATOM)).encode())
             h.update(f.read_bytes())
+            if f.name == "polling.py":
+                h.update(polling.CACHE_TAG)  # its value is from the environment
     return h.hexdigest()[:16]
 
 

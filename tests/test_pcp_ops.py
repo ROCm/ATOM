@@ -572,9 +572,10 @@ def test_draft_split_follows_the_target_not_the_current_pass(monkeypatch):
 
 
 def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
-    """After a row-split target prefill the proposer passes this rank's aux
-    stripe and the row count to the model, which decides what to gather;
-    otherwise the gathered aux rows, as before PCP."""
+    """After a row-split target prefill the proposer passes this rank's stripe
+    of each tap and the row count to the model, which decides what to gather;
+    otherwise the gathered taps, as before PCP. Either way the taps arrive
+    unjoined: joining them is the model's business."""
     dp = _import_or_skip_dep("atom.spec_decode.dspark_proposer")
     n, n_local = 10, 3  # 4 ranks pad to 12: 3 rows per rank
     positions = torch.arange(50, 50 + n + 6)
@@ -601,7 +602,8 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     drafter.aux_for = lambda h: pytest.fail("gathered the aux states")
     dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
     ((aux, pos, kw),) = calls
-    assert torch.equal(aux, torch.cat([b[:n_local] for b in bufs], dim=-1))
+    assert len(aux) == len(bufs)
+    assert all(torch.equal(a, b[:n_local]) for a, b in zip(aux, bufs))
     assert pos is positions and kw == {"pcp_num_tokens": n}
 
     # TR_HYBRID: `positions` covers fewer rows than the target ran.
@@ -617,7 +619,8 @@ def test_dspark_proposer_hands_the_model_its_own_stripe(monkeypatch):
     drafter.aux_for = lambda h: full
     dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
     ((aux, pos, kw),) = calls
-    assert torch.equal(aux, torch.cat(full, dim=-1)) and kw == {}
+    assert len(aux) == len(full) and kw == {}
+    assert all(torch.equal(a, f) for a, f in zip(aux, full))
 
 
 def _split_ctx(monkeypatch, ws, dummy=False):
@@ -640,6 +643,7 @@ def test_dspark_v4_split_context_kv_gathers_each_rank_s_own_kv(monkeypatch, widt
     ws, n, n_local = 4, 10, 3
     positions = torch.arange(50, 50 + n + 6)  # the forward buffer runs past n
     aux_full = torch.randn(n, 5)
+    taps_full = [aux_full[:, :2], aux_full[:, 2:]]  # two taps, joined by the model
     _split_ctx(monkeypatch, ws)
 
     class Layer:
@@ -654,13 +658,16 @@ def test_dspark_v4_split_context_kv_gathers_each_rank_s_own_kv(monkeypatch, widt
             self.written.append((rows, pos))
 
     layers = [Layer(1.0), Layer(-2.0)]
-    model = SimpleNamespace(project_context=lambda a: a * 3, context_layers=layers)
+    model = SimpleNamespace(
+        project_context=lambda taps: DSparkDraftModel.concat_taps(taps) * 3,
+        context_layers=layers,
+    )
     model.write_context_kv = types.MethodType(DSparkDraftModel.write_context_kv, model)
     model.write_split_context_kv = types.MethodType(
         v4d.DeepseekV4DSpark.write_split_context_kv, model
     )
     stripes = [
-        pu.pcp_round_robin_split(pu.pcp_pad_dense(aux_full, 2), ws, r)
+        [pu.pcp_round_robin_split(pu.pcp_pad_dense(t, 2), ws, r) for t in taps_full]
         for r in range(ws)
     ]
     sent = []
@@ -679,7 +686,7 @@ def test_dspark_v4_split_context_kv_gathers_each_rank_s_own_kv(monkeypatch, widt
         torch.stack([sent[r][i] for r in range(ws)], dim=1).reshape(ws * n_local, -1)
         for i in range(width * len(layers))
     ]
-    ctx_full = model.project_context(aux_full)
+    ctx_full = model.project_context(taps_full)
     for i, layer in enumerate(layers):
         want = layer.context_kv_rows(ctx_full, positions[:n])
         for j in range(width):
@@ -697,8 +704,9 @@ def test_dspark_v4_split_context_kv_gathers_each_rank_s_own_kv(monkeypatch, widt
 
 
 def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
-    """A draft that does not make its KV row by row gathers the aux stripe and
-    writes as before; a dummy run writes nothing either way."""
+    """A draft that does not make its KV row by row gathers every tap's stripe
+    in one collective and writes as before; a dummy run writes nothing either
+    way."""
     from atom.models.dspark_draft import DSparkDraftModel
 
     ws, n = 4, 10
@@ -706,7 +714,7 @@ def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
     written = []
     gathers = []
     model = SimpleNamespace(
-        project_context=lambda a: a + 1,
+        project_context=lambda taps: DSparkDraftModel.concat_taps(taps) + 1,
         context_layers=[
             SimpleNamespace(write_context_kv=lambda h, p, s: written.append((h, p, s)))
         ],
@@ -723,13 +731,14 @@ def test_dspark_default_split_context_kv_gathers_the_aux_rows(monkeypatch):
     monkeypatch.setattr(pu, "pcp_allgather_rerange_many", gather)
     positions = torch.arange(n)
     slots = torch.arange(n) + 100
-    model.write_context_kv(torch.ones(3, 5), positions, slots, pcp_num_tokens=n)
+    taps = [torch.ones(3, 2), torch.ones(3, 3)]
+    model.write_context_kv(taps, positions, slots, pcp_num_tokens=n)
     ((h, p, s),) = written
-    assert gathers == [[3]] and h.shape == (n, 5) and p is positions and s is slots
+    assert gathers == [[3, 3]] and h.shape == (n, 5) and p is positions and s is slots
 
     written.clear()
     _split_ctx(monkeypatch, ws, dummy=True)
-    model.write_context_kv(torch.ones(3, 5), positions, pcp_num_tokens=n)
+    model.write_context_kv(taps, positions, pcp_num_tokens=n)
     assert written == []
 
 
