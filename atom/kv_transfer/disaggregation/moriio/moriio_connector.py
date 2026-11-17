@@ -489,14 +489,16 @@ class MoRIIOConnector(KVConnectorBase):
         session = sessions.get(key)
         if session is None:
             name = self._regions[region_idx].name
+            local_metas = self.layer_name_to_local_kv_cache_metadata[name]
+            remote_metas = self.layer_name_to_remote_kv_cache_metadata[engine_id][name]
+            if local_metas == remote_metas:
+                raise ValueError(
+                    f"region {name}: {engine_id} advertised descriptors "
+                    "byte-identical to ours"
+                )
             unpack = self.moriio_wrapper.get_unpack_memory_metadata
             session = self.moriio_wrapper.build_session(
-                unpack(self.layer_name_to_local_kv_cache_metadata[name][local_chunk]),
-                unpack(
-                    self.layer_name_to_remote_kv_cache_metadata[engine_id][name][
-                        remote_chunk
-                    ]
-                ),
+                unpack(local_metas[local_chunk]), unpack(remote_metas[remote_chunk])
             )
             sessions[key] = session
         return session
@@ -2310,13 +2312,16 @@ class _Region:
     @classmethod
     def of(cls, name: str, kind: str, region: Any) -> _Region:
         unit = int(region.unit_bytes)
+        total = int(region.total_bytes)
         if unit > MAX_RDMA_CHUNK_BYTES:
             raise ValueError(f"region {name}: a {unit} B unit exceeds one RDMA chunk")
+        if total % unit:
+            raise ValueError(f"region {name}: {total} B is not whole {unit} B units")
         return cls(
             name,
             kind,
             int(region.base_addr),
-            int(region.total_bytes),
+            total,
             unit,
             bool(region.reverse_indexed),
             (MAX_RDMA_CHUNK_BYTES // unit) * unit,
@@ -2342,10 +2347,14 @@ class _Region:
         return (self.name, self.kind, self.unit, self.reverse, self.chunk_bytes)
 
     def chunks(self) -> list[tuple[int, int]]:
-        return [
-            (self.base + offset, min(self.chunk_bytes, self.total - offset))
-            for offset in range(0, self.total, self.chunk_bytes)
-        ]
+        chunks: list[tuple[int, int]] = []
+        offset = 0
+        for size in KVTransferRegion.chunk_sizes(
+            self.total, self.unit, self.chunk_bytes
+        ):
+            chunks.append((self.base + offset, size))
+            offset += size
+        return chunks
 
     def locate(self, index: int) -> tuple[int, int]:
         """``(chunk, offset within chunk)`` of unit ``index``."""
