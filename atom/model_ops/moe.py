@@ -68,14 +68,13 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
     use_mori_low_latency,
 )
-from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
-from atom.model_ops.fused_moe.ptpc_shared_staging import PtpcSharedStaging
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
     pack_routed_rows,
     resolve_routed_rows_wire,
 )
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
+from atom.model_ops.fused_moe.shared_expert_staging import SharedExpertStaging
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
     is_rocm_aiter_fuse_routed_scaling_factor,
@@ -3616,8 +3615,7 @@ class FusedMoE(torch.nn.Module):
     """
 
     # Set in __init__ for a shared expert staged into its fused slot.
-    shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
-    ptpc_shared_staging: PtpcSharedStaging | None = None
+    shared_expert_staging: SharedExpertStaging | None = None
 
     def __init__(
         self,
@@ -3728,8 +3726,9 @@ class FusedMoE(torch.nn.Module):
                 quant_config, prefix, shared_spec, layer_quant_config
             )
         )
-        stage_shared_mxfp8 = shared_spec is not None and (
-            fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
+        stage_shared = stage_shared_ptpc or bool(
+            shared_spec is not None
+            and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -3977,16 +3976,15 @@ class FusedMoE(torch.nn.Module):
         )
         self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
-        self.shared_mxfp8_into_mxfp4 = (
-            Mxfp8SharedIntoMxfp4(
-                self, quant_config, hidden_size, self.intermediate_size_per_partition
+        self.shared_expert_staging = (
+            SharedExpertStaging(
+                self,
+                quant_config,
+                hidden_size,
+                self.intermediate_size_per_partition,
+                ptpc=stage_shared_ptpc,
             )
-            if stage_shared_mxfp8
-            else None
-        )
-        self.ptpc_shared_staging = (
-            PtpcSharedStaging(self, hidden_size, self.intermediate_size_per_partition)
-            if stage_shared_ptpc
+            if stage_shared
             else None
         )
         compilation_config = atom_config.compilation_config
@@ -4050,10 +4048,8 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
-        if self.shared_mxfp8_into_mxfp4 is not None:
-            self.shared_mxfp8_into_mxfp4.fuse(self)
-        if self.ptpc_shared_staging is not None:
-            self.ptpc_shared_staging.fuse(self)
+        if self.shared_expert_staging is not None:
+            self.shared_expert_staging.fuse(self)
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
@@ -5287,9 +5283,7 @@ class FusedMoE(torch.nn.Module):
         if expert_id == -1:
             return
         # getattr: test doubles borrow this loader without subclassing FusedMoE.
-        staging = getattr(self, "shared_mxfp8_into_mxfp4", None) or getattr(
-            self, "ptpc_shared_staging", None
-        )
+        staging = getattr(self, "shared_expert_staging", None)
         if staging is not None and staging.load(
             self, param, loaded_weight, shard_id, expert_id
         ):
