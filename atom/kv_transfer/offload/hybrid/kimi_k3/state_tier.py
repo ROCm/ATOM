@@ -153,6 +153,10 @@ class StateOffloadTier:
     def shutdown(self) -> None:
         self._load_executor.shutdown(wait=True)
         self._store_executor.shutdown(wait=True)
+        # No thread reaches the codec any more: it may let its buffers go.
+        close = getattr(self.codec, "close", None)
+        if callable(close):
+            close()
 
     def _do_store(self, op, unit_ids, ready_event) -> None:
         # `release_source` fires from `codec.put` once `pack`'s gather+D2H

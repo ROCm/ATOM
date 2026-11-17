@@ -51,6 +51,7 @@ import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
 from atom.kv_transfer.offload import atom_lmcache_staging
+from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import (
     _DEFAULT_GPU_STAGING_BYTES,
     BlockGPUConnector,
@@ -161,8 +162,23 @@ def _head_first_windows(start: int, end: int, size: int) -> list[range]:
 
 
 class MooncakeStoreOffloadConnector(DenseOffloadConnector):
-    """Offload worker (dense KV, M3 PAGE, or V4.1 replay PAGEs) whose tier is a
-    Mooncake Store, reached directly."""
+    """Offload worker (dense KV, M3 PAGE, V4.1 replay PAGEs, or Kimi-K3's KV
+    and KDA state) whose tier is a Mooncake Store, reached directly."""
+
+    def __new__(cls, config: Any = None, *args: Any, **kwargs: Any):
+        # Registered once for every layout; Kimi-K3 also carries a state tier.
+        # No config: `copy` and `pickle` rebuilding an instance.
+        if (
+            cls is MooncakeStoreOffloadConnector
+            and config is not None
+            and offcfg.select_offload_layout(config) == "kimi_k3"
+        ):
+            from atom.kv_transfer.offload.mooncake_store.kimi_k3 import (
+                MooncakeStoreKimiK3Connector,
+            )
+
+            return super().__new__(MooncakeStoreKimiK3Connector)
+        return super().__new__(cls)
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)

@@ -496,6 +496,21 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     # done (the block GPU connector), separately from the store terminal.
     _supports_early_block_release = True
 
+    def __new__(cls, config: Any = None, *args: Any, **kwargs: Any):
+        # Registered once for every layout; Kimi-K3 also carries a state tier.
+        # No config: `copy` and `pickle` rebuilding an instance.
+        if (
+            cls is MooncakeStoreOffloadScheduler
+            and config is not None
+            and offcfg.select_offload_layout(config) == "kimi_k3"
+        ):
+            from atom.kv_transfer.offload.mooncake_store.kimi_k3 import (
+                MooncakeStoreKimiK3Scheduler,
+            )
+
+            return super().__new__(MooncakeStoreKimiK3Scheduler)
+        return super().__new__(cls)
+
     def __init__(self, config: Any) -> None:
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)

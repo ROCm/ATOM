@@ -26,6 +26,9 @@ DENSE_CODEC_ID = "dense-opaque-block-v1"
 # V4.1 stores PAGE regions only; request state is rebuilt by replay, so its
 # objects must not share a namespace with dense or M3 bytes.
 REPLAY_PAGE_CODEC_ID = "v41-replay-page-v1"
+# Kimi-K3: dense KV chunks (MLA rows, K3.1's DSA index) plus KDA checkpoint
+# images (`mooncake_store.kimi_k3`), so its KV is never read without its state.
+KIMI_K3_CODEC_ID = "kimi-k3-dense-state-v1"
 
 CodecBuilder = Callable[[Any, Any, int | None, bool], Any]
 
@@ -48,6 +51,10 @@ def _m3_codec_id() -> str:
 
 def _replay_codec_id() -> str:
     return REPLAY_PAGE_CODEC_ID
+
+
+def _kimi_k3_codec_id() -> str:
+    return KIMI_K3_CODEC_ID
 
 
 def _build_dense(
@@ -90,6 +97,8 @@ MOONCAKE_LAYOUTS: dict[str, MooncakeLayout] = {
     "dense": MooncakeLayout(_dense_codec_id, _build_dense),
     "m3": MooncakeLayout(_m3_codec_id, _build_m3),
     "dsv41": MooncakeLayout(_replay_codec_id, _build_replay_pages),
+    # The dense codec skips the KDA slots the K3 worker's state tier moves.
+    "kimi_k3": MooncakeLayout(_kimi_k3_codec_id, _build_dense),
 }
 
 
@@ -100,7 +109,8 @@ def require_mooncake_layout(name: str) -> MooncakeLayout:
     except KeyError:
         raise ValueError(
             "the Mooncake Store offload moves the dense KV layout, M3 PAGE "
-            f"layout, and V4.1's replay PAGEs; this model resolves to {name!r}"
+            "layout, V4.1's replay PAGEs, and Kimi-K3's KV with its state; this "
+            f"model resolves to {name!r}"
         ) from None
 
 
