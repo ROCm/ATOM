@@ -12,6 +12,50 @@ import torch
 import triton
 import triton.language as tl
 
+# fused_sigmoid_gating_delta_rule_update(onorm=...) runs one 4-wave workgroup
+# per (request, head). On MI455X (256 CUs) it beats the BV=32 recurrence plus
+# the separate o_norm up to 768 workgroups and loses from 792 on, i.e. past
+# three workgroups per CU.
+_ONORM_MAX_WGS_PER_CU = 3
+
+
+def onorm_fits(num_seqs: int, num_heads: int) -> bool:
+    """Whether the decode recurrence with ``onorm`` (one token per request) is
+    faster than the recurrence plus a separate o_norm at this size."""
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    return num_seqs * num_heads <= _ONORM_MAX_WGS_PER_CU * get_cu_num()
+
+
+@triton.jit
+def _onorm_e8m0_row(
+    x, o_v, mask_v, w_ptr, p_g, p_y, p_s, eps, V: tl.constexpr, FP8_MAX: tl.constexpr
+):
+    """rmsnorm_gated + per-1x128 E8M0 quant of one (token, head) row in the
+    arithmetic of rmsnorm_gated_gluon._rmsnorm_gated_e8m0_kernel (the variance
+    is summed in Triton's order, not the Gluon kernel's)."""
+    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / V + eps)
+    w = tl.load(w_ptr + o_v, mask=mask_v, other=0.0).to(tl.float32)
+    gate = tl.load(p_g, mask=mask_v, other=0.0)
+    a = x * rstd * w
+    sg = 1 / (1 + tl.exp(-gate.to(tl.float32)))
+    p = a * sg + 0.0  # as the +0 addend: a -0 product rounds to +0
+    err = tl.fma(a, sg, -p)
+    bits = p.to(tl.uint32, bitcast=True)
+    tie = ((bits & 0xFFFF) == 0x8000) & (err != 0.0)
+    bits = tl.where(tie, tl.where((err > 0.0) == (p > 0.0), bits + 1, bits - 1), bits)
+    y = bits.to(tl.float32, bitcast=True).to(tl.bfloat16).to(tl.float32)
+    amax = tl.max(tl.abs(y), axis=0)
+    amax = tl.minimum(tl.maximum(amax, 1e-10), 448.0 * 2.0**119)
+    bits = (amax * (1.0 / FP8_MAX)).to(tl.uint32, bitcast=True)
+    code = (bits >> 23) & 0xFF
+    code += ((code < 0xFF) & ((bits & 0x7FFFFF) != 0)).to(tl.uint32)
+    y = y * ((254 - code) << 23).to(tl.float32, bitcast=True)
+    y = tl.maximum(y, -FP8_MAX, propagate_nan=tl.PropagateNan.ALL)
+    y = tl.minimum(y, FP8_MAX, propagate_nan=tl.PropagateNan.ALL)
+    tl.store(p_s, code.to(tl.uint8))
+    tl.store(p_y, y.to(p_y.dtype.element_ty), mask=mask_v)
+
 
 @triton.heuristics(
     {
@@ -20,6 +64,7 @@ import triton.language as tl
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+        "ONORM": lambda args: args["onorm_y"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -57,6 +102,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    onorm_w,
+    onorm_g,
+    onorm_y,
+    onorm_s,
+    onorm_eps,
+    stride_og_t,
+    stride_og_h,
+    stride_oy_t,
+    stride_os_t,
+    stride_os_h,
+    FP8_MAX: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -65,6 +121,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    ONORM: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -101,6 +158,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     p_b = b + bos * stride_b_token + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+    if ONORM:
+        p_og = onorm_g + bos * stride_og_t + i_hv * stride_og_h + o_v
+        p_oy = onorm_y + bos * stride_oy_t + i_hv * V + o_v
+        p_os = onorm_s + bos * stride_os_t + i_hv * stride_os_h
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -167,7 +228,25 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_h += b_v[:, None] * b_k[None, :]
         # [BV]
         b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        if ONORM:
+            # The o_norm input is the BF16 output the recurrence would store.
+            _onorm_e8m0_row(
+                b_o.to(tl.bfloat16).to(tl.float32),
+                o_v,
+                mask_v,
+                onorm_w,
+                p_og,
+                p_oy,
+                p_os,
+                onorm_eps,
+                V,
+                FP8_MAX,
+            )
+            p_og += stride_og_t
+            p_oy += stride_oy_t
+            p_os += stride_os_t
+        else:
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
@@ -215,6 +294,7 @@ def fused_sigmoid_gating_delta_rule_update(
     is_kda: bool = False,
     ssm_state_indices_in: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    onorm: tuple | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -228,6 +308,16 @@ def fused_sigmoid_gating_delta_rule_update(
         `lower_bound * sigmoid(exp(A_log) * (a + dt_bias))`, matching fla's
         `fused_recurrent_kda` USE_LOWER_BOUND branch. Pair with is_kda=True so
         `a`/`dt_bias` are read as per-K-channel vectors (KDA's diagonal decay).
+
+    ``onorm = (weight, gate, eps, quant_dtype, col_major)`` fuses the KDA
+    o_norm (``rmsnorm_gated`` with o_proj's per-1x128 E8M0 quant) into the
+    recurrence and returns ``(fp8 [T, HV * V], E8M0 scale [T, HV])`` in the
+    layout of ``rmsnorm_gated_gluon.rmsnorm_gated_e8m0`` on the BF16 output,
+    which is then never written. ``gate`` is [T, HV, V] and may be strided.
+    One workgroup owns a whole head (BV = V = 128); the recurrence and its
+    state keep their bytes. The variance sum order differs from the Gluon
+    kernel, so an FP8 value can differ by one ulp (about 1 in 10^7 on
+    heavy-tailed rows); the E8M0 codes have matched in every test.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -236,6 +326,9 @@ def fused_sigmoid_gating_delta_rule_update(
     # the same bytes in flight (HV=12, K=V=128, N=64: 18.2 -> 16.1 us, while
     # fp32 goes 24.6 -> 25.2).
     bv_cap = 64 if initial_state.element_size() <= 2 else 32
+    if onorm is not None:
+        assert K == V == 128 and q.dtype == torch.bfloat16, (K, V, q.dtype)
+        bv_cap = V
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), bv_cap)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -253,7 +346,18 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    if o is None:
+    if onorm is not None:
+        on_w, on_g, on_eps, on_dtype, col_major = onorm
+        assert on_g.shape == (T * B, HV, V) and on_g.stride(-1) == 1, on_g.shape
+        on_y = q.new_empty((T * B, HV * V), dtype=on_dtype)
+        on_s = torch.empty(
+            (HV, T * B) if col_major else (T * B, HV),
+            dtype=torch.uint8,
+            device=q.device,
+        )
+        stride_os_t, stride_os_h = (1, T * B) if col_major else (HV, 1)
+        o = on_y
+    elif o is None:
         o = q.new_empty(NK, *v.shape)
     else:
         o = o.unsqueeze(0)
@@ -320,11 +424,26 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        onorm_w=on_w if onorm is not None else None,
+        onorm_g=on_g if onorm is not None else None,
+        onorm_y=on_y if onorm is not None else None,
+        onorm_s=on_s if onorm is not None else None,
+        onorm_eps=float(on_eps) if onorm is not None else 0.0,
+        stride_og_t=on_g.stride(0) if onorm is not None else 0,
+        stride_og_h=on_g.stride(1) if onorm is not None else 0,
+        stride_oy_t=HV * V,
+        stride_os_t=stride_os_t if onorm is not None else 0,
+        stride_os_h=stride_os_h if onorm is not None else 0,
+        FP8_MAX=float(torch.finfo(on_dtype).max) if onorm is not None else 0.0,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if onorm is not None:
+        from aiter import dtypes
+
+        return (on_y, on_s.view(T * B, HV).view(dtypes.fp8_e8m0)), final_state
     o = o.squeeze(0)
     return o, final_state

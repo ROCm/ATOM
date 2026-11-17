@@ -5,6 +5,7 @@
 
 from atom.model_ops.kimi_k3.activations import (
     rmsnorm_gated,
+    rmsnorm_gated_e8m0_col_major,
     situ_and_mul,
     situ_and_mul_maybe_quant,
     situ_and_mul_quant,
@@ -17,6 +18,7 @@ __all__ = [
     "apply_attn_res",
     "gather_kda_initial_state",
     "rmsnorm_gated",
+    "rmsnorm_gated_e8m0_col_major",
     "situ_and_mul",
     "situ_and_mul_maybe_quant",
     "situ_and_mul_quant",
