@@ -122,6 +122,7 @@ def test_ring_keeps_the_raw_checkpoint_and_runs_flydsl_prefill(monkeypatch, repl
         forward_metadata=SimpleNamespace(
             query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
             mamba_cache_indices=torch.tensor([3], dtype=torch.int32),
+            logical_num_tokens=8,
         ),
         req_to_token_pool=pool,
     )

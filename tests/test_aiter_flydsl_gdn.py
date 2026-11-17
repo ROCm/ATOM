@@ -16,7 +16,7 @@ from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_r
 
 ON_GFX942 = torch.cuda.get_device_properties().gcnArchName.split(":")[0] == "gfx942"
 requires_gfx942 = pytest.mark.skipif(
-    not ON_GFX942, reason="FlyDSL GDN decode is supported only on gfx942"
+    not ON_GFX942, reason="FlyDSL GDN decode is validated only on gfx942"
 )
 
 
@@ -414,7 +414,7 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     from atom.utils import envs
 
     if mode == "flydsl" and not ON_GFX942:
-        pytest.skip("FlyDSL decode numerical coverage requires gfx942")
+        pytest.skip("FlyDSL GDN decode is validated only on gfx942")
     q, k, v, a, b, log, bias = inputs(3)
     raw = torch.randn(3, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     reference = raw.clone()
