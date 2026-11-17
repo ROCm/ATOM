@@ -359,10 +359,13 @@ class SpurDispatchTest(unittest.TestCase):
 
     def test_manual_preflight_keeps_gpu_holders_beside_a_sibling_job(self):
         holder, result = self.preflight_with_gpu_holder(
-            f"42 {os.getuid()} me RUNNING\n7 {os.getuid()} me RUNNING"
+            f"42 {os.getuid()} me RUNNING\n"
+            f"6 {os.getuid() + 1} other RUNNING\n"
+            f"7 {os.getuid()} me RUNNING"
         )
         self.assertIsNone(holder.poll())
         self.assertIn("keep GPU holders", result.stdout)
+        self.assertNotIn("killed too", result.stdout)
 
     def test_other_runs_leave_gpu_holders_alone(self):
         holder, result = self.preflight_with_gpu_holder(kill="0")

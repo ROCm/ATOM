@@ -220,6 +220,7 @@ other_jobs_on_node() {
 # left alone together with the GPUs.
 free_gpus_for_this_job() {
   local host others job uid user state
+  local -a beside=()
   host="$(hostname -s)"
   if ! compgen -G "${ATOMESH_KFD_PROC_DIR:-/sys/class/kfd/kfd/proc}/[0-9]*" >/dev/null; then
     echo "no process holds the GPUs on ${host}"
@@ -235,8 +236,13 @@ free_gpus_for_this_job() {
       echo "keep GPU holders: ${host} also runs this user's job ${job} (${state})"
       return 0
     fi
-    echo "${host} also lists ${user}'s job ${job} (${state}); its GPU processes are killed too"
+    beside+=("${user}'s job ${job} (${state})")
   done <<< "${others}"
+  if [[ ${#beside[@]} -gt 0 ]]; then
+    for job in "${beside[@]}"; do
+      echo "${host} also lists ${job}; its GPU processes are killed too"
+    done
+  fi
   kill_gpu_holders
 }
 
