@@ -239,6 +239,9 @@ def attn_res_tdm_supported(block_residual: torch.Tensor) -> bool:
     )
 
 
+_XCD_REMAP_MIN_T = 512
+
+
 @functools.cache
 def _num_xcds() -> int:
     from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -250,8 +253,11 @@ def launch_attn_res_tdm(
     br, ps, sw, y, y_scale, hs, hs2, pref, ow, eps, out_eps, fp8_max, flags
 ):
     T, B, H = br.shape
-    # Only column-major E8M0 scales (stride_ys_t == 1) share lines across tokens.
+    # Only column-major E8M0 scales (stride_ys_t == 1) share lines across tokens;
+    # below _XCD_REMAP_MIN_T tokens the round-robin order is faster. The remap only
+    # picks which program computes a token, so the bytes do not depend on T.
     col_scales = flags.get("E8M0_SCALE", False) and flags.get("stride_ys_t") == 1
+    remap = col_scales and T >= _XCD_REMAP_MIN_T
     _attn_res_tdm_kernel[(T,)](
         br,
         ps,
@@ -279,6 +285,6 @@ def launch_attn_res_tdm(
         _NUM_WARPS,
         _PREFETCH,
         num_warps=_NUM_WARPS,
-        NUM_XCDS=_num_xcds() if col_scales else 1,
+        NUM_XCDS=_num_xcds() if remap else 1,
         **flags,
     )
