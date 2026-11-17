@@ -924,6 +924,9 @@ models:
         - <<: *glm52_agentic_mcstore_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c96
           concurrency: [96]
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 9000
 
         - <<: *glm52_agentic_mcstore_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112
