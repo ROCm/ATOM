@@ -300,7 +300,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
-| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. On the gfx1250 family, MiniMax-M3 dense layers run the q/k norm + RoPE through aiter `fused_qknorm_idxrqknorm` instead: with the cache write in decode, before the separate cache write above this count. **Needs aiter with #8011**; upgrade ATOM and aiter together. |
 
 ### Llama-style
 

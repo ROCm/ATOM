@@ -6,6 +6,7 @@ from functools import cache
 import aiter
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
@@ -40,14 +41,6 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
-# aiter fused_qknorm_idxrqknorm takes a layer without index heads (a dense
-# attention layer) into a per-token FP8 cache, with the faster gfx1250 kernel
-# (ROCm/aiter#8011). Earlier versions assert index operands there.
-AITER_QKNORM_TAKES_DENSE_LAYERS = getattr(
-    aiter, "FUSED_QKNORM_IDXRQKNORM_SUPPORTS_INDEXLESS_FP8", False
-)
-
-
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -57,6 +50,9 @@ class PagedAttentionImpl(nn.Module):
     # Whether forward_impl takes ``quantized_output`` / ``output_scale`` and writes
     # its output there as OCP FP8 plus per-token FP32 descales.
     supports_output_quant = False
+    # Set by a model that measured its Gemma q/k norm + RoPE through aiter
+    # fused_qknorm_idxrqknorm on gfx1250 (`_takes_aiter_gemma_norm_rope`).
+    aiter_gemma_norm_rope = False
 
     @staticmethod
     def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
@@ -312,9 +308,7 @@ class PagedAttentionImpl(nn.Module):
                 )
             aiter_norm_rope = isinstance(
                 self.q_norm, GemmaRMSNorm
-            ) and self._takes_aiter_gemma_norm_rope(
-                qkv, position, k_cache, v_cache, k_scale
-            )
+            ) and self._takes_aiter_gemma_norm_rope(k_cache, v_cache, use_triton_attn)
             if aiter_norm_rope and not fwd_ctx.context.is_prefill:
                 # One insert writes q and the K/V cache. k and v stay as they
                 # are: the decode backends read only the cache.
@@ -494,44 +488,17 @@ class PagedAttentionImpl(nn.Module):
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-    def _takes_aiter_gemma_norm_rope(
-        self, qkv, position, k_cache, v_cache, k_scale
-    ) -> bool:
-        """Whether aiter fused_qknorm_idxrqknorm can take the Gemma q/k norm +
-        RoPE off the Triton kernel: a contiguous ``[q | k | v]`` row, head_dim
-        128, a NeoX RoPE without MRoPE sections over 1-D int64 positions, and a
-        5-D SHUFFLE cache, unquantized or per-token FP8. gfx1250 only, the arch
-        it was measured on.
-
-        The op aborts on arguments it refuses instead of raising, so whatever
-        the KV pool does not already guarantee is checked here."""
-        rope = self.rotary_emb
-        if self.kv_cache_dtype == "fp8":
-            cache_dtype_ok = k_scale is not None
-        else:
-            cache_dtype_ok = (
-                self.kv_cache_dtype == "bf16" and k_cache.dtype == qkv.dtype
-            )
+    def _takes_aiter_gemma_norm_rope(self, k_cache, v_cache, use_triton_attn) -> bool:
+        """Whether aiter fused_qknorm_idxrqknorm takes the Gemma q/k norm + RoPE
+        off the Triton kernel: for a model that measured it (opted in with
+        ``aiter_gemma_norm_rope``), on the gfx1250 family where it was measured,
+        into the SHUFFLE cache. The op raises on arguments it does not take."""
         return (
-            AITER_QKNORM_TAKES_DENSE_LAYERS
-            and get_gfx() == "gfx1250"
-            and qkv.is_contiguous()
-            and qkv.shape[-1]
-            == (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
-            and self.head_dim == 128
-            and self.q_norm.weight.dtype == qkv.dtype
-            and self.k_norm.weight.dtype == qkv.dtype
-            and position is not None
-            and position.dim() == 1
-            and position.dtype == torch.int64
-            and position.is_contiguous()
-            and getattr(rope, "is_neox_style", False)
-            and getattr(rope, "mrope_section", None) is None
-            and hasattr(rope, "cos_cache")
-            and rope.rotary_dim % 8 == 0
-            and k_cache.dim() == 5
-            and v_cache.dim() == 5
-            and cache_dtype_ok
+            self.aiter_gemma_norm_rope
+            and is_gfx1250_family(get_gfx())
+            and self._use_asm_cache_layout(
+                k_cache, v_cache, use_triton_attn=use_triton_attn
+            )
         )
 
     def _aiter_gemma_norm_rope(self, qkv, position, **insert):

@@ -21,16 +21,15 @@ import torch
 pytest.importorskip("aiter")
 
 import aiter
+from aiter.jit.utils.build_targets import is_gfx1250_family
 from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops import attention_mha
 from atom.utils import envs
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or get_gfx() != "gfx1250"
-    or not attention_mha.AITER_QKNORM_TAKES_DENSE_LAYERS,
-    reason="gfx1250 only, with an aiter that inserts layers without index heads",
+    not torch.cuda.is_available() or not is_gfx1250_family(get_gfx()),
+    reason="the aiter route runs on the gfx1250 family only",
 )
 
 NQ, NKV, HD, ROT, MAX_POS = 16, 1, 128, 64, 1 << 16
@@ -48,7 +47,7 @@ def make_impl(kv_cache_dtype):
         norm.weight.data = (torch.randn(HD) * 0.1).to(torch.bfloat16).cuda()
         norms.append(norm)
     rope = get_rope(HD, ROT, MAX_POS, 10000, is_neox_style=True, dtype=torch.bfloat16)
-    return attention_mha.PagedAttentionImpl(
+    impl = attention_mha.PagedAttentionImpl(
         NQ,
         HD,
         HD**-0.5,
@@ -59,6 +58,8 @@ def make_impl(kv_cache_dtype):
         q_norm=norms[0],
         k_norm=norms[1],
     )
+    impl.aiter_gemma_norm_rope = True  # as MiniMax-M3's dense layers set it
+    return impl
 
 
 def make_cache(kv_cache_dtype, num_blocks, block_size):
@@ -184,32 +185,13 @@ def test_rope_cache_matches_the_triton_kernel(
     torch.testing.assert_close(v.reshape(num_tokens, -1), qkv_in[:, -NKV * HD :])
 
 
-def test_aiter_route_needs_a_plain_rope_a_packed_qkv_and_a_shuffle_cache(
-    monkeypatch,
-):
+def test_aiter_route_is_opt_in_and_needs_the_shuffle_cache():
     impl = make_impl("fp8")
-    qkv = torch.zeros(8, (NQ + 2 * NKV) * HD, dtype=torch.bfloat16, device="cuda")
-    position = torch.zeros(8, dtype=torch.long, device="cuda")
-    k_cache, v_cache, k_scale, _ = make_cache("fp8", 4, 128)
+    k_cache, v_cache, _, _ = make_cache("fp8", 4, 128)
     ok = impl._takes_aiter_gemma_norm_rope
-    assert ok(qkv, position, k_cache, v_cache, k_scale)
-    # MRoPE: one row of positions per section
-    assert not ok(qkv, position.expand(3, 8), k_cache, v_cache, k_scale)
-    assert not ok(qkv, position.int(), k_cache, v_cache, k_scale)
-    # a qkv with more columns than [q | k | v], or not contiguous
-    wide = torch.zeros(8, (NQ + 2 * NKV + 1) * HD, dtype=torch.bfloat16, device="cuda")
-    assert not ok(wide, position, k_cache, v_cache, k_scale)
-    assert not ok(wide[:, : qkv.shape[1]], position, k_cache, v_cache, k_scale)
-    # an FP8 cache without its per-token scales, a V cache not in SHUFFLE order
-    assert not ok(qkv, position, k_cache, v_cache, None)
-    assert not ok(qkv, position, k_cache, v_cache.flatten(2, 3), k_scale)
-    # caches the op does not write: MXFP4 pages, a bf16 cache for an fp16 qkv
-    impl.kv_cache_dtype = "fp4"
-    assert not ok(qkv, position, k_cache, v_cache, k_scale)
-    impl.kv_cache_dtype = "bf16"
-    bf16_k, bf16_v, _, _ = make_cache("bf16", 4, 128)
-    assert ok(qkv, position, bf16_k, bf16_v, None)
-    assert not ok(qkv.half(), position, bf16_k, bf16_v, None)
-    # an aiter without ROCm/aiter#8011
-    monkeypatch.setattr(attention_mha, "AITER_QKNORM_TAKES_DENSE_LAYERS", False)
-    assert not ok(qkv, position, bf16_k, bf16_v, None)
+    assert ok(k_cache, v_cache, False)
+    # a V cache the Triton backend keeps in its standard 4-D layout
+    assert not ok(k_cache, v_cache.flatten(2, 3), True)
+    # a model that did not opt in
+    impl.aiter_gemma_norm_rope = False
+    assert not ok(k_cache, v_cache, False)
