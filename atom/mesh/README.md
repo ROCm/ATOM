@@ -264,8 +264,11 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 `prefix_hash` routes on exact request tokens. Messages and Responses have no
 registered token-routing template, so under `prefix_hash` they return
-`501 token_routing_unsupported`. Use a policy that does not need tokens, such as
-`cache_aware` or `round_robin`, for models served through these APIs.
+`501 token_routing_unsupported`. So do chats for a model whose tokenizer
+llm-tokenizer renders with a built-in encoder chosen from `config.json`, not a
+chat template, such as DeepSeek V3.2 and V4
+([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
+need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
 ## Reliability
 
