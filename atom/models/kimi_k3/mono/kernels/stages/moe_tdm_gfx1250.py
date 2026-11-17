@@ -62,6 +62,7 @@ from atom.mono.device.ops import (
     uniform,
 )
 from atom.mono.plan.architecture import GFX1250
+from atom.utils import envs
 
 THREADS = 256
 WAVES = THREADS // GFX1250.wave_size
@@ -88,6 +89,7 @@ LATENT_SCALES = LATENT // 32
 LATENT_PAD_EVERY = 64
 LATENT_TDM_WORDS = LATENT_WORDS + LATENT_WORDS // LATENT_PAD_EVERY
 assert LATENT_WORDS % LATENT_PAD_EVERY == 0 and LATENT_TDM_WORDS % 2 == 1
+assert STEPS * 16 == LATENT_PAD_EVERY
 INTER_GROUPS = 12  # MXFP4 blocks of an expert's 384 intermediates
 INTER_WORDS = 48
 
@@ -865,7 +867,11 @@ def _down_share(union, bid, ups, up_units=UP_UNITS):
 
 
 def build_moe(
-    rows: int, profile: bool = False, publish_at: int = 1, up_units: int = UP_UNITS
+    rows: int,
+    profile: bool = False,
+    publish_at: int = 1,
+    up_units: int = UP_UNITS,
+    rolled: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -880,7 +886,14 @@ def build_moe(
     the epoch the flags are tagged with on, so a replay needs no reset.
     ``profile``: each CTA's phase stamps past it (5 words a CTA: start, plan,
     gate/up done, down done, down tiles) and its flag waits (2 words a CTA:
-    100 MHz ticks, expert switches) past those."""
+    100 MHz ticks, expert switches) past those.
+
+    ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
+    M tiles' epilogues, a down tile's M tiles and the ring's first copies run
+    as runtime loops, and a switch stages its picks' rows a round an
+    iteration, so a cold launch fetches one body of each."""
+    if rolled is None:
+        rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     routes = rows * TOPK
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
@@ -913,8 +926,10 @@ def build_moe(
         picks: fx.Array[fx.Int32, routes, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
 
-    name = f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}" + (
-        "_profile" if profile else ""
+    name = (
+        f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
+        + ("_rl" if rolled else "")
+        + ("_profile" if profile else "")
     )
     sources = SOURCES
 
@@ -1105,9 +1120,14 @@ def build_moe(
                     whole=True,
                     width=LATENT_SCALES // 2,
                 )
-        for ahead in range_constexpr(ring - 1):
-            if ahead < flat:
-                issue(fx.Int32(ahead), ahead)
+        if const_expr(rolled):
+            for first_item in range(fx.Int32(0), fx.Int32(ring - 1), unroll=1):
+                if first_item < flat:
+                    issue(first_item, first_item)
+        else:
+            for ahead in range_constexpr(ring - 1):
+                if ahead < flat:
+                    issue(fx.Int32(ahead), ahead)
         # Read only now: a wave waits on this load where it reads it, and the
         # flags' tag is not needed before the first task's flag.
         epoch = uniform(fx.Int32(ld_dev(state, 2)))
@@ -1137,7 +1157,58 @@ def build_moe(
                 for m in range(tiles)
             ]
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
-            for tile_k in range_constexpr(k_tiles):
+            if const_expr(rolled):
+                for k_tile in range(fx.Int32(0), fx.Int32(k_tiles), unroll=1):
+                    k_item = n * k_tiles + k_tile
+                    k_before = clock()
+                    wait_for(k_item)
+                    if k_tile == publish_at:
+                        rocdl.s_wait_storecnt(0)
+                    _lds_barrier()
+                    up_wait = up_wait + since(k_before)
+                    if (k_tile == publish_at) & (tid == 0) & (pending >= 0):
+                        publish(pending)
+                    if k_item + ring - 1 < flat:
+                        issue(k_item + ring - 1, (k_item + ring - 1) % ring)
+                    k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
+                    if wave < UP_WAVES:
+                        k_scale = (
+                            smem.item_scales.ptr
+                            + (k_item % ring) * SCALE_WORDS
+                            + wave * STEPS * 32
+                            + lane
+                        )
+                        k_weights = [
+                            _weight_operand(k_stage, wave, lane, step)
+                            for step in range(STEPS)
+                        ]
+                        k_weight_scales = [
+                            fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
+                        ]
+                        # A K tile's STEPS * 16 words hold one pad dword.
+                        k_latq = lds["latq"] + k_tile
+                        for m in range_constexpr(tiles):
+                            if m == 0 or m * 16 < count:
+                                for step in range_constexpr(STEPS):
+                                    accumulators[m] = _wmma(
+                                        k_weights[step],
+                                        _activation_fragment(
+                                            k_latq,
+                                            LATENT_TDM_WORDS,
+                                            tokens[m],
+                                            k_tile * STEPS + step,
+                                            lane,
+                                        ),
+                                        accumulators[m],
+                                        k_weight_scales[step],
+                                        fx.ptr_load(
+                                            lds["latsc"]
+                                            + tokens[m] * (LATENT_SCALES // 4)
+                                            + k_tile * STEPS
+                                            + step
+                                        ),
+                                    )
+            for tile_k in range_constexpr(0 if rolled else k_tiles):
                 item = n * k_tiles + tile_k
                 before = clock()
                 wait_for(item)
@@ -1190,7 +1261,40 @@ def build_moe(
                                     ),
                                 )
             before = clock()
-            for m in range_constexpr(tiles):
+            if const_expr(rolled):
+                up_tiles = fx.min((count + 15) // 16, tiles)
+                for up_m in range(fx.Int32(0), up_tiles, unroll=1):
+                    if wave < UP_WAVES:
+                        chosen = [accumulators[0][e] for e in range(16)]
+                        for other in range_constexpr(1, tiles):
+                            chosen = [
+                                (up_m == other).select(
+                                    accumulators[other][e], chosen[e]
+                                )
+                                for e in range(16)
+                            ]
+                        fx.ptr_store(
+                            fx.Vector.from_elements(_situ(chosen), fx.Float32),
+                            lds["red"] + (wave * GFX1250.wave_size + lane) * 8,
+                        )
+                    _lds_barrier()
+                    if wave < UP_ROWS // 64:
+                        _epilogue(
+                            lds,
+                            inter,
+                            0,
+                            picks,
+                            count,
+                            block,
+                            wave,
+                            up_m,
+                            lane,
+                            in_row=True,
+                            pairs=UP_ROWS // 64,
+                            activated=True,
+                        )
+                    _lds_barrier()
+            for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
                     # Each wave its own SiTU: 6 waves' share, not 3's.
                     if wave < UP_WAVES:
@@ -1251,8 +1355,30 @@ def build_moe(
                 if const_expr(profile):
                     waited = waited + (fx.Int32(_realtime()) - before)
                     switches = switches + 1
+                if const_expr(rolled):
+                    for staged in range(
+                        fx.Int32(0),
+                        (count * INTER_ROW_WORDS + THREADS - 1) // THREADS,
+                        unroll=1,
+                    ):
+                        staged_at = tid + staged * THREADS
+                        if staged_at < count * INTER_ROW_WORDS:
+                            staged_pick = fx.ptr_load(
+                                lds["picks"] + start + staged_at // INTER_ROW_WORDS
+                            )
+                            staged_value = ld_dev(
+                                inter,
+                                staged_pick * INTER_ROW_WORDS
+                                + staged_at % INTER_ROW_WORDS,
+                            )
+                            fx.ptr_store(
+                                fx.Int32(staged_value),
+                                rows_lds
+                                + staged_at // INTER_ROW_WORDS * INTER_LDS_WORDS
+                                + staged_at % INTER_ROW_WORDS,
+                            )
                 for index in range_constexpr(
-                    (rows * INTER_ROW_WORDS + THREADS - 1) // THREADS
+                    0 if rolled else (rows * INTER_ROW_WORDS + THREADS - 1) // THREADS
                 ):
                     at = tid + index * THREADS
                     if at < count * INTER_ROW_WORDS:
@@ -1282,7 +1408,51 @@ def build_moe(
                 + lane
             )
             out = tile * TASK_ROWS + wave * 32 + (lane // 16) * 8
-            for m in range_constexpr(tiles):
+            if const_expr(rolled):
+                down_weights = [
+                    _weight_operand(stage, wave, lane, step, GROUP_DOWN_BYTES)
+                    for step in range(DOWN_STEPS)
+                ]
+                down_scales = [
+                    fx.ptr_load(item_scale + step * 32) for step in range(DOWN_STEPS)
+                ]
+                down_tiles = fx.min((count + 15) // 16, tiles)
+                for down_m in range(fx.Int32(0), down_tiles, unroll=1):
+                    down_index = down_m * 16 + lane % 16
+                    down_local = fx.min(down_index, count - 1)
+                    down_acc = fx.Vector.filled(16, 0.0, fx.Float32)
+                    for step in range_constexpr(DOWN_STEPS):
+                        down_acc = _wmma(
+                            down_weights[step],
+                            _activation_fragment(
+                                rows_lds, INTER_LDS_WORDS, down_local, step, lane
+                            ),
+                            down_acc,
+                            down_scales[step],
+                            fx.ptr_load(
+                                rows_lds
+                                + down_local * INTER_LDS_WORDS
+                                + INTER_WORDS
+                                + step
+                            ),
+                        )
+                    if down_index < count:
+                        down_pick = fx.ptr_load(lds["picks"] + start + down_index)
+                        for half in range_constexpr(2):
+                            down_packed = (
+                                fx.Vector.from_elements(
+                                    [down_acc[half * 8 + e] for e in range(8)],
+                                    fx.Float32,
+                                )
+                                .to(fx.BFloat16)
+                                .bitcast(fx.Int32)
+                            )
+                            bo.buffer_store(
+                                down_packed,
+                                rsrc(grouped),
+                                (down_pick * LATENT + out + half * 16) // 2,
+                            )
+            for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
                     index = m * 16 + lane % 16
                     local = fx.min(index, count - 1)

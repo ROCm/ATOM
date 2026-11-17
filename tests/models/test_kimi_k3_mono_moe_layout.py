@@ -141,3 +141,13 @@ def test_k2_candidate_lds_is_bounded_across_wave32_inputs(tokens, threads):
     latent = ml.LatentQuantContract(GFX1250, threads, tokens)
     assert route.scan_words == threads // 32
     assert latent.blocks == tokens * ml.LATENT // 32
+
+
+@pytest.mark.parametrize("rows", (10, 40))
+@pytest.mark.parametrize("rolled", (False, True))
+def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    kernel = build_moe(rows, rolled=rolled)
+    assert kernel.name.startswith(f"k3_gfx1250_moe_s{rows}_")
+    assert kernel.name.endswith("_rl") == rolled

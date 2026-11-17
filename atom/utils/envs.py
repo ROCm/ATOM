@@ -645,6 +645,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_TDM_ROLLED": lambda: int(
         os.getenv("ATOM_KIMI_MONO_TDM_ROLLED", "1")
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
+    # epilogues and down tiles, and its staging loops as runtime loops, so a
+    # cold launch fetches one body's code each (the same bits); 0, the default,
+    # unrolls them at trace time.
+    "ATOM_KIMI_MONO_ROLLED_MOE": lambda: (
+        os.getenv("ATOM_KIMI_MONO_ROLLED_MOE", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the
