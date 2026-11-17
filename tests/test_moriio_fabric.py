@@ -56,6 +56,14 @@ class BlockRunsTest(unittest.TestCase):
         self.assertEqual(fabric.block_runs([], []), [])
 
 
+class RepeatedBlocksTest(unittest.TestCase):
+    def test_each_repeated_block_once(self):
+        self.assertEqual(fabric.repeated_blocks([7, 3, 7, 5, 3, 7]), [3, 7])
+
+    def test_distinct_blocks(self):
+        self.assertEqual(fabric.repeated_blocks([4, 1, 9]), [])
+
+
 class PageOffsetsTest(unittest.TestCase):
     def test_every_region_gets_every_run_at_its_own_offsets(self):
         local = [(0, 16), (1000, 4)]
