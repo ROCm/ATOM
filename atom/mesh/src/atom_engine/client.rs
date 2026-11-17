@@ -554,6 +554,21 @@ impl Shared {
     /// Core `rank` is gone: fail what runs there and place nothing more on it.
     /// Unless `shutdown` asked it to stop, the client is lost with it.
     fn core_lost(&self, rank: usize, why: &str) {
+        // Dead and its sequences failed before `lost` is published: whoever
+        // `wait_lost` wakes sees the Core gone.
+        {
+            let mut balancer = self.balancer.lock();
+            balancer.mark_dead(rank);
+            self.seqs.retain(|&seq_id, slot| {
+                if slot.rank != rank {
+                    return true;
+                }
+                balancer.release(seq_id);
+                let failure = SeqFailure::Unavailable(format!("EngineCore DP rank {rank} is gone"));
+                let _ = slot.events.send(SeqEvent::Failed(failure));
+                false
+            });
+        }
         if self.shutting_down.load(Ordering::Acquire) {
             info!(dp_rank = rank, "EngineCore {why}");
         } else {
@@ -570,16 +585,5 @@ impl Shared {
                 first
             });
         }
-        let mut balancer = self.balancer.lock();
-        balancer.mark_dead(rank);
-        self.seqs.retain(|&seq_id, slot| {
-            if slot.rank != rank {
-                return true;
-            }
-            balancer.release(seq_id);
-            let failure = SeqFailure::Unavailable(format!("EngineCore DP rank {rank} is gone"));
-            let _ = slot.events.send(SeqEvent::Failed(failure));
-            false
-        });
     }
 }
