@@ -17,7 +17,7 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
-from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.model_engine.sequence import Sequence, SequenceStatus, new_block_table
 
 
 @pytest.fixture
@@ -313,6 +313,39 @@ def test_pool_partition_and_waiting_queue_exclusion():
     assert snapshot["scheduler_metrics"]["waiting"] == 0
     assert snapshot["scheduler_metrics"]["waiting_kv"] == 1
     pool.free(used.block_id)
+
+
+def test_deferred_free_counts_shared_blocks_once():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    ranks = {}
+    # Finished P/D sources awaiting their send. Rank 0's two share a prefix
+    # block, so they hold 5 physical blocks; rank 1's one holds 3.
+    for rank, tables in enumerate(([[3, 4], [3, 5, 6, 7]], [[1, 2, 9]])):
+        scheduler = Scheduler(MockConfig())
+        handler = EngineUtilityHandler(None, Queue(), scheduler=scheduler)
+        assert handler.collect_metrics()["kv_blocks_deferred_free"] == 0
+        scheduler.deferred_free_blocks = {
+            seq_id: SimpleNamespace(block_table=new_block_table(table))
+            for seq_id, table in enumerate(tables)
+        }
+        ranks[rank] = handler.collect_metrics()
+    assert ranks[0]["requests_deferred_free"] == 2
+    assert ranks[0]["kv_blocks_deferred_free"] == 5
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(latest_metrics=ranks, get_dp_router_statistics=dict)
+    )
+    stats = LLMEngine.get_metrics_statistics(engine)
+    assert stats["requests_deferred_free"] == 3
+    assert stats["kv_blocks_deferred_free"] == 8
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(stats)
+    values = samples(exporter)
+    assert values[("atom:requests_deferred_free", ())] == 3
+    assert values[("atom:kv_cache_blocks_deferred_free", ())] == 8
 
 
 def test_cache_tiers_preserve_admitted_reuse_through_snapshots():

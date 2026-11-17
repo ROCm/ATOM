@@ -27,9 +27,11 @@ from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral
 
+import numpy as np
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
+from atom.utils import upload_numpy
 
 logger = logging.getLogger("atom")
 
@@ -613,9 +615,10 @@ class DSV4PageSlotCodec:
 
         The caller must retain the returned owner through the pipeline fence,
         including recovery, and use the same explicit stream for every launch.
-        The upload is blocking, so a preparation error cannot leave a live
-        metadata copy after this method unwinds. Repeated IDs in distinct
-        groups retain the ordinary per-group validation semantics.
+        The IDs are uploaded on this stream with ``upload_numpy`` and are only
+        ever read on it, so the caching allocator's stream ordering covers their
+        lifetime. Repeated IDs in distinct groups retain the ordinary per-group
+        validation semantics.
         """
 
         plans = tuple(
@@ -650,10 +653,12 @@ class DSV4PageSlotCodec:
             ):
                 region_plan = self._region_plan(DSV4PayloadKind.PAGE, stream=stream)
                 with torch.cuda.stream(stream):
-                    device_ids = triton_page_slot._static_device_i64(ids, target)
+                    device_ids = upload_numpy(np.asarray(ids, np.int64), target)
         return _PreparedBlockIdGroups(
             self, stream, plans, tuple(offsets), device_ids, region_plan
         )
+
+    supports_strided_restore = True
 
     def _copy_prepared_block_id_group(
         self,
@@ -663,6 +668,8 @@ class DSV4PageSlotCodec:
         *,
         gather: bool,
         stream: torch.cuda.Stream | None,
+        items_per_chunk: int = 1,
+        chunk_stride_bytes: int | None = None,
     ) -> None:
         if not isinstance(owner, _PreparedBlockIdGroups) or owner._codec is not self:
             raise ValueError("prepared block IDs belong to a different codec")
@@ -690,6 +697,20 @@ class DSV4PageSlotCodec:
         ):
             raise ValueError("prepared block IDs have an invalid shape or layout")
         _, item_ids, buffer_offset = sections[0]
+        stride_kwargs = {}
+        if chunk_stride_bytes is not None:
+            if gather:
+                raise ValueError("strided prepared buffers support restore only")
+            count = _integer("items_per_chunk", items_per_chunk)
+            stride = _integer("chunk_stride_bytes", chunk_stride_bytes)
+            chunk_bytes = count * self.bytes_per_block
+            if count <= 0 or stride < chunk_bytes or len(item_ids) % count:
+                raise ValueError("invalid strided PAGE chunk geometry")
+            chunks = len(item_ids) // count
+            required = buffer_offset + (chunks - 1) * stride + chunk_bytes
+            if int(device_buf.numel()) < required:
+                raise ValueError("strided PAGE buffer is too small")
+            stride_kwargs = {"items_per_chunk": count, "chunk_stride_bytes": stride}
         with (
             torch.cuda.device(self.device)
             if self.device.index is not None
@@ -706,6 +727,7 @@ class DSV4PageSlotCodec:
                 device_buf,
                 buffer_offset=buffer_offset,
                 stream=stream,
+                **stride_kwargs,
                 prepared_item_ids=ids[
                     owner._offsets[index] : owner._offsets[index + 1]
                 ],
@@ -733,6 +755,27 @@ class DSV4PageSlotCodec:
     ) -> None:
         self._copy_prepared_block_id_group(
             device_buf, owner, group_index, gather=False, stream=stream
+        )
+
+    def chunk_major_strided_buffer_to_gpu_prepared(
+        self,
+        device_buf: torch.Tensor,
+        owner: _PreparedBlockIdGroups,
+        group_index: int,
+        *,
+        items_per_chunk: int,
+        chunk_stride_bytes: int,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Restore aligned Store slots without copying away their padding."""
+        self._copy_prepared_block_id_group(
+            device_buf,
+            owner,
+            group_index,
+            gather=False,
+            stream=stream,
+            items_per_chunk=items_per_chunk,
+            chunk_stride_bytes=chunk_stride_bytes,
         )
 
     def gather_slot(
