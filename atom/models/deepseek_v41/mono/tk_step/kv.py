@@ -33,9 +33,9 @@ from dataclasses import dataclass
 import torch
 
 from ..hi.pd import convert as C
+from . import BLOCK  # ATOM's KV block
 
 KV_SOURCES = {2: 2, 8: 2, 14: 2, 20: 1}
-BLOCK = 128
 INDEX_DIM, INDEX_ROW = 128, 132  # FP8 index: 128 E4M3 bytes + one fp32 scale a row
 INDEX_TILE = 8
 

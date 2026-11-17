@@ -176,7 +176,7 @@ cannot affect a server that does not use the feature.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4.1, and Qwen3.8-Flash-Next deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. Qwen3.8-Flash-Next (Quark MXFP4, TP1, MTP3) runs either GDN verify (ReplaySSM by default, or classic with `ATOM_ENABLE_REPLAYSSM=0`); see `recipes/Qwen3.8-Flash-Next-Mono-Program.md`. |
+| **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4.1, and Qwen3.8-Flash-Next deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. DeepSeek-V4.1 on gfx950 takes the TileRT-derived TP8 step (`mono/tk_step`) on the deployment it serves (TP8, DSpark 5, `max_num_seqs` 1, BF16 KV with an FP8 index, 128-token blocks, no prefix caching, CUDA graphs; sampled requests) before the hi / mono paths, which serve anywhere else (the hi path's deployment, an FP4 index, is not one it serves). Qwen3.8-Flash-Next (Quark MXFP4, TP1, MTP3) runs either GDN verify (ReplaySSM by default, or classic with `ATOM_ENABLE_REPLAYSSM=0`); see `recipes/Qwen3.8-Flash-Next-Mono-Program.md`. |
 
 ### MiniMax-M3
 
@@ -203,13 +203,12 @@ On the deployment they are built for, V4.1 mono decode's served steps run the hi
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DSV41_MONO_HI** | str | auto | `auto`: the hi monokernels on the deployment they serve (above), ATOM's mono decode on any other with one info line (`V4.1 mono hi off: <why>`), also when only the loaded model shows the mismatch; `1`: on, or an error naming why not; `0`: off. Off, the `mono/hi` package is never imported. |
-| **ATOM_DSV41_TK_STEP** | bool | 0 | `1`: V4.1 decode steps on the TileRT-derived TP8 step (`mono/tk_step`: gfx950 TP8, DSpark 5, `max_num_seqs` 1, sampling only; a request it admits stays on it), the production path for any step it does not serve. |
-| **ATOM_DSV41_TK_CO** | str | "" | Dev only, with ATOM_DSV41_TK_STEP: launch TileRT's code objects from this directory instead of our FlyDSL builds. |
-| **ATOM_DSV41_TK_TOKTAB_DIR** | str | "" | With ATOM_DSV41_TK_STEP: a cache of the DSpark token tables, `rank<r>.pt` (read when present, else built, ATOM_DSV41_TK_TOKTAB_BUILD, and saved there). |
-| **ATOM_DSV41_TK_SWAP** | str | "" | Dev only, with ATOM_DSV41_TK_STEP: a swap table over the code table (`tk.codeobj.CodeTable.swap`). |
-| **ATOM_DSV41_TK_TOKTAB_BUILD** | str | gpu | With ATOM_DSV41_TK_STEP: how the DSpark token tables are built when ATOM_DSV41_TK_TOKTAB_DIR holds none: `gpu` (on each rank's GPU by the kernels TileRT's build runs, `hi/tk/toktab_device.py`: bit-exact); dev only, not bit-exact: `cpu` (`hi/tk/toktab.py`) or `cpu-hw` (the same with the GPU's `v_rsq_f32` / `v_exp_f32` / `v_rcp_f32`). |
-| **ATOM_DSV41_TK_FLY_CACHE** | str | "" | With ATOM_DSV41_TK_STEP: the node-local cache of the step's FlyDSL code objects built from source (`hi/tk/flybuild.py`; default `~/.cache/atom/tk_fly`). |
+| **ATOM_DSV41_MONO_HI** | str | auto | `auto`: the hi monokernels on the deployment they serve (above), ATOM's mono decode on any other with one info line (`V4.1 mono hi off: <why>`), also when only the loaded model shows the mismatch; `1`: on (also over the TileRT-path step, `mono/tk_step`, on gfx950), or an error naming why not; `0`: off. Off, the `mono/hi` package is never imported. |
+| **ATOM_DSV41_TK_CO** | str | "" | Dev only, for the TileRT-path step (`mono/tk_step`): launch TileRT's code objects from this directory instead of our FlyDSL builds. |
+| **ATOM_DSV41_TK_TOKTAB_DIR** | str | "" | For the TileRT-path step (`mono/tk_step`): a cache of the DSpark token tables, `rank<r>.pt` (read when present, else built, ATOM_DSV41_TK_TOKTAB_BUILD, and saved there). |
+| **ATOM_DSV41_TK_SWAP** | str | "" | Dev only, for the TileRT-path step (`mono/tk_step`): a swap table over the code table (`tk.codeobj.CodeTable.swap`). |
+| **ATOM_DSV41_TK_TOKTAB_BUILD** | str | gpu | For the TileRT-path step (`mono/tk_step`): how the DSpark token tables are built when ATOM_DSV41_TK_TOKTAB_DIR holds none: `gpu` (on each rank's GPU by the kernels TileRT's build runs, `hi/tk/toktab_device.py`: bit-exact); dev only, not bit-exact: `cpu` (`hi/tk/toktab.py`) or `cpu-hw` (the same with the GPU's `v_rsq_f32` / `v_exp_f32` / `v_rcp_f32`). |
+| **ATOM_DSV41_TK_FLY_CACHE** | str | "" | For the TileRT-path step (`mono/tk_step`): the node-local cache of the step's FlyDSL code objects built from source (`hi/tk/flybuild.py`; default `~/.cache/atom/tk_fly`). |
 
 The hi path serves the step widths 6 to 48 rows (1 to 8 requests verifying DSpark's 5 drafts and the anchor; past 4 requests on the batch bands of 6 and 8) and a context up to 1 Mi tokens (a `--max-model-len` past it keeps ATOM's mono decode). Its builds use FlyDSL's disk cache (`FLYDSL_RUNTIME_CACHE_DIR`), which also holds the gfx950 linear blocks' fitted prefetch depths where the frozen table does not apply (`dsv41_hi_fits`); `FLYDSL_DEBUG_MAX_LOC_DEPTH=1` shortens the trace of a first start's builds.
 

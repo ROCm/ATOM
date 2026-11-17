@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Which deployments and which steps the DeepSeek-V4.1 mono decode takes."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -371,6 +372,52 @@ def test_refused_deployment_is_not_wrapped(native, monkeypatch):
     assert isinstance(wrapped, dispatch.MonoDecodeModel)
     # attributes the runner never overrides pass through to the wrapped model
     assert wrapped.in_features == 2
+
+
+def _tk_step_world(monkeypatch, refusal=None):
+    """gfx950 (``tk_step.enabled``), the TileRT-path step's install refusal ``refusal``, its install a stand-in."""
+    from atom.models.deepseek_v41.mono import hi_gate, tk_step
+    from atom.models.deepseek_v41.mono.tk_step import dispatch as tk_dispatch
+
+    monkeypatch.setattr(tk_step, "enabled", lambda: True)
+    monkeypatch.setattr(tk_dispatch, "install_refusal", lambda cfg, builder: refusal)
+    monkeypatch.setattr(tk_dispatch, "install_tk_step", lambda m, cfg, d, b: ("tk_step", m))  # fmt: skip
+    monkeypatch.setattr(hi_gate, "_LOGGED", set())
+
+
+@pytest.mark.parametrize("hi", ["auto", "0"])
+def test_tk_step_comes_first_where_it_serves(native, monkeypatch, hi):
+    _tk_step_world(monkeypatch)
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", hi)
+    model = torch.nn.Linear(2, 2)
+    assert dispatch.install_mono_decode(model, _atom_config(), None) == ("tk_step", model)  # fmt: skip
+
+
+def test_a_tk_step_refusal_falls_through_to_hi_and_mono(native, monkeypatch, caplog):
+    _tk_step_world(monkeypatch, refusal="max_num_seqs 4")
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", "auto")
+    model = torch.nn.Linear(2, 2)
+    with caplog.at_level(logging.INFO, logger="atom"):
+        wrapped = dispatch.install_mono_decode(model, _atom_config(), None)
+    # the hi gate's own refusal (no metadata builder), then ATOM's mono decode, as without the TileRT-path step
+    assert isinstance(wrapped, dispatch.MonoDecodeModel)
+    assert "V4.1 TileRT-path step off: max_num_seqs 4" in caplog.text
+
+
+def test_an_explicit_mono_hi_wins_over_tk_step(native, monkeypatch, caplog):
+    _tk_step_world(monkeypatch)
+    monkeypatch.setenv("ATOM_DSV41_MONO_HI", "1")
+    model = torch.nn.Linear(2, 2)
+    # the hi path, required: here it cannot serve (no metadata builder), so its error, not the TileRT-path step
+    with (
+        caplog.at_level(logging.INFO, logger="atom"),
+        pytest.raises(RuntimeError, match="ATOM_DSV41_MONO_HI=1"),
+    ):
+        dispatch.install_mono_decode(model, _atom_config(), None)
+    assert (
+        "V4.1 TileRT-path step off: ATOM_DSV41_MONO_HI=1 keeps the hi path"
+        in caplog.text
+    )
 
 
 def _v41_config():

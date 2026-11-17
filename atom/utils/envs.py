@@ -668,7 +668,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tables are built on the GPU by those kernels, ATOM_DSV41_TK_TOKTAB_DIR
     # (rank<r>.pt) their cache. Dev options only: TileRT's code objects (ATOM_DSV41_TK_CO) and
     # a CodeTable swap table over them (ATOM_DSV41_TK_SWAP).
-    "ATOM_DSV41_TK_STEP": lambda: os.getenv("ATOM_DSV41_TK_STEP", "0") == "1",
     "ATOM_DSV41_TK_CO": lambda: os.getenv("ATOM_DSV41_TK_CO", ""),
     "ATOM_DSV41_TK_TOKTAB_DIR": lambda: os.getenv("ATOM_DSV41_TK_TOKTAB_DIR", ""),
     "ATOM_DSV41_TK_SWAP": lambda: os.getenv("ATOM_DSV41_TK_SWAP", ""),

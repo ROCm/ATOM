@@ -258,17 +258,20 @@ class TkStepModel(StepOverrideModel, nn.Module):
             return getattr(self.model, name)
 
 
-def install_tk_step(
-    model: nn.Module, atom_config, drafter, metadata_builder=None
-) -> nn.Module:
-    """``TkStepModel`` over ``model``, its ``TkRound`` on ``metadata_builder`` (V4.1's, ``use_decode_round``), or
-    ``model`` when this deployment cannot run it (logged)."""
+def install_refusal(atom_config, metadata_builder) -> str | None:
+    """Why this deployment does not take the TileRT-path step (``tk_step.refusal``, and the builder its decode round
+    needs), or None."""
     why = refusal(atom_config)
     if why is None and not hasattr(metadata_builder, "use_decode_round"):
         why = "no V4.1 metadata builder to take its decode round (ATOM's state bookkeeping)"
-    if why is not None:
-        logger.info("V4.1 TileRT-path step off: %s", why)
-        return model
+    return why
+
+
+def install_tk_step(
+    model: nn.Module, atom_config, drafter, metadata_builder
+) -> nn.Module:
+    """``TkStepModel`` over ``model``, its ``TkRound`` on ``metadata_builder`` (V4.1's, ``use_decode_round``); the
+    caller (``mono.dispatch.install_mono_decode``) has found no ``install_refusal``."""
     from atom.models.deepseek_v41.mono.tk_step.runner import TkStepRunner
 
     runner = TkStepRunner.create(

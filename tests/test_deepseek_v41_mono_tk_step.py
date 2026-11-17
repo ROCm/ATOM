@@ -411,12 +411,19 @@ def test_tk_step_refuses_prefix_caching_and_eager(monkeypatch):
     def config(**kw):
         base = {"speculative_config": SimpleNamespace(method="dspark", num_speculative_tokens=5),
                 "dspark": SimpleNamespace(confidence_schedule=False, ragged=False), "max_num_seqs": 1,
-                "max_model_len": 65536, "enable_prefix_caching": False, "enforce_eager": False}  # fmt: skip
+                "max_model_len": 65536, "enable_prefix_caching": False, "enforce_eager": False,
+                "kv_cache_dtype": "bf16", "index_cache_dtype": "fp8", "kv_cache_block_size": 128}  # fmt: skip
         return SimpleNamespace(**{**base, **kw})
 
     assert tk_step.refusal(config()) is None
     assert "prefix caching" in tk_step.refusal(config(enable_prefix_caching=True))
     assert "enforce_eager" in tk_step.refusal(config(enforce_eager=True))
+    # the caches its KV conversion reads (the hi path's FP4 index is not one)
+    assert "--index-cache-dtype fp4" in tk_step.refusal(config(index_cache_dtype="fp4"))
+    assert "--kv_cache_dtype fp8" in tk_step.refusal(config(kv_cache_dtype="fp8"))
+    assert "--block-size 16" in tk_step.refusal(config(kv_cache_block_size=16))
+    # a field missing: a deployment it is not written for, not an error
+    assert "max_num_seqs None" in tk_step.refusal(SimpleNamespace(**{k: v for k, v in vars(config()).items() if k != "max_num_seqs"}))  # fmt: skip
 
 
 def test_install_needs_the_v41_builder(monkeypatch):
@@ -426,10 +433,10 @@ def test_install_needs_the_v41_builder(monkeypatch):
         RN.TkStepRunner, "create", classmethod(lambda cls, *a, **k: runner)
     )
     model, cfg = torch.nn.Identity(), SimpleNamespace(model="m")
-    assert (
-        D.install_tk_step(model, cfg, None) is model
-    )  # nothing to keep ATOM's state bookkeeping
+    # nothing to keep ATOM's state bookkeeping: refused (mono.dispatch then takes the hi / mono paths)
+    assert "metadata builder" in D.install_refusal(cfg, None)
     builder = SimpleNamespace(use_decode_round=lambda r: setattr(builder, "round", r))
+    assert D.install_refusal(cfg, builder) is None
     wrapped = D.install_tk_step(model, cfg, None, builder)
     assert isinstance(wrapped, D.TkStepModel) and builder.round.model is wrapped
 
@@ -479,13 +486,15 @@ def test_held_steps_skip_the_verdict_wait(monkeypatch):
 
 
 def test_tk_step_obeys_the_mono_master_switch(monkeypatch):
-    """ATOM_MONO_ENABLE=0 turns every mono path off, the TileRT-path step too."""
+    """ATOM_MONO_ENABLE=0 turns every mono path off, the TileRT-path step too; on, it is gfx950's, with no switch of
+    its own (``mono.dispatch.install_mono_decode`` then asks its install refusal)."""
     from atom.models.deepseek_v41.mono import tk_step
 
-    monkeypatch.setenv("ATOM_DSV41_TK_STEP", "1")
+    monkeypatch.setattr(tk_step, "_arch", lambda: "gfx950")
     monkeypatch.setenv("ATOM_MONO_ENABLE", "0")
     assert not tk_step.enabled()
     monkeypatch.setenv("ATOM_MONO_ENABLE", "1")
     assert tk_step.enabled()
-    monkeypatch.setenv("ATOM_DSV41_TK_STEP", "0")
-    assert not tk_step.enabled()
+    for arch in ("gfx942", "gfx1250", None):
+        monkeypatch.setattr(tk_step, "_arch", lambda a=arch: a)
+        assert not tk_step.enabled()

@@ -119,6 +119,10 @@ def mi355x(monkeypatch):
         lambda name: object() if name == "flydsl" else None,
     )
     monkeypatch.delenv("ATOM_DSV41_MONO_HI", raising=False)
+    # on a gfx950 host the TileRT-path step is asked first; its selection is test_deepseek_v41_mono_dispatch.py's
+    from atom.models.deepseek_v41.mono import tk_step
+
+    monkeypatch.setattr(tk_step, "enabled", lambda: False)
 
 
 def test_the_default_is_auto(mi355x):
