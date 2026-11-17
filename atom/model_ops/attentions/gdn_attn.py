@@ -64,6 +64,7 @@ from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferRegion
+    from atom.models.kimi_k3.midstep import KdaSnapshots
 
 logger = logging.getLogger("atom")
 
@@ -180,7 +181,7 @@ class GDNAttentionMetadata:
     ssm_chunk_offsets: torch.Tensor | None = None
     # Kimi-K3 midstep checkpoints (ATOM_K3_KDA_STATE_MIDSTEP=1) this prefill
     # writes, as `_KimiMLAGDNCommon._kda_snapshots` builds them, else None.
-    kda_snapshots: object | None = None
+    kda_snapshots: "KdaSnapshots | None" = None
     # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.
     ssm_conv_state_len: int = 0
     # Keep the chunk kernel's per-chunk states for a caller that places its own
