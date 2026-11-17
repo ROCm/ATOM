@@ -174,8 +174,8 @@ def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
 
 
 # ---- initial ramp (ATOM_PREFILL_INITIAL_RAMP) under the adaptive policy ----
-# reduce-buffer slots: the ranks whose free seq slots fill a prefill chunk, and
-# (no cost slots) the first adaptive one, the requests a FIRE could admit
+# reduce-buffer slots: the ranks whose free seq slots fill target_fill of a chunk,
+# and (no cost slots) the first adaptive one, the requests a FIRE could admit
 _FULL_CHUNK = 11
 _ADMITTABLE = _FIXED_SLOTS
 
@@ -236,7 +236,7 @@ def test_initial_ramp_fires_before_min_ticks():
     clk = _Clock()
     d = _adaptive_delayer(clock=clk)
     assert _tick(d)  # first call: warmup seed
-    # Every rank fills a whole chunk: release at once, every tick.
+    # Every rank fills target_fill of a chunk: release at once, every tick.
     for _ in range(_MIN_TICKS - 1):
         d.notify_prefill_executed(8000)
         clk.t += 0.05
@@ -287,7 +287,7 @@ def test_initial_ramp_ends_on_kv_high():
 
 
 def test_ramp_off_ignores_full_chunk():
-    # Without the ramp a whole chunk changes nothing: rent-or-buy as before.
+    # Without the ramp full_chunk changes nothing: rent-or-buy as before.
     with_full = _adaptive_delayer(prefill_ramp=False)
     without = _adaptive_delayer(prefill_ramp=False)
     running = [10] * 9 + [0] + [10] * 5

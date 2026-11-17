@@ -62,14 +62,14 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   any_partial     = any rank mid-chunked-prefill
   any_prefill_ran = any rank completed a prefill forward on the previous tick
   n_full          = #prefillable ranks whose resumable partials plus the waiting
-                    requests that fit their free seq slots fill a prefill
-                    chunk (initial ramp only)
+                    requests that fit their free seq slots fill target_fill of
+                    a prefill chunk (initial ramp only)
 
   if any_prefill_ran:                              arm decode interval
   if G_running_dec == 0:                          re-arm the initial ramp
   elif n_full < dp_size or any_kv_high:           end the initial ramp
-  # -- initial ramp, ahead of every admit policy --
-  if the initial ramp is on and n_full == dp_size: FIRE  # every rank fills a chunk
+  # -- initial ramp, ahead of every admit policy (see below) --
+  if the initial ramp is on and n_full == dp_size: FIRE  # all ranks reach target_fill
   if post-prefill decode interval is active and decode exists:
       stall = 0 if the group's work changed;      HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
@@ -101,6 +101,18 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   if fill >= target_fill:                         FIRE
   if stall >= stall_ticks:                        FIRE
   HOLD
+
+Initial ramp
+------------
+With ``prefill_ramp`` (``ATOM_PREFILL_INITIAL_RAMP``) the ramp starts armed and
+fires on every decision while every rank can fill ``target_fill`` of a prefill
+chunk from resumable partials plus the waiting requests that fit its free seq
+slots, and KV is below the high watermark: the same as a decode interval of 0
+(and no coalescing or adaptive wait) until the seq slots or the KV fill. One
+rank that cannot fill ``target_fill`` of a chunk, e.g. a drained rank or a
+saturated one with no free seq slot, ends the ramp for the whole group once the
+group has decode. It stays off until the group has no decode
+(``G_running_dec == 0``), which re-arms it.
 
 Why SUM (not MAX)
 -----------------
@@ -401,7 +413,7 @@ class PrefillDelayer:
             )
             prefill_decode_interval = 0
         self.prefill_decode_interval = prefill_decode_interval
-        # Initial ramp (one-shot): while every rank can fill a whole prefill chunk
+        # Initial ramp: while every rank can fill target_fill of a prefill chunk
         # from waiting requests that fit its free seq slots, release at once,
         # ahead of the decode interval, the coalescer and the adaptive rule.
         self.prefill_ramp = bool(prefill_ramp)
@@ -424,7 +436,8 @@ class PrefillDelayer:
         #   slot 10 = unreachable flag  (SUM → n_unreachable; no prefill and no
         #                                decode completion within the hold)
         #   slot 11 = full_chunk flag   (SUM → n_full; waiting requests that fit
-        #                                the free seq slots fill a prefill chunk)
+        #                                the free seq slots fill target_fill of
+        #                                a prefill chunk)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -545,7 +558,8 @@ class PrefillDelayer:
     @property
     def ramp_active(self) -> bool:
         """The initial ramp is on: prefill is released at once, whatever the
-        admit policy, while every rank can still fill a whole prefill chunk."""
+        admit policy, while every rank can still fill target_fill of a prefill
+        chunk."""
         return self.prefill_ramp and not self._ramp_done
 
     def protects_decode(self, running_decode_batch: int) -> bool:
@@ -782,16 +796,17 @@ class PrefillDelayer:
             self._reset()
             return True
 
-        # The initial ramp ends for good once a rank can no longer fill a prefill
-        # chunk from its free seq slots, or KV runs high; an idle group re-arms it.
+        # The initial ramp ends once a rank can no longer fill target_fill of a
+        # prefill chunk from its free seq slots, or KV runs high; it re-arms once
+        # the group has no decode.
         if g_running_dec == 0:
             self._ramp_done = False
         elif not self._ramp_done and (n_full < self.dp_size or any_kv_high):
             self._ramp_done = True
 
-        # Initial ramp, ahead of every admit policy: every rank fills a whole
-        # chunk from its free seq slots, so any wait (decode interval, coalescer,
-        # rent-or-buy) would only leave those slots empty. The decode interval
+        # Initial ramp, ahead of every admit policy: every rank fills target_fill
+        # of a chunk from its free seq slots, so any wait (decode interval,
+        # coalescer, rent-or-buy) would only leave those slots empty. The decode interval
         # armed by these prefills applies from the first decision after the ramp.
         if self.ramp_active and n_full == self.dp_size:
             return self._fire("ramp", g_pending)

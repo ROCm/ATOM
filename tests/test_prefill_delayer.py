@@ -650,7 +650,8 @@ class TestPrefillDecodeInterval:
         full = {"pending_tokens": MAX_BATCHED, "full_chunk": True}
         assert call(d, running_decode_batch=10, **full) is True
         d.notify_prefill_executed()
-        # A whole chunk fits the free slots: back-to-back prefill, no protection.
+        # target_fill of a chunk fits the free slots: back-to-back prefill, no
+        # protection.
         assert call(d, running_decode_batch=50, **full) is True
         assert d._stat_fire_ramp == 1
         assert d.ramp_active and not d.protects_decode(50)
@@ -673,7 +674,7 @@ class TestPrefillDecodeInterval:
         assert call(d, pending_tokens=MAX_BATCHED, full_chunk=True) is False
         assert d._stat_fire_ramp == 0 and not d.ramp_active
 
-    def test_ramp_ends_on_kv_high_and_rearms_when_idle(self):
+    def test_ramp_ends_on_kv_high_and_rearms_without_decode(self):
         d = make_delayer(prefill_decode_interval=3, prefill_ramp=True)
         full = {"pending_tokens": MAX_BATCHED, "full_chunk": True}
         assert call(d, running_decode_batch=10, **full) is True
@@ -681,7 +682,7 @@ class TestPrefillDecodeInterval:
         # KV runs high before the batch fills: the ramp ends, the interval holds.
         assert call(d, running_decode_batch=50, kv_usage=0.95, **full) is False
         assert d._stat_fire_ramp == 0
-        # An idle group re-arms the ramp for the next burst.
+        # A group with no decode re-arms the ramp for the next burst.
         assert call(d, running_decode_batch=0, **full) is True
         assert d._stat_fire_ramp == 1 and d.ramp_active
         d.notify_prefill_executed()

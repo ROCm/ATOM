@@ -1286,11 +1286,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
     # Initial ramp (on by default, "0" disables), whatever the admit policy: while
-    # every DP rank can fill a whole prefill chunk from waiting requests that fit
-    # its free seq slots, prefill is released at once (ahead of that interval,
-    # the coalescer and the adaptive rule), so the batch fills with back-to-back
-    # full prefills; it ends for good when a rank cannot (or KV runs high) and
-    # re-arms when the group goes idle.
+    # every DP rank can fill target_fill of a prefill chunk from waiting requests
+    # that fit its free seq slots, prefill is released at once (ahead of that
+    # interval, the coalescer and the adaptive rule), so the batch fills with
+    # back-to-back full prefills; it ends when a rank cannot (or KV runs high)
+    # and re-arms once the group has no decode.
     "ATOM_PREFILL_INITIAL_RAMP": lambda: (
         os.getenv("ATOM_PREFILL_INITIAL_RAMP", "1") == "1"
     ),
