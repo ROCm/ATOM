@@ -172,7 +172,8 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
 - **Weekly night**: every `nightly` entry of `oot_models_accuracy.json` needs
   `nightly_weekday` (`Mon` … `Sun`). The vLLM nightly accuracy run that starts
   at 00:00 Beijing time on that weekday validates the case, so each case runs
-  once a week; the workflow refuses a nightly entry without one.
+  once a week. `validate_catalog.py` (semantic rule) fails a PR that adds a
+  nightly entry without one; the workflow refuses such an entry too.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a

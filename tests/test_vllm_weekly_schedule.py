@@ -23,6 +23,7 @@ ACCURACY_CATALOG = REPO / ".github" / "benchmark" / "oot_models_accuracy.json"
 DEADLINE = WORKFLOWS / "atom-nightly-deadline.yaml"
 
 # 2026-11-16 is a Monday; the accuracy run of each Beijing date starts at 00:00.
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 WEEK = [f"2026-11-{16 + day}T00:05:00+08:00" for day in range(7)]
 
 
@@ -84,20 +85,21 @@ def test_benchmark_runs_each_scheduled_model_once_a_week():
     assert weekly == Counter(everything)
 
 
-def test_accuracy_runs_each_nightly_case_once_a_week():
+def test_accuracy_runs_each_nightly_case_on_its_weekday_only():
     script = _embedded_python(_workflow(ACCURACY), "prepare-oot-image", "meta")
-    weekly = Counter()
-    for beijing_now in WEEK:
-        tonight = _accuracy_models(script, beijing_now)
-        assert tonight, beijing_now
-        weekly.update(tonight)
-
     nightly = [
-        m["model_name"]
+        m
         for m in json.loads(ACCURACY_CATALOG.read_text())
         if m.get("test_level", "nightly") == "nightly"
     ]
-    assert weekly == Counter(nightly)
+    weekly = Counter()
+    for weekday, beijing_now in zip(WEEKDAYS, WEEK):
+        tonight = _accuracy_models(script, beijing_now)
+        expected = [m["model_name"] for m in nightly if m["nightly_weekday"] == weekday]
+        assert expected, weekday
+        assert sorted(tonight) == sorted(expected), weekday
+        weekly.update(tonight)
+    assert weekly == Counter(m["model_name"] for m in nightly)
 
 
 def test_accuracy_rejects_a_nightly_case_without_a_weekday(tmp_path):

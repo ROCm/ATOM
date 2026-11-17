@@ -696,7 +696,10 @@ jobs:
               schedule_cron = os.environ.get("SCHEDULE_CRON", "")
               if schedule_cron not in WEEKLY_SCHEDULE:
                   raise SystemExit(f"No weekly benchmark night for cron {schedule_cron!r}.")
-              selected_group, tonight = WEEKLY_SCHEDULE[schedule_cron]
+              # selected_group also names a manual run's group (ALL), so a
+              # scheduled night's group is "<night> weekly", not the bare day.
+              night, tonight = WEEKLY_SCHEDULE[schedule_cron]
+              selected_group = f"{night} weekly"
               selected = select_by_display(all_variants, tonight)
               missing = tonight - {
                   str(m.get("display", "")) for m in selected
