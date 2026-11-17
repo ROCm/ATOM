@@ -188,6 +188,20 @@ def test_models_metadata_is_deployment_scoped(server, monkeypatch):
     assert card["effort"]["default_level"] == "high"
 
 
+@pytest.mark.parametrize("defaults", [{}, {"enable_thinking": False}])
+def test_models_report_the_default_chat_template_kwargs(server, monkeypatch, defaults):
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", defaults)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.get("/v1/models")
+
+    card = asyncio.run(run()).json()["data"][0]
+    assert card["default_chat_template_kwargs"] == defaults
+
+
 @pytest.mark.parametrize("endpoint", ["chat/completions", "responses"])
 @pytest.mark.parametrize(
     "effort,expected",

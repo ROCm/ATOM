@@ -288,6 +288,11 @@ required/named `tool_choice` still applies.
   prompt must still fit within the total context budget.
 - DSpark advertises text input, even if the checkpoint also declares vision.
 - Text output and the configured model's supported effort levels are exposed.
+- `default_chat_template_kwargs` is the server's `--default-chat-template-kwargs`
+  (`{}` when unset), which every chat renders with under the request's
+  `chat_template_kwargs`. A router that tokenizes chats to place them, as
+  atomesh's `cache_aware --kv-events` does, needs them to match the engine's
+  prompt.
 - Unknown capabilities are omitted rather than inferred from a served alias.
 
 The V4.1 adapter advertises `low`, `high`, and `max` thinking effort. The output

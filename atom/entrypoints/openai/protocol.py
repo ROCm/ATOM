@@ -481,6 +481,9 @@ class ModelCard(BaseModel):
     input_modalities: list[str] | None = None
     output_modalities: list[str] | None = None
     effort: dict[str, Any] | None = None
+    # --default-chat-template-kwargs: every chat renders with these, under the
+    # request's chat_template_kwargs.
+    default_chat_template_kwargs: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

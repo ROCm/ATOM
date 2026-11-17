@@ -3516,6 +3516,7 @@ async def list_models():
         data=[
             ModelCard(
                 id=model_name,
+                default_chat_template_kwargs=default_chat_template_kwargs,
                 **deployment_metadata(_get_engine_config(), custom_message_encoder),
             )
         ]
