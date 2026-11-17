@@ -40,6 +40,7 @@ LOSSLESS = (
 
 class FakeDraftModel:
     supports_lossless_draft = True
+    lossless_block_verify = False
     vocab_size = VOCAB
 
     def __init__(self):
@@ -70,6 +71,7 @@ def proposer(
     prop.config = SimpleNamespace(
         max_num_seqs=MAX_BS,
         pipeline_parallel_size=pp,
+        tensor_parallel_size=1,
         **{
             "kv_transfer_config": {},
             "enable_rapidserve": False,

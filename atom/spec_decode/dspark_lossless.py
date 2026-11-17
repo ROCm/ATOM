@@ -186,7 +186,9 @@ class DSparkLossless:
         # it a step later, after the batch may have been reordered.
         self.q_store = SparseQStore.allocate(q_slots * t, store_width(vocab), device)
         # The draft's own: the verify reads q from the store, not from here.
-        self.draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
+        self.draft_scratch = dspark_markov_sample_scratch(
+            max_bs, vocab, device, tp_size=drafter.config.tensor_parallel_size
+        )
         # Members of the runner's `sampling` publication, uploaded by the H2D
         # `prepare_sample` issues; its `begin()` waits out the previous upload.
         # The Philox key, the first q row each batch row drafts into, and the
