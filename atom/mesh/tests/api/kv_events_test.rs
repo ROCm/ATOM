@@ -104,6 +104,19 @@ async fn storage_once(app: &Router, done: impl Fn(&Value) -> bool) -> Value {
     panic!("timed out at /kv_storage/sources");
 }
 
+/// Once every step of the registration `created` ran: its job's status goes then.
+async fn registered(app: &Router, created: &Value) {
+    let uri = format!("/workers/{}", created["worker_id"].as_str().unwrap());
+    for _ in 0..1500 {
+        let (_, worker) = call(app, "GET", &uri, None).await;
+        if worker["job_status"].is_null() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out registering at {uri}");
+}
+
 /// A Mooncake master's admin service, its port, holding the taint key when `tainted`.
 async fn mooncake_admin(tainted: Arc<AtomicBool>) -> u16 {
     let answer = move |Query(query): Query<HashMap<String, String>>| {
@@ -294,7 +307,7 @@ async fn each_rank_of_a_dp_aware_worker_is_followed_until_the_worker_is_removed(
 
 /// Registered again at its address, as a DP-aware service that restarted is, a worker
 /// reads only the store its ranks report now: none when they leave it out, or report no
-/// sources at all.
+/// sources at all. An answer it cannot read changes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_worker_registered_again_reads_only_the_store_it_reports_now() {
     let admin_port = mooncake_admin(Arc::new(AtomicBool::new(false))).await;
@@ -332,13 +345,15 @@ async fn a_worker_registered_again_reads_only_the_store_it_reports_now() {
     };
     for (sources, readers) in [
         (ranks(Some(&offload)), 2),
+        (json!("unreadable"), 2),
         (ranks(None), 0),
         (ranks(Some(&offload)), 2),
         (json!({}), 0),
     ] {
         worker.set_kv_event_sources(sources).await;
-        let (status, _) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        let (status, created) = call(&app, "POST", "/workers", Some(json!({"url": url}))).await;
         assert!(status.is_success(), "{status}");
+        registered(&app, &created).await;
         storage_once(&app, read_by(readers)).await;
     }
     ctx.shutdown().await;
