@@ -436,20 +436,14 @@ and catches it; set it when chasing a corruption that does not reproduce.
 
 ## KV pool backend
 
-Who manages the paged KV pool. The default keeps it in the engine, as before.
-`umbp` hands it to a MORI-UMBP standalone server: UMBP allocates each rank's
-pool on that rank's GPU, the runner maps it, and DP ranks reuse each other's
-cached prefixes (a prefix another rank holds is copied into the requesting
-rank's own pool before the prefix walk). Needs MORI's `mori_umbp_l1` Python
-module on `PYTHONPATH` and a running `umbp_standalone_server`.
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_KV_POOL_BACKEND** | str | local | `local`: the engine allocates and manages the pool. `umbp`: a UMBP standalone server owns the memory and the slot table. |
-| **ATOM_UMBP_L1_ADDRESS** | str | "" | gRPC address of the UMBP standalone server, e.g. `unix:///tmp/umbp.grpc.sock`. Required with `ATOM_KV_POOL_BACKEND=umbp`. |
-| **ATOM_UMBP_L1_NAMESPACE** | str | atom | Prefix of this engine's pool names (`<namespace>:dp<rank>:tp<rank>`). Two engines on one UMBP server need different ones. |
-| **ATOM_UMBP_L1_GROUP** | str | "" (derived) | Share group: pools exchange blocks only within a group. By default it is derived from the model, KV dtype, block size and draft settings. |
-| **ATOM_UMBP_L1_FETCH** | bool | true | `0` keeps the UMBP pool but never copies blocks in from other ranks' pools. |
+No variables. The paged KV pool is the engine's own unless a KV connector
+provides it (`KVConnectorBase.kv_pool_memory`,
+`KVConnectorSchedulerBase.make_block_pool`). The `umbp_l1` connector hands it to
+a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
+through `--kv-transfer-config` like any connector, e.g.
+`{"kv_connector": "umbp_l1", "kv_connector_extra_config": {"address":
+"unix:///tmp/umbp-l1/server.sock", "share_ratio": 0.5}}`. Its settings are
+documented in `atom/kv_transfer/l1/umbp_l1/settings.py`.
 
 ## State checkpoints
 

@@ -2247,7 +2247,14 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
-            buf = self._kv_pool_memory().allocate(total, self.device)
+            # Nothing to carve when every builder allocates its own (V4.1):
+            # its arena comes from the same provider later, and asking for
+            # zero bytes here would claim the provider's one pool for nothing.
+            buf = (
+                self._kv_pool_memory().allocate(total, self.device)
+                if total
+                else torch.zeros(0, dtype=torch.uint8, device=self.device)
+            )
         elif buf.numel() < total:
             raise ValueError(
                 f"the imported paged pool holds {buf.numel()} B but this side's "
@@ -2257,12 +2264,18 @@ class ModelRunner:
         return buf, regions, builders
 
     def _kv_pool_memory(self):
-        """Where the paged pool's bytes come from (`ATOM_KV_POOL_BACKEND`)."""
+        """Where the paged pool's bytes come from: the KV connector's provider
+        if it takes the pool over (`KVConnectorBase.kv_pool_memory`), else this
+        process's own allocation."""
         memory = getattr(self, "_kv_pool_memory_provider", None)
         if memory is None:
             from atom.model_engine.kv_block_pool import make_pool_memory
 
-            memory = make_pool_memory(self.config, self.rank)
+            memory = make_pool_memory(
+                self.config,
+                self.rank,
+                kv_connector=get_kvconnector("worker", self.config),
+            )
             self._kv_pool_memory_provider = memory
         return memory
 
@@ -2392,6 +2405,23 @@ class ModelRunner:
                 transfer_tensors.block_regions if transfer_tensors is not None else (),
                 num_kvcache_blocks,
             )
+        else:
+            # A builder that allocates its own arena (DeepSeek-V4.1) took it
+            # from the same provider in `allocate_per_req_cache` and names
+            # its PAGE regions itself: its transfer tensors exist only under a
+            # kv_transfer_config.
+            owned = getattr(self.attn_metadata_builder, "owned_pool_layout", None)
+            layout = owned() if callable(owned) else None
+            if layout is not None:
+                replays = self.attn_metadata_builder.state_transfer().replays
+                if not replays and self._kv_pool_memory().shares_blocks:
+                    # Another rank's block carries PAGE only; without bounded
+                    # replay a hit would need a STATE checkpoint it lacks.
+                    raise NotImplementedError(
+                        "a pool shared across ranks needs encoder SWA bounded "
+                        "replay (--enable-encoder-swa-bounded-replay)"
+                    )
+                self._kv_pool_memory().bind_layout(*layout, num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as

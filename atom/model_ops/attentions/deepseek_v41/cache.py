@@ -46,12 +46,48 @@ from .speculative import TentativeState
 
 class PagedAttentionCache:
     def _allocate_backing(self, size, device):
-        """BF16's flat arena, or a frontend-owned slab for source buffers."""
+        """BF16's flat arena, or a frontend-owned slab for source buffers.
+
+        PAGE and STATE share a single address space here because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all. What an override returns has to be
+        zeroed, flat uint8, contiguous, on ``device`` and exactly ``size``
+        elements.
+
+        `allocate_backing` is that override for a caller that cannot subclass:
+        the serving cache takes its arena from the runner's `KVPoolMemory`, so
+        a pool another process owns (UMBP) backs PAGE and STATE alike.
+        """
+        if self._allocate_external is not None:
+            self.arena = self._allocate_external(size, torch.device(device))
+            return self.arena
         return torch.zeros(size, dtype=torch.uint8, device=device)
 
+    # Where each source buffer starts inside an external arena.
+    _BUFFER_ALIGN = 4096
+
     def _allocate_buffers(self, sizes, device):
+        """The quantized pool's separate source buffers.
+
+        Taken from one external arena when `allocate_backing` is set: a pool
+        another process manages is one allocation it addresses by offset, so
+        the buffers are aligned slices of it rather than allocations of their
+        own.
+        """
+        if self._allocate_external is None:
+            return tuple(
+                torch.zeros(size, dtype=torch.uint8, device=device) for size in sizes
+            )
+        align = self._BUFFER_ALIGN
+        starts, end = [], 0
+        for size in sizes:
+            starts.append(end)
+            end += -(-size // align) * align
+        self.arena = self._allocate_external(end, torch.device(device))
         return tuple(
-            torch.zeros(size, dtype=torch.uint8, device=device) for size in sizes
+            self.arena[start : start + size] for start, size in zip(starts, sizes)
         )
 
     def _allocate_quantized(self, device):
@@ -150,9 +186,13 @@ class PagedAttentionCache:
         max_tokens=0,
         workspace=None,
         prefill_window_staging=None,
+        allocate_backing=None,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
+        self._allocate_external = allocate_backing
+        # The one allocation `allocate_backing` returned, whichever layout.
+        self.arena = None
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
         index_layout = geometry.index_layout
         if index_layout == FP4_MFMA and (
