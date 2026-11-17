@@ -3299,18 +3299,6 @@ class MooncakeConnector(KVConnectorBase):
         staged_token_regions: list[int] = []
         source_blocks = np.asarray(src_block_ids, dtype=np.int64)
         destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
-
-        def add_token_runs(region_idx: int) -> bool:
-            return batch.add(
-                *self._dcp_token_descriptors(
-                    region_idx,
-                    self.kv_caches_base_addr[region_idx],
-                    consumer_base_addrs[cmap[region_idx]],
-                    self._per_block_bytes_list[region_idx],
-                    sharded_runs,
-                )
-            )
-
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -3351,7 +3339,11 @@ class MooncakeConnector(KVConnectorBase):
                 self._dcp_token_unit(region_idx, bpb)
                 staged_token_regions.append(region_idx)
                 continue
-            if not add_token_runs(region_idx):
+            if not batch.add(
+                *self._dcp_token_descriptors(
+                    region_idx, src_base, dst_base, bpb, sharded_runs
+                )
+            ):
                 logger.error("[PRODUCER] block transfer failed for req %s", req_id)
                 return False
 
