@@ -10,9 +10,13 @@ from abc import ABC, abstractmethod
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon_supports_arch,
-)
+try:
+    from aiter.ops.triton.gluon.pa_decode_gluon import (
+        pa_decode_gluon_supports_arch,
+    )
+except ImportError:
+    # aiter pre-gluon (bf37d container); gluon decode unavailable → routes to triton/asm
+    pa_decode_gluon_supports_arch = lambda: False  # noqa: E731
 from torch import nn
 
 from atom.config import get_current_atom_config
@@ -102,7 +106,10 @@ def dense_decode_splits(num_seqs: int, num_kv_heads: int) -> int:
     already folds the query tokens in -- as is the vLLM bridge's own copy of this
     dispatch, which is untested against this.
     """
-    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+    except ImportError:
+        get_recommended_splits = lambda *_: 1  # noqa: E731
 
     n = max(1, int(num_seqs) * int(num_kv_heads))
     # Power of two, and only the term added here: the PS reduce compiles one

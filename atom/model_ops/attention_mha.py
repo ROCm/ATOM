@@ -9,7 +9,11 @@ from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import _flash_attn_varlen_forward
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
+try:
+    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
+except ImportError:
+    # aiter pre-gluon (bf37d container); gluon decode unavailable → routes to triton/asm
+    pa_decode_gluon_supports_arch = lambda: False  # noqa: E731
 from aiter.ops.triton.unified_attention import unified_attention
 from torch import nn
 

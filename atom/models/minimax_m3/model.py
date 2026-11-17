@@ -12,7 +12,11 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
+try:
+    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
+except ImportError:
+    # aiter pre-gluon (bf37d container); gluon decode unavailable → routes to triton/asm
+    pa_decode_gluon_supports_arch = lambda: False  # noqa: E731
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
