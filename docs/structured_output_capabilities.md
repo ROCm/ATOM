@@ -297,7 +297,8 @@ required/named `tool_choice` still applies.
     or `null` when none does;
   - `reasoning_rules`: which rules apply `thinking` and `reasoning_effort`
     (`chat`, or `deepseek_v41`);
-  - `template_efforts`: the effort names the chat rules pass to a template;
+  - `template_efforts`: the effort names the `chat` rules forward to a
+    template (ignored under `deepseek_v41`);
   - `encoder`: for a model rendered by its own encoder rather than a Jinja
     template, the encoder's `name`, the `defaults` it sets, the kwargs it
     `accepts` (`null` for any), and whether its model `prepares_kwargs` past
