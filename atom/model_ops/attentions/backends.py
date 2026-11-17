@@ -404,6 +404,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             "implement relocate_state_slots"
         )
 
+    def copy_paged_blocks(self, copies: Sequence[tuple[int, int]]) -> None:
+        """Copy whole paged blocks `(source, destination)` on the compute
+        stream, before the forward (a split pool demoting a private block into
+        its shared part). A backend whose pool can be split implements it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot copy paged blocks; "
+            "a share_ratio below 1 (umbp_l1 connector) is not supported for this model"
+        )
+
     def execute_paged_state_copies(
         self,
         store_ops: Sequence[CheckpointStoreOp],
@@ -1684,6 +1693,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+        if state_ops.block_copies:
+            self.copy_paged_blocks(state_ops.block_copies)
         if is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups
