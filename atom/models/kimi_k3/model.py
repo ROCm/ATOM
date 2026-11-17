@@ -1723,12 +1723,16 @@ class KimiKDAAttention(nn.Module):
         beta: torch.Tensor,
     ) -> None:
         """`_prefill_recurrence` for `_kda_recurrence`, on ``[T, ...]`` inputs
-        and the live step's state, into ``out``; the recording's dummy prefill
-        (no KDA metadata) leaves it alone."""
+        and the live step's state, into ``out``. The recording's dummy prefill
+        leaves it alone, as `MLAAttention._prefill_attend` does; a live step
+        without KDA metadata is a bug, not a step to skip."""
         fwd_ctx = get_forward_context()
-        kda_metadata = step_kda_metadata(fwd_ctx)
-        if kda_metadata is None:
+        if fwd_ctx.context.is_dummy_run:
             return
+        kda_metadata = step_kda_metadata(fwd_ctx)
+        assert (
+            kda_metadata is not None
+        ), f"{self.layer_name}: a live KDA prefill replay has no KDA metadata"
         _, conv_state, ssm_state = self._state(fwd_ctx)
         n = kda_metadata.num_actual_tokens
         gate, beta = self._recurrence_gate_beta(gate[:n], beta[:n])

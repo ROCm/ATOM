@@ -531,15 +531,17 @@ def _kda_layer(model, calls):
     return layer
 
 
-def _kda_step(monkeypatch, model, layer, rows, metadata):
-    """A prefill step of ``rows`` real tokens; ``metadata`` None is the
-    recording's dummy step, which has no KDA metadata."""
+def _kda_step(monkeypatch, model, layer, rows, metadata, dummy=False):
+    """A prefill step of ``rows`` real tokens with KDA ``metadata`` (None:
+    none); ``dummy`` is the recording's dummy step, which has none."""
     width = KDA_HEADS * KDA_DIM
     attn_metadata = SimpleNamespace()
     if metadata is not None:
         attn_metadata.kda_metadata = metadata
     ctx = SimpleNamespace(
-        context=SimpleNamespace(is_prefill=True, scheduled_tokens=rows),
+        context=SimpleNamespace(
+            is_prefill=True, scheduled_tokens=rows, is_dummy_run=dummy
+        ),
         attn_metadata=attn_metadata,
         kv_cache_data={
             "layer_0": SimpleNamespace(
@@ -604,8 +606,20 @@ def test_the_kda_recordings_dummy_step_leaves_the_output_alone(monkeypatch):
     model = gpu_stack_import("atom.models.kimi_k3.model")
     calls = []
     layer = _kda_layer(model, calls)
-    _kda_step(monkeypatch, model, layer, 8, None)
+    _kda_step(monkeypatch, model, layer, 8, None, dummy=True)
     split = layer._forward_prefill_split(torch.randn(8, HIDDEN), None)
     assert split.shape == (8, HIDDEN)
     assert torch.count_nonzero(split) == 0
+    assert not calls
+
+
+def test_a_live_kda_replay_without_metadata_fails_loudly(monkeypatch):
+    """Only the recording's dummy step may skip the recurrence; a live step
+    with no KDA metadata must not hand back zeros as its output."""
+    model = gpu_stack_import("atom.models.kimi_k3.model")
+    calls = []
+    layer = _kda_layer(model, calls)
+    _kda_step(monkeypatch, model, layer, 5, None)
+    with pytest.raises(AssertionError, match="no KDA metadata"):
+        layer._forward_prefill_split(torch.randn(8, HIDDEN), None)
     assert not calls
