@@ -88,12 +88,27 @@ O_RBD = O_CNT + 64 * 4                   # stage_select_any's per-row bound, bat
 LDS_BYTES2 = O_RBD + 3 * 64 * 4
 
 
+# (v7) lds_topk's histogram copies, their merged bins, the block scan's wave totals (past LDS_BYTES2)
+F_H8 = LDS_BYTES2
+NCP = 16
+F_MG = F_H8 + NCP * 256 * 4
+F_SB = F_MG + 256 * 4
+F_LDS = F_SB + 64
+
+
 @ASTRewriter.transform
-def lds_topk(n, k, load, emit, sm, tid):
+def lds_topk(n, k, load, emit, sm, tid, ST=None):
+    hist8 = sm + F_H8
+    merged = sm + F_MG
+    sbuf = sm + F_SB
     """The top k (traced, <= 2048) of n (<= 8192) values: load(q, i) -> the 4 values i..i+3 (thread's quad q);
-    emit(pos, bits, i) for pos < k (bits 0 / i -1 past min(n, k)). A small code footprint (the step kernel is
-    instruction-fetch bound): the thread's 32 order keys go to LDS (keys[tid*32 + d]), and the 4 radix passes, the
-    above / tie counts, the winners' placement (staged in LDS outs) and the emit are runtime loops."""
+    emit(pos, bits, i) for pos < k (bits 0 / i -1 past min(n, k)), pos in position order (ties to the lower index).
+    The thread's order keys in LDS (thread-contiguous runs); up to 4 radix passes of 8 bits, each key adding to copy lane % NCP
+    of the pass's histogram (the scores' concentrated sign / exponent bytes made one shared histogram a chain of
+    same-address atomics), bin t's copies merged (and zeroed) by thread t, every wave scanning the merged bins itself;
+    the passes stop once the k-th key's bin holds exactly the keys still needed (the comparisons then use the resolved
+    prefix, key & mask); the winners placed after a one-barrier block scan. Same winners and order
+    as the 4-pass shared-histogram version it replaced (GPU check: bit-identical), 8192 -> 512 18.0 -> 10.4 us."""
     tid = hx.fresh(tid)
     lane, wave = tid % 32, tid // 32
     keys, hist, buf, outs = sm + O_KEYS, sm + O_HIST, sm + O_BUF, sm + O_OUT
@@ -110,51 +125,65 @@ def lds_topk(n, k, load, emit, sm, tid):
         cz0 = hx.fresh(tid) + THREADS * r
         if cz0 < 2 * HIST_WORDS:
             hx.lstore(hist + cz0 * 4, I32(0))
+    for r in range_constexpr(NCP * 256 // THREADS):
+        hx.lstore(hist8 + (hx.fresh(tid) + r * THREADS) * 4, I32(0))
     gpu.barrier()
+    if fx.const_expr(ST is not None):
+        ST(1)
     prefix = I32(0)
     mask = I32(0)
     need = I32(k)
     n = fx.max(n, I32(0))
     if n > k:
+        # (v5, after hi's topk) 4 passes of 8 bits: a key adds to copy lane % 8 of the pass's 256-bin histogram (8 LDS
+        # copies: the scores' concentrated sign / exponent bytes no longer make 32 lanes add to one word); every wave
+        # sums the copies and scans the bins itself (no second barrier); the passes stop once the k-th key's bin holds
+        # exactly the keys still needed (the comparisons below then use the resolved prefix, key & mask)
+        lp = hx.fresh(tid) % 32
+        hcopy = (lp % NCP) * (256 * 4)
+        done = I32(0)
         for p in range(4):
-            lp = hx.fresh(tid) % 32
-            shift = 24 - 8 * p
-            h = hist + (p % 3) * (HIST_WORDS * 4)
-            dummy = 256 + lp
-            run_bin = I32(256) + lp
-            run = I32(0)
-            for dq in range(nq):
-                kp4 = hx.lload(keys + (base + 4 * dq) * 4, I32, 4)
-                for e in range_constexpr(4):
-                    keyp = kp4[e]
-                    cntd = (base + 4 * dq + e < n) & ((keyp & mask) == prefix)
-                    binp = cntd.select((keyp >> shift) & 255, dummy)
-                    samep = binp == run_bin
-                    hx.latomic_add_i32(h + samep.select(dummy, run_bin) * 4, samep.select(I32(0), run))
-                    run = samep.select(run + 1, I32(1))
-                    run_bin = binp
-            hx.latomic_add_i32(h + run_bin * 4, run)
-            gpu.barrier()
-            if p < 2:
-                for r in range_constexpr((HIST_WORDS + THREADS - 1) // THREADS):
-                    cz = hx.fresh(tid) + r * THREADS
-                    if cz < HIST_WORDS:
-                        hx.lstore(hist + (((p + 2) % 3) * HIST_WORDS + cz) * 4, I32(0))
-            cs = [hx.lload(h + (255 - 8 * lp - q) * 4, I32) for q in range(8)]
-            s4 = cs[0]
-            for q in range_constexpr(1, 8):
-                s4 = s4 + cs[q]
-            before = wave_incl_scan(s4, lp) - s4
-            found = I32(-1)
-            for q in range_constexpr(8):
-                hit = (before < need) & (need <= before + cs[q])
-                found = hit.select(((255 - 8 * lp - q) << 16) | (need - before), found)
-                before = before + cs[q]
-            found = wave_max(found)
-            prefix = prefix | (((found >> 16) & 255) << shift)
-            mask = mask | (I32(255) << shift)
-            need = found & 0xFFFF
+            if done == I32(0):
+                shift = 24 - 8 * p
+                hs = hist8
+                for dq in range(nq):
+                    kp4 = hx.lload(keys + (base + 4 * dq) * 4, I32, 4)
+                    for e in range_constexpr(4):
+                        keyp = kp4[e]
+                        if (base + 4 * dq + e < n) & ((keyp & mask) == prefix):
+                            hx.latomic_add_i32(hs + hcopy + ((keyp >> shift) & 255) * 4, I32(1))
+                gpu.barrier()
+                tb_ = hx.fresh(tid)   # (thread t: bin t of the NCP copies -> merged, the copies zeroed for the next pass)
+                sm_ = I32(0)
+                for cp in range_constexpr(NCP):
+                    sm_ = sm_ + hx.lload(hs + (cp * 256 + tb_) * 4, I32)
+                    hx.lstore(hs + (cp * 256 + tb_) * 4, I32(0))
+                hx.lstore(merged + tb_ * 4, sm_)
+                gpu.barrier()
+                v0 = hx.lload(merged + (248 - 8 * lp) * 4, I32, 4)
+                v1 = hx.lload(merged + (252 - 8 * lp) * 4, I32, 4)
+                cs = [v1[3], v1[2], v1[1], v1[0], v0[3], v0[2], v0[1], v0[0]]
+                s4 = cs[0]
+                for q in range_constexpr(1, 8):
+                    s4 = s4 + cs[q]
+                before = wave_incl_scan(s4, lp) - s4
+                found = I32(-1)
+                fcnt = I32(-1)
+                for q in range_constexpr(8):
+                    hit = (before < need) & (need <= before + cs[q])
+                    found = hit.select(((255 - 8 * lp - q) << 16) | (need - before), found)
+                    fcnt = hit.select(cs[q], fcnt)
+                    before = before + cs[q]
+                found = wave_max(found)
+                fcnt = wave_max(fcnt)
+                prefix = prefix | (((found >> 16) & 255) << shift)
+                mask = mask | (I32(255) << shift)
+                need = found & 0xFFFF
+                done = (fcnt == need).select(I32(1), I32(0))
+    if fx.const_expr(ST is not None):
+        ST(2)
     take_all = n <= k
+    # (v6) the winners from the registers (no LDS reload), one barrier for the block scan, an unrolled placement
     gt_bits = I32(0)
     eq_bits = I32(0)
     above = I32(0)
@@ -163,13 +192,24 @@ def lds_topk(n, k, load, emit, sm, tid):
         kg4 = hx.lload(keys + (base + 4 * dg) * 4, I32, 4)
         for e in range_constexpr(4):
             vd = base + 4 * dg + e < n
-            gt = (vd & ult(prefix, kg4[e])).select(I32(1), I32(0))
-            eq = (vd & (kg4[e] == prefix)).select(I32(1), I32(0))
+            gt = (vd & ult(prefix, kg4[e] & mask)).select(I32(1), I32(0))
+            eq = (vd & ((kg4[e] & mask) == prefix)).select(I32(1), I32(0))
             gt_bits = gt_bits | (gt << (4 * dg + e))
             eq_bits = eq_bits | (eq << (4 * dg + e))
             above = above + gt
             ties = ties + eq
-    packed = block_excl_scan(above | (ties << 16), lane, wave, buf)
+    if fx.const_expr(ST is not None):
+        ST(3)
+    pv = above | (ties << 16)
+    incl = wave_incl_scan(pv, lane)
+    if lane == 31:
+        hx.lstore(sbuf + wave * 4, incl)
+    gpu.barrier()
+    bw = I32(0)
+    for wv in range_constexpr(WAVES):
+        cw = hx.lload(sbuf + wv * 4, I32)
+        bw = bw + (wv < wave).select(cw, I32(0))
+    packed = incl - pv + bw
     ab = packed & 0xFFFF
     tb = packed >> 16
     for dw in range(nq):
@@ -186,12 +226,16 @@ def lds_topk(n, k, load, emit, sm, tid):
                 hx.lstore(outs + at * 8, fx.Vector.from_elements([(kd < 0).select(kd & I32(0x7FFFFFFF), ~kd), iw], I32))
             ab = ab + gtw
             tb = tb + tiew
+    if fx.const_expr(ST is not None):
+        ST(4)
     n_out = fx.min(n, I32(k))
     for rp in range((I32(k) + (THREADS - 1)) // THREADS):   # k traced: runtime loops, one copy of the emit code
         posp = hx.fresh(tid) + THREADS * rp
         if (posp >= n_out) & (posp < k):
             hx.lstore(outs + posp * 8, fx.Vector.from_elements([I32(0), I32(-1)], I32))
     gpu.barrier()
+    if fx.const_expr(ST is not None):
+        ST(5)
     for re in range((I32(k) + (THREADS - 1)) // THREADS):
         pose = hx.fresh(tid) + THREADS * re
         if pose < k:
