@@ -203,8 +203,7 @@ class K3MonoDecodeRunner:
         )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
-        self.state_len = self._state_len()
-        self.state16 = self._state_dtype() == torch.float16
+        self.state_len, self.state16 = self._state_constants()
         self.replay_cap = self._replay_cap()
         self._replay_tables = {}  # layer id -> (K1's ReplaySSM table, its pointers)
         # the DSA layers' indexers: static checks every rank shares, so no
@@ -221,9 +220,10 @@ class K3MonoDecodeRunner:
             self.ix = None
         self._allocate()
 
-    def _state_len(self) -> int:
-        """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
-        verify window the KDA state pool was allocated for.
+    def _state_constants(self) -> tuple[int, bool]:
+        """The KDA state pools' build constants: the conv state's window
+        (``CONV_WIDTH - 1`` plus the verify window the pool was allocated for)
+        and whether the recurrent state is fp16 (``state16``).
 
         Every mono layer is checked, not just the first. ``_conv_state`` and
         ``_recurrent_state`` are the only validation the KDA state pools get,
@@ -253,38 +253,28 @@ class K3MonoDecodeRunner:
         Build time has that vote for free: ``bind_agreed`` turns this rank's
         ``MonoUnsupported`` into a ``group_agree(False)`` every peer follows.
         """
-        lens = set()
+        lens, dtypes = set(), set()
         for plan in self.plans:
             if not plan.mono:
                 continue
             lens.add(self._conv_state(plan.layer_id).size(-1))
-            self._recurrent_state(plan.layer_id)
+            dtypes.add(self._recurrent_state(plan.layer_id).dtype)
         if len(lens) != 1:
             raise MonoUnsupported(
                 f"mono layers disagree on the conv window: {sorted(lens)}; "
                 "`state_len` is one build constant for all of them"
             )
-        return lens.pop()
-
-    def _state_dtype(self) -> torch.dtype:
-        """The recurrent state pools' dtype, a build constant (``state16``) for the
-        same reason ``state_len`` is one."""
-        dtypes = {
-            self._recurrent_state(plan.layer_id).dtype
-            for plan in self.plans
-            if plan.mono
-        }
         if len(dtypes) != 1:
             raise MonoUnsupported(
                 "mono layers disagree on the recurrent state dtype: "
                 f"{sorted(map(str, dtypes))}"
             )
-        return dtypes.pop()
+        return lens.pop(), dtypes.pop() == torch.float16
 
     def _replay_cap(self) -> int:
         """ReplaySSM's record buffer length (its ``cache_len``), 0 without:
         read off the buffers allocated, every mono layer's checked as
-        ``_state_len`` checks the state pools -- a build constant, refused for
+        ``_state_constants`` checks the state pools -- a build constant, refused for
         the whole runner. K1 indexes them as contiguous [slot][head][cap][128]:
         k and u bf16, the log gates fp32."""
         caps = set()
@@ -320,9 +310,7 @@ class K3MonoDecodeRunner:
         this is the pool that was actually allocated. The recurrence reads and
         writes it in place as fp32, or as fp16 under ``state16`` (widened to
         fp32 on load, rounded to nearest on every store), so any other dtype is
-        reinterpreted rather than converted -- wrong numbers, no error. The
-        conv state next door has been checked all along; this one was not,
-        although the module docstring claimed both were.
+        reinterpreted rather than converted -- wrong numbers, no error.
         """
         cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
         state = cache.v_cache

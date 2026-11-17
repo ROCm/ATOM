@@ -48,7 +48,7 @@ def _pools(window=WINDOW, *, channels=QKV, conv=torch.bfloat16, rec=torch.float3
 
 
 def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
-    """A runner stubbed down to what `_state_len` reads."""
+    """A runner stubbed down to what `_state_constants` reads."""
     runner = object.__new__(K3MonoDecodeRunner)
     runner.dims = SimpleNamespace(qkv=QKV)
     runner.plans = [
@@ -66,7 +66,7 @@ def _runner(monkeypatch, caches, *, mono_layers=(0, 1, 2)):
 
 def test_matching_pools_give_the_build_constant(monkeypatch):
     runner = _runner(monkeypatch, {lid: _pools() for lid in range(4)})
-    assert runner._state_len() == WINDOW
+    assert runner._state_constants() == (WINDOW, False)
 
 
 @pytest.mark.parametrize(
@@ -85,7 +85,7 @@ def test_a_later_mono_layers_bad_pool_is_refused_at_bind(monkeypatch, broken, ma
     caches[2] = _pools(**broken)
     runner = _runner(monkeypatch, caches)
     with pytest.raises(MonoUnsupported, match=match):
-        runner._state_len()
+        runner._state_constants()
 
 
 def test_mono_layers_that_disagree_on_the_window_are_refused(monkeypatch):
@@ -96,7 +96,7 @@ def test_mono_layers_that_disagree_on_the_window_are_refused(monkeypatch):
     caches[2] = _pools(window=WINDOW + 1)
     runner = _runner(monkeypatch, caches)
     with pytest.raises(MonoUnsupported, match="disagree on the conv window"):
-        runner._state_len()
+        runner._state_constants()
 
 
 def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
@@ -104,15 +104,14 @@ def test_a_non_mono_layers_pool_is_not_checked(monkeypatch):
     caches = {lid: _pools() for lid in range(4)}
     caches[3] = _pools(WINDOW + 7, conv=torch.float16)
     runner = _runner(monkeypatch, caches)
-    assert runner._state_len() == WINDOW
+    assert runner._state_constants() == (WINDOW, False)
 
 
 def test_an_fp16_recurrent_pool_is_admitted(monkeypatch):
     # the recurrence widens fp16 to fp32 and rounds each state it writes back;
     # a bf16 pool is refused (`test_a_later_mono_layers_bad_pool_is_refused_at_bind`)
     runner = _runner(monkeypatch, {lid: _pools(rec=torch.float16) for lid in range(4)})
-    assert runner._state_len() == WINDOW
-    assert runner._state_dtype() == torch.float16
+    assert runner._state_constants() == (WINDOW, True)
 
 
 def test_mono_layers_that_disagree_on_the_recurrent_dtype_are_refused(monkeypatch):
@@ -121,7 +120,7 @@ def test_mono_layers_that_disagree_on_the_recurrent_dtype_are_refused(monkeypatc
     caches[2] = _pools(rec=torch.float16)
     runner = _runner(monkeypatch, caches)
     with pytest.raises(MonoUnsupported, match="disagree on the recurrent state dtype"):
-        runner._state_dtype()
+        runner._state_constants()
 
 
 class _PastTheChecks(Exception):
