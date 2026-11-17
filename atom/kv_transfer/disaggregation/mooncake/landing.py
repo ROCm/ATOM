@@ -418,7 +418,7 @@ class LandingReceiver:
             )
         self._stream.synchronize()
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="mooncake-mla-landing"
+            target=self._run, daemon=True, name="mooncake-landing"
         )
         self._thread.start()
 
