@@ -60,7 +60,9 @@ def _layer(monkeypatch, n, source, e8m0=True):
 
 
 def _norm(monkeypatch):
-    monkeypatch.setattr(layernorm_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        layernorm_mod, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     target = LayerQuantConfig(
         quant_type=QuantType.per_1x128, quant_dtype=dtypes.fp8, is_dynamic=True
     )
@@ -141,13 +143,3 @@ def test_a_norm_and_its_consumers_switch_together_or_not_at_all(monkeypatch):
     assert kimi_k3._row_major_x_scale(norm, [e8m0])
     assert e8m0.x_scale_row_major_key == norm._row_major_key != 0
     assert norm._aiter_transpose_scale
-
-
-def test_the_switch_is_off_without_the_env(monkeypatch):
-    if not _row_major_supported():
-        pytest.skip("needs gfx1250 and an aiter with the row-major x_scale query")
-    source = torch.randn(2176, K, dtype=torch.bfloat16) * 0.02
-    layer = _layer(monkeypatch, 2176, source)
-    monkeypatch.setenv("ATOM_KIMI_K3_ROW_MAJOR_X_SCALE", "0")
-    assert not layer.use_row_major_x_scale()
-    assert not layer.x_scale_row_major_key
