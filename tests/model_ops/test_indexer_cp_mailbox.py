@@ -18,7 +18,9 @@ def _mailbox_x4():
         return False
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx_runtime() in ("gfx950", "gfx1250")
+    from atom.distributed.indexer_cp import _MAILBOX_ARCHES
+
+    return get_gfx_runtime() in _MAILBOX_ARCHES
 
 
 pytestmark = pytest.mark.skipif(
@@ -26,13 +28,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 WORLD, QLEN, TOPK, MAX_LEN = 4, 4, 16, 1 << 20
+# Launches are MAX_LEN wide (max_model_len 1M), or as wide as a longer row.
+# 384: rows of 3 blocks and 1 leave ranks with no live block.
 # 900000: shard rows past two narrow local top-k tiles take the wide one.
+# 1M + 1024: 8200 blocks, so every rank walks two wide tiles.
 # A fifth field of 1 emits the MXFP4 KV's page geometry (one page a block).
 CASES = [
     (1, 1000, 0, 1),
+    (2, 384, 1, 4),
     (16, 60000, 1, 4),
     (64, 100000, 1, 4),
     (8, 900000, 1, 4),
+    (2, (1 << 20) + 1024, 1, 4),
     (16, 60000, 1, 4, 1),
 ]
 # The first four calls cross both boundaries: 2**30 wraps the stored counter,
@@ -50,7 +57,7 @@ def _case(rank, mailbox, batch, context, init, keep, pages=None):
     if pages is not None:
         geometry = {"pages_per_block": pages, "block_page_stride": pages}
 
-    blocks = triton.cdiv(MAX_LEN, 128)
+    blocks = triton.cdiv(max(MAX_LEN, context), 128)
     local = triton.cdiv(blocks, WORLD)
     tokens = batch * QLEN
     same = torch.Generator(device="cuda").manual_seed(batch)

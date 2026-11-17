@@ -172,9 +172,7 @@ class CandidateMailbox:
                 torch.cuda.synchronize(device)
             except Exception as error:  # noqa: BLE001 - agree every mapping failure
                 failure = error
-            if group_agree(failure is None, cpu_group):
-                failure = None
-            else:
+            if not group_agree(failure is None, cpu_group):
                 failure = failure or RuntimeError("a peer failed to map the mailbox")
         else:
             failure = failure or RuntimeError("a peer failed to allocate the mailbox")
