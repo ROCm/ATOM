@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary
 
+from conftest import with_min_load
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     KVConnectorOutput,
@@ -145,14 +147,16 @@ def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0):
         return adapter
 
     monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
-    config = SimpleNamespace(
-        kv_cache_block_size=4,
-        kv_transfer_config={
-            "kv_role": "offload",
-            "kv_connector_extra_config": {"lmcache.chunk_size": CHUNK},
-        },
-        parallel_config=SimpleNamespace(data_parallel_rank=0),
-        state_replay_tokens=replay,  # what `Config.__post_init__` sets
+    config = with_min_load(
+        SimpleNamespace(
+            kv_cache_block_size=4,
+            kv_transfer_config={
+                "kv_role": "offload",
+                "kv_connector_extra_config": {"lmcache.chunk_size": CHUNK},
+            },
+            parallel_config=SimpleNamespace(data_parallel_rank=0),
+            state_replay_tokens=replay,  # what `Config.__post_init__` sets
+        )
     )
     scheduler = NativeStateLMCacheMPConnectorScheduler(config)
     checkpoints = PagedStateCheckpointCoordinator(

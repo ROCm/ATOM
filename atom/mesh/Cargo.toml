@@ -77,7 +77,7 @@ reasoning-parser = "=1.0.0"
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 num-traits = "0.2"
 rustpython-parser = "0.4.0"
-llm-tokenizer = "=1.0.0"
+llm-tokenizer = "=1.4.2"
 wfaas = "=1.0.0"
 data-connector = "=1.0.0"
 openmetrics-parser = "0.4.4"

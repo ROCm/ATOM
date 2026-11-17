@@ -402,9 +402,12 @@ load: owners --batch_get_into--> run of slots of the registered pool --unpack (T
 
 A window whose slots are one run of the HBM pool is one chunk-major buffer, and
 the dense codec packs or unpacks it in place with one kernel and one stream
-sync. A window whose slots are scattered (quarantined slots broke the region
-up) goes through the block GPU connector's staging buffer instead: pack, then
-a copy into each slot (and the reverse).
+sync. The DSV4/M3 PAGE codec also restores (load only) a run of padded slots in
+place, reading each slot at the pool's slot stride and skipping the padding;
+saves into padded slots still go through staging. A window whose slots are
+scattered (quarantined slots broke the region up) goes through the block GPU
+connector's staging buffer instead: pack, then a copy into each slot (and the
+reverse).
 
 - One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
   opaque bytes of that rank's layers, 16 blocks in one contiguous range

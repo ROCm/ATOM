@@ -357,6 +357,30 @@ def mla_dcp_kernel_num_heads(
     return gathered
 
 
+def mla_dcp_persistent_width(
+    num_heads: int,
+    dcp_world_size: int,
+    min_kernel_heads: int = _MLA_MIN_HEADS,
+    *,
+    kv_cache_dtype: str,
+) -> int | None:
+    """Gathered width a persistent DCP decode runs at, or None when DCP is off
+    or aiter has no persistent kernel at that width (``dcp_persistent_supported``).
+    """
+    if dcp_world_size <= 1:
+        return None
+    width = mla_dcp_kernel_num_heads(
+        num_heads,
+        dcp_world_size,
+        min_kernel_heads,
+        kv_cache_dtype=kv_cache_dtype,
+        persistent=True,
+    )
+    if not dcp_persistent_supported(width, kv_cache_dtype, dcp_world_size):
+        return None
+    return width
+
+
 def mla_dcp_sparse_prefill_num_heads(
     num_heads: int,
     dcp_world_size: int,
@@ -886,7 +910,6 @@ class MLAAttention(nn.Module):
         self._qrep_local_proj = None
         self._qrep_local_src = None
 
-        self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
         # Every sparse DCP shape is per-token q_len=1 rows -- one per sequence
         # in decode, one per query token in sparse prefill and MTP verify.
@@ -931,6 +954,17 @@ class MLAAttention(nn.Module):
         The vLLM plugin initializes its process groups independently from the
         native ATOM config, so it calls this again with vLLM's DCP size.
         """
+        # Whether aiter runs this layer's DCP decode persistent, at the width
+        # the persistent path gathers to.
+        self.dcp_persistent_supported = (
+            mla_dcp_persistent_width(
+                self.num_heads,
+                dcp_world_size,
+                self.min_query_heads,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            is not None
+        )
         # DCP decode all-gathers Q on the head dim, so the width reaching
         # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
         # dispatchable one. The pad sits entirely inside _forward_decode: it goes
@@ -984,7 +1018,6 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
-                self.dcp_persistent_supported,
                 get_current_atom_config().max_num_batched_tokens,
             )
             (
