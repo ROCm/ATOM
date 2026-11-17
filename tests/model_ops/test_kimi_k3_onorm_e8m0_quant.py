@@ -13,6 +13,7 @@ if not torch.cuda.is_available():
 from aiter import QuantType, dtypes
 
 from atom.model_ops.kimi_k3 import rmsnorm_gated
+from atom.model_ops.kimi_k3.rmsnorm_gated_gluon import rmsnorm_gated_e8m0
 from atom.model_ops.linear import per_1x128_e8m0_quant
 
 # Decode and prefill token counts; 12 heads = 96 / TP8.
@@ -54,3 +55,32 @@ def test_o_norm_e8m0_matches_rmsnorm_gated_then_o_proj_quant(
     assert s.dtype == dtypes.fp8_e8m0 and s.shape == s_ref.shape
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def _codes(s, tokens, col_major):
+    raw = s.view(torch.uint8).reshape(-1)
+    return raw.reshape(HEADS, tokens).t() if col_major else raw.reshape(tokens, HEADS)
+
+
+@pytest.mark.parametrize("col_major", [True, False])
+def test_o_norm_e8m0_is_batch_invariant(col_major):
+    # The decode launch packs rows per workgroup and long batches take one head of
+    # consecutive tokens per workgroup; a token's bytes must not depend on which.
+    torch.manual_seed(20261117)
+    full = 1024
+    x = torch.randn(full, HEADS, DIM, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(full, HEADS, 3 * DIM, dtype=torch.bfloat16, device="cuda")
+    gate = gate[..., DIM : 2 * DIM]
+    weight = torch.randn(DIM, dtype=torch.bfloat16, device="cuda")
+
+    def run(tokens):
+        q, s = rmsnorm_gated_e8m0(
+            x[:tokens], weight, gate[:tokens], 1e-6, dtypes.fp8, col_major
+        )
+        return q.view(torch.uint8), _codes(s, tokens, col_major)
+
+    q_full, s_full = run(full)
+    for tokens in (1, 3, 4, 5, 58, 545, 767, 768, 769):
+        q, s = run(tokens)
+        assert torch.equal(q, q_full[:tokens]), tokens
+        assert torch.equal(s, s_full[:tokens]), tokens
