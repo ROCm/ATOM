@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Lane maxima: held beside the packed FP4 logits, written only by an FP4
-band launch whose config writes them."""
+"""Lane maxima: held beside the packed FP4 logits, handed only to a band of
+at least 64 rows, and written only by an FP4 band launch whose config
+writes them."""
 
 from types import SimpleNamespace
 
@@ -61,3 +62,50 @@ def test_the_packed_workspace_holds_lane_max_sized_by_aiter():
     )
     fp8 = ScoreWorkspace(_geometry(False), 40, 9, "cpu", lane_max_elems=sizing)
     assert fp8.packed_lane_max() is None
+
+
+@pytest.mark.parametrize("count", [1, 63, 64, 65])
+def test_a_band_below_64_rows_hands_lane_max_to_neither_kernel(
+    score, monkeypatch, count
+):
+    """A packed FP4 band of fewer than 64 rows passes no lane maxima to its
+    scorer or its top-k; from 64 rows on both get the workspace's buffer.
+    The band's rows alone decide it, so a captured batch decides it once."""
+    lane_max = torch.zeros(16)
+    workspace = SimpleNamespace(
+        packed_logits=lambda: torch.zeros(4 * count),
+        packed_lane_max=lambda: lane_max,
+    )
+    rows = SimpleNamespace(
+        workspace=workspace,
+        bands=[(0, count)],
+        next_n=1,
+        packed_offsets=torch.arange(count, dtype=torch.int32),
+        row_ends=torch.ones(count, dtype=torch.int32),
+        width=4,
+    )
+    seen = {}
+
+    def scorer(*args):
+        seen["scorer"] = args[-1]
+
+    def top_k(*args, **kwargs):
+        seen["top_k"] = kwargs["lane_max"]
+
+    monkeypatch.setattr(score, "_fp4_band_logits", scorer)
+    monkeypatch.setattr(score, "top_k_per_row_decode", top_k)
+    query = (torch.zeros(count, 1, 2), torch.zeros(count, 1, 1))
+    score._score_paged(
+        query,
+        torch.zeros(count, 2),
+        SimpleNamespace(fp4=True),
+        rows,
+        8,
+        1.0,
+        True,
+        None,
+        torch.empty(count, 8, dtype=torch.int32),
+    )
+    expected = lane_max if count >= 64 else None
+    assert seen["scorer"] is expected
+    assert seen["top_k"] is expected

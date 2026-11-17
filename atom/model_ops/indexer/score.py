@@ -46,6 +46,12 @@ _fp8_paged_mqa_logits = (
     else deepgemm_fp8_paged_mqa_logits
 )
 
+# A packed FP4 band shorter than this many rows gets no lane maxima: on so
+# small a grid the top-k's prefilter does not pay for itself and the
+# scorer's lane-max stores would still cost. A band's rows are fixed when a
+# graph is recorded, so each captured batch takes the same side every replay.
+_LANE_MAX_MIN_ROWS = 64
+
 
 def score_topk(
     query,
@@ -175,9 +181,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
         if rows.packed_offsets is not None:
             scores = workspace.packed_logits()
             offsets = rows.packed_offsets[span]
-            # Whether this band's scorer writes them is `_fp4_band_logits`'s
-            # call; the top-k selects the same whatever the buffer holds.
-            lane_max = workspace.packed_lane_max()
+            lane_max = _band_lane_max(workspace, count)
         else:
             scores = (
                 plane[:count]
@@ -321,6 +325,16 @@ def _gather_pass_keys(cache, keys, p):
     torch.index_select(shard_bytes, 0, gather_index, out=k_fp8.view(torch.uint8))
     torch.index_select(shard_scales, 0, gather_index, out=k_scale)
     return k_fp8, k_scale
+
+
+def _band_lane_max(workspace, count):
+    """A packed band's lane maxima, or None below `_LANE_MAX_MIN_ROWS` rows,
+    where neither its scorer nor its top-k is handed them. Whether the
+    scorer writes them is `_fp4_band_logits`'s call; the top-k selects the
+    same whatever the buffer holds."""
+    if count < _LANE_MAX_MIN_ROWS:
+        return None
+    return workspace.packed_lane_max()
 
 
 def _writes_lane_max(cache, launch):
