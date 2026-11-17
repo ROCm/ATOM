@@ -318,6 +318,7 @@ jobs:
         run: |
           docker exec -e ATOM_REQUIRE_FUSED_ATTENTION_TESTS=1 "$CONTAINER_NAME" \
             python3 -m pytest -q tests/models/deepseek_v41/test_fused_fp8_attention.py \
+            tests/models/deepseek_v41/test_attention_streams.py \
             --junitxml=/workspace/fused-attention-results.xml -o junit_family=legacy
 
       - name: Upload test results

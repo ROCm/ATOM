@@ -17,7 +17,7 @@ to `None` would pass just as well with the streams unplumbed.
 """
 
 import contextlib
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -249,6 +249,9 @@ def test_forward_orders_window_and_side_stream_joins(
         (None, None),
     )[1]
     instance._use_fused_attention = lambda *a: fused
+    instance._fused_output_buffers = MethodType(
+        Attention._fused_output_buffers, instance
+    )
     instance._attend = lambda query, *a, **k: (log.append("attend"), query)[1]
     instance._project_out = lambda *a: None
     instance._project_quantized_out = lambda *a: None

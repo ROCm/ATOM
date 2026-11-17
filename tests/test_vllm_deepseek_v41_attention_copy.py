@@ -75,10 +75,31 @@ def test_plugin_forward_passes_fused_quant_into_capture_break(
         head_dim = 16
 
         def _atom_v41_attend_block(
-            self, attn_out, hidden, scale, cache, step, rope, queries, hidden_fp8=None
+            self,
+            attn_out,
+            hidden,
+            scale,
+            cache,
+            step,
+            rope,
+            queries,
+            hidden_fp8=None,
+            *,
+            fused=False,
         ):
             calls.append(
-                (self, attn_out, hidden, scale, cache, step, rope, queries, hidden_fp8)
+                (
+                    self,
+                    attn_out,
+                    hidden,
+                    scale,
+                    cache,
+                    step,
+                    rope,
+                    queries,
+                    hidden_fp8,
+                    fused,
+                )
             )
 
     attention = Attention()
@@ -107,6 +128,7 @@ def test_plugin_forward_passes_fused_quant_into_capture_break(
     assert call[2] is hidden and call[3] is scale
     assert call[4] is cache and call[5] is step and call[6] is rope
     assert call[7] is queries and call[8] is hidden_fp8
+    assert call[9] is False
     attention._project_out.assert_called_once_with(
         attn_out, rope, queries.positions if bounded_queries else positions
     )
@@ -144,7 +166,7 @@ def test_plugin_forward_carries_mx_scale_across_the_break_as_bytes(
     assert crossed.dtype == torch.uint8
     assert crossed.data_ptr() == scale.data_ptr() and crossed.shape == scale.shape
     assert args[7] is hidden_fp8
-    assert kwargs == {"hidden_scale_dtype": torch.float8_e8m0fnu}
+    assert kwargs == {"hidden_scale_dtype": torch.float8_e8m0fnu, "fused": False}
 
 
 def test_plugin_attend_block_restores_the_mx_scale(plugin_attention):
@@ -524,6 +546,7 @@ def test_plugin_fused_forward_owns_both_output_planes(
     assert values.dtype == torch.float8_e4m3fn
     assert scales.shape == (rows, 2, 8 * model.head_dim // 32)
     assert scales.dtype == torch.float8_e8m0fnu
+    assert kwargs["fused"] is True
     assert kwargs["attn_out_scale"].dtype == torch.uint8
     assert kwargs["attn_out_scale"].data_ptr() == scales.data_ptr()
     assert args[2].dtype == torch.uint8
@@ -625,6 +648,7 @@ def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
         rope,
         queries,
         attn_out_scale=scales,
+        fused=True,
     )
     assert result is None
     assert torch.all(values.view(torch.uint8) == 7) and torch.all(scales == 127)
@@ -635,6 +659,27 @@ def test_plugin_fused_region_writes_capture_buffers_and_orders_ring(
         else ["norm", "select", "join", "attend", "write"]
     )
     cache.rope_quant_window.assert_not_called()
+
+
+@pytest.mark.parametrize("fused,has_scale", [(True, False), (False, True)])
+def test_plugin_attend_block_rejects_output_mode_mismatch(
+    plugin_attention, fused, has_scale
+):
+    values = torch.empty(2, 1, 32, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(2, 1, 1, dtype=torch.uint8) if has_scale else None
+    with pytest.raises(AssertionError):
+        plugin_attention._attend_block(
+            SimpleNamespace(),
+            values,
+            None,
+            None,
+            SimpleNamespace(),
+            SimpleNamespace(requests=()),
+            None,
+            None,
+            attn_out_scale=scales,
+            fused=fused,
+        )
 
 
 def test_plugin_fused_idle_replay_initializes_both_planes(
@@ -653,6 +698,7 @@ def test_plugin_fused_idle_replay_initializes_both_planes(
         None,
         None,
         attn_out_scale=scales,
+        fused=True,
     )
     assert values.view(torch.uint8).count_nonzero() == 0
     assert torch.all(scales == 127)

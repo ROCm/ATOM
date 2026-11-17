@@ -547,6 +547,8 @@ def _attend_block(
     hidden_fp8=None,
     hidden_scale_dtype=None,
     attn_out_scale=None,
+    *,
+    fused=False,
 ):
     """Everything from the compressor fork to the attention rows, in place.
 
@@ -562,7 +564,10 @@ def _attend_block(
     if hidden_scale_dtype is not None:
         hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
-    fused = attn_out_scale is not None
+    if fused:
+        assert attn_out is not None and attn_out_scale is not None
+    else:
+        assert attn_out_scale is None
     if fused and not step.requests:
         self._zero_mxfp8(attn_out, attn_out_scale)
         return
@@ -723,6 +728,7 @@ def _forward(
         rope,
         queries,
         hidden_fp8,
+        fused=fused,
         **scale_view_kwargs,
     )
     if fused:

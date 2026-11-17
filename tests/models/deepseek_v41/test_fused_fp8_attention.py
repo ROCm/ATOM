@@ -374,7 +374,8 @@ def test_fused_verify_is_causal(fused_factory, monkeypatch, ratio, record_proper
 @pytest.mark.parametrize("stage", ["decode", "prefill", "long_prefill"])
 @pytest.mark.parametrize("q_lora_rank", [32, 64, 96, 1280])
 def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage, q_lora_rank):
-    # 32 must stay unsplit; 64/96 and V4.1's 1280 exercise full-group splits.
+    # At 800 tokens, long_prefill exercises full-group splits for 64/96 and
+    # V4.1's 1280; 32 and the shorter decode/prefill cases stay unsplit.
     lengths = {"decode": (1, 1), "prefill": (3, 5), "long_prefill": (800,)}[stage]
     case = fused_factory(
         64, slots=2, max_tokens=sum(lengths), q_lora_rank=q_lora_rank, hidden_size=256
