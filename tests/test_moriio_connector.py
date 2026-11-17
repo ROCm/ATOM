@@ -240,7 +240,7 @@ class ConnectorSourceTest(unittest.TestCase):
         # offsets, and `_kv_layout` refuses the mixed model outright.
         self.assertLess(
             body.index('getattr(kv_cache, "per_request_state", False)'),
-            body.index("chunk_tensor_for_rdma("),
+            body.index("self._registration_chunks("),
         )
         self.assertIn("self._register_state(layer_name, kv_cache)", body)
 

@@ -2382,6 +2382,25 @@ class ModelRunner:
             )
         return pool
 
+    def _kv_transfer_mem_pool(self):
+        """Where the paged KV pool and the per-request state are allocated.
+
+        A moriio P/D pair over the UALink fabric (kv_transfer_config backend
+        "fabric") moves them with mori's FABRIC backend, which can only export
+        fabric VMM memory: allocate them from a fabric MemPool, kept alive with
+        the runner. Everything else stays on the default allocator.
+        """
+        kv_cfg = getattr(self.config, "kv_transfer_config", {}) or {}
+        if kv_cfg.get("kv_connector") != "moriio" or (
+            str(kv_cfg.get("backend", "rdma")).lower() != "fabric"
+        ):
+            return nullcontext()
+        from mori.io import make_fabric_mem_pool
+
+        self._kv_fabric_pool = make_fabric_mem_pool()
+        logger.info("KV pool and per-request state come from a fabric MemPool (UALink)")
+        return torch.cuda.use_mem_pool(self._kv_fabric_pool)
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -2400,18 +2419,19 @@ class ModelRunner:
         # What comes back is only what a region cannot carry: scalars like
         # `aligned_index_dim` and the compact layer maps, setattr'd here so
         # their readers find them where they always have.
-        pool = self._back_paged_pools(num_kvcache_blocks)
-        if pool.numel():
-            self.kv_cache = pool
+        with self._kv_transfer_mem_pool():
+            pool = self._back_paged_pools(num_kvcache_blocks)
+            if pool.numel():
+                self.kv_cache = pool
 
-        # Per-request cache allocation (model-agnostic, delegated to the
-        # attention metadata builder). For GDN this returns
-        # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
-        # attentions it returns an empty dict (no-op). Values are setattr'd
-        # on `self` so model layers can access them as `model_runner.<name>`.
-        per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
-            self.pool_plan.entries
-        )
+            # Per-request cache allocation (model-agnostic, delegated to the
+            # attention metadata builder). For GDN this returns
+            # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
+            # attentions it returns an empty dict (no-op). Values are setattr'd
+            # on `self` so model layers can access them as `model_runner.<name>`.
+            per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
+                self.pool_plan.entries
+            )
         for name, value in per_req_state.items():
             setattr(self, name, value)
         # The pools are reachable through `self` only now, which is the

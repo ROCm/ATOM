@@ -157,32 +157,28 @@ class MoRIIOConnector(KVConnectorBase):
         )
         self.moriio_wrapper = MoRIIOWrapper(moriio_engine=self.moriio_engine)
 
-        qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
-        post_batch_size = kv_transfer_config.get("post_batch_size", -1)
-        num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
-        poll_mode = PollCqMode.POLLING
-        enable_notification = kv_transfer_config.get("enable_notification", False)
+        # "rdma" (default) or "fabric": GPU-to-GPU over the UALink scale-up
+        # fabric, for a P/D pair in one vPOD. FABRIC can only export fabric VMM
+        # memory, so ModelRunner allocates the KV pool and the per-request state
+        # from a fabric MemPool under the same setting.
+        self.backend = str(kv_transfer_config.get("backend", "rdma")).lower()
+        if self.backend == "fabric":
+            # Imported here: only mori builds with the FABRIC backend have it,
+            # and the RDMA path must keep working without one.
+            from mori.io import FabricBackendConfig
 
-        rdma_cfg = RdmaBackendConfig(
-            qp_per_transfer,
-            post_batch_size,
-            num_worker_threads,
-            poll_mode,
-            enable_notification,
-        )
-        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
-        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
-        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
-        logger.info(
-            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
-            "poll_mode=%s, notification=%s, transfer_mode=%s",
-            qp_per_transfer,
-            num_worker_threads,
-            poll_mode.name,
-            enable_notification,
-            self.transfer_mode,
-        )
-        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
+            self.moriio_wrapper.set_backend_type(
+                BackendType.FABRIC, FabricBackendConfig()
+            )
+            logger.info(
+                "MoRIIO backend FABRIC (UALink), transfer_mode=%s", self.transfer_mode
+            )
+        elif self.backend == "rdma":
+            self._set_rdma_backend(kv_transfer_config)
+        else:
+            raise ValueError(
+                f"moriio backend must be 'rdma' or 'fabric', got {self.backend!r}"
+            )
 
         # Per-layer local metadata (populated in register_kv_caches)
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -279,6 +275,49 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
+    def _set_rdma_backend(self, kv_transfer_config: dict) -> None:
+        qp_per_transfer = kv_transfer_config.get("qp_per_transfer", 4)
+        post_batch_size = kv_transfer_config.get("post_batch_size", -1)
+        num_worker_threads = kv_transfer_config.get("num_worker_threads", 4)
+        poll_mode = PollCqMode.POLLING
+        enable_notification = kv_transfer_config.get("enable_notification", False)
+
+        rdma_cfg = RdmaBackendConfig(
+            qp_per_transfer,
+            post_batch_size,
+            num_worker_threads,
+            poll_mode,
+            enable_notification,
+        )
+        rdma_cfg.max_send_wr = kv_transfer_config.get("max_send_wr", 0)
+        rdma_cfg.max_cqe_num = kv_transfer_config.get("max_cqe_num", 0)
+        rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
+        logger.info(
+            "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
+            "poll_mode=%s, notification=%s, transfer_mode=%s",
+            qp_per_transfer,
+            num_worker_threads,
+            poll_mode.name,
+            enable_notification,
+            self.transfer_mode,
+        )
+        self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
+
+    def _registration_chunks(
+        self, tensor: Any, block_size_in_dim0: int
+    ) -> tuple[list[tuple[int, int]], int]:
+        """The ``(ptr, bytes)`` ranges to register for a block-addressed tensor.
+
+        RDMA registrations stay under 2 GiB. A fabric import maps the whole
+        allocation behind each registered range, so FABRIC registers the tensor
+        as one range rather than mapping the KV pool once per 2 GiB chunk.
+        """
+        if getattr(self, "backend", "rdma") != "fabric":
+            return chunk_tensor_for_rdma(tensor, block_size_in_dim0)
+        per_block = block_size_in_dim0 * tensor.stride(0) * tensor.element_size()
+        blocks = tensor.shape[0] // block_size_in_dim0
+        return [(tensor.data_ptr(), blocks * per_block)], max(1, blocks)
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -321,7 +360,7 @@ class MoRIIOConnector(KVConnectorBase):
             # equals the KV cache block_size (typically 16).
             # Non-MLA: dim 0 = num_blocks directly, so 1.
             bsd0 = self.kv_cache_block_size if is_mla else 1
-            k_chunks, bpc = chunk_tensor_for_rdma(cache_tensor, bsd0)
+            k_chunks, bpc = self._registration_chunks(cache_tensor, bsd0)
 
             if self.blocks_per_chunk is None:
                 self.blocks_per_chunk = bpc
@@ -337,7 +376,7 @@ class MoRIIOConnector(KVConnectorBase):
                 v_device_id = (
                     v_cache.device.index if v_cache.device.index is not None else -1
                 )
-                v_chunks, _ = chunk_tensor_for_rdma(v_cache, 1)
+                v_chunks, _ = self._registration_chunks(v_cache, 1)
                 for ptr, size in v_chunks:
                     meta_list.append(
                         self.moriio_wrapper.register_local_buffer(
@@ -437,7 +476,10 @@ class MoRIIOConnector(KVConnectorBase):
                     f"it {self._num_state_slots}"
                 )
             slot_bytes = tensor.stride(0) * tensor.element_size()
-            if num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
+            if (
+                getattr(self, "backend", "rdma") != "fabric"
+                and num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES
+            ):
                 raise ValueError(
                     f"{name}: {num_slots} slots of {slot_bytes} bytes exceed one "
                     "RDMA registration"
