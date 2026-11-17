@@ -27,7 +27,7 @@ from collections import OrderedDict
 import pytest
 from conftest import MockConfig
 
-from atom.kv_transfer.l1.umbp_l1.pool import UmbpL1Pool
+from atom.kv_transfer.pool.umbp.pool import UmbpL1Pool
 from atom.model_engine import block_manager as bm_module
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool

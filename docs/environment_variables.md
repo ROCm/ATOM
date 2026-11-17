@@ -438,12 +438,12 @@ and catches it; set it when chasing a corruption that does not reproduce.
 
 No variables. The paged KV pool is the engine's own unless a KV connector
 provides it (`KVConnectorBase.kv_pool_memory`,
-`KVConnectorSchedulerBase.make_block_pool`). The `umbp_l1` connector hands it to
+`KVConnectorSchedulerBase.make_block_pool`). The `umbp_pool` connector hands it to
 a MORI-UMBP standalone server so DP ranks share cached prefixes; it is set up
 through `--kv-transfer-config` like any connector, e.g.
-`{"kv_connector": "umbp_l1", "kv_connector_extra_config": {"address":
+`{"kv_connector": "umbp_pool", "kv_connector_extra_config": {"address":
 "unix:///tmp/umbp-l1/server.sock", "share_ratio": 0.5}}`. Its settings are
-documented in `atom/kv_transfer/l1/umbp_l1/settings.py`.
+documented in `atom/kv_transfer/pool/umbp/settings.py`.
 
 ## State checkpoints
 

@@ -14,8 +14,8 @@ Two interfaces, one per process that touches the pool:
 ATOM's own implementation (`block_pool.BlockPool` over a tensor this process
 allocates) is the default. A KV connector can provide both instead
 (`KVConnectorBase.kv_pool_memory`, `KVConnectorSchedulerBase.make_block_pool`),
-e.g. `umbp_l1`, which hands the pool to MORI-UMBP so engine ranks share it
-(`atom/kv_transfer/l1`). `BlockManager` and `ModelRunner` only ever see the
+e.g. `umbp_pool`, which hands the pool to MORI-UMBP so engine ranks share it
+(`atom/kv_transfer/pool`). `BlockManager` and `ModelRunner` only ever see the
 interfaces.
 """
 
