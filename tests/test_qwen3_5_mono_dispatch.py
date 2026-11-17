@@ -49,6 +49,7 @@ _HF = {
 def _atom_config(**overrides):
     fields = {
         "tensor_parallel_size": 4,
+        "is_multinode_tp": False,
         "enable_expert_parallel": False,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
@@ -117,6 +118,7 @@ def test_a_flat_text_config_is_read(native):
         ({"tensor_parallel_size": 8}, "TP 8 not in"),
         ({"tensor_parallel_size": 3}, "GDN key heads 16 is not divisible by TP 3"),
         ({"enable_expert_parallel": True}, "expert parallel"),
+        ({"is_multinode_tp": True}, "TP group spans nodes"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"decode_context_parallel_size": 2}, "decode CP"),
