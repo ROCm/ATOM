@@ -2169,6 +2169,25 @@ def _hf_architecture_factor(hf_config) -> tuple:
     return (_hf_config_fields(hf_config), _hf_config_fields(text_config))
 
 
+def _check_mono_poll_sleep_units() -> None:
+    """Reject a bad ATOM_MONO_POLL_SLEEP_UNITS (importing ``atom.mono.polling``
+    raises) before the workers, which read the same environment, spawn; warn
+    once when it is below the default."""
+    from atom.mono import polling
+
+    if polling.POLL_SLEEP_UNITS < polling.DEFAULT:
+        logger.warning(
+            "%s=%d: Mono mailbox polls back off less than the default %d. "
+            "Values below %d hung beside concurrent KV copies (offload or P/D "
+            "connectors) in the reproducer (ROCm/ATOM#3369); use it only on a "
+            "deployment without them.",
+            polling.ENV,
+            polling.POLL_SLEEP_UNITS,
+            polling.DEFAULT,
+            polling.DEFAULT,
+        )
+
+
 @dataclass
 class Config:
     model: str
@@ -2661,6 +2680,7 @@ class Config:
             raise ValueError("sequence_parallel_size must be at least 1")
         if envs.ATOM_DSV41_A8W4_ATTN not in ("auto", "off"):
             raise ValueError("ATOM_DSV41_A8W4_ATTN must be auto or off")
+        _check_mono_poll_sleep_units()
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
