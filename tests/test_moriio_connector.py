@@ -267,6 +267,46 @@ def import_connector(name: str = "MoRIIOConnector"):
     return getattr(moriio_connector, name)
 
 
+class RemoteLookupTest(unittest.TestCase):
+    """The consumer's remote-KV lookup, as the scheduler drives it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scheduler = import_connector("MoRIIOConnectorScheduler")
+        if cls.scheduler is None:
+            raise unittest.SkipTest("moriio_connector needs aiter, torch and a GPU")
+
+    def make(self):
+        import types
+
+        conn = object.__new__(self.scheduler)
+        conn.is_producer = False
+        conn.request_id_to_transfer_id = {}
+        conn.transfer_id_to_request_id = {}
+        conn._reqs_need_recv = {}
+        seq = types.SimpleNamespace(
+            id=5,
+            prompt_token_ids=[1, 2, 3],
+            kv_transfer_params={"do_remote_prefill": True, "transfer_id": 7},
+            block_table=[0, 1],
+            state_slot=3,
+        )
+        return conn, seq
+
+    def test_a_request_held_back_is_still_loaded_remotely_next_pass(self):
+        conn, seq = self.make()
+        # The pass that asks first can put the request back (running set full)
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (3, True))
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (3, True))
+
+    def test_the_lookup_says_no_once_the_receive_is_queued(self):
+        conn, seq = self.make()
+        conn.get_num_new_matched_tokens(seq)
+        conn.update_state_after_alloc(seq)
+        self.assertIn(5, conn._reqs_need_recv)
+        self.assertEqual(conn.get_num_new_matched_tokens(seq), (0, False))
+
+
 class ConnectorBehaviourTest(unittest.TestCase):
     """The same guards as above, executed rather than read."""
 
