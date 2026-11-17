@@ -438,17 +438,12 @@ t "a card that softens BEYOND ONE PASS is refused" \
   "$(_cov_gate "$_BIG" 'Coverage: 47 files / 16647 added lines')" "SOFTENED-COVERAGE"
 t "a card carrying the measured coverage passes" \
   "$(_cov_gate "$_SMALL" 'Coverage: 5 files / 49 added lines -- within one review pass')" "ok"
-# EMPTY-COVERAGE had no case: removing the branch left every test green, so the label
-# could have reached a reader with nothing after it and no gate would have noticed.
+# The label alone, with nothing after the colon, is not a verdict.
 t "a coverage label with nothing after it is refused" \
   "$(_cov_gate "$_SMALL" 'Coverage:')" "EMPTY-COVERAGE"
 
-# The gate read rules.txt and compared. The three ways it could READ NOTHING and still
-# return green were invisible: no rules.txt at all, a rules.txt that is not Step 1's
-# output, and -- worst -- `[diff-too-large]`, which is GitHub refusing to serve a diff
-# over 20000 lines. That last one is the largest PR the bot can ever see, the exact case
-# where "a sample, not a sweep" has to reach the reader, and the card could omit coverage
-# entirely and pass. A check that does not run must not look like a check that passed.
+# `[diff-too-large]` (GitHub refusing a diff over 20000 lines) writes no coverage line,
+# so the card has to supply one and it has to say BEYOND ONE PASS.
 _cov_raw() {  # <full rules.txt, or MISSING> <card coverage line or -> problem kind or ok
   python3 -c '
 import sys, tempfile, pathlib

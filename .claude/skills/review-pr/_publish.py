@@ -486,12 +486,8 @@ def build_review(pr, card, diff_text, flagged, sha):
     what = _line_starting(card, "**")
     if what:
         parts.append(what)
-    # Coverage sits with the verdict, above the findings, because it says whether the
-    # findings below are all of them. It was computed (triage.py), required (SKILL.md)
-    # and gated (_check_coverage_line) from the start -- but the gate reads card.md and
-    # this builds the body that is posted, so twenty-one reviews carried the verdict in
-    # a file nobody reads and dropped it on the way out. A measurement that is gated and
-    # then discarded is worse than one never taken: the gate reports success either way.
+    # Coverage sits above the findings: it says whether they are all of them. The gate
+    # reads card.md; this builds the body that is posted, so both have to carry it.
     for pref in ("Review:", "Coverage:", "Validation"):
         l = _line_starting(card, pref)
         if l:
@@ -507,12 +503,8 @@ def build_review(pr, card, diff_text, flagged, sha):
             + "\n".join(index)
         )
     elif loose:
-        # The branch above states its own reason and then stops one case short of it. With
-        # no anchors at all the block vanishes, and the review goes out with no inline
-        # comments and nothing saying any were expected -- which is the same invisibility,
-        # total instead of partial. ATOM#2152 published six findings this way: five cite no
-        # `path:line`, the sixth cites merge-target files the diff never touches. A reader
-        # cannot tell that from a review whose findings simply had nowhere to attach.
+        # With findings but no anchors, say so: otherwise the review carries no inline
+        # comments and nothing telling the reader any were expected.
         parts.append(
             f"**0 of {len(loose)} finding(s) could be anchored to a line in this diff** "
             "— each is stated in full above. A finding anchors when it cites a "

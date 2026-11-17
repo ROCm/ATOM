@@ -407,12 +407,8 @@ def test_summary_carries_the_verdict_and_validation_lines(report, monkeypatch):
 def test_summary_carries_the_coverage_verdict(report, monkeypatch):
     """The coverage line must reach the posted review, not just card.md.
 
-    triage.py measures it, SKILL.md requires it on the card and _check_coverage_line
-    gates that the card carries it -- but that gate reads card.md while build_review
-    assembles the body that is posted, and build_review's prefix list did not name it.
-    Twenty-one published reviews carried no coverage line, including one on a
-    10179-line, 54-file diff where "these findings are a sample, not a sweep" is the
-    whole point. Every gate was green throughout: they were watching the other copy.
+    The gate reads card.md; build_review assembles what is posted. A verdict gated in
+    one copy and dropped from the other is a gate that reports success either way.
     """
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     body = _publish.review_payload("9999")["body"]
@@ -422,15 +418,17 @@ def test_summary_carries_the_coverage_verdict(report, monkeypatch):
     # Above the findings: a reader who stops at the index must already know whether it
     # is the whole diff or a sample of it.
     assert body.index("Coverage:") < body.index("finding(s) posted inline")
+    # Some findings anchor here and some do not. The 0-of-N line belongs only to the
+    # all-or-nothing case: without this, `elif loose:` degrading to `if loose:` emits
+    # both blocks at once and every test stays green.
+    assert "could be anchored" not in body
 
 
 def test_the_coverage_line_publishes_as_the_card_writes_it(report, monkeypatch):
     """The publisher must match the line the gate accepts, not a stricter form.
 
-    `_check_coverage_line` accepts any line whose strip().lower() starts `coverage:`;
-    `_line_starting` required the exact prefix `Coverage:` at column 0. So a card that
-    copies rules.txt's `  coverage: ...` verbatim -- which SKILL.md asks for -- passed
-    the gate and was dropped on the way out: this PR's own bug, one case over.
+    The gate matches on `strip().lower()`, and SKILL.md asks the card to carry
+    rules.txt's `  coverage: ...` line verbatim. The publisher must accept the same.
     """
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     for written in (
@@ -449,13 +447,8 @@ def test_the_coverage_line_publishes_as_the_card_writes_it(report, monkeypatch):
 def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
     """0 of N anchored must be stated, not inferred from an absent block.
 
-    ATOM#2152 -- 4546 lines, 8 files, the largest diff this bot has reviewed --
-    posted six findings and anchored none: five cite no `path:line` at all, and the
-    sixth cites merge-target files the diff never touches. The summary names the
-    anchored count only when there IS one, so the review went out with no inline
-    comments and nothing saying any were expected. That is the failure the index
-    block's own comment describes one branch away: "an invisible finding reads
-    exactly like a finding that was never made."
+    The summary names the anchored count only when there is one, so a review whose
+    findings all failed to anchor carried no inline comments and no notice of it.
     """
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     unanchorable = CARD.replace(
@@ -465,7 +458,7 @@ def test_a_review_that_anchors_nothing_says_so(report, monkeypatch):
     (report / "card.md").write_text(unanchorable, encoding="utf-8")
     body = _publish.review_payload("9999")["body"]
     assert "finding(s) posted inline" not in body
-    assert "could be anchored" in body, (
+    assert "0 of 2 finding(s) could be anchored" in body, (
         "a review with findings and no anchors must say so -- silence reads as a "
         "review that simply had nothing to attach"
     )
