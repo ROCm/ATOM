@@ -99,13 +99,17 @@ def test_a_kv_offload_tier_keeps_the_penalty(role):
 
 def test_one_row_per_request_outside_verification():
     table = PresencePenalties(VOCAB, 2, "cpu")
-    rows, count = table.stage(_batch([7, 8, 9], [1.5, 0.0, -0.5]), None, _buffer())
+    buffer = _buffer()
+    rows, count = table.stage(_batch([7, 8, 9], [1.5, 0.0, -0.5]), None, buffer)
     assert rows.slots.tolist() == [0, -1, 1]
     assert rows.penalties.tolist() == [1.5, 0.0, -0.5]
     assert rows.drafts_before.tolist() == [0, 0, 0]
     assert rows.emit_slots.tolist() == [0, -1, 1]
     assert rows.fresh.tolist() == [0, 1]
+    # Nothing resumed: no copy of its own, an empty view of the buffer.
     assert rows.resumed_ids.numel() == 0
+    storage = buffer.gpu.untyped_storage().data_ptr()
+    assert rows.resumed_ids.untyped_storage().data_ptr() == storage
     assert count == 3 * 3 + 3 + 2
 
 
@@ -292,7 +296,8 @@ def test_a_preempted_request_resumes_with_its_output(twins):
     penalties.release([7])  # `prepare_sample`, from `presence_preempted`
     _emit(penalties, runner, _batch([8], [1.0]), [5])
     resumed = {7: np.array([31, 63], np.int32)}
-    logits = _emit(penalties, runner, _batch([8, 7], [1.0, 1.0], None, resumed), [9, 9])
+    batch = _batch([8, 7], [1.0, 1.0], resumed=resumed)
+    logits = _emit(penalties, runner, batch, [9, 9])
     assert logits[1].nonzero()[:, 0].tolist() == [31, 63]
     assert logits[0].nonzero()[:, 0].tolist() == [5]
 

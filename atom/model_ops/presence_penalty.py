@@ -97,14 +97,14 @@ class PresencePenalties:
         out[e + bs : e + bs + len(fresh)] = fresh
         count = e + bs + len(fresh)
         gpu = buffer.gpu
-        # Rare (a resumed request) and of any length: a blocking copy of its
-        # own, not the fixed-size publication.
-        resumed = [
-            torch.from_numpy(np.concatenate(part or [np.zeros(0, np.int32)])).to(
-                gpu.device
-            )
-            for part in (resumed_slots, resumed_ids)
-        ]
+        resumed = [gpu[:0], gpu[:0]]
+        if resumed_ids:
+            # Rare and of any length: a blocking copy of its own, not the
+            # fixed-size publication.
+            resumed = [
+                torch.from_numpy(np.concatenate(part)).to(gpu.device)
+                for part in (resumed_slots, resumed_ids)
+            ]
         return (
             PresenceRows(
                 slots=gpu[:rows],
