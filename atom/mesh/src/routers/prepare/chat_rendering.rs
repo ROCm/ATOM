@@ -26,8 +26,9 @@ pub(crate) struct ChatRendering {
     reasoning_toggle: Option<ReasoningToggle>,
     /// The name of the rules the chat endpoint applies reasoning controls by.
     reasoning_rules: String,
-    /// The efforts ATOM's chat rules pass to a template.
-    template_efforts: Vec<String>,
+    /// The efforts ATOM's `chat` rules forward to a template; `None` under
+    /// other rules, which do not read them.
+    template_efforts: Option<Vec<String>>,
     /// The encoder the worker renders chats with instead of the template, if any.
     encoder: Option<ChatEncoder>,
 }
@@ -103,7 +104,7 @@ pub(crate) fn atom_chat_template_kwargs(
         sent.thinking.as_ref(),
         request.reasoning_effort.as_deref(),
         rules,
-        &rendering.template_efforts,
+        rendering.template_efforts.as_deref().unwrap_or_default(),
     )?;
     let toggle = rendering.reasoning_toggle.as_ref();
     apply_reasoning_controls(&mut kwargs, toggle, controls, rules);
