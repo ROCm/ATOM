@@ -14,7 +14,7 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import PrefixEncoding, SegmentTokenizer
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import PER_REQ_CACHE_MODEL_TYPES, Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.structured_output import is_structured
@@ -694,7 +694,7 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        if self.config.hf_config.model_type in self._per_req_cache_model_types():
+        if self.config.hf_config.model_type in PER_REQ_CACHE_MODEL_TYPES:
             self.has_per_req_cache = True
         # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
         # 0 = no prefix cache. The engine rehashes on a mismatch.
@@ -704,29 +704,6 @@ class InputOutputProcessor:
             self.prefix_hash_block_size = hash_block_size_for(
                 block_size, config.decode_context_parallel_size
             )
-
-    @staticmethod
-    def _per_req_cache_model_types() -> frozenset[str]:
-        """Single source of truth for which model_types use per-req cache.
-
-        Read by Sequence-construction (here) AND by ModelRunner's startup
-        sanity check, which asserts that any model whose attention builder
-        declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means
-        adding its model_type to this set.
-        """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "glm5_next_text",
-                "deepseek_v4",
-                "deepseek_v41_text",
-                "qwen4_exp_text",
-            }
-        )
 
     def preprocess(
         self,

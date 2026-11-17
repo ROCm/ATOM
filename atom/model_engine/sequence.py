@@ -12,6 +12,26 @@ import numpy as np
 
 from atom.sampling_params import UNCONSTRAINED, SamplingParams
 
+# The model_types whose sequences need a per-request stateful buffer outside
+# the paged KV pool (`Sequence.has_per_req_cache`): BlockManager reserves them
+# a per-req cache slot. Read wherever a `Sequence` is built (the frontend's
+# `InputOutputProcessor`, the Core's `zmq_protocol.codec.AdmissionContext`)
+# and by ModelRunner's startup check that a builder declaring a per-request
+# state sub-pool is listed here. A new stateful-attention model adds its
+# model_type.
+PER_REQ_CACHE_MODEL_TYPES = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "kimi_linear",
+        "glm5_next_text",
+        "deepseek_v4",
+        "deepseek_v41_text",
+        "qwen4_exp_text",
+    }
+)
+
 
 def new_token_ids(token_ids=()) -> array.array:
     """A sequence's token ids.

@@ -6,7 +6,10 @@
 // This file is the specification: what follows is everything a client in any
 // language needs, beyond the messages themselves, to drive an EngineCore.
 // atom/mesh/build.rs compiles it into the Rust binding
-// (atom/mesh/src/atom_engine/wire.rs).
+// (atom/mesh/src/atom_engine/wire.rs); the Python binding, engine_v1_pb2.py,
+// is checked in beside it: after editing this file, run
+// atom/model_engine/zmq_protocol/generate.py and commit both. codec.py there
+// is the Python codec.
 //
 // ============================================================== SOCKETS ===
 //
@@ -351,7 +354,8 @@ message Ready {
 message Completion {
   uint64 seq_id = 1;
   BufferRef completion_token_ids = 2;  // int32
-  BufferRef logprobs = 3;              // float64, one per completion token
+  // float64, one per completion token; absent: the request asked for none.
+  BufferRef logprobs = 3;
   uint32 num_prompt_tokens = 4;
   // Prompt tokens whose KV the Core holds: the whole prompt once prefill is
   // done. Not the prefix-cache hit -- that is StreamBatch.num_cached_tokens.
