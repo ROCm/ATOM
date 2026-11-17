@@ -5,8 +5,14 @@
 //! up on a Core that stops before it is ready or exits, or when interrupted,
 //! and `EngineClient` drives fake Cores (`test_support`) through the
 //! protocol's every ending.
+//!
+//! The protocol across languages: the Core's messages as Python encodes them
+//! (`tests/fixtures/engine_v1/core_*`, written by
+//! `tests/test_engine_v1_cross_language.py`) drive the client here, and the
+//! client's own messages are kept as `client_*` there for Python to decode.
+//! `ATOM_UPDATE_FIXTURES=1` rewrites the `client_*` ones.
 
-use std::{future::poll_fn, thread, time::Duration};
+use std::{future::poll_fn, path::PathBuf, thread, time::Duration};
 
 use prost::Message as _;
 use serde_json::json;
@@ -650,4 +656,175 @@ async fn shutdown_fails_what_is_still_in_flight() {
         SeqEvent::Failed(SeqFailure::Unavailable(_))
     ));
     assert_eq!(harness.client.lost(), None);
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/engine_v1")
+        .join(format!("{name}.frames"))
+}
+
+/// A message as `u32le length, bytes` per frame, as the Python test keeps it.
+fn read_fixture(name: &str) -> Vec<Vec<u8>> {
+    let path = fixture(name);
+    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut frames = Vec::new();
+    let mut rest = &data[..];
+    while !rest.is_empty() {
+        let n = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+        frames.push(rest[4..4 + n].to_vec());
+        rest = &rest[4 + n..];
+    }
+    frames
+}
+
+/// The next whole message on `socket`, frames as sent.
+fn raw_message(socket: &zmq::Socket) -> Vec<Vec<u8>> {
+    assert!(
+        socket.poll(zmq::POLLIN, WAIT.as_millis() as i64).unwrap() > 0,
+        "no message within the timeout"
+    );
+    socket.recv_multipart(0).unwrap()
+}
+
+/// Fail when any of the client's `messages` drifted from its fixture, which
+/// Python decodes; under `ATOM_UPDATE_FIXTURES`, rewrite them all and fail (a
+/// rewrite is not a pass).
+fn check_client_fixtures(messages: &[(&str, Vec<Vec<u8>>)]) {
+    if std::env::var_os("ATOM_UPDATE_FIXTURES").is_some() {
+        for (name, frames) in messages {
+            let mut data = Vec::new();
+            for frame in frames {
+                data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                data.extend_from_slice(frame);
+            }
+            std::fs::write(fixture(name), data).unwrap();
+        }
+        panic!("rewrote the client_* fixtures; rerun without ATOM_UPDATE_FIXTURES");
+    }
+    // Arrival times are the clock's; everything else must match.
+    let envelope = |frames: &[Vec<u8>]| {
+        let mut envelope = pb::Envelope::decode(&frames[0][..]).unwrap();
+        if let Some(pb::envelope::Body::Submit(batch)) = &mut envelope.body {
+            batch.requests.iter_mut().for_each(|r| r.arrive_time = 0.0);
+        }
+        envelope
+    };
+    for (name, frames) in messages {
+        let kept = read_fixture(name);
+        assert!(
+            envelope(frames) == envelope(&kept) && frames[1..] == kept[1..],
+            "{name}.frames is stale: rerun with ATOM_UPDATE_FIXTURES=1, then \
+             tests/test_engine_v1_cross_language.py against it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_clients_messages_match_what_python_decodes() {
+    let harness = Harness::start(&[None]);
+    let sampling = pb::SamplingParams {
+        temperature: Some(0.7),
+        top_k: Some(20),
+        top_p: Some(0.9),
+        max_tokens: Some(64),
+        stop_strings: Some(pb::StopStrings {
+            value: Some(pb::stop_strings::Value::Many(pb::StringList {
+                items: vec!["\n\n".into()],
+            })),
+        }),
+        n: Some(2),
+        logprobs: Some(pb::sampling_params::Logprobs::LogprobsFlag(true)),
+        required_channel: Some(pb::RequiredChannel {
+            after: vec![1],
+            opening: vec![2, 3],
+            opens_at: 1,
+            end_ids: vec![4],
+        }),
+        ..Default::default()
+    };
+    let handles = harness
+        .client
+        .submit(Submission {
+            request_id: "req",
+            prompt: &[11, 12, 13],
+            sampling,
+            stop_token_sequences: vec![
+                pb::TokenIds { ids: vec![5, 6] },
+                pb::TokenIds { ids: vec![7] },
+            ],
+            n: 2,
+            session: Some("sess"),
+            rank: None,
+            stream: false,
+        })
+        .unwrap();
+    let core = &harness.cores[0];
+    let submit = raw_message(&core.input);
+    drop(handles);
+    let abort = raw_message(&core.control);
+    let _second_abort = raw_message(&core.control);
+    harness.client.shutdown(Duration::from_millis(100));
+    let shutdown = raw_message(&core.control);
+    check_client_fixtures(&[
+        ("client_submit", submit),
+        ("client_abort", abort),
+        ("client_shutdown", shutdown),
+    ]);
+}
+
+#[tokio::test]
+async fn python_core_messages_drive_the_client() {
+    let decode = |name| {
+        inbound(read_fixture(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .body
+    };
+    assert!(matches!(
+        decode("core_ready"),
+        pb::envelope::Body::Ready(pb::Ready {
+            max_pool_tokens: Some(4096)
+        })
+    ));
+    assert!(matches!(
+        decode("core_stopped"),
+        pb::envelope::Body::Stopped(_)
+    ));
+
+    // Each harness's first sequence is 0, the one the fixtures name.
+    let harness = Harness::start(&[None]);
+    let mut handles = harness.submit(1, true, false);
+    harness.cores[0].send_frames(read_fixture("core_stream"));
+    assert!(matches!(next_event(&mut handles[0]).await, SeqEvent::Tokens(t) if t == [7, 8]));
+    match next_event(&mut handles[0]).await {
+        SeqEvent::Finished(done) => {
+            assert_eq!(done.token_ids, [7, 8]);
+            assert_eq!(done.leave_reason, "eos");
+            assert_eq!((done.prompt_tokens, done.cached_tokens), (3, 3));
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+
+    let harness = Harness::start(&[None]);
+    let mut handles = harness.submit(1, false, true);
+    harness.cores[0].send_frames(read_fixture("core_completions"));
+    match next_event(&mut handles[0]).await {
+        SeqEvent::Finished(done) => {
+            assert_eq!(done.token_ids, [5, 6]);
+            assert_eq!(done.logprobs.as_deref(), Some(&[-0.5, -1.25][..]));
+            // The prefix hit comes from the stream, and this request had no
+            // stream entry; the Completion's count is the KV computed.
+            assert_eq!((done.prompt_tokens, done.cached_tokens), (3, 0));
+            assert_eq!(done.leave_reason, "max_tokens");
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+
+    let harness = Harness::start(&[None]);
+    let mut handles = harness.submit(1, false, false);
+    harness.cores[0].send_frames(read_fixture("core_rejected"));
+    assert!(matches!(
+        next_event(&mut handles[0]).await,
+        SeqEvent::Failed(SeqFailure::Invalid(reason)) if reason == "bad"
+    ));
 }
