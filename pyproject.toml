@@ -42,6 +42,7 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "model_engine/zmq_protocol/*.proto",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -66,6 +67,9 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # vendored the same way and carry the same exemption -- black already excludes
 # this directory below, for the same reason.
 "tests/models/glm52/kernels/*.py" = ["ALL"]
+# Protobuf bindings are kept as the compiler wrote them
+# (atom/model_engine/zmq_protocol/generate.py); black excludes them below.
+"*_pb2.py" = ["ALL"]
 # review-pr's gate infrastructure is vendored from ROCm/aiter at pinned commit
 # c1c482e00 and kept close to upstream so the port stays diffable against
 # `git -C aiter show c1c482e00:<path>` -- that diff is what let reviewers
@@ -136,4 +140,5 @@ force-exclude = '''
   | check_prompts
   | scan_index_width
 )\.py$
+| _pb2\.py$
 '''
