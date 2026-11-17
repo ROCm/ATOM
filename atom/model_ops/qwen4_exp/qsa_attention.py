@@ -73,6 +73,8 @@ logger = logging.getLogger(__name__)
 
 # Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
 # four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
+# Mirrors aiter; remove once ROCm/aiter#8083 lands
+# (`aiter.ops.qsa.qsa_sparse_prefill_widths()`).
 _FLYDSL_WIDTHS = (1027, 2051, 3075, 4099)
 
 
@@ -128,6 +130,7 @@ def flydsl_fallback_reason(
     the layer. `ATOM_QSA_FLYDSL_ATTN` is checked by the callers."""
     if not kv_bf16:
         return "the KV cache is not BF16"
+    # `_FLYDSL_WIDTHS` mirrors aiter; remove once ROCm/aiter#8083 lands.
     if compress_ratio != 4 or token_topk + 3 not in _FLYDSL_WIDTHS:
         return f"indexer compress ratio {compress_ratio} / budget {token_topk}"
     if num_kv_heads != 1 or num_heads not in (12, 6, 3) or head_dim != 256:
@@ -161,6 +164,8 @@ def _flydsl_call_fallback_reason(query, width, qsa) -> str | None:
     if width is None:
         return f"selection wider than {_FLYDSL_WIDTHS[-1]} columns"
     # aiter rejects a padded selection spanning 2**31 bytes or more (int32).
+    # Mirrors aiter; remove once ROCm/aiter#8083 lands
+    # (`aiter.ops.qsa.qsa_sparse_prefill_supports_selection(rows, width)`).
     if query.shape[0] * width * 4 >= 2**31:
         return "padded selection spans 2**31 bytes or more"
     if torch.cuda.is_current_stream_capturing():
@@ -178,8 +183,13 @@ class _FlyDSLPrefill:
     Every QSA layer of a forward has the same rows, selection width and host
     lengths, so the first one makes the checks, the per-request prefix lengths
     and the kernel-width selection buffer, and leaves them on the forward's
-    QSA metadata. `key` holds everything the decision reads from the layer and
-    its inputs; a layer with another key makes its own.
+    QSA metadata. `key` holds what the decision reads from the layer and the
+    query; a layer with another key makes its own. The host lengths
+    (`query_lens`, `prefix_lens`) come from `qsa.host_lens` and are not in the
+    key. That is safe because the layout lives on one forward's metadata: the
+    SGLang bridge builds a new `Qwen4ExpQSAMetadata` every forward
+    (`build_qsa_metadata` in `qwen4_exp_bridge.py`), and a `for_tokens` that
+    trims rows returns a copy without the layout.
     """
 
     __slots__ = (
@@ -189,12 +199,14 @@ class _FlyDSLPrefill:
         "prefix_lens",
         "query_lens",
         "reason",
+        "rows",
         "width",
     )
 
     def __init__(self, key, layer, query, qsa) -> None:
         ratio, topk, heads, kv_heads, head_dim, kv_bf16 = key[:6]
         self.key = key
+        self.rows = query.shape[0]
         self.laid_out = False
         self.reason = self.width = self.query_lens = self.prefix_lens = None
         self.indices = None
@@ -217,6 +229,7 @@ class _FlyDSLPrefill:
                 ratio,
                 qsa.max_seq_len,
             )[2]
+            # `_FLYDSL_WIDTHS` mirrors aiter; remove once ROCm/aiter#8083 lands.
             width = next((w for w in _FLYDSL_WIDTHS if w >= columns), None)
             reason = _flydsl_call_fallback_reason(query, width, qsa)
         self.reason = reason
@@ -260,7 +273,7 @@ class _FlyDSLPrefill:
         nothing writes the rest."""
         if self.indices is None:
             self.indices = torch.full(
-                (self.key[6], self.width), -1, dtype=torch.int32, device=device
+                (self.rows, self.width), -1, dtype=torch.int32, device=device
             )
         return self.indices
 
