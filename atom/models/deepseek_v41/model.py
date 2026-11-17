@@ -271,7 +271,7 @@ class DeepseekV41ForCausalLM(nn.Module):
             shared_expert_spec=converted_linear_spec(config),
             online_routed_experts=True,
         )
-        # As V4's: the loader's shared-expert rename reads it.
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
         self.quant_config = self.moe_quant_config
         # A stream earns a hardware queue only where two branches are live at
         # once -- overlapping lifetimes, not independent data. One per model

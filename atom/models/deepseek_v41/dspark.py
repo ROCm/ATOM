@@ -237,7 +237,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
             shared_expert_spec=converted_linear_spec(draft),
             online_routed_experts=True,
         )
-        # As V4's: the loader's shared-expert rename reads it.
+        # Read by the loader's shared-expert rename (`_fuse_shared_expert`).
         self.quant_config = self.moe_quant_config
         topology = build_attention_topology(args)[args.num_hidden_layers :]
         # The backbone's, handed down: the two models never run at once, so a

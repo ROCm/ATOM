@@ -103,3 +103,36 @@ def test_shared_loading_follows_any_fused_layer():
     assert probe(Mock(model=layers)) is False
     layers[1]._fuse_shared_into_routed = False
     assert probe(Mock(model=layers)) is True
+
+
+@pytest.mark.parametrize("entrypoint", ["runtime", "offline", "draft"])
+def test_loader_shared_expert_rename_asks_with_the_published_quant_config(
+    monkeypatch, single_rank, unallocated_moe, build_v41, entrypoint
+):
+    """The backbone and the draft publish their MoE quant config as
+    `quant_config`, which `_fuse_shared_expert` asks with."""
+    from atom.model_loader import loader
+
+    instance = build_v41(entrypoint)
+    assert instance.quant_config is instance.moe_quant_config
+
+    class _Stop(Exception):
+        pass
+
+    captured, asked = {}, []
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(loader, "load_weights_into_model", capture)
+    monkeypatch.setattr(
+        loader,
+        "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config",
+        lambda quant_config, **_: asked.append(quant_config) or True,
+    )
+    with pytest.raises(_Stop):
+        loader.load_model(instance, "unused", hf_config=None)
+    fuse = captured["fuse_shared_expert"]
+    assert fuse("layers.0.ffn.shared_experts", "layers.0.ffn.experts")
+    assert asked == [instance.moe_quant_config]

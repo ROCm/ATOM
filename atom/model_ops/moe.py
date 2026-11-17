@@ -5282,8 +5282,7 @@ class FusedMoE(torch.nn.Module):
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
-        # getattr: test doubles borrow this loader without subclassing FusedMoE.
-        staging = getattr(self, "shared_expert_staging", None)
+        staging = self.shared_expert_staging
         if staging is not None and staging.load(
             self, param, loaded_weight, shard_id, expert_id
         ):

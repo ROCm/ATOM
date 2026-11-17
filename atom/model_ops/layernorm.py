@@ -1405,8 +1405,14 @@ class DualRMSNormBF16:
     def __call__(self, q: torch.Tensor, k: torch.Tensor):
         lead = q.shape[:-1]
         q2, k2 = _rows(q), _rows(k)
-        yq = torch.empty(q2.shape, dtype=q.dtype, device=q.device)
         yk = torch.empty(k2.shape, dtype=k.dtype, device=k.device)
+        yq, sq = self._norm(q2, k2, yk)
+        sq = None if sq is None else sq.view(*lead, 1)
+        return yq.view(*lead, -1), sq, yk.view(*lead, -1)
+
+    def _norm(self, q2, k2, yk):
+        """The launch over rows, K into `yk`; returns Q and its scale."""
+        yq = torch.empty(q2.shape, dtype=q2.dtype, device=q2.device)
         if q2.shape[0]:
             fused_qk_rmsnorm_group_quant(
                 q=q2,
@@ -1418,7 +1424,7 @@ class DualRMSNormBF16:
                 k_epsilon=self.k_norm.eps,
                 k_out=yk,
             )
-        return yq.view(*lead, -1), None, yk.view(*lead, -1)
+        return yq, None
 
 
 class DualRMSNormPerToken(DualRMSNormBF16):
@@ -1437,13 +1443,9 @@ class DualRMSNormPerToken(DualRMSNormBF16):
         super().__init__(q_norm, k_norm, prefix)
         self.quant_dtype = quant_dtype
 
-    @mark_trace
-    def __call__(self, q: torch.Tensor, k: torch.Tensor):
-        lead = q.shape[:-1]
-        q2, k2 = _rows(q), _rows(k)
-        yq = torch.empty(q2.shape, dtype=self.quant_dtype, device=q.device)
-        sq = torch.empty((q2.shape[0], 1), dtype=torch.float32, device=q.device)
-        yk = torch.empty(k2.shape, dtype=k.dtype, device=k.device)
+    def _norm(self, q2, k2, yk):
+        yq = torch.empty(q2.shape, dtype=self.quant_dtype, device=q2.device)
+        sq = torch.empty((q2.shape[0], 1), dtype=torch.float32, device=q2.device)
         if q2.shape[0]:
             fused_qk_rmsnorm_per_token_quant(
                 yq,
@@ -1456,7 +1458,7 @@ class DualRMSNormPerToken(DualRMSNormBF16):
                 k_epsilon=self.k_norm.eps,
                 k_out=yk,
             )
-        return yq.view(*lead, -1), sq.view(*lead, 1), yk.view(*lead, -1)
+        return yq, sq
 
 
 # ---------------------------------------------------------------------------
