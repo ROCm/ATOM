@@ -974,6 +974,20 @@ kill -KILL "${other}"
         self.assertIn("DROPPER RUNS", result.stdout)
         self.assertIn("OTHER SURVIVES", result.stdout)
 
+    def test_the_page_cache_dropper_stops_once_the_owners_mount(self):
+        # Past the mount it only evicts the pages the workers are loading.
+        result = self.run_shell(
+            """
+start_mooncake_store
+mooncake_page_cache_dropper_running && echo "DROPPER STILL RUNS"
+echo "dropper pid=[${mooncake_page_cache_dropper_pid}]"
+stop_mooncake_store
+""",
+            MOONCAKE_STORE_OWNERS="0:8;1:8",
+        )
+        self.assertNotIn("DROPPER STILL RUNS", result.stdout)
+        self.assertIn("dropper pid=[]", result.stdout)
+
     def test_an_owner_dying_before_ready_stops_the_store(self):
         self.run_shell(
             "start_mooncake_store\n",
