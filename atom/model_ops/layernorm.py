@@ -181,6 +181,7 @@ def _aiter_rms_quant_fake(
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
     e8m0_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
@@ -233,9 +234,14 @@ def _aiter_rms_quant(
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
     e8m0_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
+    if transpose_scale and row_major_key:
+        from atom.model_ops.linear import row_major_x_scale_for
+
+        transpose_scale = not row_major_x_scale_for(row_major_key, x.shape[0])
     out, scale, out_res1 = _aiter_rms_quant_fake(
         x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
     )
@@ -309,6 +315,20 @@ class RMSNorm(nn.Module):
         self._aiter_e8m0_scale = (
             quant_type.value == _QV_PER_1X128 and quant_config.blockscale_e8m0_scale
         )
+
+    # Set by use_row_major_scale(): the row-major x_scale group of this norm's
+    # fused E8M0 per-1x128 quant (0: always column-major). Per M, the group says
+    # whether the scale goes out row-major (``linear.row_major_x_scale_for``).
+    _row_major_key: int = 0
+
+    def use_row_major_scale(self, key: int) -> bool:
+        """Join row-major x_scale group ``key`` (its consumers must join too,
+        ``LinearBase.use_row_major_x_scale``). Not for the fused-AllReduce
+        quant, which only writes the column-major preshuffle layout here."""
+        if self.fused_allreduce:
+            return False
+        self._row_major_key = key
+        return True
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -516,6 +536,7 @@ class RMSNorm(nn.Module):
                     ),
                     self.params_dtype,
                     self._aiter_e8m0_scale,
+                    self._row_major_key,
                 )
                 if batched:
                     x = x.view(*lead, -1)

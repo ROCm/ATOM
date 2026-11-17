@@ -190,6 +190,7 @@ class AttnRes(nn.Module):
                 self.out_quant_dtype,
                 getattr(self.out_norm, "_aiter_e8m0_scale", False),
                 getattr(self.out_norm, "_aiter_transpose_scale", False),
+                getattr(self.out_norm, "_row_major_key", 0),
             )
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand

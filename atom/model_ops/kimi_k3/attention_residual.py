@@ -496,6 +496,16 @@ direct_register_custom_op(
 # type is fixed at registration.
 
 
+def _resolve_transpose_scale(transpose_scale: bool, row_major_key: int, T: int) -> bool:
+    """The out-norm's row-major x_scale group (``row_major_key``) may hand its
+    GEMMs a row-major E8M0 scale at this T instead of the column-major default."""
+    if transpose_scale and row_major_key:
+        from atom.model_ops.linear import row_major_x_scale_for
+
+        return not row_major_x_scale_for(row_major_key, T)
+    return transpose_scale
+
+
 def _quant_scale_fake(prefix_sum: torch.Tensor, e8m0_scale: bool) -> torch.Tensor:
     T, H = prefix_sum.shape
     if e8m0_scale:
@@ -513,7 +523,11 @@ def _apply_attn_res_quant_op(
     quant_dtype: torch.dtype,
     e8m0_scale: bool = False,
     transpose_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    transpose_scale = _resolve_transpose_scale(
+        transpose_scale, row_major_key, prefix_sum.shape[0]
+    )
     y, y_scale, _ = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
@@ -538,6 +552,7 @@ def _apply_attn_res_quant_op_fake(
     quant_dtype: torch.dtype,
     e8m0_scale: bool = False,
     transpose_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -565,7 +580,11 @@ def _apply_attn_res_add_quant_op(
     add_hidden2: torch.Tensor | None = None,
     e8m0_scale: bool = False,
     transpose_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    transpose_scale = _resolve_transpose_scale(
+        transpose_scale, row_major_key, prefix_sum.shape[0]
+    )
     return _apply_attn_res_impl(
         prefix_sum,
         block_residual,
@@ -593,6 +612,7 @@ def _apply_attn_res_add_quant_op_fake(
     add_hidden2: torch.Tensor | None = None,
     e8m0_scale: bool = False,
     transpose_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.empty_like(prefix_sum, dtype=quant_dtype),
@@ -622,6 +642,7 @@ def apply_attn_res(
     quant_dtype: torch.dtype | None = None,
     e8m0_scale: bool = False,
     transpose_scale: bool = False,
+    row_major_key: int = 0,
 ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
@@ -648,6 +669,7 @@ def apply_attn_res(
                 quant_dtype,
                 e8m0_scale,
                 transpose_scale,
+                row_major_key,
             )
             return (y, y_scale), prefix_sum
         y, y_scale, prefix_out = torch.ops.aiter.kimi_k3_apply_attn_res_add_quant(
@@ -662,6 +684,7 @@ def apply_attn_res(
             add_hidden2,
             e8m0_scale,
             transpose_scale,
+            row_major_key,
         )
         return (y, y_scale), prefix_out
     if add_hidden is None:

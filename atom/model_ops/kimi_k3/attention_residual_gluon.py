@@ -239,11 +239,12 @@ def attn_res_tdm_supported(block_residual: torch.Tensor) -> bool:
     )
 
 
-# A column-major E8M0 scale (stride_ys_t == 1) puts neighbouring tokens in one
-# cache line that every XCD writes; the remap gives each XCD a contiguous run of
+# E8M0 scale lines written from every XCD: a column-major scale (stride_ys_t
+# == 1) puts neighbouring tokens in one line, and a row-major token's codes need
+# not start on a line boundary. The remap gives each XCD a contiguous run of
 # tokens. Smallest T to remap from, keyed by "column-major" (no entry: never).
 # The remap only picks which program computes a token, so it trades speed only.
-_XCD_REMAP_MIN_T = {True: 512}
+_XCD_REMAP_MIN_T = {True: 512, False: 160}
 
 
 @functools.cache
