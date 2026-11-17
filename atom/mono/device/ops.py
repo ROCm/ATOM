@@ -140,6 +140,19 @@ def fresh(v):
     )  # fmt: skip
 
 
+def pinned(v):
+    """Kernel argument ``v`` (Int32 / Int64) through an opaque scalar move. LLVM rematerializes a
+    kernel argument from the argument segment instead of reloading it, yet keeps the spill slot it
+    had assigned: a dead slot, scratch all the same (refused: ``runtime.widths``)."""
+    x = as_ir_value(v)
+    w = ir.IntegerType(x.type).width
+    return (fx.Int64 if w == 64 else fx.Int32)(
+        llvm.inline_asm(
+            x.type, [x], f"s_mov_b{w} $0, $1", "=s,s", has_side_effects=False
+        )
+    )
+
+
 def uniform(v):
     return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v).ir_value()))
 

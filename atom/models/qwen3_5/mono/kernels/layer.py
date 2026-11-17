@@ -67,7 +67,7 @@ from atom.models.qwen3_5.mono.layout import (
     stage_tasks,
     xin_stage,
 )
-from atom.mono.device.ops import rsrc, uniform
+from atom.mono.device.ops import pinned, rsrc, uniform
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
@@ -361,6 +361,9 @@ def build_qwen35_kernel(
         keys = lds.keys.ptr
         dnw = lds.dnw.ptr
         tls = lds.tls.ptr
+        # the kernel arguments LLVM would rematerialize at their uses, leaving a dead spill slot
+        rank, layer, bt_stride = pinned(rank), pinned(layer), pinned(bt_stride)
+        h_in, x_out = pinned(h_in), pinned(x_out)
         # the full-attention projection's matrix comes in the GDN qkvz slot
         w_qkv, s_qkv = w_qkvz, s_qkvz
         # this launch's mailbox: tag layer + 1, every mailbox zeroed at the step's start (the runner's
