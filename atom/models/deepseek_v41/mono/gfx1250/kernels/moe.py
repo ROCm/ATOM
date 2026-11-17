@@ -1164,8 +1164,9 @@ def _rv_wmax(v):   # (the router's wave max: front imports moe, so a call-time i
 #        before the wait for the pick's 18 group flags), wave 6 the shared expert (FP8) of row r (its 18 flags); x the
 #        route weight, the 7 partials summed in fixed order in LDS -> 128 bf16
 #   J    the 128-col partial pushed as tagged 16-byte words {w0, tag, w1, tag} to the 4 ranks' receive regions [r][s]
-# Shared CTAs 144..159: x8 of all TR rows (x8_self), groups g = j, j + 16 (< 18) of the FP8 shared UG, K over the 8
-#   waves, epilogue -> MID slot SHS0 (rows = tokens), one LL flag a group.
+# Shared CTAs 144..159: x8 of all TR rows (x8_self), the FP8 shared UG's 72 16-row tiles evenly (CTA j: tiles
+#   [72 j / 16, 72 (j + 1) / 16), 4 or 5), K over the 8 waves, SwiGLU -> bf16 LL words of the rows' act (c["shact"]);
+#   the down's shared wave quantizes the row (ug_epilogue's MXFP8, bit-identical).
 # Owners b < 160 (recv_owner): their 32 cols of every row: the 4 ranks' words summed in rank order 0..3 -> y2.
 
 # SPDX-License-Identifier: MIT
@@ -1183,6 +1184,9 @@ NSHD = 8 * DNU * UNIT8 // 16       # its 16-byte chunks
 DNPD = 2                           # routed down tiles in flight a wave (2: with the body's waves_per_eu 4, step.WAVES_PER_EU)
 TP_TG = 40960
 KB = 8                             # UG K steps in flight a wave
+SHT, SHT_MAX = 4 * NUG, 5          # the shared UG's 72 16-row tiles (8 gate + 8 up rows = 8 MID cols); tiles a shared CTA (4, 5)
+SHACT = 16384                      # the rows' shared act LL words [TR][288] (bf16 pairs) past the MoE flags (mflag + SHACT)
+SHAL = 198000                      # LDS (down CTA): the row's shared MID row (fp8 [640], then codes [20] at SHAL + 640)
 
 
 def rslot(b):
@@ -1386,11 +1390,9 @@ def dn_row(c, s):
             if tl == 0:   # token 0: cols j * 16 + (l // 16) * 8 + jj, the pick's weighted bf16 partial
                 hx.lstore(sm + DRED + (w * 128 + j * 16 + (l // 16) * 8) * 4,
                           fx.Vector.from_elements([(acc[jj] * wt).to(BF16).to(F32) for jj in range(8)], F32), align=16)
-    if w == KT:   # the shared expert (FP8) of row r
-        hx.get(c["mflag"] + i64(c["shflag0"] + fx.min(l, I32(NUG - 1))) * 8, c["mtag"], 7)
-        mrow = c["mid8"] + i64(SHS0 * MAXTOK + r) * MROW
-        crow = c["midc"] + i64(SHS0 * MAXTOK + r) * CROW
-        B = [ldb_g(mrow, crow, ks, l) for ks in range(DNU)]
+    if w == KT:   # the shared expert (FP8) of row r: its MXFP8 MID row made here from the shared act (sh_act_q8)
+        sh_act_q8(c, r, l, sm)
+        B = [(ldb_l(sm + SHAL, ks, l), hx.lload(sm + SHAL + 640 + ks * 4, I32)) for ks in range(DNU)]
         for j in range(8):
             ra = [lda8_l(sm + SHDL + (j * DNU + ks) * UNIT8, l) for ks in range(DNU)]
             acc = fx.Vector.filled(8, 0.0, F32)
@@ -1462,46 +1464,95 @@ def recv_owner(c, region, tag, TR):
                 hx.stx_dev(c["ytgt"] + (i64(r) * H + i64(b * 32 + 4 * q + 2 * h)) * 2, wq)
 
 
+def _pk_bf2(a, b):
+    """Two bf16-exact f32 (silu_clamp's outputs) as one bf16 pair word (a low)."""
+    return a.to(BF16).bitcast(fx.Int16).to(I32) & 0xFFFF | (b.to(BF16).bitcast(fx.Int16).to(I32) << 16)
+
+
 @ASTRewriter.transform
 def shared_ug(c, j, TR):
-    """Shared CTA j: FP8 shared UG groups j, j + 16 (< 18) for the TR rows (tokens), K steps 5 w .. 5 w + 4 a wave, the
-    8 partials summed in wave order (LDS), wave 0's epilogue -> MID slot SHS0 rows 0..TR-1, one flag a group."""
+    """Shared CTA j: the FP8 shared UG's 16-row tiles [72 j / 16, 72 (j + 1) / 16) (4 or 5: the 72 tiles evenly; groups
+    j, j + 16 put two groups on CTAs 144 / 145, ~5 us past the others, and every row's down waited for them) for the TR
+    rows, K steps 5 w .. 5 w + 4 a wave (each tile's 5-WMMA chain as before), the 8 wave partials summed in wave order
+    (LDS), wave q the epilogue of tile q: silu_clamp (bf16-rounded) of token l's 8 cols -> 4 bf16 pair LL words
+    c["shact"] [l][4 tp ..] (lanes l < TR). The down's shared wave makes the MXFP8 MID row from them (sh_act_q8)."""
+    assert SHACT + TR * 288 * 8 <= 36864   # (below the stage_Apub flags of the same 40 KB half, step.pub)
     w, l, sm = c["w"], c["l"], c["sm"]
     tl = l % 16
     rowx = fx.min(tl, I32(TR - 1))
-    for gi in range_constexpr(2):
-        g = j + 16 * gi
-        live = g < NUG
-        gcl = fx.min(g, I32(NUG - 1))
-        ab = c["shplane"] + i64(gcl * UGU) * UNIT8
-        acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
-        if live:
-            ks0 = w * 5
-            for kk in range_constexpr(5):
-                ra = [lda8(ab + (i64(ks0 + kk) * 4 + tile) * UNIT8, l) for tile in range(4)]
-                p = sm + X8LO + rowx * H + (ks0 + kk) * 128 + (l // 16) * 16
-                parts = [hx.lload(p + cc * 32, I32, 4, align=16) for cc in range(4)]
-                bq = fx.Vector.from_elements([parts[cc][e] for cc in range(4) for e in range(4)], I32)
-                bs = hx.lload(sm + X8LS + rowx * (H // 32) + (ks0 + kk) * 4, I32)
-                acc = [wmma_fp8(avec8(ra[tile]), ra[tile][4], bq, bs, acc[tile]) for tile in range(4)]
-        gpu.barrier()
-        for tile in range_constexpr(4):
-            ow = sm + O_RED8 + ((w * 4 + tile) * 32 + l) * 32
-            hx.lstore(ow, fx.Vector.from_elements([acc[tile][i] for i in range(4)], F32), align=16)
-            hx.lstore(ow + 16, fx.Vector.from_elements([acc[tile][i] for i in range(4, 8)], F32), align=16)
-        gpu.barrier()
-        if (w == 0) & live:
-            tot = [fx.Vector.filled(8, 0.0, F32) for _ in range(4)]
-            for ww in range(8):
-                for tile in range_constexpr(4):
-                    orr = sm + O_RED8 + ((ww * 4 + tile) * 32 + l) * 32
-                    lo = hx.lload(orr, F32, 4, align=16)
-                    hi = hx.lload(orr + 16, F32, 4, align=16)
-                    tot[tile] = fx.Vector.from_elements([tot[tile][i] + lo[i] for i in range(4)] + [tot[tile][i + 4] + hi[i] for i in range(4)], F32)
-            ug_epilogue(c, I32(SHS0), gcl, I32(TR), tot)
-            hx.wait_storecnt0()
-            if l == 0:
-                hx.put(c["mflag"] + i64(c["shflag0"] + gcl) * 8, I32(0), c["mtag"])
+    t0 = (SHT * j) // NSC
+    t1 = (SHT * (j + 1)) // NSC
+    tid = [fx.min(t0 + q, t1 - 1) for q in range(SHT_MAX)]   # (a 4-tile CTA's 5th: its last tile again, not stored)
+    base = [c["shplane"] + i64((tid[q] // 4) * UGU) * UNIT8 for q in range(SHT_MAX)]
+    acc = [fx.Vector.filled(8, 0.0, F32) for _ in range(SHT_MAX)]
+    ks0 = w * 5
+    for kk in range_constexpr(5):
+        ra = [lda8(base[q] + (i64(ks0 + kk) * 4 + i64(tid[q] % 4)) * UNIT8, l) for q in range(SHT_MAX)]
+        p = sm + X8LO + rowx * H + (ks0 + kk) * 128 + (l // 16) * 16
+        parts = [hx.lload(p + cc * 32, I32, 4, align=16) for cc in range(4)]
+        bq = fx.Vector.from_elements([parts[cc][e] for cc in range(4) for e in range(4)], I32)
+        bs = hx.lload(sm + X8LS + rowx * (H // 32) + (ks0 + kk) * 4, I32)
+        acc = [wmma_fp8(avec8(ra[q]), ra[q][4], bq, bs, acc[q]) for q in range(SHT_MAX)]
+    gpu.barrier()
+    for q in range_constexpr(SHT_MAX):
+        ow = sm + O_RED8 + ((w * SHT_MAX + q) * 32 + l) * 32
+        hx.lstore(ow, fx.Vector.from_elements([acc[q][i] for i in range(4)], F32), align=16)
+        hx.lstore(ow + 16, fx.Vector.from_elements([acc[q][i] for i in range(4, 8)], F32), align=16)
+    gpu.barrier()
+    if (w < SHT_MAX) & (t0 + w < t1):
+        tot = fx.Vector.filled(8, 0.0, F32)
+        for ww in range(8):
+            orr = sm + O_RED8 + ((ww * SHT_MAX + w) * 32 + l) * 32
+            lo = hx.lload(orr, F32, 4, align=16)
+            hi = hx.lload(orr + 16, F32, 4, align=16)
+            tot = fx.Vector.from_elements([tot[i] + lo[i] for i in range(4)] + [tot[i + 4] + hi[i] for i in range(4)], F32)
+        x = []
+        for i in range_constexpr(8):
+            gv = tot[i]
+            uv = gv.shuffle_xor(16, 32)
+            x.append(silu_clamp(gv, uv))
+        if l < TR:
+            a = c["shact"] + i64(l * 288 + (t0 + w) * 4) * 8
+            hx.put2(a, _pk_bf2(x[0], x[1]), _pk_bf2(x[2], x[3]), c["mtag"])
+            hx.put2(a + i64(16), _pk_bf2(x[4], x[5]), _pk_bf2(x[6], x[7]), c["mtag"])
+
+
+@ASTRewriter.transform
+def sh_act_q8(c, r, l, sm):
+    """(the down's shared wave) lane l < 18: block l of row r's shared act (16 LL words: tiles 4 l .. 4 l + 3) polled,
+    then ug_epilogue's MXFP8 of the 32 values (same amax / e8m0 / cvt) -> LDS SHAL [32 l ..] + code SHAL + 640 + l;
+    lanes 18, 19: the down's K pad (zeros, code 1)."""
+    if l < NUG:
+        ad = c["shact"] + i64(r * 288 + l * 16) * 8
+        t0 = hx.clock()
+        pg = [hx.peek(ad + i64(8 * k)) for k in range(16)]
+        bad = I32(0)
+        for k in range_constexpr(16):
+            bad = bad | (pg[k][1] != c["mtag"]).select(I32(1), I32(0))
+        while (bad != 0) & (hx.clock() - t0 < I64(hx.POLL_TICKS)):
+            hx.s_sleep(1)
+            pg = [hx.peek(ad + i64(8 * k)) for k in range(16)]
+            bad = I32(0)
+            for k in range_constexpr(16):
+                bad = bad | (pg[k][1] != c["mtag"]).select(I32(1), I32(0))
+        v = []
+        for k in range_constexpr(16):
+            wd = pg[k][0]
+            v.append((wd << 16).bitcast(F32))
+            v.append((wd & I32(-65536)).bitcast(F32))
+        am = F32(0.0)
+        for e in range_constexpr(32):
+            am = fx.max(am, abs(v[e]))
+        code = e8m0_of(am)
+        words = q8words(v, inv_pow2(code))
+        hx.lstore(sm + SHAL + l * 32, fx.Vector.from_elements(words[:4], I32), align=16)
+        hx.lstore(sm + SHAL + l * 32 + 16, fx.Vector.from_elements(words[4:], I32), align=16)
+        hx.lstore(sm + SHAL + 640 + l, code.to(fx.Int8))
+    if (l >= NUG) & (l < 20):
+        zv = fx.Vector.from_elements([I32(0)] * 4, I32)
+        hx.lstore(sm + SHAL + l * 32, zv, align=16)
+        hx.lstore(sm + SHAL + l * 32 + 16, zv, align=16)
+        hx.lstore(sm + SHAL + 640 + l, I32(1).to(fx.Int8))
 
 
 @ASTRewriter.transform

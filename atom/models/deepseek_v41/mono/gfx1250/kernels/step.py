@@ -366,7 +366,7 @@ P2A, X1A, P3A = 524288, 786432, 851968   # attention side: mix partials, x1, lev
 P2F, X1F, P3F = 65536, 327680, 458752    # FFN side
 UGF = 40960              # MoE UG -> down flags
 ENGP = 1081344           # Engram gate partials
-DNF = 999424             # the MoE's LL flags (UG groups -> down, shared UG -> down): [parity] x 40 KB
+DNF = 999424             # the MoE's LL flags (UG groups -> down) + the shared act words (moe.SHACT): [parity] x 40 KB
 # the v3 flag sites: (plog offset from V3F0, epoch32 site)
 F_D, F_E, F_A2, F_C, F_KV, F_P, F_X, F_AP, F_W, F_ENG = ((0, 4), (8192, 5), (16384, 6), (24576, 7), (32768, 8),
                                                          (40960, 9), (49152, 10), (57344, 11), (65536, 12), (73728, 13))
@@ -628,7 +628,7 @@ def target_layer(E, Ly):
     # ---- (design 7) the FFN / MoE block per row (TileRT F0 / top-k wave 0 / H / I / G / G' / J)
     mfl = plog(DNF) + i64(par) * 40960
     cr = dict(t=t, b=b, w=w, l=l, sm=sm + FLO, rank=rank, recv=c["recv"], mflag=mfl, mtag=hx.epoch32(tep, Ly, 14),
-              shflag0=6 * MS.TOPK * MS.NUG, ids_lds=moe_ids == "ids", ids=fptr(fp, moe_ids), ktop=RTOPK,
+              shact=mfl + i64(MS.SHACT), ids_lds=moe_ids == "ids", ids=fptr(fp, moe_ids), ktop=RTOPK,
               w13=ltab(fp, Ly, "mw13")(), s13=ltab(fp, Ly, "ms13")(), w2=ltab(fp, Ly, "mw2")(), s2=ltab(fp, Ly, "ms2")(),
               shplane=ltab(fp, Ly, "shplane")(), mid8=fptr(fp, "mid8"), midc=fptr(fp, "midc"), nw=ltab(fp, Ly, "nw")(),
               x1g=plog(X1F), part2=plog(P2F), norm_eps=D.RMS_EPS,
