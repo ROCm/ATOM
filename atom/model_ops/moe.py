@@ -20,7 +20,13 @@ from aiter.ops.shuffle import (
     moe_shuffle_scale,
     moe_shuffle_weight,
 )
-from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+try:
+    from aiter.ops.topk import _FLYDSL_HERD_MAX_M, _FLYDSL_HERD_MIN_M, _FLYDSL_USE_HERD
+except ImportError:
+    # aiter < v0.1.26 (pre-ROCm/aiter#5693); HERD path stays disabled
+    _FLYDSL_USE_HERD = False
+    _FLYDSL_HERD_MIN_M = 0
+    _FLYDSL_HERD_MAX_M = 0
 from torch import nn
 from transformers import PretrainedConfig
 
