@@ -302,7 +302,8 @@ def scratch_bytes(K, nlt: int) -> dict[str, int]:
         # the selection tree (M.IDX_LEVELS levels): a level's lists of (value, index) pairs a row, a level-0 list per
         # 8192 index rows of the bound (ILW), k a list -- 2048 for layer 20's candidate blocks (topk "blk": also
         # its dummy-row store, row T, lands there), 512 otherwise
-        "ilvl": M.IDX_LEVELS * (T + 1) * level_stride * 8 + 64,
+        # (x 2: layer 20's top-512 and top-2048 block trees run side by side, the block lists past topk.NLMAX levels)
+        "ilvl": 2 * max(M.IDX_LEVELS, M.TK.NLMAX) * (T + 1) * level_stride * 8 + 64,
         "aux8": T * 15360,
         "auxs": T * 480,
         "dR": T * 4 * H * 2,

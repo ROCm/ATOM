@@ -263,6 +263,11 @@ def _emit_any(c, mode, lev, final, tok, j, q, k, lstride, cur, pbase, pos, bits,
         c["stx"](cur + lslot, fx.Vector.from_elements([(ii >= 0).select(bits, I32(0)), col], I32))
 
 
+def blk_lvl_off(c):
+    """Bytes from lvl to the block tree's lists: past the top-512 tree's NLMAX levels (buffers: ilvl holds both)."""
+    return i64(NLMAX) * i64(T + 1) * i64(_cdiv(c["ilw"], I32(SEG)) * KSEL) * 8
+
+
 @ASTRewriter.transform
 def stage_select_any(c, lev, nlev, mode):
     """Level lev (traced, < nlev) of a selection tree, mode (MODE_*, traced): MODE_SEL the top-512 of a FULL layer's
@@ -301,7 +306,10 @@ def stage_select_any(c, lev, nlev, mode):
     tot0 = hx.lane_gather(inc0, I32(31))
     inc1 = wave_incl_scan(c1, ln) + tot0
     nt = hx.lane_gather(inc1, I32(31))
-    for i in range(b, nt, 256):
+    bb = b
+    if fx.const_expr("rev" in c):   # (traced: the block tree beside the top-512 tree takes its tasks from the last CTA down)
+        bb = c["rev"].select(I32(255) - b, b)
+    for i in range(bb, nt, 256):
         # the task's row: the rows whose inclusive prefix is <= i are before it; j = i - that prefix
         p0 = inc0 <= i
         p1 = inc1 <= i

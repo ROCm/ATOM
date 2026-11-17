@@ -553,11 +553,19 @@ def target_layer(E, Ly):
             lsel = (nmax > fx.Int32(TK.SEG)).select(sel_levels, fx.Int32(1))
             npass = isrx.select(lsel, cs_["iprod"].select(sel_levels + blk_levels, lsel))
             if cs_["iprod"]:   # the candidate-block layer (its top-512 and top-2048 blocks): the selection tree
-                for pi in range(npass):
-                    pmode = isrx.select(fx.Int32(TK.MODE_RX), (pi < sel_levels).select(fx.Int32(TK.MODE_SEL), fx.Int32(TK.MODE_BLK)))
-                    plev = (pi < sel_levels).select(pi, pi - sel_levels)
-                    nlev = (pi < sel_levels).select(sel_levels, blk_levels)
-                    TK.stage_select_any(cwith(cs_, ts=None), plev, nlev, pmode)
+                # The top-512 tree (ilog) and the top-2048 block tree (ibmax) are independent: pass pi runs level pi of
+                # both, the block tasks from the last CTA down and their lists in the second half of lvl (topk.BLK_LVL):
+                # max(sel, blk) passes and handoffs, not sel + blk (133K: 5 -> 3, <= 131072 keys: 4 -> 2)
+                # (one instance of the selection code, a runtime loop over the two trees: code size is the step's cost)
+                boff = TK.blk_lvl_off(cs_)
+                for pi in range(fx.max(sel_levels, blk_levels)):
+                    for q in range(hx.opaque_s(fx.Int32(2))):
+                        isb = q == fx.Int32(1)
+                        nl = isb.select(blk_levels, sel_levels)
+                        if pi < nl:
+                            TK.stage_select_any(cwith(cs_, ts=None, lvl=cs_["lvl"] + isb.select(boff, i64(0)), rev=isb), pi, nl,
+                                                isb.select(fx.Int32(TK.MODE_BLK), fx.Int32(TK.MODE_SEL)))
+                        gpu.barrier()   # (both share the CTA's LDS task counts)
                     handoff(lc + i64(LY.SELECT0) + i64(pi) * 4, t, True)
             else:   # FULL / REINDEX: every row's top-512 by 8 or 32 CTAs a row (4 radix rounds, a group count each), one handoff
                 mh = fptr(fp, "mchist")
