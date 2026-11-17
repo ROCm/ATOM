@@ -1284,15 +1284,13 @@ class V4MonoSession:
                     from atom.spec_decode.dspark_proposer import DSparkProposer
 
                     spec = drafter._aux_capture_spec()
-                    if (
-                        spec is None
-                        or spec.capture != "output"
-                        or spec.extract is not DSparkProposer._extract_layer_hidden
-                    ):
+                    if spec is None or spec.capture != "output":
                         raise MonoUnsupported(
                             "V4 Mono requires the settled DSpark post-layer aux contract"
                         )
-                    taps = bind_aux_taps(drafter, spec.hidden_size)
+                    taps = bind_aux_taps(
+                        drafter, spec.hidden_size, DSparkProposer._extract_layer_hidden
+                    )
                     if taps.layer_ids != spec.layer_ids:
                         raise MonoUnsupported("DSpark aux capture declaration changed")
                     self.runner.bind_aux_outputs(taps.layer_ids, taps.buffers)

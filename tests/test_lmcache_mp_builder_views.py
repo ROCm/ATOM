@@ -131,7 +131,6 @@ def mla_builder_cls():
         "atom.distributed.dcp_utils": _module(
             "atom.distributed.dcp_utils",
             NONPS_MAX_Q_ROWS=32768,
-            dcp_persistent_supported=noop,
             get_dcp_rank=lambda: 0,
             get_dcp_world_size=lambda: 1,
             mla_dcp_decode_is_persistent=lambda *args, **kwargs: False,
@@ -157,6 +156,7 @@ def mla_builder_cls():
             _MLA_SPLIT_BUDGET_AUTO=-1,
             MLAAttention=type("MLAAttention", (), {}),
             mla_dcp_kernel_num_heads=noop,
+            mla_dcp_persistent_width=lambda *args, **kwargs: None,
             mla_dcp_sparse_prefill_num_heads=noop,
             mla_kernel_num_heads=lambda heads: max(16, -(-heads // 16) * 16),
         ),
@@ -204,6 +204,16 @@ def mla_builder_cls():
             concat_rows=noop,
             fp4_rows=noop,
             fp8_rows=noop,
+            packed_concat_rows=noop,
+        ),
+        "atom.model_ops.indexer.workspace": _module(
+            "atom.model_ops.indexer.workspace",
+            ConcatKeyWorkspace=noop,
+            ConcatPass=noop,
+            DcpGather=noop,
+            aligned_spans=noop,
+            concat_passes=noop,
+            dcp_gather_index=noop,
         ),
         "atom.model_ops.indexer.schedule": _module(
             "atom.model_ops.indexer.schedule", any_layer_skips_index_topk=noop
@@ -257,7 +267,11 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
         kv_pools={"gqa4": pool},
         # Both layers' KV and the first one's indexer keys (128 FP8 a token).
         pool_rows={"gqa4": dict(zip(layers, range(2))), "index": {layers[0]: 0}},
-        _index_cache_spec=lambda: SimpleNamespace(dim=128, dtype=torch.float8_e4m3fnuz),
+        block_size=128,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: SimpleNamespace(
+            view_dtype=torch.float8_e4m3fnuz, view_shape=(-1, 128, 128)
+        ),
     )
 
     transfer = mha_export_method(builder)

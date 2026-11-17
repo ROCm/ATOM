@@ -146,10 +146,7 @@ def _stub_v4_runtime_imports():
         "get_pcp_world_size",
         "pcp_is_enabled",
         "pcp_owned_rows_by_request",
-        "pcp_pad_dense",
-        "pcp_pad_indptr",
         "pcp_pad_len",
-        "pcp_reindex_ragged",
     ):
         setattr(pcp_utils, name, lambda *args, **kwargs: None)
     pcp_utils.PcpBalGroup = tuple
@@ -846,6 +843,9 @@ def _fp4_pd_pair(builder_cls, writer, kv_dtype="fp8", coalesce=False):
         _block_mr_ends=[[r.total_bytes] for r in src.block_regions],
         _swa_block_regions=src.swa_block_regions,
         _slot_regions=[],
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _coalesce_blocks=coalesce,
         _trace_transfers=False,
         _num_local_layers=4,

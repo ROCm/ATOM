@@ -48,6 +48,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
     require_native_state_server,
+    transfer_spec,
 )
 from atom.kv_transfer.offload.mp.metadata import MPReqMeta
 from atom.kv_transfer.offload.mp.native_state_layout import (
@@ -627,8 +628,6 @@ class LMCacheMPConnector(KVConnectorBase):
         return self._native_layout.transfer_block_ids(pages, unit_ids, count)
 
     def _submit_load(self, req: MPReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -655,11 +654,12 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            op = AtomMPTransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: the failure is provable and terminal.
@@ -699,8 +699,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
 
     def _submit_save(self, req: MPReqMeta, event: Any) -> None:
-        from lmcache.integration.atom import AtomMPTransferSpec
-
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
         request_id = _mp_session_id(self._config, req.req_id)
@@ -742,11 +740,12 @@ class LMCacheMPConnector(KVConnectorBase):
                 self._immediate_saves[completion] = None
             return
         try:
-            op = AtomMPTransferSpec(
+            op = transfer_spec(
                 token_ids=token_list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
                 end=end,
+                cache_salt=req.cache_salt,
             )
         except Exception:
             # Nothing was sent: report a terminal failure so the save settles.

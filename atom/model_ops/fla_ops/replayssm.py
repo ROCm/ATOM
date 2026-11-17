@@ -39,7 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .op import exp
 
@@ -1354,11 +1354,30 @@ def _serial_launch_config(
     where BV=64 stays best; num_stages is flat either way.
 
     The small-batch rule is gated to gfx950, the only architecture it was
-    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
-    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
+    measured on. The gfx1250 ladder below is gated to the one shape it was
+    measured on; other shapes and gfx942 keep the large-batch config.
     """
     if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
+    if (
+        not is_kda
+        and HV == 48
+        and V == 128
+        and max_query_len == 4
+        and get_gfx_runtime() == "gfx1250"
+    ):
+        # gfx1250, Qwen3.8 H=16 HV=48 K=V=128 T=4, cold state, CUDA graph,
+        # us at BV=64 -> chosen BV: bs1 9.3 -> 6.6 (BV16), bs4 9.5 -> 8.3
+        # (BV16), bs8 10.5 -> 10.5 (BV64), bs16 20.6 -> 18.7 (BV32), bs48
+        # 49.3 -> 43.7 (BV32), bs128 128.7 -> 113.1 (BV32). num_warps=2 is
+        # slower at every size.
+        if N * HV <= 192:
+            bv = 16
+        elif N * HV <= 384:
+            bv = 64
+        else:
+            bv = 32
+        return min(triton.next_power_of_2(V), bv), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
 

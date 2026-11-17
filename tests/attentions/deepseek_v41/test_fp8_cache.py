@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The FP8 pool: 528-byte MXFP8 rows, row addressed, read by AITER's v4.1
-sparse attention."""
+"""The FP8 cache: contiguous source planes read by AITER sparse attention."""
 
 from dataclasses import replace
 
@@ -24,20 +23,22 @@ FLASH = {
 }
 
 
-def test_fp8_rows_are_whole_rows_of_the_pool():
+def test_fp8_source_rows_preserve_budget_and_use_local_addresses():
     geo = V41PoolGeometry(**FLASH, kv_dtype="fp8")
     bf16 = replace(geo, kv_dtype="bf16")
     assert (geo.row_bytes, geo.main_row_bytes, geo.window_row_bytes) == (528,) * 3
     assert geo.alignment % 528 == 0 and geo.alignment % 256 == 0
-    # every region a row id reaches starts on a whole row of the pool
+    # Keep the existing logical PAGE/STATE budget and its alignment.
     assert geo.page_bytes % 528 == 0 and geo.state_bytes % 528 == 0
     for field, start, _ in field_extents(geo.page_fields):
         assert start % 528 == 0, field.name
     pages = 1000
     for layer in (0, geo.layers - 1):
-        rows, raw = geo.window(layer, pages), geo.window_bytes(layer, pages)
-        assert rows.ring_start * 528 == raw.ring_start
-        assert rows.slot_rows * 528 == raw.slot_rows
+        rows = geo.window(layer, pages)
+        assert rows.ring_start == 0
+        assert rows.slot_rows == rows.ring_slots == geo.ring_slots
+        with pytest.raises(ValueError, match="separate data/scale"):
+            geo.window_bytes(layer, pages)
     # the padding to whole rows costs nothing at the served page
     assert geo.page_bytes == sum(f.bytes_per_entry for f in geo.page_fields)
     assert geo.page_bytes / bf16.page_bytes == pytest.approx(528 / 1024)
@@ -46,7 +47,8 @@ def test_fp8_rows_are_whole_rows_of_the_pool():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("heads", [32, 64])
-def test_v41_attention_matches_its_dequantized_reference(heads):
+@pytest.mark.parametrize("planar", [False, True])
+def test_v41_attention_matches_its_dequantized_reference(heads, planar):
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx950":
@@ -62,7 +64,8 @@ def test_v41_attention_matches_its_dequantized_reference(heads):
     device, dim, tokens = "cuda", 512, 7
 
     def rows(n):
-        return pack_rows(*quantize_fp8(torch.randn(n, dim, device=device).bfloat16()))
+        values = quantize_fp8(torch.randn(n, dim, device=device).bfloat16())
+        return tuple(v.contiguous() for v in values) if planar else pack_rows(*values)
 
     pool, extend = rows(4096), rows(tokens + 128)
     prefix_counts = [0, 1, 37, 512, 300, 64, 129]

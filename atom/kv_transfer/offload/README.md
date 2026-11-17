@@ -264,7 +264,9 @@ frees it. Instead, a transfer that is still not terminal after
 `lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
 `LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
 from submission, including time queued at the MP server, not a model request
-timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+timeout or a heartbeat timeout. A native-state load's restore is held to the same
+deadline, counted from when its copy is enqueued, not from submission.
+The deadline from submission also catches a live server whose ZMQ handler
 failed without replying; no LMCache transport changes are required. The scheduler
 independently watches dispatched operations with an additional 10 s margin for
 lost or never-aggregated completion reports. These checks run when the respective
@@ -400,9 +402,12 @@ load: owners --batch_get_into--> run of slots of the registered pool --unpack (T
 
 A window whose slots are one run of the HBM pool is one chunk-major buffer, and
 the dense codec packs or unpacks it in place with one kernel and one stream
-sync. A window whose slots are scattered (quarantined slots broke the region
-up) goes through the block GPU connector's staging buffer instead: pack, then
-a copy into each slot (and the reverse).
+sync. The DSV4/M3 PAGE codec also restores (load only) a run of padded slots in
+place, reading each slot at the pool's slot stride and skipping the padding;
+saves into padded slots still go through staging. A window whose slots are
+scattered (quarantined slots broke the region up) goes through the block GPU
+connector's staging buffer instead: pack, then a copy into each slot (and the
+reverse).
 
 - One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
   opaque bytes of that rank's layers, 16 blocks in one contiguous range
@@ -1231,6 +1236,16 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: salted keys
+
+Image placeholder ids are the same for every picture, so a prompt with a
+`cache_seed` keys its tier objects by it as well (`tier_cache_salt`,
+`_offload_common.py`): `lmcache_mp` as `IPCCacheServerKey.cache_salt`, the
+in-process engine as the `lmcache.tag.cache_salt` key tag. Lookups, saves and
+loads of the chunked schedulers and of DSV4 PAGE+SLOT carry it. Text prompts
+key unchanged. DSV4's SLOT boundary hashes start from the same `cache_seed`, as
+`BlockManager`'s chain does; Mooncake seeds its chain (`chain_seed`).
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
@@ -1245,6 +1260,30 @@ reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 | AOS1 identity, size, TP, and CRC match | `decode_checkpoint` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
 | Exact save generations aggregate across TP | `SaveOperationId`, aggregator | A failed or delayed rank from another save cannot commit a boundary. |
 | Dense save packs wait on the step's producer event | dense `start_load_kv`, `batched_from_gpu` | A non-final prefill chunk yields no token, so nothing else orders the save thread's pack stream after the producing kernels; `producer_fenced` in the transfer stats reports the wait was enqueued. Under PP the save frontier runs ahead of the forwards (`schedule()` advances it at dispatch), but it never covers the chunk of the batch whose metadata carries the save, and every stage takes metadata and batches in dispatch order: each records the event after enqueueing the forward of every chunk the save reads. |
+| Kimi-K3 state stores wait on the step's producer event | K3 `_start_state_stores`, `StateOffloadTier._do_store` | A checkpoint is READY once the batch carrying its slot->PAGE copy is issued, not once the copy has run, so the gather is ordered after the copy only by this event. |
+
+### Async save contract
+
+The dense KV save and the Kimi-K3 state store share one contract, written out
+above `record_save_fence` in `_offload_common.py`:
+
+- **Fence.** One event per step, recorded on the current stream after the
+  writes the step's saves read are enqueued (`record_save_fence`), is handed to
+  every save of the step; the save thread host-waits on it (`wait_save_fence`)
+  before it reads the source, and the KV save also passes it to `store()` for
+  the pack stream. A fence that cannot be recorded fails the step's saves, and
+  one that raises while waited on fails that save.
+- **Lifecycle.** "Source safe to release" and "store succeeded" are separate
+  facts. Each save releases its source at most once and reports exactly one
+  terminal outcome on every path. The state store reports them apart through
+  `SaveLifecycle`: the release as soon as the D2H drains, or at the terminal
+  when the store was refused or raised. The KV save's terminal comes from
+  `_do_save_req`, or from `_guard` when it raised; with early block release the
+  GPU connector reports the source per staging group, and without it (Kimi-K3)
+  the terminal releases the source.
+
+KV chunk packing and state image packing stay separate, and both saves keep
+the host wait.
 
 ### Failure handling
 
@@ -1462,7 +1501,8 @@ env var. This per-thread isolation is exactly why load and save never contend.
   `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
+  servers derive the **same** ZMQ socket path, one per server
+  (`server_instance_id`) and DP rank.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts
@@ -1544,7 +1584,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
 | `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
-| `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
+| `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)`, × `pipeline_parallel_size` on Kimi-K3's connector | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — (48 MiB for `mooncake_store`) | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |

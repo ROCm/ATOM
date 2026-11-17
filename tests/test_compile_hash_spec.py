@@ -32,6 +32,7 @@ def _hash(spec=None):
 
 
 def _spec(method="dspark", k=3, **kw):
+    kw.setdefault("draft_kv_dtype", "bf16")  # a field of every SpeculativeConfig
     return SimpleNamespace(method=method, num_speculative_tokens=k, **kw)
 
 

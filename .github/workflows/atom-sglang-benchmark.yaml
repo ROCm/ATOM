@@ -1,15 +1,26 @@
 name: ATOM SGLang Benchmark
+# Scheduled MI355 and MI308 nights are separate runs; the title tells
+# atom-nightly-deadline.yaml which ones to stop at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled {1})', github.workflow, github.event.schedule == '0 15 * * 1-6' && 'MI308' || 'MI355') || github.workflow }}"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}${{ github.event.schedule && format('-{0}', github.event.schedule) || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 on:
   schedule:
-    # Nightly at 23:00 Beijing time (15:00 UTC). MI308 runs Mon-Sat; MI355 tiers run Tue/Thu/Sat.
-    - cron: '0 15 * * 1,3,5'  # Mon/Wed/Fri: MI308 only
-    - cron: '0 15 * * 2,4'    # Tue/Thu: SGLang-OOB P0 + P1 on MI355, plus MI308
-    - cron: '0 15 * * 6'      # Sat only: SGLang-OOB P0 + P1 + P2 on MI355, plus MI308
+    # Nightly at 23:00 Beijing time (15:00 UTC), so the cron weekday is the
+    # Beijing weekday. MI355 and MI308 are separate runs: one MI355 cron a
+    # night (MI355_WEEKLY_SCHEDULE in load-models runs each MI355 case on one
+    # night a week) and MI308_NIGHTLY_CRON for MI308, Mon-Sat.
+    - cron: '0 15 * * 1-6'
+    - cron: '0 15 * * 0'
+    - cron: '0 15 * * 1'
+    - cron: '0 15 * * 2'
+    - cron: '0 15 * * 3'
+    - cron: '0 15 * * 4'
+    - cron: '0 15 * * 5'
+    - cron: '0 15 * * 6'
   workflow_dispatch:
     inputs:
       benchmark_suite:
@@ -28,34 +39,11 @@ on:
           - all
           - OOB_P0
           - OOB_P1
-          - OOB_P2
           - OOB_P0+OOB_P1
           - DeepSeek-V4-Pro TP8
-          - DeepSeek-V4-Pro MTP1 TP8
           - DeepSeek-V4-Pro MTP3 TP8
           - DeepSeek-V4-Pro Prefix Cache TP8
-          - DeepSeek-V3.2 FP8 TP4
-          - DeepSeek-V3.2 FP8 TP4 DP4 EP4
-          - DeepSeek-V3.2 FP8 TP8
-          - DeepSeek-V3.2 FP8 TP8 DP8 EP8
-          - DeepSeek-R1 FP8 TP4
-          - DeepSeek-R1 FP8 TP8
-          - DeepSeek-R1 FP4 TP4
-          - DeepSeek-R1 FP4 TP4 DP4 EP4
-          - DeepSeek-R1 FP4 TP8
-          - DeepSeek-R1 FP4 TP8 EP8
-          - DeepSeek-R1 FP4 TP8 DP8 EP8
-          - DeepSeek-R1 FP4 TP8 MTP1
-          - DeepSeek-R1 FP4 TP8 MTP3
-          - DeepSeek-R1 FP4 MTP3 TP4 DP4 EP4
-          - DeepSeek-R1 FP4 MTP3 TP8 DP8 EP8
-          - Qwen3.5-397B-A17B-FP8 TP4
-          - Qwen3.5-397B-A17B-FP8 TP8
-          - Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8
-          - Qwen3.8-Flash-Next-FP8 TP2
-          - GLM-5.1 FP8 TP8
           - GLM-5.2 FP8 TP4
-          - GLM-5.2 FP8 TP4 PCP4
           - GLM-5.2 FP4 TP4
           - Kimi-K3 TP8
           - GLM-5.2 FP4 TP4 MTP3
@@ -407,7 +395,7 @@ jobs:
           WORKLOAD_LABEL="SGLang-OOB"
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
             case "${SCHEDULE_CRON}" in
-              "0 15 * * 1,3,5"|"0 15 * * 2,4"|"0 15 * * 6") WORKLOAD_LABEL="SGLang-OOB" ;;
+              "0 15 * * "[0-6]|"0 15 * * 1-6") WORKLOAD_LABEL="SGLang-OOB" ;;
               *) WORKLOAD_LABEL="SGLang-OOB" ;;
             esac
           fi
@@ -683,31 +671,9 @@ jobs:
 
           MODEL_SELECTION_ALIASES = {
               "DeepSeek-V4-Pro TP8": "deepseek-v4-pro-tp8",
-              "DeepSeek-V4-Pro MTP1 TP8": "deepseek-v4-pro-mtp1-tp8",
               "DeepSeek-V4-Pro MTP3 TP8": "deepseek-v4-pro-mtp3-tp8",
               "DeepSeek-V4-Pro Prefix Cache TP8": "deepseek-v4-pro-prefix-cache-tp8",
-              "DeepSeek-V3.2 FP8 TP4": "deepseek-v3-2-fp8-tp4",
-              "DeepSeek-V3.2 FP8 TP4 DP4 EP4": "deepseek-v3-2-fp8-tp4-dp4-ep4",
-              "DeepSeek-V3.2 FP8 TP8": "deepseek-v3-2-fp8-tp8",
-              "DeepSeek-V3.2 FP8 TP8 DP8 EP8": "deepseek-v3-2-fp8-tp8-dp8-ep8",
-              "DeepSeek-R1 FP8 TP4": "deepseek-r1-fp8-tp4",
-              "DeepSeek-R1 FP8 TP8": "deepseek-r1-fp8-tp8",
-              "DeepSeek-R1 FP4 TP4": "deepseek-r1-fp4-tp4",
-              "DeepSeek-R1 FP4 TP4 DP4 EP4": "deepseek-r1-fp4-tp4-dp4-ep4",
-              "DeepSeek-R1 FP4 TP8": "deepseek-r1-fp4-tp8",
-              "DeepSeek-R1 FP4 TP8 EP8": "deepseek-r1-fp4-tp8-ep8",
-              "DeepSeek-R1 FP4 TP8 DP8 EP8": "deepseek-r1-fp4-tp8-dp8-ep8",
-              "DeepSeek-R1 FP4 TP8 MTP1": "deepseek-r1-fp4-tp8-mtp1",
-              "DeepSeek-R1 FP4 TP8 MTP3": "deepseek-r1-fp4-tp8-mtp3",
-              "DeepSeek-R1 FP4 MTP3 TP4 DP4 EP4": "deepseek-r1-fp4-mtp3-tp4-dp4-ep4",
-              "DeepSeek-R1 FP4 MTP3 TP8 DP8 EP8": "deepseek-r1-fp4-mtp3-tp8-dp8-ep8",
-              "Qwen3.5-397B-A17B-FP8 TP4": "qwen3-5-397b-a17b-fp8-tp4",
-              "Qwen3.5-397B-A17B-FP8 TP8": "qwen3-5-397b-a17b-fp8-tp8",
-              "Qwen3.8-2.4T-A95B-Quark-MXFP4 TP8": "qwen3-8-2-4t-a95b-quark-mxfp4-tp8",
-              "Qwen3.8-Flash-Next-FP8 TP2": "qwen3-8-flash-next-fp8-tp2",
-              "GLM-5.1 FP8 TP8": "glm-5-1-fp8-tp8",
               "GLM-5.2 FP8 TP4": "glm-5-2-fp8-tp4",
-              "GLM-5.2 FP8 TP4 PCP4": "glm-5-2-fp8-tp4-pcp4",
               "GLM-5.2 FP4 TP4": "glm-5-2-fp4-tp4",
               "GLM-5.2 FP4 TP4 MTP3": "glm-5-2-fp4-tp4-mtp3",
               "MiniMax-M3-MXFP4 TP4": "minimax-m3-mxfp4-tp4",
@@ -735,38 +701,14 @@ jobs:
 
           OOB_P0_PREFIX_ORDER = [
               "deepseek-v4-pro-tp8",
-              "deepseek-v4-pro-mtp1-tp8",
               "deepseek-v4-pro-mtp3-tp8",
               "glm-5-2-fp8-tp4",
-              "glm-5-2-fp8-tp4-pcp4",
               "glm-5-2-fp4-tp4",
               "glm-5-2-fp4-tp4-mtp3",
               "minimax-m3-mxfp4-tp4",
           ]
           OOB_P1_PREFIX_ORDER = [
-              "deepseek-v3-2-fp8-tp4",
-              "deepseek-v3-2-fp8-tp4-dp4-ep4",
-              "deepseek-v3-2-fp8-tp8",
-              "deepseek-v3-2-fp8-tp8-dp8-ep8",
               "minimax-m3-mxfp8-eagle3-tp4-mtp3",
-          ]
-          OOB_P2_PREFIX_ORDER = [
-              "deepseek-r1-fp8-tp8",
-              "deepseek-r1-fp8-tp4",
-              "deepseek-r1-fp4-tp8",
-              "deepseek-r1-fp4-tp8-ep8",
-              "deepseek-r1-fp4-tp8-dp8-ep8",
-              "deepseek-r1-fp4-tp8-mtp3",
-              "deepseek-r1-fp4-tp8-mtp1",
-              "deepseek-r1-fp4-tp4",
-              "deepseek-r1-fp4-tp4-dp4-ep4",
-              "deepseek-r1-fp4-mtp3-tp4-dp4-ep4",
-              "deepseek-r1-fp4-mtp3-tp8-dp8-ep8",
-              "qwen3-5-397b-a17b-fp8-tp4",
-              "qwen3-5-397b-a17b-fp8-tp8",
-              "qwen3-8-2-4t-a95b-quark-mxfp4-tp8",
-              "qwen3-8-flash-next-fp8-tp2",
-              "glm-5-1-fp8-tp8",
           ]
 
           def is_oob_mi308(model):
@@ -783,24 +725,29 @@ jobs:
                       by_prefix[prefix] = model
               return by_prefix
 
+          # Each MI355 OOB_P0 / OOB_P1 case runs on one night a week, keyed by
+          # the night's cron (23:00 Beijing time, Beijing weekday). MI308 has
+          # its own run, every night but Sunday, which the 09:00 deadline
+          # leaves alone. The accuracy workflow spreads its MI355 cases over
+          # the same nights.
+          MI355_WEEKLY_SCHEDULE = {
+              "0 15 * * 1": ("Mon", ["deepseek-v4-pro-tp8"]),
+              "0 15 * * 2": ("Tue", ["deepseek-v4-pro-mtp3-tp8"]),
+              "0 15 * * 3": ("Wed", ["glm-5-2-fp8-tp4"]),
+              "0 15 * * 4": ("Thu", ["glm-5-2-fp4-tp4"]),
+              "0 15 * * 5": ("Fri", ["glm-5-2-fp4-tp4-mtp3"]),
+              "0 15 * * 6": ("Sat", ["minimax-m3-mxfp4-tp4"]),
+              "0 15 * * 0": ("Sun", ["minimax-m3-mxfp8-eagle3-tp4-mtp3"]),
+          }
+          MI308_NIGHTLY_CRON = "0 15 * * 1-6"  # also in run-name
+
           def scheduled_oob_selection(schedule_cron):
-              schedule_to_tiers = {
-                  "0 15 * * 1,3,5": ("MI308-only", []),
-                  "0 15 * * 2,4": (
-                      "OOB-P0+P1",
-                      OOB_P0_PREFIX_ORDER + OOB_P1_PREFIX_ORDER,
-                  ),
-                  "0 15 * * 6": (
-                      "OOB-P0+P1+P2",
-                      OOB_P0_PREFIX_ORDER
-                      + OOB_P1_PREFIX_ORDER
-                      + OOB_P2_PREFIX_ORDER,
-                  ),
-              }
-              if schedule_cron not in schedule_to_tiers:
+              if schedule_cron == MI308_NIGHTLY_CRON:
+                  return "MI308 nightly", select_oob_models([], include_mi308=True)
+              if schedule_cron not in MI355_WEEKLY_SCHEDULE:
                   return "SKIP-UNKNOWN-DAY", []
-              selected_group, tier_order = schedule_to_tiers[schedule_cron]
-              return selected_group, select_oob_models([tier_order], include_mi308=True)
+              night, mi355_prefixes = MI355_WEEKLY_SCHEDULE[schedule_cron]
+              return f"{night}: MI355 weekly", select_oob_models([mi355_prefixes], include_mi308=False)
 
           def select_oob_models(tier_orders, include_mi308):
               by_prefix = first_model_by_prefix(models)
@@ -832,7 +779,6 @@ jobs:
           MANUAL_OOB_SELECTIONS = {
               "OOB_P0": ("OOB_P0", [OOB_P0_PREFIX_ORDER]),
               "OOB_P1": ("OOB_P1", [OOB_P1_PREFIX_ORDER]),
-              "OOB_P2": ("OOB_P2", [OOB_P2_PREFIX_ORDER]),
               "OOB_P0+OOB_P1": ("OOB_P0+OOB_P1", [OOB_P0_PREFIX_ORDER, OOB_P1_PREFIX_ORDER]),
           }
 

@@ -4,18 +4,9 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
     types: [opened, synchronize, reopened, ready_for_review, labeled, closed]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'atom/plugin/sglang/**'
-      - 'atom/mesh/**'
-      - '.github/benchmark/models_atomesh.yaml'
-      - '.github/scripts/atomesh/**'
-      - '.github/workflows/atomesh-*.yaml'
-      - '.github/workflows/atom-sglang-*.yaml'
-      - '.github/benchmark/sglang_models_accuracy.json'
-      - 'LICENSE'
-      - '.gitignore'
+    # Do not use paths-ignore here. The required gate must be published for
+    # every PR; ci-gate below keeps the old path-ignore behavior for expensive
+    # jobs.
   pull_request_review:
     types: [submitted]
 
@@ -42,6 +33,7 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      decidable: ${{ steps.gate.outputs.decidable }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -54,9 +46,13 @@ jobs:
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
+            .claude/**
             atom/plugin/sglang/**
             atom/mesh/**
+            .github/benchmark/models_atomesh.yaml
+            .github/scripts/atomesh/**
             .github/workflows/atomesh-*.yaml
+            .github/workflows/atom-review-bot*.yml
             .github/scripts/atomesh_*.sh
             .github/dashboard/atomesh_*.html
             .github/workflows/atom-sglang-*.yaml
@@ -141,16 +137,6 @@ jobs:
               VLLM_USE_V2_MODEL_RUNNER=1
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.93
-            runner: linux-atom-pitt-mi350x-8
-          - display_name: "GLM-5.2-MXFP4-MTP TP4"
-            model_name: "GLM-5.2-MXFP4-MTP"
-            model_path: "amd/GLM-5.2-MXFP4"
-            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9 --additional-config '{\"online_quant_config\": {\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\", \"model.layers.[1-6][0-9].mlp.*expert*\", \"model.layers.7[0-7].mlp.*expert*\"]}}' --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 3}'"
-            # vLLM keeps GlmMoeDsaForCausalLM on V1 on ROCm unless asked; this
-            # cell runs it, and its MTP draft, on Model Runner V2.
-            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nAITER_USE_FLYDSL_MOE_SORTING=1\nVLLM_USE_V2_MODEL_RUNNER=1"
-            lm_eval_num_fewshot: 20
-            accuracy_test_threshold: 0.91
             runner: linux-atom-pitt-mi350x-8
           - display_name: "MiniMax-M3-MXFP4 EAGLE3 TP4"
             model_name: "MiniMax-M3-MXFP4-EAGLE3"
@@ -332,3 +318,32 @@ jobs:
           name: oot-${{ matrix.model_name }}-artifacts
           path: plugin-ci-results/
           if-no-files-found: ignore
+
+  atom-vllm-test-gate:
+    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.should_run == 'true') && 'ATOM vLLM Test Gate' || 'ATOM vLLM Test Gate not requested' }}
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - ci-gate
+      - check-signal
+      - download_aiter_wheel
+      - atom-vllm-oot
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Evaluate ATOM vLLM test gate
+        uses: ./.github/actions/evaluate-test-gate
+        with:
+          gate-name: ATOM vLLM Test Gate
+          suite-name: ATOM vLLM tests
+          should-run: ${{ needs.ci-gate.outputs.should_run }}
+          decidable: ${{ needs.ci-gate.outputs.decidable }}
+          reason: ${{ needs.ci-gate.outputs.reason }}
+          ci-gate-result: ${{ needs.ci-gate.result }}
+          required-results: |
+            check-signal=${{ needs.check-signal.result }}
+            download_aiter_wheel=${{ needs.download_aiter_wheel.result }}
+            atom-vllm-oot=${{ needs.atom-vllm-oot.result }}

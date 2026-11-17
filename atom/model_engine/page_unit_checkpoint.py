@@ -14,6 +14,7 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_entry_bytes
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -45,14 +46,12 @@ class PagedStateCheckpointSpec:
     image_bytes: int
     # Pipeline stages hold images of different sizes in units of different
     # sizes, yet one scheduler hands every stage the same unit ids. These are
-    # what the stages agreed on: the largest unit count any stage needs, the
-    # bytes an op names (every stage's image, summed), and the largest image
-    # any stage holds, which bounds how many images every stage's CPU tier
-    # keeps. 0 outside PP, where the image alone decides all three.
-    # `layout_id` is then the stages' joint id.
+    # what the stages agreed on: the largest unit count any stage needs and
+    # the bytes an op names (every stage's image, summed), which also splits
+    # the stages' CPU state budget. 0 outside PP, where the image alone
+    # decides both. `layout_id` is then the stages' joint id.
     pipeline_units: int = 0
     pipeline_op_bytes: int = 0
-    pipeline_image_bytes: int = 0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -72,19 +71,11 @@ class PagedStateCheckpointSpec:
         for name, value in (
             ("pipeline_units", self.pipeline_units),
             ("pipeline_op_bytes", self.pipeline_op_bytes),
-            ("pipeline_image_bytes", self.pipeline_image_bytes),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        if not (
-            bool(self.pipeline_units)
-            == bool(self.pipeline_op_bytes)
-            == bool(self.pipeline_image_bytes)
-        ):
-            raise ValueError(
-                "pipeline_units, pipeline_op_bytes and pipeline_image_bytes are "
-                "agreed together"
-            )
+        if bool(self.pipeline_units) != bool(self.pipeline_op_bytes):
+            raise ValueError("pipeline_units and pipeline_op_bytes are agreed together")
         if self.pipeline_units and self.pipeline_units < self._own_units:
             raise ValueError(
                 f"the stages agreed on {self.pipeline_units} units but this "
@@ -94,14 +85,6 @@ class PagedStateCheckpointSpec:
             raise ValueError(
                 f"pipeline_op_bytes {self.pipeline_op_bytes} is less than this "
                 f"stage's own {self.image_bytes} B image"
-            )
-        if self.pipeline_image_bytes and not (
-            self.image_bytes <= self.pipeline_image_bytes <= self.pipeline_op_bytes
-        ):
-            raise ValueError(
-                f"pipeline_image_bytes {self.pipeline_image_bytes} is not "
-                f"between this stage's {self.image_bytes} B image and the "
-                f"{self.pipeline_op_bytes} B all stages hold"
             )
 
     @property
@@ -117,21 +100,12 @@ class PagedStateCheckpointSpec:
         """The `total_bytes` a store or restore op names for one image."""
         return self.pipeline_op_bytes or self.image_bytes
 
-    @property
-    def largest_image_bytes(self) -> int:
-        """The largest image any stage's CPU tier keeps an entry of."""
-        return self.pipeline_image_bytes or self.image_bytes
-
     def for_pipeline(
-        self, layout_id: str, units: int, op_bytes: int, largest_image_bytes: int
+        self, layout_id: str, units: int, op_bytes: int
     ) -> PagedStateCheckpointSpec:
         """This stage's spec under the geometry every stage agreed on."""
         return replace(
-            self,
-            layout_id=layout_id,
-            pipeline_units=units,
-            pipeline_op_bytes=op_bytes,
-            pipeline_image_bytes=largest_image_bytes,
+            self, layout_id=layout_id, pipeline_units=units, pipeline_op_bytes=op_bytes
         )
 
     def to_wire(self) -> dict[str, int | str]:
@@ -146,7 +120,6 @@ class PagedStateCheckpointSpec:
         if self.pipeline_units:
             wire["pipeline_units"] = self.pipeline_units
             wire["pipeline_op_bytes"] = self.pipeline_op_bytes
-            wire["pipeline_image_bytes"] = self.pipeline_image_bytes
         return wire
 
     @classmethod
@@ -154,11 +127,7 @@ class PagedStateCheckpointSpec:
         if not isinstance(wire, Mapping):
             raise TypeError("paged state checkpoint spec must be a mapping")
         expected = {"page_unit_bytes", "slot_bytes", "image_bytes", "layout_id"}
-        pipelined = expected | {
-            "pipeline_units",
-            "pipeline_op_bytes",
-            "pipeline_image_bytes",
-        }
+        pipelined = expected | {"pipeline_units", "pipeline_op_bytes"}
         if set(wire) not in (expected, pipelined):
             raise ValueError(
                 "invalid paged state checkpoint spec fields: "
@@ -172,8 +141,33 @@ class PagedStateCheckpointSpec:
             layout_id=wire["layout_id"],  # type: ignore[arg-type]
             pipeline_units=wire.get("pipeline_units", 0),  # type: ignore[arg-type]
             pipeline_op_bytes=wire.get("pipeline_op_bytes", 0),  # type: ignore[arg-type]
-            pipeline_image_bytes=wire.get("pipeline_image_bytes", 0),  # type: ignore[arg-type]
         )
+
+
+def published_page_unit_bytes(builder) -> int:
+    """Bytes of one PAGE unit a checkpoint transfer publishes for `builder`.
+
+    The state image lives in the target's own PAGE rows, so the unit is the
+    target builder's share of the paged class, not the merged entry: a draft
+    KV pool joined to the same class is ordinary KV after those rows. A
+    backend whose charged share exceeds what it publishes (alignment padding
+    that is not a region) narrows it with `checkpoint_page_unit_bytes()`;
+    `None` keeps the share.
+    """
+    unit = page_entry_bytes(builder.sub_pool_specs())
+    if unit <= 0:
+        raise RuntimeError(f"{type(builder).__name__} declares no PAGE bytes")
+    published_unit = getattr(builder, "checkpoint_page_unit_bytes", None)
+    published = published_unit() if callable(published_unit) else None
+    if published is None:
+        return unit
+    published = int(published)
+    if published <= 0 or published > unit:
+        raise RuntimeError(
+            f"checkpoint PAGE unit is {published} B but "
+            f"{type(builder).__name__} declares {unit} B per block"
+        )
+    return published
 
 
 def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:

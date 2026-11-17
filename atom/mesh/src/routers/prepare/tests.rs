@@ -2,13 +2,17 @@ mod a_chat_template {
     use serde_json::json;
 
     use crate::protocols::{
-        chat::{ChatMessage, MessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},
     };
     use crate::routers::prepare::chat_template::{
-        process_content_format, process_tool_call_arguments, ProcessedMessages,
+        process_chat_messages, process_content_format, process_tool_call_arguments,
+        ProcessedMessages,
     };
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
+    use crate::routers::test_mocks::tokenizer::hf_tokenizer_path;
+    use crate::tokenizer::{
+        chat_template::ChatTemplateContentFormat, traits::Tokenizer, HuggingFaceTokenizer,
+    };
 
     fn user_parts(parts: Vec<ContentPart>) -> ChatMessage {
         ChatMessage::User {
@@ -177,6 +181,53 @@ mod a_chat_template {
     fn test_processed_messages_has_no_multimodal_field() {
         let ty = std::any::type_name::<ProcessedMessages>();
         assert!(ty.ends_with("ProcessedMessages"));
+    }
+
+    /// The engine renders with transformers, so routed tokens only match its KV
+    /// cache when this render is byte-identical. This toy template covers two of
+    /// the renders 1.4.2 changed: `tojson` is `json.dumps`, which leaves `<>&'`
+    /// unescaped, unlike Jinja's, and history tool-call arguments are a dict. The
+    /// expected text is transformers 5.16.1's `_compile_jinja_template(TEMPLATE)
+    /// .render(messages=..., tools=..., add_generation_prompt=True)` for this request.
+    #[test]
+    fn test_tojson_and_tool_call_arguments_render_as_in_transformers() {
+        const TEMPLATE: &str = r#"{% for tool in tools %}
+{{ tool.function | tojson }}
+{% endfor %}
+{% for m in messages %}
+    {% if m.role == 'system' %}{% continue %}{% endif %}
+{{ m.role }}:{% for k, v in (m.tool_calls[0].function.arguments if m.tool_calls else {}).items() %} {{ k }}={{ v }}{% endfor %};
+{% endfor %}"#;
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(TEMPLATE.to_string()).unwrap();
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "c0",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\": \"a.txt\", \"limit\": 5}"}
+                }]}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "read",
+                "description": "Read a file's <head> & tail.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+            }}]
+        }))
+        .unwrap();
+
+        let rendered = process_chat_messages(&request, &tokenizer).unwrap().text;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                r#"{"name": "read", "description": "Read a file's <head> & tail.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}"#,
+                "\nuser:;\nassistant: path=a.txt limit=5;\n",
+            )
+        );
     }
 }
 

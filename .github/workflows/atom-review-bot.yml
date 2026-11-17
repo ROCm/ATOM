@@ -30,7 +30,10 @@ on:
     types: [created]
 
 permissions:
-  contents: read          # read-only; comments are posted with the bot's own PAot PAT
+  contents: read          # read-only; comments are posted with the bot's own PAT
+  pull-requests: read     # fetch.sh reads the PR via `gh pr view`/`gh pr diff` and its
+                          # review comments via `gh api .../pulls/<n>/comments`. Read only:
+                          # check_prompts.py still asserts no issues/pull-requests WRITE.
 
 concurrency:
   # Serialize repeated triggers on the same PR; do not cancel an in-flight review.
@@ -186,13 +189,40 @@ jobs:
           ATOM_BOT_LOGIN: ${{ vars.ATOM_BOT_LOGIN }}
         if: env.ATOM_BOT_TOKEN != ''
         run: |
-          curl -s -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
+          # The 👀 is cosmetic, so this step must never fail the job -- but it must not
+          # report success for a reaction that was never added either. `>/dev/null || true`
+          # did both: the first live run on ATOM logged a green claim step and left no
+          # reaction on the comment. Print the status instead; a 4xx here is the earliest
+          # visible sign that the token cannot act on this repo, which is the same root
+          # cause that will silently break the card and the failure notice further down.
+          code=$(curl -s -o /tmp/eyes.json -w '%{http_code}' \
+            -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -d '{"content":"eyes"}' >/dev/null || true
+            -d '{"content":"eyes"}') || true   # `|| true` AFTER the assignment, not inside
+          # the substitution: the step runs under `bash -e`, so an unguarded `code=$(curl ...)`
+          # aborts it on a connection failure (exit 7) -- and this step must never fail the
+          # job. Guarding inside the substitution instead (`... || echo 000`) appends a second
+          # 000 to the one curl's %{http_code} already prints, logging HTTP 000000.
+          if [[ "$code" == 2* ]]; then
+            echo "claimed 👀 (HTTP $code)"
+          else
+            echo "::warning title=atom-review-bot::could not claim 👀 as the bot (HTTP $code): $(head -c 300 /tmp/eyes.json 2>/dev/null)"
+          fi
 
       - name: Review (headless GLM)
         id: review
+        env:
+          # fetch.sh shells out to `gh`, which refuses to use an ambient login once it sees
+          # GITHUB_ACTIONS=true -- without this the step dies at "fetch produced no WORK dir"
+          # with gh's own "set the GH_TOKEN environment variable" on the line above. The
+          # other three jobs already pass github.token the same way; this one was the gap.
+          #
+          # github.token, NOT ATOM_BOT_TOKEN: this step runs the agent with
+          # --dangerously-skip-permissions, so it must never hold a credential that can
+          # write. github.token is scoped by the permissions block above (read only) and
+          # expires with the run.
+          GH_TOKEN: ${{ github.token }}
         run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR" "$GITHUB_REPOSITORY"
 
       # P0.5: ATOM_BOT_TOKEN is live, so _publish.py is invoked with --post and actually
@@ -236,8 +266,10 @@ jobs:
             printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.atom-review-status"
           fi
           # _notify.py sets the `notified` output itself, and only once a post has actually
-          # landed. It returns 0 without posting in three cases -- no status file, no token, a
-          # POST that threw -- and in every one of them the report job must still speak.
+          # landed. It returns 0 without posting in four cases -- no status file, no token, a
+          # POST that threw, and a POST GitHub answered 2xx without creating a comment (a
+          # redirect downgrades it to a GET) -- and in every one of them the report job must
+          # still speak.
           python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
 
   report:

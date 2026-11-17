@@ -193,8 +193,8 @@ def check_req_words():
     """[3] The request words of the programs that use ATOM's storage in place (``_req_words`` / ``_dead_words``): a
     live request's batch id, slot and liveness and its rows' (its padding rows dead), a pad request (batch id -1) and
     a request whose slot is out of range dead with all their rows, the batch slots past the step's requests and the
-    rows past its rows dead (none of their stores may reach ATOM's storage), their first positions 0; the page
-    geometry's words untouched."""
+    rows past its rows dead (none of their stores may reach ATOM's storage), their first positions and bounds 0; the
+    page geometry's words untouched."""
     num_slots, bm, rq, nb = 4, 6, 6, 4
     rows = nb * rq
     batch = torch.tensor(
@@ -204,8 +204,13 @@ def check_req_words():
     positions = torch.arange(rows, dtype=torch.int64) + 100
     req = torch.full((ml.REQ_WORDS,), 77, dtype=torch.int32)
     pos = torch.full((bm,), 77, dtype=torch.int32)
-    ml._req_words_kernel[(nb,)](positions, batch, slot_map, num_slots, 1 << 20, req, pos, rows, NB=nb, BM=bm,
-                                RQP=8)  # fmt: skip
+    rb = 64
+    bounds = torch.full((3, rb), 77, dtype=torch.int32)
+    ml._req_words_kernel[(nb,)](positions, batch, slot_map, num_slots, 1 << 20, req, pos, bounds, rows, NB=nb, BM=bm,
+                                RQP=8, RB=rb)  # fmt: skip
+    # the dead slots' rows' bounds 0 (rows .. bm x rq), the rest untouched (a live request's: ``_step_bounds``)
+    want_bounds = torch.full((3, rb), 77, dtype=torch.int32)
+    want_bounds[:, rows : bm * rq] = 0
     want = [77] * 4
     want += [
         0,
@@ -222,8 +227,10 @@ def check_req_words():
     want += [1] * 10 + [0] * (ml.MAX_ROWS - 10)  # rows
     report(
         "[3] request words: live / padding rows / pad request / bad slot / dead slots and rows",
-        req.tolist() == want and pos.tolist() == [77] * nb + [0] * (bm - nb),
-        f"({req.tolist()}, {pos.tolist()})",
+        req.tolist() == want
+        and pos.tolist() == [77] * nb + [0] * (bm - nb)
+        and torch.equal(bounds, want_bounds),
+        f"({req.tolist()}, {pos.tolist()}, {bounds.tolist()})",
     )
 
 
@@ -371,8 +378,8 @@ def check_fused(engram: bool = False):
         w["h_in"][:rows].copy_(w["hidden"].view(rows, 1, -1).expand(rows, 4, hid))
         ml._import_rings_kernel[(len(mf), win)](w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"],
                                                 w["bounds"], *geo, rows, WIN=win, DIM=dim, RB=8)  # fmt: skip
-        ml._req_words_kernel[(1,)](positions, batch, slot_map, num_slots, 1 << 20, w["req"], w["pos"], rows, NB=1, BM=1,
-                                   RQP=8)  # fmt: skip
+        ml._req_words_kernel[(1,)](positions, batch, slot_map, num_slots, 1 << 20, w["req"], w["pos"], w["bounds"],
+                                   rows, NB=1, BM=1, RQP=8, RB=8)  # fmt: skip
         hi_writes(w)
         ml._gates_planar_kernel[(rows,)](
             w["gate"], w["pre"], w["post"], w["comb"], NMIX=24, NHC=4
@@ -631,11 +638,12 @@ def check_incremental(configs=((16, 7), (128, 64), (5, 300)), control: bool = Tr
 class _BatchWorld:
     """ATOM's side and the hi-side buffers of a batch-capable hook (``BM`` request slots), with requests "A".."F"
     each its own slot: the pool (its rings); the hi-side rings [NMF, BM, WIN, DIM], ``pos`` [BM], bounds [3, RB] a
-    row, the request words ``req``, ``imp`` [BM x 4]; the end step's taps / gates a row. (``pos`` has 8 spare words:
-    a one-request launch on a later request's views clears the dead slots' first positions past its own.)
+    row, the request words ``req``, ``imp`` [BM x 4]; the end step's taps / gates a row. (``pos`` has 8 spare words
+    and the bounds' planes room for BM requests' rows past the last request's first row: a one-request launch on a
+    later request's views clears the dead slots' first positions and bounds past its own.)
     """
 
-    dim, win, hid, RB = 512, 128, 2048, 32
+    dim, win, hid, RB = 512, 128, 2048, 64
     mf = (0, 2, 3, 20, 39)
     ring_start0, ring_slots, slot_rows, num_slots = 37000, 134, 6000, 6
 
@@ -739,8 +747,8 @@ class _BatchWorld:
         ml._import_rings_kernel[(len(self.mf), self.win, nb)](
             w["pool"], positions, batch, slot_map, w["rings"], ids, w["pos"], w["bounds"], *self.geo(), rows,
             WIN=self.win, DIM=self.dim, RB=self.RB, NB=nb, BM=self.bm)  # fmt: skip
-        ml._req_words_kernel[(nb,)](positions, batch, slot_map, self.num_slots, 1 << 20, w["req"], w["pos"], rows,
-                                    NB=nb, BM=self.bm, RQP=triton.next_power_of_2(rq))  # fmt: skip
+        ml._req_words_kernel[(nb,)](positions, batch, slot_map, self.num_slots, 1 << 20, w["req"], w["pos"],
+                                    w["bounds"], rows, NB=nb, BM=self.bm, RQP=triton.next_power_of_2(rq), RB=self.RB)  # fmt: skip
         return rq
 
     def separate_end(self, positions, batch, slot_map, rows, nb):
@@ -1019,9 +1027,10 @@ def check_batch_incremental(configs=((16, 7), (128, 64), (5, 300))):
 
 
 class _BandWorld(_BatchWorld):
-    """``_BatchWorld`` with the batch bands' slots: 8 requests "A".."H" (a slot each) and the bounds of 48 rows."""
+    """``_BatchWorld`` with the batch bands' slots: 8 requests "A".."H" (a slot each) and the bounds of 48 rows (and
+    the one-request views' 42 + 48)."""
 
-    num_slots, RB = 8, 64
+    num_slots, RB = 8, 128
 
 
 def check_bands():
@@ -1118,6 +1127,39 @@ def check_bands():
         "[10g] batch bands: split past MAX_BATCH, _band_step, the bridge at 5 / 8 of 8 request slots",
         ok,
         f"({notes})" if notes else "",
+    )
+
+
+def check_band_shrink():
+    """[10h] A band's dead slots after its batch shrank (requests finished; the hang of the 6-8-request steps): every
+    batch slot's rows' bounds [3, RB] are at most those of a request at the slot's first position ``pos[b]``
+    ((p + j + 1) // 2, p + j + 1, ceil((p + j + 1) / 8); equal on a live request), so a dead request's TopKs never rank
+    past the tiles its Indexer scores from ``pos[b]`` (0): an earlier step's bounds left on a dead slot (its request
+    gone) had them poll scores no task of the launch puts. Steps of 8, 6, 5 then 7 requests of ~2K tokens, the
+    fused begin-step (incremental import) on the bands' 8 request slots."""
+    rq, bm = 6, 8
+    slot_of = {k: i for i, k in enumerate("CHAEGBDF")}
+    ctx = {"A": 2043, "B": 2100, "C": 1990, "D": 2500, "E": 700, "F": 2044, "G": 1500, "H": 2300}  # fmt: skip
+    w = _BandWorld(bm, bm * rq, 300)
+    notes = []
+    for t, names in enumerate(("ABCDEFGH", "ACDEFG", "ACDFG", "ACDEFGH")):
+        reqs = [(n, ctx[n] + 6 * t, rq) for n in names]
+        positions, batch, slot_map = _batch_step(reqs, rq, slot_of)
+        nb = len(reqs)
+        w.begin(positions, batch, slot_map, nb * rq, nb, incr=True)
+        pos, bounds = w.w["pos"][:bm].long(), w.w["bounds"].long()
+        for b in range(bm):
+            p1 = pos[b] + torch.arange(rq) + 1
+            want = torch.stack((p1 // 2, p1, (p1 + 7) // 8))
+            got = bounds[:, b * rq : (b + 1) * rq]
+            ok = torch.equal(got, want) if b < nb else bool((got <= want).all())
+            if not ok:
+                notes.append(f"step {t} ({nb} requests) slot {b}{'' if b < nb else ' (dead)'}: pos {int(pos[b])}, "
+                             f"bounds {got[0].tolist()}")  # fmt: skip
+    report(
+        "[10h] batch bands: a dead slot's bounds within its first position's after the batch shrank",
+        not notes,
+        f"({notes[:3]})" if notes else "",
     )
 
 
@@ -1638,6 +1680,11 @@ def test_batch_incremental(rp):
 @interpreted
 def test_bands():
     _run(check_bands)
+
+
+@interpreted
+def test_band_shrink():
+    _run(check_band_shrink)
 
 
 @interpreted

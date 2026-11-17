@@ -83,6 +83,9 @@ def _producer(pages, mem, heads, partition, rank, monkeypatch):
             mc._pack_unit_layout(pages) and tuple(p.unit_spec for p in pages)
         ),
         _block_region_consumer_indices=None,
+        _slot_region_consumer_indices=None,
+        _slot_region_tp_segments=None,
+        _slot_region_tp_replicated=None,
         _unit_plans={},
         _slot_regions=[],
         _swa_block_regions=[],
@@ -268,8 +271,9 @@ def test_the_backend_views_sparse_layers_as_the_sparse_writer_lays_heads_out():
         KvGeometry(4, HEAD_DIM): {m: row for row, m in enumerate(modules)},
         aiter_attention.INDEX_ROWS: {modules[1]: 0},
     }
-    builder._index_cache_spec = lambda: aiter_attention._IndexCacheSpec(
-        1, 128, torch.float8_e4m3fn
+    builder.block_size, builder.block_ratio = BLOCK, 1
+    builder._index_cache_spec = lambda entry_tokens: aiter_attention._IndexCacheSpec(
+        1, (BLOCK * 128,), torch.float8_e4m3fn, (-1, BLOCK, 128)
     )
     pages = builder.get_kv_transfer_tensors().pages
     by_unit = {(p.unit_spec.field, p.unit_spec.layer): p for p in pages}
