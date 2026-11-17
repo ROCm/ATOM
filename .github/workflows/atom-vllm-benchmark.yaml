@@ -1,4 +1,7 @@
 name: ATOM vLLM Benchmark
+# Scheduled runs are titled "(scheduled MI355)" so atom-nightly-deadline.yaml
+# stops them at 09:00 Beijing time.
+run-name: "${{ github.event_name == 'schedule' && format('{0} (scheduled MI355)', github.workflow) || github.workflow }}"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event_name }}-${{ github.ref_name }}
@@ -7,12 +10,15 @@ concurrency:
 
 on:
   schedule:
-    # Mon/Wed/Fri at 23:30 Beijing (15:30 UTC); the cron weekday is the
-    # Beijing weekday. One cron a night: WEEKLY_SCHEDULE (load-models) runs
-    # each scheduled model on one night a week.
+    # Mon-Sat at 23:30 Beijing (15:30 UTC); the cron weekday is the Beijing
+    # weekday. One cron a night: WEEKLY_SCHEDULE (load-models) runs each
+    # scheduled model on one night a week.
     - cron: '30 15 * * 1'
+    - cron: '30 15 * * 2'
     - cron: '30 15 * * 3'
+    - cron: '30 15 * * 4'
     - cron: '30 15 * * 5'
+    - cron: '30 15 * * 6'
   workflow_dispatch:
     inputs:
       benchmark_client:
@@ -678,9 +684,12 @@ jobs:
           # Each scheduled model runs on one night a week, keyed by that
           # night's cron.
           WEEKLY_SCHEDULE = {
-              "30 15 * * 1": ("Mon", {"DeepSeek-V4-Flash TP4", "Kimi-K3 DSpark DCP8 TP8"}),
-              "30 15 * * 3": ("Wed", {"DeepSeek-V4.1-Flash DSpark TP4", "MiniMax-M3-MXFP4 EAGLE3 TP4"}),
-              "30 15 * * 5": ("Fri", {"GLM-5.3-Flash kpool MTP prefix-cache TP4", "Qwen3.5-397B-A17B-MXFP4 TP4"}),
+              "30 15 * * 1": ("Mon", {"DeepSeek-V4-Flash TP4"}),
+              "30 15 * * 2": ("Tue", {"DeepSeek-V4.1-Flash DSpark TP4"}),
+              "30 15 * * 3": ("Wed", {"Kimi-K3 DSpark DCP8 TP8"}),
+              "30 15 * * 4": ("Thu", {"MiniMax-M3-MXFP4 EAGLE3 TP4"}),
+              "30 15 * * 5": ("Fri", {"Qwen3.5-397B-A17B-MXFP4 TP4"}),
+              "30 15 * * 6": ("Sat", {"GLM-5.3-Flash kpool MTP prefix-cache TP4"}),
           }
 
           if event == "schedule":

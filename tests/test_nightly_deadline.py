@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Run atom-sglang-nightly-deadline.yaml's real Bash step against a fake `gh`:
+"""Run atom-nightly-deadline.yaml's real Bash step against a fake `gh`:
 the job must go red whenever runs could not be listed or stopped."""
 
 import os
@@ -14,10 +14,11 @@ import yaml
 
 WORKFLOW = (
     Path(__file__).resolve().parent.parent
-    / ".github/workflows/atom-sglang-nightly-deadline.yaml"
+    / ".github/workflows/atom-nightly-deadline.yaml"
 )
 BENCHMARK = "atom-sglang-benchmark.yaml"
 ACCURACY = "atom-sglang-accuracy-validation.yaml"
+VLLM_BENCHMARK = "atom-vllm-benchmark.yaml"
 
 # State lives in $FAKE_GH: unfinished/<workflow> holds a run id per line,
 # list_fails/<workflow> makes listing that workflow fail, and cancel_mode /
@@ -66,7 +67,7 @@ def deadline(tmp_path):
         cancel="stops",
         force_cancel="stops",
     ):
-        for workflow in (BENCHMARK, ACCURACY):
+        for workflow in workflows.split():
             ids = (unfinished or {}).get(workflow, [])
             (state / "unfinished" / workflow).write_text("".join(f"{i}\n" for i in ids))
         for workflow in list_fails:
@@ -104,10 +105,14 @@ def test_nothing_unfinished_is_green(deadline):
     assert (code, posts) == (0, [])
 
 
+def test_deadline_covers_sglang_and_vllm_benchmark():
+    assert _script()[0].split() == [BENCHMARK, ACCURACY, VLLM_BENCHMARK]
+
+
 def test_runs_that_stop_on_cancel_are_not_force_cancelled(deadline):
-    code, posts, _ = deadline({BENCHMARK: [1], ACCURACY: [2]})
+    code, posts, _ = deadline({BENCHMARK: [1], ACCURACY: [2], VLLM_BENCHMARK: [3]})
     assert code == 0
-    assert posts == [("cancel", 1), ("cancel", 2)]
+    assert posts == [("cancel", 1), ("cancel", 2), ("cancel", 3)]
 
 
 def test_runs_that_ignore_cancel_are_force_cancelled(deadline):
@@ -123,14 +128,16 @@ def test_failed_cancel_is_covered_by_force_cancel(deadline):
     assert "::warning::Cancelling run 1 failed" in out
 
 
-@pytest.mark.parametrize("unlisted", [BENCHMARK, ACCURACY])
-def test_a_workflow_that_cannot_be_listed_is_red_but_the_other_is_still_stopped(
+@pytest.mark.parametrize("unlisted", [BENCHMARK, ACCURACY, VLLM_BENCHMARK])
+def test_a_workflow_that_cannot_be_listed_is_red_but_the_others_are_still_stopped(
     deadline, unlisted
 ):
-    other_run = 2 if unlisted == BENCHMARK else 1
-    code, posts, out = deadline({BENCHMARK: [1], ACCURACY: [2]}, list_fails=[unlisted])
+    runs = {BENCHMARK: 1, ACCURACY: 2, VLLM_BENCHMARK: 3}
+    code, posts, out = deadline(
+        {workflow: [run] for workflow, run in runs.items()}, list_fails=[unlisted]
+    )
     assert code == 1
-    assert posts == [("cancel", other_run)]
+    assert posts == [("cancel", run) for w, run in runs.items() if w != unlisted]
     assert f"::error::Could not list the runs of {unlisted}." in out
 
 

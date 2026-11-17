@@ -19,6 +19,7 @@ WORKFLOWS = REPO / ".github" / "workflows"
 BENCHMARK = WORKFLOWS / "atom-vllm-benchmark.yaml"
 ACCURACY = WORKFLOWS / "atom-vllm-accuracy-validation.yaml"
 ACCURACY_CATALOG = REPO / ".github" / "benchmark" / "oot_models_accuracy.json"
+DEADLINE = WORKFLOWS / "atom-nightly-deadline.yaml"
 
 # 2026-11-16 is a Monday; the accuracy run of each Beijing date starts at 00:00.
 WEEK = [f"2026-11-{16 + day}T00:05:00+08:00" for day in range(7)]
@@ -68,7 +69,7 @@ def test_benchmark_runs_each_scheduled_model_once_a_week():
     workflow = _workflow(BENCHMARK)
     script = _embedded_python(workflow, "load-models", "load")
     crons = _crons(workflow)
-    assert sorted(crons) == ["30 15 * * 1", "30 15 * * 3", "30 15 * * 5"]
+    assert sorted(crons) == [f"30 15 * * {day}" for day in range(1, 7)]
 
     weekly = Counter()
     for cron in crons:
@@ -120,3 +121,14 @@ def test_accuracy_rejects_a_nightly_case_without_a_weekday(tmp_path):
     )
     assert result.returncode != 0
     assert "needs nightly_weekday" in result.stderr
+
+
+def test_benchmark_schedule_runs_are_stopped_by_the_nightly_deadline():
+    # The deadline stops a workflow's runs titled "(scheduled MI355)".
+    assert (
+        "format('{0} (scheduled MI355)', github.workflow)"
+        in _workflow(BENCHMARK)["run-name"]
+    )
+    deadline = _workflow(DEADLINE)["jobs"]["stop-overrunning-nightly-runs"]
+    assert "atom-vllm-benchmark.yaml" in deadline["env"]["WORKFLOWS"].split()
+    assert 'endswith("(scheduled MI355)")' in DEADLINE.read_text()

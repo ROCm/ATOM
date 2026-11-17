@@ -1,9 +1,11 @@
-name: ATOM SGLang Nightly Deadline
+name: ATOM Nightly Deadline
 
-# Stops the scheduled MI355 SGLang benchmark / accuracy runs that are still
-# going at 09:00 Beijing time, so a nightly that overruns does not hold the
-# MI355 runners into the working day. Scheduled MI308 runs (their own runs,
-# titled "(scheduled MI308)") and manually dispatched runs are left alone.
+# Stops the scheduled MI355 runs of the workflows in WORKFLOWS (SGLang
+# benchmark / accuracy, vLLM benchmark) that are still going at 09:00 Beijing
+# time, so a nightly that overruns does not hold the MI355 runners into the
+# working day. A workflow opts its scheduled runs in by titling them
+# "(scheduled MI355)" in run-name. Scheduled MI308 runs (titled
+# "(scheduled MI308)") and manually dispatched runs are left alone.
 on:
   schedule:
     - cron: '0 1 * * *'  # 09:00 Beijing time (01:00 UTC)
@@ -14,12 +16,12 @@ permissions:
 
 jobs:
   stop-overrunning-nightly-runs:
-    name: Stop scheduled MI355 SGLang runs still in progress
+    name: Stop scheduled MI355 runs still in progress
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      WORKFLOWS: atom-sglang-benchmark.yaml atom-sglang-accuracy-validation.yaml
+      WORKFLOWS: atom-sglang-benchmark.yaml atom-sglang-accuracy-validation.yaml atom-vllm-benchmark.yaml
       # A plain cancel still runs the GPU jobs' `if: always()` container
       # cleanup; runs that have not finished after this grace period are
       # force-cancelled, which skips it.
@@ -67,7 +69,7 @@ jobs:
 
           list_runs
           if [ "${#runs[@]}" -eq 0 ]; then
-            echo "No scheduled MI355 SGLang run is still in progress."
+            echo "No scheduled MI355 run is still in progress."
             exit "${failed}"
           fi
 
