@@ -455,7 +455,7 @@ def target_layer(E, Ly):
     RPC = Lx["RPC"]
     DCT = ((TR + RPC - 1) // RPC) * CL       # the D CTAs (row x key segment)
 
-    if lfl(128):   # the row before an Engram layer: its embeddings -> MXFP8
+    if hx.unlikely(lfl(128)):   # the row before an Engram layer: its embeddings -> MXFP8
         ES.stage_engq(cwith(c, engemb=ltab(fp, Ly, "engemb")(), eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs")))
 
     # ---- A: x from the TP2 owners (apflag), wqkv -> latents (A2 flags)
@@ -464,16 +464,16 @@ def target_layer(E, Ly):
     pub = dict(pubflag=plog(DNF) + i64(par) * 40960 + i64(36864), pubtag=hx.epoch32(tep, Ly, 15))
     # (seam) stage A's x8 comes from the TP2 owners (un-normalized, ffn_post_owner): the publishers run only on the
     # indexer layers, for the normed axn of iw / the compressor GEMM (their pubflag)
-    if newA & lfl(8):
+    if hx.unlikely(newA & lfl(8)):
         AS.stage_Apub(cwith(c, x1a=plog(X1A), part2=plog(P2A), anw=ltab(fp, Lp, "anw")(), apflag=apfl, aptag=aptg,
                             axn=fptr(fp, "axn"), norm_eps=D.RMS_EPS, axn_only=True, **pub))
     stage_A(cwith(c, newA=newA, **pub, **v3a, apflag=apfl, aptag=aptg, attpost=lc + i64(ATT_POST), part2=plog(P2A),
                   x1a=plog(X1A), anw=ltab(fp, Lp, "anw")(), norm_eps=D.RMS_EPS, axn=fptr(fp, "axn")))
     pf_rows(c["wqb"] + i64(b) * (16 * QL), QL, 16, QL, t)
     pf_rows(c["wqb"] + i64(b + CTAS) * (16 * QL), QL, 16, QL, t)
-    if lfl(128):   # (Engram-next layers only: the Engram kv reads every CTA's eng8; indexer layers wait on LL flags below)
+    if hx.unlikely(lfl(128)):   # (Engram-next layers only: the Engram kv reads every CTA's eng8; indexer layers wait on LL flags below)
         handoff(lc, t, True)   # LY.ATTN_A
-    if lfl(128):   # the next layer's Engram kv
+    if hx.unlikely(lfl(128)):   # the next layer's Engram kv
         ES.stage_engkv(cwith(c, eng8=fptr(fp, "eng8"), engs=fptr(fp, "engs"), engw=ltab(fp, Ly, "engw")(),
                              engws=ltab(fp, Ly, "engws")(), engkv=fptr(fp, "engkv")))
 
@@ -483,7 +483,9 @@ def target_layer(E, Ly):
 
     # ---- indexer layers: iq / iw / compressor GEMM, iquant / compressor rows, scorer + selection
     isidx = lfl(8)
-    if isidx:
+    # (cold) the index chain and the Engram stages: unlikely, so block placement moves them past the layer loop's
+    # hot path (the plain layers' C runs straight into D instead of jumping over ~8.7K instructions)
+    if hx.unlikely(isidx):
         # (contract 6.4) iq reads A2's q blocks + ss (the 40 q-block flags), iw / the compressor GEMM read axn (the 32
         # publishers' flags; layer 0: the entry front's, before the loop): LL waits, not the ATTN_A handoff
         ll_w = hx.opaque_v(fx.thread_idx.x) // 32
@@ -501,9 +503,9 @@ def target_layer(E, Ly):
         r1 = (lfl1 & fx.Int64(4)) != fx.Int64(0)
         if hascomp:
             CS.stage_cgemm(cwith(c, cwkv=ltab(fp, Ly, "cwkv")(), axn=fptr(fp, "axn"), cpart=fptr(fp, "cpart")), r1)
-    if keepA:
+    if hx.unlikely(keepA):
         handoff(lc + i64(LY.KV_C), t, True)
-    if isidx:
+    if hx.unlikely(isidx):
         IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                               iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
         lfl2 = ltab(fp, Ly, "lflags")()
