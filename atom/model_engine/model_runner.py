@@ -128,6 +128,7 @@ from atom.model_ops.fused_moe.routed_experts_capturer import (
     current_slot_mapping,
     fused_moe_modules,
     merge_routed_patches,
+    set_routed_expert_capture,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RELAXED_TOP_N, RejectionSampler
@@ -869,16 +870,17 @@ class ModelRunner:
     # the target's launch (`prepare_model`).
     compute_head: Callable | None = None
     spec_status_deferred = False
-
-    # Read on every step; the per-step route hooks run only when it is set.
-    _return_routed_experts: bool = False
+    # Routed-expert replay off; `__init__` sets it on the instance only when
+    # the flag is on. Read every step: the route hooks run only when set.
+    _return_routed_experts = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
         self.structured_compile_executor = None
         self.structured_compilations = OrderedDict()
-        self._return_routed_experts = bool(config.enable_return_routed_experts)
+        if config.enable_return_routed_experts:
+            self._return_routed_experts = True
         self._routed_experts_capturer: RoutedExpertsCapturer | None = None
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
@@ -887,6 +889,7 @@ class ModelRunner:
         from atom.utils.graph_marker import set_graph_marker_enabled
 
         set_graph_marker_enabled(self.mark_trace)
+        set_routed_expert_capture(self._return_routed_experts)
         set_current_atom_config(config)
         hf_config = config.hf_config
         self.block_size = config.kv_cache_block_size

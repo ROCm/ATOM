@@ -30,6 +30,16 @@ UNCAPTURED = -1
 # The GPU capture buffer's element type; the KV pool budget is sized from it.
 CAPTURE_DTYPE = torch.int32
 
+# Whether this process captures routes: set once from the config before the
+# model is built (`set_routed_expert_capture`) and never flipped after, so a
+# compiled graph's guard on it holds. Routing reads it before entering the hook.
+CAPTURE_ROUTED_EXPERTS = False
+
+
+def set_routed_expert_capture(enabled: bool) -> None:
+    global CAPTURE_ROUTED_EXPERTS
+    CAPTURE_ROUTED_EXPERTS = bool(enabled)
+
 
 class RoutedExpertsPatch(NamedTuple):
     """One step's routes for every request it forwarded.
@@ -100,7 +110,7 @@ def prefix_slots(block_table: AbcSequence[int], lo: int, hi: int, block_size: in
 def batch_prefix_slots(batch: Any, block_size: int):
     """``(req_ids, starts, lens, slots)`` of a batch's ``routed_prefix_ranges``,
     or None when it has none. Ranges name requests by batch position."""
-    ranges = getattr(batch, "routed_prefix_ranges", None)
+    ranges = batch.routed_prefix_ranges
     if not ranges:
         return None
     if len(batch.block_tables) != len(batch.req_ids):

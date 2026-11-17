@@ -41,6 +41,7 @@ from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
     eplb_map_and_record_fused,
 )
+from atom.model_ops.fused_moe import routed_experts_capturer
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -505,8 +506,10 @@ def _select_logical(
     num_fused_shared_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
-    `num_fused_shared_experts` shared columns widened in. Captured here, the
-    one place every quant method routes through, for routed-expert replay."""
+    `num_fused_shared_experts` shared columns widened in, captured for
+    routed-expert replay. Every `select_experts` routes here except
+    `Mxfp4MoEMethod`'s HERD step, which replay turns off, and Qwen4-Exp's
+    single-token experts, which capture their own ids."""
     topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=x,
         router_logits=router_logits,
@@ -523,7 +526,8 @@ def _select_logical(
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
     )
-    maybe_capture_routed_experts(layer, topk_ids)
+    if routed_experts_capturer.CAPTURE_ROUTED_EXPERTS:
+        maybe_capture_routed_experts(layer, topk_ids)
     return topk_weights, topk_ids
 
 
@@ -1564,11 +1568,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton_ep = False
 
         # AITER_FLYDSL_USE_HERD: aiter's gfx1250 HERD drop, TP only (no expert_mask).
+        # Off under routed-expert replay: fused_moe drops one of the K+1
+        # candidates inside the kernel, so the K ids it ran are never seen here
+        # to capture; the plain routing captures them.
         self.use_flydsl_herd = (
             _FLYDSL_USE_HERD
             and self.is_gfx1250
             and self.is_guinterleave
             and not ep_moe
+            and not get_current_atom_config().enable_return_routed_experts
             and not getattr(get_current_atom_config(), "eplb_enable", False)
             and _herd_sees_own_rows(self.moe.moe_parallel_config)
             and _aiter_serves_flydsl_herd()

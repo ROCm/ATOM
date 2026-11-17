@@ -696,7 +696,9 @@ class Scheduler:
     # on to keep what was running (see `preempt_running`).
     can_recompute_prompts = True
     pd_admission: PdAdmissionController | None = None
-    _return_routed_experts: bool = False
+    # Routed-expert replay off; `__init__` sets it on the instance only when
+    # the flag is on.
+    _return_routed_experts = False
 
     def __init__(
         self,
@@ -747,9 +749,8 @@ class Scheduler:
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
 
-        self._return_routed_experts = bool(
-            getattr(config, "enable_return_routed_experts", False)
-        )
+        if config.enable_return_routed_experts:
+            self._return_routed_experts = True
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -4949,7 +4950,7 @@ class Scheduler:
                 seq = running_by_id.get(request_id)
                 if seq is not None and "embedding_spans" in data:
                     seq.multimodal_cache_ready = True
-        routed = getattr(fwd_output, "routed_experts", None)
+        routed = fwd_output.routed_experts
         if routed is not None:
             # A dummy prefill's output carries the previous step's routes with
             # ``batch=None``, where ``running_by_id`` is empty.

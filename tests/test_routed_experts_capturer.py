@@ -310,9 +310,12 @@ def test_prefix_hit_segment_reads_cached_slots():
     np.testing.assert_array_equal(new[:, 0, :], [[5, 6]])
 
 
-def test_every_quant_methods_routing_is_captured(monkeypatch):
-    """Quant methods' `select_experts` all go through `_select_logical`, so
-    its capture covers FusedMoE and the comm-fused path alike."""
+@pytest.mark.parametrize("capture", [True, False])
+def test_select_logical_captures_its_routing(monkeypatch, capture):
+    """`_select_logical` captures the ids it returns: FusedMoE and the
+    comm-fused path both route there (HERD, the exception, is off under
+    replay: `test_flydsl_herd_routing.py`). With capture off the hook is
+    never entered."""
     moe = pytest.importorskip(
         "atom.model_ops.moe",
         reason="moe imports aiter at module load",
@@ -344,10 +347,12 @@ def test_every_quant_methods_routing_is_captured(monkeypatch):
         routed_scaling_factor=1.0,
     )
 
+    monkeypatch.setattr(cap_mod, "CAPTURE_ROUTED_EXPERTS", capture)
+
     out = moe._select_logical(layer, torch.zeros(2, 4), torch.zeros(2, 8), 8, 0)
 
     assert out == (topk_weights, topk_ids)
-    assert captured == [(layer, topk_ids)]
+    assert captured == ([(layer, topk_ids)] if capture else [])
 
 
 def test_maybe_capture_skips_an_unbound_layer():
@@ -881,6 +886,7 @@ def test_qwen4_exp_single_token_moe_captures_its_routes(
         exc_type=ImportError,
     )
 
+    monkeypatch.setattr(cap_mod, "CAPTURE_ROUTED_EXPERTS", True)
     capturer = RoutedExpertsCapturer(num_slots=8, num_layers=2, top_k=2, device="cpu")
     kernel_ids = torch.tensor([[3, 1, 4]], dtype=torch.int32)
     selected_ids = torch.tensor([[2, 0, 4]], dtype=torch.int32)

@@ -263,6 +263,26 @@ class OffloadJointRecord:
 class Sequence:
     counter = count()
 
+    # Routed-expert replay state. Class defaults, assigned on an instance only
+    # by the R3 paths, so with R3 off none of it is in a pickled sequence.
+    # MoE routes gathered from KV slots: int16 [seq_len-1, layers, top_k].
+    # One growable buffer (capacity doubles) so deferred overlapping
+    # patches are a slice write, not an O(steps) chunk-list walk.
+    # `_routed_expert_rows` is the live length; the tail is unused.
+    _routed_expert_buf: np.ndarray | None = None
+    _routed_expert_rows: int = 0
+    # Positions some scheduled forward already returns routes for; a
+    # prefix-cache hit past it must have its rows read from the cache.
+    routed_forwarded_end: int = 0
+    # First position whose routes a scheduled forward still owes (its patch
+    # not yet received), or None. A request finishing early can be that
+    # short; one finishing with nothing owed must hold every row.
+    routed_owed_from: int | None = None
+    # First position of a pure middle chunk whose routes are still on the
+    # device, waiting for the next step's copy (`add_held_routed_experts`),
+    # or None. They stay owed one output past that step.
+    routed_held_from: int | None = None
+
     def __init__(
         self,
         token_ids: list[int],
@@ -503,23 +523,6 @@ class Sequence:
         self.json_schema = sampling_params.json_schema
         self.structured_reasoning_end = sampling_params.structured_reasoning_end
         self.structured_tool_format = sampling_params.structured_tool_format
-        # MoE routes gathered from KV slots: int16 [seq_len-1, layers, top_k].
-        # One growable buffer (capacity doubles) so deferred overlapping
-        # patches are a slice write, not an O(steps) chunk-list walk.
-        # `_routed_expert_rows` is the live length; the tail is unused.
-        self._routed_expert_buf: np.ndarray | None = None
-        self._routed_expert_rows: int = 0
-        # Positions some scheduled forward already returns routes for; a
-        # prefix-cache hit past it must have its rows read from the cache.
-        self.routed_forwarded_end: int = 0
-        # First position whose routes a scheduled forward still owes (its patch
-        # not yet received), or None. A request finishing early can be that
-        # short; one finishing with nothing owed must hold every row.
-        self.routed_owed_from: int | None = None
-        # First position of a pure middle chunk whose routes are still on the
-        # device, waiting for the next step's copy (`add_held_routed_experts`),
-        # or None. They stay owed one output past that step.
-        self.routed_held_from: int | None = None
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
