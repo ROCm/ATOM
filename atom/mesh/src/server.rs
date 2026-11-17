@@ -444,11 +444,18 @@ pub fn build_app(
             get(get_worker).put(update_worker).delete(delete_worker),
         );
 
+    let rl_routes = if app_state.context.router_config.rl.enabled {
+        crate::rl::router()
+    } else {
+        Router::new()
+    };
+
     Router::new()
         .merge(protected_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .merge(rl_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(axum::middleware::from_fn_with_state(
             max_payload_size,

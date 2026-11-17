@@ -15,6 +15,7 @@ impl ConfigValidator {
         }
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
+        Self::validate_rl(&config.rl)?;
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -32,6 +33,25 @@ impl ConfigValidator {
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
+        Ok(())
+    }
+
+    fn validate_rl(rl: &crate::rl::RlConfig) -> ConfigResult<()> {
+        if !rl.enabled {
+            return Ok(());
+        }
+        for (field, value) in [
+            ("rl.control_timeout_secs", rl.control_timeout_secs),
+            ("rl.fanout_concurrency", rl.fanout_concurrency as u64),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be greater than zero".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
