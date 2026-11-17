@@ -27,7 +27,10 @@ from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _query_start_loc,
+    advance_draft_decode_mrope,
     bind_qsa_caches,
+    prepare_qwen4_exp_decode_graph_metadata,
+    stage_draft_graph_mrope,
 )
 
 
@@ -481,3 +484,92 @@ def test_stacked_loader_sees_only_the_routed_ep_range():
     assert experts.expert_map is fused_map
     assert experts.expert_map.shape[0] == num_routed + 2
     assert int(experts.expert_map[-2]) == local_num
+
+
+def test_draft_graph_mrope_broadcasts_text_positions_and_zeroes_padding():
+    """SGLang computed no mRoPE: stage the 1-D positions on all three rows."""
+    buf = torch.full((3, 6), 99, dtype=torch.int64)
+    batch = SimpleNamespace(
+        mrope_positions=None, positions=torch.tensor([64, 7, 300], dtype=torch.int64)
+    )
+    stage_draft_graph_mrope(buf, batch)
+    assert buf[:, :3].tolist() == [[64, 7, 300]] * 3
+    assert buf[:, 3:].eq(0).all()
+
+
+def test_draft_graph_mrope_keeps_multimodal_offsets():
+    """Live rows carry the image delta; staging must not rebuild them from positions."""
+    buf = torch.full((3, 4), 99, dtype=torch.int64)
+    live = torch.tensor([[10, 11], [12, 13], [14, 15]], dtype=torch.int64)
+    batch = SimpleNamespace(
+        mrope_positions=live, positions=torch.tensor([500, 501], dtype=torch.int64)
+    )
+    stage_draft_graph_mrope(buf, batch)
+    assert torch.equal(buf[:, :2], live)
+    assert buf[:, 2:].eq(0).all()
+
+
+def test_draft_decode_mrope_tracks_positions_across_steps():
+    """EAGLE draft_forward: forward, then positions.add_(1); mRoPE must follow."""
+    positions = torch.tensor([64, 7], dtype=torch.int64)
+    delta = torch.tensor([-1000, 0], dtype=torch.int64)
+    batch = SimpleNamespace(
+        positions=positions,
+        mrope_positions=(positions + delta).unsqueeze(0).repeat(3, 1),
+    )
+    for _ in range(3):
+        assert torch.equal(batch.mrope_positions - batch.positions, delta.expand(3, -1))
+        advance_draft_decode_mrope(batch)
+        batch.positions.add_(1)
+    advance_draft_decode_mrope(SimpleNamespace(mrope_positions=None))
+
+
+class EagleDraftInput:
+    pass
+
+
+class _DecodeMode:
+    @staticmethod
+    def is_decode_or_idle():
+        return True
+
+    @staticmethod
+    def is_target_verify():
+        return False
+
+
+def test_draft_decode_hook_never_builds_target_graph_metadata():
+    """Flash draft decode batches stop before the target's _DECODE_GRAPH fill."""
+    flash = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen4_exp_text"))
+    draft = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=EagleDraftInput())
+    assert prepare_qwen4_exp_decode_graph_metadata(draft, atom_config=flash) is not None
+
+
+def test_draft_decode_hook_ignores_other_models():
+    """Another EAGLE drafter on the ATOM backend keeps its normal metadata path."""
+    other = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="qwen3_5_moe", architectures=["X"])
+    )
+    draft = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=EagleDraftInput())
+    assert prepare_qwen4_exp_decode_graph_metadata(draft, atom_config=other) is None
+
+
+def test_draft_qsa_covers_the_graph_bucket_without_a_request_limit(monkeypatch):
+    """No --max-running-requests: the 32-row default must grow to the capture bucket."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    args = SimpleNamespace(
+        max_running_requests=None,
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1, 8, 64])),
+    )
+    seen = {}
+    monkeypatch.setattr(bridge, "_server_args", lambda: args)
+    monkeypatch.setattr(bridge, "_get_qsa_graph_max_tokens_per_req", lambda: 5)
+    monkeypatch.setattr(
+        bridge,
+        "_DRAFT_QSA",
+        SimpleNamespace(allocate_once=lambda **kw: seen.update(kw)),
+    )
+    bridge._ensure_draft_qsa(torch.device("cpu"), block_size=64, ctx_len=8192)
+    assert seen["max_bs"] == 64
+    assert seen["max_tokens"] == 64 * 5

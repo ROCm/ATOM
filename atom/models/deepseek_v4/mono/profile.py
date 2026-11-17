@@ -170,6 +170,8 @@ def deployment_refusal(
         or atom_config.parallel_config.data_parallel_size != 1
     ):
         return "only pure TP8 without TBO/context parallel is supported"
+    if atom_config.is_multinode_tp:
+        return "TP group spans nodes (HIP IPC peer memory)"
     if atom_config.kv_cache_dtype != "fp8" or atom_config.index_cache_dtype != "fp4":
         return "FP8 KV / FP4 index is required"
     if getattr(atom_config, "enable_prefix_caching", False):

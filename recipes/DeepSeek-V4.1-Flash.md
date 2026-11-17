@@ -1,9 +1,12 @@
 # DeepSeek-V4.1-Flash
 
 The native text backbone and the paged ModelRunner/Scheduler lifecycle are
-usable. The KV cache is FP8 (`--kv_cache_dtype fp8`, MXFP8 rows attended by
-AITER's `mla_sparse_prefill_v41`); on the BF16 or FP4 pool the original V4
-BF16 attention and inverse RoPE kernels are reused.
+usable. With `--kv_cache_dtype fp8`, AITER's `mla_sparse_prefill_v41`
+attends over contiguous MXFP8 data and scale planes. With FP4 KV,
+`ATOM_DSV41_A8W4_ATTN=auto` (the default) uses native A8W4 on supported
+gfx950 configurations, as selected by AITER's V4.1 capability API. Setting
+`ATOM_DSV41_A8W4_ATTN=off`, or using a query/backend that cannot run A8W4,
+selects the BF16 adapter. BF16 KV uses the original V4 BF16 attention.
 Chat, tool and reasoning-effort protocol integration is complete, and native
 image requests support chunked prefill and request-owned embedding lifetime.
 
@@ -81,6 +84,51 @@ run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no
 collective policy of its own.
 
+## Shared Mooncake Store across data-parallel ranks
+
+A Mooncake Store shared by every DP rank lets a request run on any rank and load
+the prefix another rank computed, so requests need no session affinity. Start a
+Mooncake master (with its HTTP metadata server) and a DRAM owner on the host, then
+start the server with the Store as the offload tier and the `share_cache` router:
+
+```bash
+export ATOM_KV_OFFLOAD=mooncake_store
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{
+  "mooncake_store.master": "127.0.0.1:19861",
+  "mooncake_store.metadata": "http://127.0.0.1:19862/metadata",
+  "mooncake_store.protocol": "rdma",
+  "mooncake_store.rdma_devices": "<rdma device>",
+  "mooncake_store.local_hostname": "127.0.0.1"}'
+python -m atom.entrypoints.openai_server --model <V4.1 checkpoint> \
+  --enable_prefix_caching --enable-dp-attention -tp 4 \
+  --dp-load-balance share_cache
+```
+
+- `share_cache` needs `--enable_prefix_caching` and `ATOM_FRONTEND_PREFIX_HASH=1`
+  (the default), and excludes `ATOM_DP_SESSION_AFFINITY=1`. It places a request on
+  the rank with the least prefill left, charging it only what it will compute.
+- The Store tier loads from 512 tokens (`OFFLOAD_MIN_LOAD_TOKENS`) and starts a load
+  as soon as the lookup answers (early tier load), without a flag.
+- Set `ATOM_PREFILL_DELAYER_TARGET_FILL=0.8` (default 0.9). At 0.9 a DP4 shared
+  Store had a median TTFT well above main's; at 0.8, against main with session
+  affinity (DP4, AgentX, 1800 s, same time, MI355X), 256 concurrency gave throughput
+  +5.2%, mean TTFT -50.9%, median -17.0%, ITL -1.6%; 512 gave +4.7%, -31.4%, -41.2%,
+  and ITL +2.8%.
+- Use one Store every DP rank reaches. `share_cache` refuses
+  `mooncake_store.pools` that name more than one (master, metadata) pair:
+  each worker reads its own NIC's pool, so a request placed on another rank
+  would miss every load. NIC aliases of one pair are accepted.
+- Give the owner enough DRAM for the prefixes you expect (768 GB held a 30-minute
+  agentic run at 256 concurrency), and watch `OFFLOAD-STORE-STATS`: repeated
+  `NO_AVAILABLE_HANDLE` failures mean the master dropped the owner's segment (raise
+  the master's `--client_ttl` if the owner can be starved of CPU while the engine
+  starts).
+- Prefill/decode disaggregation: on the prefill side set the same variables and
+  add the Mooncake transfer connector (`kv_role: kv_producer`) through
+  `--kv-transfer-config`; ATOM composes the two into one `multi` connector. The
+  decode side runs the Mooncake consumer only and does not use the Store.
+  `share_cache` accepts that composite on the prefill side.
+
 ## gfx1250 (MI455X)
 
 V4.1 runs on gfx1250 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
@@ -97,13 +145,22 @@ DSpark, and at DEP4 (EP + DP attention). On gfx1250 its FP8 linears, the grouped
 
 What differs from gfx950:
 
-- **Mono fused decode is gfx950-only** (wave64, `permlane32`). On gfx1250 the
-  deployment check refuses it and logs `V4.1 mono decode off: arch gfx1250`, so
-  `ATOM_MONO_ENABLE` needs no setting. DSpark still runs: its draft passes and
+- **The per-layer mono kernels are gfx950-only** (wave64, `permlane32`). On
+  gfx1250 the deployment check refuses them and logs `V4.1 mono decode off:
+  arch gfx1250`. gfx1250 has its own fused decode instead, the
+  [single-launch step](#gfx1250-single-launch-decode-step), switched like the
+  gfx950 mono decode (`ATOM_MONO_ENABLE`, on by default); with
+  `ATOM_MONO_ENABLE=0`, or a deployment it refuses, DSpark's draft passes and
   verify steps take the original, unfused path.
 - **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
-- **FP8 index only.** The FP4 index plane (`--index-cache-dtype fp4`) scores
-  with a gfx950 FlyDSL kernel and does not compile on gfx1250.
+- **FP4 index interface (hardware validation pending).** With
+  `--index-cache-dtype fp4`, gfx1250 uses natural query/cache rows with AITER's
+  H32 OPUS MQA API, including full-layer and candidate tables and packed logits.
+  Requires AITER [#7128](https://github.com/ROCm/aiter/pull/7128) and
+  [#6952](https://github.com/ROCm/aiter/pull/6952). gfx1250 correctness, model E2E
+  and performance remain unvalidated. On gfx950, FP4 defaults to the OPUS
+  scorer with MFMA cache layout; set `ATOM_V4_UNIFIED_MQA=flydsl` before
+  startup to use the FlyDSL scorer and its page-8 layout.
 - **`--level 0`.** A first `--level 3` start can stall while ranks compile and
   autotune at different times.
 
@@ -202,6 +259,53 @@ concurrency 2) the check mode holds as at TP4, and GSM8K 3-shot on the first
 49.2%. At TP8 the kernels compile and fit, but the server does not start on
 the original path: the shared expert's down projection has K = 288 there, and
 AITER's gfx950 FP8 blockscale GEMM needs K to be a multiple of its K tile.
+
+## gfx1250 single-launch decode step
+
+On gfx1250, mono decode (`ATOM_MONO_ENABLE`, on by default) runs each DSpark
+decode step as one
+persistent FlyDSL kernel per TP rank, issued as two launches: the target
+launch covers the 40 target layers, the LM head, sampling and the block
+verification; the draft launch covers the draft context KV, the three draft
+stages, the draft head and the Markov drafts. Inside the kernel:
+
+- the compressor, Engram, the indexer (2-level selection, REINDEX) and the MoE;
+- temperature / top-p sampling with the probabilistic draft and block verify.
+
+It replaces the target forward, the sampler, the rejection sampler and the
+DSpark proposer of a served step
+(`atom/models/deepseek_v41/mono/gfx1250/`).
+
+- **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache, FP8
+  index cache, up to 8 requests (6 verify rows each), no DSpark confidence
+  schedule or ragged verify. Anything else is refused at load
+  (`V4.1 single-launch step off: <why>`).
+- **Memory.** The kernel reads the routed experts in place, as the
+  production MoE keeps them (no second copy). Its own buffers a rank: ~77 MB
+  scratch, ~28 MB peer receive and the shared experts' FP8 planes (~0.4 GB).
+- **Steps it does not serve** take the production path; it says why once per
+  kind in the log (`not served (...)`). These are:
+  - prefill;
+  - steps with structured output, logprobs or top-k;
+  - a block table or index bound past the kernel's (`tables.BCOLS`, `ILW`).
+- **Build.** Every width (6..48 rows) is built at startup, ~2.5 min cold.
+  The builds go to the FlyDSL disk cache; clear it after editing a kernel.
+- **Debug switches** (the mono ones, `atom/utils/envs.py`):
+  - `ATOM_MONO_TIMELINE=<prefix>`: per-step time split, averaged over 64
+    steps, logged and appended to `<prefix>_r<rank>.jsonl`;
+  - `ATOM_MONO_CHECK` (eager): the launch beside the production forward,
+    its head, selection, taps and drafts compared.
+
+Measured on MI455X (TP4, `--level 0`, same machine, original path as the
+reference):
+
+| | single launch | original |
+|---|---|---|
+| GSM8K (T = 1, 512 questions) | 453 | 455 |
+| GSM8K draft acceptance | 0.365 | 0.365 |
+| step time, 8 requests (short prompts) | 7.18 ms | 7.97 ms |
+| step time, 1 request | 5.44 ms | 6.75 ms |
+| TPOT, 8 requests, ~26.6k-token agentic prompts (2 runs) | 2.01 / 2.06 ms | 2.30 / 2.15 ms |
 
 ## Equal-score index selection
 

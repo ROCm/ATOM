@@ -17,7 +17,11 @@ an attention builder and whose package promises to import no attention at all.
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
+
+
+class _Tagged(Protocol):
+    tag: str  # what a KV layout (`mha_kv_pool.KvLayout`) names its row space by
 
 
 class KvGeometry(NamedTuple):
@@ -32,12 +36,17 @@ class KvGeometry(NamedTuple):
 
     num_kv_heads: int
     head_dim: int
+    # None for the dtype-wide cache; a layout for layers whose pages read another
+    # way (MiniMax-M3's sparse layers under --kv-cache-dtype fp4) -- a separate
+    # pool beside any dense layers' one. Hashable, with a `tag` naming it.
+    layout: _Tagged | None = None
 
     def __str__(self) -> str:
         """What this row space is called, wherever one is named -- the startup
         log, and the `semantic_role` its transfer regions carry. Both are for a
         person: the default repr would print the class and field names."""
-        return f"h{self.num_kv_heads}d{self.head_dim}"
+        tag = self.layout.tag if self.layout is not None else ""
+        return f"h{self.num_kv_heads}d{self.head_dim}{tag}"
 
 
 class PoolRowsMixin:

@@ -18,6 +18,7 @@ from atom.config import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -119,9 +120,12 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    tensor_parallel_size_local: int | None = None
+    tensor_parallel_rank: int = 0
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_size_local: int | None = None
     data_parallel_rank: int = 0
@@ -144,7 +148,10 @@ class EngineArgs:
     enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
+    sampler_independent_noise: bool = False
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -152,6 +159,7 @@ class EngineArgs:
     dynamic_chunking_smooth_factor: float | None = None
     dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
@@ -211,6 +219,28 @@ class EngineArgs:
             help="Tensor parallel size.",
         )
         parser.add_argument(
+            "--tensor-parallel-size-local",
+            type=int,
+            default=None,
+            help=(
+                "Number of tensor-parallel ranks to run on THIS node. Defaults "
+                "to --tensor-parallel-size (single-node). Set it lower to "
+                "spread one TP group over several nodes; every node then needs "
+                "--data-parallel-master-ip of the node that runs TP rank 0 and "
+                "the same --data-parallel-base-port."
+            ),
+        )
+        parser.add_argument(
+            "--tensor-parallel-rank",
+            type=int,
+            default=0,
+            help=(
+                "First tensor-parallel rank owned by this node. Node 0 uses 0 "
+                "and serves the API; the second node of a 2x4 run uses 4 and "
+                "runs only its model-runner workers."
+            ),
+        )
+        parser.add_argument(
             "--pipeline-parallel-size",
             "-pp",
             type=int,
@@ -225,6 +255,17 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
+            "--sequence-parallel-size",
+            "-sp",
+            type=int,
+            default=1,
+            help="Ulysses sequence parallel size. Shards tokens across the "
+            "group and trades sequence for heads around attention via "
+            "all-to-all. Requires --tensor-parallel-size 1 and DP1/PP1; "
+            "refuses EP, TBO, speculative decoding, KV transfer and image "
+            "input. Attention heads must divide across the ranks.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -303,10 +344,12 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp4' is MiniMax-M3.1's MXFP4 K/V "
+            "or DeepSeek-V4.1's own FP4 KV; other models refuse it. M3's conditions "
+            "are in the configuration guide.",
         )
         parser.add_argument(
             "--index-cache-dtype",
@@ -316,7 +359,8 @@ class EngineArgs:
             default=None,
             help="Index cache type. Native single-node DeepSeek-V4 defaults to "
             "'fp4' except on gfx942, which defaults to 'fp8'; other models "
-            "default to --kv_cache_dtype.",
+            "default to --kv_cache_dtype. 'fp4' is MiniMax-M3's MXFP4 index "
+            "cache or another model's own FP4 layout; see the configuration guide.",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -394,6 +438,17 @@ class EngineArgs:
             "prompt-token load. 'least_tokens': route to the rank with "
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
+            "'share_cache': with an offload tier every rank shares "
+            "(mooncake_store, lmcache_mp), route to the rank with the least "
+            "prefill left as the ranks report it, charging a request only what "
+            "it will compute (prompt minus the prefix any rank already put in "
+            "the tier); needs --enable_prefix_caching and "
+            "ATOM_FRONTEND_PREFIX_HASH=1, excludes ATOM_DP_SESSION_AFFINITY. "
+            "'prefix_spread': keep a request on the rank holding its prompt's "
+            "prefix unless that rank has a prefill backlog and another is "
+            "about to idle (ATOM_DP_PREFIX_IDLE_TOKENS); the moved request "
+            "loads its prefix from the offload tier. Needs prefix caching; "
+            "excludes ATOM_DP_SESSION_AFFINITY. "
             "Has no effect when data_parallel_size == 1.",
         )
         parser.add_argument(
@@ -423,7 +478,8 @@ class EngineArgs:
             default="standard",
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
-            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE, "
+            "or AITER MegaMoeTP under --sequence-parallel-size.",
         )
         parser.add_argument(
             "--method",
@@ -572,6 +628,32 @@ class EngineArgs:
             "Use --no-enable_chunked_prefill to disable.",
         )
         parser.add_argument(
+            "--enable-request-context-metrics",
+            action="store_true",
+            default=False,
+            help="Enable per-request prefill/decode context metrics (default: disabled). "
+            "Retains request-labelled series after completion; use only for short "
+            "diagnostic captures. Aggregate metrics are unaffected.",
+        )
+        parser.add_argument(
+            "--sampler-independent-noise",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Draw fresh per-row exponential noise for unfiltered "
+            "temperature sampling instead of broadcasting one row across the "
+            "batch, so ordinary n=1 stochastic requests are sampled "
+            "independently, not only fan-out siblings (n>1) and speculative "
+            "verification. Off by default; enabling it allocates a "
+            "(num_tokens, vocab_size) float32 noise tensor per sampler call "
+            "and changes the RNG stream, so identical seeds no longer "
+            "reproduce the default tokens. The top-k/top-p path already "
+            "draws per-row noise, so the option is inert there by design; "
+            "greedy rows never draw noise. Native ATOM "
+            "engine only (vLLM/SGLang plugin paths are unaffected). "
+            "Use --no-sampler-independent-noise to state the default "
+            "explicitly.",
+        )
+        parser.add_argument(
             "--enable-log-stats",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -588,7 +670,24 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",
@@ -656,6 +755,17 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--prefill-admit-policy",
+            choices=list(PREFILL_ADMIT_POLICIES),
+            default="interval",
+            help="When the prefill delayer admits new prefills. 'interval' "
+            "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
+            "'adaptive' fires once the held requests' accumulated cost reaches "
+            "the fixed prefill cost times the decode batch, fitted from measured "
+            "step times; on DP=1, PP=1 it enables the delayer as a positive "
+            "interval does.",
         )
         parser.add_argument(
             "--mark-trace",
@@ -902,22 +1012,46 @@ class EngineArgs:
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
-        parallel_config_kwargs = {
-            "data_parallel_size": kwargs["data_parallel_size"],
-            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
-            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
-            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
-            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
-        }
-        base_port = kwargs.pop("data_parallel_base_port")
-        if base_port is not None:
-            parallel_config_kwargs["data_parallel_base_port"] = base_port
-        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
+        for name in self._PARALLEL_CONFIG_FIELDS:
+            if name != "data_parallel_size":
+                kwargs.pop(name)
+        kwargs["parallel_config"] = self.parallel_config()
 
         logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
 
+    _PARALLEL_CONFIG_FIELDS = (
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_rank",
+        "data_parallel_master_ip",
+        "data_parallel_master_port",
+        "data_parallel_base_port",
+        "tensor_parallel_size_local",
+        "tensor_parallel_rank",
+    )
+
+    def parallel_config(self) -> ParallelConfig:
+        """This node's ParallelConfig, with the ATOM_DP_* environment applied.
+
+        A node that runs only TP workers reads the engine's address from it as
+        well, so both nodes resolve that address the same way.
+        """
+        kwargs = {name: getattr(self, name) for name in self._PARALLEL_CONFIG_FIELDS}
+        if kwargs["data_parallel_base_port"] is None:
+            del kwargs["data_parallel_base_port"]
+        return ParallelConfig(**kwargs)
+
     def create_engine(self, tokenizer=None) -> LLMEngine:
-        """Create and return an LLMEngine instance with the configured parameters."""
+        """Create and return an LLMEngine instance with the configured parameters.
+
+        A node whose TP slice starts past rank 0 (--tensor-parallel-rank) has no
+        engine to create: it runs its TP workers for the engine on another node
+        and exits the process with their status once they stop.
+        """
+        if self.tensor_parallel_rank > 0:
+            from atom.model_engine.tp_multinode import serve_remote_tp_ranks
+
+            raise SystemExit(serve_remote_tp_ranks(self))
         return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())

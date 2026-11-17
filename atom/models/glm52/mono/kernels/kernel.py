@@ -141,6 +141,7 @@ from atom.models.glm52.mono.kernels.geometry import (
     THREADS,
     TL_COLS,
 )
+from atom.mono.plan.build_key import source_digest
 from atom.mono.plan.tiles import (
     atom_mxfp4_scale_index,
     atom_mxfp4_scale_pair,
@@ -150,6 +151,7 @@ from atom.mono.device.ops import (
     div_rn,
     f8_word,
     fp8_pack4,
+    kernel_symbol,
     mem_realtime,
     read_lane_i32,
     spin_pause,
@@ -268,6 +270,11 @@ def build_glm5_monokernel(
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
     """
+    # Shared retry primitives can be outside FlyDSL's traced helper walk.
+    # Capture their contents in the real launcher's scalar closure cache key.
+    source_key = source_digest(
+        "models/glm52/mono/kernels", "mono/device", "mono/plan", "mono/polling.py"
+    )
     assert uv_scale_rows in (64, 128)
     assert heads % WAVES == 0, "split attention maps one local head to each wave"
     assert kv_cache_dtype in ("bf16", "fp8")
@@ -529,7 +536,19 @@ def build_glm5_monokernel(
     class Smem:
         work: fx.Array[fx.Float32, WORK_WORDS, 16]
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    kernel_name = kernel_symbol(
+        "glm5_mono",
+        s=S,
+        tp=npes,
+        n=launches_per_step,
+        ix=with_indexer,
+        cp=indexer_cp,
+        dcp=dcp_size,
+        kv=kv_cache_dtype,
+        t=timeline,
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def glm5_monokernel(
         h_in: Int64,
         x_out: Int64,
@@ -4172,6 +4191,7 @@ def build_glm5_monokernel(
         layer: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        _ = source_key
         glm5_monokernel(
             h_in,
             x_out,

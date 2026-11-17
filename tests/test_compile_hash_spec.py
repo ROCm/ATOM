@@ -15,19 +15,24 @@ def _hash(spec=None):
         parallel_config=None,
         tensor_parallel_size=8,
         prefill_context_parallel_size=1,
+        sequence_parallel_size=1,
         dcp_config=None,
         enable_dp_attention=True,
         index_cache_dtype="fp4",
+        index_cache_layout=None,
         enable_decoder_swa_bounded_replay=True,
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,
+        max_num_batched_tokens=16384,
+        kv_cache_dtype="fp8",
         speculative_config=spec,
     )
     return Config.compute_hash(cfg)
 
 
 def _spec(method="dspark", k=3, **kw):
+    kw.setdefault("draft_kv_dtype", "bf16")  # a field of every SpeculativeConfig
     return SimpleNamespace(method=method, num_speculative_tokens=k, **kw)
 
 

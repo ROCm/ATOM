@@ -26,6 +26,7 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import (
@@ -37,7 +38,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -234,10 +235,51 @@ class _Qwen4ExpDecodeGraphBuffers:
 
 
 _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
-# Draft stays eager (Flash mRoPE) but must not write the buffers baked into
+# The draft must not write the buffers baked into
 # the target verify graph. A second set still keeps page tables and seq_lens
 # on device, so a draft step does not allocate or sync seq_lens back to host.
 _DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
+# Non-None marker returned to the draft runner's out-of-graph hook
+# before the first draft forward has populated _DRAFT_QSA.last_qsa.
+_DRAFT_GRAPH_METADATA_IN_GRAPH = object()
+
+
+def _is_draft_decode_batch(forward_batch: Any) -> bool:
+    """Draft-runner decode batch (EAGLE draft input)."""
+    spec = getattr(forward_batch, "spec_info", None)
+    return type(spec).__name__ == "EagleDraftInput"
+
+
+def stage_draft_graph_mrope(mrope_buffer: torch.Tensor, forward_batch: Any) -> None:
+    """Stage the live mRoPE rows into a draft graph runner's ``[3, N]`` buffer.
+
+    SGLang's EAGLE draft decode / draft-extend runners capture
+    ``forward_batch.mrope_positions`` from that buffer but refresh only the
+    1-D ``positions`` on replay, and the buffer is shared by name and shape
+    with other runners. The Flash drafter reads the 3-row positions
+    (``_lm_positions_for_runtime``), so copy SGLang's live rows in (they carry
+    multimodal offsets), or broadcast the 1-D positions when SGLang computed
+    none. Rows past the batch are zeroed, as SGLang zeroes padded ``positions``.
+    """
+    live = getattr(forward_batch, "mrope_positions", None)
+    if live is None:
+        live = forward_batch.positions.unsqueeze(0).expand(3, -1)
+    num_tokens = int(live.shape[-1])
+    mrope_buffer[:, :num_tokens].copy_(live)
+    mrope_buffer[:, num_tokens:].zero_()
+
+
+def advance_draft_decode_mrope(forward_batch: Any) -> None:
+    """Advance mRoPE in step with EAGLE ``draft_forward``'s ``positions.add_(1)``.
+
+    SGLang moves only the 1-D positions after each draft decode step, so the
+    3-row positions the Flash drafter reads would stay at step 0. The plugin's
+    ``draft_forward`` wrapper calls this on the caller's batch after every draft
+    decode forward; inside a draft decode graph capture the add is recorded.
+    """
+    mrope = getattr(forward_batch, "mrope_positions", None)
+    if mrope is not None:
+        mrope.add_(1)
 
 
 def _is_draft_forward() -> bool:
@@ -918,11 +960,14 @@ def _serving_context_len(atom_config: Any, indexer_budget: int) -> int:
 
 
 def _ensure_draft_qsa(device: torch.device, block_size: int, ctx_len: int) -> None:
-    """Allocate the draft page tables once, at serving capacity."""
+    """Allocate the draft page tables once, at serving and graph capacity."""
     args = _server_args()
     max_bs = 32
     if args is not None:
         max_bs = max(int(getattr(args, "max_running_requests", 32) or 32), 1)
+    # The draft decode graph captures up to the decode bucket, which exceeds
+    # the 32-row default when --max-running-requests is omitted.
+    max_bs = max(max_bs, _get_cuda_graph_max_bs())
     ctx = max(int(ctx_len), 1)
     tokens_per_req = _get_qsa_graph_max_tokens_per_req()
     pages = max(1, (ctx + block_size - 1) // block_size)
@@ -948,7 +993,7 @@ def _fill_qsa_like_native(
     ctx_len: int,
     buffers: _Qwen4ExpDecodeGraphBuffers | None = None,
 ) -> Qwen4ExpQSAMetadata:
-    """Native ``_build_qsa_metadata`` / ``prepare_decode`` for SGLang CUDA graphs.
+    """Native ``_stage_qsa`` / ``_finish_qsa`` (decode) for SGLang CUDA graphs.
 
     GPU packed token→req into the baked tensor, GPU gather of live page-table
     rows, Triton ``qsa_compressed_slots`` in place. Persistent addresses stay
@@ -1156,6 +1201,16 @@ def build_qsa_metadata(
 
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
+    host_lens = context_slots = None
+    # Only eager unpacked extends reach here (packed draft steps returned
+    # above), so this covers the target prefill and the drafter's prefill
+    # extend over the same tokens.
+    if not packed_step and _flydsl_layout_needed(
+        forward_batch, atom_config, compress_ratio, indexer_budget
+    ):
+        host_lens, context_slots = _flydsl_prefill_layout(
+            forward_batch, live_bs, num_tokens, block_tables, block_size
+        )
     qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
         slot_mapping=slot_mapping,
@@ -1164,31 +1219,153 @@ def build_qsa_metadata(
         logical_positions=logical,
         seq_lens=seq_lens,
         max_seq_len=max(max_seq_len, 1),
+        host_lens=host_lens,
+        context_slots=context_slots,
     )
     return qsa
 
 
-def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
-    """Native allocates PLE conv state for the whole per-req pool, not max_bs.
+def _flydsl_layout_needed(
+    forward_batch: Any, atom_config: Any, compress_ratio: int, indexer_budget: int
+) -> bool:
+    """Whether this forward's QSA layers can take the FlyDSL attention, so
+    its host layout is worth building: `qsa_attention.flydsl_fallback_reason`,
+    the predicate the layer's fallback uses, on the per-rank head shape of
+    this model's config and the KV dtype of the pool the QSA caches are bound
+    from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
+    detect it; a pool whose dtype cannot be read keeps the native kernel. With
+    the flag on, each reason is logged once."""
+    if not envs.ATOM_QSA_FLYDSL_ATTN:
+        return False  # flag off: keep the bridge free of the layer module
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 
-    Decode CUDA graphs bake ``conv_state``'s address. Growing after capture
-    frees that storage; undersizing it makes a recycled mamba slot OOB on the
-    next eager prefill (the conc=4 wave-2 HSA).
-    """
-    slots = max(int(_DECODE_GRAPH.max_bs), 16)
-    backend = resolve_attn_backend(forward_batch)
-    pool = resolve_mamba_req_pool(forward_batch, backend)
-    if pool is not None:
-        mapping = getattr(pool, "req_index_to_mamba_index_mapping", None)
-        if torch.is_tensor(mapping) and mapping.numel():
-            slots = max(slots, int(mapping.numel()))
-        slots = _max_int_attrs(pool, ("size", "max_num_reqs", "mamba_size"), slots)
-    slots = _max_int_attrs(
-        _req_to_token_pool(forward_batch), ("size", "max_num_reqs"), slots
+    from atom.model_ops.qwen4_exp import qsa_attention
+
+    hf = _hf_text_config(atom_config)
+    num_heads, num_kv_heads = qsa_attention.qsa_rank_heads(
+        int(hf.num_attention_heads),
+        int(hf.num_key_value_heads),
+        get_tensor_model_parallel_world_size(),
     )
+    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
+    reason = qsa_attention.flydsl_fallback_reason(
+        compress_ratio,
+        indexer_budget,
+        num_heads,
+        num_kv_heads,
+        int(hf.head_dim),
+        kv_bf16=kv_dtype == torch.bfloat16,
+    )
+    if reason is not None:
+        qsa_attention.log_flydsl_fallback(reason)
+        return False
+    return True
+
+
+def _token_to_kv_pool(forward_batch: Any) -> Any:
+    """The SGLang KV pool the QSA K/V caches are bound from."""
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        backend = resolve_attn_backend(forward_batch)
+        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
+            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
+        )
+    return pool
+
+
+def _flydsl_prefill_layout(
+    forward_batch: Any,
+    live_bs: int,
+    num_tokens: int,
+    block_tables: torch.Tensor,
+    block_size: int,
+) -> tuple[tuple | None, torch.Tensor | None]:
+    """Host lengths for FlyDSL QSA attention, plus context rows when prefixed.
+
+    Returns (None, None) unless the packed tokens are exactly the scheduled
+    extends, so padded or partial batches keep the native kernel.
+    """
+    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seqs = getattr(forward_batch, "seq_lens_cpu", None)
+    if extends is None or seqs is None:
+        return None, None
+    extends = tuple(int(n) for n in list(extends)[:live_bs])
+    seqs = tuple(int(n) for n in list(seqs)[:live_bs])
+    if (
+        len(extends) != live_bs
+        or len(seqs) != live_bs
+        or sum(extends) != num_tokens
+        or any(e < 0 or s < e for e, s in zip(extends, seqs))
+    ):
+        return None, None
+    if all(s == e for e, s in zip(extends, seqs)):
+        return (extends, seqs), None
+    # Built on the device from the per-request lengths (a few bytes up):
+    # host-side index arrays would be MBs per prefixed forward.
+    device = block_tables.device
+    lengths = upload_numpy(np.asarray(seqs, dtype=np.int64), device)
+    total = sum(seqs)
+    requests = torch.repeat_interleave(
+        torch.arange(live_bs, device=device), lengths, output_size=total
+    )
+    tokens = torch.arange(total, device=device) - torch.repeat_interleave(
+        torch.cumsum(lengths, 0) - lengths, lengths, output_size=total
+    )
+    pages = block_tables[requests, tokens // block_size].to(torch.int64)
+    return (extends, seqs), pages * block_size + tokens % block_size
+
+
+def _mamba_physical_slots(pool: Any) -> int:
+    """Slot rows of the physical mamba pool, 0 if it is not attached yet.
+
+    The full conv / temporal tensors are ``[num_mamba_layers, size + 1, ...]``:
+    axis 1 counts slots, SGLang's reserved row included, so every mamba index
+    (working, ping-pong track and cached slots alike) is below it.
+    """
+    if pool is None:
+        return 0
+    mamba_pool = getattr(pool, "mamba_pool", None) or pool
+    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+    if mamba_cache is None:
+        return 0
+    slots = 0
+    conv = getattr(mamba_cache, "conv", None)
+    if conv is not None and len(conv) > 0 and getattr(conv[0], "ndim", 0) >= 2:
+        slots = max(slots, int(conv[0].shape[1]))
+    temporal = getattr(mamba_cache, "temporal", None)
+    if temporal is not None and getattr(temporal, "ndim", 0) >= 2:
+        slots = max(slots, int(temporal.shape[1]))
+    return slots
+
+
+def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
+    """PLE state rows: one per physical mamba slot, like Native's whole-pool state.
+
+    Decode CUDA graphs bake ``conv_state``'s address, so the buffer cannot grow
+    after capture, and with ``extra_buffer`` radix any slot of the pool (track
+    slots included) can become a working slot. Sizing to the physical pool is
+    exact for both.
+
+    Capture can build PLE before the pool is reachable from ``forward_batch``;
+    the Hybrid linear child's pool is tried first. Only when no pool resolves
+    does a conservative estimate apply, which may overallocate but never
+    undersizes a configured pool.
+    """
+    backend = resolve_attn_backend(forward_batch)
+    linear = getattr(backend, "linear_attn_backend", None) or backend
+    pool = resolve_mamba_req_pool(forward_batch, linear)
+    if pool is None:
+        pool = getattr(linear, "req_to_token_pool", None)
+    slots = _mamba_physical_slots(pool)
+    if not slots:
+        try:
+            slots = _mamba_physical_slots(_req_to_token_pool(forward_batch))
+        except Exception:
+            logger.debug("Flash PLE: req_to_token_pool not attached yet", exc_info=True)
+    if not slots:
+        slots = _ple_state_pool_slots_estimate(forward_batch)
     # Host indices only. A GPU ``idx.max().item()`` drains verify, which is
-    # still queued when eager draft builds PLE state. Pool capacity above
-    # already matches Native's whole-pool allocation.
+    # still queued when eager draft builds PLE state.
     if (
         torch.is_tensor(idx)
         and idx.numel()
@@ -1197,6 +1374,40 @@ def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
     ):
         slots = max(slots, int(idx.max().item()) + 1)
     return slots
+
+
+def _ple_state_pool_slots_estimate(forward_batch: Any) -> int:
+    """Row count when the physical mamba pool is not reachable yet.
+
+    Pool capacities count usable slots; the pool holds one more (reserved) row.
+    """
+    slots = max(int(_DECODE_GRAPH.max_bs), 512)
+    args = _server_args()
+    if args is not None:
+        # Mamba slots only: `max_total_tokens` is the KV token budget, and as
+        # a row floor it allocated one PLE row (184 KB on Flash) per KV token.
+        mamba_cache_size = getattr(args, "max_mamba_cache_size", None)
+        if mamba_cache_size:
+            slots = max(slots, int(mamba_cache_size) + 1)
+        running = int(getattr(args, "max_running_requests", 0) or 0)
+        if running > 0:
+            # extra_buffer ≈ 2x; radix retains finished track slots on top.
+            slots = max(slots, running * 64)
+    # SGLang resolves the real mamba capacity onto the schedule object after
+    # memory-pool init (launch-time server_args.max_mamba_cache_size stays None).
+    try:
+        from sglang.srt.runtime_context import get_schedule
+
+        mamba_cap = getattr(get_schedule(), "max_mamba_cache_size", None)
+        if mamba_cap:
+            slots = max(slots, int(mamba_cap) + 1)
+    except Exception:
+        logger.debug("Flash PLE: schedule mamba capacity unavailable", exc_info=True)
+    pool = getattr(forward_batch, "req_to_token_pool", None)
+    mapping = getattr(pool, "req_index_to_mamba_index_mapping", None)
+    if torch.is_tensor(mapping) and mapping.numel():
+        slots = max(slots, int(mapping.numel()))
+    return _max_int_attrs(pool, ("size", "max_num_reqs", "mamba_size"), slots)
 
 
 def _max_int_attrs(obj: Any, keys: tuple[str, ...], current: int) -> int:
@@ -1249,6 +1460,7 @@ def _ensure_ple_states(
     hf = _hf_text_config(atom_config)
     ngram = max(int(getattr(hf, "ngram_size", 3)), 1)
     rows = max(num_slots, 1)
+    existing = getattr(model, "_atom_ple_conv_state", None)
     conv_state = _grow_once_tensor(
         model,
         "_atom_ple_conv_state",
@@ -1267,6 +1479,17 @@ def _ensure_ple_states(
         dtype=torch.int64,
         fill=int(eos[0] if isinstance(eos, (list, tuple)) else eos),
     )
+    if not getattr(_ensure_ple_states, "_logged", False) or (
+        existing is not None and int(existing.shape[0]) < int(conv_state.shape[0])
+    ):
+        logger.info(
+            "Flash PLE state pool rows=%s (requested=%s active=%s capturing=%s)",
+            int(conv_state.shape[0]),
+            rows,
+            bool(_DECODE_GRAPH.active),
+            bool(_is_capturing()),
+        )
+        _ensure_ple_states._logged = True  # type: ignore[attr-defined]
     return conv_state, ngram_state
 
 
@@ -1414,12 +1637,7 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     if not qsa_layers:
         return
 
-    pool = getattr(forward_batch, "token_to_kv_pool", None)
-    if pool is None:
-        backend = resolve_attn_backend(forward_batch)
-        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
-            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
-        )
+    pool = _token_to_kv_pool(forward_batch)
     block_size = _block_size(forward_batch, atom_config)
     compress_ratio = _compress_ratio(atom_config)
     hf = _hf_text_config(atom_config)
@@ -1601,6 +1819,12 @@ def prepare_qwen4_exp_decode_graph_metadata(
             return None
     if atom_config is None or not _is_qwen4_exp_config(atom_config):
         return None
+    # A Flash draft decode graph rebuilds its QSA metadata into
+    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
+    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
+    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
+    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
+        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
 
     tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
     positions = getattr(forward_batch, "positions", None)
@@ -1653,7 +1877,12 @@ def qwen4_exp_metadata_from_forward_batch(
     that storage in place; there is no extra PLE copy.
     """
     bind_qsa_caches(model, forward_batch, atom_config)
-    if _is_capturing() and _DECODE_GRAPH.last_qsa is not None:
+    # Draft graphs build into _DRAFT_QSA inside the graph instead.
+    if (
+        _is_capturing()
+        and not _is_draft_forward()
+        and _DECODE_GRAPH.last_qsa is not None
+    ):
         ple = _DECODE_GRAPH.last_ple
         if ple is None:
             ple = _build_decode_graph_ple_metadata(

@@ -52,6 +52,24 @@ def test_the_draft_holds(traces):
     check(traces["draft_k2"], contract.k2_regions(DRAFT_K2))
 
 
+@pytest.mark.parametrize("index_mfma", [False, True], ids=["flydsl", "opus"])
+@pytest.mark.parametrize("tok_par", [False, True], ids=["replicated", "token_parallel"])
+def test_fp4_index_layout_contract(monkeypatch, index_mfma, tok_par):
+    monkeypatch.setenv("ARCH", "gfx950")
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    key = k2.LayerPostBuild(
+        tokens=12,
+        index_bound_max=65536,
+        tp=4,
+        index_fp4=True,
+        index_mfma=index_mfma,
+        kv_fp8=True,
+        tok_par=tok_par,
+    )
+    record = trace(k2.build_layer_post(key), k2.ABI)
+    check(record, contract.k2_regions(key))
+
+
 def _changed(decls, name, **change):
     assert any(d.name == name for d in decls), name
     return [dataclasses.replace(d, **change) if d.name == name else d for d in decls]

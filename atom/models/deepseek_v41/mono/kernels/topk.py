@@ -18,11 +18,11 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
 from atom.mono.device.ops import block_excl_scan, traced, wave_incl_scan, wave_max
+from atom.mono.device.select import INT_MIN, u32_lt
 from atom.mono.plan.execution import THREADS, WAVES
 
 PER_THREAD = 64  # the largest a CTA's LDS takes alone: 32768 keys
 LDS_KEYS = THREADS * PER_THREAD
-INT_MIN = -(2**31)
 
 
 def order_key(bits):
@@ -33,11 +33,6 @@ def order_key(bits):
 def key_bits(key):
     """The fp32 bits ``order_key`` came from."""
     return (key < 0).select(key ^ INT_MIN, ~key)
-
-
-def ult(a, b):
-    """a < b as u32."""
-    return (a ^ INT_MIN) < (b ^ INT_MIN)
 
 
 # a histogram: 256 bins, then a dummy bin a lane: a key outside the pass's
@@ -139,7 +134,7 @@ def lds_topk(n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None)
     take_all = n <= k
     # winners: keys above the k-th, then its ties lowest index first; one scan of
     # (above, ties) packed in 16-bit halves gives both prefixes
-    gts = [(base + d < n) & ult(prefix, kv[d]) for d in range(per_thread)]
+    gts = [(base + d < n) & u32_lt(prefix, kv[d]) for d in range(per_thread)]
     eqs = [(base + d < n) & (kv[d] == prefix) for d in range(per_thread)]
     above, ties = Int32(0), Int32(0)
     for d in range_constexpr(per_thread):

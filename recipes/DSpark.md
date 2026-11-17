@@ -8,15 +8,19 @@ block. A per-request **confidence head** predicts how many drafted tokens are
 worth verifying, so each request can verify a different length and the freed
 batch capacity lifts throughput.
 
-ATOM supports two DSpark flavors, which differ only in **where the draft lives**:
+ATOM supports these DSpark drafts:
 
-| Target | Draft | How it's loaded |
-|---|---|---|
-| **DeepSeek-V4-Pro** | in-checkpoint (`mtp.*` namespace) | auto-detected via the `dspark_block_size` config field — no `--draft-model` |
-| **Kimi-K3** | separate checkpoint | passed explicitly with `--draft-model` |
+| Target | Draft | How it's loaded | Draft KV | DCP |
+|---|---|---|---|---|
+| **DeepSeek-V4-Pro** | in-checkpoint (`mtp.*` namespace) | auto-detected via the `dspark_block_size` config field — no `--draft-model` | target's pool | — |
+| **Kimi-K3** | [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) (MLA) | `--draft-model` | extra rows in the target's MLA pool | sharded with the target |
+| **Kimi-K3** | [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) (SpecForge DFlash, GQA) | `--draft-model` | its own pool, `--kv_cache_dtype` | not sharded: every rank holds the whole context |
 
-Everything downstream of loading — the parallel block draft, confidence-scheduled
-ragged verify, and `--dspark-config` knobs — is shared between the two.
+Everything downstream of loading — the parallel block draft, the verify paths,
+and `--dspark-config` knobs — is shared between them. The confidence-scheduled
+ragged verify needs a draft that returns confidence: the V4 draft does, the two
+Kimi-K3 drafts do not (neither loads its checkpoint's `confidence_head`), so
+with them `confidence_schedule` / `ragged` pick no per-request verify length.
 
 ## Preparing environment
 
@@ -75,8 +79,49 @@ Notes for Kimi-K3:
   target's own full-attention layers cache, so the draft's 5 layers bind into
   the target's KV pool as extra rows and inherit `--kv_cache_dtype`.
 - `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
-- The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
-  omit it to run the plain batch-uniform verify.
+- The draft returns no confidence, so the confidence-scheduled ragged verify
+  does not apply: omit `--dspark-config` to run the plain batch-uniform verify.
+
+### Kimi-K3 with the RadixArk DSpark GQA draft (TP8 + DCP8 + FP8 KV Cache)
+
+[RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) is a
+5-layer Qwen3-style GQA draft (SpecForge DFlash) that reads an aggregate of the
+target's hidden states. It serves a Kimi-K3 target only. Its block width is
+`--num-speculative-tokens`, as for the Inferact draft above.
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model moonshotai/Kimi-K3 \
+  --draft-model RadixArk/Kimi-K3-DSpark \
+  --tensor-parallel-size 8 \
+  --decode-context-parallel-size 8 \
+  --kv_cache_dtype fp8 \
+  --block-size 128 \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --trust-remote-code \
+  --server-port 7777
+```
+
+Notes:
+- The draft has 2 KV heads at TP8 and, as in SGLang, is not split across the
+  DCP group: each rank caches the draft KV for every context token. With DCP8
+  the draft's entry is `block_size * 8` tokens: 1,310,720 B of a 3,080,192 B
+  paged block at fp8, i.e. 43% of the block including the draft, or 74% on top
+  of the target's own 1,769,472 B of MLA rows. The MLA draft above adds
+  368,640 B (17% of its 2,138,112 B block), so with the same memory this draft
+  leaves about 31% fewer KV blocks (1 - 2,138,112 / 3,080,192 = 30.6%).
+- The draft KV is fp8 when `--kv_cache_dtype fp8`, at a per-tensor scale of 1.0
+  (the checkpoint ships no KV scales). SGLang serves this checkpoint with
+  `--speculative-draft-kv-cache-dtype fp8_e4m3` and supports only per-tensor
+  fp8 KV scales as well.
+- On gfx950 over an fp8 pool, the draft's block read casts q to the pool's fp8
+  dtype so aiter's Gluon `unified_attention` kernel serves it, about 1.6x
+  faster than the Triton path at bs 32 / 128k context. SGLang's verify kernel
+  casts q to the pool dtype for the prefix dot as well.
+- The draft ropes from its own config: YaRN x16 from 65536 at theta 10000,
+  neox-style, where Kimi-K3 is x32 from 32768 at theta 50000. Inheriting the
+  target's rope loads clean and only costs acceptance length.
 
 ### `--dspark-config` knobs
 
@@ -92,6 +137,19 @@ parent process and pickled into every engine-core worker (see `DSparkConfig` in
 | `ragged_graph_sizes` | str | Comma-separated per-seq CUDA-graph query-length buckets to capture for the ragged path, e.g. `"1,3,6"` or `"8"`. Smaller buckets are what actually free dense/MoE compute; a single full bucket (`mtp_k+1`) only saves attention. |
 | `q_buckets` | str | CUDA-graph query-length buckets for the older batch-uniform q-bucket verify path (independent of the ragged path). |
 | `disable_sps_calib` | bool | Skip SPS calibration (replays captured graphs at warmup) and use the synthetic SPS stub. |
+| `draft_kv_dtype` | str | Native DeepSeek-V4.1 draft **attention precision**: `"auto"` (default) retains BF16 attention, including when the target stores FP8/FP4 KV; `"fp8"` uses MXFP8 history/current KV with AITER OPUS A8W8 attention. Requires native V4.1 DSpark, FP8 or FP4 target KV, and an eligible AITER backend; unsupported configurations fail at startup. |
+
+For V4.1, add `--dspark-config '{"draft_kv_dtype": "fp8"}'` to opt into
+FP8 draft attention, or include that key alongside the other DSpark settings.
+This option controls attention precision independently of the target KV dtype;
+it is distinct from the internally resolved `SpeculativeConfig.draft_kv_dtype`,
+which describes the draft's page storage. FP8 drafting uses AITER and bypasses
+Mono's draft path. See the [V4.1 recipe](DeepSeek-V4.1-Flash.md) for launch options.
+
+Offline calibration profiles distinguish FP8 draft attention and an enabled
+A8W4 target. Profiles measured before these choices remain compatible with
+BF16 drafting and the target's original attention path; changing either
+precision/path requires a matching profile.
 
 Tips on server configuration:
 - **`--num-speculative-tokens 7`** sets the draft block; the max verify length is

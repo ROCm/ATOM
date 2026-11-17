@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ipaddress
+from datetime import timedelta
+
+import torch
+from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
     _get_default_timeout,
     _unregister_process_group,
 )
-from torch.distributed import ProcessGroup
 from torch.distributed.rendezvous import rendezvous
-import torch
-from datetime import timedelta
 
-
-from atom.utils import is_torch_equal_or_newer
+from atom.utils import envs, is_torch_equal_or_newer
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -30,6 +30,52 @@ def get_tcp_uri(ip: str, port: int) -> str:
         return f"tcp://[{ip}]:{port}"
     else:
         return f"tcp://{ip}:{port}"
+
+
+def raise_default_group_timeout(seconds: int) -> None:
+    """Raise, never lower, the timeout torch gives groups created without one.
+
+    The default group and aiter's gloo and NCCL groups are built that way.
+    Across nodes their first collective after the weight load waits for the
+    slowest node, and a cold read of a large checkpoint from NFS can trail
+    another node's by more than torch's defaults (30 minutes for gloo, 10 for
+    NCCL).
+    """
+    from torch.distributed import distributed_c10d
+
+    floor = timedelta(seconds=seconds)
+    distributed_c10d.default_pg_timeout = max(
+        distributed_c10d.default_pg_timeout, floor
+    )
+    nccl = distributed_c10d.default_pg_nccl_timeout
+    if nccl is not None:  # None in a torch built without NCCL
+        distributed_c10d.default_pg_nccl_timeout = max(nccl, floor)
+
+
+def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the DP group has ranks on other nodes.
+
+    Read from the topology, the group's ranks against the ranks this node runs,
+    so every rank of a group agrees. ParallelConfig.is_multinode_dp also reads
+    data_parallel_rank, which in a worker is its own global rank, so it would
+    match ranks 1.. of a single-node group.
+    """
+    if parallel_config.data_parallel_size_local < parallel_config.data_parallel_size:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
+
+
+def raise_timeout_if_tp_spans_nodes(config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the TP group has ranks on other
+    nodes (tp_multinode.py), as raise_timeout_if_dp_spans_nodes does for DP."""
+    if config.is_multinode_tp:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
+
+
+def kv_blocks_differ_across_ranks(config) -> bool:
+    """Whether ranks can size different KV pools: PP stages hold different
+    layers, and ranks on another node have their own free memory. Only rank
+    0's count reaches the scheduler, so these reduce to the global minimum."""
+    return config.pipeline_parallel_size > 1 or config.is_multinode_tp
 
 
 def init_gloo_process_group(

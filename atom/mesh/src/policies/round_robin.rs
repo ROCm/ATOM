@@ -7,7 +7,10 @@ use std::sync::{
 
 use async_trait::async_trait;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{
+    get_healthy_worker_indices, LoadBalancingPolicy, RouteDecision, SelectWorkerInfo,
+    NO_HEALTHY_WORKERS,
+};
 use crate::core::Worker;
 
 /// Round-robin selection policy
@@ -28,22 +31,25 @@ impl RoundRobinPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for RoundRobinPolicy {
-    async fn select_worker(
+    async fn select_with_decision(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
+    ) -> (Option<usize>, RouteDecision) {
         let healthy_indices = get_healthy_worker_indices(workers);
 
         if healthy_indices.is_empty() {
-            return None;
+            return (None, RouteDecision::branch(NO_HEALTHY_WORKERS));
         }
 
         // Get and increment counter atomically
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected_idx = count % healthy_indices.len();
 
-        Some(healthy_indices[selected_idx])
+        (
+            Some(healthy_indices[selected_idx]),
+            RouteDecision::branch("round_robin"),
+        )
     }
 
     fn name(&self) -> &'static str {

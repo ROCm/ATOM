@@ -1025,7 +1025,7 @@ def _publish_fp8_prefill_index_rows(md, atom_config) -> None:
     if int(starts.shape[0]) == 0:
         return
     from atom.distributed.dcp_utils import get_dcp_rank
-    from atom.model_ops.indexer.rows import ConcatKeys, DcpSplit, concat_rows
+    from atom.model_ops.indexer.rows import ConcatKeys, RowSplit, concat_rows
 
     world = int(getattr(atom_config, "decode_context_parallel_size", 1) or 1)
     rank = get_dcp_rank() if world > 1 else 0
@@ -1038,7 +1038,7 @@ def _publish_fp8_prefill_index_rows(md, atom_config) -> None:
             total=int(md.total_kv),
             row_starts=starts,
         ),
-        DcpSplit.of(int(row_ends.shape[0]), rank, world),
+        RowSplit.of(int(row_ends.shape[0]), rank, world),
     )
 
 

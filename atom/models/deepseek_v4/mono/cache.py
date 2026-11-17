@@ -95,6 +95,7 @@ class V4CacheAdapter:
         request_widths: tuple[int, ...] = (1, 2, 4, 8),
     ):
         from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+            FP4_GFX950_OPUS,
             FP4_GFX950_PRESHUFFLE,
         )
 
@@ -224,7 +225,12 @@ class V4CacheAdapter:
             state["st_sc"] = state["score_state"].stride(0)
             if cfg.indexed:
                 idx, icmp = attn.indexer, attn.indexer.compressor
-                if not idx._indexer_fp4 or idx.indexer_layout != FP4_GFX950_PRESHUFFLE:
+                if (
+                    not idx._indexer_fp4
+                    or idx.indexer_layout
+                    not in (FP4_GFX950_PRESHUFFLE, FP4_GFX950_OPUS)
+                    or idx.indexer_layout != cfg.indexer_layout
+                ):
                     raise MonoUnsupported("real FP4 index pool layout")
                 codes, scales = view(idx, "kv_cache"), view(idx, "kv_scale")
                 nb = codes.shape[0]

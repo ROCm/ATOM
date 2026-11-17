@@ -104,6 +104,15 @@ pub fn filter_decode_args_from(raw_args: &[String]) -> Vec<String> {
     filtered_args
 }
 
+fn parse_fraction(value: &str) -> Result<f64, String> {
+    let fraction: f64 = value.parse().map_err(|err| format!("{err}"))?;
+    if (0.0..=1.0).contains(&fraction) {
+        Ok(fraction)
+    } else {
+        Err(format!("{fraction} is not between 0 and 1"))
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Backend {
     #[value(name = "sglang")]
@@ -202,6 +211,8 @@ pub struct CliArgs {
     #[cfg(feature = "ext-proc")]
     #[command(flatten)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
+    #[command(flatten)]
+    pub prepare_pool: crate::config::PreparePoolConfig,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
@@ -257,6 +268,11 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     pub dp_aware: bool,
 
+    /// Follow the KV cache events each worker reports at /kv_event_sources (ATOM);
+    /// /kv_events/sources shows every subscription
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    pub kv_events: bool,
+
     // ==================== PD Disaggregation ====================
     /// Enable PD (Prefill-Decode) disaggregated mode
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -306,6 +322,12 @@ pub struct CliArgs {
     /// Enable structured JSON log output instead of plain text
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     pub json_log: bool,
+
+    /// Fraction of inference requests (0 to 1) that log their routing decisions
+    /// at info level under target mesh::route; above 0, the x-mesh-route-trace
+    /// request header logs a single request regardless. HTTP routers only
+    #[arg(long, default_value_t = 0.0, value_parser = parse_fraction, help_heading = "Logging")]
+    pub route_log_sample_rate: f64,
 
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics
@@ -618,6 +640,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .prepare_pool(self.prepare_pool.clone())
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
@@ -662,6 +685,7 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .dp_aware(self.dp_aware)
+            .kv_events(self.kv_events)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .build()
@@ -694,6 +718,7 @@ impl CliArgs {
             log_dir: self.log_dir.clone(),
             log_level: Some(self.log_level.clone()),
             json_log: self.json_log,
+            route_log_sample_rate: self.route_log_sample_rate,
             prometheus_config,
             request_timeout_secs: self.request_timeout_secs,
             request_id_headers: if self.request_id_headers.is_empty() {
@@ -718,6 +743,75 @@ impl CliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_log_sample_rate_must_be_a_fraction() {
+        let parse = |rate: &str| {
+            CliArgs::try_parse_from(["atomesh", &format!("--route-log-sample-rate={rate}")])
+                .map(|args| args.route_log_sample_rate)
+        };
+        assert_eq!(parse("0.25").unwrap(), 0.25);
+        for rate in ["-1", "2", "NaN"] {
+            assert!(parse(rate).is_err(), "{rate} was accepted");
+        }
+    }
+
+    #[test]
+    fn cli_prepare_options_map_to_router_config() {
+        let args = CliArgs::try_parse_from([
+            "atomesh",
+            "--prepare-workers",
+            "2",
+            "--prepare-queue-capacity",
+            "6",
+            "--prepare-queue-timeout-ms",
+            "100",
+            "--prepare-timeout-ms",
+            "2000",
+            "--prepare-max-tokenize-bytes",
+            "8192",
+        ])
+        .unwrap();
+        let config = args.to_router_config(Vec::new()).unwrap();
+        assert_eq!(
+            config.prepare_pool,
+            crate::config::PreparePoolConfig {
+                workers: Some(2),
+                queue_capacity: Some(6),
+                queue_timeout_ms: 100,
+                prepare_timeout_ms: 2000,
+                max_tokenize_bytes: Some(8192),
+            }
+        );
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
+
+        // Common prepare options and legacy ext-proc options keep separate ids,
+        // and the common options win once both are resolved.
+        #[cfg(feature = "ext-proc")]
+        {
+            let args = CliArgs::try_parse_from([
+                "atomesh",
+                "--ext-proc",
+                "--ext-proc-parser-concurrency",
+                "4",
+                "--prepare-workers",
+                "1",
+                "--ext-proc-max-tokenize-bytes",
+                "4096",
+                "--prepare-max-tokenize-bytes",
+                "8192",
+            ])
+            .unwrap();
+            assert_eq!(args.ext_proc.parser_concurrency, Some(4));
+            assert_eq!(args.ext_proc.max_tokenize_bytes, Some(4096));
+            assert_eq!(args.prepare_pool.workers, Some(1));
+            assert_eq!(args.prepare_pool.max_tokenize_bytes, Some(8192));
+            let config = args.to_router_config(Vec::new()).unwrap();
+            assert_eq!(config.resolved_prepare_workers(), 1);
+            assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
+            assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+        }
+    }
 
     #[test]
     fn parse_policy_accepts_dp_sticky() {
@@ -781,6 +875,7 @@ impl Default for CliArgs {
         Self {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
+            prepare_pool: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,
             worker_urls: Vec::new(),
@@ -793,6 +888,7 @@ impl Default for CliArgs {
             prefix_token_count: 256,
             prefix_hash_load_factor: 1.25,
             dp_aware: false,
+            kv_events: false,
             pd_disaggregation: false,
             decode: Vec::new(),
             prefill_policy: None,
@@ -803,6 +899,7 @@ impl Default for CliArgs {
             log_dir: None,
             log_level: "info".to_string(),
             json_log: false,
+            route_log_sample_rate: 0.0,
             prometheus_port: 29_000,
             prometheus_host: "0.0.0.0".to_string(),
             prometheus_duration_buckets: Vec::new(),

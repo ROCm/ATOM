@@ -14,7 +14,8 @@ rather than relying on `-1 * per_page + (per_page - 1)` landing back on `-1`.
 FP4: the key before its norm, normed, rotated and quantized in the same pass
 (`_write_index_fp4_kernel`), bit for bit `Indexer.project_keys` then the
 official group-32 E8M0 arithmetic (aiter's `_mxfp4_quant_op`), stored in the
-page-8 layout of `index_plane` at the address the FP8 writer resolves.
+selected layout of `index_plane` at the address the FP8 writer resolves.
+OPUS on gfx950 groups 64 rows physically; table IDs still name 8-row pages.
 """
 
 import torch
@@ -23,6 +24,8 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
+
+from .index_plane import FP4_FLYDSL, FP4_MFMA, FP4_OPUS
 
 MFMA_N = 16
 """Columns one shuffled group interleaves: the MFMA B operand's width.
@@ -166,6 +169,8 @@ def _write_index_fp4_kernel(
     HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     PAGE: tl.constexpr,
+    NATURAL: tl.constexpr,
+    MFMA: tl.constexpr,
 ):
     """One program per plan row, as `_write_index_kernel`: its key normed
     (RMSNorm, rounded to bf16 as the norm's output is), its RoPE tail rotated
@@ -204,13 +209,25 @@ def _write_index_fp4_kernel(
     value_at = ((chunk // 4 * LANE_KEYS + t % LANE_KEYS) * 4 + chunk % 4) * (
         PAGE // LANE_KEYS
     ) + t // LANE_KEYS
+    value_offset = value_at * 16 + b % 16
+    if NATURAL:
+        value_offset = t * (HEAD_DIM // 2) + b
+    elif MFMA:
+        # [64-row group, 32-dim chunk, row, packed byte]
+        value_offset = (chunk * PAGE + t) * 16 + b % 16
     tl.store(
-        values + page * (PAGE * HEAD_DIM // 2) + value_at * 16 + b % 16,
+        values + page * (PAGE * HEAD_DIM // 2) + value_offset,
         tl.reshape(packed, (HEAD_DIM // 2,)),
     )
     g = tl.arange(0, HEAD_DIM // 32)
+    scale_offset = g * PAGE + t
+    if NATURAL:
+        scale_offset = t * (HEAD_DIM // 32) + g
+    elif MFMA:
+        # [group, chunk % 2, row % 32, chunk // 2, row // 32]
+        scale_offset = (g % 2) * 128 + (t % 32) * 4 + (g // 2) * 2 + t // 32
     tl.store(
-        scales + page * (PAGE * HEAD_DIM // 32) + g * PAGE + t,
+        scales + page * (PAGE * HEAD_DIM // 32) + scale_offset,
         tl.reshape(e8m0, (HEAD_DIM // 32,)),
     )
 
@@ -224,6 +241,10 @@ def write_index_rows_fp4(
     count = plan.shape[0]
     if not count:
         return
+    if units.layout not in (FP4_FLYDSL, FP4_OPUS, FP4_MFMA):
+        raise ValueError(f"unknown V4.1 FP4 index layout {units.layout!r}")
+    if units.layout == FP4_MFMA and (keys.shape[-1] != 128 or per_page % 64):
+        raise ValueError("gfx950 OPUS needs dim=128 and complete 64-row PAGE groups")
     _write_index_fp4_kernel[(count,)](
         keys,
         norm.weight,
@@ -239,5 +260,7 @@ def write_index_rows_fp4(
         RATIO=ratio,
         HEAD_DIM=keys.shape[-1],
         ROPE_DIM=rope.rope_dim,
-        PAGE=units.values.shape[1],
+        PAGE=64 if units.layout == FP4_MFMA else units.values.shape[1],
+        NATURAL=units.layout == FP4_OPUS,
+        MFMA=units.layout == FP4_MFMA,
     )

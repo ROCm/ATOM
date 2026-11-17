@@ -29,8 +29,14 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadCompletionId,
     SaveCompletionId,
+    raw_req_id,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.load_math import (
+    chunk_floor,
+    loadable_hit,
+    tier_load_tokens,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -63,6 +69,31 @@ def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
+#: The in-process LMCache key tag a prompt's `tier_cache_salt` travels under.
+CACHE_SALT_TAG = "lmcache.tag.cache_salt"
+
+
+def tier_cache_salt(seq) -> str:
+    """What keeps a multimodal prompt's tier keys apart from another's with
+    the same placeholder ids: its `cache_seed`, which also seeds
+    `BlockManager`'s chain. Empty for a text prompt, whose keys stay unsalted.
+    """
+    # The vLLM plugin's `SeqView` carries no `cache_seed`.
+    seed = getattr(seq, "cache_seed", -1)
+    return "" if seed == -1 else str(seed)
+
+
+def salt_kwargs(cache_salt: str) -> dict:
+    """`cache_salt` as a tier call's `request_configs` (the in-process engine's
+    key tag); no argument at all for an unsalted prompt."""
+    return {"request_configs": {CACHE_SALT_TAG: cache_salt}} if cache_salt else {}
+
+
+def tier_lookup_kwargs(seq) -> dict:
+    """A tier lookup's arguments past the prompt (`salt_kwargs`)."""
+    return salt_kwargs(tier_cache_salt(seq))
+
+
 def validated_kv_role(kvc: dict) -> str:
     role = kvc.get("kv_role", "offload")
     if role not in _VALID_KV_ROLES:
@@ -86,6 +117,83 @@ def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
     )
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
+
+
+# -- async save contract ------------------------------------------------------
+#
+# The dense KV save (`DenseOffloadConnector`) and the Kimi-K3 state store
+# (`StateOffloadTier`) both copy device memory a forward wrote, from a thread of
+# their own. Both follow one contract:
+#
+# * Fence. The dispatching thread records one event per step on the current
+#   stream, after the writes the step's saves read are enqueued
+#   (`record_save_fence`), and hands that event to every save of the step. The
+#   save thread host-waits on it (`wait_save_fence`) before it reads the source;
+#   the KV save also passes it to LMCache's `store()`, whose pack stream waits on
+#   it. A fence that cannot be recorded fails the step's saves before anything
+#   reads; one that raises while waited on fails that save.
+# * Lifecycle. "Source safe to release" (the device has stopped reading the
+#   source) and "store succeeded" (the CPU tier holds the bytes) are separate
+#   facts. Each save releases its source at most once and reports exactly one
+#   terminal outcome -- stored, refused, or raised. The state store reports them
+#   apart through `SaveLifecycle`. The KV save reports one terminal per save
+#   from `_do_save_req`, or from `_guard` when it raised; with early block
+#   release on, the GPU connector reports the source per staging group, and
+#   without it (Kimi-K3) the terminal releases the source.
+
+
+def record_save_fence() -> torch.cuda.Event:
+    """Record a save fence on the current stream, behind the step's writes."""
+    event = torch.cuda.Event()
+    event.record(torch.cuda.current_stream())
+    return event
+
+
+def wait_save_fence(event) -> None:
+    """Block the save thread until the writes behind `event` have run.
+
+    Fails closed on ``None``: a save without its fence must fail rather than read
+    a source nothing ordered.
+    """
+    if event is None:
+        raise ValueError("a save was handed no producer fence")
+    event.synchronize()
+
+
+class SaveLifecycle:
+    """One save's source release and terminal report, each emitted once.
+
+    Both callbacks run under `lock`, the lock the reports are drained under, so
+    a drain sees a terminal together with its release; they must not take it.
+    """
+
+    def __init__(self, lock, *, release_source, report_terminal) -> None:
+        self._lock = lock
+        self._release_source = release_source
+        self._report_terminal = report_terminal
+        self._released = False
+        self._finished = False
+
+    def release_source(self) -> None:
+        """Hand the source back. Later calls are no-ops."""
+        with self._lock:
+            self._release_locked()
+
+    def finish(self, stored: bool) -> None:
+        """Report the terminal outcome once, releasing the source first if no
+        earlier call did. Call it only once the device has stopped reading the
+        source."""
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            self._release_locked()
+            self._report_terminal(stored)
+
+    def _release_locked(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release_source()
 
 
 def build_offload_engine(
@@ -364,9 +472,9 @@ class OffloadWorkerMixin:
             logger.exception(
                 "offload %s failed for %s",
                 getattr(fn, "__name__", kind),
-                getattr(req, "req_id", req),
+                raw_req_id(req),
             )
-            rid = getattr(req, "req_id", req)
+            rid = raw_req_id(req)
             if kind == "load":
                 self._on_load_fail(rid)
                 with self._lock:
@@ -456,6 +564,9 @@ class OffloadSchedulerMixin(ABC):
     # halfway through a lookup. `_remember_tier_hit` replaces the None with a
     # per-instance dict on first use.
     _tier_hit_memo: dict | None = None
+    # The smallest tier hit worth loading; a scheduler sets its configuration's
+    # value (`offcfg.min_load_tokens`) in `__init__`.
+    _min_load_tokens: int = offcfg.DEFAULT_MIN_LOAD_TOKENS
     _tier_memo_steps = 32
     _tier_retry_steps = 32
     total_lookups_skipped_by_memo = 0
@@ -516,12 +627,12 @@ class OffloadSchedulerMixin(ABC):
         """Apply offload-specific completions and expose plain request IDs."""
 
         loaded = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.finished_loading
             if self.load_finished(value) is not False
         }
         failed = {
-            value.req_id if hasattr(value, "req_id") else value
+            raw_req_id(value)
             for value in output.failed_loading
             if self.load_failed(value) is not False
         }
@@ -540,10 +651,10 @@ class OffloadSchedulerMixin(ABC):
             # non-terminal milestone such as PAGE source-safety.
             if handled is True:
                 value = completion.operation_id
-                terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+                terminal_saves.add(raw_req_id(value))
         for value in output.finished_saving:
             self.save_finished(value)
-            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+            terminal_saves.add(raw_req_id(value))
 
         output.finished_loading = loaded
         output.failed_loading = failed
@@ -676,31 +787,13 @@ class OffloadSchedulerMixin(ABC):
         return getattr(self, "_max_pending_saves", None)
 
     def _chunk_floor(self, tokens: int) -> int:
-        chunk = int(self.chunk_size or 256)
-        return (max(0, int(tokens)) // chunk) * chunk
+        return chunk_floor(tokens, int(self.chunk_size or 256))
 
     def _loadable_hit(self, hit: int, num_prompt: int) -> int:
-        """Turn a lookup hit into a length the external tier can actually serve.
-
-        Two steps, in this order:
-
-        * A hit covering the whole prompt leaves nothing to compute, so step
-          back one token.
-        * Floor to a chunk. `retrieve` resolves the tier at chunk granularity,
-          so a `hit` that is not a chunk multiple names tokens the tier does
-          not hold and the load's `ret_mask[hbm:lmc].all()` check can never
-          pass. The decrement above is exactly how that happens in practice:
-          a prompt whose length is a multiple of the chunk size lands on a
-          boundary and stepping back one token walks off it -- which is why the
-          floor must come second. Flooring costs at most one chunk of
-          re-prefill and makes the spec satisfiable; without it such a request
-          can never load, only fail.
-        """
-
-        hit = int(hit)
-        if hit == int(num_prompt):
-            hit -= 1
-        return self._chunk_floor(hit)
+        """Turn a lookup hit into a length the external tier can actually serve
+        (`load_math.loadable_hit`: step back from a whole-prompt hit, then floor
+        to a chunk, so the load's `ret_mask[hbm:lmc].all()` check can pass)."""
+        return loadable_hit(hit, num_prompt, int(self.chunk_size or 256))
 
     # -- the one expensive input: how much of this prompt the tier holds ---
     def _init_tier_hit_memo(self) -> None:
@@ -739,7 +832,7 @@ class OffloadSchedulerMixin(ABC):
         """A reference that does not keep an aborted request's prompt alive.
 
         A request can leave the waiting queue without ever reaching
-        `request_finished` -- `Scheduler._reject_aborted_waiting` is one such
+        `request_finished` -- `Scheduler._finish_rejected_waiting` is one such
         path -- and an entry holding the sequence strongly would pin its whole
         `token_ids` list for the life of the process.
         """
@@ -800,7 +893,7 @@ class OffloadSchedulerMixin(ABC):
         if self._tier_hit_memo:
             self._tier_hit_memo.pop(sid, None)
 
-    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool:
+    def _ensure_lookup_pin(self, seq, sid: str, spec) -> bool | None:
         """Re-take the worker-side lookup pin before a load is committed.
 
         An answer served from the remembered hit carries no pin: the metadata
@@ -810,9 +903,11 @@ class OffloadSchedulerMixin(ABC):
         A transfer does: it must not read an entry that nothing is holding. So
         the step that turns a load spec into a dispatched retrieve asks the tier
         for real, and the load stands only if the tier still holds at least what
-        the spec promised. If it holds less -- evicted in the steps since -- the
-        load is dropped and the request prefills, which is what would have
-        happened with no tier at all.
+        the spec promised. If it holds less -- evicted in the steps since -- this
+        answers False, and None if the lookup did not answer (a timeout or an
+        RPC error); the caller drops the load either way, and reopens its saves
+        only on False, when the tier has lost what the request recomputes. The
+        request prefills, which is what would have happened with no tier at all.
 
         Confirming rather than re-deriving is deliberate: by this point the spec
         may have been shaped by something this mixin does not own (the unaligned
@@ -847,8 +942,7 @@ class OffloadSchedulerMixin(ABC):
                 hit,
                 int(spec.lmcache_cached_tokens),
             )
-            self._clear_pending_load(sid)
-            return False
+            return None if hit is None else False
         return True
 
     def _repeat_load_suppressed(self, seq, sid: str) -> bool:
@@ -874,6 +968,19 @@ class OffloadSchedulerMixin(ABC):
         failed_seq = self._load_lifecycles.get(sid)
         if failed_seq is not None:
             self._load_failed_seqs[sid] = failed_seq
+
+    def _reopen_saves(self, sid: str) -> None:
+        """A tier hit that is not loaded (the tier lost it, or the load failed)
+        is recomputed from the HBM frontier the dispatch recorded: let
+        `[hbm, hit)` be stored again rather than treated as persisted.
+
+        A promise withdrawn before dispatch records none and reopens nothing:
+        the tier still holds what the request recomputes.
+        """
+        floor = self._load_save_floors.get(sid)
+        entry = self._save_tracker.get(sid)
+        if floor is not None and entry is not None:
+            entry[1] = min(int(entry[1]), int(floor))
 
     def _release_failed_load_attempt(self, sid: str, seq) -> None:
         """Drop the mark when its sequence is done with the request ID."""
@@ -904,8 +1011,8 @@ class OffloadSchedulerMixin(ABC):
     ) -> bool:
         boundary = ((hbm + chunk - 1) // chunk) * chunk
         remaining_after_boundary = lmc - boundary
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if boundary <= hbm or remaining_after_boundary < min_load:
+        min_load = int(self._min_load_tokens)
+        if boundary <= hbm or not tier_load_tokens(hbm, lmc, chunk, min_load):
             return False
 
         sid = str(seq.id)
@@ -1030,7 +1137,7 @@ class OffloadSchedulerMixin(ABC):
         seq.offload_loaded_tokens = hbm
         self._perf_bump("skip_" + reason)
         self._perf_bump("skip_tokens_" + reason, max(0, lmc - hbm))
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
+        min_load = int(self._min_load_tokens)
         logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
             "need=%d min_load=%d chunk=%d reason=%s",
@@ -1065,8 +1172,9 @@ class OffloadSchedulerMixin(ABC):
         seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         return True
 
-    def _save_frontier(self, seq) -> int:
-        computed = min(
+    def _save_computed_tokens(self, seq) -> int:
+        """Prompt tokens whose KV a save emitted now may read."""
+        return min(
             int(
                 getattr(
                     seq,
@@ -1076,7 +1184,9 @@ class OffloadSchedulerMixin(ABC):
             ),
             int(getattr(seq, "num_prompt_tokens", 0)),
         )
-        return self._chunk_floor(computed)
+
+    def _save_frontier(self, seq) -> int:
+        return self._chunk_floor(self._save_computed_tokens(seq))
 
     def _has_pending_save(self, seq) -> bool:
         sid = str(seq.id)
@@ -1092,15 +1202,21 @@ class OffloadSchedulerMixin(ABC):
         return active is not None and active[0] is seq
 
 
-def max_pending_saves(kvc, save_workers: int) -> int:
-    """Return the maximum running-plus-queued worker save operations."""
+def max_pending_saves(kvc, save_workers: int, pp_size: int = 1) -> int:
+    """Return the maximum running-plus-queued worker save operations.
+
+    Under pipeline parallelism a save reports only once every stage has stored
+    its layers, and a stage reaches the save only after the batches queued ahead
+    of it, so one save stays outstanding for about `pp_size` times as long. The
+    default scales with it; an explicit setting is taken as given.
+    """
 
     extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
     configured = extra.get("max_pending_saves")
     if configured is None:
         capacity = envs.OFFLOAD_MAX_PENDING_SAVES
         if capacity is None:
-            capacity = max(2, 2 * save_workers)
+            capacity = max(2, 2 * save_workers) * max(1, int(pp_size))
     else:
         if isinstance(configured, bool) or not isinstance(configured, int):
             raise ValueError("max pending saves must be a positive integer")

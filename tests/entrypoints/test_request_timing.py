@@ -220,7 +220,14 @@ def _metrics(exporter):
 
 @pytest.mark.parametrize("spec_version", ["2.0", "2.4"])
 @pytest.mark.parametrize(
-    "path", ["/v1/chat/completions", "/v1/completions", "/v1/messages"]
+    "path",
+    [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/beta/chat/completions",
+        "/beta/completions",
+    ],
 )
 def test_streaming_ttft_includes_preprocessing_skips_role_and_records_once(
     monkeypatch, path, spec_version

@@ -29,9 +29,11 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
+from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
+from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.check import (
     check_front,
@@ -56,6 +58,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -63,6 +66,7 @@ from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_u
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -125,7 +129,7 @@ def f32_bits(x: float) -> int:
 
 class V41MonoDecodeRunner:
     """Binds every rank's weights and buffers, or none: a rank that cannot is a
-    refusal every rank agrees on (``tp_agree``) before anything collective.
+    refusal every rank agrees on (``group_agree``) before anything collective.
 
     A step is up to ``max_rows`` rows, whatever requests they belong to (a
     row's window comes from its own batch id, ``write_step_meta``); the buffers
@@ -143,6 +147,7 @@ class V41MonoDecodeRunner:
     # the index plane is FP4: K1 quantizes the indexer query for, and K2a
     # scores with, ``index_score_fp4``
     index_fp4 = False
+    index_layout = "fp8"
 
     def __init__(self, model, drafter, max_model_len: int, index_fp4: bool) -> None:
         # the indexer's widest bound: a ratio-1 layer sees every position. No
@@ -150,6 +155,9 @@ class V41MonoDecodeRunner:
         # selection would never reach a final level nor publish IRDY
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
+        self.index_layout = (
+            get_current_atom_config().index_cache_layout if index_fp4 else "fp8"
+        )
         self._bind_agreed(lambda: self._bind(model, drafter))
 
     def _bind_agreed(self, bind) -> None:
@@ -204,7 +212,11 @@ class V41MonoDecodeRunner:
         self.aux = (
             AuxTaps((), ())
             if drafter is None
-            else bind_aux_taps(drafter, model.config.hidden_size)
+            else bind_aux_taps(
+                drafter,
+                model.config.hidden_size,
+                DeepseekV41DSpark._target_layer_input,
+            )
         )
         self.tok_par_from = TOK_PAR_FROM.get(self.tp, self.max_rows + 1)
         # DP attention gathers no rows: a rank's step is its own
@@ -259,9 +271,15 @@ class V41MonoDecodeRunner:
         if not self.index_fp4:
             return self.iq
         rows = self.iq.shape[0]
+        scales = self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, QS_M_TILES)
+        if self.index_layout == FP4_MFMA:
+            # Debug/reference scorer only: K1 and K2 keep their query ABI.
+            natural = scales[:, 0, 0, :, :, : ip.HEADS // 16].permute(0, 3, 2, 1)
+            scales = natural.reshape(rows, 1, 32, 2, 2).permute(0, 4, 2, 3, 1)
+            scales = scales.contiguous().view(rows, 1, 2, 32, ip.HEADS // 16)
         return (
             self.iq.view(rows, 1, *self.iq.shape[1:]),
-            self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, QS_M_TILES),
+            scales,
         )
 
     @staticmethod
@@ -362,6 +380,7 @@ class V41MonoDecodeRunner:
             tokens=s,
             index_bound_max=self.index_bound_max,
             index_fp4=self.index_fp4,
+            index_mfma=self.index_layout == FP4_MFMA,
             experts=self.experts,
             topk=self.topk,
             tp=self.tp,
@@ -495,7 +514,7 @@ class V41MonoDecodeRunner:
         if self.debug:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
-        self.scratch = torch.zeros(nbytes, device=dev, dtype=torch.uint8)
+        self.scratch = uncached_bytes(nbytes, dev)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -630,7 +649,9 @@ class V41MonoDecodeRunner:
             "wqb": p(weights["attn.wq_b.weight"]),
             "wqb_s": p(weights["attn.wq_b.weight_scale"]),
             "cos": p(rope.cos_cache), "sin": p(rope.sin_cache),
-            "pos": p(self._rope_positions(cache, step)), "ring": p(cache.pool),
+            "pos": p(self._rope_positions(cache, step)),
+            "ring": p(cache.ring_view(layer_id)[0]) if cache.kv_fp8 else p(cache.pool),
+            "ring_scale": p(cache.ring_view(layer_id)[1]) if cache.kv_fp8 else 0,
             "ring_rows": p(self.ring_rel),
             "ring_off": cache.geometry.window(layer_id, cache.num_pages).ring_start,
             "res_out": p(res_out), "post_out": p(post), "comb_out": p(comb),
@@ -667,6 +688,7 @@ class V41MonoDecodeRunner:
             **self._moe_args(weights),
             **self._peer_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
         _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
@@ -703,7 +725,11 @@ class V41MonoDecodeRunner:
         owner = spec.topk_owner if spec.ratio else None
         return {
             **index,
-            "q": p(self.q), "pool": p(cache.pool),
+            "q": p(self.q),
+            "pool": p(cache.main_view(spec.kv_owner)[0]) if cache.kv_fp8 else p(cache.pool),
+            "pool_scale": p(cache.main_view(spec.kv_owner)[1]) if cache.kv_fp8 else 0,
+            "window": p(cache.ring_view(layer_id)[0]) if cache.kv_fp8 else 0,
+            "window_scale": p(cache.ring_view(layer_id)[1]) if cache.kv_fp8 else 0,
             # a layer without a selection reads a dummy row it never uses
             "sel": p(meta if owner is None else self.irow[owner]),
             "topk": 1 if owner is None else ip.TOPK,
@@ -712,9 +738,9 @@ class V41MonoDecodeRunner:
             "kmeta": p(meta),
             "table": p(step.block_tables) if spec.ratio else p(meta),
             "rows_per_page": geometry.rows_per_page(spec.ratio or 1),
-            "page_rows": geometry.page_bytes // geometry.row_bytes,
+            "page_rows": geometry.rows_per_page(spec.ratio or 1) if cache.kv_fp8 else geometry.page_bytes // geometry.row_bytes,
             "main_off": geometry.main_offset(spec.kv_owner) if spec.ratio else 0,
-            "ring_off": geometry.window(layer_id, cache.num_pages).ring_start,
+            "ring_off": cache.main_view(spec.kv_owner)[0].shape[0] if cache.kv_fp8 else geometry.window(layer_id, cache.num_pages).ring_start,
             "ring_slots": geometry.window(layer_id, cache.num_pages).ring_slots,
             "sink": p(attn.attn_sink),
             "qk_scale": f32_bits(attn.softmax_scale * LOG2E),
@@ -739,6 +765,7 @@ class V41MonoDecodeRunner:
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2b", layer_id),
             # where the merged launch's layout puts K2b's regions
             "scratch": self.scratch.data_ptr() + k2.moe_base(key_a),
@@ -816,6 +843,8 @@ class V41MonoDecodeRunner:
         assert batch_ids.dtype == torch.int32 and batch_ids.stride(0) == 1
         self.bounds[spec.layer_id] = bound
         units = cache.index_units[spec.kv_owner]
+        if self.index_fp4 and units.layout != self.index_layout:
+            raise ValueError("V4.1 Mono index build and cache layouts differ")
         if self.index_fp4:
             args.update({
                 "iqs": p(self.iq_scale), "pscale": p(units.scales),

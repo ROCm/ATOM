@@ -30,12 +30,18 @@ BRIDGE = ROOT / "atom/plugin/vllm/deepseek_v41_bridge.py"
 
 def _fields_prepare_reads() -> set[str]:
     paths = (BACKEND, ROOT / "atom/plugin/vllm/v41_core_overrides.py")
-    readers = ("_prepare", "_prepare_idle", "_prepare_step")
-    return {
-        n.attr
+    readers = {"_prepare", "_prepare_step"}
+    functions = [
+        fn
         for path in paths
         for fn in ast.walk(ast.parse(path.read_text()))
         if isinstance(fn, ast.FunctionDef) and fn.name in readers
+    ]
+    # A renamed reader would otherwise match nothing, and silently.
+    assert {fn.name for fn in functions} == readers
+    return {
+        n.attr
+        for fn in functions
         for n in ast.walk(fn)
         if isinstance(n, ast.Attribute)
         and isinstance(n.value, ast.Name)
