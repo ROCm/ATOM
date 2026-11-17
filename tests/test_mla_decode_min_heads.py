@@ -3,39 +3,26 @@
 """The 12-head MLA decode: where MLAAttention pads a query to, and that the
 metadata builder plans the step's one work plan at the same width.
 
-aiter's get_mla_decode_shape_support needs the device (or its JIT modules) to
-answer, so it is replaced by a fake that records ATOM's call and returns the
-MlaDecodeShapeSupport a test asks for."""
+The modules are imported against the stand-in AITER, so Pre Checkin (no AITER)
+runs this file. aiter's get_mla_decode_shape_support needs the device (or its
+JIT modules) to answer, so it is replaced by a fake that records ATOM's call
+and returns the answer a test asks for."""
 
 import logging
 from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stub import atom_under_stubs
 from torch import nn
 
 from atom import config as atom_config_module
 from atom.plugin import prepare
 
-
-def _import_with_lent_arch(name):
-    """AITER's Triton helpers read the GPU arch at import; a CPU runner has
-    none. Nothing here launches a kernel, so lend one for the import."""
-    arch_info = pytest.importorskip("aiter.ops.triton.utils._triton.arch_info")
-    lent = arch_info._CACHED_ARCH is None
-    if lent:
-        arch_info._CACHED_ARCH = "gfx950"
-    try:
-        return pytest.importorskip(name)
-    finally:
-        if lent:
-            arch_info._CACHED_ARCH = None
-
-
-attention_mla = _import_with_lent_arch("atom.model_ops.attention_mla")
-aiter_mla = _import_with_lent_arch("atom.model_ops.attentions.aiter_mla")
+with atom_under_stubs() as load:
+    attention_mla = load("atom.model_ops.attention_mla")
+    aiter_mla = load("atom.model_ops.attentions.aiter_mla")
 dtypes = attention_mla.dtypes
-aiter_attention = pytest.importorskip("aiter.ops.attention")
 
 FP8 = torch.float8_e4m3fn
 MLAAttention = attention_mla.MLAAttention
@@ -52,24 +39,8 @@ class _AiterShapeSupport:
 
     def __call__(self, num_heads, max_seqlen_qo, q_dtype, kv_dtype, **kwargs):
         self.calls.append(((num_heads, max_seqlen_qo, q_dtype, kv_dtype), kwargs))
-        return aiter_attention.MlaDecodeShapeSupport(
-            arch="gfx950",
-            enable_experimental=False,
-            flydsl_ps1=False,
-            planner="v1_2",
-            planner_accepts=True,
-            natively_supported=self.native,
-            fold_factor=1 if self.native else 2,
-            seqlen_fold=1,
-            native=self.native,
-            kernel_num_heads=num_heads if self.native else 16,
-            reduce_supported=True,
-            backend=aiter_attention.MlaBackend.ASM,
-            asm_status=aiter_attention.MlaAsmStatus.OK,
-            asm_kernel="fake",
-            supported=self.supported,
-            reasons=(),
-        )
+        # The two fields of aiter's MlaDecodeShapeSupport that ATOM reads.
+        return SimpleNamespace(native=self.native, supported=self.supported)
 
 
 @pytest.fixture
@@ -107,7 +78,7 @@ def native(monkeypatch, aiter_shape):
     )
     monkeypatch.setattr(attention_mla, "dcp_persistent_supported", lambda: True)
     monkeypatch.setattr(attention_mla, "dcp_prefill_merge_bf16_ok", lambda: True)
-    # A CPU runner's aiter cannot name the arch's fp8; pin e4m3fn.
+    # The stand-in AITER names no fp8 for the arch; pin e4m3fn.
     monkeypatch.setitem(dtypes.d_dtypes, "fp8", FP8)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     for name in ("ATOM_USE_TRITON_MLA", "ATOM_MLA_KV_SHUFFLED", "ATOM_MLA_PAGE_SIZE"):

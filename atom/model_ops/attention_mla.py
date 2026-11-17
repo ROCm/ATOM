@@ -274,12 +274,10 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
         and atom_config.kv_cache_dtype == "fp8"
         and max_seqlen_q == _MLA_NARROW_QLEN
     )
-    if (
-        not narrow_is_faster
-        or is_plugin_mode()
-        or dcp_world_size > 1
-        or has_mla_indexer(get_hf_text_config(atom_config.hf_config))
-    ):
+    if not narrow_is_faster or is_plugin_mode() or dcp_world_size > 1:
+        return _MLA_MIN_HEADS
+    hf_config = get_hf_text_config(atom_config.hf_config)
+    if has_mla_indexer(hf_config):
         return _MLA_MIN_HEADS
     # The decode the builder plans for: _forward_decode's asm branch (not the
     # Triton or shuffled-KV one), persistent by the layer's own predicate.
@@ -311,7 +309,7 @@ def mla_dense_min_query_heads(atom_config, num_heads: int, dcp_world_size: int) 
         kv_dtype,
         kv_dtype,
         num_heads_k=1,
-        v_head_dim=get_hf_text_config(atom_config.hf_config).kv_lora_rank,
+        v_head_dim=hf_config.kv_lora_rank,
         return_lse=False,
         causal=True,
         persistent=True,
@@ -698,9 +696,8 @@ def supports_dpa_persistent_mode(
     Keep this gate exact so other DPA models retain the existing non-persistent
     policy and all MLA variants continue to use the common 576-wide KV layout.
 
-    Decided from the model's config and the layer's head shape only, never a
-    layer's MLAModules: ``mla_dense_min_query_heads`` asks it from the metadata
-    builder, which has no layer.
+    Takes no ``MLAModules``, so the metadata builder, which has no layer, can
+    call it through ``mla_dense_min_query_heads``.
     """
     # Force-enabled for now: persistent mode is turned on for all MLA models
     # under DPA. Re-introduce the per-model gate here if a model regresses.
@@ -779,8 +776,8 @@ class MLAAttention(nn.Module):
             self.min_query_heads = mla_dense_min_query_heads(
                 get_current_atom_config(), num_heads, get_dcp_world_size()
             )
-        # Pad to the floor, and past it to a multiple of 16, so a per-rank
-        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
+        # Pad to the floor, and past it to a multiple of 16: 24 heads (K3 at
+        # tp4) pad to 32.
         self.padded_num_heads = mla_kernel_num_heads(num_heads, self.min_query_heads)
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
