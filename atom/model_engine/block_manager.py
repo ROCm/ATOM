@@ -2772,6 +2772,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # Onto the LMCache chunk grid when the joint load serves this tier, as
         # the prompt-end anchor is (`_record_checkpoint_end`), and for the same
         # missing chunk. A demand sits where prompts fork, so the chunk covering
@@ -2808,14 +2816,6 @@ class BlockManager:
                 self.demands_dropped_at_grid_hit += not seq.checkpoint_demand_dropped
                 seq.checkpoint_demand_dropped = True
                 demand = 0
-        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
-        # replay bounds what the missing checkpoint costs. A demand would cut
-        # every replay admission's forward at the hit and write a checkpoint
-        # there, for a branch at that exact hit that may never come:
-        # conversations resume at prompt ends, which the anchor covers, the
-        # hit included (`scheduler._cut_floor` lets it land there).
-        if seq.replays_hit:
-            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel

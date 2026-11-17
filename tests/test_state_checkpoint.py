@@ -3407,7 +3407,8 @@ class TestPromptEndAnchorTemplateMargin:
         assert self._dropped(bm) == 1
 
     def test_a_deferred_next_turn_is_dropped_once_however_often_it_asks(self):
-        """Counted once per seq, as the other two demand counters are."""
+        """Counted once per seq, as the other two demand counters are, and not
+        at all for a replayed hit, which wants no demand whatever the floor."""
         bm = self._grid_bm()
         t1 = self._prompt([], 7 * self.BLOCK + 5)
         self._run_turn(bm, t1)
@@ -3415,6 +3416,10 @@ class TestPromptEndAnchorTemplateMargin:
         for _ in range(5):
             assert bm.can_allocate(nxt) >= 0
         assert self._dropped(bm) == 1, "counted per attempt"
+        self._monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        replayed = Sequence(t1 + self._fresh(80), self.BLOCK, has_per_req_cache=True)
+        assert bm.can_allocate(replayed) >= 0 and replayed.replays_hit
+        assert self._dropped(bm) == 1, "a replayed hit counted"
 
     def _conversation(self, bm, turns=6):
         """`turns` turns, each resending the last verbatim and going on."""
