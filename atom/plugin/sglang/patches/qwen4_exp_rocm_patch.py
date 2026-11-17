@@ -1,4 +1,4 @@
-"""ROCm workarounds for Flash MTP on SGLang 0.5.20.
+"""ROCm workarounds for Flash on SGLang 0.5.20.
 
 Ling's #2385 owns the Qwen4Exp MTP adapter (draft rewrite, QSA bridge,
 NextN wrapper). These patches stay in the plugin and only cover shapes
@@ -196,7 +196,7 @@ def _install_gfx950_bf16_hipblaslt_bypass() -> None:
 
 
 def apply_qwen4_exp_rocm_patch() -> None:
-    """Install Flash MTP ROCm workarounds that stay outside atom core."""
+    """Install Flash ROCm workarounds that stay outside atom core."""
 
     _patch_hip_topk1_tree_kernel()
     _install_gfx950_bf16_hipblaslt_bypass()

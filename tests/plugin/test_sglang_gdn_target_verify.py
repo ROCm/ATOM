@@ -191,7 +191,7 @@ def test_target_verify_conv_reads_the_live_state_in_place():
             cache_indices=cache_indices,
             core_attn_out=torch.empty(2, 1, 1),
             conv=live.clone(),
-            replay_fn=lambda *, q, o=None, **_kw: q if o is None else o,
+            replay_fn=lambda *, o, **_kw: o,
         )
         assert seen["conv_state_in"] is layer_cache.conv[0]
         reads = seen["conv_state_indices_in"]
@@ -210,10 +210,8 @@ def test_target_verify_conv_reads_the_live_state_in_place():
 def test_replayssm_verify_writes_the_layer_output_in_place():
     calls = []
 
-    def fake_replay(*, q, v, o=None, **_kwargs):
+    def fake_replay(*, o, **_kwargs):
         calls.append(o)
-        if o is None:
-            return torch.full_like(v, 5.0)
         o.fill_(3.0)
         return o.unsqueeze(0)
 
@@ -224,20 +222,9 @@ def test_replayssm_verify_writes_the_layer_output_in_place():
         core_attn_out=out,
         replay_fn=fake_replay,
     )
-    assert calls[-1] is not None and calls[-1].data_ptr() == out.data_ptr()
+    assert calls[-1].data_ptr() == out.data_ptr()
     assert result is out
     torch.testing.assert_close(out, torch.full((2, 1, 1), 3.0))
-
-    # A buffer the kernel cannot write directly still gets the result.
-    out64 = torch.empty(2, 1, 1, dtype=torch.float64)
-    _verify_once(
-        replay=True,
-        cache_indices=torch.tensor([1], dtype=torch.int32),
-        core_attn_out=out64,
-        replay_fn=fake_replay,
-    )
-    assert calls[-1] is None
-    torch.testing.assert_close(out64, torch.full((2, 1, 1), 5.0, dtype=torch.float64))
 
 
 def test_target_verify_rejects_non_speculative_state_pool():

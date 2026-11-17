@@ -283,59 +283,11 @@ def _conv_per_step_loop(inp: _Inputs):
     return qkv, windows
 
 
-def _conv_batched(inp: _Inputs, seed: bool = True):
-    """One spec call writing the shared wide window, mirroring SGLang's
-    deduplicated ``intermediate_conv_window`` physical buffer."""
-    shared_win = inp.draft + STATE_LEN - 1
-    conv = torch.zeros(
-        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
-    )
-    if seed:
-        conv[inp.cache_indices, :, :STATE_LEN] = inp.live_conv[inp.cache_indices]
-    query_start_loc = torch.arange(
-        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
-    )
-    query, key, value = causal_conv1d_update(
-        inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
-        conv,
-        inp.conv_weight,
-        K_DIM,
-        V_DIM,
-        inp.conv_bias,
-        "silu",
-        conv_state_indices=inp.cache_indices.reshape(inp.bs, 1).to(torch.int32),
-        num_accepted_tokens=torch.ones(inp.bs, device="cuda", dtype=torch.int32),
-        query_start_loc=query_start_loc,
-        max_query_len=inp.draft,
-        validate_data=False,
-    )
-    qkv = torch.cat([query, key, value], dim=-1).reshape(inp.bs, inp.draft, CONV_DIM)
-    # SGLang's view: step t's window is phys[..., t : t + STATE_LEN].
-    windows = torch.stack(
-        [conv[inp.cache_indices, :, t : t + STATE_LEN] for t in range(inp.draft)],
-        dim=1,
-    )
-    return qkv, windows
-
-
-@pytest.mark.parametrize("draft", DRAFT_LENS)
-@pytest.mark.parametrize("bs", BATCH_SIZES)
-def test_conv_per_step_windows_match_wide_window_slices(bs: int, draft: int):
-    """One wide-window spec call reproduces both the projected q/k/v and every
-    per-step conv window that the loop materialises."""
-    inp = _Inputs(bs, draft)
-    qkv_a, win_a = _conv_per_step_loop(inp)
-    qkv_b, win_b = _conv_batched(inp)
-
-    torch.testing.assert_close(qkv_b, qkv_a, rtol=0, atol=0)
-    torch.testing.assert_close(win_b, win_a, rtol=0, atol=0)
-
-
 def _conv_batched_live(inp: _Inputs, live_conv: torch.Tensor, fill: float):
     """The production call (``_spec_conv_qkv``): the history is read in place
-    from the live pool by cache slot (``conv_state_in``), the wide window is
-    written by batch position, and nothing is seeded. Rows whose cache slot is
-    the pad slot (-1) have it only in the read table."""
+    from the live pool by cache slot (``conv_state_in``) and the wide window is
+    written by batch position. Rows whose cache slot is the pad slot (-1) have
+    it only in the read table."""
     shared_win = inp.draft + STATE_LEN - 1
     window = torch.full(
         (NUM_SLOTS, CONV_DIM, shared_win), fill, device="cuda", dtype=torch.bfloat16
@@ -362,10 +314,24 @@ def _conv_batched_live(inp: _Inputs, live_conv: torch.Tensor, fill: float):
         validate_data=False,
     )
     qkv = torch.cat([query, key, value], dim=-1).reshape(inp.bs, inp.draft, CONV_DIM)
+    # SGLang's view: step t's window is phys[..., t : t + STATE_LEN].
     windows = torch.stack(
         [window[: inp.bs, :, t : t + STATE_LEN] for t in range(inp.draft)], dim=1
     )
     return qkv, windows, window
+
+
+@pytest.mark.parametrize("draft", DRAFT_LENS)
+@pytest.mark.parametrize("bs", BATCH_SIZES)
+def test_conv_per_step_windows_match_wide_window_slices(bs: int, draft: int):
+    """One wide-window spec call reproduces both the projected q/k/v and every
+    per-step conv window that the loop materialises."""
+    inp = _Inputs(bs, draft)
+    qkv_a, win_a = _conv_per_step_loop(inp)
+    qkv_b, win_b, _ = _conv_batched_live(inp, inp.live_conv, 0.0)
+
+    torch.testing.assert_close(qkv_b, qkv_a, rtol=0, atol=0)
+    torch.testing.assert_close(win_b, win_a, rtol=0, atol=0)
 
 
 def _live_conv_in_layout(live_conv: torch.Tensor, layout: str) -> torch.Tensor:
@@ -447,48 +413,14 @@ def test_conv_state_in_width_check_counts_accepted_tokens():
         call(2)
 
 
-def test_conv_equivalence_detects_missing_history_seed():
-    """Negative control: not seeding the wide window with the live conv history
-    must NOT compare equal."""
-    inp = _Inputs(3, 8)
-    qkv_a, win_a = _conv_per_step_loop(inp)
-    qkv_b, win_b = _conv_batched(inp, seed=False)
-    assert not torch.allclose(qkv_b.float(), qkv_a.float(), rtol=1e-2, atol=1e-2)
-    assert not torch.allclose(win_b.float(), win_a.float(), rtol=1e-2, atol=1e-2)
-
-
 def test_conv_equivalence_detects_off_by_one_window_slice():
     """Negative control: shifting the sliding-window slice by one column must
     NOT compare equal."""
     inp = _Inputs(3, 8)
     _qkv_a, win_a = _conv_per_step_loop(inp)
-    shared_win = inp.draft + STATE_LEN - 1
-    conv = torch.zeros(
-        NUM_SLOTS, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
-    )
-    conv[inp.cache_indices, :, :STATE_LEN] = inp.live_conv[inp.cache_indices]
-    query_start_loc = torch.arange(
-        0, (inp.bs + 1) * inp.draft, inp.draft, device="cuda", dtype=torch.int32
-    )
-    causal_conv1d_update(
-        inp.mixed.reshape(inp.bs * inp.draft, CONV_DIM),
-        conv,
-        inp.conv_weight,
-        K_DIM,
-        V_DIM,
-        inp.conv_bias,
-        "silu",
-        conv_state_indices=inp.cache_indices.reshape(inp.bs, 1).to(torch.int32),
-        num_accepted_tokens=torch.ones(inp.bs, device="cuda", dtype=torch.int32),
-        query_start_loc=query_start_loc,
-        max_query_len=inp.draft,
-        validate_data=False,
-    )
+    _qkv_b, _win_b, window = _conv_batched_live(inp, inp.live_conv, 0.0)
     shifted = torch.stack(
-        [
-            conv[inp.cache_indices, :, t + 1 : t + 1 + STATE_LEN]
-            for t in range(inp.draft - 1)
-        ],
+        [window[: inp.bs, :, t + 1 : t + 1 + STATE_LEN] for t in range(inp.draft - 1)],
         dim=1,
     )
     assert not torch.allclose(
