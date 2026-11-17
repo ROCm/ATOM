@@ -199,12 +199,11 @@ def test_models_report_how_chats_render(server, monkeypatch, defaults):
         ) as client:
             return (await client.get("/v1/models")).json()["data"][0]
 
-    efforts = sorted(VALID_TEMPLATE_EFFORTS)
     assert asyncio.run(card())["chat_rendering"] == {
         "default_kwargs": defaults,
         "reasoning_toggle": {"name": "thinking_mode", "off": "chat", "on": "thinking"},
         "reasoning_rules": "deepseek_v41",
-        "template_efforts": efforts,
+        "template_efforts": None,
         "encoder": {
             "name": "encoding_dsv41",
             "defaults": {},
@@ -220,7 +219,7 @@ def test_models_report_how_chats_render(server, monkeypatch, defaults):
         "default_kwargs": defaults,
         "reasoning_toggle": {"name": "enable_thinking", "off": False, "on": True},
         "reasoning_rules": "chat",
-        "template_efforts": efforts,
+        "template_efforts": sorted(VALID_TEMPLATE_EFFORTS),
         "encoder": None,
     }
 
