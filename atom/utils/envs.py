@@ -665,10 +665,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # serves, every decoder layer, the verify head, the DSpark draft and the
     # round's glue run the hi programs (atom/models/deepseek_v41/mono/hi_*.py).
     # "auto" (default): on for the deployment they serve (MI355X, TP2 / TP4 /
-    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; TP8 also needs ATOM's own
-    # V4.1 path to start at TP8, ROCm/aiter#7967), any other keeps ATOM's mono
-    # path; "1":
-    # on, or an error naming why not; "0": off.
+    # TP8, BF16 KV, DSpark, ...: `mono/hi_gate.py`; at TP8 ATOM's own path
+    # starts on gfx950 through the shared expert's in-place K pad, 288 -> 320,
+    # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
+    # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
