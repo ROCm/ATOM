@@ -5,12 +5,20 @@ use crate::core::{HashRing, Worker};
 use crate::observability::{metrics::MeshMetrics, route_trace};
 use crate::policies::{LoadBalancingPolicy, RouteDecision, SelectWorkerInfo};
 
+/// A worker chosen by a policy, with the policy's estimate of the prompt tokens it
+/// still has to prefill.
+#[derive(Debug)]
+pub struct PlacedWorker {
+    pub worker: Arc<dyn Worker>,
+    pub prefill_tokens: Option<usize>,
+}
+
 pub async fn apply_policy(
     candidates: &[Arc<dyn Worker>],
     policy: &dyn LoadBalancingPolicy,
     descriptor: &RequestDescriptor<'_>,
     hash_ring: Option<Arc<HashRing>>,
-) -> Result<Arc<dyn Worker>, PlacementError> {
+) -> Result<PlacedWorker, PlacementError> {
     if candidates.is_empty() {
         return Err(PlacementError::NoAvailableWorkers);
     }
@@ -26,7 +34,11 @@ pub async fn apply_policy(
     // The planner passes the candidates of one pool.
     let pool = candidates[0].worker_type().as_metric_label();
     record_decision(pool, policy.name(), selected.as_ref(), decision);
-    selected.ok_or(PlacementError::PolicyReturnedNone)
+    let worker = selected.ok_or(PlacementError::PolicyReturnedNone)?;
+    Ok(PlacedWorker {
+        worker,
+        prefill_tokens: decision.prefill_tokens,
+    })
 }
 
 /// Records one selection. Runs before the router adds the request, so the

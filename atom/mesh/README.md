@@ -288,6 +288,7 @@ Supported tool parsers: `json`, `python`, `xml`.
 | `cache_aware` | Prefix-tree matching for cache reuse, with configurable balance thresholds; with `--kv-events`, a request the router can tokenize goes by the blocks each worker's device cache holds, once one holds more of it than `cache_threshold`. Requests with media, imbalanced load and workers without indexed events stay on the tree |
 | `power_of_two` | Chooses the lighter of two randomly sampled workers |
 | `prefix_hash` | Consistent prefix hashing |
+| `agentic` | Prefill and regular pools. Lowest prefill cost: queued prefill tokens, plus the prompt tokens the worker's GPU cache does not hold (from `--kv-events`, or a text tree for requests the index cannot match), plus `--agentic-request-token-equivalent` (512) per in-flight request. See [agentic routing](docs/agentic_cost.md) |
 
 In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 

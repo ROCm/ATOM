@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::core::{HashRing, Worker};
 
-pub mod agentic;
+mod agentic;
 mod cache_aware;
 mod dp_sticky;
 mod factory;
@@ -20,6 +20,7 @@ mod registry;
 mod round_robin;
 pub mod tree;
 pub(crate) mod utils;
+pub use agentic::{AgenticConfig, AgenticCost, AgenticPolicy};
 pub use cache_aware::CacheAwarePolicy;
 pub use dp_sticky::DpStickyPolicy;
 pub use factory::PolicyFactory;
@@ -42,8 +43,12 @@ pub struct RouteDecision {
     /// Expected prefix cache hit ratio on the selected worker, reconciled with the
     /// cached tokens its response reports. `cache_aware`'s tree branches set it only
     /// when the selected worker is the best candidate, its KV event branches always;
-    /// other policies leave it None.
+    /// `agentic` sets it when it knows the selected worker's hit; other policies leave
+    /// it None.
     pub estimated_hit_ratio: Option<f64>,
+    /// Prompt tokens the selected worker still has to prefill, for policies that
+    /// estimate its cache reuse. `None` charges the whole prompt.
+    pub prefill_tokens: Option<usize>,
 }
 
 impl RouteDecision {
@@ -52,6 +57,7 @@ impl RouteDecision {
             branch,
             match_ratio: None,
             estimated_hit_ratio: None,
+            prefill_tokens: None,
         }
     }
 }

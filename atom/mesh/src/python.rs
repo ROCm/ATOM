@@ -143,6 +143,10 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     cli_args_dict.set_item("max_tree_size", cli_args.max_tree_size)?;
     cli_args_dict.set_item("prefix_token_count", cli_args.prefix_token_count)?;
     cli_args_dict.set_item("prefix_hash_load_factor", cli_args.prefix_hash_load_factor)?;
+    cli_args_dict.set_item(
+        "agentic_request_token_equivalent",
+        cli_args.agentic_request_token_equivalent,
+    )?;
     cli_args_dict.set_item("dp_aware", cli_args.dp_aware)?;
     cli_args_dict.set_item("pd_disaggregation", cli_args.pd_disaggregation)?;
     cli_args_dict.set_item("decode", cli_args.decode)?;
