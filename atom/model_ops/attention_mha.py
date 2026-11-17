@@ -615,10 +615,12 @@ class PagedAttentionImpl(nn.Module):
 
     def _flydsl_may_take_decode(self) -> bool:
         """The part of `_flydsl_takes_decode` this layer's configuration
-        decides, before the call's shapes."""
+        decides, before the call's shapes. On a GPU with gluon decode, only
+        under ATOM_PA_FLYDSL: a decode past gluon's query-length limit (MTP-4
+        and MTP-5) then goes to FlyDSL, which carries per-token KV scales."""
         return not (
             envs.ATOM_USE_UNIFIED_ATTN
-            or pa_decode_gluon_supports_arch()
+            or (pa_decode_gluon_supports_arch() and not envs.ATOM_PA_FLYDSL)
             or self.sliding_window > 0
         )
 
@@ -635,7 +637,8 @@ class PagedAttentionImpl(nn.Module):
         return False
 
     def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
-        """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
+        """Without gluon decode (gfx1250), or past gluon's query-length limit
+        under ATOM_PA_FLYDSL: whether FlyDSL accepts this call.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
         """
