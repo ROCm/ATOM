@@ -38,6 +38,7 @@ from atom.kv_transfer.disaggregation.sharded_transfer import (
 )
 from atom.kv_transfer.disaggregation.staging_config import (
     landing_reserve_bytes,
+    landing_spec,
     mla_landing_configured,
     mla_landing_table_segments,
 )
@@ -1147,6 +1148,37 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     assert new._kv_staging_slots.free  # the source slot goes back either way
 
 
+def test_a_request_from_before_a_decode_restart_keeps_the_new_partition(
+    monkeypatch,
+):
+    # The write listener adopts a partition when its request arrives. A
+    # request queued before the decode restarted still names the old epoch;
+    # its transfer must not bring that epoch back, or the next request from
+    # the restarted decode would find the new epoch's in-flight slot free.
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
+    new = _producer(mc, _source_regions(1, 8), staging_rows=16)
+    new._send_on_socket = lambda *_a, **_k: None
+    pool = torch.zeros((2, 16 * TOKEN_BYTES), dtype=torch.uint8)
+    offer = {"base": pool.data_ptr(), "slot_bytes": 16 * TOKEN_BYTES, "slots": [0, 1]}
+    restarted = {**offer, "epoch": 2}
+    credits = new._landing_credits
+    credits.sync("consumer:1", restarted)
+    in_flight = credits.acquire("consumer:1", 2, 0)
+    request = _request(1, 4, 0, [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)])
+    request["mla_landing"] = {**offer, "epoch": 1}
+    assert mc.MooncakeConnector._execute_block_transfer(
+        new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+    )
+    # No credit under the old epoch: the rows went straight to the pages.
+    assert [label for label, _ in new._nic.labels] == ["staged-kv"]
+    assert "_landed_slots" not in request
+    credits.sync("consumer:1", restarted)  # the restarted decode's next request
+    assert credits.acquire("consumer:1", 2, 0) == 1 - in_flight
+    assert credits.acquire("consumer:1", 2, 0) is None
+
+
 def test_quarantined_credits_come_back_after_the_hold(monkeypatch):
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     credits = LandingCredits()
@@ -1595,8 +1627,9 @@ def test_landing_is_built_only_where_it_was_reserved(monkeypatch):
     conn = object.__new__(mc.MooncakeConnector)
     conn._block_region_roles = [MLA_KV_ROLE]
     conn._has_slot_regions = False
-    assert conn._build_landing() is None  # nothing reserved
     both = {"kv_connector": "mooncake", "kv_role": "kv_both"}
+    conn._landing_spec = landing_spec(_config(both))  # as __init__ sets it
+    assert conn._build_landing() is None  # nothing reserved
     assert not mla_landing_configured(_config(both))
     consumer = _config({"kv_connector": "mooncake", "kv_role": "kv_consumer"})
     assert mla_landing_configured(consumer)

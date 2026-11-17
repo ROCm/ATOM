@@ -10,6 +10,7 @@ KV cache data from producer (prefill) to consumer (decode) nodes.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import math
@@ -201,6 +202,18 @@ class SlotPool:
         with self._cv:
             self.free.append(idx)
             self._cv.notify()
+
+
+@functools.cache
+def _log_page_wider_than_landing(target: str, page_bytes: int, slot_bytes: int):
+    """Logged once per decode rank: every transfer to it takes the same path."""
+    logger.warning(
+        "[PRODUCER] %s offers %d-byte landing slots, less than one %d-byte "
+        "destination PAGE; KV to it is staged straight to its pages",
+        target,
+        slot_bytes,
+        page_bytes,
+    )
 
 
 def _mc_transfer_timeout_s() -> float:
@@ -1380,9 +1393,7 @@ class MooncakeConnector(KVConnectorBase):
     # Class-level so a connector built without __init__ keeps the per-token
     # paths; register_kv_caches sets the instance values.
     _kv_staging: torch.Tensor | None = None
-    _kv_staging_reserve = 0
     _landing: LandingReceiver | None = None
-    _landing_spec = None
 
     def _rdma_chunk_units(self, unit_bytes: int) -> int:
         """Units per MR chunk of a region registered by ``_rdma_chunk_sizes``.
@@ -3482,10 +3493,12 @@ class MooncakeConnector(KVConnectorBase):
                 raise ValueError("KV landing wire layout mismatch")
             if plan.minimum_slot_bytes <= int(landing["slot_bytes"]):
                 slot_bytes = min(slot_bytes, int(landing["slot_bytes"]))
-                self._landing_credits.sync(target, landing)
             else:
                 # P can gather this PAGE, but D cannot land it. Use staged
                 # direct writes without acquiring credits or sending READYs.
+                _log_page_wider_than_landing(
+                    target, plan.minimum_slot_bytes, int(landing["slot_bytes"])
+                )
                 landing = None
         slots = plan.pack(slot_bytes)
         stream = self._send_worker_stream()

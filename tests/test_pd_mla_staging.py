@@ -578,8 +578,9 @@ def test_staged_mla_still_refuses_a_non_mla_region(monkeypatch):
 
 
 @pytest.mark.parametrize("source_too_small", [False, True])
-def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small):
+def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small, caplog):
     mc = _mooncake()
+    mc._log_page_wider_than_landing.cache_clear()
     regions = _source_regions(1, 8)
     old = _producer(mc, regions)
     new = _producer(mc, regions, pool_size=1, slot_pages=4)
@@ -592,11 +593,33 @@ def test_dcp_page_capacity_fallback_matches_direct_bytes(source_too_small):
     # is needed: an undersized offer must not reach the landing credit path.
     request["mla_landing"] = {"slot_bytes": PAGE_BYTES - 4}
     assert _run(mc, old, _request(1, 2, 1, 1, expected), range(4), [3, 5], None)
-    assert _run(mc, new, request, range(4), [3, 5], object())
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert _run(mc, new, request, range(4), [3, 5], object())
     assert torch.equal(actual[0], expected[0])
     assert "_landed_slots" not in request
     assert set(new._nic.labels) == ({"block"} if source_too_small else {"staged-kv"})
     assert new._kv_staging_slots.free == [0]
+    # The staged path says why it left the offer unused.
+    dropped = [r for r in caplog.records if "less than one" in r.message]
+    assert len(dropped) == (0 if source_too_small else 1)
+
+
+def test_a_landing_offer_for_another_unit_layout_fails_before_any_rdma():
+    mc = _mooncake()
+    regions = _source_regions(1, 8)
+    conn = _producer(mc, regions, pool_size=1, slot_pages=4)
+    request = _request(1, 2, 1, 1, [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8)])
+    request["mla_landing"] = {
+        "epoch": 1,
+        "base": 0,
+        "slot_bytes": 4 * PAGE_BYTES,
+        "slots": [0],
+        "layout": "mha_pages_v1",
+    }
+    with pytest.raises(ValueError, match="wire layout mismatch"):
+        _run(mc, conn, request, range(4), [3, 5], object())
+    assert conn._nic.labels == []
+    assert conn._kv_staging_slots.free == [0]
 
 
 def _per_token_reference(mc, regions):

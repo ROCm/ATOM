@@ -16,6 +16,9 @@ class GatherLayout:
 
     Units may be contiguous token rows or physical PAGEs. Ownership is supplied
     separately as the source index tensor; this describes only physical bytes.
+    ``first``, ``src_stride`` and ``width`` describe strided slices, such as one
+    rank's heads of a PAGE; ``gather_units`` copies whole units only and
+    refuses the rest.
     """
 
     source_bytes: int
