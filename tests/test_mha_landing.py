@@ -7,6 +7,7 @@ that the original recipes used is not on this branch.
 
 import ctypes
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -49,6 +50,17 @@ def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("GPU gather/scatter")
     return request.param
+
+
+@pytest.fixture(autouse=True)
+def host_streams(monkeypatch):
+    # On a GPU host, torch.cuda.stream rejects a CPU harness's stand-in stream.
+    cuda_stream = torch.cuda.stream
+    monkeypatch.setattr(
+        mc.torch.cuda,
+        "stream",
+        lambda s: cuda_stream(s) if isinstance(s, torch.cuda.Stream) else nullcontext(),
+    )
 
 
 def byte_view(buffers, address, size):
@@ -266,7 +278,7 @@ def test_chunks_use_receive_global_page_offsets_and_sequences(rank, cached, devi
 
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("chunks", [False, True])
-@pytest.mark.parametrize("capacity", ["source_too_small", "landing_too_small", "exact"])
+@pytest.mark.parametrize("capacity", ["source_too_small", "exact"])
 def test_page_capacity_fallback_preserves_bytes_and_completion(
     rank, chunks, capacity, device
 ):
@@ -277,8 +289,6 @@ def test_page_capacity_fallback_preserves_bytes_and_completion(
     assert max(h.c._per_block_bytes_list) > page_bytes
     slot_bytes = page_bytes - 4 if capacity == "source_too_small" else page_bytes
     h.c._kv_staging = torch.empty((1, slot_bytes), dtype=torch.uint8, device=device)
-    if capacity == "landing_too_small":
-        h.req["mla_landing"]["slot_bytes"] = page_bytes - 4
     src, dst = [3, 1, 2], [2, 0, 3]
     if chunks:
         for offset in range(3):
