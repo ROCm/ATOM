@@ -32,10 +32,7 @@ _PP_IDLE_POLL_MS = 1
 
 
 def pp_max_inflight(pp_size: int) -> int:
-    cap = envs.ATOM_PP_MAX_INFLIGHT
-    if cap < 0:
-        raise ValueError(f"ATOM_PP_MAX_INFLIGHT must be non-negative; got {cap}")
-    return cap or pp_size
+    return envs.ATOM_PP_MAX_INFLIGHT or pp_size
 
 
 class PPEngineCoreProc(EngineCore):

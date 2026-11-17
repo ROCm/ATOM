@@ -1630,7 +1630,7 @@ def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch, env, cap):
     pp_engine_core = sys.modules[_pp_engine_core_cls().__module__]
     monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", env)
     if cap is None:
-        with pytest.raises(ValueError, match="non-negative"):
+        with pytest.raises(ValueError, match="must be >= 0"):
             pp_engine_core.pp_max_inflight(2)
     else:
         assert pp_engine_core.pp_max_inflight(2) == cap
