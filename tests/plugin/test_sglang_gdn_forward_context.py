@@ -276,33 +276,37 @@ class _ScalarReadSpy(TorchDispatchMode):
 
 
 @pytest.mark.parametrize(
-    "logical_num_tokens, expected_tokens, expected_reads",
-    [(5, 5, 0), (None, 99, 1)],
-    ids=["sglang-host-count", "no-host-count"],
+    "from_sglang, expected_tokens, expected_reads",
+    [(True, 5, 0), (False, 99, 1)],
+    ids=["sglang-host-count", "reconstructed"],
 )
 def test_extend_token_count_comes_from_sglang_host_count(
-    logical_num_tokens, expected_tokens, expected_reads
+    from_sglang, expected_tokens, expected_reads
 ):
     """``logical_num_tokens`` is SGLang's host sum of extend_seq_lens.
 
     Reading ``query_start_loc[-1]`` instead syncs the stream once per prefill;
-    it is only the fallback when SGLang left the host count unset.
+    only metadata rebuilt from the mamba pool, which has no host count, does.
     """
     forward_metadata = SimpleNamespace(
         # The device offsets disagree with the host count, to show which is read.
         query_start_loc=torch.tensor([0, 3, 99], dtype=torch.int32),
         mamba_cache_indices=torch.tensor([4, 7], dtype=torch.int32),
-        logical_num_tokens=logical_num_tokens,
+        logical_num_tokens=5,
     )
     forward_batch = SimpleNamespace(
         forward_mode=_ExtendMode(),
         batch_size=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        # The rebuild takes the same device offsets from these.
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3, 96], dtype=torch.int32),
         extend_prefix_lens=torch.tensor([0, 2], dtype=torch.int32),
         extend_seq_lens_cpu=[3, 2],
     )
     linear = SimpleNamespace(
-        forward_metadata=forward_metadata, req_to_token_pool=_MambaPool()
+        forward_metadata=forward_metadata if from_sglang else None,
+        req_to_token_pool=_MambaPool(),
     )
 
     with _ScalarReadSpy() as spy:
@@ -516,6 +520,7 @@ def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
         forward_metadata=SimpleNamespace(
             query_start_loc=query_start_loc,
             mamba_cache_indices=indices,
+            logical_num_tokens=8,
         ),
         req_to_token_pool=_MambaPool(),
     )
