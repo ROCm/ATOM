@@ -283,13 +283,24 @@ def test_fp8_query_heads_a_program_is_bit_exact(monkeypatch, fp8_heads):
         assert torch.equal(actual, expected)
 
 
+def _zero_sign_cleared(values):
+    """MXFP8 bytes with an OCP E4M3 -0.0 read as +0.0. FNUZ has no -0.0 (its
+    0x80 is NaN), so those bytes are kept as they are."""
+    if values.dtype != torch.float8_e4m3fn:
+        return values.view(torch.uint8)
+    values = values.view(torch.uint8)
+    return torch.where(values & 0x7F == 0, 0, values)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("rope_dim", [16, 64])
-@pytest.mark.parametrize("tokens", [1, 7, 1344])
+@pytest.mark.parametrize("tokens", [1, 7, 1344, 1536, 2048])
 def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
-    """Grouped heads rotate only the RoPE tail when it is whole quant groups;
-    the NoPE groups quantize as loaded. Same bytes as a program a head, on
-    rows of zeros, saturating, tiny and ordinary values."""
+    """From 16 heads a program only the RoPE tail is rotated when it is whole
+    quant groups, the NoPE groups quantized as loaded; 8 keep the full row.
+    Same bytes as a program a head but for the sign of a zero, on rows of
+    zeros, -0.0 lanes beside either sign, saturating, tiny and ordinary
+    values; scales and KV bytes exact."""
     from atom.model_ops.blockscale import quantize_fp8
     from atom.model_ops.deepseek_v41 import rope_window
 
@@ -300,6 +311,8 @@ def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
     normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
     query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16) * 3
     query[0, : heads // 4] = 0
+    # Even and odd lanes, NoPE and RoPE, beside neighbours of either sign.
+    query[0, heads // 4 :: 2, ::5] = -0.0
     if tokens > 1:
         query[1, :, ::3] = 3e4
         query[-1, heads // 2 :] = 1e-30
@@ -322,28 +335,93 @@ def test_fp8_query_rope_tail_only_is_bit_exact(monkeypatch, rope_dim, tokens):
             scales=rows[:, dim:].view(e8m0),
             query_fp8=(qv, qs),
         )
-        return rows, qv.view(torch.uint8), qs.view(torch.uint8)
+        return rows, _zero_sign_cleared(qv), qs.view(torch.uint8)
 
     reference = run(1)
-    for n in (8, 16):
+    for n in (8, 16, 32):
         for expected, actual in zip(reference, run(n)):
             assert torch.equal(actual, expected)
 
 
 def test_fp8_query_heads_a_program_follow_the_arch(monkeypatch):
-    """16 heads a program on gfx1250, 8 elsewhere, unless `_FP8_HEADS` says."""
+    """gfx1250 tries 16 heads a program then 8, elsewhere 8, unless
+    `_FP8_HEADS` says; the first that divides the heads and keeps two
+    programs a CU wins. A rank's 8 heads (TP8) keep 8 on gfx1250."""
     pytest.importorskip("aiter", reason="the arch is read through AITER")
     from aiter.jit.utils import chip_info
 
     from atom.model_ops.deepseek_v41 import rope_window
 
-    for arch, heads in (("gfx1250", 16), ("gfx950", 8), ("gfx942", 8)):
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: 256)
+    for arch, tokens, heads, expected in (
+        ("gfx1250", 1344, 64, 16),
+        ("gfx1250", 1344, 8, 8),
+        ("gfx1250", 64, 64, 8),
+        ("gfx1250", 32, 64, 1),
+        ("gfx1250", 1344, 6, 1),
+        ("gfx950", 1344, 64, 8),
+        ("gfx950", 1344, 8, 8),
+        ("gfx942", 1344, 64, 8),
+    ):
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda arch=arch: arch)
         rope_window._arch_fp8_heads.cache_clear()
-        assert rope_window._fp8_heads() == heads
+        assert rope_window._fp8_heads(tokens, heads, "cuda") == expected
     monkeypatch.setattr(rope_window, "_FP8_HEADS", 4)
-    assert rope_window._fp8_heads() == 4
+    assert rope_window._fp8_heads(1344, 64, "cuda") == 4
+    assert rope_window._fp8_heads(1344, 6, "cuda") == 1
     rope_window._arch_fp8_heads.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize(
+    "heads, tokens, fp8_heads",
+    [(8, 1344, 8), (8, 2048, 8), (64, 1344, 16), (64, 2048, 16), (64, 64, 8)],
+)
+def test_fp8_query_heads_fall_back_along_the_list(
+    monkeypatch, heads, tokens, fp8_heads
+):
+    """With gfx1250's (16, 8), a rank's 8 heads (TP8) still quantize 8 a
+    program rather than 1, and so do 64 heads where 16 a program would leave
+    too few programs; the bytes match a program a head's."""
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    torch.manual_seed(heads + tokens)
+    monkeypatch.setattr(rope_window, "_cu_count", lambda device: 256)
+    monkeypatch.setattr(rope_window, "_arch_fp8_heads", lambda: (16, 8))
+    device, dim, rope_dim = "cuda", 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.randint(0, 1024, (tokens,), device=device, dtype=torch.int32)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    fp8, e8m0 = (t.dtype for t in quantize_fp8(normed))
+
+    def run(n):
+        monkeypatch.setattr(rope_window, "_FP8_HEADS", n)
+        spy = _GridSpy(rope_window._rope_window_kernel)
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+        rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+        qv = torch.empty(tokens, heads, dim, device=device, dtype=fp8)
+        qs = torch.empty(tokens, heads, dim // 32, device=device, dtype=e8m0)
+        rope_window.rope_quant_window(
+            query.clone(),
+            normed,
+            rope.cos_cache,
+            rope.sin_cache,
+            positions,
+            rope_dim=rope_dim,
+            values=rows[:, :dim].view(fp8),
+            scales=rows[:, dim:].view(e8m0),
+            query_fp8=(qv, qs),
+        )
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy.kernel)
+        return (rows, _zero_sign_cleared(qv), qs.view(torch.uint8)), spy.launches
+
+    reference, _ = run(1)
+    actual, launches = run(None)
+    assert launches == [((tokens * (heads // fp8_heads + 1),), False, fp8_heads)]
+    for expected, got in zip(reference, actual):
+        assert torch.equal(got, expected)
 
 
 class _GridSpy:
