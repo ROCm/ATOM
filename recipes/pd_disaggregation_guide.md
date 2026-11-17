@@ -26,7 +26,8 @@ still apply. See [the implementation and CPU verification notes](../docs/pd_chun
 Mooncake reserves D's destination KV blocks before P writes them, so a backlog
 of pending receives can hold most of D's KV pool while few requests decode.
 The opt-in `pd_admission` policy defers a new receive while the receive targets
-already pending would exceed a per-rank byte budget. Set it in the consumer's
+already pending would exceed a per-rank byte budget, and can keep room free for
+the admitted requests to keep decoding. Set it in the consumer's
 top-level `--kv-transfer-config`; with `multi`, put it next to `connectors` and
 list the Mooncake consumer first:
 
@@ -34,16 +35,28 @@ list the Mooncake consumer first:
 "pd_admission": {"enabled": true, "max_pending_kv_fraction": 0.15}
 ```
 
-| Option | Default when enabled | Meaning |
-| --- | --- | --- |
-| `max_pending_kv_fraction` | `0.15` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
-| `max_pending_kv_bytes` | unset | Bytes per D rank, instead of a fraction. |
+Each limit applies only when set; with none set, the byte budget defaults to
+`max_pending_kv_fraction: 0.15`. Omit a limit to turn it off; `null` is
+rejected.
 
-Only blocks Mooncake transfers are charged; local prefix hits are not.
-Whole-prompt and chunked receives share the budget. A request holds its credit
-until its first local forward; preemption, a failed receive and a cancelled one
-(once its writes drain) return it. With nothing pending, one request may exceed
-the budget, so long prompts are not starved. D must have PP=1, DCP=1, PCP=1,
+| Option | Meaning |
+| --- | --- |
+| `max_pending_kv_fraction` | Fraction of each D rank's paged KV pool, converted to bytes at startup. |
+| `max_pending_kv_bytes` | Bytes per D rank, instead of a fraction. |
+| `num_reserved_decode_tokens` | Decode tokens kept free for each admitted request to grow by, for example `512`. A new receive is deferred if, after it takes its blocks, the free pool could not grow every receiving, ready and running request and itself by that many tokens, each capped by what it may still generate but never below the draft lookahead its next decode allocates. Reusable cached blocks count as free, and a local prefix hit on a block another request holds takes nothing. It must be at least the draft lookahead (`num_speculative_tokens` with a block drafter such as DSpark, one less with serial MTP), which a P/D receive takes from the reserve at its first decode; startup rejects a smaller value. That decode also writes the first token and its `num_speculative_tokens` verify slots out of the same tokens, so keep it well above that floor. |
+
+The byte budget charges the blocks Mooncake writes: a local prefix hit is
+charged only on a full transfer (offset 0). Whole-prompt and chunked receives
+share the budget. A request
+holds its credit until its first local forward; preemption, a failed receive
+and a cancelled one (once its writes drain) return it. With nothing pending,
+one request may exceed the byte budget, so long prompts are not starved. The
+decode reserve covers every admitted request, including one past its first
+forward, so it holds while any request runs on D; only an idle D admits below
+it. Falling below it defers admission only and never preempts. Both limits
+apply to Mooncake P/D receives only: a request parked for a tier or replay KV
+load through an offload connector is not checked, and holds its blocks outside
+the reserve until its load lands and it runs. D must have PP=1, DCP=1, PCP=1,
 SP=1 and a single paged KV pool. Metrics are listed under `atom:pd_admission_*`
 in the [metrics guide](../docs/metrics_guide.md#scheduler).
 
