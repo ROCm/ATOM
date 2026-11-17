@@ -3039,14 +3039,16 @@ class MLAAttention(nn.Module):
 
         return self._v_up_proj_and_o_proj(o)
 
-    def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
-        """Write an already-roped full k (kv_lora + rope) into the k-cache.
+    def _write_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
+        """Write an already-roped k (kv_lora + rope) into the k-cache at
+        ``slot_mapping``, in this layer's cache layout.
 
-        Used by the PCP prefill path to materialise the full sequence's KV after
-        the fused MLA kernel produced q_out on 1/pcp queries. Mirrors the
-        non-fused k-writes used by the dense (`not use_prefill_mla`) prefill
-        branch so the physical cache layout matches exactly. `k_rope` must
-        already be rotary-embedded.
+        The one door every writer of whole k rows goes through, so the physical
+        layout matches exactly: the dense (`not use_prefill_mla`) prefill
+        (`_write_prefill_kv`), the PCP prefill materialising the full
+        sequence's KV after the fused MLA kernel produced q_out on 1/pcp
+        queries, and a drafter's context rows (`write_context_kv_latent`).
+        `k_rope` must already be rotary-embedded.
         """
         if self.kv_shuffled:
             shuffled_cache = self._shuffled_kv_view(kv_cache)
@@ -3060,6 +3062,11 @@ class MLAAttention(nn.Module):
                 shuffled_kv_cache=True,
             )
         elif self.use_seg_mla:
+            # Write the KV cache in the segmented layout so the decode-phase
+            # mla_decode_fwd (which reads seg layout) sees a consistent cache
+            # for tokens written during prefill. kv_cache is flattened to
+            # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so the
+            # kernel derives page_size from stride(0).
             kv_cache_seg = self._seg_kv_cache_view(kv_cache)
             concat_and_cache_mla_seg(
                 k_nope,
@@ -3100,7 +3107,7 @@ class MLAAttention(nn.Module):
         attn_metadata for those rows, so it cannot reach the cache through
         ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
         This lives here rather than in the model so that every cache layout
-        stays behind one door, as ``_pcp_write_full_kv`` already is.
+        stays behind one door, as ``_write_kv`` already is.
 
         ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
         projection -- normally the strided ``[..., q_lora_rank:]`` half of a
@@ -3171,7 +3178,7 @@ class MLAAttention(nn.Module):
         # deepseek_v2 does for its own k-only rope under PCP.
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
+        self._write_kv(kv_cache, kv_c, k_pe, slot_mapping)
 
     def _prefill_q(
         self,
@@ -3198,43 +3205,8 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
     ) -> None:
         """A dense prefill's new tokens written to the paged KV cache."""
-        if kv_cache.numel() == 0:
-            return
-        if self.kv_shuffled:
-            shuffled_cache = self._shuffled_kv_view(kv_cache)
-            triton_cat_and_cache_mla(
-                k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
-                k_rope.view(-1, self.num_kv_heads, self.qk_rope_head_dim),
-                shuffled_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self._k_scale,
-                apply_scale=True,
-                shuffled_kv_cache=True,
-            )
-        elif self.use_seg_mla:
-            # Write the KV cache in the segmented layout so the decode-phase
-            # mla_decode_fwd (which reads seg layout) sees a consistent cache
-            # for tokens written during prefill. kv_cache is flattened to
-            # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so the
-            # kernel derives page_size from stride(0).
-            kv_cache_seg = self._seg_kv_cache_view(kv_cache)
-            concat_and_cache_mla_seg(
-                k_nope,
-                k_rope.squeeze(1),
-                kv_cache_seg,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=self._k_scale,
-            )
-        else:
-            concat_and_cache_mla(
-                k_nope,
-                k_rope.squeeze(1),
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=self._k_scale,
-            )
+        if kv_cache.numel() > 0:
+            self._write_kv(kv_cache, k_nope, k_rope, attn_metadata.slot_mapping)
 
     # ---- Dense prefill split for token graphs: the head (Q projection, the
     # new tokens' kv_b_proj and FP8 quantization) is sized by the rows alone,
@@ -3256,11 +3228,12 @@ class MLAAttention(nn.Module):
         return (recording or warmup) and self.prefill_split_supported()
 
     def prefill_split_supported(self) -> bool:
-        """Dense, no ``o_proj`` inside, no PCP, and the plain ``kv_b_proj``
-        the eager prefill uses: under ``ATOM_USE_TRITON_GEMM`` a prefill without
-        a cached prefix takes the fused GEMM + split + cat instead, which the
-        recorded head would not. Kimi records no token graphs without it
-        (`supports_token_graph`)."""
+        """Dense, no ``o_proj`` inside, no PCP group of more than one rank (a
+        group of one shards nothing), and the plain ``kv_b_proj`` the eager
+        prefill uses: under ``ATOM_USE_TRITON_GEMM`` a prefill without a cached
+        prefix takes the fused GEMM + split + cat instead, which the recorded
+        head would not. Kimi records no token graphs unless every MLA layer of
+        its own passes (`supports_token_graph`)."""
         return (
             not self.is_sparse_mla
             and isinstance(self.o_proj, nn.Identity)
@@ -3581,7 +3554,7 @@ class MLAAttention(nn.Module):
                     self.rotary_emb(
                         positions_full, k_rope_full, torch.empty_like(k_rope_full)
                     )
-                    self._pcp_write_full_kv(
+                    self._write_kv(
                         kv_cache,
                         k_nope_full,
                         k_rope_full,
