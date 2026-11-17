@@ -741,13 +741,13 @@ def weight_is_stored_preshuffled(
     preshuffle path is off, so it is shuffled once at load rather than per
     forward.
 
-    ``native_group_rows`` marks a native group32 weight, otherwise read as
-    checkpoint bytes. Native 32x32 weights are shuffled on gfx950 for AITER's
-    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
-    always on gfx1250, whose only group32 GEMM is AITER's preshuffled FlyDSL
-    one. Native 1x32 weights are shuffled only when the existing
-    ``needs_preshuffled_weight`` override is set, as the M3.1 shape-gated
-    opt-in path does.
+    ``native_group_rows`` marks a native group32 weight (1x32 or 32x32),
+    otherwise read as checkpoint bytes. Native weights are shuffled on gfx950
+    for AITER's preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by
+    default), always on gfx1250, whose only group32 GEMM is AITER's preshuffled
+    FlyDSL one, and always under ``needs_preshuffled_weight``. On gfx1250 a
+    shuffled 1x32 weight's scale changes layout too
+    (``native_1x32_scale_for_preshuffle``).
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -790,6 +790,30 @@ def weight_is_stored_preshuffled(
     if quant_value == QuantType.per_1x128.value:
         return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE or needs_preshuffled_weight
     return False
+
+
+def native_1x32_scale_for_preshuffle(scale: torch.Tensor) -> torch.Tensor:
+    """The E8M0 scale of a preshuffled native 1x32 FP8 weight, as its GEMM reads it.
+
+    gfx1250's group32 GEMM (AITER's FlyDSL mxfp8_32) reads a 1x32 weight scale
+    as ``shuffle_scale_n32k4`` bytes under the row-major ``(N, K / 32)`` shape,
+    so a row-major scale is not rejected, only misread. gfx950's reads it
+    row-major, unchanged.
+    """
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx1250":
+        return scale
+    from aiter.ops.shuffle import shuffle_scale_n32k4
+
+    n, k_blocks = scale.shape
+    if n % 32 or k_blocks % 4:
+        raise ValueError(
+            "gfx1250's 1x32 FP8 GEMM needs N % 32 == 0 and K % 128 == 0, got "
+            f"N={n}, K={32 * k_blocks}"
+        )
+    shuffled = shuffle_scale_n32k4(scale.view(1, n, k_blocks))
+    return shuffled.view(scale.dtype).view(n, k_blocks)
 
 
 class LinearBase(nn.Module):
@@ -1412,6 +1436,10 @@ class LinearBase(nn.Module):
                 native_group_rows=self.native_a8_group_rows,
             ):
                 shuffle_weights(self.weight)
+                if self.native_a8_group_rows == 1:
+                    self.weight_scale.data = native_1x32_scale_for_preshuffle(
+                        self.weight_scale.data
+                    )
             return
         if self.weight.numel() == 0:
             return
