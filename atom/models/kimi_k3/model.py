@@ -40,6 +40,7 @@ from atom.model_ops.fla_ops.replayssm import (
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
     ReplicatedLinear,
@@ -196,9 +197,7 @@ def _row_major_x_scale(norm: RMSNorm, consumers: list[nn.Module | None]) -> bool
     consumer quantizing for itself stays column-major, so the GEMMs always get
     the layout they are told."""
     if not consumers or not all(
-        getattr(c, "use_row_major_x_scale", None) is not None
-        and c.use_row_major_x_scale()
-        for c in consumers
+        isinstance(c, LinearBase) and c.use_row_major_x_scale() for c in consumers
     ):
         return False
     key = register_row_major_x_scale_group(
@@ -1776,9 +1775,7 @@ class KimiDecoderLayer(nn.Module):
         )
         _row_major_x_scale(self.input_layernorm, self.self_attn.input_scale_consumers())
         if hasattr(self, "mlp"):
-            _row_major_x_scale(
-                self.post_attention_layernorm, [getattr(self.mlp, "gate_up_proj", None)]
-            )
+            _row_major_x_scale(self.post_attention_layernorm, [self.mlp.gate_up_proj])
 
     def _ffn(
         self, hidden_states: torch.Tensor
