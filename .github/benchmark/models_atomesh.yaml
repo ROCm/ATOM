@@ -2626,6 +2626,21 @@ models:
               max_num_seqs: 400
               spec_decode_acceptance_length: 4.04
 
+        # DSpark4 (InferenceX golden AL 3.19) against DSpark7 at the same concurrency.
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark4-mcstore-agentx-c140
+          display_topology: 1P1D-PP4-TP4-DSPARK4-NVFP4-MCSTORE
+          concurrency: [140]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,280]"
+          server:
+            common_args:
+              max_num_seqs: 280
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.19
+
     accuracy:
       task: gsm8k
       fewshot: 20
