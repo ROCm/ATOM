@@ -196,8 +196,8 @@ def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
     layers = [_Layer(), _Layer()]
 
     class _Draft(DSparkDraftModel):
-        def project_context(self, aux_concat):
-            return aux_concat
+        def project_context(self, taps):
+            return self.concat_taps(taps)
 
         @property
         def context_layers(self):
@@ -211,7 +211,7 @@ def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
         ),
     )
     slots = torch.arange(4)
-    DSparkDraftModel.write_context_kv(_Draft(), torch.zeros(4, 2), None, slots)
+    DSparkDraftModel.write_context_kv(_Draft(), [torch.zeros(4, 2)], None, slots)
     assert len(calls) == 2 and all(c is slots for c in calls)
 
 
