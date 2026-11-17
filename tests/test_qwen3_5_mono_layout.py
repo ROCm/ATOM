@@ -112,7 +112,7 @@ def _regions(table):
     return [(name, off, end) for (off, name), end in zip(starts, ends)]
 
 
-@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
 @pytest.mark.parametrize("full", [False, True], ids=["gdn", "full"])
 @pytest.mark.parametrize("tokens", TOKEN_COUNTS)
 def test_regions_are_disjoint_nonempty_and_aligned(weights, full, tokens):
@@ -151,7 +151,7 @@ def test_down_tiles_cover_hidden_in_whole_row_groups(tokens):
     assert tile % 16 == 0 and hidden % tile == 0
 
 
-@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
 @pytest.mark.parametrize("tokens_per_seq", [1, 2, 4])
 def test_every_stage_has_tasks_and_gdn_runs_a_task_per_sequence_head(
     weights, tokens_per_seq
@@ -168,7 +168,7 @@ def test_every_stage_has_tasks_and_gdn_runs_a_task_per_sequence_head(
                 assert tasks["gdn"] == tokens // tokens_per_seq * dims["hv"]
 
 
-@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
 @pytest.mark.parametrize("full", [False, True], ids=["gdn", "full"])
 def test_mixer_output_mailboxes_follow_the_out_proj_input(weights, full):
     """The FP8 checkpoint's GDN output is FP8 already (its gated norm quantizes, as aiter's does): four
@@ -179,7 +179,7 @@ def test_mixer_output_mailboxes_follow_the_out_proj_input(weights, full):
     scratch, _ = layout.layout(tokens, 4, full, **dims)
     sizes = {name: end - start for name, start, end in _regions(scratch)}
     out_k = layout.out_k(full, dims)
-    if full or weights == "mxfp4":
+    if full or weights != "fp8":
         assert "gq" not in sizes and sizes["gated"] >= tokens * out_k // 2 * 8
     else:
         assert "gated" not in sizes
@@ -234,7 +234,7 @@ def test_an_aiter_pick_reads_as_its_partial_sum_rounding(pick, rule):
     assert layout.aiter_bf16_rule(pick) == rule
 
 
-@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
 def test_every_bf16_gemm_the_kernel_follows_is_asked_of_aiter(weights):
     """Every BF16 GEMM on the decode path the kernel reproduces, at its TP 4 shard shape: a rule of
     ``BF16_GEMM_RULES`` or one fp32 sum."""
@@ -242,7 +242,10 @@ def test_every_bf16_gemm_the_kernel_follows_is_asked_of_aiter(weights):
         name: (n, k, rule)
         for name, n, k, rule in layout.bf16_gemms(Q35Config(weights=weights))
     }
-    want = {"router": (528, 4096, "router"), "in_proj_ba": (32, 4096, None)}
+    # the per-token FP8 checkpoint merges b | a into its FP8 in_proj and fuses the shared expert
+    want = {"router": (528, 4096, "router")}
+    if weights != "mxfp4_attnfp8":
+        want["in_proj_ba"] = (32, 4096, None)
     if weights == "mxfp4":
         want |= {
             "in_proj_qkvz": (5120, 4096, None),
@@ -255,7 +258,7 @@ def test_every_bf16_gemm_the_kernel_follows_is_asked_of_aiter(weights):
     assert got == want
 
 
-@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4", "mxfp4_attnfp8"])
 def test_bf16_gemm_rules_match_aiters_tuned_picks(weights):
     """A re-tune of aiter's BF16 GEMM configs can change which partial sums baseline ATOM rounds: the
     runner refuses then (``bf16_gemm_refusal``), and the installed aiter must agree with the table

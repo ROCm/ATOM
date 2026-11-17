@@ -26,10 +26,14 @@ from atom.mono.runtime.compile import trace
 BUILDS = (
     [
         (False, w, T, cap, False, 6 if T == 6 else 4)
-        for w in ("fp8", "mxfp4")
+        for w in ("fp8", "mxfp4", "mxfp4_attnfp8")
         for T, cap in ((1, 0), (4, 0), (4, 16), (6, 0), (6, 16))
     ]
-    + [(True, w, T, 0, False, 4) for w in ("fp8", "mxfp4") for T in (1, 4)]
+    + [
+        (True, w, T, 0, False, 4)
+        for w in ("fp8", "mxfp4", "mxfp4_attnfp8")
+        for T in (1, 4)
+    ]
     + [
         (True, w, T, 0, True, S)
         for w, T, S in (
@@ -41,6 +45,8 @@ BUILDS = (
             ("fp8", 6, 12),
             ("mxfp4", 1, 4),
             ("mxfp4", 6, 6),
+            ("mxfp4_attnfp8", 4, 4),
+            ("mxfp4_attnfp8", 6, 12),
         )
     ]
 )
