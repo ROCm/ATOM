@@ -222,6 +222,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moriio_backend fabric: compare a digest of every PAGE region's blocks
     # between the producer's source and the consumer's destination.
     "ATOM_MORIIO_VERIFY": lambda: _flag_env("ATOM_MORIIO_VERIFY", "0"),
+    # MoRIIO P/D write mode, prefill side (debugging): log every forward that
+    # runs a request after its final prefill forward recorded the KV-ready
+    # event, with the blocks it writes and how far that request's push is.
+    "ATOM_MORIIO_DIAG_POST_READY": lambda: _flag_env(
+        "ATOM_MORIIO_DIAG_POST_READY", "0"
+    ),
+    # P/D producer: 0 surfaces each prefill's sampled token from its own
+    # forward, as for a producer with recurrent state, instead of deferring it
+    # to one more decode step of that request.
+    "ATOM_PD_PRODUCER_DEFER_OUTPUT": lambda: _flag_env(
+        "ATOM_PD_PRODUCER_DEFER_OUTPUT", "1"
+    ),
     # MoRIIO P/D with moriio_backend fabric: one INFO line per request transfer
     # with its size and timings.
     "ATOM_MORIIO_TRANSFER_STATS": lambda: _flag_env("ATOM_MORIIO_TRANSFER_STATS"),

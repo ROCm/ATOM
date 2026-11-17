@@ -175,6 +175,25 @@ def test_the_scheduler_resolves_the_runners_deferral(pp_size):
     assert defers_output(config) is (pp_size == 1)
 
 
+def test_a_producer_can_turn_deferred_output_off(monkeypatch):
+    """ATOM_PD_PRODUCER_DEFER_OUTPUT=0 treats an MHA producer like a
+    recurrent-state one; a consumer still defers."""
+    config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        kv_transfer_config={"kv_role": "kv_producer"},
+        hf_config=object(),
+    )
+    with (
+        mock.patch("atom.model_engine.scheduler.get_hf_text_config"),
+        mock.patch("atom.model_engine.scheduler.attn_family", return_value=Family.MHA),
+    ):
+        assert defers_output(config) is True
+        monkeypatch.setenv("ATOM_PD_PRODUCER_DEFER_OUTPUT", "0")
+        assert defers_output(config) is False
+        config.kv_transfer_config = {"kv_role": "kv_consumer"}
+        assert defers_output(config) is True
+
+
 def test_a_consumer_keeps_deferred_output():
     """The other polarity of the sweep below, which fixes the role to producer.
 

@@ -853,6 +853,8 @@ class ModelRunner:
     # past the target's launch (`prepare_model`).
     verify_head: VerifyHead | None = None
     spec_status_deferred = False
+    # ATOM_MORIIO_DIAG_POST_READY, read in __init__.
+    _diag_post_ready: ClassVar[bool] = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -950,6 +952,7 @@ class ModelRunner:
         self.num_spec_tokens = (
             self.config.speculative_config.num_speculative_tokens if use_spec else 0
         )
+        self._diag_post_ready = envs.ATOM_MORIIO_DIAG_POST_READY
 
         self._pp_pending_send: list = []
         self.tokenID_processor = tokenIDProcessor(
@@ -3828,6 +3831,10 @@ class ModelRunner:
         # race the dummy's still-pending H2D copies.
         self._advance_forward_vars()
         self._gate_staging_reuse()
+        if self._diag_post_ready:
+            note = getattr(get_kvconnector(), "note_forward", None)
+            if callable(note):
+                note(batch, self.block_size, self.num_spec_tokens)
         (
             input_ids,
             temperatures,
