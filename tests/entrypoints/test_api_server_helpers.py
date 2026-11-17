@@ -891,6 +891,7 @@ def _kv_events_engine(
     """An engine with KV events configured as `events`, by default DP=2 on one
     node, serving the sources its CoreManager builds."""
     from atom.config import KVEventsConfig, ParallelConfig
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
     from atom.model_engine.engine_core_mgr import kv_event_sources
 
     config = SimpleNamespace(
@@ -907,6 +908,7 @@ def _kv_events_engine(
         kv_cache_dtype="fp8",
         speculative_config=None,
     )
+    config.offload_min_load_tokens = KVConnectorFactory.resolve_min_load_tokens(config)
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(
         api_server,
@@ -1025,12 +1027,18 @@ def fake_aiter(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
 
 
+@pytest.mark.parametrize(
+    "min_load, reported", [(None, 512), ("1024", 1024)], ids=["store-default", "env"]
+)
 def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
-    monkeypatch, fake_aiter
+    monkeypatch, fake_aiter, min_load, reported
 ):
     from atom.kv_transfer.offload.mooncake_store import keys
 
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "512")
+    if min_load is None:
+        monkeypatch.delenv("OFFLOAD_MIN_LOAD_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", min_load)
     pools = {
         "rdma0": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.1:8080"},
         "rdma1": {"master": "10.0.0.1:50051", "metadata": "http://10.0.0.9:8080"},
@@ -1045,7 +1053,7 @@ def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
             "mooncake_store.chunk_tokens": 64,
         },
     }
-    pd = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     config = _kv_events_engine(
         monkeypatch,
         kv_transfer_config={"kv_connector": "multi", "connectors": [pd, store]},
@@ -1063,7 +1071,7 @@ def test_kv_event_sources_reports_the_store_keys_as_its_connector_builds_them(
             "namespace": keys.store_namespace(leaf, 64),
             "chunk_tokens": 64,
             "world": 1,
-            "min_load_tokens": 512,
+            "min_load_tokens": reported,
             "chain_check": keys.chunk_hash_chain(range(64), 64).hex(),
         }
     assert asyncio.run(api_server.kv_event_sources()) == expected

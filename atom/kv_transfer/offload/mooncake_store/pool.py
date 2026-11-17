@@ -224,14 +224,34 @@ class TransferSlotPool:
         GLM-5.2 stage's is -- are a buffer the codec packs or unpacks in one
         call, with no staging copy.
         """
-        if not slots or self.slot_stride != self.chunk_bytes:
+        if self.slot_stride != self.chunk_bytes:
+            return None
+        return self.strided_view(slots)
+
+    def strided_view(self, slots: list[Slot]) -> torch.Tensor | None:
+        """An ordered physical slot run, including inter-slot padding."""
+        if not slots:
             return None
         first = slots[0]
+        for slot in slots:
+            owned = self._slots.get(slot.region, ())
+            if (
+                slot.index < 0
+                or slot.index >= len(owned)
+                or owned[slot.index] is not slot
+            ):
+                return None
         for previous, slot in pairwise(slots):
-            if slot.region != first.region or slot.index != previous.index + 1:
+            if (
+                slot.region != first.region
+                or slot.index != previous.index + 1
+                or slot.ptr != previous.ptr + self.slot_stride
+            ):
                 return None
         offset = first.ptr - self.base_ptr
-        return self._buffer[offset : offset + len(slots) * self.chunk_bytes]
+        return self._buffer[
+            offset : offset + (len(slots) - 1) * self.slot_stride + self.chunk_bytes
+        ]
 
     def release(self, slots: list[Slot]) -> None:
         """Return slots no GPU or NIC access can still touch."""
@@ -337,10 +357,12 @@ class TransferSlotPool:
     def _take_locked(self, region: str, n: int) -> list[Slot]:
         """``n`` free slots of ``region`` in index order, one run if there is one.
 
-        The lowest run of ``n`` consecutive slots, so a window is one buffer
-        (``contiguous_view``); only a region that quarantine or other windows
-        have broken up hands out scattered slots, and those go through the
-        staging copy instead.
+        The lowest run of ``n`` consecutive slots, so a window is one buffer:
+        ``contiguous_view`` when slots are unpadded, or ``strided_view`` (the
+        run including inter-slot padding) for a codec that restores padded
+        slots in place. Only a region that quarantine or other windows have
+        broken up hands out scattered slots, and those go through the staging
+        copy instead.
         """
         free = self._free[region]
         ordered = sorted(free, key=lambda slot: slot.index)

@@ -15,7 +15,6 @@ from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store import keys
 from atom.kv_transfer.offload.mooncake_store.config import parse_mooncake_store_config
-from atom.utils import envs
 
 
 def offload_report(config: Any) -> dict[str, Any] | None:
@@ -36,7 +35,8 @@ def _mooncake_store_report(config: Any) -> dict[str, Any]:
         "namespace": keys.store_namespace(config, chunk_tokens),
         "chunk_tokens": chunk_tokens,
         "world": offcfg.lmcache_replica_world_size(config),
-        "min_load_tokens": envs.OFFLOAD_MIN_LOAD_TOKENS,
+        # Resolved by `Config`: the env var alone is None unless it is set.
+        "min_load_tokens": config.offload_min_load_tokens,
         # The digest of a text prompt's first chunk when its tokens are
         # 0..chunk_tokens-1: a router that computes another must not read keys.
         "chain_check": keys.chunk_hash_chain(range(chunk_tokens), chunk_tokens).hex(),

@@ -41,6 +41,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   (embed + lm_head are shared with the target via share_with_target)
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -1038,15 +1039,15 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``main_norm(main_proj(concat(aux)))`` -- the shared context.
+    def project_context(self, taps: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``main_norm(main_proj(concat(taps)))`` -- the shared context.
 
         Stage 0 owns main_proj/main_norm; the projection runs once and every
         stage then writes its own rolling-KV rows from it (each stage has its
         own kv cache and attention linears).
         """
         stage0 = self.model.mtp[0]
-        return stage0.main_norm(linear_out(stage0.main_proj(aux_concat)))
+        return stage0.main_norm(linear_out(stage0.main_proj(self.concat_taps(taps))))
 
     @property
     def context_layers(self):
@@ -1055,7 +1056,7 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
     def write_split_context_kv(
         self,
-        aux_local: torch.Tensor,  # this PCP rank's round-robin stripe
+        taps_local: Sequence[torch.Tensor],  # this PCP rank's stripe of each tap
         positions: torch.Tensor,  # [num_tokens] absolute positions
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,  # unused: addressed by position
@@ -1072,11 +1073,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
         )
 
         pcp_ws = get_pcp_world_size()
-        pad = aux_local.shape[0] * pcp_ws - num_tokens
+        pad = taps_local[0].shape[0] * pcp_ws - num_tokens
         local_positions = pcp_round_robin_split(
             pcp_pad_dense(positions[:num_tokens], pad), pcp_ws
         )
-        ctx_local = self.project_context(aux_local)
+        ctx_local = self.project_context(taps_local)
         layers = list(self.context_layers)
         local = [layer.context_kv_rows(ctx_local, local_positions) for layer in layers]
         gathered = iter(

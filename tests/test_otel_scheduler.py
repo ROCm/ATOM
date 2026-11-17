@@ -204,6 +204,7 @@ def test_engine_teardown_always_flushes_traces(monkeypatch, engine_kind, failure
         is_finished=lambda: True,
         publish_kv_events=lambda: cleanup("publish"),
         shutdown_kv_events=lambda: cleanup("shutdown"),
+        close_kv_connector=lambda: None,
     )
     core.runner_mgr = SimpleNamespace(call_func=lambda *a, **k: None)
     core.is_head = engine_kind == "pp_head"
@@ -371,7 +372,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
 
     failure_callbacks = []
 
-    def runner_manager(*args, on_worker_failure, kv_progress_event):
+    def runner_manager(*args, local_proc_num, on_worker_failure, kv_progress_event):
         assert kv_progress_event is not None
         failure_callbacks.append(on_worker_failure)
         return SimpleNamespace(call_func=call)
@@ -387,6 +388,7 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
     config = MockConfig(
         parallel_config=SimpleNamespace(control_address="unused", data_parallel_size=1),
         tp_world_size=1,
+        is_multinode_tp=False,
         pcp_group_size=1,
         runner_qualname="unused",
         enforce_eager=True,
