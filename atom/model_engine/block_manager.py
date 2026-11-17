@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -231,6 +232,7 @@ class BlockManager:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        kv_connector: Any = None,
     ):
         self._min_load_tokens = config.offload_min_load_tokens
         block_size = config.kv_cache_block_size
@@ -300,6 +302,7 @@ class BlockManager:
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
             reserve_null_block=state_runtime.checkpoint_spec is not None,
+            kv_connector=kv_connector,
         )
         # Sequences whose prompt chain a content-sharing pool was already asked
         # for (`_fetch_shared_prefix`), by the seed it was asked under.
@@ -600,10 +603,12 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        take_copies = getattr(self.kv, "take_block_copies", None)
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            block_copies=take_copies() if take_copies is not None else (),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -1460,7 +1465,28 @@ class BlockManager:
             local += 1
         if local == n:
             return
-        self.kv.fetch(chain[local:], lambda i: self._hash_block_tokens(seq, local + i))
+        tokens_of = lambda i: self._hash_block_tokens(seq, local + i)
+        if getattr(self.kv, "async_fetch", False):
+            # Copied in the background; the scheduler holds the sequence back
+            # while it is in flight (`shared_prefix_pending`).
+            self.kv.fetch_async(seq.id, chain[local:], tokens_of)
+            return
+        self.kv.fetch(chain[local:], tokens_of)
+
+    def shared_prefix_pending(self, seq: Sequence) -> bool:
+        """Whether `seq` should wait for its prefix to arrive from other pools.
+
+        Starts the copy on the first ask (`_fetch_shared_prefix`, which a
+        walk would otherwise start), so the scheduler can ask before probing.
+        """
+        if not (
+            self.kv.shares_content
+            and self.enable_prefix_caching
+            and getattr(self.kv, "async_fetch", False)
+        ):
+            return False
+        self._fetch_shared_prefix(seq)
+        return self.kv.fetch_pending(seq.id)
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`

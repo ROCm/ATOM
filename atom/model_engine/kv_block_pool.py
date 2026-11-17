@@ -12,10 +12,11 @@ Two interfaces, one per process that touches the pool:
                 and when the device has finished writing them.
 
 ATOM's own implementation (`block_pool.BlockPool` over a tensor this process
-allocates) is one backend. Another keeps both in an external process, so the
-memory and its management can outlive, and be shared between, engine instances
-(`umbp_block_pool`). `BlockManager` and `ModelRunner` only ever see the
-interfaces; `ATOM_KV_POOL_BACKEND` picks the backend.
+allocates) is the default. A KV connector can provide both instead
+(`KVConnectorBase.kv_pool_memory`, `KVConnectorSchedulerBase.make_block_pool`),
+e.g. `umbp_l1`, which hands the pool to MORI-UMBP so engine ranks share it
+(`atom/kv_transfer/l1`). `BlockManager` and `ModelRunner` only ever see the
+interfaces.
 """
 
 from __future__ import annotations
@@ -26,15 +27,11 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from atom.model_engine.kv_block import Block
-from atom.utils import envs
 
 if TYPE_CHECKING:
     import torch
 
     from atom.model_engine.block_pool import BlockRetirement
-
-LOCAL_BACKEND = "local"
-UMBP_BACKEND = "umbp"
 
 
 class KVBlockPool(ABC):
@@ -195,6 +192,9 @@ class KVPoolMemory(ABC):
     #: `ModelRunner` checks its sizing against those only when it does.
     counted_by_torch: bool = True
 
+    #: Whether other engine ranks can read and fill blocks of this pool.
+    shares_blocks: bool = False
+
     @abstractmethod
     def allocate(self, nbytes: int, device: torch.device) -> torch.Tensor:
         """A zero-filled `uint8` buffer of `nbytes` on `device`."""
@@ -232,16 +232,6 @@ class LocalPoolMemory(KVPoolMemory):
         return torch.zeros(nbytes, dtype=torch.uint8, device=device)
 
 
-def kv_pool_backend() -> str:
-    backend = envs.ATOM_KV_POOL_BACKEND.strip().lower()
-    if backend not in (LOCAL_BACKEND, UMBP_BACKEND):
-        raise ValueError(
-            f"unknown ATOM_KV_POOL_BACKEND {backend!r}; "
-            f"expected {LOCAL_BACKEND!r} or {UMBP_BACKEND!r}"
-        )
-    return backend
-
-
 def make_block_pool(
     config,
     num_blocks: int,
@@ -250,14 +240,22 @@ def make_block_pool(
     on_remap: Callable[[int], None] | None = None,
     cache_policy: str = "lru",
     protected_ratio: float = 0.5,
+    reserve_null_block: bool = False,
+    kv_connector: Any = None,
 ) -> KVBlockPool:
-    """The scheduler-side pool for the configured backend."""
-    if kv_pool_backend() == UMBP_BACKEND:
-        from atom.model_engine.umbp_block_pool import make_umbp_block_pool
-
-        return make_umbp_block_pool(
-            config, num_blocks, on_evict=on_evict, on_remap=on_remap
+    """The scheduler-side pool: the connector's if it provides one, else ATOM's."""
+    if kv_connector is not None:
+        pool = kv_connector.make_block_pool(
+            config,
+            num_blocks,
+            on_evict=on_evict,
+            on_remap=on_remap,
+            cache_policy=cache_policy,
+            protected_ratio=protected_ratio,
+            reserve_null_block=reserve_null_block,
         )
+        if pool is not None:
+            return pool
     from atom.model_engine.block_pool import BlockPool
 
     return BlockPool(
@@ -266,13 +264,14 @@ def make_block_pool(
         cache_policy=cache_policy,
         protected_ratio=protected_ratio,
         on_remap=on_remap,
+        reserve_null_block=reserve_null_block,
     )
 
 
-def make_pool_memory(config, rank: int = 0) -> KVPoolMemory:
-    """The runner-side memory provider for the configured backend."""
-    if kv_pool_backend() == UMBP_BACKEND:
-        from atom.model_engine.umbp_block_pool import make_umbp_pool_memory
-
-        return make_umbp_pool_memory(config, rank)
+def make_pool_memory(config, rank: int = 0, kv_connector: Any = None) -> KVPoolMemory:
+    """The runner-side memory provider: the connector's if any, else local."""
+    if kv_connector is not None:
+        memory = kv_connector.kv_pool_memory(config, rank)
+        if memory is not None:
+            return memory
     return LocalPoolMemory()

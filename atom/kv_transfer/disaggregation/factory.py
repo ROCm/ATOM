@@ -106,6 +106,10 @@ class KVConnectorFactory:
     # "module:function" taking the leaf's `kv_transfer_config`. Absent means 1.
     _chunk_tokens: ClassVar[dict[str, str]] = {}
     _lowers_hbm_hit_to_chunk: ClassVar[dict[str, bool]] = {}
+    # A backend that provides the paged pool and shares it across DP ranks:
+    # "module:function" taking the leaf's `kv_transfer_config`, returning what
+    # routing may count on (`pool_sharing`).
+    _shares_pool: ClassVar[dict[str, str]] = {}
 
     @classmethod
     def register(
@@ -125,6 +129,7 @@ class KVConnectorFactory:
         shared_tier: bool = False,
         chunk_tokens: str | None = None,
         lowers_hbm_hit_to_chunk: bool = False,
+        shares_pool: str | None = None,
     ) -> None:
         """Register a KV connector backend.
 
@@ -149,6 +154,10 @@ class KVConnectorFactory:
                 (`offload_tier`).
             lowers_hbm_hit_to_chunk: Admission may reload an unaligned HBM tail
                 from the preceding transfer chunk, rather than recompute it.
+            shares_pool: ``"module:function"`` for a backend that provides the
+                paged pool and shares it across DP ranks, returning from the
+                leaf's ``kv_transfer_config`` what routing may count on
+                (`pool_sharing`).
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -183,6 +192,8 @@ class KVConnectorFactory:
         cls._lowers_hbm_hit_to_chunk[name] = bool(lowers_hbm_hit_to_chunk)
         if chunk_tokens:
             cls._chunk_tokens[name] = chunk_tokens
+        if shares_pool:
+            cls._shares_pool[name] = shares_pool
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -203,6 +214,25 @@ class KVConnectorFactory:
                 f"{path} has unknown KV connector {value!r}; available: {available}"
             )
         return canonical
+
+    @classmethod
+    def pool_sharing(cls, config: Any) -> dict[str, Any] | None:
+        """What a configured pool-providing backend offers DP routing, or None.
+
+        ``{"loads": bool, "session_migrate_margin": float | None}``: whether a
+        rank copies a prefix it lacks from another rank's pool, and how crowded
+        a rank may get before a session moves off it. From the registry and
+        ``config`` alone; nothing is built.
+        """
+        for name, sub in cls.leaf_connectors(config) or ():
+            target = cls._shares_pool.get(name)
+            if target is None:
+                continue
+            module, attr = target.split(":", 1)
+            return getattr(importlib.import_module(module), attr)(
+                getattr(sub, "kv_transfer_config", None) or {}
+            )
+        return None
 
     @classmethod
     def is_offload_backend(cls, name: str) -> bool:
@@ -515,3 +545,8 @@ KVConnectorFactory.register(
 # Registration is explicit after the factory exists; importing an offload
 # value type does not recursively import this factory.
 register_backends(KVConnectorFactory)
+
+# Connectors that provide the paged pool itself (atom/kv_transfer/l1).
+from atom.kv_transfer.l1 import register_backends as _register_l1
+
+_register_l1(KVConnectorFactory)
