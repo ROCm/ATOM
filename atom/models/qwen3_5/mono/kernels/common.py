@@ -68,6 +68,23 @@ def mxfp4_qd(v0, v1):
     epilogue, RCEIL): the E8M0 scale ``ceil_pow2(amax * fl(1 / 6))``, E2M1 round to nearest even, back
     to f32 (exact in bf16).
     """
+    word, ef = mxfp4_q(v0, v1)
+    one = as_ir_value(fx.Float32(1.0))
+    out = fx.Vector(
+        rocdl.cvt_scalef32_pk_f32_fp4(
+            res=fx.Vector.make_type(2, fx.Float32),
+            src=as_ir_value(word),
+            scale=one,
+            src_sel_index=0,
+        )
+    )
+    ds = (ef << 23).bitcast(fx.Float32)
+    return out[0] * ds, out[1] * ds
+
+
+def mxfp4_q(v0, v1):
+    """``mxfp4_qd``'s quantize half: the pair's two E2M1 codes (byte 0, v0 the low nibble) and the
+    block's E8M0 scale byte."""
     amax = fx.max(fmath.absf(v0), fmath.absf(v1))
     for o in (1, 2, 4, 8):
         amax = fx.max(amax, xshfl(amax, o))
@@ -86,16 +103,7 @@ def mxfp4_qd(v0, v1):
             0,
         )
     )
-    out = fx.Vector(
-        rocdl.cvt_scalef32_pk_f32_fp4(
-            res=fx.Vector.make_type(2, fx.Float32),
-            src=as_ir_value(word),
-            scale=one,
-            src_sel_index=0,
-        )
-    )
-    ds = ((e + 127) << 23).bitcast(fx.Float32)
-    return out[0] * ds, out[1] * ds
+    return word & 0xFF, ef
 
 
 # The per-1x128 FP8 activation quants of baseline ATOM's decode, one per kernel family: rule(amax) ->

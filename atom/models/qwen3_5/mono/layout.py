@@ -332,10 +332,15 @@ def layout(
             ("sel", S * slots * pr),
             ("prob", S * slots * pr),
             ("mid", S * slots * inter * pr),
-            # MXFP4 experts: the MoE input as bf16 pairs, per-32 MXFP4 quantize-dequantized (the bank's), and
-            # normed (the separate BF16 shared expert's, "mxfp4")
+            # MXFP4 experts: the MoE input per-32 MXFP4 (the bank's: a word a 8 E2M1 codes, then a word a
+            # 128-K block's four E8M0 scales), and normed as bf16 pairs (the separate BF16 shared expert's,
+            # "mxfp4")
             *([("x2b", S * hidden // 2 * pr)] if weights == "mxfp4" else []),
-            *([("xb", S * hidden // 2 * pr)] if experts_mxfp4(weights) else []),
+            *(
+                [("xb", (S * hidden // 8 + S * hidden // 128) * pr)]
+                if experts_mxfp4(weights)
+                else []
+            ),
         ]
     )
     # a debug build's wait records (one a CTA, atom.mono.device.sync), zeroed with the mailboxes at a

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from atom.models.qwen3_5.mono import layout
-from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config
+from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, max_rows
 
 TOKEN_COUNTS = range(1, MAX_TOKENS + 1)
 
@@ -330,10 +330,18 @@ def test_per_token_fp8_gemm_orders_match_aiters_tuned_picks():
 
 
 @pytest.mark.parametrize(
-    "weights, rows", [("fp8", MAX_TOKENS), ("mxfp4", MAX_TOKENS), ("mxfp4_attnfp8", 8)]
+    "weights, T, rows",
+    [
+        ("fp8", 1, MAX_TOKENS),
+        ("fp8", 4, MAX_TOKENS),
+        ("mxfp4", 1, MAX_TOKENS),
+        ("mxfp4_attnfp8", 1, 8),
+        ("mxfp4_attnfp8", 4, 12),
+        ("mxfp4_attnfp8", 6, 12),
+    ],
 )
-def test_the_widest_step_each_checkpoint_serves(weights, rows):
-    assert Q35Config(weights=weights).max_rows == rows
+def test_the_widest_step_each_checkpoint_serves(weights, T, rows):
+    assert max_rows(weights, T) == rows
 
 
 def test_every_launch_width_has_its_bf16_gemm_rule():

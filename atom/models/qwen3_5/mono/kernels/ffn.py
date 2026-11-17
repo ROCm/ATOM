@@ -12,6 +12,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.kernels.common import (
+    mxfp4_q,
     mxfp4_qd,
     quant_floor,
     sigmoid_fast,
@@ -70,6 +71,7 @@ def ffn_stages(ctx):
     keys = ctx["keys"]
     lane = ctx["lane"]
     mb = ctx["mb"]
+    put_words = ctx["st"].put_words
     misc = ctx["misc"]
     mma_units = ctx["mma_units"]
     n_sel = ctx["n_sel"]
@@ -103,6 +105,9 @@ def ffn_stages(ctx):
     wave = ctx["wave"]
     x_out = ctx["x_out"]
     xs = ctx["xs"]
+
+    # MXFP4: mailbox ``xb``'s scale words follow its S * HIDDEN / 8 code words; LDS xs the same
+    XF4_SC = S * HIDDEN // 8
 
     # ====== 5. post-attn RMSNorm -> router logits (+ shared gate) + this task's FP8 MoE input blocks
     r_wr = rsrc(w_r)
@@ -169,11 +174,26 @@ def ffn_stages(ctx):
                 )
                 if const_expr(MX):
                     # MXFP4 checkpoint: the normed input (the BF16 shared expert's) and its per-32 MXFP4
-                    # quantize-dequantize (the A4W4 routed experts'), bf16 pairs
-                    m0, m1 = mxfp4_qd(v0, v1)
+                    # quant (the A4W4 routed experts'): mailbox ``xb`` holds the E2M1 codes, one word a
+                    # 8 elements, sample-major, then the E8M0 scales, one word a 128-K block
                     if const_expr(SH_BF16):
                         put_bf(mb("x2b"), x_s * HIDDEN + xk, [v0, v1])
-                    put_bf(mb("xb"), x_s * HIDDEN + xk, [m0, m1])
+                    qb, qe = mxfp4_q(v0, v1)
+                    qb = qb | (xshfl(qb, 1) << 8)
+                    qb = qb | (xshfl(qb, 2) << 16)
+                    qb2 = xshfl(qb, 4)
+                    if lane % 8 == 0:
+                        put_words(
+                            mb("xb"),
+                            (x_s * HIDDEN + x_blk * 128) // 8 + lane // 4,
+                            [qb, qb2],
+                        )
+                    qe = qe | (xshfl(qe, 16) << 8)
+                    qe = qe | (xshfl(qe, 32) << 16)
+                    if lane == 0:
+                        put_words(
+                            mb("xb"), XF4_SC + x_s * (HIDDEN // 128) + x_blk, [qe]
+                        )
                 else:
                     q0, q1, qs = quant_floor(v0, v1)
                     w8 = (
@@ -287,7 +307,7 @@ def ffn_stages(ctx):
             return units
 
         def mx_units(w_rg, w_ln, e, sample, live):
-            """A routed tile of the MXFP4 bank: 128-K E2M1 tiles against the MXFP4-dequantized input."""
+            """A routed tile of the MXFP4 bank: 128-K E2M1 tiles against the staged MXFP4 input."""
             nw = (
                 None
                 if live is None
@@ -315,12 +335,23 @@ def ffn_stages(ctx):
                         w_rg,
                         kt,
                         HIDDEN,
-                        (sn * HIDDEN + kt * 128) // 2,
+                        (sn * HIDDEN + kt * 128) // 8,
                         None,
                         w_ln,
+                        b_scale=XF4_SC + sn * (HIDDEN // 128) + kt,
                     )
                 )
             return units
+
+        def stage_xf4():
+            """LDS xs: the MXFP4 input's code words, then its scale words (mailbox ``xb``'s order)."""
+            stage_x_pairs("xb", 2 * XF4_SC, lambda k: k)
+            n_sc = S * HIDDEN // 128
+            for i in range_constexpr(-(-n_sc // THREADS)):
+                w = tid + i * THREADS
+                if w < n_sc:
+                    v = poll([(mb("xb"), XF4_SC + w, 1)])[0]
+                    lds_st(xs, XF4_SC + w, v[0].bitcast(fx.Float32))
 
         def sh_units(w_rg, w_ln):
             """The BF16 shared expert's tile (its [gate | up] rows, row-major) against the normed input;
@@ -440,12 +471,12 @@ def ffn_stages(ctx):
                 gpu.barrier()
                 ug8_emit(c0, slot0, 0, True, live0)
             gpu.barrier()
-            stage_x_pairs("xb", S * HIDDEN, lambda k: k)
+            stage_xf4()
             gpu.barrier()
         else:
             # the fused bank: the shared expert's tile on the routed experts' input
             if const_expr(MX):
-                stage_x_pairs("xb", S * HIDDEN, lambda k: k)
+                stage_xf4()
             else:
                 stage_moe_input(list(range(S)))
             gpu.barrier()

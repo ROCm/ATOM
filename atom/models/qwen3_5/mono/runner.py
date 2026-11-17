@@ -25,7 +25,12 @@ import logging
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
+from atom.models.qwen3_5.mono.config import (
+    MAX_TOKENS,
+    Q35Config,
+    is_full_attention,
+    max_rows,
+)
 from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import (
     BF16_GEMM_RULES,
@@ -687,8 +692,9 @@ class Qwen35MonoDecodeRunner:
 
     def launch_width(self, rows: int) -> int | None:
         """The launch width of a ``rows``-row step, or None (not served): whole requests' rows, up to the
-        checkpoint's widest (``Q35Config.max_rows``)."""
-        return rows if 0 < rows <= self.cfg.max_rows and rows % self.T == 0 else None
+        checkpoint's widest (``config.max_rows``)."""
+        widest = max_rows(self.cfg.weights, self.T)
+        return rows if 0 < rows <= widest and rows % self.T == 0 else None
 
     def prepare(self, rows: int) -> bool:
         """Whether every rank holds the launch of a ``rows``-row step."""
@@ -699,7 +705,7 @@ class Qwen35MonoDecodeRunner:
         """Every width a step can take, built now (collective, at install). A CUDA-graph deployment
         builds them while capturing; an eager one would otherwise stall a serving step on each.
         """
-        for rows in range(self.T, self.cfg.max_rows + 1, self.T):
+        for rows in range(self.T, max_rows(self.cfg.weights, self.T) + 1, self.T):
             self.prepare(rows)
 
     # ---------------------------------------------------------------- forward
