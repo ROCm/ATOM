@@ -130,6 +130,31 @@ concurrency above 32 (its prefix cache cannot be flushed between runs).
 | 48 | 204.1 s / 411 ms / 75.6 ms | 135.7-137.0 s / 299-312 ms / 49.1-49.6 ms | 134.6 s / 348 ms / 49.1 ms |
 | 64 | 166.4 s / 682 ms / 77.9 ms | 112.7-112.9 s / 514-530 ms / 51.5 ms | 121.7 s / 387 ms / 59.4 ms |
 
+At 64 the plugin trades TTFT for throughput because the client concurrency equals `--max-running-requests`. SGLang's
+scheduler decides whether a waiting request fits before it drops the requests that finished in the step it has just
+processed (`get_new_batch_prefill` runs before `update_running_batch` filters them), so with every slot taken a request
+that replaces a finished one is admitted one decode step later. Arrivals then coalesce into about half as many prefill
+steps as native ATOM takes (2.2 vs 4.2 a second), which lowers TPOT and wall time and raises TTFT. To schedule like
+native ATOM, leave a few slots above the client concurrency, e.g. `--max-running-requests 68` for 64 clients. The decode
+graphs can stay at 64 while there are at most 64 clients: a decode round never holds more than the clients' requests.
+With more clients than graph buckets, rounds above 64 run eagerly, so raise `--cuda-graph-max-bs-decode` too. Same
+3-shot GSM8K workload at 64, same day, plugin rows 1-3 runs (a fresh server or a server that has served before),
+native a fresh server for each run. The client sends one request before the burst; the earlier client built its HTTP
+opener in all 64 threads at once, which added about 2.5 s to the first wave's TTFT of every plugin run.
+
+| launch | wall | TTFT mean / p50 / p99 | TPOT | output tok/s |
+|---|---|---|---|---|
+| default (`--max-running-requests 64`), 3 runs | 109.4-111.0 s | 567-590 / 498-512 / 2028-2493 ms | 51.5-51.9 ms | 1116-1117 |
+| `--max-running-requests 68`, 3 runs | 122.7-123.9 s | 410-436 / 357-369 / 2028-2509 ms | 59.9-60.9 ms | 989-1003 |
+| `--max-running-requests 80`, 1 run | 123.1 s | 408 / 363 / 2037 ms | 60.2 ms | 1006 |
+| native ATOM DSpark, default, 2 runs | 123.6-124.1 s | 435-444 / 394-400 / 2090-2120 ms | 60.1-60.3 ms | 1000-1002 |
+
+The p99 is set by the first wave (64 prompts at once), whose mean TTFT is 1.31-1.34 s on a server that has served
+before and 1.77-1.79 s on the first run after start-up (native 1.46 s, fresh server), whatever
+`--max-running-requests`. At 32 clients the setting
+changes nothing (wall 158.0 s with 80, 160.1 s with 64, native 158.0 s); acceptance (49.6% with 80, native 49.3%,
+z = 0.90) and lm_eval GSM8K 3-shot (0.922 with 80, 0.920 with 64, native 0.923) are unchanged.
+
 Random 4096-token prompts, 2048 output tokens, forced accept length 3.47 (`atom.benchmarks.benchmark_serving`, 2x
 concurrency prompts): at concurrency 48, 989 tok/s with graphs up to 32, 1753 tok/s with graphs up to 64 (native 1736);
 at 64, 1154 and 1649 tok/s (native 1822; TPOT 30.1 vs 32.6 ms). The forced accept length is drawn once a round for the
