@@ -44,7 +44,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
     let shared = [1, 2].map(|port| {
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
-                .labels(HashMap::from([(
+                .labels(std::collections::HashMap::from([(
                     "mesh.responses_state".into(),
                     "shared".into(),
                 )]))
@@ -63,7 +63,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
-        .labels(HashMap::from([(
+        .labels(std::collections::HashMap::from([(
             "mesh.apis".into(),
             "/v1/messages, /v1/chat/completions".into(),
         )]))
@@ -91,8 +91,7 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         } else {
             json!({"model":"m","input":"hi"})
         };
-        let body = serde_json::to_vec(&body).unwrap();
-        let parsed = ParsedInference::parse(path, &body).unwrap();
+        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(
             EndpointSpec::find(path)
                 .unwrap()
@@ -105,7 +104,7 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, &body, ctx)
+                routing.prepare(&parsed, ctx)
             })
             .await
             .unwrap()
@@ -140,13 +139,16 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         if marked {
             app.chats_without_template.write().insert(id.clone());
         }
-        let body = br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#;
-        let parsed = ParsedInference::parse("/v1/chat/completions", body).unwrap();
+        let parsed = ParsedInference::parse(
+            "/v1/chat/completions",
+            br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#,
+        )
+        .unwrap();
         let routing = IngressRouting::new(&app);
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, body, ctx)
+                routing.prepare(&parsed, ctx)
             })
             .await
             .unwrap()
@@ -160,9 +162,8 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         }
     }
 }
-
 /// An app whose model `m` has a tokenizer with a word per id, and a template
-/// that adds `off` when reasoning is off; its toggle recorded at registration.
+/// that adds `off` when `enable_thinking` is false.
 async fn app_with_switched_chats() -> (AppContext, PreparePoolRuntime) {
     use crate::tokenizer::traits::Tokenizer;
     let config = crate::config::RouterConfig {
@@ -195,11 +196,6 @@ async fn app_with_switched_chats() -> (AppContext, PreparePoolRuntime) {
         .unwrap();
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
     let id = TokenizerRegistry::generate_id();
-    let toggle =
-        crate::routers::prepare::reasoning_controls::probe_reasoning_toggle(&*tokenizer).unwrap();
-    app.reasoning_controls
-        .write()
-        .insert(id.clone(), ReasoningControls::Template(Some(toggle)));
     app.tokenizer_registry
         .load(&id, "m", "hf-test", || async { Ok(tokenizer) })
         .await
@@ -220,7 +216,7 @@ async fn chat_tokens(app: &AppContext, fields: &serde_json::Value) -> Option<Vec
     let (_, tokens) = app
         .prepare_pool
         .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-            routing.prepare(&parsed, &body, ctx)
+            routing.prepare(&parsed, ctx)
         })
         .await
         .unwrap()
@@ -231,51 +227,55 @@ async fn chat_tokens(app: &AppContext, fields: &serde_json::Value) -> Option<Vec
     tokens
 }
 
-/// A chat is tokenized as ATOM renders it, its reasoning controls setting the
-/// tokenizer's toggle; `thinking` too, though the typed request has no such field.
+/// A chat is tokenized as the workers it can be placed on render it, by the
+/// chat rendering they report: their default kwargs under the request's, and
+/// its reasoning controls setting their toggle, `thinking` too, which the
+/// typed request has no field for. Without one alike for all, it is tokenized
+/// with its own template kwargs alone.
 #[tokio::test]
-async fn chats_are_tokenized_with_atoms_reasoning_controls() {
+async fn chats_are_tokenized_as_their_workers_render_them() {
     let (app, _pool) = app_with_switched_chats().await;
-    for (controls, want) in [
-        (json!({}), vec![1]),
-        (json!({"reasoning_effort": "none"}), vec![1, 2]),
-        (json!({"thinking": {"type": "disabled"}}), vec![1, 2]),
-    ] {
-        assert_eq!(chat_tokens(&app, &controls).await, Some(want), "{controls}");
-    }
-}
-
-/// A chat is tokenized with the `--default-chat-template-kwargs` its model's
-/// workers report, under the request's own; with none once they differ.
-#[tokio::test]
-async fn chats_are_tokenized_with_the_workers_default_kwargs() {
-    let (app, _pool) = app_with_switched_chats().await;
-    let worker = |port: u16, defaults: Option<&str>| {
-        let labels = defaults.map(|json| {
-            (
-                DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL.to_string(),
-                json.to_string(),
-            )
-        });
+    let worker = |port: u16, rendering: Option<&str>| {
+        let label = rendering.map(|json| (CHAT_RENDERING_LABEL.to_string(), json.to_string()));
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
                 .model_id("m")
-                .labels(labels.into_iter().collect())
+                .labels(label.into_iter().collect())
                 .build(),
         )
     };
+    let own = [
+        (json!({}), vec![1]),
+        (json!({"thinking": {"type": "disabled"}}), vec![1]),
+        (
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            vec![1, 2],
+        ),
+    ];
+    for (fields, want) in own.clone() {
+        assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
+    }
+    let rendering = json!({
+        "default_kwargs": {"enable_thinking": false},
+        "reasoning_toggle": {"name": "enable_thinking", "off": false, "on": true},
+        "reasoning_rules": "chat",
+        "template_efforts": ["high", "low", "max"],
+        "encoder": null,
+    });
     app.worker_registry
-        .register(worker(1, Some(r#"{"enable_thinking":false}"#)));
+        .register(worker(1, Some(&rendering.to_string())));
     app.worker_registry
-        .register(worker(2, Some(r#"{ "enable_thinking": false }"#)));
-    for (fields, want) in [
+        .register(worker(2, Some(&format!("{rendering:#}"))));
+    let rendered = [
         (json!({}), vec![1, 2]),
         (
             json!({"chat_template_kwargs": {"enable_thinking": true}}),
             vec![1],
         ),
         (json!({"thinking": {"type": "enabled"}}), vec![1]),
-    ] {
+        (json!({"reasoning_effort": "none"}), vec![1, 2]),
+    ];
+    for (fields, want) in rendered {
         assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
     }
     app.worker_registry.register(Arc::new(
@@ -286,7 +286,9 @@ async fn chats_are_tokenized_with_the_workers_default_kwargs() {
     ));
     assert_eq!(chat_tokens(&app, &json!({})).await, Some(vec![1, 2]));
     app.worker_registry.register(worker(4, None));
-    assert_eq!(chat_tokens(&app, &json!({})).await, Some(vec![1]));
+    for (fields, want) in own {
+        assert_eq!(chat_tokens(&app, &fields).await, Some(want), "{fields}");
+    }
 }
 
 fn json_headers() -> HeaderMap {
@@ -1309,14 +1311,13 @@ async fn wanted_tokens_fall_back_to_the_text() {
         ("/v1/chat/completions", chat, "untokenized", false, true),
         ("/v1/messages", messages, "messages", false, false),
     ] {
-        let body = serde_json::to_vec(&body).unwrap();
-        let parsed = ParsedInference::parse(path, &body).unwrap();
+        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
         let text = parsed.metadata_with_text(true).text;
         let routing = IngressRouting::new(&app);
         let (metadata, tokens) = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, &body, ctx)
+                routing.prepare(&parsed, ctx)
             })
             .await
             .unwrap()
@@ -1393,13 +1394,12 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
                 true,
             ),
         ] {
-            let body = body.to_string();
-            let parsed = ParsedInference::parse("/generate", body.as_bytes()).unwrap();
+            let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
             let routing = IngressRouting::new(&app);
             let (metadata, tokens) = app
                 .prepare_pool
                 .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                    routing.prepare(&parsed, body.as_bytes(), ctx)
+                    routing.prepare(&parsed, ctx)
                 })
                 .await
                 .unwrap()

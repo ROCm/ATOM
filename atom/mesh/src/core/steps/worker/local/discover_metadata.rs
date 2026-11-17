@@ -14,8 +14,7 @@ use super::strip_protocol;
 use crate::{
     config::BackendType,
     core::{
-        steps::workflow_data::LocalWorkerWorkflowData, worker::DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL,
-        ConnectionMode,
+        steps::workflow_data::LocalWorkerWorkflowData, worker::CHAT_RENDERING_LABEL, ConnectionMode,
     },
     routers::grpc::engine::worker_client_cache::GrpcClient,
 };
@@ -308,8 +307,7 @@ async fn discover_http_sglang(url: &str, api_key: Option<&str>) -> HashMap<Strin
 }
 
 /// Discover HTTP metadata from an OpenAI-compatible backend (vLLM, ATOM) via
-/// /v1/models: the model id, and the `--default-chat-template-kwargs` an ATOM
-/// card reports, unless it has none.
+/// /v1/models: the model id, and how an ATOM card reports it renders chats.
 async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
 
@@ -318,15 +316,9 @@ async fn discover_http_openai(url: &str, api_key: Option<&str>) -> HashMap<Strin
             if let Some(id) = card["id"].as_str() {
                 labels.insert("model_path".to_string(), id.to_string());
             }
-            let defaults = &card["default_chat_template_kwargs"];
-            if defaults
-                .as_object()
-                .is_some_and(|kwargs| !kwargs.is_empty())
-            {
-                labels.insert(
-                    DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL.to_string(),
-                    defaults.to_string(),
-                );
+            let rendering = &card["chat_rendering"];
+            if rendering.is_object() {
+                labels.insert(CHAT_RENDERING_LABEL.to_string(), rendering.to_string());
             }
         }
         Err(e) => {
@@ -417,16 +409,15 @@ mod tests {
 
     use super::*;
 
-    /// An ATOM card's `--default-chat-template-kwargs` become a label, unless
-    /// there are none.
+    /// An ATOM card's chat rendering becomes a label, as reported.
     #[tokio::test]
-    async fn test_openai_discovery_records_the_default_chat_template_kwargs() {
+    async fn test_openai_discovery_records_the_chat_rendering() {
         for (card, want) in [
             (
-                json!({"id": "m", "default_chat_template_kwargs": {"enable_thinking": false}}),
-                Some(r#"{"enable_thinking":false}"#),
+                json!({"id": "m", "chat_rendering": {"default_kwargs": {"enable_thinking": false}}}),
+                Some(r#"{"default_kwargs":{"enable_thinking":false}}"#),
             ),
-            (json!({"id": "m", "default_chat_template_kwargs": {}}), None),
+            (json!({"id": "m", "chat_rendering": null}), None),
             (json!({"id": "m"}), None),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -440,8 +431,8 @@ mod tests {
 
             let labels = discover_http_openai(&url, None).await;
             assert_eq!(labels.get("model_path").map(String::as_str), Some("m"));
-            let defaults = labels.get(DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL);
-            assert_eq!(defaults.map(String::as_str), want);
+            let rendering = labels.get(CHAT_RENDERING_LABEL);
+            assert_eq!(rendering.map(String::as_str), want);
         }
     }
 }

@@ -271,24 +271,31 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
-Chats are tokenized as ATOM's `/v1/chat/completions` renders them. The template
-kwargs are the workers' `--default-chat-template-kwargs`, the request's
-`chat_template_kwargs` over them, its `response_format` and a string
-`tool_choice`, then its `reasoning_effort` and `thinking` as ATOM applies them:
-to `thinking_effort`, and to the kwarg that switches the template's reasoning,
-which the router finds as each tokenizer registers, as ATOM does at startup. A
-local DeepSeek V4.1 checkpoint that ships `encoding/encoding.py`, which ATOM
-renders with that encoder, gets the kwargs ATOM passes it, under V4.1's effort
-aliases and rules.
+Chats are tokenized as their workers render them. An ATOM worker reports in its
+`/v1/models` card how its `/v1/chat/completions` renders chats
+(`chat_rendering`), as it resolved that at startup: its
+`--default-chat-template-kwargs`, the kwarg that switches the template's
+reasoning, the rules it applies `reasoning_effort` and `thinking` by, and the
+encoder it renders with in place of the template, if any (DeepSeek V4.1's
+`encoding/encoding.py`). The router reads it as the worker registers, keeps it
+as the worker's `chat_rendering` label, and renders a chat with the kwargs ATOM
+gives it: the defaults, the request's `chat_template_kwargs` over them, its
+`response_format` and a string `tool_choice`, then its reasoning controls, and
+for an encoder, what its adapter passes on. The rules and DeepSeek V4.1's
+kwargs hook are ATOM's code, which the router mirrors by the names the card
+gives them; `tests/entrypoints/fixtures/chat_rendering.json` holds the kwargs
+ATOM gives a set of chats, and both ATOM's and the router's tests check them.
 
-An ATOM worker reports its `--default-chat-template-kwargs` in its `/v1/models`
-card, which the router reads when the worker registers and keeps as the
-worker's `default_chat_template_kwargs` label; a worker's configured labels can
-set it too. A worker that reports none has none. When the HTTP workers serving
-a model's chats report different ones, the router warns once and renders the
-model's chats without any, as no one render is every worker's; with
-`--kv-events`, a chat's blocks then match only on the workers those defaults
-leave its render unchanged for.
+A chat renders with only its own `reasoning_effort` and `chat_template_kwargs`
+when the HTTP workers serving its model report no chat rendering, as backends
+other than ATOM do, and, with a warning once for the model, when they report
+different ones or one naming rules or a kwargs hook this router does not
+mirror, as a newer ATOM's may. With `--kv-events`, such a chat's blocks match
+only on the workers that render it so.
+
+The router reads `reasoning_effort` as a string, as the OpenAI API defines it,
+so it rejects a chat sending ATOM's integer budget there, whatever the policy;
+send the budget as `thinking.effort`.
 
 ## Reliability
 

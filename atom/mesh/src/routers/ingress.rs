@@ -1,6 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -25,15 +25,15 @@ use crate::{
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
         },
         prepare_pool::{JobContext, PrepareHandle},
-        worker::DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL,
+        worker::CHAT_RENDERING_LABEL,
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::{
+            chat_rendering::{atom_chat_template_kwargs, ChatRendering},
             inference::{InferenceMetadata, InferenceRequest, ParsedInference},
-            reasoning_controls::ReasoningControls,
         },
     },
     server::AppState,
@@ -76,9 +76,23 @@ fn untokenized(model: Option<&str>, error: &IngressError) {
     }
 }
 
-/// Models whose workers report different `--default-chat-template-kwargs`, each
-/// warned of once, as many as `UNTOKENIZED_MODELS` keeps.
-static DISAGREEING_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+/// Models whose chats HTTP routing renders without their workers' chat rendering,
+/// each warned of once, as many as `UNTOKENIZED_MODELS` keeps.
+static UNMIRRORED_MODELS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+fn unmirrored(model: &str, reason: &str) {
+    let models = &UNMIRRORED_MODELS;
+    if models.len() < MAX_UNTOKENIZED_MODELS
+        && !models.contains(model)
+        && models.insert(model.to_string())
+    {
+        warn!(
+            model,
+            reason,
+            "HTTP routing renders the model's chats with only their own template kwargs, which may not be the engine's prompt"
+        );
+    }
+}
 
 const MAX_RESPONSE_ID_BYTES: usize = 256;
 /// Worker label listing the inference paths a backend serves.
@@ -502,7 +516,7 @@ impl InferenceEnvelope {
             .submit(deadline, move |ctx| -> Result<Self, IngressError> {
                 let mut request = parse()?;
                 if let Some(routing) = routing {
-                    request.routed = Some(routing.prepare(&request.parsed, &request.body, ctx)?);
+                    request.routed = Some(routing.prepare(&request.parsed, ctx)?);
                     request.dp_rank_body = routing.dp_rank_body(&request.metadata, &request.body);
                 }
                 Ok(request)
@@ -547,7 +561,7 @@ impl InferenceEnvelope {
         }
         let routing = routing.clone();
         self.prepare(pool, move |request, ctx| {
-            routing.prepare_text_and_tokens(&request.parsed, &request.body, tokens, ctx)
+            routing.prepare_text_and_tokens(&request.parsed, tokens, ctx)
         })
         .await
     }
@@ -640,7 +654,6 @@ pub struct IngressRouting {
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
-    reasoning_controls: Arc<RwLock<HashMap<String, ReasoningControls>>>,
     pd: bool,
     max_tokenize_bytes: usize,
 }
@@ -652,7 +665,6 @@ impl IngressRouting {
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
-            reasoning_controls: app.reasoning_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
         }
@@ -696,12 +708,10 @@ impl IngressRouting {
         matches!(self.requirements(model).1, Tokens::Needed { .. })
     }
 
-    /// Validate the request against this topology and prepare what its policy
-    /// needs. `body` is the request as sent, as `parsed` was parsed from it.
+    /// Validate the request against this topology and prepare what its policy needs.
     pub(crate) fn prepare(
         &self,
         parsed: &ParsedInference,
-        body: &[u8],
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         ctx.check()?;
@@ -710,7 +720,7 @@ impl IngressRouting {
         if !needs_text && tokens == Tokens::Unused {
             return Ok((metadata, None));
         }
-        self.prepare_text_and_tokens(parsed, body, tokens, ctx)
+        self.prepare_text_and_tokens(parsed, tokens, ctx)
     }
 
     /// Validate the API and topology, then return whether the policy needs
@@ -726,13 +736,12 @@ impl IngressRouting {
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
-        body: &[u8],
         tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
         let tokens = match tokens {
-            Tokens::Needed { wanted } => Some(self.tokens(parsed, body, &metadata, ctx, wanted)?),
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
             // The index cannot match media, and these APIs have no token-routing template.
             Tokens::Wanted
                 if metadata.carries_media
@@ -744,7 +753,7 @@ impl IngressRouting {
                 None
             }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
-            Tokens::Wanted => match self.tokens(parsed, body, &metadata, ctx, true) {
+            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
                 Err(error) => {
@@ -846,61 +855,45 @@ impl IngressRouting {
         Ok(())
     }
 
-    /// The `--default-chat-template-kwargs` that the workers a chat can be placed
-    /// on report, which ATOM renders it with first. A worker that reports none
-    /// has none. Workers that differ share no one render, and get none.
-    fn chat_template_defaults(
-        &self,
-        metadata: &InferenceMetadata,
-    ) -> HashMap<String, serde_json::Value> {
-        fn reported(worker: &Arc<dyn Worker>) -> Option<&String> {
-            worker
-                .metadata()
-                .labels
-                .get(DEFAULT_CHAT_TEMPLATE_KWARGS_LABEL)
-        }
-        fn parse(label: Option<&String>) -> HashMap<String, serde_json::Value> {
-            label
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default()
-        }
-        let (Some(model), Ok(workers)) =
-            (metadata.model.as_deref(), self.candidates(metadata, false))
-        else {
-            return HashMap::new();
-        };
-        let mut labels = workers.iter().map(reported);
-        let first = labels.next().flatten();
-        if labels.all(|label| label == first) {
-            return parse(first);
-        }
-        let defaults = parse(first);
-        if workers
+    /// How the workers a chat can be placed on render it: the chat rendering they
+    /// all report, if this router mirrors it. `None` when none reports one, as
+    /// backends other than ATOM do not, and, warning once for the model, when
+    /// they report different ones or one naming rules or a kwargs hook this
+    /// router does not mirror.
+    fn chat_rendering(&self, metadata: &InferenceMetadata) -> Option<ChatRendering> {
+        let model = metadata.model.as_deref()?;
+        let workers = self.candidates(metadata, false).ok()?;
+        let labels: Vec<_> = workers
             .iter()
-            .all(|worker| parse(reported(worker)) == defaults)
-        {
-            return defaults;
+            .map(|worker| worker.metadata().labels.get(CHAT_RENDERING_LABEL))
+            .collect();
+        if labels.iter().all(Option::is_none) {
+            return None;
         }
-        let models = &DISAGREEING_MODELS;
-        if models.len() < MAX_UNTOKENIZED_MODELS
-            && !models.contains(model)
-            && models.insert(model.to_string())
-        {
-            warn!(
-                model,
-                "The model's workers report different --default-chat-template-kwargs: HTTP routing renders its chats without them"
-            );
-        }
-        HashMap::new()
+        let parse = |label: Option<&String>| match label {
+            Some(json) => ChatRendering::parse(json),
+            None => Err("a worker reports none".to_string()),
+        };
+        let first = labels[0];
+        let rendering = parse(first).and_then(|rendering| {
+            let alike = labels[1..]
+                .iter()
+                .all(|label| *label == first || parse(*label).as_ref() == Ok(&rendering));
+            if alike {
+                Ok(rendering)
+            } else {
+                Err("the workers report different ones".to_string())
+            }
+        });
+        rendering.map_err(|reason| unmirrored(model, &reason)).ok()
     }
 
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
-    /// when `add_special_tokens`. A chat renders with the template kwargs ATOM's chat
-    /// endpoint takes from `body`, over its model's workers' defaults.
+    /// when `add_special_tokens`. A chat renders with the template kwargs its workers
+    /// render it with, if they report how (`chat_rendering`).
     fn tokens(
         &self,
         parsed: &ParsedInference,
-        body: &[u8],
         metadata: &InferenceMetadata,
         ctx: &JobContext,
         add_special_tokens: bool,
@@ -936,28 +929,20 @@ impl IngressRouting {
         }
         ctx.check()?;
         let template_started = Instant::now();
-        let prompt = if let Some(chat) = parsed.chat() {
+        let prompt = if let Some((chat, sent)) = parsed.chat_as_sent() {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            let controls = self
-                .reasoning_controls
-                .read()
-                .get(&entry.id)
-                .cloned()
-                .unwrap_or_default();
-            let defaults = self.chat_template_defaults(metadata);
-            let template_kwargs = super::prepare::reasoning_controls::atom_chat_template_kwargs(
-                chat, body, defaults, &controls,
-            )
-            .map_err(IngressError::invalid)?;
-            super::prepare::chat_template::render_chat_messages(
-                chat,
-                &*entry.tokenizer,
-                &template_kwargs,
-            )
-            .map_err(IngressError::invalid)?
-            .text
+            let tokenizer = &*entry.tokenizer;
+            let rendered = match self.chat_rendering(metadata) {
+                Some(rendering) => {
+                    let kwargs = atom_chat_template_kwargs(chat, sent, &rendering)
+                        .map_err(IngressError::invalid)?;
+                    super::prepare::chat_template::render_chat_messages(chat, tokenizer, &kwargs)
+                }
+                None => super::prepare::chat_template::process_chat_messages(chat, tokenizer),
+            };
+            rendered.map_err(IngressError::invalid)?.text
         } else {
             metadata.text.clone()
         };
