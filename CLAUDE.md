@@ -132,8 +132,8 @@ Key entry points:
   (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
   V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
-  hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
-  python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
+  hand-offs without a GPU with `ARCH=gfx950 python -m
+  atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
   yet). DeepSeek-V4.1 also has the high-interactivity monokernels
   (`ATOM_DSV41_MONO_HI`, on by default where `deepseek_v41/mono/hi_gate.py`
