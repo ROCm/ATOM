@@ -12,6 +12,7 @@ import pytest
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import build_message_encoder_adapter
+from atom.entrypoints.openai.reasoning import VALID_TEMPLATE_EFFORTS
 from atom.entrypoints.openai.serving_responses import (
     ResponseStreamEmitter,
     stream_failure_frames,
@@ -189,17 +190,39 @@ def test_models_metadata_is_deployment_scoped(server, monkeypatch):
 
 
 @pytest.mark.parametrize("defaults", [{}, {"enable_thinking": False}])
-def test_models_report_the_default_chat_template_kwargs(server, monkeypatch, defaults):
+def test_models_report_how_chats_render(server, monkeypatch, defaults):
     monkeypatch.setattr(api_server, "default_chat_template_kwargs", defaults)
 
-    async def run():
+    async def card():
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
         ) as client:
-            return await client.get("/v1/models")
+            return (await client.get("/v1/models")).json()["data"][0]
 
-    card = asyncio.run(run()).json()["data"][0]
-    assert card["default_chat_template_kwargs"] == defaults
+    efforts = sorted(VALID_TEMPLATE_EFFORTS)
+    assert asyncio.run(card())["chat_rendering"] == {
+        "default_kwargs": defaults,
+        "reasoning_toggle": {"name": "thinking_mode", "off": "chat", "on": "thinking"},
+        "reasoning_rules": "deepseek_v41",
+        "template_efforts": efforts,
+        "encoder": {
+            "name": "encoding_dsv41",
+            "defaults": {},
+            "accepts": None,
+            "prepares_kwargs": True,
+        },
+    }
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(
+        api_server, "reasoning_toggle", ("enable_thinking", False, True)
+    )
+    assert asyncio.run(card())["chat_rendering"] == {
+        "default_kwargs": defaults,
+        "reasoning_toggle": {"name": "enable_thinking", "off": False, "on": True},
+        "reasoning_rules": "chat",
+        "template_efforts": efforts,
+        "encoder": None,
+    }
 
 
 @pytest.mark.parametrize("endpoint", ["chat/completions", "responses"])

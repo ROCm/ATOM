@@ -34,6 +34,7 @@ from .reasoning import (
 from .reasoning_controls import (
     CHAT_REASONING_RULES,
     ReasoningRules,
+    apply_reasoning_controls,
     resolve_reasoning_controls,
 )
 from .sse import data_frame
@@ -106,6 +107,34 @@ def resolve_thinking(
     """Read Chat control fields and resolve them with the selected model rules."""
     return resolve_reasoning_controls(
         thinking=request.thinking, effort=request.reasoning_effort, rules=rules
+    )
+
+
+def resolve_chat_template_kwargs(
+    request: ChatCompletionRequest,
+    *,
+    defaults: dict[str, Any],
+    toggle: tuple[str, Any, Any] | None,
+    rules: ReasoningRules = CHAT_REASONING_RULES,
+) -> dict[str, Any]:
+    """The template kwargs the chat endpoint renders ``request`` with.
+
+    The server's ``defaults``, the request's ``chat_template_kwargs`` over them,
+    then its reasoning controls under ``rules``. A custom encoder's adapter
+    takes these and applies its own (`MessageEncoderAdapter.render_kwargs`).
+    """
+    kwargs = dict(defaults)
+    if request.chat_template_kwargs:
+        kwargs.update(request.chat_template_kwargs)
+    # Forward K3 template controls the chat template needs but that pydantic
+    # does not otherwise thread through: structured-output response_format,
+    # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
+    if request.response_format is not None:
+        kwargs["response_format"] = request.response_format
+    if isinstance(request.tool_choice, str):
+        kwargs["tool_choice"] = request.tool_choice
+    return apply_reasoning_controls(
+        kwargs, toggle, resolve_thinking(request, rules=rules), rules=rules
     )
 
 

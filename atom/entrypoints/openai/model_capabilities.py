@@ -33,3 +33,26 @@ def deployment_metadata(config, encoder):
             contract.output_token_limit,
         )
     return result
+
+
+def chat_rendering(defaults, toggle, encoder, rules):
+    """The template kwargs the chat endpoint renders a chat with, as data a
+    router can apply to place chats by the prompt the engine sees.
+
+    The server's ``defaults``, the request's `chat_template_kwargs` over them,
+    then its reasoning controls under ``rules`` (named; ATOM's code), which set
+    ``toggle`` and name an effort its templates read. A custom ``encoder``
+    then takes them through `MessageEncoderAdapter.render_kwargs`.
+    """
+    from .reasoning import VALID_TEMPLATE_EFFORTS
+
+    if toggle is not None:
+        name, off, on = toggle
+        toggle = {"name": name, "off": off, "on": on}
+    return {
+        "default_kwargs": dict(defaults),
+        "reasoning_toggle": toggle,
+        "reasoning_rules": rules.name,
+        "template_efforts": sorted(VALID_TEMPLATE_EFFORTS),
+        "encoder": None if encoder is None else encoder.rendering(),
+    }

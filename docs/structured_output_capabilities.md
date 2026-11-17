@@ -288,11 +288,25 @@ required/named `tool_choice` still applies.
   prompt must still fit within the total context budget.
 - DSpark advertises text input, even if the checkpoint also declares vision.
 - Text output and the configured model's supported effort levels are exposed.
-- `default_chat_template_kwargs` is the server's `--default-chat-template-kwargs`
-  (`{}` when unset), which every chat renders with under the request's
-  `chat_template_kwargs`. A router that tokenizes chats to place them, as
-  atomesh's `cache_aware --kv-events` does, needs them to match the engine's
-  prompt.
+- `chat_rendering` is how `/v1/chat/completions` turns a request into template
+  kwargs, as resolved at startup, for a router that tokenizes chats to place
+  them, as atomesh's `cache_aware --kv-events` does:
+  - `default_kwargs`: the server's `--default-chat-template-kwargs` (`{}` when
+    unset), under the request's `chat_template_kwargs`;
+  - `reasoning_toggle`: the kwarg that switches reasoning, `{name, off, on}`,
+    or `null` when none does;
+  - `reasoning_rules`: which rules apply `thinking` and `reasoning_effort`
+    (`chat`, or `deepseek_v41`);
+  - `template_efforts`: the effort names the chat rules pass to a template;
+  - `encoder`: for a model rendered by its own encoder rather than a Jinja
+    template, the encoder's `name`, the `defaults` it sets, the kwargs it
+    `accepts` (`null` for any), and whether its model `prepares_kwargs` past
+    that; otherwise `null`.
+
+  The rules and a model's kwargs preparation are code: a router mirrors them
+  by name. `tests/entrypoints/fixtures/chat_rendering.json` holds the kwargs
+  they give for a set of requests; ATOM's tests check these against the
+  endpoint's own functions, and atomesh's against its copy.
 - Unknown capabilities are omitted rather than inferred from a served alias.
 
 The V4.1 adapter advertises `low`, `high`, and `max` thinking effort. The output
