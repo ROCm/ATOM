@@ -23,6 +23,7 @@ use super::workflow_data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
     config::TokenizerCacheConfig,
+    routers::prepare::reasoning_controls::probe_reasoning_controls,
     tokenizer::{
         cache::{CacheConfig, CachedTokenizer},
         chat_template::ChatTemplateParams,
@@ -106,6 +107,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
         let chats_without_template = app_context.chats_without_template.clone();
+        let reasoning_controls = app_context.reasoning_controls.clone();
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -118,6 +120,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let chat_template = chat_template.clone();
                 let cache_cfg = cache_config.clone();
                 let chats_without_template = chats_without_template.clone();
+                let reasoning_controls = reasoning_controls.clone();
                 async move {
                     // Load base tokenizer
                     let base_tokenizer = factory::create_tokenizer_async_with_chat_template(
@@ -134,6 +137,13 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                     )
                     .await;
+                    let controls = probe_reasoning_controls(&source, &*base_tokenizer);
+                    info!(
+                        tokenizer = %name,
+                        ?controls,
+                        "HTTP routing applies a chat's reasoning controls as ATOM does for this model"
+                    );
+                    reasoning_controls.write().insert(id.clone(), controls);
 
                     // Wrap with caching layer if configured
                     let tokenizer: Arc<dyn Tokenizer> = match cache_cfg {
@@ -381,6 +391,71 @@ mod tests {
         assert!(!marked(&jinja));
         remove_tokenizer(&context, &deepseek).await;
         assert!(!marked(&deepseek));
+    }
+
+    /// Registering a tokenizer records how ATOM applies its chats' reasoning
+    /// controls: with the kwarg that switches its template, `--chat-template`'s
+    /// when given, or with DeepSeek V4.1's encoder hooks for a checkpoint ATOM
+    /// loads them for. Removing it drops the record.
+    #[tokio::test]
+    async fn test_registration_records_the_reasoning_controls() {
+        use crate::routers::prepare::reasoning_controls::ReasoningControls;
+        let context = app_context();
+        let dir = tokenizer_dir("LlamaForCausalLM");
+        let template = dir.path().join("template.jinja");
+        std::fs::write(
+            &template,
+            "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if enable_thinking is defined and not enable_thinking %}/no_think{% endif %}",
+        )
+        .unwrap();
+        let v41 = tokenizer_dir("DeepseekV41ForCausalLM");
+        std::fs::write(
+            v41.path().join("config.json"),
+            json!({"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41"})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(v41.path().join("encoding")).unwrap();
+        std::fs::write(v41.path().join("encoding").join("encoding.py"), "").unwrap();
+        let [switched, plain, deepseek] = [(); 3].map(|()| TokenizerRegistry::generate_id());
+        for (id, source, chat_template_path) in [
+            (
+                &switched,
+                dir.path().to_str().unwrap(),
+                Some(template.to_str().unwrap().to_string()),
+            ),
+            (&plain, hf_tokenizer_path(), None),
+            (&deepseek, v41.path().to_str().unwrap(), None),
+        ] {
+            let config = TokenizerConfigRequest {
+                id: id.clone(),
+                name: id.clone(),
+                source: source.to_string(),
+                chat_template_path,
+                cache_config: None,
+                fail_on_duplicate: true,
+            };
+            let mut workflow = WorkflowContext::new(
+                WorkflowInstanceId::new(),
+                create_tokenizer_workflow_data(config, context.clone()),
+            );
+            LoadTokenizerStep.execute(&mut workflow).await.unwrap();
+        }
+
+        let controls = |id: &str| context.reasoning_controls.read().get(id).cloned();
+        assert!(
+            matches!(
+                controls(&switched),
+                Some(ReasoningControls::Template(Some(toggle))) if toggle.name == "enable_thinking"
+            ),
+            "{:?}",
+            controls(&switched)
+        );
+        assert_eq!(controls(&plain), Some(ReasoningControls::Template(None)));
+        assert_eq!(controls(&deepseek), Some(ReasoningControls::DeepseekV41));
+        remove_tokenizer(&context, &switched).await;
+        assert_eq!(controls(&switched), None);
     }
 
     #[test]

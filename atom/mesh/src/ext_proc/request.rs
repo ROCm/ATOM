@@ -275,7 +275,7 @@ impl RequestParser {
             .submit(deadline, move |context| {
                 let parsed = ParsedInference::parse(&request.path, &request.raw)
                     .map_err(ProcessingError::invalid)?;
-                let (metadata, tokens) = routing.prepare(&parsed, context)?;
+                let (metadata, tokens) = routing.prepare(&parsed, &request.raw, context)?;
                 let input = RoutingInput {
                     dp_rank_body: routing.dp_rank_body(&metadata, &request.raw),
                     metadata,

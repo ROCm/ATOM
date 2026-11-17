@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -22,7 +22,10 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
-    routers::{atom_standalone::AtomStandaloneRuntime, router_manager::RouterManager},
+    routers::{
+        atom_standalone::AtomStandaloneRuntime, prepare::reasoning_controls::ReasoningControls,
+        router_manager::RouterManager,
+    },
     tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
 };
@@ -51,6 +54,9 @@ pub struct AppContext {
     /// their Jinja template, found as each registers. HTTP routing does not
     /// tokenize those chats.
     pub chats_without_template: Arc<RwLock<HashSet<String>>>,
+    /// How ATOM applies the reasoning controls of each tokenizer's chats, by
+    /// registry id, found as each registers. HTTP routing renders chats with them.
+    pub reasoning_controls: Arc<RwLock<HashMap<String, ReasoningControls>>>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
     pub worker_registry: Arc<WorkerRegistry>,
@@ -287,6 +293,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
             chats_without_template: Default::default(),
+            reasoning_controls: Default::default(),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,

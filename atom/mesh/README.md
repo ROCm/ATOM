@@ -271,6 +271,18 @@ chat template, such as DeepSeek V3.2 and V4
 ([#3377](https://github.com/ROCm/ATOM/issues/3377)). Use a policy that does not
 need tokens, such as `cache_aware` or `round_robin`, for these models and APIs.
 
+Chats are tokenized as ATOM's `/v1/chat/completions` renders them. The template
+kwargs are the request's `chat_template_kwargs`, its `response_format` and a
+string `tool_choice`, then its `reasoning_effort` and `thinking` as ATOM applies
+them: to `thinking_effort`, and to the kwarg that switches the template's
+reasoning, which the router finds as each tokenizer registers, as ATOM does at
+startup. A local DeepSeek V4.1 checkpoint that ships `encoding/encoding.py`,
+which ATOM renders with that encoder, gets the kwargs ATOM passes it, under
+V4.1's effort aliases and rules. The router does not see the workers'
+`--default-chat-template-kwargs`, so with `--kv-events` a chat's blocks match
+only as far as those defaults leave its render unchanged; GLM-5.2's
+`{"enable_thinking": false}` changes its first block.
+
 ## Reliability
 
 - **Request preparation**: Parsing, template rendering and tokenization use a fixed

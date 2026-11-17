@@ -1,6 +1,6 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -30,7 +30,10 @@ use crate::{
     policies::{LoadBalancingPolicy, PolicyRegistry},
     routers::{
         comm::error::{IngressError, MeshLocalError},
-        prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+        prepare::{
+            inference::{InferenceMetadata, InferenceRequest, ParsedInference},
+            reasoning_controls::ReasoningControls,
+        },
     },
     server::AppState,
     tokenizer::TokenizerRegistry,
@@ -494,7 +497,7 @@ impl InferenceEnvelope {
             .submit(deadline, move |ctx| -> Result<Self, IngressError> {
                 let mut request = parse()?;
                 if let Some(routing) = routing {
-                    request.routed = Some(routing.prepare(&request.parsed, ctx)?);
+                    request.routed = Some(routing.prepare(&request.parsed, &request.body, ctx)?);
                     request.dp_rank_body = routing.dp_rank_body(&request.metadata, &request.body);
                 }
                 Ok(request)
@@ -539,7 +542,7 @@ impl InferenceEnvelope {
         }
         let routing = routing.clone();
         self.prepare(pool, move |request, ctx| {
-            routing.prepare_text_and_tokens(&request.parsed, tokens, ctx)
+            routing.prepare_text_and_tokens(&request.parsed, &request.body, tokens, ctx)
         })
         .await
     }
@@ -632,6 +635,7 @@ pub struct IngressRouting {
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,
     chats_without_template: Arc<RwLock<HashSet<String>>>,
+    reasoning_controls: Arc<RwLock<HashMap<String, ReasoningControls>>>,
     pd: bool,
     max_tokenize_bytes: usize,
 }
@@ -643,6 +647,7 @@ impl IngressRouting {
             worker_registry: app.worker_registry.clone(),
             tokenizer_registry: app.tokenizer_registry.clone(),
             chats_without_template: app.chats_without_template.clone(),
+            reasoning_controls: app.reasoning_controls.clone(),
             pd: app.router_config.mode.is_pd_mode(),
             max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
         }
@@ -686,10 +691,12 @@ impl IngressRouting {
         matches!(self.requirements(model).1, Tokens::Needed { .. })
     }
 
-    /// Validate the request against this topology and prepare what its policy needs.
+    /// Validate the request against this topology and prepare what its policy
+    /// needs. `body` is the request as sent, as `parsed` was parsed from it.
     pub(crate) fn prepare(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         ctx.check()?;
@@ -698,7 +705,7 @@ impl IngressRouting {
         if !needs_text && tokens == Tokens::Unused {
             return Ok((metadata, None));
         }
-        self.prepare_text_and_tokens(parsed, tokens, ctx)
+        self.prepare_text_and_tokens(parsed, body, tokens, ctx)
     }
 
     /// Validate the API and topology, then return whether the policy needs
@@ -714,12 +721,13 @@ impl IngressRouting {
     fn prepare_text_and_tokens(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         tokens: Tokens,
         ctx: &JobContext,
     ) -> Result<RoutingPreparation, IngressError> {
         let metadata = parsed.metadata();
         let tokens = match tokens {
-            Tokens::Needed { wanted } => Some(self.tokens(parsed, &metadata, ctx, wanted)?),
+            Tokens::Needed { wanted } => Some(self.tokens(parsed, body, &metadata, ctx, wanted)?),
             // The index cannot match media, and these APIs have no token-routing template.
             Tokens::Wanted
                 if metadata.carries_media
@@ -731,7 +739,7 @@ impl IngressRouting {
                 None
             }
             // With the special tokens, as ATOM's `tokenizer.encode(prompt)` stores the blocks.
-            Tokens::Wanted => match self.tokens(parsed, &metadata, ctx, true) {
+            Tokens::Wanted => match self.tokens(parsed, body, &metadata, ctx, true) {
                 Ok(tokens) => Some(tokens),
                 // Routed by its text, unless the job is cancelled or late.
                 Err(error) => {
@@ -834,10 +842,12 @@ impl IngressRouting {
     }
 
     /// The request's `input_ids`, or its prompt encoded, with the tokenizer's special tokens
-    /// when `add_special_tokens`.
+    /// when `add_special_tokens`. A chat renders with the template kwargs ATOM's chat
+    /// endpoint takes from `body`.
     fn tokens(
         &self,
         parsed: &ParsedInference,
+        body: &[u8],
         metadata: &InferenceMetadata,
         ctx: &JobContext,
         add_special_tokens: bool,
@@ -877,9 +887,23 @@ impl IngressRouting {
             if self.chats_without_template.read().contains(&entry.id) {
                 return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this model's chats render with a built-in encoder whose defaults are not the engine's; use a policy that does not require exact tokens"));
             }
-            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
-                .map_err(IngressError::invalid)?
-                .text
+            let controls = self
+                .reasoning_controls
+                .read()
+                .get(&entry.id)
+                .cloned()
+                .unwrap_or_default();
+            let template_kwargs = super::prepare::reasoning_controls::atom_chat_template_kwargs(
+                chat, body, &controls,
+            )
+            .map_err(IngressError::invalid)?;
+            super::prepare::chat_template::render_chat_messages(
+                chat,
+                &*entry.tokenizer,
+                &template_kwargs,
+            )
+            .map_err(IngressError::invalid)?
+            .text
         } else {
             metadata.text.clone()
         };

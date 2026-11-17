@@ -1183,6 +1183,325 @@ fn minimal_generate_request_with_stream(
     }
 }
 
+mod g_reasoning_controls {
+    use serde_json::{json, Value};
+
+    use crate::routers::{
+        prepare::{
+            chat_template::render_chat_messages,
+            inference::ParsedInference,
+            reasoning_controls::{
+                atom_chat_template_kwargs, probe_reasoning_controls, probe_reasoning_toggle,
+                ReasoningControls, ReasoningToggle,
+            },
+        },
+        test_mocks::tokenizer::hf_tokenizer_path,
+    };
+    use crate::tokenizer::{traits::Tokenizer, HuggingFaceTokenizer};
+
+    fn tokenizer(template: &str) -> HuggingFaceTokenizer {
+        let mut tokenizer = HuggingFaceTokenizer::from_file(hf_tokenizer_path()).unwrap();
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        tokenizer
+    }
+
+    /// A chat with `fields`, as sent and as the router parses it.
+    fn chat(fields: Value) -> (String, ParsedInference) {
+        let mut request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let body = request.to_string();
+        let parsed = ParsedInference::parse("/v1/chat/completions", body.as_bytes()).unwrap();
+        (body, parsed)
+    }
+
+    fn kwargs(fields: Value, controls: &ReasoningControls) -> Result<Value, String> {
+        let (body, parsed) = chat(fields);
+        atom_chat_template_kwargs(parsed.chat().unwrap(), body.as_bytes(), controls)
+            .map(|kwargs| Value::Object(kwargs.into_iter().collect()))
+    }
+
+    /// Each family's switch is found as ATOM's `resolve_reasoning_toggle` finds it,
+    /// MiniMax-M3's `thinking_mode` values before DeepSeek-V4's, whose template
+    /// rejects MiniMax's.
+    #[test]
+    fn test_probe_finds_the_kwarg_that_switches_the_template() {
+        for (switch, want) in [
+            (
+                "{% if enable_thinking is defined and not enable_thinking %}/no_think{% endif %}",
+                Some(("enable_thinking", json!(false), json!(true))),
+            ),
+            (
+                "{% if thinking is defined and not thinking %}/no_think{% endif %}",
+                Some(("thinking", json!(false), json!(true))),
+            ),
+            (
+                "{% if thinking_mode == 'disabled' %}/no_think{% endif %}",
+                Some(("thinking_mode", json!("disabled"), json!("enabled"))),
+            ),
+            (
+                concat!(
+                    "{% if thinking_mode is defined and thinking_mode not in ['chat', 'thinking'] %}",
+                    "{{ raise_exception('thinking_mode') }}{% endif %}",
+                    "{% if thinking_mode == 'chat' %}/no_think{% endif %}",
+                ),
+                Some(("thinking_mode", json!("chat"), json!("thinking"))),
+            ),
+            ("", None),
+        ] {
+            let template = ["{% for m in messages %}{{ m.content }}{% endfor %}", switch].concat();
+            let toggle = probe_reasoning_toggle(&tokenizer(&template));
+            assert_eq!(toggle.map(|t| (t.name, t.off, t.on)), want, "{switch}");
+        }
+    }
+
+    /// The kwargs ATOM's chat endpoint renders a request with: the reasoning controls
+    /// over `chat_template_kwargs`, `tool_choice` only as sent, and no
+    /// `reasoning_effort` of the request's own.
+    #[test]
+    fn test_template_kwargs_are_atoms() {
+        let controls = ReasoningControls::Template(Some(ReasoningToggle {
+            name: "enable_thinking",
+            off: json!(false),
+            on: json!(true),
+        }));
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+        for (fields, want) in [
+            (json!({}), json!({})),
+            (
+                json!({"reasoning_effort": "high"}),
+                json!({"thinking_effort": "high"}),
+            ),
+            (json!({"reasoning_effort": "medium"}), json!({})),
+            (
+                json!({"reasoning_effort": "none"}),
+                json!({"enable_thinking": false}),
+            ),
+            (
+                json!({"thinking": {"type": "disabled"}}),
+                json!({"enable_thinking": false}),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "effort": "max"}, "reasoning_effort": "low"}),
+                json!({"enable_thinking": true, "thinking_effort": "max"}),
+            ),
+            (
+                json!({"thinking": {"effort": 30}}),
+                json!({"thinking_effort": 30}),
+            ),
+            (
+                json!({"reasoning_effort": "none",
+                    "chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "high"}}),
+                json!({"enable_thinking": false, "reasoning_effort": "high"}),
+            ),
+            (json!({"tools": tools}), json!({})),
+            (
+                json!({"tools": tools, "tool_choice": "required"}),
+                json!({"tool_choice": "required"}),
+            ),
+            (
+                json!({"tools": tools, "tool_choice": {"type": "function", "function": {"name": "f"}}}),
+                json!({}),
+            ),
+            (
+                json!({"response_format": {"type": "json_object"}}),
+                json!({"response_format": {"type": "json_object"}}),
+            ),
+        ] {
+            assert_eq!(kwargs(fields.clone(), &controls), Ok(want), "{fields}");
+        }
+        // A template no toggle switches gets the effort alone.
+        assert_eq!(
+            kwargs(
+                json!({"thinking": {"type": "disabled"}, "reasoning_effort": "low"}),
+                &ReasoningControls::Template(None)
+            ),
+            Ok(json!({"thinking_effort": "low"}))
+        );
+    }
+
+    /// ATOM rejects an effort that is neither a budget in [1, 100] nor a name.
+    #[test]
+    fn test_template_kwargs_reject_an_effort_atom_rejects() {
+        for effort in [json!(0), json!(101), json!(2.5), json!(true)] {
+            let fields = json!({"thinking": {"effort": effort}});
+            let controls = ReasoningControls::Template(None);
+            assert!(kwargs(fields, &controls).is_err(), "{effort}");
+        }
+    }
+
+    /// The kwargs ATOM passes DeepSeek V4.1's encoder for each request: its chat
+    /// endpoint's merge under V4.1's rules, then the encoder adapter's default,
+    /// `prepare_kwargs` and signature filter; and the requests it rejects.
+    #[test]
+    fn test_deepseek_v41_kwargs_are_its_encoders() {
+        let thinking =
+            |effort: Value| json!({"thinking_mode": "thinking", "reasoning_effort": effort});
+        for (fields, want) in [
+            (json!({}), json!({"thinking_mode": "thinking"})),
+            (json!({"reasoning_effort": "low"}), thinking(json!("low"))),
+            (json!({"reasoning_effort": "max"}), thinking(json!("max"))),
+            (
+                json!({"reasoning_effort": "medium"}),
+                thinking(json!("high")),
+            ),
+            (
+                json!({"reasoning_effort": "minimal"}),
+                thinking(json!("low")),
+            ),
+            (
+                json!({"reasoning_effort": "none"}),
+                json!({"thinking_mode": "chat"}),
+            ),
+            (
+                json!({"thinking": {"type": "disabled"}}),
+                json!({"thinking_mode": "chat"}),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "effort": 30}}),
+                thinking(json!(30)),
+            ),
+            (
+                json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                json!({"thinking_mode": "thinking"}),
+            ),
+            (
+                json!({"chat_template_kwargs": {"reasoning_effort": "none"}, "reasoning_effort": "high"}),
+                thinking(json!("high")),
+            ),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": "chat"}, "reasoning_effort": "low"}),
+                thinking(json!("low")),
+            ),
+            (
+                json!({"chat_template_kwargs": {"reasoning_effort": "none"}, "thinking": {"type": "enabled"}}),
+                json!({"thinking_mode": "thinking"}),
+            ),
+            (
+                json!({"response_format": {"type": "json_object"}, "tool_choice": "none"}),
+                json!({"thinking_mode": "thinking"}),
+            ),
+            (
+                json!({"chat_template_kwargs": {"thinking_mode": "enabled"}, "reasoning_effort": "low"}),
+                thinking(json!("low")),
+            ),
+            (
+                json!({"chat_template_kwargs": {"return_multi_modal_data": false}}),
+                json!({"thinking_mode": "thinking", "return_multi_modal_data": false}),
+            ),
+            (
+                json!({"chat_template_kwargs": {"return_multi_modal_data": 0}}),
+                json!({"thinking_mode": "thinking", "return_multi_modal_data": 0}),
+            ),
+        ] {
+            let got = kwargs(fields.clone(), &ReasoningControls::DeepseekV41);
+            assert_eq!(got, Ok(want), "{fields}");
+        }
+        for fields in [
+            json!({"reasoning_effort": "bogus"}),
+            json!({"thinking": {"type": "enabled", "effort": true}}),
+            json!({"chat_template_kwargs": {"thinking_mode": "enabled"}}),
+            json!({"chat_template_kwargs": {"thinking_mode": null}}),
+            json!({"chat_template_kwargs": {"return_multi_modal_data": true}}),
+            json!({"chat_template_kwargs": {"return_multi_modal_data": "yes"}}),
+        ] {
+            let got = kwargs(fields.clone(), &ReasoningControls::DeepseekV41);
+            assert!(got.is_err(), "{fields}");
+        }
+    }
+
+    /// DeepSeek V4.1's hooks are ATOM's for a checkpoint whose `encoding/` holds
+    /// only the standalone `encoding.py` and whose `config.json` names V4.1;
+    /// otherwise its template's toggle applies.
+    #[test]
+    fn test_probe_finds_deepseek_v41_as_atom_loads_its_encoder() {
+        let tokenizer = tokenizer(
+            "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if enable_thinking is defined and not enable_thinking %}/no_think{% endif %}",
+        );
+        let template = ReasoningControls::Template(probe_reasoning_toggle(&tokenizer));
+        assert_ne!(template, ReasoningControls::Template(None));
+        for (files, model_type, want) in [
+            (
+                &["encoding.py", "test_encoding.py"][..],
+                "deepseek_v41",
+                ReasoningControls::DeepseekV41,
+            ),
+            (
+                &["encoding.py", "encoding_dsv4.py"][..],
+                "deepseek_v41",
+                template.clone(),
+            ),
+            (&["encoding.py"][..], "deepseek_v4", template.clone()),
+            (&[][..], "deepseek_v41", template.clone()),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config = json!({"model_type": model_type}).to_string();
+            std::fs::write(dir.path().join("config.json"), config).unwrap();
+            std::fs::create_dir(dir.path().join("encoding")).unwrap();
+            for file in files {
+                std::fs::write(dir.path().join("encoding").join(file), "").unwrap();
+            }
+            let source = dir.path().to_str().unwrap();
+            assert_eq!(
+                probe_reasoning_controls(source, &tokenizer),
+                want,
+                "{files:?} {model_type}"
+            );
+        }
+    }
+
+    /// Chats render as ATOM renders them on a template with GLM-5.2's reasoning lines.
+    /// The expected texts are ATOM's `apply_chat_template` with the kwargs its chat
+    /// endpoint merges for each request, in transformers 5.16.1.
+    #[test]
+    fn test_chats_render_as_atom_renders_glm_reasoning() {
+        const TEMPLATE: &str = concat!(
+            "[gMASK]<sop>\n",
+            "{%- set effective_reasoning_effort = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' -%}\n",
+            "{%- if (enable_thinking is not defined or enable_thinking) and effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}\n",
+            "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}\n",
+            "{%- if add_generation_prompt -%}\n",
+            "    <|assistant|>{{- '<think></think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}\n",
+            "{%- endif -%}",
+        );
+        const TURNS: &str = "<|system|>You are a coding agent.<|user|>List the files.<|assistant|>";
+        let thinking = format!("[gMASK]<sop><|system|>Reasoning Effort: Max{TURNS}<think>");
+        let no_thinking = format!("[gMASK]<sop>{TURNS}<think></think>");
+        let high = format!("[gMASK]<sop><|system|>Reasoning Effort: High{TURNS}<think>");
+        let tokenizer = tokenizer(TEMPLATE);
+        let toggle = probe_reasoning_toggle(&tokenizer);
+        assert_eq!(toggle.as_ref().map(|t| t.name), Some("enable_thinking"));
+        for (mut fields, want) in [
+            (json!({}), &thinking),
+            (json!({"reasoning_effort": "high"}), &thinking),
+            (json!({"reasoning_effort": "none"}), &no_thinking),
+            (json!({"thinking": {"type": "disabled"}}), &no_thinking),
+            (
+                json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                &high,
+            ),
+            (
+                json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}),
+                &no_thinking,
+            ),
+        ] {
+            fields["messages"] = json!([
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "List the files."},
+            ]);
+            let (body, parsed) = chat(fields);
+            let request = parsed.chat().unwrap();
+            let controls = ReasoningControls::Template(toggle.clone());
+            let kwargs = atom_chat_template_kwargs(request, body.as_bytes(), &controls).unwrap();
+            let rendered = render_chat_messages(request, &tokenizer, &kwargs).unwrap();
+            assert_eq!(&rendered.text, want, "{body}");
+        }
+    }
+}
+
 mod h_prepare_chat_generate {
     use std::sync::Arc;
 

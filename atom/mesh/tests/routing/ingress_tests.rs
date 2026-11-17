@@ -44,7 +44,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
     let shared = [1, 2].map(|port| {
         Arc::new(
             BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
-                .labels(std::collections::HashMap::from([(
+                .labels(HashMap::from([(
                     "mesh.responses_state".into(),
                     "shared".into(),
                 )]))
@@ -63,7 +63,7 @@ fn response_state_never_fails_over_to_a_different_owner() {
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
-        .labels(std::collections::HashMap::from([(
+        .labels(HashMap::from([(
             "mesh.apis".into(),
             "/v1/messages, /v1/chat/completions".into(),
         )]))
@@ -91,7 +91,8 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         } else {
             json!({"model":"m","input":"hi"})
         };
-        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let body = serde_json::to_vec(&body).unwrap();
+        let parsed = ParsedInference::parse(path, &body).unwrap();
         assert_eq!(
             EndpointSpec::find(path)
                 .unwrap()
@@ -104,7 +105,7 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &body, ctx)
             })
             .await
             .unwrap()
@@ -139,16 +140,13 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         if marked {
             app.chats_without_template.write().insert(id.clone());
         }
-        let parsed = ParsedInference::parse(
-            "/v1/chat/completions",
-            br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#,
-        )
-        .unwrap();
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"test"}]}"#;
+        let parsed = ParsedInference::parse("/v1/chat/completions", body).unwrap();
         let routing = IngressRouting::new(&app);
         let result = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, body, ctx)
             })
             .await
             .unwrap()
@@ -160,6 +158,79 @@ async fn chats_rendered_without_their_template_are_not_tokenized() {
         } else {
             assert!(result.unwrap().1.is_some());
         }
+    }
+}
+
+/// A chat is tokenized as ATOM renders it, its reasoning controls setting the
+/// tokenizer's toggle; `thinking` too, though the typed request has no such field.
+#[tokio::test]
+async fn chats_are_tokenized_with_atoms_reasoning_controls() {
+    use crate::tokenizer::traits::Tokenizer;
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let app = AppContext::from_config(config, 5, _pool.handle())
+        .await
+        .unwrap();
+    // A word per id, and a template that adds `off` when reasoning is off.
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = json!({"version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "unk_token": "<unk>",
+            "vocab": {"<unk>": 0, "hi": 1, "off": 2}}});
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer.to_string()).unwrap();
+    let mut tokenizer =
+        crate::tokenizer::HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+    tokenizer
+        .set_chat_template(
+            "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if enable_thinking is defined and not enable_thinking %} off{% endif %}"
+                .to_string(),
+        )
+        .unwrap();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+    let id = TokenizerRegistry::generate_id();
+    let toggle =
+        crate::routers::prepare::reasoning_controls::probe_reasoning_toggle(&*tokenizer).unwrap();
+    app.reasoning_controls
+        .write()
+        .insert(id.clone(), ReasoningControls::Template(Some(toggle)));
+    app.tokenizer_registry
+        .load(&id, "m", "hf-test", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    for (controls, want) in [
+        (json!({}), vec![1]),
+        (json!({"reasoning_effort": "none"}), vec![1, 2]),
+        (json!({"thinking": {"type": "disabled"}}), vec![1, 2]),
+    ] {
+        let mut request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(controls.as_object().unwrap().clone());
+        let body = serde_json::to_vec(&request).unwrap();
+        let parsed = ParsedInference::parse("/v1/chat/completions", &body).unwrap();
+        let routing = IngressRouting::new(&app);
+        let (_, tokens) = app
+            .prepare_pool
+            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
+                routing.prepare(&parsed, &body, ctx)
+            })
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tokens, Some(want), "{controls}");
     }
 }
 fn json_headers() -> HeaderMap {
@@ -1182,13 +1253,14 @@ async fn wanted_tokens_fall_back_to_the_text() {
         ("/v1/chat/completions", chat, "untokenized", false, true),
         ("/v1/messages", messages, "messages", false, false),
     ] {
-        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let body = serde_json::to_vec(&body).unwrap();
+        let parsed = ParsedInference::parse(path, &body).unwrap();
         let text = parsed.metadata_with_text(true).text;
         let routing = IngressRouting::new(&app);
         let (metadata, tokens) = app
             .prepare_pool
             .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                routing.prepare(&parsed, ctx)
+                routing.prepare(&parsed, &body, ctx)
             })
             .await
             .unwrap()
@@ -1265,12 +1337,13 @@ async fn tokens_cache_aware_wants_carry_the_special_tokens_in_any_pair() {
                 true,
             ),
         ] {
-            let parsed = ParsedInference::parse("/generate", body.to_string().as_bytes()).unwrap();
+            let body = body.to_string();
+            let parsed = ParsedInference::parse("/generate", body.as_bytes()).unwrap();
             let routing = IngressRouting::new(&app);
             let (metadata, tokens) = app
                 .prepare_pool
                 .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                    routing.prepare(&parsed, ctx)
+                    routing.prepare(&parsed, body.as_bytes(), ctx)
                 })
                 .await
                 .unwrap()
