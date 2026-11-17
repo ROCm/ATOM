@@ -161,10 +161,16 @@ def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
 
 
 def native_group32_runs_bf16() -> bool:
-    """Whether native group32 FP8 linears run in BF16 (no MX MFMA, no A8 rounding)."""
-    from aiter.jit.utils.chip_info import get_gfx_runtime
+    """Whether native group32 FP8 linears run in BF16: AITER has no group32 GEMM
+    for a 32x32 weight in the layout `weight_is_stored_preshuffled` keeps."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_group32_supported
 
-    return get_gfx_runtime().startswith("gfx94")
+    return not gemm_a8w8_blockscale_group32_supported(
+        "32x32",
+        bpreshuffle=weight_is_stored_preshuffled(
+            QuantType.per_1x32, dtypes.fp8, native_group_rows=32
+        ),
+    )
 
 
 def _is_mxfp4(quant_type, quant_dtype) -> bool:
