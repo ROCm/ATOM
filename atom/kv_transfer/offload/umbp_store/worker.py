@@ -22,7 +22,9 @@ to and from it through HIP IPC before it answers each call. What is UMBP's own:
   object; this worker then loads nothing more from the server and marks it in
   this process (``_distrust_store``, :mod:`.taint`). The mark is this
   process's only: other worker processes and other engines are not told.
-* No groups: each rank's object of a chunk is put, and evicted, on its own.
+* Group eviction: after each put, all rank copies of the same chunk are linked
+  as an eviction group on the server.  Evicting any one copy evicts all others,
+  so stranded copies (one rank's shard surviving another's) cannot waste DRAM.
 * UMBP has no remove by key: the startup probe's object stays on the server
   until it is evicted.
 """
@@ -37,7 +39,7 @@ import torch
 
 from atom.kv_transfer.offload.kv_store import pool as _store_pool
 from atom.kv_transfer.offload.kv_store.client import CallRefused
-from atom.kv_transfer.offload.kv_store.keys import probe_key
+from atom.kv_transfer.offload.kv_store.keys import chunk_keys, probe_key, rank_key_prefix
 from atom.kv_transfer.offload.kv_store.pool import Slot
 from atom.kv_transfer.offload.kv_store.worker import (
     KVStoreOffloadConnector,
@@ -256,9 +258,35 @@ class UMBPStoreOffloadConnector(KVStoreOffloadConnector):
         keys: list[str],
         slots: list[Slot],
     ) -> list[bool]:
-        return client.put(
+        answer = client.put(
             keys, [slot.ptr for slot in slots], [self._chunk_bytes] * len(slots)
         )
+        if any(answer) and self._world > 1:
+            self._link_groups(client, keys, answer)
+        return answer
+
+    def _link_groups(
+        self,
+        client: UMBPStoreClient,
+        keys: list[str],
+        stored: list[bool],
+    ) -> None:
+        """Associate each stored chunk's rank copies as an eviction group.
+
+        When any rank's copy is evicted by the server the other ranks' copies
+        are evicted too, preventing stranded-object DRAM waste.
+        """
+        namespace = self._namespace
+        world = self._world
+        for key, ok in zip(keys, stored):
+            if not ok:
+                continue
+            # Key format: {namespace}/w{rank}of{world}/{digest}
+            digest = key.rsplit("/", 1)[-1]
+            group_keys = [
+                rank_key_prefix(namespace, r, world) + digest for r in range(world)
+            ]
+            client.link_group(digest, group_keys)
 
     def _settle_put(
         self, pool: TransferSlotPool, slots: list[Slot], answer: list[bool]
