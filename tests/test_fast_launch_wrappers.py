@@ -523,3 +523,155 @@ def test_fused_qk_norm_matches_plain_triton_bitwise(
         ),
         (layernorm._fused_qk_norm_single, layernorm._fused_qk_norm_single_kernel),
     )
+
+
+# --- HC: combine + norm, scaled SiLU, gated mean (+ FP8 quant) -------------
+
+
+@pytest.fixture
+def hc():
+    pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
+    from atom.model_ops.qwen4_exp.ops import gated, hc_fused
+
+    return SimpleNamespace(gated=gated, hc_fused=hc_fused)
+
+
+def _hc_inputs(m, offset=0, seed=0, hidden=2560, streams=4, rank=320):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    def randn(*shape, scale=1.0):
+        x = torch.randn(*shape, generator=gen, device="cuda", dtype=torch.bfloat16)
+        return x * scale
+
+    h = randn(m * streams * hidden + offset)[offset:].view(m, streams * hidden)
+    d = randn(m, rank + streams)
+    return SimpleNamespace(
+        h=h,
+        norm_w=randn(streams * hidden, scale=0.1),
+        block=randn(m, hidden),
+        raw=d[:, rank:],
+        x=d[:, :rank],
+        up=randn(m, streams * hidden),
+        hidden=hidden,
+        streams=streams,
+        rank=rank,
+    )
+
+
+def _reference_combine_norm(hc, t, combine, eps=1e-6):
+    """`hc_combine_norm` as it was: plain `kernel[grid]` launches."""
+    kernels = hc.hc_fused
+    m, hidden, streams = t.h.shape[0], t.hidden, t.streams
+    normed = torch.empty_like(t.h)
+    h_new = torch.empty_like(t.h) if combine else t.h
+    block, raw = (t.block, t.raw) if combine else (t.h, t.h)
+    strides = (
+        t.h.stride(0),
+        t.block.stride(0) if combine else 0,
+        t.raw.stride(0) if combine else 0,
+    )
+    ba = 1 << (hidden.bit_length() - 1)
+    if m >= kernels.COMBINE_NORM_ROWS_MIN_M:
+        kernels._hc_combine_norm_rows_kernel[(triton.cdiv(m, 2), streams)](
+            t.h, block, raw, t.norm_w, h_new, normed, m, *strides, eps,
+            H=hidden, HC=streams, COMBINE=combine, RB=2, BA=ba, BB=hidden - ba,
+            num_warps=4,
+        )  # fmt: skip
+    else:
+        kernels._hc_combine_norm_kernel[(m, streams)](
+            t.h, block, raw, t.norm_w, h_new, normed, *strides, eps,
+            H=hidden, HC=streams, COMBINE=combine,
+            BLOCK=triton.next_power_of_2(hidden), num_warps=4,
+        )  # fmt: skip
+    return h_new, normed
+
+
+def _reference_tail(hc, t, normed, quant_dtype):
+    """`scaled_silu` and `hc_gated_mean(_quant)` as they were."""
+    m, hidden, streams, rank = t.h.shape[0], t.hidden, t.streams, t.rank
+    gate = torch.empty((m, rank), dtype=t.x.dtype, device="cuda")
+    block = min(1024, triton.next_power_of_2(rank))
+    hc.gated._gated_pointwise_kernel[(m, triton.cdiv(rank, block))](
+        t.x, t.x, t.x, gate, t.x.stride(0), 0, 0, rank, rank, streams, True, False,
+        block, num_warps=4, enable_fp_fusion=False,
+    )  # fmt: skip
+    out = torch.empty((m, hidden), dtype=normed.dtype, device="cuda")
+    if quant_dtype is None:
+        hc.hc_fused._hc_gated_mean_tiled_kernel[(triton.cdiv(m, 4), hidden // 512)](
+            normed, t.up, out, m, normed.stride(0), out.stride(0),
+            H=hidden, HC=streams, RB=4, BH=512, num_warps=4,
+        )  # fmt: skip
+        return gate, out
+    q = torch.empty((m, hidden), dtype=quant_dtype, device="cuda")
+    scale = torch.empty((m, 1), dtype=torch.float32, device="cuda")
+    hc.hc_fused._hc_gated_mean_quant_kernel[(m,)](
+        normed, t.up, out, q, scale, m, normed.stride(0),
+        H=hidden, HC=streams, FP8_MAX=torch.finfo(quant_dtype).max, RB=1,
+        BH=triton.next_power_of_2(hidden), num_warps=8,
+    )  # fmt: skip
+    return gate, out, q, scale
+
+
+def _hc_launches(hc, t, combine, quant_dtype):
+    block, raw = (t.block, t.raw) if combine else (None, None)
+    h, normed = hc.hc_fused.hc_combine_norm(t.h, t.norm_w, 1e-6, t.streams, block, raw)
+    gate = hc.gated.scaled_silu(t.x, t.streams)
+    if quant_dtype is None:
+        tail = (gate, hc.hc_fused.hc_gated_mean(normed, t.up, t.streams))
+    else:
+        tail = (
+            gate,
+            *hc.hc_fused.hc_gated_mean_quant(normed, t.up, t.streams, quant_dtype),
+        )
+    return (h, normed), tail
+
+
+@gpu
+@pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
+@pytest.mark.parametrize("combine", [True, False])
+@pytest.mark.parametrize("m", [2112, 1056, 1050, 256, 16, 3])
+@torch.inference_mode()
+def test_hc_launches_match_plain_triton_bitwise(hc, m, combine, offset):
+    """Prefill (whole and SP-shard), mid and small batches, combining or not,
+    streams 16-byte aligned or not: against the launches written out as they
+    were, and against the same wrappers on Triton's ordinary path."""
+    t = _hc_inputs(m, offset=offset, seed=m + offset)
+    quant = None if m > 1024 else torch.float8_e4m3fnuz
+    ref_head = _reference_combine_norm(hc, t, combine)
+    ref_tail = _reference_tail(hc, t, ref_head[1], quant)
+    head, tail = _hc_launches(hc, t, combine, quant)
+    torch.cuda.synchronize()
+    assert _bitwise_equal(head, ref_head)
+    assert _bitwise_equal(tail, ref_tail)
+
+    kernels = hc.hc_fused
+    combine_norm = (
+        (kernels._hc_combine_norm_rows, kernels._hc_combine_norm_rows_kernel)
+        if m >= kernels.COMBINE_NORM_ROWS_MIN_M
+        else (kernels._hc_combine_norm, kernels._hc_combine_norm_kernel)
+    )
+    gated_mean = (
+        (kernels._hc_gated_mean_tiled, kernels._hc_gated_mean_tiled_kernel)
+        if quant is None
+        else (kernels._hc_gated_mean_quant, kernels._hc_gated_mean_quant_kernel)
+    )
+    _plain_vs_cached(
+        lambda: [x for part in _hc_launches(hc, t, combine, quant) for x in part],
+        combine_norm,
+        (hc.gated._scaled_silu, hc.gated._gated_pointwise_kernel),
+        gated_mean,
+    )
+
+
+@gpu
+@torch.inference_mode()
+def test_hc_launches_replay_in_a_cuda_graph(hc):
+    t = _hc_inputs(1056, seed=11)
+    ref = _reference_combine_norm(hc, t, True)
+    _hc_launches(hc, t, True, None)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        head, _ = _hc_launches(hc, t, True, None)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _bitwise_equal(head, ref)

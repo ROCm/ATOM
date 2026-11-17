@@ -190,13 +190,16 @@ def _gated_pointwise_kernel(
     tl.store(out_ptr + row * WIDTH + cols, result, cols < WIDTH)
 
 
+_scaled_silu = fast_launch(_gated_pointwise_kernel, by_specialization=True)
+
+
 def scaled_silu(x: torch.Tensor, scale: int) -> torch.Tensor:
     """SiLU(x / scale), retaining the intermediate activation dtype."""
     rows, width = x.shape
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows:
         block = min(1024, triton.next_power_of_2(width))
-        _gated_pointwise_kernel[(rows, triton.cdiv(width, block))](
+        _scaled_silu[(rows, triton.cdiv(width, block))](
             x,
             x,
             x,
