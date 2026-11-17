@@ -188,11 +188,11 @@ def kv_event_sources(config) -> dict[str, dict[str, Any]]:
     per hashed block, the replay endpoint, offset alike, when replay is on, and
     the Mooncake Store the ranks offload to, if any. Empty with events off or
     the null publisher."""
-    from atom.kv_transfer.offload.report import offload_report
-
     events = config.kv_events_config
     if not events.enable or events.publisher == "null":
         return {}
+    from atom.kv_transfer.offload.report import offload_report
+
     block_size = hash_block_size_for(
         config.kv_cache_block_size, config.decode_context_parallel_size
     )
