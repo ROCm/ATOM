@@ -652,15 +652,12 @@ def test_gqa_draft_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_gqa_aggregate_leaves_folded_zeros_readable_by_the_next_layer(compiled):
+def test_gqa_aggregate_and_successor_read_cloned_zero_addends(compiled):
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("the attention-residual kernel needs a GPU")
-    from atom.model_ops.kimi_k3.attention_residual import (
-        apply_attn_res,
-        folded_zero_like,
-    )
+    from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
 
     hidden, rows = 16, 13
     target = _k3_target_stub(hidden=hidden)
@@ -671,6 +668,7 @@ def test_gqa_aggregate_leaves_folded_zeros_readable_by_the_next_layer(compiled):
     bank = torch.randn(rows, 2, hidden, device="cuda", dtype=torch.bfloat16)
 
     def read_twice(prefix, add, add2, bank):
+        add, add2 = add.clone(), add2.clone()
         aux = layer.aggregate_hidden_state((prefix, add, add2, bank), next_layer)
         mixed, next_prefix = apply_attn_res(
             prefix, bank, res.score_weight, res.eps, add, add_hidden2=add2
@@ -683,7 +681,7 @@ def test_gqa_aggregate_leaves_folded_zeros_readable_by_the_next_layer(compiled):
     if compiled:
         read_twice = torch.compile(read_twice, fullgraph=True)
     for _ in range(2):
-        add, add2 = [folded_zero_like(prefix).fill_(float("nan")) for _ in range(2)]
+        add, add2 = torch.zeros_like(prefix), torch.zeros_like(prefix)
         actual = read_twice(prefix, add, add2, bank)
         assert torch.isfinite(add).all() and torch.isfinite(add2).all()
         for got, want in zip(actual, expected):

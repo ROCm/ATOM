@@ -224,8 +224,8 @@ def test_row_sharded_layer_sums_to_the_base(logged, monkeypatch, tokens, layer_n
             ("all_gather", chunk),
         ]
         residual, routed, shared, bank = got
-        routed.fill_(float("nan"))
-        shared.fill_(float("nan"))
+        assert not routed.any() and not shared.any()
+        assert len({t.data_ptr() for t in (residual, routed, shared)}) == 3
         assert torch.equal(bank, want[3])
         # The row-sharded sum rounds to BF16 twice, the reference once.
         exact = sum(t.float() for t in want[:3])
@@ -271,46 +271,3 @@ def test_below_row_floor_all_reduces(logged, monkeypatch, floor):
     for (want, want_log), (out, log) in zip(base, got):
         assert log == want_log
         assert all(torch.equal(a, b) for a, b in zip(out, want))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@torch.inference_mode()
-def test_folded_zeros_are_added_without_loading(monkeypatch):
-    """`apply_attn_res` takes a row-sharded layer's folded zeros as zero
-    without loading them (NaN-poisoned here), still returns a fresh prefix,
-    and releases them."""
-    from atom.model_ops.kimi_k3 import attention_residual as attn_res
-
-    gen = torch.Generator().manual_seed(7)
-
-    def randn(*shape):
-        return torch.randn(*shape, generator=gen).bfloat16().cuda()
-
-    prefix, bank, norm = randn(13, 7168), randn(13, 3, 7168), randn(7168)
-    score_weight = randn(7168).float() * 0.01
-    kernel, flags = attn_res._attn_res_fused_kernel, []
-
-    class _Kernel:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                flags.append(
-                    (kwargs["DO_ADD"], kwargs["DO_ADD2"], kwargs["WRITE_PREF"])
-                )
-                return kernel[grid](*args, **kwargs)
-
-            return launch
-
-    monkeypatch.setattr(attn_res, "_attn_res_fused_kernel", _Kernel())
-
-    def call(add, add2):
-        return attn_res._apply_attn_res_impl(
-            prefix, bank, score_weight, 1e-6, add, norm, 1e-6, add2
-        )
-
-    poisoned = [attn_res.folded_zero_like(prefix).fill_(float("nan")) for _ in "ab"]
-    folded = call(*poisoned)
-    loaded = call(torch.zeros_like(prefix), torch.zeros_like(prefix))
-    assert flags == [(False, False, True), (True, True, True)]
-    assert not attn_res._folded_zeros
-    assert folded[1].data_ptr() != prefix.data_ptr()
-    assert all(torch.equal(a, b) for a, b in zip(folded, loaded))

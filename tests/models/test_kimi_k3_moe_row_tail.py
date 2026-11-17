@@ -15,7 +15,6 @@ from torch import nn
 pytest.importorskip("aiter", reason="atom.models.kimi_k3.model imports aiter")
 
 from atom.model_ops import module_dispatch_ops
-from atom.model_ops.kimi_k3 import attention_residual
 from atom.models import qwen4_exp
 from atom.models.kimi_k3 import model as kimi
 from atom.utils.tbo import ubatching
@@ -99,6 +98,13 @@ class _Stub(nn.Module):
 def stub_block_parts(monkeypatch):
     """`KimiSparseMoeBlock.__init__` runs for real on CPU: its sub-modules are
     stubs, the TP size is WORLD and its config registers into one context."""
+    empty_like = torch.empty_like
+
+    def poisoned_empty_like(*args, **kwargs):
+        out = empty_like(*args, **kwargs)
+        return out.fill_(float("nan")) if out.is_floating_point() else out
+
+    monkeypatch.setattr(torch, "empty_like", poisoned_empty_like)
     for name in ("ReplicatedLinear", "FusedMoE", "KimiMLP", "RMSNorm"):
         monkeypatch.setattr(kimi, name, _Stub)
     monkeypatch.setattr(kimi, "get_tensor_model_parallel_world_size", lambda: WORLD)
@@ -196,16 +202,10 @@ def test_row_sharded_pair_sums_to_the_base_pair(ranks, monkeypatch, tokens):
         # The base up-projects every row; the sharded tail only this rank's.
         assert up_rows == [tokens, -(-tokens // WORLD)]
         assert summed.shape == zeros.shape == (tokens, HIDDEN)
-        assert _folded(zeros)
+        assert not zeros.any()
+        assert zeros.data_ptr() != summed.data_ptr()
         expected = (routed.float() + shared.float()).to(summed.dtype)
         torch.testing.assert_close(summed, expected)
-
-
-def _folded(zero: torch.Tensor) -> bool:
-    """Whether `zero` is a folded zero: poisoned, it still materializes as zero."""
-    zero.fill_(float("nan"))
-    attention_residual.materialize_folded_zeros(zero)
-    return not zero.any()
 
 
 @pytest.fixture
@@ -229,7 +229,8 @@ def test_forward_with_dual_stream_off_takes_the_row_sharded_tail(
         ranks, tokens, lambda block, x: block.forward(x)
     ):
         assert up_rows == [tokens, -(-tokens // WORLD)]
-        assert _folded(zeros)
+        assert not zeros.any()
+        assert zeros.data_ptr() != summed.data_ptr()
         expected = (routed.float() + shared.float()).to(summed.dtype)
         torch.testing.assert_close(summed, expected)
 
