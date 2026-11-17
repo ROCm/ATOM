@@ -19,7 +19,6 @@ m32k4 GEMM A-scale layout unless asked for `scale_row_major`, so there the
 fused output needs an AITER with that option, else the GEMM quantizes.
 """
 
-import inspect
 from functools import cache
 
 import torch
@@ -45,14 +44,13 @@ def _row_major_scale_options():
     arch = get_gfx_runtime()
     if arch == "gfx950":
         return {}
-    if (
-        arch == "gfx1250"
-        and "scale_row_major" in inspect.signature(mega_mhc).parameters
-    ):
+    if arch == "gfx1250":
+        # scale_row_major is a plain mega_mhc parameter on aiter main.
         return {"scale_row_major": True}
     return None
 
 
+@cache
 def use_asm_seam(hc_mult: int, hidden: int) -> bool:
     """Whether a seam with a post passes the FP32 weight to mega_mhc for AITER's
     gfx942 ASM seam: wherever AITER supports it, unless

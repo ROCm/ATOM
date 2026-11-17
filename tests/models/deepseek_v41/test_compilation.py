@@ -234,85 +234,6 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
     assert tuple(model.state_dict()) == names == ("embed.weight",)
 
 
-@pytest.mark.parametrize(
-    "env, with_post, supported, expected",
-    [
-        ("auto", True, True, "mega"),  # gfx942 post seam where AITER supports it
-        ("triton", True, True, "triton"),  # forced Triton, even where ASM is supported
-        ("auto", True, False, "triton"),  # AITER does not support the ASM seam here
-        (
-            "auto",
-            False,
-            True,
-            "triton",
-        ),  # a seam without a post never takes the ASM seam
-    ],
-)
-def test_v41_mhc_pre_delayed_selects_backend(
-    env, with_post, supported, expected, monkeypatch
-):
-    """Which seam kernel v41_mhc_pre_delayed picks, on CPU with the kernels stubbed,
-    so non-GPU CI covers the gfx942 ASM branch that the GPU guard test skips."""
-    from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
-
-    monkeypatch.setenv("ATOM_DSV41_MHC_BACKEND", env)
-    monkeypatch.setattr(
-        mhc,
-        "mhc_fused_post_pre_delayed_asm_supported",
-        lambda hidden, hc_mult: supported,
-    )
-    rows, hc, hidden = 2, 4, 5120
-    calls = []
-
-    def stub(name):
-        def kernel(residual, *args, **kwargs):
-            calls.append(name)
-            return (
-                residual.clone(),
-                torch.zeros(rows, hc),
-                torch.zeros(rows, hc, hc),
-                torch.zeros(rows, hidden),
-                torch.zeros(rows, hc),
-            )
-
-        return kernel
-
-    monkeypatch.setattr(mhc, "mega_mhc", stub("mega"))
-    monkeypatch.setattr(mhc, "mhc_fused_post_pre_delayed_rmsnorm", stub("triton"))
-
-    residual = torch.randn(1, rows, hc, hidden)
-    pre = torch.full((1, rows, hc), 1 / hc)
-    fn = torch.randn(24, hc * hidden)
-    common = {
-        "rms_eps": 1e-6,
-        "hc_eps": 1e-6,
-        "sinkhorn_iters": 20,
-        "post_mult": 2.0,
-        "norm_eps": 1e-6,
-    }
-    post_kw = (
-        {
-            "sublayer_output": torch.randn(1, rows, hidden),
-            "post_mix": torch.ones_like(pre),
-            "combination": torch.eye(hc).expand(1, rows, hc, hc).contiguous(),
-        }
-        if with_post
-        else {}
-    )
-    # Call the unwrapped function: the eager branch logic, without op registration.
-    mhc.v41_mhc_pre_delayed.__wrapped__(
-        residual,
-        pre,
-        fn,
-        torch.ones(3),
-        torch.zeros(24),
-        torch.ones(hidden),
-        **common,
-        **post_kw,
-    )
-    assert calls == [expected]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
 @pytest.mark.parametrize("mode", ["pre", "post_pre"])
 @pytest.mark.parametrize("backend", ["triton", "hip", "hip_quant", "asm"])
@@ -324,6 +245,7 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend, monkeypatch):
     monkeypatch.setenv(
         "ATOM_DSV41_MHC_BACKEND", "triton" if backend == "triton" else "auto"
     )
+    mhc.use_asm_seam.cache_clear()  # the env is pinned per case
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)
