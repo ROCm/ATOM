@@ -1186,9 +1186,7 @@ models:
         # eager, since a P/D producer never decodes. It also keeps the unsharded
         # KDA gate GEMM (f_b_proj, N 12288, K 128) in bf16: aiter has no tuned
         # FP8 config for that shape, and its untuned FP8 GEMM needs K above 192.
-        # Drop the exclusion once aiter's FP8 GEMM serves K 128. Each stage
-        # repacks its MLA KV for the TP8xDCP8 decode in the producer's MLA
-        # staging pool (ATOM_PD_MLA_STAGING, on by default).
+        # Drop the exclusion once aiter's FP8 GEMM serves K 128.
         - &kimi_k3_1p1d_pp8_dcp8
           <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
