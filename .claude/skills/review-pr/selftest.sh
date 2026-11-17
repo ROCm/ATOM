@@ -476,10 +476,8 @@ t "a diff GitHub refused to serve still owes the reader a coverage line" \
   "$(_cov_raw '    [diff-too-large        ] A1 A2' -)" "MISSING-COVERAGE"
 t "a diff GitHub refused to serve passes once the card says it is partial" \
   "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: BEYOND ONE PASS -- GitHub refused the diff')" "ok"
-# ...but only if it says the right thing. The measured path refuses a card that
-# reports a BEYOND ONE PASS diff as an ordinary one; this path checked only that SOME
-# coverage line was present, so the softening the other branch exists to catch walked
-# straight through on the one diff too large for GitHub to even serve.
+# ...but only if it says the right thing: a present coverage line is not enough, it has
+# to carry the verdict.
 t "a diff GitHub refused to serve may not be called ordinary" \
   "$(_cov_raw '    [diff-too-large        ] A1 A2' 'Coverage: 3 files / 20 added lines -- within one review pass')" \
   "SOFTENED-COVERAGE"

@@ -2908,10 +2908,13 @@ def _check_coverage_line(card_text, work_dir=None):
             if ln.strip().startswith("coverage:"):
                 want = ln.strip()
                 break
-    # `[diff-too-large]` writes no coverage line, but GitHub refusing a diff over 20000
-    # lines is itself the measurement, and the strongest one -- an order of magnitude
-    # past BIG_ADDED, so BEYOND ONE PASS by definition. `[underivable]` and
-    # `[derivation-failed]` measured nothing, so no verdict exists for the card to drop.
+    # `[diff-too-large]` writes no coverage line, so BEYOND ONE PASS is required here by
+    # policy, not by measurement: GitHub's 20000-line cap counts every line of the diff,
+    # while BIG_ADDED counts only non-test added lines, so a deletion-heavy refusal could
+    # still measure as one pass. The policy holds because the diff was never served -- a
+    # review of what could not be read is a sample whatever the counts would have said.
+    # `[underivable]` and `[derivation-failed]` measured nothing, so no verdict exists
+    # for the card to drop.
     too_large = text is not None and not want and "[diff-too-large" in text
     if not want and not too_large:
         return []
