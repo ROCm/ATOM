@@ -3391,6 +3391,9 @@ class TestPromptEndAnchorTemplateMargin:
     def _demand_cuts(self, bm):
         return bm.checkpoint_funnel()["chunks_cut_for_demand"]
 
+    def _dropped(self, bm):
+        return bm.checkpoint_funnel()["demands_dropped_at_grid_hit"]
+
     def test_the_next_turn_cuts_no_demand_above_the_floored_anchor(self):
         """The anchor is floored so the joint load, which needs the whole chunk
         covering it, can restore it from the CPU tier. The next turn resumes
@@ -3401,6 +3404,7 @@ class TestPromptEndAnchorTemplateMargin:
         _, anchor = self._run_turn(bm, t1)
         resumed, _ = self._run_turn(bm, t1 + self._fresh(80))
         assert (anchor, resumed, self._demand_cuts(bm)) == (self.CHUNK, self.CHUNK, 0)
+        assert self._dropped(bm) == 1
 
     def _conversation(self, bm, turns=6):
         """`turns` turns, each resending the last verbatim and going on."""
@@ -3479,7 +3483,7 @@ class TestPromptEndAnchorTemplateMargin:
         resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
         assert anchor == self.CHUNK
         assert resumed == [self.CHUNK, self.CHUNK]
-        assert self._demand_cuts(bm) == 0
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (0, 2)
 
     def test_a_short_shared_header_keeps_its_demand(self):
         """A hit at 0 is no floored anchor (one under a chunk stays put), so a
@@ -3490,7 +3494,7 @@ class TestPromptEndAnchorTemplateMargin:
         self._run_turn(bm, forks[0])
         resumed = [self._run_turn(bm, f)[0] for f in forks[1:]]
         assert resumed == [0, 3 * self.BLOCK]
-        assert self._demand_cuts(bm) == 1
+        assert (self._demand_cuts(bm), self._dropped(bm)) == (1, 0)
 
     def _forks_one_chunk_up(self, bm):
         """Forks a whole chunk above the floored anchor (8 blocks, anchor 4)."""
@@ -3518,12 +3522,16 @@ class TestPromptEndAnchorTemplateMargin:
     )
     def test_a_demand_outside_the_dropped_shape_keeps_its_rung(self, forks, resumed):
         """Only a demand under one chunk above a nonzero hit on the chunk grid
-        is dropped. One a whole chunk up, or above a hit off the grid, still
-        cuts its rung, and the second fork resumes there."""
+        is dropped. One a whole chunk up, or above a hit off the grid, is not
+        counted as dropped and still cuts its rung, and the second fork resumes
+        there. (Above that new rung on the grid, the second fork's own demand
+        in `offgrid_hit` is the dropped shape.)"""
         bm = self._grid_bm()
         prompts = forks(self, bm)
-        cuts = self._demand_cuts(bm)
-        assert [self._run_turn(bm, p)[0] for p in prompts] == resumed
+        cuts, dropped = self._demand_cuts(bm), self._dropped(bm)
+        first = self._run_turn(bm, prompts[0])[0]
+        assert self._dropped(bm) == dropped
+        assert [first, self._run_turn(bm, prompts[1])[0]] == resumed
         assert self._demand_cuts(bm) - cuts == 1
 
     # ── The margin's range (review of #2589) ────────────────────────────────

@@ -425,6 +425,7 @@ class LLMEngine:
                 "checkpoints_orphaned",
                 "demands_recorded",
                 "demands_declined_no_room",
+                "demands_dropped_at_grid_hit",
                 "chunks_cut_for_demand",
                 # Both cut counters or neither: their ratio is what separates a
                 # placement that converges from one that pays per request, and
@@ -544,6 +545,7 @@ class LLMEngine:
             "checkpoints_orphaned",
             "demands_recorded",
             "demands_declined_no_room",
+            "demands_dropped_at_grid_hit",
             "chunks_cut_for_demand",
             "chunks_cut_for_end",
         )

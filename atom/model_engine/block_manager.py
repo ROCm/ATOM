@@ -563,6 +563,10 @@ class BlockManager:
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
         self.demands_declined_no_room: int = 0
+        # Dropped because the demand's chunk floor is a nonzero hit: the shape a
+        # floored anchor leaves the next turn, and also a real fork that close
+        # above a grid rung (`_record_checkpoint_demand`).
+        self.demands_dropped_at_grid_hit: int = 0
         # The anchor's own cut counter, kept separate from the demand's: the
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
@@ -2801,6 +2805,8 @@ class BlockManager:
             if floor > hit_tokens:
                 demand = floor
             elif floor == hit_tokens > 0:
+                self.demands_dropped_at_grid_hit += not seq.checkpoint_demand_dropped
+                seq.checkpoint_demand_dropped = True
                 demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
@@ -3236,6 +3242,7 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "demands_declined_no_room": self.demands_declined_no_room,
+            "demands_dropped_at_grid_hit": self.demands_dropped_at_grid_hit,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
             "midstep_positions_unreadable": self.midstep_positions_unreadable,
@@ -3684,6 +3691,7 @@ class BlockManager:
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
+        seq.checkpoint_demand_dropped = False
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here
