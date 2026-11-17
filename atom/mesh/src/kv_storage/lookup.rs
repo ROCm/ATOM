@@ -203,10 +203,11 @@ fn loadable_hit(hit: u32, prompt: u32, chunk: u32) -> u32 {
     hit / chunk * chunk
 }
 
-/// The tokens ATOM's scheduler loads of a `loadable` hit, from the first chunk boundary
-/// at or after the `device` tokens it holds; none when they are fewer than `min_load`.
+/// The tokens ATOM's scheduler loads of a `loadable` hit, from the chunk boundary at or
+/// below the `device` tokens it holds, as a Mooncake Store reloads their unaligned tail;
+/// none when they are fewer than `min_load`.
 fn load_tokens(device: u32, loadable: u32, chunk: u32, min_load: u32) -> u32 {
-    let moved = loadable.saturating_sub(device.div_ceil(chunk).saturating_mul(chunk));
+    let moved = loadable.saturating_sub(device / chunk * chunk);
     if moved > 0 && moved >= min_load {
         moved
     } else {
@@ -245,9 +246,11 @@ mod tests {
             }
         };
         assert_eq!((cached(3000, 16_384), cached(3000, 10_240)), (16_384, 3000));
-        // A load starts at the device's next chunk boundary: 11264 − 3072 is 8192.
-        assert_eq!(load_tokens(3000, 11_264, 256, 8192), 8192);
-        assert_eq!(load_tokens(3000, 11_008, 256, 8192), 0);
+        // A load starts at the chunk boundary at or below what the device holds, so it
+        // reloads the device's unaligned tail: 11008 − 2816 is 8192, and 768 − 256 is 512.
+        assert_eq!(load_tokens(3000, 11_008, 256, 8192), 8192);
+        assert_eq!(load_tokens(3000, 10_752, 256, 8192), 0);
+        assert_eq!(load_tokens(304, 768, 256, 512), 512);
         assert_eq!(load_tokens(0, 0, 256, 0), 0);
         // A hit of the whole prompt leaves its last token, and its last chunk, to compute.
         assert_eq!(loadable_hit(512, 512, 256), 256);
@@ -335,16 +338,17 @@ mod tests {
         let prompt: Vec<u32> = (0..64).collect();
         let cached = |device| read.cached_tokens(&client, &prompt, device);
 
-        // All 4 chunks held: the engine loads 3 of them, past what its device holds.
+        // All 4 chunks held: the engine loads 3 of them, from the chunk boundary at or
+        // below what its device holds.
         admin.held.store(4, Ordering::Relaxed);
-        assert_eq!((cached(0).await, cached(32).await), (Some(48), Some(48)));
+        assert_eq!((cached(0).await, cached(40).await), (Some(48), Some(48)));
         assert!(read.lookups.last_lookup_us().is_some());
         admin.held.store(1, Ordering::Relaxed);
         assert_eq!(cached(0).await, Some(16));
         admin.held.store(0, Ordering::Relaxed);
         assert_eq!(cached(16).await, Some(16));
-        // The store could not add a chunk past 40 tokens of 64: it is not asked.
-        assert_eq!(cached(40).await, Some(40));
+        // The store could not add a chunk past 48 tokens of 64: it is not asked.
+        assert_eq!(cached(48).await, Some(48));
         assert_eq!(admin.asked.load(Ordering::Relaxed), 4);
 
         // Late or failed answers are unknown, and 5 in a row open the breaker.
