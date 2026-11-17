@@ -3032,10 +3032,22 @@ class Config:
                 own_pool=draft_owns_kv_pool(self),
                 requested=spec.kv_cache_dtype,
             )
-            if spec.draft_kv_dtype != self.kv_cache_dtype and self.kv_transfer_config:
-                # The offload namespace keys the target's KV dtype alone, so a
-                # draft page of another dtype would share a key with the target's.
-                # The flag has no fp4 / nvfp4 to match an FP4 target with.
+            # An own-pool draft publishes its pages as regions of their own (each
+            # with its dtype in its PageUnitSpec), and the lmcache_offload PAGE
+            # namespace hashes the whole speculative_config, draft KV dtype
+            # included, so its pages never share a key with the target's.
+            draft_dtype_offload_ok = (
+                draft_owns_kv_pool(self)
+                and isinstance(self.kv_transfer_config, dict)
+                and self.kv_transfer_config.get("kv_connector") == "lmcache_offload"
+            )
+            if (
+                spec.draft_kv_dtype != self.kv_cache_dtype
+                and self.kv_transfer_config
+                and not draft_dtype_offload_ok
+            ):
+                # P/D transfer connectors move pages under the target's KV dtype
+                # alone. The flag has no fp4 / nvfp4 to match an FP4 target with.
                 hint = (
                     ""
                     if self.kv_cache_dtype in FP4_CACHE_DTYPES

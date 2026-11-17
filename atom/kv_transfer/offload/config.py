@@ -776,7 +776,13 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
-    kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+    # FP4 pages are packed bytes with no torch dtype in aiter's table; the
+    # raw-byte metadata wrapper reports uint8 to LMCache either way.
+    kv_dtype = (
+        torch.uint8
+        if config.kv_cache_dtype in ("fp4", "nvfp4")
+        else dtypes.d_dtypes[config.kv_cache_dtype]
+    )
     model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent
