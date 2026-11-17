@@ -351,6 +351,7 @@ def _dense_impl(prefix_k, prefix_v):
         "_prefill_attend",
         "_prefill_q",
         "_write_prefill_kv",
+        "_write_kv",
         "_new_token_kv",
         "_quantize_new_tokens",
         "_chunked_prefill_attention",
