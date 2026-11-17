@@ -369,7 +369,7 @@ def p3_task(c, j):
 def p4_task(c, j):
     """Head h = j / 4, absorbed columns l0 = 128 (j % 4) ..: wave w the 16 rows
     l0 + 16 w .. of W_K[h] (K = q_nope's 128) -- the triton FP8 BMM's per-token
-    128-group prequant of q_nope (``mla_post``'s v-up code), one chunk, then
+    128-group prequant of q_nope (``mla_post.prequant_mfma``), one chunk, then
     ``bf16(fma(dot, a_scale, 0) * b_scale)`` and straight on to q_out: the
     rope kernel's nope part, RNE E4M3 of clamp(bf16 * inv_q). The j % 4 == 0
     CTA also writes the head's rope part of q_out. Tokens with a negative
