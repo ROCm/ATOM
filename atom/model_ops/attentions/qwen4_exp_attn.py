@@ -77,7 +77,9 @@ class Qwen4ExpQSAMetadata:
     host_lens: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     context_slots: torch.Tensor | None = None
     # The forward's FlyDSL attention layout, left by its first QSA layer
-    # (`qsa_attention._FlyDSLPrefill`). Not copied by `for_tokens`.
+    # (`qsa_attention._FlyDSLPrefill`). A `for_tokens` call that trims rows
+    # returns a copy without it (`init=False`); one that trims nothing returns
+    # this object, layout included, for the same rows.
     flydsl_prefill: Any = field(default=None, init=False, repr=False, compare=False)
 
     def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":

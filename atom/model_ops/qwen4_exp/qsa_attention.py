@@ -156,12 +156,12 @@ def _log_flydsl_active() -> None:
     logger.info("QSA attention runs eager prefill on the aiter FlyDSL kernel")
 
 
-def _flydsl_call_fallback_reason(query, index_bytes, width, qsa) -> str | None:
+def _flydsl_call_fallback_reason(query, width, qsa) -> str | None:
     """Why this one laid-out prefill call cannot take the FlyDSL attention, or None."""
     if width is None:
         return f"selection wider than {_FLYDSL_WIDTHS[-1]} columns"
-    # aiter rejects a padded selection spanning 2**31 bytes or more.
-    if query.shape[0] * width * index_bytes >= 2**31:
+    # aiter rejects a padded selection spanning 2**31 bytes or more (int32).
+    if query.shape[0] * width * 4 >= 2**31:
         return "padded selection spans 2**31 bytes or more"
     if torch.cuda.is_current_stream_capturing():
         return "graph capture"
@@ -192,17 +192,14 @@ class _FlyDSLPrefill:
         "width",
     )
 
-    def __init__(self, key, query, qsa) -> None:
-        ratio, topk, heads, kv_heads, head_dim, kv_bf16, _, _, columns, index_bytes = (
-            key
-        )
+    def __init__(self, key, layer, query, qsa) -> None:
+        ratio, topk, heads, kv_heads, head_dim, kv_bf16 = key[:6]
         self.key = key
         self.laid_out = False
         self.reason = self.width = self.query_lens = self.prefix_lens = None
         self.indices = None
         if not envs.ATOM_QSA_FLYDSL_ATTN:
             return
-        width = next((w for w in _FLYDSL_WIDTHS if w >= columns), None)
         # The prefixed path reads raw cache rows; the kernel takes BF16 only.
         reason = flydsl_fallback_reason(
             ratio, topk, heads, kv_heads, head_dim, kv_bf16=kv_bf16
@@ -212,18 +209,31 @@ class _FlyDSLPrefill:
             # runner); the SGLang bridge logs its own reasons for skipping.
             return
         self.laid_out = True
-        self.reason = reason or _flydsl_call_fallback_reason(
-            query, index_bytes, width, qsa
-        )
-        if self.reason is None:
+        if reason is None:
+            columns = _selection_widths(
+                layer.compressed_key_cache,
+                qsa.block_tables,
+                topk,
+                ratio,
+                qsa.max_seq_len,
+            )[2]
+            width = next((w for w in _FLYDSL_WIDTHS if w >= columns), None)
+            reason = _flydsl_call_fallback_reason(query, width, qsa)
+        self.reason = reason
+        if reason is None:
             self.width = width
             self.query_lens, seq_lens = qsa.host_lens
             self.prefix_lens = tuple(s - q for q, s in zip(self.query_lens, seq_lens))
 
+    @property
+    def ready(self) -> bool:
+        """Laid out and supported: this forward's QSA layers run FlyDSL."""
+        return self.laid_out and self.reason is None
+
     @classmethod
-    def of(cls, layer, query, qsa, columns, index_bytes) -> "_FlyDSLPrefill":
-        """The forward's layout for `layer` and a `columns`-wide selection of
-        `index_bytes` entries, made by its first QSA layer and kept on `qsa`."""
+    def of(cls, layer, query, qsa) -> "_FlyDSLPrefill":
+        """The forward's layout for `layer`, made by its first QSA layer and
+        kept on `qsa`."""
         key = (
             layer.indexer.compress_ratio,
             layer.indexer.token_topk,
@@ -233,12 +243,11 @@ class _FlyDSLPrefill:
             layer.k_scale_cache is None,
             query.shape[0],
             query.dtype,
-            columns,
-            index_bytes,
+            layer.compressed_key_cache.shape[1],
         )
-        plan = getattr(qsa, "flydsl_prefill", None)
+        plan = qsa.flydsl_prefill
         if plan is None or plan.key != key:
-            plan = cls(key, query, qsa)
+            plan = cls(key, layer, query, qsa)
             qsa.flydsl_prefill = plan
         return plan
 
@@ -683,24 +692,17 @@ class Qwen4ExpAttention(nn.Module):
         else:
             qsa = qsa.for_tokens(num_tokens)
             self._store_kv(key, value, qsa.slot_mapping)
-            out = None
-            if forward_context.context.is_prefill and qsa.host_lens is not None:
-                # FlyDSL reads the selection at its kernel width: select straight
-                # into that buffer instead of padding a copy.
-                columns = _selection_widths(
-                    self.compressed_key_cache,
-                    qsa.block_tables,
-                    self.indexer.token_topk,
-                    self.indexer.compress_ratio,
-                    qsa.max_seq_len,
-                )[2]
-                plan = _FlyDSLPrefill.of(self, query, qsa, columns, 4)
-                if plan.laid_out and plan.reason is None:
+            plan = out = None
+            if forward_context.context.is_prefill:
+                plan = _FlyDSLPrefill.of(self, query, qsa)
+                if plan.ready:
+                    # FlyDSL reads the selection at its kernel width: select
+                    # straight into that buffer instead of padding a copy.
                     out = plan.selection_out(query.device)
             selected = self._select_tokens(hidden_states, positions, qsa, rows, out)
             attn_out = None
-            if forward_context.context.is_prefill:
-                attn_out = self._flydsl_attention(query, key, value, selected, qsa)
+            if plan is not None:
+                attn_out = self._flydsl_attention(query, key, value, plan, qsa)
             if attn_out is None:
                 attn_out = self._attend(
                     query,
@@ -722,56 +724,29 @@ class Qwen4ExpAttention(nn.Module):
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
 
-    def _flydsl_attention(self, query, key, value, selected, qsa):
+    def _flydsl_attention(self, query, key, value, plan, qsa):
         """aiter FlyDSL sparse attention for an eager prefill, or None for the
-        native kernel. With the flag on, the first FlyDSL call and each
-        distinct fallback reason are logged once."""
-        plan = _FlyDSLPrefill.of(
-            self, query, qsa, selected.shape[1], selected.element_size()
-        )
+        native kernel. `plan` is the forward's layout; when it is ready the
+        selection was written into `plan.indices`. With the flag on, the first
+        FlyDSL call and each distinct fallback reason are logged once."""
         if not plan.laid_out:
             return None
         if plan.reason is not None:
             log_flydsl_fallback(plan.reason)
             return None
         _log_flydsl_active()
-        slots = qsa.context_slots
-        kv_slots = None
-        if slots is None:
+        kv_slots = qsa.context_slots
+        if kv_slots is None:
             k, v = key.contiguous(), value.contiguous()
-        elif (
-            slots.dtype == torch.int32
-            and self.k_cache.shape[1] % 4 == 0
-            and self.k_cache.is_contiguous()
-            and self.v_cache.is_contiguous()
-        ):
-            # Read the context rows in place: every four-token block of a
-            # request sits in four consecutive rows of one page, starting at a
-            # multiple of four, which is aiter's slot-table contract.
-            k, v, kv_slots = (
-                self.k_cache.flatten(0, 1),
-                self.v_cache.flatten(0, 1),
-                slots,
-            )
         else:
-            k = self.k_cache.flatten(0, 1).index_select(0, slots)
-            v = self.v_cache.flatten(0, 1).index_select(0, slots)
-        indices = plan.indices
-        if (
-            indices is None
-            or selected.data_ptr() != indices.data_ptr()
-            or selected.stride(0) != indices.stride(0)
-        ):
-            # The kernel does not validate the layout: a malformed selection
-            # gives wrong output. See `_FlyDSLPrefill.selection_out`.
-            indices = torch.nn.functional.pad(
-                selected, (0, plan.width - selected.shape[1]), value=-1
-            )
+            # With a prefix the kernel reads the context rows in place through
+            # the bridge's slot table.
+            k, v = self.k_cache.flatten(0, 1), self.v_cache.flatten(0, 1)
         return _flydsl_attention_op()(
             query.contiguous(),
             k,
             v,
-            indices,
+            plan.indices,
             query_lens=plan.query_lens,
             prefix_lens=plan.prefix_lens,
             softmax_scale=self.scaling,
