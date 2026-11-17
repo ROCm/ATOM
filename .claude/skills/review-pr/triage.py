@@ -2923,14 +2923,26 @@ def _check_coverage_line(card_text, work_dir=None):
         if "[underivable" in text or "[derivation-failed" in text:
             return []          # Step 1 measured nothing; no verdict exists to drop
         if "[diff-too-large" in text:
-            # GitHub refusing the diff IS the measurement, and it is the strongest one.
+            # GitHub refusing the diff IS the measurement, and it is the strongest one:
+            # over 20000 lines is an order of magnitude past BIG_ADDED, so this diff is
+            # BEYOND ONE PASS by definition and the card has to say the words. Checking
+            # only that SOME coverage line was present let the softening the measured
+            # path exists to refuse walk through on the largest diff of all.
+            want = ("  coverage: BEYOND ONE PASS -- GitHub would not serve this diff "
+                    "(over 20000 lines). Findings below are a sample, not a sweep.")
             for line in (card_text or "").splitlines():
-                if line.strip().lower().startswith("coverage:"):
-                    return []
+                st = line.strip()
+                if st.lower().startswith("coverage:"):
+                    if "BEYOND ONE PASS" in st:
+                        return []
+                    return [("SOFTENED-COVERAGE", st[:70],
+                             "GitHub would not serve this diff, and the card reports it as "
+                             "an ordinary one -- the findings read as complete when they "
+                             f"are a sample. Write: `{want.strip()}`")]
             return [("MISSING-COVERAGE", "[diff-too-large]",
                      "GitHub would not serve this diff (over 20000 lines), which makes it "
-                     "the largest PR this bot reviews -- the card must say the findings "
-                     "are a sample, not a sweep")]
+                     "the largest PR this bot reviews. rules.txt has no line to copy here, "
+                     f"so write: `{want.strip()}`")]
         return [("UNCHECKED-COVERAGE", "rules.txt has no `coverage:` line",
                  "this is not Step 1's output, so the card's coverage claim was compared "
                  "against nothing -- re-run `triage.py rules` into this work dir")]
