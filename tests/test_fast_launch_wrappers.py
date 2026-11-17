@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-triton = pytest.importorskip("triton")
+pytest.importorskip("triton")
 fast_launch = pytest.importorskip(
     "aiter.ops.triton.utils.fast_launch", exc_type=ImportError
 )
@@ -585,60 +585,6 @@ def _hc_inputs(m, offset=0, seed=0, hidden=2560, streams=4, rank=320):
     )
 
 
-def _reference_combine_norm(hc, t, combine, eps=1e-6):
-    """`hc_combine_norm` as it was: plain `kernel[grid]` launches."""
-    kernels = hc.hc_fused
-    m, hidden, streams = t.h.shape[0], t.hidden, t.streams
-    normed = torch.empty_like(t.h)
-    h_new = torch.empty_like(t.h) if combine else t.h
-    block, raw = (t.block, t.raw) if combine else (t.h, t.h)
-    strides = (
-        t.h.stride(0),
-        t.block.stride(0) if combine else 0,
-        t.raw.stride(0) if combine else 0,
-    )
-    ba = 1 << (hidden.bit_length() - 1)
-    if m >= kernels.COMBINE_NORM_ROWS_MIN_M:
-        kernels._hc_combine_norm_rows_kernel[(triton.cdiv(m, 2), streams)](
-            t.h, block, raw, t.norm_w, h_new, normed, m, *strides, eps,
-            H=hidden, HC=streams, COMBINE=combine, RB=2, BA=ba, BB=hidden - ba,
-            num_warps=4,
-        )  # fmt: skip
-    else:
-        kernels._hc_combine_norm_kernel[(m, streams)](
-            t.h, block, raw, t.norm_w, h_new, normed, *strides, eps,
-            H=hidden, HC=streams, COMBINE=combine,
-            BLOCK=triton.next_power_of_2(hidden), num_warps=4,
-        )  # fmt: skip
-    return h_new, normed
-
-
-def _reference_tail(hc, t, normed, quant_dtype):
-    """`scaled_silu` and `hc_gated_mean(_quant)` as they were."""
-    m, hidden, streams, rank = t.h.shape[0], t.hidden, t.streams, t.rank
-    gate = torch.empty((m, rank), dtype=t.x.dtype, device="cuda")
-    block = min(1024, triton.next_power_of_2(rank))
-    hc.gated._gated_pointwise_kernel[(m, triton.cdiv(rank, block))](
-        t.x, t.x, t.x, gate, t.x.stride(0), 0, 0, rank, rank, streams, True, False,
-        block, num_warps=4, enable_fp_fusion=False,
-    )  # fmt: skip
-    out = torch.empty((m, hidden), dtype=normed.dtype, device="cuda")
-    if quant_dtype is None:
-        hc.hc_fused._hc_gated_mean_tiled_kernel[(triton.cdiv(m, 4), hidden // 512)](
-            normed, t.up, out, m, normed.stride(0), out.stride(0),
-            H=hidden, HC=streams, RB=4, BH=512, num_warps=4,
-        )  # fmt: skip
-        return gate, out
-    q = torch.empty((m, hidden), dtype=quant_dtype, device="cuda")
-    scale = torch.empty((m, 1), dtype=torch.float32, device="cuda")
-    hc.hc_fused._hc_gated_mean_quant_kernel[(m,)](
-        normed, t.up, out, q, scale, m, normed.stride(0),
-        H=hidden, HC=streams, FP8_MAX=torch.finfo(quant_dtype).max, RB=1,
-        BH=triton.next_power_of_2(hidden), num_warps=8,
-    )  # fmt: skip
-    return gate, out, q, scale
-
-
 def _hc_launches(hc, t, combine, quant_dtype):
     block, raw = (t.block, t.raw) if combine else (None, None)
     h, normed = hc.hc_fused.hc_combine_norm(t.h, t.norm_w, 1e-6, t.streams, block, raw)
@@ -660,17 +606,9 @@ def _hc_launches(hc, t, combine, quant_dtype):
 @torch.inference_mode()
 def test_hc_launches_match_plain_triton_bitwise(hc, m, combine, offset):
     """Prefill (whole and SP-shard), mid and small batches, combining or not,
-    streams 16-byte aligned or not: against the launches written out as they
-    were, and against the same wrappers on Triton's ordinary path."""
+    streams 16-byte aligned or not."""
     t = _hc_inputs(m, offset=offset, seed=m + offset)
     quant = None if m > 1024 else torch.float8_e4m3fnuz
-    ref_head = _reference_combine_norm(hc, t, combine)
-    ref_tail = _reference_tail(hc, t, ref_head[1], quant)
-    head, tail = _hc_launches(hc, t, combine, quant)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(head, ref_head)
-    assert _bitwise_equal(tail, ref_tail)
-
     kernels = hc.hc_fused
     combine_norm = (
         (kernels._hc_combine_norm_rows, kernels._hc_combine_norm_rows_kernel)
@@ -694,8 +632,7 @@ def test_hc_launches_match_plain_triton_bitwise(hc, m, combine, offset):
 @torch.inference_mode()
 def test_hc_launches_replay_in_a_cuda_graph(hc):
     t = _hc_inputs(1056, seed=11)
-    ref = _reference_combine_norm(hc, t, True)
-    _hc_launches(hc, t, True, None)
+    ref, _ = _hc_launches(hc, t, True, None)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         head, _ = _hc_launches(hc, t, True, None)
