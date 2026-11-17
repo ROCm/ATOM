@@ -18,7 +18,17 @@ def _mxfp4_kv_refusal(config) -> str | None:
     if config.torch_dtype != torch.bfloat16:
         # aiter's MXFP4 pa_decode only writes bf16; an fp16 model fails in its first forward.
         return f"it needs a bfloat16 model, got {config.torch_dtype}"
-    if config.kv_transfer_config:
+    kvt = config.kv_transfer_config
+    # An NVFP4 page is one self-contained field (data and scales inline, the global
+    # K/V scale a constant 1.0) and the NVFP4 index entry one page too: the
+    # in-process lmcache_offload connector moves them as opaque per-block bytes.
+    # P-D connectors reshard by head runs, which do not describe this layout.
+    nvfp4_offload_ok = (
+        config.kv_cache_dtype == "nvfp4"
+        and isinstance(kvt, dict)
+        and kvt.get("kv_connector") == "lmcache_offload"
+    )
+    if kvt and not nvfp4_offload_ok:
         # Offload / P-D transfer moves pages by a layout that does not know this format.
         return "it does not run with KV offload or --kv-transfer-config"
     if config.sequence_parallel_size > 1:
