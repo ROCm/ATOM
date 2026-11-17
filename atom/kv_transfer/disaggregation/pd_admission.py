@@ -233,10 +233,11 @@ class PdAdmissionController:
     def _growth_blocks(self, seq, held: int) -> int:
         # Past the blocks `seq` holds, which can lead its length by a draft
         # lookahead already allocated or trail it by the block this step's
-        # decode has yet to take. No more than it may still generate.
-        tokens = min(
-            self.reserve_tokens, max(0, seq.max_tokens - seq.num_completion_tokens)
-        )
+        # decode has yet to take. No more than it may still generate, but no
+        # less than the lookahead its next decode allocates whatever is left.
+        left = max(0, seq.max_tokens - seq.num_completion_tokens)
+        lookahead = self._block_manager.draft_lookahead
+        tokens = max(min(self.reserve_tokens, left), lookahead)
         return max(0, self._block_manager.num_pool_blocks(len(seq) + tokens) - held)
 
     def _charged_hits(self, probe, offset: int) -> int:

@@ -123,6 +123,7 @@ def standalone(max_bytes, *, reserve_tokens=None, free_blocks=0):
     connector = SimpleNamespace(pd_receive_block_offset=lambda seq, n, cached: 0)
     block_manager = SimpleNamespace(
         num_pool_blocks=lambda tokens: tokens,
+        draft_lookahead=0,
         draft_lookahead_blocks=lambda tokens: 0,
         kv=SimpleNamespace(lookup=lambda h: -1, num_free=free_blocks),
     )
@@ -339,9 +340,12 @@ def test_decode_reserve_starts_from_the_blocks_a_request_holds():
 
 
 @pytest.mark.parametrize("num_kvcache_blocks, b_admitted", [(6, True), (5, False)])
+# B has plenty left to generate, or is a 6-token prompt with one token left,
+# fewer than the lookahead.
+@pytest.mark.parametrize("b_tokens, b_max_tokens", [(8, 64), (6, 1)])
 @pytest.mark.parametrize("chunked", [False, True])
 def test_decode_reserve_counts_the_draft_lookahead_once(
-    build, chunked, num_kvcache_blocks, b_admitted
+    build, chunked, b_tokens, b_max_tokens, num_kvcache_blocks, b_admitted
 ):
     sched, request = build(
         chunked=chunked,
@@ -352,23 +356,28 @@ def test_decode_reserve_counts_the_draft_lookahead_once(
         options={"enabled": True, "num_reserved_decode_tokens": 4},
     )
     bm = sched.block_manager
-    assert bm.draft_lookahead_blocks(8) == 1
-    a, b = request(), request()
+    assert bm.draft_lookahead_blocks(b_tokens) == 1
+    a, b = request(), request(b_tokens)
+    b.max_tokens = b_max_tokens
     sched.extend([a, b])
     sched.schedule()
     # A receives its two prompt blocks; its lookahead block waits for its
-    # first decode. B takes two blocks too, and A and B each need one more to
-    # grow by 4 tokens, their lookahead included: 6 blocks admit B with none
-    # to spare and 5 do not. Charging B's lookahead now, or reserving it on
-    # top of the growth, would defer B at 6; leaving it out of the reserve
-    # would admit B at 5.
+    # first decode. B takes two blocks too. Each needs one more to grow by 4
+    # tokens, their lookahead included, and B with one token left still needs
+    # it for the lookahead its first decode allocates: 6 blocks admit B with
+    # none to spare and 5 do not. Charging B's lookahead now, or reserving it
+    # on top of the growth, would defer B at 6; leaving it out of the reserve,
+    # or capping B's growth at the one token it has left, would admit B at 5.
     assert len(a.block_table) == 2
     assert bool(b.block_table) is b_admitted
     assert sched.pd_admission.deferred["free_kv"] == (0 if b_admitted else 1)
     sched._update_from_kv_xfer_finished(receive_success(a))
     batch, _ = sched.schedule()
-    # A's first decode takes the lookahead block the reserve kept free.
+    # A's first decode starts past T0 and its 3 verify slots, so it takes two
+    # blocks, not only its lookahead's; B has yet to decode, so nothing is
+    # preempted.
     assert a.id in batch.req_ids
+    assert len(a.block_table) == 4
     assert bm.draft_writes_allocated(a)
     assert sched.total_preemptions == 0
 
