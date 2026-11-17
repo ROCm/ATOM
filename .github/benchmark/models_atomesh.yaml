@@ -2701,7 +2701,7 @@ models:
             common: *m31b_common_env
             # The P/D decode's features on GPUs 0-3, plus LMCache on their NUMA0 (the launcher
             # starts a Store only for a P/D prefill); 4 x 256 GiB, the pin the rocm7 THP fix validated.
-            decode:
+            decode: &m31b_agg_decode_env
               <<: *m31b_decode_env
               HIP_VISIBLE_DEVICES: "0,1,2,3"
               LMCACHE_LOCAL_CPU: "True"
@@ -2791,6 +2791,51 @@ models:
               max_num_seqs: 128
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 2.88
+
+        # v2, the aggregated layout of recipes/MiniMax-M3-Agentic-InferenceX.md: ranks two per
+        # socket (GPUs 0,1,4,5) so each NUMA pins 2 x 448 GiB of LMCache, SLRU in HBM and in
+        # the CPU tier, utilization 0.95 and 32K prefill chunks.
+        - &m31b_agg2_agentx
+          <<: *m31b_agg_agentx
+          name: m31b-nvfp4-agg2-tp4-dspark7-lmcache-agentx-c64
+          display_topology: AGG2-TP4-DSPARK7-NVFP4-LMCACHE
+          concurrency: [64]
+          decode: *m31b_agg_decode_c64
+          server:
+            common_args: &m31b_agg2_args
+              <<: *m31b_agg_args
+              max_num_seqs: 128
+              gpu_memory_utilization: 0.95
+              max_num_batched_tokens: 32768
+          env:
+            common: *m31b_common_env
+            decode:
+              <<: *m31b_agg_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,4,5"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "448"
+              LMCACHE_CACHE_POLICY: ATOM_SLRU
+              ATOM_PREFIX_CACHE_POLICY: slru
+              ATOM_PREFIX_CACHE_PROTECTED_RATIO: "0.5"
+
+        - <<: *m31b_agg2_agentx
+          name: m31b-nvfp4-agg2-tp4-dspark3-lmcache-agentx-c64
+          display_topology: AGG2-TP4-DSPARK3-NVFP4-LMCACHE
+          server:
+            common_args:
+              <<: *m31b_agg2_args
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.88
+
+        - <<: *m31b_agg2_agentx
+          name: m31b-nvfp4-agg2-tp4-dspark7-lmcache-agentx-c80
+          concurrency: [80]
+          decode:
+            <<: *m31b_agg_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160]"
+          server:
+            common_args:
+              <<: *m31b_agg2_args
+              max_num_seqs: 160
 
 
     accuracy:
