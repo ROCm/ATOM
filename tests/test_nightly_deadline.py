@@ -19,6 +19,7 @@ WORKFLOW = (
 BENCHMARK = "atom-sglang-benchmark.yaml"
 ACCURACY = "atom-sglang-accuracy-validation.yaml"
 VLLM_BENCHMARK = "atom-vllm-benchmark.yaml"
+VLLM_ACCURACY = "atom-vllm-accuracy-validation.yaml"
 
 # State lives in $FAKE_GH: unfinished/<workflow> holds a run id per line,
 # list_fails/<workflow> makes listing that workflow fail, and cancel_mode /
@@ -105,8 +106,8 @@ def test_nothing_unfinished_is_green(deadline):
     assert (code, posts) == (0, [])
 
 
-def test_deadline_covers_sglang_and_vllm_benchmark():
-    assert _script()[0].split() == [BENCHMARK, ACCURACY, VLLM_BENCHMARK]
+def test_deadline_covers_sglang_and_vllm_benchmark_and_accuracy():
+    assert _script()[0].split() == [BENCHMARK, ACCURACY, VLLM_BENCHMARK, VLLM_ACCURACY]
 
 
 def test_runs_that_stop_on_cancel_are_not_force_cancelled(deadline):

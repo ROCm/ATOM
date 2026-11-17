@@ -12,6 +12,7 @@ import textwrap
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
@@ -123,12 +124,19 @@ def test_accuracy_rejects_a_nightly_case_without_a_weekday(tmp_path):
     assert "needs nightly_weekday" in result.stderr
 
 
-def test_benchmark_schedule_runs_are_stopped_by_the_nightly_deadline():
-    # The deadline stops a workflow's runs titled "(scheduled MI355)".
-    assert (
-        "format('{0} (scheduled MI355)', github.workflow)"
-        in _workflow(BENCHMARK)["run-name"]
-    )
+@pytest.mark.parametrize("workflow_path", [BENCHMARK, ACCURACY])
+def test_scheduled_runs_are_stopped_by_the_nightly_deadline(workflow_path):
+    # The deadline stops a listed workflow's runs titled "(scheduled MI355)".
+    run_name = _workflow(workflow_path)["run-name"]
+    assert "format('{0} (scheduled MI355)', github.workflow)" in run_name
     deadline = _workflow(DEADLINE)["jobs"]["stop-overrunning-nightly-runs"]
-    assert "atom-vllm-benchmark.yaml" in deadline["env"]["WORKFLOWS"].split()
+    assert workflow_path.name in deadline["env"]["WORKFLOWS"].split()
     assert 'endswith("(scheduled MI355)")' in DEADLINE.read_text()
+
+
+def test_accuracy_jobs_no_longer_skip_late_in_the_beijing_day():
+    job = _workflow(ACCURACY)["jobs"]["oot-model-accuracy-priority-1"]
+    window = job["steps"][0]
+    assert window["id"] == "validation-window"
+    assert "MIN_REMAINING_MINUTES" not in window.get("env", {})
+    assert "remaining" not in window["run"]
