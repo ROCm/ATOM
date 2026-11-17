@@ -1232,7 +1232,9 @@ def fused_qk_norm(
     # Small batch: XBLOCK=1 minimizes register pressure per program.
     # Large batch: XBLOCK=2 amortizes overhead, but XBLOCK>2 hurts due to
     # cross-token stride jumps in non-contiguous split views.
+    # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
     XBLOCK = 2 if total_rows > 8192 else 1
+    NUM_WARPS = 1
     # When q_weight is None pass k_weight as a placeholder pointer (the
     # kernel won't load from it — Q_HAS_WEIGHT=False gates the load).
     q_weight_arg = q_weight if q_weight is not None else k_weight
@@ -1256,8 +1258,7 @@ def fused_qk_norm(
         Q_HAS_WEIGHT=q_weight is not None,
         RBLOCK=RBLOCK,
         XBLOCK=XBLOCK,
-        # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
-        num_warps=1,
+        num_warps=NUM_WARPS,
     )
     return q_out, k_out
 
