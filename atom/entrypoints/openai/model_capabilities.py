@@ -67,6 +67,8 @@ def chat_rendering(
         "default_kwargs": dict(defaults),
         "reasoning_toggle": toggle,
         "reasoning_rules": rules.name,
-        "template_efforts": sorted(VALID_TEMPLATE_EFFORTS),
+        "template_efforts": (
+            sorted(VALID_TEMPLATE_EFFORTS) if rules.name == "chat" else None
+        ),
         "encoder": None if encoder is None else encoder.rendering(),
     }

@@ -187,6 +187,9 @@ def test_servers_report_the_fixture_renderings(servers):
     ids=lambda case: f"{case['rendering']} {json.dumps(case['request'])}",
 )
 def test_chats_render_with_the_fixture_kwargs(servers, case):
+    # The request model ignores unknown fields, so a misspelt one would test
+    # another request.
+    assert case["request"].keys() <= ChatCompletionRequest.model_fields.keys()
     server = servers[case["rendering"]]
     if case["kwargs"] is None:
         with pytest.raises(ValueError):
