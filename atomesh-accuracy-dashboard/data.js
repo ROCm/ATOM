@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794853082886,
+  "lastUpdate": 1794943775072,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -5068,6 +5068,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8946,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/43904897081 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611151511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1736 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Felix Li",
+            "username": "coderfeli",
+            "email": "felix.li@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "8713a5e974d99fdba48835a68fdcbbed07fa6150",
+          "message": "[mono] Keep FlyDSL's disk cache on for checked builds; no source locations for serving builds (#3348)\n\n* [mono] Keep FlyDSL's disk cache on for checked builds; no source locations for serving builds\n\nFlyDSL 0.5.0 traces a build before it looks it up in its disk cache (the key\nis the traced module), so a cached build is still traced, recorded and\nchecked. Stop forcing FLYDSL_RUNTIME_ENABLE_CACHE=0 in Qwen3.8's and the V4.1\nhi checked builds and in the V4.1 / MiniMax-M3 contract and gfx1250 trace\ntests, and fix the comments and docs that said a cached build is not traced.\n\nsrcloc: drop the 0.4-era fingerprinted location capture; scoped() keeps one\nframe a location for the checked builds, unlocated() captures none for the\nengine's builds (without debug info the binary and its cache key carry no\nlocations). CPU tests for both.\n\nThe first launch still traces each program again (COMPILE_ONLY returns no\ncallable); that belongs in aiter's _preload_compiled once its FlyDSL pin\nincludes FlyDSL#1392.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [mono] Say debug info brings the serving builds' source locations back\n\nsrcloc.unlocated() falls back to scoped() when FLYDSL_DEBUG_ENABLE_DEBUG_INFO\nis set; the hi compile_traced docstrings and the srcloc module docstring now\nsay so. compile_traced is annotated -> Record | None.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-17T15:58:06Z",
+          "url": "https://github.com/ROCm/ATOM/commit/8713a5e974d99fdba48835a68fdcbbed07fa6150"
+        },
+        "date": 1794943774394,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44123216193 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611171508 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8901,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/44123216193 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611171508 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1471 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
