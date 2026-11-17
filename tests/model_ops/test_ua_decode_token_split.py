@@ -80,6 +80,43 @@ def test_the_host_value_is_aiters(monkeypatch, programs, lo, hi):
             assert host(lens, constants, pages) == int(ref)
 
 
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_k4v8", "fp8_k4v4pt"])
+def test_the_constants_follow_the_v_format(monkeypatch, kv_cache_dtype):
+    """The target builder's and the draft's split constants are aiter's for the
+    pool's V dtype: an fp4pt V (A8K4V4PT) takes aiter's fp4pt minimum tiles a
+    segment, so the host value and the grid aiter sizes from the V cache agree."""
+    import importlib
+
+    from atom.model_ops.attentions.aiter_attention import (
+        AiterAttentionMetadataBuilder,
+    )
+    from atom.model_ops.attentions.mha_kv_pool import mha_kv_dtypes
+    from atom.spec_decode.eagle_fused_glue import draft_token_split
+
+    # ATOM's import can re-import aiter's module: patch the object its callers import now
+    live = importlib.import_module("aiter.ops.triton.attention.unified_attention")
+    monkeypatch.setenv("ATOM_UA_DECODE_TOKEN_SPLIT", "1")
+    monkeypatch.setattr(live, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(live, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(live, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
+    monkeypatch.setattr(live, "_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT", 8)
+    ps = importlib.import_module("aiter.dist.parallel_state")
+    monkeypatch.setattr(ps, "get_tp_group", lambda: NS(world_size=1))
+    v_dtype = mha_kv_dtypes(kv_cache_dtype)[0]
+    want = live.gfx12_token_split_constants(v_dtype)
+    assert want[1] == (8 if kv_cache_dtype == "fp8_k4v4pt" else 16)
+    runner = NS(
+        kv_cache_dtype=kv_cache_dtype,
+        config=NS(hf_config=NS(num_key_value_heads=KV_HEADS)),
+    )
+    builder = NS(model_runner=runner, block_size=PAGE)
+    got = AiterAttentionMetadataBuilder._decode_token_split_constants(builder, KV_HEADS)
+    assert got == (PAGE, KV_HEADS, *want)
+    draft = draft_token_split(builder, "cpu")
+    assert (draft.programs, draft.min_tiles, draft.max_tiles) == want
+    assert int(draft.tiles[0]) == want[1]
+
+
 def _layer():
     return NS(
         _reject_per_token_scales_on_unified=lambda *a: None,

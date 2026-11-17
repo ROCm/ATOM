@@ -877,7 +877,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             )
         except ImportError:
             return None
-        constants = gfx12_token_split_constants()
+        # the minimum tiles a segment follow the V format (fp4pt V: aiter's _FP4PT minimum)
+        v_dtype = mha_kv_dtypes(self.model_runner.kv_cache_dtype)[0]
+        constants = gfx12_token_split_constants(v_dtype)
         if constants is None:
             return None
         return (triton.next_power_of_2(self.block_size), num_kv_heads, *constants)

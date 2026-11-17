@@ -668,7 +668,11 @@ def draft_token_split(builder, device) -> DraftTokenSplit | None:
         )
     except ImportError:
         return None
-    constants = gfx12_token_split_constants()
+    from atom.model_ops.attentions.mha_kv_pool import mha_kv_dtypes
+
+    # the minimum tiles a segment follow the V format, as in the target's decode split
+    v_dtype = mha_kv_dtypes(builder.model_runner.kv_cache_dtype)[0]
+    constants = gfx12_token_split_constants(v_dtype)
     if constants is None:
         return None
     hf_config = builder.model_runner.config.hf_config
