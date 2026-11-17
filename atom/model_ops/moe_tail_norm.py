@@ -1230,6 +1230,23 @@ def pad_router_weight(weight: Tensor) -> Tensor:
     return padded
 
 
+def router_logits_gemm(x: Tensor, w_router_padded: Tensor, n_router: int) -> Tensor:
+    """x @ w_router.T [M, n_router] by the a16w16 GEMM: bitwise the logits of
+    `router_shared_expert` (both kernels run the a16w16 K chain)."""
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+    return gemm_a16w16(x, w_router_padded[:n_router], None, x.dtype)
+
+
+def shared_expert_gemms(x: Tensor, w_gate_up: Tensor, w_down: Tensor) -> Tensor:
+    """The bf16 shared expert by two GEMMs (gated gate_up, down): bitwise the
+    shared output of `router_shared_expert`. `w_gate_up` is interleaved."""
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+    h = _silu_gate_up_gemm_impl(x, w_gate_up)
+    return gemm_a16w16(h, w_down, None, x.dtype)
+
+
 def router_shared_expert(
     x: Tensor,
     w_router_padded: Tensor,

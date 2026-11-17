@@ -580,6 +580,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_FUSED_ROUTER_SHARED_EXPERT_PREFILL_MIN_TOKENS", "513")
     ),
+    # Qwen3-Next / Qwen3.5 sparse MoE block at TP1 (gfx1250), steps of
+    # ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS to _MAX_TOKENS rows: the
+    # router GEMM alone on the main stream, the bf16 shared expert (gate_up +
+    # SiLU-and-mul, down) on a side stream beside the routed experts, joined
+    # before the norm that sums them. From _LATE_MIN_TOKENS rows the side
+    # stream forks after the routing / activation-quant launch (beside the
+    # expert GEMMs only) instead of right after the router. Bitwise the fused
+    # router + shared kernel and the separate GEMMs. Takes precedence over
+    # ATOM_FUSED_ROUTER_SHARED_EXPERT in its row range. Off by default.
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM": lambda: (
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM", "0") == "1"
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS", "129")
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MAX_TOKENS", "65536")
+    ),
+    "ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_LATE_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_LATE_MIN_TOKENS", "3072")
+    ),
     # Qwen3.5 MTP drafter at TP > 1: the target's all-reduce fusions. o_proj, its
     # all-reduce and post_attention_layernorm run as aiter's gfx1250 GEMM +
     # all-reduce + RMSNorm (TP4, up to 128 rows; else the GEMM, then the fused
@@ -739,6 +760,72 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-chunk factors exp(g_last - g_i) and exp(g_last); chunk_h reads them
     # instead of the gates. Bit-identical outputs. On by default; 0 = chunk_h reads the gates.
     "ATOM_GDN_CHUNK_H_DECAY": lambda: os.getenv("ATOM_GDN_CHUNK_H_DECAY", "1") == "1",
+    # gfx1250 GDN prefill state walk (chunk_h) in a token graph. The plan's sequence capacity
+    # picks the 128-wide value tile, which leaves most CUs idle at one sequence. 2 (default) =
+    # the kernel picks 32 wide while the step's workgroups fit the CUs (1-2 sequences) and 128
+    # otherwise; 1 = always 32 wide (faster for one long plus short sequences, slower for 3+
+    # similar ones); 0 = the capacity's tile. Same outputs bitwise.
+    "ATOM_GDN_CHUNK_H_PLAN_TILE": lambda: int(
+        os.getenv("ATOM_GDN_CHUNK_H_PLAN_TILE", "2")
+    ),
+    # gfx1250 GDN prefill state walk (chunk_h) with exact checkpoints: each chunk's checkpoint slot
+    # is read a chunk ahead (a vector register), not at the chunk, where every chunk of the walk
+    # waited for the load. Same outputs bitwise. On by default; 0 = read at the chunk.
+    "ATOM_GDN_CHUNK_H_CKPT_AHEAD": lambda: os.getenv("ATOM_GDN_CHUNK_H_CKPT_AHEAD", "1")
+    == "1",
+    # gfx1250 GDN prefill state walk (chunk_h): the initial state loads unconditionally and a
+    # select zeroes a cold sequence's, instead of a load masked by the sequence's flag (which
+    # compiles to a branch per element: 2.7 KB of code, ~1.2 us of the prologue). Same outputs
+    # bitwise. On by default; 0 = the masked load.
+    "ATOM_GDN_CHUNK_H_H0_SELECT": lambda: os.getenv("ATOM_GDN_CHUNK_H_H0_SELECT", "1")
+    == "1",
+    # GDN state checkpoint copy: one program a block of the state looping over the step's
+    # targets (one vector read of the table) instead of one program a (target, block) pair,
+    # most of them padding. Same bytes written. On by default; 0 = the per-target grid.
+    "ATOM_GDN_CKPT_COPY_LOOP": lambda: os.getenv("ATOM_GDN_CKPT_COPY_LOOP", "1") == "1",
+    # gfx1250 GDN prefill fused KKT kernel, launches of at most this many 64-token chunks
+    # (the plan capacity; 40 = the 1536-token bucket): V loads into its own LDS tile with K
+    # at the start, and the grid runs head-fastest (live chunks dispatch first, a key head's
+    # two value heads on one XCD). Larger launches keep the chunk-fastest grid and the V load
+    # after the W store. Same outputs bitwise. 0 = never.
+    "ATOM_GDN_KKT_SMALL_MAX_CHUNKS": lambda: int(
+        os.getenv("ATOM_GDN_KKT_SMALL_MAX_CHUNKS", "40")
+    ),
+    # gfx1250: Triton / Gluon kernels whose name matches this regular expression get an
+    # instruction prefetch prologue (utils/gfx1250_inst_prefetch.py): the kernel's whole code is
+    # requested into the instruction cache at its start. In a layer the kernels evict each other's
+    # code and a cold cache costs ~0.4-0.5 us per KB of straight-line code. Same outputs bitwise.
+    # "" = off.
+    "ATOM_INST_PREFETCH_KERNELS": lambda: os.getenv("ATOM_INST_PREFETCH_KERNELS", ""),
+    # GDN prefill causal conv1d: token rows (the graph bucket) from which the persistent TDM
+    # kernel runs instead of the rows kernel. It rounds differently (its SiLU and the
+    # unrounded q / k norm input), so lowering this changes those buckets' bits; 2048 makes
+    # the 2048 / 3072 buckets' conv 3-5 us faster. Default 4096 (as before).
+    "ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS", "4096")
+    ),
+    # GDN prefill causal conv1d (buckets below ATOM_GDN_CONV_PERSISTENT_MIN_TOKENS):
+    # `_causal_conv1d_fwd_rows_v2_kernel`, every load issued before the first use and no
+    # branch between them (the rows kernel waits on about a dozen dependent memory round
+    # trips: one scalar table load after another, each of its 8 rows in turn, then the
+    # final-state rows again). Same outputs bitwise. In the GDN layer chain (instruction
+    # prefetch on) 455 tokens 7.9 -> 5.5 us, 1024 9.8 -> 8.0, 3000 18.9 -> 15.9. 0 = the rows
+    # kernel.
+    "ATOM_GDN_CONV_ROWS_V2": lambda: os.getenv("ATOM_GDN_CONV_ROWS_V2", "1") == "1",
+    # With ATOM_GDN_CONV_ROWS_V2: the GDN metadata builder also uploads the rows kernel's
+    # program table packed, [programs, 8] int32 (sequence, chunk, first token, end token,
+    # read slot, write slot, has-initial-state, 0) from host data, so a program reads every
+    # scalar in one round trip instead of two (another 0.3-0.7 us a layer). 0 = the kernel
+    # reads the sequence's entries itself.
+    "ATOM_GDN_CONV_PACKED_META": lambda: (
+        os.getenv("ATOM_GDN_CONV_PACKED_META", "1") == "1"
+    ),
+    # A8K4V8 attention prefill padded to a token-graph bucket (attention runs eagerly): the fused
+    # Q/K norm + MRoPE + KV-cache write computes only the scheduled rows (aiter `num_tokens`), not
+    # the bucket's pad rows, which nothing reads (the attention takes q[:scheduled]). 0 = all rows.
+    "ATOM_QK_NORM_ROPE_SCHEDULED_ROWS": lambda: (
+        os.getenv("ATOM_QK_NORM_ROPE_SCHEDULED_ROWS", "0") == "1"
+    ),
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
@@ -1454,10 +1541,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_DRAFT_PRESENCE_PENALTY": lambda: _flag_env(
         "ATOM_MTP_DRAFT_PRESENCE_PENALTY", "0"
     ),
+    # Speculative rejection sampling (model_ops/spec_rejection.py, TP1 draft LM
+    # head): the draft passes draw their tokens from the draft head's
+    # distribution q with the verify's sampler (aiter topk_topp_sample: top
+    # ATOM_MTP_RS_DRAFT_TOPK logits, the request's temperature and top-p, the draft
+    # presence penalty in its kernel) and keep its record of q; a verify row
+    # accepts its draft with min(1, p/q) and otherwise draws from max(0, p - q),
+    # p the official sampler's own distribution. Exact like the default rule
+    # (draft = argmax, kept when the target's own sample equals it); more drafts
+    # stand when q is close to p. Verify steps the fused sampler does not serve,
+    # or with top_k not an int <= ATOM_MTP_RS_MAX_TOPK (at most 64), keep the
+    # default rule (still exact with sampled drafts).
+    "ATOM_MTP_REJECTION_SAMPLING": lambda: _flag_env(
+        "ATOM_MTP_REJECTION_SAMPLING", "0"
+    ),
+    "ATOM_MTP_RS_DRAFT_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_DRAFT_TOPK", "20")),
+    "ATOM_MTP_RS_MAX_TOPK": lambda: int(os.getenv("ATOM_MTP_RS_MAX_TOPK", "64")),
     # The MTP draft passes' LM head from a 128x128-block FP8 (e8m0 scales) copy of
     # the head (TP1): half the bytes a pass. The verify rows keep the bf16 head, so
     # only how often drafts are accepted can change, not the output distribution.
     "ATOM_MTP_DRAFT_LM_HEAD_FP8": lambda: _flag_env("ATOM_MTP_DRAFT_LM_HEAD_FP8", "0"),
+    # The MTP draft layer's attention over its last N positions only (0: full).
+    # A mask, the KV cache is unchanged; the verify keeps full attention.
+    "ATOM_MTP_DRAFT_ATTN_WINDOW": lambda: int(
+        os.getenv("ATOM_MTP_DRAFT_ATTN_WINDOW", "0")
+    ),
+    # Diagnostics: a directory; each engine appends one JSON line per finished
+    # request to spec_steps_<pid>.jsonl there (prompt length, the prompt's first
+    # 64 / last 16 ids, the completion ids, and the tokens each step emitted,
+    # negative for a step that verified no drafts). For offline studies of
+    # drafting policies against the realized MTP outcomes. Off when empty.
+    "ATOM_SPEC_STEP_LOG": lambda: os.getenv("ATOM_SPEC_STEP_LOG", ""),
     # With ATOM_MTP_FUSED_DRAFT_GLUE: skip the per-pass kv_indices generation
     # where no draft attention reads kv_indices (page sizes other than 256 / 1024,
     # whose persistent ASM decode is its only reader). kv_indptr is still written.

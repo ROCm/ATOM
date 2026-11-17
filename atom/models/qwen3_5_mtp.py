@@ -122,6 +122,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 self.mtp_start_layer_idx + self.num_mtp_layers,
             )
         )
+        # ATOM_MTP_DRAFT_ATTN_WINDOW: the draft layer attends to its last W
+        # positions only (a sliding-window mask on the full KV cache, nothing
+        # freed). The verify keeps full attention, so only how often drafts are
+        # accepted can change, not the output distribution.
+        draft_window = envs.ATOM_MTP_DRAFT_ATTN_WINDOW
+        if draft_window > 0:
+            for layer in self.layers:
+                layer.self_attn.attn.impl.sliding_window = draft_window
 
         self.norm = Qwen3_5RMSNorm(
             config.hidden_size,

@@ -1086,6 +1086,10 @@ class EagleProposer(Drafter):
                     next_input_ids = self.model.compute_draft_ids(
                         sample_hidden_states, out=exported
                     )
+                spec_rs = getattr(self, "spec_rs", None)
+                if spec_rs is not None:
+                    # ATOM_MTP_REJECTION_SAMPLING: this pass's q records.
+                    spec_rs.store_step(i, scheduled_bs, context)
 
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.
@@ -1384,6 +1388,7 @@ class EagleProposer(Drafter):
         step_ids = self.step.buffer("input_ids", running_bs)
         step_hidden = self.step.buffer("hidden_states", running_bs)
         step_positions = self.step.buffer("positions", running_bs)
+        spec_rs = getattr(self, "spec_rs", None)
         for i in range(self.mtp_k):
             with record_function(
                 f"propose_eagle[{i}/{self.mtp_k} "
@@ -1451,6 +1456,10 @@ class EagleProposer(Drafter):
                         positions=step_positions,
                         hidden_states=step_hidden,
                     )
+                if spec_rs is not None:
+                    # ATOM_MTP_REJECTION_SAMPLING: this pass's q records, before
+                    # the next pass overwrites the scratch they sit in.
+                    spec_rs.store_step(i, scheduled_bs, context)
 
                 if i == self.mtp_k - 1:
                     draft_ids[:, i].copy_(out_ids[:scheduled_bs])

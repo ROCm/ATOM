@@ -109,7 +109,8 @@ def _load_chunk(
 
 
 @gluon.jit
-def _chunk_h_gfx1250_kernel(
+def _walk(
+    wg,
     k,
     u,
     w,
@@ -146,6 +147,8 @@ def _chunk_h_gfx1250_kernel(
     USE_STATE_IDX: gl.constexpr,
     STORE_CKPT: gl.constexpr,
     PAIRED: gl.constexpr,
+    CKPT_AHEAD: gl.constexpr,
+    H0_SELECT: gl.constexpr,
 ):
     WMMA: gl.constexpr = _layout("WMMA", K, BLOCK_M, BLOCK_N)
     OP_A: gl.constexpr = _layout("OP_A", K, BLOCK_M, BLOCK_N)
@@ -158,18 +161,17 @@ def _chunk_h_gfx1250_kernel(
     SMEM_TILE: gl.constexpr = _layout("SMEM_TILE", K, BLOCK_M, BLOCK_N)
     SMEM_STATE: gl.constexpr = _layout("SMEM_STATE", K, BLOCK_M, BLOCK_N)
     SMEM_G: gl.constexpr = _layout("SMEM_G", K, BLOCK_M, BLOCK_N)
+    TILES: gl.constexpr = V // BLOCK_N
     if Hg % 8 == 0:
         # Workgroups go round-robin over 8 XCDs: keep the value tiles of a head
         # and the heads of a k head on one XCD.
-        TILES: gl.constexpr = V // BLOCK_N
         GROUP: gl.constexpr = H // Hg
-        wg = gl.program_id(1) * TILES + gl.program_id(0)
         pid_n = (wg // 8) % TILES
         pid_g = (wg // (8 * TILES * GROUP)) * 8 + wg % 8  # sequence * Hg + k head
         pid_m = pid_g * GROUP + (wg // (8 * TILES)) % GROUP
     else:
-        pid_n = gl.program_id(0)
-        pid_m = gl.program_id(1)
+        pid_n = wg % TILES
+        pid_m = wg // TILES
     sequence = pid_m // H
     head = pid_m % H
     if IS_VARLEN and HAS_N:  # noqa: SIM102 (a constexpr, then a device load)
@@ -283,7 +285,11 @@ def _chunk_h_gfx1250_kernel(
     offs_io = offs_k_io[:, None] * V + (start_n + offs_n_io)[None, :]
     if USE_STATE_IDX:
         if USE_INITIAL_STATE:
-            h0 = h0 + (gl.load(h0_idx + sequence).to(gl.int64) * H + head) * K * V
+            slot_in = gl.load(h0_idx + sequence)
+            if H0_SELECT:
+                # The unconditional load below must stay inside the pool even for a pad slot.
+                slot_in = gl.maximum(slot_in, 0)
+            h0 = h0 + (slot_in.to(gl.int64) * H + head) * K * V
         if STORE_FINAL_STATE:
             ht = ht + (gl.load(ht_idx + sequence).to(gl.int64) * H + head) * K * V
         use_h0 = gl.load(h0_flag + sequence) != 0
@@ -316,10 +322,19 @@ def _chunk_h_gfx1250_kernel(
         )
         if SAVE_NEW_VALUE:
             gl.amd.gfx1250.tdm.async_load(u_desc, [start_m, start_n], u_smem.index(i))
+    # H0_SELECT: a cold sequence's (stale) slot is zeroed by a select after an unconditional
+    # load; the uniform flag in a load mask compiles to a branch per element.
     if USE_INITIAL_STATE and h0.dtype.element_ty == gl.bfloat16:
         # A bf16 state converts in the shared memory left beside the ring buffers.
-        b_h0 = gl.load(h0 + offs_io, mask=(offs_io >= 0) & use_h0, other=0.0)
+        if H0_SELECT:
+            b_h0 = gl.where(use_h0, gl.load(h0 + offs_io, mask=offs_io >= 0), 0.0)
+        else:
+            b_h0 = gl.load(h0 + offs_io, mask=(offs_io >= 0) & use_h0, other=0.0)
         state = gl.convert_layout(b_h0, WMMA).to(gl.float32)
+    elif USE_INITIAL_STATE and H0_SELECT:
+        state = gl.where(
+            use_h0, gl.load(h0 + offs_state, mask=offs_state >= 0).to(gl.float32), 0.0
+        )
     elif USE_INITIAL_STATE:
         state = gl.load(h0 + offs_state, mask=(offs_state >= 0) & use_h0, other=0.0).to(
             gl.float32
@@ -330,6 +345,12 @@ def _chunk_h_gfx1250_kernel(
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_V))
     zero_v = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=WMMA_V)
+    if STORE_CKPT and CKPT_AHEAD:
+        # Each chunk's checkpoint slot is read a chunk ahead, into a vector register: a load
+        # at the chunk itself put its latency on every chunk of the serial walk.
+        CKPT_ROW: gl.constexpr = gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
+        ckpt_row = ckpt_slot + first_chunk + gl.zeros([1], gl.int32, layout=CKPT_ROW)
+        cslot_next = gl.load(ckpt_row)
 
     for chunk in range(num_chunks):
         buf = chunk % NB
@@ -338,13 +359,18 @@ def _chunk_h_gfx1250_kernel(
         gl.barrier()
         if STORE_CKPT:
             # Checkpoints preserve the incoming fp32 state before bf16 rounding.
-            cslot = gl.load(ckpt_slot + first_chunk + chunk)
+            if CKPT_AHEAD:
+                cslot = gl.max(cslot_next, 0)
+            else:
+                cslot = gl.load(ckpt_slot + first_chunk + chunk)
             if cslot >= 0:
                 gl.store(
                     ckpt_pool + (cslot.to(gl.int64) * H + head) * K * V + offs_state,
                     state.to(ckpt_pool.dtype.element_ty),
                     mask=offs_state >= 0,
                 )
+            if CKPT_AHEAD:
+                cslot_next = gl.load(ckpt_row + gl.minimum(chunk + 1, num_chunks - 1))
         h_cur = h_smem.index(buf)
         if EARLY_READS:
             # Read the operands of the first product before the TDM issue.
@@ -425,7 +451,186 @@ def _chunk_h_gfx1250_kernel(
 
     gl.amd.gfx1250.tdm.async_wait(0)
     if STORE_FINAL_STATE:
-        gl.store(ht + offs_io, gl.convert_layout(state.to(ht.dtype.element_ty), STATE_IO))
+        gl.store(
+            ht + offs_io, gl.convert_layout(state.to(ht.dtype.element_ty), STATE_IO)
+        )
+
+
+@gluon.jit
+def _chunk_h_gfx1250_kernel(
+    k,
+    u,
+    w,
+    v_new,
+    g,
+    decay,
+    h,
+    h0,
+    ht,
+    cu_seqlens,
+    chunk_offsets,
+    n_ptr,
+    h0_idx,
+    ht_idx,
+    h0_flag,
+    T,
+    NT_ALL,
+    ckpt_pool,
+    ckpt_slot,
+    H: gl.constexpr,
+    Hg: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    EARLY_READS: gl.constexpr,
+    USE_DECAY: gl.constexpr,
+    USE_INITIAL_STATE: gl.constexpr,
+    STORE_FINAL_STATE: gl.constexpr,
+    SAVE_NEW_VALUE: gl.constexpr,
+    IS_VARLEN: gl.constexpr,
+    HAS_N: gl.constexpr,
+    USE_STATE_IDX: gl.constexpr,
+    STORE_CKPT: gl.constexpr,
+    PAIRED: gl.constexpr,
+    ADAPT: gl.constexpr = False,
+    NUM_CUS: gl.constexpr = 256,
+    BUFFERS_WIDE: gl.constexpr = 2,
+    CKPT_AHEAD: gl.constexpr = False,
+    H0_SELECT: gl.constexpr = False,
+):
+    """`_walk` at BLOCK_N, or (ADAPT, a planned launch sized for BLOCK_N = 32) at 32 when the
+    step's sequences' workgroups all fit on the CUs at once, else at 128."""
+    wg = gl.program_id(1) * (V // BLOCK_N) + gl.program_id(0)
+    if ADAPT:
+        gl.static_assert(BLOCK_N == 32)
+        if gl.load(n_ptr) * (H * (V // 32)) <= NUM_CUS:
+            _walk(
+                wg,
+                k,
+                u,
+                w,
+                v_new,
+                g,
+                decay,
+                h,
+                h0,
+                ht,
+                cu_seqlens,
+                chunk_offsets,
+                n_ptr,
+                h0_idx,
+                ht_idx,
+                h0_flag,
+                T,
+                NT_ALL,
+                ckpt_pool,
+                ckpt_slot,
+                H,
+                Hg,
+                K,
+                V,
+                BLOCK_M,
+                32,
+                NUM_BUFFERS,
+                EARLY_READS,
+                USE_DECAY,
+                USE_INITIAL_STATE,
+                STORE_FINAL_STATE,
+                SAVE_NEW_VALUE,
+                IS_VARLEN,
+                HAS_N,
+                USE_STATE_IDX,
+                STORE_CKPT,
+                PAIRED,
+                CKPT_AHEAD,
+                H0_SELECT,
+            )
+        else:
+            _walk(
+                wg,
+                k,
+                u,
+                w,
+                v_new,
+                g,
+                decay,
+                h,
+                h0,
+                ht,
+                cu_seqlens,
+                chunk_offsets,
+                n_ptr,
+                h0_idx,
+                ht_idx,
+                h0_flag,
+                T,
+                NT_ALL,
+                ckpt_pool,
+                ckpt_slot,
+                H,
+                Hg,
+                K,
+                V,
+                BLOCK_M,
+                128,
+                BUFFERS_WIDE,
+                False,
+                USE_DECAY,
+                USE_INITIAL_STATE,
+                STORE_FINAL_STATE,
+                SAVE_NEW_VALUE,
+                IS_VARLEN,
+                HAS_N,
+                USE_STATE_IDX,
+                STORE_CKPT,
+                PAIRED,
+                CKPT_AHEAD,
+                H0_SELECT,
+            )
+    else:
+        _walk(
+            wg,
+            k,
+            u,
+            w,
+            v_new,
+            g,
+            decay,
+            h,
+            h0,
+            ht,
+            cu_seqlens,
+            chunk_offsets,
+            n_ptr,
+            h0_idx,
+            ht_idx,
+            h0_flag,
+            T,
+            NT_ALL,
+            ckpt_pool,
+            ckpt_slot,
+            H,
+            Hg,
+            K,
+            V,
+            BLOCK_M,
+            BLOCK_N,
+            NUM_BUFFERS,
+            EARLY_READS,
+            USE_DECAY,
+            USE_INITIAL_STATE,
+            STORE_FINAL_STATE,
+            SAVE_NEW_VALUE,
+            IS_VARLEN,
+            HAS_N,
+            USE_STATE_IDX,
+            STORE_CKPT,
+            PAIRED,
+            CKPT_AHEAD,
+            H0_SELECT,
+        )
 
 
 @functools.cache
@@ -533,6 +738,8 @@ def chunk_h_gfx1250(
     BLOCK_M,
     ckpt_pool,
     ckpt_slot,
+    config_n=None,
+    adapt=False,
 ):
     """Write chunk states, residual values, final states and requested checkpoints.
 
@@ -543,10 +750,22 @@ def chunk_h_gfx1250(
     None disables the initial/final state, residual output or checkpoints.
     Writes supplied buffers and returns None. Requires K=128, BLOCK_M=64,
     V divisible by the selected value tile width, and nonempty sequences.
+    config_n: the sequence count the tile choice assumes (default N, the grid's).
+    adapt (with n_ptr): the kernel picks the value tile width (32, or 128 for steps with
+    more sequences than fit the CUs at 32); the grid is sized for 32.
     """
+    num_cus = _num_cus(k.device.index)
     BLOCK_N, num_buffers, num_warps = launch_config(
-        N, H, V, NT_ALL, longest_chunks, _num_cus(k.device.index)
+        config_n or N, H, V, NT_ALL, longest_chunks, num_cus
     )
+    adapt = adapt and n_ptr is not None and BLOCK_N == 32 and V % 128 == 0
+    adapt_kw = {}
+    if adapt:
+        adapt_kw = {
+            "ADAPT": True,
+            "NUM_CUS": num_cus,
+            "BUFFERS_WIDE": _CONFIGS[128]["buffers"],
+        }
     _chunk_h_gfx1250_kernel[(triton.cdiv(V, BLOCK_N), N * H)](
         k,
         u,
@@ -584,5 +803,8 @@ def chunk_h_gfx1250(
         USE_STATE_IDX=h0_idx is not None,
         STORE_CKPT=ckpt_slot is not None,
         PAIRED=envs.ATOM_GDN_CHUNK_H_PAIRED_LOADS,
+        CKPT_AHEAD=envs.ATOM_GDN_CHUNK_H_CKPT_AHEAD,
+        H0_SELECT=envs.ATOM_GDN_CHUNK_H_H0_SELECT,
+        **adapt_kw,
         num_warps=num_warps,
     )

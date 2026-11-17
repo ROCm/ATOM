@@ -116,6 +116,8 @@ def _dummy_ok(layer) -> bool:
 def _fusable_rows(logits, x, top_k, decode_supported, prefill_supported) -> bool:
     """Whether one of aiter's fused kernels takes this many rows."""
     rows = logits.shape[0]
-    if 0 < rows <= _MAX_ROWS:
-        return decode_supported(logits, x, top_k, True)
+    # aiter may hand part of the decode range to its prefill kernel
+    # (AITER_TOPK_ROUTE_QUANT_DECODE_MAX_ROWS), so either kernel qualifies.
+    if 0 < rows <= _MAX_ROWS and decode_supported(logits, x, top_k, True):
+        return True
     return prefill_supported is not None and prefill_supported(logits, x, top_k, True)

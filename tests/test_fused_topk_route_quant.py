@@ -121,6 +121,33 @@ def test_prefill_rows_defer_to_the_prefill_kernel(env):
     assert len(calls) == 1
 
 
+def test_decode_rows_the_decode_kernel_declines_take_the_prefill_kernel(
+    env, monkeypatch
+):
+    """aiter may hand part of the decode range to its prefill kernel
+    (AITER_TOPK_ROUTE_QUANT_DECODE_MAX_ROWS): those rows still defer."""
+    import sys
+
+    from atom.model_ops.fused_moe.fused_topk_route_quant import (
+        try_defer_topk_route_quant,
+    )
+
+    calls, _ = env
+    fake = sys.modules["aiter.ops.flydsl.grouped_moe_gfx1250"]
+    monkeypatch.setattr(
+        fake, "fused_topk_route_quant_supported", lambda g, x, k, rn: g.shape[0] <= 256
+    )
+    monkeypatch.setattr(
+        fake,
+        "fused_topk_route_quant_prefill_supported",
+        lambda g, x, k, rn: 256 < g.shape[0] <= 1024,
+    )
+    logits = torch.zeros((300, 256), dtype=torch.bfloat16)
+    x = torch.zeros((300, 2048), dtype=torch.bfloat16)
+    assert try_defer_topk_route_quant(_method(), _layer(), x, logits) is not None
+    assert len(calls) == 1
+
+
 def test_too_many_rows_keeps_normal_route(env):
     from atom.model_ops.fused_moe.fused_topk_route_quant import (
         try_defer_topk_route_quant,

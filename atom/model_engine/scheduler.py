@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import enum
 import itertools
+import json
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -62,6 +64,36 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import timeline, tracing
 from atom.utils import envs
+
+_SPEC_STEP_LOG = envs.ATOM_SPEC_STEP_LOG
+_spec_step_file = None
+
+
+def _log_spec_steps(seq, reason, num_tokens) -> None:
+    """ATOM_SPEC_STEP_LOG: one JSON line for a finished request (see envs)."""
+    global _spec_step_file
+    try:
+        if _spec_step_file is None:
+            os.makedirs(_SPEC_STEP_LOG, exist_ok=True)
+            _spec_step_file = open(
+                os.path.join(_SPEC_STEP_LOG, f"spec_steps_{os.getpid()}.jsonl"),
+                "a",
+                buffering=1 << 20,
+            )
+        n_prompt = int(seq.num_prompt_tokens)
+        ids = seq.token_ids
+        rec = {
+            "id": str(seq.id),
+            "reason": str(reason),
+            "n_prompt": n_prompt,
+            "head": [int(t) for t in ids[: min(64, n_prompt)]],
+            "tail": [int(t) for t in ids[max(0, n_prompt - 16) : n_prompt]],
+            "out": [int(t) for t in ids[n_prompt : int(num_tokens)]],
+            "steps": list(getattr(seq, "_spec_emits", [])),
+        }
+        _spec_step_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception as e:  # diagnostics never fail a request
+        logger.warning("ATOM_SPEC_STEP_LOG: %s", e)
 
 if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
@@ -4321,6 +4353,16 @@ class Scheduler:
                     self.engine_stats.update_spec(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
+                if _SPEC_STEP_LOG:
+                    # ATOM_SPEC_STEP_LOG: tokens this step emitted, negative on
+                    # a step that verified no drafts.
+                    if not hasattr(seq, "_spec_emits"):
+                        seq._spec_emits = []
+                    seq._spec_emits.append(
+                        num_new_token
+                        if (num_new_token + num_rejected) > 1
+                        else -num_new_token
+                    )
                 # DSpark Phase 2: stash this step's scheduler-chosen ell on the
                 # seq so the NEXT decode schedule can size its verification to
                 # ell+1. Keyed by req_id (order-safe). Missing -> leave default
@@ -4646,6 +4688,8 @@ class Scheduler:
 
     def _mark_finished(self, seq, reason, num_tokens):
         tracing.finish(seq, reason=reason, num_tokens=num_tokens)
+        if _SPEC_STEP_LOG and reason != "aborted":
+            _log_spec_steps(seq, reason, num_tokens)
         # Set the reason before the connector decides whether to claim the
         # source blocks. This runs exactly once, including early cancellation
         # without sampled output and requests without a stream queue.

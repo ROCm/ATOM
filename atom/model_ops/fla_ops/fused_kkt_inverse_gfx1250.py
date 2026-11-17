@@ -7,6 +7,8 @@ import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from atom.utils import envs
+
 from .index import prepare_chunk_indices
 
 
@@ -213,22 +215,45 @@ def _fused_kkt_inverse_gfx1250_kernel(
     BLOCK_V: gl.constexpr,
     HAS_NT: gl.constexpr,
     STORE_DECAY: gl.constexpr,
+    EARLY_V: gl.constexpr = False,
+    HEADS_FIRST: gl.constexpr = False,
 ):
     L16: gl.constexpr = _layout("L16", K, V)
     OA16: gl.constexpr = _layout("OA16", K, V)
     OB16: gl.constexpr = _layout("OB16", K, V)
     SMEM_K: gl.constexpr = _layout("SMEM_K", K, V)
     SMEM_V: gl.constexpr = _layout("SMEM_V", K, V)
-    pid_m = gl.program_id(0)
-    pid_h = gl.program_id(1)
-    # Padded programs must return before reading chunk metadata.
-    if HAS_NT:
-        if pid_m >= gl.load(nt_ptr):
+    if HEADS_FIRST:
+        # Head-fastest grid: the live chunks' programs dispatch first; the two value heads
+        # of a key head share an XCD (workgroups go round-robin over 8).
+        lin = gl.program_id(0)
+        x = lin % 8
+        y = (lin // 8) % 4
+        pid_h = 2 * (x + 8 * (y // 2)) + y % 2
+        pid_m = gl.program_id(1)
+    else:
+        pid_m = gl.program_id(0)
+        pid_h = gl.program_id(1)
+    if HEADS_FIRST:
+        # The chunk's table row is read with the chunk count (clamped into the table);
+        # padded programs return before reading the sequence bounds.
+        pid_c = gl.minimum(pid_m, NT - 1)
+        seq = gl.load(chunk_indices + pid_c * 2).to(gl.int32)
+        t0 = gl.load(chunk_indices + pid_c * 2 + 1).to(gl.int32) * BLOCK_M
+        if HAS_NT:
+            if pid_m >= gl.load(nt_ptr):
+                return
+        elif pid_m >= NT:
             return
-    elif pid_m >= NT:
-        return
-    seq = gl.load(chunk_indices + pid_m * 2).to(gl.int32)
-    t0 = gl.load(chunk_indices + pid_m * 2 + 1).to(gl.int32) * BLOCK_M
+    else:
+        # Padded programs must return before reading chunk metadata.
+        if HAS_NT:
+            if pid_m >= gl.load(nt_ptr):
+                return
+        elif pid_m >= NT:
+            return
+        seq = gl.load(chunk_indices + pid_m * 2).to(gl.int32)
+        t0 = gl.load(chunk_indices + pid_m * 2 + 1).to(gl.int32) * BLOCK_M
     bos = gl.load(cu_seqlens + seq).to(gl.int32)
     M = gl.load(cu_seqlens + seq + 1).to(gl.int32) - bos - t0
     start_m = (bos + t0).to(gl.int64)
@@ -250,6 +275,10 @@ def _fused_kkt_inverse_gfx1250_kernel(
     )
     k_smem = gl.allocate_shared_memory(k_ptr.type.element_ty, [BLOCK_M, K], SMEM_K)
     gl.amd.gfx1250.tdm.async_load(k_desc, [0, 0], k_smem)
+    if EARLY_V:
+        # V gets its own tile, loaded with K: u needs no store-then-load round trip.
+        v_smem = gl.allocate_shared_memory(v_ptr.type.element_ty, [BLOCK_M, V], SMEM_V)
+        gl.amd.gfx1250.tdm.async_load(v_desc, [0, 0], v_smem)
 
     # The gates in fp32; beta is rounded to bf16 as in the unfused KKT kernel.
     LG: gl.constexpr = gl.BlockedLayout([1], [32], [1], [0])
@@ -341,8 +370,8 @@ def _fused_kkt_inverse_gfx1250_kernel(
     r3 = b_lds.slice(32, 16).load(LR)
     r4 = b_lds.slice(48, 16).load(LR)
 
-    # The K tile supplies KKT and the later WY product.
-    gl.amd.gfx1250.tdm.async_wait(0)
+    # The K tile supplies KKT and the later WY product (V may still be in flight).
+    gl.amd.gfx1250.tdm.async_wait(1 if EARLY_V else 0)
     gl.barrier()
     k1 = k_smem.slice(0, 16, dim=0).load(OA16)
     k2 = k_smem.slice(16, 16, dim=0).load(OA16)
@@ -402,16 +431,18 @@ def _fused_kkt_inverse_gfx1250_kernel(
         c = g_lds.slice(48, 16).load(LC)
         a44 = _gate(kk44, g4, c, r4, 48, 48, L16)
 
-    # V is read after W is stored; warm the L2 with it now. The prefetch clamps out-of-bounds rows to
-    # base + shape[0] * stride[0] - 1, so its descriptor starts at head 0 of the chunk's first row.
-    vp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=v_ptr + start_m * H * V,
-        shape=(M, H * V),
-        strides=(H * V, 1),
-        block_shape=(BLOCK_M, V),
-        layout=SMEM_V,
-    )
-    gl.amd.gfx1250.tdm.prefetch(vp_desc, [0, pid_h * V])
+    if not EARLY_V:
+        # V is read after W is stored; warm the L2 with it now. The prefetch clamps
+        # out-of-bounds rows to base + shape[0] * stride[0] - 1, so its descriptor starts at
+        # head 0 of the chunk's first row.
+        vp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=v_ptr + start_m * H * V,
+            shape=(M, H * V),
+            strides=(H * V, 1),
+            block_shape=(BLOCK_M, V),
+            layout=SMEM_V,
+        )
+        gl.amd.gfx1250.tdm.prefetch(vp_desc, [0, pid_h * V])
     offs_i = gl.arange(0, 16, layout=LR)
     offs_j = gl.arange(0, 16, layout=LC)
     eye = (offs_i[:, None] == offs_j[None, :]).to(gl.float32)
@@ -559,8 +590,12 @@ def _fused_kkt_inverse_gfx1250_kernel(
         OB16,
         SMEM_K,
     )
-    gl.amd.gfx1250.tdm.async_wait(0)
-    gl.amd.gfx1250.tdm.async_load(v_desc, [0, 0], k_smem)
+    if EARLY_V:
+        u_src = v_smem
+    else:
+        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_load(v_desc, [0, 0], k_smem)
+        u_src = k_smem
     # u = (Ai diag(beta)) v
     b1 = b_lds.slice(0, 16).load(LC)
     b2 = b_lds.slice(16, 16).load(LC)
@@ -572,10 +607,12 @@ def _fused_kkt_inverse_gfx1250_kernel(
     p33h, p33l = _pair(ai33 * b3[None, :], z, OA16)
     p41h, p41l = _pair(ai41 * b1[None, :], ai42 * b2[None, :], OA16)
     p43h, p43l = _pair(ai43 * b3[None, :], ai44 * b4[None, :], OA16)
-    gl.amd.gfx1250.tdm.async_wait(0)
+    if not EARLY_V:
+        # (with EARLY_V, V landed before the W product's wait)
+        gl.amd.gfx1250.tdm.async_wait(0)
     gl.barrier()
     _wy(
-        k_smem,
+        u_src,
         u_ptr + (start_m * H + pid_h) * V,
         H * V,
         M,
@@ -648,8 +685,12 @@ def fused_kkt_inverse_gfx1250(k, v, cu_seqlens, plan, gating, with_decay):
         if with_decay
         else None
     )
-    # A chunk-grid multiple of 8 puts both heads of a K head on one XCD (round-robin over 8).
-    _fused_kkt_inverse_gfx1250_kernel[(-(-NT // 8) * 8, H)](
+    # Small launches (ATOM_GDN_KKT_SMALL_MAX_CHUNKS): V loaded early, head-fastest grid.
+    # Otherwise a chunk-grid multiple of 8 puts both heads of a K head on one XCD.
+    small = NT <= envs.ATOM_GDN_KKT_SMALL_MAX_CHUNKS
+    heads_first = small and H == 32 and Hg == 16
+    grid = (H, NT) if heads_first else (-(-NT // 8) * 8, H)
+    _fused_kkt_inverse_gfx1250_kernel[grid](
         chunk_indices,
         cu_seqlens,
         nt_ptr,
@@ -677,6 +718,8 @@ def fused_kkt_inverse_gfx1250(k, v, cu_seqlens, plan, gating, with_decay):
         BLOCK_V=32,
         HAS_NT=nt_ptr is not None,
         STORE_DECAY=with_decay,
+        EARLY_V=small,
+        HEADS_FIRST=heads_first,
         num_warps=1,
     )
     return g_cumsum, decay, w, u, beta_hm, scale_hm

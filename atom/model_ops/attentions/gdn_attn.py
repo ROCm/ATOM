@@ -1451,7 +1451,13 @@ class GDNStateMixin(PoolRowsMixin):
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
             nums_dict, batch_ptr, token_chunk_offset_ptr = self._conv1d_metadata(
-                non_spec_query_start_loc, num_prefills
+                non_spec_query_start_loc,
+                num_prefills,
+                has_init_host=(
+                    np.asarray(batch.num_cached_tokens[:num_prefills]) > 0
+                    if cached is not None
+                    else np.zeros(num_prefills, dtype=np.bool_)
+                ),
             )
             self._prime_chunk_indices(non_spec_query_start_loc, num_prefills)
         else:
@@ -2257,8 +2263,17 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return torch.as_tensor(values, dtype=torch.int64, device=self.device)
         return out
 
-    def _conv1d_metadata(self, query_start_loc, num_prefills: int):
-        """Return separate row and persistent program tables from host lengths."""
+    def _conv1d_metadata(
+        self, query_start_loc, num_prefills: int, has_init_host: np.ndarray | None = None
+    ):
+        """Return separate row and persistent program tables from host lengths.
+
+        Under ATOM_GDN_CONV_ROWS_V2 and ATOM_GDN_CONV_PACKED_META (with
+        `has_init_host`, the sequences' initial-state flags) the rows kernel's
+        table also goes up packed:
+        [programs, 8] int32 (sequence, chunk, first token, end token, read
+        slot, write slot, has-initial-state, 0), so a program reads every
+        scalar it needs in one round trip."""
         cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
         lens = np.diff(cu).astype(np.int64)
         nums_dict = {}
@@ -2307,6 +2322,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 "batch_ptr": batch_ptr,
                 "token_chunk_offset_ptr": offset_ptr,
             }
+            if (
+                BLOCK_M == 8
+                and has_init_host is not None
+                and envs.ATOM_GDN_CONV_ROWS_V2
+                and envs.ATOM_GDN_CONV_PACKED_META
+            ):
+                packed = self._conv1d_packed_meta(cu, mlist, offsets, tot, has_init_host)
+                prog_meta = self._stage_upload(
+                    "conv1d_meta_8", packed.reshape(-1), cap * 8, torch.int32
+                )
+                if prog_meta is not None:
+                    nums_dict[BLOCK_M]["prog_meta"] = prog_meta.view(-1, 8)
             if programs_max is not None:
                 nums_dict[BLOCK_M]["programs_max"] = programs_max
         return (
@@ -2314,6 +2341,25 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             nums_dict[8]["batch_ptr"],
             nums_dict[8]["token_chunk_offset_ptr"],
         )
+
+    def _conv1d_packed_meta(self, cu, mlist, offsets, tot, has_init_host):
+        """The rows kernel's [programs, 8] int32 table (pad programs: sequence
+        PAD_SLOT_ID, the rest 0)."""
+        n = len(cu) - 1
+        rows = len(mlist)
+        packed = np.zeros((rows, 8), dtype=np.int32)
+        packed[:, 0] = PAD_SLOT_ID
+        seq = mlist[:tot].astype(np.int64)
+        slot_out = self.non_spec_state_indices_tensor.np[:n]
+        slot_in = self.non_spec_state_indices_in_tensor.np[:n]
+        packed[:tot, 0] = seq
+        packed[:tot, 1] = offsets[:tot]
+        packed[:tot, 2] = cu[seq]
+        packed[:tot, 3] = cu[seq + 1]
+        packed[:tot, 4] = slot_in[seq]
+        packed[:tot, 5] = slot_out[seq]
+        packed[:tot, 6] = has_init_host[:n][seq]
+        return packed
 
     # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
     # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token

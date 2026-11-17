@@ -702,6 +702,9 @@ class PagedAttentionImpl(nn.Module):
             # one aiter Gluon kernel: norm, MRoPE, NVFP4 K + fp8 V into the cache, Q out in fp8
             from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope_cache
 
+            # A prefill padded to the token-graph bucket (attention runs eagerly): the
+            # kernel computes only the scheduled rows, as the attention reads them.
+            n_tok = fwd_ctx.context.scheduled_tokens
             fused = try_fused_qk_norm_mrope_cache(
                 self.q_norm,
                 self.k_norm,
@@ -717,6 +720,14 @@ class PagedAttentionImpl(nn.Module):
                 v_cache,
                 fwd_ctx.attn_metadata.slot_mapping,
                 kv_scale=self.kv_scale_float,
+                num_tokens=(
+                    n_tok
+                    if envs.ATOM_QK_NORM_ROPE_SCHEDULED_ROWS
+                    and fwd_ctx.context.is_prefill
+                    and 0 < n_tok < q_raw.shape[0]
+                    and not torch.cuda.is_current_stream_capturing()
+                    else None
+                ),
             )
             if fused is not None:
                 self.per_token_quant = False

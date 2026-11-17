@@ -219,3 +219,91 @@ def test_persistent_kernel_matches_fp64_with_padded_metadata(fork):
         assert steps.max() <= 1
         assert (steps > 0).double().mean() < 1e-4
         assert (got.double() - ref).abs()[tail].max() < 2**-18
+
+
+@pytest.mark.parametrize("k_heads,v_heads", [(16, 32), (1, 2)])
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("fork", [False, True])
+@pytest.mark.parametrize("padded_metadata", [False, True])
+def test_rows_v2_kernel_bitwise_rows_kernel(
+    k_heads, v_heads, norm, fork, padded_metadata, monkeypatch
+):
+    """ATOM_GDN_CONV_ROWS_V2's kernel (its loads in three round trips) leaves
+    q, k, v and the conv-state pool bit for bit as the rows kernel, also with
+    bucket-shaped program tables (pad programs) and in-place state slots."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.gdn_attn import compute_causal_conv1d_metadata
+
+    k_dim, v_dim = k_heads * HEAD, v_heads * HEAD
+    dim = 2 * k_dim + v_dim
+    seqlens = [1, 2, 3, 4, 7, 8, 9, 70, 129, 517, 3, 1000]
+    tokens, n = sum(seqlens), len(seqlens)
+    g = torch.Generator(device="cpu").manual_seed(7 * k_heads + 2 * norm + fork)
+    proj = torch.randn(tokens, dim + v_dim, generator=g).to(torch.bfloat16).to(DEV)
+    weight = (torch.randn(dim, 4, generator=g) * 0.5).to(torch.bfloat16).to(DEV)
+    bias = (torch.randn(dim, generator=g) * 0.1).to(torch.bfloat16).to(DEV)
+    alloc = torch.randn(64, 3, dim, generator=g).to(torch.bfloat16).to(DEV)
+    perm = torch.randperm(64, generator=g).to(torch.int32).to(DEV)
+    slots_out = perm[:n]
+    slots_in = perm[n : 2 * n] if fork else slots_out
+    has_init = (torch.rand(n, generator=g) < 0.7).to(DEV)
+    cu = torch.tensor([0] + seqlens, device=DEV).cumsum(0).to(torch.int32)
+    metadata = None
+    if padded_metadata:
+        tables, batch, offsets = compute_causal_conv1d_metadata(cu)
+        tables[8]["programs_max"] = tables[8]["tot"] + 5
+        metadata = SimpleNamespace(
+            nums_dict={8: tables[8]}, batch_ptr=batch, token_chunk_offset_ptr=offsets
+        )
+    variants = [("0", None), ("1", None)]
+    if padded_metadata:
+        # the packed per-program table: (sequence, chunk, first token, end token, read slot,
+        # write slot, has-initial-state, 0), pad programs -1
+        t8 = tables[8]
+        tot, cap = t8["tot"], t8["programs_max"]
+        seq = t8["mlist"].long()
+        cu_c = cu.long().cpu()
+        packed = torch.zeros(cap, 8, dtype=torch.int32)
+        packed[:, 0] = -1
+        packed[:tot, 0] = seq.int()
+        packed[:tot, 1] = t8["offsetlist"]
+        packed[:tot, 2] = cu_c[seq].int()
+        packed[:tot, 3] = cu_c[seq + 1].int()
+        packed[:tot, 4] = slots_in.cpu()[seq]
+        packed[:tot, 5] = slots_out.cpu()[seq]
+        packed[:tot, 6] = has_init.cpu()[seq].int()
+        variants.append(("1", packed.to(DEV)))
+    outs, pools = [], []
+    for v2, packed in variants:
+        monkeypatch.setenv("ATOM_GDN_CONV_ROWS_V2", v2)
+        if metadata is not None:
+            if packed is None:
+                metadata.nums_dict[8].pop("prog_meta", None)
+            else:
+                metadata.nums_dict[8]["prog_meta"] = packed
+        for b in (bias, None):
+            a = alloc.clone()
+            outs.append(
+                causal_conv1d_fn(
+                    proj[:, :dim].T,
+                    weight,
+                    b,
+                    conv_states=a.transpose(-1, -2),
+                    query_start_loc=cu,
+                    k_dim_size=k_dim,
+                    v_dim_size=v_dim,
+                    cache_indices=slots_out,
+                    cache_indices_in=slots_in,
+                    has_initial_state=has_init,
+                    activation="silu",
+                    qk_l2norm_head_dim=HEAD if norm else None,
+                    metadata=metadata,
+                )
+            )
+            pools.append(a)
+    for j in range(2, len(outs)):
+        i = j % 2
+        assert torch.equal(pools[j], pools[i])
+        for got, ref in zip(outs[j], outs[i]):
+            assert torch.equal(got, ref)

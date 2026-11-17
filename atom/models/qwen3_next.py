@@ -1,3 +1,4 @@
+import contextlib
 import logging
 from typing import ClassVar
 
@@ -62,7 +63,9 @@ from atom.model_ops.moe_tail_norm import (
     moe_gather_tail_rmsnorm_mx32,
     moe_tail_rmsnorm_mx32,
     pad_router_weight,
+    router_logits_gemm,
     router_shared_expert,
+    shared_expert_gemms,
     silu_gate_up_gemm,
 )
 from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
@@ -397,6 +400,31 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             w.data = padded[: w.shape[0]]
             self.router_padded = padded
 
+    def _router_shared_operands_ok(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the router GEMM and the shared expert can run as the aiter
+        a16w16 kernels: TP1, a gated (interleaved) bf16 shared expert without
+        its own gate, bf16 rows and router weight, eager / graph capture."""
+        mlp = self.shared_expert
+        return not (
+            mlp is None
+            or self.tp_size != 1
+            or not mlp.gated_gate_up
+            or mlp.expert_gate is not None
+            or hidden_states.shape[0] <= 0
+            or torch.compiler.is_compiling()
+            or hidden_states.dtype != torch.bfloat16
+            or self.gate.bias is not None
+            or self.gate.weight.dtype != torch.bfloat16
+            or not fused_router_shared_available()
+        )
+
+    def _router_weight_padded(self) -> torch.Tensor:
+        w_router = self.gate.weight
+        padded = self.router_padded
+        if padded is None or padded.data_ptr() != w_router.data_ptr():
+            padded = w_router  # correct, only slower
+        return padded
+
     def fused_router_shared(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -408,11 +436,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         m = hidden_states.shape[0]
         if (
             not envs.ATOM_FUSED_ROUTER_SHARED_EXPERT
-            or mlp is None
-            or self.tp_size != 1
-            or not mlp.gated_gate_up
-            or mlp.expert_gate is not None
-            or m <= 0
             or (
                 m > envs.ATOM_FUSED_ROUTER_SHARED_EXPERT_MAX_TOKENS
                 and not (
@@ -421,17 +444,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                     and fused_router_shared_prefill_available()
                 )
             )
-            or torch.compiler.is_compiling()
-            or hidden_states.dtype != torch.bfloat16
-            or self.gate.bias is not None
-            or self.gate.weight.dtype != torch.bfloat16
-            or not fused_router_shared_available()
+            or not self._router_shared_operands_ok(hidden_states)
         ):
             return None
         w_router = self.gate.weight
-        padded = self.router_padded
-        if padded is None or padded.data_ptr() != w_router.data_ptr():
-            padded = w_router  # correct, only slower
+        padded = self._router_weight_padded()
         return router_shared_expert(
             hidden_states,
             padded,
@@ -524,7 +541,91 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             and not getattr(cfg, "pcp_merge", False)
         )
 
+    def _shared_side_stream_mode(self, hidden_states: torch.Tensor) -> str | None:
+        """ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM: "early" (fork the shared expert
+        right after the router GEMM), "late" (fork it after the routing /
+        quant launch, beside the expert GEMMs only) or None."""
+        m = hidden_states.shape[0]
+        if not (
+            envs.ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM
+            and envs.ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MIN_TOKENS
+            <= m
+            <= envs.ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_MAX_TOKENS
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
+            and self._router_shared_operands_ok(hidden_states)
+        ):
+            return None
+        if m >= envs.ATOM_QWEN_SHARED_EXPERT_SIDE_STREAM_LATE_MIN_TOKENS:
+            try:
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: F401
+                    after_routing_launched,
+                )
+
+                return "late"
+            except ImportError:  # an aiter without the routing hook
+                pass
+        return "early"
+
+    def side_stream_moe_forward(
+        self, hidden_states: torch.Tensor, late: bool
+    ) -> torch.Tensor | MoEGatedSum:
+        """`single_stream_moe_forward` with the router GEMM alone on the main
+        stream and the shared expert on a side stream beside the routed
+        experts (memory-bound at prefill sizes, so the shared expert's bf16
+        GEMMs run in their shadow); joined before the sum."""
+        mlp = self.shared_expert
+        logits = router_logits_gemm(
+            hidden_states, self._router_weight_padded(), self.gate.weight.shape[0]
+        )
+        router_logits = logits[:, : self.n_routed_experts]
+        current_stream = torch.cuda.current_stream()
+        side = _shared_expert_stream()
+        shared = []
+
+        def fork():
+            side.wait_stream(current_stream)
+            with torch.cuda.stream(side):
+                shared.append(
+                    shared_expert_gemms(
+                        hidden_states, mlp.gate_up_proj.weight, mlp.down_proj.weight
+                    )
+                )
+
+        hook = contextlib.nullcontext()
+        if late:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import after_routing_launched
+
+            hook = after_routing_launched(fork)
+        else:
+            fork()
+        with hook:
+            if self.defer_gather and not torch.compiler.is_compiling():
+                routed_output = self._experts_deferred_gather(
+                    hidden_states, router_logits
+                )
+            else:
+                routed_output = self.experts(
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
+        if shared:
+            current_stream.wait_stream(side)
+        else:  # the routed path never reached its expert GEMMs (no fork)
+            shared.append(
+                shared_expert_gemms(
+                    hidden_states, mlp.gate_up_proj.weight, mlp.down_proj.weight
+                )
+            )
+        shared_gate_logits = logits[:, self.n_routed_experts :]
+        if self.defer_gated_sum:
+            return MoEGatedSum(routed_output, shared[0], shared_gate_logits)
+        return shared_expert_gate_add(
+            shared[0], shared_gate_logits, routed_output, ATOM_FUSED_SIGMOID_GATE
+        )
+
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        side_mode = self._shared_side_stream_mode(hidden_states)
+        if side_mode is not None:
+            return self.side_stream_moe_forward(hidden_states, side_mode == "late")
         # router_logits: (num_tokens, n_experts + 1)
         fused = self.fused_router_shared(hidden_states)
         shared_output = None
