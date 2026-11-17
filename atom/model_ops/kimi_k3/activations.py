@@ -391,6 +391,22 @@ def _onorm_gluon_module():
     return rmsnorm_gated_gluon
 
 
+def rmsnorm_gated_e8m0_col_major(
+    quant_type: QuantType | None, quant_dtype: torch.dtype | None, e8m0_scale: bool
+) -> bool | None:
+    """The scale layout (col_major) ``rmsnorm_gated`` gives the gfx1250 Gluon
+    E8M0 o_norm for this scheme at decode, or None when it does not take it."""
+    if not (
+        quant_type == QuantType.per_1x128 and quant_dtype == dtypes.fp8 and e8m0_scale
+    ):
+        return None
+    if _onorm_gluon_module() is None:
+        return None
+    from atom.utils import envs
+
+    return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+
+
 @mark_trace
 def rmsnorm_gated(
     x: torch.Tensor,
