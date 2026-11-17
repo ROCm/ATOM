@@ -112,8 +112,10 @@ def fp4_q_scale_shape(
 ) -> tuple:
     """`q_scale_out`'s shape: `[T, k_tiles, 4, 16, round_up(H // 16, 4)]`.
 
-    The trailing pad is the dword a lane loads its four M-tile scale bytes with,
-    so it is four even where the head count needs two.
+    In PRESHUFFLE, the trailing pad is the dword a lane loads its four
+    M-tile scale bytes with, so it is four even where the head count needs two.
+    MFMA uses the OPUS shape `[T, 2, 32, H // 16]` for D128 and H32/H64;
+    its E8M0 addressing differs from the PRESHUFFLE permutation.
     """
     if layout == MFMA:
         if head_dim != 128 or heads not in (32, 64):

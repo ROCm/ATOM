@@ -51,8 +51,11 @@ def _dcp_stage_indexer_fp4_prefill(
     from a page of their own, which `dcp_indexer_fp4_block_tables` lists as
     the request's own block table does its cache pages.
 
-    The two planes disagree on their row axis, so both the read and the write
-    bend through `fp4_index_scale_rows`; see it for what goes wrong otherwise.
+    In PRESHUFFLE the two planes disagree on their row axis, so the scale
+    read and write use `fp4_index_scale_rows`. MFMA instead gathers each
+    logical row's four scale bytes through `fp4_scale_byte` and scatters
+    that OPUS permutation into the staged scale plane after the all-gather.
+    `layout` selects the matching data and scale addressing for both.
     """
     # Built once per forward by the metadata builder.
     page = prefill_metadata.dcp_indexer_fp4_read_page

@@ -81,8 +81,10 @@ def test_index_cache_scale_exists_before_pool_allocation():
     cache = model.DeepseekV32IndexerCache(
         head_dim=132, dtype=torch.uint8, prefix="indexer.k_cache", cache_config="fp8"
     )
-    # Dummy forwards accept no scale plane; allocation binds the FP4 tensor.
-    assert cache.kv_cache_scale is None
+    # Compilation sees a tensor before allocation rebinds the FP4 plane.
+    assert isinstance(cache.kv_cache_scale, torch.Tensor)
+    assert cache.kv_cache_scale.dtype == torch.uint8
+    assert cache.kv_cache_scale.numel() == 0
     assert cache.kv_cache[0].numel() == 0
     allocated = torch.empty((2, 4, 64), dtype=torch.uint8)
     cache.kv_cache_scale = allocated
