@@ -374,6 +374,7 @@ Y2L = 7168               # (seam) LDS past FLO: the owner's y2 [TR][32] bf16, re
 # (free then: the post's sums end at 6144 + 128; the MoE's LDS of the CTA is dead after its push_row)
 # layer counters (bytes from the layer's counter base)
 ATT_POST, AMIX_POST, AMIX_L1, ASINK = 440, 444, 448, 452
+CRF_OFF = 1177600        # (B) plog: the compressor rows' new-key flags [parity][T] (past the router flags; site 2)
 
 
 
@@ -506,6 +507,19 @@ def target_layer(E, Ly):
         IS.stage_iquant(cwith(c, iq=fptr(fp, "iq"), iwp=fptr(fp, "iwp"), iq_out=fptr(fp, "iq_out"),
                               iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out")))
         lfl2 = ltab(fp, Ly, "lflags")()
+        # (B) a c1 compressor layer whose scorer takes the grouped path: the INDEX_QUANT handoff right after iquant (the
+        # query), not after the compressor rows; the rows' CTAs (stage_crow) skip the scorer and flag their new keys
+        # (CRF_OFF), which only the score tasks covering the context's last columns wait for (SC.stage_score_grouped)
+        early = fx.Int32(0) != fx.Int32(0)
+        if fx.const_expr(TR <= 6):
+            lge = hx.opaque_v(fx.thread_idx.x) % 32
+            bme = TK.wave_max((lge < TR).select(hx.gload(ltab(fp, Ly, "ibound")() + i64(fx.min(lge, fx.Int32(TR - 1))) * 4, fx.Int32), fx.Int32(0)))
+            early = (((lfl2 & fx.Int64(2)) != fx.Int64(0)) & ((lfl2 & fx.Int64(64)) == fx.Int64(0))
+                     & (ltab(fp, Ly, "ibat")() != fx.Int64(0)) & (bme > fx.Int32(SC.GROUPED_MIN_BOUND)))
+        crf = plog(CRF_OFF) + i64(par) * 512
+        crtag = hx.epoch32(tep, Ly, 2)
+        if early:
+            handoff(lc + i64(LY.INDEX_QUANT), t, True)
         if (lfl2 & fx.Int64(2)) != fx.Int64(0):
             r1b = (lfl2 & fx.Int64(4)) != fx.Int64(0)
             cc = cwith(c, cpart=fptr(fp, "cpart"), cnw=ltab(fp, Ly, "cnw")(), cape=ltab(fp, Ly, "cape")(),
@@ -514,8 +528,9 @@ def target_layer(E, Ly):
                        cmain=fx.Int32(ltab(fp, Ly, "cmain")()), crpp=fx.Int32(ltab(fp, Ly, "crpp")()),
                        cprow=fx.Int32(ltab(fp, Ly, "cprow")()), cplane=ltab(fp, Ly, "cplane")(), cscale=ltab(fp, Ly, "iscale")(), ckv=ltab(fp, Ly, "ckv")(),
                        cscore=ltab(fp, Ly, "cscore")(), cstate=ltab(fp, Ly, "cstate")(), btab=ltab(fp, Ly, "btab")(),
-                       bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")())
+                       bstride=fx.Int32(ltab(fp, Ly, "bstride")()), slots=ltab(fp, Ly, "slots")(), crflag=crf, crtag=crtag)
             CS.stage_crow(cc, r1b)
+            CS.crow_flag(cc)
             CS.stage_cring(cc, r1b)
         if ltab(fp, Ly, "ibat")() == fx.Int64(0):   # (no scorer: the INDEX_QUANT handoff here; else inside the scorer)
             handoff(lc + i64(LY.INDEX_QUANT), t, True)
@@ -526,7 +541,8 @@ def target_layer(E, Ly):
                         irow=ltab(fp, Ly, "irow")(), cprow=fx.Int32(ltab(fp, Ly, "cprow")()), imain=fx.Int32(ltab(fp, Ly, "imain")()),
                         iq_out=fptr(fp, "iq_out"), iqs_out=fptr(fp, "iqs_out"), iw_out=fptr(fp, "iw_out"),
                         iscale=ltab(fp, Ly, "iscale")(),
-                        prewait=lambda: handoff(lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), True))
+                        prewait=lambda: SC.handoff_unless(lc + i64(LY.INDEX_QUANT), hx.opaque_v(fx.thread_idx.x), early),
+                        early=early, crflag=crf, crtag=crtag)
             lfl3 = ltab(fp, Ly, "lflags")()
             isrx = (lfl3 & fx.Int64(64)) != fx.Int64(0)
             cs_ = cwith(cs_, ibmax=ltab(fp, Ly, "ibmax")(), icand=ltab(fp, Ly, "icand")(), lvl=fptr(fp, "ilvl"),

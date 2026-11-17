@@ -249,6 +249,16 @@ GROUPED_MIN_BOUND = 8192   # index rows past which a c1 FULL layer scores its ke
 
 
 @ASTRewriter.transform
+def handoff_unless(cnt, t, done):
+    """(B) The INDEX_QUANT handoff here unless the layer took it already, right after iquant (step.py `early`)."""
+    if done == (I32(0) != I32(0)):
+        hx.handoff(cnt, t, True)
+
+
+CROW0, NCROW = 192, T     # (B) the compressor rows' CTAs (compressor.CROW0 .. + T): no score tasks when `early`
+
+
+@ASTRewriter.transform
 def stage_score_grouped(c):
     """FULL layers at c1 (one request, its TR rows over the same keys): a task = one 128-column chunk of the request's
     longest row; its keys are read once and scored for every row (each row masked to its own context), not once a
@@ -268,7 +278,13 @@ def stage_score_grouped(c):
     cmax = TK.wave_max((ln < TR).select(hx.lload(osr + fx.min(ln, I32(TR - 1)) * 4, I32), I32(0)))
     bmax = TK.wave_max((ln < TR).select(hx.lload(osr + (64 + fx.min(ln, I32(TR - 1))) * 4, I32), I32(0)))
     nt = IP.score_tasks(cmax, I32(CHUNK))
-    nme = fx.max((nt - b + (CTAS - 1)) // CTAS, I32(0))
+    # (B) `early`: the tasks over the CTAs outside the compressor rows' (still writing this step's keys)
+    early = c.get("early", I32(0) != I32(0))
+    ncta = early.select(I32(CTAS - NCROW), I32(CTAS))
+    vb = early.select((b >= CROW0).select(b - NCROW, b), b)
+    busy = early & (b >= CROW0) & (b < CROW0 + NCROW)
+    nme = busy.select(I32(0), fx.max((nt - vb + (ncta - 1)) // ncta, I32(0)))
+    newc = cmax - 16          # (B) tasks reaching a column >= this read keys the compressor rows write this step
     iprod = c["iprod"]
 
     def page_row(task):
@@ -277,14 +293,17 @@ def stage_score_grouped(c):
         page = hx.gload(c["btab"] + (i64(q) * i64(c["bstride"]) + i64(krow // c["irpp"])) * 4, I32)
         return i64(page) * i64(c["irpp"]) + i64(krow % c["irpp"])
 
-    flat0 = page_row(fx.min(b, fx.max(nt - 1, I32(0))))   # (the first task's page chain before the wait for the query)
+    flat0 = page_row(fx.min(vb, fx.max(nt - 1, I32(0))))   # (the first task's page chain before the wait for the query)
     if fx.const_expr("prewait" in c):
         c["prewait"]()
     for k in range_constexpr(TR):   # every row's query and head weights -> LDS slots 0..TR-1
         stage_q_rows(c, sm, t, k, k)
     gpu.barrier()
     for i in range(nme):
-        task = b + i * CTAS
+        task = vb + i * ncta
+        if early & ((task + 1) * CHUNK > newc):   # (B) this step's new keys: the compressor rows' flags
+            hx.wait_flags(c["crflag"], NCROW, c["crtag"], w, l, 11)
+            gpu.barrier()
         col = task * CHUNK + w * 16 + l % 16
         flat = (i == I32(0)).select(flat0, page_row(task))
         if fx.const_expr(c["ifp4"]):

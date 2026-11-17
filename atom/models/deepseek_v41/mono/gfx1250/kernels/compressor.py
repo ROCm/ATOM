@@ -278,6 +278,18 @@ def stage_crow(c, r1):
 
 
 @ASTRewriter.transform
+def crow_flag(c):
+    """(B) A compressor-row CTA's new keys (its device-scope stores) are out: its LL flag (CTAs CROW0 .. CROW0 + T - 1;
+    the grouped scorer's last-column tasks wait for all T)."""
+    t, b = c["t"], c["b"]
+    if (b >= CROW0) & (b < CROW0 + T):
+        hx.wait_storecnt0()
+        gpu.barrier()
+        if t == 0:
+            hx.put(c["crflag"] + i64(b - CROW0) * 8, I32(0), c["crtag"])
+
+
+@ASTRewriter.transform
 def stage_cring(c, r1):
     t, b, w, l = c["t"], c["b"], c["w"], c["l"]
     q = (b - CRING0) * 8 + w
