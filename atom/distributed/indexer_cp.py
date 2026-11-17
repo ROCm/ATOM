@@ -105,12 +105,11 @@ def _mailbox_runtime():
     outside its fallback, so a renamed symbol fails setup instead of silently
     taking the collective path.
 
-    Needs ROCm/aiter main at de06bd30b (#6974) or later, the first commit with
-    every name used here (``IPCBufferPool.open_peer_buffers`` included).
-    Validated with ROCm/aiter@55cde6a0c49cc04f39f6141e312938a8c48e61fb.
-    ``CandidateMailbox`` uses ``create(raw_cached=True)`` and requires ROCm 7.14
-    or later (aiter's gfx1250 hipIpc floor, applied on every arch); older ROCm
-    or VMM setups take the collective fallback.
+    Needs aiter with ROCm/aiter#6974, which adds every name used here
+    (``IPCBufferPool.open_peer_buffers`` included). ``CandidateMailbox`` uses
+    ``create(raw_cached=True)`` and requires ROCm 7.14 or later (aiter's
+    gfx1250 hipIpc floor, applied on every arch); older ROCm or VMM setups take
+    the collective fallback.
     """
     from aiter.dist.device_communicators.custom_all_reduce import (
         IPCBufferPool,
@@ -127,7 +126,7 @@ class CandidateMailbox:
     counters.
 
     Cached memory, as aiter's gluon all-reduce inboxes: polling uncached memory
-    made the one-launch exchange 2 us slower at 32 x 4 rows on MI455X.
+    is slower.
 
     Setup failures are agreed before any rank can return a usable mailbox.
     Failures before ``open_peer_buffers`` keep every rank out of the handle
@@ -203,9 +202,8 @@ def _open_candidate_mailbox(device, max_rows: int) -> None:
     global _mailbox
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    # Validated on gfx950 and gfx1250: cross-GPU `.wt`/`.cv` lower to sc0 sc1,
-    # delayed-rank and 12K-call stress tests make progress, and the fused path
-    # beats the collective exchange. Other architectures retain the fallback.
+    # The mailbox needs cross-GPU `.wt`/`.cv` to lower to sc0 sc1, as on
+    # _MAILBOX_ARCHES. Other architectures keep the collective exchange.
     if _mailbox is not None or get_gfx_runtime() not in _MAILBOX_ARCHES:
         return
     group = get_indexer_cp_group()
@@ -218,7 +216,11 @@ def _open_candidate_mailbox(device, max_rows: int) -> None:
         )
     except RuntimeError as error:
         # CandidateMailbox agrees recoverable setup failures before raising.
-        logger.warning("indexer CP keeps the collective candidate exchange: %s", error)
+        logger.warning(
+            "indexer CP keeps the collective candidate exchange: %s",
+            error,
+            exc_info=True,
+        )
 
 
 def exchange_candidates(keys: torch.Tensor) -> torch.Tensor:

@@ -97,8 +97,8 @@ def _context_score(
             if TRANSPOSED:
                 # On CDNA5 `.cv` is a system-scoped volatile/last-use load, not
                 # a streaming (`.cs`) policy. It is safe here because earlier
-                # kernels finished producing K and no writer races this launch;
-                # `.cs` has not been substituted without a separate benchmark.
+                # kernels finished producing K and no writer races this launch.
+                # Benchmark `.cs` before substituting it.
                 k = tl.load(
                     k_page + pos[None, :] * 128 + d[:, None], cache_modifier=".cv"
                 )

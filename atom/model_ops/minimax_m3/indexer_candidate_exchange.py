@@ -133,8 +133,7 @@ def _shard_winners(
 
     # One wide tile costs about two narrow ones, so a long row takes the wide
     # tile rather than walking many narrow ones. When the launch fits in one
-    # wide tile (up to 1M at TP4) its loop is not compiled: carrying the dead
-    # loop cost the wide path about 0.1 us against main's single tile.
+    # wide tile (up to 1M at TP4) its loop is not compiled.
     if live_end > 2 * BLOCK_SIZE_K:
         winners = _walk_tiles(
             s_row,
