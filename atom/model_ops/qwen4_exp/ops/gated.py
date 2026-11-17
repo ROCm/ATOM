@@ -16,8 +16,8 @@ import torch
 import triton
 import triton.language as tl
 from aiter import QuantType
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
-from atom.utils.triton_launch import CachedLauncher
 
 def is_per_token_fp8_linear(linear: torch.nn.Module) -> bool:
     """Whether `linear` runs the dynamic per-token FP8 GEMM, so the kernel in
@@ -392,8 +392,8 @@ def _sigmoid_rmsnorm_quant_kernel(
     _store_per_token_fp8(out_ptr, scale_ptr, token, offsets, mask, y, FP8_MAX)
 
 
-_sigmoid_rmsnorm_quant = CachedLauncher(
-    _sigmoid_rmsnorm_quant_kernel, num_warps=4, enable_fp_fusion=False
+_sigmoid_rmsnorm_quant = fast_launch(
+    _sigmoid_rmsnorm_quant_kernel, by_specialization=True
 )
 
 
@@ -417,8 +417,7 @@ def sigmoid_rmsnorm_quant(
     out = torch.empty((tokens, heads * dim), dtype=quant_dtype, device=x.device)
     scale = torch.empty((tokens, 1), dtype=torch.float32, device=x.device)
     if tokens:
-        _sigmoid_rmsnorm_quant(
-            (tokens,),
+        _sigmoid_rmsnorm_quant[(tokens,)](
             x,
             gate,
             weight,
@@ -434,6 +433,8 @@ def sigmoid_rmsnorm_quant(
             torch.finfo(quant_dtype).max,
             triton.next_power_of_2(heads),
             triton.next_power_of_2(dim),
+            num_warps=4,
+            enable_fp_fusion=False,
         )
     return out, scale
 
@@ -460,14 +461,7 @@ def _sigmoid_mul_quant_kernel(
     _store_per_token_fp8(out_ptr, scale_ptr, row, row * WIDTH + cols, mask, y, FP8_MAX)
 
 
-# Measured on MI355X at width 6144: 4 warps for decode batches, 2 once there
-# are enough rows to fill the device.
-_sigmoid_mul_quant = {
-    warps: CachedLauncher(
-        _sigmoid_mul_quant_kernel, num_warps=warps, enable_fp_fusion=False
-    )
-    for warps in (4, 2)
-}
+_sigmoid_mul_quant = fast_launch(_sigmoid_mul_quant_kernel, by_specialization=True)
 
 
 def sigmoid_mul_quant(
@@ -485,8 +479,7 @@ def sigmoid_mul_quant(
     out = torch.empty((rows, width), dtype=quant_dtype, device=x.device)
     scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
     if rows:
-        _sigmoid_mul_quant[4 if rows <= 1024 else 2](
-            (rows,),
+        _sigmoid_mul_quant[(rows,)](
             x,
             gate,
             out,
@@ -496,5 +489,9 @@ def sigmoid_mul_quant(
             width,
             torch.finfo(quant_dtype).max,
             triton.next_power_of_2(width),
+            # Measured on MI355X at width 6144: 4 warps for decode batches,
+            # 2 once there are enough rows to fill the device.
+            num_warps=4 if rows <= 1024 else 2,
+            enable_fp_fusion=False,
         )
     return out, scale

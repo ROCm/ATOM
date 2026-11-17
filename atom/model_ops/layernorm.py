@@ -22,6 +22,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.ops.triton.quant.fused_mxfp8_quant import fused_dual_rmsnorm_mxfp8_quant
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
@@ -30,7 +31,6 @@ from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
-from atom.utils.triton_launch import CachedLauncher
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -1189,8 +1189,9 @@ def _fused_qk_norm_single_kernel(
     )
 
 
-# num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
-_fused_qk_norm_single = CachedLauncher(_fused_qk_norm_single_kernel, num_warps=1)
+_fused_qk_norm_single = fast_launch(
+    _fused_qk_norm_single_kernel, by_specialization=True
+)
 
 
 def fused_qk_norm(
@@ -1235,8 +1236,7 @@ def fused_qk_norm(
     # When q_weight is None pass k_weight as a placeholder pointer (the
     # kernel won't load from it — Q_HAS_WEIGHT=False gates the load).
     q_weight_arg = q_weight if q_weight is not None else k_weight
-    _fused_qk_norm_single(
-        ((total_rows + XBLOCK - 1) // XBLOCK,),
+    _fused_qk_norm_single[((total_rows + XBLOCK - 1) // XBLOCK,)](
         q,
         k,
         q_out,
@@ -1256,6 +1256,8 @@ def fused_qk_norm(
         Q_HAS_WEIGHT=q_weight is not None,
         RBLOCK=RBLOCK,
         XBLOCK=XBLOCK,
+        # num_warps=1 is universally optimal for head_dim=256 workloads on MI355X.
+        num_warps=1,
     )
     return q_out, k_out
 

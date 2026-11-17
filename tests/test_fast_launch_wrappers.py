@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The Qwen3.8-Flash-Next prefill wrappers that launch through
-`CachedLauncher`: each launch's key against Triton's own (from the arguments
-the wrapper really passes, recorded on CPU), and each wrapper on the GPU
-against the same launches through plain `kernel[grid]`."""
+"""The Qwen3.8-Flash-Next wrappers that launch through aiter's `fast_launch`:
+each wrapper on the GPU against the same launches through plain
+`kernel[grid]`. The key itself is tested against Triton's in aiter
+(`op_tests/triton_tests/utils/test_fast_launch.py`)."""
 
 from types import SimpleNamespace
 
@@ -11,72 +11,34 @@ import pytest
 import torch
 
 triton = pytest.importorskip("triton")
-
-from atom.utils.triton_launch import CachedLauncher
-from tests.test_triton_launch import (
-    _assert_key_is_at_least_tritons,
-    _bitwise_equal,
+fast_launch = pytest.importorskip(
+    "aiter.ops.triton.utils.fast_launch", exc_type=ImportError
 )
 
 
-class _Recorder:
-    """Stands in for a module's launcher and keeps the arguments it gets."""
-
-    def __init__(self, launcher):
-        self.launcher = launcher
-        self.calls = []
-
-    def __call__(self, grid, *args, **kwargs):
-        assert type(grid) is tuple
-        self.calls.append(list(args) + list(kwargs.values()))
+def _bitwise_equal(a, b):
+    return len(a) == len(b) and all(
+        torch.equal(x.view(torch.uint8), y.view(torch.uint8)) for x, y in zip(a, b)
+    )
 
 
-class _Plain:
-    """The launch as it was: `kernel[grid](*args, **options)` every time."""
-
-    def __init__(self, launcher):
-        self.kernel, self.options = launcher.kernel, launcher.options
-
-    def __call__(self, grid, *args, **kwargs):
-        self.kernel[grid](*args, **kwargs, **self.options)
-
-
-def _record(monkeypatch, module, name, run):
-    """The launcher `module.<name>` and the argument lists `run()` passes it."""
-    recorder = _Recorder(getattr(module, name))
-    monkeypatch.setattr(module, name, recorder)
-    run()
-    monkeypatch.setattr(module, name, recorder.launcher)
-    assert recorder.calls
-    return recorder.launcher, recorder.calls
-
-
-def _check_keys(launcher, calls):
-    assert isinstance(launcher, CachedLauncher) and launcher._enabled
-    for args in calls:
-        assert len(args) == len(launcher._names)
-        _assert_key_is_at_least_tritons(launcher, args)
-
-
-def _plain_vs_cached(monkeypatch, launchers, run):
-    """`run()` with `launchers` (module, name) on plain `kernel[grid]`, then
-    twice through the cached launchers, the second time from the cache."""
-    cached = [getattr(module, name) for module, name in launchers]
-    for module, name in launchers:
-        monkeypatch.setattr(module, name, _Plain(getattr(module, name)))
-    ref = [t.clone() for t in run()]
-    for (module, name), launcher in zip(launchers, cached):
-        monkeypatch.setattr(module, name, launcher)
-    first = [t.clone() for t in run()]
-    second = run()
+def _plain_vs_cached(run, *launches):
+    """`run()` through plain `kernel[grid]`, then twice through the wrappers of
+    `launches` ((wrapper, kernel) pairs): the first run compiles into each
+    wrapper, the second hits for every launch."""
+    for wrapper, _ in launches:
+        wrapper.clear()
+    with fast_launch.bypassed():
+        ref = [t.clone() for t in run()]
+    with fast_launch.recording() as compiled:
+        first = [t.clone() for t in run()]
+    with fast_launch.recording() as missed:
+        second = run()
     torch.cuda.synchronize()
+    assert {kernel.__name__ for _, kernel in launches} <= {n for n, _ in compiled}
+    assert missed == []
     assert _bitwise_equal(first, ref)
     assert _bitwise_equal(second, ref)
-    assert all(launcher._kernels for launcher in cached)
-
-
-def _on_cpu(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -170,69 +132,20 @@ def _gating_inputs(tokens, offset=0, device="cuda"):
     return params[0], ba[:, _V_HEADS:], ba[:, :_V_HEADS], params[1]
 
 
-@pytest.mark.parametrize("native_layout", [False, True], ids=["sglang", "native"])
-@pytest.mark.parametrize("buffer_ops", ["1", "0"])
-def test_gdn_keys_tell_apart_what_triton_tells_apart(
-    monkeypatch, gdn, buffer_ops, native_layout
-):
-    _on_cpu(monkeypatch)
-    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
-    x = _randn(1, 300, _K_HEADS, _HEAD_DIM, offset=1, device="cpu")
-    _check_keys(
-        *_record(
-            monkeypatch, gdn.l2norm, "_l2norm_fwd2", lambda: gdn.l2norm.l2norm_fwd(x)
-        )
-    )
-    t = _conv_inputs((7, 290, 3), offset=1, native_layout=native_layout, device="cpu")
-    metadata = _record(
-        monkeypatch,
-        gdn.conv,
-        "_causal_conv1d_metadata",
-        lambda: gdn.conv.compute_causal_conv1d_metadata(t.query_start_loc, t.tokens),
-    )
-    _check_keys(*metadata)
-    # The program map lives on the GPU; on CPU any map of the right size does.
-    cpu_map = torch.zeros(40, dtype=torch.int32)
-    meta = SimpleNamespace(
-        nums_dict={8: {"tot": 40, "num_tokens": t.tokens}},
-        batch_ptr=cpu_map,
-        token_chunk_offset_ptr=cpu_map,
-    )
-    _check_keys(
-        *_record(
-            monkeypatch,
-            gdn.conv,
-            "_causal_conv1d_fwd",
-            lambda: _conv1d(gdn, t, t.states, meta),
-        )
-    )
-    gating = _gating_inputs(300, offset=1, device="cpu")
-    _check_keys(
-        *_record(
-            monkeypatch,
-            gdn.gating,
-            "_fused_gdn_gating",
-            lambda: gdn.gating.fused_gdn_gating(*gating),
-        )
-    )
-
-
 @gpu
 @pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
 @pytest.mark.parametrize("tokens", [2112, 2096, 16, 2111, 3, 1])
 @torch.inference_mode()
-def test_l2norm_and_gating_match_plain_triton_bitwise(monkeypatch, gdn, tokens, offset):
+def test_l2norm_and_gating_match_plain_triton_bitwise(gdn, tokens, offset):
     x = _randn(1, tokens, _K_HEADS, _HEAD_DIM, offset=offset, seed=tokens)
     _plain_vs_cached(
-        monkeypatch,
-        [(gdn.l2norm, "_l2norm_fwd2")],
         lambda: [gdn.l2norm.l2norm_fwd(x)],
+        (gdn.l2norm._l2norm_fwd2, gdn.l2norm.l2norm_fwd_kernel2),
     )
     gating = _gating_inputs(tokens, offset)
     _plain_vs_cached(
-        monkeypatch,
-        [(gdn.gating, "_fused_gdn_gating")],
         lambda: list(gdn.gating.fused_gdn_gating(*gating)),
+        (gdn.gating._fused_gdn_gating, gdn.gating.fused_gdn_gating_kernel),
     )
 
 
@@ -243,7 +156,7 @@ def test_l2norm_and_gating_match_plain_triton_bitwise(monkeypatch, gdn, tokens, 
 @pytest.mark.parametrize("lens", [(2112,), (16,), (2111,), (7, 1000, 1, 64)])
 @torch.inference_mode()
 def test_causal_conv1d_matches_plain_triton_bitwise(
-    monkeypatch, gdn, lens, offset, native_layout, initial
+    gdn, lens, offset, native_layout, initial
 ):
     """The conv state is updated in place, so each run starts from a copy."""
     t = _conv_inputs(lens, offset, native_layout, initial)
@@ -257,11 +170,12 @@ def test_causal_conv1d_matches_plain_triton_bitwise(
             storage = states = t.states.clone()
         return [*_conv1d(gdn, t, states, metadata), storage]
 
-    _plain_vs_cached(monkeypatch, [(gdn.conv, "_causal_conv1d_fwd")], run)
     _plain_vs_cached(
-        monkeypatch,
-        [(gdn.conv, "_causal_conv1d_metadata")],
+        run, (gdn.conv._causal_conv1d_fwd, gdn.conv._causal_conv1d_fwd_kernel)
+    )
+    _plain_vs_cached(
         lambda: list(_conv_metadata(gdn, t).__dict__.values())[1:],
+        (gdn.conv._causal_conv1d_metadata, gdn.conv._causal_conv1d_metadata_kernel),
     )
 
 
@@ -312,53 +226,22 @@ def _mul_quant_inputs(tokens, offset=0, device="cuda"):
     return x, gate, _FP8
 
 
-@pytest.mark.parametrize("buffer_ops", ["1", "0"])
-def test_gated_quant_keys_tell_apart_what_triton_tells_apart(
-    monkeypatch, gated, buffer_ops
-):
-    _on_cpu(monkeypatch)
-    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
-    inputs = _rmsnorm_quant_inputs(300, offset=1, device="cpu")
-    _check_keys(
-        *_record(
-            monkeypatch,
-            gated,
-            "_sigmoid_rmsnorm_quant",
-            lambda: gated.sigmoid_rmsnorm_quant(*inputs),
-        )
-    )
-    cached = gated._sigmoid_mul_quant
-    recorders = {warps: _Recorder(launcher) for warps, launcher in cached.items()}
-    monkeypatch.setattr(gated, "_sigmoid_mul_quant", recorders)
-    for tokens in (300, 1100):  # 4 warps up to 1024 rows, 2 beyond
-        gated.sigmoid_mul_quant(*_mul_quant_inputs(tokens, offset=1, device="cpu"))
-    for warps, recorder in recorders.items():
-        assert recorder.launcher.options["num_warps"] == warps
-        _check_keys(recorder.launcher, recorder.calls)
-
-
 @gpu
 @pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
 @pytest.mark.parametrize("tokens", [2112, 1056, 1024, 1025, 16, 3, 1])
 @torch.inference_mode()
-def test_gated_quant_match_plain_triton_bitwise(monkeypatch, gated, tokens, offset):
+def test_gated_quant_match_plain_triton_bitwise(gated, tokens, offset):
+    """Across the 1024-row switch from 4 to 2 warps in `sigmoid_mul_quant`."""
     inputs = _rmsnorm_quant_inputs(tokens, offset)
     _plain_vs_cached(
-        monkeypatch,
-        [(gated, "_sigmoid_rmsnorm_quant")],
         lambda: list(gated.sigmoid_rmsnorm_quant(*inputs)),
+        (gated._sigmoid_rmsnorm_quant, gated._sigmoid_rmsnorm_quant_kernel),
     )
-    warps = 4 if tokens <= 1024 else 2
     inputs = _mul_quant_inputs(tokens, offset)
-    cached = gated._sigmoid_mul_quant[warps]
-    monkeypatch.setattr(gated, "_sigmoid_mul_quant", {warps: _Plain(cached)})
-    ref = [t.clone() for t in gated.sigmoid_mul_quant(*inputs)]
-    monkeypatch.undo()
-    first = [t.clone() for t in gated.sigmoid_mul_quant(*inputs)]
-    second = gated.sigmoid_mul_quant(*inputs)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
-    assert cached._kernels
+    _plain_vs_cached(
+        lambda: list(gated.sigmoid_mul_quant(*inputs)),
+        (gated._sigmoid_mul_quant, gated._sigmoid_mul_quant_kernel),
+    )
 
 
 # --- QSA: mRoPE, cache rows, group pooling, selection expansion -------------
@@ -409,6 +292,15 @@ def _qsa_batch(tokens, context=8192, page=64, pool_pages=400, device="cuda"):
         raw_cache=_randn(pool_pages, page, 1, 128, seed=7, device=device),
         compressed_cache=_randn(pool_pages, page // 4, 1, 128, seed=8, device=device),
     )
+
+
+_KERNELS = {
+    "_qsa_mrope": "_qsa_mrope_kernel",
+    "_qsa_store_rows": "_qsa_store_rows_kernel",
+    "_qsa_compress_groups": "_qsa_compress_groups_kernel",
+    "_expand_selected": "_expand_selected_groups",
+    "_qsa_compressed_slots": "_qsa_compressed_slots_kernel",
+}
 
 
 def _qsa_helper_runs(qsa, tokens, offset=0, device="cuda"):
@@ -488,23 +380,13 @@ def _qsa_helper_runs(qsa, tokens, offset=0, device="cuda"):
     }
 
 
-@pytest.mark.parametrize("buffer_ops", ["1", "0"])
-def test_qsa_helper_keys_tell_apart_what_triton_tells_apart(
-    monkeypatch, qsa, buffer_ops
-):
-    _on_cpu(monkeypatch)
-    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
-    for attr, run in _qsa_helper_runs(qsa, 300, offset=1, device="cpu").values():
-        _check_keys(*_record(monkeypatch, qsa, attr, run))
-
-
 @gpu
 @pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
 @pytest.mark.parametrize("tokens", [2112, 1056, 2096, 16, 2111, 3, 1])
 @torch.inference_mode()
-def test_qsa_helpers_match_plain_triton_bitwise(monkeypatch, qsa, tokens, offset):
+def test_qsa_helpers_match_plain_triton_bitwise(qsa, tokens, offset):
     for attr, run in _qsa_helper_runs(qsa, tokens, offset).values():
-        _plain_vs_cached(monkeypatch, [(qsa, attr)], run)
+        _plain_vs_cached(run, (getattr(qsa, attr), getattr(qsa, _KERNELS[attr])))
 
 
 @gpu
@@ -579,102 +461,26 @@ def _attend(qsa, b, q):
     return [out]
 
 
-def _stacked_warps(qsa):
-    return qsa._stacked_decode_tiles(qsa._FMT_BF16)[2]
-
-
-def test_every_scorer_and_attention_config_has_a_launcher(qsa):
-    """Built up front, one per launch option set the wrappers can pick."""
-    for tiles in (qsa._STACKED_DECODE_TILES, qsa._STACKED_DECODE_TILES_GFX1250):
-        for _, _, warps, _ in tiles.values():
-            assert qsa._scorer_stacked[warps].options == {"num_warps": warps}
-    configs = {
-        qsa._kernel_config(tokens, kv_heads, splits, group, num_cu=80)[1:4]
-        for tokens in (1, 4, 16, 64, 300, 2096, 16384)
-        for kv_heads in (1, 2)
-        for splits in (1, 4, 16, 64)
-        for group in (6, 12, 24)
-    }
-    configs |= {tile[1:] for tile in qsa._GQA_TILES.values()}
-    for warps, stages, waves in configs:
-        launcher = qsa._sparse_paged_gqa[warps, stages, waves]
-        assert launcher.options == {
-            "num_warps": warps,
-            "num_stages": stages,
-            "waves_per_eu": waves,
-        }
-
-
-@pytest.mark.parametrize("tokens", [300, 16], ids=["mfma", "stacked"])
-@pytest.mark.parametrize("buffer_ops", ["1", "0"])
-def test_qsa_scoring_keys_tell_apart_what_triton_tells_apart(
-    monkeypatch, qsa, buffer_ops, tokens
-):
-    _on_cpu(monkeypatch)
-    monkeypatch.setattr(qsa, "get_cu_num", lambda: 80)
-    monkeypatch.setattr(qsa, "reduce_split_k", lambda *args: None)
-    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
-    b = _native_qsa_batch(tokens, device="cpu")
-    recorders = {
-        "_scorer_mfma": _Recorder(qsa._scorer_mfma),
-        "_scorer_stacked": {
-            w: _Recorder(launcher) for w, launcher in qsa._scorer_stacked.items()
-        },
-        "_sparse_paged_gqa": {
-            o: _Recorder(launcher) for o, launcher in qsa._sparse_paged_gqa.items()
-        },
-    }
-    for name, recorder in recorders.items():
-        monkeypatch.setattr(qsa, name, recorder)
-    _score(qsa, b, _randn(tokens, 4, 128, offset=1, device="cpu"))
-    _attend(qsa, b, _randn(tokens, 12, 256, offset=1, device="cpu"))
-    called = [recorders["_scorer_mfma"]]
-    called += list(recorders["_scorer_stacked"].values())
-    called += list(recorders["_sparse_paged_gqa"].values())
-    called = [recorder for recorder in called if recorder.calls]
-    assert len(called) == 2  # one scorer, one attention
-    for recorder in called:
-        _check_keys(recorder.launcher, recorder.calls)
-
-
 @gpu
 @pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
 @pytest.mark.parametrize("tokens", [2096, 1056, 2111, 300, 256, 16, 3, 1])
 @torch.inference_mode()
-def test_qsa_scoring_and_attention_match_plain_triton_bitwise(
-    monkeypatch, qsa, tokens, offset
-):
+def test_qsa_scoring_and_attention_match_plain_triton_bitwise(qsa, tokens, offset):
     """Above 256 rows the MFMA scorer, up to 256 the stacked one; one
     attention split for prefill-sized batches, split-K for small ones."""
     b = _native_qsa_batch(tokens)
     q = _randn(tokens, 4, 128, offset=offset, seed=17)
-    if tokens > 256:
-        _plain_vs_cached(
-            monkeypatch, [(qsa, "_scorer_mfma")], lambda: _score(qsa, b, q)
-        )
-    else:
-        scorer = qsa._scorer_stacked[_stacked_warps(qsa)]
-        plain = {**qsa._scorer_stacked, _stacked_warps(qsa): _Plain(scorer)}
-        monkeypatch.setattr(qsa, "_scorer_stacked", plain)
-        ref = [t.clone() for t in _score(qsa, b, q)]
-        monkeypatch.undo()
-        first = [t.clone() for t in _score(qsa, b, q)]
-        second = _score(qsa, b, q)
-        torch.cuda.synchronize()
-        assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
-        assert scorer._kernels
-
+    scorer = (
+        (qsa._scorer_mfma, qsa._qsa_paged_mqa_logits_mfma_kernel)
+        if tokens > 256
+        else (qsa._scorer_stacked, qsa._qsa_paged_mqa_logits_stacked_kernel)
+    )
+    _plain_vs_cached(lambda: _score(qsa, b, q), scorer)
     q = _randn(tokens, 12, 256, offset=offset, seed=18)
-    cached = qsa._sparse_paged_gqa
-    plain = {options: _Plain(launcher) for options, launcher in cached.items()}
-    monkeypatch.setattr(qsa, "_sparse_paged_gqa", plain)
-    ref = [t.clone() for t in _attend(qsa, b, q)]
-    monkeypatch.undo()
-    first = [t.clone() for t in _attend(qsa, b, q)]
-    second = _attend(qsa, b, q)
-    torch.cuda.synchronize()
-    assert _bitwise_equal(first, ref) and _bitwise_equal(second, ref)
-    assert any(launcher._kernels for launcher in cached.values())
+    _plain_vs_cached(
+        lambda: _attend(qsa, b, q),
+        (qsa._sparse_paged_gqa, qsa._qsa_sparse_paged_gqa_kernel),
+    )
 
 
 # --- fused Q/K RMSNorm (QSA attention's q_norm / k_norm) --------------------
@@ -698,45 +504,22 @@ def _qk_norm_inputs(tokens, offset=0, device="cuda"):
     return q, k, *weights, 1e-6
 
 
-@pytest.mark.parametrize("weightless_q", [False, True])
-@pytest.mark.parametrize("tokens", [300, 700])  # one row a program, then two
-@pytest.mark.parametrize("buffer_ops", ["1", "0"])
-def test_fused_qk_norm_keys_tell_apart_what_triton_tells_apart(
-    monkeypatch, layernorm, buffer_ops, tokens, weightless_q
-):
-    _on_cpu(monkeypatch)
-    monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", buffer_ops)
-    q, k, q_weight, k_weight, eps = _qk_norm_inputs(tokens, 1, device="cpu")
-    q_weight = None if weightless_q else q_weight
-    _check_keys(
-        *_record(
-            monkeypatch,
-            layernorm,
-            "_fused_qk_norm_single",
-            lambda: layernorm.fused_qk_norm(
-                q, k, q_weight, k_weight, eps, add_unit_offset=not weightless_q
-            ),
-        )
-    )
-
-
 @gpu
 @pytest.mark.parametrize("weightless_q", [False, True])
 @pytest.mark.parametrize("offset", [0, 1], ids=["aligned", "misaligned"])
 @pytest.mark.parametrize("tokens", [2112, 2096, 683, 682, 16, 3, 1])
 @torch.inference_mode()
 def test_fused_qk_norm_matches_plain_triton_bitwise(
-    monkeypatch, layernorm, tokens, offset, weightless_q
+    layernorm, tokens, offset, weightless_q
 ):
     """683 tokens are the first past the 8192-row switch to two rows a program."""
     q, k, q_weight, k_weight, eps = _qk_norm_inputs(tokens, offset)
     q_weight = None if weightless_q else q_weight
     _plain_vs_cached(
-        monkeypatch,
-        [(layernorm, "_fused_qk_norm_single")],
         lambda: list(
             layernorm.fused_qk_norm(
                 q, k, q_weight, k_weight, eps, add_unit_offset=not weightless_q
             )
         ),
+        (layernorm._fused_qk_norm_single, layernorm._fused_qk_norm_single_kernel),
     )

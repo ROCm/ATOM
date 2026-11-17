@@ -8,8 +8,7 @@
 import torch
 import triton
 import triton.language as tl
-
-from atom.utils.triton_launch import CachedLauncher
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -59,7 +58,9 @@ def _causal_conv1d_metadata_kernel(
             tl.store(token_chunk_offset_ptr + p, pad, mask=mask)
 
 
-_causal_conv1d_metadata = CachedLauncher(_causal_conv1d_metadata_kernel)
+_causal_conv1d_metadata = fast_launch(
+    _causal_conv1d_metadata_kernel, by_specialization=True
+)
 
 
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: int):
@@ -78,8 +79,7 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor, num_tokens: 
         (2, num_programs), dtype=torch.int32, device=query_start_loc_p.device
     )
     batch_ptr, token_chunk_offset_ptr = out[0], out[1]
-    _causal_conv1d_metadata(
-        (num_seqs + 1,),
+    _causal_conv1d_metadata[(num_seqs + 1,)](
         query_start_loc_p,
         batch_ptr,
         token_chunk_offset_ptr,
@@ -602,7 +602,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
-_causal_conv1d_fwd = CachedLauncher(_causal_conv1d_fwd_kernel, num_stages=2)
+_causal_conv1d_fwd = fast_launch(_causal_conv1d_fwd_kernel, by_specialization=True)
 
 
 def causal_conv1d_fn(
@@ -782,8 +782,7 @@ def causal_conv1d_fn(
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
-    _causal_conv1d_fwd(
-        grid,
+    _causal_conv1d_fwd[grid](
         # Pointers to matrices
         x,
         weight,
@@ -836,6 +835,7 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        num_stages=2,
     )
     return query, key, value
 

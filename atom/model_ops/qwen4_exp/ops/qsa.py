@@ -30,6 +30,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.mqa_logits import qsa_flydsl_layout
 from aiter.ops.topk import top_k_per_row_prefill
+from aiter.ops.triton.utils.fast_launch import fast_launch
 
 from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
     qsa_gfx1250_supports,
@@ -37,7 +38,6 @@ from atom.model_ops.qwen4_exp.ops.qsa_gfx1250 import (
 )
 from atom.model_ops.qwen4_exp.ops.qsa_split_k import reduce_split_k, split_k_buffers
 from atom.utils import envs
-from atom.utils.triton_launch import CachedLauncher
 
 # Quantized cache rows. FP8 rows carry one FP32 scale (row amax / FP8 max), so
 # any magnitude is representable and nothing saturates. FP4 rows are MXFP4:
@@ -501,7 +501,9 @@ def _qsa_compressed_slots_kernel(
     tl.store(out_ptr + tokens, tl.where(closes_group, slot // RATIO, -1), mask)
 
 
-_qsa_compressed_slots = CachedLauncher(_qsa_compressed_slots_kernel, num_warps=4)
+_qsa_compressed_slots = fast_launch(
+    _qsa_compressed_slots_kernel, by_specialization=True
+)
 
 
 def qsa_compressed_slots(
@@ -529,8 +531,7 @@ def qsa_compressed_slots(
     if out.ndim != 1 or out.stride(0) != 1:
         raise ValueError("QSA compressed slots output must be contiguous")
     if tokens:
-        _qsa_compressed_slots(
-            (triton.cdiv(tokens, 256),),
+        _qsa_compressed_slots[(triton.cdiv(tokens, 256),)](
             slot_mapping,
             logical_positions,
             out,
@@ -539,6 +540,7 @@ def qsa_compressed_slots(
             logical_positions.stride(0),
             RATIO=compress_ratio,
             BLOCK=256,
+            num_warps=4,
         )
 
 
@@ -601,7 +603,7 @@ def _qsa_mrope_kernel(
     tl.store(dst + dims, result, dims < HEAD_DIM)
 
 
-_qsa_mrope = CachedLauncher(_qsa_mrope_kernel, num_warps=1, enable_fp_fusion=False)
+_qsa_mrope = fast_launch(_qsa_mrope_kernel, by_specialization=True)
 
 
 def qsa_apply_mrope(
@@ -643,8 +645,7 @@ def qsa_apply_mrope(
         positions.stride(0) if positions.ndim == 2 and positions.shape[0] == 3 else 0
     )
     kv_heads = k.shape[1] if k is not None else 0
-    _qsa_mrope(
-        (tokens * (heads + kv_heads),),
+    _qsa_mrope[(tokens * (heads + kv_heads),)](
         q,
         k if k is not None else q,
         out_q,
@@ -667,6 +668,8 @@ def qsa_apply_mrope(
         SECTION_W=sections[2],
         INTERLEAVED=getattr(rotary_emb, "mrope_interleaved", False),
         BLOCK_D=triton.next_power_of_2(dim),
+        num_warps=1,
+        enable_fp_fusion=False,
     )
     return out_q, out_k
 
@@ -717,7 +720,7 @@ def _qsa_store_rows_kernel(
     )
 
 
-_qsa_store_rows = CachedLauncher(_qsa_store_rows_kernel, num_warps=4)
+_qsa_store_rows = fast_launch(_qsa_store_rows_kernel, by_specialization=True)
 
 
 def qsa_store_rows(
@@ -745,8 +748,7 @@ def qsa_store_rows(
 
     flat = cache.view(cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3])
     head_dim = values.shape[2]
-    _qsa_store_rows(
-        (rows, values.shape[1]),
+    _qsa_store_rows[(rows, values.shape[1])](
         flat,
         slots,
         values,
@@ -761,6 +763,7 @@ def qsa_store_rows(
         NUM_HEADS=values.shape[1],
         HEAD_DIM=head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
     )
 
 
@@ -883,7 +886,7 @@ def _qsa_compress_groups_kernel(
         )
 
 
-_qsa_compress_groups = CachedLauncher(_qsa_compress_groups_kernel, num_warps=4)
+_qsa_compress_groups = fast_launch(_qsa_compress_groups_kernel, by_specialization=True)
 
 
 def qsa_compress_groups(
@@ -932,8 +935,7 @@ def qsa_compress_groups(
         position_cache = raw_key_cache
         position_strides = (0, 0, 0)
 
-    _qsa_compress_groups(
-        (rows,),
+    _qsa_compress_groups[(rows,)](
         raw_key_cache,
         position_cache,
         page_table,
@@ -962,6 +964,7 @@ def qsa_compress_groups(
         BLOCK_D=triton.next_power_of_2(head_dim),
         LOAD_POSITIONS=load_positions,
         ROPE_POSITION_OFFSET=0 if load_positions else rope_position_offset,
+        num_warps=4,
     )
     return pooled, first_positions
 
@@ -1309,7 +1312,7 @@ def _expand_selected_groups(
     )
 
 
-_expand_selected = CachedLauncher(_expand_selected_groups)
+_expand_selected = fast_launch(_expand_selected_groups, by_specialization=True)
 
 
 @triton.jit
@@ -1644,16 +1647,10 @@ _STACKED_DECODE_TILES_GFX1250 = {_FMT_BF16: (4, 64, 2, None)}
 _STACKED_DECODE_PROGRAMS_PER_CU = 8
 
 
-_scorer_mfma = CachedLauncher(_qsa_paged_mqa_logits_mfma_kernel, num_warps=4)
-# One per warp count of the tables above, built here: a call traced by
-# torch.compile can look a launcher up but not construct one.
-_scorer_stacked = {
-    warps: CachedLauncher(_qsa_paged_mqa_logits_stacked_kernel, num_warps=warps)
-    for _, _, warps, _ in (
-        *_STACKED_DECODE_TILES.values(),
-        *_STACKED_DECODE_TILES_GFX1250.values(),
-    )
-}
+_scorer_mfma = fast_launch(_qsa_paged_mqa_logits_mfma_kernel, by_specialization=True)
+_scorer_stacked = fast_launch(
+    _qsa_paged_mqa_logits_stacked_kernel, by_specialization=True
+)
 
 
 def _stacked_decode_tiles(key_fmt: int) -> tuple[int, int, int, int | None]:
@@ -1798,8 +1795,7 @@ def qsa_paged_mqa_logits(
         and head_dim & (head_dim - 1) == 0
         and head_dim >= 16
     ):
-        _scorer_stacked[warps](
-            (row_programs, min(triton.cdiv(columns, bn), column_programs)),
+        _scorer_stacked[(row_programs, min(triton.cdiv(columns, bn), column_programs))](
             q,
             compressed_k_cache,
             scale,
@@ -1831,6 +1827,7 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
+            num_warps=warps,
         )
         return logits, visible_groups
     # Otherwise decode-sized batches keep the CUDA-core kernel: one row per
@@ -1866,8 +1863,7 @@ def qsa_paged_mqa_logits(
             )
             return logits, visible_groups
         bmt, bn = 16, 128
-        _scorer_mfma(
-            (triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn)),
+        _scorer_mfma[(triton.cdiv(q.shape[0], bmt), triton.cdiv(columns, bn))](
             q,
             compressed_k_cache,
             scale,
@@ -1899,6 +1895,7 @@ def qsa_paged_mqa_logits(
             BN=bn,
             KEY_FMT=key_fmt,
             GROUP=FP4_GROUP,
+            num_warps=4,
         )
         return logits, visible_groups
     column_programs = min(
@@ -2026,8 +2023,7 @@ def qsa_expand_block_indices(
     if block_indices.shape[0] == 0:
         return out
 
-    _expand_selected(
-        (block_indices.shape[0], triton.cdiv(output_width, 128)),
+    _expand_selected[(block_indices.shape[0], triton.cdiv(output_width, 128))](
         block_indices,
         context_lens,
         query_positions,
@@ -2415,23 +2411,9 @@ def _qsa_sparse_paged_gqa_kernel(
 # issue's points (36 decode rows over 9 requests; one 16384-row prefill at
 # 98304 context).
 _GQA_TILES = {(True, False): (32, 4, 2, 0), (True, True): (32, 2, 2, 0)}
-# One per (num_warps, num_stages, waves_per_eu) that `_kernel_config` returns
-# or `_GQA_TILES` overrides it with, built here for the same reason as
-# `_scorer_stacked`.
-_sparse_paged_gqa = {
-    (warps, stages, waves): CachedLauncher(
-        _qsa_sparse_paged_gqa_kernel,
-        num_warps=warps,
-        num_stages=stages,
-        waves_per_eu=waves,
-    )
-    for warps, stages, waves in (
-        (4, 1, 0),
-        (2, 1, 0),
-        (4, 1, 3),
-        *(tile[1:] for tile in _GQA_TILES.values()),
-    )
-}
+
+
+_sparse_paged_gqa = fast_launch(_qsa_sparse_paged_gqa_kernel, by_specialization=True)
 
 
 def qsa_sparse_paged_gqa(
@@ -2535,8 +2517,7 @@ def qsa_sparse_paged_gqa(
         return out.zero_()
     target, partial_max, partial_sum, widths = split_k_buffers(out, kv_splits)
     grid_y = k_cache.shape[2] * num_head_groups
-    _sparse_paged_gqa[num_warps, num_stages, waves_per_eu](
-        (q.shape[0], grid_y, kv_splits),
+    _sparse_paged_gqa[(q.shape[0], grid_y, kv_splits)](
         q,
         k_cache,
         v_cache,
@@ -2584,6 +2565,9 @@ def qsa_sparse_paged_gqa(
         KV_SPLITS=kv_splits,
         SUB_GROUP=sub_group if sub_group < group_size else 0,
         KV_FP8=kv_fp8,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
     reduce_split_k(out, target, partial_max, partial_sum, widths, kv_splits, block_n)
     return out
