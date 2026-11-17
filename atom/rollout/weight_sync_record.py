@@ -13,6 +13,12 @@ from collections.abc import Iterable, Mapping
 import torch
 
 
+def is_calibrated(name: str) -> bool:
+    """Whether *name* is a static activation scale: calibrated, not trained,
+    so no trainer sends one."""
+    return name.endswith("input_scale")
+
+
 class WeightSyncRecord:
     """From a sync's first update on this rank to the step that completes it."""
 
@@ -39,16 +45,13 @@ class WeightSyncRecord:
         written.add(part)
 
     def missing(self, params: Mapping[str, torch.nn.Parameter]) -> list[str]:
-        """The names in *params* this sync left as they were.
-
-        A static activation scale is not counted: it is calibrated, not
-        trained, so no trainer sends one.
-        """
+        """The names in *params* this sync left as they were, a calibrated
+        one aside (``is_calibrated``)."""
         covered = self._written | {
             pid for pid, (whole, written) in self._parts.items() if whole <= written
         }
         return sorted(
             name
             for name, param in params.items()
-            if id(param) not in covered and not name.endswith("input_scale")
+            if id(param) not in covered and not is_calibrated(name)
         )

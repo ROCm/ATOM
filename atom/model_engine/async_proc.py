@@ -403,10 +403,9 @@ class AsyncIOProc:
         try:
             value = func(*call_args, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
-            return RpcResult(
-                payload.request_id,
-                self.rank,
-                error=f"{type(exc).__name__}: {exc}",
+            return self._failure(
+                payload,
+                f"{type(exc).__name__}: {exc}",
                 refused_before_writing=isinstance(exc, WeightReloadRefused),
             )
         if not is_plain_rpc_value(value):
@@ -418,9 +417,16 @@ class AsyncIOProc:
             )
         return RpcResult(payload.request_id, self.rank, value=value)
 
-    def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
+    def _failure(
+        self, payload: RpcPayload, error: str, *, refused_before_writing: bool = False
+    ) -> RpcResult:
         """This rank's reply to *payload* when the call could not succeed."""
-        return RpcResult(payload.request_id, self.rank, error=error)
+        return RpcResult(
+            payload.request_id,
+            self.rank,
+            error=error,
+            refused_before_writing=refused_before_writing,
+        )
 
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()

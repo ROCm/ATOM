@@ -7,6 +7,8 @@ formats a reload can rewrite."""
 
 import torch
 
+from atom.rollout.weight_sync_record import is_calibrated
+
 
 def _requantise_per_1x128(module, weight: torch.Tensor, fp8_dtype):
     """A true 128x128 block scale of shape (N//128, K//128), the layout the
@@ -71,8 +73,9 @@ class ReloadPolicyMixin:
         type. Anything else -- FP4 or MXFP4 packed bytes, integer quantisation,
         FP8 of another scheme -- is cast into garbage where the shapes agree.
         A module that writes its weights itself (``sync_weight``) knows their
-        format, and an int64 parameter is a constant, an index or a hash: no
-        quantisation stores weights in it.
+        format, an int64 parameter is a constant, an index or a hash: no
+        quantisation stores weights in it, and no sync sends a calibrated one
+        (``is_calibrated``).
         """
         unreloadable = []
         for prefix, module in self._sync_target_model().named_modules():
@@ -81,7 +84,7 @@ class ReloadPolicyMixin:
             quant_type = getattr(getattr(module, "quant_type", None), "name", None)
             for name, param in module.named_parameters(recurse=False):
                 if (
-                    name.endswith("input_scale")
+                    is_calibrated(name)
                     or param.dtype == torch.int64
                     or (param.dtype.is_floating_point and param.element_size() >= 2)
                 ):

@@ -9,7 +9,11 @@ from functools import wraps
 import torch
 
 from atom.model_engine.collective_rpc import WeightReloadRefused
-from atom.model_loader.weight_names import have_shared_expert
+from atom.model_loader.weight_names import (
+    have_shared_expert,
+    shared_expert_prefixes,
+    shared_expert_slot_name,
+)
 from atom.rollout.reload_policy import (
     FP8_REQUANTISERS,
     ReloadPolicyMixin,
@@ -417,13 +421,12 @@ class WeightUpdaterMixin(ReloadPolicyMixin):
         matching = have_shared_expert(name)
         if matching is None:
             return None
-        layer_prefix = name.split(matching, 1)[0]
-        module_prefix = matching.split("shared_expert", 1)[0]
-        entry = param_to_module.get(f"{layer_prefix}{module_prefix}experts.w13_weight")
+        _, routed = shared_expert_prefixes(name, matching)
+        entry = param_to_module.get(f"{routed}.w13_weight")
         layout = getattr(entry[0], "expert_layout", None) if entry else None
         if layout is None or not layout.num_fused_shared_experts:
             return None
-        return name.replace(matching, f"{module_prefix}experts.{layout.num_routed}.")
+        return shared_expert_slot_name(name, matching, layout.num_routed)
 
     def _get_expert_params_mapping(self) -> list[tuple[str, str, int, str]]:
         """[(ckpt weight fragment, ATOM param fragment, expert_id, shard_id)].
