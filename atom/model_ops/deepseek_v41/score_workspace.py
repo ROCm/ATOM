@@ -130,8 +130,8 @@ class ScoreWorkspace(LogitsWorkspace):
             if self.packed
             else None
         )
-        # The packed logits' lane maxima, which gfx1250's OPUS scorer writes
-        # beside them for the top-k of the same band (`packed_lane_max`).
+        # The packed logits' lane maxima, which the OPUS scorer writes beside
+        # them where aiter says it does (`packed_lane_max`).
         # Allocated here with the rest, so the memory profile counts them.
         self._lane_max = (
             torch.empty(

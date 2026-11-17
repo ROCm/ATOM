@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.pa_mqa_logits_mxfp4 import mqa_logits_mxfp4_lane_max_elems
+from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+    mqa_logits_mxfp4_lane_max_elems,
+    mqa_logits_mxfp4_writes_lane_max,
+)
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.model_hooks import DecodeRound
@@ -36,6 +38,7 @@ from atom.model_ops.engram.device.staging import (
     EngramStep,
     engram_staging,
 )
+from atom.model_ops.indexer.layout import MFMA, NATURAL
 from atom.model_ops.v4_kernels import make_compress_plans
 from atom.models.deepseek_v41.bounded_replay import (
     ReplayPlan,
@@ -65,6 +68,20 @@ logger = logging.getLogger("atom")
 ENGRAM_ROWS = "v41_engram_rows"
 # the prefix of the step buffers a bounded replay's decoder rows publish into
 DECODER_ROWS = "tail_"
+
+
+def _lane_max_sizing(device, heads, index_layout):
+    """aiter's lane-maxima sizing (`mqa_logits_mxfp4_lane_max_elems`) where
+    the FP4 index plane is scored by the OPUS kernels and aiter says their
+    launches on `device` with `heads` index heads write lane maxima
+    (`mqa_logits_mxfp4_writes_lane_max`), else None. V4.1's OPUS bands never
+    take a schedule (`IndexRows.fp4_bands`), so where the buffer exists every
+    band launch writes it and no top-k is handed one left unwritten."""
+    if index_layout not in (NATURAL, MFMA):
+        return None
+    if not mqa_logits_mxfp4_writes_lane_max(device, heads):
+        return None
+    return mqa_logits_mxfp4_lane_max_elems
 
 
 def _compress_plan_buffer_names(ratio):
@@ -249,10 +266,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # list, which the checkpoint fixes and `max_model_len` does not
             # bound. Short contexts make it the widest plane in the model.
             candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
-            # gfx1250's OPUS FP4 scorer writes lane maxima beside the packed
+            # Where the OPUS FP4 scorer writes lane maxima beside the packed
             # logits for the top-k of the same band.
-            lane_max_elems=(
-                mqa_logits_mxfp4_lane_max_elems if get_gfx() == "gfx1250" else None
+            lane_max_elems=_lane_max_sizing(
+                self.device, self.config.index_n_heads, self.geometry.index_layout
             ),
         )
         logger.info(

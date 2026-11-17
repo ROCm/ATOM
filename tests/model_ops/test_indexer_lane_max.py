@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Lane maxima: held beside the packed FP4 logits, handed only to a band of
-at least 128 rows, and written only by an FP4 band launch whose config
-writes them."""
+"""Lane maxima: allocated where aiter says the OPUS launches write them, held
+beside the packed FP4 logits, handed only to a band of at least 128 rows, and
+written only by an FP4 band launch whose config writes them."""
 
 from types import SimpleNamespace
 
@@ -109,3 +109,34 @@ def test_a_band_below_128_rows_hands_lane_max_to_neither_kernel(
     expected = lane_max if count >= 128 else None
     assert seen["scorer"] is expected
     assert seen["top_k"] is expected
+
+
+@pytest.fixture(scope="module")
+def backend():
+    with atom_under_stubs() as load:
+        yield load("atom.model_ops.attentions.deepseek_v41.backend")
+
+
+@pytest.mark.parametrize("writes", [True, False])
+@pytest.mark.parametrize("layout", ["natural", "mfma", "preshuffle", None])
+def test_the_workspace_sizes_lane_max_from_aiters_query(
+    backend, monkeypatch, writes, layout
+):
+    """The buffer is sized only where aiter says the OPUS launches on this
+    device with these index heads write lane maxima, and only on an
+    OPUS-scored FP4 plane: the device and head count go to aiter as they
+    are, and ATOM keeps no arch rule of its own."""
+    asked = []
+
+    def query(device, heads):
+        asked.append((device, heads))
+        return writes
+
+    monkeypatch.setattr(backend, "mqa_logits_mxfp4_writes_lane_max", query)
+    sizing = backend._lane_max_sizing("cuda:1", 32, layout)
+    opus = layout in (backend.NATURAL, backend.MFMA)
+    if opus and writes:
+        assert sizing is backend.mqa_logits_mxfp4_lane_max_elems
+    else:
+        assert sizing is None
+    assert asked == ([("cuda:1", 32)] if opus else [])
