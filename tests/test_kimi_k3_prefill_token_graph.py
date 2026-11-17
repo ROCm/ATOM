@@ -116,10 +116,12 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
         # own, not this module's `mla`.
         attn = load(kimi.MLAAttention.__module__)
     monkeypatch.setattr(attn, "pcp_is_enabled", lambda: False)
+    target_layers = 4
 
     def supports(dp, *layers):
         config = SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_size=dp),
+            hf_config=SimpleNamespace(num_hidden_layers=target_layers),
             compilation_config=SimpleNamespace(
                 static_forward_context={f"l{i}": m for i, m in enumerate(layers)}
             ),
@@ -127,8 +129,9 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
         builder = SimpleNamespace(model_runner=SimpleNamespace(config=config))
         return kimi._KimiMLAGDNCommon.supports_token_graph.fget(builder)
 
-    def mla_layer(**over):
-        return SimpleNamespace(impl=_mla_impl(kimi.MLAAttention, **over))
+    def mla_layer(layer_num=0, **over):
+        impl = _mla_impl(kimi.MLAAttention, layer_num=layer_num, **over)
+        return SimpleNamespace(impl=impl)
 
     kda_layer = SimpleNamespace()
     assert supports(1, mla_layer(), kda_layer)
@@ -136,9 +139,27 @@ def test_kimi_records_prefill_token_graphs_without_dp_while_its_layers_split(
     assert not supports(8, mla_layer(), kda_layer)
     # A recorded layer whose split stands down would run as one region.
     assert not supports(1, mla_layer(), mla_layer(is_sparse_mla=True))
-    # A drafter's layer, which the recording does not run.
-    drafter = mla_layer(split_prefill_recording=False, o_proj=nn.Linear(2, 2))
+    # Kimi-K3.1: every MLA layer opted in, and every one is sparse.
+    assert not supports(1, mla_layer(is_sparse_mla=True), kda_layer)
+    # GLM-5.3-Flash shares this builder and opts no layer in: its MLA layers
+    # are all sparse and never set `split_prefill_recording`; its linear
+    # attention and its MTP layer (numbered past the target's) beside them.
+    glm_mla = mla_layer(split_prefill_recording=False, is_sparse_mla=True)
+    glm_mtp = mla_layer(
+        target_layers, split_prefill_recording=False, is_sparse_mla=True
+    )
+    assert not supports(1, glm_mla, kda_layer, glm_mtp)
+    # A target layer the model did not opt in counts too.
+    assert not supports(1, mla_layer(), mla_layer(split_prefill_recording=False))
+    # A drafter's layer, numbered past the target's, does not: the recording
+    # does not run it.
+    drafter = mla_layer(
+        target_layers, split_prefill_recording=False, o_proj=nn.Linear(2, 2)
+    )
     assert supports(1, mla_layer(), drafter)
+    # Nothing opted in, nothing recorded: a drafter alone, or no MLA layer.
+    assert not supports(1, drafter, kda_layer)
+    assert not supports(1, kda_layer)
     monkeypatch.setattr(attn, "pcp_is_enabled", lambda: True)
     monkeypatch.setattr(attn, "get_pcp_world_size", lambda: 2)
     assert not supports(1, mla_layer(), kda_layer)
