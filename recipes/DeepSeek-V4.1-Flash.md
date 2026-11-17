@@ -232,13 +232,14 @@ DSpark proposer of a served step
 (`atom/models/deepseek_v41/mono/gfx1250/`).
 
 - **Deployment.** TP4, DSpark with 5 speculative tokens, BF16 KV cache (FP4
-  KV is served too, but use BF16: at c1 FP4 measured no faster — E13 TPOT 1.03
-  vs 1.01 ms, a step reads ~640 keys a layer — and its ~300K-token prefills hit
-  MES queue-eviction hangs on the current MI455X driver, not root-caused), FP8
+  KV is served too, but measured no faster at c1 — E13 TPOT 1.03 vs 1.01 ms; a
+  step reads ~640 keys a layer), FP8
   or FP4 index cache (FP4: the gfx1250 natural layout, `--index-cache-dtype
   fp4`; the step's long-context scoring reads half the bytes), one request a step (6 verify rows; `runner.MAX_STEP_ROWS`, wider steps take the production path), no DSpark confidence
   schedule or ragged verify. Anything else is refused at load
-  (`V4.1 single-launch step off: <why>`).
+  (`V4.1 single-launch step off: <why>`). On the current MI455X driver,
+  back-to-back ~300K-token prefills (production path; BF16 and FP4 KV alike)
+  have hung the GPUs in MES `REMOVE_QUEUE`; not root-caused.
 - **Draft temperature.** `ATOM_DSPARK_PROB_DRAFT_TSCALE` scales the
   probabilistic drafter's temperature (`T_d = T * scale`, default 1). The
   verify uses the same draft distribution, so any value keeps the output
