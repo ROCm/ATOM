@@ -236,7 +236,7 @@ def test_vk_checkpoint_layout():
 @pytest.mark.parametrize("dims", [(128, 128), (64, 128)])
 def test_vk_snapshot_checkpoints_match_kv_snapshot(pool_vk, planned_rows, dims):
     """FlyDSL's snapshot is a view over VK storage; it checkpoints the same
-    bytes as the KV copy it replaces, into either pool layout. Unequal K and V
+    bytes as its contiguous KV copy, into either pool layout. Unequal K and V
     catch an interchanged axis."""
     from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
 

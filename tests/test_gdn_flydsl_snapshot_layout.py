@@ -1,50 +1,45 @@
-"""CPU contracts for the layout of the GDN prefill's chunk-state snapshot."""
+"""The GDN checkpoint writer refuses a chunk-state layout it cannot read.
+
+`write_state_checkpoints` reads off `h`'s strides whether its states are stored
+KV or VK, and rejects any other layout before it launches. The non-GPU unit
+tests run without Triton, so the module is loaded from its source with Triton
+stubbed for the import.
+"""
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
 
 import pytest
 import torch
 
-
-def test_kv_snapshot_is_the_kernel_states_viewed_as_kv(monkeypatch):
-    pytest.importorskip("triton", reason="GDN prefill requires Triton")
-    from atom.model_ops.fla_ops import gdn_flydsl
-
-    q = torch.ones((1, 2, 1, 2))
-    # The K5 kernel's chunk states, stored VK: [B, NT, H, V, K].
-    h = torch.arange(24, dtype=torch.float32).reshape(1, 2, 1, 3, 4)
-    final = torch.ones((1, 1, 3, 4))
-    monkeypatch.setattr(gdn_flydsl, "prefill_supported", lambda *args: True)
-    monkeypatch.setattr(gdn_flydsl, "_log_dispatch", lambda *args: None)
-    monkeypatch.setattr(gdn_flydsl, "l2norm_fwd", lambda value: value)
-    monkeypatch.setattr(gdn_flydsl, "prepare_prefill_state", lambda state, *_: state)
-    monkeypatch.setattr(
-        gdn_flydsl,
-        "ops",
-        lambda: (None, lambda **kwargs: (q, q, q), lambda **kwargs: (h, q, final)),
-    )
-    monkeypatch.setattr(gdn_flydsl, "chunk_fwd_o", lambda *args, **kwargs: q)
-    prefill = getattr(gdn_flydsl.prefill, "_rtp_original", gdn_flydsl.prefill)
-    inputs = (q, q, q, q, q, final, None, (object(), object()))
-
-    _, _, kv = prefill(*inputs, True)
-    _, _, vk = prefill(*inputs, True, snapshot_layout="vk")
-    _, _, none = prefill(*inputs, False)
-    assert vk is h and none is None
-    # The KV contract without a copy: the kernel's own storage, by strides.
-    assert kv.shape == (1, 2, 1, 4, 3)
-    assert kv.data_ptr() == h.data_ptr() and kv.stride() == (24, 12, 12, 1, 4)
-    assert torch.equal(kv, h.transpose(-1, -2))
+SOURCE = (
+    Path(__file__).resolve().parents[1] / "atom/model_ops/fla_ops/state_checkpoint.py"
+)
 
 
-def test_checkpoint_writer_rejects_an_unknown_snapshot_layout():
-    pytest.importorskip("triton", reason="GDN checkpoints require Triton")
-    from atom.model_ops.fla_ops.state_checkpoint import write_state_checkpoints
+@pytest.fixture
+def state_checkpoint(monkeypatch):
+    triton = types.ModuleType("triton")
+    triton.jit = lambda fn: fn
+    triton.language = types.ModuleType("triton.language")
+    spec = importlib.util.spec_from_file_location("_gdn_state_checkpoint_probe", SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as m:
+        m.setitem(sys.modules, "triton", triton)
+        m.setitem(sys.modules, "triton.language", triton.language)
+        spec.loader.exec_module(module)
+    return module
 
+
+def test_checkpoint_writer_rejects_an_unknown_snapshot_layout(state_checkpoint):
     pool = torch.zeros(2, 1, 4, 3)
     # Neither [K, V] nor [V, K] contiguous per state: every other column.
     strided = torch.zeros(1, 2, 1, 4, 6)[..., ::2]
     one = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="neither a KV nor a VK layout"):
-        write_state_checkpoints(
+        state_checkpoint.write_state_checkpoints(
             strided,
             pool,
             torch.zeros(64, 2),
