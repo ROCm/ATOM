@@ -362,8 +362,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
         a shape its kernel does not take, and passes a single joined block
         (a PP relay) through as it is.
         """
+        main_proj = self.mtp[0].main_proj
+        if main_proj.runs_bf16:  # no group32 FP8 GEMM here: BF16 in
+            return main_proj(self.concat_taps(taps).unsqueeze(0))
         x, x_scale = quantize_fp8_taps(taps)
-        return self.mtp[0].main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
+        return main_proj(x.unsqueeze(0), x_scale=x_scale.unsqueeze(0))
 
     def _main_norm_quant(self):
         """The fused norm built in ``__init__``."""

@@ -147,3 +147,20 @@ def test_project_context_projects_only_the_kv_rows_of_a_bf16_wqkv_a(runs_bf16):
     assert attention._wkv_shard.call_count == int(runs_bf16)
     assert attention.project_qkv.call_count == int(not runs_bf16)
     assert torch.equal(attention.context_keys.call_args.args[0], 2 * kv)
+
+
+def test_a_bf16_main_proj_takes_the_joined_taps_unquantized():
+    """Where `main_proj` runs in BF16 (no group32 FP8 GEMM), the taps reach it
+    joined and unquantized."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    model_cls = _draft_model()
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    main_proj = Mock(runs_bf16=True, return_value="projected")
+    model.mtp = [SimpleNamespace(main_proj=main_proj)]
+    taps = [torch.randn(3, 4, dtype=torch.bfloat16) for _ in range(3)]
+    assert model._project_taps(taps) == "projected"
+    (x,), kwargs = main_proj.call_args
+    assert torch.equal(x, torch.cat(taps, dim=-1)[None]) and not kwargs
