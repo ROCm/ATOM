@@ -2590,6 +2590,42 @@ models:
               max_num_seqs: 320
               spec_decode_acceptance_length: 4.04
 
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c100
+          concurrency: [100]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,200]"
+          server:
+            common_args:
+              max_num_seqs: 200
+              spec_decode_acceptance_length: 4.04
+
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c180
+          concurrency: [180]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,288,320,360]"
+          server:
+            common_args:
+              max_num_seqs: 360
+              spec_decode_acceptance_length: 4.04
+
+        - <<: *m31b_agentx
+          name: m31b-nvfp4-1p1d-pp4-tp4-dspark7-mcstore-agentx-c200
+          concurrency: [200]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,288,320,360,400]"
+          server:
+            common_args:
+              max_num_seqs: 400
+              spec_decode_acceptance_length: 4.04
+
     accuracy:
       task: gsm8k
       fewshot: 20
