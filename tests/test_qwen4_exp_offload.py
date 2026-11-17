@@ -14,6 +14,7 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
+from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     published_bytes_for,
@@ -165,8 +166,6 @@ def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
     monkeypatch, one_tp_rank, caplog
 ):
     """The PLE windows are snapshotted only where a forward ends."""
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-
     builder, cls = _builder()
     parent = GDNAttentionMetadataBuilder.state_transfer(builder)
     readable = replace(
@@ -182,6 +181,19 @@ def test_ple_turns_a_midstep_readable_transfer_off_and_says_so(
     assert (transfer.midstep_grid, transfer.midstep_min_offset) == (0, 0)
     assert transfer.copies == readable.copies
     assert transfer.paged_layout_id.startswith(readable.paged_layout_id + ":")
+
+
+@pytest.mark.parametrize("replayssm", [True, False])
+def test_decode_snapshot_is_the_gdn_parents(one_tp_rank, replayssm):
+    """The PAGE planes carry no ReplaySSM records, so under ReplaySSM a decode
+    image must be built at its verify step, never copied as the slot is."""
+    builder, cls = _builder()
+    builder.replayssm = replayssm
+    transfer = cls.state_transfer(builder)
+    assert transfer.copies
+    assert transfer.decode_snapshot is replayssm
+    parent = GDNAttentionMetadataBuilder.state_transfer(builder)
+    assert transfer.decode_snapshot is parent.decode_snapshot
 
 
 def _layout_id(builder, cls):
@@ -246,7 +258,6 @@ def test_ssm_storage_follows_the_decode_switches(
     monkeypatch, one_tp_rank, env, replayssm, storage
 ):
     """The layout id and the binding read one decision."""
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.fla_ops import gdn_flydsl
 
     for name, value in env.items():
@@ -267,8 +278,6 @@ def test_ssm_storage_follows_the_decode_switches(
 
 
 def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch, one_tp_rank):
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-
     builder, cls = _builder()
     builder.device = torch.device("cpu")
     builder.slots_per_req = lambda: 1
