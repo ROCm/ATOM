@@ -2039,6 +2039,10 @@ def qsa_select_paged_groups(
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
     compressed_k_scale: torch.Tensor | None = None,
+    *,
+    use_aiter_indexer: bool = False,
+    query_lens: tuple[int, ...] | None = None,
+    prefix_lens: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Score and select: `[tokens, block_topk]` group ids, and the token width
     `qsa_expand_block_indices` must emit for them.
@@ -2051,6 +2055,31 @@ def qsa_select_paged_groups(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
     rows = q.shape[0]
+    if use_aiter_indexer:
+        from atom.model_ops.qwen4_exp.ops.aiter_indexer import try_select
+
+        selected = try_select(
+            q,
+            compressed_k_cache,
+            page_table,
+            token_to_request,
+            query_positions,
+            context_lens,
+            token_topk,
+            compress_ratio,
+            columns,
+            output_width,
+            logits_workspace_bytes,
+            max_seq_len,
+            compressed_k_scale,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+        )
+        if selected is not None:
+            # The fourth token exists only for a complete group. A causal tail
+            # has at most three tokens, so this also preserves its -1 padding.
+            groups = torch.div(selected[:, 3:2048:4], 4, rounding_mode="floor")
+            return groups, output_width
     groups = torch.empty((rows, block_topk), dtype=torch.int32, device=q.device)
     # Chunk over query rows so the FP32 logits buffer stays within budget.
     rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
@@ -2104,21 +2133,54 @@ def qsa_select_paged_tokens(
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
     compressed_k_scale: torch.Tensor | None = None,
+    *,
+    use_aiter_indexer: bool = False,
+    query_lens: tuple[int, ...] | None = None,
+    prefix_lens: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Score, select and expand in one call: `[tokens, width]` token ids
     (see `_selection_widths` for the width)."""
     rows = q.shape[0]
-    _, _, output_width = _selection_widths(
+    columns, _, output_width = _selection_widths(
         compressed_k_cache, page_table, token_topk, compress_ratio, max_seq_len
     )
-    if out is None:
-        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
-    elif out.shape[0] != rows or out.shape[1] < output_width:
-        raise ValueError("out has an invalid shape")
-    else:
+    if out is not None:
+        if out.shape[0] != rows or out.shape[1] < output_width:
+            raise ValueError("out has an invalid shape")
         out = out[:, :output_width]
     if rows == 0:
-        return out
+        return (
+            torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
+            if out is None
+            else out
+        )
+    if use_aiter_indexer:
+        from atom.model_ops.qwen4_exp.ops.aiter_indexer import try_select
+
+        selected = try_select(
+            q,
+            compressed_k_cache,
+            page_table,
+            token_to_request,
+            query_positions,
+            context_lens,
+            token_topk,
+            compress_ratio,
+            columns,
+            output_width,
+            logits_workspace_bytes,
+            max_seq_len,
+            compressed_k_scale,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+        )
+        if selected is not None:
+            if out is None:
+                return selected
+            out.copy_(selected)
+            return out
+    if out is None:
+        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
     groups, _ = qsa_select_paged_groups(
         q,
         compressed_k_cache,

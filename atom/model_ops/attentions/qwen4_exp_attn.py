@@ -75,6 +75,9 @@ class Qwen4ExpQSAMetadata:
     # request-major order. None elsewhere.
     host_lens: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     context_slots: torch.Tensor | None = None
+    # Selection-only planning does not require the attention K/V gather plan.
+    indexer_query_lens: tuple[int, ...] | None = None
+    indexer_prefix_lens: tuple[int, ...] | None = None
 
     def for_tokens(self, num_tokens: int) -> "Qwen4ExpQSAMetadata":
         """Draft step zero uses real rows, without the target graph's padding."""
@@ -683,6 +686,14 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         attn_metadata.qsa_metadata = self._finish_qsa(
             attn_metadata, num_reqs, batch.total_tokens_num_prefill
         )
+        cached = getattr(batch, "num_cached_tokens", None)
+        if cached is not None:
+            attn_metadata.qsa_metadata.indexer_query_lens = tuple(
+                int(n) for n in query_lens
+            )
+            attn_metadata.qsa_metadata.indexer_prefix_lens = tuple(
+                int(n) for n in cached[:num_reqs]
+            )
         attn_metadata.ple_metadata = self._finish_ple(attn_metadata, num_reqs)
 
     def stage_decode(self, batch, running_bs, running_tokens, max_seqlen_q, group):

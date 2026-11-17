@@ -193,7 +193,7 @@ def build_qwen4_exp_rope(config, head_size: int):
         and (rope_parameters.get("rope_type") or rope_parameters.get("type"))
         else None
     )
-    return get_rope(
+    rotary = get_rope(
         head_size=head_size,
         rotary_dim=rotary_dim,
         max_position=int(config.max_position_embeddings),
@@ -201,6 +201,12 @@ def build_qwen4_exp_rope(config, head_size: int):
         is_neox_style=True,
         rope_scaling=scaling,
     )
+    if scaling is not None and not hasattr(rotary, "mrope_section"):
+        # YaRN keeps the scaled frequency table in a different rotary class.
+        # QSA applies the axes itself, so retain the model's MRoPE metadata.
+        rotary.mrope_section = tuple(scaling["mrope_section"])
+        rotary.mrope_interleaved = bool(scaling.get("mrope_interleaved", False))
+    return rotary
 
 
 def canonical_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -514,6 +520,12 @@ class Qwen4ExpAttention(nn.Module):
             )
 
         allow_flydsl = get_forward_context().context.is_prefill
+        use_aiter = envs.ATOM_QSA_AITER_INDEXER
+        query_lens = prefix_lens = None
+        if use_aiter:
+            from atom.model_ops.qwen4_exp.ops.aiter_indexer import packed_lengths
+
+            query_lens, prefix_lens = packed_lengths(qsa, rows)
         if rows is None:
             return qsa_select_paged_tokens(
                 index_q,
@@ -527,6 +539,9 @@ class Qwen4ExpAttention(nn.Module):
                 max_seq_len=qsa.max_seq_len,
                 allow_flydsl=allow_flydsl,
                 compressed_k_scale=self.compressed_key_scale,
+                use_aiter_indexer=use_aiter,
+                query_lens=query_lens,
+                prefix_lens=prefix_lens,
             )
         local = slice(rows.start, min(rows.start + rows.chunk, rows.num_tokens))
         groups, width = qsa_select_paged_groups(
@@ -541,6 +556,9 @@ class Qwen4ExpAttention(nn.Module):
             max_seq_len=qsa.max_seq_len,
             allow_flydsl=allow_flydsl,
             compressed_k_scale=self.compressed_key_scale,
+            use_aiter_indexer=use_aiter and query_lens is not None,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
         )
         if groups.shape[0] < rows.chunk:
             groups = nn.functional.pad(groups, (0, 0, 0, rows.chunk - groups.shape[0]))
@@ -687,6 +705,8 @@ class Qwen4ExpAttention(nn.Module):
             block_tables=torch.arange(pages, device=device, dtype=torch.int32)[None],
             seq_lens=torch.tensor([tokens], device=device, dtype=torch.int32),
             max_seq_len=tokens,
+            indexer_query_lens=(tokens,),
+            indexer_prefix_lens=(0,),
         )
         names = (
             "k_cache",

@@ -1202,6 +1202,9 @@ def build_qsa_metadata(
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
     host_lens = context_slots = None
+    indexer_lens = None
+    if not packed_step and envs.ATOM_QSA_AITER_INDEXER:
+        indexer_lens = _packed_prefill_lengths(forward_batch, live_bs, num_tokens)
     # Only eager unpacked extends reach here (packed draft steps returned
     # above), so this covers the target prefill and the drafter's prefill
     # extend over the same tokens.
@@ -1221,6 +1224,12 @@ def build_qsa_metadata(
         max_seq_len=max(max_seq_len, 1),
         host_lens=host_lens,
         context_slots=context_slots,
+        indexer_query_lens=None if indexer_lens is None else indexer_lens[0],
+        indexer_prefix_lens=(
+            None
+            if indexer_lens is None
+            else tuple(s - q for q, s in zip(*indexer_lens))
+        ),
     )
     return qsa
 
@@ -1273,6 +1282,34 @@ def _token_to_kv_pool(forward_batch: Any) -> Any:
     return pool
 
 
+def _packed_prefill_lengths(forward_batch, live_bs, num_tokens):
+    """Read existing CPU lengths for selection, without building a KV gather map."""
+    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seqs = getattr(forward_batch, "seq_lens_cpu", None)
+    if extends is None or seqs is None:
+        return None
+    if any(
+        isinstance(v, torch.Tensor) and v.device.type != "cpu" for v in (extends, seqs)
+    ):
+        return None
+    extends, seqs = list(extends)[:live_bs], list(seqs)[:live_bs]
+    if any(
+        isinstance(v, torch.Tensor) and v.device.type != "cpu"
+        for v in (*extends, *seqs)
+    ):
+        return None
+    extends = tuple(int(n) for n in extends)
+    seqs = tuple(int(n) for n in seqs)
+    if (
+        len(extends) != live_bs
+        or len(seqs) != live_bs
+        or sum(extends) != num_tokens
+        or any(e < 0 or s < e for e, s in zip(extends, seqs))
+    ):
+        return None
+    return extends, seqs
+
+
 def _flydsl_prefill_layout(
     forward_batch: Any,
     live_bs: int,
@@ -1285,19 +1322,10 @@ def _flydsl_prefill_layout(
     Returns (None, None) unless the packed tokens are exactly the scheduled
     extends, so padded or partial batches keep the native kernel.
     """
-    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    seqs = getattr(forward_batch, "seq_lens_cpu", None)
-    if extends is None or seqs is None:
+    lengths = _packed_prefill_lengths(forward_batch, live_bs, num_tokens)
+    if lengths is None:
         return None, None
-    extends = tuple(int(n) for n in list(extends)[:live_bs])
-    seqs = tuple(int(n) for n in list(seqs)[:live_bs])
-    if (
-        len(extends) != live_bs
-        or len(seqs) != live_bs
-        or sum(extends) != num_tokens
-        or any(e < 0 or s < e for e, s in zip(extends, seqs))
-    ):
-        return None, None
+    extends, seqs = lengths
     if all(s == e for e, s in zip(extends, seqs)):
         return (extends, seqs), None
     # Built on the device from the per-request lengths (a few bytes up):
