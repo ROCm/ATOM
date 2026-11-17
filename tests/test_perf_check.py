@@ -1318,13 +1318,11 @@ def test_the_published_base_is_the_base_that_was_measured():
     and a reader reproducing it checked out the wrong tree while the right sha
     sat unread in every cell's provenance.json.
     """
-    judge = "".join(
-        s.get("run", "") for s in _workflow()["jobs"]["judge"]["steps"]
-    )
+    judge = "".join(s.get("run", "") for s in _workflow()["jobs"]["judge"]["steps"])
     assert "steps.collect.outputs.base_sha" in judge
-    assert "github.event.pull_request.base.sha" not in judge, (
-        "the base branch tip is not the tree that was benchmarked"
-    )
+    assert (
+        "github.event.pull_request.base.sha" not in judge
+    ), "the base branch tip is not the tree that was benchmarked"
 
 
 def test_the_cleanup_safety_net_is_not_refused_by_the_authz_plugin():
@@ -1340,7 +1338,8 @@ def test_the_cleanup_safety_net_is_not_refused_by_the_authz_plugin():
     # Comments, not commands: the step's own comment explains why the flag is
     # gone and names it, so a plain substring check passes on prose. It did.
     commands = "\n".join(
-        ln for ln in _step("paired-bench", "Clean up")["run"].splitlines()
+        ln
+        for ln in _step("paired-bench", "Clean up")["run"].splitlines()
         if not ln.lstrip().startswith("#")
     )
     assert "--privileged" not in commands
