@@ -877,6 +877,149 @@ def test_fused_moe_reads_the_finish_routes_and_feeds_the_gather(
         assert [value is reduce for value in calls["all_reduce"]] == [True]
 
 
+def test_fused_tail_takes_the_gather_norm_and_finalize_in_one_launch(monkeypatch):
+    rows, layer_id, latent, hidden, topk = 2, 3, 3584, 7168, 16
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        **{
+            name: torch.zeros(8, dtype=torch.uint8)
+            for name in (
+                "w_gate",
+                "w_ld",
+                "w_sgu",
+                "bias",
+                "w_sd",
+                "w13",
+                "w13s",
+                "w2",
+                "w2s",
+                "ln_w",
+                "w_up_full",
+            )
+        },
+        w_sgu_scale=None,
+        w_sd_scale=None,
+    )
+    reduce = torch.zeros(rows * (latent + hidden), dtype=torch.bfloat16)
+    buffers = {
+        name: torch.zeros(rows, 4, dtype=torch.uint8)
+        for name in (
+            "router_logits",
+            "latent_fp4",
+            "latent_scales",
+            "shared_gate_up",
+            "shared_hidden",
+            "flags",
+            "experts",
+            "kof",
+            "union_sizes",
+            "intermediate_fp4",
+            "intermediate_scales",
+            "finish_scratch",
+            "final",
+            "fused_inter",
+        )
+    }
+    buffers["route"] = torch.zeros(rows, topk, dtype=torch.int32)
+    buffers["tile_route"] = torch.zeros(rows, topk)
+    buffers["fused_grouped"] = torch.zeros(rows * topk, latent, dtype=torch.bfloat16)
+    buffers["fused_rows"] = torch.arange(rows * topk, dtype=torch.int32).view(
+        rows, topk
+    )
+    buffers["reduce"] = reduce
+    buffers["routed"] = reduce[: rows * latent].view(rows, latent)
+    buffers["shared"] = reduce[rows * latent :].view(rows, hidden)
+    calls = {}
+
+    def recorder(name, abi=None):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args), abi=abi
+        )
+
+    local = SimpleNamespace(
+        front=recorder("front"),
+        finish=recorder("finish"),
+        finalize=recorder("finalize"),
+        buffers=buffers,
+        grouped_experts=True,
+        replicated_finalize=True,
+        herd=False,
+        herd_routes=None,
+        allreduce=recorder("allreduce", GATHER_ALLREDUCE_ABI),
+        grouped_moe=None,
+        fused_moe=recorder("fused_moe"),
+        tail=recorder("tail"),
+    )
+    experts = SimpleNamespace(
+        w13_weight_scale=torch.zeros(4, dtype=torch.uint8),
+        w2_weight_scale=torch.zeros(4, dtype=torch.uint8),
+    )
+
+    def no_norm(_value):
+        raise AssertionError("the fused tail applies the routed norm itself")
+
+    layer = SimpleNamespace(
+        mlp_attn_res=lambda *_args: (torch.zeros(rows, 4), torch.zeros(rows, 4)),
+        block_sparse_moe=SimpleNamespace(experts=experts, routed_expert_norm=no_norm),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.rank = 5
+    runner.k2_peers = SimpleNamespace(
+        peers=torch.zeros(8, dtype=torch.int64),
+        epochs=torch.zeros(256, dtype=torch.int32),
+    )
+    runner.k2_tail_flags = torch.zeros(256, dtype=torch.int32)
+    runner.fused_moe_sync = (
+        torch.zeros(64, dtype=torch.int32),
+        torch.zeros(4, dtype=torch.int32),
+    )
+    runner.routed = {layer_id: weight}
+    runner.inner = SimpleNamespace(layers={layer_id: layer})
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        runner_module, "_bf16_attn_res", lambda site, *args: site(*args[:3])
+    )
+
+    _, out = runner._routed_k2(
+        SimpleNamespace(k2={layer_id: local}),
+        SimpleNamespace(layer_id=layer_id),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 4),
+        torch.zeros(rows, 3, 4),
+    )
+
+    assert "allreduce" not in calls and "finalize" not in calls
+    assert calls["tail"] == (
+        reduce.data_ptr(),
+        buffers["fused_grouped"].data_ptr(),
+        buffers["fused_rows"].data_ptr(),
+        buffers["tile_route"].data_ptr(),
+        weight.ln_w.data_ptr(),
+        weight.w_up_full.data_ptr(),
+        buffers["final"].data_ptr(),
+        runner.k2_tail_flags.data_ptr(),
+        runner.k2_peers.peers.data_ptr(),
+        runner.k2_peers.epochs.data_ptr(),
+        5,
+    )
+    assert out is buffers["final"]
+
+
+def test_fused_tail_needs_the_plain_routed_norm(monkeypatch):
+    plain = SimpleNamespace(use_fused_quant=False, x_pad_to_multiple=0)
+    assert runner_module._plain_routed_norm(plain)
+    assert not runner_module._plain_routed_norm(None)
+    assert not runner_module._plain_routed_norm(
+        SimpleNamespace(use_fused_quant=True, x_pad_to_multiple=0)
+    )
+    assert not runner_module._plain_routed_norm(
+        SimpleNamespace(use_fused_quant=False, x_pad_to_multiple=64)
+    )
+    monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
+    assert not runner_module._plain_routed_norm(plain)
+
+
 def test_precomputed_herd_hands_over_routes_laid_out_for_the_tile(monkeypatch):
     from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
         herd_scratch_layout,

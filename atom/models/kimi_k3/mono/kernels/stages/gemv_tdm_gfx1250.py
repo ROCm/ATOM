@@ -249,6 +249,7 @@ def project(
     prologue=None,
     x_cache_policy: int = 0,
     wide: bool = True,
+    token_buffers: int = 2,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -265,7 +266,10 @@ def project(
     ``wide``: each slab's tokens and each task's weight slab move in one TDM
     copy, by a wave of its own in turn, not as every wave's few rows: a wave
     keeps at most three tensor copies in flight, so small copies cap the bytes
-    a CU has in flight."""
+    a CU has in flight.
+
+    ``token_buffers``: token slabs resident in LDS (``x_words`` grows with
+    it), so that many are in flight once ``x`` is first read."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -274,7 +278,7 @@ def project(
     if fp8 and slabs > GFX1250.wave_size:
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
-    if _ROLLED_UNROLL and wide and 1 + 2 * tasks <= WAVES:
+    if _ROLLED_UNROLL and wide and token_buffers == 2 and 1 + 2 * tasks <= WAVES:
         return _project_rolled(
             lds,
             x,
@@ -292,8 +296,8 @@ def project(
             x_cache_policy,
         )
     tiles = (rows + ROWS - 1) // ROWS
-    x_words, _ = tdm_lds_words(rows, tasks, fp8)
     token_words = rows * ROW_STRIDE // 2
+    x_words = token_buffers * token_words
     task_words = tdm_task_words(fp8)
     stages = depth + 1
     rows_per_wave = (rows + WAVES - 1) // WAVES
@@ -333,7 +337,7 @@ def project(
             load_rows(
                 x + fx.Int64(slab * SLAB * 2),
                 x_stride,
-                lds + (slab % 2) * token_words,
+                lds + (slab % token_buffers) * token_words,
                 rows,
                 rows if whole else rows_per_wave,
                 _CLUSTER_MASK,
@@ -390,13 +394,16 @@ def project(
         [fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32) for _ in range(tiles)]
         for _ in range(tasks)
     ]
+    ahead = min(token_buffers, slabs)
     if prologue is None:
-        issue_tokens(0)
+        for slab in range(max(ahead - 1, 1)):
+            issue_tokens(slab)
     for slab in range(min(depth, slabs)):
         issue_weights(slab)
     if prologue is not None:
         prologue()
-        issue_tokens(0)
+        for slab in range(max(ahead - 1, 1)):
+            issue_tokens(slab)
     for slab in range(slabs):
         if slab:
             # The buffers slab - 1 read are the ones refilled below.
@@ -404,10 +411,10 @@ def project(
                 cluster.cluster_barrier()
             else:
                 gpu.barrier()
-            if slab + 1 < slabs:
-                issue_tokens(slab + 1)
-        elif slabs > 1:
-            issue_tokens(1)
+            if slab + ahead - 1 < slabs:
+                issue_tokens(slab + ahead - 1)
+        elif ahead > 1:
+            issue_tokens(ahead - 1)
         if slab + depth < slabs:
             issue_weights(slab + depth)
         if wide:
@@ -438,7 +445,7 @@ def project(
             )
             for task in range(tasks)
         ]
-        tokens = lds + (slab % 2) * token_words
+        tokens = lds + (slab % token_buffers) * token_words
         for tile in range(tiles):
             activations = _operand(
                 tokens,

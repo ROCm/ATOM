@@ -92,6 +92,11 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
     build_oproj_allreduce,
     oproj_peer_bytes,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_tail_gfx1250 import (
+    build_k2_tail,
+    tail_flag_words,
+    tail_max_rows,
+)
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
     FLAG_WORDS,
     INTER_ROW_WORDS,
@@ -129,6 +134,17 @@ def _uses_ptpc_o_proj(layer) -> bool:
 def _fuse_ptpc_core(layer, rows: int) -> bool:
     """Measured crossover against K1 + AITER per-token quant on gfx1250."""
     return rows <= K1_PTPC_FUSION_MAX_ROWS and _uses_ptpc_o_proj(layer)
+
+
+def _plain_routed_norm(norm) -> bool:
+    """Whether the routed norm is ``rmsnorm2d_fwd(x, weight, eps)`` itself,
+    the arithmetic the fused K2 tail reproduces."""
+    return (
+        norm is not None
+        and not getattr(norm, "use_fused_quant", False)
+        and not getattr(norm, "x_pad_to_multiple", 0)
+        and not envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM
+    )
 
 
 def _resident_hazards(launcher: object) -> tuple[str, ...]:
@@ -234,6 +250,9 @@ class Gfx1250RoutedK2Build:
     # the routed experts as one fused launch (moe_tdm_gfx1250.build_moe) at
     # widths up to ATOM_KIMI_MONO_FUSED_MOE_ROWS, in place of AITER's
     fused_moe: object | None = None
+    # the gathering all-reduce, routed RMSNorm and finalize as one launch
+    # (k2_tail_gfx1250) where ATOM_KIMI_MONO_TAIL is set
+    tail: object | None = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +275,9 @@ class Gfx1250WidthBuild:
             )
             if k2.allreduce is not None:
                 pairs.append((k2.allreduce.launcher, k2.allreduce.abi))
+            tail = getattr(k2, "tail", None)
+            if tail is not None:
+                pairs.append((tail.launcher, tail.abi))
         if self.oproj is not None:
             pairs.append((self.oproj.launcher, self.oproj.abi))
 
@@ -511,7 +533,21 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     routed.w_sgu_scale is not None,
                     routed.w_sd_scale is not None,
                 )
-                k2_key = (nblocks, reset, routed.gu_interleave, whole_up, fp8_shared)
+                tail_eps = None
+                if envs.ATOM_KIMI_MONO_TAIL:
+                    moe = getattr(
+                        self.inner.layers[layer.layer_id], "block_sparse_moe", None
+                    )
+                    if _plain_routed_norm(getattr(moe, "routed_expert_norm", None)):
+                        tail_eps = routed.ln_eps
+                k2_key = (
+                    nblocks,
+                    reset,
+                    routed.gu_interleave,
+                    whole_up,
+                    fp8_shared,
+                    tail_eps,
+                )
                 k2_local = k2_cache.get(k2_key)
                 if k2_local is None:
                     k2_local = self._build_routed_k2(
@@ -521,6 +557,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                         routed.gu_interleave,
                         whole_up,
                         fp8_shared,
+                        tail_eps,
                     )
                     k2_cache[k2_key] = k2_local
                 k2_by_layer[layer.layer_id] = k2_local
@@ -540,7 +577,10 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         gu_interleave: bool,
         whole_up: bool = False,
         fp8_shared: tuple[bool, bool] = (False, False),
+        tail_eps: float | None = None,
     ) -> Gfx1250RoutedK2Build:
+        """``tail_eps``: the routed norm's epsilon where the gathering
+        all-reduce, the norm and the finalize may run as one launch."""
         plan = self._plan(rows, nblocks)
         # AITER's grouped TDM MoE reads GUGU gate/up planes only.
         grouped = gu_interleave
@@ -641,6 +681,23 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if grouped_moe is not None or fused_moe is not None
                 else build_allreduce(self.tp, rows)
             )
+        tail = None
+        if (
+            tail_eps is not None
+            and allreduce is not None
+            and allreduce.abi is GATHER_ALLREDUCE_ABI
+            and rows <= tail_max_rows()
+        ):
+            # the fused MoE's routes are its own rows: ``fused_rows``
+            tail = build_k2_tail(
+                self.tp, rows, tail_eps, identity_routes=fused_moe is not None
+            )
+            if "k2_tail_flags" not in self.__dict__:
+                # one set for every layer and width: a launch's flags carry
+                # its epoch, unique to it
+                self.k2_tail_flags = torch.zeros(
+                    tail_flag_words(), dtype=torch.int32, device=self.device
+                )
         return Gfx1250RoutedK2Build(
             plan,
             front,
@@ -663,6 +720,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             allreduce,
             grouped_moe,
             fused_moe,
+            tail,
         )
 
     def _fused_moe_for(self, rows: int):
@@ -867,6 +925,21 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 ),
             )
         if local.replicated_finalize:
+            tail = getattr(local, "tail", None)
+            if tail is not None and gathered is not None:
+                tail.launcher(
+                    buffers["reduce"].data_ptr(),
+                    *[t.data_ptr() for t in gathered],
+                    weight.ln_w.data_ptr(),
+                    weight.w_up_full.data_ptr(),
+                    buffers["final"].data_ptr(),
+                    self.k2_tail_flags.data_ptr(),
+                    self.k2_peers.peers.data_ptr(),
+                    self.k2_peers.epochs.data_ptr(),
+                    self.rank,
+                    stream=stream,
+                )
+                return prefix, buffers["final"]
             if local.allreduce is not None:
                 local.allreduce.launcher(
                     buffers["reduce"].data_ptr(),
