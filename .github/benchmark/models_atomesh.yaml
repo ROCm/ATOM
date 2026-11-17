@@ -257,7 +257,15 @@ models:
             wait_server_timeout: 4500
           run_eval: true
           eval_only: true
-          accuracy:
+          accuracy: &dsv4_chat_gsm8k
+            task: gsm8k
+            fewshot: 3
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            batch_size: 64
+            max_gen_toks: 16384
+            apply_chat_template: true
+            fewshot_as_multiturn: true
             threshold: 0.90
         - <<: *dsv4_moriio_gsm8k
           name: ds-v4-2p1d-tp8-moriio-gsm8k
