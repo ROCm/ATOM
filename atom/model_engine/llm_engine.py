@@ -595,6 +595,8 @@ class LLMEngine:
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
             "preemptions": summed("preemptions"),
+            "requests_deferred_free": summed("requests_deferred_free"),
+            "kv_blocks_deferred_free": summed("kv_blocks_deferred_free"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
             "kv_blocks_total": kv_total,
